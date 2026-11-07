@@ -366,6 +366,13 @@ pub(crate) fn load(
         if let Some(detail) = northnarrow_agent::module_trust::apply_policy(&policy, signed) {
             northnarrow_agent::boot::degradation::report("rule_policy", &detail);
         }
+        // Lot 290: the signed per-loader opt-outs of the refused BPF
+        // program types (the registration writes them to the kernel)
+        if let Some(detail) =
+            nn_linux::anti_tamper::bpf_defense::apply_loader_policy(&policy, signed)
+        {
+            northnarrow_agent::boot::degradation::report("rule_policy", &detail);
+        }
         if !policy.is_builtin() {
             warn!(
                 source = %policy.source,

@@ -324,6 +324,11 @@ fn exempt_resolvers(ebpf: &mut Ebpf) {
             warn!(uid, error = %e, "DNS budget: could not exempt a resolver user");
         }
     }
+    drop(exempt);
+    // Lot 290 (item 3): written once per load — frozen
+    if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, "DNS_EXEMPT_UIDS") {
+        warn!(error = %e, "DNS budget: DNS_EXEMPT_UIDS NOT frozen");
+    }
     info!(uids = ?uids, "DNS budget: local resolver users exempt (review 78)");
 }
 

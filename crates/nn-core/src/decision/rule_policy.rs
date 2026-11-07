@@ -161,6 +161,15 @@ pub struct RulePolicy {
     /// read as `_`. The agent honours it only from a policy whose signature
     /// it verified.
     module_allow: std::collections::BTreeSet<String>,
+    /// Lot 290: `bpf-loader-allow <executable> <type>[,<type>…]` — the
+    /// signed per-loader opt-out of the `bpf` hook's refusal of the program
+    /// types that can rewrite user memory, override a kernel function's
+    /// return, signal a process or take a hook's place (kprobe, tracing,
+    /// lsm, ext, struct_ops): that executable, by the device and inode its
+    /// absolute path names when the policy is applied, may load those types
+    /// outside a window, each load recorded. The agent honours it only from
+    /// a policy whose signature it verified.
+    bpf_loader_allow: BTreeMap<String, u32>,
     /// Where it came from (`built-in defaults`, `<path> (signed, sha256 …)`).
     pub source: String,
 }
@@ -208,6 +217,13 @@ impl RulePolicy {
         self.module_allow.iter().map(String::as_str)
     }
 
+    /// Lot 290: the signed per-loader opt-outs — the executable's absolute
+    /// path and the mask of the types it may load
+    /// (`common::bpf_prog_class::type_bit`).
+    pub fn bpf_loader_opt_outs(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.bpf_loader_allow.iter().map(|(p, m)| (p.as_str(), *m))
+    }
+
     /// No directive at all.
     pub fn is_builtin(&self) -> bool {
         self.modes.is_empty()
@@ -215,6 +231,7 @@ impl RulePolicy {
             && !self.ransomware_combat_without_corroboration
             && self.sysctl_allow.is_empty()
             && self.module_allow.is_empty()
+            && self.bpf_loader_allow.is_empty()
     }
 
     /// One line for the logs and the audit row (lot 280a: the sysctl
@@ -230,6 +247,14 @@ impl RulePolicy {
             0 => {}
             n => opt_outs.push_str(&format!(
                 ", {n} module opt-out{}",
+                if n == 1 { "" } else { "s" }
+            )),
+        }
+        // Lot 290
+        match self.bpf_loader_allow.len() {
+            0 => {}
+            n => opt_outs.push_str(&format!(
+                ", {n} BPF loader opt-out{}",
                 if n == 1 { "" } else { "s" }
             )),
         }
@@ -270,8 +295,48 @@ impl RulePolicy {
         for m in &self.module_allow {
             out.push_str(&format!("module-allow {m}\n"));
         }
+        for (path, mask) in &self.bpf_loader_allow {
+            out.push_str(&format!(
+                "bpf-loader-allow {path} {}\n",
+                common::bpf_prog_class::mask_names(*mask)
+            ));
+        }
         out
     }
+}
+
+/// Lot 290: the most `bpf-loader-allow` lines a policy holds (the kernel's
+/// map has room for 64 executables).
+pub const MAX_BPF_LOADER_OPT_OUTS: usize = 32;
+
+/// Lot 290: a `bpf-loader-allow` line's executable and types — an absolute
+/// path without `.` or `..` components, and types among those refused by
+/// default (`common::bpf_prog_class::opt_out_type`), each once.
+fn bpf_loader_opt_out(path: &str, types: &str) -> Result<(String, u32), String> {
+    if !path.starts_with('/')
+        || path.len() < 2
+        || path.ends_with('/')
+        || path
+            .split('/')
+            .skip(1)
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err("not an absolute path to an executable".to_string());
+    }
+    let mut mask = 0u32;
+    for t in types.split(',') {
+        let Some(ty) = common::bpf_prog_class::opt_out_type(t) else {
+            return Err(format!(
+                "`{t}` is not a type refused by default (kprobe, tracing, lsm, ext, struct_ops)"
+            ));
+        };
+        let bit = common::bpf_prog_class::type_bit(ty);
+        if mask & bit != 0 {
+            return Err(format!("`{t}` twice"));
+        }
+        mask |= bit;
+    }
+    Ok((path.to_string(), mask))
 }
 
 /// `v` for one value, `min..max` for a range (the directive's spelling).
@@ -333,6 +398,15 @@ pub fn show(p: &RulePolicy) -> String {
             out.push_str(&format!(
                 "module-allow {m} (its files in the running kernel's tree load, each load \
                  recorded; honoured only signed)\n"
+            ));
+        }
+        // Lot 290
+        for (path, mask) in p.bpf_loader_opt_outs() {
+            out.push_str(&format!(
+                "bpf-loader-allow {path} {} (that executable, by its device and inode when the \
+                 policy is applied, loads them outside a window, each load recorded; honoured \
+                 only signed)\n",
+                common::bpf_prog_class::mask_names(mask)
             ));
         }
     }
@@ -694,6 +768,27 @@ fn parse_as(
                 }
             }
             ["module-allow", ..] => return Err(err("`module-allow <module>`".to_string())),
+            // Lot 290: the signed per-loader opt-out of the refused BPF
+            // program types
+            ["bpf-loader-allow", path, types] => {
+                let (path, mask) = bpf_loader_opt_out(path, types)
+                    .map_err(|why| err(format!("bpf-loader-allow {path}: {why}")))?;
+                if p.bpf_loader_allow.insert(path.clone(), mask).is_some() {
+                    return Err(err(format!("bpf-loader-allow {path} twice")));
+                }
+                if p.bpf_loader_allow.len() > MAX_BPF_LOADER_OPT_OUTS {
+                    return Err(err(format!(
+                        "more than {MAX_BPF_LOADER_OPT_OUTS} bpf-loader-allow lines"
+                    )));
+                }
+            }
+            ["bpf-loader-allow", ..] => {
+                return Err(err(
+                    "`bpf-loader-allow <absolute executable path> <type>[,<type>…]` (types: \
+                     kprobe, tracing, lsm, ext, struct_ops)"
+                        .to_string(),
+                ))
+            }
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
                 if id != RANSOMWARE_RULE {
@@ -709,7 +804,7 @@ fn parse_as(
             [kw, ..] => {
                 return Err(err(format!(
                     "unknown directive `{kw}`: enforce, alert, audit, off, exempt, \
-                     combat-without-corroboration, sysctl-allow, module-allow"
+                     combat-without-corroboration, sysctl-allow, module-allow, bpf-loader-allow"
                 )))
             }
             [] => unreachable!("empty content skipped"),
@@ -1058,6 +1153,62 @@ mod tests {
         assert_eq!(p.mode(resolve_rule("R008").unwrap()), Some(Mode::Off));
         // The rendering reads back to the same policy.
         assert_eq!(parse(&p.render()).unwrap(), p);
+    }
+
+    /// Lot 290 (named): the signed per-loader opt-out — an absolute
+    /// executable and types refused by default, each once; read back as
+    /// written, counted, shown as honoured only signed; a relative path, a
+    /// `..`, a type not refused (xdp), a duplicate refused.
+    #[test]
+    fn a_bpf_loader_opt_out_names_an_executable_and_refused_types() {
+        use common::bpf_prog_class::type_bit;
+        let p = parse(
+            "bpf-loader-allow /usr/bin/bpftrace kprobe,tracing   # the SRE's tracing\n\
+             bpf-loader-allow /usr/bin/falco lsm\n",
+        )
+        .unwrap();
+        assert!(!p.is_builtin());
+        assert_eq!(
+            p.bpf_loader_opt_outs().collect::<Vec<_>>(),
+            [
+                ("/usr/bin/bpftrace", type_bit(2) | type_bit(26)),
+                ("/usr/bin/falco", type_bit(29)),
+            ]
+        );
+        assert_eq!(parse(&p.render()).unwrap(), p);
+        assert!(p
+            .render()
+            .contains("bpf-loader-allow /usr/bin/bpftrace kprobe,tracing\n"));
+        assert!(
+            p.summary().ends_with(", 2 BPF loader opt-outs"),
+            "{}",
+            p.summary()
+        );
+        let shown = show(&p);
+        assert!(
+            shown.contains("bpf-loader-allow /usr/bin/falco lsm (that executable")
+                && shown.contains("honoured only signed"),
+            "{shown}"
+        );
+        for (line, why) in [
+            ("bpf-loader-allow bpftrace kprobe\n", "absolute path"),
+            ("bpf-loader-allow /usr/bin/../tmp/x kprobe\n", "absolute path"),
+            ("bpf-loader-allow /usr/bin/x/ kprobe\n", "absolute path"),
+            ("bpf-loader-allow /usr/bin/x xdp\n", "not a type refused by default"),
+            ("bpf-loader-allow /usr/bin/x kprobe,kprobe\n", "`kprobe` twice"),
+            ("bpf-loader-allow /usr/bin/x\n", "<absolute executable path>"),
+            (
+                "bpf-loader-allow /usr/bin/x lsm\nbpf-loader-allow /usr/bin/x ext\n",
+                "/usr/bin/x twice",
+            ),
+        ] {
+            let e = parse(line).unwrap_err().to_string();
+            assert!(e.contains(why), "{line:?}: {e}");
+        }
+        let many: String = (0..=MAX_BPF_LOADER_OPT_OUTS)
+            .map(|i| format!("bpf-loader-allow /opt/t{i} kprobe\n"))
+            .collect();
+        assert!(parse(&many).unwrap_err().to_string().contains("more than"));
     }
 
     /// Lot 280a: the signed per-sysctl opt-out — a guarded sysctl by its

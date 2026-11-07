@@ -409,6 +409,9 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
         Program::RawTracePoint(p) => p.load(),
         // Lot 280a: the sysctl judge (cgroup/sysctl on the root cgroup)
         Program::CgroupSysctl(p) => p.load(),
+        // Lot 290: the cross-view's iterators (`iter/bpf_prog`,
+        // `iter/bpf_link`)
+        Program::Iter(p) => p.load(target, btf),
         other => {
             return Outcome::Error(format!(
                 "program type {:?} is not one the agent loads",

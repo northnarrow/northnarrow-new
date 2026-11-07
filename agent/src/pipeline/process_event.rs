@@ -513,11 +513,17 @@ pub(crate) fn process_event(
             let opted_out = *operation == nn_model::FsProtectOperation::SysctlOptOut;
             // Lot 280b: what the kernel-state round found — the kernel's own
             // record, not a refusal.
+            // Lot 290: and its BPF cross-view.
             let found = matches!(
                 operation,
                 nn_model::FsProtectOperation::KernelTaint
                     | nn_model::FsProtectOperation::SysctlRootProg
+                    | nn_model::FsProtectOperation::BpfUnseen
+                    | nn_model::FsProtectOperation::BpfBaseline
             );
+            // Lot 290: a load the signed per-loader opt-out let through.
+            let loader_opted_out =
+                *operation == nn_model::FsProtectOperation::BpfProgOptOut;
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
@@ -540,6 +546,13 @@ pub(crate) fn process_event(
                         "CGROUP EXEMPTION SPOOF: a process moved into an exempt cgroup by someone \
                          other than systemd — not refused; it and what it starts are never exempt \
                          by that cgroup or unit"
+                    );
+                } else if loader_opted_out {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        prog_type = target_ino,
+                        "BPF LOADER OPT-OUT: a refused program type's load let through by the \
+                         signed per-rule policy's bpf-loader-allow (recorded, not refused)"
                     );
                 } else if opted_out {
                     let (kind, value) = common::sysctl_judge::record_of(*target_dev, *target_ino);
@@ -598,6 +611,23 @@ pub(crate) fn process_event(
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
                             "not refused: found on the root cgroup's cgroup/sysctl slot by the \
                              kernel-state round"
+                                .to_string()
+                        } else if loader_opted_out {
+                            "not refused: let through by the signed per-rule policy's \
+                             bpf-loader-allow (the loader's executable and the type)"
+                                .to_string()
+                        } else if matches!(
+                            operation,
+                            nn_model::FsProtectOperation::BpfUnseen
+                                | nn_model::FsProtectOperation::BpfBaseline
+                        ) {
+                            "not refused: found by the BPF cross-view of the kernel-state round"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfProgType {
+                            "denied in kernel (the bpf LSM hook: a refused program type)"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfHandle {
+                            "denied in kernel (the BPF guard: a handle on the agent's own object)"
                                 .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootAttach {
                             "denied in kernel (the bpf LSM hook: an attach to the root cgroup)"

@@ -21,6 +21,11 @@
 //!   a root the attach no longer finds as it left it (our program gone, the
 //!   mode no longer multi) is a signed degradation while it holds.
 //!
+//! * Lot 290: the light cross-view of the host's BPF programs and links
+//!   ([`crate::bpf_crossview`]): an object the `bpf` hook never saw loading
+//!   — present at the start (the baseline, signed once) or appearing later
+//!   (a signed High) — with its type, name, tag and attach point.
+//!
 //! The detections go through the bus as the `fs_protect` source's events
 //! (the kernel's refusals' source): judged, signed and counted like them.
 
@@ -120,6 +125,8 @@ pub enum Finding {
     Taint { new: u64, mask: u64 },
     /// A program not ours on the root's `cgroup/sysctl` slot.
     RootProgram(u32),
+    /// Lot 290: the cross-view's finding.
+    Bpf(crate::bpf_crossview::Finding),
 }
 
 impl Watch {
@@ -182,14 +189,28 @@ fn monotonic_ns() -> u64 {
 /// The event a finding is signed as (NN-L-AT-001): the kernel's own act,
 /// no process behind it (pid 0, `kernel`).
 pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
+    let mut comm = "kernel".to_string();
     let (operation, target_dev, target_ino) = match f {
         Finding::Taint { new, mask } => (FsProtectOperation::KernelTaint, *new, *mask),
         Finding::RootProgram(id) => (FsProtectOperation::SysctlRootProg, 0, u64::from(*id)),
+        Finding::Bpf(b) => {
+            use crate::bpf_crossview::Finding as B;
+            let (op, o) = match b {
+                B::Baseline(o) => (FsProtectOperation::BpfBaseline, o),
+                B::Unseen(o) => (FsProtectOperation::BpfUnseen, o),
+            };
+            comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
+            (
+                op,
+                o.tag,
+                common::bpf_prog_class::crossview_ino(o.is_link, o.object_type, o.id),
+            )
+        }
     };
     Event::FsProtectDenial {
         pid: 0,
         uid: 0,
-        comm: "kernel".to_string(),
+        comm,
         target_dev,
         target_ino,
         operation,
@@ -226,15 +247,56 @@ pub fn round(w: &mut Watch, root: &Path) -> Vec<Finding> {
     out
 }
 
+/// Lot 290: one cross-view round — its findings, each logged; an error
+/// is a signed degradation while it holds ([`crate::bpf_crossview::DEGRADATION`]).
+pub fn crossview_round(
+    cross: &mut crate::bpf_crossview::CrossView,
+    failing: &mut Option<String>,
+) -> Vec<Finding> {
+    use crate::bpf_crossview::DEGRADATION;
+    match cross.round() {
+        Ok(found) => {
+            if failing.take().is_some() {
+                info!("kernel state: the BPF cross-view runs again");
+                crate::boot::degradation::withdraw(DEGRADATION, &[]);
+            }
+            for f in &found {
+                warn!(finding = ?f, "kernel state: a BPF object the bpf hook never saw loading");
+            }
+            found.into_iter().map(Finding::Bpf).collect()
+        }
+        Err(why) => {
+            let line = format!(
+                "the BPF cross-view could not enumerate the host's programs: {why} — a program \
+                 the bpf hook never saw is not found"
+            );
+            if failing.as_deref() != Some(line.as_str()) {
+                warn!(detail = %line, "kernel state: BPF cross-view");
+                crate::boot::degradation::withdraw(DEGRADATION, &[]);
+                if crate::boot::degradation::report(DEGRADATION, &line) {
+                    crate::boot::degradation::flush();
+                }
+                *failing = Some(line);
+            }
+            Vec::new()
+        }
+    }
+}
+
 /// Start the round: every [`PERIOD`], its findings sent on `tx` (the
 /// `fs_protect` source). The first read is the baseline of the taint mask.
-pub fn spawn(tx: BusSender) {
+/// Lot 290: and `cross`, the BPF cross-view, when the attach set it up.
+pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) {
     tokio::spawn(async move {
         let mut w = Watch::default();
+        let mut failing: Option<String> = None;
         let mut tick = tokio::time::interval(PERIOD);
         loop {
             tick.tick().await;
-            let found = round(&mut w, Path::new("/"));
+            let mut found = round(&mut w, Path::new("/"));
+            if let Some(c) = cross.as_mut() {
+                found.extend(crossview_round(c, &mut failing));
+            }
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;

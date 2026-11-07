@@ -418,7 +418,13 @@ pub(crate) fn wire(
     // cgroup's cgroup/sysctl programs, every 5 s — a new taint of code
     // entering the kernel, a foreign program on the root: signed detections
     // through the bus, as the `fs_protect` source's events.
-    nn_linux::kernel_state::spawn(sensor.event_tx_for("fs_protect"));
+    // Lot 290: and the light cross-view of the host's BPF programs and
+    // links (its status file beside the program-id list).
+    let crossview = sensor.bpf_guard().crossview(
+        super::attach::own_prog_ids_file(cli)
+            .map(|p| nn_linux::bpf_crossview::status_path(&p)),
+    );
+    nn_linux::kernel_state::spawn(sensor.event_tx_for("fs_protect"), crossview);
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.
     northnarrow_agent::self_integrity::spawn(
         audit_log.clone(),
