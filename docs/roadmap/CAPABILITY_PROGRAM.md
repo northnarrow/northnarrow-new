@@ -7791,12 +7791,13 @@ number in parentheses is a lab PR.
     source-reading `xtask/tests/foreign_bpf.rs` (the type refusal in every
     mode, the handles off limits, the seen loads and the iterators, the
     cross-view in the round, the frozen maps and the opt-out's wiring, the
-    own-ids map's capacity). Mutations: 81 of the new code (common 11,
+    own-ids map's capacity). Mutations: 80 of the new code (common 11,
     policy 7, NN-L-AT-001 6, posture 4, R011 4, the cross-view and the
-    agent's half 24, the eBPF code read by xtask 22, the round's event 3):
-    all caught by a named test — four only once their test was made whole
-    (a partial iterator record, the event's early bit) or the code made
-    plain (a check the pending set already made, removed).
+    agent's half 24, the eBPF code read by xtask 19, the round's event 5):
+    all caught by a named test — two only once their test was made whole
+    (a partial iterator record, the event's early bit); a third survivor
+    was a check the pending set already made, removed from the code (the
+    mutation of the set itself caught).
   - Open: the handle refusals hold in enforce mode only; `tracepoint`,
     `raw_tracepoint` and `perf_event` programs (which can call
     `bpf_probe_write_user` and `bpf_send_signal`) are let through and
