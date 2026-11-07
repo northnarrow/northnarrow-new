@@ -779,7 +779,8 @@ others. What an operator sees change:
   High for one of the five types above (one loaded while no agent ran); a
   program or link that appears later and the hook never saw is
   `bpf_unseen`, High. A host with many container or systemd programs has
-  as many Low baseline records at each agent start.
+  as many Low baseline records at each agent start; the kernel's own
+  programs (loaded before user space: HID-BPF's `hid_tail_call`) are Low.
 - **R011's record of a plain `modprobe <name>` by root is Low** (it was
   High): the system's tool asked for modules by name, its environment read
   clean. The suspicious cases keep their severity (a process gone before

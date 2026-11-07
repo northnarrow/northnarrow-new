@@ -2188,7 +2188,10 @@ loading is
 - the **baseline** when it was there at the first enumeration (loaded while
   the agent was not running: at boot before it, in a restart's or an
   upgrade's gap) — each signed once, NN-L-AT-001 `bpf_baseline`, Low, High
-  for one of the refused types;
+  for one of the refused types; Low again for a program the kernel loaded
+  itself before user space started (its `load_time` before PID 1's start:
+  HID-BPF's `hid_tail_call`, a `tracing` program, prog id 2 on the 6.8
+  guest — the lab's first round signed it High at every start);
 - **unseen** when it appears later — loaded through a path the hook does not
   see, or hidden from it: NN-L-AT-001 `bpf_unseen`, High, with its type,
   name, tag and attach point.
