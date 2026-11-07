@@ -140,7 +140,7 @@ if want F4; then
     if ! sudo grep -qa 'NN_BPF_DEFENSE_ENFORCE=1' "/proc/$(agent_pid)/environ" 2>/dev/null; then
         sudo systemctl set-environment NN_BPF_DEFENSE_ENFORCE=1 && ENF=1 && restart_agent
     fi
-    TDIR=$(ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null | head -1)
+    TDIR=$(sudo sh -c "ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null" | head -1)
     window 60
     MID=$(sudo bpftool -j map show pinned "$TDIR/CGROUP_JOINED" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)
     PID_=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1; exit}' /run/northnarrow/bpf-own-ids 2>/dev/null)
