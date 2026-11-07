@@ -220,8 +220,10 @@ pub struct Object {
     /// Where it is attached: the attach function, else the link types of
     /// its links, else its expected attach type (when it has one).
     pub attach: String,
-    /// Loaded by the kernel itself before user space started (its load
-    /// time before PID 1's start: HID-BPF's `hid_tail_call`).
+    /// The kernel's own: loaded before user space started (its load time
+    /// before PID 1's start), or one of the programs the kernel loads from a
+    /// module's init (`common::bpf_prog_class::KERNEL_PROGRAMS`: HID-BPF's
+    /// `hid_tail_call` on its attach function).
     pub early: bool,
 }
 
@@ -346,7 +348,9 @@ pub fn judge(
             name: text(&p.name),
             tag: tag_word(p.tag),
             attach: attach_of(p, &link_types),
-            early: p.load_time != 0 && w.user_space_since.is_some_and(|t| p.load_time < t),
+            early: (p.load_time != 0 && w.user_space_since.is_some_and(|t| p.load_time < t))
+                || (p.attach_read == 1
+                    && common::bpf_prog_class::is_kernel_program(&p.name, &p.attach)),
         });
     }
     // a link is judged through its program; one whose program the program
@@ -696,13 +700,20 @@ mod tests {
             user_space_since: Some(3_000_000_000),
             ..Watch::default()
         };
-        let mut hid = with_attach(prog(2, 26, "hid_tail_call"), "__hid_bpf_tail_call");
-        hid.load_time = 1_200_000_000;
+        let mut boot = with_attach(prog(2, 26, "built_in"), "some_fn");
+        boot.load_time = 1_200_000_000;
+        // the 6.8 guest's: loaded by udev's modprobe in the initramfs, after
+        // PID 1 started — told by its name and attach function
+        let hid = with_attach(prog(6, 26, "hid_tail_call"), "__hid_bpf_tail_call");
+        let fake = with_attach(prog(7, 26, "hid_tail_call"), "bpf_lsm_file_open");
         let mut unread = prog(4, 26, "x");
         unread.load_time = 0;
         let mut legacy = prog(5, 15, "sd_devices");
         legacy.expected_attach_type = 0;
-        let r = en(vec![hid, prog(3, 2, "late"), unread, legacy], None);
+        let r = en(
+            vec![boot, prog(3, 2, "late"), unread, legacy, hid, fake],
+            None,
+        );
         judge(&mut w, vec![], &r, &own);
         let (f, foreign) = judge(&mut w, vec![], &r, &own);
         let early: Vec<(u32, bool)> = f
@@ -711,15 +722,30 @@ mod tests {
                 Finding::Baseline(o) | Finding::Unseen(o) => (o.id, o.early),
             })
             .collect();
-        assert_eq!(early, vec![(2, true), (3, false), (4, false), (5, false)]);
+        assert_eq!(
+            early,
+            vec![
+                (2, true),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, true),
+                (7, false)
+            ]
+        );
         assert_eq!(
             foreign.iter().find(|o| o.id == 5).unwrap().attach,
             "unknown (no link, no attach type)"
         );
         let body = render_status(&w, &foreign);
+        assert!(body.contains("some_fn baseline kernel\n"), "{body}");
         assert!(
             body.contains("__hid_bpf_tail_call baseline kernel\n"),
             "{body}"
+        );
+        assert!(
+            body.contains("bpf_lsm_file_open baseline\n"),
+            "the name alone is not the kernel's: {body}"
         );
         assert!(
             body.contains("late ab00000000000003 cgroup_device baseline\n"),

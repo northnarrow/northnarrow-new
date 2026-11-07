@@ -235,6 +235,31 @@ pub fn mask_names(mask: u32) -> String {
         .join(",")
 }
 
+/// Lot 290 (the lab's rounds on 6.8): programs the kernel loads itself —
+/// from a module's init, through its light skeleton — by their name and the
+/// kernel function they are attached to (which the kernel checks at the
+/// load: a program of that name elsewhere is not one of them). HID-BPF's
+/// dispatcher (6.3 to 6.10; prog id 2 on the 6.8 guest, loaded when udev
+/// loads `hid` in the initramfs, after PID 1 started: its load time does
+/// not tell it) and `bpf_preload`'s iterators (`maps.debug`, `progs.debug`).
+pub const KERNEL_PROGRAMS: [(&str, &str); 3] = [
+    ("hid_tail_call", "__hid_bpf_tail_call"),
+    ("dump_bpf_map", "bpf_iter_bpf_map"),
+    ("dump_bpf_prog", "bpf_iter_bpf_prog"),
+];
+
+/// Whether `(name, attach function)` is one of [`KERNEL_PROGRAMS`].
+pub fn is_kernel_program(name: &[u8], attach: &[u8]) -> bool {
+    fn trim(b: &[u8]) -> &[u8] {
+        let end = b.iter().position(|c| *c == 0).unwrap_or(b.len());
+        &b[..end]
+    }
+    let (n, a) = (trim(name), trim(attach));
+    KERNEL_PROGRAMS
+        .iter()
+        .any(|(kn, ka)| kn.as_bytes() == n && ka.as_bytes() == a)
+}
+
 /// Length of a program's name in the kernel (`BPF_OBJ_NAME_LEN`).
 pub const OBJ_NAME_LEN: usize = 16;
 /// The bytes of a program's attach function's name an iterator record
@@ -518,6 +543,21 @@ mod tests {
             ("nn_x", "bpf_lsm_file_open")
         );
         assert_eq!(object_of_comm("plain"), ("plain", "?"));
+    }
+
+    /// Lot 290 (named; the lab's rounds): the kernel's own programs by
+    /// name AND attach function — the same name elsewhere is not one.
+    #[test]
+    fn the_kernel_s_own_programs_are_told_by_name_and_attach_point() {
+        assert!(is_kernel_program(
+            b"hid_tail_call\0\0\0",
+            b"__hid_bpf_tail_call\0"
+        ));
+        assert!(is_kernel_program(b"dump_bpf_prog", b"bpf_iter_bpf_prog"));
+        assert!(!is_kernel_program(b"hid_tail_call", b"bpf_lsm_file_open"));
+        assert!(!is_kernel_program(b"hid_tail_cal", b"__hid_bpf_tail_call"));
+        assert!(!is_kernel_program(b"rootkit", b"__hid_bpf_tail_call"));
+        assert!(!is_kernel_program(b"", b""));
     }
 
     /// Lot 290: the iterators' records, as userland reads them.
