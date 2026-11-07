@@ -504,7 +504,10 @@ mod tests {
         let rk_at_start = prog(11, 2, "kp_at_start");
         let ours = prog(1, 29, "nn_hook");
         let r0 = en(vec![ours, sd, rk_at_start], None);
-        assert!(judge(&mut w, vec![], &r0, &own).0.is_empty(), "first sight: nothing yet");
+        assert!(
+            judge(&mut w, vec![], &r0, &own).0.is_empty(),
+            "first sight: nothing yet"
+        );
         let (f, foreign) = judge(&mut w, vec![], &r0, &own);
         assert_eq!(ids(&f), vec![('B', false, 10), ('B', false, 11)]);
         assert_eq!(foreign.len(), 2, "ours is not foreign");
@@ -513,7 +516,10 @@ mod tests {
         let seen_one = prog(20, 15, "runc_dev");
         let r = en(vec![ours, sd, rk_at_start, seen_one], None);
         assert!(judge(&mut w, vec![(20, seen(4242))], &r, &own).0.is_empty());
-        assert!(judge(&mut w, vec![], &r, &own).0.is_empty(), "seen stays seen");
+        assert!(
+            judge(&mut w, vec![], &r, &own).0.is_empty(),
+            "seen stays seen"
+        );
         assert_eq!(w.seen()[&20].tgid, 4242);
         // an unseen one: signed a round after it shows, once
         let hidden = with_attach(prog(30, 29, "hide"), "bpf_lsm_file_open");
@@ -556,22 +562,54 @@ mod tests {
         let own: BTreeSet<u32> = [1].into();
         let mut w = Watch::default();
         let old_run = prog(5, 29, "bpf_map_guard");
-        assert!(judge(&mut w, vec![], &en(vec![old_run], Some(vec![])), &own).0.is_empty());
-        assert!(judge(&mut w, vec![], &en(vec![], Some(vec![])), &own).0.is_empty());
+        assert!(
+            judge(&mut w, vec![], &en(vec![old_run], Some(vec![])), &own)
+                .0
+                .is_empty()
+        );
+        assert!(judge(&mut w, vec![], &en(vec![], Some(vec![])), &own)
+            .0
+            .is_empty());
         let kp = prog(60, 2, "kp");
         let links = vec![
-            LinkRecord { id: 7, link_type: 7, prog_id: 60, _pad: 0 },
-            LinkRecord { id: 8, link_type: 2, prog_id: 99, _pad: 0 },
-            LinkRecord { id: 9, link_type: 3, prog_id: 0, _pad: 0 },
-            LinkRecord { id: 10, link_type: 2, prog_id: 1, _pad: 0 },
+            LinkRecord {
+                id: 7,
+                link_type: 7,
+                prog_id: 60,
+                _pad: 0,
+            },
+            LinkRecord {
+                id: 8,
+                link_type: 2,
+                prog_id: 99,
+                _pad: 0,
+            },
+            LinkRecord {
+                id: 9,
+                link_type: 3,
+                prog_id: 0,
+                _pad: 0,
+            },
+            LinkRecord {
+                id: 10,
+                link_type: 2,
+                prog_id: 1,
+                _pad: 0,
+            },
         ];
         let r = en(vec![kp], Some(links));
         assert!(judge(&mut w, vec![], &r, &own).0.is_empty());
         let (f, foreign) = judge(&mut w, vec![], &r, &own);
         assert_eq!(ids(&f), vec![('U', false, 60), ('U', true, 8)]);
-        assert_eq!(foreign.iter().find(|o| o.id == 60).unwrap().attach, "perf_event");
+        assert_eq!(
+            foreign.iter().find(|o| o.id == 60).unwrap().attach,
+            "perf_event"
+        );
         let l = foreign.iter().find(|o| o.is_link).unwrap();
-        assert_eq!((l.id, l.object_type, l.attach.as_str()), (8, 2, "program 99 not enumerated"));
+        assert_eq!(
+            (l.id, l.object_type, l.attach.as_str()),
+            (8, 2, "program 99 not enumerated")
+        );
         let plain = prog(70, 15, "dev");
         assert_eq!(attach_of(&plain, &BTreeMap::new()), "cgroup_device");
         let f = with_attach(prog(71, 26, "fe"), "do_unlinkat");
@@ -584,13 +622,24 @@ mod tests {
     fn the_status_file_names_each_foreign_object_and_its_loader() {
         let own: BTreeSet<u32> = BTreeSet::new();
         let mut w = Watch::default();
-        let r = en(vec![prog(10, 15, "sd_devices"), prog(20, 15, "runc_dev")], None);
+        let r = en(
+            vec![prog(10, 15, "sd_devices"), prog(20, 15, "runc_dev")],
+            None,
+        );
         judge(&mut w, vec![(20, seen(77))], &r, &own);
         let (_, foreign) = judge(&mut w, vec![], &r, &own);
         let body = render_status(&w, &foreign);
-        assert!(body.contains("prog 10 cgroup_device sd_devices ab0000000000000a cgroup_device baseline\n"), "{body}");
+        assert!(
+            body.contains(
+                "prog 10 cgroup_device sd_devices ab0000000000000a cgroup_device baseline\n"
+            ),
+            "{body}"
+        );
         assert!(body.contains("prog 20 cgroup_device runc_dev ab00000000000014 cgroup_device seen pid=77 uid=0 comm=runc\n"), "{body}");
-        assert!(body.contains("load 20 cgroup_device pid=77 uid=0 comm=runc\n"), "{body}");
+        assert!(
+            body.contains("load 20 cgroup_device pid=77 uid=0 comm=runc\n"),
+            "{body}"
+        );
         assert_eq!(
             status_path(Path::new("/run/northnarrow/agent.pid")),
             Path::new("/run/northnarrow/bpf-foreign")

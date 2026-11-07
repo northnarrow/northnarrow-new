@@ -1192,11 +1192,23 @@ mod tests {
         );
         for (line, why) in [
             ("bpf-loader-allow bpftrace kprobe\n", "absolute path"),
-            ("bpf-loader-allow /usr/bin/../tmp/x kprobe\n", "absolute path"),
+            (
+                "bpf-loader-allow /usr/bin/../tmp/x kprobe\n",
+                "absolute path",
+            ),
             ("bpf-loader-allow /usr/bin/x/ kprobe\n", "absolute path"),
-            ("bpf-loader-allow /usr/bin/x xdp\n", "not a type refused by default"),
-            ("bpf-loader-allow /usr/bin/x kprobe,kprobe\n", "`kprobe` twice"),
-            ("bpf-loader-allow /usr/bin/x\n", "<absolute executable path>"),
+            (
+                "bpf-loader-allow /usr/bin/x xdp\n",
+                "not a type refused by default",
+            ),
+            (
+                "bpf-loader-allow /usr/bin/x kprobe,kprobe\n",
+                "`kprobe` twice",
+            ),
+            (
+                "bpf-loader-allow /usr/bin/x\n",
+                "<absolute executable path>",
+            ),
             (
                 "bpf-loader-allow /usr/bin/x lsm\nbpf-loader-allow /usr/bin/x ext\n",
                 "/usr/bin/x twice",

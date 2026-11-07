@@ -389,9 +389,18 @@ mod tests {
                 assert_eq!(got[i], *n, "{name} value {i}");
             }
         }
-        assert_eq!(PROG_TYPES[PROG_TYPE_KPROBE as usize], "BPF_PROG_TYPE_KPROBE");
-        assert_eq!(PROG_TYPES[PROG_TYPE_TRACING as usize], "BPF_PROG_TYPE_TRACING");
-        assert_eq!(PROG_TYPES[PROG_TYPE_STRUCT_OPS as usize], "BPF_PROG_TYPE_STRUCT_OPS");
+        assert_eq!(
+            PROG_TYPES[PROG_TYPE_KPROBE as usize],
+            "BPF_PROG_TYPE_KPROBE"
+        );
+        assert_eq!(
+            PROG_TYPES[PROG_TYPE_TRACING as usize],
+            "BPF_PROG_TYPE_TRACING"
+        );
+        assert_eq!(
+            PROG_TYPES[PROG_TYPE_STRUCT_OPS as usize],
+            "BPF_PROG_TYPE_STRUCT_OPS"
+        );
         assert_eq!(PROG_TYPES[PROG_TYPE_EXT as usize], "BPF_PROG_TYPE_EXT");
         assert_eq!(PROG_TYPES[PROG_TYPE_LSM as usize], "BPF_PROG_TYPE_LSM");
         assert_eq!(ATTACH_TYPES[ATTACH_TRACE_ITER as usize], "BPF_TRACE_ITER");
@@ -426,7 +435,10 @@ mod tests {
         ] {
             let t = PROG_TYPES
                 .iter()
-                .position(|n| n.trim_start_matches("BPF_PROG_TYPE_").eq_ignore_ascii_case(allowed))
+                .position(|n| {
+                    n.trim_start_matches("BPF_PROG_TYPE_")
+                        .eq_ignore_ascii_case(allowed)
+                })
                 .unwrap_or_else(|| panic!("{allowed}")) as u32;
             assert!(!denied_by_default(t), "{allowed}");
         }
@@ -458,7 +470,11 @@ mod tests {
         ] {
             assert_eq!(opt_out_type(n), Some(t), "{n}");
         }
-        assert_eq!(opt_out_type("xdp"), None, "not refused: nothing to opt out of");
+        assert_eq!(
+            opt_out_type("xdp"),
+            None,
+            "not refused: nothing to opt out of"
+        );
         assert_eq!(opt_out_type("KPROBE"), None);
         assert_eq!(mask_names(type_bit(2) | type_bit(29)), "kprobe,lsm");
         assert_eq!(mask_names(0), "");
@@ -470,7 +486,12 @@ mod tests {
     /// come back the same.
     #[test]
     fn a_cross_view_record_round_trips() {
-        for (link, t, id) in [(false, 29, 7), (true, 2, u32::MAX), (false, 0, 0), (true, 13, 1)] {
+        for (link, t, id) in [
+            (false, 29, 7),
+            (true, 2, u32::MAX),
+            (false, 0, 0),
+            (true, 13, 1),
+        ] {
             assert_eq!(crossview_of(crossview_ino(link, t, id)), (link, t, id));
         }
         assert_eq!(crossview_ino(false, 29, 7), (29 << 32) | 7);
@@ -478,7 +499,10 @@ mod tests {
             tag_hex(tag_word([0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3])),
             "deadbeef00010203"
         );
-        assert_eq!(object_of_comm(&object_comm("nn_x", "bpf_lsm_file_open")), ("nn_x", "bpf_lsm_file_open"));
+        assert_eq!(
+            object_of_comm(&object_comm("nn_x", "bpf_lsm_file_open")),
+            ("nn_x", "bpf_lsm_file_open")
+        );
         assert_eq!(object_of_comm("plain"), ("plain", "?"));
     }
 

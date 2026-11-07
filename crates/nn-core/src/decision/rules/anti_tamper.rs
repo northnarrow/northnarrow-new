@@ -361,7 +361,11 @@ impl Rule for NnLAt001AntiTamperDenial {
 /// it is of a type refused outside a window (kprobe, tracing, LSM,
 /// extension, struct_ops), Low otherwise (systemd's and the container
 /// runtimes' cgroup programs).
-pub fn crossview_severity(operation: FsProtectOperation, is_link: bool, object_type: u32) -> Severity {
+pub fn crossview_severity(
+    operation: FsProtectOperation,
+    is_link: bool,
+    object_type: u32,
+) -> Severity {
     match operation {
         FsProtectOperation::BpfBaseline
             if is_link || !common::bpf_prog_class::denied_by_default(object_type) =>
@@ -385,7 +389,10 @@ fn crossview_verdict(
     let (is_link, t, id) = c::crossview_of(target_ino);
     let (name, attach) = c::object_of_comm(comm);
     let what = if is_link {
-        format!("BPF link id {id} (link type `{}`, {attach})", c::link_type_name(t))
+        format!(
+            "BPF link id {id} (link type `{}`, {attach})",
+            c::link_type_name(t)
+        )
     } else {
         format!(
             "BPF program id {id} `{name}` (type `{}`, tag {}, attached at {attach})",
@@ -948,11 +955,19 @@ mod tests {
         let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
         let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 1, 31));
         assert_eq!(h.severity, Severity::High);
-        assert!(h.reasoning.contains("map id 31") && h.reasoning.contains("refused it"), "{}", h.reasoning);
+        assert!(
+            h.reasoning.contains("map id 31") && h.reasoning.contains("refused it"),
+            "{}",
+            h.reasoning
+        );
         let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 2, 32));
         assert!(h.reasoning.contains("program id 32"), "{}", h.reasoning);
         let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 0, 0));
-        assert!(h.reasoning.contains("/sys/fs/bpf/northnarrow*"), "{}", h.reasoning);
+        assert!(
+            h.reasoning.contains("/sys/fs/bpf/northnarrow*"),
+            "{}",
+            h.reasoning
+        );
         let t = v(ev(FsProtectOperation::BpfProgType, "bpftrace", 0, 2));
         assert_eq!(t.severity, Severity::High);
         assert!(
@@ -964,7 +979,11 @@ mod tests {
         );
         let o = v(ev(FsProtectOperation::BpfProgOptOut, "bpftrace", 0, 26));
         assert_eq!(o.severity, Severity::Low);
-        assert!(o.reasoning.contains("`tracing`") && !o.reasoning.contains("refused it"), "{}", o.reasoning);
+        assert!(
+            o.reasoning.contains("`tracing`") && !o.reasoning.contains("refused it"),
+            "{}",
+            o.reasoning
+        );
         let tag = tag_word([0xab, 0xcd, 0, 0, 0, 0, 0, 1]);
         let u = v(ev(
             FsProtectOperation::BpfUnseen,
@@ -973,7 +992,15 @@ mod tests {
             crossview_ino(false, 29, 812),
         ));
         assert_eq!(u.severity, Severity::High);
-        for n in ["id 812", "`hide_me`", "type `lsm`", "tag abcd000000000001", "bpf_lsm_file_open", "never saw it load", "not refused"] {
+        for n in [
+            "id 812",
+            "`hide_me`",
+            "type `lsm`",
+            "tag abcd000000000001",
+            "bpf_lsm_file_open",
+            "never saw it load",
+            "not refused",
+        ] {
             assert!(u.reasoning.contains(n), "{n}: {}", u.reasoning);
         }
         let l = v(ev(
@@ -983,7 +1010,11 @@ mod tests {
             crossview_ino(true, 2, 41),
         ));
         assert_eq!(l.severity, Severity::High);
-        assert!(l.reasoning.contains("BPF link id 41 (link type `tracing`"), "{}", l.reasoning);
+        assert!(
+            l.reasoning.contains("BPF link id 41 (link type `tracing`"),
+            "{}",
+            l.reasoning
+        );
         let b = |t, link| {
             v(ev(
                 FsProtectOperation::BpfBaseline,
@@ -995,9 +1026,20 @@ mod tests {
         assert_eq!(b(15, false).severity, Severity::Low);
         assert_eq!(b(2, false).severity, Severity::High);
         assert_eq!(b(29, false).severity, Severity::High);
-        assert_eq!(b(2, true).severity, Severity::Low, "a link: its program is weighed");
-        assert!(b(15, false).reasoning.contains("while the agent was not running"));
-        assert!(b(29, false).reasoning.contains("refuses outside a trusted-installer window"));
-        assert_eq!(crossview_severity(FsProtectOperation::BpfUnseen, true, 0), Severity::High);
+        assert_eq!(
+            b(2, true).severity,
+            Severity::Low,
+            "a link: its program is weighed"
+        );
+        assert!(b(15, false)
+            .reasoning
+            .contains("while the agent was not running"));
+        assert!(b(29, false)
+            .reasoning
+            .contains("refuses outside a trusted-installer window"));
+        assert_eq!(
+            crossview_severity(FsProtectOperation::BpfUnseen, true, 0),
+            Severity::High
+        );
     }
 }

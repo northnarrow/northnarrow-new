@@ -1317,7 +1317,10 @@ mod tests {
         let v = r
             .evaluate(&read_as(modprobe(&["br_netfilter"]), exited))
             .expect("recorded");
-        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::High));
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
         let v = r
             .evaluate(&read_ok(modprobe(&["/tmp/rk.ko"])))
             .expect("killed");

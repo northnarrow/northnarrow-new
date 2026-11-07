@@ -613,7 +613,9 @@ pub(crate) fn register_own_objects(
     for (name, outcome) in freeze_config_maps(ebpf) {
         match outcome {
             Ok(()) => debug!(map = name, "BPF self-defence: configuration map frozen"),
-            Err(e) => warn!(map = name, error = %e, "BPF self-defence: configuration map NOT frozen"),
+            Err(e) => {
+                warn!(map = name, error = %e, "BPF self-defence: configuration map NOT frozen")
+            }
         }
     }
     info!(
@@ -719,7 +721,8 @@ pub struct LoaderOptOut {
 }
 
 /// The per-loader opt-outs in force (from a signed policy only).
-static LOADER_OPT_OUTS: parking_lot::RwLock<Vec<LoaderOptOut>> = parking_lot::RwLock::new(Vec::new());
+static LOADER_OPT_OUTS: parking_lot::RwLock<Vec<LoaderOptOut>> =
+    parking_lot::RwLock::new(Vec::new());
 
 /// The per-loader opt-outs in force now.
 pub fn loader_opt_outs_now() -> Vec<LoaderOptOut> {
@@ -804,7 +807,10 @@ pub fn apply_loader_policy(
         ));
     }
     if !lines.is_empty() {
-        info!(count = lines.len(), "BPF loader opt-out: the signed policy's bpf-loader-allow lines in force");
+        info!(
+            count = lines.len(),
+            "BPF loader opt-out: the signed policy's bpf-loader-allow lines in force"
+        );
     }
     None
 }
@@ -822,7 +828,8 @@ fn write_loader_opt_outs_to<M: std::borrow::BorrowMut<MapData> + std::borrow::Bo
         .filter(|k| !want.iter().any(|o| o.key == k.0))
         .collect();
     for k in &stale {
-        map.remove(k).map_err(|e| format!("removing a stale opt-out: {e}"))?;
+        map.remove(k)
+            .map_err(|e| format!("removing a stale opt-out: {e}"))?;
     }
     for o in &want {
         map.insert(AyaInodeKey(o.key), o.mask, 0)
@@ -1514,5 +1521,42 @@ mod tests {
         assert_eq!(kept, ["3 cgroup_join_mark kept", "8 nn_sysctl_guard kept"]);
         assert!(body.contains("\n6 task_kill\n") && body.contains("\n9 protected_write_deny\n"));
         assert!(pin_name_key(&format!("link_{}", crate::sysctl_cgroup::PROGRAM)).is_some());
+    }
+
+    /// Lot 290 (named): a `bpf-loader-allow` line is resolved to the
+    /// device and inode its path names now (the kernel's device number), a
+    /// path that is not there is named and not in force; the frozen maps
+    /// are the three this module writes once.
+    #[test]
+    fn a_loader_opt_out_is_its_executable_s_device_and_inode() {
+        let lines = [("/usr/bin/bpftrace", 0b100), ("/opt/gone", 0b1)];
+        let stat = |p: &str| match p {
+            "/usr/bin/bpftrace" => Ok(((8u64 << 8) | 2, 4242u64)),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        let (ok, missing) = resolve_loader_opt_outs(&lines, stat);
+        assert_eq!(
+            ok,
+            vec![LoaderOptOut {
+                path: "/usr/bin/bpftrace".into(),
+                key: common::wire::InodeKey {
+                    dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev((8 << 8) | 2),
+                    ino: 4242
+                },
+                mask: 0b100
+            }]
+        );
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].starts_with("/opt/gone: "), "{missing:?}");
+        assert_eq!(
+            FROZEN_AT_REGISTRATION,
+            ["BPF_DEFENSE_MODE", "OWN_EXE_INODES", "OWN_PIN_NAMES"]
+        );
+        // an unsigned policy honours none
+        let p = nn_core::decision::rule_policy::parse("bpf-loader-allow /usr/bin/true kprobe\n")
+            .unwrap();
+        let detail = apply_loader_policy(&p, false).expect("withheld");
+        assert!(detail.contains("NOT honoured"), "{detail}");
+        assert!(loader_opt_outs_now().is_empty());
     }
 }

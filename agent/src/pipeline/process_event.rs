@@ -522,8 +522,7 @@ pub(crate) fn process_event(
                     | nn_model::FsProtectOperation::BpfBaseline
             );
             // Lot 290: a load the signed per-loader opt-out let through.
-            let loader_opted_out =
-                *operation == nn_model::FsProtectOperation::BpfProgOptOut;
+            let loader_opted_out = *operation == nn_model::FsProtectOperation::BpfProgOptOut;
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)

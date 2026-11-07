@@ -464,6 +464,41 @@ mod tests {
             (TAINT_UNSIGNED_MODULE, TAINT_UNSIGNED_MODULE | 1, 9)
         );
         assert_eq!(operation, FsProtectOperation::KernelTaint);
+        // lot 290: a cross-view finding carries the object
+        let o = crate::bpf_crossview::Object {
+            is_link: false,
+            id: 77,
+            object_type: 29,
+            name: "hide".into(),
+            tag: 0xabcd,
+            attach: "bpf_lsm_file_open".into(),
+        };
+        let e = event_of(
+            &Finding::Bpf(crate::bpf_crossview::Finding::Unseen(o.clone())),
+            3,
+        );
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial {
+                    pid: 0,
+                    target_dev: 0xabcd,
+                    operation: FsProtectOperation::BpfUnseen,
+                    comm,
+                    target_ino,
+                    ..
+                } if comm == "hide@bpf_lsm_file_open"
+                    && *target_ino == common::bpf_prog_class::crossview_ino(false, 29, 77)
+            ),
+            "{e:?}"
+        );
+        assert!(matches!(
+            event_of(&Finding::Bpf(crate::bpf_crossview::Finding::Baseline(o)), 3),
+            Event::FsProtectDenial {
+                operation: FsProtectOperation::BpfBaseline,
+                ..
+            }
+        ));
         assert!(matches!(
             event_of(&Finding::RootProgram(812), 1),
             Event::FsProtectDenial {

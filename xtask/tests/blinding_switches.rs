@@ -179,7 +179,9 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     .unwrap();
     let e = code("agent/src/boot/evidence.rs");
     // (lot 290: with the BPF cross-view)
-    assert!(e.contains("nn_linux::kernel_state::spawn(sensor.event_tx_for(\"fs_protect\"), crossview);"));
+    assert!(e.contains(
+        "nn_linux::kernel_state::spawn(sensor.event_tx_for(\"fs_protect\"), crossview);"
+    ));
     let s = code("crates/nn-linux/src/sysctl_cgroup.rs");
     in_order(
         body(&s, "root_report"),
