@@ -159,8 +159,8 @@ print(max(ids) if ids else "")')
     window 60
     PID_=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1; exit}' /run/northnarrow/bpf-own-ids 2>/dev/null)
     echo "    tracker map CGROUP_JOINED id ${MID:-?} ($TDIR), an agent program id ${PID_:-?}"
-    o=$(sudo $PROBE map-fd-by-id "${MID:-0}")
-    [[ $o == OK* ]] && pass "F4 inside a window a handle is given ($o)" || bad "F4 inside a window: $o"
+    o=$(sudo $PROBE map-fd-by-id "${MID:-0}" --rdonly)
+    [[ $o == OK* ]] && pass "F4 inside a window a read-only handle by id is given ($o)" || bad "F4 inside a window: $o"
     o=$(sudo $PROBE obj-get "$RPIN" --rdonly)
     [[ $o == OK* ]] && pass "F4 inside a window the pin root's map opens by path ($o)" || bad "F4 inside a window, $RPIN: $o"
     no_window
