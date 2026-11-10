@@ -1198,7 +1198,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
             runs,
-            start_ticks: start_ticks.filter(|_| start_ns != 0),
+            start_ticks,
             uid,
         };
         let mut s = self.inner.state.write();
@@ -6474,6 +6474,21 @@ mod tests {
             ),
             (
                 "/usr/bin/ruby",
+                &["ruby", "-W:no-deprecated", "-rjson", "/tmp/e.rb"][..],
+                script("/tmp/e.rb"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-lw", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-0x1Fw", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/ruby",
                 &[
                     "ruby",
                     "--disable-gems",
@@ -6544,6 +6559,11 @@ mod tests {
                 Some("/tmp/e.js"),
             ),
             (
+                "/usr/bin/node",
+                &["node", "--frobnicate", "--inspect", "/tmp/e.js"][..],
+                Some("/tmp/e.js"),
+            ),
+            (
                 "/usr/bin/zsh",
                 &["zsh", "-T", "/usr/bin/aws", "/tmp/e.sh"][..],
                 Some("/usr/bin/aws"),
@@ -6608,6 +6628,69 @@ mod tests {
             t.exec_identity(4800, AsOf::Judged(20 * S)).map(|i| i.exe),
             Some(PathBuf::from("/usr/bin/bash")),
             "an event at 20 s, before the exec at 30 s, is the seeded image's"
+        );
+    }
+
+    /// BUG-56: two entries of one pid are one process when their starts
+    /// agree — exact against exact, ticks against an exact start (either
+    /// way), ticks against the same ticks.
+    #[test]
+    fn same_start_reads_the_ticks_either_way() {
+        let t = AuthSessionTracker::new(TempDir::new().unwrap().path());
+        let e = |start_ns: u64, start_ticks: Option<u64>| Entry {
+            ppid: 1,
+            exe: PathBuf::from("/usr/bin/bash"),
+            spawn_ns: 0,
+            start_ns,
+            argv_npm_cli: false,
+            runs: Runs::Inline,
+            start_ticks,
+            uid: 0,
+        };
+        let exact = e(4_003_217_000, None);
+        let seeded = e(4_000_000_000, Some(400));
+        assert!(t.same_start(&seeded, &exact));
+        assert!(t.same_start(&exact, &seeded));
+        assert!(t.same_start(&seeded, &e(3_990_000_000, Some(400))));
+        assert!(!t.same_start(&seeded, &e(4_010_000_000, Some(401))));
+        assert!(t.same_start(&exact, &e(4_003_217_000, None)));
+        assert!(!t.same_start(&exact, &e(4_003_217_001, None)));
+        let later = e(9_000_000_000, None);
+        assert!(!t.same_start(&seeded, &later));
+        assert!(!t.same_start(&later, &seeded));
+    }
+
+    /// BUG-56, for a fork the sweep entered: its start is read from
+    /// `/proc` too (tick 1200). When it executes later (`tar`, the exec's
+    /// exact start inside that tick), an event before that exec is judged on
+    /// the fork's image, the parent's script — not "not known".
+    #[test]
+    fn a_swept_fork_s_image_is_the_past_of_its_later_exec() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(600, 1, "/usr/bin/dpkg", &[], 10 * S, 10 * S, 0);
+        write_exe(proc.path(), 600, "/usr/bin/dpkg");
+        write_status(proc.path(), 600, 1);
+        write_started(proc.path(), "600", 1, 1_000);
+        let script = argv(&["sh", "/var/lib/dpkg/info/x.postinst"]);
+        t.ingest_exec(601, 600, "/usr/bin/dash", &script, 11 * S, 11 * S, 0);
+        write_exe(proc.path(), 601, "/usr/bin/dash");
+        write_status(proc.path(), 601, 600);
+        write_started(proc.path(), "601", 600, 1_100);
+        write_exe(proc.path(), 602, "/usr/bin/dash");
+        write_status(proc.path(), 602, 601);
+        write_started(proc.path(), "602", 601, 1_200);
+        assert_eq!(t.sweep().forks, 1);
+        t.ingest_exec(602, 601, "/usr/bin/tar", &[], 20 * S, 12_004_000_000, 0);
+        let id = t
+            .exec_identity(602, AsOf::Judged(15 * S))
+            .expect("the fork's image");
+        assert_eq!(
+            (id.exe, id.runs),
+            (
+                PathBuf::from("/usr/bin/dash"),
+                Runs::Script("/var/lib/dpkg/info/x.postinst".into())
+            )
         );
     }
 

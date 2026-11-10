@@ -746,6 +746,33 @@ fn sanctioned_and_suspicious_lineages() {
         f.suspicious,
         Some((500, "/usr/bin/bash /tmp/.x/init.sh".to_string()))
     );
+    // lot 292: an interpreter whose options its table cannot read still
+    // shows the staged script it may run — the detection looks at it
+    h.lineage.ingest_exec(
+        600,
+        200,
+        "/usr/bin/node",
+        &[
+            "node".into(),
+            "--frobnicate".into(),
+            "/tmp/.x/init.js".into(),
+        ],
+        99 * S,
+        99 * S,
+        0,
+    );
+    let f = h
+        .run(
+            601,
+            600,
+            "/usr/bin/systemctl",
+            &["systemctl", "stop", "aegis"],
+        )
+        .unwrap();
+    assert_eq!(
+        f.suspicious,
+        Some((600, "/usr/bin/node /tmp/.x/init.js".to_string()))
+    );
 }
 
 #[test]

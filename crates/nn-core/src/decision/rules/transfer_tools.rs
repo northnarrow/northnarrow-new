@@ -212,6 +212,29 @@ mod tests {
         );
     }
 
+    /// Lot 292: an ancestor whose options its interpreter's table cannot
+    /// read (`node --frobnicate /tmp/.x/c2.js`) still shows the staged
+    /// script it may run: the exemption is revoked as for a named one.
+    #[test]
+    fn an_unread_ancestor_s_staged_script_revokes_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let l = AuthSessionTracker::new(tmp.path());
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        l.ingest_spawn_with_argv(
+            50,
+            1,
+            "/usr/bin/node",
+            &argv(&["node", "--frobnicate", "/tmp/.x/c2.js"]),
+            1,
+        );
+        l.ingest_spawn_with_argv(51, 50, "/usr/bin/curl", &argv(&["curl"]), 2);
+        let s = store_of(&[(51, 50)]);
+        assert_eq!(
+            precursor_of(&s, &l, 51, 1_000, crate::posture::lineage::AsOf::Now),
+            Some("a staging-directory image among its ancestors")
+        );
+    }
+
     #[test]
     fn a_credential_read_by_an_ancestor_revokes_it() {
         let (_t, l) = lineage_of(&[(30, 1, "/usr/bin/python3"), (31, 30, "/usr/bin/curl")]);

@@ -201,8 +201,7 @@ fn short(family: Family, c: char) -> Option<Opt> {
             'e' => Inline,
             _ => return None,
         },
-        // node's own short options (it reads no other cluster than `-pe`,
-        // handled before the table).
+        // node's own short options (`-pe` is `-p`: inline).
         Family::Node => match c {
             'i' | 'c' | 'v' | 'h' => Flag,
             'r' | 'C' => Arg,
@@ -509,9 +508,6 @@ fn read(family: Family, argv: &[String]) -> Runs {
                 None => return Runs::Script(a.as_str().into()),
             },
         };
-        if family == Family::Node && letters == "pe" {
-            return Runs::Inline;
-        }
         // the arguments `Next` letters of this cluster take
         let mut next = 0;
         let mut pos = 0;
