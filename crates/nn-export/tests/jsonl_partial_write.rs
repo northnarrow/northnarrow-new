@@ -3,7 +3,7 @@
 //! (`RLIMIT_FSIZE`) of the whole process for an instant — the kernel's own
 //! short write, as a full disk makes it (the first `write` takes what fits,
 //! the next fails) — so no other test of the crate may run beside them; the
-//! three here take turns.
+//! tests here take turns.
 
 use std::sync::Mutex;
 
@@ -116,4 +116,22 @@ fn a_rotation_after_a_partial_write_closes_the_line_in_its_file() {
     s.write(&[b"{\"rec\":3}".to_vec()]).unwrap();
     let active = std::fs::read(d.path().join(ACTIVE)).unwrap();
     assert_eq!(lines_of(&active), [b"{\"rec\":2}", b"{\"rec\":3}"]);
+}
+
+/// The active file gone after a write stopped part-way (a new one opened):
+/// nothing to close in it — no empty line first.
+#[test]
+fn a_new_active_file_after_a_partial_write_has_no_empty_line() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let rec = br#"{"rec":1,"x":"cccccccc"}"#.to_vec();
+    let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+    assert_eq!(
+        write_bounded(&mut s, std::slice::from_ref(&rec), 10),
+        Err(libc::EFBIG)
+    );
+    std::fs::remove_file(d.path().join(ACTIVE)).unwrap();
+    s.write(std::slice::from_ref(&rec)).unwrap();
+    let body = std::fs::read(d.path().join(ACTIVE)).unwrap();
+    assert_eq!(lines_of(&body), [&rec[..]]);
 }

@@ -818,9 +818,6 @@ impl<K: ChainSigner> AuditLog<K> {
             self.numbered = tail.seq.numbered();
             self.second_key_added |= tail.second_key_added;
             self.anchoring_started |= tail.anchoring_started;
-            if self.seq_break.is_none() {
-                self.seq_break = tail.seq_break;
-            }
             Ok(repair)
         })();
         match reread {
@@ -3218,5 +3215,34 @@ mod tests {
             .map(|r| r.op)
             .collect();
         assert_eq!(ops, ["test_op_1", CHAIN_TAIL_REPAIRED_OP, "test_op_4"]);
+    }
+
+    /// A row its failed fsync left whole in the file counts as written: its
+    /// number, and what it records (the second key, the numbering's start),
+    /// as the next open would read them.
+    #[test]
+    fn a_row_kept_after_its_failed_fsync_counts_as_written() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        assert!(!log.numbered() && !log.second_key_added() && !log.anchoring_started());
+        for op in ["rotate_keys_add", crate::chain_anchor::NUMBERING_STARTED_OP] {
+            host::inject(Fault::SyncFails { prefix: b"{" });
+            let draft = AuditEntryDraft {
+                op: op.to_string(),
+                ..sample_draft(0)
+            };
+            assert!(log.append(draft).is_err(), "premise: the fsync fails");
+        }
+        // the second append's re-read took the first row as written
+        assert!(log.second_key_added() && !log.anchoring_started());
+        log.append(sample_draft(3)).unwrap();
+        assert_eq!(log.rows(), 3);
+        assert!(log.numbered() && log.second_key_added() && log.anchoring_started());
+        let rows = every_line_a_row(&log_path);
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2)]
+        );
+        whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
     }
 }

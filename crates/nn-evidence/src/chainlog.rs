@@ -6932,7 +6932,14 @@ mod tests {
             list_archive_seqs(&active).unwrap().is_empty(),
             "premise: not renamed"
         );
-        for j in failed + 1..failed + 4 {
+        let fsyncs = log.fsyncs();
+        log.append(payload(failed + 1)).unwrap();
+        assert_eq!(
+            log.fsyncs(),
+            fsyncs + 2,
+            "the sealed file synced again before its rename, then the line"
+        );
+        for j in failed + 2..failed + 4 {
             log.append(payload(j)).unwrap();
         }
         drop(log);
@@ -7047,7 +7054,15 @@ mod tests {
     /// manifest is never shorter without the row that says so.
     #[test]
     fn a_torn_manifest_tail_is_attested_even_if_the_first_attestation_fails() {
-        for partial in [false, true] {
+        // a fragment shorter than the attesting row, the same cut short,
+        // and one longer than the row (cut after it)
+        let short = b"{\"manifest\":{\"fmt_ver\":3,\"ts\":\"2026-05".to_vec();
+        let long = [
+            b"{\"manifest\":{\"fmt_ver\":3,\"ts\":\"".as_slice(),
+            &[b'x'; 2000],
+        ]
+        .concat();
+        for (partial, fragment) in [(false, short.clone()), (true, short), (false, long)] {
             let dir = TempDir::new().unwrap();
             let active = dir.path().join("test.jsonl");
             let kp = dir.path().join("key");
@@ -7061,8 +7076,7 @@ mod tests {
             }
             let manifest = manifest_path_for(&active);
             let clean = fs::metadata(&manifest).unwrap().len();
-            let fragment = b"{\"manifest\":{\"fmt_ver\":3,\"ts\":\"2026-05";
-            append_raw(&manifest, fragment);
+            append_raw(&manifest, &fragment);
             if partial {
                 host::inject(Fault::ShortWriteAt { keep: 12 });
             } else {
@@ -7088,9 +7102,14 @@ mod tests {
             assert_eq!(attested.len(), 1, "partial {partial}: {attested:?}");
             assert_eq!((attested[0].0.as_str(), attested[0].1), ("manifest", clean));
             if !partial {
-                assert_eq!(attested[0].3, sha256_hex(fragment));
+                assert_eq!(attested[0].3, sha256_hex(&fragment));
             }
             verify_log_set::<TestPayload>(&active, &pk).unwrap();
+            let text = fs::read_to_string(&manifest).unwrap();
+            assert!(
+                text.ends_with('\n') && !text.contains("xxx"),
+                "cut after its row"
+            );
         }
     }
 
@@ -7126,5 +7145,64 @@ mod tests {
         let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(r.total_records, 2);
         assert_eq!(torn_repairs(&active).len(), 1);
+    }
+
+    /// The first line of a fresh active file (after a rotation) cut short:
+    /// the file holds only the fragment, cut; the next line chains off the
+    /// seal of the archive, not the genesis.
+    #[test]
+    fn the_first_line_after_a_rotation_cut_short_chains_off_the_seal() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 2000);
+        let mut i = 0;
+        while list_archive_seqs(&active).unwrap().is_empty() {
+            log.append(payload(i)).unwrap();
+            i += 1;
+            assert!(i < 100);
+        }
+        // the line that rotated is in the fresh file: put that file back to
+        // empty, as right after the rotation
+        let moved = fs::read(&active).unwrap();
+        assert_eq!(moved.iter().filter(|b| **b == b'\n').count(), 1);
+        fs::write(&active, b"").unwrap();
+        drop(log);
+        let mut log = faulty_log(&active, &kp, 2000);
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 30,
+        });
+        assert!(log.append(payload(i)).is_err());
+        log.append(payload(i + 1)).unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == i), "{r:?}");
+    }
+
+    /// An active file emptied under the running writer, then a failed write:
+    /// the re-read roots the next line as an open would (here the genesis:
+    /// no rotation yet), not off the line that is gone.
+    #[test]
+    fn a_file_emptied_under_the_writer_is_rooted_as_the_open_roots_it() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append(payload(0)).unwrap();
+        log.append(payload(1)).unwrap();
+        fs::write(&active, b"").unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 0,
+        });
+        assert!(log.append(payload(2)).is_err());
+        log.append(payload(3)).unwrap();
+        assert_eq!(log.position().1, fs::metadata(&active).unwrap().len());
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 1), "{r:?}");
     }
 }

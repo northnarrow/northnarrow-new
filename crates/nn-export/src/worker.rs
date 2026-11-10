@@ -314,7 +314,6 @@ fn file_rows(
     };
     match result {
         Ok(()) => {
-            f.fault = None;
             if let Some(l) = last {
                 f.written.insert(r.chain, l);
             }
