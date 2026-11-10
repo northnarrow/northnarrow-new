@@ -7205,4 +7205,34 @@ mod tests {
         let r = verify_log_set::<TestPayload>(&active, &pk);
         assert!(r.as_ref().is_ok_and(|r| r.total_records == 1), "{r:?}");
     }
+
+    /// A failed fsync of deferred lines poisons the writer too: what the
+    /// file still holds after it is not known — a device that failed the
+    /// fsync may have dropped the lines (here: cut by the test). The next
+    /// line chains off what the file holds, not off a line that is gone.
+    #[test]
+    fn lines_a_failed_sync_lost_are_not_chained_off() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append_deferred(payload(0)).unwrap();
+        log.sync().unwrap();
+        let len = fs::metadata(&active).unwrap().len();
+        host::inject(Fault::SyncFails { prefix: b"{\"ts\"" });
+        log.append_deferred(payload(1)).unwrap();
+        assert!(log.sync().is_err(), "premise: the fsync fails");
+        // the device dropped the line
+        OpenOptions::new()
+            .write(true)
+            .open(&active)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        log.append(payload(2)).unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
+    }
 }
