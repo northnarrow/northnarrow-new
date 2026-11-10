@@ -64,8 +64,9 @@ const PIN_NAMES_MAP: &str = "OWN_PIN_NAMES";
 /// The window the kernel reads a pin's final component from (mirrors
 /// `PIN_NAME_LEN` in the eBPF crate): a longer name is never matched.
 const PIN_NAME_LEN: usize = 32;
-/// Prefix of the LSM link pins written by `antitamper_bpf::lsm_pin_paths`.
-const LINK_PIN_PREFIX: &str = "link_";
+/// Prefix of the LSM link pins written by `antitamper_bpf::lsm_pin_paths`
+/// (lot 300: and the self-test's consistency test reads it).
+pub(crate) const LINK_PIN_PREFIX: &str = "link_";
 /// Period of the link self-check.
 pub const LINK_CHECK_SECS: u64 = 10;
 /// Audit op of a missing link (one entry per link, at the first miss).

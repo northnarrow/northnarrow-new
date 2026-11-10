@@ -1141,6 +1141,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The sensor self-test no longer reports `module_load` missed, then an
+  alert, on every host (lot 300; found on Ubuntu 22.04, measured on 5.15
+  and 6.8: not a kernel matter). Since lot 285 the module files' write history
+  (`module_write_observe`, `file_open`) is pinned in its own directory
+  beside the pin root, and its link was dropped once pinned; the agent's
+  view of its own links — the ones it holds and the root's `link_*` pins —
+  did not have it. The round's attach check therefore found the program
+  "detached" (a signed `sensor_selftest` degradation at the first round, a
+  `sensor_selftest_alert` at the second, `module_load` `unknown` then
+  `attached_not_invoked`, the trust level one lower), and the BPF guard did
+  not register the link as the agent's own (a foreign handle on it not
+  refused, its loss not noticed by the link self-check). The agent now
+  holds the link it pins there (`antitamper_bpf::reattach_fresh_held`), as
+  it does the `cgroup/sysctl` judge's. Named tests: the module-load
+  programs and the attach check's agree and each is linked where the check
+  reads (host), and the first round's `module_load` word is `seen` (the
+  privileged e2e).
 - DNS, tunnels and flows: ten bugs of the external bug hunt (editions 1.2
   and 1.3), as our triage verified them (lot 291).
   - NN-L-NET-014 kills a DNS tunnel whose payload runs over several labels

@@ -2344,3 +2344,91 @@ fn agent_without_admin_pub_starts_degraded_and_says_so() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Lot 300: the sensor self-test's first round finds the module-load
+/// programs linked — `module_load`'s word is `seen`, never `missed`. Since
+/// lot 285 the module files' write history (`module_write_observe`, on
+/// `file_open`) was pinned in a directory of its own beside the pin root
+/// and its link dropped once pinned; the round's attach check, which reads
+/// the links the agent holds and the pin root's `link_*` pins, found it
+/// detached in every round on every host — a signed degradation at the
+/// first round, an alert at the second (lot 293's lab: 5.15 and 6.12).
+#[test]
+fn the_sensor_self_test_finds_the_module_load_programs_linked() {
+    // Declared first: removed after the agent stopped.
+    let (installed_agent, _installed_admin) = install_priv_bins();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    let rules = d.join("combat-rules.v4");
+    std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
+    let state = AgentState::new(d);
+    let audit_log = state.audit_log();
+    let log_path = d.join("agent.log");
+    let log = std::fs::File::create(&log_path).expect("create agent.log");
+    let log_err = log.try_clone().expect("clone the log handle");
+
+    common::require_bpftool();
+    let _eni = EniIptablesGuard::install();
+    let child = installed_agent
+        .command(&state, Launch::Sudo, &[("NO_COLOR", "1")])
+        .arg("--combat-rules")
+        .arg(&rules)
+        .arg("--detect-only")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .expect("spawn northnarrow-agent");
+    let _guard = AgentGuard(Some(child));
+    let agent_log = || common::strip_ansi(&std::fs::read_to_string(&log_path).unwrap_or_default());
+    let tail = |text: String| {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    };
+
+    // The first round runs 20 s after the start (`FIRST_ROUND_SECS`), its
+    // events within 5 s; every source's first word goes into the manifest
+    // at once (the journal's line, the signed row within a minute).
+    let words = common::wait_until(Duration::from_secs(90), || {
+        agent_log()
+            .lines()
+            .find(|l| {
+                l.contains("the capability manifest changed")
+                    && l.contains("source module_load: sensor self-test pending →")
+            })
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "no sensor self-test round with a word on module_load within 90 s\n{}",
+            tail(agent_log())
+        )
+    });
+    assert!(
+        words.contains("source module_load: sensor self-test pending → seen"),
+        "module_load's first self-test word is not `seen` (its programs not all linked where \
+         the attach check reads them): {words}"
+    );
+    let text = agent_log();
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("SENSOR SELF-TEST") && l.contains("sensor=\"module_load\"")),
+        "a module_load self-test miss in the agent log\n{}",
+        tail(text.clone())
+    );
+    let missed: Vec<serde_json::Value> = common::read_jsonl_strict(&audit_log)
+        .into_iter()
+        .filter(|r| {
+            r["op"] == "integrity_drift"
+                && r["extra"]["kind"] == "subsystem_degraded"
+                && r["extra"]["detail"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("self-test") && s.contains("module_load"))
+        })
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "a signed self-test degradation names module_load: {missed:?}"
+    );
+}
