@@ -718,6 +718,17 @@ mod tests {
         assert!(boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
             .findings
             .is_empty());
+        // the stop's snapshot is written even when nothing moved; the tick's
+        // only when a head did
+        let counter = || match crate::chain_anchor::HeadsStore::read::<LinuxHost>(&heads, &pk) {
+            crate::chain_anchor::HeadsRead::Valid(s) => s.counter,
+            other => panic!("{other:?}"),
+        };
+        let before = counter();
+        refresh_anchor(&anchor, Some(&audit), false).unwrap();
+        assert_eq!(counter(), before, "nothing moved");
+        refresh_anchor(&anchor, Some(&audit), true).unwrap();
+        assert_eq!(counter(), before + 1, "the stop's snapshot");
     }
 
     /// EVD-007 (NN-AUD-273): `nn-admin chain verify` refuses a numbered row

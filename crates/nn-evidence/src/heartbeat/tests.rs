@@ -1250,6 +1250,14 @@ fn loss_of_a_run_ended_between_two_checks_is_alerted() {
         "events lost since the last beat seen: stage 4 (bus queue) +5000 (run \
          aaaaaaaaaaaaaaaa, ended at beat 12)"
     );
+    let d = r.alerts[1].detail();
+    for want in [
+        "3 new telemetry gap(s) of the probe (run aaaaaaaaaaaaaaaa, ended at beat 12)",
+        "7 action row(s) not in the signed actions chain (run aaaaaaaaaaaaaaaa, ended at beat \
+         12)",
+    ] {
+        assert!(d.contains(want), "{want}: {d}");
+    }
 }
 
 /// BUG12 (c): `--max-silence-secs 18446744073709551615` makes a beat
@@ -1411,6 +1419,7 @@ fn a_whole_run_between_two_checks_is_compared_from_zero() {
     let mut start = beat(3, 20);
     start.kind = BeatKind::Start;
     start.run = run_b.into();
+    start.actions.interrupted_at_boot = 1;
     c.push(start);
     let mut b = beat(4, 30);
     b.run = run_b.into();
@@ -1423,6 +1432,7 @@ fn a_whole_run_between_two_checks_is_compared_from_zero() {
     stop.stop_reason = Some("system_shutdown".into());
     stop.loss[1] = Some(12);
     stop.probe_gaps = Some(2);
+    stop.actions.interrupted_at_boot = 1;
     stop.degradations = vec!["sensor pump exited: dns".into()];
     c.push(stop);
     let mut start = beat(6, 50);
@@ -1443,6 +1453,40 @@ fn a_whole_run_between_two_checks_is_compared_from_zero() {
         "{d}"
     );
     assert!(d.contains("sensor pump exited: dns"), "{d}");
+    assert!(
+        d.contains(
+            "1 action(s) of an earlier run interrupted between intent and outcome (run \
+             bbbbbbbbbbbbbbbb, ended at beat 5)"
+        ),
+        "{d}"
+    );
+}
+
+/// BUG12: a beat's lateness within a run is measured with its interval
+/// within the agent's bounds — a signed beat that says 100000 s is late
+/// 400 s after the one before it, and one that says nearly `u64::MAX` does
+/// not overflow the threshold.
+#[test]
+fn a_late_beat_is_measured_within_the_agent_s_bounds() {
+    for interval in [100_000, u64::MAX / 1000] {
+        let mut c = Chain::new();
+        c.push(beat(1, 0));
+        c.push(beat(2, 30));
+        let s = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg())
+            .state
+            .unwrap();
+        let mut b = beat(3, 430);
+        b.interval_secs = interval;
+        c.push(b);
+        let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(431), &cfg());
+        assert_eq!(kinds(&r), ["DEGRADED"], "{interval}: {r:?}");
+        assert!(
+            r.alerts[0]
+                .detail()
+                .contains("beat 3 came 400 s after beat 2"),
+            "{r:?}"
+        );
+    }
 }
 
 /// BUG01 (the triage's case beside it): a stop beat that is not the newest
