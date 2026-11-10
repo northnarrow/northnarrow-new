@@ -505,4 +505,254 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         assert_eq!(read_chain_tail::<LinuxHost>(&link, &all(1 << 20)).count, 0);
     }
+
+    // ── Lot 296 (external bug hunt BUG15, BUG17): the kernel's own short
+    //    write, in the agent's writers on the agent's host ──
+
+    /// Lowers this process's file size limit to `limit` bytes for `f`: the
+    /// kernel's own short write, as a full disk makes it (the first `write`
+    /// takes what fits, the next fails `EFBIG`). Only in a helper process of
+    /// its own: the limit is the process's, the other tests' threads must
+    /// not see it.
+    fn with_file_size_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: signal/getrlimit/setrlimit with valid arguments; the limit
+        // is put back at once.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old), 0);
+            let low = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &low), 0);
+        }
+        let r = f();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &old), 0);
+        }
+        r
+    }
+
+    const SHORT_WRITE_DIR: &str = "NN_LINUX_SHORT_WRITE_DIR";
+
+    /// The writer of [`a_short_write_glues_no_row_to_the_next`], in a
+    /// process of its own. A no-op without its variable.
+    #[test]
+    #[ignore = "a helper: run by a_short_write_glues_no_row_to_the_next"]
+    fn short_write_writer() {
+        let Some(dir) = std::env::var_os(SHORT_WRITE_DIR) else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        // the audit log
+        let log_path = dir.join("audit.log");
+        let mut log = AuditLog::open(&log_path, key(dir), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        let len = fs::metadata(&log_path).unwrap().len();
+        let e = with_file_size_limit(len + 55, || log.append(sample_draft(2))).unwrap_err();
+        assert_eq!(
+            e.root_cause()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EFBIG),
+            "{e:#}"
+        );
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().len(),
+            len + 55,
+            "a short write"
+        );
+        log.append(sample_draft(3)).unwrap();
+        // a rotating chain
+        let active = dir.join("log.jsonl");
+        let mut chain = RotatingChainLog::<P, _>::open(
+            &active,
+            key(dir),
+            RotationConfig::default(),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        chain.append(p(0)).unwrap();
+        let len = fs::metadata(&active).unwrap().len();
+        assert!(with_file_size_limit(len + 50, || chain.append(p(1))).is_err());
+        assert_eq!(
+            fs::metadata(&active).unwrap().len(),
+            len + 50,
+            "a short write"
+        );
+        chain.append(p(2)).unwrap();
+    }
+
+    /// BUG15 and BUG17 with the kernel's own short write (the file size
+    /// limit) on the agent's host: the writers' `write_all` stops part-way.
+    /// The next row is glued to no fragment — the audit log opens again (a
+    /// start in enforce mode refused it), the rotating chain verifies (it
+    /// was Malformed for good) —, and each cut is attested.
+    #[test]
+    fn a_short_write_glues_no_row_to_the_next() {
+        let dir = TempDir::new().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "chain_host_linux::tests::short_write_writer",
+                "--test-threads=1",
+            ])
+            .env(SHORT_WRITE_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the writer: {st}");
+        let k = key(dir.path());
+        let log_path = dir.path().join("audit.log");
+        if let Err(e) = AuditLog::open(&log_path, key(dir.path()), [0u8; 16]) {
+            panic!("the audit log does not open again after a short write: {e:#}");
+        }
+        let text = fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<crate::audit::AuditEntry> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a row: {e}")))
+            .collect();
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "test_op_1",
+                crate::audit::CHAIN_TAIL_REPAIRED_OP,
+                "test_op_3"
+            ]
+        );
+        crate::audit::verify_chain(&rows, &k.verifying_key()).unwrap();
+        let active = dir.path().join("log.jsonl");
+        let r = crate::chainlog::verify_log_set::<P>(&active, &k.verifying_key());
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
+        let manifest = fs::read_to_string(manifest_path(&active)).unwrap();
+        let cut: Vec<ManifestEvent> = manifest
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::chainlog::ManifestLine>(l)
+                    .unwrap()
+                    .manifest
+                    .event
+            })
+            .filter(|e| matches!(e, ManifestEvent::TornTailRepaired { .. }))
+            .collect();
+        assert!(
+            matches!(&cut[..], [ManifestEvent::TornTailRepaired { role, dropped_bytes: 50, .. }] if role == "active"),
+            "{cut:?}"
+        );
+    }
+
+    // ── Lot 296 (external bug hunt BUG27): a real failed fsync ──
+
+    thread_local! {
+        static PIPE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PIPE: std::cell::RefCell<Option<std::io::PipeReader>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The agent's host, but its next append-open hands out a pipe: the
+    /// write succeeds, the fsync fails (`EINVAL`, the kernel's), and the test
+    /// then puts the bytes written in the file — the line is in the file,
+    /// its fsync failed (the triage's host, in nn-evidence before: a pure
+    /// crate names no `std::os`).
+    struct PipeHost;
+
+    impl ChainHost for PipeHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<File> {
+            LinuxHost::open_read_nofollow(path)
+        }
+        fn is_symlink_refusal(err: &io::Error) -> bool {
+            LinuxHost::is_symlink_refusal(err)
+        }
+        fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
+            if PIPE_NEXT.with(|c| c.replace(false)) {
+                let (r, w) = std::io::pipe()?;
+                PIPE.with(|p| *p.borrow_mut() = Some(r));
+                return Ok(File::from(std::os::fd::OwnedFd::from(w)));
+            }
+            LinuxHost::open_with_mode(options, mode, path)
+        }
+        fn open_with_mode_nofollow(
+            options: &mut OpenOptions,
+            mode: u32,
+            path: &Path,
+        ) -> io::Result<File> {
+            LinuxHost::open_with_mode_nofollow(options, mode, path)
+        }
+        fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {
+            LinuxHost::create_dir_all_with_mode(dir, mode)
+        }
+        fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+            LinuxHost::rename_noreplace(from, to)
+        }
+        fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+            LinuxHost::write_all_at(file, buf, offset)
+        }
+        fn anchor(path: &Path) -> PathBuf {
+            LinuxHost::anchor(path)
+        }
+    }
+
+    struct PipeKey(AgentSigningKey);
+
+    impl crate::chain_host::ChainSigner for PipeKey {
+        type Host = PipeHost;
+        fn sign(&self, msg: &[u8]) -> ed25519_dalek::Signature {
+            crate::chain_host::ChainSigner::sign(&self.0, msg)
+        }
+        fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+            crate::chain_host::ChainSigner::verifying_key(&self.0)
+        }
+    }
+
+    /// BUG27 with a real failed fsync: the line written whole, its fsync
+    /// failed (`EINVAL`); the next line chains off it — `last_hash` and the
+    /// position did not move, and the next line forked the chain
+    /// (`PrevHashMismatch`, the triage's test on `main`).
+    #[test]
+    fn a_real_failed_fsync_does_not_fork_the_chain() {
+        use std::io::Read as _;
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let mut log = RotatingChainLog::<P, _>::open(
+            &active,
+            PipeKey(key(dir.path())),
+            RotationConfig::default(),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        log.append(p(0)).unwrap();
+        PIPE_NEXT.with(|c| c.set(true));
+        let e = log.append(p(1)).unwrap_err();
+        assert!(format!("{e:#}").contains("fsync"), "premise: {e:#}");
+        let mut written = Vec::new();
+        PIPE.with(|p| p.borrow_mut().take())
+            .unwrap()
+            .read_to_end(&mut written)
+            .unwrap();
+        assert!(written.ends_with(b"\n") && written.len() > 50);
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(&written)
+            .unwrap();
+        log.append(p(2)).unwrap();
+        drop(log);
+        let k = key(dir.path());
+        let r = crate::chainlog::verify_log_set::<P>(
+            &active,
+            &crate::chain_host::ChainSigner::verifying_key(&k),
+        );
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == 3),
+            "the chain forked after a failed fsync: {r:?}"
+        );
+    }
 }

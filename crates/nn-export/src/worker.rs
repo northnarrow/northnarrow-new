@@ -328,8 +328,9 @@ fn file_rows(
             }
         }
         Err(fault) => {
-            // nothing of this batch counts: written again next time
-            f.sink = None;
+            // nothing of this batch counts: written again next time — by the
+            // same sink (lot 296, BUG31): it knows whether its last write
+            // stopped inside a line, which a sink opened again does not
             f.fault = Some(fault);
             ExportRowsOut {
                 acked: before,
@@ -462,6 +463,90 @@ mod tests {
             (o.acked, o.state),
             (Some(RowPos { file: 1, line: 1 }), SinkState::Up)
         );
+    }
+
+    /// Lot 296 (BUG31): the writer of
+    /// [`a_batch_written_again_after_a_partial_write_is_whole_lines`], in a
+    /// process of its own — the file size limit (`RLIMIT_FSIZE`, the
+    /// kernel's own short write, as a full disk makes it) is the process's:
+    /// the test's threads must not see it. A no-op without its variable.
+    #[test]
+    #[ignore = "a helper: run by a_batch_written_again_after_a_partial_write_is_whole_lines"]
+    fn partial_write_worker() {
+        let Some(dir) = std::env::var_os("NN_EXPORT_PARTIAL_WRITE_DIR") else {
+            return;
+        };
+        let mut w = ExportWorker::new(Path::new(&dir));
+        let out = w.setup(&setup(true, false, false), &mut |_| false);
+        assert_eq!(out.file, SinkState::Up);
+        let fx = crate::ocsf::tests::fixtures();
+        let req = rows(ExportSink::File, vec![row(1, &fx[0].1)]);
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: signal/getrlimit/setrlimit with valid arguments, in this
+        // helper process alone; the limit is put back at once.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old), 0);
+            let low = libc::rlimit {
+                rlim_cur: 100,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &low), 0);
+        }
+        let o = w.rows(&req);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &old), 0);
+        }
+        assert_eq!(
+            (o.acked, o.state, o.fault),
+            (None, SinkState::Down, Some(SinkFault::File(libc::EFBIG)))
+        );
+        // space back: the core gives the batch again
+        let o = w.rows(&req);
+        assert_eq!(
+            (o.acked, o.state, o.fault, o.records),
+            (Some(RowPos { file: 1, line: 1 }), SinkState::Up, None, 2)
+        );
+    }
+
+    /// Lot 296 (BUG31): a batch the file took part of (a full disk) is Down
+    /// and not acknowledged; written again, each of its records is a line of
+    /// its own — the worker kept its sink, which closes the start of a line
+    /// its last write left. A sink opened again knew nothing of it, and the
+    /// first record, acknowledged, was glued to that start.
+    #[test]
+    fn a_batch_written_again_after_a_partial_write_is_whole_lines() {
+        let d = tempfile::tempdir().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "worker::tests::partial_write_worker",
+                "--test-threads=1",
+            ])
+            .env("NN_EXPORT_PARTIAL_WRITE_DIR", d.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the writer: {st}");
+        let text = std::fs::read_to_string(d.path().join(crate::jsonl::ACTIVE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "the start of a record, then two: {} line(s)",
+            lines.len()
+        );
+        assert_eq!(lines[0].len(), 100);
+        assert!(serde_json::from_str::<Value>(lines[0]).is_err());
+        for l in &lines[1..] {
+            let v: Value = serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}"));
+            assert!(crate::schema::check_record(&v).is_empty());
+        }
     }
 
     /// The pin: asked for and refused, the syslog sink connects nowhere;
