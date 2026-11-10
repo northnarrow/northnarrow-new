@@ -705,8 +705,7 @@ fn to_jsonl<T: Serialize>(line: &T) -> Result<String> {
 /// Append a pre-serialised line to `path` (create if missing) + fsync.
 fn append_and_fsync<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<()> {
     let f = append_line::<H>(path, line, mode)?;
-    f.sync_all()
-        .with_context(|| format!("fsync {}", path.display()))?;
+    H::sync_all(&f).with_context(|| format!("fsync {}", path.display()))?;
     Ok(())
 }
 
@@ -715,7 +714,7 @@ fn append_and_fsync<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<
 fn append_line<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
     let mut f = H::open_with_mode(OpenOptions::new().create(true).append(true), mode, path)
         .with_context(|| format!("opening chainlog {} for append", path.display()))?;
-    f.write_all(line.as_bytes())
+    H::append_all(&mut f, line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
     Ok(f)
 }
@@ -916,6 +915,14 @@ pub struct RotatingChainLog<P, K> {
     /// Lab PR 249: the time the terminators and manifest rows are stamped
     /// with (the host's unless [`Self::open_with_clock`] was given another).
     clock: std::sync::Arc<dyn Clock>,
+    /// Lot 296 (external bug hunt BUG17, BUG27): a write or an fsync of the
+    /// active file failed (the error). What it left there is not known —
+    /// nothing, the start of a line (a full disk), the whole line (a failed
+    /// fsync) —, so the next append reads the tail again first
+    /// ([`Self::recover_active`]).
+    active_poison: Option<String>,
+    /// Lot 296: the same for the manifest ([`Self::recover_manifest`]).
+    manifest_poison: Option<String>,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -968,12 +975,10 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         let check_active = |l: &[u8]| check_active_line::<P>(l, &pubkey);
         let check_manifest = |l: &[u8]| check_manifest_line(l, P::KIND, &pubkey);
         // Recover the manifest tail O(1). If a prior crash tore its last
-        // line, truncate the fragment so the next manifest line can't fuse
-        // with it; the repair is attested below (once the log can sign one).
+        // line, the fragment is replaced by the signed row attesting it (below,
+        // once the log can sign one), so the next manifest line can't fuse
+        // with it.
         let manifest_rec = recover_tail(&manifest_path, &check_manifest)?;
-        if manifest_rec.torn {
-            truncate_file(&manifest_path, manifest_rec.clean_len)?;
-        }
 
         let mut log = Self {
             active_path: active_path.to_path_buf(),
@@ -992,18 +997,17 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             since_checkpoint: 0,
             checkpoint_at: std::time::Instant::now(),
             clock,
+            active_poison: None,
+            manifest_poison: None,
             _marker: std::marker::PhantomData,
         };
 
         // Attest a manifest self-repair into its own meta-chain (chained off
-        // the recovered tail) — truncating a signed log MUST be recorded.
+        // the recovered tail) — truncating a signed log MUST be recorded. Lot
+        // 296 (external bug hunt BUG39): the row takes the fragment's place,
+        // so the manifest is never cut without it.
         if manifest_rec.torn {
-            log.attest_torn_repair(
-                "manifest",
-                manifest_rec.clean_len,
-                manifest_rec.dropped_bytes,
-                manifest_rec.dropped_sha256.clone(),
-            )?;
+            log.replace_torn_manifest_tail(&manifest_rec)?;
         }
         if let Some(reason) = &manifest_rec.unverified {
             log.attest_tail_unverified("manifest", &manifest_rec.tail_hash, reason);
@@ -1015,13 +1019,20 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // setattr deny, so the in-place truncate is allowed).
         let active_rec = recover_tail(active_path, &check_active)?;
         if active_rec.torn {
-            truncate_file(active_path, active_rec.clean_len)?;
+            // Lot 296 (external bug hunt BUG39): attested first, then cut. A
+            // cut made first and then not attested (the manifest could not be
+            // written once) was attested by no later open: it found no torn
+            // tail. A failed attestation now leaves the fragment in place, and
+            // the next open repairs and attests it. The manifest is created
+            // first if need be, inside the `+i` dance (a new name).
+            log.ensure_manifest()?;
             log.attest_torn_repair(
                 "active",
                 active_rec.clean_len,
                 active_rec.dropped_bytes,
                 active_rec.dropped_sha256.clone(),
             )?;
+            truncate_file(active_path, active_rec.clean_len)?;
         }
         if let Some(reason) = &active_rec.unverified {
             log.attest_tail_unverified("active", &active_rec.tail_hash, reason);
@@ -1203,14 +1214,19 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         if !self.unsynced {
             return Ok(());
         }
-        let f = OpenOptions::new()
+        let synced = OpenOptions::new()
             .append(true)
             .open(&self.active_path)
-            .with_context(|| {
-                format!("opening chainlog {} for fsync", self.active_path.display())
-            })?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.active_path.display()))?;
+            .with_context(|| format!("opening chainlog {} for fsync", self.active_path.display()))
+            .and_then(|f| {
+                K::Host::sync_all(&f)
+                    .with_context(|| format!("fsync {}", self.active_path.display()))
+            });
+        if let Err(e) = synced {
+            // Lot 296: read again before the next line, like any failed write
+            self.active_poison = Some(format!("{e:#}"));
+            return Err(e);
+        }
         self.unsynced = false;
         self.fsyncs += 1;
         Ok(())
@@ -1262,22 +1278,126 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         self.fsyncs
     }
 
-    /// Write `bytes` to the active file, with or without an fsync.
+    /// Write `bytes` to the active file, with or without an fsync. Lot 296:
+    /// a failure poisons the writer — the next append reads the tail again.
     fn write_active(&mut self, bytes: &str, durable: bool) -> Result<()> {
+        let written = if durable {
+            append_and_fsync::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)
+        } else {
+            append_line::<K::Host>(&self.active_path, bytes, self.cfg.file_mode).map(drop)
+        };
+        if let Err(e) = written {
+            self.active_poison = Some(format!("{e:#}"));
+            return Err(e);
+        }
         if durable {
-            append_and_fsync::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             // The fsync covers the earlier deferred lines of this file.
             self.unsynced = false;
             self.fsyncs += 1;
         } else {
-            append_line::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             self.unsynced = true;
+        }
+        Ok(())
+    }
+
+    /// Lot 296 (external bug hunt BUG17, BUG27): after a failed write or
+    /// fsync of the active file, its tail is read again as the open reads it,
+    /// before the next line:
+    ///
+    /// - what the failure left after the last complete line — the start of a
+    ///   line, a full disk — is cut, attested in the manifest first (as at
+    ///   the open, BUG39): the next line no longer fuses with it into a line
+    ///   that breaks the chain for good;
+    /// - a line it wrote whole (its fsync failed) is the chain's tail: the
+    ///   next line chains off it, not off the one before (a fork), and the
+    ///   position the checkpoints name is the file's;
+    /// - a seal written whole (its fsync failed) finishes its rotation: the
+    ///   file is never sealed a second time.
+    ///
+    /// A failure here keeps the writer poisoned: the next append tries again.
+    fn recover_active(&mut self) -> Result<()> {
+        let Some(cause) = self.active_poison.take() else {
+            return Ok(());
+        };
+        let r = self.reread_active(&cause);
+        if r.is_err() && self.active_poison.is_none() {
+            self.active_poison = Some(cause);
+        }
+        r
+    }
+
+    fn reread_active(&mut self, cause: &str) -> Result<()> {
+        let pubkey = self.key.verifying_key();
+        let rec = recover_tail(&self.active_path, &|l| check_active_line::<P>(l, &pubkey))
+            .context("reading the active file's tail again after a failed write")?;
+        if rec.torn {
+            self.ensure_manifest()?;
+            self.attest_torn_repair(
+                "active",
+                rec.clean_len,
+                rec.dropped_bytes,
+                rec.dropped_sha256.clone(),
+            )?;
+            truncate_file(&self.active_path, rec.clean_len)?;
+        }
+        if let Some(reason) = &rec.unverified {
+            self.attest_tail_unverified("active", &rec.tail_hash, reason);
+        }
+        let before = self.active_bytes;
+        if let Some(seq) = rec.sealed_seq {
+            // the seal is on file: the next append finishes that rotation
+            self.last_hash = rec.tail_hash.clone();
+            self.active_bytes = rec.clean_len;
+            self.pending_seal = Some(PendingSeal {
+                seq,
+                terminator_hash: rec.tail_hash,
+                bytes: before,
+                records: self.active_records,
+            });
+        } else if rec.clean_len == 0 {
+            if before > 0 {
+                // emptied under the writer: rooted as the open roots it
+                self.last_hash = if self.next_seq == 1 {
+                    GENESIS_PREV_HASH.to_string()
+                } else {
+                    self.prior_link_or_genesis(self.next_seq - 1)
+                };
+            }
+            self.active_bytes = 0;
+        } else {
+            if rec.clean_len > before {
+                self.active_records += 1;
+            }
+            self.last_hash = rec.tail_hash;
+            self.active_bytes = rec.clean_len;
+        }
+        if self.active_bytes < before {
+            error!(
+                log = %self.active_path.display(),
+                left = before,
+                now = self.active_bytes,
+                "chainlog: the active file is shorter than this writer left it"
+            );
+        }
+        warn!(
+            log = %self.active_path.display(),
+            error = %cause,
+            cut = rec.torn.then_some(rec.dropped_bytes),
+            kept = self.active_bytes.saturating_sub(before),
+            sealed = self.pending_seal.is_some(),
+            "chainlog: tail read again after a failed write"
+        );
+        if self.active_bytes > before {
+            // the line kept: its fsync failed, so another one now
+            self.unsynced = true;
+            self.sync()?;
         }
         Ok(())
     }
 
     fn append_with(&mut self, payload: P, durable: bool) -> Result<String> {
         check_reserved_keys(&payload)?;
+        self.recover_active()?;
         // External audit NN-AUD-115: a previous rotation sealed the active
         // file but could not rename it. Retry only the finish step.
         if let Some(p) = self.pending_seal.clone() {
@@ -1346,7 +1466,14 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // SEAL: append the terminator to the active file. Done OUTSIDE the
         // `+i` dance — appending to an *existing* file is allowed under an
         // immutable dir; only NEW/renamed dir entries need the lift.
-        append_and_fsync::<K::Host>(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
+        if let Err(e) =
+            append_and_fsync::<K::Host>(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)
+        {
+            // Lot 296 (BUG27): a seal on file whose fsync failed finishes its
+            // rotation at the next append (`recover_active`), never sealed twice
+            self.active_poison = Some(format!("{e:#}"));
+            return Err(e);
+        }
         // The terminator's fsync covers the deferred lines before it.
         self.unsynced = false;
         self.fsyncs += 1;
@@ -1444,11 +1571,17 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             create_fresh_active::<K::Host>(&active, file_mode)?;
             protection_inner.register_active(&active)?;
             // 4. Manifest + eviction — NON-FATAL (archive already committed).
-            let evicted = evict_excess_archives(&active, max_archives, protection_inner.as_ref())
-                .unwrap_or_else(|e| {
-                error!(error = %e, "chainlog: archive eviction failed post-rotate (committed; continuing)");
-                Vec::new()
-            });
+            //    Lot 296 (external bug hunt BUG10): the archives a failed pass
+            //    removed before its failure keep their `Evicted` rows.
+            let (evicted, failed) =
+                evict_excess_archives(&active, max_archives, protection_inner.as_ref());
+            if let Some(e) = failed {
+                error!(
+                    error = %format!("{e:#}"),
+                    evicted = evicted.len(),
+                    "chainlog: archive eviction failed post-rotate (committed; continuing)"
+                );
+            }
             let rotated = self.manifest_append(ManifestEvent::Rotated {
                 seq,
                 terminator_hash: terminator_hash.clone(),
@@ -1598,13 +1731,103 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     }
 
     fn manifest_append(&mut self, event: ManifestEvent) -> Result<()> {
+        self.recover_manifest()?;
         let entry = ManifestEntry {
             fmt_ver: CHAINLOG_FMT_V3,
             ts: stamp(self.clock.as_ref()),
             event,
         };
         let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash, P::KIND)?;
-        append_and_fsync::<K::Host>(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
+        if let Err(e) =
+            append_and_fsync::<K::Host>(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)
+        {
+            self.manifest_poison = Some(format!("{e:#}"));
+            return Err(e);
+        }
+        self.manifest_last_hash = line.entry_hash;
+        Ok(())
+    }
+
+    /// Lot 296 (external bug hunt BUG27 for the manifest): after a failed
+    /// write or fsync of the manifest, its tail read again before its next
+    /// row — as [`Self::recover_active`] for the active file. A row written
+    /// whole is the manifest's tail; a fragment is replaced by the row
+    /// attesting it ([`Self::replace_torn_manifest_tail`]).
+    fn recover_manifest(&mut self) -> Result<()> {
+        let Some(cause) = self.manifest_poison.take() else {
+            return Ok(());
+        };
+        let r = self.reread_manifest();
+        if r.is_err() && self.manifest_poison.is_none() {
+            self.manifest_poison = Some(cause);
+        }
+        r
+    }
+
+    fn reread_manifest(&mut self) -> Result<()> {
+        let pubkey = self.key.verifying_key();
+        let rec = recover_tail(&self.manifest_path, &|l| {
+            check_manifest_line(l, P::KIND, &pubkey)
+        })
+        .context("reading the manifest's tail again after a failed write")?;
+        if rec.torn {
+            self.replace_torn_manifest_tail(&rec)?;
+        } else {
+            self.manifest_last_hash = rec.tail_hash.clone();
+        }
+        if let Some(reason) = &rec.unverified {
+            self.attest_tail_unverified("manifest", &rec.tail_hash, reason);
+            if let Some(e) = &self.manifest_poison {
+                return Err(anyhow!("{e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The manifest's own torn tail, repaired. Its repair is attested in the
+    /// manifest itself, so the attesting row (chained off the last complete
+    /// row) takes the fragment's place in one positioned write, and the file
+    /// is then cut just after it. Lot 296 (external bug hunt BUG39): the
+    /// fragment used to be cut first; when the attestation then failed, no
+    /// later open found a torn tail to attest. Until the row is written
+    /// whole the file still ends in a fragment (the old one, or the old one
+    /// under the start of the row), which the next open or append repairs
+    /// again: the manifest is never shorter without the row that says so.
+    fn replace_torn_manifest_tail(&mut self, rec: &TailRecovery) -> Result<()> {
+        warn!(
+            log = %self.active_path.display(),
+            role = "manifest",
+            recovered_len = rec.clean_len,
+            dropped_bytes = rec.dropped_bytes,
+            dropped_sha256 = %rec.dropped_sha256,
+            "chainlog: torn-tail repair — the manifest's fragment replaced by the row \
+             attesting its discard"
+        );
+        let entry = ManifestEntry {
+            fmt_ver: CHAINLOG_FMT_V3,
+            ts: stamp(self.clock.as_ref()),
+            event: ManifestEvent::TornTailRepaired {
+                role: "manifest".to_string(),
+                recovered_len: rec.clean_len,
+                dropped_bytes: rec.dropped_bytes,
+                dropped_sha256: rec.dropped_sha256.clone(),
+            },
+        };
+        let line = ManifestLine::sealed(entry, &self.key, &rec.tail_hash, P::KIND)?;
+        let text = to_jsonl(&line)?;
+        let path = self.manifest_path.clone();
+        let replaced =
+            K::Host::open_with_mode(OpenOptions::new().write(true), self.cfg.file_mode, &path)
+                .and_then(|f| {
+                    K::Host::write_all_at(&f, text.as_bytes(), rec.clean_len)?;
+                    f.set_len(rec.clean_len + text.len() as u64)?;
+                    K::Host::sync_all(&f)
+                })
+                .with_context(|| format!("replacing the torn tail of {}", path.display()));
+        if let Err(e) = replaced {
+            self.manifest_poison = Some(format!("{e:#}"));
+            return Err(e);
+        }
         self.manifest_last_hash = line.entry_hash;
         Ok(())
     }
@@ -1827,19 +2050,41 @@ fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
 /// `(seq, terminator_hash)` of each evicted file (hash read from the
 /// archive's terminator line before unlink, for the manifest record).
 /// Each archive's inode is released from the protection first (review 80).
+///
+/// Lot 296 (external bug hunt BUG10): the archives removed are returned
+/// even when the pass then fails (with its error), so each gets its
+/// `Evicted` row — they were left without one, read later as an eviction no
+/// row attests (`UncorroboratedEviction`) for good. An entry at an archive
+/// name that is not a regular file (a directory, a link) is not an archive
+/// of this log: it is left in place, reported, and the pass goes on past it
+/// (it stopped every later pass, so retention never ran again). A regular
+/// archive that cannot be removed still stops the pass: removing the newer
+/// ones past it would leave a gap in the chain.
 fn evict_excess_archives(
     active: &Path,
     max_archives: usize,
     protection: &dyn ProtectionManager,
-) -> Result<Vec<(u64, String)>> {
-    let seqs = list_archive_seqs(active)?;
+) -> (Vec<(u64, String)>, Option<anyhow::Error>) {
+    let seqs = match list_archive_seqs(active) {
+        Ok(s) => s,
+        Err(e) => return (Vec::new(), Some(e)),
+    };
     if seqs.len() <= max_archives {
-        return Ok(Vec::new());
+        return (Vec::new(), None);
     }
     let drop_n = seqs.len() - max_archives;
     let mut evicted = Vec::new();
     for &seq in seqs.iter().take(drop_n) {
         let path = archive_path(active, seq);
+        if let Some((kind, bytes)) = slot_kind(&path).filter(|(k, _)| *k != "file") {
+            error!(
+                seq, kind, bytes,
+                path = %path.display(),
+                "chainlog: a foreign entry holds an archive name past the retention; left in \
+                 place, the eviction goes on past it"
+            );
+            continue;
+        }
         let hash = read_terminator_hash(&path).unwrap_or_default();
         if let Err(e) = protection.release(&path) {
             warn!(
@@ -1848,10 +2093,13 @@ fn evict_excess_archives(
                 "chainlog: could not release an evicted archive's inode from PROTECTED_INODES"
             );
         }
-        fs::remove_file(&path).with_context(|| format!("evicting archive {}", path.display()))?;
+        if let Err(e) = fs::remove_file(&path) {
+            let e = anyhow!(e).context(format!("evicting archive {}", path.display()));
+            return (evicted, Some(e));
+        }
         evicted.push((seq, hash));
     }
-    Ok(evicted)
+    (evicted, None)
 }
 
 // ── torn tail of an append-only chain file ─────────────────────────
@@ -6216,5 +6464,667 @@ mod tests {
             n += 1;
         }
         assert!(n >= 2, "a rotation and a checkpoint: {manifest}");
+    }
+
+    // ── Lot 296 (external bug hunt, editions 1.2/1.3): the writer after a
+    //    failed write, the repairs' attestations, the eviction ──
+
+    use crate::chain_host::testing::{self as host, Fault, FaultyKey};
+
+    fn faulty_log(active: &Path, kp: &Path, cap: u64) -> RotatingChainLog<TestPayload, FaultyKey> {
+        RotatingChainLog::<TestPayload, _>::open(
+            active,
+            FaultyKey(key_at(kp)),
+            cfg(cap, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap()
+    }
+
+    fn rotate_until(
+        log: &mut RotatingChainLog<TestPayload, TestKey>,
+        active: &Path,
+        archives: usize,
+        from: u64,
+    ) -> u64 {
+        let mut i = from;
+        while list_archive_seqs(active).unwrap().len() < archives {
+            log.append(payload(i)).unwrap();
+            i += 1;
+            assert!(i < from + 1000);
+        }
+        i
+    }
+
+    fn torn_repairs(active: &Path) -> Vec<(String, u64, u64, String)> {
+        manifest_events(active)
+            .into_iter()
+            .filter_map(|e| match e {
+                ManifestEvent::TornTailRepaired {
+                    role,
+                    recovered_len,
+                    dropped_bytes,
+                    dropped_sha256,
+                } => Some((role, recovered_len, dropped_bytes, dropped_sha256)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A protection whose release of `0` swaps that archive for a directory
+    /// that is not empty: its removal (`unlink`) then fails, as an archive
+    /// that cannot be removed does.
+    struct SwapOnRelease(PathBuf);
+
+    impl ProtectionManager for SwapOnRelease {
+        fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn release(&self, path: &Path) -> Result<()> {
+            if path == self.0 {
+                fs::remove_file(path)?;
+                fs::create_dir(path)?;
+                fs::write(path.join("x"), b"x")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// BUG10 (b): an eviction pass that removes archive 1 and then fails on
+    /// archive 2 keeps the `Evicted` row of 1 (it was lost with the pass's
+    /// error: an eviction no row attests, `UncorroboratedEviction` for
+    /// good). The pass stops there: removing 3 past it would leave a gap.
+    #[test]
+    fn unlinked_archive_gets_its_evicted_row() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 300);
+        let i = rotate_until(&mut log, &active, 3, 0);
+        drop(log);
+        // the operator lowers the retention to one archive; archive 2
+        // cannot be removed
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(300, 1),
+            std::sync::Arc::new(SwapOnRelease(archive_path(&active, 2))),
+        )
+        .unwrap();
+        let mut j = i;
+        while !archive_path(&active, 4).exists() {
+            log.append(payload(j)).unwrap();
+            j += 1;
+            assert!(j < i + 100);
+        }
+        drop(log);
+        assert!(
+            !archive_path(&active, 1).exists(),
+            "premise: archive 1 removed"
+        );
+        assert!(
+            archive_path(&active, 2).is_dir(),
+            "premise: the pass failed on 2"
+        );
+        assert!(
+            archive_path(&active, 3).is_file(),
+            "nothing removed past it"
+        );
+        let evicted: Vec<u64> = manifest_events(&active)
+            .iter()
+            .filter_map(|e| match e {
+                ManifestEvent::Evicted {
+                    seq,
+                    terminator_hash,
+                } => {
+                    assert!(is_chain_hash(terminator_hash), "{terminator_hash}");
+                    Some(*seq)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evicted,
+            [1],
+            "archive 1 was removed by the eviction: its Evicted row, and no other"
+        );
+    }
+
+    /// BUG10: the triage's case — a directory at archive 2's name is not an
+    /// archive of the log: left in place, and the pass goes on past it, each
+    /// archive it removes with its row.
+    #[test]
+    fn a_foreign_entry_past_the_retention_is_left_in_place() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 300);
+        let i = rotate_until(&mut log, &active, 3, 0);
+        drop(log);
+        fs::rename(archive_path(&active, 2), dir.path().join("aside")).unwrap();
+        fs::create_dir(archive_path(&active, 2)).unwrap();
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(300, 1),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        let mut j = i;
+        while !archive_path(&active, 4).exists() {
+            log.append(payload(j)).unwrap();
+            j += 1;
+            assert!(j < i + 100);
+        }
+        drop(log);
+        assert!(!archive_path(&active, 1).exists() && !archive_path(&active, 3).exists());
+        assert!(
+            archive_path(&active, 2).is_dir(),
+            "the foreign entry is left in place"
+        );
+        let evicted: Vec<u64> = manifest_events(&active)
+            .iter()
+            .filter_map(|e| match e {
+                ManifestEvent::Evicted { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evicted, [1, 3]);
+    }
+
+    /// BUG10 (a): an entry that is not an archive (a directory) at the
+    /// oldest archive name no longer stops every eviction pass: it is left
+    /// in place and the pass goes on past it, so the retention holds.
+    #[test]
+    fn unremovable_oldest_entry_does_not_block_retention() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(300, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        rotate_until(&mut log, &active, 5, 0);
+        drop(log);
+        fs::remove_file(archive_path(&active, 1)).unwrap();
+        fs::create_dir(archive_path(&active, 1)).unwrap();
+        let mut evicted = Vec::new();
+        for _ in 0..3 {
+            let (e, failed) = evict_excess_archives(&active, 1, &NoProtection);
+            assert!(failed.is_none(), "{failed:?}");
+            evicted.extend(e.into_iter().map(|(s, _)| s));
+        }
+        let files = (2..=5u64)
+            .filter(|s| archive_path(&active, *s).is_file())
+            .count();
+        assert!(
+            files <= 1,
+            "retention stuck: {files} archives left with max_archives = 1"
+        );
+        assert_eq!(
+            evicted,
+            [2, 3, 4],
+            "each archive removed once, with its row"
+        );
+        assert!(archive_path(&active, 1).is_dir(), "left in place");
+    }
+
+    /// BUG17: a full disk stops a line part-way (its start stays in the
+    /// file). The writer's next lines are not fused with it — the chain
+    /// stays verifiable (it was Malformed for good) —, the cut is attested
+    /// in the manifest, and the position (what the checkpoints name) is the
+    /// file's again.
+    #[test]
+    fn append_after_a_short_write_keeps_the_chain_verifiable() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        for i in 0..2 {
+            log.append(payload(i)).unwrap();
+        }
+        let len = fs::metadata(&active).unwrap().len();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 50,
+        });
+        assert!(log.append(payload(2)).is_err(), "premise: the disk is full");
+        let left = host::left_behind();
+        assert_eq!(left.len(), 1);
+        assert_eq!(fs::metadata(&active).unwrap().len(), len + 50, "premise");
+        for i in 3..5 {
+            log.append(payload(i)).unwrap();
+        }
+        assert_eq!(log.position().1, fs::metadata(&active).unwrap().len());
+        log.checkpoint().unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            r.as_ref()
+                .is_ok_and(|r| r.total_records == 4 && r.checkpoints_verified >= 1),
+            "chain broken for good after one failed append: {r:?}"
+        );
+        assert_eq!(
+            torn_repairs(&active),
+            [("active".to_string(), len, 50, sha256_hex(&left[0]))]
+        );
+    }
+
+    /// BUG17 for the deferred lines (a group commit): the line cut short is
+    /// not glued to the next one, which chains off the last whole line.
+    #[test]
+    fn a_failed_append_does_not_glue_the_next_row_to_its_fragment() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        let first = log.append_deferred(payload(0)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 1,
+        });
+        assert!(log.append_deferred(payload(1)).is_err());
+        log.append_deferred(payload(2)).unwrap();
+        log.sync().unwrap();
+        drop(log);
+        let text = fs::read_to_string(&active).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        let second: ChainLine<TestPayload> = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            (second.payload.seq, second.prev_hash.as_str()),
+            (2, first.as_str())
+        );
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+    }
+
+    /// A host whose next append-open hands out a pipe: the write succeeds,
+    /// the fsync fails (EINVAL, a real one), and the test then puts the
+    /// bytes written in the file — the line is in the file, its fsync
+    /// failed.
+    struct PipeHost;
+
+    thread_local! {
+        static PIPE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PIPE: std::cell::RefCell<Option<std::io::PipeReader>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    impl ChainHost for PipeHost {
+        fn open_read_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+            PortableHost::open_read_nofollow(path)
+        }
+        fn is_symlink_refusal(err: &std::io::Error) -> bool {
+            PortableHost::is_symlink_refusal(err)
+        }
+        fn open_with_mode(
+            options: &mut OpenOptions,
+            mode: u32,
+            path: &Path,
+        ) -> std::io::Result<std::fs::File> {
+            if PIPE_NEXT.with(|c| c.replace(false)) {
+                let (r, w) = std::io::pipe()?;
+                PIPE.with(|p| *p.borrow_mut() = Some(r));
+                return Ok(std::fs::File::from(std::os::fd::OwnedFd::from(w)));
+            }
+            PortableHost::open_with_mode(options, mode, path)
+        }
+        fn open_with_mode_nofollow(
+            options: &mut OpenOptions,
+            mode: u32,
+            path: &Path,
+        ) -> std::io::Result<std::fs::File> {
+            PortableHost::open_with_mode_nofollow(options, mode, path)
+        }
+        fn create_dir_all_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+            PortableHost::create_dir_all_with_mode(dir, mode)
+        }
+        fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+            PortableHost::rename_noreplace(from, to)
+        }
+        fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            PortableHost::write_all_at(file, buf, offset)
+        }
+        fn anchor(path: &Path) -> PathBuf {
+            PortableHost::anchor(path)
+        }
+    }
+
+    struct PipeKey(TestKey);
+
+    impl ChainSigner for PipeKey {
+        type Host = PipeHost;
+        fn sign(&self, msg: &[u8]) -> ed25519_dalek::Signature {
+            self.0.sign(msg)
+        }
+        fn verifying_key(&self) -> VerifyingKey {
+            self.0.verifying_key()
+        }
+    }
+
+    /// BUG27: the line is written, its fsync fails (a real EINVAL): the next
+    /// line chains off it, the file's tail — `last_hash` and the position
+    /// did not move, and the next line forked the chain (PrevHashMismatch).
+    #[test]
+    fn fsync_failure_after_the_write_does_not_fork_the_chain() {
+        use std::io::Read as _;
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            PipeKey(key_at(&kp)),
+            cfg(1 << 30, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        log.append(payload(0)).unwrap();
+        PIPE_NEXT.with(|c| c.set(true));
+        assert!(log.append(payload(1)).is_err(), "premise: the fsync fails");
+        let mut written = Vec::new();
+        PIPE.with(|p| p.borrow_mut().take())
+            .unwrap()
+            .read_to_end(&mut written)
+            .unwrap();
+        assert!(written.ends_with(b"\n") && written.len() > 100);
+        append_raw(&active, &written);
+        log.append(payload(2)).unwrap();
+        assert_eq!(log.position().1, fs::metadata(&active).unwrap().len());
+        log.checkpoint().unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == 3),
+            "the chain forked after a failed fsync: {r:?}"
+        );
+        assert!(torn_repairs(&active).is_empty(), "nothing cut");
+    }
+
+    /// BUG27 for the manifest: a manifest row written whole whose fsync
+    /// fails. The next row chains off it — the manifest's own chain did not
+    /// move, and its next row forked it (the whole set refused).
+    #[test]
+    fn a_failed_manifest_fsync_does_not_fork_the_manifest() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append(payload(0)).unwrap();
+        log.checkpoint().unwrap();
+        log.append(payload(1)).unwrap();
+        host::inject(Fault::SyncFails {
+            prefix: b"{\"manifest\"",
+        });
+        assert!(log.checkpoint().is_err(), "premise: the fsync fails");
+        assert_eq!(host::armed(), 0);
+        log.append(payload(2)).unwrap();
+        log.checkpoint().unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            r.as_ref().is_ok_and(|r| r.checkpoints_verified == 3),
+            "the manifest forked after a failed fsync: {r:?}"
+        );
+    }
+
+    /// BUG27 for the manifest, a row cut short: its fragment is replaced by
+    /// the row attesting it, and the manifest's chain goes on.
+    #[test]
+    fn a_short_manifest_row_is_replaced_by_its_attestation() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append(payload(0)).unwrap();
+        log.checkpoint().unwrap();
+        let len = fs::metadata(manifest_path_for(&active)).unwrap().len();
+        log.append(payload(1)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"manifest\"",
+            keep: 33,
+        });
+        assert!(log.checkpoint().is_err(), "premise: the disk is full");
+        let left = host::left_behind();
+        log.append(payload(2)).unwrap();
+        log.checkpoint().unwrap();
+        drop(log);
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(
+            torn_repairs(&active),
+            [("manifest".to_string(), len, 33, sha256_hex(&left[0]))]
+        );
+    }
+
+    /// BUG27 for the seal: the terminator is written whole, its fsync fails.
+    /// The next append finishes that rotation — the file was sealed a second
+    /// time (two terminators: the archive refused).
+    #[test]
+    fn a_failed_seal_fsync_finishes_its_rotation_once() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 2000);
+        host::inject(Fault::SyncFails {
+            prefix: b"{\"rotate\"",
+        });
+        let mut i = 0;
+        let failed = loop {
+            if log.append(payload(i)).is_err() {
+                break i;
+            }
+            i += 1;
+            assert!(i < 100);
+        };
+        assert_eq!(host::armed(), 0, "premise: the seal's fsync failed");
+        assert!(
+            list_archive_seqs(&active).unwrap().is_empty(),
+            "premise: not renamed"
+        );
+        for j in failed + 1..failed + 4 {
+            log.append(payload(j)).unwrap();
+        }
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), [1]);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == failed + 3),
+            "the seal written twice: {r:?}"
+        );
+        assert!(manifest_events(&active)
+            .iter()
+            .any(|e| matches!(e, ManifestEvent::Rotated { seq: 1, .. })));
+    }
+
+    /// A seal cut short (a full disk): its fragment is cut and attested, and
+    /// the rotation is done again, with one terminator.
+    #[test]
+    fn a_short_seal_is_cut_and_its_rotation_done_again() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 2000);
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"rotate\"",
+            keep: 20,
+        });
+        let mut i = 0;
+        let failed = loop {
+            if log.append(payload(i)).is_err() {
+                break i;
+            }
+            i += 1;
+            assert!(i < 100);
+        };
+        let left = host::left_behind();
+        assert_eq!(left.len(), 1, "premise: the seal cut short");
+        for j in failed + 1..failed + 4 {
+            log.append(payload(j)).unwrap();
+        }
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), [1]);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == failed + 3),
+            "{r:?}"
+        );
+        let cut = torn_repairs(&active);
+        assert_eq!(cut.len(), 1);
+        assert_eq!((cut[0].0.as_str(), cut[0].2), ("active", 20));
+        assert_eq!(cut[0].3, sha256_hex(&left[0]));
+    }
+
+    /// BUG39: the torn tail of the active file is attested before it is
+    /// cut. It was cut first: when the attestation then failed once, no
+    /// later open found a torn tail to attest.
+    #[test]
+    fn a_torn_tail_cut_is_attested_even_if_the_first_attestation_fails() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        let fragment = b"{\"payload\":{\"ts\":\"2026-05-30T00:00:03";
+        append_raw(&active, fragment);
+        let len_torn = fs::metadata(&active).unwrap().len();
+        let manifest = manifest_path_for(&active);
+        assert!(!manifest.exists());
+        // the manifest cannot be written once (a dangling symlink here)
+        std::os::unix::fs::symlink(dir.path().join("no-such-dir/m"), &manifest).unwrap();
+        let first = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(1 << 30, 50),
+            std::sync::Arc::new(NoProtection),
+        );
+        assert!(first.is_err(), "premise: the first attestation fails");
+        drop(first);
+        fs::remove_file(&manifest).unwrap();
+        let truncated = fs::metadata(&active).unwrap().len() < len_torn;
+        drop(open_log(&active, &kp, 1 << 30));
+        let attested = torn_repairs(&active);
+        assert!(
+            !truncated || !attested.is_empty(),
+            "the active file was cut ({len_torn} -> {} bytes) and no open attested it: {:?}",
+            fs::metadata(&active).unwrap().len(),
+            manifest_events(&active)
+        );
+        assert_eq!(
+            attested,
+            [(
+                "active".to_string(),
+                len_torn - fragment.len() as u64,
+                fragment.len() as u64,
+                sha256_hex(fragment)
+            )]
+        );
+        assert_eq!(
+            fs::metadata(&active).unwrap().len(),
+            len_torn - fragment.len() as u64
+        );
+    }
+
+    /// BUG39 for the manifest's own torn tail: its attestation goes in the
+    /// manifest itself, so it replaces the fragment in one write. A first
+    /// attempt that fails (the manifest cannot be opened), or writes only
+    /// the start of the row, leaves a torn tail the next open repairs: the
+    /// manifest is never shorter without the row that says so.
+    #[test]
+    fn a_torn_manifest_tail_is_attested_even_if_the_first_attestation_fails() {
+        for partial in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let active = dir.path().join("test.jsonl");
+            let kp = dir.path().join("key");
+            let pk = key_at(&kp).verifying_key();
+            {
+                let mut log = open_log(&active, &kp, 1 << 30);
+                log.append(payload(0)).unwrap();
+                log.checkpoint().unwrap();
+                log.append(payload(1)).unwrap();
+                log.checkpoint().unwrap();
+            }
+            let manifest = manifest_path_for(&active);
+            let clean = fs::metadata(&manifest).unwrap().len();
+            let fragment = b"{\"manifest\":{\"fmt_ver\":3,\"ts\":\"2026-05";
+            append_raw(&manifest, fragment);
+            if partial {
+                host::inject(Fault::ShortWriteAt { keep: 12 });
+            } else {
+                host::inject(Fault::OpenFails {
+                    suffix: ".manifest.jsonl",
+                });
+            }
+            let first = RotatingChainLog::<TestPayload, _>::open(
+                &active,
+                FaultyKey(key_at(&kp)),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            );
+            assert!(first.is_err(), "premise: the first attestation fails");
+            assert_eq!(host::armed(), 0);
+            drop(first);
+            assert!(
+                fs::metadata(&manifest).unwrap().len() > clean,
+                "partial {partial}: the manifest was cut and its attestation failed"
+            );
+            drop(open_log(&active, &kp, 1 << 30));
+            let attested = torn_repairs(&active);
+            assert_eq!(attested.len(), 1, "partial {partial}: {attested:?}");
+            assert_eq!((attested[0].0.as_str(), attested[0].1), ("manifest", clean));
+            if !partial {
+                assert_eq!(attested[0].3, sha256_hex(fragment));
+            }
+            verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        }
+    }
+
+    /// The writer's re-read after a failure is itself retried: while the
+    /// tail cannot be read again, appends fail and write nothing; once it
+    /// can, the chain goes on whole.
+    #[test]
+    fn a_tail_that_cannot_be_read_again_keeps_the_next_lines_out() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append(payload(0)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 10,
+        });
+        assert!(log.append(payload(1)).is_err());
+        // the cut's attestation cannot be written: the manifest cannot open
+        host::inject(Fault::OpenFails {
+            suffix: ".manifest.jsonl",
+        });
+        let torn = fs::read(&active).unwrap();
+        assert!(log.append(payload(2)).is_err());
+        assert_eq!(
+            fs::read(&active).unwrap(),
+            torn,
+            "nothing cut, nothing written"
+        );
+        log.append(payload(3)).unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(r.total_records, 2);
+        assert_eq!(torn_repairs(&active).len(), 1);
     }
 }

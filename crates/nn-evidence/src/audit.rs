@@ -76,7 +76,7 @@
 //!    flipped.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -376,6 +376,15 @@ pub struct AuditLog<K> {
     /// ([`Self::in_memory`]): the rows are appended here, and the caller
     /// writes the bytes through a file it opened itself.
     memory: Option<Vec<u8>>,
+    /// Lot 296 (external bug hunt BUG15): an append failed (the error): what
+    /// it left in the file is not known — nothing, the start of its row (a
+    /// full disk), or the whole row (a failed fsync). The next append reads
+    /// the tail again first ([`Self::recover_after_failed_append`]).
+    poisoned: Option<String>,
+    /// Lot 296: fragments cut from the end of the log whose
+    /// `chain_tail_repaired` row is not written yet (its own append failed):
+    /// written before the next row.
+    unattested: Vec<crate::chainlog::TailRepair>,
 }
 
 impl<K: ChainSigner> AuditLog<K> {
@@ -433,6 +442,8 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_agent_id: tail.last_agent_id,
             identity_attested: false,
             memory: None,
+            poisoned: None,
+            unattested: Vec::new(),
         };
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
@@ -463,6 +474,8 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_agent_id: None,
             identity_attested: false,
             memory: Some(Vec::new()),
+            poisoned: None,
+            unattested: Vec::new(),
         }
     }
 
@@ -717,7 +730,16 @@ impl<K: ChainSigner> AuditLog<K> {
     /// 4 KiB — typical entry is <500 bytes). On success advances
     /// the in-memory tail hash and returns the entry as
     /// persisted.
+    ///
+    /// Lot 296 (external bug hunt BUG15): after a failed append the next one
+    /// first reads the log's tail again — a fragment the failure left is cut
+    /// and the cut attested, a row it wrote whole is the chain's tail — so a
+    /// row is never glued to a fragment (a log the next start refuses) nor
+    /// chained off a row that is no longer the tail.
     pub fn append(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
+        if self.memory.is_none() && (self.poisoned.is_some() || !self.unattested.is_empty()) {
+            self.recover_after_failed_append()?;
+        }
         let entry = build_signed_entry(
             &draft,
             &self.key,
@@ -731,8 +753,9 @@ impl<K: ChainSigner> AuditLog<K> {
         line.push('\n');
         if let Some(memory) = &mut self.memory {
             memory.extend_from_slice(line.as_bytes());
-        } else {
-            self.write_line(&line)?;
+        } else if let Err(e) = self.write_line(&line) {
+            self.poisoned = Some(format!("{e:#}"));
+            return Err(e);
         }
         self.last_hash = entry.entry_hash.clone();
         self.rows += 1;
@@ -761,10 +784,65 @@ impl<K: ChainSigner> AuditLog<K> {
         )
         .map_err(|e| refused_open::<K::Host>(e, &self.path, "for append"))?;
         regular_file(&f, &self.path)?;
-        f.write_all(line.as_bytes())
+        K::Host::append_all(&mut f, line.as_bytes())
             .with_context(|| format!("appending audit entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        K::Host::sync_all(&f).with_context(|| format!("fsync {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Lot 296 (external bug hunt BUG15, BUG27's pattern): the tail read
+    /// again after a failed append, as the open reads it. What the failure
+    /// left after the last newline — the start of its row — is cut
+    /// ([`crate::chainlog::repair_torn_tail`]) and the cut attested
+    /// (`chain_tail_repaired`, the fragment's length and SHA-256); a row it
+    /// wrote whole (its fsync failed) is the chain's tail, and the next row
+    /// chains off it. A cut whose attestation fails is attested at the next
+    /// append (kept here until then).
+    fn recover_after_failed_append(&mut self) -> Result<()> {
+        let cause = self.poisoned.take();
+        let reread = (|| -> Result<Option<crate::chainlog::TailRepair>> {
+            let repair = crate::chainlog::repair_torn_tail::<K::Host>(&self.io_path, |l| {
+                serde_json::from_slice::<AuditEntry>(l).is_ok()
+            })?;
+            let tail = read_tail::<K::Host>(&self.io_path)?;
+            if tail.last_hash != self.last_hash {
+                tracing::warn!(
+                    file = %self.path.display(),
+                    rows = tail.seq.rows(),
+                    "audit log: the row of a failed append reached the file whole; it is the \
+                     chain's tail"
+                );
+            }
+            self.last_hash = tail.last_hash;
+            self.rows = tail.seq.rows();
+            self.numbered = tail.seq.numbered();
+            self.second_key_added |= tail.second_key_added;
+            self.anchoring_started |= tail.anchoring_started;
+            if self.seq_break.is_none() {
+                self.seq_break = tail.seq_break;
+            }
+            Ok(repair)
+        })();
+        match reread {
+            Ok(Some(r)) => self.unattested.push(r),
+            Ok(None) => {}
+            Err(e) => {
+                self.poisoned = cause;
+                return Err(e.context(format!(
+                    "audit log {}: reading its tail again after a failed append",
+                    self.path.display()
+                )));
+            }
+        }
+        let path = self.path.clone();
+        let mut pending = std::mem::take(&mut self.unattested).into_iter();
+        while let Some(r) = pending.next() {
+            if let Err(e) = self.attest_tail_repair(&path, &r) {
+                self.unattested.push(r);
+                self.unattested.extend(pending);
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -2949,5 +3027,196 @@ mod tests {
                 (2, hashes[2].clone())
             ]
         );
+    }
+
+    // ── Lot 296 (external bug hunt, editions 1.2/1.3): a failed append ──
+
+    use crate::chain_host::testing::{self as host, Fault, FaultyKey};
+
+    fn faulty(key_path: &Path) -> FaultyKey {
+        FaultyKey(TestKey::load_or_bootstrap(key_path).unwrap())
+    }
+
+    /// The rows of `path`, every line one (a line that is not a row fails).
+    fn every_line_a_row(path: &Path) -> Vec<AuditEntry> {
+        let text = fs::read_to_string(path).unwrap();
+        text.lines()
+            .enumerate()
+            .map(|(n, l)| {
+                serde_json::from_str::<AuditEntry>(l).unwrap_or_else(|e| {
+                    panic!(
+                        "line {} ({} bytes) is not an audit row: {e}",
+                        n + 1,
+                        l.len()
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// BUG15: a full disk stops an append part-way (the first `write` takes
+    /// what fits, the next fails ENOSPC): the start of its row stays in the
+    /// file. The running log's next row is not glued to it — the next start
+    /// opens the log (it refused it, and the agent in enforce mode with
+    /// it) —, every line is a row, the chain verifies, and the cut is
+    /// attested (the fragment's length and SHA-256).
+    #[test]
+    fn a_failed_append_does_not_glue_the_next_row_to_its_fragment() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 55,
+        });
+        assert!(
+            log.append(sample_draft(2)).is_err(),
+            "premise: the disk is full"
+        );
+        let left = host::left_behind();
+        assert_eq!(left.len(), 1, "premise: a fragment left");
+        assert_eq!(left[0].len(), 55);
+        // space back: the running agent's next rows
+        log.append(sample_draft(3))
+            .expect("the append after the failed one");
+        log.append(sample_draft(4)).unwrap();
+        drop(log);
+        if let Err(e) = AuditLog::open(
+            &log_path,
+            TestKey::load_or_bootstrap(&key_path).unwrap(),
+            [0u8; 16],
+        ) {
+            panic!("the log does not open again after a failed append: {e:#}");
+        }
+        let rows = every_line_a_row(&log_path);
+        whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "test_op_1",
+                CHAIN_TAIL_REPAIRED_OP,
+                "test_op_3",
+                "test_op_4"
+            ],
+            "the cut is attested before the next row; the failed row is not in the chain"
+        );
+        let detail = rows[1].extra["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&sha256_hex(&left[0])) && detail.contains("(55 bytes"),
+            "the attestation names the fragment: {detail}"
+        );
+        assert_eq!(rows[1].extra["file"], log_path.display().to_string());
+    }
+
+    /// BUG15 with BUG27's shape: the row is written whole, its fsync fails.
+    /// The next row chains off it (the file's tail), not off the row before
+    /// (a fork: two rows with one `prev_hash` and one `seq`).
+    #[test]
+    fn fsync_failure_after_the_write_does_not_fork_the_chain() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        assert!(
+            log.append(sample_draft(2)).is_err(),
+            "premise: the fsync fails"
+        );
+        assert_eq!(host::armed(), 0);
+        log.append(sample_draft(3)).unwrap();
+        drop(log);
+        let rows = every_line_a_row(&log_path);
+        whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            ["test_op_1", "test_op_2", "test_op_3"],
+            "nothing cut, nothing attested"
+        );
+        assert_eq!(rows[2].seq, Some(2));
+        assert!(AuditLog::open(
+            &log_path,
+            TestKey::load_or_bootstrap(&key_path).unwrap(),
+            [0u8; 16]
+        )
+        .is_ok());
+    }
+
+    /// A cut whose attestation fails too (the disk still full) is attested
+    /// at the next append, with the second fragment's: no cut is left
+    /// without its row while the log runs. Nothing is written before both.
+    #[test]
+    fn a_cut_whose_attestation_fails_is_attested_at_the_next_append() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 40,
+        });
+        assert!(log.append(sample_draft(2)).is_err());
+        // the next append's attestation is cut short too
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 70,
+        });
+        assert!(
+            log.append(sample_draft(3)).is_err(),
+            "its attestation failed"
+        );
+        let left = host::left_behind();
+        assert_eq!(left.iter().map(Vec::len).collect::<Vec<_>>(), [40, 70]);
+        log.append(sample_draft(4)).unwrap();
+        drop(log);
+        let rows = every_line_a_row(&log_path);
+        whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "test_op_1",
+                CHAIN_TAIL_REPAIRED_OP,
+                CHAIN_TAIL_REPAIRED_OP,
+                "test_op_4"
+            ]
+        );
+        for (row, frag) in rows[1..3].iter().zip(&left) {
+            let detail = row.extra["detail"].as_str().unwrap();
+            assert!(detail.contains(&sha256_hex(frag)), "{detail}");
+        }
+    }
+
+    /// A failed append whose tail cannot be read again keeps the log
+    /// poisoned: the next append fails too and writes nothing, until the
+    /// tail reads.
+    #[test]
+    fn a_tail_that_cannot_be_read_again_keeps_the_next_rows_out() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 30,
+        });
+        assert!(log.append(sample_draft(2)).is_err());
+        let torn = fs::read(&log_path).unwrap();
+        host::inject(Fault::OpenFails {
+            suffix: "audit.log",
+        });
+        let e = log.append(sample_draft(3)).unwrap_err();
+        assert!(format!("{e:#}").contains("reading its tail again"), "{e:#}");
+        assert_eq!(fs::read(&log_path).unwrap(), torn, "nothing written");
+        log.append(sample_draft(4)).unwrap();
+        drop(log);
+        let ops: Vec<String> = every_line_a_row(&log_path)
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        assert_eq!(ops, ["test_op_1", CHAIN_TAIL_REPAIRED_OP, "test_op_4"]);
     }
 }

@@ -15,6 +15,17 @@
 //! A log shipper reading these files is behind the sink: what rotates out
 //! before it reads it, it misses (the files are the bound, the chains the
 //! record).
+//!
+//! Lot 296 (external bug hunt BUG31): a write stopped part-way (a full disk:
+//! the first `write` takes what fits, the next fails) leaves the start of a
+//! line in the active file. The batch is not acknowledged and is written
+//! again; its first line used to be glued to that start, one record no
+//! longer a line of its own although acknowledged. The sink knows where its
+//! last `write` stopped and closes such a line with a newline before the
+//! next one; the worker keeps its sink across the error, so that knowledge
+//! is not lost. The worker cannot read its files (its seccomp list has no
+//! `read` of them): a start left by a process that ended in the middle of a
+//! line (a crash) is not seen.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -51,6 +62,10 @@ pub struct JsonlSink {
     max_files: u8,
     fd: Option<OwnedFd>,
     size: u64,
+    /// Lot 296 (BUG31): the active file ends inside a line — the sink's
+    /// last `write` stopped before a newline (the start of a line it was not
+    /// acknowledged for). The next write closes it first.
+    torn: bool,
     /// Files rotated out (removed) since the sink opened.
     pub dropped_files: u64,
     /// Files an earlier configuration left past this one's count, removed
@@ -71,6 +86,7 @@ impl JsonlSink {
             max_files: max_files.max(1),
             fd: None,
             size: 0,
+            torn: false,
             dropped_files: 0,
             cleared_files: 0,
         };
@@ -157,6 +173,10 @@ impl JsonlSink {
             return Err(errno());
         }
         self.size = end as u64;
+        if self.size == 0 {
+            // a new active file (a rotation that went through)
+            self.torn = false;
+        }
         self.fd = Some(fd);
         Ok(())
     }
@@ -207,12 +227,17 @@ impl JsonlSink {
     }
 
     /// Append `lines` (each without its newline), rotating before a line
-    /// that would pass the size, then sync. `Ok`: all of them are on disk.
+    /// that would pass the size, then sync. `Ok`: all of them are on disk,
+    /// each a line of its own — the start of a line an earlier write left
+    /// (it stopped part-way) is closed first.
     pub fn write(&mut self, lines: &[Vec<u8>]) -> Result<(), i32> {
         if self.fd.is_none() {
             self.reopen()?;
         }
         let mut buf: Vec<u8> = Vec::new();
+        if self.torn {
+            buf.push(b'\n');
+        }
         for l in lines {
             let need = l.len() as u64 + 1;
             if self.size + buf.len() as u64 + need > self.max_bytes
@@ -245,6 +270,9 @@ impl JsonlSink {
                 return Err(e);
             }
             self.size += n as u64;
+            if n > 0 {
+                self.torn = buf[n as usize - 1] != b'\n';
+            }
             buf = &buf[n as usize..];
         }
         Ok(())

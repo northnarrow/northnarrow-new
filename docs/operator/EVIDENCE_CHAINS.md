@@ -300,6 +300,32 @@ start's own findings (`chain_truncated`, …) and are reported apart.
 - `chain_lines_unverified` is written each time a read verb leaves out
   another number of rows of a file than the last time; the ERROR is in the
   journal every time.
+- A write the disk stopped part-way (full: the first `write` takes what
+  fits, the next fails) or whose `fsync` failed (lot 296): before its next
+  row the writer reads the file's tail again, as a start does. The start
+  of a row left at the end is cut, and the cut attested with the length and
+  SHA-256 of what was cut — `chain_tail_repaired` in the audit chain for
+  `audit.log`; `torn_tail_repaired` in a rotating log's manifest, role
+  `active` (written before the cut) or `manifest` (the attesting row takes
+  the fragment's place in one write). A row the failure wrote whole stays,
+  and the chain goes on from it; a seal written whole finishes its rotation
+  (never a second seal). The row whose append failed is not in the chain
+  unless it was written whole (a rotating log's journal says which: WARN
+  `chainlog: tail read again after a failed write`, with what was cut and
+  what kept). While the tail cannot be read again, or the cut not
+  attested, every append of that chain fails and writes nothing. Before lot
+  296 the next row was glued to the fragment, or chained off the row before
+  the one written whole: an audit log the next start refused (the agent did
+  not start in enforce mode), a rotating log `BROKEN` in `nn-admin chain
+  verify` for as long as that generation was kept.
+- Retention (lot 296): a pass that cannot remove an archive keeps the
+  `Evicted` rows of those it removed before it, and stops there (removing
+  newer ones past it would leave a gap); the ERROR `archive eviction failed
+  post-rotate` names it. An entry at an archive's name that is not a
+  regular file (a directory, a link) is not the log's: it is left in place
+  (ERROR `a foreign entry holds an archive name past the retention`, and
+  `nn-admin chain verify` names it) and the eviction goes on past it — it
+  used to stop every later pass.
 - A rotating log whose checkpoint is unreachable keeps failing
   `nn-admin chain verify` until that generation leaves retention (the
   evidence is still missing; that is the point).

@@ -505,4 +505,146 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         assert_eq!(read_chain_tail::<LinuxHost>(&link, &all(1 << 20)).count, 0);
     }
+
+    // ── Lot 296 (external bug hunt BUG15, BUG17): the kernel's own short
+    //    write, in the agent's writers on the agent's host ──
+
+    /// Lowers this process's file size limit to `limit` bytes for `f`: the
+    /// kernel's own short write, as a full disk makes it (the first `write`
+    /// takes what fits, the next fails `EFBIG`). Only in a helper process of
+    /// its own: the limit is the process's, the other tests' threads must
+    /// not see it.
+    fn with_file_size_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: signal/getrlimit/setrlimit with valid arguments; the limit
+        // is put back at once.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old), 0);
+            let low = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &low), 0);
+        }
+        let r = f();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &old), 0);
+        }
+        r
+    }
+
+    const SHORT_WRITE_DIR: &str = "NN_LINUX_SHORT_WRITE_DIR";
+
+    /// The writer of [`a_short_write_glues_no_row_to_the_next`], in a
+    /// process of its own. A no-op without its variable.
+    #[test]
+    #[ignore = "a helper: run by a_short_write_glues_no_row_to_the_next"]
+    fn short_write_writer() {
+        let Some(dir) = std::env::var_os(SHORT_WRITE_DIR) else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        // the audit log
+        let log_path = dir.join("audit.log");
+        let mut log = AuditLog::open(&log_path, key(dir), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        let len = fs::metadata(&log_path).unwrap().len();
+        let e = with_file_size_limit(len + 55, || log.append(sample_draft(2))).unwrap_err();
+        assert_eq!(
+            e.root_cause()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EFBIG),
+            "{e:#}"
+        );
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().len(),
+            len + 55,
+            "a short write"
+        );
+        log.append(sample_draft(3)).unwrap();
+        // a rotating chain
+        let active = dir.join("log.jsonl");
+        let mut chain = RotatingChainLog::<P, _>::open(
+            &active,
+            key(dir),
+            RotationConfig::default(),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        chain.append(p(0)).unwrap();
+        let len = fs::metadata(&active).unwrap().len();
+        assert!(with_file_size_limit(len + 50, || chain.append(p(1))).is_err());
+        assert_eq!(
+            fs::metadata(&active).unwrap().len(),
+            len + 50,
+            "a short write"
+        );
+        chain.append(p(2)).unwrap();
+    }
+
+    /// BUG15 and BUG17 with the kernel's own short write (the file size
+    /// limit) on the agent's host: the writers' `write_all` stops part-way.
+    /// The next row is glued to no fragment — the audit log opens again (a
+    /// start in enforce mode refused it), the rotating chain verifies (it
+    /// was Malformed for good) —, and each cut is attested.
+    #[test]
+    fn a_short_write_glues_no_row_to_the_next() {
+        let dir = TempDir::new().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "chain_host_linux::tests::short_write_writer",
+                "--test-threads=1",
+            ])
+            .env(SHORT_WRITE_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the writer: {st}");
+        let k = key(dir.path());
+        let log_path = dir.path().join("audit.log");
+        if let Err(e) = AuditLog::open(&log_path, key(dir.path()), [0u8; 16]) {
+            panic!("the audit log does not open again after a short write: {e:#}");
+        }
+        let text = fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<crate::audit::AuditEntry> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a row: {e}")))
+            .collect();
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "test_op_1",
+                crate::audit::CHAIN_TAIL_REPAIRED_OP,
+                "test_op_3"
+            ]
+        );
+        crate::audit::verify_chain(&rows, &k.verifying_key()).unwrap();
+        let active = dir.path().join("log.jsonl");
+        let r = crate::chainlog::verify_log_set::<P>(&active, &k.verifying_key());
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
+        let manifest = fs::read_to_string(manifest_path(&active)).unwrap();
+        let cut: Vec<ManifestEvent> = manifest
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::chainlog::ManifestLine>(l)
+                    .unwrap()
+                    .manifest
+                    .event
+            })
+            .filter(|e| matches!(e, ManifestEvent::TornTailRepaired { .. }))
+            .collect();
+        assert!(
+            matches!(&cut[..], [ManifestEvent::TornTailRepaired { role, dropped_bytes: 50, .. }] if role == "active"),
+            "{cut:?}"
+        );
+    }
 }
