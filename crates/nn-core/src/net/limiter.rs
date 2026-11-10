@@ -345,6 +345,9 @@ mod tests {
         assert!(g.hold_back(&r, Instant::now()));
         let mut s = store.lock();
         let key = s.current_key(4300);
+        // Bug hunt 1.3, BUG75: CHAIN-007's late read needs the sequence's
+        // first step, a staging exec before it.
+        s.record(key, PrecursorKind::TmpExec, 3_000_000_000);
         let note = s
             .answer_sequence_after(
                 key,

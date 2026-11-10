@@ -146,9 +146,17 @@ impl Bucket {
         }
     }
 
-    /// Nothing left to report, nothing spent: safe to forget.
+    /// Nothing left to report, nothing spent, nothing owed to the pair's
+    /// next record: safe to forget.
+    ///
+    /// Bug hunt 1.3, BUG60: `held_since_record` was not looked at, so on a
+    /// full table a pair whose held count the reporter had taken (its
+    /// bucket refilled since, or never spent: a coalesced count spends no
+    /// token) was forgotten, and its next record said `suppressed_before:
+    /// 0` — the count survived only in the signed `detections_held` audit
+    /// entry.
     fn idle(&self) -> bool {
-        self.tokens == BURST && self.held_since_report == 0
+        self.tokens == BURST && self.held_since_report == 0 && self.held_since_record == 0
     }
 }
 
@@ -600,5 +608,54 @@ mod tests {
         let later = t0 + REFILL * 2;
         assert_eq!(records(&b, "S", 1, BURST, later), BURST);
         assert_eq!(b.admit_at("S", 1, later, nos), Admit::Hold { first: true });
+    }
+
+    // ── bug hunt 1.3 (editions 1.2/1.3) ─────────────────────────────
+
+    /// BUG60: a pair with detections held since its last record, its
+    /// bucket refilled and its report taken, is not pruned on a full table:
+    /// its next record says `suppressed_before: 2` (it said 0).
+    #[test]
+    fn prune_keeps_a_pair_with_held_since_record() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        for _ in 0..BURST {
+            assert!(b.admit_at("R", 0, t0, nos).record());
+        }
+        assert!(!b.admit_at("R", 0, t0, nos).record());
+        assert!(!b.admit_at("R", 0, t0, nos).record());
+        assert_eq!(b.take_held()[0].count, 2);
+        for uid in 1..MAX_KEYS as u32 {
+            assert!(b.admit_at("R", uid, t0, nos).record());
+        }
+        let later = t0 + REFILL * BURST;
+        assert!(b.admit_at("S", 1, later, nos).record());
+        assert_eq!(
+            b.admit_at("R", 0, later, nos),
+            Admit::Record {
+                suppressed_before: 2
+            },
+            "the 2 held since the previous record of (R, 0)"
+        );
+    }
+
+    /// BUG60, coalesced variant: no wait at all — a coalesced count never
+    /// spends a token, so the pair was idle as soon as the report was taken.
+    #[test]
+    fn prune_keeps_a_coalesced_count() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        b.count_coalesced_many_at("NN-L-AT-001", 0, 1499, t0, nos);
+        assert_eq!(b.take_held()[0].count, 1499);
+        for uid in 1..MAX_KEYS as u32 {
+            assert!(b.admit_at("R", uid, t0, nos).record());
+        }
+        assert!(b.admit_at("S", 1, t0, nos).record());
+        assert_eq!(
+            b.admit_at("NN-L-AT-001", 0, t0, nos),
+            Admit::Record {
+                suppressed_before: 1499
+            }
+        );
     }
 }

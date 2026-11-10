@@ -1719,6 +1719,35 @@ fn chain_cred_read_parent_then_descendant_egress_trips_chain_004() {
     fx.wait_for_verdict("NN-L-CHAIN-004_CrossPidCredExfil");
 }
 
+/// CHAIN-001 — one process reads a credential store, then egresses
+/// (T1555 → T1041). Lot 294 (bug hunt 1.3, BUG62/BUG45): the same-PID
+/// two-step chain whose correlation the lot touched had no e2e. The helper
+/// lives OUTSIDE /tmp (installed root-owned, so only `CredRead`, no
+/// `TmpExec`), reads the FIM-watched browser-cred file and connects; the
+/// fixture's agent is detect-only, so FIM-015's kill does not race the
+/// connect.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn chain_cred_read_then_egress_trips_chain_001() {
+    let _eni = EniIptablesGuard::install();
+    let creddir = tempfile::tempdir().expect("cred tempdir");
+    let cred = creddir.path().join("Login Data");
+    std::fs::write(&cred, b"placeholder\n").expect("seed cred file");
+    let fx = Fixture::setup(&[&cred]);
+
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    let dir = tempfile::tempdir().expect("helper tempdir");
+    let seq = install_to_priv_bin(&compile_seq_helper(dir.path(), "nnseq_cred", C2_PORT));
+    let _ = Command::new(&seq.path)
+        .arg(&cred)
+        .stdout(Stdio::null())
+        .status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-001_CredReadThenEgress");
+}
+
 /// CHAIN-007 — same-PID 3-step: `/tmp` exec → cred read → egress
 /// (T1059 → T1555 → T1041), all one process, via the D3 N-event
 /// has_sequence.
