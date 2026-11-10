@@ -42,6 +42,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   manifest is created at its open (empty until its first row), so the
   actions chain's response threads, which may not lift the state
   directory's immutability, can attest their repair (the lab's finding).
+- The actions chain rotates (lot 296; found by lot 295's lab): its rows
+  are written by the response threads, which may not lift the state
+  directory's `+i`, so its rotation sealed the active file, failed the
+  rename, and every later action row was lost (an ERROR each) until the
+  next start. A thread that may not lift the directory seals nothing: its
+  row goes on past the cap, and the chain's rotation thread
+  (`nn-actions-rotate`, the writer's role; the actuator is given no
+  capability) rotates it.
 - A torn tail is attested before it is cut (lot 296, BUG39): the active
   file's at the open, after its manifest row; a manifest's own by its
   attesting row written over the fragment, the file cut after it. A cut

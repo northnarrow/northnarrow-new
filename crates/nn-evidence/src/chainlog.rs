@@ -923,6 +923,12 @@ pub struct RotatingChainLog<P, K> {
     active_poison: Option<String>,
     /// Lot 296: the same for the manifest ([`Self::recover_manifest`]).
     manifest_poison: Option<String>,
+    /// Lot 296 (lot 295's finding): a rotation the appending thread could
+    /// not start — the protection refused to lift the state directory (the
+    /// actions chain's response threads may not lift it). Nothing was
+    /// sealed: the lines go on in the active file past its cap, and a
+    /// thread that may lift it rotates ([`Self::rotate_owed`]).
+    rotation_owed: bool,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -999,6 +1005,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             clock,
             active_poison: None,
             manifest_poison: None,
+            rotation_owed: false,
             _marker: std::marker::PhantomData,
         };
         // Lot 296: the manifest exists from the open, created inside the `+i`
@@ -1411,6 +1418,8 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         self.recover_active()?;
         // External audit NN-AUD-115: a previous rotation sealed the active
         // file but could not rename it. Retry only the finish step.
+        // (a sealed file takes no line: until then the rotation is owed —
+        // `rotation_owed` — to a thread that may finish it)
         if let Some(p) = self.pending_seal.clone() {
             self.finish_rotation(p.seq, p.terminator_hash, p.bytes, p.records)?;
         }
@@ -1421,7 +1430,9 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // pre-existing over-cap active file — e.g. a legacy log inherited at
         // the BUG-026 migration — must rotate on its FIRST append, and an
         // empty fresh file (0 bytes) must NOT rotate its first line.
-        if self.active_bytes > 0 && self.active_bytes + bytes.len() as u64 > self.cfg.size_cap_bytes
+        if self.active_bytes > 0
+            && self.active_bytes + bytes.len() as u64 > self.cfg.size_cap_bytes
+            && self.may_rotate_here()
         {
             self.rotate()?;
             // After rotation the line was hashed off the OLD tail; rebuild
@@ -1441,6 +1452,65 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         self.active_records += 1;
         self.after_append();
         Ok(line.entry_hash)
+    }
+
+    /// Lot 296 (lot 295's finding): whether this thread may rotate — the
+    /// protection lifts the directory (and puts it back) with nothing done
+    /// in between, before anything is sealed. A thread it refuses (the
+    /// actions chain's response threads: no `CAP_LINUX_IMMUTABLE`) used to
+    /// seal the file, fail the rename, and lose every later line of the
+    /// chain (a sealed file takes none). Refused, the line goes on past the
+    /// cap and the rotation is owed ([`Self::rotate_owed`]); said once.
+    fn may_rotate_here(&mut self) -> bool {
+        match self.protection.with_mutable_dir(&mut || Ok(())) {
+            Ok(()) => true,
+            Err(e) => {
+                if !self.rotation_owed {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        log = %self.active_path.display(),
+                        cap = self.cfg.size_cap_bytes,
+                        "chainlog: this thread may not rotate the log; its lines go on past the \
+                         cap until a thread that may rotates it"
+                    );
+                }
+                self.rotation_owed = true;
+                false
+            }
+        }
+    }
+
+    /// Lot 296: a rotation this writer owes ([`Self::may_rotate_here`]
+    /// refused it, or a seal waits for its rename).
+    pub fn rotation_owed(&self) -> bool {
+        self.rotation_owed || self.pending_seal.is_some()
+    }
+
+    /// Lot 296: the owed rotation, done on the calling thread — one the
+    /// protection lets lift the directory (the actions chain's rotation
+    /// thread). `Ok(true)`: the active file was archived.
+    pub fn rotate_owed(&mut self) -> Result<bool> {
+        if !self.rotation_owed() {
+            return Ok(false);
+        }
+        self.recover_active()?;
+        if let Some(p) = self.pending_seal.clone() {
+            self.finish_rotation(p.seq, p.terminator_hash, p.bytes, p.records)?;
+            return Ok(true);
+        }
+        if self.active_bytes == 0 {
+            self.rotation_owed = false;
+            return Ok(false);
+        }
+        if !self.may_rotate_here() {
+            // nothing sealed: still owed
+            return Err(anyhow!(
+                "{}: this thread may not rotate the log either",
+                self.active_path.display()
+            ));
+        }
+        self.rotate()?;
+        Ok(true)
     }
 
     /// Seal the active file, archive it, open a fresh active, and evict
@@ -1574,6 +1644,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             self.active_records = 0;
             self.next_seq = seq + 1;
             self.pending_seal = None;
+            self.rotation_owed = false;
             // The `Rotated` row anchors the sealed file.
             self.since_checkpoint = 0;
             self.checkpoint_at = std::time::Instant::now();
@@ -5065,11 +5136,18 @@ mod tests {
     /// leaving two terminators in one file.
     #[test]
     fn a_failed_rename_does_not_seal_twice() {
-        struct FailOnce(std::sync::atomic::AtomicBool);
+        // Lot 296: the dance that fails is the finish step's, the second of
+        // the rotation (its first, the probe of `may_rotate_here`, passes;
+        // a probe refused seals nothing: `a_thread_that_may_not_rotate_…`)
+        struct FailOnce(std::sync::atomic::AtomicU32);
         impl ProtectionManager for FailOnce {
             fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    return Err(anyhow!("simulated dance failure"));
+                let n = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                if n > 0 {
+                    self.0.store(n - 1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 1 {
+                        return Err(anyhow!("simulated dance failure"));
+                    }
                 }
                 f()
             }
@@ -5081,14 +5159,14 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
-        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicBool::new(false)));
+        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicU32::new(0)));
         let mut log = open_log_with(&active, &kp, 2000, prot.clone());
         let mut i = 0;
         while log.active_bytes + 400 < 2000 {
             log.append(payload(i)).unwrap();
             i += 1;
         }
-        prot.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        prot.0.store(2, std::sync::atomic::Ordering::SeqCst);
         assert!(
             log.append(payload(i)).is_err(),
             "the first finish step fails"
@@ -7288,5 +7366,96 @@ mod tests {
         let r = verify_log_set::<TestPayload>(&active, &pk);
         assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
         assert_eq!(torn_repairs(&active).len(), 1);
+    }
+
+    /// Lot 296 (lot 295's finding): the actions chain's rows are written by
+    /// threads that may not lift the state directory. Its rotation sealed
+    /// the file, failed the rename, and every later line was lost (a sealed
+    /// file takes none). Now nothing is sealed on such a thread: the lines go
+    /// on past the cap, and a thread that may rotates — every line kept, the
+    /// chain verifiable across the rotation.
+    #[test]
+    fn a_thread_that_may_not_rotate_keeps_its_lines_past_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let prot = std::sync::Arc::new(NoDanceAfter(std::sync::atomic::AtomicBool::new(false)));
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(2000, 50),
+            prot.clone(),
+        )
+        .unwrap();
+        prot.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..20 {
+            log.append(payload(i)).unwrap();
+        }
+        assert!(
+            list_archive_seqs(&active).unwrap().is_empty(),
+            "nothing rotated"
+        );
+        assert!(log.position().1 > 2000, "past the cap");
+        assert!(log.rotation_owed());
+        // still refused: owed, nothing sealed (the lines still go on)
+        let len = fs::metadata(&active).unwrap().len();
+        assert!(log.rotate_owed().is_err());
+        assert!(log.rotation_owed());
+        assert_eq!(fs::metadata(&active).unwrap().len(), len, "nothing sealed");
+        log.append(payload(99)).unwrap();
+        // the thread that may
+        prot.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(log.rotate_owed().unwrap());
+        assert!(!log.rotation_owed());
+        assert!(!log.rotate_owed().unwrap(), "nothing owed");
+        for i in 20..25 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), [1]);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 26), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(archive_path(&active, 1))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.contains("\"rotate\""))
+                .count(),
+            21
+        );
+    }
+
+    /// An owed rotation whose active file is found empty when the thread
+    /// that may rotate comes (emptied under the writer, read again after a
+    /// failed write) seals nothing: no archive of a terminator alone.
+    #[test]
+    fn an_owed_rotation_of_an_emptied_file_seals_nothing() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let prot = std::sync::Arc::new(NoDanceAfter(std::sync::atomic::AtomicBool::new(false)));
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            FaultyKey(key_at(&kp)),
+            cfg(2000, 50),
+            prot.clone(),
+        )
+        .unwrap();
+        prot.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..10 {
+            log.append(payload(i)).unwrap();
+        }
+        assert!(log.rotation_owed());
+        fs::write(&active, b"").unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 0,
+        });
+        assert!(log.append(payload(10)).is_err());
+        prot.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!log.rotate_owed().unwrap(), "nothing to archive");
+        assert!(!log.rotation_owed());
+        assert!(list_archive_seqs(&active).unwrap().is_empty());
     }
 }

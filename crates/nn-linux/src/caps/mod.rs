@@ -11,7 +11,7 @@
 //! |---|---|---|---|
 //! | [`Role::Decision`] | `nn-decision` | [`Role::Decision`]'s set | the same: the rest given up for good, and a seccomp filter of its own ([`filter`]) refuses `capset`, `execve`, `execveat`, `bpf` and the calls that reach another process's memory |
 //! | [`Role::Actuator`] | `nn-response-*`, `nn-response-watch` | `KILL NET_ADMIN SETFCAP DAC_OVERRIDE SYS_PTRACE` | the bounding set |
-//! | [`Role::Writer`] | `nn-canary-log` | `LINUX_IMMUTABLE` | the bounding set |
+//! | [`Role::Writer`] | `nn-canary-log`, `nn-actions-rotate` (lot 296: the actions chain's rotation) | `LINUX_IMMUTABLE` | the bounding set |
 //! | [`Role::Supervisor`] | `nn-workers` | `SETUID SETGID KILL BPF` | the bounding set |
 //! | [`Role::Loader`] | the start's thread while the eBPF object loads and attaches ([`lower`]) | `BPF PERFMON` (and `SYS_ADMIN` where the Debian drop-in grants it) | the bounding set |
 //! | [`Role::Errands`] | `nn-errands` ([`errands`]): what the decision's filter refuses it, done for it | `BPF` | the bounding set |
@@ -325,7 +325,8 @@ impl Role {
     ///   strip reach the file through `/proc/1/root` and the target's
     ///   `/proc/<pid>/exe` (§3.2's own entry for it).
     /// - writer: `LINUX_IMMUTABLE` (the state directory's `chattr +i`
-    ///   lifted for a new chain file).
+    ///   lifted for a new chain file — the actions chain's rotation too,
+    ///   lot 296: the actuator may not).
     /// - supervisor: `SETUID`, `SETGID` (the worker's account, set in the
     ///   child before `exec`), `KILL` (the worker runs as another user),
     ///   `BPF` (its pid's role in `PROTECTED_PIDS`).

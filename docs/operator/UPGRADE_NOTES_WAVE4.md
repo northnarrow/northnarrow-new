@@ -951,6 +951,15 @@ holding a flow against a later kill (BUG45). After the upgrade:
   actions chain's response threads, which may not lift it, can attest a
   repair there (lot 296's lab: without it, every action row after a full
   disk was lost until the next start).
+- **The actions chain rotates** (lot 295's finding, added to this lot):
+  its rows are written by the response threads, which may not lift the
+  state directory; past its cap (16 MiB, `NN_ACTIONS_CAP_BYTES`) every row
+  was lost until the next start. A response thread now keeps its row past
+  the cap and the chain's rotation thread (`nn-actions-rotate`, role
+  writer) rotates it. Nothing to configure. An install that lost rows that
+  way has the ERRORs `an action's row is NOT in the signed actions chain`
+  with `lifting immutability` in the journal, and an active file ending in
+  a terminator that the next start's open archived.
 - **Retention** (BUG10): an entry at an archive's name that is not a
   regular file is left in place and passed (ERROR in the journal; `chain
   verify` names it); a pass that fails keeps the `Evicted` rows of what it

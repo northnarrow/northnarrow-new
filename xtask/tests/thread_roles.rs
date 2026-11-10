@@ -63,6 +63,14 @@ fn every_role_s_thread_takes_its_role() {
         12,
         ".on_start(|| {\n                                nn_linux::caps::enter_or_report(nn_linux::caps::Role::Writer);",
     );
+    // lot 296: the actions chain's rotation thread (the response threads
+    // may not lift the state directory)
+    requires(
+        "crates/nn-linux/src/response/journal.rs",
+        ".name(ROTOR_THREAD.to_string())",
+        4,
+        "crate::caps::enter_or_report(crate::caps::Role::Writer)",
+    );
     requires(
         "crates/nn-linux/src/worker/supervisor.rs",
         ".name(SUPERVISOR_THREAD.to_string())",

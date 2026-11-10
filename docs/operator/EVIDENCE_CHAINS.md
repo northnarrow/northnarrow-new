@@ -85,6 +85,18 @@ log not open: no key, a write refused) is logged whole at ERROR (`an
 action's row is NOT in the signed actions chain — this line is its
 record`) and counted (`rows not in the chain`); the action still runs.
 
+Its rotation (lot 296): the rows are written by the response threads, which
+may not lift the state directory's `+i` (they hold no
+`CAP_LINUX_IMMUTABLE`). Before lot 296 their rotation sealed the active
+file, failed the rename, and every later row was lost (the ERROR above,
+one per row) until the next start. Now such a thread seals nothing: its row
+goes on in the active file past the cap (WARN `this thread may not rotate
+the log`, once), and the chain's rotation thread `nn-actions-rotate` (the
+writer's role) rotates it within moments (INFO `the actions chain rotated
+on its rotation thread`). If even that thread cannot (ERROR `could not
+rotate on its rotation thread`, once), the rows still go on past the cap,
+none lost; the heartbeat's signed head shows the file's size.
+
 ### The heartbeat chain (R12c-2, lab PR 270)
 
 `/var/lib/northnarrow/heartbeat.jsonl` (`--heartbeat-file`; 4 MiB × 4
