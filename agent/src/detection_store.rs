@@ -1340,8 +1340,6 @@ fn collect_matching_from_file(
     cap: usize,
     keep_lines: bool,
 ) -> Vec<(DetectionRecord, String)> {
-    use std::collections::BinaryHeap;
-    use std::io::{BufRead, BufReader};
     if cap == 0 {
         return Vec::new();
     }
@@ -1349,9 +1347,20 @@ fn collect_matching_from_file(
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    collect_matching(std::io::BufReader::new(f), filter, cap, keep_lines)
+}
+
+/// [`collect_matching_from_file`] over the file's reader.
+fn collect_matching(
+    reader: impl std::io::BufRead,
+    filter: &DetectionFilter,
+    cap: usize,
+    keep_lines: bool,
+) -> Vec<(DetectionRecord, String)> {
+    use std::collections::BinaryHeap;
     // Min-heap on the rank: the root is the first to give way.
     let mut held: BinaryHeap<std::cmp::Reverse<Held>> = BinaryHeap::new();
-    for (line_no, line) in BufReader::new(f).lines().enumerate() {
+    for (line_no, line) in reader.lines().enumerate() {
         // Lot 297 (external bug hunt BUG69): a line that is not UTF-8 was
         // read past and is skipped; any other error ends the file. Every
         // error was skipped, but a read error repeats at every call without
@@ -1545,13 +1554,21 @@ fn collect_latest_status_from_file(
     out: &mut HashMap<u64, DetectionStatus>,
     unresolved: &mut HashSet<u64>,
 ) {
-    use std::io::{BufRead, BufReader};
     let f = match std::fs::OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(_) => return,
     };
+    collect_latest_status(std::io::BufReader::new(f), out, unresolved);
+}
+
+/// [`collect_latest_status_from_file`] over the file's reader.
+fn collect_latest_status(
+    reader: impl std::io::BufRead,
+    out: &mut HashMap<u64, DetectionStatus>,
+    unresolved: &mut HashSet<u64>,
+) {
     let mut touched: Vec<u64> = Vec::new();
-    for line in BufReader::new(f).lines() {
+    for line in reader.lines() {
         // Lot 297 (external bug hunt BUG74): as in
         // `collect_matching_from_file` (BUG69) — a line that is not UTF-8
         // skipped, a read error the end of the file, not an endless loop.
@@ -4260,5 +4277,51 @@ mod tests {
                 (4, DetectionStatus::Resolved)
             ])
         );
+    }
+
+    /// A reader that serves `data`, then fails with EIO at every call
+    /// without reading on (a failing disk).
+    struct FailsAfter(std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// Lot 297 (BUG69, BUG74): an I/O error part-way through a file (EIO,
+    /// at every call) ends that file's read — the rows and events read
+    /// before it count, and an id resolved before it is resolved (no older
+    /// file overrides it). `continue` spun on it for ever.
+    #[test]
+    fn an_io_error_part_way_ends_the_file_and_keeps_what_was_read() {
+        let mut data = Vec::new();
+        for id in [1u64, 2] {
+            data.extend_from_slice((serde_json::to_string(&mk_id(id)).unwrap() + "\n").as_bytes());
+        }
+        let got = within_3s(move || {
+            let r = std::io::BufReader::new(FailsAfter(std::io::Cursor::new(data)));
+            collect_matching(r, &DetectionFilter::default(), 10, false)
+                .into_iter()
+                .map(|(r, _)| r.id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(got, Some(vec![2, 1]));
+
+        let ev = mk_event(4, "2026-06-09T12:01:00.000000Z", DetectionStatus::Resolved);
+        let data = (serde_json::to_string(&ev).unwrap() + "\n").into_bytes();
+        let got = within_3s(move || {
+            let r = std::io::BufReader::new(FailsAfter(std::io::Cursor::new(data)));
+            let mut out = HashMap::new();
+            let mut unresolved: HashSet<u64> = [4u64, 5].into_iter().collect();
+            collect_latest_status(r, &mut out, &mut unresolved);
+            (out, unresolved)
+        });
+        let (out, unresolved) = got.expect("returns within 3 s");
+        assert_eq!(out.get(&4), Some(&DetectionStatus::Resolved));
+        assert_eq!(unresolved, [5u64].into_iter().collect(), "4 resolved here");
     }
 }
