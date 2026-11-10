@@ -611,4 +611,16 @@ mod tests {
             assert_eq!(p.buf, want, "tail={tail}");
         }
     }
+
+    /// Lot 299: what the command wrote to stdout before it exited is read
+    /// whole, however much was still in the pipe at its exit (the fetch
+    /// reads it once the exit is seen).
+    #[test]
+    fn the_whole_answer_written_before_the_exit_is_read() {
+        for _ in 0..3 {
+            let out =
+                run_with_timeout("head -c 1000000 /dev/zero", Duration::from_secs(10)).unwrap();
+            assert_eq!(out.len(), 1_000_000);
+        }
+    }
 }

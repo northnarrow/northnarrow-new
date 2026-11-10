@@ -2260,4 +2260,25 @@ mod tests {
         let q = h.quantile_us(0.5).unwrap();
         assert!(q >= 600_000_000, "p50 {q} us below the 600 s value");
     }
+
+    /// Lot 299 (BUG-79), the other side: only the last bucket answers the
+    /// largest seen. A latency in the bucket before it (480 s) still gets
+    /// its own bucket's upper end, within 12.5 % of it, however long the
+    /// largest.
+    #[test]
+    fn a_quantile_before_the_last_bucket_stays_in_its_bucket() {
+        let mut h = LatencyHistogram::default();
+        h.record_ns(480 * 1_000_000_000);
+        h.record_ns(2_000 * 1_000_000_000);
+        assert_eq!(
+            LatencyHistogram::bucket(480_000_000),
+            OCTAVES * SUB - 2,
+            "the bucket before the last"
+        );
+        let q = h.quantile_us(0.5).unwrap();
+        assert!(
+            (480_000_000..=540_000_000).contains(&q),
+            "p50 {q} us: not within its bucket"
+        );
+    }
 }
