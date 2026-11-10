@@ -204,6 +204,18 @@ fn is_module_tool_image(exe: &str) -> bool {
     )
 }
 
+/// Lot 290 (backlog lot 289): the severity of R011's verdict on a module
+/// tool's exec — Low for the system's tool asked for modules by name by
+/// root, its environment read clean (`Ok((_, false))`); High for the rest:
+/// a record whose process had exited before its environment could be read,
+/// a non-root exec, and every kill.
+pub fn plain_root_record_severity(judged: &Result<(String, bool), String>, uid: u32) -> Severity {
+    match judged {
+        Ok((_, false)) if uid == 0 => Severity::Low,
+        _ => Severity::High,
+    }
+}
+
 /// Lot 279: the note of a record whose process had exited before the exec
 /// pump could read its environment (the coordinator's decision of 04/11: a
 /// kill would reach no one).
@@ -279,6 +291,7 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::ProcessSpawn {
             pid,
+            uid,
             comm,
             filename,
             exe,
@@ -334,9 +347,15 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             return None;
         }
         // Lot 279: judged on the command line's syntax and on what the exec
-        // pump read at the exec — recorded (High, no kill) by name, killed as
-        // before otherwise.
-        let (action, mut reasoning) = match judge(event) {
+        // pump read at the exec — recorded (no kill) by name, killed as
+        // before otherwise. Lot 290 (backlog lot 289): the plain case — the
+        // system's tool by module name, run by root, nothing moved, forced
+        // or injected, its environment read clean — is recorded Low (a lab
+        // round left 369 High lines of it: xtables, container runtimes and
+        // udev ask for modules by name); the rest keeps High.
+        let judged = judge(event);
+        let severity = plain_root_record_severity(&judged, *uid);
+        let (action, mut reasoning) = match judged {
             Ok((what, false)) => (
                 ResponseAction::Log,
                 format!(
@@ -370,7 +389,7 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             &self.allowlist,
             event,
             judgement.apply(
-                build_verdict(self, event, action, Severity::High, &reasoning),
+                build_verdict(self, event, action, severity, &reasoning),
                 comm,
             ),
         );
@@ -1123,7 +1142,8 @@ mod tests {
             let e = read_ok(e);
             let v = r.evaluate(&e).expect("recorded");
             assert_eq!(v.action, ResponseAction::Log, "{e:?}: {}", v.reasoning);
-            assert_eq!(v.severity, Severity::High);
+            // lot 290 (backlog lot 289): the plain root case is Low
+            assert_eq!(v.severity, Severity::Low);
             assert_eq!(v.rule_id, "R011_KernelModuleTooling");
             for part in [what, "by module name", "T1547.006", "R018", "parent=bash"] {
                 assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
@@ -1271,6 +1291,52 @@ mod tests {
             assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
             assert!(!v.reasoning.contains(EXITED_NOTE), "{}", v.reasoning);
         }
+    }
+
+    /// Lot 290 (named; backlog lot 289): the system's tool by module name
+    /// run by root, its environment read clean, is recorded Low; the same
+    /// exec whose process exited before its environment was read stays
+    /// High, a non-root one and every kill stay High.
+    #[test]
+    fn a_plain_root_modprobe_is_low_and_the_suspicious_keep_high() {
+        let r = rule();
+        let plain = r
+            .evaluate(&read_ok(modprobe(&["br_netfilter"])))
+            .expect("recorded");
+        assert_eq!(
+            (plain.action.clone(), plain.severity),
+            (ResponseAction::Log, Severity::Low)
+        );
+        let exited = ExecFacts {
+            program: Ok(()),
+            environment: Environment::Exited("gone".into()),
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+        };
+        let v = r
+            .evaluate(&read_as(modprobe(&["br_netfilter"]), exited))
+            .expect("recorded");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        let v = r
+            .evaluate(&read_ok(modprobe(&["/tmp/rk.ko"])))
+            .expect("killed");
+        assert_eq!(v.severity, Severity::High);
+        assert_ne!(v.action, ResponseAction::Log);
+        let ok = Ok(("modprobe of 'x'".to_string(), false));
+        assert_eq!(plain_root_record_severity(&ok, 0), Severity::Low);
+        assert_eq!(plain_root_record_severity(&ok, 1000), Severity::High);
+        assert_eq!(
+            plain_root_record_severity(&Ok(("x".to_string(), true)), 0),
+            Severity::High
+        );
+        assert_eq!(
+            plain_root_record_severity(&Err("names a file".to_string()), 0),
+            Severity::High
+        );
     }
 
     /// Lot 279, the coordinator's decision of 04/11: a process that had

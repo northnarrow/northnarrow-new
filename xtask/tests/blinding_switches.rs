@@ -132,7 +132,8 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
 /// Named (item 5): the bpf hook refuses a cgroup/sysctl attach whose target
 /// is the cgroup v2 root — outside a window, past the family and a fresh
 /// instance, a target it cannot read refused too — signed, before the
-/// observation.
+/// observation. Lot 290: in every mode (it held in enforce mode only: the
+/// lab's observe build let it through).
 #[test]
 fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     let c = code("agent-ebpf/src/bpf_defense.rs");
@@ -140,13 +141,14 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     in_order(
         h,
         &[
-            "if !observed(cmd) || caller_is_exempt() {\n        return 0;\n    }",
+            "if !observed(cmd) {\n        return 0;\n    }",
+            "if caller_is_exempt() {",
             "BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,",
-            "if judges_attach_target(cmd, arg)\n        && enforce()\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
+            "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
             "Some(off) if !attr.is_null() => {",
             "None => ROOT_UNREADABLE,",
             "if root != ROOT_NO {\n            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);\n            return -EPERM;\n        }",
-            "let foreign_handle = own_map_handle || own_link_handle || own_link_pin;",
+            "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
         ],
     )
     .unwrap();
@@ -177,7 +179,10 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     )
     .unwrap();
     let e = code("agent/src/boot/evidence.rs");
-    assert!(e.contains("nn_linux::kernel_state::spawn(sensor.event_tx_for(\"fs_protect\"));"));
+    // (lot 290: with the BPF cross-view)
+    assert!(e.contains(
+        "nn_linux::kernel_state::spawn(sensor.event_tx_for(\"fs_protect\"), crossview);"
+    ));
     let s = code("crates/nn-linux/src/sysctl_cgroup.rs");
     in_order(
         body(&s, "root_report"),

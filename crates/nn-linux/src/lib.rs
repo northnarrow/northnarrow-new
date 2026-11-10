@@ -94,6 +94,8 @@ pub mod bounded_cmd;
 // `boot`, whose deny self-test, BPF LSM gate, trust level and signed
 // manifest stay in the agent).
 pub mod boot;
+/// Lot 290: the light cross-view of the host's BPF programs and links.
+pub mod bpf_crossview;
 
 // The capabilities of the core's threads: each role's effective set, the
 // decision thread's own seccomp filter (R14c, plan §3.1, §3.2).

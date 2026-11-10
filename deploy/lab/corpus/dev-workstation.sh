@@ -86,9 +86,9 @@ chmod +x "$W/app/AppDir/AppRun"
 mksquashfs "$W/app/AppDir" "$W/app/nn-corpus.squashfs" -quiet -noappend -all-root >/dev/null
 
 echo "== measure"
+smallfile_start
 corpus_settle
 corpus_mark
-smallfile_start
 wl_cargo session dev
 step "dev cargo fmt (120 unformatted modules)" 300 -- env CARGO_HOME="$W/cache/cargo" bash -c "cd $W/crate && cargo fmt"
 wl_go session dev

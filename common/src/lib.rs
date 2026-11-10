@@ -26,6 +26,10 @@ pub mod wire;
 /// The uapi `bpf_cmd` numbers, one copy for the eBPF programs and the
 /// agent (lab PR 215). NOT `std`-gated.
 pub mod bpf_cmd;
+/// Lot 290: the BPF program types refused to a foreign loader, the names
+/// the records carry, the cross-view's iterator records. NOT `std`-gated
+/// (the names are).
+pub mod bpf_prog_class;
 /// Hard-coded kernel struct field offsets + the boot-time revalidation
 /// table (BUG-036). `no_std`-clean (consts + a `&'static str` table, no
 /// alloc) so the eBPF crate compiles the SAME values the agent

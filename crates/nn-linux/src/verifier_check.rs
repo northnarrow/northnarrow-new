@@ -409,6 +409,9 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
         Program::RawTracePoint(p) => p.load(),
         // Lot 280a: the sysctl judge (cgroup/sysctl on the root cgroup)
         Program::CgroupSysctl(p) => p.load(),
+        // Lot 290: the cross-view's iterators (`iter/bpf_prog`,
+        // `iter/bpf_link`)
+        Program::Iter(p) => p.load(target, btf),
         other => {
             return Outcome::Error(format!(
                 "program type {:?} is not one the agent loads",
@@ -462,6 +465,15 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
         if let Some(why) = crate::sensors::net_telemetry::other_arity(name, params) {
             return Some(why);
         }
+    }
+    // Lot 290: the cross-view's link iterator, on a kernel without one
+    // (`bpf_iter_bpf_link`, 5.19+): the programs are enumerated alone
+    if section == "iter/bpf_link" && matches!(outcome, Outcome::Absent(_)) {
+        return Some(
+            "optional: this kernel has no bpf_link iterator (the cross-view enumerates the \
+             programs only)"
+                .into(),
+        );
     }
     if let Outcome::Absent(_) = outcome {
         let hook = section.strip_prefix("lsm/").unwrap_or("");
@@ -1003,9 +1015,28 @@ mod tests {
             s.get("exec_check_lsm").map(String::as_str),
             Some("lsm/bprm_check_security")
         );
+        // Lot 290: by the section, not by a `nn_` prefix — lot 280a's
+        // `cgroup/sysctl` program is named `nn_sysctl_guard` (this test,
+        // which CI only compiles, failed on it since); the global
+        // subprograms of .text are not programs
         assert!(
-            !s.keys().any(|k| k.starts_with("nn_")),
+            !s.values().any(|sec| sec == ".text"),
             "subprograms in .text are not programs"
+        );
+        for sub in [
+            "nn_link_id_of_fd",
+            "nn_obj_get_own_link",
+            "nn_loader_opted_out",
+        ] {
+            assert!(!s.contains_key(sub), "{sub} is a subprogram");
+        }
+        assert_eq!(
+            s.get("nn_sysctl_guard").map(String::as_str),
+            Some("cgroup/sysctl")
+        );
+        assert_eq!(
+            s.get("census_progs").map(String::as_str),
+            Some("iter/bpf_prog")
         );
     }
 
@@ -1020,5 +1051,12 @@ mod tests {
         };
         assert!(optional_reason("probe_bprm", "lsm/bprm_check_security", &refused).is_some());
         assert!(optional_reason("exec_check_lsm", "lsm/bprm_check_security", &refused).is_none());
+        // lot 290: the link iterator absent does not count; refused it does,
+        // and so does the program iterator absent
+        let no_link_iter = Outcome::Absent("bpf_iter_bpf_link".into());
+        assert!(optional_reason("census_links", "iter/bpf_link", &no_link_iter).is_some());
+        assert!(optional_reason("census_links", "iter/bpf_link", &refused).is_none());
+        let no_prog_iter = Outcome::Absent("bpf_iter_bpf_prog".into());
+        assert!(optional_reason("census_progs", "iter/bpf_prog", &no_prog_iter).is_none());
     }
 }

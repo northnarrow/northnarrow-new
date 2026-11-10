@@ -830,7 +830,8 @@ fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
     let status = child.wait().expect("wait modprobe");
     assert!(status.success(), "modprobe dummy: {status}");
     let rec = r011_record_of(&fx, pid);
-    assert_eq!(rec["severity"], "High", "record: {rec}");
+    // lot 290 (backlog lot 289): the plain root case is Low
+    assert_eq!(rec["severity"], "Low", "record: {rec}");
     // The verdict is the evidence: a record, not a kill. The fixture's
     // agent is detect-only, where a Log decision's report is "would
     // execute" too (`Executor::log_report` under `dry_run`), so `response`
@@ -955,7 +956,10 @@ fn assert_r011(fx: &Fixture, pid: u32, verdict: &str, why: &str) {
         serde_json::json!({ "Rule": verdict }),
         "record: {rec}"
     );
-    assert_eq!(rec["severity"], "High", "record: {rec}");
+    // lot 290 (backlog lot 289): a record by name of root's plain
+    // modprobe is Low; every kill High
+    let severity = if verdict == "Log" { "Low" } else { "High" };
+    assert_eq!(rec["severity"], severity, "record: {rec}");
     let line = r011_line_of(fx, pid);
     assert!(line.contains(why), "{why}: {line}");
 }
