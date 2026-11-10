@@ -8329,3 +8329,61 @@ number in parentheses is a lab PR.
     registration) and the held maps and programs left out (every map and
     program the agent holds is its object's, registered already).
   - Level unchanged (C23 2, provisional): a fix inside the capability.
+- **Lot 299 — FIM, the admin tools and minor findings: the external bug
+  hunt's lot 9** (`fix/w4-bh-fim-admin`; the triage of editions 1.2/1.3,
+  lot 9: BUG73, 66, 20, 22, 34, 38, 36, 78, 79; P2/P3).
+  - What was open (our triage of 10/11/2026, its fix guidance followed):
+    inside a trusted-installer window a write in place of the agent's own
+    unit in the vendor directory was NN-L-FIM-009's Log/Low and, beside
+    it, NN-L-FIM-001's kill of the writer's tree (`/usr/lib/` prefix;
+    BUG73); a malformed `/etc/passwd` row named `syslog` turned
+    NN-L-FIM-005's rsyslogd carve-out off (BUG66); `heartbeat watch` read
+    its source command's stderr only after the exit (a stderr past 64 KiB
+    stopped the command until the timeout, BUG22) and waited without a
+    bound on a descendant holding stdout or stderr — no `OK`, no `ALERT`
+    (BUG34, BUG38); the syslog/TLS export's stall counted from the last
+    progress, so an idle session's first row was cut `ack_wait` after its
+    write (BUG20); the admin envelope's version was judged after its
+    message and the v0 fallback took a v2 envelope for a v0 `Status`
+    (BUG36, no production caller); the `sysctl-allow` refusal offered a
+    name it always refuses (BUG78); the latency quantiles past 2^29 µs
+    were 536870911 µs (BUG79).
+  - What changed (trust model, `HEARTBEAT.md`, `EXPORT.md`,
+    `RULE_POLICY.md`, the Tappa 8 design §6.2, upgrade notes §22):
+    NN-L-FIM-001 answers nothing for a `Modified` of our unit or drop-in
+    inside an open window — the one condition both rules read
+    (`own_unit_under_open_window`); `heartbeat watch` reads both pipes
+    together with `poll` under the one bound and stops at the command's
+    exit (what it left in the pipes read, the stderr's last 4 KiB kept);
+    the stall's count restarts on a session with nothing waiting; the
+    envelope's version is read first, `version: 0` refused, the v0
+    fallback retired; the refusal's list filtered by the opt-out's own
+    judge; the last bucket's quantile is the largest seen.
+  - The lab, as measured (our own guest under lease k299, Ubuntu 24.04
+    `6.8.0-147-generic`; clean at the start: no agent, no pin, no overlay;
+    one round at ecaf811b, the install.sh layout): inside a 40 s window our
+    unit made in `/usr/lib/systemd/system/`, written in place by a writer
+    that stayed 8 s, then a `cp` over it: **5 NN-L-FIM-009 records
+    (response none, Low), 0 NN-L-FIM-001, the writer alive**; outside the
+    window (the copy not yet protected) the same write: **NN-L-FIM-001
+    KillProcessTree, Critical, the writer killed** (rc 137), posture
+    Observing. Then `upgrade-check` (install.sh --upgrade in its window):
+    complete, the cold boot after it with the agent and the watchdog
+    active, 77 pins, 47 own LSM programs, deny hooks 28 of 28; since the
+    round began, 1 NN-L-FIM-001 verdict on our units — the control's. The
+    upgrade itself cannot meet BUG73: install.sh stops the agent before
+    it switches the units (only an operator's edit inside a window can).
+    The copy removed in a window, the agent uninstalled, a cold boot: no
+    agent, 0 pins, 0 overlays, powered off, lease released. Not measured
+    in the lab: BUG66, 20, 22, 34, 36, 38, 78, 79 (host tests).
+  - Host: a named test for each bug, failing on `main` (the triage's 9 at
+    6f10fa44), and 15 more (the BUG73 controls, the heartbeat's pipes,
+    the stall from the oldest row, the bare v0 frame, the version 0, the
+    bucket before the last). Mutation on the fixes: 32 mutants over three
+    passes, the 28 on the final code each caught by a named test; the
+    three survivors of pass 1 got a test (the bucket before the last; the
+    bytes left in the pipe at the exit, read through a smaller read) or a
+    new shape (the stall's reset before the first write, no condition left
+    to mutate).
+  - Levels unchanged (C06 2, C21 1, C23 2 provisional): fixes inside the
+    capabilities.
