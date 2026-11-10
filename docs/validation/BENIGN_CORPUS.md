@@ -123,7 +123,15 @@ brackets, empty ones counted too), its top three processes, and marks a
 step at or above the candidate threshold of 50. It is data for the
 in-session small-file threshold (lot 282's backlog), not a verdict.
 bpftrace is known BPF tooling to the agent (NN-L-BPF-001's exemption); its
-kprobe adds the cost of one probe per open while it runs.
+kprobe adds the cost of one probe per open while it runs. Since lot 290 the
+agent refuses bpftrace's `kprobe` and `perf_event` loads outside a
+trusted-installer window in every mode: the probe is loaded inside a signed
+window of its own (`smallfile_start`, 150 s) before the settle, whose
+restart of the agent closes the window 75 s before the first step — no
+window is open while the steps run, and neither the agent's code nor the
+policy carries an exception for it. Its programs stay attached after the
+window; the restarted agent's cross-view records them at its start
+(`bpf_baseline`, before the corpus's mark: not counted).
 
 ## Reading a report
 

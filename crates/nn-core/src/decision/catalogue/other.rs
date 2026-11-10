@@ -382,15 +382,23 @@ pub(super) const DOCS: &[RuleDoc] = &[
     // ── anti-tamper ─────────────────────────────────────────────────
     RuleDoc {
         id: "NN-L-AT-001_AntiTamperDenial",
-        severities: &[Severity::High],
+        severities: &[Severity::High, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::AntiTamper],
         data_components: &["DC0035", "DC0061", "DC0040", "DC0055", "DC0021"],
         observes: "Every action on the agent an anti-tamper LSM hook refused: a signal to a \
                    protected pid, a ptrace or /proc/<pid>/mem access, a write, unlink, rename \
-                   or new entry in its protected files, a handle to its BPF maps or links, a \
-                   kexec load, a read of its signing key. Issued by process_event outside the \
-                   engine.",
+                   or new entry in its protected files, a handle to its BPF maps, programs or \
+                   links, a kexec load, a read of its signing key; lot 290: a load of a \
+                   `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, \
+                   `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF \
+                   program outside a window (High; one the signed per-loader opt-out lets through, Low), and the \
+                   kernel-state round's cross-view — a BPF program present at the agent's \
+                   start (Low, High for those types) or one its hook never saw loading (High). \
+                   Also the not-refused records of lots 277–281 (a move into an exempt cgroup, \
+                   a sysctl opt-out's write Low, a kernel taint Critical or High, an injection \
+                   into an exempt process High or Critical). Issued by process_event outside \
+                   the engine.",
         false_positives: "An administrator's `systemctl stop` or `kill` of the agent, or an \
                           upgrade, outside a trusted-installer window; a debugger or \
                           `strace -p` on the agent. Lot 283b: `deb-systemd-helper`, when a \
@@ -408,6 +416,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       (deny=signal, deny=ptrace).",
         tests: &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
+            "deploy/lab/malsim/foreign-bpf-check.sh::F2",
             "deploy/lab/adversarial/anti-tamper.sh::case C01",
             "deploy/lab/adversarial/anti-tamper.sh::case C03",
         ],

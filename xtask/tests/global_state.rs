@@ -449,6 +449,12 @@ const STATICS: &[Kept] = &[
         "lot 285: the module-load judge's controller's last report on the one eBPF object's trust map (the journal and the status read it)",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "LOADER_OPT_OUTS",
+        Kernel,
+        "lot 290: the signed per-loader opt-outs in force (an executable's device and inode, the refused BPF program types it may load), the mirror of the pinned BPF_LOADER_OPTOUT of the one eBPF object, written at the start and by `policy set`, read by its registration",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "OPT_OUTS",
         Kernel,
@@ -664,6 +670,11 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "execq::shutdown",
         "stops the exec quarantine's controller thread",
+    ),
+    (
+        "bpf_defense::apply_loader_policy",
+        "the rule policy's signed bpf-loader-allow lines, resolved to devices and inodes for the \
+         bpf hook of the one eBPF object (as sysctl_cgroup::apply_policy for its opt-outs)",
     ),
     (
         "module_trust::apply_policy",

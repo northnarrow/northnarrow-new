@@ -308,21 +308,27 @@ fn resolver_uids(passwd: &str) -> Vec<u32> {
 /// Write the resolvers' uids into the kernel's `DNS_EXEMPT_UIDS`.
 fn exempt_resolvers(ebpf: &mut Ebpf) {
     let uids = resolver_uids(&std::fs::read_to_string("/etc/passwd").unwrap_or_default());
-    let Some(map) = ebpf.map_mut("DNS_EXEMPT_UIDS") else {
-        warn!("DNS budget: no DNS_EXEMPT_UIDS map — local resolvers are paced too");
-        return;
-    };
-    let mut exempt = match aya::maps::HashMap::<_, u32, u8>::try_from(map) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = %e, "DNS budget: DNS_EXEMPT_UIDS unusable — local resolvers are paced too");
+    {
+        let Some(map) = ebpf.map_mut("DNS_EXEMPT_UIDS") else {
+            warn!("DNS budget: no DNS_EXEMPT_UIDS map — local resolvers are paced too");
             return;
+        };
+        let mut exempt = match aya::maps::HashMap::<_, u32, u8>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "DNS budget: DNS_EXEMPT_UIDS unusable — local resolvers are paced too");
+                return;
+            }
+        };
+        for uid in &uids {
+            if let Err(e) = exempt.insert(uid, 1, 0) {
+                warn!(uid, error = %e, "DNS budget: could not exempt a resolver user");
+            }
         }
-    };
-    for uid in &uids {
-        if let Err(e) = exempt.insert(uid, 1, 0) {
-            warn!(uid, error = %e, "DNS budget: could not exempt a resolver user");
-        }
+    }
+    // Lot 290 (item 3): written once per load — frozen
+    if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, "DNS_EXEMPT_UIDS") {
+        warn!(error = %e, "DNS budget: DNS_EXEMPT_UIDS NOT frozen");
     }
     info!(uids = ?uids, "DNS budget: local resolver users exempt (review 78)");
 }

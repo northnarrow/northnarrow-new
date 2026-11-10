@@ -111,6 +111,14 @@ fn config_overlay_set(
             if let Some(detail) = crate::module_trust::apply_policy(&rule_policy.current(), true) {
                 nn_linux::boot::degradation::report("rule_policy", &detail);
             }
+            // Lot 290: the per-loader opt-outs of the refused BPF program
+            // types (signed), resolved and written to the kernel now
+            if let Some(detail) = nn_linux::anti_tamper::bpf_defense::apply_loader_policy(
+                &rule_policy.current(),
+                true,
+            ) {
+                nn_linux::boot::degradation::report("rule_policy", &detail);
+            }
             warn!(
                 target: "admin.config_overlay",
                 path = %target.display(),

@@ -7693,3 +7693,157 @@ number in parentheses is a lab PR.
     (one removed from the code), 1 named and caught.
   - Levels unchanged (C12 2, C23 2 provisional): a new kernel deny,
     measured on two kernels, in capabilities already at their level.
+- **Lot 290 — foreign BPF: the rootkit-grade program types refused, the
+  agent's objects off limits, a light cross-view (Wave 4 phase 3, wave 1;
+  C23).**
+  - What was open: a root BPF program could name one of the agent's maps
+    (lot 281's residual: only a write handle on a map was refused; a read
+    handle and a program handle were given); the `bpf` hook's root
+    `cgroup/sysctl` refusal held in enforce mode only (lots 280a, 280b); any
+    root process could load the program types that rewrite a process's
+    memory, override a kernel function's return, signal a process or replace
+    a hook; nothing compared the host's BPF programs with what the hook saw;
+    R011 signed every root `modprobe <name>` High (backlog lot 289: 369
+    lines in one lab round).
+  - What changed (trust model "Lot 290", `RULE_POLICY.md` §2.5): outside a
+    window a caller outside the family gets `EPERM` on a `BPF_PROG_LOAD` of
+    `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`,
+    `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` (the
+    four tracepoint and perf-event types added by the coordinator's decision
+    after the benign corpus), in every mode
+    (NN-L-AT-001 `bpf_prog_type`, High, ENGAGED), unless a signed
+    `bpf-loader-allow <executable> <types>` names it by device and inode
+    (`bpf_prog_opt_out`, Low); the root `cgroup/sysctl` attach refusal holds
+    in every mode; in enforce mode `*_GET_FD_BY_ID` of the agent's maps and
+    programs, `BPF_OBJ_GET` under `/sys/fs/bpf/northnarrow*`, and any handle
+    the `bpf_map` hook (a read handle too) or a new `bpf_prog` hook sees on
+    its objects are refused (`bpf_handle`, ENGAGED). `BPF_MAP_FREEZE` on six
+    configuration maps written once. A light cross-view in the kernel-state
+    round: the agent's own iterators (`iter/bpf_prog`, `iter/bpf_link`; the
+    unit has no `CAP_SYS_ADMIN`) against the loads its hook saw since the
+    start (`SEEN_PROGS`): the start's foreign programs signed once
+    (`bpf_baseline`: Low, High for the nine types, Low for the kernel's
+    own), one appearing later unseen High (`bpf_unseen`, type, name, tag,
+    attach point); `/run/northnarrow/bpf-foreign`. R011's plain root record
+    Low. `OWN_BPF_IDS` 256 → 1024.
+  - The lab, as measured (our own guests under lease k290, one at a time;
+    `nn-lab.sh foreign-bpf-check`, the benign corpora):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255). Round r1
+      (a67c0712) found the agent's start refused: `OWN_BPF_IDS` full
+      (`E2BIG` at the 257th registration: the object was within ten of 256)
+      — fixed (1024, a test keeps it at twice the object's maps and
+      programs). Then the **benign corpus first**: `containers` (rootless
+      podman, docker, k3s and a pod; 13 steps), `db` (PostgreSQL 16; 15
+      steps), `dev` (24 steps), all rc 0 — **0 loads of the workloads
+      refused**; the loaders and types seen (the agent's journal, one line a
+      second per loader and type): systemd `cgroup_device` 32 and
+      `cgroup_skb` 24, runc `cgroup_skb` 20, `cgroup_device` 20 and
+      `socket_filter` 20, bpftrace `perf_event` and `socket_filter`. One
+      refusal: the corpus harness's own small-file probe (bpftrace, a lab
+      instrument, not a workload) — its `kprobe`/`tracing` load refused, as
+      designed outside a window. `foreign-bpf-check`: a `kprobe` program
+      calling `bpf_probe_write_user` refused (`EPERM`, `bpf_prog_type`
+      High) and loaded inside a window; bpftrace refused ("Error loading
+      program", rc 255), run inside a window, and run outside one under a
+      signed `bpf-loader-allow /usr/bin/bpftrace kprobe,tracing`
+      (`bpf_prog_opt_out` Low, nothing refused, another loader still
+      refused, refused again once the policy was removed); the six maps
+      frozen (`NET_CONNECT_DENY_MODE` is frozen only where the connect deny
+      is armed); a `kprobe` and a socket filter loaded and pinned while no
+      agent ran (inside a window) signed at the next start, `bpf_baseline`
+      High and Low; a transient systemd unit with `IPAddressDeny`,
+      `DevicePolicy`, `RestrictNetworkInterfaces`, `SocketBindDeny` and
+      `RestrictFileSystems` ran, nothing refused; `modprobe dummy` by root:
+      R011 Low. `verifier-check` 104 programs, 102 OK, 2 not counted, 0
+      failing (`bpf_syscall_observe` 4,330 instructions, `bpf_prog_guard`
+      1,097, `bpf_map_guard` 1,017, the iterators `census_progs` 514 and
+      `census_links` 255 — measured under their first names `nn_iter_*`,
+      renamed after the lab: a `nn_*` symbol is a subprogram). Round r2 found HID-BPF's `hid_tail_call` (a `tracing` program
+      the kernel loads when udev loads `hid` in the initramfs, after PID 1)
+      signed High at every start — fixed (the kernel's own programs by name
+      and attach function; r3: `baseline kernel`, Low). Round r3: with the
+      guard enforcing, `BPF_MAP_GET_FD_BY_ID` of the tracker's
+      `CGROUP_JOINED` (read-write and read-only), `BPF_PROG_GET_FD_BY_ID` of
+      an agent program, `BPF_OBJ_GET` of a pin root map read-only, of the
+      tracker's pin, of the same pin through a bind mount of the bpffs and
+      by a relative path: all `EPERM`, 7 `bpf_handle` High; a read-only
+      handle inside a window given. **`bpftool prog show` outside a window
+      stops** ("can't get prog by id (211): Operation not permitted", rc
+      255). Each round: uninstalled, the guest clean and off.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, systemd 249).
+      `verifier-check` 104 programs, 98 OK, 6 not counted, 0 failing
+      (`census_links` absent: no `bpf_iter_bpf_link`, the programs are
+      enumerated alone); the `kprobe` with `bpf_probe_write_user` refused
+      and loaded inside a window; the program handle, the pin root map's
+      and the tracker's pins, a bind mount and a relative path refused (5
+      `bpf_handle`); the maps frozen; the gap's `kprobe` High and socket
+      filter Low at the next start; R011 Low. The round found the exploit
+      guard's programs (loaded after the registration) listed foreign for a
+      round — they are the agent's own by their seen loader now. Round
+      r2204b (the guard enforcing): `BPF_MAP_GET_FD_BY_ID` of the tracker's
+      `CGROUP_JOINED` read-write and read-only, `BPF_PROG_GET_FD_BY_ID`, the
+      pin root map's read-only `BPF_OBJ_GET`, the tracker's pin, a bind
+      mount and a relative path: all `EPERM`, 7 `bpf_handle` High; a
+      read-only handle by id and by path inside a window given; `bpftool
+      prog show` outside a window stops at once (rc 255).
+    - **Ubuntu 24.04, round r4** (b495c400: the nine types, the guard in
+      **enforce** mode — `NN_BPF_DEFENSE_ENFORCE=1` in the manager's
+      environment, `nn-admin capabilities`: "27 of 27 attached; BPF guard
+      enforce"). The corpora again: `containers` 13 steps, `db` 16, `dev`
+      24, all rc 0 but the `dev` control's `www-data` run (137, by design)
+      — **0 refusals** of any load (`bpf_prog_type` 0) and of any handle
+      (`bpf_handle` 0), the workloads' and the harness's; loaders seen
+      (NN-L-BPF-001): runc 36, bpftrace 4 (the small-file probe, loaded
+      inside its own window before the settle). After the corpora: 16
+      foreign programs (systemd's 15 seen loading by PID 1, HID-BPF's
+      `hid_tail_call` the kernel's); one `bpf_baseline` High — the probe's
+      programs at the settle's restart, before the mark. `foreign-bpf-check`
+      F1–F3: a `kprobe`, a `tracepoint`, a `perf_event` and a
+      `raw_tracepoint` program calling `bpf_probe_write_user` each `EPERM`
+      outside a window (4 `bpf_prog_type` High) and loaded inside one;
+      bpftrace refused, run inside a window, and run outside one under a
+      signed `bpf-loader-allow /usr/bin/bpftrace
+      kprobe,tracing,tracepoint,perf_event,raw_tracepoint` (`bpf_prog_opt_out`
+      Low, nothing refused, another loader refused, refused again once
+      withdrawn). Uninstalled, the guest clean and off.
+  - Gates (33eadc11, once): eBPF, the four clippy runs, fmt, 92 suites
+    4,206 passed and 2 failed (the agent's catalogue tests, on this lot's
+    NN-L-AT-001 entry), the privileged no-run, attack-coverage, golden ×5
+    (57 files, the same bytes), MSRV 1.89, the fuzz replay (14), portable
+    (5), the lockfiles unchanged; an added run of nn-linux's debug-trigger
+    tests found `verifier_check`'s sections test failing on lot 280a's
+    `nn_sysctl_guard` (a program named like a subprogram; CI compiles that
+    test only) and this lot's iterators. Fixed (c4a05c5b: the iterators
+    renamed, the catalogue entry, the test by section) and those suites run
+    again: all pass.
+  - Host: named tests `only_the_rootkit_grade_types_are_refused_by_default`,
+    `the_type_tables_are_the_uapi_headers`, `a_cross_view_record_round_trips`,
+    `the_kernel_s_own_programs_are_told_by_name_and_attach_point`,
+    `a_bpf_loader_opt_out_names_an_executable_and_refused_types`,
+    `foreign_bpf_is_named_and_weighed`,
+    `foreign_bpf_refusals_impair_and_the_cross_view_raises_nothing`,
+    `a_plain_root_modprobe_is_low_and_the_suspicious_keep_high`,
+    `the_start_is_the_baseline_and_a_later_unseen_program_is_signed_once`,
+    `a_releasing_program_is_no_baseline_and_a_link_is_judged_through_its_program`,
+    `the_kernel_s_own_program_is_told_by_its_load_time`,
+    `a_loader_opt_out_is_its_executable_s_device_and_inode`, and the
+    source-reading `xtask/tests/foreign_bpf.rs` (the type refusal in every
+    mode, the handles off limits, the seen loads and the iterators, the
+    cross-view in the round, the frozen maps and the opt-out's wiring, the
+    own-ids map's capacity). Mutations: 80 of the new code (common 11,
+    policy 7, NN-L-AT-001 6, posture 4, R011 4, the cross-view and the
+    agent's half 24, the eBPF code read by xtask 19, the round's event 5):
+    all caught by a named test — two only once their test was made whole
+    (a partial iterator record, the event's early bit); a third survivor
+    was a check the pending set already made, removed from the code (the
+    mutation of the set itself caught).
+  - Open: the handle refusals hold in enforce mode only (a production
+    build's default; observe in a `debug-trigger` build or with the signed
+    weakening `NN_BPF_DEFENSE_OBSERVE=1`); a tracer or profiler that loads
+    one of the nine types outside a window needs a signed opt-out; a
+    program that lives less than a round is not seen by the
+    cross-view; the `bpf` and `bpf_prog` hooks are not pinned (a gap only a
+    window opens: the next start's baseline signs what it left); a link pin
+    reached through a bind mount is matched by its name only.
+  - Levels unchanged (C23 2 provisional): residuals closed and a census of
+    the host's BPF added, not a new capability.

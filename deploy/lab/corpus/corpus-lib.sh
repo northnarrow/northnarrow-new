@@ -146,9 +146,19 @@ corpus_mark() {
 # The small-file probe (lot 282's backlog): every write-open of an existing
 # regular file under 4 KiB, by process, from bpftrace in its own unit.
 # NN_CORPUS_SMALLFILE=0 turns it off.
+# Lot 290: bpftrace loads a kprobe and a perf_event program, types the
+# agent refuses outside a trusted-installer window in every mode — the
+# probe is the harness's instrument, not a workload: it loads inside a
+# signed window of its own, and runs BEFORE corpus_settle, whose restart of
+# the agent closes every window (the window ends at its deadline or at a
+# restart, whichever comes first) 75 s before the measurement: no window is
+# open while the steps run. No exception in the agent's code, none in the
+# policy.
 smallfile_start() {
     [[ ${NN_CORPUS_SMALLFILE:-1} == 1 ]] || return 0
     command -v bpftrace >/dev/null || { echo "  small-file probe: no bpftrace"; return 0; }
+    sudo "$ADMIN" trusted-installer-grant --key "$KEY" --window-secs 150 >/dev/null 2>&1 ||
+        { echo "  small-file probe: no window (not started)"; return 0; }
     sudo systemd-run --quiet --unit="$SF_UNIT" --collect \
         --setenv=BPFTRACE_MAP_KEYS_MAX=262144 --setenv=BPFTRACE_MAX_MAP_KEYS=262144 \
         -- bpftrace -B line -o "$OUT/smallfile.out" "$CORPUS_DIR/smallfile.bt" || { echo "  small-file probe: not started"; return 0; }

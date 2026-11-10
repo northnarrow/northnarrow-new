@@ -41,3 +41,5 @@ tarpaulin-report.html
 *.bak2
 *.bak.*
 dist/
+# Python bytecode (a lab helper run in place)
+__pycache__/
