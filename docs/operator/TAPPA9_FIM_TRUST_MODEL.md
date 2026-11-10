@@ -171,7 +171,11 @@ argument is missing, leaves what the interpreter runs not known: never a
 client, and the record says the kernel ran the interpreter with "options not
 understood". The tables cover python, perl, ruby, node, bash/dash/sh, and
 for zsh, ksh and mono the options every one of them reads the same way;
-`crates/nn-core/src/posture/script_args.rs` lists them.
+`crates/nn-core/src/posture/script_args.rs` lists them. Residual, as a
+binary's `LD_PRELOAD`: an option that loads the caller's code before the
+named script (`node -r`, `perl -M`, `ruby -r`) and the interpreter's
+environment (`PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`) are not judged: the
+identity is the script named.
 
 ## File capabilities (review 86)
 

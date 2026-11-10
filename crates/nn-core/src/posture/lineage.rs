@@ -6461,6 +6461,28 @@ mod tests {
                 &["node", "--", "/tmp/e.js"][..],
                 script("/tmp/e.js"),
             ),
+            (
+                "/usr/bin/node",
+                &[
+                    "node",
+                    "--harmony-shadow-realm",
+                    "--title",
+                    "x",
+                    "/tmp/e.js",
+                ][..],
+                script("/tmp/e.js"),
+            ),
+            (
+                "/usr/bin/ruby",
+                &[
+                    "ruby",
+                    "--disable-gems",
+                    "--enable",
+                    "frozen-string-literal",
+                    "/tmp/e.rb",
+                ][..],
+                script("/tmp/e.rb"),
+            ),
             // inline programs
             (
                 "/usr/bin/perl",

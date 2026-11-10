@@ -28,6 +28,12 @@
 //!   nothing below it. Only an option that is not in the table costs an
 //!   identity, and only its trust: the table never guesses an arity, since
 //!   either wrong guess hands the identity to a path the caller chose.
+//!
+//! Residual, as a binary's `LD_PRELOAD` is (CM-25): an option that loads
+//! the caller's code before the named script (`node -r`, `--import`, `perl
+//! -M`, `-I`, `ruby -r`, `-I`) and the interpreter's environment
+//! (`PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`) are not judged
+//! here: the identity is the script named.
 
 use std::path::Path;
 
@@ -256,6 +262,8 @@ fn long(family: Family, name: &str) -> Option<Long> {
             | "rjit" | "mjit" => Flag,
             "enable" | "disable" | "encoding" | "external-encoding" | "internal-encoding"
             | "dump" | "backtrace-limit" | "crash-report" | "parser" => Arg,
+            // `--disable-gems`: the feature joined by a hyphen
+            _ if name.starts_with("enable-") || name.starts_with("disable-") => Flag,
             _ => return None,
         },
         Family::Node => return node_long(name),
@@ -430,11 +438,12 @@ fn node_long(name: &str) -> Option<Long> {
         "allow-natives-syntax",
     ];
     let name = name.replace('_', "-");
-    if name.starts_with("no-") || FLAG.contains(&name.as_str()) {
-        return Some(Long::Flag);
-    }
     if ARG.contains(&name.as_str()) {
         return Some(Long::Arg);
+    }
+    // `--no-…` negates a flag; V8's `--harmony-…` are flags
+    if name.starts_with("no-") || name.starts_with("harmony-") || FLAG.contains(&name.as_str()) {
+        return Some(Long::Flag);
     }
     match name.as_str() {
         "eval" | "print" => Some(Long::Inline),
