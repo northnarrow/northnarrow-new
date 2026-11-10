@@ -292,7 +292,7 @@ impl Mapper {
         match kind.as_str() {
             "intent" | "interrupted" => {
                 let intent = match v.get("intent") {
-                    Some(i) if !i.is_null() => i.clone(),
+                    Some(i) => i.clone(),
                     // Lot 298 (external bug hunt, BUG19): an interrupted row
                     // without its intent (an agent before lot 298 wrote
                     // none) is mapped with the intent this mapper kept, as an

@@ -420,9 +420,9 @@ pub fn verify(mut input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Rep
             break;
         }
         n += 1;
-        // the line without its end, as `lines` gave it: "\n", or "\r\n"
+        // the line without its newline (a "\r" before it is trimmed with
+        // the record's spaces, `record_of`)
         let bytes = buf.strip_suffix(b"\n").unwrap_or(&buf);
-        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
         let line = match std::str::from_utf8(bytes) {
             Ok(l) => l,
             Err(e) => {
@@ -1773,6 +1773,13 @@ mod tests {
             rec["unmapped"]["northnarrow"]["intent_row"].clone();
         let r = verify(forged.to_string().as_bytes(), &pk).unwrap();
         assert_eq!(r.exit_code(), 13, "{:?}", report_lines(&r));
+        assert!(
+            r.tampered[0]
+                .1
+                .contains("the intent row it carries is not its action's intent"),
+            "{:?}",
+            r.tampered
+        );
     }
 
     #[test]

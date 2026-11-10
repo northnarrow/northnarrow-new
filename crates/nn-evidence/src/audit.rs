@@ -1747,11 +1747,21 @@ mod tests {
     fn refused_boot_is_not_an_abrupt_previous_run() {
         let (_d, key_path, log_path) = fresh_paths();
         let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
-        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        let clock = Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-11-10T08:00:00.000000Z",
+        ));
+        let stamps = || AuditStamps {
+            clock: clock.clone(),
+            self_pid: 4_200_000,
+        };
+        let open = || AuditLog::open_with(&log_path, key(), [0u8; 16], stamps()).unwrap();
+        let mut log = open();
         log.boot_probe(None, "verified", "source-tree", &test_build())
             .unwrap();
+        clock.advance(chrono::TimeDelta::seconds(5));
         log.stop_entry("sigterm", 42).unwrap();
-        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        clock.advance(chrono::TimeDelta::seconds(5));
+        let mut log = open();
         assert!(matches!(log.previous_run(), PreviousRun::Clean { .. }));
         let refused = log
             .boot_refused_by(
@@ -1766,7 +1776,8 @@ mod tests {
             (refused.op.as_str(), refused.result.as_str()),
             ("agent_boot", "refused")
         );
-        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        clock.advance(chrono::TimeDelta::seconds(5));
+        let mut log = open();
         let boot = log
             .boot_probe(None, "verified", "source-tree", &test_build())
             .unwrap();
@@ -1776,6 +1787,18 @@ mod tests {
             boot.extra["previous_run"]
         );
         assert_eq!(boot.extra["previous_run"]["reason"], "sigterm");
+        // that run killed in turn: its own boot and last row
+        clock.advance(chrono::TimeDelta::seconds(5));
+        let last = log.append(sample_draft(1)).unwrap();
+        clock.advance(chrono::TimeDelta::seconds(5));
+        let log = open();
+        assert_eq!(
+            log.previous_run(),
+            &PreviousRun::Abrupt {
+                booted_at: boot.ts.clone(),
+                last_entry_at: last.ts.clone(),
+            }
+        );
         assert!(verify_chain_ok(&log_path));
     }
 

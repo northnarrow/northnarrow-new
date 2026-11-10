@@ -12,13 +12,13 @@
 //! Lot 298 (external bug hunt, BUG04/06/07): the answer is always the
 //! newest rows, contiguous — a row is never returned when a newer matching
 //! one was left out for the budget (a row longer than the whole frame, which
-//! no answer can carry, is skipped with `truncated`), and `truncated` says
-//! whenever older matching rows may
-//! exist: past the budget, past a file that is there and cannot be read
-//! (BUG07), and when a row older than `since` follows a row at or after it
-//! (the clock stepped back, BUG06): such a row no longer stops the descent
-//! into the archives. A row stamped before `since` at the very head of a
-//! file still stops it (it cannot be told from rows in order).
+//! no answer can carry, is skipped with `truncated`) — and `truncated` says
+//! whenever older matching rows may exist: past the budget, past a file
+//! that is there and cannot be read (BUG07), and when a row older than
+//! `since` follows a row at or after it (the clock stepped back, BUG06):
+//! such a row no longer stops the descent into the archives. A row stamped
+//! before `since` at the very head of a file still stops it (it cannot be
+//! told from rows in order).
 //!
 //! Bounds (the read runs on the admin socket's task):
 //! - memory: the rows kept never exceed `soft_cap` bytes, and a line longer
@@ -228,7 +228,7 @@ fn scan_file(
     // answer stays the newest rows, contiguous. Cut at the room, such a row
     // was "oversized" and skipped while an older, shorter one was kept.
     // Memory stays bounded by `soft_cap` (one line) plus the room.
-    let max_line = query.soft_cap.max(1);
+    let max_line = query.soft_cap;
 
     let mut out = FileScan {
         rows: VecDeque::new(),
