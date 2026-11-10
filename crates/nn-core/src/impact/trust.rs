@@ -686,9 +686,11 @@ mod tests {
             (200, id("/usr/bin/bash", None)),
         ];
         let got = judge(400, Some(&l), false, &distro);
+        // (the messages name what was expected, not the verdict: CodeQL's
+        // cleartext-logging query reads a `Trusted` value as sensitive)
         assert!(
             matches!(&got, Judged::Untrusted { actor: 300, program, .. } if program == "/tmp/enc.sh"),
-            "{got:?}"
+            "openssl under `bash -e /tmp/enc.sh` is judged against the script"
         );
     }
 
@@ -713,7 +715,7 @@ mod tests {
         let got = judge(300, Some(&l), false, &distro);
         assert!(
             matches!(&got, Judged::Untrusted { actor: 300, .. }),
-            "{got:?}"
+            "`python3 -O /tmp/enc.py /usr/bin/tar` is judged"
         );
         let unknown = ExecIdentity::of_exec(
             "/usr/bin/python3",
@@ -727,7 +729,7 @@ mod tests {
                     (300, "its arguments do not tell what it runs")
                 )
             }
-            other => panic!("{other:?}"),
+            Judged::Trusted(_) => panic!("an unread writer is judged"),
         }
         let l = [
             (400, id("/usr/bin/openssl", None)),
@@ -741,10 +743,10 @@ mod tests {
                 assert_eq!((actor, key), (300, 400));
                 assert!(
                     why.contains("whose arguments do not tell what it runs"),
-                    "{why}"
+                    "the reason names the unread ancestor"
                 );
             }
-            other => panic!("{other:?}"),
+            Judged::Trusted(_) => panic!("a tool under an unread ancestor is judged"),
         }
     }
 }
