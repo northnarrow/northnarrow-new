@@ -1001,6 +1001,20 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             manifest_poison: None,
             _marker: std::marker::PhantomData,
         };
+        // Lot 296: the manifest exists from the open, created inside the `+i`
+        // dance by the opening thread (the agent's start, which may lift the
+        // state directory's immutability). A writer's thread that may not
+        // (the actions chain's response threads) can then still append to it
+        // — the attestation of a repair first: without the file that
+        // attestation, and with it the repair and every later row, failed
+        // (the lab, lot 296). Non-fatal, as the open's checkpoint.
+        if let Err(e) = log.ensure_manifest() {
+            warn!(
+                error = %format!("{e:#}"),
+                log = %log.active_path.display(),
+                "chainlog: the manifest could not be created at open"
+            );
+        }
 
         // Attest a manifest self-repair into its own meta-chain (chained off
         // the recovered tail) — truncating a signed log MUST be recorded. Lot
@@ -4407,7 +4421,9 @@ mod tests {
         // One append first, so `open` saw a normal (absent) manifest; THEN
         // make the manifest path a DIRECTORY so every subsequent
         // manifest_append (a create) fails — the same shape as the +i EPERM.
+        // (Lot 296: the open created it, empty; removed first.)
         log.append(payload(0)).unwrap();
+        std::fs::remove_file(manifest_path_for(&active)).unwrap();
         std::fs::create_dir_all(manifest_path_for(&active)).unwrap();
         // Many rotations, each with a failing manifest_append — none may error.
         for i in 1..40 {
@@ -7002,7 +7018,9 @@ mod tests {
         append_raw(&active, fragment);
         let len_torn = fs::metadata(&active).unwrap().len();
         let manifest = manifest_path_for(&active);
-        assert!(!manifest.exists());
+        // the open made it, empty (lot 296): no row yet
+        assert_eq!(fs::read(&manifest).unwrap(), b"");
+        fs::remove_file(&manifest).unwrap();
         // the manifest cannot be written once (a dangling symlink here)
         std::os::unix::fs::symlink(dir.path().join("no-such-dir/m"), &manifest).unwrap();
         let first = RotatingChainLog::<TestPayload, _>::open(
@@ -7291,6 +7309,60 @@ mod tests {
         log.checkpoint().unwrap();
         drop(log);
         verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(torn_repairs(&active).len(), 1);
+    }
+
+    /// A protection whose dance (a new name in the protected directory) is
+    /// refused once `refused` is set: a writer's thread without the right to
+    /// lift the directory's immutability.
+    struct NoDanceAfter(std::sync::atomic::AtomicBool);
+
+    impl ProtectionManager for NoDanceAfter {
+        fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow!("lifting immutability: Operation not permitted"));
+            }
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The lab (lot 296): the actions chain's rows are written by threads
+    /// that may not lift the state directory's immutability. A log opened
+    /// empty had no manifest, so the repair after a short write could not be
+    /// attested, nor the fragment cut: every later row was lost. The open
+    /// now creates the manifest (empty), and the repair appends to it.
+    #[test]
+    fn a_writer_that_may_not_lift_the_directory_still_attests_its_repair() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let prot = std::sync::Arc::new(NoDanceAfter(std::sync::atomic::AtomicBool::new(false)));
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            FaultyKey(key_at(&kp)),
+            cfg(1 << 30, 50),
+            prot.clone(),
+        )
+        .unwrap();
+        prot.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        log.append_deferred(payload(0)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"ts\"",
+            keep: 64,
+        });
+        assert!(
+            log.append_deferred(payload(1)).is_err(),
+            "premise: the disk is full"
+        );
+        log.append_deferred(payload(2)).unwrap();
+        log.sync().unwrap();
+        drop(log);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
         assert_eq!(torn_repairs(&active).len(), 1);
     }
 }

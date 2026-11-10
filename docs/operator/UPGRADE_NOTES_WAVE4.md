@@ -945,6 +945,12 @@ holding a flow against a later kill (BUG45). After the upgrade:
   the end that is not a row is corruption (`BOOT_INTEGRITY.md`, gate
   `audit_log`); keep it as evidence (`EVIDENCE_CHAINS.md`, "When a check
   fails").
+- **Each rotating log's manifest** (`<log>.manifest.jsonl`) now exists from
+  the agent's first start after the upgrade, empty until its first row:
+  created by the start inside the protected directory's `+i` lift, so the
+  actions chain's response threads, which may not lift it, can attest a
+  repair there (lot 296's lab: without it, every action row after a full
+  disk was lost until the next start).
 - **Retention** (BUG10): an entry at an archive's name that is not a
   regular file is left in place and passed (ERROR in the journal; `chain
   verify` names it); a pass that fails keeps the `Evicted` rows of what it

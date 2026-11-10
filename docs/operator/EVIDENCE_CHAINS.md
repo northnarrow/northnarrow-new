@@ -313,7 +313,15 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   unless it was written whole (a rotating log's journal says which: WARN
   `chainlog: tail read again after a failed write`, with what was cut and
   what kept). While the tail cannot be read again, or the cut not
-  attested, every append of that chain fails and writes nothing. Before lot
+  attested, every append of that chain fails and writes nothing. The repair
+  is made at that chain's next row, or at the next start: until then a
+  chain idle since the failure ends in the fragment, and `nn-admin chain
+  verify` reports it `BROKEN` (`malformed line N: … EOF while parsing`, its
+  last line) — the lab's netflow log for 50 s after the disk had room
+  again. A rotating log's manifest exists from its first start, empty until
+  its first row, so a writer that may not create a name in the protected
+  state directory (the actions chain's response threads) can still write
+  the attestation there. Before lot
   296 the next row was glued to the fragment, or chained off the row before
   the one written whole: an audit log the next start refused (the agent did
   not start in enforce mode), a rotating log `BROKEN` in `nn-admin chain
