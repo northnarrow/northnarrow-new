@@ -7786,6 +7786,26 @@ number in parentheses is a lab PR.
       mount and a relative path: all `EPERM`, 7 `bpf_handle` High; a
       read-only handle by id and by path inside a window given; `bpftool
       prog show` outside a window stops at once (rc 255).
+    - **Ubuntu 24.04, round r4** (b495c400: the nine types, the guard in
+      **enforce** mode — `NN_BPF_DEFENSE_ENFORCE=1` in the manager's
+      environment, `nn-admin capabilities`: "27 of 27 attached; BPF guard
+      enforce"). The corpora again: `containers` 13 steps, `db` 16, `dev`
+      24, all rc 0 but the `dev` control's `www-data` run (137, by design)
+      — **0 refusals** of any load (`bpf_prog_type` 0) and of any handle
+      (`bpf_handle` 0), the workloads' and the harness's; loaders seen
+      (NN-L-BPF-001): runc 36, bpftrace 4 (the small-file probe, loaded
+      inside its own window before the settle). After the corpora: 16
+      foreign programs (systemd's 15 seen loading by PID 1, HID-BPF's
+      `hid_tail_call` the kernel's); one `bpf_baseline` High — the probe's
+      programs at the settle's restart, before the mark. `foreign-bpf-check`
+      F1–F3: a `kprobe`, a `tracepoint`, a `perf_event` and a
+      `raw_tracepoint` program calling `bpf_probe_write_user` each `EPERM`
+      outside a window (4 `bpf_prog_type` High) and loaded inside one;
+      bpftrace refused, run inside a window, and run outside one under a
+      signed `bpf-loader-allow /usr/bin/bpftrace
+      kprobe,tracing,tracepoint,perf_event,raw_tracepoint` (`bpf_prog_opt_out`
+      Low, nothing refused, another loader refused, refused again once
+      withdrawn). Uninstalled, the guest clean and off.
   - Gates (33eadc11, once): eBPF, the four clippy runs, fmt, 92 suites
     4,206 passed and 2 failed (the agent's catalogue tests, on this lot's
     NN-L-AT-001 entry), the privileged no-run, attack-coverage, golden ×5
