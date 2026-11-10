@@ -126,16 +126,16 @@ pub fn precursor_of<H: PostureHost>(
             continue;
         };
         let exe = id.exe.to_string_lossy();
+        // lot 292: an argv whose options could not be read still shows
+        // what may be its script — a detection looks at it
+        let script = id.runs.mentioned();
         if crate::decision::rules::is_staging_path(&exe)
-            || id
-                .script
-                .as_deref()
-                .is_some_and(crate::decision::rules::is_staging_path)
+            || script.is_some_and(crate::decision::rules::is_staging_path)
         {
             return Some("a staging-directory image among its ancestors");
         }
         let base = base_of(&exe);
-        let program = id.script.as_deref().map(base_of).unwrap_or(base);
+        let program = script.map(base_of).unwrap_or(base);
         if shell_below && EXPOSED_SERVICES.iter().any(|s| program_is(program, s)) {
             return Some("a shell started by an exposed network service");
         }

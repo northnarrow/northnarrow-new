@@ -45,6 +45,7 @@ pub mod exempt;
 pub mod host;
 pub mod lineage;
 pub mod mass_write_overlay;
+pub mod script_args;
 pub mod state;
 pub mod transitions;
 pub mod triggers;

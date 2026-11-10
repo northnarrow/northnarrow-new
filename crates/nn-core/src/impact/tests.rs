@@ -570,3 +570,103 @@ fn imp001_still_judges_a_service_encrypting_its_own_data() {
         assert!(b.decisive, "marked {marked}: {b:?}");
     }
 }
+
+// ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-72 ──────────────
+
+/// BUG-72: the same actor (pid 500, `/tmp/x`) rewrites at t0; 30 s later its
+/// lineage cannot be read any more (its parent's pid now names a process
+/// that started before t1 and executed after it: what that pid ran then is
+/// not known) and it renames to a new extension. The walk fails toward
+/// counting ("(lineage unknown)", same key), and the shape counted 30 s
+/// earlier is still in the window.
+#[test]
+fn unreadable_lineage_mid_window_keeps_the_actors_shapes() {
+    let h = Host::new();
+    h.exec(500, 200, "/tmp/x", &["x"]);
+    let t = h.tracker(Fixed::low());
+    let t1 = T0 + 30 * S;
+    let a1 = t.assess(&rewrites(500, T0, "/home/u/docs/a.pdf")).unwrap();
+    assert_eq!((a1.program.as_str(), a1.key), ("/tmp/x", 500));
+    assert_eq!(a1.added, vec![Signal::Rewrites]);
+    h.lineage.ingest_exec(
+        200,
+        1,
+        "/usr/bin/true",
+        &["true".to_string()],
+        t1 + 10 * S,
+        T0 + S,
+        1000,
+    );
+    let a2 = t
+        .assess(&renames(500, t1, "/home/u/docs/a.pdf.locked", 20, 3))
+        .unwrap();
+    // preconditions: unreadable, still judged under the same key
+    assert_eq!((a2.program.as_str(), a2.key), ("(lineage unknown)", 500));
+    assert_eq!(a2.added, vec![Signal::RenameExtension]);
+    let shapes: Vec<Signal> = a2.signals.iter().map(|(s, _)| *s).collect();
+    assert!(
+        shapes.contains(&Signal::Rewrites) && a2.decisive,
+        "the rewrites counted 30 s earlier for pid 500 were dropped: {shapes:?}, decisive {}",
+        a2.decisive
+    );
+}
+
+/// BUG-72, the other way: the window opened while the lineage could not be
+/// read ("(lineage unknown)") is the actor's once its program is read
+/// again; and two programs read under one pid (a pid reused) still start
+/// the window over.
+#[test]
+fn a_window_opened_unreadable_is_the_actor_s_once_read() {
+    let h = Host::new();
+    let t = h.tracker(Fixed::low());
+    // no exec of pid 510 known yet: not readable
+    let a1 = t.assess(&rewrites(510, T0, "/home/u/docs/b.pdf")).unwrap();
+    assert_eq!((a1.program.as_str(), a1.key), ("(lineage unknown)", 510));
+    h.exec(510, 1, "/tmp/y", &["y"]);
+    let a2 = t
+        .assess(&renames(
+            510,
+            T0 + 30 * S,
+            "/home/u/docs/b.pdf.locked",
+            20,
+            3,
+        ))
+        .unwrap();
+    assert_eq!((a2.program.as_str(), a2.key), ("/tmp/y", 510));
+    let shapes: Vec<Signal> = a2.signals.iter().map(|(s, _)| *s).collect();
+    assert!(
+        shapes.contains(&Signal::Rewrites) && a2.decisive,
+        "{shapes:?}"
+    );
+    // pid 520 runs /tmp/a, then (reused) /tmp/b: two programs, two windows
+    h.exec(520, 1, "/tmp/a", &["a"]);
+    let b1 = t.assess(&rewrites(520, T0, "/home/u/docs/c.pdf")).unwrap();
+    assert_eq!(b1.program, "/tmp/a");
+    // a later process takes the pid and executes /tmp/b
+    h.lineage.ingest_exec(
+        520,
+        1,
+        "/tmp/b",
+        &["b".to_string()],
+        T0 + 10 * S,
+        T0 + 5 * S,
+        1000,
+    );
+    let b2 = t
+        .assess(&renames(
+            520,
+            T0 + 30 * S,
+            "/home/u/docs/c.pdf.locked",
+            20,
+            3,
+        ))
+        .unwrap();
+    assert_eq!(b2.program, "/tmp/b");
+    let shapes: Vec<Signal> = b2.signals.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        shapes,
+        vec![Signal::RenameExtension],
+        "a reused pid's shapes"
+    );
+    assert!(!b2.decisive);
+}

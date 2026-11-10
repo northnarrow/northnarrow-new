@@ -2707,9 +2707,12 @@ impl<H: PostureHost> Rule for OwnClient<H> {
         }
         let ran = identity.map_or_else(
             || "a process whose exec could not be read".to_string(),
-            |id| match id.script {
-                Some(script) => format!("{} {}", id.exe.display(), script),
-                None => id.exe.display().to_string(),
+            |id| match &id.runs {
+                crate::posture::lineage::Runs::Script(script) => {
+                    format!("{} {}", id.exe.display(), script)
+                }
+                crate::posture::lineage::Runs::Inline => id.exe.display().to_string(),
+                crate::posture::lineage::Runs::Unknown(_) => id.program(),
             },
         );
         Some(Verdict {
@@ -6118,5 +6121,71 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = built(r.as_ref(), &at(300, exec_ns + 61_000_000_000)).unwrap();
         assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    // ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-44 ──────────
+
+    /// BUG-44: a stealer run as `python3 -O /tmp/steal.py /usr/bin/aws` (or
+    /// `perl -X …`) is not the client its next argument names: the
+    /// credential read (NN-L-FIM-011, a kill in every posture) is killed,
+    /// and a root write of `/etc/passwd` claiming `useradd` (NN-L-FIM-003)
+    /// is not downgraded to a record. Nor is one whose options the table
+    /// cannot read (`python3 -Z …`): what it runs is not known.
+    #[test]
+    fn a_skipped_script_does_not_make_a_client() {
+        let (_tmp, lineage) = exec_fixture(&[
+            (
+                600,
+                "/usr/bin/python3.12",
+                &["python3", "-O", "/tmp/steal.py", "/usr/bin/aws"],
+            ),
+            (
+                601,
+                "/usr/bin/perl",
+                &["perl", "-X", "/tmp/steal.pl", "/usr/bin/aws"],
+            ),
+            (
+                602,
+                "/usr/bin/python3.12",
+                &["python3", "-O", "/tmp/adduser.py", "/usr/sbin/useradd"],
+            ),
+            (
+                603,
+                "/usr/bin/python3.12",
+                &["python3", "-Z", "/usr/bin/aws"],
+            ),
+        ]);
+        let rules = rules_by_id(&lineage);
+        let mut wrong = Vec::new();
+        for pid in [600, 601, 603] {
+            let v = rules["NN-L-FIM-011_AwsCredsRead"].evaluate(&read_by(
+                "/root/.aws/credentials",
+                pid,
+                "python3",
+            ));
+            if v.as_ref().map(|v| &v.action) != Some(&ResponseAction::KillProcess) {
+                wrong.push(format!("FIM-011 pid {pid}: {:?}", v.map(|v| v.action)));
+            }
+        }
+        let mut e = written_by(FimOp::Modified, "/etc/passwd", 602, "useradd");
+        if let Event::Fim(fe) = &mut e {
+            fe.modifier_uid = 0;
+        }
+        let v = rules["NN-L-FIM-003_SensitiveConfigModified"].evaluate(&e);
+        if v.as_ref().map(|v| &v.action) == Some(&ResponseAction::Log) {
+            wrong.push("FIM-003 pid 602: kill downgraded to Log".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // the record says what the kernel ran when the comm claims a client
+        let v = rules["NN-L-FIM-011_AwsCredsRead"]
+            .evaluate(&read_by("/root/.aws/credentials", 603, "aws"))
+            .unwrap();
+        assert!(
+            v.reasoning.contains(
+                "the kernel ran /usr/bin/python3.12 /usr/bin/aws (options not understood)"
+            ),
+            "{}",
+            v.reasoning
+        );
     }
 }

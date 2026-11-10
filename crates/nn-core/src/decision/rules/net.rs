@@ -1419,10 +1419,8 @@ fn common_port_service<H: PostureHost>(
             crate::posture::lineage::AsOf::judged(nl.timestamp_ns),
         ),
         None => match nl.exe.as_deref() {
-            Some(exe) => Some(crate::posture::lineage::ExecIdentity {
-                exe: exe.into(),
-                script: None,
-            }),
+            // lot 292: no argv, so an interpreter's script is not known
+            Some(exe) => Some(crate::posture::lineage::ExecIdentity::of_exe(exe)),
             None => return Some(true),
         },
     };

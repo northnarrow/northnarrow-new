@@ -577,7 +577,10 @@ impl<H: DecisionHost> RansomTracker<H> {
 }
 
 /// The window of `actor`, a fresh one for a pid that now runs another
-/// program (reused), the stalest actor evicted at the bound.
+/// program (reused), the stalest actor evicted at the bound. Lot 292
+/// (BUG-72): a lineage that could not be read ([`trust::LINEAGE_UNKNOWN`])
+/// names no program — the walk fails toward counting, so it keeps the
+/// pid's window, and a window opened under it takes the program read next.
 fn actor_window<'a>(st: &'a mut State, actor: u32, program: &str, ts: u64) -> &'a mut ActorWindow {
     if st.actors.len() >= ACTORS_CAP && !st.actors.contains_key(&actor) {
         let stale: Vec<u32> = st
@@ -602,10 +605,15 @@ fn actor_window<'a>(st: &'a mut State, actor: u32, program: &str, ts: u64) -> &'
     }
     let w = st.actors.entry(actor).or_default();
     if w.program != program {
-        *w = ActorWindow {
-            program: program.to_string(),
-            ..Default::default()
-        };
+        if w.program.is_empty() || w.program == trust::LINEAGE_UNKNOWN {
+            // a new window, or one opened while the lineage was unreadable
+            w.program = program.to_string();
+        } else if program != trust::LINEAGE_UNKNOWN {
+            *w = ActorWindow {
+                program: program.to_string(),
+                ..Default::default()
+            };
+        }
     }
     w.last = w.last.max(ts);
     w

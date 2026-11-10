@@ -955,6 +955,55 @@ mod tests {
         assert_eq!(named, 1);
     }
 
+    /// Lot 292 (BUG-44): a script that names the fan-out client after
+    /// itself (`python3 -O /tmp/scan.py /usr/bin/ansible`) or whose options
+    /// cannot be read (`python3 -Z /usr/bin/ansible`) is not ansible; the
+    /// client itself (`python3 -O /usr/bin/ansible …`) still is.
+    #[test]
+    fn a_skipped_script_is_not_the_fanout_client() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let l = AuthSessionTracker::new(tmp.path());
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        l.ingest_spawn_with_argv(
+            710,
+            1,
+            "/usr/bin/python3.12",
+            &argv(&["python3", "-O", "/tmp/scan.py", "/usr/bin/ansible"]),
+            1,
+        );
+        l.ingest_spawn_with_argv(
+            711,
+            1,
+            "/usr/bin/python3.12",
+            &argv(&["python3", "-Z", "/usr/bin/ansible"]),
+            1,
+        );
+        l.ingest_spawn_with_argv(
+            712,
+            1,
+            "/usr/bin/python3.12",
+            &argv(&["python3", "-O", "/usr/bin/ansible", "all", "-m", "ping"]),
+            1,
+        );
+        let r = NnLNet026ScanFanOut::new(FanoutContext::new(
+            Arc::new(FanoutConfig::default()),
+            None,
+            Some(l),
+        ));
+        let mut fired = [0; 3];
+        for (n, pid) in [710u32, 711, 712].into_iter().enumerate() {
+            for i in 0..100u32 {
+                let dst = [10, n as u8 + 1, 0, i as u8];
+                if r.evaluate(&connect(pid, dst, 22, S + u64::from(i)))
+                    .is_some()
+                {
+                    fired[n] += 1;
+                }
+            }
+        }
+        assert_eq!(fired, [1, 1, 0], "(scan.py, unread options, ansible)");
+    }
+
     /// Bounded: the keys past the cap go, least recently sampled first.
     #[test]
     fn the_windows_are_bounded() {

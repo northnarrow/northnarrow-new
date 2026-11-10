@@ -55,7 +55,7 @@ use std::time::SystemTime;
 use parking_lot::Mutex;
 
 use crate::decision::host::DecisionHost;
-use crate::posture::lineage::{in_system_tree, is_interpreter, ExecIdentity};
+use crate::posture::lineage::{in_system_tree, is_interpreter, ExecIdentity, Runs};
 
 /// Why a writer's bursts do not count.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,47 +93,76 @@ pub enum Judged {
     },
 }
 
+/// What a writer whose lineage could not be read is recorded as.
+pub const LINEAGE_UNKNOWN: &str = "(lineage unknown)";
+
 /// The program an identity names, for the record: the script an
-/// interpreter runs, else the executable.
+/// interpreter runs, else the executable ([`ExecIdentity::program`]).
 pub fn program_of(id: &ExecIdentity) -> String {
-    match &id.script {
-        Some(s) => s.clone(),
-        None => id.exe.to_string_lossy().into_owned(),
-    }
+    id.program()
 }
 
 /// A hop that vouches for nothing below it: neither a program root
 /// installed nor an installed interpreter running no named script (the
-/// test of lab PR 222's `cow::trust::is_foreign`).
+/// test of lab PR 222's `cow::trust::is_foreign`). Lot 292 (BUG-44): an
+/// interpreter whose options could not be read ([`Runs::Unknown`]) is one.
 pub fn is_foreign(id: &ExecIdentity) -> bool {
     if id.is_installed_program() {
         return false;
     }
     let exe = id.exe.to_string_lossy();
-    !(id.script.is_none() && is_interpreter(&id.exe) && in_system_tree(&exe))
+    !(id.runs == Runs::Inline && is_interpreter(&id.exe) && in_system_tree(&exe))
 }
 
-/// The writer's own program is packaged: its executable, or for an
-/// interpreter the script it runs (an absolute path), is one a package
-/// installed. `owned` answers from the package database (`None`: no
-/// database to ask — a root-owned system tree stands in). An interpreter
-/// running nothing named (`python3 -c`, a module) is never packaged.
-fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
-    let file = if is_interpreter(&id.exe) {
-        match &id.script {
-            Some(s) if s.starts_with('/') => PathBuf::from(s),
-            _ => return false,
-        }
-    } else {
-        id.exe.clone()
-    };
+/// `file` is one a package installed. `owned` answers from the package
+/// database (`None`: no database to ask — a root-owned system tree stands
+/// in); a deleted or replaced file, or one named through `..`, is not.
+fn owned_file(file: &Path, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
     let text = file.to_string_lossy();
     if text.ends_with(" (deleted)") || text.contains("/../") {
         return false;
     }
-    match owned(&file) {
+    match owned(file) {
         Some(o) => o,
         None => in_system_tree(&text),
+    }
+}
+
+/// The program is packaged: its executable is one a package installed and,
+/// for an interpreter, so is the script it runs (an absolute path). An
+/// interpreter running nothing named (`python3 -c`, a module) is never
+/// packaged, nor one whose options could not be read (lot 292).
+fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
+    if !owned_file(&id.exe, owned) {
+        return false;
+    }
+    if !is_interpreter(&id.exe) {
+        return true;
+    }
+    match id.script() {
+        Some(s) if s.starts_with('/') => owned_file(Path::new(s), owned),
+        _ => false,
+    }
+}
+
+/// Lot 292 (BUG-49): an ancestor vouches for what it starts when a package
+/// installed its program ([`packaged`]), or when it is an interpreter a
+/// package installed running no named script (an interactive shell, `sh
+/// -c`). Lying in a root-owned tree (`/opt/x`, `/usr/local/bin/x`) is not
+/// being installed by a package, and an interpreter whose options could
+/// not be read vouches for nothing.
+pub fn vouches(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
+    packaged(id, owned)
+        || (id.runs == Runs::Inline && is_interpreter(&id.exe) && owned_file(&id.exe, owned))
+}
+
+/// Why a hop that is not trusted is not: what it runs is not known, or no
+/// package installed it.
+fn not_installed(id: &ExecIdentity) -> &'static str {
+    if matches!(id.runs, Runs::Unknown(_)) {
+        "its arguments do not tell what it runs"
+    } else {
+        "no package installed it"
     }
 }
 
@@ -153,12 +182,19 @@ pub fn judge(
         return Judged::Untrusted {
             actor: pid,
             key: pid,
-            program: "(lineage unknown)".to_string(),
+            program: LINEAGE_UNKNOWN.to_string(),
             why: "its lineage could not be read".to_string(),
         };
     };
     let (_, writer) = &hops[0];
-    if let Some(i) = hops.iter().position(|(_, id)| is_foreign(id)) {
+    // BUG-49: the writer and the copies of itself that forked it are judged
+    // below ([`packaged`]); every ancestor above them must vouch for it.
+    let own = topmost_same(hops, 0);
+    if let Some(i) = hops
+        .iter()
+        .enumerate()
+        .position(|(n, (_, id))| is_foreign(id) || (n > own && !vouches(id, owned)))
+    {
         let (actor, id) = &hops[topmost_same(hops, i)];
         // A foreign writer's shapes add up with its forked workers'; a
         // packaged tool's under a foreign program count for that tool's
@@ -167,7 +203,13 @@ pub fn judge(
         // burst. The kill reaches the foreign program either way.
         let key = if i == 0 { *actor } else { hops[0].0 };
         let why = if i == 0 {
-            "no package installed it".to_string()
+            not_installed(id).to_string()
+        } else if matches!(id.runs, Runs::Unknown(_)) {
+            format!(
+                "{} was started by {}, whose arguments do not tell what it runs",
+                program_of(writer),
+                program_of(id)
+            )
         } else {
             format!(
                 "{} was started by {}, which no package installed",
@@ -193,14 +235,14 @@ pub fn judge(
         why: if is_interpreter(&writer.exe) {
             "an interpreter running an inline program or an unpackaged script".to_string()
         } else {
-            "no package installed it".to_string()
+            not_installed(writer).to_string()
         },
     }
 }
 
 /// The hop above `i` up to which every ancestor runs the program `i` runs:
 /// a payload's forked workers count against the payload.
-fn topmost_same(hops: &[(u32, ExecIdentity)], i: usize) -> usize {
+pub fn topmost_same(hops: &[(u32, ExecIdentity)], i: usize) -> usize {
     let mut top = i;
     while top + 1 < hops.len() && hops[top + 1].1 == hops[i].1 {
         top += 1;
@@ -339,7 +381,7 @@ mod tests {
     fn id(exe: &str, script: Option<&str>) -> ExecIdentity {
         ExecIdentity {
             exe: PathBuf::from(exe),
-            script: script.map(str::to_string),
+            runs: script.map_or(Runs::Inline, |s| Runs::Script(s.into())),
         }
     }
 
@@ -504,5 +546,202 @@ mod tests {
             ProgramOwners::new(bare.path()).owned(Path::new("/usr/bin/x")),
             None
         );
+    }
+
+    // ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-49, and what
+    // BUG-42/BUG-44 feed ───────────────────────────────────────────────
+
+    /// BUG-49: `openssl` started by a binary no package installed, in `/opt`
+    /// or `/usr/local` (the module doc: "a packaged tool started by such a
+    /// program" is judged), counts against that binary.
+    #[test]
+    fn packaged_tool_under_unpackaged_opt_binary_is_judged() {
+        let mut wrong = Vec::new();
+        for dropped in ["/opt/x/locker", "/usr/local/bin/locker"] {
+            let l = [
+                (400, id("/usr/bin/openssl", None)),
+                (300, id(dropped, None)),
+                (200, id("/usr/bin/bash", None)),
+                (100, id("/usr/sbin/sshd", None)),
+            ];
+            let got = judge(400, Some(&l), false, &distro);
+            if !matches!(
+                &got,
+                Judged::Untrusted {
+                    actor: 300,
+                    key: 400,
+                    program,
+                    ..
+                } if program == dropped
+            ) {
+                wrong.push(format!("{dropped}: {got:?}"));
+            }
+        }
+        // and a script from /usr/local that drives `mv`
+        let l = [
+            (400, id("/usr/bin/mv", None)),
+            (300, id("/usr/bin/bash", Some("/usr/local/bin/enc.sh"))),
+            (200, id("/usr/bin/bash", None)),
+        ];
+        let got = judge(400, Some(&l), false, &distro);
+        if !matches!(
+            &got,
+            Judged::Untrusted {
+                actor: 300,
+                key: 400,
+                ..
+            }
+        ) {
+            wrong.push(format!("/usr/local/bin/enc.sh: {got:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// BUG-49, what keeps vouching: an interactive shell or `sh -c` a
+    /// package installed, a packaged daemon, a packaged script; and with no
+    /// package database to ask, a root-owned tree, as before. An interpreter
+    /// no package installed vouches for nothing, even running no script.
+    #[test]
+    fn an_installed_shell_and_packaged_programs_still_vouch() {
+        for shell in [
+            id("/usr/bin/bash", None),
+            id("/usr/bin/dash", None),
+            ExecIdentity::of_exec(
+                "/usr/bin/bash",
+                &["bash".to_string(), "-c".into(), "x".into()],
+            ),
+        ] {
+            let l = [
+                (400, id("/usr/bin/openssl", None)),
+                (300, shell.clone()),
+                (200, id("/usr/sbin/sshd", None)),
+                (1, id("/usr/lib/systemd/systemd", None)),
+            ];
+            assert_eq!(
+                judge(400, Some(&l), false, &distro),
+                Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into())),
+                "{shell:?}"
+            );
+        }
+        let l = [
+            (400, id("/usr/bin/tar", None)),
+            (300, id("/usr/bin/python3", Some("/usr/lib/borg/backup.py"))),
+            (200, id("/usr/lib/systemd/systemd", None)),
+        ];
+        assert!(matches!(
+            judge(400, Some(&l), false, &distro),
+            Judged::Trusted(_)
+        ));
+        // no package database: a root-owned tree stands in, as before
+        let none = |_: &Path| None;
+        let l = [
+            (400, id("/usr/bin/openssl", None)),
+            (300, id("/opt/x/locker", None)),
+        ];
+        assert!(matches!(
+            judge(400, Some(&l), false, &none),
+            Judged::Trusted(_)
+        ));
+        // a shell no package installed
+        let l = [
+            (400, id("/usr/bin/openssl", None)),
+            (300, id("/usr/local/bin/bash", None)),
+            (200, id("/usr/sbin/sshd", None)),
+        ];
+        assert!(matches!(
+            judge(400, Some(&l), false, &distro),
+            Judged::Untrusted {
+                actor: 300,
+                key: 400,
+                ..
+            }
+        ));
+        // a payload's forked copies are its own program, not ancestors
+        let l = [
+            (402, id("/usr/bin/tar", None)),
+            (401, id("/usr/bin/tar", None)),
+            (300, id("/usr/bin/bash", None)),
+        ];
+        assert!(matches!(
+            judge(402, Some(&l), false, &distro),
+            Judged::Trusted(_)
+        ));
+    }
+
+    /// BUG-42 downstream: a script run under errexit (`bash -e /tmp/enc.sh`,
+    /// identity as the exec event builds it) names its script and vouches
+    /// for none of the packaged tools it drives.
+    #[test]
+    fn errexit_script_does_not_vouch_for_its_tools() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let l = [
+            (400, id("/usr/bin/openssl", None)),
+            (
+                300,
+                ExecIdentity::of_exec("/usr/bin/bash", &args(&["bash", "-e", "/tmp/enc.sh"])),
+            ),
+            (200, id("/usr/bin/bash", None)),
+        ];
+        let got = judge(400, Some(&l), false, &distro);
+        assert!(
+            matches!(&got, Judged::Untrusted { actor: 300, program, .. } if program == "/tmp/enc.sh"),
+            "{got:?}"
+        );
+    }
+
+    /// BUG-44 downstream: `python3 -O /tmp/enc.py /usr/bin/tar` — the
+    /// writer's identity is the script it runs, not a packaged file it
+    /// names; and one whose options cannot be read is no packaged program
+    /// and vouches for nothing.
+    #[test]
+    fn python_dash_o_writer_is_not_a_packaged_program() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let l = [
+            (
+                300,
+                ExecIdentity::of_exec(
+                    "/usr/bin/python3",
+                    &args(&["python3", "-O", "/tmp/enc.py", "/usr/bin/tar"]),
+                ),
+            ),
+            (200, id("/usr/bin/bash", None)),
+            (150, id("/usr/sbin/sshd", None)),
+        ];
+        let got = judge(300, Some(&l), false, &distro);
+        assert!(
+            matches!(&got, Judged::Untrusted { actor: 300, .. }),
+            "{got:?}"
+        );
+        let unknown = ExecIdentity::of_exec(
+            "/usr/bin/python3",
+            &args(&["python3", "-Z", "/usr/bin/tar"]),
+        );
+        let l = [(300, unknown.clone()), (200, id("/usr/bin/bash", None))];
+        match judge(300, Some(&l), false, &distro) {
+            Judged::Untrusted { actor, why, .. } => {
+                assert_eq!(
+                    (actor, why.as_str()),
+                    (300, "its arguments do not tell what it runs")
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let l = [
+            (400, id("/usr/bin/openssl", None)),
+            (300, unknown),
+            (200, id("/usr/bin/bash", None)),
+        ];
+        match judge(400, Some(&l), false, &distro) {
+            Judged::Untrusted {
+                actor, key, why, ..
+            } => {
+                assert_eq!((actor, key), (300, 400));
+                assert!(
+                    why.contains("whose arguments do not tell what it runs"),
+                    "{why}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

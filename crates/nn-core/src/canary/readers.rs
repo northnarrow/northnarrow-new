@@ -145,10 +145,7 @@ impl<H: PostureHost> CanaryReaders<H> {
         if !id.is_client(&entries) {
             return None;
         }
-        Some(match id.script {
-            Some(script) => script,
-            None => id.exe.to_string_lossy().into_owned(),
-        })
+        Some(id.program())
     }
 }
 

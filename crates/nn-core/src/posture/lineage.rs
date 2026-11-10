@@ -70,6 +70,8 @@ use nn_model::Event;
 use parking_lot::RwLock;
 
 use super::host::PostureHost;
+pub use super::script_args::Runs;
+use super::script_args::{family_of, runs_of};
 
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
@@ -415,9 +417,16 @@ struct Entry {
     /// when `exe` ∈ [`NODE_EXES`] — that exe gate is applied at read
     /// time in [`AuthSessionTracker::is_npm_cli_writer`].
     argv_npm_cli: bool,
-    /// Review 85: what an interpreter `exe` runs ([`script_of`]): a script
-    /// path or a `-m` module. `None` for a binary, or an inline program.
-    script: Option<Box<str>>,
+    /// Review 85: what an interpreter `exe` runs ([`runs_of`]): a script
+    /// path or a `-m` module; [`Runs::Inline`] for a binary or an inline
+    /// program; lot 292: [`Runs::Unknown`] for an argv its table could not
+    /// read.
+    runs: Runs,
+    /// Lot 292 (BUG-56): the start as `/proc/<pid>/stat` showed it, in
+    /// clock ticks, when `start_ns` was computed from it (the start's scan,
+    /// a fork or an orphan the sweep entered): rounded down to a tick, and
+    /// less the time suspended then. `None`: the exec event's exact start.
+    start_ticks: Option<u64>,
     /// Lab PR 175: the real uid the process executed `exe` as (the exec
     /// event's, from the kernel's credentials; 0 for the plain ingest
     /// calls of tests and tools).
@@ -431,7 +440,9 @@ struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecIdentity {
     pub exe: PathBuf,
-    pub script: Option<String>,
+    /// Lot 292 (BUG-44, BUG-42): what an interpreter runs ([`Runs`]): a
+    /// script, nothing named, or not known.
+    pub runs: Runs,
 }
 
 impl ExecIdentity {
@@ -440,8 +451,30 @@ impl ExecIdentity {
     /// script an interpreter runs, from its argv.
     pub fn of_exec(exe: &str, argv: &[String]) -> Self {
         let path = PathBuf::from(exe);
-        let script = script_of(&path, argv).map(|s| s.to_string());
-        Self { exe: path, script }
+        let runs = runs_of(&path, argv);
+        Self { exe: path, runs }
+    }
+
+    /// Lot 292: the identity of a process known by its executable only (no
+    /// argv): an interpreter's is not known ([`Runs::Unknown`]).
+    pub fn of_exe(exe: impl Into<PathBuf>) -> Self {
+        let exe = exe.into();
+        let runs = if is_interpreter(&exe) {
+            Runs::Unknown(None)
+        } else {
+            Runs::Inline
+        };
+        Self { exe, runs }
+    }
+
+    /// The script or module it is known to run ([`Runs::script`]).
+    pub fn script(&self) -> Option<&str> {
+        self.runs.script()
+    }
+
+    /// The program, for a record ([`Runs::describe`]).
+    pub fn program(&self) -> String {
+        self.runs.describe(&self.exe)
     }
 
     /// External audit NETR-015 (NN-AUD-298): a program root installed. The
@@ -449,7 +482,9 @@ impl ExecIdentity {
     /// and, for an interpreter, so does the script it runs, named by an
     /// absolute path: an inline program (`-c`, `-e`), a module (`-m`,
     /// found through the caller's working directory and `PYTHONPATH`), a
-    /// relative path or standard input is the caller's, not the tree's.
+    /// relative path or standard input is the caller's, not the tree's;
+    /// and an argv whose options could not be read (lot 292) names no
+    /// script.
     pub fn is_installed_program(&self) -> bool {
         if !in_system_tree(&self.exe.to_string_lossy()) {
             return false;
@@ -457,8 +492,7 @@ impl ExecIdentity {
         if !is_interpreter(&self.exe) {
             return true;
         }
-        self.script
-            .as_deref()
+        self.script()
             .is_some_and(|s| s.starts_with('/') && in_system_tree(s))
     }
 
@@ -482,10 +516,15 @@ impl ExecIdentity {
     /// exe, and a script, must lie in a root-owned system tree
     /// ([`in_system_tree`]); an interpreter running an inline program
     /// (`python3 -c …`), a module (`-m`) or nothing is never a client by
-    /// name.
+    /// name. Lot 292 (BUG-44): nor is one whose options could not be read
+    /// ([`Runs::Unknown`]), even in a client's own tree — what it runs is
+    /// not known.
     pub fn is_client(&self, clients: &[&str]) -> bool {
         let exe = self.exe.to_string_lossy();
         if !in_system_tree(&exe) {
+            return false;
+        }
+        if matches!(self.runs, Runs::Unknown(_)) {
             return false;
         }
         if clients
@@ -499,13 +538,15 @@ impl ExecIdentity {
             let base = base.strip_suffix(".py").unwrap_or(base);
             clients.iter().any(|c| !c.ends_with('/') && names(c, base))
         };
-        match &self.script {
-            None => named(&exe),
-            Some(script) if script.starts_with('/') => in_system_tree(script) && named(script),
+        match &self.runs {
+            Runs::Inline => named(&exe),
+            Runs::Script(script) if script.starts_with('/') => {
+                in_system_tree(script) && named(script)
+            }
             // A module run with `-m` resolves through the working directory
             // and PYTHONPATH, both the caller's: only a client's own runtime
             // tree (above) vouches for it.
-            Some(_) => false,
+            Runs::Script(_) | Runs::Unknown(_) => false,
         }
     }
 }
@@ -987,7 +1028,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// recorded. Tests and tools: the process is recorded as executed by
     /// root; the agent feeds [`Self::ingest_exec`], with the event's uid.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns, 0, 0);
+        self.ingest_inner(pid, ppid, exe, false, Runs::Inline, spawn_ns, (0, None), 0);
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -1058,15 +1099,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         uid: u32,
     ) {
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
-        let script = script_of(Path::new(exe), argv);
+        let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
             pid,
             ppid,
             exe,
             argv_npm_cli,
-            script,
+            runs,
             spawn_ns,
-            start_ns,
+            (start_ns, None),
             uid,
         );
     }
@@ -1108,7 +1149,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 continue;
             };
             let start_ns = ticks.saturating_mul(tick).saturating_sub(suspended).max(1);
-            let script = self.proc_script(pid, &exe).map(String::into_boxed_str);
+            let runs = self.proc_runs(pid, &exe);
             let exe = exe.to_string_lossy().into_owned();
             // the pid may have been entered by an exec since the check
             if self.holds(pid) {
@@ -1119,9 +1160,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 ppid,
                 &exe,
                 false,
-                script,
+                runs,
                 0,
-                start_ns,
+                (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
             );
             seeded += 1;
@@ -1142,9 +1183,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         ppid: u32,
         exe: &str,
         argv_npm_cli: bool,
-        script: Option<Box<str>>,
+        runs: Runs,
         spawn_ns: u64,
-        start_ns: u64,
+        (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
     ) {
         if pid == 0 {
@@ -1156,7 +1197,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
-            script,
+            runs,
+            start_ticks: start_ticks.filter(|_| start_ns != 0),
             uid,
         };
         let mut s = self.inner.state.write();
@@ -1436,9 +1478,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.ppid,
                     &e.exe.to_string_lossy(),
                     e.argv_npm_cli,
-                    e.script,
+                    e.runs,
                     e.spawn_ns,
-                    e.start_ns,
+                    (e.start_ns, e.start_ticks),
                     e.uid,
                 );
                 if orphan {
@@ -1494,7 +1536,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let first = *could.first()?;
         if could
             .iter()
-            .any(|e| e.script != first.script || e.argv_npm_cli != first.argv_npm_cli)
+            .any(|e| e.runs != first.runs || e.argv_npm_cli != first.argv_npm_cli)
         {
             return None;
         }
@@ -1524,7 +1566,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: H::monotonic_ns().max(start_ns),
             start_ns,
             argv_npm_cli: first.argv_npm_cli,
-            script: first.script.clone(),
+            runs: first.runs.clone(),
+            start_ticks: Some(ticks),
             uid,
         })
     }
@@ -1609,7 +1652,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 // executed the same file itself (restic, clamscan: canary
                 // readers) before that exec reached the cache would take
                 // the identity, and nothing tells the two apart
-                if e.script.is_some()
+                if e.runs != Runs::Inline
                     || e.argv_npm_cli
                     || is_interpreter(&e.exe)
                     || !is_auth_binary(&e.exe)
@@ -1639,7 +1682,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: start_ns,
             start_ns,
             argv_npm_cli: parent.argv_npm_cli,
-            script: parent.script,
+            runs: parent.runs,
+            start_ticks: Some(ticks),
             uid,
         })
     }
@@ -1660,9 +1704,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             match found {
                 None => found = Some(e),
                 Some(f)
-                    if f.exe != e.exe
-                        || f.script != e.script
-                        || f.argv_npm_cli != e.argv_npm_cli =>
+                    if f.exe != e.exe || f.runs != e.runs || f.argv_npm_cli != e.argv_npm_cli =>
                 {
                     return None
                 }
@@ -1699,9 +1741,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 .get(&pid)
                 .and_then(|h| h.iter().rev().find(|e| e.spawn_ns <= t))
             {
-                Some(e) if e.start_ns == cur.start_ns || t < cur.start_ns => {
-                    CachedAt::Past(e.clone())
-                }
+                Some(e) if self.same_start(e, cur) || t < cur.start_ns => CachedAt::Past(e.clone()),
                 _ => CachedAt::LaterOnly,
             },
             _ => CachedAt::Current(cur.clone()),
@@ -2502,20 +2542,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// What the kernel executed for a hop: the spawn cache's record, else
     /// `/proc` (`cmdline` names the script an interpreter runs).
     fn hop_identity(&self, hop: &Hop) -> ExecIdentity {
-        let script = if hop.cached {
-            hop.script.as_deref().map(str::to_string)
+        let runs = if hop.cached {
+            hop.runs.clone()
         } else {
-            self.proc_script(hop.pid, &hop.exe)
+            self.proc_runs(hop.pid, &hop.exe)
         };
         ExecIdentity {
             exe: hop.exe.clone(),
-            script,
+            runs,
         }
     }
 
-    /// The script or module an interpreter `exe` runs as process `pid`,
-    /// from `/proc/<pid>/cmdline` ([`script_of`]).
-    fn proc_script(&self, pid: u32, exe: &Path) -> Option<String> {
+    /// What an interpreter `exe` runs as process `pid`, from
+    /// `/proc/<pid>/cmdline` ([`runs_of`]).
+    fn proc_runs(&self, pid: u32, exe: &Path) -> Runs {
         let cmdline =
             H::read(self.inner.proc_root.join(pid.to_string()).join("cmdline")).unwrap_or_default();
         let argv: Vec<String> = cmdline
@@ -2523,7 +2563,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .filter(|a| !a.is_empty())
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        script_of(exe, &argv).map(String::from)
+        runs_of(exe, &argv)
     }
 
     /// One hop of the walk as of `as_of` (review #471 A1, R-F): the spawn
@@ -2549,7 +2589,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     ppid: e.ppid,
                     exe: e.exe,
-                    script: e.script,
+                    runs: e.runs,
                     cached: true,
                     spawn_ns: e.spawn_ns,
                     start_ns: e.start_ns,
@@ -2568,7 +2608,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            script: None,
+            runs: Runs::Inline,
             cached: false,
             spawn_ns: 0,
             start_ns: 0,
@@ -2682,6 +2722,22 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// A `/proc` start of `ticks` (boot clock) is the monotonic start
     /// `start_ns` ([`Self::started_at`]).
+    /// Lot 292 (BUG-56): two entries of a pid were made for one process —
+    /// the same start. An exec event's start is exact; one read from
+    /// `/proc` ([`Entry::start_ticks`]: the start's scan, a fork, an
+    /// orphan) is rounded down to a tick and less the time suspended, so it
+    /// is the same start when those ticks show the exact one
+    /// ([`Self::ticks_show_start`]), or when both were read as the same
+    /// ticks.
+    fn same_start(&self, a: &Entry, b: &Entry) -> bool {
+        match (a.start_ticks, b.start_ticks) {
+            (None, None) => a.start_ns == b.start_ns,
+            (Some(ticks), None) => self.ticks_show_start(ticks, b.start_ns),
+            (None, Some(ticks)) => self.ticks_show_start(ticks, a.start_ns),
+            (Some(x), Some(y)) => x == y,
+        }
+    }
+
     fn ticks_show_start(&self, ticks: u64, start_ns: u64) -> bool {
         let tick = H::clock_tick_ns();
         let shown = ticks.saturating_mul(tick);
@@ -2823,7 +2879,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::Current(e) | CachedAt::Past(e) => {
                 return Some(ExecIdentity {
                     exe: e.exe,
-                    script: e.script.as_deref().map(str::to_string),
+                    runs: e.runs,
                 });
             }
             CachedAt::LaterOnly => return None,
@@ -2832,7 +2888,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 // its image ([`Self::fork_entry`]), else not known
                 return self.fork_entry(pid, as_of.time(), 0).map(|e| ExecIdentity {
                     exe: e.exe,
-                    script: e.script.as_deref().map(str::to_string),
+                    runs: e.runs,
                 });
             }
             CachedAt::Absent => {}
@@ -2841,8 +2897,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if exe.to_string_lossy().ends_with(" (deleted)") {
             return None;
         }
-        let script = self.proc_script(pid, &exe);
-        Some(ExecIdentity { exe, script })
+        let runs = self.proc_runs(pid, &exe);
+        Some(ExecIdentity { exe, runs })
     }
 
     /// External audit NETR-008: the image `pid` runs, for a network row
@@ -2992,8 +3048,8 @@ struct Hop {
     pid: u32,
     ppid: u32,
     exe: PathBuf,
-    /// Cached only: what an interpreter `exe` runs ([`Entry::script`]).
-    script: Option<Box<str>>,
+    /// Cached only: what an interpreter `exe` runs ([`Entry::runs`]).
+    runs: Runs,
     /// From the spawn cache (the exec was seen), else from `/proc`.
     cached: bool,
     /// Cached only: when it executed `exe`, and its start.
@@ -3034,50 +3090,11 @@ fn is_node_exe(exe: &Path) -> bool {
 }
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
-/// what they run is named by their arguments, not by their exe.
+/// what they run is named by their arguments, not by their exe. Lot 292:
+/// each family reads them with its own option table
+/// ([`crate::posture::script_args`]).
 pub fn is_interpreter(exe: &Path) -> bool {
-    let base = exe
-        .file_name()
-        .map(|b| b.to_string_lossy())
-        .unwrap_or_default();
-    [
-        "python", "perl", "ruby", "node", "nodejs", "bash", "sh", "dash", "zsh", "ksh", "mono",
-    ]
-    .iter()
-    .any(|i| {
-        base.strip_prefix(i)
-            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    })
-}
-
-/// Review 85: the script or module an interpreter runs, from its argv:
-/// the first argument that is not an option, or the module after `-m`
-/// (also `-Im`, `-Em`). An inline program (`-c`, `-e`, `--eval`) runs
-/// nothing named, and neither does an interpreter with no argument.
-fn script_of(exe: &Path, argv: &[String]) -> Option<Box<str>> {
-    if !is_interpreter(exe) {
-        return None;
-    }
-    let mut args = argv.iter().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "-c" | "-e" | "--eval" | "-p" | "--print" => return None,
-            "-W" | "-X" | "-O" => {
-                args.next();
-            }
-            _ if a.starts_with("--") => {}
-            _ if a.starts_with('-') && a.len() > 1 => {
-                if a.ends_with('m') {
-                    return args.next().map(|m| m.as_str().into());
-                }
-                if a.contains('c') || a.contains('e') {
-                    return None;
-                }
-            }
-            _ => return Some(a.as_str().into()),
-        }
-    }
-    None
+    family_of(exe).is_some()
 }
 
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
@@ -4624,7 +4641,7 @@ mod tests {
         assert_eq!(t.sweep().orphans, 1);
         assert_eq!(
             t.exec_identity(620, AsOf::Judged(H::monotonic_ns()))
-                .and_then(|i| i.script)
+                .and_then(|i| i.script().map(str::to_string))
                 .as_deref(),
             Some("/opt/a.py")
         );
@@ -5332,7 +5349,7 @@ mod tests {
         let (_tmp, t) = fork(10_006 * MS, 9_500 * MS);
         let id = t.exec_identity(801, judged);
         assert_eq!(
-            id.and_then(|i| i.script).as_deref(),
+            id.and_then(|i| i.script().map(str::to_string)).as_deref(),
             Some("/home/u/evil.py")
         );
         let readers = crate::canary::readers::CanaryReaders::new(Default::default(), t.clone());
@@ -5802,7 +5819,7 @@ mod tests {
     #[test]
     fn script_of_reads_the_script_or_module_an_interpreter_runs() {
         let py = Path::new("/usr/bin/python3.12");
-        let s = |a: &[&str]| script_of(py, &argv(a)).map(|b| b.to_string());
+        let s = |a: &[&str]| runs_of(py, &argv(a)).script().map(str::to_string);
         assert_eq!(
             s(&["python3", "/usr/bin/aws", "s3", "ls"]).as_deref(),
             Some("/usr/bin/aws")
@@ -5829,8 +5846,8 @@ mod tests {
         assert_eq!(s(&["python3", "-Sc", "print(1)"]), None);
         assert_eq!(s(&["python3"]), None);
         assert_eq!(
-            script_of(Path::new("/usr/bin/cat"), &argv(&["cat", "/x"])),
-            None
+            runs_of(Path::new("/usr/bin/cat"), &argv(&["cat", "/x"])),
+            Runs::Inline
         );
         assert!(is_interpreter(Path::new("/usr/bin/bash")));
         assert!(is_interpreter(Path::new("/usr/bin/perl5.36")));
@@ -5880,7 +5897,7 @@ mod tests {
             t.exec_identity(100, AsOf::Now),
             Some(ExecIdentity {
                 exe: "/usr/bin/python3.12".into(),
-                script: Some("/usr/bin/aws".into()),
+                runs: Runs::Script("/usr/bin/aws".into()),
             })
         );
         // Not cached: /proc/<pid>/exe and cmdline.
@@ -5892,7 +5909,7 @@ mod tests {
             t.exec_identity(200, AsOf::Now),
             Some(ExecIdentity {
                 exe: "/usr/bin/perl".into(),
-                script: None,
+                runs: Runs::Inline,
             })
         );
         assert_eq!(t.exec_identity(300, AsOf::Now), None, "unknown pid");
@@ -5913,7 +5930,7 @@ mod tests {
     fn a_comm_length_entry_names_the_longer_program() {
         let id = |exe: &str| ExecIdentity {
             exe: PathBuf::from(exe),
-            script: None,
+            runs: Runs::Inline,
         };
         assert!(id("/usr/lib/systemd/systemd-networkd").is_client(&["systemd-network"]));
         assert!(id("/usr/lib/systemd/systemd-networkd").is_known_binary(&["systemd-network"]));
@@ -6193,5 +6210,420 @@ mod tests {
             "no ancestor outside it"
         );
         assert!(!in_agent_containment("/northnarrow.slice-other/x.scope"));
+    }
+
+    // ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-42, BUG-44,
+    // BUG-56 ──────────────────────────────────────────────────────────
+
+    /// BUG-42: a shell's `-e` is errexit (`#!/bin/sh -e`: the kernel runs
+    /// `/bin/sh -e <script>`), not an inline program: the script is named.
+    #[test]
+    fn shell_errexit_script_is_named() {
+        let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a));
+        let mut wrong = Vec::new();
+        for (exe, a, want) in [
+            (
+                "/bin/sh",
+                &["/bin/sh", "-e", "/usr/lib/dpkg/info/foo.postinst"][..],
+                "/usr/lib/dpkg/info/foo.postinst",
+            ),
+            (
+                "/bin/bash",
+                &["/bin/bash", "-eu", "/usr/bin/legit"][..],
+                "/usr/bin/legit",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-e", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+            // lot 292: an option's argument, and the end of the options
+            (
+                "/usr/bin/bash",
+                &["bash", "-euo", "pipefail", "/usr/bin/legit"][..],
+                "/usr/bin/legit",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-O", "extglob", "/usr/bin/legit"][..],
+                "/usr/bin/legit",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-oo", "errexit", "nounset", "/usr/bin/legit"][..],
+                "/usr/bin/legit",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "+e", "+O", "extglob", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "--norc", "--rcfile", "/etc/x", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+            (
+                "/usr/bin/dash",
+                &["sh", "-", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+            (
+                "/usr/bin/dash",
+                &["sh", "--", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+        ] {
+            let got = id(exe, a);
+            if got.script() != Some(want) {
+                wrong.push(format!("{a:?} -> {:?}", got.runs));
+            }
+        }
+        assert!(wrong.is_empty(), "errexit scripts not named: {wrong:?}");
+        // controls: an inline program, or standard input, stays unnamed
+        for a in [
+            &["sh", "-c", "echo"][..],
+            &["bash", "-ec", "echo"],
+            &["sh", "-e", "-c", "echo"],
+            &["bash", "-euo", "pipefail", "-c", "echo"],
+            // `-s`: the commands are read from standard input, and the
+            // arguments are its positional parameters — `/usr/bin/legit`
+            // is not what runs
+            &["sh", "-s", "/usr/bin/legit"],
+            &["bash"],
+        ] {
+            assert_eq!(id("/usr/bin/bash", a).runs, Runs::Inline, "{a:?}");
+        }
+        // a script `-e` names is installed only from a system tree
+        assert!(id(
+            "/bin/sh",
+            &["/bin/sh", "-e", "/usr/lib/dpkg/info/foo.postinst"]
+        )
+        .is_installed_program());
+        assert!(!id("/usr/bin/bash", &["bash", "-e", "/tmp/enc.sh"]).is_client(&["bash"]));
+    }
+
+    /// BUG-44: Python's `-O` takes no argument (nor do Perl's `-X`/`-W`):
+    /// the next argument is the script, not one to skip — else any script
+    /// claims the identity of whatever path follows it.
+    #[test]
+    fn option_without_argument_does_not_skip_the_script() {
+        let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a));
+        let py = id(
+            "/usr/bin/python3",
+            &["python3", "-O", "/home/u/evil.py", "/usr/bin/aws"],
+        );
+        let pl = id(
+            "/usr/bin/perl",
+            &["perl", "-X", "/home/u/evil.pl", "/usr/bin/aws"],
+        );
+        // what the spoof buys, read before the assertions
+        let claims = (
+            py.script().map(str::to_string),
+            py.is_installed_program(),
+            py.is_client(&["aws"]),
+            pl.script().map(str::to_string),
+            pl.is_client(&["aws"]),
+        );
+        assert_eq!(
+            claims,
+            (
+                Some("/home/u/evil.py".to_string()),
+                false,
+                false,
+                Some("/home/u/evil.pl".to_string()),
+                false
+            ),
+            "(py script, py installed, py client aws, pl script, pl client aws)"
+        );
+    }
+
+    /// BUG-44, the same family: an option that takes no argument skips no
+    /// script (Perl's `-W`), and one that takes a separate argument skips
+    /// it (Node's `-r`/`--require`, Ruby's `-r`/`-I`): either way the
+    /// identity is the program the interpreter runs, read with its own
+    /// option table.
+    #[test]
+    fn family_option_arguments_are_paired_per_interpreter() {
+        let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a)).runs;
+        let script = |s: &str| Runs::Script(s.into());
+        let mut wrong = Vec::new();
+        for (exe, a, want) in [
+            (
+                "/usr/bin/perl",
+                &["perl", "-W", "/tmp/e.pl", "/usr/bin/x"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "-r", "/usr/lib/x.js", "/tmp/e.js"][..],
+                script("/tmp/e.js"),
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--require", "/usr/lib/x.js", "/tmp/e.js"][..],
+                script("/tmp/e.js"),
+            ),
+            // lot 292: the rest of each family's table
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-Wignore", "/tmp/e.py", "/usr/bin/aws"][..],
+                script("/tmp/e.py"),
+            ),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-X", "dev", "-OO", "/tmp/e.py"][..],
+                script("/tmp/e.py"),
+            ),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-Xdev", "-uE", "/tmp/e.py"][..],
+                script("/tmp/e.py"),
+            ),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-mhttp.server", "8080"][..],
+                script("http.server"),
+            ),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "--check-hash-based-pycs", "never", "/tmp/e.py"][..],
+                script("/tmp/e.py"),
+            ),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-", "/usr/bin/aws"][..],
+                script("-"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-I", "/usr/share/perl5", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-Mstrict", "-wT", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-pi.bak", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            // `-i` takes the rest: `-pie` is an extension `e`, not `-e`
+            (
+                "/usr/bin/perl",
+                &["perl", "-pie", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-0777", "-n", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-d:NYTProf", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-F:", "-s", "/tmp/e.pl"][..],
+                script("/tmp/e.pl"),
+            ),
+            (
+                "/usr/bin/ruby3.2",
+                &["ruby", "-r", "json", "/tmp/e.rb", "/usr/bin/x"][..],
+                script("/tmp/e.rb"),
+            ),
+            (
+                "/usr/bin/ruby3.2",
+                &["ruby", "-I", "/usr/lib/ruby/x", "-rjson", "/tmp/e.rb"][..],
+                script("/tmp/e.rb"),
+            ),
+            (
+                "/usr/bin/ruby3.2",
+                &["ruby", "-W0", "-Ku", "--disable", "gems", "/tmp/e.rb"][..],
+                script("/tmp/e.rb"),
+            ),
+            (
+                "/usr/bin/node",
+                &[
+                    "node",
+                    "--max-old-space-size=4096",
+                    "--no-warnings",
+                    "/tmp/e.js",
+                ][..],
+                script("/tmp/e.js"),
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--", "/tmp/e.js"][..],
+                script("/tmp/e.js"),
+            ),
+            // inline programs
+            (
+                "/usr/bin/perl",
+                &["perl", "-lane", "/usr/bin/aws"][..],
+                Runs::Inline,
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "-le", "/usr/bin/aws"][..],
+                Runs::Inline,
+            ),
+            ("/usr/bin/perl", &["perl", "-de", "0"][..], Runs::Inline),
+            (
+                "/usr/bin/perl",
+                &["perl", "-CSD", "-E", "say 1"][..],
+                Runs::Inline,
+            ),
+            (
+                "/usr/bin/ruby",
+                &["ruby", "-ne", "/usr/bin/aws"][..],
+                Runs::Inline,
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "-pe", "/usr/bin/aws"][..],
+                Runs::Inline,
+            ),
+            ("/usr/bin/node", &["node", "--eval", "1"][..], Runs::Inline),
+            (
+                "/usr/bin/python3",
+                &["python3", "-Ic", "1"][..],
+                Runs::Inline,
+            ),
+        ] {
+            let got = id(exe, a);
+            if got != want {
+                wrong.push(format!("{a:?} -> {got:?}, not {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Lot 292: an option the interpreter's table does not hold, or one
+    /// whose argument is missing, leaves what it runs not known — never the
+    /// next path. Such an identity is no client and no installed program,
+    /// even when the argument that may be its script lies in a system tree.
+    #[test]
+    fn an_option_the_table_does_not_hold_leaves_the_script_unknown() {
+        let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a));
+        for (exe, a, guess) in [
+            (
+                "/usr/bin/python3",
+                &["python3", "-Z", "/usr/bin/aws"][..],
+                Some("/usr/bin/aws"),
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--frobnicate", "/tmp/e.js", "/usr/bin/aws"][..],
+                Some("/tmp/e.js"),
+            ),
+            (
+                "/usr/bin/zsh",
+                &["zsh", "-T", "/usr/bin/aws", "/tmp/e.sh"][..],
+                Some("/usr/bin/aws"),
+            ),
+            (
+                "/usr/bin/perl",
+                &["perl", "--frobnicate", "/usr/bin/aws"][..],
+                Some("/usr/bin/aws"),
+            ),
+            ("/usr/bin/python3", &["python3", "-W"][..], None),
+            ("/usr/bin/bash", &["bash", "-o"][..], None),
+            (
+                "/usr/bin/perl",
+                &["perl", "-M", "/usr/bin/aws"][..],
+                Some("/usr/bin/aws"),
+            ),
+        ] {
+            let i = id(exe, a);
+            assert_eq!(i.runs, Runs::Unknown(guess.map(Into::into)), "{a:?}");
+            assert_eq!(i.script(), None, "{a:?}");
+            assert!(!i.is_client(&["aws", "e.js", "e.sh"]), "{a:?}");
+            assert!(
+                !i.is_client(&["/usr/"]),
+                "{a:?}: not even by a client's tree"
+            );
+            assert!(!i.is_installed_program(), "{a:?}");
+        }
+        // what a record and a staging check still see
+        let i = id("/usr/bin/node", &["node", "--frobnicate", "/tmp/e.js"]);
+        assert_eq!(i.runs.mentioned(), Some("/tmp/e.js"));
+        assert_eq!(
+            i.program(),
+            "/usr/bin/node /tmp/e.js (options not understood)"
+        );
+        // no argv to read: not known for an interpreter, the file for a binary
+        assert_eq!(
+            ExecIdentity::of_exe("/usr/bin/python3").runs,
+            Runs::Unknown(None)
+        );
+        assert_eq!(ExecIdentity::of_exe("/usr/sbin/nginx").runs, Runs::Inline);
+    }
+
+    /// BUG-56: a process older than the agent (seeded at tick 400) executes
+    /// at 30 s; the exec carries the kernel's exact start (4.003217 s,
+    /// inside tick 400). An event at 20 s is judged on the seeded image
+    /// (`seed_from_proc`'s doc), not "not known".
+    #[test]
+    fn seeded_image_is_the_past_of_an_exec_with_the_exact_start() {
+        let proc = TempDir::new().unwrap();
+        write_started(proc.path(), "self", 1, 500);
+        write_exe(proc.path(), 4800, "/usr/bin/bash");
+        write_status(proc.path(), 4800, 1);
+        write_started(proc.path(), "4800", 1, 400);
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(t.seed_from_proc(), 1);
+        t.ingest_exec(4800, 1, "/usr/bin/restic", &[], 30 * S, 4_003_217_000, 1000);
+        assert_eq!(
+            t.exec_identity(4800, AsOf::Judged(31 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/restic"))
+        );
+        assert_eq!(
+            t.exec_identity(4800, AsOf::Judged(20 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash")),
+            "an event at 20 s, before the exec at 30 s, is the seeded image's"
+        );
+    }
+
+    /// BUG-56, the other side: a pid reused by a process that started after
+    /// the seeded one (10 s, not inside tick 400) and executed at 30 s —
+    /// at 20 s the pid was that later process, whose image then is not
+    /// known: not the seeded one's.
+    #[test]
+    fn a_reused_pid_s_seeded_image_is_not_the_later_process_past() {
+        let proc = TempDir::new().unwrap();
+        write_started(proc.path(), "self", 1, 500);
+        write_exe(proc.path(), 4800, "/usr/bin/bash");
+        write_status(proc.path(), 4800, 1);
+        write_started(proc.path(), "4800", 1, 400);
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(t.seed_from_proc(), 1);
+        t.ingest_exec(4800, 1, "/usr/bin/restic", &[], 30 * S, 10 * S, 1000);
+        assert_eq!(t.exec_identity(4800, AsOf::Judged(20 * S)), None);
+        // before the later process started, the pid was the seeded one
+        assert_eq!(
+            t.exec_identity(4800, AsOf::Judged(9 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
+        // an exec whose start lies past the seeded tick and its slack (two
+        // ticks: 4.02 s) is another process's; one inside it, the same
+        write_exe(proc.path(), 4801, "/usr/bin/bash");
+        write_status(proc.path(), 4801, 1);
+        write_started(proc.path(), "4801", 1, 400);
+        write_exe(proc.path(), 4802, "/usr/bin/bash");
+        write_status(proc.path(), 4802, 1);
+        write_started(proc.path(), "4802", 1, 400);
+        assert_eq!(t.seed_from_proc(), 2);
+        t.ingest_exec(4801, 1, "/usr/bin/restic", &[], 30 * S, 4_020_000_001, 1000);
+        t.ingest_exec(4802, 1, "/usr/bin/restic", &[], 30 * S, 4_020_000_000, 1000);
+        assert_eq!(t.exec_identity(4801, AsOf::Judged(20 * S)), None);
+        assert_eq!(
+            t.exec_identity(4802, AsOf::Judged(20 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
     }
 }
