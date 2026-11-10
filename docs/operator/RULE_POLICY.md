@@ -323,6 +323,19 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
 | `sysctl-allow <sysctl> <value>` or `sysctl-allow <sysctl> <min>..<max>` | (lot 280a) a guarded sysctl may take that value or range outside a trusted-installer window too, each such write recorded; honoured **only signed** (§2.2) |
 
+**Modes on an open flow** (bug hunt 1.3, BUG45). A TCP flow is judged at
+its connect, in snapshots while it stays open and at its close, and a rule
+that answered it is not asked again. An `off` match and an exempt one are no
+answer: they leave the flow to the other rules (an `off`
+NN-L-CHAIN-002 at the connect used to take the flow's chain verdict, so the
+CHAIN-001/CHAIN-007 kill of a credential read on the open session never
+came). A chain answer that ran no response — `alert`, `audit`, an aged
+precursor's record, NN-L-CHAIN-008's `Log` — does not keep a chain's kill
+from a later phase of the flow; another record of a chain on that flow is
+not written. An exempt rule is judged again in the later phases, so its
+recorded-only match may be written again (bounded by the detection budget),
+and it acts there if the exemption no longer holds (§2.3).
+
 `enforce` is **refused** for a rule whose kill would not be fail-safe:
 - NN-L-NET-003, a TLS fingerprint (JA3 or JA4) in the operator's list — one
   attribute many benign programs share, until the rule has a second
