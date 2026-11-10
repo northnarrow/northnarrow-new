@@ -1002,3 +1002,35 @@ holding a flow against a later kill (BUG45). After the upgrade:
   that ended in the middle of a write is not closed (`EXPORT.md` §8).
 - Nothing to configure; the files' formats are unchanged (an `nn-admin` of
   an earlier version reads the new rows).
+
+## 21. The agent's stores and the watchdog's respawn argv (lot 297)
+
+- **The copy-on-first-write journal (EXPERIMENTAL) keeps its copies across
+  a crash** (external bug hunt BUG64). A start after a crash during an
+  append to `index.jsonl` reads every line it can: expect one signed
+  `subsystem_degraded` `journal_open` "1 unreadable line(s) of index.jsonl
+  skipped" — the cut line, nothing lost; the line is ended at that start.
+  An index the agent cannot read at all (a disk error) leaves its scope
+  unprotected for that run (`journal_open: false` in the guard's start row,
+  the same signed `journal_open` naming the error): its copies stay on
+  disk for the next start — check the disk. Before, either case deleted
+  every copy of the scope. A restore keeps both (`<name>.nn-restored-<id>`)
+  when a writer seen before the copy restored wrote again after it (BUG48).
+- **The `response` of a tree kill whose root was not killed** (BUG61) now
+  also names what was left running, after a `;`: `KillProcessTree (already
+  gone; partial: 2 not killed, 1 spared, walk truncated)`. A reader matching
+  the whole string `KillProcessTree (already gone)` misses these; the action
+  stays the first word. Records written before keep their text.
+- **`nn-admin detections` returns** with a directory at a chain path or a
+  failing disk (BUG69, BUG74), and serves the rows it verified when a
+  thousand forged rows came first (BUG59). Nothing to configure.
+- **The watchdog's exec backend** (non-systemd hosts, `--respawn-backend
+  exec`; BUG58, BUG67): the respawned agent gets the first launch's argv
+  byte for byte, an empty argument (`--flag ''`) and one that is not UTF-8
+  included; `/run/northnarrow/agent.argv` keeps them the same way (its
+  format is unchanged). The systemd backend (the default with systemd) was
+  never affected. The agent itself no longer aborts at its start on such an
+  argument, or on an environment variable that is not UTF-8. The `admin_socket_vanished` record says "on N STATUS
+  pings since it last answered" (BUG81: a timeout between two of those
+  pings does not start the count over — that was always so; the text said
+  "in a row").

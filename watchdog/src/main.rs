@@ -1294,15 +1294,18 @@ async fn run_ping_loop(
 /// ERROR on `watchdog.tamper` and a record the agent signs
 /// (`admin_socket_vanished`); a frozen agent signs it after its recovery.
 fn socket_vanished(holds: &std::path::Path, socket: &std::path::Path, agent_pid: u32, pings: u32) {
+    // Lot 297 (external bug hunt BUG81): the pings counted are those since
+    // the agent's last answer — a timeout between them (the socket back,
+    // nothing answering) does not start the count over.
     let secs = STATUS_PING_INTERVAL.as_secs() * u64::from(pings.saturating_sub(1));
     error!(
         target: "watchdog.tamper",
         socket = %socket.display(),
         agent_pid,
         pings,
-        "the agent's admin socket has been gone for at least {secs} s after the agent answered — \
-         removed or replaced while the agent runs, and not bound again (agent frozen or \
-         stuck?); stuck recovery follows if it stays away"
+        "the agent's admin socket was missing on {pings} STATUS pings since the agent last \
+         answered, the first at least {secs} s ago — removed or replaced while the agent runs, \
+         and not bound again (agent frozen or stuck?); stuck recovery follows if it stays away"
     );
     let record = nn_proto::watchdog_hold::HoldRecord {
         at: std::time::SystemTime::now()
@@ -1312,8 +1315,8 @@ fn socket_vanished(holds: &std::path::Path, socket: &std::path::Path, agent_pid:
         agent_pid,
         reason: nn_proto::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED.to_string(),
         detail: format!(
-            "{}: nothing that is the agent answers there on {pings} STATUS pings in a row \
-             (at least {secs} s) after it had answered",
+            "{}: nothing that is the agent was there on {pings} STATUS pings since it last \
+             answered (the first at least {secs} s before)",
             socket.display()
         ),
         unit_state: None,

@@ -169,7 +169,16 @@ was answered.
   mtime, ctime, birth time, mode, owner, SHA-256, the writer (pid, start in
   ticks, program) and its lineage, the time, the method. Orphan objects are
   deleted at start; the file is compacted when it grows past four times its
-  live records.
+  live records. The replay reads it line by line (lot 297, external bug hunt
+  BUG64): a line that does not parse — the last one cut by a crash, even
+  inside a multi-byte character — is skipped and counted (a signed
+  `journal_open` degradation), the others are read, and a cut last line is
+  ended at the open so the next record is a line of its own. An index that
+  cannot be read at all (EIO) leaves its scope out of that run (signed
+  `journal_open`, `journal_open: false` in the start row): no copy is
+  deleted, the index is not compacted, and the next start reads it again.
+  One unreadable line used to fail the whole read, after which the start
+  deleted every copy of the scope as an orphan.
 - **Budget** per scope (`budget=`, default 1 GiB), each copy counted at its
   logical size — a reflink too, since an attacker who rewrites the whole file
   unshares every block. A copy that does not fit evicts the least recently
@@ -207,7 +216,10 @@ writer still runs is skipped. Then, per file:
 1. copy missing or SHA-256 mismatch → **refused** (`journal_corrupt`);
 2. nothing at the path (renamed `.locked`, deleted) → **recreated** (mode,
    owner, mtime of the original); the attack's renamed copy of that inode, in
-   the same directory, is moved to `evidence/` unless someone else wrote it;
+   the same directory, is moved to `evidence/` unless someone else wrote it
+   (names that are not UTF-8 are passed over in that search — lot 297,
+   BUG63: one ended it; a renamed copy whose own name is not UTF-8 stays
+   where it is);
 3. not a regular file now → **kept both**;
 4. content already the original (whatever the inode) → **unchanged**;
 5. another file at the path (other inode, or the inode number reused — the
@@ -222,8 +234,10 @@ writer still runs is skipped. Then, per file:
 "Kept both" writes the original beside the file (`<name>.nn-restored-<entry>`,
 new, never over anything) and reports both: a restore does not overwrite a
 file someone else changed after the attack **as far as the guard saw it**.
-The write-opens of rule 6 are kept in memory (the last 8 per inode, one per
-writer) and lost at a restart, after which only the mtime is compared (rule
+The write-opens of rule 6 are kept in memory (the last 8 writers per inode,
+each writer's latest write-open — lot 297, BUG48: its first one was kept, so
+its edit after a later copy was missed and the restore of that copy
+overwrote it) and lost at a restart, after which only the mtime is compared (rule
 7); a file of 0 bytes is never copied, so its write-opens are not recorded.
 Paths are reached with
 `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |

@@ -108,3 +108,138 @@ fn a_mount_marked_guard_never_waits_on_its_own_journal() {
         "no copy was taken: {status:?}"
     );
 }
+
+/// The guard's copies of `scope`'s files by one writer (`sh`), committed:
+/// waits until the index holds `want` entries.
+fn write_all_and_wait(store: &Store, scope: &std::path::Path, want: usize) {
+    let script = format!(
+        "for f in {}/f*.bin; do printf y >> \"$f\"; done",
+        scope.display()
+    );
+    let ok = Command::new("sh").arg("-c").arg(&script).status().unwrap();
+    assert!(ok.success());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let n = store.index.lock().entry_count(0);
+        if n >= want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} of {want} copies committed within 20 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every entry of the index (sorted by id) and every copy file with its
+/// bytes.
+fn snapshot(
+    store: &Store,
+    journal: &std::path::Path,
+) -> (
+    Vec<northnarrow_agent::cow::index::Entry>,
+    Vec<(String, Vec<u8>)>,
+) {
+    let entries: Vec<_> = store.index.lock().entries().cloned().collect();
+    let mut objects: Vec<(String, Vec<u8>)> = std::fs::read_dir(journal.join("objects"))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    objects.sort();
+    (entries, objects)
+}
+
+/// Lot 297 (external bug hunt BUG64): the guard's real copies (fanotify on
+/// a tmpfs scope) survive a restart whose index.jsonl ends in a line cut
+/// inside a multi-byte character (a crash during an append): the replay
+/// skips that line alone, no copy is deleted as an orphan, and a copy
+/// taken after the restart is a line of its own (the cut line was ended
+/// at the open), there at the start after.
+#[test]
+#[ignore = "requires root (fanotify, a tmpfs mount); lab: nn-lab.sh test-one cow_privileged_e2e"]
+fn a_torn_index_line_keeps_the_guards_copies() {
+    let dir = tempfile::Builder::new()
+        .prefix("nn-cow-torn")
+        .tempdir()
+        .unwrap();
+    let scope = dir.path().join("scope");
+    std::fs::create_dir(&scope).unwrap();
+    let mounted = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=64m", "nn-cow-test"])
+        .arg(&scope)
+        .status()
+        .unwrap();
+    assert!(mounted.success(), "mount a tmpfs at the scope (root?)");
+    let _mount = Mount(scope.clone());
+    for i in 0..10u8 {
+        std::fs::write(scope.join(format!("f{i:02}.bin")), vec![i; 16 * 1024]).unwrap();
+    }
+    let journal = scope.join(".northnarrow-cow");
+    let cfg = CowConfig::parse(&format!(
+        "enabled = true\nscope = {} mark=mount\n",
+        scope.display()
+    ))
+    .unwrap();
+    let tracker = || AuthSessionTracker::new(dir.path());
+
+    // A first run: a copy of every file.
+    let (store, problems) = Store::open(cfg.clone(), None);
+    assert!(problems.is_empty(), "{problems:?}");
+    let guard = Runtime::start(Arc::clone(&store), tracker()).expect("the guard starts");
+    write_all_and_wait(&store, &scope, 10);
+    guard.stop();
+    drop(guard);
+    let (entries, objects) = snapshot(&store, &journal);
+    assert_eq!(entries.len(), 10);
+    assert!(!objects.is_empty());
+    drop(store);
+
+    // The crash: index.jsonl ends in a cut line.
+    let index = journal.join("index.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&index)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"{\"op\":\"entry\",\"entry\":{\"id\":99,\"object\":99,\"scope\":0,\"path\":\"/srv/Universit\xC3",
+    )
+    .unwrap();
+    drop(f);
+
+    // The restart: the copies and their entries as they were, one line
+    // counted; then a second writer's copies.
+    let (store, problems) = Store::open(cfg.clone(), None);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("1 unreadable line(s) of index.jsonl skipped"),
+        "{problems:?}"
+    );
+    assert_eq!(
+        snapshot(&store, &journal),
+        (entries.clone(), objects),
+        "the restart kept every copy and entry"
+    );
+    let guard = Runtime::start(Arc::clone(&store), tracker()).expect("the guard starts");
+    write_all_and_wait(&store, &scope, 20);
+    guard.stop();
+    drop(guard);
+    let (entries, objects) = snapshot(&store, &journal);
+    drop(store);
+
+    // The start after: all of them, still the one line.
+    let (store, problems) = Store::open(cfg, None);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert_eq!(
+        snapshot(&store, &journal),
+        (entries, objects),
+        "the copies taken after the restart are there at the start after"
+    );
+}

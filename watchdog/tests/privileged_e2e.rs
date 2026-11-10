@@ -261,6 +261,11 @@ impl E2eFixture {
     /// pidfile. Returns when the pidfile is observable (the
     /// agent's own readiness signal).
     fn spawn_agent(&mut self) -> u32 {
+        self.spawn_agent_with(&[])
+    }
+
+    /// [`Self::spawn_agent`] with `extra` arguments after the fixture's.
+    fn spawn_agent_with(&mut self, extra: &[&std::ffi::OsStr]) -> u32 {
         // Seed admin.pub with one fresh keypair just so AdminAuth::load
         // doesn't reject an empty file. Tests don't actually use the
         // key — they only need the agent's anti_tamper bring-up.
@@ -284,6 +289,7 @@ impl E2eFixture {
             // a watchdog running the binary it expects — here the test's.
             .arg("--watchdog-exe")
             .arg(self.watchdog_priv_path())
+            .args(extra)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -744,6 +750,58 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
     assert!(
         zombies.is_empty(),
         "zombie children of the watchdog (pid {watchdog_pid}): {zombies:?}"
+    );
+}
+
+/// Lot 297 (external bug hunt BUG58, BUG67): the exec backend respawns the
+/// agent with its first launch's argv byte for byte — an empty argument
+/// and one that is not UTF-8 included. The empty one was dropped (the
+/// respawned agent's parser refused `--ade-prompt --ade-model …` and it
+/// never came back) and the other rewritten with U+FFFD. The two removed
+/// advisor flags take any value and are ignored with a WARN. The lab's
+/// first run of this test found the agent itself aborting at the start on
+/// the non-UTF-8 argument (its self-integrity check read
+/// `std::env::args()`): fixed with it.
+#[test]
+fn a_respawned_agent_has_its_first_launchs_argv_byte_for_byte() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let non_utf8 = std::ffi::OsString::from_vec(b"/nonexistent/mod\xe8le".to_vec());
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent_with(&[
+        std::ffi::OsStr::new("--ade-prompt"),
+        std::ffi::OsStr::new(""),
+        std::ffi::OsStr::new("--ade-model"),
+        &non_utf8,
+    ]);
+    let cmdline = |pid: u32| -> Vec<u8> {
+        let out = Command::new("sudo")
+            .arg("cat")
+            .arg(format!("/proc/{pid}/cmdline"))
+            .output()
+            .expect("sudo cat");
+        out.stdout
+    };
+    let first = cmdline(pid0);
+    let mut tail = b"--ade-prompt\0\0--ade-model\0".to_vec();
+    tail.extend_from_slice(non_utf8.as_bytes());
+    tail.push(0);
+    assert!(
+        first.ends_with(&tail),
+        "the first launch's argv: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+    fx.spawn_watchdog();
+    fx.unprotect_and_sigkill_agent(pid0);
+    let new_pid = new_agent_pid(&fx, pid0, Duration::from_secs(30)).unwrap_or_else(|| {
+        panic!("the watchdog never respawned the agent (an argv its parser refused?)")
+    });
+    let again = cmdline(new_pid);
+    assert_eq!(
+        again,
+        first,
+        "respawn argv {:?}, first launch {:?}",
+        String::from_utf8_lossy(&again),
+        String::from_utf8_lossy(&first)
     );
 }
 

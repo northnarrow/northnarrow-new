@@ -282,15 +282,21 @@ impl DetectionRecord {
 /// stays the first word, so a reader keyed on it (a prefix match) still
 /// finds the action; records written before keep their text (the chain
 /// covers each line as written).
+///
+/// Lot 297 (external bug hunt BUG61): what the tree kill left running is
+/// said whatever became of the root — a root gone, refused or denied with
+/// descendants still running read `"KillProcessTree (already gone)"`, as
+/// if nothing was left. Both now: `"KillProcessTree (already gone;
+/// partial: 2 not killed, 1 spared)"`.
 pub fn describe_response(report: &ExecutionReport) -> String {
-    let outcome = match &report.primary {
+    let root = match &report.primary {
         ExecutionOutcome::WouldExecute { .. } => return "suppressed (detect-only)".to_string(),
         _ if report.action == ResponseAction::Log => return "none".to_string(),
         ExecutionOutcome::Killed { .. }
         | ExecutionOutcome::Blocked { .. }
         | ExecutionOutcome::Quarantined { .. }
         | ExecutionOutcome::Throttled { .. }
-        | ExecutionOutcome::CapabilityStripped { .. } => partial_outcome(&report.additional),
+        | ExecutionOutcome::CapabilityStripped { .. } => None,
         ExecutionOutcome::AlreadyGone { .. } => Some("already gone".to_string()),
         ExecutionOutcome::Refused { reason, .. } => Some(format!("refused: {reason}")),
         ExecutionOutcome::PermissionDenied { .. } => Some("permission denied".to_string()),
@@ -298,6 +304,10 @@ pub fn describe_response(report: &ExecutionReport) -> String {
         ExecutionOutcome::Failed { errno, .. } => Some(format!("failed: {}", errno_text(*errno))),
         // Never a primary outcome today; reported, not hidden, if it becomes one.
         ExecutionOutcome::TreeTruncated { .. } => Some("partial: walk truncated".to_string()),
+    };
+    let outcome = match (root, partial_outcome(&report.additional)) {
+        (Some(root), Some(partial)) => Some(format!("{root}; {partial}")),
+        (root, partial) => root.or(partial),
     };
     let action = format!("{:?}", report.action);
     match outcome {
@@ -1228,12 +1238,22 @@ pub fn read_last_n_verified(
             collected.truncate(limit);
             return;
         };
+        //
+        // Lot 297 (external bug hunt BUG59): a row verified in an earlier
+        // file stays once the failure budget is spent — the loop broke on
+        // the budget before looking at it, and a read whose active file
+        // spent the budget served nothing after its archive fill. Only the
+        // rows not yet checked wait for the budget.
         let mut kept = Vec::with_capacity(limit.min(collected.len()));
         for (r, line, checked) in collected.drain(..) {
-            if kept.len() >= limit || unverified >= MAX_UNVERIFIED_PER_READ {
+            if kept.len() >= limit {
                 break;
             }
-            if checked || crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk) {
+            if checked {
+                kept.push((r, line, true));
+            } else if unverified >= MAX_UNVERIFIED_PER_READ {
+                continue;
+            } else if crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk) {
                 kept.push((r, line, true));
             } else {
                 unverified += 1;
@@ -1306,8 +1326,10 @@ thread_local! {
 /// sealed archive), at most `cap` of them: the ones the read serves first
 /// (highest id, then earliest line), in that order, each with its raw
 /// line when `keep_lines` (the signature check needs it). Best-effort: a
-/// missing / unreadable file contributes nothing; lines that don't parse
-/// as a `DetectionRecord` (terminators, blanks) are skipped.
+/// missing / unreadable file contributes nothing, a read error ends the
+/// file (the rows before it count); lines that don't parse as a
+/// `DetectionRecord` (terminators, blanks, a line that is not UTF-8) are
+/// skipped.
 ///
 /// External audit EVD-010 (NN-AUD-275): a bounded min-heap of `cap`
 /// entries — the file is still read line by line (≤ the rotation cap),
@@ -1318,8 +1340,6 @@ fn collect_matching_from_file(
     cap: usize,
     keep_lines: bool,
 ) -> Vec<(DetectionRecord, String)> {
-    use std::collections::BinaryHeap;
-    use std::io::{BufRead, BufReader};
     if cap == 0 {
         return Vec::new();
     }
@@ -1327,10 +1347,31 @@ fn collect_matching_from_file(
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    collect_matching(std::io::BufReader::new(f), filter, cap, keep_lines)
+}
+
+/// [`collect_matching_from_file`] over the file's reader.
+fn collect_matching(
+    reader: impl std::io::BufRead,
+    filter: &DetectionFilter,
+    cap: usize,
+    keep_lines: bool,
+) -> Vec<(DetectionRecord, String)> {
+    use std::collections::BinaryHeap;
     // Min-heap on the rank: the root is the first to give way.
     let mut held: BinaryHeap<std::cmp::Reverse<Held>> = BinaryHeap::new();
-    for (line_no, line) in BufReader::new(f).lines().enumerate() {
-        let Ok(line) = line else { continue };
+    for (line_no, line) in reader.lines().enumerate() {
+        // Lot 297 (external bug hunt BUG69): a line that is not UTF-8 was
+        // read past and is skipped; any other error ends the file. Every
+        // error was skipped, but a read error repeats at every call without
+        // reading on (a directory at the path: EISDIR; a failing disk: EIO)
+        // and the loop never ended — the admin `Detections` verb hung on a
+        // runtime worker at 100 % CPU.
+        let line = match line {
+            Ok(line) => line,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1503,23 +1544,39 @@ pub fn latest_status_for_ids(
 /// wins within the file, since events are appended oldest-first). Ids
 /// recorded here are removed from `unresolved` AFTER the whole file is
 /// read, so a newer file always shadows an older one for the same id.
-/// Best-effort: a missing/unreadable file contributes nothing; lines
-/// that don't parse as a [`StatusEvent`] (terminators, blanks, the
-/// detection records in a different file) are skipped. Bounded read
-/// (the file is ≤ the rotation cap).
+/// Best-effort: a missing/unreadable file contributes nothing, a read
+/// error ends the file (the events before it count); lines that don't
+/// parse as a [`StatusEvent`] (terminators, blanks, a line that is not
+/// UTF-8, the detection records in a different file) are skipped. Bounded
+/// read (the file is ≤ the rotation cap).
 fn collect_latest_status_from_file(
     path: &Path,
     out: &mut HashMap<u64, DetectionStatus>,
     unresolved: &mut HashSet<u64>,
 ) {
-    use std::io::{BufRead, BufReader};
     let f = match std::fs::OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(_) => return,
     };
+    collect_latest_status(std::io::BufReader::new(f), out, unresolved);
+}
+
+/// [`collect_latest_status_from_file`] over the file's reader.
+fn collect_latest_status(
+    reader: impl std::io::BufRead,
+    out: &mut HashMap<u64, DetectionStatus>,
+    unresolved: &mut HashSet<u64>,
+) {
     let mut touched: Vec<u64> = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let Ok(line) = line else { continue };
+    for line in reader.lines() {
+        // Lot 297 (external bug hunt BUG74): as in
+        // `collect_matching_from_file` (BUG69) — a line that is not UTF-8
+        // skipped, a read error the end of the file, not an endless loop.
+        let line = match line {
+            Ok(line) => line,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -3427,14 +3484,17 @@ mod tests {
                 collected.truncate(limit);
                 return;
             };
+            // lot 297 (BUG59): rows already verified stay past the budget
             let mut kept = Vec::new();
             for (r, line, checked) in collected.drain(..) {
-                if kept.len() >= limit || unverified >= MAX_UNVERIFIED_PER_READ {
+                if kept.len() >= limit {
                     break;
                 }
-                if checked
-                    || crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk)
-                {
+                if checked {
+                    kept.push((r, line, true));
+                } else if unverified >= MAX_UNVERIFIED_PER_READ {
+                    continue;
+                } else if crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk) {
                     kept.push((r, line, true));
                 } else {
                     unverified += 1;
@@ -3987,5 +4047,281 @@ mod tests {
             DetectionStatus::Resolved,
             "overlay reads the latest status through the real signed chain envelope"
         );
+    }
+
+    // ── Lot 297: the external bug hunt (editions 1.2/1.3) ──────────────
+
+    /// Lot 297 (BUG59): rows verified in an earlier file stay in the result
+    /// when the failure budget was spent there and an archive is read next.
+    #[test]
+    fn verified_rows_survive_the_archive_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let key = test_key();
+        let pk = key.verifying_key();
+        {
+            let mut log = RotatingChainLog::<DetectionRecord>::open(
+                &path,
+                key,
+                RotationConfig::default(),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
+            for id in 1001..=1010u64 {
+                log.append_deferred(mk_id(id)).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        // 1000 forged rows, older ids than the genuine ones
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        for id in 1..=1000u64 {
+            body.push_str(&forged_line(mk_id(id)));
+            body.push('\n');
+        }
+        std::fs::write(&path, &body).unwrap();
+        let filter = DetectionFilter::default();
+        // control: no archive, the 10 genuine rows are served
+        let (got, unverified) = read_last_n_verified(&path, 50, &filter, Some(&pk));
+        assert_eq!(ids(&got), (1001..=1010u64).rev().collect::<Vec<_>>());
+        assert_eq!(unverified, MAX_UNVERIFIED_PER_READ);
+        // a sealed archive with no matching row
+        std::fs::write(
+            crate::chainlog::archive_path_for(&path, 1),
+            "{\"rotate\":{\"this_seq\":1}}\n",
+        )
+        .unwrap();
+        let (got, unverified) = read_last_n_verified(&path, 50, &filter, Some(&pk));
+        assert_eq!(unverified, MAX_UNVERIFIED_PER_READ);
+        assert_eq!(
+            ids(&got),
+            (1001..=1010u64).rev().collect::<Vec<_>>(),
+            "verified rows dropped once an archive is read"
+        );
+        // a forged archive row with a higher id than the verified ones: not
+        // checked (the budget is spent), and the verified rows after it in
+        // the read's order still served
+        std::fs::write(
+            crate::chainlog::archive_path_for(&path, 1),
+            forged_line(mk_id(5000)) + "\n",
+        )
+        .unwrap();
+        let (got, unverified) = read_last_n_verified(&path, 50, &filter, Some(&pk));
+        assert_eq!(unverified, MAX_UNVERIFIED_PER_READ);
+        assert_eq!(ids(&got), (1001..=1010u64).rev().collect::<Vec<_>>());
+    }
+
+    /// Lot 297 (BUG61): a tree kill whose root was not killed still says
+    /// what was left of the tree.
+    #[test]
+    fn root_not_killed_hides_the_rest_of_the_tree() {
+        let r = report(
+            ResponseAction::KillProcessTree,
+            ExecutionOutcome::AlreadyGone { pid: 500 },
+            vec![
+                ExecutionOutcome::Failed { pid: 501, errno: 1 },
+                ExecutionOutcome::PermissionDenied { pid: 502, errno: 1 },
+                ExecutionOutcome::Refused {
+                    pid: 503,
+                    reason: "sshd",
+                },
+                ExecutionOutcome::TreeTruncated {
+                    pid: 500,
+                    limit: 4096,
+                },
+            ],
+        );
+        let got = describe_response(&r);
+        assert!(
+            got.contains("partial: 2 not killed, 1 spared, walk truncated"),
+            "root AlreadyGone: {got:?}"
+        );
+        let r = report(
+            ResponseAction::KillProcessTree,
+            ExecutionOutcome::Refused {
+                pid: 500,
+                reason: "PID is protected",
+            },
+            vec![
+                ExecutionOutcome::Killed { pid: 501 },
+                ExecutionOutcome::Failed { pid: 502, errno: 3 },
+            ],
+        );
+        let got = describe_response(&r);
+        assert!(got.contains("1 not killed"), "root Refused: {got:?}");
+    }
+
+    /// Run `f` on a thread; `None` when it does not return within 3 s.
+    fn within_3s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+    }
+
+    /// Lot 297 (BUG69): a directory at the active path or at an archive
+    /// path (open succeeds, every read is EISDIR) contributes nothing; the
+    /// read returns.
+    #[test]
+    fn directory_in_the_detection_set_does_not_hang_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("detections.jsonl");
+        std::fs::create_dir_all(&active).unwrap();
+        let a = active.clone();
+        let got_active = within_3s(move || ids(&read_last_n(&a, 10, &DetectionFilter::default())));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let active = dir2.path().join("detections.jsonl");
+        write_records(&active, &[mk_id(7)]);
+        std::fs::create_dir_all(crate::chainlog::archive_path_for(&active, 1)).unwrap();
+        let got_archive =
+            within_3s(move || ids(&read_last_n(&active, 10, &DetectionFilter::default())));
+        assert_eq!(
+            (got_active, got_archive),
+            (Some(vec![]), Some(vec![7])),
+            "(active path a directory, archive a directory): None = no return within 3 s"
+        );
+    }
+
+    /// Lot 297 (BUG74): the status overlay returns when status_events.jsonl
+    /// is a directory.
+    #[test]
+    fn directory_status_file_does_not_hang_the_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("status_events.jsonl");
+        std::fs::create_dir_all(&p).unwrap();
+        let got = within_3s(move || {
+            let wanted: HashSet<u64> = [7u64].into_iter().collect();
+            latest_status_for_ids(&p, &wanted).len()
+        });
+        assert_eq!(
+            got,
+            Some(0),
+            "status_events.jsonl a directory: no return within 3 s"
+        );
+    }
+
+    /// Lot 297 (BUG69, BUG74): a line that is not UTF-8 in the middle of a
+    /// file is skipped, and the rows after it are still read — the read
+    /// error that ends a file is not this one (`InvalidData`: the line was
+    /// read past). A plain `break` on every error lost them.
+    #[test]
+    fn a_non_utf8_line_in_the_middle_is_skipped_not_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        let evt = dir.path().join("status_events.jsonl");
+        let line = |r: &DetectionRecord| serde_json::to_string(r).unwrap() + "\n";
+        let mut body = line(&mk_id(1)).into_bytes();
+        body.extend_from_slice(b"{\"id\":2,\"comm\":\"\xE8\"}\n");
+        body.extend_from_slice(line(&mk_id(3)).as_bytes());
+        std::fs::write(&det, &body).unwrap();
+        let ev = |e: &StatusEvent| serde_json::to_string(e).unwrap() + "\n";
+        let mut body = ev(&mk_event(
+            1,
+            "2026-06-09T12:01:00.000000Z",
+            DetectionStatus::Acknowledged,
+        ))
+        .into_bytes();
+        body.extend_from_slice(b"\xFF\xFE not a status event\n");
+        body.extend_from_slice(
+            ev(&mk_event(
+                3,
+                "2026-06-09T12:01:01.000000Z",
+                DetectionStatus::Resolved,
+            ))
+            .as_bytes(),
+        );
+        std::fs::write(&evt, &body).unwrap();
+        let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
+        let by_id: Vec<(u64, DetectionStatus)> = got.iter().map(|r| (r.id, r.status)).collect();
+        assert_eq!(
+            by_id,
+            vec![
+                (3, DetectionStatus::Resolved),
+                (1, DetectionStatus::Acknowledged)
+            ]
+        );
+    }
+
+    /// Lot 297 (BUG69, BUG74): a read error ends that file only — the rows
+    /// of the other files are still served (an archive that is a directory
+    /// between two readable files), and an id unresolved in the overlay's
+    /// active file is still resolved in its archive.
+    #[test]
+    fn a_file_that_cannot_be_read_ends_that_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        write_records(&det, &[mk_id(9)]);
+        std::fs::create_dir(crate::chainlog::archive_path_for(&det, 2)).unwrap();
+        write_records(&crate::chainlog::archive_path_for(&det, 1), &[mk_id(4)]);
+        let evt = dir.path().join("status_events.jsonl");
+        std::fs::create_dir(&evt).unwrap();
+        write_events(
+            &crate::chainlog::archive_path_for(&evt, 1),
+            &[mk_event(
+                4,
+                "2026-06-09T12:01:00.000000Z",
+                DetectionStatus::Resolved,
+            )],
+        );
+        let got = within_3s(move || {
+            read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default())
+                .iter()
+                .map(|r| (r.id, r.status))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            got,
+            Some(vec![
+                (9, DetectionStatus::Open),
+                (4, DetectionStatus::Resolved)
+            ])
+        );
+    }
+
+    /// A reader that serves `data`, then fails with EIO at every call
+    /// without reading on (a failing disk).
+    struct FailsAfter(std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// Lot 297 (BUG69, BUG74): an I/O error part-way through a file (EIO,
+    /// at every call) ends that file's read — the rows and events read
+    /// before it count, and an id resolved before it is resolved (no older
+    /// file overrides it). `continue` spun on it for ever.
+    #[test]
+    fn an_io_error_part_way_ends_the_file_and_keeps_what_was_read() {
+        let mut data = Vec::new();
+        for id in [1u64, 2] {
+            data.extend_from_slice((serde_json::to_string(&mk_id(id)).unwrap() + "\n").as_bytes());
+        }
+        let got = within_3s(move || {
+            let r = std::io::BufReader::new(FailsAfter(std::io::Cursor::new(data)));
+            collect_matching(r, &DetectionFilter::default(), 10, false)
+                .into_iter()
+                .map(|(r, _)| r.id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(got, Some(vec![2, 1]));
+
+        let ev = mk_event(4, "2026-06-09T12:01:00.000000Z", DetectionStatus::Resolved);
+        let data = (serde_json::to_string(&ev).unwrap() + "\n").into_bytes();
+        let got = within_3s(move || {
+            let r = std::io::BufReader::new(FailsAfter(std::io::Cursor::new(data)));
+            let mut out = HashMap::new();
+            let mut unresolved: HashSet<u64> = [4u64, 5].into_iter().collect();
+            collect_latest_status(r, &mut out, &mut unresolved);
+            (out, unresolved)
+        });
+        let (out, unresolved) = got.expect("returns within 3 s");
+        assert_eq!(out.get(&4), Some(&DetectionStatus::Resolved));
+        assert_eq!(unresolved, [5u64].into_iter().collect(), "4 resolved here");
     }
 }
