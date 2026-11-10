@@ -600,7 +600,14 @@ actually dropped the hooks was the pin, below.) The pin-name check is
 name-based on purpose (no path walk in the kernel): a path longer than
 255 bytes or a symlink elsewhere that points at a pin is not recognised —
 acceptable for a handle that cannot detach or update anything, while the
-pin files themselves are protected by inode. Independently of the mode,
+pin files themselves are protected by inode. Lot 301: the links
+registered are those the agent holds and every link pinned in any of its
+pin directories that runs one of its programs — the pin root and every
+directory beside it named after it (`/sys/fs/bpf/northnarrow*`: the
+start-in-cgroup tracker's, the sysctl judge's, the module files' write
+history's) — so the tracker's seven links are refused by id too; any other
+entry there is a signed `foreign_pin` at the start, never registered or
+removed. Independently of the mode,
 the agent re-checks every registered link every 10 s through its own fd or
 its pin (no `CAP_SYS_ADMIN` needed: the unit has it only with the
 copy-on-first-write drop-in) and, if one

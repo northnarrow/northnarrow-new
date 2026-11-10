@@ -8261,6 +8261,74 @@ number in parentheses is a lab PR.
   - Levels unchanged (C22 0, C23 2 provisional): an evidence-integrity gap
     of the anchor and of the verifier closed and measured on one kernel —
     not a new capability.
+- **Lot 301 — every BPF object the agent pins is its own to the BPF guard
+  (C23).**
+  - What was open: the guard knows the agent's objects by id
+    (`OWN_BPF_IDS`), and the agent registered as its links only those it
+    holds open and the pin root's `link_*` pins. Lot 300 found a link pinned
+    beside the root and closed (the module files' write history's) in
+    neither; the start-in-cgroup tracker's links (lot 277, pinned in
+    `/sys/fs/bpf/northnarrow-cgroup-join-v*`) were the same. Measured first,
+    on `main` (Ubuntu 24.04, `6.8.0-147-generic`, the guard enforcing): of
+    the agent's 78 links the tracker's 7 were handed to root by
+    `BPF_LINK_GET_FD_BY_ID` outside a window, the other 71 refused;
+    `BPF_LINK_DETACH` on those handles answered `EOPNOTSUPP` (this kernel
+    has no detach for these link types: a hole in the guard, not a detach),
+    the tracker marking still. The new e2e failed on exactly those 7 of the
+    101 objects pinned under `/sys/fs/bpf/northnarrow*`: no other object was
+    pinned and left unregistered.
+  - What changed: at each start the registration walks every pin
+    directory — the root and every directory beside it named after it, the
+    paths the `bpf` hook refuses by prefix — and registers each link there
+    that runs one of the agent's programs (with its pin's name), with every
+    map, program and link the agent holds open; any other entry is a signed
+    `foreign_pin`, never registered or removed (ATP-017's rule, extended from
+    the root's `link_*` entries to every entry). The walk is bounded (4,096
+    entries, four levels, no symbolic link followed). The link self-check,
+    the sensor self-test's attach check and the late registration read the
+    same directories. Named tests: three host tests in `bpf_defense` (the
+    consistency test among them) and the privileged e2e
+    `every_object_pinned_under_the_pin_directories_is_registered_as_the_agent_s`.
+  - The lab, as measured (our own guests under lease k301, one at a time;
+    agents uninstalled, the guests clean and off at the end; `nn-lab.sh
+    own-pins-check` puts the guard in enforce mode for its run):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`): `main` as above. The fix: the
+      start's registration names 31 links in the root, 7 in the tracker's
+      directory, 1 in the write history's, 1 in the sysctl judge's; all 78
+      of the agent's links refused by id (the 79th on the host is not
+      ours), each of the tracker's 7 refused a handle and `bpftool link
+      detach` with `EPERM`, 92 `bpf_link` detections (High) for the 92
+      refused attempts; the tracker marked a root process that moved itself
+      into a cgroup; the agent untouched, no `bpf_link_missing`. The same
+      after a restart in a window (the tracker's new links, ids 365–371),
+      after `upgrade-check` and its cold boot, and — the guard enforcing
+      before an `install.sh --upgrade` in the same boot — on the upgraded
+      agent's own start (ids 207–213; 14 detections for the 14 refused
+      attempts; that run's per-link record match was a script bug, the
+      detection names the caller, not the link; fixed); the cold boot after
+      it: bootcheck OK (77 pins, 47 LSM programs, twice 30 s apart). The e2e
+      on a fresh boot passed (33 s).
+    - **Ubuntu 22.04** (`5.15.0-202-generic`): the same check passed — 75
+      links on the host, 75 refused by id and none given, the tracker's 7
+      refused a handle and a detach, 89 detections, the tracker marking;
+      `verifier-check`: 105 programs, 99 OK, 6 not counted (a kernel's
+      variants), 0 failing (no eBPF change in this lot); the e2e on a fresh
+      boot passed (28 s).
+  - Mutations (a catch is a named test failing): 20 on the new code. 17 caught on the
+    host by the three `bpf_defense` tests, `foreign_link_pin_is_not_registered`,
+    `fdinfo_parser_reads_link_and_prog_ids` and the xtask sysctl test (the
+    pin directories reduced to the root, a symbolic link taken for one, the
+    name prefix dropped, the walk's depth, cap, symbolic links and deep
+    directories, each ownership rule, the names, the cut-short note, the
+    pinned and held links' union, the fdinfo order, the registration without
+    the walk; the symbolic-link mutant was caught once the test's opener
+    resolved a link as `OBJ_GET` does). 1 caught by the e2e on Ubuntu 24.04,
+    a fresh boot: `live_links` reading no pin — the link self-check found
+    the pinned links gone. 2 argued equivalent on this code: the late
+    registration without the walk (nothing is pinned after the start's
+    registration) and the held maps and programs left out (every map and
+    program the agent holds is its object's, registered already).
+  - Level unchanged (C23 2, provisional): a fix inside the capability.
 - **Lot 296 — the chain writers, the audit log and the export after a failed
   write: the external bug hunt's lot 6** (`fix/w4-bh-chain-writers`; the
   triage of editions 1.2/1.3, lot 6: P1 BUG15; then BUG17, BUG27, BUG39,
