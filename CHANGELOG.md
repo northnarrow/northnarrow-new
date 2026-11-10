@@ -38,7 +38,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   seal written whole finishes its rotation. The next row used to be glued
   to the fragment — an audit log the next start refused, so the agent did
   not start in enforce mode; a rotating log broken for good — or, after a
-  failed fsync, chained off the row before (a fork).
+  failed fsync, chained off the row before (a fork). Each rotating log's
+  manifest is created at its open (empty until its first row), so the
+  actions chain's response threads, which may not lift the state
+  directory's immutability, can attest their repair (the lab's finding).
 - A torn tail is attested before it is cut (lot 296, BUG39): the active
   file's at the open, after its manifest row; a manifest's own by its
   attesting row written over the fragment, the file cut after it. A cut
