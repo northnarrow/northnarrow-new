@@ -2381,3 +2381,59 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   signal and `PR_SET_PDEATHSIG` are a parent's and a child's own; the
   limits, the OOM score and the cgroup files are lot 273's, 273b's and
   273c's.
+
+## Lot 301 — every BPF object the agent pins is its own to the BPF guard
+
+**What it closes.** The guard recognises the agent's objects by id
+(`OWN_BPF_IDS`: maps, programs, links), and the agent registered as its
+links only those it holds open and the `link_*` pins of its pin root. A
+link pinned in one of the directories beside the root and closed was in
+neither: lot 300 found `module_write_observe`'s (fixed there, the link held
+open), and the same holds for the seven links of the start-in-cgroup tracker
+(lot 277, lot 281's two LSM programs among them, pinned in
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>`). Its path was
+refused to a foreign `OBJ_GET` (lot 290's prefix), its id was not: a root
+outside a window took a handle on each by `BPF_LINK_GET_FD_BY_ID`. The link
+self-check never expected those links, and the sensor self-test's attach
+check never saw a link pinned beside the root.
+
+**The rule, structural.** At each start — which is where the tracker's
+directory, the module files' write history and the sysctl judge's pins are
+adopted or made — the registration walks every **pin directory**: the pin
+root and every directory beside it whose name begins with the root's
+(`anti_tamper::bpf_defense::own_pin_dirs`), the same paths the `bpf` hook's
+`PIN_DIRS_PREFIX` refuses to a foreign `OBJ_GET`; each entry (any name,
+directories below followed four levels, a symbolic link never) is opened
+and read from `/proc/self/fdinfo`. Registered: every link there that runs
+one of the agent's programs, with its pin's final name (`OWN_PIN_NAMES`);
+every map and program it registers already (its object's), and every map,
+program and link it holds open. Anything else under the pin directories — a
+map or a program that is not one of the agent's, a link that runs another
+program or none, a symbolic link — is reported, not registered and not
+removed: one WARN and one signed `integrity_drift` `foreign_pin` each at the
+start (external audit ATP-017's rule, which judged the root's `link_*`
+entries only: registering a planted object would hand its planter a refusal
+for another product, and a flood of them would fill `OWN_BPF_IDS` and refuse
+the start). A walk stops at 4,096 entries and says so. The late
+registration (the FIM observers, the file-open sensor) takes the pinned
+links again. One view feeds the registration, the link self-check (every
+10 s), the sensor self-test's attach check and the retirement of a link:
+`bpf_defense::live_links`, the links held and those pinned in every pin
+directory. The cross-view judges a link through its program, already the
+agent's.
+
+**What a root outside a window meets now,** in enforce mode: a handle by id
+on one of the tracker's links refused (`EPERM`, NN-L-AT-001 `bpf_link`), so
+no `BPF_LINK_DETACH` or `BPF_LINK_UPDATE` can name it (the kernels the agent
+supports refuse both on these link types anyway); an `OBJ_GET` of its pin
+refused by its name in every window too (the agent's link pins' rule), the
+directory's prefix outside one; an unpin refused by the inode protection.
+A link of the tracker unpinned or detached while the agent runs is a signed
+`bpf_link_missing`.
+
+**What stays open.** The `bpf` hook that refuses a link handle is not
+pinned (lot 290's residual): while no agent runs — a restart's or an
+upgrade's gap, which only a window opens — nothing refuses one. A pinned
+object the agent cannot prove its own by id (an earlier build's map left in
+a pin directory) is reported, not protected by id; its path stays refused by
+the prefix.

@@ -2418,6 +2418,16 @@ impl StateDirProtection {
     }
 }
 
+/// Lot 296: `path` resolves outside `dir` (both resolved: a log's path is
+/// anchored through `/proc/self/fd/<n>`, the directory it was opened in).
+/// `false` when either does not resolve: the caller's own check decides.
+fn outside_dir(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(p), Ok(d)) => !p.starts_with(&d),
+        _ => false,
+    }
+}
+
 impl crate::chainlog::ProtectionManager for StateDirProtection {
     fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         // Serialize the dance first, THEN lift immutability. Drop order is
@@ -2430,6 +2440,20 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
     }
 
     fn register_active(&self, path: &Path) -> Result<()> {
+        // Lot 296: only a file of the state directory. The open makes a
+        // rotating log's manifest now, and a test agent of the privileged
+        // suites, its logs in a directory of its own and its map the
+        // installed agent's (one pin root), protected them: the suites'
+        // removal of their directories was refused, and the installed
+        // agent's ladder answered the refusals.
+        if outside_dir(path, &self.dir) {
+            debug!(
+                path = %path.display(),
+                dir = %self.dir.display(),
+                "anti-tamper FS: not in the state directory — not registered"
+            );
+            return Ok(());
+        }
         let key = crate::fim::attach::key_for_path(path)?;
         // at-authz-1: rotated chain logs are integrity files — WRITE+MUTATE.
         self.inodes
@@ -2452,6 +2476,43 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Lot 296: the state directory's protection registers its own files
+    /// only — one named through the anchor of its directory
+    /// (`/proc/self/fd/<n>`, as the chain logs name theirs) is inside; a
+    /// test agent's log in a directory of its own, or a link out, is not.
+    #[test]
+    fn only_the_state_directory_s_files_are_its_to_register() {
+        let state = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let sub = state.path().join("detections");
+        std::fs::create_dir(&sub).unwrap();
+        let inside = sub.join("actions.jsonl.manifest.jsonl");
+        let elsewhere = other.path().join("actions.jsonl.manifest.jsonl");
+        std::fs::write(&inside, b"").unwrap();
+        std::fs::write(&elsewhere, b"").unwrap();
+        assert!(!outside_dir(&inside, state.path()));
+        assert!(outside_dir(&elsewhere, state.path()));
+        // anchored, as the writers name their files
+        let fd = std::fs::File::open(&sub).unwrap();
+        let anchored = PathBuf::from(format!(
+            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
+            fd.as_raw_fd()
+        ));
+        assert!(!outside_dir(&anchored, state.path()));
+        let fd2 = std::fs::File::open(other.path()).unwrap();
+        let anchored2 = PathBuf::from(format!(
+            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
+            fd2.as_raw_fd()
+        ));
+        assert!(outside_dir(&anchored2, state.path()));
+        // a link in the directory to a file elsewhere is not its file
+        let link = sub.join("link.jsonl");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(outside_dir(&link, state.path()));
+        // a path that does not resolve: the caller's check decides
+        assert!(!outside_dir(&sub.join("gone"), state.path()));
+    }
 
     /// Lot 285 (the CI's privileged suite on #513): the LSM pins are named
     /// after the HOOK (`prog_<hook>`, `link_<hook>`), so a second pinned

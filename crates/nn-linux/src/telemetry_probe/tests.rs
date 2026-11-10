@@ -680,8 +680,9 @@ fn the_module_load_check_reads_each_of_its_programs_where_it_is_linked() {
         let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(name.starts_with(LINK_PIN_PREFIX), "{program}: {name}");
     }
-    // the write history's: beside the root, which the check never walks —
-    // so the agent holds it (the pinned link handed back, kept open)
+    // the write history's: beside the root — the agent holds it (the
+    // pinned link handed back, kept open), and since lot 301 the check
+    // walks that directory too (every pin directory beside the root)
     let link = crate::module_writes::link_pin(&crate::module_writes::pin_dir(root));
     assert_ne!(link.parent(), Some(root));
     let mw = include_str!(concat!(
@@ -698,12 +699,17 @@ fn the_module_load_check_reads_each_of_its_programs_where_it_is_linked() {
         !mw.contains("reattach_fresh(ebpf, PROGRAM"),
         "a link dropped once pinned"
     );
-    // and the check's view takes what the agent holds
+    // and the check's view takes what the agent holds, and (lot 301) every
+    // link pinned in the pin directories, the write history's among them
     let bd = include_str!(concat!(
         env!("NN_REPO_ROOT"),
         "/crates/nn-linux/src/anti_tamper/bpf_defense.rs"
     ));
     let at = bd.find("fn live_links(").expect("live_links");
+    let view = &bd[at..at + 700];
+    assert!(view.contains("held_objects()"), "{view}");
+    assert!(view.contains("pinned_objects(root)"), "{view}");
+    let at = bd.find("fn held_objects(").expect("held_objects");
     assert!(bd[at..at + 400].contains("read_dir(\"/proc/self/fd\")"));
 }
 

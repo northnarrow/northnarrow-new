@@ -65,8 +65,9 @@ const PIN_NAMES_MAP: &str = "OWN_PIN_NAMES";
 /// `PIN_NAME_LEN` in the eBPF crate): a longer name is never matched.
 const PIN_NAME_LEN: usize = 32;
 /// Prefix of the LSM link pins written by `antitamper_bpf::lsm_pin_paths`
-/// (lot 300: and the self-test's consistency test reads it).
-pub(crate) const LINK_PIN_PREFIX: &str = "link_";
+/// (lot 300: and the self-test's consistency test reads it; lot 301: the
+/// walk of the pin directories reads every entry, whatever its name).
+pub const LINK_PIN_PREFIX: &str = "link_";
 /// Period of the link self-check.
 pub const LINK_CHECK_SECS: u64 = 10;
 /// Audit op of a missing link (one entry per link, at the first miss).
@@ -469,6 +470,19 @@ pub(crate) fn register_own_objects(
             }
         }
     }
+    // Lot 301: and every map and program the agent holds open — its own,
+    // wherever it was taken from.
+    for o in held_objects() {
+        match o {
+            BpfObj::Map(id) => map_ids.push(id),
+            BpfObj::Prog(id) => prog_ids.push(id),
+            BpfObj::Link(..) => {}
+        }
+    }
+    map_ids.sort_unstable();
+    map_ids.dedup();
+    prog_ids.sort_unstable();
+    prog_ids.dedup();
     // Every map our programs use must be in the set: a map moved out of the
     // object before its id was recorded would be guarded by nothing.
     let own: HashSet<u32> = map_ids.iter().copied().collect();
@@ -493,52 +507,57 @@ pub(crate) fn register_own_objects(
         own.insert(own_key(KIND_PROG, *id), KIND_PROG, 0)
             .with_context(|| format!("registering own program id {id}"))?;
     }
-    // Links: every loaded link whose program is ours (the LSM hooks, the
-    // tracepoints, the kprobes). The kernel keeps map, program and link
-    // ids in three separate spaces, hence the kind in the value.
-    let link_ids = own_link_ids(&prog_ids, pin_root);
+    // Links: every link the agent holds whose program is ours (the sensors,
+    // the transient hooks) and — lot 301 — every object pinned under its
+    // pin directories, the pin root and those beside it (the start-in-cgroup
+    // tracker's, the sysctl judge's, the module files' write history's, any
+    // later one): each link there that runs one of our programs. Only the
+    // root's `link_*` pins were read, so a link pinned beside it and closed
+    // (the tracker's seven, lot 277) was not registered — a foreign root
+    // took a handle on it by id. The kernel keeps map, program and link ids
+    // in three separate spaces, hence the kind in the value.
+    let own_maps: HashSet<u32> = map_ids.iter().copied().collect();
+    let own_progs: HashSet<u32> = prog_ids.iter().copied().collect();
+    let walk = pin_root.map(pinned_objects).unwrap_or_default();
+    let pins = split_pins(&walk, &own_maps, &own_progs);
+    let link_ids = own_links_of(held_objects(), &pins, &own_progs);
     for id in &link_ids {
         own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
             .with_context(|| format!("registering own link id {id}"))?;
+    }
+    for (dir, ids) in pins.links_by_dir() {
+        info!(
+            dir = %dir.display(),
+            links = ?ids,
+            "BPF self-defence: the links pinned in this directory registered as the agent's own"
+        );
     }
     let _ = guard.0.own_links.set(OwnLinks {
         ids: link_ids.clone(),
         pin_root: pin_root.map(Path::to_path_buf),
     });
-    // Pin names: the final component of every `link_*` pin under the pin
-    // root whose link runs one of our programs, so `OBJ_GET` on a pinned
-    // link is recognised without a path walk in the kernel. External audit
-    // ATP-017 (NN-AUD-265): only those — every `link_*` entry used to go
-    // in, so 64 planted ones (the map's size) refused the start, and a
-    // planted name equal to another product's pin denied that product's
-    // `OBJ_GET`. The others are reported (`foreign_pin`), never registered
-    // or removed.
-    let own_progs: HashSet<u32> = prog_ids.iter().copied().collect();
-    let LinkPins {
-        own: pin_names,
+    // Pin names: the final component of every link pin of ours under the
+    // pin directories, so `OBJ_GET` on a pinned link is recognised without a
+    // path walk in the kernel. External audit ATP-017 (NN-AUD-265): only
+    // those — every `link_*` entry used to go in, so 64 planted ones (the
+    // map's size) refused the start, and a planted name equal to another
+    // product's pin denied that product's `OBJ_GET`. Lot 301: any other
+    // entry under the pin directories (a map or a program that is not one
+    // of ours, a link that runs none of our programs) is reported
+    // (`foreign_pin`), never registered or removed.
+    let PinSplit {
+        names: pin_names,
         foreign,
-    } = link_pins(pin_root, &own_progs);
+        ..
+    } = pins;
     for f in &foreign {
         warn!(
             pin = %f,
-            "BPF self-defence: a link_* entry in the pin root is not one of the agent's links — \
-             not registered, not removed"
+            "BPF self-defence: an entry under the agent's pin directories is not one of its \
+             objects — not registered, not removed"
         );
     }
     *guard.0.foreign_pins.lock() = foreign;
-    // Lot 280a: the cgroup/sysctl judge's link pin, beside the pin root (its
-    // link id is registered above, from the descriptor the agent holds)
-    let mut pin_names = pin_names;
-    if pin_root.is_some()
-        && matches!(
-            crate::sysctl_cgroup::judge(),
-            Some(crate::sysctl_cgroup::Judge::Attached { .. })
-        )
-    {
-        if let Some(k) = pin_name_key(&format!("link_{}", crate::sysctl_cgroup::PROGRAM)) {
-            pin_names.push(k);
-        }
-    }
     {
         let names = ebpf
             .map_mut(PIN_NAMES_MAP)
@@ -875,9 +894,22 @@ pub fn register_late_objects(guard: &BpfGuard, ebpf: &mut Ebpf) -> Result<usize>
     }
     // Lot 290: the cross-view's "own"
     guard.0.own_progs.lock().extend(prog_ids.iter().copied());
-    // Their links are held by this process (not pinned): found through
-    // its descriptors.
-    let link_ids = own_link_ids(&prog_ids, None);
+    // Their links are held by this process (not pinned): found through its
+    // descriptors — lot 301: with every link pinned under the pin
+    // directories that runs one of the agent's programs, so that nothing
+    // pinned since the start's registration escapes it.
+    let own_progs = guard.own_prog_ids();
+    let pin_root = guard.0.own_links.get().and_then(|o| o.pin_root.clone());
+    let link_ids: Vec<u32> = {
+        let mut ids: Vec<u32> = live_links(pin_root.as_deref())
+            .into_iter()
+            .filter(|(_, prog)| own_progs.contains(prog))
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
     let own = ebpf
         .map_mut(OWN_IDS_MAP)
         .with_context(|| format!("{OWN_IDS_MAP} missing from the eBPF object"))?;
@@ -970,16 +1002,18 @@ fn dump_verifier_log(program: &str, e: &anyhow::Error) {
 }
 
 /// Ids of the agent's own links: the links whose fd this process holds
-/// (sensors, transient hooks) plus the pinned LSM links under the pin
-/// root, kept when their program is one of ours. No `CAP_SYS_ADMIN` is
-/// needed — `*_GET_NEXT_ID` would, and the unit does not grant it: every
-/// link is reached through an fd and read from `/proc/self/fdinfo`.
-fn own_link_ids(prog_ids: &[u32], pin_root: Option<&Path>) -> Vec<u32> {
-    let own: HashSet<u32> = prog_ids.iter().copied().collect();
-    let mut ids: Vec<u32> = live_links(pin_root)
+/// (`held`: sensors, transient hooks) and those pinned under its pin
+/// directories (`pins`), kept when their program is one of ours. No
+/// `CAP_SYS_ADMIN` is needed — `*_GET_NEXT_ID` would, and the unit does not
+/// grant it: every link is reached through an fd and read from
+/// `/proc/self/fdinfo`.
+fn own_links_of(held: Vec<BpfObj>, pins: &PinSplit, own_progs: &HashSet<u32>) -> Vec<u32> {
+    let mut ids: Vec<u32> = held
         .into_iter()
-        .filter(|(_, prog)| own.contains(prog))
+        .filter_map(BpfObj::link)
+        .filter(|(_, prog)| own_progs.contains(prog))
         .map(|(id, _)| id)
+        .chain(pins.links.iter().map(|(id, _)| *id))
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -987,9 +1021,50 @@ fn own_link_ids(prog_ids: &[u32], pin_root: Option<&Path>) -> Vec<u32> {
 }
 
 /// `(link_id, prog_id)` of every link reachable from this process right
-/// now: held fds and `link_*` pins. A link detached from outside keeps its
-/// id but reports `prog_id` 0; a pin that is gone is simply absent.
+/// now: held fds and (lot 301) every link pinned under the agent's pin
+/// directories ([`own_pin_dirs`]: the pin root and those beside it) — the
+/// root's `link_*` pins were the only ones read, so a link pinned beside it
+/// and closed (the start-in-cgroup tracker's, lot 277) was neither
+/// registered nor checked. A link detached from outside keeps its id but
+/// reports `prog_id` 0; a pin that is gone is simply absent.
 pub(crate) fn live_links(pin_root: Option<&Path>) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = held_objects()
+        .into_iter()
+        .filter_map(BpfObj::link)
+        .collect();
+    if let Some(root) = pin_root {
+        out.extend(
+            pinned_objects(root)
+                .entries
+                .iter()
+                .filter_map(|p| p.obj.clone().ok().and_then(BpfObj::link)),
+        );
+    }
+    out
+}
+
+/// Lot 301: the BPF object a descriptor holds, as its fdinfo names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BpfObj {
+    Map(u32),
+    Prog(u32),
+    /// `(link_id, prog_id)`: `prog_id` 0 when the link holds no program
+    /// (detached).
+    Link(u32, u32),
+}
+
+impl BpfObj {
+    fn link(self) -> Option<(u32, u32)> {
+        match self {
+            BpfObj::Link(id, prog) => Some((id, prog)),
+            _ => None,
+        }
+    }
+}
+
+/// Every BPF map, program and link whose descriptor this process holds
+/// (`/proc/self/fd`, each read from `/proc/self/fdinfo`).
+fn held_objects() -> Vec<BpfObj> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
         for entry in entries.flatten() {
@@ -1000,48 +1075,149 @@ pub(crate) fn live_links(pin_root: Option<&Path>) -> Vec<(u32, u32)> {
             else {
                 continue;
             };
-            if let Some(link) = link_from_fdinfo(fd) {
-                out.push(link);
-            }
-        }
-    }
-    if let Some(root) = pin_root {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if !name.starts_with(LINK_PIN_PREFIX) {
-                    continue;
-                }
-                if let Some(fd) = obj_get_fd(&entry.path()) {
-                    if let Some(link) = link_from_fdinfo(fd.as_raw_fd()) {
-                        out.push(link);
-                    }
-                }
+            if let Some(o) = obj_from_fdinfo(fd) {
+                out.push(o);
             }
         }
     }
     out
 }
 
-/// `(link_id, prog_id)` from `/proc/self/fdinfo/<fd>` when the fd is a BPF
-/// link (the kernel prints `link_type`, `link_id`, `prog_id` for those).
-fn link_from_fdinfo(fd: i32) -> Option<(u32, u32)> {
+/// The BPF object `/proc/self/fdinfo/<fd>` describes, if any.
+fn obj_from_fdinfo(fd: i32) -> Option<BpfObj> {
     let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
-    parse_link_fdinfo(&text)
+    parse_obj_fdinfo(&text)
 }
 
-fn parse_link_fdinfo(text: &str) -> Option<(u32, u32)> {
-    let mut link_id = None;
-    let mut prog_id = None;
+/// The kernel prints `link_id` and `prog_id` for a link (an iterator link
+/// over a map's elements adds a `map_id`: a link is told first), `map_id`
+/// for a map, `prog_id` for a program; nothing of these for any other file.
+fn parse_obj_fdinfo(text: &str) -> Option<BpfObj> {
+    let (mut link, mut map, mut prog) = (None, None, None);
     for line in text.lines() {
-        if let Some(v) = line.strip_prefix("link_id:") {
-            link_id = v.trim().parse::<u32>().ok();
-        } else if let Some(v) = line.strip_prefix("prog_id:") {
-            prog_id = v.trim().parse::<u32>().ok();
+        let field = |name: &str| {
+            line.strip_prefix(name)
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        };
+        if let Some(v) = field("link_id:") {
+            link = Some(v);
+        } else if let Some(v) = field("map_id:") {
+            map = Some(v);
+        } else if let Some(v) = field("prog_id:") {
+            prog = Some(v);
         }
     }
-    Some((link_id?, prog_id.unwrap_or(0)))
+    match (link, map, prog) {
+        (Some(id), _, p) => Some(BpfObj::Link(id, p.unwrap_or(0))),
+        (None, Some(id), _) => Some(BpfObj::Map(id)),
+        (None, None, Some(id)) => Some(BpfObj::Prog(id)),
+        (None, None, None) => None,
+    }
+}
+
+/// Lot 301: the most entries one walk of the pin directories reads (the
+/// agent pins under 200; past this a planted flood is not judged further,
+/// and that is said).
+const PIN_WALK_MAX: usize = 4096;
+/// Lot 301: how deep a walk goes below a pin directory (the agent makes no
+/// directory in one; a planted tree is not followed further).
+const PIN_WALK_DEPTH: u32 = 4;
+
+/// Lot 301: the agent's pin directories — the pin root and every directory
+/// beside it whose name begins with the root's: the start-in-cgroup
+/// tracker's (`<root>-cgroup-join-v<schema>_<generation>`), the sysctl
+/// judge's (`<root>-sysctl`), the module files' write history's
+/// (`<root>-module-writes`) and any later one. The `bpf` hook refuses a
+/// foreign `OBJ_GET` under the same prefix (`PIN_DIRS_PREFIX` in the eBPF
+/// crate); the registration walks the same directories. A symbolic link is
+/// never one.
+pub fn own_pin_dirs(pin_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let (Some(parent), Some(name)) = (pin_root.parent(), pin_root.file_name()) else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().as_bytes().starts_with(name.as_bytes()) {
+            continue;
+        }
+        if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Lot 301: one entry under the agent's pin directories and the object it
+/// holds — `Err` says why it holds none the agent could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pinned {
+    pub path: PathBuf,
+    pub obj: std::result::Result<BpfObj, String>,
+}
+
+/// Lot 301: one walk of the pin directories.
+#[derive(Debug, Default)]
+pub(crate) struct PinWalk {
+    pub entries: Vec<Pinned>,
+    /// The walk stopped at [`PIN_WALK_MAX`] entries.
+    pub truncated: bool,
+}
+
+/// Lot 301: every entry under the pin directories of `pin_root`
+/// ([`own_pin_dirs`]), each opened (`OBJ_GET`) and read from
+/// `/proc/self/fdinfo`.
+pub(crate) fn pinned_objects(pin_root: &Path) -> PinWalk {
+    walk_pins(&own_pin_dirs(pin_root), &|path| {
+        let fd = obj_get_fd(path).ok_or_else(|| "not openable as a BPF object".to_string())?;
+        obj_from_fdinfo(fd.as_raw_fd()).ok_or_else(|| "not a BPF map, program or link".to_string())
+    })
+}
+
+/// [`pinned_objects`] with the opener given: every entry of `dirs` and of
+/// the directories below them ([`PIN_WALK_DEPTH`] deep), a symbolic link
+/// never followed (it could name an object anywhere), at most
+/// [`PIN_WALK_MAX`] entries.
+fn walk_pins(
+    dirs: &[PathBuf],
+    open: &dyn Fn(&Path) -> std::result::Result<BpfObj, String>,
+) -> PinWalk {
+    let mut walk = PinWalk::default();
+    let mut todo: Vec<(PathBuf, u32)> = dirs.iter().rev().map(|d| (d.clone(), 0)).collect();
+    while let Some((dir, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && depth < PIN_WALK_DEPTH {
+                todo.push((path, depth + 1));
+                continue;
+            }
+            if walk.entries.len() >= PIN_WALK_MAX {
+                walk.truncated = true;
+                return walk;
+            }
+            let obj = if meta.is_dir() {
+                Err(format!(
+                    "a directory {PIN_WALK_DEPTH} levels down a pin directory: not walked"
+                ))
+            } else if meta.file_type().is_symlink() {
+                Err("a symbolic link: not followed".to_string())
+            } else {
+                open(&path)
+            };
+            walk.entries.push(Pinned { path, obj });
+        }
+    }
+    walk
 }
 
 /// Open a bpffs pin (`BPF_OBJ_GET`) and own the fd. aya keeps the fd of a
@@ -1071,78 +1247,98 @@ fn obj_get_fd(path: &Path) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-/// External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
-/// root, split by owner — `own` holds the [`pin_name_key`] of each pin whose
-/// link runs one of the agent's programs, `foreign` a description of each
-/// other entry.
+/// Lot 301 (from external audit ATP-017, NN-AUD-265, the root's `link_*`
+/// entries): the entries of the pin directories split by owner.
 #[derive(Debug, Default)]
-struct LinkPins {
-    own: Vec<u64>,
+struct PinSplit {
+    /// Each link of the agent's pinned there, with its pin.
+    links: Vec<(u32, PathBuf)>,
+    /// The [`pin_name_key`] of each of those pins.
+    names: Vec<u64>,
+    /// A description of every other entry (not registered, not removed).
     foreign: Vec<String>,
 }
 
-/// Kind of the signed `integrity_drift` for a `link_*` entry of the pin
-/// root that is not one of the agent's links.
-pub const FOREIGN_PIN_KIND: &str = "foreign_pin";
-
-/// Whose link a `link_*` entry holds: `link` is its `(link_id, prog_id)`
-/// (`None`: not a link, or not openable as one). `Err` says why it is not
-/// one of the agent's.
-fn link_pin_owner(link: Option<(u32, u32)>, own_progs: &HashSet<u32>) -> Result<(), String> {
-    match link {
-        None => Err("not a BPF link".to_string()),
-        Some((id, 0)) => Err(format!("link {id} holds no program (detached)")),
-        Some((id, prog)) if !own_progs.contains(&prog) => Err(format!(
-            "link {id} runs program {prog}, not one of the agent's"
-        )),
-        Some(_) => Ok(()),
+impl PinSplit {
+    /// The agent's pinned links, by directory.
+    fn links_by_dir(&self) -> std::collections::BTreeMap<PathBuf, Vec<u32>> {
+        let mut by_dir: std::collections::BTreeMap<PathBuf, Vec<u32>> = Default::default();
+        for (id, pin) in &self.links {
+            let dir = pin.parent().map(Path::to_path_buf).unwrap_or_default();
+            by_dir.entry(dir).or_default().push(*id);
+        }
+        by_dir
     }
 }
 
-/// The `link_*` entries under `pin_root`, each opened (`OBJ_GET`) and read
-/// from `/proc/self/fdinfo` like [`own_link_ids`] does, split by owner
-/// ([`link_pin_owner`]). Names that do not fit the key are skipped with a
-/// WARN — none of ours is that long.
-fn link_pins(pin_root: Option<&Path>, own_progs: &HashSet<u32>) -> LinkPins {
-    let mut out = LinkPins::default();
-    let Some(root) = pin_root else {
-        return out;
-    };
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, path = %root.display(), "BPF self-defence: cannot list the pin root — link pins not registered by name");
-            return out;
-        }
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(LINK_PIN_PREFIX) {
+/// Kind of the signed `integrity_drift` for an entry under the agent's pin
+/// directories that is not one of its objects (lot 301: any entry; a
+/// `link_*` entry of the pin root before).
+pub const FOREIGN_PIN_KIND: &str = "foreign_pin";
+
+/// Whose object a pinned entry holds (`Err`: none the agent could read). A
+/// map or a program is the agent's when its id is one the agent registers
+/// (`maps`, `progs`: its object's and those it holds); a link when it runs
+/// one of the agent's programs. `Err` says why the entry is not the
+/// agent's.
+fn pinned_owner(
+    obj: &std::result::Result<BpfObj, String>,
+    maps: &HashSet<u32>,
+    progs: &HashSet<u32>,
+) -> std::result::Result<(), String> {
+    match obj {
+        Err(why) => Err(why.clone()),
+        Ok(BpfObj::Map(id)) if maps.contains(id) => Ok(()),
+        Ok(BpfObj::Map(id)) => Err(format!("map {id}, not one of the agent's")),
+        Ok(BpfObj::Prog(id)) if progs.contains(id) => Ok(()),
+        Ok(BpfObj::Prog(id)) => Err(format!("program {id}, not one of the agent's")),
+        Ok(BpfObj::Link(id, 0)) => Err(format!("link {id} holds no program (detached)")),
+        Ok(BpfObj::Link(_, prog)) if progs.contains(prog) => Ok(()),
+        Ok(BpfObj::Link(id, prog)) => Err(format!(
+            "link {id} runs program {prog}, not one of the agent's"
+        )),
+    }
+}
+
+/// The walk's entries split by owner ([`pinned_owner`]): the agent's
+/// links, with their pins' names (a name that does not fit the key is
+/// skipped with a WARN — none of ours is that long), and every entry that
+/// is not the agent's. A walk cut short says so among the foreign.
+fn split_pins(walk: &PinWalk, maps: &HashSet<u32>, progs: &HashSet<u32>) -> PinSplit {
+    let mut out = PinSplit::default();
+    for p in &walk.entries {
+        if let Err(why) = pinned_owner(&p.obj, maps, progs) {
+            out.foreign.push(format!("{}: {why}", p.path.display()));
             continue;
         }
-        let link = obj_get_fd(&entry.path()).and_then(|fd| link_from_fdinfo(fd.as_raw_fd()));
-        if let Err(why) = link_pin_owner(link, own_progs) {
-            out.foreign
-                .push(format!("{}: {why}", entry.path().display()));
+        let Ok(BpfObj::Link(id, _)) = p.obj else {
             continue;
-        }
+        };
+        out.links.push((id, p.path.clone()));
+        let name = p.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         match pin_name_key(name) {
-            Some(k) => out.own.push(k),
+            Some(k) => out.names.push(k),
             None => warn!(
-                name,
+                pin = %p.path.display(),
                 "BPF self-defence: link pin name too long for OWN_PIN_NAMES — not registered"
             ),
         }
+    }
+    if walk.truncated {
+        out.foreign.push(format!(
+            "more than {PIN_WALK_MAX} entries under the agent's pin directories: the rest not \
+             judged"
+        ));
     }
     out
 }
 
 impl BpfGuard {
-    /// One signed `integrity_drift` ([`FOREIGN_PIN_KIND`]) per `link_*` entry
-    /// of the pin root found at boot that is not one of the agent's links (a
-    /// stale pin of an earlier build, or one a root planted). Called by the
-    /// start once the audit log is open.
+    /// One signed `integrity_drift` ([`FOREIGN_PIN_KIND`]) per entry under
+    /// the agent's pin directories found at boot that is not one of its
+    /// objects (a stale pin of an earlier build, or one a root planted; lot
+    /// 301: any entry of any of them — a `link_*` entry of the root before).
+    /// Called by the start once the audit log is open.
     pub fn attest_foreign_pins(&self, audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>) {
         let foreign = std::mem::take(&mut *self.0.foreign_pins.lock());
         if foreign.is_empty() {
@@ -1150,8 +1346,8 @@ impl BpfGuard {
         }
         error!(
             count = foreign.len(),
-            "INTEGRITY DRIFT — link_* entries in the agent's pin root that are not its links \
-         (not registered as its own, not removed)"
+            "INTEGRITY DRIFT — entries under the agent's pin directories that are not its \
+             objects (not registered as its own, not removed)"
         );
         let Some(log) = audit_log else {
             return;
@@ -1162,8 +1358,8 @@ impl BpfGuard {
                 extra: serde_json::json!({
                     "kind": FOREIGN_PIN_KIND,
                     "detail": format!(
-                        "{detail} — a link_* entry in the pin root that is not the agent's: not \
-                         registered as its own, not removed"
+                        "{detail} — an entry under the agent's pin directories that is not one \
+                         of its objects: not registered as its own, not removed"
                     ),
                     "at_boot": true,
                 }),
@@ -1335,50 +1531,270 @@ mod tests {
     /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
     /// of the agent's programs is its own; anything else named `link_*` is
     /// reported, not registered — 70 of them no longer overflow the
-    /// 64-entry `OWN_PIN_NAMES` and refuse the start.
+    /// 64-entry `OWN_PIN_NAMES` and refuse the start. Lot 301: every entry
+    /// of the pin directories is judged, whatever its name (the root's
+    /// `prog_task_kill` that is no BPF object is reported too), a directory
+    /// is walked, not reported.
     #[test]
     fn foreign_link_pin_is_not_registered() {
         let own: HashSet<u32> = [7u32, 9].into_iter().collect();
-        assert_eq!(link_pin_owner(Some((3, 7)), &own), Ok(()));
-        assert!(link_pin_owner(None, &own)
+        let maps: HashSet<u32> = [4u32].into_iter().collect();
+        assert_eq!(pinned_owner(&Ok(BpfObj::Link(3, 7)), &maps, &own), Ok(()));
+        assert!(pinned_owner(&Err("not a BPF link".into()), &maps, &own)
             .unwrap_err()
             .contains("not a BPF link"));
-        assert!(link_pin_owner(Some((3, 0)), &own)
+        assert!(pinned_owner(&Ok(BpfObj::Link(3, 0)), &maps, &own)
             .unwrap_err()
             .contains("detached"));
-        assert!(link_pin_owner(Some((3, 8)), &own)
+        assert!(pinned_owner(&Ok(BpfObj::Link(3, 8)), &maps, &own)
             .unwrap_err()
             .contains("program 8, not one of the agent's"));
 
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("link_x"), "").unwrap();
-        std::fs::create_dir(root.path().join("link_dir")).unwrap();
-        std::fs::write(root.path().join("prog_task_kill"), "").unwrap();
+        let bpffs = tempfile::tempdir().unwrap();
+        let root = bpffs.path().join("northnarrow");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("link_x"), "").unwrap();
+        std::fs::create_dir(root.join("link_dir")).unwrap();
+        std::fs::write(root.join("prog_task_kill"), "").unwrap();
         for i in 0..70 {
-            std::fs::write(root.path().join(format!("link_planted_{i}")), "").unwrap();
+            std::fs::write(root.join(format!("link_planted_{i}")), "").unwrap();
         }
-        let pins = link_pins(Some(root.path()), &own);
-        assert!(pins.own.is_empty(), "no planted name is registered");
+        let pins = split_pins(&pinned_objects(&root), &maps, &own);
+        assert!(pins.links.is_empty(), "no planted entry is registered");
+        assert!(pins.names.is_empty(), "no planted name is registered");
         assert_eq!(pins.foreign.len(), 72, "{:?}", pins.foreign);
         assert!(pins
             .foreign
             .iter()
-            .any(|f| f.contains("link_x: not a BPF link")));
-        assert!(!pins.foreign.iter().any(|f| f.contains("prog_task_kill")));
-        assert!(link_pins(None, &own).foreign.is_empty());
+            .any(|f| f.contains("link_x: not openable as a BPF object")));
+        assert!(pins.foreign.iter().any(|f| f.contains("prog_task_kill")));
+        assert!(!pins.foreign.iter().any(|f| f.contains("link_dir")));
+        assert!(split_pins(&PinWalk::default(), &maps, &own)
+            .foreign
+            .is_empty());
     }
 
     #[test]
     fn fdinfo_parser_reads_link_and_prog_ids() {
         let text = "pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1058\nlink_type:\ttracing\nlink_id:\t557\nprog_tag:\tdeadbeef\nprog_id:\t781\n";
-        assert_eq!(parse_link_fdinfo(text), Some((557, 781)));
+        assert_eq!(parse_obj_fdinfo(text), Some(BpfObj::Link(557, 781)));
         // detached link: prog_id 0
         assert_eq!(
-            parse_link_fdinfo("link_id:\t5\nprog_id:\t0\n"),
-            Some((5, 0))
+            parse_obj_fdinfo("link_id:\t5\nprog_id:\t0\n"),
+            Some(BpfObj::Link(5, 0))
         );
-        // not a link
-        assert_eq!(parse_link_fdinfo("pos:\t0\nflags:\t02\n"), None);
+        // not a BPF object
+        assert_eq!(parse_obj_fdinfo("pos:\t0\nflags:\t02\n"), None);
+        // Lot 301: a map (5.15's and 6.8's fields), a program, an iterator
+        // link over a map's elements (it prints the map's id too)
+        let map = "pos:\t0\nflags:\t02000002\nmap_type:\t1\nkey_size:\t8\nvalue_size:\t1\nmax_entries:\t1024\nmap_flags:\t0x0\nmemlock:\t81920\nmap_id:\t312\nfrozen:\t0\n";
+        assert_eq!(parse_obj_fdinfo(map), Some(BpfObj::Map(312)));
+        let prog = "pos:\t0\nflags:\t02000002\nprog_type:\t29\nprog_jited:\t1\nprog_tag:\t0123456789abcdef\nmemlock:\t4096\nprog_id:\t1243\nrun_time_ns:\t0\nrun_cnt:\t0\nrecursion_misses:\t0\nverified_insns:\t466\n";
+        assert_eq!(parse_obj_fdinfo(prog), Some(BpfObj::Prog(1243)));
+        let iter = "link_type:\titer\nlink_id:\t9\nprog_tag:\tab\nprog_id:\t44\ntarget_name:\tbpf_map_elem\nmap_id:\t312\n";
+        assert_eq!(parse_obj_fdinfo(iter), Some(BpfObj::Link(9, 44)));
+    }
+
+    /// Lot 301: the pin directories are the pin root and every directory
+    /// beside it that the start-in-cgroup tracker, the sysctl judge and the
+    /// module files' write history pin in — each named after the root, so
+    /// the `bpf` hook's prefix refuses a foreign `OBJ_GET` in each — and
+    /// nothing else: not a file, not a symbolic link, not another product's
+    /// directory.
+    #[test]
+    fn the_pin_directories_are_the_root_and_those_beside_it() {
+        let bpffs = tempfile::tempdir().unwrap();
+        let root = bpffs.path().join("northnarrow");
+        let tracker = PathBuf::from(common::cgroup_join::pin_dir(root.to_str().unwrap(), 3));
+        let sysctl = crate::sysctl_cgroup::pin_dir(&root);
+        let writes = crate::module_writes::pin_dir(&root);
+        for d in [&root, &tracker, &sysctl, &writes] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::create_dir(bpffs.path().join("tc")).unwrap();
+        std::fs::create_dir(bpffs.path().join("nn-feasibility")).unwrap();
+        std::fs::write(bpffs.path().join("northnarrow-file"), "").unwrap();
+        std::os::unix::fs::symlink(
+            bpffs.path().join("tc"),
+            bpffs.path().join("northnarrow-elsewhere"),
+        )
+        .unwrap();
+        let mut want = vec![root.clone(), tracker, sysctl, writes];
+        want.sort();
+        assert_eq!(own_pin_dirs(&root), want);
+        // the hook's prefix is the production root's: every directory the
+        // agent pins in on a host starts with it
+        let ebpf = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent-ebpf/src/bpf_defense.rs"
+        ));
+        let prefix = ebpf
+            .split("const PIN_DIRS_PREFIX: &[u8; 23] = b\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("PIN_DIRS_PREFIX");
+        assert_eq!(prefix, antitamper_bpf::DEFAULT_BPFFS_ROOT);
+        let real = Path::new(antitamper_bpf::DEFAULT_BPFFS_ROOT);
+        for d in [
+            common::cgroup_join::pin_dir(antitamper_bpf::DEFAULT_BPFFS_ROOT, 0),
+            crate::sysctl_cgroup::pin_dir(real).display().to_string(),
+            crate::module_writes::pin_dir(real).display().to_string(),
+        ] {
+            assert!(
+                d.starts_with(prefix) && Path::new(&d).parent() == real.parent(),
+                "{d}"
+            );
+        }
+        assert!(own_pin_dirs(Path::new("/")).is_empty());
+    }
+
+    /// Lot 301 (named; the host half of the consistency check, the
+    /// privileged e2e `every_object_pinned_under_the_pin_directories_is_
+    /// registered_as_the_agent_s` is the kernel's): every object pinned
+    /// under any of the pin directories is either registered as the
+    /// agent's — a link that runs one of its programs, whatever the pin's
+    /// name or depth, with its pin's name; a map or a program it registers
+    /// — or reported, never left out in silence. Lot 300 found the tracker's
+    /// links (pinned beside the root and closed) in neither: the root's
+    /// `link_*` pins were the only ones read.
+    #[test]
+    fn every_object_pinned_under_the_pin_directories_is_registered_or_reported() {
+        let bpffs = tempfile::tempdir().unwrap();
+        let root = bpffs.path().join("northnarrow");
+        let tracker = PathBuf::from(common::cgroup_join::pin_dir(root.to_str().unwrap(), 0));
+        let sysctl = crate::sysctl_cgroup::pin_dir(&root);
+        let writes = crate::module_writes::pin_dir(&root);
+        let other = bpffs.path().join("other");
+        for d in [&root, &tracker, &sysctl, &writes, &other] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        // what each pin holds, for the fake opener (an empty file: not a
+        // BPF object)
+        let mut objs: Vec<(PathBuf, BpfObj)> = vec![
+            (root.join("link_task_kill"), BpfObj::Link(10, 100)),
+            (root.join("prog_task_kill"), BpfObj::Prog(100)),
+            (root.join("PROTECTED_PIDS"), BpfObj::Map(5)),
+            (root.join("sub/deeper/odd_name"), BpfObj::Link(50, 100)),
+            (root.join("link_foreign"), BpfObj::Link(60, 999)),
+            (root.join("link_detached"), BpfObj::Link(61, 0)),
+            (root.join("STALE_MAP"), BpfObj::Map(77)),
+            (root.join("prog_planted"), BpfObj::Prog(888)),
+            (tracker.join("CGROUP_JOINED"), BpfObj::Map(6)),
+            (sysctl.join("link_nn_sysctl_guard"), BpfObj::Link(30, 300)),
+            (sysctl.join("prog_nn_sysctl_guard"), BpfObj::Prog(300)),
+            (
+                crate::module_writes::link_pin(&writes),
+                BpfObj::Link(40, 400),
+            ),
+            (other.join("link_x"), BpfObj::Link(70, 100)),
+        ];
+        for (i, (name, _, _)) in crate::cgroup_join::PROGRAMS.iter().enumerate() {
+            let (prog, link) = crate::cgroup_join::pin_paths(&tracker, name);
+            objs.push((link, BpfObj::Link(20 + i as u32, 200 + i as u32)));
+            objs.push((prog, BpfObj::Prog(200 + i as u32)));
+        }
+        for (p, _) in &objs {
+            std::fs::write(p, "").unwrap();
+        }
+        std::fs::write(root.join("not_bpf"), "").unwrap();
+        std::os::unix::fs::symlink(tracker.join("link_cgroup_join_mark"), root.join("link_sym"))
+            .unwrap();
+        // as `OBJ_GET` would: a symbolic link resolved to what it names
+        let open = |p: &Path| {
+            let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            objs.iter()
+                .find(|(q, _)| std::fs::canonicalize(q).is_ok_and(|q| q == real))
+                .map(|(_, o)| *o)
+                .ok_or_else(|| "not openable as a BPF object".to_string())
+        };
+        let walk = walk_pins(&own_pin_dirs(&root), &open);
+        assert!(!walk.truncated);
+        assert!(
+            !walk.entries.iter().any(|e| e.path.starts_with(&other)),
+            "another directory walked"
+        );
+        let progs: HashSet<u32> = [100, 300, 400].into_iter().chain(200..207).collect();
+        let maps: HashSet<u32> = [5, 6].into_iter().collect();
+        let pins = split_pins(&walk, &maps, &progs);
+        let mut links: Vec<u32> = pins.links.iter().map(|(id, _)| *id).collect();
+        links.sort_unstable();
+        let mut want: Vec<u32> = vec![10, 30, 40, 50];
+        want.extend(20..27);
+        want.sort_unstable();
+        assert_eq!(links, want, "the agent's pinned links");
+        // the tracker's seven, by directory
+        let by_dir = pins.links_by_dir();
+        assert_eq!(by_dir.get(&tracker).map(Vec::len), Some(7), "{by_dir:?}");
+        // their pins' names (the kernel's OBJ_GET match), each of them
+        for (_, pin) in &pins.links {
+            let name = pin.file_name().unwrap().to_str().unwrap();
+            assert!(pins.names.contains(&pin_name_key(name).unwrap()), "{name}");
+        }
+        assert_eq!(pins.names.len(), pins.links.len());
+        // everything else reported, nothing in silence
+        let mut foreign: Vec<String> = pins
+            .foreign
+            .iter()
+            .map(|f| f.split_once(": ").map(|(p, _)| p.to_string()).unwrap())
+            .collect();
+        foreign.sort();
+        let mut want_foreign: Vec<String> = [
+            "link_detached",
+            "link_foreign",
+            "link_sym",
+            "not_bpf",
+            "prog_planted",
+            "STALE_MAP",
+        ]
+        .iter()
+        .map(|n| root.join(n).display().to_string())
+        .collect();
+        want_foreign.sort();
+        assert_eq!(foreign, want_foreign);
+        assert_eq!(
+            walk.entries.len(),
+            links.len() + pins.foreign.len() + 11,
+            "every entry judged (the 11 maps and programs of the agent's: registered by id)"
+        );
+        // with what the agent holds: a held link of one of its programs in,
+        // another's out
+        let held = vec![BpfObj::Link(90, 100), BpfObj::Link(91, 999), BpfObj::Map(5)];
+        let all = own_links_of(held, &pins, &progs);
+        assert!(all.contains(&90) && !all.contains(&91) && all.contains(&26));
+        assert_eq!(all.len(), want.len() + 1);
+    }
+
+    /// Lot 301: the walk is bounded — a planted tree is not followed below
+    /// four levels (the directory there is reported), a flood stops at
+    /// [`PIN_WALK_MAX`] entries and says so.
+    #[test]
+    fn the_walk_of_the_pin_directories_is_bounded() {
+        let bpffs = tempfile::tempdir().unwrap();
+        let root = bpffs.path().join("northnarrow");
+        let deep = root.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("a/b/c/d/at_four"), "").unwrap();
+        std::fs::write(deep.join("at_five"), "").unwrap();
+        let open = |_: &Path| Ok(BpfObj::Map(1));
+        let walk = walk_pins(&own_pin_dirs(&root), &open);
+        let paths: Vec<&PathBuf> = walk.entries.iter().map(|e| &e.path).collect();
+        assert_eq!(paths, [&root.join("a/b/c/d/at_four"), &deep], "{paths:?}");
+        assert!(walk.entries[1]
+            .obj
+            .as_ref()
+            .unwrap_err()
+            .contains("not walked"));
+        let flood = bpffs.path().join("northnarrow-flood");
+        std::fs::create_dir(&flood).unwrap();
+        for i in 0..=PIN_WALK_MAX {
+            std::fs::write(flood.join(format!("p{i}")), "").unwrap();
+        }
+        let walk = walk_pins(&own_pin_dirs(&root), &open);
+        assert!(walk.truncated);
+        assert_eq!(walk.entries.len(), PIN_WALK_MAX);
+        let pins = split_pins(&walk, &HashSet::new(), &HashSet::new());
+        assert!(pins.foreign.last().unwrap().contains("the rest not judged"));
     }
 
     #[test]

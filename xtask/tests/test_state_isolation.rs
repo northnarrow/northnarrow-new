@@ -92,6 +92,12 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
          after it — an empty write, the file never changed",
     ),
     (
+        "agent/tests/privileged_e2e.rs",
+        "the agent's pin directories (lot 301): every object pinned under \
+         /sys/fs/bpf/northnarrow* opened (`BPF_OBJ_GET`) and read from its fdinfo, to check that \
+         the fixture's agent registered it as its own — nothing there is written",
+    ),
+    (
         "agent/tests/cgroup_join_privileged_e2e.rs",
         "the pin root's tracker maps (lot 277, the review of #494, D5): the marks the kernel \
          made, read through a read-only descriptor — nothing there is written",

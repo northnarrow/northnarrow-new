@@ -8261,6 +8261,188 @@ number in parentheses is a lab PR.
   - Levels unchanged (C22 0, C23 2 provisional): an evidence-integrity gap
     of the anchor and of the verifier closed and measured on one kernel —
     not a new capability.
+- **Lot 301 — every BPF object the agent pins is its own to the BPF guard
+  (C23).**
+  - What was open: the guard knows the agent's objects by id
+    (`OWN_BPF_IDS`), and the agent registered as its links only those it
+    holds open and the pin root's `link_*` pins. Lot 300 found a link pinned
+    beside the root and closed (the module files' write history's) in
+    neither; the start-in-cgroup tracker's links (lot 277, pinned in
+    `/sys/fs/bpf/northnarrow-cgroup-join-v*`) were the same. Measured first,
+    on `main` (Ubuntu 24.04, `6.8.0-147-generic`, the guard enforcing): of
+    the agent's 78 links the tracker's 7 were handed to root by
+    `BPF_LINK_GET_FD_BY_ID` outside a window, the other 71 refused;
+    `BPF_LINK_DETACH` on those handles answered `EOPNOTSUPP` (this kernel
+    has no detach for these link types: a hole in the guard, not a detach),
+    the tracker marking still. The new e2e failed on exactly those 7 of the
+    101 objects pinned under `/sys/fs/bpf/northnarrow*`: no other object was
+    pinned and left unregistered.
+  - What changed: at each start the registration walks every pin
+    directory — the root and every directory beside it named after it, the
+    paths the `bpf` hook refuses by prefix — and registers each link there
+    that runs one of the agent's programs (with its pin's name), with every
+    map, program and link the agent holds open; any other entry is a signed
+    `foreign_pin`, never registered or removed (ATP-017's rule, extended from
+    the root's `link_*` entries to every entry). The walk is bounded (4,096
+    entries, four levels, no symbolic link followed). The link self-check,
+    the sensor self-test's attach check and the late registration read the
+    same directories. Named tests: three host tests in `bpf_defense` (the
+    consistency test among them) and the privileged e2e
+    `every_object_pinned_under_the_pin_directories_is_registered_as_the_agent_s`.
+  - The lab, as measured (our own guests under lease k301, one at a time;
+    agents uninstalled, the guests clean and off at the end; `nn-lab.sh
+    own-pins-check` puts the guard in enforce mode for its run):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`): `main` as above. The fix: the
+      start's registration names 31 links in the root, 7 in the tracker's
+      directory, 1 in the write history's, 1 in the sysctl judge's; all 78
+      of the agent's links refused by id (the 79th on the host is not
+      ours), each of the tracker's 7 refused a handle and `bpftool link
+      detach` with `EPERM`, 92 `bpf_link` detections (High) for the 92
+      refused attempts; the tracker marked a root process that moved itself
+      into a cgroup; the agent untouched, no `bpf_link_missing`. The same
+      after a restart in a window (the tracker's new links, ids 365–371),
+      after `upgrade-check` and its cold boot, and — the guard enforcing
+      before an `install.sh --upgrade` in the same boot — on the upgraded
+      agent's own start (ids 207–213; 14 detections for the 14 refused
+      attempts; that run's per-link record match was a script bug, the
+      detection names the caller, not the link; fixed); the cold boot after
+      it: bootcheck OK (77 pins, 47 LSM programs, twice 30 s apart). The e2e
+      on a fresh boot passed (33 s).
+    - **Ubuntu 22.04** (`5.15.0-202-generic`): the same check passed — 75
+      links on the host, 75 refused by id and none given, the tracker's 7
+      refused a handle and a detach, 89 detections, the tracker marking;
+      `verifier-check`: 105 programs, 99 OK, 6 not counted (a kernel's
+      variants), 0 failing (no eBPF change in this lot); the e2e on a fresh
+      boot passed (28 s).
+  - Mutations (a catch is a named test failing): 20 on the new code. 17 caught on the
+    host by the three `bpf_defense` tests, `foreign_link_pin_is_not_registered`,
+    `fdinfo_parser_reads_link_and_prog_ids` and the xtask sysctl test (the
+    pin directories reduced to the root, a symbolic link taken for one, the
+    name prefix dropped, the walk's depth, cap, symbolic links and deep
+    directories, each ownership rule, the names, the cut-short note, the
+    pinned and held links' union, the fdinfo order, the registration without
+    the walk; the symbolic-link mutant was caught once the test's opener
+    resolved a link as `OBJ_GET` does). 1 caught by the e2e on Ubuntu 24.04,
+    a fresh boot: `live_links` reading no pin — the link self-check found
+    the pinned links gone. 2 argued equivalent on this code: the late
+    registration without the walk (nothing is pinned after the start's
+    registration) and the held maps and programs left out (every map and
+    program the agent holds is its object's, registered already).
+  - Level unchanged (C23 2, provisional): a fix inside the capability.
+- **Lot 296 — the chain writers, the audit log and the export after a failed
+  write: the external bug hunt's lot 6** (`fix/w4-bh-chain-writers`; the
+  triage of editions 1.2/1.3, lot 6: P1 BUG15; then BUG17, BUG27, BUG39,
+  BUG10, BUG31; and lot 295's finding, the actions chain that could not
+  rotate, added by the coordinator).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): a full disk stops a row part-way
+    and the writer's next row was glued to the fragment — the audit log
+    refused at the next start, so the agent did not start in enforce mode
+    (BUG15, P1), a rotating log broken for good (BUG17); after a failed
+    fsync of a row written whole the next row forked the chain (BUG27);
+    a torn tail was cut before its repair was attested, and a failed
+    attestation was never written again (BUG39); a retention pass that
+    failed part-way lost the `Evicted` rows of what it had removed, and an
+    entry at the oldest archive's name stopped every later pass (BUG10);
+    the JSONL export glued a retried batch to the start of a line its failed
+    write left (BUG31).
+  - What changed (`EVIDENCE_CHAINS.md` "What the agent did about it",
+    `EXPORT.md` §3 and §8, upgrade notes §20): a writer is poisoned by any
+    failed write or fsync, and its next append reads its tail again as the
+    open does — the start of a row cut and the cut attested (the audit
+    chain's `chain_tail_repaired`, a manifest's `torn_tail_repaired`), a row
+    written whole adopted, a seal written whole finishing its rotation; the
+    active file's torn tail attested before it is cut, the manifest's own
+    replaced by its attesting row in one positioned write; each rotating
+    log's manifest created at its open (empty), so the actions chain's
+    response threads, which may not lift the state directory's
+    immutability, can attest a repair (found by the lab's first round); a
+    failed eviction keeps the rows of what it removed, a non-regular entry
+    at an archive's name is left in place and passed; the JSONL sink closes
+    the start of a line its last write left, and the worker keeps its sink
+    across the error. The actions chain: a thread the protection refuses
+    (the response threads hold no `CAP_LINUX_IMMUTABLE`) seals nothing, its
+    rows go on past the cap and the rotation is owed to the chain's
+    rotation thread (`nn-actions-rotate`, the writer's role) — it was sealed,
+    the rename refused, and every later action row lost. `ChainHost` gains `append_all` and `sync_all` (std's
+    calls by default): the tests' host fails them part-way.
+  - The lab, as measured (our own guest under lease k296, **Ubuntu 24.04**
+    `6.8.0-147-generic`, clean at the start: no agent, no pin, no overlay;
+    the root filesystem — the state directories' — filled as root with
+    `fallocate` and `dd` to ENOSPC, 4,091–4,093 blocks left in ext4's own
+    reserve, while R001 killed `www-data` execs from `/tmp` and
+    `nn-admin response status` wrote audit rows, every 3 s for about 70 s,
+    then the space given back; the agent uninstalled and the guest powered
+    off at each round's end):
+    - Round r1 (9aaed551): the audit log took **6** `chain_tail_repaired`
+      rows (the row's fragment, then the attestations' own, each 349 bytes
+      at one block's end) and verified; the detections and heartbeat logs
+      one `torn_tail_repaired` each and verified; the netflow log ended in
+      a fragment until its next row, 50 s after the space came back, then
+      repaired and attested. **The actions chain stalled**: opened empty, it
+      had no manifest, and its repair, run on a response thread, had to
+      create one inside the `+i` lift (EPERM: the thread may not lift it,
+      lot 295's finding for its rotation) — every later action row lost
+      (an ERROR each) and the fragment left; fixed in fc8ae59c (the
+      manifest at the open). The cold boot after: the agent active, its
+      pin root and LSM programs (bootcheck OK) — the audit log with its
+      repairs opened.
+    - Round r2 (fc8ae59c, this PR's code): the six rotating logs' manifests
+      there from the open, empty; while full the audit log, the actions,
+      detections, heartbeat and netflow logs each ended in a fragment (the
+      kernel's short write at a block's end); with the space back (and a few
+      TCP connects for the netflow log) **every chain ends in a whole line
+      and `nn-admin chain verify` is OK for all ten** (rc 0): the audit log
+      9 `chain_tail_repaired` rows, the four logs one `torn_tail_repaired`
+      each (115 to 1,073 bytes cut), 21 action rows lost while the disk was
+      full (ENOSPC, an ERROR each) and **none** after. The cold boot: the
+      bootcheck OK, `chain verify` OK again (10 heads anchored, a checkpoint
+      reachable in each log written).
+    - Round r3 (5b2eba78, the actions chain's rotation, added by the
+      coordinator from lot 295's finding): `NN_ACTIONS_CAP_BYTES` at 1 MiB,
+      **1,150 R001 kills** of `www-data` execs in bursts of 50: the response
+      threads' rows went past the cap (WARN `this thread may not rotate
+      the log`, once), the rotation thread `nn-actions-rotate` rotated the
+      chain (INFO, once; archive 1 of 1,050,105 bytes), **1,150 intents and
+      1,150 outcomes in the chain, 0 rows not in it** (`nn-admin status`),
+      `nn-admin chain verify --log actions` OK (2,303 records, 1 archive, 3
+      checkpoints). After the cold boot: bootcheck OK, all ten chains OK.
+      On `main` the same burst past the cap loses every later row (the
+      host test: 445 of 480 rows lost).
+    - Not measured in the lab: the export (off by default; its sink's short
+      write is the kernel's in the host test), a failed fsync (no failing
+      device), a retention pass (the host tests).
+  - Host: a named test for each bug; on `main` (d8ae57f1, the lot's tests
+    that need no new API, as at 3dc7bc08) 8 of them fail — among them the agent's host with the kernel's own short
+    write (`RLIMIT_FSIZE`, a helper process: the audit log refused at the
+    reopen, `line 2 (558 bytes) is not an audit row`) — and 1 control
+    passes; the rest need the new host seam and fail with their fix
+    reverted. Mutation on the fixes: 59 mutants on the final code, all
+    caught by a named test (6 survivors of the first pass named, or their
+    code removed as unreachable; the actions chain's rotation 12 of 12).
+    The CI's privileged run on the PR found the open's manifest lifting the
+    installed agent's state directory from every test agent (the
+    protection's directory is the fixed one): the installed agent's ladder
+    killed the later suites and isolated the guest; the manifest is now
+    created without a lift where its directory takes a new name. Gates on the PR's tree: eBPF, the four clippy runs,
+    fmt, 94 suites (one failure in the first run: xtask's pure-crate check
+    on two of this lot's tests, which named `std::os` in nn-evidence —
+    moved, rerun green), the privileged no-run, the debug-trigger builds,
+    the eBPF maps (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage, golden ×5
+    (57 files, the same bytes), MSRV 1.89, the fuzz replay (14), portable
+    (5), the lockfiles unchanged.
+  - Open: a fragment left by an export worker that ended in the middle of a
+    write is not closed (the worker cannot read its files); an idle chain
+    shows its fragment to `nn-admin chain verify` until its next row or the
+    next start; the flat chains of nn-linux (canary registry and access
+    log, FIM baseline, the listener log) keep their own `write_all`
+    without a re-read (not in this lot's bugs; a follow-up); the actions
+    chain's rotation is the rotation thread's (a rotation it cannot do
+    either leaves the rows past the cap, said once).
+  - Levels unchanged (C21 1, C23 2 provisional): an evidence-integrity gap
+    of the writers closed and measured on one kernel — not a new
+    capability.
+
 - **Lot 297 — the agent's stores and the watchdog's respawn argv: the
   external bug hunt's lot 7** (`fix/w4-bh-agent-stores-watchdog`; the triage
   of editions 1.2/1.3, lot 7: BUG64, BUG48, BUG63, BUG59, BUG61, BUG69,

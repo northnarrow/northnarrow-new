@@ -13,6 +13,12 @@
 #   bpf-probe.py map-fd-by-id ID [--rdonly]
 #   bpf-probe.py prog-fd-by-id ID
 #   bpf-probe.py obj-get PATH [--rdonly]
+#   bpf-probe.py link-ids
+#       (lot 301) every link id on the host (BPF_LINK_GET_NEXT_ID: no handle)
+#   bpf-probe.py link-fd-by-id ID [--detach]
+#       (lot 301) BPF_LINK_GET_FD_BY_ID; a handle given is described ("OK fd
+#       N prog P": BPF_OBJ_GET_INFO_BY_FD) and, with --detach, BPF_LINK_DETACH
+#       is tried on it ("... detach OK" / "... detach ERR <errno>")
 #
 # A program loaded with --pin is pinned at PATH (its directory made) so it
 # outlives this process.
@@ -28,6 +34,10 @@ BPF_PROG_LOAD = 5
 BPF_OBJ_PIN = 6
 BPF_OBJ_GET = 7
 BPF_PROG_GET_FD_BY_ID = 13
+BPF_OBJ_GET_INFO_BY_FD = 15
+BPF_LINK_GET_FD_BY_ID = 30
+BPF_LINK_GET_NEXT_ID = 31
+BPF_LINK_DETACH = 34
 BPF_F_RDONLY = 1 << 3
 PROG_TYPE_SOCKET_FILTER = 1
 PROG_TYPE_KPROBE = 2
@@ -131,6 +141,35 @@ def main(argv):
         flags = BPF_F_RDONLY if "--rdonly" in args else 0
         p = ctypes.create_string_buffer(args[0].encode() + b"\0")
         return report(*bpf(BPF_OBJ_GET, struct.pack("<QII", ctypes.addressof(p), 0, flags)))
+    if cmd == "link-ids":
+        ids, cur = [], 0
+        while True:
+            buf = ctypes.create_string_buffer(struct.pack("<II", cur, 0), 128)
+            r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_LINK_GET_NEXT_ID), buf, ctypes.c_long(128))
+            if r < 0:
+                e = ctypes.get_errno()
+                if e == errno.ENOENT:
+                    break
+                print(f"ERR {errno.errorcode.get(e, '?')} {e}")
+                return 1
+            cur = struct.unpack_from("<I", buf.raw, 4)[0]
+            ids.append(cur)
+        print("OK " + " ".join(str(i) for i in ids))
+        return 0
+    if cmd == "link-fd-by-id":
+        fd, e = bpf(BPF_LINK_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0))
+        if fd is None:
+            return report(fd, e)
+        # struct bpf_link_info: type, id, prog_id (then the type's union)
+        info = ctypes.create_string_buffer(64)
+        _, ie = bpf(BPF_OBJ_GET_INFO_BY_FD, struct.pack("<IIQ", fd, 64, ctypes.addressof(info)))
+        prog = struct.unpack_from("<I", info.raw, 8)[0] if ie == 0 else f"? (info errno {ie})"
+        extra = f" prog {prog}"
+        if "--detach" in args:
+            _, de = bpf(BPF_LINK_DETACH, struct.pack("<I", fd))
+            extra += " detach OK" if de == 0 else f" detach ERR {errno.errorcode.get(de, '?')} {de}"
+        os.close(fd)
+        return report(fd, 0, extra)
     print(f"unknown command {cmd}", file=sys.stderr)
     return 2
 

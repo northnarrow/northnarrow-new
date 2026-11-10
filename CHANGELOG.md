@@ -27,6 +27,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   read. Each is `REPLAY`, `LOSS` or `DEGRADED` now, as is a stop with a
   reason that is not a clean stop's followed by the next run's start; a
   head gone from the beats is said once.
+- Every BPF object the agent pins is its own to the BPF guard (lot 301;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 301"). The registration read
+  the links the agent holds and the pin root's `link_*` pins only: the
+  start-in-cgroup tracker's seven links, pinned beside the root and closed,
+  were not in `OWN_BPF_IDS`, so a root outside a window took a handle on
+  each by id (`BPF_LINK_GET_FD_BY_ID`), and the link self-check never
+  expected them. At each start the agent now walks every pin directory —
+  the root and every directory beside it named after it, the paths the
+  `bpf` hook already refused by prefix — and registers each link there that
+  runs one of its programs (with its pin's name), with every map, program
+  and link it holds open; any other entry is a signed `foreign_pin`, never
+  registered or removed. The link self-check, the sensor self-test's attach
+  check and the late registration read the same view.
 - A signal through a file's owner is refused to the agent, the watchdog
   and the workers (lot 293, external bug hunt BUG14, P0;
   `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 293"). A root process killed
@@ -88,6 +101,39 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   interval, an operator's `--max-silence-secs 18446744073709551615`, or a
   head hash that is not ASCII no longer gives a false `SILENT`, wraps or
   panics (lot 295, BUG12, BUG32).
+- A chain writer whose write the disk stopped part-way (full) or whose
+  fsync failed reads its file's tail again before its next row (lot 296,
+  external bug hunt BUG15 P1, BUG17, BUG27): the start of a row left at
+  the end is cut and the cut attested (`chain_tail_repaired` in the audit
+  chain, `torn_tail_repaired` in a rotating log's manifest, with the cut
+  bytes' length and SHA-256), a row written whole is the chain's tail, a
+  seal written whole finishes its rotation. The next row used to be glued
+  to the fragment — an audit log the next start refused, so the agent did
+  not start in enforce mode; a rotating log broken for good — or, after a
+  failed fsync, chained off the row before (a fork). Each rotating log's
+  manifest is created at its open (empty until its first row), so the
+  actions chain's response threads, which may not lift the state
+  directory's immutability, can attest their repair (the lab's finding).
+- The actions chain rotates (lot 296; found by lot 295's lab): its rows
+  are written by the response threads, which may not lift the state
+  directory's `+i`, so its rotation sealed the active file, failed the
+  rename, and every later action row was lost (an ERROR each) until the
+  next start. A thread that may not lift the directory seals nothing: its
+  row goes on past the cap, and the chain's rotation thread
+  (`nn-actions-rotate`, the writer's role; the actuator is given no
+  capability) rotates it.
+- A torn tail is attested before it is cut (lot 296, BUG39): the active
+  file's at the open, after its manifest row; a manifest's own by its
+  attesting row written over the fragment, the file cut after it. A cut
+  whose attestation failed once was attested by no later open.
+- A retention pass that fails part-way keeps the `Evicted` rows of the
+  archives it removed (they read as evictions no row attests, for good),
+  and an entry at an archive's name that is not a regular file is left in
+  place and passed instead of stopping every later pass (lot 296, BUG10).
+- The JSONL export sink closes the start of a line its failed write left
+  before the batch is written again, and the worker keeps its sink across
+  the error: the first record of the batch was glued to that start (lot
+  296, BUG31).
 - `BPF_RAW_TRACEPOINT_OPEN` is observed by the `bpf` hook and judged by
   NN-L-BPF-001 as an attach (lot 293, BUG05).
 - io_uring's `READV_FIXED`/`WRITEV_FIXED` (60, 61) are file I/O and
