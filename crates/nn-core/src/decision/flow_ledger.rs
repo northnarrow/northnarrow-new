@@ -287,6 +287,7 @@ mod tests {
         assert!(!suppressed(NET010, false, &fired));
         assert!(!suppressed(C001, false, &fired), "no chain answered");
         assert!(!suppressed(C001, false, &[]));
+        assert!(!suppressed(NET010, false, &[recorded(C001)]), "not a chain");
         // a chain that acted holds the flow against every chain
         let fired = [recorded(C001), acted(C002)];
         assert!(excluded(C001, &fired) && excluded(C007, &fired));

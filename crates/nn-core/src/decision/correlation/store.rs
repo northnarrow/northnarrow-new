@@ -1975,6 +1975,35 @@ mod tests {
         ));
     }
 
+    /// BUG75: CHAIN-007's late read takes the staging exec nearest before
+    /// it (one at the read's own time included, as `has_sequence` orders
+    /// them in kernel order), and an egress past the window of every exec
+    /// before the read is not answered, nor marked.
+    #[test]
+    fn a_late_read_takes_the_exec_nearest_before_it() {
+        let k = key(42, SEC);
+        let mut s = CorrelationStore::new();
+        s.note_egress(k, note(42, 1_100 * SEC, 443));
+        s.record(k, PrecursorKind::TmpExec, 100 * SEC);
+        assert!(s.answer_sequence_after(k, 1_000 * SEC, W).is_none());
+        s.record(k, PrecursorKind::TmpExec, 1_050 * SEC);
+        assert!(
+            s.answer_sequence_after(k, 1_000 * SEC, W).is_none(),
+            "an exec after the read is not the first step"
+        );
+        s.record(k, PrecursorKind::TmpExec, 900 * SEC);
+        assert_eq!(
+            s.answer_sequence_after(k, 1_000 * SEC, W)
+                .map(|n| n.start_ns),
+            Some(1_100 * SEC),
+            "not marked by the refusals above"
+        );
+        let mut s = CorrelationStore::new();
+        s.note_egress(k, note(42, 1_100 * SEC, 443));
+        s.record(k, PrecursorKind::TmpExec, 1_000 * SEC);
+        assert!(s.answer_sequence_after(k, 1_000 * SEC, W).is_some());
+    }
+
     /// BUG77 (not a bug: the docstring said "at or before now_ns"): a
     /// precursor stamped after `now_ns` — a credential read made after the
     /// connect of a flow still open — counts for that flow, whose every

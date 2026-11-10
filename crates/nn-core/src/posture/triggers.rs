@@ -6062,6 +6062,27 @@ mod tests {
         assert!(!det
             .detect(&focal, &recent)
             .contains(&TriggerType::ExfiltrationPattern));
+        // a connect of another family (not inet) does not count either
+        let mut other_family = recent.clone();
+        other_family.extend((10..20u64).map(|i| {
+            let mut e = tcp_v6(
+                7,
+                "app",
+                "2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+                443,
+                i * SEC,
+            );
+            if let Event::TcpConnect { family, .. } = &mut e {
+                *family = 1;
+            }
+            e
+        }));
+        assert!(!det
+            .detect(&focal, &other_family)
+            .contains(&TriggerType::ExfiltrationPattern));
         recent.extend((10..20u64).map(|i| tcp_v4_comm(7, "app", [100, 64, 1, 2], 80, i * SEC)));
         assert!(det
             .detect(&focal, &recent)
