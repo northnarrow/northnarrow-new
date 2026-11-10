@@ -2276,8 +2276,9 @@ mod tests {
         let mut h = harness();
         let (tx, mut rx) = crate::sensors::bus::channel();
         let stub: IpAddr = "127.0.0.53".parse().unwrap();
-        // an old connect: its close waits for nothing
-        let t0 = monotonic_ns().saturating_sub(500 * S);
+        // a connect at 1,000 s, announced: its close waits for nothing
+        // (any time: a fresh host's monotonic clock may be under 500 s)
+        let t0 = 1_000 * S;
         h.dns
             .on_dns_query(9825, "c2.example".into(), 1, stub, t0 - 1_000);
         {
