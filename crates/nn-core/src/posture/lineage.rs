@@ -6704,6 +6704,40 @@ mod tests {
         );
     }
 
+    /// BUG-56, for an orphan the sweep adopted (its start read from `/proc`,
+    /// tick 1200): when it executes later (the exec's exact start inside
+    /// that tick), an event after the sweep and before that exec is judged on
+    /// the adopted image.
+    #[test]
+    fn an_adopted_orphan_s_image_is_the_past_of_its_later_exec() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        t.ingest_exec(600, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        write_exe(proc.path(), 600, "/usr/bin/bash");
+        write_status_uid(proc.path(), 600, 1, 1000);
+        write_started(proc.path(), "600", 1, 500);
+        t.ingest_exec(610, 600, "/usr/bin/clamscan", &[], 10 * S, 10 * S, 1000);
+        write_exe(proc.path(), 620, "/usr/bin/clamscan");
+        write_status_uid(proc.path(), 620, 600, 1000);
+        write_started(proc.path(), "620", 600, 1_200);
+        assert_eq!(t.sweep().orphans, 1);
+        let swept = H::monotonic_ns();
+        t.ingest_exec(
+            620,
+            600,
+            "/usr/bin/tar",
+            &[],
+            swept + 10 * S,
+            12_004_000_000,
+            1000,
+        );
+        assert_eq!(
+            t.exec_identity(620, AsOf::Judged(swept + 5 * S))
+                .map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/clamscan"))
+        );
+    }
+
     /// BUG-56, the other side: a pid reused by a process that started after
     /// the seeded one (10 s, not inside tick 400) and executed at 30 s —
     /// at 20 s the pid was that later process, whose image then is not
