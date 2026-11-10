@@ -35,9 +35,7 @@
 //! stopped, crashed or was killed between the two — and answers each with a
 //! signed [`ActionRow::Interrupted`] row: whether that action took effect is
 //! not known, and the operator is told (a WARN, the status, and the boot's
-//! signed `response_interrupted` audit row). The interrupted row carries the
-//! intent it answers (lot 298, external bug hunt BUG19: it carried none, and
-//! the export mapped it as an unknown remediation).
+//! signed `response_interrupted` audit row).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -258,7 +256,9 @@ impl ActionJournal {
 
     /// R12c-3: the run's start, once the boot signed its audit row of
     /// `recovery` (`response_interrupted`): each open intent of an earlier
-    /// run answered by an interrupted row (WARNed, counted), then this
+    /// run answered by an interrupted row that carries that intent (lot 298,
+    /// external bug hunt BUG19: it carried none, and the export mapped it as
+    /// an unknown remediation) (WARNed, counted), then this
     /// run's `run_started` row. A crash before this leaves the intents
     /// open: the next start reports them again — the audit row is never
     /// missing for an interrupted row (the re-check of #476).

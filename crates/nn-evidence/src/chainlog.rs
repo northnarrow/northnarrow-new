@@ -5297,6 +5297,233 @@ mod tests {
         assert_eq!(plain_ts(&serde_json::json!({})), None);
     }
 
+    // ── lot 298: the external bug hunt's verifier and readers (BUG11, 28, 29) ──
+
+    /// BUG11: a genuine line longer than the 64 KiB read-back window was
+    /// reported as not held.
+    #[test]
+    fn a_line_longer_than_64k_is_still_held() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("c.jsonl");
+        let a = r#"{"entry_hash":"aaaa"}"#;
+        let b = format!(r#"{{"entry_hash":"bbbb","pad":"{}"}}"#, "x".repeat(70_000));
+        fs::write(&p, format!("{a}\n{b}\n")).unwrap();
+        let end = (a.len() + b.len() + 2) as u64;
+        assert!(holds_line_ending_at(&p, (a.len() + 1) as u64, "aaaa").unwrap());
+        assert!(
+            holds_line_ending_at(&p, end, "bbbb").unwrap(),
+            "the line ending at {end} is intact and carries bbbb"
+        );
+        // the same long line with another hash, or cut: not held
+        assert!(!holds_line_ending_at(&p, end, "cccc").unwrap());
+        let c = format!(r#"{{"entry_hash":"cccc","pad":"{}"}}"#, "x".repeat(70_000));
+        fs::write(&p, format!("{a}\n{c}\n")).unwrap();
+        assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
+        // a line that starts past the largest window (16 MiB) is not taken
+        // for held: its start is not seen
+        let huge = format!(
+            r#"{{"entry_hash":"dddd","pad":"{}"}}"#,
+            "x".repeat(17 * 1024 * 1024)
+        );
+        fs::write(&p, format!("{a}\n{huge}\n")).unwrap();
+        let end = (a.len() + huge.len() + 2) as u64;
+        assert!(!holds_line_ending_at(&p, end, "dddd").unwrap());
+    }
+
+    /// BUG28: a foreign entry the probe before the seal skipped got no
+    /// `ForeignArchive` row (one met at the rename does).
+    #[test]
+    fn foreign_slot_skipped_before_the_seal_is_attested() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 2000);
+        fs::write(archive_path(&active, 1), b"foreign\n").unwrap(); // after the open
+        for i in 0..8 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        let seqs = list_archive_seqs(&active).unwrap();
+        assert!(
+            seqs.len() >= 2 && seqs[0] == 1,
+            "rotated past the slot: {seqs:?}"
+        );
+        // the foreign entry is still refused by the full verifier
+        assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
+        let attested = manifest_events(&active)
+            .iter()
+            .filter(|e| {
+                matches!(e, ManifestEvent::ForeignArchive { seq: 1, entry_type, bytes: 8 } if entry_type == "file")
+            })
+            .count();
+        assert_eq!(
+            attested,
+            1,
+            "the foreign slot 1 skipped by the rotation has one ForeignArchive row: {:?}",
+            manifest_events(&active)
+        );
+    }
+
+    /// BUG28: the finish step fails once after the seal (the rename's
+    /// dance); its retry from `pending_seal` still attests the slot the
+    /// probe skipped, once.
+    #[test]
+    fn foreign_slot_skipped_before_a_retried_seal_is_attested() {
+        struct FailOnce(std::sync::atomic::AtomicBool);
+        impl ProtectionManager for FailOnce {
+            fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(anyhow!("simulated dance failure"));
+                }
+                f()
+            }
+            fn register_active(&self, _path: &Path) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicBool::new(false)));
+        let mut log = open_log_with(&active, &kp, 2000, prot.clone());
+        let mut i = 0;
+        while log.active_bytes + 400 < 2000 {
+            log.append(payload(i)).unwrap();
+            i += 1;
+        }
+        fs::write(archive_path(&active, 1), b"foreign\n").unwrap();
+        prot.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            log.append(payload(i)).is_err(),
+            "the first finish step fails"
+        );
+        assert!(log.pending_seal.is_some(), "sealed, not renamed");
+        log.append(payload(i + 1)).unwrap();
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 2]);
+        let attested: Vec<u64> = manifest_events(&active)
+            .into_iter()
+            .filter_map(|e| match e {
+                ManifestEvent::ForeignArchive { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attested, vec![1], "attested once, at the retried finish");
+    }
+
+    fn rotate_twice(active: &Path, kp: &Path) {
+        let mut log = open_log(active, kp, 2000);
+        let mut i = 0;
+        while list_archive_seqs(active).unwrap().len() < 2 {
+            log.append(payload(i)).unwrap();
+            i += 1;
+            assert!(i < 1000);
+        }
+    }
+
+    /// BUG29: genuine lines replayed after an archive's terminator verified
+    /// and were counted.
+    #[test]
+    fn lines_after_an_archive_terminator_do_not_verify() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        rotate_twice(&active, &kp);
+        let before = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        let a1 = archive_path(&active, 1);
+        let a2 = archive_path(&active, 2);
+        let head: Vec<String> = fs::read_to_string(&a2)
+            .unwrap()
+            .lines()
+            .take(2)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(head.len() == 2 && head.iter().all(|l| !l.contains("\"rotate\"")));
+        let mut bytes = fs::read(&a1).unwrap();
+        bytes.extend_from_slice(head.concat().as_bytes());
+        fs::write(&a1, bytes).unwrap();
+        let after = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(
+            after.is_err(),
+            "lines after archive 1's terminator accepted: {after:?} (before: {} records)",
+            before.total_records
+        );
+        let e = after.unwrap_err().to_string();
+        assert!(e.contains("after the file's terminator"), "{e}");
+    }
+
+    /// BUG29: a second terminator in one archive (sealed twice) does not
+    /// verify either.
+    #[test]
+    fn two_terminators_in_one_archive_do_not_verify() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        rotate_twice(&active, &kp);
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        // archive 1 sealed again: a terminator chained off its terminator
+        let a1 = archive_path(&active, 1);
+        let body = fs::read_to_string(&a1).unwrap();
+        let last: TerminatorLine = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        let again = TerminatorLine::sealed(
+            last.rotate.clone(),
+            &key_at(&kp),
+            &last.entry_hash,
+            TestPayload::KIND,
+            &SystemClock,
+        )
+        .unwrap();
+        append_raw(&a1, to_jsonl(&again).unwrap().as_bytes());
+        let e = verify_log_set::<TestPayload>(&active, &pk)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("after the file's terminator"), "{e}");
+    }
+
+    /// BUG29: in the active file too, nothing follows a terminator (the
+    /// writer finishes a sealed file's rotation before it appends again).
+    #[test]
+    fn a_line_after_a_terminator_in_the_active_file_does_not_verify() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        let term = TerminatorLine::sealed(
+            RotateTerminator {
+                fmt_ver: CHAINLOG_FMT_V3,
+                this_seq: 1,
+                next_seq: 2,
+                record_count: 3,
+                bytes: 0,
+            },
+            &key_at(&kp),
+            &tail,
+            TestPayload::KIND,
+            &SystemClock,
+        )
+        .unwrap();
+        append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
+        // sealed, not renamed (a rotation interrupted): verifies
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        // a genuine line chained off the terminator, appended to the file
+        let line = ChainLine::sealed(payload(3), &key_at(&kp), &term.entry_hash).unwrap();
+        append_raw(&active, to_jsonl(&line).unwrap().as_bytes());
+        let e = verify_log_set::<TestPayload>(&active, &pk)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("after the file's terminator"), "{e}");
+    }
+
     // ── External audit, Wave 3, lab PR 190 ─────────────────────────────
 
     /// EVD-017 (NN-AUD-280): an empty `<base>.000001` next to a valid
@@ -6239,232 +6466,5 @@ mod tests {
             n += 1;
         }
         assert!(n >= 2, "a rotation and a checkpoint: {manifest}");
-    }
-
-    // ── lot 298: the external bug hunt's verifier and readers (BUG11, 28, 29) ──
-
-    /// BUG11: a genuine line longer than the 64 KiB read-back window was
-    /// reported as not held.
-    #[test]
-    fn a_line_longer_than_64k_is_still_held() {
-        let dir = TempDir::new().unwrap();
-        let p = dir.path().join("c.jsonl");
-        let a = r#"{"entry_hash":"aaaa"}"#;
-        let b = format!(r#"{{"entry_hash":"bbbb","pad":"{}"}}"#, "x".repeat(70_000));
-        fs::write(&p, format!("{a}\n{b}\n")).unwrap();
-        let end = (a.len() + b.len() + 2) as u64;
-        assert!(holds_line_ending_at(&p, (a.len() + 1) as u64, "aaaa").unwrap());
-        assert!(
-            holds_line_ending_at(&p, end, "bbbb").unwrap(),
-            "the line ending at {end} is intact and carries bbbb"
-        );
-        // the same long line with another hash, or cut: not held
-        assert!(!holds_line_ending_at(&p, end, "cccc").unwrap());
-        let c = format!(r#"{{"entry_hash":"cccc","pad":"{}"}}"#, "x".repeat(70_000));
-        fs::write(&p, format!("{a}\n{c}\n")).unwrap();
-        assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
-        // a line that starts past the largest window (16 MiB) is not taken
-        // for held: its start is not seen
-        let huge = format!(
-            r#"{{"entry_hash":"dddd","pad":"{}"}}"#,
-            "x".repeat(17 * 1024 * 1024)
-        );
-        fs::write(&p, format!("{a}\n{huge}\n")).unwrap();
-        let end = (a.len() + huge.len() + 2) as u64;
-        assert!(!holds_line_ending_at(&p, end, "dddd").unwrap());
-    }
-
-    /// BUG28: a foreign entry the probe before the seal skipped got no
-    /// `ForeignArchive` row (one met at the rename does).
-    #[test]
-    fn foreign_slot_skipped_before_the_seal_is_attested() {
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("test.jsonl");
-        let kp = dir.path().join("key");
-        let pk = key_at(&kp).verifying_key();
-        let mut log = open_log(&active, &kp, 2000);
-        fs::write(archive_path(&active, 1), b"foreign\n").unwrap(); // after the open
-        for i in 0..8 {
-            log.append(payload(i)).unwrap();
-        }
-        drop(log);
-        let seqs = list_archive_seqs(&active).unwrap();
-        assert!(
-            seqs.len() >= 2 && seqs[0] == 1,
-            "rotated past the slot: {seqs:?}"
-        );
-        // the foreign entry is still refused by the full verifier
-        assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
-        let attested = manifest_events(&active)
-            .iter()
-            .filter(|e| {
-                matches!(e, ManifestEvent::ForeignArchive { seq: 1, entry_type, bytes: 8 } if entry_type == "file")
-            })
-            .count();
-        assert_eq!(
-            attested,
-            1,
-            "the foreign slot 1 skipped by the rotation has one ForeignArchive row: {:?}",
-            manifest_events(&active)
-        );
-    }
-
-    /// BUG28: the finish step fails once after the seal (the rename's
-    /// dance); its retry from `pending_seal` still attests the slot the
-    /// probe skipped, once.
-    #[test]
-    fn foreign_slot_skipped_before_a_retried_seal_is_attested() {
-        struct FailOnce(std::sync::atomic::AtomicBool);
-        impl ProtectionManager for FailOnce {
-            fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    return Err(anyhow!("simulated dance failure"));
-                }
-                f()
-            }
-            fn register_active(&self, _path: &Path) -> Result<()> {
-                Ok(())
-            }
-        }
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("test.jsonl");
-        let kp = dir.path().join("key");
-        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicBool::new(false)));
-        let mut log = open_log_with(&active, &kp, 2000, prot.clone());
-        let mut i = 0;
-        while log.active_bytes + 400 < 2000 {
-            log.append(payload(i)).unwrap();
-            i += 1;
-        }
-        fs::write(archive_path(&active, 1), b"foreign\n").unwrap();
-        prot.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            log.append(payload(i)).is_err(),
-            "the first finish step fails"
-        );
-        assert!(log.pending_seal.is_some(), "sealed, not renamed");
-        log.append(payload(i + 1)).unwrap();
-        drop(log);
-        assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 2]);
-        let attested: Vec<u64> = manifest_events(&active)
-            .into_iter()
-            .filter_map(|e| match e {
-                ManifestEvent::ForeignArchive { seq, .. } => Some(seq),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(attested, vec![1], "attested once, at the retried finish");
-    }
-
-    fn rotate_twice(active: &Path, kp: &Path) {
-        let mut log = open_log(active, kp, 2000);
-        let mut i = 0;
-        while list_archive_seqs(active).unwrap().len() < 2 {
-            log.append(payload(i)).unwrap();
-            i += 1;
-            assert!(i < 1000);
-        }
-    }
-
-    /// BUG29: genuine lines replayed after an archive's terminator verified
-    /// and were counted.
-    #[test]
-    fn lines_after_an_archive_terminator_do_not_verify() {
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("test.jsonl");
-        let kp = dir.path().join("key");
-        let pk = key_at(&kp).verifying_key();
-        rotate_twice(&active, &kp);
-        let before = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        let a1 = archive_path(&active, 1);
-        let a2 = archive_path(&active, 2);
-        let head: Vec<String> = fs::read_to_string(&a2)
-            .unwrap()
-            .lines()
-            .take(2)
-            .map(|l| format!("{l}\n"))
-            .collect();
-        assert!(head.len() == 2 && head.iter().all(|l| !l.contains("\"rotate\"")));
-        let mut bytes = fs::read(&a1).unwrap();
-        bytes.extend_from_slice(head.concat().as_bytes());
-        fs::write(&a1, bytes).unwrap();
-        let after = verify_log_set::<TestPayload>(&active, &pk);
-        assert!(
-            after.is_err(),
-            "lines after archive 1's terminator accepted: {after:?} (before: {} records)",
-            before.total_records
-        );
-        let e = after.unwrap_err().to_string();
-        assert!(e.contains("after the file's terminator"), "{e}");
-    }
-
-    /// BUG29: a second terminator in one archive (sealed twice) does not
-    /// verify either.
-    #[test]
-    fn two_terminators_in_one_archive_do_not_verify() {
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("test.jsonl");
-        let kp = dir.path().join("key");
-        let pk = key_at(&kp).verifying_key();
-        rotate_twice(&active, &kp);
-        verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        // archive 1 sealed again: a terminator chained off its terminator
-        let a1 = archive_path(&active, 1);
-        let body = fs::read_to_string(&a1).unwrap();
-        let last: TerminatorLine = serde_json::from_str(body.lines().last().unwrap()).unwrap();
-        let again = TerminatorLine::sealed(
-            last.rotate.clone(),
-            &key_at(&kp),
-            &last.entry_hash,
-            TestPayload::KIND,
-            &SystemClock,
-        )
-        .unwrap();
-        append_raw(&a1, to_jsonl(&again).unwrap().as_bytes());
-        let e = verify_log_set::<TestPayload>(&active, &pk)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("after the file's terminator"), "{e}");
-    }
-
-    /// BUG29: in the active file too, nothing follows a terminator (the
-    /// writer finishes a sealed file's rotation before it appends again).
-    #[test]
-    fn a_line_after_a_terminator_in_the_active_file_does_not_verify() {
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("test.jsonl");
-        let kp = dir.path().join("key");
-        let pk = key_at(&kp).verifying_key();
-        let tail = {
-            let mut log = open_log(&active, &kp, 1 << 30);
-            for i in 0..3 {
-                log.append(payload(i)).unwrap();
-            }
-            log.last_hash().to_string()
-        };
-        let term = TerminatorLine::sealed(
-            RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V3,
-                this_seq: 1,
-                next_seq: 2,
-                record_count: 3,
-                bytes: 0,
-            },
-            &key_at(&kp),
-            &tail,
-            TestPayload::KIND,
-            &SystemClock,
-        )
-        .unwrap();
-        append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
-        // sealed, not renamed (a rotation interrupted): verifies
-        verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        // a genuine line chained off the terminator, appended to the file
-        let line = ChainLine::sealed(payload(3), &key_at(&kp), &term.entry_hash).unwrap();
-        append_raw(&active, to_jsonl(&line).unwrap().as_bytes());
-        let e = verify_log_set::<TestPayload>(&active, &pk)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("after the file's terminator"), "{e}");
     }
 }
