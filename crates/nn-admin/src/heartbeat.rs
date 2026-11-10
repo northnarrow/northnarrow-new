@@ -568,4 +568,47 @@ mod tests {
         .unwrap();
         assert_eq!(out.len() as u64, FETCH_MAX_BYTES);
     }
+
+    /// Lot 299: a source that closes its stdout first and then writes more
+    /// than a pipe holds on stderr is still read to its exit (each pipe
+    /// read on its own readiness, a closed one left out of the poll).
+    #[test]
+    fn a_source_that_closes_its_stdout_first_still_drains_its_stderr() {
+        let e = run_with_timeout(
+            "exec 1>&-; head -c 200000 /dev/zero >&2; exit 5",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.contains("failed") && e.contains('5'), "{e}");
+    }
+
+    /// Lot 299: what a pipe keeps — stdout its first bytes up to the bound,
+    /// then closed; stderr its last bytes, read to its end.
+    #[test]
+    fn a_pipe_keeps_its_head_or_its_tail() {
+        use std::io::Write;
+        let bytes: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        for tail in [false, true] {
+            let (r, mut w) = std::io::pipe().unwrap();
+            w.write_all(&bytes).unwrap();
+            drop(w);
+            let mut p = Pipe::new(Some(r), 4096, tail);
+            for _ in 0..100 {
+                p.read_once();
+                if p.fd.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                p.fd.is_none(),
+                "tail={tail}: closed at its bound or its end"
+            );
+            let want = if tail {
+                &bytes[bytes.len() - 4096..]
+            } else {
+                &bytes[..4096]
+            };
+            assert_eq!(p.buf, want, "tail={tail}");
+        }
+    }
 }
