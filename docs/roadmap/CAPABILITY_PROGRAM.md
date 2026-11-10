@@ -8176,7 +8176,8 @@ number in parentheses is a lab PR.
 - **Lot 296 — the chain writers, the audit log and the export after a failed
   write: the external bug hunt's lot 6** (`fix/w4-bh-chain-writers`; the
   triage of editions 1.2/1.3, lot 6: P1 BUG15; then BUG17, BUG27, BUG39,
-  BUG10, BUG31).
+  BUG10, BUG31; and lot 295's finding, the actions chain that could not
+  rotate, added by the coordinator).
   - What was open (our triage of 10/11/2026, its fix guidance followed
     where it differs from the report's): a full disk stops a row part-way
     and the writer's next row was glued to the fragment — the audit log
@@ -8203,7 +8204,11 @@ number in parentheses is a lab PR.
     failed eviction keeps the rows of what it removed, a non-regular entry
     at an archive's name is left in place and passed; the JSONL sink closes
     the start of a line its last write left, and the worker keeps its sink
-    across the error. `ChainHost` gains `append_all` and `sync_all` (std's
+    across the error. The actions chain: a thread the protection refuses
+    (the response threads hold no `CAP_LINUX_IMMUTABLE`) seals nothing, its
+    rows go on past the cap and the rotation is owed to the chain's
+    rotation thread (`nn-actions-rotate`, the writer's role) — it was sealed,
+    the rename refused, and every later action row lost. `ChainHost` gains `append_all` and `sync_all` (std's
     calls by default): the tests' host fails them part-way.
   - The lab, as measured (our own guest under lease k296, **Ubuntu 24.04**
     `6.8.0-147-generic`, clean at the start: no agent, no pin, no overlay;
@@ -8237,6 +8242,17 @@ number in parentheses is a lab PR.
       full (ENOSPC, an ERROR each) and **none** after. The cold boot: the
       bootcheck OK, `chain verify` OK again (10 heads anchored, a checkpoint
       reachable in each log written).
+    - Round r3 (5b2eba78, the actions chain's rotation, added by the
+      coordinator from lot 295's finding): `NN_ACTIONS_CAP_BYTES` at 1 MiB,
+      **1,150 R001 kills** of `www-data` execs in bursts of 50: the response
+      threads' rows went past the cap (WARN `this thread may not rotate
+      the log`, once), the rotation thread `nn-actions-rotate` rotated the
+      chain (INFO, once; archive 1 of 1,050,105 bytes), **1,150 intents and
+      1,150 outcomes in the chain, 0 rows not in it** (`nn-admin status`),
+      `nn-admin chain verify --log actions` OK (2,303 records, 1 archive, 3
+      checkpoints). After the cold boot: bootcheck OK, all ten chains OK.
+      On `main` the same burst past the cap loses every later row (the
+      host test: 445 of 480 rows lost).
     - Not measured in the lab: the export (off by default; its sink's short
       write is the kernel's in the host test), a failed fsync (no failing
       device), a retention pass (the host tests).
@@ -8245,9 +8261,14 @@ number in parentheses is a lab PR.
     write (`RLIMIT_FSIZE`, a helper process: the audit log refused at the
     reopen, `line 2 (558 bytes) is not an audit row`) — and 1 control
     passes; the rest need the new host seam and fail with their fix
-    reverted. Mutation on the fixes: 47 mutants on the final code, all
+    reverted. Mutation on the fixes: 59 mutants on the final code, all
     caught by a named test (6 survivors of the first pass named, or their
-    code removed as unreachable). Gates on the PR's tree: eBPF, the four clippy runs,
+    code removed as unreachable; the actions chain's rotation 12 of 12).
+    The CI's privileged run on the PR found the open's manifest lifting the
+    installed agent's state directory from every test agent (the
+    protection's directory is the fixed one): the installed agent's ladder
+    killed the later suites and isolated the guest; the manifest is now
+    created without a lift where its directory takes a new name. Gates on the PR's tree: eBPF, the four clippy runs,
     fmt, 94 suites (one failure in the first run: xtask's pure-crate check
     on two of this lot's tests, which named `std::os` in nn-evidence —
     moved, rerun green), the privileged no-run, the debug-trigger builds,
@@ -8260,7 +8281,8 @@ number in parentheses is a lab PR.
     next start; the flat chains of nn-linux (canary registry and access
     log, FIM baseline, the listener log) keep their own `write_all`
     without a re-read (not in this lot's bugs; a follow-up); the actions
-    chain still cannot rotate from a response thread (lot 295's report).
+    chain's rotation is the rotation thread's (a rotation it cannot do
+    either leaves the rows past the cap, said once).
   - Levels unchanged (C21 1, C23 2 provisional): an evidence-integrity gap
     of the writers closed and measured on one kernel — not a new
     capability.
