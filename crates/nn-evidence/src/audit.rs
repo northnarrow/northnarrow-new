@@ -838,7 +838,6 @@ impl<K: ChainSigner> AuditLog<K> {
             if let Err(e) = self.attest_tail_repair(&path, &r) {
                 self.unattested.push(r);
                 self.unattested.extend(pending);
-                self.poisoned.get_or_insert_with(|| format!("{e:#}"));
                 return Err(e);
             }
         }
