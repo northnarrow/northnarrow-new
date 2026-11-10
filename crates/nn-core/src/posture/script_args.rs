@@ -141,7 +141,7 @@ enum Opt {
     /// the interpreter refuses `-M` alone).
     RestRequired,
     /// The octal digits after it, then more letters (`perl -l`, `-0777`,
-    /// `ruby -T`); for `x` after it, the hexadecimal digits (`perl -0x1F`).
+    /// `ruby -T`).
     Digits,
     /// The rest of its argument, else the next argument (`python -W
     /// ignore`, `-Wignore`, `perl -I dir`, `ruby -r lib`).
@@ -539,14 +539,9 @@ fn read(family: Family, argv: &[String]) -> Runs {
                     }
                     break;
                 }
-                Opt::Digits => {
-                    pos += match rest.strip_prefix(['x', 'X']) {
-                        Some(hex) if family == Family::Perl => {
-                            1 + hex.bytes().take_while(u8::is_ascii_hexdigit).count()
-                        }
-                        _ => octal_digits(rest),
-                    };
-                }
+                // Perl's `-0x1F`: the `x` then reads as `-x`, which takes
+                // the rest, as the hexadecimal digits would
+                Opt::Digits => pos += octal_digits(rest),
                 Opt::OneChar => pos += rest.chars().next().map_or(0, char::len_utf8),
                 Opt::RubyWarn if rest.starts_with(':') => break,
                 Opt::RubyWarn => pos += octal_digits(rest).min(1),

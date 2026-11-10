@@ -6574,6 +6574,16 @@ mod tests {
                 Some("/usr/bin/aws"),
             ),
             ("/usr/bin/python3", &["python3", "-W"][..], None),
+            (
+                "/usr/bin/zsh",
+                &["zsh", "-", "/usr/bin/aws"][..],
+                Some("/usr/bin/aws"),
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "+", "/usr/bin/aws"][..],
+                Some("/usr/bin/aws"),
+            ),
             ("/usr/bin/bash", &["bash", "-o"][..], None),
             (
                 "/usr/bin/perl",
