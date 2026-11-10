@@ -8377,7 +8377,20 @@ number in parentheses is a lab PR.
   - No lab (host tests suffice, the brief's call). Host: a named test for
     each bug, each failing on `main` for its reason (25 tests; the lot's
     tests on `main`'s code, a local tree), the golden of the interrupted
-    row's line and 2 controls passing there; @MUT@
-  - Gates on the PR's tree: @GATES@
+    row's line and 2 controls passing there; mutation on the fixes: 41
+    mutants, all 41 caught by a named test (3 of them, on the agent's host
+    and the journal, in a second run: the first gave cargo two test filters
+    without `--`, recorded as not run, not as caught), 0 survivors, 0 argued
+    equivalent (code that no test could tell apart was removed before:
+    `soft_cap.max(1)`, a `\r` strip `record_of` already did, a null-intent
+    guard). A trial merge with lot 296 (#522): the code merges cleanly, its
+    tests and this lot's pass (the BUG28 retry test made independent of
+    which dance fails first: #522 probes the directory before it seals).
+  - Gates on the PR's tree: eBPF, the four clippy runs (+ nn-admin's
+    debug-trigger), fmt, 93 suites with 4,383 passed and 0 failed, the
+    privileged no-run, the debug-trigger builds, the eBPF maps
+    (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage, golden ×5 (57 files, the
+    same bytes), MSRV 1.89, the fuzz replay (14), portable (5), the
+    lockfiles unchanged.
   - Levels unchanged (C21 1): correctness of the chains' readers and of the
     receiver's check, measured by host tests — not a new capability.

@@ -5366,14 +5366,20 @@ mod tests {
     }
 
     /// BUG28: the finish step fails once after the seal (the rename's
-    /// dance); its retry from `pending_seal` still attests the slot the
-    /// probe skipped, once.
+    /// dance refused); its retry from `pending_seal` still attests the slot
+    /// the probe skipped, once.
     #[test]
     fn foreign_slot_skipped_before_a_retried_seal_is_attested() {
-        struct FailOnce(std::sync::atomic::AtomicBool);
-        impl ProtectionManager for FailOnce {
+        // the dance refused once, the first time it runs on a sealed active
+        // file: the finish step's (a dance before the seal passes)
+        struct FailSealedOnce(PathBuf, std::sync::atomic::AtomicBool);
+        impl ProtectionManager for FailSealedOnce {
             fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let sealed = fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|b| b.lines().last().map(is_terminator_line))
+                    .unwrap_or(false);
+                if sealed && self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return Err(anyhow!("simulated dance failure"));
                 }
                 f()
@@ -5385,7 +5391,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("test.jsonl");
         let kp = dir.path().join("key");
-        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicBool::new(false)));
+        let prot = std::sync::Arc::new(FailSealedOnce(
+            active.clone(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
         let mut log = open_log_with(&active, &kp, 2000, prot.clone());
         let mut i = 0;
         while log.active_bytes + 400 < 2000 {
@@ -5393,7 +5402,7 @@ mod tests {
             i += 1;
         }
         fs::write(archive_path(&active, 1), b"foreign\n").unwrap();
-        prot.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        prot.1.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             log.append(payload(i)).is_err(),
             "the first finish step fails"
