@@ -296,6 +296,49 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 290: foreign BPF.
+            FsProtectOperation::BpfHandle => {
+                let object = match *target_dev {
+                    1 => format!("map id {target_ino}"),
+                    2 => format!("program id {target_ino}"),
+                    _ => "object under its pin directories (/sys/fs/bpf/northnarrow*)".to_string(),
+                };
+                format!(
+                    "to take a handle on the agent's own BPF {object} outside a trusted-installer \
+                     window — a program is loaded against a map, or replaces a function of a \
+                     program, only through a descriptor of it"
+                )
+            }
+            FsProtectOperation::BpfProgType => {
+                let t = u32::try_from(*target_ino).unwrap_or(u32::MAX);
+                format!(
+                    "to load a `{}` BPF program (program type {target_ino}) outside a \
+                     trusted-installer window — a type that can rewrite a process's memory \
+                     (bpf_probe_write_user), override a kernel function's return, signal a \
+                     process or take a hook's place; the signed per-rule policy's \
+                     `bpf-loader-allow` names the loaders allowed one",
+                    common::bpf_prog_class::prog_type_name(t)
+                )
+            }
+            FsProtectOperation::BpfProgOptOut => {
+                let t = u32::try_from(*target_ino).unwrap_or(u32::MAX);
+                let reasoning = format!(
+                    "`{comm}` loaded a `{}` BPF program, a type refused outside a \
+                     trusted-installer window; the signed per-rule policy's `bpf-loader-allow` \
+                     names its executable and that type (not refused, recorded).",
+                    common::bpf_prog_class::prog_type_name(t)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
+            FsProtectOperation::BpfUnseen | FsProtectOperation::BpfBaseline => {
+                return Some(crossview_verdict(self, event, *operation, comm, *target_dev, *target_ino));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -310,6 +353,86 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 290: the severity of a cross-view finding — High for an object the
+/// `bpf` hook never saw loading after the start; for one present at the
+/// start (the baseline, loaded while the agent was not running), High when
+/// it is of a type refused outside a window (kprobe, tracepoint,
+/// perf_event, raw_tracepoint, raw_tracepoint_writable, tracing,
+/// struct_ops, extension, LSM), Low otherwise (systemd's and the container
+/// runtimes' cgroup programs).
+pub fn crossview_severity(
+    operation: FsProtectOperation,
+    is_link: bool,
+    early: bool,
+    object_type: u32,
+) -> Severity {
+    match operation {
+        FsProtectOperation::BpfBaseline
+            if is_link || early || !common::bpf_prog_class::denied_by_default(object_type) =>
+        {
+            Severity::Low
+        }
+        _ => Severity::High,
+    }
+}
+
+/// Lot 290: a cross-view finding's verdict (NN-L-AT-001, not a refusal).
+fn crossview_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    operation: FsProtectOperation,
+    comm: &str,
+    target_dev: u64,
+    target_ino: u64,
+) -> Verdict {
+    use common::bpf_prog_class as c;
+    let (is_link, early, t, id) = c::crossview_of(target_ino);
+    let (name, attach) = c::object_of_comm(comm);
+    let what = if is_link {
+        format!(
+            "BPF link id {id} (link type `{}`, {attach})",
+            c::link_type_name(t)
+        )
+    } else {
+        format!(
+            "BPF program id {id} `{name}` (type `{}`, tag {}, attached at {attach})",
+            c::prog_type_name(t),
+            c::tag_hex(target_dev)
+        )
+    };
+    let reasoning = if operation == FsProtectOperation::BpfUnseen {
+        format!(
+            "The {what} is loaded and the agent's `bpf` hook never saw it load since the agent \
+             started: it was loaded through a path the hook does not see, or is hidden from it — \
+             the shape of a BPF rootkit. Found by the cross-view (the agent's own enumeration of \
+             the kernel's programs and links every 5 s); not refused."
+        )
+    } else if early {
+        format!(
+            "The {what} was loaded by the kernel itself before user space started (its load \
+             time before PID 1's start): the kernel's own program, the cross-view's baseline, \
+             signed once. Not refused."
+        )
+    } else {
+        format!(
+            "The {what} was loaded while the agent was not running (present at its start): \
+             the cross-view's baseline, signed once. Not refused{}.",
+            if crossview_severity(operation, is_link, early, t) == Severity::High {
+                "; its type is one the agent refuses outside a trusted-installer window"
+            } else {
+                ""
+            }
+        )
+    };
+    build_verdict(
+        rule,
+        event,
+        ResponseAction::Log,
+        crossview_severity(operation, is_link, early, t),
+        &reasoning,
+    )
 }
 
 /// Lot 281: the severity of code-injection access to a process an
@@ -819,5 +942,131 @@ mod tests {
         let p = r(FsProtectOperation::SysctlRootProg);
         assert!(p.contains("(id 709)") && p.contains("Not refused"), "{p}");
         assert!(!p.contains("refused it"), "{p}");
+    }
+
+    /// Lot 290 (named): the foreign-BPF refusals are named and High; a load
+    /// the signed opt-out let through is Low and not refused; the
+    /// cross-view's unseen object is High with its type, name, tag and
+    /// attach point; the start's baseline is Low, High for a refused type.
+    #[test]
+    fn foreign_bpf_is_named_and_weighed() {
+        use common::bpf_prog_class::{crossview_ino, object_comm, tag_word};
+        let ev = |op, comm: &str, dev, ino| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: comm.into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1,
+        };
+        let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 1, 31));
+        assert_eq!(h.severity, Severity::High);
+        assert!(
+            h.reasoning.contains("map id 31") && h.reasoning.contains("refused it"),
+            "{}",
+            h.reasoning
+        );
+        let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 2, 32));
+        assert!(h.reasoning.contains("program id 32"), "{}", h.reasoning);
+        let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 0, 0));
+        assert!(
+            h.reasoning.contains("/sys/fs/bpf/northnarrow*"),
+            "{}",
+            h.reasoning
+        );
+        let t = v(ev(FsProtectOperation::BpfProgType, "bpftrace", 0, 2));
+        assert_eq!(t.severity, Severity::High);
+        assert!(
+            t.reasoning.contains("`kprobe` BPF program")
+                && t.reasoning.contains("bpf-loader-allow")
+                && t.reasoning.contains("refused it"),
+            "{}",
+            t.reasoning
+        );
+        let o = v(ev(FsProtectOperation::BpfProgOptOut, "bpftrace", 0, 26));
+        assert_eq!(o.severity, Severity::Low);
+        assert!(
+            o.reasoning.contains("`tracing`") && !o.reasoning.contains("refused it"),
+            "{}",
+            o.reasoning
+        );
+        let tag = tag_word([0xab, 0xcd, 0, 0, 0, 0, 0, 1]);
+        let u = v(ev(
+            FsProtectOperation::BpfUnseen,
+            &object_comm("hide_me", "bpf_lsm_file_open"),
+            tag,
+            crossview_ino(false, false, 29, 812),
+        ));
+        assert_eq!(u.severity, Severity::High);
+        for n in [
+            "id 812",
+            "`hide_me`",
+            "type `lsm`",
+            "tag abcd000000000001",
+            "bpf_lsm_file_open",
+            "never saw it load",
+            "not refused",
+        ] {
+            assert!(u.reasoning.contains(n), "{n}: {}", u.reasoning);
+        }
+        let l = v(ev(
+            FsProtectOperation::BpfUnseen,
+            &object_comm("", "prog 900"),
+            0,
+            crossview_ino(true, false, 2, 41),
+        ));
+        assert_eq!(l.severity, Severity::High);
+        assert!(
+            l.reasoning.contains("BPF link id 41 (link type `tracing`"),
+            "{}",
+            l.reasoning
+        );
+        let b = |t, link| {
+            v(ev(
+                FsProtectOperation::BpfBaseline,
+                &object_comm("sd_devices", "cgroup_device"),
+                0,
+                crossview_ino(link, false, t, 5),
+            ))
+        };
+        assert_eq!(b(15, false).severity, Severity::Low);
+        assert_eq!(b(2, false).severity, Severity::High);
+        assert_eq!(b(29, false).severity, Severity::High);
+        assert_eq!(
+            b(2, true).severity,
+            Severity::Low,
+            "a link: its program is weighed"
+        );
+        assert!(b(15, false)
+            .reasoning
+            .contains("while the agent was not running"));
+        assert!(b(29, false)
+            .reasoning
+            .contains("refuses outside a trusted-installer window"));
+        assert_eq!(
+            crossview_severity(FsProtectOperation::BpfUnseen, true, false, 0),
+            Severity::High
+        );
+        // the kernel's own program (loaded before user space): Low, said so
+        let k = v(ev(
+            FsProtectOperation::BpfBaseline,
+            &object_comm("hid_tail_call", "__hid_bpf_tail_call"),
+            0,
+            crossview_ino(false, true, 26, 2),
+        ));
+        assert_eq!(k.severity, Severity::Low);
+        assert!(
+            k.reasoning
+                .contains("by the kernel itself before user space"),
+            "{}",
+            k.reasoning
+        );
+        assert_eq!(
+            crossview_severity(FsProtectOperation::BpfUnseen, false, true, 26),
+            Severity::High,
+            "an unseen object stays High"
+        );
     }
 }

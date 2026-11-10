@@ -242,6 +242,10 @@ pub fn arm(ebpf: &mut Ebpf, blocklist: &NetBlocklist) -> Result<ArmReport> {
             Array::try_from(map).with_context(|| format!("{MAP_MODE} is not an array"))?;
         mode.set(0, 1, 0).context("turning the connect deny on")?;
     }
+    // Lot 290 (item 3): set once per load — frozen
+    if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, MAP_MODE) {
+        tracing::warn!(error = %e, "connect deny: its mode map NOT frozen");
+    }
     let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the connect deny")?;
     let prog: &mut Lsm = ebpf
         .program_mut(PROGRAM)

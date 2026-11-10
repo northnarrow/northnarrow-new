@@ -552,6 +552,9 @@ planned = false
 # Lot 285: the kernel's module-load verdicts, the trust map's entry, the
 # write history's step (the eBPF programs and the agent)
 "module_judge" = "northnarrow-common"
+# Lot 290: the BPF program types refused to a foreign loader, their names,
+# the cross-view's iterator records (the eBPF programs and the agent)
+"bpf_prog_class" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

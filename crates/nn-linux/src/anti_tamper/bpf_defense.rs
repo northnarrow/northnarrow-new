@@ -15,12 +15,12 @@ use aya::maps::{Array, HashMap, Map, MapData};
 use aya::{Btf, Ebpf};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
 
@@ -33,6 +33,11 @@ pub const GUARD_PROGRAM: &str = "bpf_map_guard";
 pub const GUARD_HOOK: &str = "bpf_map";
 pub const OBSERVE_PROGRAM: &str = "bpf_syscall_observe";
 pub const OBSERVE_HOOK: &str = "bpf";
+/// Lot 290: the program-handle guard and the seen-load recorder.
+pub const PROG_GUARD_PROGRAM: &str = "bpf_prog_guard";
+pub const PROG_GUARD_HOOK: &str = "bpf_prog";
+/// Lot 290: the signed per-loader opt-out's map (pinned by name).
+pub const LOADER_OPTOUT_MAP: &str = "BPF_LOADER_OPTOUT";
 
 /// External audit EBPF-002: roles in `OWN_EXE_INODES` (mirrors
 /// `agent-ebpf/src/bpf_defense.rs`).
@@ -115,12 +120,39 @@ struct GuardState {
     /// The agent is stopping: its links go with it, and the self-check must
     /// not report them ([`BpfGuard::mark_stopping`]).
     stopping: std::sync::atomic::AtomicBool,
+    /// Lot 290: the ids of the agent's programs, both registrations (the
+    /// cross-view's "own").
+    own_progs: parking_lot::Mutex<std::collections::BTreeSet<u32>>,
+    /// Lot 290: the cross-view's kernel parts, set up at the attach and
+    /// handed to the kernel-state round ([`BpfGuard::crossview`]).
+    census: parking_lot::Mutex<Option<crate::bpf_crossview::Parts>>,
 }
 
 impl BpfGuard {
     /// An empty record, for one eBPF object.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lot 290: the agent's program ids registered so far.
+    pub fn own_prog_ids(&self) -> std::collections::BTreeSet<u32> {
+        self.0.own_progs.lock().clone()
+    }
+
+    /// Lot 290: the cross-view for the kernel-state round (its kernel parts
+    /// taken once; `None` when the attach could not set them up — a signed
+    /// degradation then), its status file at `status`.
+    pub fn crossview(&self, status: Option<PathBuf>) -> Option<crate::bpf_crossview::CrossView> {
+        let parts = self.0.census.lock().take()?;
+        let guard = self.clone();
+        Some(crate::bpf_crossview::CrossView {
+            parts,
+            own: Box::new(move || guard.own_prog_ids()),
+            status,
+            watch: crate::bpf_crossview::Watch::new(
+                crate::bpf_crossview::host_user_space_start_ns(),
+            ),
+        })
     }
 
     /// Retire every live link of program `prog_id` before the agent itself
@@ -262,6 +294,34 @@ pub(crate) fn attach(
             health
                 .observe_failures
                 .push((OBSERVE_PROGRAM, format!("{e:#}")));
+        }
+    }
+    // Lot 290: the program-handle guard (and the seen loads' recorder), and
+    // the cross-view's iterators.
+    match antitamper_bpf::attach_transient(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf) {
+        Ok(()) => info!(
+            program = PROG_GUARD_PROGRAM,
+            hook = PROG_GUARD_HOOK,
+            "BPF self-defence: program-handle guard attached"
+        ),
+        Err(e) => {
+            dump_verifier_log(PROG_GUARD_PROGRAM, &e);
+            warn!(program = PROG_GUARD_PROGRAM, hook = PROG_GUARD_HOOK, error = format!("{e:#}"), "BPF self-defence: program-handle guard attach FAILED — handles on the agent's programs not refused, loads not seen");
+            health
+                .observe_failures
+                .push((PROG_GUARD_PROGRAM, format!("{e:#}")));
+        }
+    }
+    match crate::bpf_crossview::Parts::setup(ebpf, btf) {
+        Ok(parts) => {
+            *guard.0.census.lock() = Some(parts);
+            info!("BPF self-defence: cross-view iterators ready");
+        }
+        Err(e) => {
+            warn!(error = %e, "BPF self-defence: cross-view NOT set up — a program the bpf hook never saw is not found");
+            health
+                .observe_failures
+                .push((crate::bpf_crossview::ITER_PROGS, e));
         }
     }
     health
@@ -418,6 +478,7 @@ pub(crate) fn register_own_objects(
             missing.join(", ")
         );
     }
+    guard.0.own_progs.lock().extend(prog_ids.iter().copied());
     let own = ebpf
         .map_mut(OWN_IDS_MAP)
         .with_context(|| format!("{OWN_IDS_MAP} missing from the eBPF object"))?;
@@ -544,6 +605,21 @@ pub(crate) fn register_own_objects(
         Array::try_from(mode).context("BPF_DEFENSE_MODE is not an Array<u32>")?;
     mode.set(0, if enforce { 1 } else { 0 }, 0)
         .context("arming BPF_DEFENSE_MODE")?;
+    // Lot 290: the signed per-loader opt-outs in force (a policy applied
+    // before the load wrote nothing to the kernel yet).
+    if let Err(e) = write_loader_opt_outs_object(ebpf) {
+        error!(error = %e, "BPF self-defence: the per-loader opt-outs NOT written — their loads stay refused");
+    }
+    // Lot 290 (item 3): the read-only configuration maps written once,
+    // frozen — no handle of any process writes them any more.
+    for (name, outcome) in freeze_config_maps(ebpf) {
+        match outcome {
+            Ok(()) => debug!(map = name, "BPF self-defence: configuration map frozen"),
+            Err(e) => {
+                warn!(map = name, error = %e, "BPF self-defence: configuration map NOT frozen")
+            }
+        }
+    }
     info!(
         maps = map_ids.len(),
         programs = prog_ids.len(),
@@ -568,11 +644,223 @@ pub(crate) fn register_own_objects(
     })
 }
 
+/// Lot 290 (item 3): the configuration maps this module writes once, at
+/// the registration, and nothing writes again — frozen right after
+/// (`BPF_MAP_FREEZE`: no descriptor writes them any more, the agent's
+/// included; the programs read them). `BTF_OFFSETS`, `EXECPOL_CONF`,
+/// `EXECQ_CONF` and the start-in-cgroup tracker's pinned maps were frozen
+/// before this lot; `SYSCTL_KERNEL_JUDGE`, `DNS_EXEMPT_UIDS` and
+/// `NET_CONNECT_DENY_MODE` are frozen where they are written.
+pub const FROZEN_AT_REGISTRATION: [&str; 3] = [MODE_MAP, OWN_EXE_MAP, PIN_NAMES_MAP];
+
+/// [`FROZEN_AT_REGISTRATION`] frozen, each with its outcome.
+fn freeze_config_maps(ebpf: &Ebpf) -> Vec<(&'static str, std::result::Result<(), String>)> {
+    FROZEN_AT_REGISTRATION
+        .iter()
+        .map(|name| {
+            let r = match ebpf.map(name) {
+                Some(m) => freeze_map(map_data(m)).map(|_| ()),
+                None => Err(format!("{name} missing from the eBPF object")),
+            };
+            (*name, r)
+        })
+        .collect()
+}
+
+/// Lot 290: map `name` of `ebpf` frozen ([`freeze_map`]).
+pub fn freeze_named(ebpf: &Ebpf, name: &str) -> std::result::Result<bool, String> {
+    let m = ebpf
+        .map(name)
+        .ok_or_else(|| format!("{name} missing from the eBPF object"))?;
+    freeze_map(map_data(m)).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Lot 290: `BPF_MAP_FREEZE` on `map` — unless its descriptor's fdinfo
+/// says it is frozen already (a frozen map answers `EPERM`, not `EBUSY`:
+/// lot 281's lab). `Ok(true)` frozen now, `Ok(false)` it was.
+pub fn freeze_map(map: &MapData) -> std::result::Result<bool, String> {
+    use crate::cgroup_join::{fdinfo_frozen, freeze_outcome, Freeze};
+    const MAP_FREEZE: libc::c_long = common::bpf_cmd::BPF_MAP_FREEZE as libc::c_long;
+    #[repr(C)]
+    struct FreezeAttr {
+        map_fd: u32,
+    }
+    let fd = map.fd().as_fd().as_raw_fd();
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .map_err(|e| format!("its fdinfo: {e}"))?;
+    match fdinfo_frozen(&info) {
+        Some(true) => return Ok(false),
+        Some(false) => {}
+        None => return Err("no frozen state in its fdinfo".to_string()),
+    }
+    let attr = FreezeAttr { map_fd: fd as u32 };
+    // SAFETY: bpf(BPF_MAP_FREEZE) with a valid, fully initialised attribute
+    // block of its exact size; the fd is borrowed from the live map.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            MAP_FREEZE,
+            &attr as *const FreezeAttr as *const libc::c_void,
+            std::mem::size_of::<FreezeAttr>() as u32,
+        )
+    };
+    let errno = if rc < 0 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    } else {
+        0
+    };
+    Ok(freeze_outcome(errno)? == Freeze::Now)
+}
+
+/// Lot 290: one signed per-loader opt-out in force — the line's executable,
+/// the device and inode its path named when the policy was applied, the
+/// types' mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderOptOut {
+    pub path: String,
+    pub key: common::wire::InodeKey,
+    pub mask: u32,
+}
+
+/// The per-loader opt-outs in force (from a signed policy only).
+static LOADER_OPT_OUTS: parking_lot::RwLock<Vec<LoaderOptOut>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// The per-loader opt-outs in force now.
+pub fn loader_opt_outs_now() -> Vec<LoaderOptOut> {
+    LOADER_OPT_OUTS.read().clone()
+}
+
+/// Lot 290: the `bpf-loader-allow` lines of `policy` resolved — each path's
+/// device and inode now (`stat` follows a symlink to the executable the
+/// kernel runs) — and why a line is not, if one is not.
+pub fn resolve_loader_opt_outs(
+    lines: &[(&str, u32)],
+    stat: impl Fn(&str) -> std::io::Result<(u64, u64)>,
+) -> (Vec<LoaderOptOut>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut unresolved = Vec::new();
+    for (path, mask) in lines {
+        match stat(path) {
+            Ok((dev, ino)) => out.push(LoaderOptOut {
+                path: path.to_string(),
+                key: common::wire::InodeKey {
+                    dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(dev),
+                    ino,
+                },
+                mask: *mask,
+            }),
+            Err(e) => unresolved.push(format!("{path}: {e}")),
+        }
+    }
+    (out, unresolved)
+}
+
+/// A regular file's `(st_dev, st_ino)` through `path` (a symlink followed).
+fn stat_executable(path: &str) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    if !m.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok((m.dev(), m.ino()))
+}
+
+/// Lot 290: put `policy`'s `bpf-loader-allow` lines in force — only when
+/// `signed` (the policy's signature verified for the very text applied: an
+/// unsigned policy loaded through `NN_OVERLAY_ALLOW_UNSIGNED` honours none)
+/// — and write them to the kernel's pinned map under the pin root (when
+/// the agent's object is not loaded yet, its registration writes them).
+/// The detail of a signed degradation when a line is withheld or does not
+/// resolve.
+pub fn apply_loader_policy(
+    policy: &nn_core::decision::rule_policy::RulePolicy,
+    signed: bool,
+) -> Option<String> {
+    let lines: Vec<(&str, u32)> = policy.bpf_loader_opt_outs().collect();
+    let (resolved, unresolved) = if signed {
+        resolve_loader_opt_outs(&lines, stat_executable)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    *LOADER_OPT_OUTS.write() = resolved;
+    if let Some(root) = antitamper_bpf::prepare_pin_root() {
+        let pin = root.join(LOADER_OPTOUT_MAP);
+        if pin.exists() {
+            if let Err(e) = write_loader_opt_outs_pin(&pin) {
+                warn!(error = %e, "BPF loader opt-out: NOT written to the kernel — its loads stay refused");
+            }
+        }
+    }
+    if !signed && !lines.is_empty() {
+        return Some(format!(
+            "{}: {} bpf-loader-allow line(s) NOT honoured — the policy was loaded without a valid \
+             signature (NN_OVERLAY_ALLOW_UNSIGNED=1): those loaders' refused types stay refused",
+            policy.source,
+            lines.len()
+        ));
+    }
+    if !unresolved.is_empty() {
+        return Some(format!(
+            "{}: bpf-loader-allow line(s) whose executable is not there: {} — its loads stay \
+             refused",
+            policy.source,
+            unresolved.join("; ")
+        ));
+    }
+    if !lines.is_empty() {
+        info!(
+            count = lines.len(),
+            "BPF loader opt-out: the signed policy's bpf-loader-allow lines in force"
+        );
+    }
+    None
+}
+
+/// The opt-outs in force written over `map`'s entries (every other entry
+/// removed).
+fn write_loader_opt_outs_to<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    map: &mut HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
+) -> std::result::Result<usize, String> {
+    use crate::anti_tamper::filesystem::AyaInodeKey;
+    let want = loader_opt_outs_now();
+    let stale: Vec<AyaInodeKey> = map
+        .keys()
+        .filter_map(std::result::Result::ok)
+        .filter(|k| !want.iter().any(|o| o.key == k.0))
+        .collect();
+    for k in &stale {
+        map.remove(k)
+            .map_err(|e| format!("removing a stale opt-out: {e}"))?;
+    }
+    for o in &want {
+        map.insert(AyaInodeKey(o.key), o.mask, 0)
+            .map_err(|e| format!("{}: {e}", o.path))?;
+    }
+    Ok(want.len())
+}
+
+fn write_loader_opt_outs_pin(pin: &Path) -> std::result::Result<usize, String> {
+    let md = MapData::from_pin(pin).map_err(|e| e.to_string())?;
+    let mut map: HashMap<MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
+        HashMap::try_from(Map::HashMap(md)).map_err(|e| e.to_string())?;
+    write_loader_opt_outs_to(&mut map)
+}
+
+fn write_loader_opt_outs_object(ebpf: &mut Ebpf) -> std::result::Result<usize, String> {
+    let m = ebpf
+        .map_mut(LOADER_OPTOUT_MAP)
+        .ok_or_else(|| format!("{LOADER_OPTOUT_MAP} missing from the eBPF object"))?;
+    let mut map: HashMap<&mut MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
+        HashMap::try_from(m).map_err(|e| e.to_string())?;
+    write_loader_opt_outs_to(&mut map)
+}
+
 /// External audit ATP-013: the programs and links attached after the
 /// anti-tamper step — the FIM observers, the file-open sensor — added to
 /// `OWN_BPF_IDS` in a second pass, so the set stays complete. Returns how
 /// many ids were written (inserting one already there changes nothing).
-pub fn register_late_objects(ebpf: &mut Ebpf) -> Result<usize> {
+pub fn register_late_objects(guard: &BpfGuard, ebpf: &mut Ebpf) -> Result<usize> {
     let mut prog_ids: Vec<u32> = Vec::new();
     for (name, prog) in ebpf.programs() {
         match prog.info() {
@@ -584,6 +872,8 @@ pub fn register_late_objects(ebpf: &mut Ebpf) -> Result<usize> {
             }
         }
     }
+    // Lot 290: the cross-view's "own"
+    guard.0.own_progs.lock().extend(prog_ids.iter().copied());
     // Their links are held by this process (not pinned): found through
     // its descriptors.
     let link_ids = own_link_ids(&prog_ids, None);
@@ -1002,7 +1292,7 @@ impl BpfGuard {
 /// The `MapData` behind any `Map` variant (aya 0.14 exposes `info()` on
 /// `MapData` only, and `Map` is neither `#[non_exhaustive]` nor has an
 /// accessor: an aya upgrade that adds a variant fails to compile here).
-fn map_data(m: &Map) -> &MapData {
+pub(crate) fn map_data(m: &Map) -> &MapData {
     match m {
         Map::Array(d)
         | Map::ArrayOfMaps(d)
@@ -1233,5 +1523,42 @@ mod tests {
         assert_eq!(kept, ["3 cgroup_join_mark kept", "8 nn_sysctl_guard kept"]);
         assert!(body.contains("\n6 task_kill\n") && body.contains("\n9 protected_write_deny\n"));
         assert!(pin_name_key(&format!("link_{}", crate::sysctl_cgroup::PROGRAM)).is_some());
+    }
+
+    /// Lot 290 (named): a `bpf-loader-allow` line is resolved to the
+    /// device and inode its path names now (the kernel's device number), a
+    /// path that is not there is named and not in force; the frozen maps
+    /// are the three this module writes once.
+    #[test]
+    fn a_loader_opt_out_is_its_executable_s_device_and_inode() {
+        let lines = [("/usr/bin/bpftrace", 0b100), ("/opt/gone", 0b1)];
+        let stat = |p: &str| match p {
+            "/usr/bin/bpftrace" => Ok(((8u64 << 8) | 2, 4242u64)),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        let (ok, missing) = resolve_loader_opt_outs(&lines, stat);
+        assert_eq!(
+            ok,
+            vec![LoaderOptOut {
+                path: "/usr/bin/bpftrace".into(),
+                key: common::wire::InodeKey {
+                    dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev((8 << 8) | 2),
+                    ino: 4242
+                },
+                mask: 0b100
+            }]
+        );
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].starts_with("/opt/gone: "), "{missing:?}");
+        assert_eq!(
+            FROZEN_AT_REGISTRATION,
+            ["BPF_DEFENSE_MODE", "OWN_EXE_INODES", "OWN_PIN_NAMES"]
+        );
+        // an unsigned policy honours none
+        let p = nn_core::decision::rule_policy::parse("bpf-loader-allow /usr/bin/true kprobe\n")
+            .unwrap();
+        let detail = apply_loader_policy(&p, false).expect("withheld");
+        assert!(detail.contains("NOT honoured"), "{detail}");
+        assert!(loader_opt_outs_now().is_empty());
     }
 }

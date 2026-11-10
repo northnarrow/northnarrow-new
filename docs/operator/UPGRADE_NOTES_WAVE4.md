@@ -750,7 +750,49 @@ others. What an operator sees change:
   unmodified `fim-paths.v1` of an earlier release is replaced by the
   install, as for every shipped list.
 
-## 14. What an interpreter runs, and who vouches for a writer (lot 292)
+## 14. Foreign BPF (lot 290)
+
+- **A load of a `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`,
+  `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF
+  program is refused outside a signed trusted-installer window** (`EPERM`)
+  to every process outside the agent's family, in every mode of the BPF
+  guard (`NN_BPF_DEFENSE_OBSERVE=1` included). bpftrace, Falco, Tetragon,
+  Cilium's agent and the like stop loading outside a window: before the
+  upgrade, sign a `bpf-loader-allow <executable> <types>` line for each
+  tool the host runs outside one (`RULE_POLICY.md` §2.5: bpftrace's
+  `tracepoint:` and `interval:` probes are `tracepoint` and `perf_event`
+  programs — name them too). Every other program type (systemd's and the
+  container runtimes' cgroup programs, tc, XDP, socket filters) loads as
+  before, recorded.
+  A refusal is NN-L-AT-001 `bpf_prog_type` (High, ENGAGED), a load the
+  opt-out lets through `bpf_prog_opt_out` (Low).
+- **The agent's maps and programs are off limits outside a window** (the
+  guard enforcing, a production build): `BPF_MAP_GET_FD_BY_ID` (a read-only
+  handle too), `BPF_PROG_GET_FD_BY_ID`, and `BPF_OBJ_GET` of anything under
+  `/sys/fs/bpf/northnarrow*` fail with `EPERM` (NN-L-AT-001 `bpf_handle`,
+  ENGAGED). **`bpftool prog|map|link show` stops at the first NorthNarrow
+  object** outside a window (bpftool gives up a listing at a refused
+  handle), and its `pids` column is gone (its iterator is a `tracing`
+  program); inside a window both work. The agent lists its own programs in
+  `/run/northnarrow/bpf-own-ids` and the host's foreign ones in
+  `/run/northnarrow/bpf-foreign`.
+- **New records of the kernel-state round** (5 s, not refusals, no posture
+  trigger): at each start every BPF program not the agent's that its `bpf`
+  hook did not see loading is signed once, NN-L-AT-001 `bpf_baseline` — Low,
+  High for one of the nine types above (one loaded while no agent ran); a
+  program or link that appears later and the hook never saw is
+  `bpf_unseen`, High. A host with many container or systemd programs has
+  as many Low baseline records at each agent start; the kernel's own
+  programs (loaded before user space: HID-BPF's `hid_tail_call`) are Low.
+- **R011's record of a plain `modprobe <name>` by root is Low** (it was
+  High): the system's tool asked for modules by name, its environment read
+  clean. The suspicious cases keep their severity (a process gone before
+  its environment was read High, every kill High).
+- **Frozen maps**: `BPF_DEFENSE_MODE`, `OWN_EXE_INODES`, `OWN_PIN_NAMES`,
+  `SYSCTL_KERNEL_JUDGE`, `DNS_EXEMPT_UIDS` and `NET_CONNECT_DENY_MODE` take no
+  write from any process after the start (the agent's included).
+
+## 15. What an interpreter runs, and who vouches for a writer (lot 292)
 
 The external bug hunt (editions 1.2/1.3) found an interpreter's script read
 with one option rule for every interpreter (BUG-44, BUG-42) and a writer's
