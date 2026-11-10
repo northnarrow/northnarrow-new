@@ -1210,3 +1210,521 @@ fn releases_are_ordered_part_by_part() {
     // nothing known before: nothing to compare
     assert!(contract_backwards(&older_agent_without_fields, &seen).is_empty());
 }
+
+// ── lot 295: every beat of a fetch is read (external bug hunt, editions
+// 1.2/1.3: BUG01, BUG12, BUG18, BUG30, BUG32) ─────────────────────────
+
+/// BUG01: the loss, unwritten action rows and probe gaps a run counted in
+/// its last beats are alerted even when that run stopped and a new one
+/// started before the next check (the newest beat is the new run's).
+#[test]
+fn loss_of_a_run_ended_between_two_checks_is_alerted() {
+    let mut c = Chain::new();
+    for seq in 1..=10u64 {
+        c.push(beat(seq, (seq as i64 - 1) * 30));
+    }
+    let r = check(Ok(&c.lines()), &c.pk, None, at(271), &cfg());
+    assert!(r.alerts.is_empty(), "the anchor: {r:?}");
+    let s = r.state.unwrap();
+    assert_eq!(s.seq, 10);
+    let mut b = beat(11, 300);
+    b.loss[3] = Some(5000);
+    b.actions.unwritten = 7;
+    b.probe_gaps = Some(3);
+    c.push(b);
+    let mut stop = beat(12, 310);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("system_shutdown".into());
+    stop.loss[3] = Some(5000);
+    stop.actions.unwritten = 7;
+    stop.probe_gaps = Some(3);
+    c.push(stop);
+    let mut start = beat(13, 320);
+    start.kind = BeatKind::Start;
+    start.run = "bbbbbbbbbbbbbbbb".into();
+    c.push(start);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(321), &cfg());
+    assert_eq!(kinds(&r), ["LOSS", "DEGRADED"], "{r:?}");
+    assert_eq!(
+        r.alerts[0].detail(),
+        "events lost since the last beat seen: stage 4 (bus queue) +5000 (run \
+         aaaaaaaaaaaaaaaa, ended at beat 12)"
+    );
+    let d = r.alerts[1].detail();
+    for want in [
+        "3 new telemetry gap(s) of the probe (run aaaaaaaaaaaaaaaa, ended at beat 12)",
+        "7 action row(s) not in the signed actions chain (run aaaaaaaaaaaaaaaa, ended at beat \
+         12)",
+    ] {
+        assert!(d.contains(want), "{want}: {d}");
+    }
+}
+
+/// BUG12 (c): `--max-silence-secs 18446744073709551615` makes a beat
+/// seen this very second SILENT (`bound as i64` is -1).
+#[test]
+fn max_silence_u64_max_fresh_beat_is_not_silent() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    c.push(beat(2, 30));
+    let huge = WatchConfig {
+        max_silence_secs: Some(u64::MAX),
+        ..cfg()
+    };
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &huge);
+    assert_eq!(r.age_secs, Some(0));
+    assert!(r.alerts.is_empty(), "a fresh beat: {r:?}");
+}
+
+/// BUG12 (b'): an explicit bound does not depend on the beat's interval —
+/// `unwrap_or(2 * interval + 15)` is evaluated (and overflows) anyway.
+#[test]
+fn explicit_bound_ignores_a_huge_interval() {
+    let explicit = WatchConfig {
+        max_silence_secs: Some(60),
+        ..cfg()
+    };
+    assert_eq!(silence_bound(&explicit, u64::MAX), 60);
+}
+
+/// BUG12 (d): a (signed) beat with a huge `interval_secs` must not panic
+/// the verifier (debug: overflow in the late-beat and stall thresholds;
+/// release: they wrap to a few hundred ms, a false DEGRADED).
+#[test]
+fn huge_interval_does_not_overflow_the_thresholds() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat(2, 30);
+    b.interval_secs = 18_446_744_073_709_537;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+}
+
+/// BUG18: a cut the agent declared (`kept: false`) in a beat that is not
+/// the newest of one fetch is still REPLAY.
+#[test]
+fn a_cut_declared_by_a_beat_before_the_newest_alerts() {
+    let actions = |file: u64, bytes: u64, h: u8, kept: Option<bool>| BeatHead {
+        chain: "actions".into(),
+        file: Some(file),
+        bytes: Some(bytes),
+        hash: format!("{h:02x}").repeat(32),
+        kept,
+        ..BeatHead::default()
+    };
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads.push(actions(3, 5_000, 1, None));
+    c.push(b1);
+    let lines = c.lines();
+    let s = check(Ok(&lines[..1]), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b2 = beat(2, 30);
+    b2.heads.push(actions(3, 5_500, 2, Some(false)));
+    c.push(b2);
+    let mut b3 = beat(3, 60);
+    b3.heads.push(actions(3, 6_000, 3, Some(true)));
+    c.push(b3);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+}
+
+/// BUG18 (the same blind spot, a rollback): a head that went back in a beat
+/// before the newest, then grew past the position seen, is still REPLAY.
+#[test]
+fn a_head_back_then_past_within_one_fetch_alerts() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0)); // audit head row 101
+    let lines = c.lines();
+    let s = check(Ok(&lines[..1]), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b2 = beat(2, 30);
+    b2.heads[0].seq = Some(50); // rolled back
+    b2.heads[0].hash = "ab".repeat(32);
+    c.push(b2);
+    c.push(beat(3, 60)); // row 103, past 101
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+}
+
+/// BUG30: a head gone from the beats (REPLAY once) and back lower than the
+/// one seen before it went is still a rollback.
+#[test]
+fn a_head_gone_then_back_lower_is_a_rollback() {
+    let audit = |seq: u64, hash: &str| BeatHead {
+        chain: "audit".into(),
+        seq: Some(seq),
+        hash: hash.repeat(32),
+        ..BeatHead::default()
+    };
+    let replay = |r: &CheckResult| r.alerts.iter().any(|a| matches!(a, Alert::Replay(_)));
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads = vec![audit(500, "aa")];
+    c.push(b1);
+    let r1 = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg());
+    let mut b2 = beat(2, 30);
+    b2.heads.clear();
+    c.push(b2);
+    let r2 = check(Ok(&c.lines()), &c.pk, r1.state.as_ref(), at(31), &cfg());
+    assert!(replay(&r2), "the head gone: {r2:?}");
+    let mut b3 = beat(3, 60);
+    b3.heads = vec![audit(120, "bb")];
+    c.push(b3);
+    let r3 = check(Ok(&c.lines()), &c.pk, r2.state.as_ref(), at(61), &cfg());
+    assert!(replay(&r3), "500 -> 120 after an absence: {:?}", r3.alerts);
+}
+
+/// BUG32: a head hash that is not ASCII (only the key's holder can sign
+/// one) must not panic the verifier while it formats the alert.
+#[test]
+fn a_non_ascii_head_hash_does_not_panic() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat(2, 30);
+    b.heads[0].seq = Some(101);
+    b.heads[0].hash = "€€€€€€".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+}
+
+/// BUG01: a whole run between two checks — started and stopped after the
+/// beat seen last, before the newest — is compared from zero: its loss,
+/// gaps and degradations are alerted, named by its run.
+#[test]
+fn a_whole_run_between_two_checks_is_compared_from_zero() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut stop = beat(2, 10);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("admin_shutdown".into());
+    c.push(stop);
+    let run_b = "bbbbbbbbbbbbbbbb";
+    let mut start = beat(3, 20);
+    start.kind = BeatKind::Start;
+    start.run = run_b.into();
+    start.actions.interrupted_at_boot = 1;
+    c.push(start);
+    let mut b = beat(4, 30);
+    b.run = run_b.into();
+    b.loss[1] = Some(9);
+    b.probe_gaps = Some(2);
+    c.push(b);
+    let mut stop = beat(5, 40);
+    stop.kind = BeatKind::Stop;
+    stop.run = run_b.into();
+    stop.stop_reason = Some("system_shutdown".into());
+    stop.loss[1] = Some(12);
+    stop.probe_gaps = Some(2);
+    stop.actions.interrupted_at_boot = 1;
+    stop.degradations = vec!["sensor pump exited: dns".into()];
+    c.push(stop);
+    let mut start = beat(6, 50);
+    start.kind = BeatKind::Start;
+    start.run = "cccccccccccccccc".into();
+    c.push(start);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(51), &cfg());
+    assert_eq!(kinds(&r), ["LOSS", "DEGRADED"], "{r:?}");
+    assert_eq!(
+        r.alerts[0].detail(),
+        "events lost since the last beat seen: stage 2 (kernel budget) +12 (run \
+         bbbbbbbbbbbbbbbb, ended at beat 5)",
+        "the run's last beat, once"
+    );
+    let d = r.alerts[1].detail();
+    assert!(
+        d.contains("2 new telemetry gap(s) of the probe (run bbbb"),
+        "{d}"
+    );
+    assert!(d.contains("sensor pump exited: dns"), "{d}");
+    assert!(
+        d.contains(
+            "1 action(s) of an earlier run interrupted between intent and outcome (run \
+             bbbbbbbbbbbbbbbb, ended at beat 5)"
+        ),
+        "{d}"
+    );
+}
+
+/// BUG12: a beat's lateness within a run is measured with its interval
+/// within the agent's bounds — a signed beat that says 100000 s is late
+/// 400 s after the one before it, and one that says nearly `u64::MAX` does
+/// not overflow the threshold.
+#[test]
+fn a_late_beat_is_measured_within_the_agent_s_bounds() {
+    for interval in [100_000, u64::MAX / 1000] {
+        let mut c = Chain::new();
+        c.push(beat(1, 0));
+        c.push(beat(2, 30));
+        let s = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg())
+            .state
+            .unwrap();
+        let mut b = beat(3, 430);
+        b.interval_secs = interval;
+        c.push(b);
+        let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(431), &cfg());
+        assert_eq!(kinds(&r), ["DEGRADED"], "{interval}: {r:?}");
+        assert!(
+            r.alerts[0]
+                .detail()
+                .contains("beat 3 came 400 s after beat 2"),
+            "{r:?}"
+        );
+    }
+}
+
+/// BUG01 (the triage's case beside it): a stop beat that is not the newest
+/// was followed by the next run's start, and STOPPED never named its
+/// reason. A reason that is not a clean stop's (a pump that exited, a
+/// thread lost), or none, is DEGRADED; a clean one stays quiet.
+#[test]
+fn an_abnormal_stop_followed_by_a_start_is_degraded() {
+    let run = |reason: Option<&str>| {
+        let mut c = Chain::new();
+        c.push(beat(1, 0));
+        let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+            .state
+            .unwrap();
+        let mut stop = beat(2, 10);
+        stop.kind = BeatKind::Stop;
+        stop.stop_reason = reason.map(str::to_string);
+        c.push(stop);
+        let mut start = beat(3, 20);
+        start.kind = BeatKind::Start;
+        start.run = "bbbbbbbbbbbbbbbb".into();
+        c.push(start);
+        check(Ok(&c.lines()), &c.pk, Some(&s), at(21), &cfg())
+    };
+    for reason in [
+        "sensor_pump_exited",
+        "response_dispatcher_exited",
+        "decision_thread_failed",
+    ] {
+        let r = run(Some(reason));
+        assert_eq!(kinds(&r), ["DEGRADED"], "{reason}: {r:?}");
+        assert!(
+            r.alerts[0]
+                .detail()
+                .contains(&format!("stopped at beat 2 ({reason}) and started again")),
+            "{r:?}"
+        );
+    }
+    let r = run(None);
+    assert!(r.alerts[0].detail().contains("(no reason given)"), "{r:?}");
+    // the agent's clean stops (its run loop's reasons that end with Ok)
+    for clean in [
+        "admin_shutdown",
+        "system_shutdown",
+        "sigterm",
+        "sigint",
+        "sighup",
+    ] {
+        let r = run(Some(clean));
+        assert!(r.alerts.is_empty(), "{clean}: {r:?}");
+    }
+    // the newest beat a stop of that kind: STOPPED names its reason, no more
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut stop = beat(2, 10);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("sensor_pump_exited".into());
+    c.push(stop);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(11), &cfg());
+    assert_eq!(kinds(&r), ["STOPPED"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("sensor_pump_exited"), "{r:?}");
+}
+
+/// BUG18: a cut made while the host was down (a rescue boot) and the
+/// reboot: the start beat's read-back says `kept: false`, and the next beat
+/// (`kept: true`, past the position seen) is the newest of the fetch.
+#[test]
+fn a_start_beat_kept_false_followed_by_a_beat_alerts() {
+    let actions = |bytes: u64, h: u8, kept: Option<bool>| BeatHead {
+        chain: "actions".into(),
+        file: Some(3),
+        bytes: Some(bytes),
+        hash: format!("{h:02x}").repeat(32),
+        kept,
+        ..BeatHead::default()
+    };
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads.push(actions(5_000, 1, None));
+    c.push(b1);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut stop = beat(2, 10);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("system_shutdown".into());
+    stop.heads.push(actions(5_200, 2, Some(true)));
+    c.push(stop);
+    let mut start = beat(3, 20);
+    start.kind = BeatKind::Start;
+    start.run = "bbbbbbbbbbbbbbbb".into();
+    start.heads.push(actions(5_300, 3, Some(false)));
+    c.push(start);
+    let mut b4 = beat(4, 50);
+    b4.run = "bbbbbbbbbbbbbbbb".into();
+    b4.heads.push(actions(5_400, 4, Some(true)));
+    c.push(b4);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(51), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("no longer holds")
+            && r.alerts[0].detail().contains("(beat 3)"),
+        "{r:?}"
+    );
+}
+
+/// BUG30: a head gone from the beats is REPLAY once — not at every check
+/// while it stays gone, the state written and read back between them — and
+/// one back past where it was is no alert.
+#[test]
+fn a_head_still_gone_is_not_realerted_every_check() {
+    let audit = |seq: u64, hash: &str| BeatHead {
+        chain: "audit".into(),
+        seq: Some(seq),
+        hash: hash.repeat(32),
+        ..BeatHead::default()
+    };
+    let reread = |s: Option<WatchState>| -> WatchState {
+        serde_json::from_str(&serde_json::to_string(&s.unwrap()).unwrap()).unwrap()
+    };
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads = vec![audit(500, "aa")];
+    c.push(b1);
+    let s1 = reread(check(Ok(&c.lines()), &c.pk, None, at(1), &cfg()).state);
+    let mut b2 = beat(2, 30);
+    b2.heads.clear();
+    c.push(b2);
+    let r2 = check(Ok(&c.lines()), &c.pk, Some(&s1), at(31), &cfg());
+    assert_eq!(kinds(&r2), ["REPLAY"], "{r2:?}");
+    assert!(r2.alerts[0].detail().contains("not in the beat"), "{r2:?}");
+    let s2 = reread(r2.state);
+    assert!(s2.heads_gone.contains("audit"), "{s2:?}");
+    let mut b3 = beat(3, 60);
+    b3.heads.clear();
+    c.push(b3);
+    let r3 = check(Ok(&c.lines()), &c.pk, Some(&s2), at(61), &cfg());
+    assert!(r3.alerts.is_empty(), "still gone, said once: {r3:?}");
+    let s3 = reread(r3.state);
+    let mut b4 = beat(4, 90);
+    b4.heads = vec![audit(510, "cc")];
+    c.push(b4);
+    let r4 = check(Ok(&c.lines()), &c.pk, Some(&s3), at(91), &cfg());
+    assert!(r4.alerts.is_empty(), "back past where it was: {r4:?}");
+    assert!(r4.state.unwrap().heads_gone.is_empty());
+}
+
+/// BUG12 (the hardening): a beat's interval is believed within the
+/// agent's own bounds, 5 to 300 s — a signed beat that says 100000 s is
+/// SILENT after 2 × 300 + 15 s all the same.
+#[test]
+fn a_beat_interval_outside_the_agent_s_bounds_is_bounded() {
+    assert_eq!(silence_bound(&cfg(), 30), 75);
+    assert_eq!(silence_bound(&cfg(), 100_000), 615);
+    assert_eq!(silence_bound(&cfg(), 300), 615);
+    assert_eq!(silence_bound(&cfg(), 1), 25);
+    assert_eq!(silence_bound(&cfg(), 5), 25);
+    let mut c = Chain::new();
+    let mut b = beat(1, 0);
+    b.interval_secs = 100_000;
+    c.push(b);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(616), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(617), &cfg());
+    assert_eq!(kinds(&r), ["SILENT"], "{r:?}");
+}
+
+/// BUG12: an operator's stall bound past what the thresholds can hold does
+/// not overflow (a stall is never reached, nothing panics).
+#[test]
+fn a_huge_stall_bound_does_not_overflow() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat(2, 30);
+    b.decision_since_last_ms = u64::MAX;
+    c.push(b);
+    let huge = WatchConfig {
+        stall_intervals: u64::MAX,
+        ..cfg()
+    };
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &huge);
+    assert!(r.alerts.is_empty(), "{r:?}");
+    // the same beat under the default bound: stalled
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+}
+
+/// BUG32: `short` cuts at a character's boundary.
+#[test]
+fn short_cuts_at_a_character_boundary() {
+    assert_eq!(short(""), "");
+    assert_eq!(short("€€€€€€"), "€€€€€€");
+    assert_eq!(short(&"€".repeat(20)), "€".repeat(16));
+    assert_eq!(short(&"ab".repeat(32)), "ab".repeat(8));
+}
+
+/// BUG18 (the lab's case, lot 295 round r1c): a tail cut while the agent
+/// runs leaves every later beat `kept: false` (the writer's position named
+/// no longer ends a line of the file) — one REPLAY per head named, not one
+/// per beat; a new head named `kept: false` after it is said too.
+#[test]
+fn a_cut_named_by_every_later_beat_is_said_once_per_head() {
+    let actions = |bytes: u64, h: u8, kept: Option<bool>| BeatHead {
+        chain: "actions".into(),
+        file: Some(2),
+        bytes: Some(bytes),
+        hash: format!("{h:02x}").repeat(32),
+        kept,
+        ..BeatHead::default()
+    };
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads.push(actions(230_779, 1, Some(true)));
+    c.push(b1);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    for (seq, bytes, h) in [
+        (2, 230_779, 1),
+        (3, 230_779, 1),
+        (4, 251_259, 2),
+        (5, 251_259, 2),
+    ] {
+        let mut b = beat(seq, 30 * (seq as i64 - 1));
+        b.heads.push(actions(bytes, h, Some(false)));
+        c.push(b);
+    }
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(121), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY", "REPLAY"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("(beat 2)"), "{r:?}");
+    assert!(r.alerts[1].detail().contains("(beat 4)"), "{r:?}");
+}
