@@ -22,8 +22,9 @@
 //! * [`attach`], with the anti-tamper set: the observer attached in the
 //!   directory (`reattach_fresh`: the new program first, the prior link
 //!   removed after — never a moment without one; its pins there, never in
-//!   the pin root, where `file_open`'s are the write-open deny's), then the
-//!   state registered.
+//!   the pin root, where `file_open`'s are the write-open deny's; lot 300:
+//!   its link held open too, so the agent's own-link views see it), then
+//!   the state registered.
 //!
 //! [`history`] is the controller's view: the instant from which the history
 //! covers every write ([`History::since`]). A module file changed since
@@ -39,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use aya::maps::{Map, MapData};
+use aya::programs::links::FdLink;
 use aya::{Btf, Ebpf, EbpfLoader};
 use common::module_judge::{MODULE_PKG_SCRIPTS_MAX, MODULE_WRITES_MAX};
 use tracing::{info, warn};
@@ -206,6 +208,15 @@ static LOADED: OnceLock<Vec<(String, u32)>> = OnceLock::new();
 static HISTORY: OnceLock<History> = OnceLock::new();
 /// [`after_load`]'s outcome.
 static LOAD_OUTCOME: OnceLock<Result<(), String>> = OnceLock::new();
+/// Lot 300: the observer's link this start made, held open beside its pin
+/// (like the cgroup/sysctl judge's). The agent's links are the ones it
+/// holds and the `link_*` pins of the pin root
+/// (`anti_tamper::bpf_defense::live_links`): pinned in [`pin_dir`] and
+/// dropped, the link was "detached" to the sensor self-test's attach check
+/// (module_load missed every round, an alert at the second, on every host
+/// since lot 285) and not registered as the agent's own by the BPF guard
+/// (a foreign handle on it not refused, its loss not noticed).
+static LINK: OnceLock<FdLink> = OnceLock::new();
 
 /// The history as this start has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,8 +398,11 @@ pub fn attach(
     };
     let dir = pin_dir(root);
     crate::cgroup_join::usable_dir(&dir)?;
-    antitamper_bpf::reattach_fresh(ebpf, PROGRAM, HOOK, btf, Some(&dir))
-        .map_err(|e| format!("{e:#}"))?;
+    if let Some(link) = antitamper_bpf::reattach_fresh_held(ebpf, PROGRAM, HOOK, btf, Some(&dir))
+        .map_err(|e| format!("{e:#}"))?
+    {
+        let _ = LINK.set(FdLink::from(link));
+    }
     let (history, state) = match (&loaded, PLAN.get()) {
         (Err(why), _) => (
             History {

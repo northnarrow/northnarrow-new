@@ -647,6 +647,66 @@ fn a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed() {
     assert_eq!(open_details(&st).len(), 1);
 }
 
+/// Lot 300: since lot 285 the module_load attach check found
+/// `module_write_observe` "detached" in every round, on every host (an
+/// alert at the second round; seen on 5.15 and 6.12): the check reads the
+/// links the agent holds and the `link_*` pins of the pin root
+/// (`bpf_defense::live_links`), and the write history's link was pinned in
+/// its own directory beside the root and dropped. The programs the check
+/// names are the module-load programs the agent attaches, both ways; each
+/// is linked where the check reads — a `link_<hook>` pin in the root, or,
+/// pinned in a directory of its own, a link the agent holds.
+#[test]
+fn the_module_load_check_reads_each_of_its_programs_where_it_is_linked() {
+    use crate::anti_tamper::bpf_defense::LINK_PIN_PREFIX;
+    use crate::anti_tamper::filesystem::{MODULE_LOAD_PROGRAMS, MODULE_WRITE_PROGRAM};
+    let root = Path::new("/sys/fs/bpf/northnarrow");
+    let mut attached: Vec<&str> = MODULE_LOAD_PROGRAMS
+        .iter()
+        .map(|(p, _)| *p)
+        .chain([MODULE_WRITE_PROGRAM.0])
+        .collect();
+    let mut named = Sensor::ModuleLoad.programs().to_vec();
+    attached.sort_unstable();
+    named.sort_unstable();
+    assert_eq!(
+        named, attached,
+        "the module_load attach check and the module-load programs the agent attaches differ"
+    );
+    // the two load hooks: `link_<hook>` in the root, which the check walks
+    for (program, hook) in MODULE_LOAD_PROGRAMS {
+        let link = antitamper_bpf::lsm_pin_paths(root, hook).1;
+        assert_eq!(link.parent(), Some(root), "{program}");
+        let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.starts_with(LINK_PIN_PREFIX), "{program}: {name}");
+    }
+    // the write history's: beside the root, which the check never walks —
+    // so the agent holds it (the pinned link handed back, kept open)
+    let link = crate::module_writes::link_pin(&crate::module_writes::pin_dir(root));
+    assert_ne!(link.parent(), Some(root));
+    let mw = include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/crates/nn-linux/src/module_writes.rs"
+    ));
+    let mw = &mw[..mw.find("#[cfg(test)]").expect("module_writes' tests")];
+    let at = mw
+        .find("reattach_fresh_held(ebpf, PROGRAM, HOOK, btf, Some(&dir))")
+        .expect("the write history's link is attached and handed back");
+    let held = &mw[at..at + 200];
+    assert!(held.contains("LINK.set(FdLink::from(link))"), "{held}");
+    assert!(
+        !mw.contains("reattach_fresh(ebpf, PROGRAM"),
+        "a link dropped once pinned"
+    );
+    // and the check's view takes what the agent holds
+    let bd = include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/crates/nn-linux/src/anti_tamper/bpf_defense.rs"
+    ));
+    let at = bd.find("fn live_links(").expect("live_links");
+    assert!(bd[at..at + 400].contains("read_dir(\"/proc/self/fd\")"));
+}
+
 /// Lot 280c: the attach checks — each loaded program of the sensor has a
 /// live link; none loaded is not exercised; and the module count: more
 /// modules new in the kernel's list than loads reported is a miss.
