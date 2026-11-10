@@ -647,4 +647,112 @@ mod tests {
             "{cut:?}"
         );
     }
+
+    // ── Lot 296 (external bug hunt BUG27): a real failed fsync ──
+
+    thread_local! {
+        static PIPE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PIPE: std::cell::RefCell<Option<std::io::PipeReader>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The agent's host, but its next append-open hands out a pipe: the
+    /// write succeeds, the fsync fails (`EINVAL`, the kernel's), and the test
+    /// then puts the bytes written in the file — the line is in the file,
+    /// its fsync failed (the triage's host, in nn-evidence before: a pure
+    /// crate names no `std::os`).
+    struct PipeHost;
+
+    impl ChainHost for PipeHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<File> {
+            LinuxHost::open_read_nofollow(path)
+        }
+        fn is_symlink_refusal(err: &io::Error) -> bool {
+            LinuxHost::is_symlink_refusal(err)
+        }
+        fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
+            if PIPE_NEXT.with(|c| c.replace(false)) {
+                let (r, w) = std::io::pipe()?;
+                PIPE.with(|p| *p.borrow_mut() = Some(r));
+                return Ok(File::from(std::os::fd::OwnedFd::from(w)));
+            }
+            LinuxHost::open_with_mode(options, mode, path)
+        }
+        fn open_with_mode_nofollow(
+            options: &mut OpenOptions,
+            mode: u32,
+            path: &Path,
+        ) -> io::Result<File> {
+            LinuxHost::open_with_mode_nofollow(options, mode, path)
+        }
+        fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {
+            LinuxHost::create_dir_all_with_mode(dir, mode)
+        }
+        fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+            LinuxHost::rename_noreplace(from, to)
+        }
+        fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+            LinuxHost::write_all_at(file, buf, offset)
+        }
+        fn anchor(path: &Path) -> PathBuf {
+            LinuxHost::anchor(path)
+        }
+    }
+
+    struct PipeKey(AgentSigningKey);
+
+    impl crate::chain_host::ChainSigner for PipeKey {
+        type Host = PipeHost;
+        fn sign(&self, msg: &[u8]) -> ed25519_dalek::Signature {
+            crate::chain_host::ChainSigner::sign(&self.0, msg)
+        }
+        fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+            crate::chain_host::ChainSigner::verifying_key(&self.0)
+        }
+    }
+
+    /// BUG27 with a real failed fsync: the line written whole, its fsync
+    /// failed (`EINVAL`); the next line chains off it — `last_hash` and the
+    /// position did not move, and the next line forked the chain
+    /// (`PrevHashMismatch`, the triage's test on `main`).
+    #[test]
+    fn a_real_failed_fsync_does_not_fork_the_chain() {
+        use std::io::Read as _;
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let mut log = RotatingChainLog::<P, _>::open(
+            &active,
+            PipeKey(key(dir.path())),
+            RotationConfig::default(),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        log.append(p(0)).unwrap();
+        PIPE_NEXT.with(|c| c.set(true));
+        let e = log.append(p(1)).unwrap_err();
+        assert!(format!("{e:#}").contains("fsync"), "premise: {e:#}");
+        let mut written = Vec::new();
+        PIPE.with(|p| p.borrow_mut().take())
+            .unwrap()
+            .read_to_end(&mut written)
+            .unwrap();
+        assert!(written.ends_with(b"\n") && written.len() > 50);
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(&written)
+            .unwrap();
+        log.append(p(2)).unwrap();
+        drop(log);
+        let k = key(dir.path());
+        let r = crate::chainlog::verify_log_set::<P>(
+            &active,
+            &crate::chain_host::ChainSigner::verifying_key(&k),
+        );
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == 3),
+            "the chain forked after a failed fsync: {r:?}"
+        );
+    }
 }

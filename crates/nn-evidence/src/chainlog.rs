@@ -6753,97 +6753,22 @@ mod tests {
         verify_log_set::<TestPayload>(&active, &pk).unwrap();
     }
 
-    /// A host whose next append-open hands out a pipe: the write succeeds,
-    /// the fsync fails (EINVAL, a real one), and the test then puts the
-    /// bytes written in the file — the line is in the file, its fsync
-    /// failed.
-    struct PipeHost;
-
-    thread_local! {
-        static PIPE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        static PIPE: std::cell::RefCell<Option<std::io::PipeReader>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    impl ChainHost for PipeHost {
-        fn open_read_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-            PortableHost::open_read_nofollow(path)
-        }
-        fn is_symlink_refusal(err: &std::io::Error) -> bool {
-            PortableHost::is_symlink_refusal(err)
-        }
-        fn open_with_mode(
-            options: &mut OpenOptions,
-            mode: u32,
-            path: &Path,
-        ) -> std::io::Result<std::fs::File> {
-            if PIPE_NEXT.with(|c| c.replace(false)) {
-                let (r, w) = std::io::pipe()?;
-                PIPE.with(|p| *p.borrow_mut() = Some(r));
-                return Ok(std::fs::File::from(std::os::fd::OwnedFd::from(w)));
-            }
-            PortableHost::open_with_mode(options, mode, path)
-        }
-        fn open_with_mode_nofollow(
-            options: &mut OpenOptions,
-            mode: u32,
-            path: &Path,
-        ) -> std::io::Result<std::fs::File> {
-            PortableHost::open_with_mode_nofollow(options, mode, path)
-        }
-        fn create_dir_all_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
-            PortableHost::create_dir_all_with_mode(dir, mode)
-        }
-        fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-            PortableHost::rename_noreplace(from, to)
-        }
-        fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-            PortableHost::write_all_at(file, buf, offset)
-        }
-        fn anchor(path: &Path) -> PathBuf {
-            PortableHost::anchor(path)
-        }
-    }
-
-    struct PipeKey(TestKey);
-
-    impl ChainSigner for PipeKey {
-        type Host = PipeHost;
-        fn sign(&self, msg: &[u8]) -> ed25519_dalek::Signature {
-            self.0.sign(msg)
-        }
-        fn verifying_key(&self) -> VerifyingKey {
-            self.0.verifying_key()
-        }
-    }
-
-    /// BUG27: the line is written, its fsync fails (a real EINVAL): the next
-    /// line chains off it, the file's tail — `last_hash` and the position
-    /// did not move, and the next line forked the chain (PrevHashMismatch).
+    /// BUG27: the line is written whole, its fsync fails: the next line
+    /// chains off it, the file's tail — `last_hash` and the position did not
+    /// move, and the next line forked the chain (PrevHashMismatch). The same
+    /// with a real failed fsync (a pipe's `EINVAL`) on the agent's host:
+    /// nn-linux's `a_real_failed_fsync_does_not_fork_the_chain`.
     #[test]
     fn fsync_failure_after_the_write_does_not_fork_the_chain() {
-        use std::io::Read as _;
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("test.jsonl");
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
-        let mut log = RotatingChainLog::<TestPayload, _>::open(
-            &active,
-            PipeKey(key_at(&kp)),
-            cfg(1 << 30, 50),
-            std::sync::Arc::new(NoProtection),
-        )
-        .unwrap();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
         log.append(payload(0)).unwrap();
-        PIPE_NEXT.with(|c| c.set(true));
+        host::inject(Fault::SyncFails { prefix: b"{\"ts\"" });
         assert!(log.append(payload(1)).is_err(), "premise: the fsync fails");
-        let mut written = Vec::new();
-        PIPE.with(|p| p.borrow_mut().take())
-            .unwrap()
-            .read_to_end(&mut written)
-            .unwrap();
-        assert!(written.ends_with(b"\n") && written.len() > 100);
-        append_raw(&active, &written);
+        assert_eq!(host::armed(), 0);
         log.append(payload(2)).unwrap();
         assert_eq!(log.position().1, fs::metadata(&active).unwrap().len());
         log.checkpoint().unwrap();
@@ -7017,21 +6942,20 @@ mod tests {
         let fragment = b"{\"payload\":{\"ts\":\"2026-05-30T00:00:03";
         append_raw(&active, fragment);
         let len_torn = fs::metadata(&active).unwrap().len();
-        let manifest = manifest_path_for(&active);
-        // the open made it, empty (lot 296): no row yet
-        assert_eq!(fs::read(&manifest).unwrap(), b"");
-        fs::remove_file(&manifest).unwrap();
-        // the manifest cannot be written once (a dangling symlink here)
-        std::os::unix::fs::symlink(dir.path().join("no-such-dir/m"), &manifest).unwrap();
+        // the manifest cannot be written once (the triage made it a
+        // dangling symlink; here its open fails)
+        host::inject(Fault::OpenFails {
+            suffix: ".manifest.jsonl",
+        });
         let first = RotatingChainLog::<TestPayload, _>::open(
             &active,
-            key_at(&kp),
+            FaultyKey(key_at(&kp)),
             cfg(1 << 30, 50),
             std::sync::Arc::new(NoProtection),
         );
         assert!(first.is_err(), "premise: the first attestation fails");
+        assert_eq!(host::armed(), 0);
         drop(first);
-        fs::remove_file(&manifest).unwrap();
         let truncated = fs::metadata(&active).unwrap().len() < len_torn;
         drop(open_log(&active, &kp, 1 << 30));
         let attested = torn_repairs(&active);
