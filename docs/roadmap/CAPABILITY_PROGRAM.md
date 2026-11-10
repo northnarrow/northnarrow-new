@@ -7910,3 +7910,100 @@ number in parentheses is a lab PR.
     not among the forwarders NN-L-NET-004/014 spare (noticed, not this
     lot's).
   - Levels unchanged (C07 2, C14 2): fixes in capabilities at their level.
+- **Lot 293 — the external bug hunt's self-defence findings (bug hunt lot
+  3): a signal through a file's owner refused, the per-attempt refusals'
+  budget, and the guards in `common`** (`fix/w4-bh-self-defense`; the
+  triage of editions 1.2/1.3, lot 3: P0 BUG14, P1 BUG71, then BUG05, 37,
+  68, 54-doc, 21, 03, 35, 33; BUG13 closed by lot 290).
+  - What changed (trust model "Lot 293"): a deny hook on
+    `file_send_sigiotask` (the 22nd) refuses every signal through a file's
+    owner (`F_SETOWN`/`F_SETOWN_EX`/`FIOSETOWN` with `O_ASYNC`/`FIOASYNC`:
+    SIGIO or the `F_SETSIG` signal, SIGURG, a lease or dnotify signal) to a
+    protected pid, with no exemption by caller; inside a signed window the
+    window's signal grant applies (SIGTERM, SIGCONT, SIGKILL), the plain
+    SIGIO stays refused; signed NN-L-AT-001 `sigio` (High), the posture
+    ENGAGED. The per-attempt refusals (inode operations, a write-open, a
+    protected cgroup file's open) behind a per-CPU budget of their own
+    (`denial_rate`, 50/s per CPU), apart from the task denials'.
+    `BPF_RAW_TRACEPOINT_OPEN` observed and judged by NN-L-BPF-001;
+    `setgroups` out of the exploit guard's id table; io_uring 58/60/61
+    classified; `admin.pub` read as bytes; the supervisor's second kill;
+    `run_bounded`'s group kill; the stderr line's bound;
+    `RANSOMWARE_DECISIVE.md` corrected (no code: the report's fix would let
+    an encryptor's staging through).
+  - Lab (our own guests, lease k293, one at a time):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, round r1 on the lot's first
+      build — this PR's product code but the boot's argument check and a
+      test helper): `verifier-check` 105 programs, 103 OK, 2 not counted, 0
+      failing (`file_send_sigiotask_deny` 331 instructions); 28 of 28 deny
+      hooks. Tamper cases (`anti-tamper.sh --only`): C01/C02 (`kill -9`
+      through a pidfd) refused; **C112** (the plain SIGIO, `F_SETOWN` +
+      `O_ASYNC` on a pipe), **C112a** (`F_SETSIG(SIGKILL)`), **C112b**
+      (`F_SETOWN_EX(F_OWNER_TID)` + SIGKILL, the watchdog), **C112c**
+      (`FIOSETOWN` + `FIOASYNC`, SIGKILL), **C112d** (`F_OWNER_PGRP`, the
+      agent's group, SIGKILL) refused — the target alive, one signed
+      `deny=sigio` each; inside a window **C112w** (`F_SETSIG(SIGCONT)`, the
+      grant's) let through and not recorded, **C112x** (the plain SIGIO)
+      refused and signed. The benign corpus `dev` (24 steps): rc 0 but its
+      own control (R001's kill of a `/tmp` program run as `www-data`, by
+      design), the same kills and verdicts as lot 291's run on `main`'s
+      code, 0 NN-L-AT-001. A cold boot: the agent and the watchdog active,
+      the sigio deny pinned (bootcheck OK). Round r4 (the PR's code before the
+      merge of main, a fresh boot, no agent installed): the privileged e2e
+      `signals_through_a_file_s_owner_are_refused_and_signed` and
+      `bpf_guard_enforce_refuses_protected_pids_write` (with BUG13's
+      read-only pin handle, `EPERM`) pass. (Round r1's e2e ran after the
+      uninstall, on the uninstalled agent's pins: the fixtures' agents
+      refused their start, `agent_mounts`; it is why r4 runs on a fresh
+      boot.)
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, round r2, the PR's code before
+      the merge of main):
+      `verifier-check` 105 programs, 99 OK, 6 not counted, 0 failing; 26 of
+      26 deny hooks; C01, C02, C112–C112d, C112x refused and signed, C112w
+      let through. **BUG37**: a loop of refused creates in
+      `/etc/northnarrow` on one CPU for 2 s, a refused ptrace of the agent
+      in the middle of it: `RING_DROPS` `denial_rate` 324,273 held back,
+      `fs_protect` (the ring full) 0, `task_denial_rate` 0, the ptrace's
+      `deny=ptrace` recorded.
+    - **Debian 13** (`6.12.115+deb13.1-cloud-amd64`, round r3, the same):
+      `verifier-check` 105 programs, 102 OK, 3 not counted, 0 failing; 28 of
+      28; the same cases as 22.04, all as expected; BUG37's loop 264,890
+      held back, 0 lost by the ring or the task budget, the ptrace
+      recorded.
+    - The uninstall right after the tamper cases did not run on 22.04 and
+      Debian 13: R009 killed `sudo ./deploy/uninstall.sh` run from the lab
+      user's checkout, the agent in COMBAT after the BUG37 loop's refusals
+      (the known R009 lab behaviour, not this lot's); rounds r2b/r3b booted
+      each guest again and uninstalled it. Every guest ended uninstalled,
+      clean and off. Found on the way, **pre-existing** (the same on
+      `main`'s code, round r6 on 22.04): the sensor self-test misses
+      `module_load` from its first round (step "its programs linked, and a
+      load reported for each module new in /proc/modules"), an ALERT at the
+      second — lot 285's sensor, reported to the coordinator, not changed
+      here.
+  - Gates, on this PR's tree (main with lot 291 merged in): eBPF, the four
+    clippy runs (+ nn-admin's debug-trigger), fmt, 93 suites 4,268 passed
+    and 1 failed — `boot::degradation::tests::a_record_without_a_source_keeps_the_old_shape`,
+    a pre-existing flake (a concurrent test's degradation in the global
+    state; lot 292's gates met it too), green in two reruns of nn-linux —
+    the privileged no-run, nn-proto and nn-linux with debug-trigger, the
+    eBPF maps, attack-coverage, golden ×5 (57 files, the same bytes), MSRV
+    1.89, the fuzz replay (14), portable (5), the lockfiles unchanged.
+  - Host: the named tests of the PR's table; `xtask/tests/self_defense.rs`
+    reads the hook, the budget, the code the agent and the watchdog run (no
+    `O_ASYNC`, `F_SETOWN`, … anywhere: the hook's no-exemption policy rests
+    on it) and the corrected design document. Mutations: 44 of the new code
+    (BUG14 12, BUG37 8, BUG05 4, BUG71 3, BUG68 3, BUG54 1, BUG21 1, BUG03
+    6, BUG35 2, BUG33 4), all caught by a named test — four only once their
+    array's size was mutated with them (compile errors at the first run,
+    not counted as catches); one survivor (the writer waited for again
+    after the group kill, nothing observable) removed from the code.
+  - Open: the SIGIO record names the process whose I/O raised the signal,
+    not the arming one; the BPF guard's refusals stay outside the new
+    budget (lot 290's per-object records; their own budget is a
+    follow-up); other kernel-sent signals no hook sees are out of scope
+    (a tty's job control — the units have no controlling terminal — a
+    child's exit signal, `PR_SET_PDEATHSIG`).
+  - Levels unchanged (C23 2 provisional): a self-defence gap closed and
+    the evidence channel bounded, measured on 5.15, 6.8 and 6.12 — not a new
+    capability.
