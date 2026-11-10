@@ -8261,3 +8261,76 @@ number in parentheses is a lab PR.
   - Levels unchanged (C22 0, C23 2 provisional): an evidence-integrity gap
     of the anchor and of the verifier closed and measured on one kernel —
     not a new capability.
+- **Lot 297 — the agent's stores and the watchdog's respawn argv: the
+  external bug hunt's lot 7** (`fix/w4-bh-agent-stores-watchdog`; the triage
+  of editions 1.2/1.3, lot 7: BUG64, BUG48, BUG63, BUG59, BUG61, BUG69,
+  BUG74, BUG58, BUG67, BUG81 documentation only; all P2/P3).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): one `index.jsonl` line cut inside a
+    multi-byte character made the copy-on-first-write replay fail whole, and
+    the start deleted every copy of the scope as an orphan (BUG64); the
+    guard kept each writer's first write-open, so a restore of a later copy
+    overwrote that writer's later edit (BUG48); a name that is not UTF-8
+    ended the search for the attack's renamed copy (BUG63); the detection
+    read dropped the rows it had verified once its failure budget was spent
+    (BUG59), and both chain readers looped for ever on a read error — a
+    directory at a path, EIO — with `nn-admin detections` hung (BUG69,
+    BUG74); a tree kill whose root was not killed hid what it left running
+    (BUG61); the watchdog's exec respawn dropped empty arguments and
+    rewrote non-UTF-8 ones (BUG58, BUG67). BUG81's report fix (the two
+    "in a row" counters resetting each other) is harmful — a frozen agent
+    whose socket root removes and puts back at every ping would never be
+    recovered — and was not applied: the texts are corrected and a test
+    pins the behaviour.
+  - What changed (`COPY_ON_FIRST_WRITE.md` §2.4/§2.5, `EVIDENCE_CHAINS.md`,
+    `WATCHDOG_RESPAWN_V2_DESIGN.md`, upgrade notes §21): the replay reads
+    the bytes line by line (a bad line skipped and counted, a cut last line
+    ended at the open), a read error leaves the scope out of the run with
+    its copies kept; each writer's latest write-open, the most recent of 8;
+    the readers skip a non-UTF-8 line and end a file on any other read
+    error; the verified rows stay past the budget; the root's outcome and
+    the tree's partial outcome both said; the respawn argv is `OsString`
+    from `/proc` to `spawn` and to `agent.argv`. Found by this lot's lab:
+    the agent aborted at its start on an argument (or a variable) that is
+    not UTF-8 — its self-integrity check read `std::env::args()`/`vars()` —
+    so a byte-exact argv could not run; both read lossy now.
+  - The lab, as measured (our own guest under lease k297, Ubuntu 24.04
+    `6.8.0-147-generic`; clean at the start: no agent, no pin, no overlay;
+    no agent installed — the two privileged e2e tests start their own; the
+    control is `main` da55b9ec with the lot's two e2e tests only):
+    - **The cow store, real guard** (`cow_privileged_e2e::
+      a_torn_index_line_keeps_the_guards_copies`: fanotify on a tmpfs scope,
+      `sh` writers, 10 copies, `index.jsonl` cut inside "Universit\xC3",
+      restart, a second writer's 10 copies, restart): control **FAILED** —
+      the restart's replay failed whole ("read index.jsonl: stream did not
+      contain valid UTF-8"; the copies' deletion that follows is measured on
+      the host test, not in the lab); the lot (r2 6ffd33d1, r3 8a5a742d)
+      **passed**: the 10 copies and entries as they were, one unreadable
+      line, and the 20 there at the start after.
+    - **The watchdog's exec respawn** (`privileged_e2e::
+      a_respawned_agent_has_its_first_launchs_argv_byte_for_byte`: the
+      agent started with `--ade-prompt '' --ade-model /nonexistent/mod\xe8le`,
+      SIGKILLed, the watchdog's respawn compared from `/proc/<pid>/cmdline`):
+      control **FAILED** (its verdict line not kept by the round's log);
+      r2 (6ffd33d1) **FAILED** on the agent itself — it aborted at its start
+      (`panicked at …/std/src/env.rs:168`), the self-integrity check's
+      `std::env::args()` on the non-UTF-8 argument: fixed (8a5a742d);
+      r3 **passed**: respawn attempt 1, `argc=47`, the new agent's
+      cmdline equal to the first launch's byte for byte.
+    - The guest: nine `*-e2etest-*` copies from earlier lots (2026-10-14,
+      2026-11-04) found in `/usr/local/bin` and removed after a cold boot;
+      the failed runs' pins (77, held by their attached programs) gone with
+      a power cycle; at the end no agent, no pin, no copy, no overlay,
+      powered off.
+  - Host: the triage's 9 named tests fail on `main` da55b9ec (9 of 9) and
+    pass; 14 more (the replay's tolerance and its EIO seam, the slot per
+    writer, the restore of a later copy, the readers over a mid-file EIO
+    and a non-UTF-8 line, the recorded argv, `--agent-bin`, the lossy
+    self-integrity reads, the BUG81 guard, the two e2e). Mutation on the
+    fixes: 33 mutants, all caught by a named test (one survivor of the first pass,
+    `--agent-bin` made lossy, got its test); the report's BUG81 fix, as two
+    mutants, caught by `alternating_timeout_and_vanished_still_trips_stuck`.
+  - Levels unchanged (C19 1, C23 2 provisional): defects of the experimental
+    rollback journal, of the operator's detection read and of the
+    watchdog's non-systemd backend closed and measured on one kernel — not
+    a new capability.
