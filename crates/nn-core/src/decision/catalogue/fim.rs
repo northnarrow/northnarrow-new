@@ -243,8 +243,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "An open (read or write) of ~/.aws/credentials or ~/.aws/config, or a change \
             that never opens it: the file replaced by a rename over it, truncated, or its mode or \
             owner changed.",
-        false_positives: "The AWS CLI (aws, aws-cli; told by the kernel-resolved exe, not comm) is \
-            exempt unless it reads another user's file. An open found only by the file-open \
+        false_positives: "The AWS CLI (aws, aws-cli; told by the kernel-resolved exe, not comm; \
+            for an interpreter, by the script its own option table reads — lot 292: `python3 -O \
+            /tmp/x.py /usr/bin/aws` runs /tmp/x.py and is killed) is exempt unless it reads \
+            another user's file. An open found only by the file-open \
             sensor's credential names (a home outside the watch list) is recorded, not killed, \
             unless a non-root user other than the owner read it; any other reader of a watched \
             path, a backup tool included, is killed.",
@@ -254,6 +256,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim011_fires_on_aws_cred_read_by_unknown_process",
             "crates/nn-core/src/fim/rules.rs::fim011_fires_on_replaced_credentials",
+            "crates/nn-core/src/fim/rules.rs::a_skipped_script_does_not_make_a_client",
             "agent/tests/fim_privileged_e2e.rs::fim_subprocess_open_aws_creds_records_opened_event",
             "deploy/lab/open-sensor/open-sensor-check.sh::NN-L-FIM-011_AwsCredsRead",
         ],
@@ -609,9 +612,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    off by default (new in lab PR 225): the posture's RansomwareEncryption needs \
                    corroboration, ENGAGED alone, never locked.",
         false_positives: "Writers trusted by exec identity, package ownership and lineage, never \
-                          by name: a root package transaction, or a packaged program with no \
-                          foreign program in its lineage (rsync, tar, git, compilers, backup \
-                          agents, databases), never counts. Copy-then-delete by anyone else — \
+                          by name: a root package transaction, or a packaged program whose \
+                          every ancestor a package installed (rsync, tar, git, compilers, \
+                          backup agents, databases), never counts. Lot 292: a packaged tool \
+                          started by unpackaged software in /opt or /usr/local (a toolchain \
+                          from a tarball) counts against that software, and an interpreter is \
+                          the script its own option table reads. Copy-then-delete by anyone else — \
                           `mv` across filesystems, `rsync --remove-source-files`, a package \
                           unpack, compiler temporaries, an editor's safe write, `git gc`, log \
                           rotation with compression — is one shape (the deletions): no copy \
@@ -630,6 +636,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/impact.rs::imp001_kills_the_actors_tree_on_two_shapes",
             "agent/src/impact/host_tests.rs::copy_delete_beside_fresh_originals_is_decisive",
             "agent/src/impact/host_tests.rs::benign_copy_delete_shapes_are_not_decisive",
+            "crates/nn-core/src/impact/trust.rs::packaged_tool_under_unpackaged_opt_binary_is_judged",
+            "crates/nn-core/src/impact/trust.rs::python_dash_o_writer_is_not_a_packaged_program",
+            "crates/nn-core/src/impact/tests.rs::unreadable_lineage_mid_window_keeps_the_actors_shapes",
             "deploy/lab/malsim/ransom-check.sh::MS-23",
         ],
         attack_note: "Data Encrypted for Impact (T1486) by the shape of the writes, not by a \

@@ -787,10 +787,27 @@ impl SyscallAbi {
             (Self::X64, n::EXECVEAT) | (Self::X32, crate::epg::X32_EXECVEAT) => "execveat",
             (Self::X64 | Self::X32, n::IO_URING_ENTER) => "io_uring_enter",
             (Self::X64 | Self::X32, n::CLONE3) => "clone3",
+            // Lot 292 (BUG-82): every i386 call the guard knows (`epg::nr32`),
+            // the 16-bit uid calls under the name of the 32-bit one.
+            (Self::Ia32, n32::FORK) => "fork",
+            (Self::Ia32, n32::VFORK) => "vfork",
+            (Self::Ia32, n32::CLONE) => "clone",
+            (Self::Ia32, n32::CLONE3) => "clone3",
             (Self::Ia32, n32::IOCTL) => "ioctl",
             (Self::Ia32, n32::EXECVE) => "execve",
+            (Self::Ia32, n32::EXECVEAT) => "execveat",
+            (Self::Ia32, n32::CHROOT) => "chroot",
+            (Self::Ia32, n32::PIVOT_ROOT) => "pivot_root",
+            (Self::Ia32, n32::PRCTL) => "prctl",
             (Self::Ia32, n32::SETUID | n32::SETUID16) => "setuid",
+            (Self::Ia32, n32::SETGID | n32::SETGID16) => "setgid",
+            (Self::Ia32, n32::SETREUID | n32::SETREUID16) => "setreuid",
+            (Self::Ia32, n32::SETREGID | n32::SETREGID16) => "setregid",
+            (Self::Ia32, n32::SETGROUPS | n32::SETGROUPS16) => "setgroups",
             (Self::Ia32, n32::SETRESUID | n32::SETRESUID16) => "setresuid",
+            (Self::Ia32, n32::SETRESGID | n32::SETRESGID16) => "setresgid",
+            (Self::Ia32, n32::SETFSUID | n32::SETFSUID16) => "setfsuid",
+            (Self::Ia32, n32::SETFSGID | n32::SETFSGID16) => "setfsgid",
             (Self::Ia32, n32::CAPSET) => "capset",
             (Self::Ia32, n32::UNSHARE) => "unshare",
             (Self::Ia32, n32::SETNS) => "setns",
@@ -1658,7 +1675,16 @@ fn reconstruct_module_path(
         // External audit PROC-005: a component that is not UTF-8 was
         // dropped, and `<bytes>/lib/modules/…` collapsed into a standard
         // path. It is kept, lossily, and the path is no module directory.
-        comps.push(String::from_utf8_lossy(&s[..end]).into_owned());
+        let mut comp = String::from_utf8_lossy(&s[..end]).into_owned();
+        // Lot 292 (BUG-52): the kernel's string read keeps SLOT - 1 bytes
+        // and the NUL, and a longer name reads the same: a component that
+        // long may have been cut, so it ends in a cut mark and the path
+        // names no file exactly ([`module_path_is_cut`]; as
+        // `wire::exe::relative_path` does since EBPF-021).
+        if end >= SLOT - 1 {
+            comp.push(MODULE_PATH_CUT);
+        }
+        comps.push(comp);
     }
     if comps.is_empty() {
         return None;
@@ -1689,6 +1715,18 @@ fn reconstruct_module_path(
 /// [`reconstruct_module_path`]): relative, i.e. no leading `/`.
 pub fn module_path_is_truncated(path: &str) -> bool {
     !path.starts_with('/')
+}
+
+/// Lot 292 (BUG-52): the mark a component of a [`Event::ModuleLoad`] path
+/// ends with when the kernel's read may have cut it (31 bytes, the slot's).
+pub const MODULE_PATH_CUT: char = '…';
+
+/// Lot 292 (BUG-52): `true` when a component of a [`Event::ModuleLoad`]
+/// path may have been cut ([`MODULE_PATH_CUT`]): the path, absolute or
+/// not, names no file exactly — its directories are what they read, its
+/// file is not known.
+pub fn module_path_is_cut(path: &str) -> bool {
+    path.split('/').any(|c| c.ends_with(MODULE_PATH_CUT))
 }
 
 /// What a module path deeper than the kernel walk's slots starts with:
@@ -2306,5 +2344,123 @@ mod tests {
         let legacy = json.replace(",\"exe\":null", "");
         assert_ne!(legacy, json);
         assert!(serde_json::from_str::<Event>(&legacy).is_ok());
+    }
+
+    // ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-52, BUG-82 ──
+
+    /// The slots `walk_components` writes for `path` (agent-ebpf
+    /// module_load.rs): leaf first, each name read by
+    /// `bpf_probe_read_kernel_str_bytes` into 32 bytes (31 and the NUL),
+    /// the root dentry's "/" last; the root reached (`truncated` 0).
+    fn kernel_walk(path: &str) -> ([u8; crate::wire::MODULE_PATH_LEN], usize) {
+        let mut out = [0u8; crate::wire::MODULE_PATH_LEN];
+        let mut names: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        names.reverse();
+        names.push("/");
+        for (i, n) in names.iter().enumerate() {
+            let b = n.as_bytes();
+            let len = b.len().min(31);
+            out[i * 32..i * 32 + len].copy_from_slice(&b[..len]);
+        }
+        (out, names.len())
+    }
+
+    /// BUG-52: a component of 32 bytes or more comes back cut to 31 inside a
+    /// path that reads as complete and absolute: it carries the cut mark,
+    /// and the path names no file exactly — not even the packaged file a
+    /// longer name's first 31 bytes spell.
+    #[test]
+    fn long_component_is_not_returned_as_a_complete_path() {
+        let mut wrong = Vec::new();
+        for real in [
+            "/usr/lib/modules/5.14.0-427.42.1.el9_4.x86_64+debug/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko.xz",
+            "/usr/lib/modules/6.8.0-45-generic/kernel/sound/soc/intel/boards/snd-soc-intel-sof-cirrus-common.ko.zst",
+            "/usr/lib/modules/6.8.0-45-generic/extra/vendor-storage-controller-hb.ko.backdoor",
+        ] {
+            let (slots, n) = kernel_walk(real);
+            let got = reconstruct_module_path(&slots, n, 0).expect("a path");
+            if got == real || !module_path_is_cut(&got) || module_path_is_truncated(&got) {
+                wrong.push(got);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "cut paths returned as complete: {wrong:#?}"
+        );
+        let (slots, n) = kernel_walk(
+            "/usr/lib/modules/6.8.0-45-generic/extra/vendor-storage-controller-hb.ko.backdoor",
+        );
+        assert_eq!(
+            reconstruct_module_path(&slots, n, 0).as_deref(),
+            Some("/usr/lib/modules/6.8.0-45-generic/extra/vendor-storage-controller-hb.ko…")
+        );
+        // control: short components come back exact and unmarked, a
+        // 30-byte one too
+        for ok in [
+            "/lib/modules/6.8.0/kernel/net/tls/tls.ko.zst",
+            "/lib/modules/6.8.0/extra/abcdefghijklmnopqrstuvwxyz0.ko",
+        ] {
+            let (slots, n) = kernel_walk(ok);
+            let got = reconstruct_module_path(&slots, n, 0);
+            assert_eq!(got.as_deref(), Some(ok));
+            assert!(!module_path_is_cut(ok));
+        }
+        // a name of exactly 31 bytes reads like a cut one: marked too
+        let (slots, n) = kernel_walk("/lib/modules/6.8.0/extra/abcdefghijklmnopqrstuvwxyz01.ko");
+        assert!(module_path_is_cut(
+            &reconstruct_module_path(&slots, n, 0).unwrap()
+        ));
+    }
+
+    /// BUG-82: every i386 call the guard knows (`epg::nr32`) has its name.
+    #[test]
+    fn every_ia32_call_the_guard_knows_is_named() {
+        use crate::epg::nr32 as n;
+        let all = [
+            ("fork", n::FORK),
+            ("execve", n::EXECVE),
+            ("setuid", n::SETUID16),
+            ("setgid", n::SETGID16),
+            ("ioctl", n::IOCTL),
+            ("chroot", n::CHROOT),
+            ("setreuid", n::SETREUID16),
+            ("setregid", n::SETREGID16),
+            ("setgroups", n::SETGROUPS16),
+            ("clone", n::CLONE),
+            ("setfsuid", n::SETFSUID16),
+            ("setfsgid", n::SETFSGID16),
+            ("setresuid", n::SETRESUID16),
+            ("setresgid", n::SETRESGID16),
+            ("prctl", n::PRCTL),
+            ("capset", n::CAPSET),
+            ("vfork", n::VFORK),
+            ("setreuid", n::SETREUID),
+            ("setregid", n::SETREGID),
+            ("setgroups", n::SETGROUPS),
+            ("setresuid", n::SETRESUID),
+            ("setresgid", n::SETRESGID),
+            ("setuid", n::SETUID),
+            ("setgid", n::SETGID),
+            ("setfsuid", n::SETFSUID),
+            ("setfsgid", n::SETFSGID),
+            ("pivot_root", n::PIVOT_ROOT),
+            ("unshare", n::UNSHARE),
+            ("setns", n::SETNS),
+            ("execveat", n::EXECVEAT),
+            ("clone3", n::CLONE3),
+        ];
+        let missing: Vec<String> = all
+            .iter()
+            .filter(|(name, nr)| SyscallAbi::Ia32.syscall_name(*nr) != Some(*name))
+            .map(|(name, nr)| format!("{name}({nr})"))
+            .collect();
+        assert!(missing.is_empty(), "i386 calls without a name: {missing:?}");
+        // the reasoning names them with their ABI
+        assert_eq!(
+            SyscallAbi::Ia32.describe_call(n::SETGID16),
+            "setgid (46, i386)"
+        );
+        // a number the guard does not know stays a number
+        assert_eq!(SyscallAbi::Ia32.syscall_name(3), None);
     }
 }

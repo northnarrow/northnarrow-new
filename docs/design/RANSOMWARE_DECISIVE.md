@@ -72,16 +72,34 @@ it belongs to a **package transaction run by root**, or when it is a
 **packaged program** — its executable (for an interpreter, the script it
 runs) is listed by dpkg or rpm (snap and Nix store images are owned by
 construction; a host with neither database falls back to a root-owned system
-tree) — **and no hop of its lineage is foreign** (every ancestor up to PID 1
-an installed program or an installed interpreter running no named script).
-Never by `comm`, never by a name list.
+tree) — **and every hop of its lineage vouches for it**: every ancestor up to
+PID 1 above the writer and its own forked copies is a program a package
+installed (its executable, and for an interpreter the script it runs, by the
+same database) or an interpreter a package installed running no named script
+(an interactive shell, `sh -c`). Lying in a root-owned tree is not being
+installed by a package: a binary in `/opt` or `/usr/local` no package lists
+vouches for nothing it starts (lot 292, BUG-49; before, the ancestors were
+judged by tree alone). Never by `comm`, never by a name list.
+
+What an interpreter runs is read from its argv with that interpreter's own
+option table (lot 292, BUG-44 and BUG-42: `python3 -O x.py` runs `x.py`,
+`node -r m x.js` runs `x.js`, `sh -e x.sh` runs `x.sh`). An option the table
+does not hold, or one whose argument is missing, leaves what it runs **not
+known**: such a writer is no packaged program, and such an ancestor vouches
+for nothing (`crates/nn-core/src/posture/script_args.rs`).
 
 That is why `rsync`, `tar`, `git`, `cp`, compilers, `apt`/`dpkg`, a packaged
 backup agent or database, started by a person or by a unit, never trip it.
 What is judged: a binary no package installed (`/root/x`, `/opt/x`,
-`/usr/local/bin/x`, `/tmp/x`), an interpreter running an inline program or
-an unpackaged script, a packaged tool started by such a program, an unknown
-lineage.
+`/usr/local/bin/x`, `/tmp/x`), an interpreter running an inline program, an
+unpackaged script or a program its arguments do not tell, a packaged tool
+started by such a program, an unknown lineage.
+
+A lineage the walk cannot read is recorded as `(lineage unknown)`, under the
+writer's own pid: it keeps the shapes the pid's window already counted, and a
+window opened while the lineage was unreadable is the actor's once its
+program is read (lot 292, BUG-72). Two programs read under one pid (a pid
+reused) still start the window over.
 
 Shapes add up under one process: the writer, or the payload whose forked
 workers it is. A packaged tool under a foreign script counts for itself —
@@ -158,6 +176,11 @@ kill targets the nearest foreign program (the script, the payload).
   encryptor that runs set-uid (its files owned by another uid than the one
   the kernel records for the burst) has its copies in a shared directory
   left out.
+- Lot 292 (BUG-49): a packaged tool started by unpackaged software a
+  person installed in `/opt` or `/usr/local` (a vendor's agent, a toolchain
+  from a tarball: `go build` under `/usr/local/go` running `gcc`) is judged
+  now; its bursts count against that program. Nothing is killed by default
+  (NN-L-IMP-001's kill is held by the signed per-rule policy).
 - Residuals: an intruder in an interactive session who encrypts with
   packaged tools only (`openssl`, `gpg` from that session) is a trusted
   writer here; an encryptor that forks a new process every few files stays

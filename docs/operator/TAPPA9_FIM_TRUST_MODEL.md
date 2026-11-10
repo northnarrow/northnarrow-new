@@ -162,6 +162,21 @@ An inline program (`python3 -c …`), a module run from the caller's path,
 or a copy outside a system tree is not a client. A client reading another
 user's credentials is acted on like any other reader.
 
+The script is read from the interpreter's argv with that interpreter's own
+option table (lot 292, BUG-44): `python3 -O /tmp/steal.py /usr/bin/aws` runs
+`/tmp/steal.py` and is no `aws` client (NN-L-FIM-011 kills it, as any other
+reader); `perl -X`, `node -r <module>`, `ruby -r <lib>`, `sh -e <script>`
+are read the same way. An option the table does not hold, or one whose
+argument is missing, leaves what the interpreter runs not known: never a
+client, and the record says the kernel ran the interpreter with "options not
+understood". The tables cover python, perl, ruby, node, bash/dash/sh, and
+for zsh, ksh and mono the options every one of them reads the same way;
+`crates/nn-core/src/posture/script_args.rs` lists them. Residual, as a
+binary's `LD_PRELOAD`: an option that loads the caller's code before the
+named script (`node -r`, `perl -M`, `ruby -r`) and the interpreter's
+environment (`PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`) are not judged: the
+identity is the script named.
+
 ## File capabilities (review 86)
 
 A file capability (`security.capability`) gives whoever runs the file the

@@ -829,3 +829,37 @@ verified them; `CHANGELOG.md` has each one.
   per-process bound dropped while still in its window, and a live window
   of NN-L-NET-020/021 evicted when 4,096 are held (they were all cleared
   before).
+
+## 16. What an interpreter runs, and who vouches for a writer (lot 292)
+
+The external bug hunt (editions 1.2/1.3) found an interpreter's script read
+with one option rule for every interpreter (BUG-44, BUG-42) and a writer's
+ancestors trusted by the tree they lie in (BUG-49). After the upgrade:
+
+- **An interpreter is the script its own option table reads**
+  (`crates/nn-core/src/posture/script_args.rs`; python, perl, ruby, node,
+  bash/dash/sh, and for zsh, ksh and mono the options every one of them
+  reads alike). `python3 -O /tmp/x.py /usr/bin/aws` is `/tmp/x.py`: a
+  reader of `~/.aws/credentials` run that way is killed by NN-L-FIM-011 like
+  any reader that is not the client; `sh -e /usr/lib/dpkg/info/x.postinst`
+  is that script (an installed program), not an inline one. An option the
+  table does not hold leaves what the interpreter runs **not known**: it is
+  no client of any rule's list (a credential client reading its store with
+  an unusual interpreter option is killed — report the option, it joins the
+  table), no installed service on a common port (NN-L-NET-006/-019), no
+  trusted writer, and it vouches for nothing below it. The record says
+  "(options not understood)".
+- **A shell's `-s` reads its commands from standard input**: `bash -s
+  /usr/bin/x` runs no script, and is treated as `sh -c` (it vouches as an
+  installed shell does).
+- **Every ancestor of a ransomware writer, and of a copy guard's trusted
+  editor, is asked of the package database** (dpkg or rpm; with neither, a
+  root-owned tree as before). A packaged tool (`tar`, `openssl`, `gcc`)
+  started by a program a person installed in `/opt` or `/usr/local` from a
+  tarball (a toolchain, a vendor's agent, a container's entrypoint) is
+  judged now: its bursts count, NN-L-IMP-001/-002 may record them. No kill
+  by default (NN-L-IMP-001's kill is held by the signed per-rule policy).
+  An interactive shell or `sh -c` a package installed still vouches.
+- A not-judged kernel module load (the agent's first seconds) from a path
+  whose component the sensor read only in part (31 bytes) is recorded High
+  as unverifiable; before, it was looked up as the 31-byte name.

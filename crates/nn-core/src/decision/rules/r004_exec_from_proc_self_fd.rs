@@ -198,8 +198,9 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     fn parented_by_systemd(&self, ppid: u32, as_of: crate::posture::lineage::AsOf) -> bool {
         ppid == 1
             || self.lineage.as_ref().is_some_and(|l| {
-                l.exec_identity(ppid, as_of)
-                    .is_some_and(|id| id.script.is_none() && id.is_client(&["systemd"]))
+                l.exec_identity(ppid, as_of).is_some_and(|id| {
+                    id.runs == crate::posture::lineage::Runs::Inline && id.is_client(&["systemd"])
+                })
             })
     }
 

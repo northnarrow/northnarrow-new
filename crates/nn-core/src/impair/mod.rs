@@ -291,7 +291,9 @@ impl SecurityTools {
     pub fn tool_of_process(&self, id: &ExecIdentity) -> Option<&Tool> {
         let exe = id.exe.to_string_lossy();
         let paths: Vec<&str> = std::iter::once(exe.as_ref())
-            .chain(id.script.as_deref().filter(|s| s.starts_with('/')))
+            // lot 292: what an argv whose options could not be read may
+            // run — a tool is registered to be watched, which trusts nothing
+            .chain(id.runs.mentioned().filter(|s| s.starts_with('/')))
             .collect();
         self.tools.iter().find(|t| {
             t.procs.iter().any(|p| {
@@ -982,7 +984,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         if let Some(c) = self.tools.cmds.iter().find(|c| {
             let named = if c.program.starts_with('/') {
                 id.exe.to_string_lossy() == c.program.as_str()
-                    || id.script.as_deref() == Some(c.program.as_str())
+                    || id.runs.mentioned() == Some(c.program.as_str())
                     || argv.iter().any(|a| a == &c.program)
             } else {
                 prog.iter().any(|p| *p == c.program)
@@ -1103,7 +1105,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let hops = self.lineage.lineage_identities(pid, as_of)?;
         hops.into_iter().find_map(|(p, id)| {
             let exe = id.exe.to_string_lossy().into_owned();
-            let script = id.script.clone().unwrap_or_default();
+            // lot 292: what an argv whose options could not be read may run
+            let script = id.runs.mentioned().unwrap_or_default().to_string();
             let staged = |s: &str| crate::decision::rules::is_staging_path(s);
             let unlinked = exe.ends_with(" (deleted)") || exe.starts_with("/memfd:");
             (staged(&exe) || staged(&script) || unlinked).then(|| {
