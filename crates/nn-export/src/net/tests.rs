@@ -609,3 +609,102 @@ fn backoff_doubles_to_its_ceiling() {
     assert_eq!(backoff(0).as_secs(), 1);
     assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
 }
+
+/// Lot 299 (external bug hunt, edition 1.2: BUG-20): the stall counts from
+/// the write of rows nothing acknowledged yet, not from the last progress: a
+/// row written on a session idle for longer than the stall is no stall
+/// `ack_wait` after it.
+#[test]
+fn idle_session_does_not_stall_at_its_first_write() {
+    let r = receiver(Mode::NoReadTiny);
+    let mut s = sink(r.addr, CA_PEM, "receiver.lab");
+    let big = |r: &R| Framed {
+        frames: vec![crate::syslog::frame(&vec![b'a'; 64 * 1024 + r.1 as usize])],
+        records: 1,
+        verified: true,
+    };
+    let none: [R; 0] = [];
+    let mut up = false;
+    for _ in 0..50 {
+        let d = s.rows(
+            ExportChain::Netflow,
+            &none,
+            |r| *r,
+            big,
+            Instant::now() + Duration::from_millis(200),
+        );
+        if d.state == SinkState::Up {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "the session came up");
+    // idle longer than the stall: nothing written, nothing waiting
+    std::thread::sleep(quick().stall + Duration::from_millis(150));
+    let all = rows(1);
+    let t = Instant::now();
+    let d = s.rows(
+        ExportChain::Netflow,
+        &all,
+        |r| *r,
+        big,
+        t + Duration::from_millis(200),
+    );
+    eprintln!("BUG20: {d:?} after {:?}", t.elapsed());
+    assert_ne!(
+        d.fault,
+        Some(SinkFault::Io(libc::ETIMEDOUT)),
+        "a stall {:?} after the write of a row on an idle session",
+        t.elapsed()
+    );
+}
+
+/// Lot 299 (BUG-20), the other side: the stall counts from the OLDEST row
+/// nothing acknowledged, not from the newest write. A receiver that takes
+/// nothing while rows keep coming, one per request and far below the bytes
+/// in flight, is still a stall `stall` after its first row.
+#[test]
+fn a_receiver_that_takes_nothing_stalls_however_often_rows_come() {
+    let r = receiver(Mode::NoReadTiny);
+    let mut s = sink(r.addr, CA_PEM, "receiver.lab");
+    // the first row fills the receiver's buffer; the next ones are small
+    let sized = |r: &R| {
+        if r.1 == 1 {
+            Framed {
+                frames: vec![crate::syslog::frame(&vec![b'a'; 64 * 1024])],
+                records: 1,
+                verified: true,
+            }
+        } else {
+            framed(r)
+        }
+    };
+    let all = rows(80);
+    let mut first_write = None;
+    let mut stalled = None;
+    for n in 1..=all.len() {
+        let t = Instant::now();
+        let d = s.rows(
+            ExportChain::Netflow,
+            &all[..n],
+            |r| *r,
+            sized,
+            t + Duration::from_millis(60),
+        );
+        if d.committed.is_some() && first_write.is_none() {
+            first_write = Some(t);
+        }
+        if d.fault == Some(SinkFault::Io(libc::ETIMEDOUT)) {
+            stalled = Some(t.elapsed() + t.duration_since(first_write.unwrap_or(t)));
+            break;
+        }
+        assert_eq!(d.acked, None, "a row counted that its receiver never took");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after = stalled.expect("rows written and none taken for the stall: a stall");
+    assert!(
+        after < quick().stall * 3,
+        "a stall {after:?} after the first row: counted from a later write"
+    );
+}

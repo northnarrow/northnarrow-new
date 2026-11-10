@@ -418,8 +418,8 @@ mod tests {
     #[test]
     fn admin_frame_seeds_decode() {
         use nn_proto::admin_protocol::{
-            decode_versioned_or_legacy_frame, encode_frame, encode_versioned_frame, AdminMessage,
-            ChallengeRequest, KeyedSignature, ShutdownRequest, StatusRequest,
+            decode_frame, decode_versioned_frame, encode_frame, encode_versioned_frame,
+            AdminMessage, ChallengeRequest, KeyedSignature, ShutdownRequest, StatusRequest,
             VersionedAdminMessage,
         };
         use nn_proto::admin_signed_payload::SignedPayload;
@@ -442,11 +442,15 @@ mod tests {
         );
         generated("seeds", "admin_frame", "v1-shutdown-request.bin", &shutdown);
         generated("seeds", "admin_frame", "v0-status.bin", &legacy);
+        // lot 299 (BUG-36): the envelopes through the strict decoder, the
+        // bare v0 body through the live wire's (the v0 fallback is retired)
         for (name, bytes) in inputs("seeds", "admin_frame") {
-            assert!(
-                matches!(decode_versioned_or_legacy_frame(&bytes), Ok(Some(_))),
-                "{name}"
-            );
+            let decoded = if name.starts_with("v0-") {
+                decode_frame(&bytes).map(|m| m.is_some())
+            } else {
+                decode_versioned_frame(&bytes).map(|m| m.is_some())
+            };
+            assert!(matches!(decoded, Ok(true)), "{name}");
         }
     }
 

@@ -219,6 +219,12 @@ fn resolve_uid_by_name(name: &str) -> Option<u32> {
 /// (colon field 3, 0-indexed 2) in a `/etc/passwd` body. Split out so
 /// the parse is unit-testable without touching the real file. Ignores
 /// blank/comment lines and malformed rows; first match wins.
+///
+/// Lot 299 (external bug hunt, editions 1.2/1.3: BUG-66): a malformed row
+/// WITH the name (no uid field, or one that is not a number) is ignored
+/// like any other malformed row — the first well-formed row with the name
+/// wins. It used to end the search with `None`, which turned NN-L-FIM-005's
+/// rsyslogd carve-out off.
 fn parse_passwd_uid(passwd_body: &str, name: &str) -> Option<u32> {
     for line in passwd_body.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -230,7 +236,9 @@ fn parse_passwd_uid(passwd_body: &str, name: &str) -> Option<u32> {
             continue;
         }
         // Skip the password field, then take uid.
-        return fields.nth(1).and_then(|uid| uid.parse().ok());
+        if let Some(uid) = fields.nth(1).and_then(|uid| uid.parse().ok()) {
+            return Some(uid);
+        }
     }
     None
 }
@@ -242,9 +250,32 @@ fn parse_passwd_uid(passwd_body: &str, name: &str) -> Option<u32> {
 /// tamper = supply-chain compromise class). Action:
 /// KillProcessTree of the modifier. Posture transition handled
 /// by the agent's posture state machine on Critical severity.
-pub struct NnLFim001SystemBinaryModified;
+///
+/// Lot 299 (external bug hunt, editions 1.2/1.3: BUG-73): the agent's OWN
+/// units in the vendor directory (`/usr/lib/systemd/system/`, where a
+/// package ships them) and their drop-ins are under `/usr/lib/` too. A
+/// write of one inside an OPEN trusted-installer window is the authorised
+/// upgrade NN-L-FIM-009 records at Log/Low (§15.1): this rule answers
+/// nothing for it, where it killed the writer's tree at Critical. Only that
+/// write — [`own_unit_under_open_window`], the condition NN-L-FIM-009 reads —
+/// and only a `Modified` one, the op NN-L-FIM-009 records: with the window
+/// closed, for any other unit or file under `/usr/lib/`, and for a
+/// permission change that grants power over our unit, the kill stays.
+pub struct NnLFim001SystemBinaryModified<H: PostureAgent> {
+    installer_override: Arc<H::InstallerWindow>,
+}
 
-impl Rule for NnLFim001SystemBinaryModified {
+impl<H: PostureAgent> NnLFim001SystemBinaryModified<H> {
+    /// Build with the shared trusted-installer override, as
+    /// [`NnLFim009SystemdUnitDropped::new`]: [`fim_rules`] passes the live
+    /// handle, the default/test rule sets the inert one (never armed: the
+    /// rule kills every write under its prefixes).
+    pub fn new(installer_override: Arc<H::InstallerWindow>) -> Self {
+        Self { installer_override }
+    }
+}
+
+impl<H: PostureAgent> Rule for NnLFim001SystemBinaryModified<H> {
     fn id(&self) -> &'static str {
         "NN-L-FIM-001_SystemBinaryModified"
     }
@@ -283,6 +314,12 @@ impl Rule for NnLFim001SystemBinaryModified {
             _ => return None,
         };
         if !starts_with_any(&fe.path, SYSTEM_BINARY_PREFIXES) {
+            return None;
+        }
+        // BUG-73: NN-L-FIM-009's audit record, not a kill
+        if fe.op == FimOp::Modified
+            && own_unit_under_open_window::<H>(&fe.path, &self.installer_override)
+        {
             return None;
         }
         Some(fim_verdict(
@@ -924,6 +961,17 @@ impl Rule for NnLFim008KernelModuleModified {
 
 // ── NN-L-FIM-009 — systemd unit file dropped/modified ──────────────
 
+/// §15.1: `path` is one of the agent's OWN unit files ([`OWN_SYSTEMD_UNITS`])
+/// or a drop-in of them, and a trusted-installer window is OPEN — the
+/// authorised upgrade NN-L-FIM-009 records at Log/Low. Lot 299 (BUG-73):
+/// the one condition NN-L-FIM-009 and NN-L-FIM-001 read, so the record and
+/// the absence of a kill never part. The override read is pure (an atomic
+/// load and a deadline compare).
+fn own_unit_under_open_window<H: PostureAgent>(path: &str, window: &H::InstallerWindow) -> bool {
+    (OWN_SYSTEMD_UNITS.contains(&path) || is_own_unit_dropin(path))
+        && H::installer_window_open(window)
+}
+
 /// `Created` or `Modified` op against any systemd unit
 /// directory. High severity — MITRE T1543.002 (Systemd
 /// Service) is a persistence vector second only to cron in
@@ -984,9 +1032,7 @@ impl<H: PostureAgent> Rule for NnLFim009SystemdUnitDropped<H> {
         // configuration, which the window's close judges (`own_dropins`).
         // Tight scope: any other unit or drop-in, or ours with no open
         // window, still trip the kill.
-        if (OWN_SYSTEMD_UNITS.contains(&fe.path.as_str()) || is_own_unit_dropin(&fe.path))
-            && H::installer_window_open(&self.installer_override)
-        {
+        if own_unit_under_open_window::<H>(&fe.path, &self.installer_override) {
             return Some(fim_verdict(
                 self,
                 fe,
@@ -2845,7 +2891,9 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
         // Critical first — fire on the worst-case signals
         // before any High/Medium rule has a chance to match.
         Box::new(NnLFim010RansomwareExtensionRename::default()),
-        pkg(Box::new(NnLFim001SystemBinaryModified)),
+        pkg(Box::new(NnLFim001SystemBinaryModified::<H>::new(
+            Arc::clone(&installer_override),
+        ))),
         pkg(Box::new(NnLFim002NewSuidBinary)),
         pkg(Box::new(NnLFim008KernelModuleModified)),
         // High next.
@@ -2909,6 +2957,7 @@ mod tests {
     // R08b (lab PR 251): on the portable test host.
     use crate::posture::host::testing::TestHost as H;
     type AuthSessionTracker = crate::posture::lineage::AuthSessionTracker<H>;
+    type NnLFim001SystemBinaryModified = super::NnLFim001SystemBinaryModified<H>;
     type NnLFim009SystemdUnitDropped = super::NnLFim009SystemdUnitDropped<H>;
     type NnLFim025FileCapabilityGranted = super::NnLFim025FileCapabilityGranted<H>;
     type PackageManaged = super::PackageManaged<H>;
@@ -3097,7 +3146,7 @@ mod tests {
 
     #[test]
     fn fim001_fires_on_system_binary_modified() {
-        let r = NnLFim001SystemBinaryModified;
+        let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         for path in &["/usr/sbin/sshd", "/bin/bash", "/usr/bin/sudo", "/sbin/init"] {
             let v = r
                 .evaluate(&fim_event(FimOp::Modified, path))
@@ -3110,7 +3159,7 @@ mod tests {
 
     #[test]
     fn fim001_does_not_fire_on_user_binary_modified() {
-        let r = NnLFim001SystemBinaryModified;
+        let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         // /usr/local/bin/ is NN-L-FIM-006's territory; 001 must NOT fire.
         assert!(r
             .evaluate(&fim_event(FimOp::Modified, "/usr/local/bin/x"))
@@ -3123,7 +3172,7 @@ mod tests {
 
     #[test]
     fn fim001_does_not_fire_on_non_modified_op() {
-        let r = NnLFim001SystemBinaryModified;
+        let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         // Deleted of a system binary is alarming but caught by
         // a different rule (or none in V1.0); 001 only handles
         // Modified.
@@ -3286,7 +3335,7 @@ mod tests {
 
     #[test]
     fn a_set_uid_bit_on_a_system_binary_is_killed_its_removal_is_not() {
-        let r = NnLFim001SystemBinaryModified;
+        let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         let v = r
             .evaluate(&attr_event("/usr/sbin/sshd", (0o755, 0, 0), (0o4755, 0, 0)))
             .expect("chmod u+s on a system binary");
@@ -4129,7 +4178,7 @@ mod tests {
         // Smoke: each fires at Critical on its canonical input.
         let events = [
             (
-                NnLFim001SystemBinaryModified
+                NnLFim001SystemBinaryModified::new(H::inert_installer_window())
                     .evaluate(&fim_event(FimOp::Modified, "/usr/bin/sshd")),
                 Severity::Critical,
             ),
@@ -6186,6 +6235,162 @@ mod tests {
             ),
             "{}",
             v.reasoning
+        );
+    }
+
+    /// BUG-66 (external bug hunt, edition 1.3): "Ignores ... malformed
+    /// rows; first match wins" — a malformed row with the name is skipped,
+    /// the valid one after it wins.
+    #[test]
+    fn a_malformed_row_with_the_name_is_ignored() {
+        let body = "root:x:0:0::/root:/bin/sh\nsyslog:x\nsyslog:x:104:110::/home/syslog:/usr/sbin/nologin\n";
+        assert_eq!(parse_passwd_uid(body, "syslog"), Some(104));
+        let body = "syslog:x:abc:110:::\nsyslog:x:104:110::/home/syslog:/usr/sbin/nologin\n";
+        assert_eq!(
+            parse_passwd_uid(body, "syslog"),
+            Some(104),
+            "non-numeric uid"
+        );
+    }
+
+    /// BUG-73 (external bug hunt, edition 1.3): inside an OPEN
+    /// trusted-installer window an in-place write of our own unit in the
+    /// vendor directory, by a writer outside a package transaction, is
+    /// NN-L-FIM-009's audit record — no rule of the set kills its writer.
+    #[test]
+    fn own_vendor_unit_in_open_window_is_audit_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let rules = fim_rules_with_lineage(armed_override(), lineage);
+        let ev = fim_event(
+            FimOp::Modified,
+            "/usr/lib/systemd/system/northnarrow-agent.service",
+        );
+        let verdicts: Vec<Verdict> = rules.iter().filter_map(|r| r.evaluate(&ev)).collect();
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| v.rule_id == "NN-L-FIM-009_SystemdUnitDropped"
+                    && v.action == ResponseAction::Log
+                    && v.severity == Severity::Low),
+            "{verdicts:?}"
+        );
+        for v in &verdicts {
+            assert_eq!(
+                v.action,
+                ResponseAction::Log,
+                "{} answers {:?}/{:?} to the authorised installer",
+                v.rule_id,
+                v.action,
+                v.severity
+            );
+        }
+    }
+
+    // ── Lot 299: BUG-73's controls ──────────────────────────────────
+
+    /// The whole FIM set, its package carve-out over an empty lineage (the
+    /// writer is no package transaction), and its verdicts on `ev`.
+    fn set_verdicts(
+        window: Arc<crate::posture::host::testing::TestWindow>,
+        ev: &Event,
+    ) -> Vec<Verdict> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = fim_rules_with_lineage(window, AuthSessionTracker::new(tmp.path()));
+        rules.iter().filter_map(|r| r.evaluate(ev)).collect()
+    }
+
+    fn fim001(verdicts: &[Verdict]) -> Option<(ResponseAction, Severity)> {
+        verdicts
+            .iter()
+            .find(|v| v.rule_id == "NN-L-FIM-001_SystemBinaryModified")
+            .map(|v| (v.action.clone(), v.severity))
+    }
+
+    /// Every own unit and drop-in the vendor directory can hold, written in
+    /// place inside an OPEN window: recorded by NN-L-FIM-009 at Log/Low,
+    /// killed by no rule; the `/lib/` and `/etc/` spellings were never
+    /// NN-L-FIM-001's.
+    #[test]
+    fn every_own_vendor_unit_in_open_window_is_audit_only() {
+        let mut paths: Vec<&str> = OWN_SYSTEMD_UNITS
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with("/usr/lib/"))
+            .collect();
+        assert_eq!(paths.len(), 4, "{paths:?}");
+        paths.push("/usr/lib/systemd/system/northnarrow-agent.service.d/10-x.conf");
+        paths.push("/usr/lib/systemd/system/northnarrow.slice.d/50-MemoryMax.conf");
+        for p in paths {
+            let v = set_verdicts(armed_override(), &fim_event(FimOp::Modified, p));
+            assert!(
+                v.iter()
+                    .any(|v| v.rule_id == "NN-L-FIM-009_SystemdUnitDropped"
+                        && v.action == ResponseAction::Log
+                        && v.severity == Severity::Low),
+                "{p}: {v:?}"
+            );
+            assert!(
+                v.iter().all(|v| v.action == ResponseAction::Log),
+                "{p}: {v:?}"
+            );
+        }
+    }
+
+    /// Control: with the window CLOSED our own vendor unit written in place
+    /// is still NN-L-FIM-001's kill (KillProcessTree, Critical).
+    #[test]
+    fn own_vendor_unit_with_the_window_closed_is_killed() {
+        for p in [
+            "/usr/lib/systemd/system/northnarrow-agent.service",
+            "/usr/lib/systemd/system/northnarrow-agent.service.d/10-x.conf",
+        ] {
+            let v = set_verdicts(H::inert_installer_window(), &fim_event(FimOp::Modified, p));
+            assert_eq!(
+                fim001(&v),
+                Some((ResponseAction::KillProcessTree, Severity::Critical)),
+                "{p}: {v:?}"
+            );
+        }
+    }
+
+    /// Control: inside an OPEN window a FOREIGN unit in the vendor
+    /// directory, a path that only looks like ours, and any other file under
+    /// `/usr/lib/` are still NN-L-FIM-001's kill.
+    #[test]
+    fn foreign_vendor_unit_in_open_window_is_killed() {
+        for p in [
+            "/usr/lib/systemd/system/evil.service",
+            "/usr/lib/systemd/system/northnarrow-agent.service.bak",
+            "/usr/lib/systemd/system/northnarrow-agent.service.d/x.service",
+            "/usr/lib/systemd/system/evil.service.d/override.conf",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        ] {
+            let v = set_verdicts(armed_override(), &fim_event(FimOp::Modified, p));
+            assert_eq!(
+                fim001(&v),
+                Some((ResponseAction::KillProcessTree, Severity::Critical)),
+                "{p}: {v:?}"
+            );
+        }
+    }
+
+    /// Control: the carve-out is the write NN-L-FIM-009 records. A
+    /// permission change that grants power over our own vendor unit (which
+    /// NN-L-FIM-009 does not record) is still NN-L-FIM-001's kill inside an
+    /// OPEN window.
+    #[test]
+    fn own_vendor_unit_permission_grant_in_open_window_is_killed() {
+        let ev = attr_event(
+            "/usr/lib/systemd/system/northnarrow-agent.service",
+            (0o644, 0, 0),
+            (0o666, 0, 0),
+        );
+        let v = set_verdicts(armed_override(), &ev);
+        assert_eq!(
+            fim001(&v),
+            Some((ResponseAction::KillProcessTree, Severity::Critical)),
+            "{v:?}"
         );
     }
 }

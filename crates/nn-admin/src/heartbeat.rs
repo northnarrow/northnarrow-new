@@ -94,7 +94,108 @@ fn fetch(source: &Source) -> Result<Vec<Vec<u8>>, String> {
         .collect())
 }
 
+/// The longest wait for the source command's bytes between two looks at
+/// whether it exited.
+const POLL_STEP: Duration = Duration::from_millis(50);
+/// Bytes of the source command's stderr kept for a failure's reason: its
+/// end, where the last line is.
+const STDERR_KEPT: usize = 4096;
+
+/// One of the source command's pipes, read as its bytes come.
+struct Pipe {
+    fd: Option<std::fs::File>,
+    buf: Vec<u8>,
+    /// The bytes kept: the first `cap` (stdout: past them the pipe is
+    /// closed, the answer cut), or the last `cap` (stderr: read to its end,
+    /// so the command never waits on it).
+    cap: usize,
+    tail: bool,
+}
+
+impl Pipe {
+    fn new(fd: Option<impl Into<std::os::fd::OwnedFd>>, cap: usize, tail: bool) -> Self {
+        Self {
+            fd: fd.map(|f| std::fs::File::from(f.into())),
+            buf: Vec::new(),
+            cap,
+            tail,
+        }
+    }
+
+    /// One read of what the pipe holds (it said it is readable, or closed).
+    fn read_once(&mut self) {
+        let Some(f) = self.fd.as_mut() else {
+            return;
+        };
+        let mut chunk = [0u8; 16 * 1024];
+        match f.read(&mut chunk) {
+            Ok(0) => self.fd = None,
+            Ok(n) if self.tail => {
+                self.buf.extend_from_slice(&chunk[..n]);
+                let over = self.buf.len().saturating_sub(self.cap);
+                self.buf.drain(..over);
+            }
+            Ok(n) => {
+                let room = self.cap.saturating_sub(self.buf.len());
+                self.buf.extend_from_slice(&chunk[..n.min(room)]);
+                if self.buf.len() >= self.cap {
+                    self.fd = None;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => self.fd = None,
+        }
+    }
+}
+
+/// Wait at most `wait` for bytes on the open pipes, then read once from
+/// each one that has some or closed. Whether one did.
+fn read_ready(out: &mut Pipe, err: &mut Pipe, wait: Duration) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let ready: Vec<bool> = {
+        let open: Vec<&std::fs::File> = [&out.fd, &err.fd].into_iter().flatten().collect();
+        if open.is_empty() {
+            std::thread::sleep(wait);
+            return false;
+        }
+        let mut fds: Vec<PollFd<'_>> = open
+            .iter()
+            .map(|f| PollFd::new(*f, PollFlags::IN))
+            .collect();
+        let timeout = Timespec::try_from(wait).unwrap_or_default();
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(0) => return false,
+            Ok(_) => fds.iter().map(|f| !f.revents().is_empty()).collect(),
+            Err(_) => {
+                std::thread::sleep(wait);
+                return false;
+            }
+        }
+    };
+    // `ready` follows `[out, err]`, the closed ones left out
+    let mut ready = ready.into_iter();
+    let mut any = false;
+    for p in [out, err] {
+        if p.fd.is_some() && ready.next() == Some(true) {
+            p.read_once();
+            any = true;
+        }
+    }
+    any
+}
+
 /// `sh -c cmd`, its stdout (bounded), killed past `timeout`.
+///
+/// Lot 299 (external bug hunt, editions 1.2/1.3: BUG-22, BUG-34, BUG-38):
+/// its stdout and its stderr are one collection under the one bound, read
+/// together as their bytes come, and the fetch ends when the command exits,
+/// with what it left in the pipes:
+/// - a command that writes more than a pipe holds on stderr before it
+///   answers is not stopped by its pipe (it was, until the timeout);
+/// - a process it started that keeps a pipe open (`cmd &`, a multiplexing
+///   ssh master) holds neither its answer nor its failure — the fetch, and
+///   `watch` with it, waited for it without a bound, with no OK and no
+///   ALERT.
 fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     let mut child = Command::new("/bin/sh")
         .arg("-c")
@@ -104,34 +205,35 @@ fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("the source command did not start: {e}"))?;
-    let mut out = child.stdout.take().expect("piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut out).take(FETCH_MAX_BYTES).read_to_end(&mut buf);
-        buf
-    });
-    let started = Instant::now();
+    let deadline = Instant::now() + timeout;
+    let mut out = Pipe::new(child.stdout.take(), FETCH_MAX_BYTES as usize, false);
+    let mut err = Pipe::new(child.stderr.take(), STDERR_KEPT, true);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) => {}
+            Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "the source command did not answer within {} s",
-                    timeout.as_secs()
-                ));
+                return Err(format!("the source command: {e}"));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => return Err(format!("the source command: {e}")),
         }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "the source command did not answer within {} s",
+                timeout.as_secs()
+            ));
+        }
+        read_ready(&mut out, &mut err, (deadline - now).min(POLL_STEP));
     };
-    let buf = reader.join().unwrap_or_default();
+    // it exited: what it wrote is in the pipes now — read that, not what a
+    // process it started may write later
+    while Instant::now() < deadline && read_ready(&mut out, &mut err, Duration::ZERO) {}
     if !status.success() {
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = (&mut e).take(4096).read_to_string(&mut err);
-        }
+        let err = String::from_utf8_lossy(&err.buf);
         let err = err.lines().last().unwrap_or("").to_string();
         return Err(format!(
             "the source command failed ({status}){}",
@@ -142,7 +244,7 @@ fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
             }
         ));
     }
-    Ok(buf)
+    Ok(out.buf)
 }
 
 /// The state: `Ok(None)` when there is none yet (the first check anchors),
@@ -328,5 +430,142 @@ mod tests {
         );
         w.reanchor = true;
         assert!(check_once(&w).is_ok());
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.2: BUG-22): a source command
+    /// that writes more than a pipe holds on stderr before it answers still
+    /// answers.
+    #[test]
+    fn noisy_stderr_source_still_answers() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let got = run_with_timeout(
+                "head -c 100000 /dev/zero >&2; echo beat",
+                Duration::from_secs(3),
+            );
+            let _ = tx.send((got, started.elapsed()));
+        });
+        let (got, took) = rx.recv_timeout(Duration::from_secs(10)).expect("returned");
+        eprintln!("BUG22: {got:?} in {took:?}");
+        assert_eq!(got, Ok(b"beat\n".to_vec()));
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.2: BUG-34): a descendant of the
+    /// source command that holds its stdout must not hold the fetch past its
+    /// bound.
+    #[test]
+    fn descendant_holding_stdout_does_not_hang_fetch() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_with_timeout(
+                "sleep 15 & echo x",
+                Duration::from_secs(1),
+            ));
+        });
+        let r = rx.recv_timeout(Duration::from_secs(8));
+        eprintln!("BUG34: {r:?}");
+        assert!(
+            r.is_ok(),
+            "run_with_timeout(.., 1 s) did not return within 8 s"
+        );
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.2: BUG-38): a failed source
+    /// command is a failed fetch at once, even when a descendant keeps its
+    /// stderr open.
+    #[test]
+    fn failed_source_does_not_wait_for_stderr_holder() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_with_timeout(
+                "sleep 15 >/dev/null & exit 3",
+                Duration::from_secs(1),
+            ));
+        });
+        let r = rx.recv_timeout(Duration::from_secs(8));
+        eprintln!("BUG38: {r:?}");
+        let e = r.expect("blocked reading stderr").unwrap_err();
+        assert!(e.contains("failed") && e.contains('3'), "{e}");
+    }
+
+    /// Lot 299 (BUG-22, BUG-34, BUG-38): `check_once` over each of those
+    /// source commands answers well within the fetch's bound (30 s): an
+    /// ALERT, never a hang.
+    #[test]
+    fn a_held_or_noisy_source_is_an_alert_not_a_hang() {
+        for cmd in [
+            "head -c 100000 /dev/zero >&2; echo beat",
+            "sleep 15 & echo x",
+            "sleep 15 >/dev/null & exit 3",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let w = Watch {
+                pubkey: key.verifying_key(),
+                source: Source::Command(cmd.into()),
+                state: dir.path().join("state.json"),
+                every: None,
+                cfg: WatchConfig::default(),
+                reanchor: false,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(check_once(&w));
+            });
+            let r = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{cmd}: no answer within 10 s"))
+                .unwrap_or_else(|e| panic!("{cmd}: {e}"));
+            assert!(!r.alerts.is_empty(), "{cmd}: no alert");
+        }
+    }
+
+    /// Lot 299: both pipes are read as their bytes come — stderr, stdout,
+    /// stderr again, each more than a pipe holds — and the answer is the
+    /// whole stdout.
+    #[test]
+    fn both_pipes_are_read_as_their_bytes_come() {
+        let out = run_with_timeout(
+            "head -c 200000 /dev/zero >&2; head -c 300000 /dev/zero; \
+             head -c 200000 /dev/zero >&2",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 300_000);
+    }
+
+    /// Lot 299: a failure's reason is the LAST line of its stderr, however
+    /// much came before it (the first 4 KiB were read: a long stderr gave a
+    /// line of its middle).
+    #[test]
+    fn a_failure_says_the_last_line_of_its_stderr() {
+        let e = run_with_timeout(
+            "printf 'first\\n' >&2; head -c 10000 /dev/zero | tr '\\0' x >&2; \
+             printf '\\nthe-reason\\n' >&2; exit 4",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.ends_with(": the-reason") && e.contains('4'), "{e}");
+    }
+
+    /// Lot 299: the answer stays bounded — a source past
+    /// [`FETCH_MAX_BYTES`] has its pipe closed at the bound, a failed fetch
+    /// (it dies of the closed pipe), never an answer cut short or read to
+    /// its end.
+    #[test]
+    fn a_source_past_the_bound_is_a_failed_fetch() {
+        let e = run_with_timeout(
+            &format!("head -c {} /dev/zero", FETCH_MAX_BYTES + 1_000_000),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(e.contains("failed"), "{e}");
+        let out = run_with_timeout(
+            &format!("head -c {FETCH_MAX_BYTES} /dev/zero"),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.len() as u64, FETCH_MAX_BYTES);
     }
 }

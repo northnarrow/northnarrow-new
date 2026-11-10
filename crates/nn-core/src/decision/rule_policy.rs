@@ -733,10 +733,14 @@ fn parse_as(
             ["sysctl-allow", name, value] => {
                 let kind = common::sysctl_judge::kind_of_name(name);
                 if let Err(why) = common::sysctl_judge::opt_out_allowed(kind) {
+                    // Lot 299 (external bug hunt, edition 1.3: BUG-78): the
+                    // names the opt-out takes, by the same judge — not every
+                    // guarded name but `kernel.ftrace_enabled`, which offered
+                    // `debug.kprobes-optimization`, refused whatever its value
                     let known: Vec<&str> = common::sysctl_judge::SYSCTL_PATHS
                         .iter()
+                        .filter(|(_, _, k)| common::sysctl_judge::opt_out_allowed(*k).is_ok())
                         .map(|(_, n, _)| *n)
-                        .filter(|n| *n != "kernel.ftrace_enabled")
                         .collect();
                     return Err(err(format!(
                         "sysctl-allow {name}: {why} (one of {})",
@@ -1979,5 +1983,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("module-allow lines"));
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.3: BUG-78): every name the
+    /// "(one of ...)" list offers is one `sysctl-allow` accepts.
+    #[test]
+    fn every_name_the_refusal_offers_is_accepted() {
+        let e = refused("sysctl-allow vm.swappiness 10\n");
+        let list = e
+            .why
+            .split("(one of ")
+            .nth(1)
+            .expect("a list")
+            .trim_end_matches(')');
+        for name in list.split(", ") {
+            let line = format!("sysctl-allow {name} 1\n");
+            assert!(parse(&line).is_ok(), "offered {name}, refused: {e}");
+        }
     }
 }

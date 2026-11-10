@@ -42,14 +42,19 @@
 //! [`FrameError::ProtocolVersionUnsupported`] and closes the
 //! connection — the rule is *forward-incompatible, backward-tolerant*.
 //!
-//! During the Tappa-8.x release cycle the agent also accepts the
-//! legacy unframed `AdminMessage` body (the v0 wire shape) for the
-//! variants that historically reached the server (`ChallengeRequest`,
-//! `Unlock`, `Status`). Use [`decode_versioned_or_legacy_frame`] for
-//! that tolerance; the strict decoder [`decode_versioned_frame`]
-//! rejects anything that is not a well-formed v1 envelope. The legacy
-//! tolerance window is documented to close once every shipped
-//! `nn-admin` is known to be on v1.
+//! The decoder [`decode_versioned_frame`] rejects anything that is not a
+//! well-formed v1 envelope, and reads the `version` before the message: a
+//! newer peer's envelope is [`FrameError::ProtocolVersionUnsupported`]
+//! even when its message is a variant this build cannot decode.
+//!
+//! Lot 299 (external bug hunt, edition 1.2: BUG-36): the v0 fallback
+//! (`decode_versioned_or_legacy_frame`, a bare `AdminMessage` body tried
+//! when the envelope did not decode) is retired, as this section planned
+//! once the tolerance window closed. It guessed from bytes that can be
+//! both: a v2 envelope with a variant unknown here decoded as a v0
+//! `Status`. It had no production caller. A migration of the live wire to
+//! the envelope tells the two shapes apart by something only one of them
+//! can hold, never by trying one and then the other.
 //!
 //! ### Why this commit doesn't switch existing call sites
 //!
@@ -1961,8 +1966,10 @@ pub enum FrameError {
     /// The frame body was larger than [`MAX_FRAME_BODY`] at encode
     /// time. Should never happen with real AdminMessages.
     EncodedBodyTooLarge { size: usize, limit: usize },
-    /// A [`VersionedAdminMessage`] decoded successfully but carried a
-    /// `version` greater than [`PROTOCOL_VERSION`]. The peer is from
+    /// A [`VersionedAdminMessage`] carried a `version` greater than
+    /// [`PROTOCOL_VERSION`] — read before its message, which may be a
+    /// variant this build cannot decode (lot 299, BUG-36) — or 0, which no
+    /// envelope carries. The peer is from
     /// a newer release than this build can speak; we close the
     /// connection rather than guess at the payload semantics. The
     /// server-side error mapping turns this into the
@@ -2058,9 +2065,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(AdminMessage, usize)>, FrameEr
 ///
 /// Encoders set `version` to [`PROTOCOL_VERSION`]; decoders accept
 /// any `version` in `1..=PROTOCOL_VERSION` (the v0 wire shape — a
-/// bare `AdminMessage` body — is recognised separately by
-/// [`decode_versioned_or_legacy_frame`] and reported as
-/// `version == 0`). A peer that receives `version > PROTOCOL_VERSION`
+/// bare `AdminMessage` body — is [`decode_frame`]'s, never an
+/// envelope's). A peer that receives a `version` outside that range
 /// returns [`FrameError::ProtocolVersionUnsupported`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionedAdminMessage {
@@ -2101,10 +2107,13 @@ pub fn encode_versioned_frame(msg: &VersionedAdminMessage) -> Result<Vec<u8>, Fr
 /// `1..=PROTOCOL_VERSION` AND whose body postcard-decodes with no
 /// trailing bytes.
 ///
-/// Strict consumption is load-bearing for the v0 fallback in
-/// [`decode_versioned_or_legacy_frame`]: a v0 frame whose first byte
-/// happens to parse as a valid `version` varint must be rejected
-/// here so the caller can retry the legacy decoder.
+/// Lot 299 (external bug hunt, edition 1.2: BUG-36): the `version` is
+/// read and judged first — the envelope's first field, postcard's encoding
+/// of a struct being its fields one after the other — so a newer peer's
+/// envelope is [`FrameError::ProtocolVersionUnsupported`] whatever its
+/// message. It was judged after the whole envelope decoded: a message
+/// variant unknown here made it a postcard error, which the retired v0
+/// fallback then took for a bare `Status`.
 pub fn decode_versioned_frame(
     buf: &[u8],
 ) -> Result<Option<(VersionedAdminMessage, usize)>, FrameError> {
@@ -2122,65 +2131,23 @@ pub fn decode_versioned_frame(
         return Ok(None);
     }
     let body = &buf[4..4 + len];
+    let (version, rest) = postcard::take_from_bytes::<u16>(body)?;
+    if !(1..=PROTOCOL_VERSION).contains(&version) {
+        return Err(FrameError::ProtocolVersionUnsupported {
+            received: version,
+            supported: PROTOCOL_VERSION,
+        });
+    }
     // take_from_bytes returns the parsed value plus the unused tail;
     // we require the tail to be empty so a v0 frame with happenstance
     // bytes can't slip through as a "valid v1 envelope plus garbage."
-    let (envelope, tail) = postcard::take_from_bytes::<VersionedAdminMessage>(body)?;
+    let (message, tail) = postcard::take_from_bytes::<AdminMessage>(rest)?;
     if !tail.is_empty() {
         return Err(FrameError::Postcard(
             postcard::Error::DeserializeUnexpectedEnd,
         ));
     }
-    if envelope.version > PROTOCOL_VERSION {
-        return Err(FrameError::ProtocolVersionUnsupported {
-            received: envelope.version,
-            supported: PROTOCOL_VERSION,
-        });
-    }
-    Ok(Some((envelope, 4 + len)))
-}
-
-/// V1-first decode with one-cycle legacy tolerance: tries
-/// [`decode_versioned_frame`] first; on a postcard-level failure
-/// retries as a bare [`AdminMessage`] (the v0 wire shape) and
-/// returns a synthetic envelope with `version == 0`.
-///
-/// `ProtocolVersionUnsupported`, `BodyTooLarge`, and short-buffer
-/// returns are **not** masked — they reflect either a genuinely
-/// newer peer or a malformed/incomplete frame, neither of which is
-/// the v0 case.
-///
-/// Use this on the agent's listener during the Tappa-8.x migration
-/// window. Switch back to [`decode_versioned_frame`] (strict) once
-/// every shipped `nn-admin` has been confirmed on v1.
-pub fn decode_versioned_or_legacy_frame(
-    buf: &[u8],
-) -> Result<Option<(VersionedAdminMessage, usize)>, FrameError> {
-    match decode_versioned_frame(buf) {
-        Ok(some) => Ok(some),
-        // Genuinely-newer peer: don't mask, surface the rejection.
-        Err(e @ FrameError::ProtocolVersionUnsupported { .. }) => Err(e),
-        // Frame-layer issues: surface as-is (caller is on the wrong
-        // protocol, not on the wrong version).
-        Err(e @ FrameError::BodyTooLarge { .. }) => Err(e),
-        Err(e @ FrameError::EncodedBodyTooLarge { .. }) => Err(e),
-        // Postcard-level failure → try the v0 wire shape. If that
-        // also fails, surface the v0 error (the original v1 error is
-        // less informative because we ruled v1 out by trying).
-        Err(FrameError::Postcard(_)) => {
-            let (msg, consumed) = match decode_frame(buf)? {
-                Some(pair) => pair,
-                None => return Ok(None),
-            };
-            Ok(Some((
-                VersionedAdminMessage {
-                    version: 0,
-                    message: msg,
-                },
-                consumed,
-            )))
-        }
-    }
+    Ok(Some((VersionedAdminMessage { version, message }, 4 + len)))
 }
 
 /// Compile-time assertion that an Ed25519 signature is exactly 64
@@ -4227,15 +4194,14 @@ mod tests {
         }
     }
 
-    /// Required A1 test 2: v0 tolerance. A legacy unframed
-    /// `AdminMessage` body (produced by [`encode_frame`]) must decode
-    /// through [`decode_versioned_or_legacy_frame`] as
-    /// `VersionedAdminMessage { version: 0, message: <original> }`.
-    /// Tests all three server-reachable client variants because they
-    /// are the historical Tappa-8.x backward-compat surface (see
-    /// design §6.2 migration path).
+    /// Required A1 test 2, lot 299 (BUG-36: the v0 fallback retired): a
+    /// legacy unframed `AdminMessage` body (produced by [`encode_frame`])
+    /// of each of the three historical client variants is never an
+    /// envelope — the strict decoder refuses it, neither a message nor a
+    /// request for more bytes — and stays [`decode_frame`]'s, the live
+    /// wire's. It used to decode through the fallback as `version: 0`.
     #[test]
-    fn versioned_or_legacy_decodes_v0_unframed_payloads_as_version_zero() {
+    fn a_bare_v0_frame_is_never_an_envelope() {
         let payloads = [
             AdminMessage::ChallengeRequest(ChallengeRequest {}),
             AdminMessage::Unlock(UnlockRequest {
@@ -4245,13 +4211,40 @@ mod tests {
         ];
         for msg in payloads {
             let v0_bytes = encode_frame(&msg).expect("encode v0");
-            let (envelope, consumed) = decode_versioned_or_legacy_frame(&v0_bytes)
-                .expect("compat decode")
+            assert!(
+                decode_versioned_frame(&v0_bytes).is_err(),
+                "{msg:?}: {:?}",
+                decode_versioned_frame(&v0_bytes)
+            );
+            let (back, consumed) = decode_frame(&v0_bytes)
+                .expect("v0 decode")
                 .expect("complete frame");
-            assert_eq!(envelope.version, 0, "v0 frame must surface as version=0");
-            assert_eq!(envelope.message, msg);
+            assert_eq!(back, msg);
             assert_eq!(consumed, v0_bytes.len());
         }
+    }
+
+    /// Lot 299 (BUG-36): no envelope carries `version: 0` — v0 was the
+    /// bare body — so one that says it is refused as a version this build
+    /// does not speak, as the strict decoder's contract always said.
+    #[test]
+    fn an_envelope_at_version_zero_is_unsupported() {
+        let zero = VersionedAdminMessage {
+            version: 0,
+            message: AdminMessage::Status(StatusRequest {}),
+        };
+        let bytes = encode_versioned_frame(&zero).expect("encode");
+        assert!(
+            matches!(
+                decode_versioned_frame(&bytes),
+                Err(FrameError::ProtocolVersionUnsupported {
+                    received: 0,
+                    supported: PROTOCOL_VERSION
+                })
+            ),
+            "{:?}",
+            decode_versioned_frame(&bytes)
+        );
     }
 
     /// Required A1 test 3: future-version reject. An envelope whose
@@ -4281,14 +4274,6 @@ mod tests {
             }
             other => panic!("expected ProtocolVersionUnsupported, got {other:?}"),
         }
-        // Compat decoder also rejects: a future version is NOT a v0
-        // case, so the legacy fallback must not mask the error.
-        match decode_versioned_or_legacy_frame(&bytes) {
-            Err(FrameError::ProtocolVersionUnsupported { received, .. }) => {
-                assert_eq!(received, PROTOCOL_VERSION + 1);
-            }
-            other => panic!("expected ProtocolVersionUnsupported, got {other:?}"),
-        }
     }
 
     /// Required A1 test 4: malformed envelopes. Covers the three
@@ -4296,8 +4281,9 @@ mod tests {
     /// (a) advertised body length exceeds MAX_FRAME_BODY,
     /// (b) buffer is shorter than the advertised length
     ///     (incremental-buffer case → Ok(None)),
-    /// (c) body bytes do not postcard-decode as either v1 or v0
-    ///     (compat decoder surfaces the v0 postcard error).
+    /// (c) body bytes do not postcard-decode as an envelope (a postcard
+    ///     error; lot 299 retired the v0 fallback, which tried the bare
+    ///     body next and surfaced its error).
     #[test]
     fn versioned_decoder_handles_malformed_envelope() {
         // (a) Oversized advertised length — same defence as
@@ -4310,11 +4296,6 @@ mod tests {
                 assert_eq!(advertised, MAX_FRAME_BODY + 1);
                 assert_eq!(limit, MAX_FRAME_BODY);
             }
-            other => panic!("expected BodyTooLarge, got {other:?}"),
-        }
-        // Same defence on the compat path.
-        match decode_versioned_or_legacy_frame(&bad) {
-            Err(FrameError::BodyTooLarge { .. }) => {}
             other => panic!("expected BodyTooLarge, got {other:?}"),
         }
 
@@ -4331,18 +4312,16 @@ mod tests {
             assert!(res.is_none(), "partial {n}/{} must be None", full.len());
         }
 
-        // (c) Body bytes are not decodable as either v1 OR v0. We
-        // hand-build a frame whose body is junk that neither shape
-        // will accept (top-bit set on the first varint byte without a
-        // continuation byte, then random tail). The compat path
-        // tries v1, errors, then tries v0, errors again, then
-        // surfaces the v0 postcard error.
+        // (c) Body bytes are not decodable as an envelope. We
+        // hand-build a frame whose body is junk no shape will accept
+        // (top-bit set on the first varint byte without a continuation
+        // byte, then random tail): its `version` does not decode.
         let mut junk_body = vec![0x80u8]; // varint continuation expected but absent
         junk_body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         let mut junk_frame = Vec::with_capacity(4 + junk_body.len());
         junk_frame.extend_from_slice(&(junk_body.len() as u32).to_be_bytes());
         junk_frame.extend_from_slice(&junk_body);
-        let err = decode_versioned_or_legacy_frame(&junk_frame).unwrap_err();
+        let err = decode_versioned_frame(&junk_frame).unwrap_err();
         assert!(
             matches!(err, FrameError::Postcard(_)),
             "expected Postcard error, got {err:?}"
@@ -4350,8 +4329,8 @@ mod tests {
     }
 
     /// Supplementary: the strict decoder rejects a v0 frame outright.
-    /// Documents the contract that the strict path is "v1 only" and
-    /// the compat path is the one to use during migration.
+    /// Documents the contract that the strict path is "v1 only" (lot 299
+    /// retired the compat path).
     #[test]
     fn versioned_strict_decoder_does_not_accept_v0_unlock_as_v1() {
         let v0_unlock = encode_frame(&AdminMessage::Unlock(UnlockRequest {
@@ -4464,5 +4443,31 @@ mod tests {
         ));
         let versioned = hex::encode(encode_versioned_frame(&quorum).unwrap());
         assert_eq!(versioned, QUORUM_NOT_MET_V1);
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.2: BUG-36): a v2 envelope
+    /// carrying a variant this build does not know surfaces as
+    /// `ProtocolVersionUnsupported`, not as a postcard error (which the
+    /// retired v0 fallback turned into a v0 `Status`).
+    #[cfg(not(feature = "debug-trigger"))]
+    #[test]
+    fn future_version_unknown_variant_is_unsupported() {
+        let body: [u8; 4] = [0x02, 0x3B, 0xAA, 0xBB];
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        let strict = decode_versioned_frame(&frame);
+        assert!(
+            matches!(
+                strict,
+                Err(FrameError::ProtocolVersionUnsupported {
+                    received: 2,
+                    supported: PROTOCOL_VERSION
+                })
+            ),
+            "strict: {strict:?}"
+        );
+        // the envelope's message alone is not one this build decodes
+        assert!(postcard::from_bytes::<AdminMessage>(&body[1..]).is_err());
     }
 }
