@@ -1169,16 +1169,31 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         }
         let manifest = self.manifest_path.clone();
         let mode = self.cfg.file_mode;
-        self.protection
-            .with_mutable_dir(&mut || match K::Host::open_with_mode(
-                OpenOptions::new().create_new(true).write(true),
-                mode,
-                &manifest,
-            ) {
-                Ok(_) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                Err(e) => Err(anyhow!(e).context(format!("creating {}", manifest.display()))),
-            })?;
+        let create = || match K::Host::open_with_mode(
+            OpenOptions::new().create_new(true).write(true),
+            mode,
+            &manifest,
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        };
+        // Lot 296: a plain create first, the protection's lift only when the
+        // directory refuses a new name (its `+i`, EPERM). The lift is the
+        // state directory's whatever directory the log is in: the open makes
+        // the manifest now, and a test agent's logs, elsewhere, lifted the
+        // installed agent's state directory at every start (its denials
+        // raised that agent's posture to COMBAT in the CI's privileged run).
+        match create() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.protection.with_mutable_dir(&mut || {
+                    create()
+                        .map_err(|e| anyhow!(e).context(format!("creating {}", manifest.display())))
+                })?;
+            }
+            Err(e) => return Err(anyhow!(e).context(format!("creating {}", manifest.display()))),
+        }
         if let Err(e) = self.protection.register_active(&self.manifest_path) {
             warn!(
                 error = %format!("{e:#}"),
@@ -7501,5 +7516,48 @@ mod tests {
         assert_eq!(list_archive_seqs(&active).unwrap(), [1]);
         let r = verify_log_set::<TestPayload>(&active, &pk);
         assert!(r.as_ref().is_ok_and(|r| r.total_records == i + 1), "{r:?}");
+    }
+
+    /// A protection that counts its lifts and refuses them all.
+    struct CountedRefusal(std::sync::atomic::AtomicU32);
+
+    impl ProtectionManager for CountedRefusal {
+        fn with_mutable_dir(&self, _f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow!("lifting immutability: Operation not permitted"))
+        }
+        fn register_active(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The CI's privileged run (lot 296): the protection lifts the state
+    /// directory whatever directory a log is in, and the open now makes the
+    /// manifest — a test agent, its logs in a directory of its own, lifted
+    /// the installed agent's state directory at every start. A directory
+    /// that takes a new name gets the manifest without any lift.
+    #[test]
+    fn a_manifest_the_directory_takes_needs_no_lift() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let prot = std::sync::Arc::new(CountedRefusal(std::sync::atomic::AtomicU32::new(0)));
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(1 << 30, 50),
+            prot.clone(),
+        )
+        .unwrap();
+        assert!(manifest_path_for(&active).is_file(), "made at the open");
+        log.append(payload(0)).unwrap();
+        log.checkpoint().unwrap();
+        drop(log);
+        assert_eq!(
+            prot.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no lift"
+        );
+        assert_eq!(manifest_events(&active).len(), 1, "the checkpoint");
     }
 }
