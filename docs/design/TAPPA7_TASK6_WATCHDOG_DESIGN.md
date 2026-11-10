@@ -177,7 +177,9 @@ the other; `pidfd_open` bridges that.
   a reply within **2 s**. This catches the **agent alive but stuck**
   case (e.g. ADE deadlocked, tokio runtime wedged) that pidfd alone
   misses. Two consecutive timeouts in a row promote "stuck" to
-  "dead" and trigger the restart path.
+  "dead" and trigger the restart path. (As built: two timeouts with no
+  answer in between — a ping that found the socket gone between them does
+  not start the count over; lot 297, external bug hunt BUG81.)
 
   The `STATUS` frame is the same frame the existing `nn-admin
   status` CLI uses today — no new protocol surface.
