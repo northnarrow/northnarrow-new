@@ -1071,6 +1071,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- DNS, tunnels and flows: ten bugs of the external bug hunt (editions 1.2
+  and 1.3), as our triage verified them (lot 291).
+  - NN-L-NET-014 kills a DNS tunnel whose payload runs over several labels
+    (BUG55, P0). The corroboration's parent domain was everything after
+    the first label: with the payload over two labels (iodine and dnscat2
+    cut it every 57 to 63 characters), or one random label more, each
+    query had a parent of its own and the kill never came. The parent is
+    now the registrable domain (`evil.example`, `evil.co.uk`; the new
+    `nn_core::net::registrable`, a curated list of the country registries'
+    and the cloud platforms' public suffixes — the repository holds no
+    Public Suffix List), never finer than the old key; neither it nor the
+    label counts its letters' case.
+  - The parse worker is no longer killed, nor disabled after five, for an
+    honest answer to a DNS response whose records are owned by the root
+    (BUG02, P0): the core's floor counted 2 bytes for a record's owner and
+    1 more for a CNAME's target, where the root takes one. Any unprivileged
+    process could have its own DNS server send such responses and leave
+    every DNS name of the host without a decode (NN-L-NET-014 and
+    NN-L-NET-002 blind). The fuzz target `dns_records` now asserts that the
+    worker's honest answer passes the core's check.
+  - An open flow deferred by the snapshots' per-tick bound is judged again
+    at the next tick (BUG76): the order was the last snapshot's time, 0
+    for a flow never handed out, so a steady supply of new long-lived flows
+    starved one deferred once; it is now when each flow became due.
+  - A flow open longer than the DNS cache's TTL (300 s) keeps its name on
+    its snapshots and its closed row (BUG43): the name its connect was given
+    is kept with the pending flow (`FlowTracker::on_tcp_connect_named`), a
+    name found again at the close still winning.
+  - NN-L-NET-028's state (BUG46, BUG57, BUG80): a pid's new holder's own
+    binding counts for it though the earlier holder's still held; one
+    name of a day's TTL no longer makes every name in the table look
+    expired at its bound (the event's time is "now", and a name of an
+    incomplete response lasts as long as its addresses); an asker read a
+    little out of order (one ring, a second of slack) no longer stops the
+    scan of a response's askers.
+  - NN-L-NET-026 reaches its kill tier (512 hosts) with three ports a host
+    (BUG47): past the 1,024 samples of a key, a sample of a host counted
+    again later goes first; a host lost to the bound is counted in
+    `net_window_evictions_total`. A sample older than the window when it
+    comes is counted nowhere, and one a little out of order expires in its
+    turn (BUG70).
+  - NN-L-NET-020/021: a full map of 4,096 live held-record windows evicts
+    one window (an ended one, else the live one that holds the least,
+    counted in `net_window_evictions_total`) instead of clearing them all —
+    a flood in progress was lost or reported twice (BUG65).
 - What an interpreter runs is read from its argv with that interpreter's
   own option table (lot 292; external bug hunt, editions 1.2/1.3: BUG-44,
   BUG-42; `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`). One option rule for

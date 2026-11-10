@@ -1351,3 +1351,100 @@ fn a_condemned_worker_is_killed_as_for_a_violation() {
         "export_rows: a row the core did not send",
     );
 }
+
+/// A DNS response to a question for the root, with one A record owned by
+/// the root: 32 bytes, what `dig @own-server . A` may receive.
+fn root_owned_a_response() -> Request {
+    Request::DnsAnswers(vec![
+        0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, //
+        0, 0, 1, 0, 1, //
+        0, 0, 1, 0, 1, 0, 0, 0, 0x3c, 0, 4, 192, 0, 2, 1,
+    ])
+}
+
+/// External bug hunt (edition 1.2), BUG02: an honest worker's answer to a
+/// response whose record names the root is no violation — the worker is
+/// neither killed for it nor, after five, disabled (which left every DNS
+/// name of the host undecoded: NN-L-NET-014 and NN-L-NET-002 blind). Any
+/// unprivileged process could send itself such responses.
+#[test]
+fn root_owned_answers_never_disable_an_honest_worker() {
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    for i in 0..=DISABLE_AFTER {
+        let got = f.workers.request(
+            WorkerKind::Parse,
+            &root_owned_a_response(),
+            Duration::from_secs(2),
+        );
+        assert!(
+            matches!(&got, Ok(Answer::DnsAnswers(Some(o))) if o.records.len() == 1),
+            "answer {i}: {got:?}"
+        );
+    }
+    let st = &f.workers.status()[0];
+    assert_eq!(
+        (st.health, st.violations, st.deaths),
+        (Health::Ready, 0, 0),
+        "{st:?}"
+    );
+    assert!(f.reports.lock().is_empty(), "{:?}", f.reports.lock());
+}
+
+/// External bug hunt (edition 1.2), BUG02: a worker disabled, whatever the
+/// cause, leaves the DNS queries without a name — the core never parses
+/// them itself — and that is never a silent blind spot: the disabling is a
+/// degradation reported (signed, in production) at once, the status says
+/// it (the heartbeat, the manifest), and the names left without a decode
+/// are counted.
+#[test]
+fn a_disabled_worker_leaves_queries_without_a_name() {
+    use crate::sensors::dns_sensor::{name_request, query_event};
+    use crate::worker::parse::ParseClient;
+    let f = fixture(Script::DieOnRequest);
+    for i in 1..=DISABLE_AFTER {
+        assert!(
+            tick_until(&f.workers, Health::Ready) || i == DISABLE_AFTER,
+            "start {i}"
+        );
+        let _ = f
+            .workers
+            .request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+        f.workers.tick(Instant::now() + MAX_BACKOFF);
+    }
+    let st = &f.workers.status()[0];
+    assert_eq!(st.health, Health::Disabled, "{st:?}");
+    // the degradation: reported at once, under the worker's source
+    let reports = f.reports.lock().clone();
+    assert!(
+        reports
+            .iter()
+            .any(|(src, d)| src == "worker_parse" && d.starts_with("disabled:")),
+        "{reports:?}"
+    );
+    // a DNS query: no decode, the event without a name, partial
+    let mut raw = common::wire::DnsQueryRaw::zeroed();
+    raw.qtype = 1;
+    raw.qname_len = 13;
+    raw.query_name[..13].copy_from_slice(b"\x07example\x03com\x00");
+    let mut parse = ParseClient::new(Some(f.workers.clone()));
+    let decoded = parse.names(vec![name_request(&raw)]);
+    assert_eq!(decoded, vec![None]);
+    assert_eq!((parse.decoded, parse.unparsed), (0, 1));
+    match query_event(&raw, decoded[0].as_ref()) {
+        nn_model::Event::DnsQuery {
+            query_name,
+            qname_partial,
+            ..
+        } => assert_eq!((query_name.as_str(), qname_partial), ("", true)),
+        e => panic!("{e:?}"),
+    }
+    // and a response: none either
+    assert_eq!(
+        parse.dns_answers(match &root_owned_a_response() {
+            Request::DnsAnswers(b) => b,
+            _ => unreachable!(),
+        }),
+        None
+    );
+}

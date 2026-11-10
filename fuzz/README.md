@@ -49,7 +49,9 @@ at exit — WDG-R09).
   `install_manifest` (WDG-R05: a relative alias of the agent, `/dev/zero`,
   which hung the check), `combat_allow` (NN-AUD-095: wide, unspecified,
   multicast entries), `canary_template` (DEC-017: an unclosed
-  placeholder), `dns_records` (NN-AUD-185: a dot inside a label), `shutdown_marker`
+  placeholder), `dns_records` (NN-AUD-185: a dot inside a label; the
+  external bug hunt's BUG02: a root-owned A, AAAA and CNAME record, whose
+  honest answer the core refused as a violation), `shutdown_marker`
   (AUT-005: nine signatures; AUT-011, declined on ciborium's recursion
   limit: a payload nested 10,000 deep), `ipc_check` (review of #480, F1: a
   JA4 with a two-byte character across byte 23, which panicked the core).

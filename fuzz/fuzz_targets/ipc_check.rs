@@ -198,10 +198,26 @@ fn accepted_answer(req: &Request, answer: &Answer) {
         }
         (Request::DnsAnswers(_), Answer::DnsAnswers(None)) => {}
         // lot 275: the records fit in the bytes, within the bound; every
-        // name printable ASCII and bounded
+        // name printable ASCII and bounded. External bug hunt (edition
+        // 1.2), BUG02: the floor is the parser's (`dns_records`): an owner
+        // and a CNAME's target of one byte, the root's name — a floor of a
+        // 2-byte owner refused the honest worker's answer to a root-owned
+        // record, and killed it as a violator
         (Request::DnsAnswers(bytes), Answer::DnsAnswers(Some(out))) => {
             assert!(out.records.len() <= MAX_DNS_RECORDS);
-            assert!(min_dns_answer_bytes(&out.records) <= bytes.len());
+            let least = 12
+                + 5
+                + out
+                    .records
+                    .iter()
+                    .map(|r| match r {
+                        DnsRecordOut::A { .. } => 1 + 10 + 4,
+                        DnsRecordOut::Aaaa { .. } => 1 + 10 + 16,
+                        DnsRecordOut::Cname { .. } => 1 + 10 + 1,
+                    })
+                    .sum::<usize>();
+            assert_eq!(min_dns_answer_bytes(&out.records), least);
+            assert!(least <= bytes.len());
             assert!(out.rcode <= 15);
             let ok = |n: &str| n.len() <= MAX_DNS_NAME_OUT && n.bytes().all(|b| (0x20..=0x7e).contains(&b));
             assert!(ok(&out.qname), "{out:?}");

@@ -68,6 +68,12 @@ pub const NAME_CAP_SECS: u64 = 86_400;
 pub const BIND_IDLE_SECS: u64 = 7_200;
 /// A response binds the processes that asked for its name this recently.
 pub const ASK_WINDOW_SECS: u64 = 10;
+/// External bug hunt (edition 1.3), BUG80: the askers are kept in the order
+/// the DNS query pump read them — one ring, whose records of several CPUs
+/// may be read a little out of time order. A response's scan of them, from
+/// the newest, stops at the first one older than its window by more than
+/// this, not at the first one older than its window.
+pub const ASK_ORDER_SLACK_NS: u64 = SEC;
 /// A name asked for this recently and never answered (as seen) makes the
 /// lineage's judgement unknown; so do records of it the budgets held.
 pub const UNSEEN_WINDOW_SECS: u64 = NAME_FLOOR_SECS;
@@ -246,6 +252,20 @@ struct NameEntry {
     answered_until: u64,
 }
 
+impl NameEntry {
+    /// When nothing of the name counts any more: its answer, its addresses,
+    /// its CNAMEs. External bug hunt (edition 1.3), BUG57: a name of an
+    /// incomplete response has addresses and no answer (`answered_until`
+    /// 0), and was evicted as expired while its addresses held.
+    fn ends(&self) -> u64 {
+        self.addrs
+            .values()
+            .chain(self.cnames.values())
+            .copied()
+            .fold(self.answered_until, u64::max)
+    }
+}
+
 /// Why a judgement outside [`ResolvedTable::check`] is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownWhy {
@@ -268,8 +288,51 @@ enum Bind {
 
 #[derive(Debug, Clone, Copy)]
 struct Binding {
+    /// The first time the binding was made.
     made_ns: u64,
+    /// External bug hunt (edition 1.3), BUG46: the two latest times it was
+    /// made again, newest first (0: none). The binding kept only the first,
+    /// so once a pid was reused while the earlier holder's binding held,
+    /// the new process's own response bound nothing it could use (made
+    /// before it started). A binding counts for a process when one of these
+    /// times falls between its start and the connect.
+    remade_ns: [u64; 2],
     until_ns: u64,
+}
+
+impl Binding {
+    fn new(made_ns: u64, until_ns: u64) -> Self {
+        Self {
+            made_ns,
+            remade_ns: [0; 2],
+            until_ns,
+        }
+    }
+
+    /// Made (again) at `t`.
+    fn made_at(&mut self, t: u64) {
+        let other = if t < self.made_ns {
+            std::mem::replace(&mut self.made_ns, t)
+        } else {
+            t
+        };
+        let [a, b] = self.remade_ns;
+        if other == self.made_ns || other == a || other == b {
+            return;
+        }
+        if other > a {
+            self.remade_ns = [other, a];
+        } else if other > b {
+            self.remade_ns = [a, other];
+        }
+    }
+
+    /// Made at a time from `start_ns` to `now_ns`, both included.
+    fn made_within(&self, start_ns: u64, now_ns: u64) -> bool {
+        std::iter::once(self.made_ns)
+            .chain(self.remade_ns.into_iter().filter(|t| *t != 0))
+            .any(|t| t >= start_ns && t <= now_ns)
+    }
 }
 
 #[derive(Default)]
@@ -577,11 +640,13 @@ impl<I: Default> ResolvedTable<I> {
         if a.resolver {
             let since = a.ts_ns.saturating_sub(ASK_WINDOW_SECS * SEC);
             let until = a.ts_ns.saturating_add(ASK_WINDOW_SECS * SEC);
+            // BUG80: an asker read after an older one is still seen
+            let stop = since.saturating_sub(ASK_ORDER_SLACK_NS);
             for (n, pid, t) in g.askers.iter().rev() {
-                if *t < since {
+                if *t < stop {
                     break;
                 }
-                if *t <= until && chain.contains(n) && !pids.contains(pid) {
+                if *t >= since && *t <= until && chain.contains(n) && !pids.contains(pid) {
                     pids.push(*pid);
                 }
             }
@@ -604,7 +669,7 @@ impl<I: Default> ResolvedTable<I> {
         } else {
             Self::ask(&mut g, a.pid, &qname, a.ts_ns);
         }
-        Self::bound(&mut g);
+        Self::bound(&mut g, a.ts_ns);
     }
 
     /// `pid`'s ask of `n` at `ts_ns`, unanswered, in its recent names.
@@ -648,7 +713,7 @@ impl<I: Default> ResolvedTable<I> {
         for (addr, until) in Self::addresses_of(&g, &n, ts_ns) {
             Self::bind(&mut g, pid, addr, ts_ns, until);
         }
-        Self::bound(&mut g);
+        Self::bound(&mut g, ts_ns);
     }
 
     /// The kernel held DNS records of `pid` back at `ts_ns` (its DNS query
@@ -713,15 +778,16 @@ impl<I: Default> ResolvedTable<I> {
         let b = g
             .bindings
             .entry((pid, addr))
-            .or_insert(Binding { made_ns, until_ns });
-        b.made_ns = b.made_ns.min(made_ns);
+            .or_insert(Binding::new(made_ns, until_ns));
+        b.made_at(made_ns);
         b.until_ns = b.until_ns.max(until_ns);
         g.binding_order.touch((pid, addr));
         g.counters.bindings += 1;
     }
 
-    /// The maps back within their bounds, the oldest out first.
-    fn bound(g: &mut Inner) {
+    /// The maps back within their bounds, the oldest out first; `now_ns`
+    /// the event's time.
+    fn bound(g: &mut Inner, now_ns: u64) {
         while g.binding_order.len() > MAX_BINDINGS {
             if let Some(k) = g.binding_order.pop_oldest() {
                 g.bindings.remove(&k);
@@ -735,22 +801,17 @@ impl<I: Default> ResolvedTable<I> {
             }
         }
         if g.names.len() > MAX_NAMES {
-            // the expired first; then the soonest to expire
-            let now = g
-                .names
-                .values()
-                .map(|e| e.answered_until)
-                .max()
-                .unwrap_or(0);
-            let horizon = now.saturating_sub(NAME_FLOOR_SECS * SEC);
+            // the expired first (a name an ask of the last
+            // UNSEEN_WINDOW_SECS may still find answered stays); then the
+            // soonest to expire. External bug hunt (edition 1.3), BUG57:
+            // "now" was the latest end of any name — a day's TTL put it a
+            // day ahead, and every name still valid looked expired.
+            let horizon = now_ns.saturating_sub(UNSEEN_WINDOW_SECS * SEC);
             let before = g.names.len();
-            g.names.retain(|_, e| e.answered_until >= horizon);
+            g.names.retain(|_, e| e.ends() >= horizon);
             if g.names.len() > MAX_NAMES {
-                let mut by_end: Vec<(u64, String)> = g
-                    .names
-                    .iter()
-                    .map(|(k, e)| (e.answered_until, k.clone()))
-                    .collect();
+                let mut by_end: Vec<(u64, String)> =
+                    g.names.iter().map(|(k, e)| (e.ends(), k.clone())).collect();
                 by_end.sort_unstable();
                 let excess = g.names.len() - MAX_NAMES * 9 / 10;
                 for (_, k) in by_end.into_iter().take(excess) {
@@ -843,7 +904,7 @@ impl<I: Default> ResolvedTable<I> {
         let Some(b) = g.bindings.get_mut(&(pid, addr)) else {
             return Bind::None;
         };
-        if b.made_ns < start_ns || b.until_ns < now_ns || b.made_ns > now_ns {
+        if b.until_ns < now_ns || !b.made_within(start_ns, now_ns) {
             return Bind::None;
         }
         if start_ns == 0 {
@@ -1668,6 +1729,235 @@ mod tests {
                 j.unknown_degraded
             ),
             (1, 1, 1, 1, 1, 1, 1)
+        );
+    }
+
+    /// Bug hunt 1.3, BUG46: pid 500 reused by a process started at
+    /// 1000 s that receives the response itself at 1010 s; the earlier
+    /// holder's binding of 10 s must not hide the fresh one.
+    #[test]
+    fn fresh_binding_after_pid_reuse_counts() {
+        let t = Table::new();
+        let rec = [a("host.example", 60, WEB)];
+        answer_as(&t, 500, 10 * SEC, "host.example", &rec, true, false);
+        answer_as(&t, 500, 1010 * SEC, "host.example", &rec, true, false);
+        assert_eq!(
+            t.check(500, 1000 * SEC, WEB, 1011 * SEC, none),
+            DnsResolution::Lineage,
+            "stub path: the new process received the response at 1010 s"
+        );
+    }
+
+    /// Bug hunt BUG46, resolver path: the new holder asked, systemd-resolved
+    /// received the upstream response.
+    #[test]
+    fn fresh_binding_after_pid_reuse_via_resolver() {
+        let t = Table::new();
+        let rec = [a("host.example", 60, WEB)];
+        t.on_query(500, "host.example", 10 * SEC);
+        answer(&t, 77, 10 * SEC, "host.example", &rec);
+        t.on_query(500, "host.example", 1010 * SEC);
+        answer(&t, 77, 1010 * SEC, "host.example", &rec);
+        assert_eq!(
+            t.check(500, 1000 * SEC, WEB, 1011 * SEC, none),
+            DnsResolution::Lineage,
+            "resolver path: the new process asked at 1010 s"
+        );
+    }
+
+    /// Bug hunt 1.3, BUG57: past MAX_NAMES, one name with a day's
+    /// TTL must not make every name still valid look expired.
+    #[test]
+    fn one_long_ttl_does_not_evict_live_names() {
+        let t = Table::new();
+        let base = u32::from(Ipv4Addr::new(198, 51, 0, 0));
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(base + i));
+        answer(
+            &t,
+            500,
+            T0,
+            "long.example",
+            &[a("long.example", 86_400, ip(0))],
+        );
+        for i in 1..=MAX_NAMES as u32 {
+            let n = format!("n{i}.example");
+            answer(&t, 500, T0 + u64::from(i), &n, &[a(&n, 3_600, ip(i))]);
+        }
+        let (_, names, _) = t.sizes();
+        let last = format!("n{MAX_NAMES}.example");
+        t.on_query(42, &last, T0 + 40 * SEC);
+        let got = t.check(42, 1, ip(MAX_NAMES as u32), T0 + 41 * SEC, none);
+        assert!(
+            names >= MAX_NAMES * 9 / 10,
+            "names left {names} of {} (none expired), evicted {}, judgement {got:?}",
+            MAX_NAMES + 1,
+            t.counters().evicted
+        );
+        assert_eq!(got, DnsResolution::Lineage);
+    }
+
+    /// Bug hunt 1.3, BUG80: an asker read after an older one must not
+    /// stop the scan of the askers before the one in the window. The
+    /// askers come from one ring, read a little out of time order: here
+    /// pid 8's query, half a second older than the response's window, is
+    /// read after pid 7's. (The triage's test read one 50 s older; no ring
+    /// inverts by that much, and the scan stops past a second of slack.)
+    #[test]
+    fn an_out_of_order_asker_does_not_hide_a_valid_one() {
+        let t = Table::new();
+        t.on_query(7, "a.example", 100 * SEC);
+        t.on_query(8, "a.example", 94 * SEC + SEC / 2);
+        answer(&t, 500, 105 * SEC, "a.example", &[a("a.example", 30, WEB)]);
+        assert_eq!(
+            t.check(7, 1, WEB, 106 * SEC, none),
+            DnsResolution::Lineage,
+            "pid 7 asked 5 s before the resolver's response"
+        );
+        // pid 8 asked outside the window: not bound by this response
+        assert_eq!(
+            t.check(8, 1, WEB, 106 * SEC, none),
+            DnsResolution::OtherLineage,
+            "pid 8 asked 10.5 s before it"
+        );
+    }
+
+    /// Bug hunt 1.3, BUG80: past the slack the scan stops — an asker in the
+    /// window read after one older than the window by more than the slack
+    /// (never, from one ring) is not looked for.
+    #[test]
+    fn the_askers_scan_stops_past_its_slack() {
+        let t = Table::new();
+        t.on_query(7, "a.example", 100 * SEC);
+        t.on_query(8, "b.example", 95 * SEC - ASK_ORDER_SLACK_NS - 1);
+        answer(&t, 500, 105 * SEC, "a.example", &[a("a.example", 30, WEB)]);
+        assert_eq!(
+            t.check(7, 1, WEB, 106 * SEC, none),
+            DnsResolution::OtherLineage
+        );
+    }
+
+    /// Bug hunt 1.3, BUG46: the binding made by the pid's new holder counts
+    /// for it however the earlier holder's and its own later ones fall
+    /// around the connect — made at 10 s (the earlier holder), at 1005 s
+    /// (the process, started at 1000 s), at 1012 s (read after the connect
+    /// at 1010 s): the report's fix (the first and the last time) missed it.
+    #[test]
+    fn a_binding_made_between_the_start_and_the_connect_counts() {
+        let t = Table::new();
+        let rec = [a("host.example", 3_600, WEB)];
+        answer_as(&t, 500, 10 * SEC, "host.example", &rec, true, false);
+        answer_as(&t, 500, 1005 * SEC, "host.example", &rec, true, false);
+        answer_as(&t, 500, 1012 * SEC, "host.example", &rec, true, false);
+        assert_eq!(
+            t.check(500, 1000 * SEC, WEB, 1010 * SEC, none),
+            DnsResolution::Lineage
+        );
+        // and none made in that span: not its own (made before it started,
+        // or after the connect)
+        let t = Table::new();
+        answer_as(&t, 501, 10 * SEC, "host.example", &rec, true, false);
+        answer_as(&t, 501, 1012 * SEC, "host.example", &rec, true, false);
+        answer_as(&t, 501, 1013 * SEC, "host.example", &rec, true, false);
+        assert_eq!(
+            t.check(501, 1000 * SEC, WEB, 1010 * SEC, none),
+            DnsResolution::Unresolved
+        );
+    }
+
+    /// Bug hunt 1.3, BUG46: a binding's times read out of order still count
+    /// — the one in the process's span read after a later one, and an
+    /// earlier one read after the first.
+    #[test]
+    fn a_binding_s_times_read_out_of_order_still_count() {
+        let rec = [a("host.example", 3_600, WEB)];
+        // the earlier holder's, the one after the connect, then the
+        // process's own
+        let t = Table::new();
+        for at in [10, 1012, 1005] {
+            answer_as(&t, 500, at * SEC, "host.example", &rec, true, false);
+        }
+        assert_eq!(
+            t.check(500, 1000 * SEC, WEB, 1010 * SEC, none),
+            DnsResolution::Lineage
+        );
+        // the first read is not the earliest; two more after the connect
+        let t = Table::new();
+        for at in [1005, 1003, 1012, 1013] {
+            answer_as(&t, 500, at * SEC, "host.example", &rec, true, false);
+        }
+        assert_eq!(
+            t.check(500, 1000 * SEC, WEB, 1004 * SEC, none),
+            DnsResolution::Lineage
+        );
+    }
+
+    /// Bug hunt 1.3, BUG46: a binding made only after the connect is not
+    /// one, whether the process's start is known or not.
+    #[test]
+    fn a_binding_made_after_the_connect_is_not_one() {
+        let t = Table::new();
+        let rec = [a("host.example", 3_600, WEB)];
+        answer_as(&t, 42, T0 + 20 * SEC, "host.example", &rec, true, false);
+        for start in [0, 1] {
+            assert_eq!(
+                t.check(42, start, WEB, T0 + 10 * SEC, none),
+                DnsResolution::Unresolved,
+                "start {start}"
+            );
+        }
+    }
+
+    /// Bug hunt 1.3, BUG57: a name of an incomplete response (no answer,
+    /// its addresses or its CNAMEs held) is not evicted as expired when the
+    /// names pass their bound: it lasts as long as they do.
+    #[test]
+    fn a_name_of_an_incomplete_response_is_not_evicted_first() {
+        let t = Table::new();
+        let base = u32::from(Ipv4Addr::new(198, 51, 0, 0));
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(base + i));
+        answer_as(
+            &t,
+            500,
+            T0,
+            "cut.example",
+            &[a("cut.example", 7_200, ip(0))],
+            false,
+            true,
+        );
+        answer_as(
+            &t,
+            500,
+            T0,
+            "alias.example",
+            &[
+                Record::Cname {
+                    name: "alias.example".into(),
+                    ttl: 7_200,
+                    target: "cut.example".into(),
+                },
+                a("cut.example", 7_200, ip(0)),
+            ],
+            false,
+            true,
+        );
+        for i in 1..=MAX_NAMES as u32 {
+            let n = format!("n{i}.example");
+            answer(&t, 500, T0 + u64::from(i), &n, &[a(&n, 3_600, ip(i))]);
+        }
+        t.on_query(42, "cut.example", T0 + 40 * SEC);
+        assert_eq!(
+            t.check(42, 1, ip(0), T0 + 41 * SEC, none),
+            DnsResolution::Lineage,
+            "{:?}",
+            t.counters()
+        );
+        // the alias, a CNAME only: its asker reaches the address through it
+        t.on_query(43, "alias.example", T0 + 40 * SEC);
+        assert_eq!(
+            t.check(43, 1, ip(0), T0 + 41 * SEC, none),
+            DnsResolution::Lineage,
+            "{:?}",
+            t.counters()
         );
     }
 }

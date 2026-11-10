@@ -218,8 +218,9 @@ static DNS_TUNNEL_LIVE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// External audit NETR-005: keys still inside their window that the
 /// network rule windows evicted for room, process-wide (NN-L-NET-005,
-/// NN-L-NET-013, NN-L-NET-014's corroboration), plus NN-L-NET-013's
-/// per-process quota evictions.
+/// NN-L-NET-013, NN-L-NET-014's corroboration, NN-L-NET-020/021's held
+/// records since bug hunt 1.3, BUG65), plus NN-L-NET-013's per-process
+/// quota evictions.
 pub fn net_window_evictions_total() -> u64 {
     DNS_BURST_LIVE_EVICTIONS.load(Ordering::Relaxed)
         + BEACON_LIVE_EVICTIONS.load(Ordering::Relaxed)
@@ -227,6 +228,8 @@ pub fn net_window_evictions_total() -> u64 {
         + DNS_TUNNEL_LIVE_EVICTIONS.load(Ordering::Relaxed)
         // Lab PR 224: the fan-out windows (NN-L-NET-026/027).
         + super::net_fanout::fanout_window_evictions_total()
+        // Bug hunt 1.3, BUG65: the held-record windows (NN-L-NET-020/021).
+        + FLOOD_LIVE_EVICTIONS.load(Ordering::Relaxed)
 }
 
 /// Per-key sliding windows of sample timestamps, in recency order.
@@ -937,6 +940,19 @@ fn hash_qname(qname: &str) -> u64 {
     QNAME_HASH_KEYS
         .get_or_init(RandomState::new)
         .hash_one(qname)
+}
+
+/// External bug hunt (edition 1.3), BUG55: a DNS name's hash whatever the
+/// case of its letters — a name server answers `eViL.eXample` as
+/// `evil.example` (RFC 4343), so a tunnel that varied the case of its zone
+/// split NN-L-NET-014's corroboration again.
+fn hash_name_ci(name: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = QNAME_HASH_KEYS.get_or_init(RandomState::new).build_hasher();
+    for b in name.bytes() {
+        h.write_u8(b.to_ascii_lowercase());
+    }
+    h.finish()
 }
 
 /// FP-5 dedup state for the qname-shape rules (NN-L-NET-004/-014).
@@ -2288,20 +2304,33 @@ impl<H: PostureHost> Rule for NnLNet019WildcardListener<H> {
 const FLOOD_WINDOW_NS: u64 = 10 * 1_000_000_000;
 /// Held-back records in a window that make a flood rule fire.
 const FLOOD_MIN_HELD: u64 = 256;
-/// Keys tracked at most per flood rule; when full, ended windows go.
+/// Keys tracked at most per flood rule; when full, ended windows go, then
+/// the live window that holds the least.
 const FLOOD_MAX_KEYS: usize = 4096;
+
+static FLOOD_LIVE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-key sums of records a kernel budget held back, over
 /// [`FLOOD_WINDOW_NS`] windows (review 78; shared with NN-L-NET-021 since
 /// external audit EBPF-013). key → (window start, held, fired).
+///
+/// External bug hunt (edition 1.3), BUG65: a full map of live windows was
+/// cleared — every key's sum and fired flag lost, so a flood in progress
+/// was never reported, or one reported already was reported again, by
+/// whoever drove 4096 keys over their budget within the window. Now one
+/// window goes for the new key: an ended one, else the live one that holds
+/// the least (the furthest from firing; ties, the oldest), counted in
+/// `net_window_evictions_total`.
 struct HeldWindows<K> {
     map: Mutex<HashMap<K, (u64, u64, bool)>>,
+    lost: Mutex<LossCounter>,
 }
 
-impl<K: Eq + Hash> HeldWindows<K> {
+impl<K: Eq + Hash + Clone> HeldWindows<K> {
     fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            lost: Mutex::new(LossCounter::new(&FLOOD_LIVE_EVICTIONS)),
         }
     }
 
@@ -2312,7 +2341,20 @@ impl<K: Eq + Hash> HeldWindows<K> {
         if map.len() >= FLOOD_MAX_KEYS && !map.contains_key(&key) {
             map.retain(|_, w| timestamp_ns.saturating_sub(w.0) < FLOOD_WINDOW_NS);
             if map.len() >= FLOOD_MAX_KEYS {
-                map.clear();
+                let victim = map
+                    .iter()
+                    .min_by_key(|(_, w)| (w.1, w.0))
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
+                    map.remove(&k);
+                    if self.lost.lock().bump() {
+                        tracing::warn!(
+                            cap = FLOOD_MAX_KEYS,
+                            "NN-L-NET-020/021 windows full: evicted the live window \
+                             holding the fewest held-back records"
+                        );
+                    }
+                }
             }
         }
         let w = map.entry(key).or_insert((timestamp_ns, 0, false));
@@ -2325,6 +2367,11 @@ impl<K: Eq + Hash> HeldWindows<K> {
         }
         w.2 = true;
         Some(w.1)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.lock().len()
     }
 }
 
@@ -2510,6 +2557,12 @@ impl Rule for NnLNet021SensorRecordFlood {
 /// names sent in pieces it did not answer. The two share one dedup window
 /// ([`DnsQnameDedupWindow`]), so a lookup's legs give one verdict.
 ///
+/// External bug hunt (edition 1.3), BUG55: the parent domain is the
+/// registrable domain of the name (`evil.example`, `evil.co.uk`;
+/// [`crate::net::registrable::tunnel_zone`]), whatever the labels between
+/// the payload's first one and it — a payload over several labels, a random
+/// label more — and whatever the case of its letters.
+///
 /// Unblocked by the Tappa 4.1 DNS observability refit — the kprobe now
 /// extracts the QNAME for connected-UDP resolution (glibc), so this
 /// rule finally has a populated `query_name` to score. (NN-L-NET-015
@@ -2644,12 +2697,19 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
             return None;
         }
         // External audit NETR-002: a tunnel is many distinct encoded labels
-        // under one parent domain; one is recorded.
-        let parent = query_name.split_once('.').map(|(_, p)| p).unwrap_or("");
+        // under one parent domain; one is recorded. External bug hunt
+        // (edition 1.3), BUG55: the parent was everything after the first
+        // label, so a payload over two labels (iodine and dnscat2 cut it
+        // every 57 to 63 characters), or one random label more, made a new
+        // parent per query and the kill never came. The parent is the zone
+        // the tunnel's name server answers — the registrable domain
+        // (`net::registrable::tunnel_zone`: never finer than before) — and
+        // neither it nor the label counts its letters' case.
+        let parent = crate::net::registrable::tunnel_zone(query_name);
         let distinct = self.corroboration.lock().observe(
             attribution.target_pid(),
-            hash_qname(parent),
-            hash_qname(first_label),
+            hash_name_ci(parent),
+            hash_name_ci(first_label),
             *timestamp_ns,
         );
         let tunnel = distinct >= DNS_TUNNEL_DISTINCT_LABELS;
@@ -4983,12 +5043,17 @@ mod tests {
     /// The lab probe in a unit: one process keeps the corroboration full
     /// with high-entropy labels under distinct parent domains while another
     /// runs a tunnel. Before the fix the tunnel was recorded only (Log).
+    ///
+    /// Bug hunt 1.3, BUG55: the parent is the registrable domain now, so the
+    /// spray's names differ in it (`spray<i>.example`); under one domain
+    /// (`p<i>.spray.example`, the probe's names before) the spray is a
+    /// tunnel itself and is killed at its eighth label.
     #[test]
     fn net_014_kills_a_tunnel_beside_a_parent_domain_spray() {
         let rule = net_014();
         let label = |i: usize| format!("{i:05}q7v3k9x2m4p8r6t1w5y0z3b7c9d2f4h6j8l0n");
         for i in 0..DNS_TUNNEL_MAX_PAIRS + 100 {
-            let q = format!("{}.p{i}.spray.example", label(i));
+            let q = format!("{}.spray{i}.example", label(i));
             let v = rule.evaluate(&dns_event(40, &q, 1)).expect("recorded");
             assert_eq!(v.action, ResponseAction::Log);
         }
@@ -5000,6 +5065,23 @@ mod tests {
         let v = last.expect("tunnel verdict");
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert_eq!(v.event_pid, 41);
+        // the probe's spray under one registrable domain: a tunnel
+        let actions: Vec<ResponseAction> = (0..DNS_TUNNEL_DISTINCT_LABELS)
+            .map(|i| {
+                let q = format!("{}.p{i}.spray.example", label(50_000 + i));
+                rule.evaluate(&dns_event(42, &q, 1))
+                    .expect("recorded")
+                    .action
+            })
+            .collect();
+        assert_eq!(
+            actions.last(),
+            Some(&ResponseAction::KillProcess),
+            "{actions:?}"
+        );
+        assert!(actions[..DNS_TUNNEL_DISTINCT_LABELS - 1]
+            .iter()
+            .all(|a| *a == ResponseAction::Log));
     }
 
     // ── external audit NET-010 (NN-AUD-006) — allowlist by exec identity ──
@@ -5380,5 +5462,228 @@ mod tests {
             unreachable!()
         };
         assert!(!may_meet_a_kill_rule(&nf, &bl));
+    }
+
+    /// Bug hunt 1.3, BUG55: a base32 chunk of `len` characters,
+    /// distinct per `seed`.
+    fn b32_chunk(seed: u64, len: usize) -> String {
+        const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                A[(x % 32) as usize] as char
+            })
+            .collect()
+    }
+
+    /// Bug hunt 1.3, BUG55: 200 queries `name(i)` from one process in 20 s,
+    /// through the whole net rule set: (kills, other verdicts, the query of
+    /// the first kill).
+    fn tunnel_kills(name: impl Fn(u64) -> String) -> (usize, usize, Option<u64>) {
+        tunnel_kills_n(200, name)
+    }
+
+    /// [`tunnel_kills`] over `n` queries.
+    fn tunnel_kills_n(n: u64, name: impl Fn(u64) -> String) -> (usize, usize, Option<u64>) {
+        let rules = net_rules_empty();
+        let (mut kills, mut others, mut first) = (0, 0, None);
+        for i in 0..n {
+            let q = name(i);
+            let ts = 1_000_000_000 + i * 100_000_000;
+            let ev = dns_event_full(4242, &q, 1, "iodine", Some("/usr/sbin/iodine"), ts);
+            for r in &rules {
+                if let Some(v) = r.evaluate(&ev) {
+                    if matches!(
+                        v.action,
+                        ResponseAction::KillProcess | ResponseAction::KillProcessTree
+                    ) {
+                        kills += 1;
+                        first.get_or_insert(i);
+                    } else {
+                        others += 1;
+                    }
+                }
+            }
+        }
+        (kills, others, first)
+    }
+
+    /// Bug hunt 1.3, BUG55: the payload over two labels (iodine and dnscat2
+    /// split it every <= 63 bytes) under t.evil.example: the net rule set
+    /// kills at the eighth distinct label.
+    #[test]
+    fn tunnel_with_payload_over_two_labels_is_killed() {
+        let got = tunnel_kills(|i| {
+            format!(
+                "{}.{}.t.evil.example",
+                b32_chunk(2 * i + 1, 50),
+                b32_chunk(2 * i + 2, 50)
+            )
+        });
+        assert!(got.0 > 0, "no kill: {got:?}");
+        assert_eq!(
+            got.2,
+            Some(DNS_TUNNEL_DISTINCT_LABELS as u64 - 1),
+            "{got:?}"
+        );
+    }
+
+    /// Bug hunt 1.3, BUG55: the same with a short last chunk (< 25
+    /// characters): the report's minimal fix leaves it in the parent domain.
+    #[test]
+    fn tunnel_with_a_short_trailing_chunk_is_killed() {
+        let got = tunnel_kills(|i| {
+            format!(
+                "{}.{}.t.evil.example",
+                b32_chunk(2 * i + 1, 50),
+                b32_chunk(2 * i + 2, 12)
+            )
+        });
+        assert!(got.0 > 0, "no kill: {got:?}");
+    }
+
+    /// Bug hunt 1.3, BUG55: one random label more between the payload and
+    /// the zone; and a tunnel under a country code's second-level registry
+    /// (`evil.co.uk`, whose parent is not `co.uk`).
+    #[test]
+    fn tunnel_with_a_random_label_more_or_under_a_country_suffix_is_killed() {
+        let got = tunnel_kills(|i| {
+            format!(
+                "{}.{}.evil.example",
+                b32_chunk(2 * i + 1, 40),
+                b32_chunk(2 * i + 2, 4)
+            )
+        });
+        assert!(got.0 > 0, "random label: {got:?}");
+        let got = tunnel_kills(|i| {
+            format!(
+                "{}.{}.evil.co.uk",
+                b32_chunk(2 * i + 1, 57),
+                b32_chunk(2 * i + 2, 30)
+            )
+        });
+        assert!(got.0 > 0, "co.uk: {got:?}");
+    }
+
+    /// Bug hunt 1.3, BUG55: a name server answers its zone whatever the case
+    /// of its letters (RFC 4343): a tunnel that varies it per query is one
+    /// zone, and a label that differs only in case is the same label.
+    #[test]
+    fn tunnel_whose_zone_varies_its_case_is_killed() {
+        let cased = |s: &str, i: u64| -> String {
+            s.chars()
+                .enumerate()
+                .map(|(k, c)| {
+                    if (i >> (k % 8)) & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        };
+        let got =
+            tunnel_kills(|i| format!("{}.{}", b32_chunk(i + 1, 50), cased("t.evil.example", i)));
+        assert!(got.0 > 0, "no kill: {got:?}");
+        // one label in eight cases, under one zone: one label
+        let got = tunnel_kills(|i| format!("{}.t.evil.example", cased(&b32_chunk(7, 50), i % 8)));
+        assert_eq!(got.0, 0, "{got:?}");
+    }
+
+    /// Bug hunt 1.3, BUG55, false positives: one process resolving
+    /// high-entropy names of eight sites under one public suffix — country
+    /// registries, object stores, load balancers, CDNs and cloud platforms,
+    /// where each customer is a name of its own — seven names a site, 56 in
+    /// all within the window: no tunnel, each site is a zone of its own. A
+    /// suffix the list lacked would add them up under the suffix and kill:
+    /// this is what each entry is for.
+    #[test]
+    fn high_entropy_names_of_sites_under_one_public_suffix_are_not_a_tunnel() {
+        let sites = DNS_TUNNEL_DISTINCT_LABELS as u64;
+        let per_site = DNS_TUNNEL_DISTINCT_LABELS as u64 - 1;
+        for suffix in [
+            "co.uk",
+            "com.au",
+            "co.jp",
+            "s3.amazonaws.com",
+            "blob.core.windows.net",
+            "azurewebsites.net",
+            "a.run.app",
+            "storage.googleapis.com",
+            "github.io",
+            "r2.cloudflarestorage.com",
+        ] {
+            let got = tunnel_kills_n(sites * per_site, |i| {
+                format!("{}.site{}.{suffix}", b32_chunk(1000 + i, 32), i % sites)
+            });
+            assert_eq!(got.0, 0, "{suffix}: {got:?}");
+        }
+        // and the same names under one site of an unlisted suffix are its
+        // own zone's: a tunnel's count
+        let got = tunnel_kills_n(sites * per_site, |i| {
+            format!("{}.site{}.example.net", b32_chunk(1000 + i, 32), i % sites)
+        });
+        assert!(got.0 > 0, "{got:?}");
+    }
+
+    /// Bug hunt 1.3, BUG65: 4096 live windows and one new key —
+    /// the live windows keep their sums and their fired flag.
+    fn fill_live_windows(h: &HeldWindows<(u32, u32)>, t0: u64) {
+        for pid in 2..=FLOOD_MAX_KEYS as u32 {
+            assert_eq!(h.add((1000, pid), 1, t0 + 1_000_000), None);
+        }
+        assert_eq!(h.add((1000, 5000), 1, t0 + 2_000_000), None);
+        assert_eq!(h.len(), FLOOD_MAX_KEYS, "the bound holds");
+    }
+
+    #[test]
+    fn a_live_window_sum_survives_a_full_map() {
+        let h: HeldWindows<(u32, u32)> = HeldWindows::new();
+        let t0 = 1_000_000_000;
+        assert_eq!(h.add((1000, 1), 255, t0), None);
+        fill_live_windows(&h, t0);
+        assert_eq!(
+            h.add((1000, 1), 255, t0 + 3_000_000),
+            Some(510),
+            "510 held within 3 ms of a 10 s window"
+        );
+    }
+
+    #[test]
+    fn a_live_window_fires_once_across_a_full_map() {
+        let h: HeldWindows<(u32, u32)> = HeldWindows::new();
+        let t0 = 1_000_000_000;
+        assert_eq!(h.add((1000, 1), 256, t0), Some(256));
+        fill_live_windows(&h, t0);
+        assert_eq!(h.add((1000, 1), 256, t0 + 3_000_000), None, "fired already");
+    }
+
+    /// Bug hunt 1.3, BUG65: at the bound an ended window goes first, then
+    /// the live one holding the least — never a clear, and counted.
+    #[test]
+    fn a_full_map_evicts_one_window_ended_first_then_the_least_held() {
+        let h: HeldWindows<(u32, u32)> = HeldWindows::new();
+        let t0 = 1_000_000_000;
+        // key 1 ends before the others; key 2 holds the least of the live
+        assert_eq!(h.add((1000, 1), 100, t0), None);
+        assert_eq!(h.add((1000, 2), 1, t0 + FLOOD_WINDOW_NS), None);
+        for pid in 3..=FLOOD_MAX_KEYS as u32 {
+            assert_eq!(h.add((1000, pid), 2, t0 + FLOOD_WINDOW_NS), None);
+        }
+        let before = net_window_evictions_total();
+        // a new key past key 1's window: key 1 goes, no live one
+        assert_eq!(h.add((1000, 9000), 1, t0 + FLOOD_WINDOW_NS + 1), None);
+        assert_eq!(h.len(), FLOOD_MAX_KEYS);
+        assert_eq!(h.add((1000, 1), 1, t0 + FLOOD_WINDOW_NS + 2), None);
+        // that took a live one: the least held (key 9000 or 2: 1 each, key
+        // 2 the oldest), so key 3 still sums
+        assert_eq!(h.len(), FLOOD_MAX_KEYS);
+        assert!(net_window_evictions_total() > before);
+        assert_eq!(h.add((1000, 3), 254, t0 + FLOOD_WINDOW_NS + 3), Some(256));
+        // key 2 lost its window: it starts again from what it adds
+        assert_eq!(h.add((1000, 2), 255, t0 + FLOOD_WINDOW_NS + 4), None);
     }
 }
