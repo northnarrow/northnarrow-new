@@ -438,6 +438,12 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "crates/nn-linux/src/module_writes.rs",
+        "LINK",
+        Kernel,
+        "lot 300: the write history's link the one eBPF object's attach pinned beside the pin root, held open for the agent's life so the self-test's attach check sees it and the BPF guard registers it as the agent's own",
+    ),
+    kept(
+        "crates/nn-linux/src/module_writes.rs",
         "HISTORY",
         Kernel,
         "lot 285: from when the one eBPF object's write history covers every write, set by its attach and read by the module-load judge's controller thread",

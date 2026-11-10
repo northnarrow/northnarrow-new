@@ -2504,7 +2504,7 @@ mod tests {
         ));
         let mw = &mw[..mw.find("#[cfg(test)]").unwrap()];
         assert!(mw.contains("let dir = pin_dir(root);"));
-        assert!(mw.contains("reattach_fresh(ebpf, PROGRAM, HOOK, btf, Some(&dir))"));
+        assert!(mw.contains("reattach_fresh_held(ebpf, PROGRAM, HOOK, btf, Some(&dir))"));
         assert_eq!(
             (crate::module_writes::PROGRAM, crate::module_writes::HOOK),
             MODULE_WRITE_PROGRAM
