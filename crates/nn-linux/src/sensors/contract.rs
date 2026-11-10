@@ -93,7 +93,8 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
      inode_rename, inode_setattr, file_ioctl, file_open, inode_create, inode_mkdir, inode_mknod, \
      inode_symlink, inode_link, inode_setxattr, inode_removexattr, bpf_map, file_permission (lot \
      273b: the write deny), task_setrlimit, task_setscheduler, task_setnice, task_setioprio (lot \
-     273c: another process's limits and priorities of a protected one); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
+     273c: another process's limits and priorities of a protected one), file_send_sigiotask (lot \
+     293: a signal through a file's owner, F_SETOWN and O_ASYNC); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
      has them; bpf (the agent's links); kernel_read_file and kernel_load_data (kexec); the cgroup \
      move guard, inode_permission, fexit cgroup_procs_write_start and fentry \
      cgroup_procs_write_finish, where the kernel has the functions in the shape it reads";
@@ -424,15 +425,25 @@ pub const SOURCES: [SourceContract; 16] = [
              signed degraded and no exemption by cgroup or unit applies (fail-closed for the \
              exemption), a process whose mark could not be kept is not known: no such exemption \
              for it and what it forks until its thread group ends",
-        kernel_budgets: &[KernelBudget {
-            allows: "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
+        kernel_budgets: &[
+            KernelBudget {
+                allows:
+                    "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
                      273b) refused write through a descriptor: one record per caller and \
                      operation a second, 50 a second per CPU (every one is refused); (lot 277) \
                      a move into a cgroup an exemption names (cgroup_join, recorded, not \
-                     refused) shares that budget; a refused open or other inode operation has \
-                     no kernel budget",
-            counter: "task_denial_rate",
-        }],
+                     refused) shares that budget",
+                counter: "task_denial_rate",
+            },
+            KernelBudget {
+                allows: "(lot 293, external bug hunt BUG37) a refused open or other inode \
+                     operation of a protected file or directory, or a refused open of a \
+                     protected cgroup file: every attempt recorded, no dedup by caller, 50 a \
+                     second per CPU in a budget of their own (a loop of them never takes the \
+                     refused signals' and ptraces' room; every one is refused)",
+                counter: "denial_rate",
+            },
+        ],
         overhead: FS_PROTECT_OVERHEAD,
         truncations: &[COMM],
         rings: &["fs_protect"],
@@ -927,6 +938,11 @@ mod tests {
         has("inet_csk_listen.rs", "const UID_BURST: u64 = 512;");
         has("inet_csk_listen.rs", "uid_refill_ns: 1_000_000_000 / 256,");
         has("inode_protect.rs", "const TASK_DENIAL_PER_SEC: u64 = 50;");
+        // lot 293 (BUG37)
+        has(
+            "inode_protect.rs",
+            "const ATTEMPT_DENIAL_PER_SEC: u64 = 50;",
+        );
         has(
             "inode_protect.rs",
             "const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;",

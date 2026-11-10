@@ -1402,11 +1402,13 @@ pub struct StageCount {
 
 /// The `RING_DROPS` slots that count records a kernel budget held back
 /// before the ring (stage 2), not a full ring (stage 1).
-const BUDGET_SLOTS: [u32; 4] = [
+const BUDGET_SLOTS: [u32; 5] = [
     common::ring_drops::ring_slot::DNS_RATE,
     common::ring_drops::ring_slot::LISTEN_RATE,
     common::ring_drops::ring_slot::IOURING_RATE,
     common::ring_drops::ring_slot::TASK_DENIAL_RATE,
+    // Lot 293 (external bug hunt BUG37): the per-attempt refusals' budget.
+    common::ring_drops::ring_slot::DENIAL_RATE,
 ];
 
 /// The eight stages with their counts: 1 to 3 as the kernel's and the
@@ -1449,7 +1451,8 @@ pub fn loss_stages(
             stage: 2,
             name: "kernel budget",
             total: Some(kernel_budget),
-            source: "RING_DROPS dns_rate, listen_rate, io_uring_rate, task_denial_rate",
+            source: "RING_DROPS dns_rate, listen_rate, io_uring_rate, task_denial_rate, \
+                     denial_rate",
         },
         StageCount {
             stage: 3,
@@ -2474,6 +2477,8 @@ mod tests {
             ("dns_rate", 5),
             ("task_denial_rate", 1),
             ("open_sensor", 3),
+            // lot 293: the per-attempt refusals' budget is a budget too
+            ("denial_rate", 10),
         ];
         let st = loss_stages(&ring, 4, &queues, None, None);
         let totals: Vec<(u8, Option<u64>)> = st.iter().map(|s| (s.stage, s.total)).collect();
@@ -2481,7 +2486,7 @@ mod tests {
             totals,
             [
                 (1, Some(5)),
-                (2, Some(6)),
+                (2, Some(16)),
                 (3, Some(4)),
                 (4, Some(8)),
                 (5, Some(0)),

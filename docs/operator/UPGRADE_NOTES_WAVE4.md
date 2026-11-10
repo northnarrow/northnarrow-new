@@ -863,3 +863,35 @@ ancestors trusted by the tree they lie in (BUG-49). After the upgrade:
 - A not-judged kernel module load (the agent's first seconds) from a path
   whose component the sensor read only in part (31 bytes) is recorded High
   as unverifiable; before, it was looked up as the 31-byte name.
+
+## 17. Self-defence findings of the external bug hunt (lot 293)
+
+- **A signal through a file's owner is refused to the agent, the watchdog
+  and the workers** (BUG14). A new deny hook, `file_send_sigiotask` (22 deny
+  hooks in all; a kernel whose BPF LSM cannot attach it refuses the start,
+  as for any deny hook, unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`): the
+  SIGIO, the `F_SETSIG` signal or SIGURG of a file whose owner
+  (`F_SETOWN`, `F_SETOWN_EX`, `FIOSETOWN`, `SIOCSPGRP`) is a protected pid
+  never reaches it — a root shell killed the agent that way. Inside a
+  signed trusted-installer window the window's signal grant (SIGTERM,
+  SIGCONT, SIGKILL) applies; the plain SIGIO stays refused. A refusal is
+  NN-L-AT-001 `sigio` (High), the posture ENGAGED. The pid the record names
+  is the process whose I/O raised the signal — not necessarily the one
+  that armed the file: look for a descriptor whose owner is the agent
+  (`/proc/<pid>/fdinfo/<fd>`, `flags` with `O_ASYNC` 020000). Nothing to
+  configure; no NorthNarrow process arms a file's owner.
+- **`denial_rate` in the ring drops** (BUG37): the refusals signed at each
+  attempt (a protected file's unlink, rename, write-open…) are recorded
+  50 a second per CPU at most, in a budget of their own; past it they are
+  counted in `nn-admin status`'s ring drops as `denial_rate` (a security
+  ring: past 64 in a sample, telemetry loss). The refusal itself is never
+  dropped.
+- **NN-L-BPF-001 judges `BPF_RAW_TRACEPOINT_OPEN`** (BUG05): an attach that
+  way by an unlisted process is a record like `PROG_ATTACH`'s
+  (`raw_tracepoint_open` in the `bpf` records).
+- **`admin.pub` with a byte that is not UTF-8** (BUG03): an ISO-8859-1
+  comment no longer disables the admin socket; a key line with such a byte
+  is skipped and signed (AUT-004's record) like any malformed line.
+- **The exploit guard and `setgroups`** (BUG71): a uid or gid gain inside
+  `setgroups` is an anomaly (NN-L-EPG-001); a `setgroups` that changes only
+  the groups, as logins and privilege drops do, is not.

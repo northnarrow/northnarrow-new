@@ -79,7 +79,7 @@ use aya_ebpf::{
 use northnarrow_common::bpf_cmd::{
     attach_target_offset, judges_attach_target, observed, BPF_LINK_CREATE, BPF_LINK_DETACH,
     BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
-    BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD,
+    BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD, BPF_RAW_TRACEPOINT_OPEN,
 };
 use northnarrow_common::bpf_prog_class::{denied_by_default, type_bit};
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
@@ -867,6 +867,9 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     if !attr.is_null() {
         let off: usize = match cmd {
             BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,
+            // Lot 293 (external bug hunt BUG05): `raw_tracepoint.prog_fd`
+            // after the name's pointer.
+            BPF_RAW_TRACEPOINT_OPEN => 8,
             _ => 0,
         };
         match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {

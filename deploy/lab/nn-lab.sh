@@ -2130,18 +2130,18 @@ own_after=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2
 n=0
 for id in $own_after; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n=$((n + 1)); done
 # External audit LAB-020 (NN-AUD-410, lab PR 206): seven own LSM programs
-# passed, against 16 deny hooks (17 since lot 273b, 21 since lot 273c) plus the observers. Now the new agent's own
+# passed, against 16 deny hooks (17 since lot 273b, 21 since lot 273c, 22 since lot 293) plus the observers. Now the new agent's own
 # health line — logged only when every deny and observe hook attached —
 # read from the journal's trusted fields (its unit's stdout, its pid; the
 # message itself, never a field of another line: a file named like the line
 # is not it, deploy/lab/lib/lab-records.py), with deny_attached equal to
-# deny_expected and at least the deny hooks of DENY_HOOKS (21)
+# deny_expected and at least the deny hooks of DENY_HOOKS (22)
 # (crates/nn-linux/src/anti_tamper/mod.rs; xtask/tests/lab_scripts.rs keeps
 # the two equal); no fewer own LSM programs than before the upgrade (an
 # observer lost fails too) nor than the deny hooks; and no anti-tamper
 # `subsystem_degraded` signed at the upgraded boot (a start under
 # NN_ANTI_TAMPER_ALLOW_DEGRADED=1, a missing observe hook).
-deny_hooks_min=21
+deny_hooks_min=22
 if [[ -n "$own_before" ]] && (( n < n_before )); then
     echo "FAIL: $n own LSM programs after the upgrade, $n_before before (a hook the new agent did not load)"; fail=1
 fi

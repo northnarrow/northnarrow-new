@@ -58,11 +58,20 @@ renamed): the absence of a format header (gzip, zstd, zip and the office
 formats, media, SQLite and its WAL, qcow2, LUKS, ELF, OpenPGP, age,
 git-crypt, borg, browser caches, …) stands in for it.
 
-The rename counter never counts the renames of an atomic write — a
-temporary file renamed to its final name (`x.py.dpkg-new → x.py`, rsync's
-`.x.c.AbC123 → x.c`, `sed -i`'s `sedAbc12 → x.conf`, `x.pyc.140234 →
-x.pyc`) — nor a rotation's digits (`syslog → syslog.1`), a move under the
-same name, or a random new name.
+The rename counter does not count the renames of an atomic write whose
+temporary appends to the final name or has a name of its own (`x.py.dpkg-new
+→ x.py`, rsync's `.x.c.AbC123 → x.c`, `sed -i`'s `sedAbc12 → x.conf`,
+`x.pyc.140234 → x.pyc`), nor a rotation's digits (`syslog → syslog.1`), a
+move under the same name, or a random new name. It does count an atomic save
+whose temporary carries its own extension in place of the final one
+(`data.tmp → data.json`, `a.part → a.iso`, `f.crdownload → f.zip`): that is
+exactly the shape of an encryptor that stages its ciphertext in a temporary
+(`a.pdf.tmp → a.pdf.locked`), and an exception for the old extension would
+let that through (external bug hunt BUG54; until lot 293 this paragraph said
+"never counts the renames of an atomic write"). Such a burst still gives no
+verdict on its own: the tracker reads nothing appended, one origin
+extension and a new extension that is no marker, so it raises no
+`RenameExtension` signal (`impact::tests::an_atomic_save_burst_replacing_the_extension_is_not_shaped`).
 
 ### Who is judged: trust by identity, package ownership and lineage
 

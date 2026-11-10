@@ -262,7 +262,7 @@ fn merge_sample(prev: &[u64], now: &[Option<u64>], failing: &mut [bool]) -> Vec<
 
 /// External audit SNS-009: the rings whose loss hides security evidence.
 /// A drop there raises `TriggerType::TelemetryLoss` (ALERTED).
-pub const SECURITY_RINGS: [u32; 10] = [
+pub const SECURITY_RINGS: [u32; 11] = [
     ring_slot::EXEC,
     ring_slot::FS_PROTECT,
     ring_slot::OPEN_SENSOR,
@@ -277,6 +277,11 @@ pub const SECURITY_RINGS: [u32; 10] = [
     // The first denial already raised the decisive trigger; a burst past
     // the budget is a loss of evidence the operator must see.
     ring_slot::TASK_DENIAL_RATE,
+    // Lot 293 (external bug hunt BUG37): the refusals signed at every
+    // attempt (a protected file's unlink, rename, write-open…) held back
+    // over their own per-CPU budget — a loop of them is refused and seen,
+    // its records past the budget a loss the operator must see.
+    ring_slot::DENIAL_RATE,
     // Lab PR 223: an exec quarantine candidate the ring could not hold
     // ran unstopped and unscanned.
     ring_slot::EXECQ,
@@ -605,6 +610,17 @@ mod tests {
             security_losses(&prev, &cur),
             vec![("task_denial_rate", 4_500)]
         );
+    }
+
+    /// Lot 293 (external bug hunt BUG37): the per-attempt refusals held
+    /// back over their budget are a security loss too.
+    #[test]
+    fn attempt_denials_over_budget_are_a_security_loss() {
+        let slots = RING_DROP_SLOTS as usize;
+        let prev = vec![0u64; slots];
+        let mut cur = prev.clone();
+        cur[ring_slot::DENIAL_RATE as usize] = 200;
+        assert_eq!(security_losses(&prev, &cur), vec![("denial_rate", 200)]);
     }
 
     fn fake_proc(root: &std::path::Path, pid: u32, euid: u32, exe: &str, cmdline: &[&str]) {

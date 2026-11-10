@@ -2336,7 +2336,7 @@ const fn check(func: &'static str, position: u32, pointee: &'static str) -> Hook
 
 /// Every pointer argument the LSM programs of `agent-ebpf` read at a fixed
 /// position (`inode_protect.rs`, `fim_watch.rs`, `open_sensor.rs`,
-/// `bpf_defense.rs`, `ptrace_check.rs`, `task_kill.rs`, `exec_lsm.rs`,
+/// `bpf_defense.rs`, `ptrace_check.rs`, `task_kill.rs`, `sigio_guard.rs`, `exec_lsm.rs`,
 /// `module_load.rs`, `sensor_probe.rs`).
 pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
     check("bpf_lsm_inode_unlink", 0, "inode"),
@@ -2368,6 +2368,8 @@ pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
     check("bpf_lsm_bprm_check_security", 0, "linux_binprm"),
     check("bpf_lsm_ptrace_access_check", 0, "task_struct"),
     check("bpf_lsm_task_kill", 0, "task_struct"),
+    // Lot 293 (`sigio_guard.rs`): `(task, fown, sig)`, the task read.
+    check("bpf_lsm_file_send_sigiotask", 0, "task_struct"),
     check("bpf_lsm_bpf_map", 0, "bpf_map"),
     check("bpf_lsm_bpf", 1, "bpf_attr"),
     // Lab PR 224 (`socket_connect.rs`, attached with --net-connect-deny):
@@ -2649,7 +2651,8 @@ mod tests {
                 c.func
             );
         }
-        assert_eq!(HOOK_ARG_CHECKS.len(), 33);
+        // lot 293: + `bpf_lsm_file_send_sigiotask`'s task
+        assert_eq!(HOOK_ARG_CHECKS.len(), 34);
     }
 
     /// Lot 273: the cgroup move guard reads the return value at the slot

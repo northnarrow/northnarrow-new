@@ -343,7 +343,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0021"],
         observes: "A bpf() program load, attach or link creation by a process outside the \
                    known BPF tooling and the process allowlist (the `bpf` LSM observer), \
-                   judged on the executable the kernel ran.",
+                   judged on the executable the kernel ran; lot 293: an attach through \
+                   BPF_RAW_TRACEPOINT_OPEN too.",
         false_positives: "BPF tooling not in the list: bpftool, bpftrace, BCC tools, an \
                           observability or security agent; add it to \
                           process-comm-allowlist.local.",
@@ -351,6 +352,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       case C10).",
         tests: &[
             "crates/nn-core/src/decision/rules/bpf.rs::program_load_by_unlisted_logs_medium_and_known_tooling_is_exempt",
+            "crates/nn-core/src/decision/rules/bpf.rs::raw_tracepoint_open_by_unlisted_is_an_attach",
             "deploy/lab/adversarial/anti-tamper.sh::case C10",
         ],
         attack_note: "A kernel-resident program from an unknown loader is the eBPF rootkit \
@@ -387,7 +389,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::AntiTamper],
         data_components: &["DC0035", "DC0061", "DC0040", "DC0055", "DC0021"],
         observes: "Every action on the agent an anti-tamper LSM hook refused: a signal to a \
-                   protected pid, a ptrace or /proc/<pid>/mem access, a write, unlink, rename \
+                   protected pid (lot 293: one through a file's owner too, F_SETOWN and \
+                   O_ASYNC — `sigio`), a ptrace or /proc/<pid>/mem access, a write, unlink, rename \
                    or new entry in its protected files, a handle to its BPF maps, programs or \
                    links, a kexec load, a read of its signing key; lot 290: a load of a \
                    `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, \
@@ -416,6 +419,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       (deny=signal, deny=ptrace).",
         tests: &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_refused_sigio_names_the_path_and_not_an_arming_process",
+            "deploy/lab/adversarial/anti-tamper.sh::case C112",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
             "deploy/lab/malsim/foreign-bpf-check.sh::F2",
             "deploy/lab/adversarial/anti-tamper.sh::case C01",

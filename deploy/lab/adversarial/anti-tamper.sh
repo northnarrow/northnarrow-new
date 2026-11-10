@@ -1031,6 +1031,74 @@ def cmd_sysctl_race(path, good, bad, tries):
         part1, left, good, "after %.1f s" % back if back is not None else "NOT within 90 s (written back by the probe)"))
     return 0
 
+def cmd_sigio(pid, comm, start, how, sig):
+    # Lot 293 (external bug hunt BUG14): a signal through a file's owner,
+    # which the kernel delivers from send_sigio_to_task without task_kill:
+    # the owner set on a pipe's read end (F_SETOWN, or F_SETOWN_EX with the
+    # target's main thread, F_OWNER_TID, or its process group,
+    # F_OWNER_PGRP) or on a socket (FIOSETOWN + FIOASYNC), F_SETSIG (none:
+    # the plain SIGIO), then one byte written. The kernel reports nothing to
+    # the writer: for a signal that kills (SIGKILL; the plain SIGIO, whose
+    # default action terminates) the target still alive one second later
+    # with its identity is the refusal (errno=EPERM is how this helper says
+    # it); for any other signal the evidence tells (a deny=sigio record).
+    import fcntl, socket, struct
+    hows = ("pipe", "ownex-tid", "ownex-pgrp", "fiosetown")
+    if how not in hows or (sig != "IO" and sig not in SIGNALS):
+        print("setup: sigio how %r sig %r" % (how, sig))
+        return 2
+    cur, why = resolve(pid, comm, start)
+    if cur is None:
+        print("target=absent (%s; nothing armed)" % why)
+        return 3
+    signum = 0 if sig == "IO" else getattr(signal, "SIG" + sig)
+    F_SETOWN, F_SETSIG, F_SETOWN_EX, F_OWNER_TID, F_OWNER_PGRP = 8, 10, 15, 0, 2
+    FIOSETOWN, FIOASYNC = 0x8901, 0x5452
+    if how == "ownex-pgrp":
+        pgid = os.getpgid(int(pid))
+        if pgid != int(pid) or pgid in (os.getpgid(0), os.getpgid(os.getppid())):
+            print("setup: pid %s does not lead its own process group (pgid %d): nothing armed" % (pid, pgid))
+            return 2
+    try:
+        if how == "fiosetown":
+            armed, other = socket.socketpair()
+            fcntl.ioctl(armed, FIOSETOWN, struct.pack("i", int(pid)))
+            if signum:
+                fcntl.fcntl(armed, F_SETSIG, signum)
+            fcntl.ioctl(armed, FIOASYNC, struct.pack("i", 1))
+            other.send(b"x")
+            armed.close()
+            other.close()
+        else:
+            r, w = os.pipe()
+            try:
+                if how == "pipe":
+                    fcntl.fcntl(r, F_SETOWN, int(pid))
+                else:
+                    kind = F_OWNER_TID if how == "ownex-tid" else F_OWNER_PGRP
+                    fcntl.fcntl(r, F_SETOWN_EX, struct.pack("ii", kind, int(pid)))
+                if signum:
+                    fcntl.fcntl(r, F_SETSIG, signum)
+                fcntl.fcntl(r, fcntl.F_SETFL, fcntl.fcntl(r, fcntl.F_GETFL) | os.O_ASYNC)
+                os.write(w, b"x")
+            finally:
+                os.close(r)
+                os.close(w)
+    except OSError as e:
+        print("arming %s: errno=%s (nothing sent)" % (how, ename(e.errno)))
+        return 1
+    time.sleep(1)
+    again = ident(pid)
+    alive = again is not None and again[2] == cur[2] and again[1] not in ("Z", "X")
+    if sig in ("KILL", "IO"):
+        if alive:
+            print("SIG%s through the file's owner (%s) to %s (%s): errno=EPERM (refused: alive 1 s later)" % (sig, how, pid, comm))
+            return 1
+        print("SIG%s through the file's owner (%s) to %s (%s): delivered (the target is gone)" % (sig, how, pid, comm))
+        return 0
+    print("SIG%s through the file's owner (%s) to %s (%s): sent (%s 1 s later)" % (sig, how, pid, comm, "alive" if alive else "gone"))
+    return 0
+
 def main(argv):
     cmds = {
         "ident": (cmd_ident, 1), "signal": (cmd_signal, 4),
@@ -1042,7 +1110,7 @@ def main(argv):
         "cgmove": (cmd_cgmove, 4), "v1move": (cmd_v1move, 4),
         "fdlater": (cmd_fdlater, 3), "handlewrite": (cmd_handlewrite, 3),
         "timedwrite": (cmd_timedwrite, 4), "ftmeasure": (cmd_ftmeasure, 1),
-        "sysctl-race": (cmd_sysctl_race, 4),
+        "sysctl-race": (cmd_sysctl_race, 4), "sigio": (cmd_sigio, 5),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -3040,6 +3108,55 @@ if selected C111; then
     fi
     grant_window 10; sleep 1; rm -f "$DF" "$EF"; wait_no_window 60 || true
     restored C111 "the lab's drop-in and environment file" absent "$([[ -e $DF || -e $EF ]] && echo present || echo absent)"
+fi
+
+# ── lot 293: a signal through a file's owner (external bug hunt BUG14) ───
+# The kernel delivers the signal of a file's owner (F_SETOWN, F_SETOWN_EX,
+# FIOSETOWN; O_ASYNC / FIOASYNC; F_SETSIG, or the plain SIGIO) from
+# send_sigio_to_task, never through task_kill: until lot 293 a root shell
+# killed the agent and the watchdog this way, unrefused and unrecorded.
+#   C112  the plain SIGIO, F_SETOWN on a pipe, to the agent (no window);
+#   C112a F_SETSIG(SIGKILL) + O_ASYNC, F_SETOWN on a pipe, to the agent;
+#   C112b F_SETOWN_EX(F_OWNER_TID) + SIGKILL to the watchdog;
+#   C112c FIOSETOWN + FIOASYNC on a socket + SIGKILL to the agent;
+#   C112d F_SETOWN_EX(F_OWNER_PGRP), the agent's own process group, SIGKILL
+#         (refused for the agent; skipped if it leads no group of its own);
+#   C112w inside a window: F_SETSIG(SIGCONT) — a stop signal of the window's
+#         grant, harmless — let through and not recorded; C112x the plain
+#         SIGIO inside the same window, still refused.
+# Each refusal the target's survival shows (a delivered SIGKILL or SIGIO
+# ends it) and the signed deny=sigio record names.
+sigio_case() {   # <id> <title> <agent|watchdog> <how> <SIG>
+    local p s c
+    if [[ $3 == agent ]]; then p=$(agent_pid); c=northnarrow-age; else p=$(wd_pid); c=northnarrow-wat; fi
+    s=$(proc_start "$p")
+    POST=$(post post_proc "${p:-0}" "${s:-0}" "$c") \
+        run_case "$1" "$2" denied "deny=sigio" 0 -- nnpy sigio "${p:-0}" "$c" "${s:-0}" "$4" "$5"
+}
+if selected_any C112,C112a,C112b,C112c,C112d,C112w,C112x && ! wait_no_window 90; then
+    rows+=("| C112 | a signal through a file's owner | not run | — | DEVIATION (not run: a trusted-installer window still open after 90 s) |")
+    echo "C112 not run: a window still open" >&2; fail=1
+else
+    sigio_case C112 "SIGIO through a pipe's owner (F_SETOWN + O_ASYNC) to the agent (no window)" agent pipe IO
+    sigio_case C112a "F_SETSIG(SIGKILL) through a pipe's owner to the agent (no window)" agent pipe KILL
+    sigio_case C112b "F_SETOWN_EX(F_OWNER_TID) + SIGKILL to the watchdog (no window)" watchdog ownex-tid KILL
+    sigio_case C112c "FIOSETOWN + FIOASYNC on a socket, SIGKILL, to the agent (no window)" agent fiosetown KILL
+    if selected C112d; then
+        P=$(agent_pid)
+        if [[ -n "$P" && "$(ps -o pgid= -p "$P" | tr -d ' ')" == "$P" ]]; then
+            sigio_case C112d "F_SETOWN_EX(F_OWNER_PGRP), the agent's process group, SIGKILL (no window)" agent ownex-pgrp KILL
+        else
+            skipped_case C112d "the agent leads no process group of its own" 1
+        fi
+    fi
+    if selected_any C112w,C112x; then
+        grant_window 30; sleep 2
+        P=$(agent_pid); S=$(proc_start "$P")
+        EV_FORBID="deny=sigio" POST=$(post post_proc "${P:-0}" "${S:-0}" northnarrow-age) \
+            run_case C112w "F_SETSIG(SIGCONT) through a pipe's owner inside a window (the grant's stop signal)" allowed "" 0 -- nnpy sigio "${P:-0}" northnarrow-age "${S:-0}" pipe CONT
+        sigio_case C112x "SIGIO through a pipe's owner inside a window (not the grant's)" agent pipe IO
+        wait_no_window 90 || echo "C112w: its window not seen ended within 90 s" >&2
+    fi
 fi
 
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────

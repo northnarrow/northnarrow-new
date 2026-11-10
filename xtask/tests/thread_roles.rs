@@ -159,7 +159,8 @@ const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/bounded_cmd.rs",
-        "thread::spawn(move || pipe.write_all(&data))",
+        // lot 293 (BUG35): its end sent back on a channel
+        "let _ = tx.send(pipe.write_all(&data));",
         "a child's stdin pipe written: no capability used",
     ),
     (
