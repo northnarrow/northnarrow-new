@@ -758,7 +758,10 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
 /// and one that is not UTF-8 included. The empty one was dropped (the
 /// respawned agent's parser refused `--ade-prompt --ade-model …` and it
 /// never came back) and the other rewritten with U+FFFD. The two removed
-/// advisor flags take any value and are ignored with a WARN.
+/// advisor flags take any value and are ignored with a WARN. The lab's
+/// first run of this test found the agent itself aborting at the start on
+/// the non-UTF-8 argument (its self-integrity check read
+/// `std::env::args()`): fixed with it.
 #[test]
 fn a_respawned_agent_has_its_first_launchs_argv_byte_for_byte() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};

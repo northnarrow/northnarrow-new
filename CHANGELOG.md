@@ -75,7 +75,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   argv byte for byte (lot 297, BUG58, BUG67): an empty argument was dropped
   — the argv shifted into one the agent refused, a respawn loop up to the
   ceiling — and an argument that is not UTF-8 was rewritten with U+FFFD,
-  in the respawn and in `agent.argv`. Its STATUS ping counters are
+  in the respawn and in `agent.argv`. The agent no longer aborts at its
+  start on an argument or an environment variable that is not UTF-8 (its
+  self-integrity check read them with `std::env::args()`/`vars()`, which
+  panic on one; found by this lot's lab). Its STATUS ping counters are
   described as they work (BUG81: failures since the agent last answered,
   a timeout and a vanished socket counted together — the report's change
   would never recover a frozen agent whose socket is removed and put back).

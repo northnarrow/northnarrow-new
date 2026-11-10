@@ -990,7 +990,8 @@ holding a flow against a later kill (BUG45). After the upgrade:
   byte for byte, an empty argument (`--flag ''`) and one that is not UTF-8
   included; `/run/northnarrow/agent.argv` keeps them the same way (its
   format is unchanged). The systemd backend (the default with systemd) was
-  never affected. The `admin_socket_vanished` record says "on N STATUS
+  never affected. The agent itself no longer aborts at its start on such an
+  argument, or on an environment variable that is not UTF-8. The `admin_socket_vanished` record says "on N STATUS
   pings since it last answered" (BUG81: a timeout between two of those
   pings does not start the count over — that was always so; the text said
   "in a row").
