@@ -66,6 +66,7 @@
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh foreign-bpf-check  # lot 290: foreign BPF — the refused program types (a kprobe with bpf_probe_write_user, bpftrace outside/inside a window, the signed per-loader opt-out), the agent's objects off limits (FOREIGN_BPF_ONLY="F2 F4" a subset), the frozen maps, the cross-view (its status file, a program loaded in the agent's gap), systemd's BPF unit features, R011 Low
+#   deploy/lab/nn-lab.sh own-pins-check     # lot 301: every BPF object the agent pins is its own to the guard — no link of the agent's (the start-in-cgroup tracker's among them) given to root by id, a handle on and a detach of the tracker's links refused and signed, the tracker still marking (the guard enforcing for the run; KEEP_ENFORCE=1 leaves it so)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
 #   deploy/lab/nn-lab.sh inject-check    # lot 281: a read-only peek at an exempt service leaves its exemption; a debugger's attach revokes it — its next action killed, the injection signed; the tracker's maps refuse a write (frozen)
 #   deploy/lab/nn-lab.sh tracker-gap-check  # lot 281: install.sh --upgrade timed (the old agent down to the new tracker armed), an attach in its gap tainted by the pinned programs
@@ -1694,6 +1695,15 @@ cmd_foreign_bpf_check() {
     vssh "cd ~/northnarrow && FOREIGN_BPF_ONLY='${FOREIGN_BPF_ONLY:-}' bash deploy/lab/malsim/foreign-bpf-check.sh"
 }
 
+cmd_own_pins_check() {
+    # Lot 301 (deploy/lab/malsim/own-pins-check.sh): every BPF object the
+    # agent pins is its own to the BPF guard — no link of the agent's given
+    # to root by id, the tracker's links' handle and detach refused and
+    # signed, the tracker still marking. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && KEEP_ENFORCE='${KEEP_ENFORCE:-}' bash deploy/lab/malsim/own-pins-check.sh"
+}
+
 cmd_selftest_check() {
     # Lot 280c (deploy/lab/contract/selftest-check.sh): the sensor
     # self-test — every source's word in the manifest, ROUNDS rounds with
@@ -2490,6 +2500,7 @@ case "${1:-help}" in
     sysctl-check)  cmd_sysctl_check ;;
     switches-check) cmd_switches_check ;;
     foreign-bpf-check) cmd_foreign_bpf_check ;;
+    own-pins-check) cmd_own_pins_check ;;
     selftest-check) cmd_selftest_check ;;
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;

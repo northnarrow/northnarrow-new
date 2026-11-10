@@ -267,9 +267,22 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
         ],
     )
     .unwrap();
+    // the judge's link and its pin's name registered as the agent's (lot
+    // 301: by the walk of every pin directory, the judge's beside the root
+    // among them — `the_pin_directories_are_the_root_and_those_beside_it`
+    // in nn-linux; it was a case of its own)
     let d = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
-    assert!(body(&d, "register_own_objects")
-        .contains("pin_name_key(&format!(\"link_{}\", crate::sysctl_cgroup::PROGRAM))"));
+    in_order(
+        body(&d, "register_own_objects"),
+        &[
+            "let walk = pin_root.map(pinned_objects).unwrap_or_default();",
+            "let pins = split_pins(&walk, &own_maps, &own_progs);",
+            "let link_ids = own_links_of(held_objects(), &pins, &own_progs);",
+            "names: pin_names,",
+        ],
+    )
+    .unwrap();
+    assert!(body(&d, "pinned_objects").contains("own_pin_dirs(pin_root)"));
     assert!(body(&d, "kept_program").contains("crate::sysctl_cgroup::is_kept_program(name)"));
     // the manifest's note, the verifier check
     assert!(code("crates/nn-linux/src/sensors/multiplexer.rs")

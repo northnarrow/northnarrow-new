@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Every BPF object the agent pins is its own to the BPF guard (lot 301;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 301"). The registration read
+  the links the agent holds and the pin root's `link_*` pins only: the
+  start-in-cgroup tracker's seven links, pinned beside the root and closed,
+  were not in `OWN_BPF_IDS`, so a root outside a window took a handle on
+  each by id (`BPF_LINK_GET_FD_BY_ID`), and the link self-check never
+  expected them. At each start the agent now walks every pin directory —
+  the root and every directory beside it named after it, the paths the
+  `bpf` hook already refused by prefix — and registers each link there that
+  runs one of its programs (with its pin's name), with every map, program
+  and link it holds open; any other entry is a signed `foreign_pin`, never
+  registered or removed. The link self-check, the sensor self-test's attach
+  check and the late registration read the same view.
 - A signal through a file's owner is refused to the agent, the watchdog
   and the workers (lot 293, external bug hunt BUG14, P0;
   `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 293"). A root process killed

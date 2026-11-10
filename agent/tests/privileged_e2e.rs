@@ -2432,3 +2432,201 @@ fn the_sensor_self_test_finds_the_module_load_programs_linked() {
         "a signed self-test degradation names module_load: {missed:?}"
     );
 }
+
+/// Lot 301: every object pinned under the agent's pin directories — the pin
+/// root and every directory beside it named after it
+/// (`/sys/fs/bpf/northnarrow*`: the start-in-cgroup tracker's, the sysctl
+/// judge's, the module files' write history's) — is in the running agent's
+/// `OWN_BPF_IDS` with its kind, so the BPF guard refuses a foreign handle on
+/// it by id as it does by path (an entry that is not the agent's is named
+/// in its foreign-pin WARN instead, never left out in silence); the link
+/// self-check expects every pinned link and finds none gone; the cross-view
+/// lists none of them as foreign. Lot 300 found the tracker's links pinned
+/// beside the root and closed: in neither the guard's ids nor its link
+/// views, a root took a handle on one by id. Fails on main (the tracker's
+/// links).
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn every_object_pinned_under_the_pin_directories_is_registered_as_the_agent_s() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    // Declared first: removed after the agent stopped.
+    let (installed_agent, _installed_admin) = install_priv_bins();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    let rules = d.join("combat-rules.v4");
+    std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
+    let state = AgentState::new(d);
+    let log_path = d.join("agent.log");
+    let log = std::fs::File::create(&log_path).expect("create agent.log");
+    let log_err = log.try_clone().expect("clone the log handle");
+    let _eni = EniIptablesGuard::install();
+    let child = installed_agent
+        .command(&state, Launch::Sudo, &[("NO_COLOR", "1")])
+        .arg("--combat-rules")
+        .arg(&rules)
+        .arg("--detect-only")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .expect("spawn northnarrow-agent");
+    let _guard = AgentGuard(Some(child));
+    let agent_log = || common::strip_ansi(&std::fs::read_to_string(&log_path).unwrap_or_default());
+    let tail = |text: String| {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    };
+    let line_with = |needle: &str, within: Duration| {
+        common::wait_until(within, || {
+            agent_log()
+                .lines()
+                .find(|l| l.contains(needle))
+                .map(str::to_string)
+        })
+    };
+
+    // 1. Registered, in the fixture's observe mode (the walk below takes
+    //    handles on the pins and reads OWN_BPF_IDS); the tracker attached,
+    //    or this proves nothing for its links.
+    let reg = line_with("own objects registered", SOCKET_POLL_TIMEOUT * 3).unwrap_or_else(|| {
+        panic!(
+            "no BPF self-defence registration line\n{}",
+            tail(agent_log())
+        )
+    });
+    assert!(reg.contains("mode=\"observe\""), "{reg}");
+    let armed = line_with("link self-check armed", Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("no link self-check armed\n{}", tail(agent_log())));
+    assert!(
+        agent_log().contains("the start-in-cgroup tracker is attached"),
+        "the start-in-cgroup tracker did not attach on this kernel: nothing to check of its \
+         links\n{}",
+        tail(agent_log())
+    );
+
+    // 2. Everything pinned under the pin directories, read by this test.
+    let bpffs = Path::new("/sys/fs/bpf");
+    let pinned = common::raw_bpf::pinned_under(bpffs, "northnarrow");
+    let unread: Vec<String> = pinned
+        .iter()
+        .filter_map(|(p, o)| o.as_ref().err().map(|e| format!("{}: {e}", p.display())))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "pins this test could not read: {unread:?}"
+    );
+    let objects: Vec<(PathBuf, u64, u32, u32)> = pinned
+        .into_iter()
+        .filter_map(|(p, o)| o.ok().map(|(k, id, prog)| (p, k, id, prog)))
+        .collect();
+    let in_tracker = |p: &Path| {
+        p.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n.to_string_lossy().contains("-cgroup-join-v"))
+    };
+    let tracker_links: Vec<u32> = objects
+        .iter()
+        .filter(|(p, k, _, _)| *k == 3 && in_tracker(p))
+        .map(|(_, _, id, _)| *id)
+        .collect();
+    assert!(
+        !tracker_links.is_empty(),
+        "no link pinned in a tracker directory (/sys/fs/bpf/northnarrow-cgroup-join-v*): {objects:?}"
+    );
+
+    // 3. Each in the agent's OWN_BPF_IDS, or named as not its own.
+    let own = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's OWN_BPF_IDS: {e}\n{}", tail(agent_log())));
+    let text = agent_log();
+    let reported = |p: &Path| {
+        text.lines().any(|l| {
+            l.contains("is not one of its objects") && l.contains(&format!("{}:", p.display()))
+        })
+    };
+    let kind = |k: u64| match k {
+        1 => "map",
+        2 => "program",
+        _ => "link",
+    };
+    let missing: Vec<String> = objects
+        .iter()
+        .filter(|(p, k, id, _)| !own.contains(&(*k, *id)) && !reported(p))
+        .map(|(p, k, id, prog)| format!("{} ({} {id}, program {prog})", p.display(), kind(*k)))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of the {} objects pinned under /sys/fs/bpf/northnarrow* are neither in the agent's \
+         OWN_BPF_IDS nor reported as foreign (a root takes a handle on each by id):\n{}",
+        missing.len(),
+        objects.len(),
+        missing.join("\n")
+    );
+    let unregistered: Vec<&u32> = tracker_links
+        .iter()
+        .filter(|id| !own.contains(&(3, **id)))
+        .collect();
+    assert!(
+        unregistered.is_empty(),
+        "the tracker's links {unregistered:?} are not in OWN_BPF_IDS"
+    );
+
+    // 4. The link self-check expects every pinned link of the agent's, and
+    //    two rounds later (10 s each, jittered) none is gone.
+    let pinned_links = objects.iter().filter(|(_, k, _, _)| *k == 3).count();
+    let expected: usize = armed
+        .split("links=")
+        .nth(1)
+        .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no link count in {armed:?}"));
+    assert!(
+        expected >= pinned_links,
+        "the link self-check expects {expected} links, {pinned_links} are pinned: {armed}"
+    );
+    std::thread::sleep(Duration::from_secs(25));
+    let gone: Vec<String> = agent_log()
+        .lines()
+        .filter(|l| l.contains("own BPF links is GONE"))
+        .map(str::to_string)
+        .collect();
+    assert!(gone.is_empty(), "the link self-check reported: {gone:?}");
+
+    // 5. The cross-view (its status file beside the pid file, a round every
+    //    5 s) lists none of the pinned programs or links as foreign.
+    let status = state
+        .pid_file()
+        .parent()
+        .expect("the pid file's directory")
+        .join("bpf-foreign");
+    let body = common::wait_until(Duration::from_secs(30), || {
+        std::fs::read_to_string(&status)
+            .ok()
+            .filter(|b| b.starts_with("# northnarrow-agent pid"))
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "no cross-view status at {}\n{}",
+            status.display(),
+            tail(agent_log())
+        )
+    });
+    let foreign: Vec<String> = objects
+        .iter()
+        .filter(|(_, k, _, _)| *k != 1)
+        .filter_map(|(p, k, id, _)| {
+            let word = if *k == 3 { "link" } else { "prog" };
+            body.lines()
+                .find(|l| l.starts_with(&format!("{word} {id} ")))
+                .map(|l| format!("{}: {l}", p.display()))
+        })
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "the cross-view lists pinned objects of the agent's as foreign:\n{}",
+        foreign.join("\n")
+    );
+}

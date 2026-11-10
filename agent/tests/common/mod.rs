@@ -1345,8 +1345,34 @@ pub mod raw_bpf {
     /// The agent's link ids: the keys of kind 3 in every map named
     /// `OWN_BPF_IDS`, read through read-only handles (no link handle).
     pub fn own_link_ids() -> Result<Vec<u32>, String> {
+        let maps = own_ids_maps()?;
         let mut ids = Vec::new();
-        let mut maps = 0;
+        for key in maps.iter().flat_map(|(_, keys)| keys) {
+            if key >> 32 == OWN_KIND_LINK && !ids.contains(&(*key as u32)) {
+                ids.push(*key as u32);
+            }
+        }
+        if ids.is_empty() {
+            return Err(format!("OWN_BPF_IDS ({} map(s)) lists no link", maps.len()));
+        }
+        Ok(ids)
+    }
+
+    /// Lot 301: the `(kind, id)` keys of the running agent's `OWN_BPF_IDS`
+    /// — the newest map of the name (an older one lives on while a prior
+    /// agent's pinned guard program holds it) — through a read-only handle.
+    pub fn own_ids() -> Result<std::collections::HashSet<(u64, u32)>, String> {
+        let maps = own_ids_maps()?;
+        let (_, keys) = maps
+            .iter()
+            .max_by_key(|(id, _)| *id)
+            .expect("own_ids_maps: at least one map");
+        Ok(keys.iter().map(|k| (k >> 32, *k as u32)).collect())
+    }
+
+    /// Every map named `OWN_BPF_IDS` (8-byte keys): its id and its keys.
+    fn own_ids_maps() -> Result<Vec<(u32, Vec<u64>)>, String> {
+        let mut out = Vec::new();
         let mut id = 0u32;
         loop {
             let mut a: Attr = [0; 32];
@@ -1373,7 +1399,7 @@ pub mod raw_bpf {
                 && info[8..12] == 8u32.to_le_bytes()
                 && info[24..36] == *b"OWN_BPF_IDS\0";
             if named {
-                maps += 1;
+                let mut keys = Vec::new();
                 let mut key = 0u64;
                 let mut next = 0u64;
                 let mut first = true;
@@ -1389,20 +1415,93 @@ pub mod raw_bpf {
                     }
                     first = false;
                     key = next;
-                    if key >> 32 == OWN_KIND_LINK && !ids.contains(&(key as u32)) {
-                        ids.push(key as u32);
-                    }
+                    keys.push(key);
                 }
+                out.push((id, keys));
             }
             close(fd);
         }
-        if maps == 0 {
+        if out.is_empty() {
             return Err("no OWN_BPF_IDS map readable".to_string());
         }
-        if ids.is_empty() {
-            return Err(format!("OWN_BPF_IDS ({maps} map(s)) lists no link"));
+        Ok(out)
+    }
+
+    /// Lot 301: every entry under the directories of `bpffs` whose name
+    /// begins with `prefix` (the agent's pin root and those beside it), and
+    /// of the directories below them — a symbolic link not followed — each
+    /// with what [`pinned_object`] reads of it.
+    #[allow(clippy::type_complexity)]
+    pub fn pinned_under(
+        bpffs: &std::path::Path,
+        prefix: &str,
+    ) -> Vec<(std::path::PathBuf, Result<(u64, u32, u32), String>)> {
+        let mut out = Vec::new();
+        let mut todo: Vec<std::path::PathBuf> = std::fs::read_dir(bpffs)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+                    .map(|e| e.path())
+                    .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        while let Some(dir) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                match std::fs::symlink_metadata(&p) {
+                    Ok(m) if m.is_dir() => todo.push(p),
+                    Ok(m) if m.file_type().is_symlink() => {
+                        out.push((p, Err("a symbolic link".to_string())))
+                    }
+                    Ok(_) => {
+                        let o = pinned_object(&p);
+                        out.push((p, o));
+                    }
+                    Err(e) => out.push((p, Err(e.to_string()))),
+                }
+            }
         }
-        Ok(ids)
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Lot 301: the object pinned at `path` as its `OBJ_GET` handle's
+    /// fdinfo names it — `(kind, id, link's program)` with the
+    /// `OWN_BPF_IDS` kinds (1 map, 2 program, 3 link). Read-only first (a
+    /// map), read-write where the kernel wants it (a program, a link:
+    /// `EINVAL` read-only).
+    pub fn pinned_object(path: &std::path::Path) -> Result<(u64, u32, u32), String> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let get = |flags: u32| {
+            let mut a: Attr = [0; 32];
+            set_ptr(&mut a, 0, c.as_ptr() as u64);
+            a[3] = flags;
+            sys_bpf(BPF_OBJ_GET, &mut a)
+        };
+        let fd = match get(BPF_F_RDONLY) {
+            Err(libc::EINVAL) => get(0),
+            r => r,
+        }
+        .map_err(|e| format!("BPF_OBJ_GET: errno {e}"))?;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"));
+        close(fd);
+        let info = info.map_err(|e| format!("its fdinfo: {e}"))?;
+        let field = |name: &str| {
+            info.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        };
+        match (field("link_id:"), field("map_id:"), field("prog_id:")) {
+            (Some(link), _, prog) => Ok((OWN_KIND_LINK, link, prog.unwrap_or(0))),
+            (None, Some(map), _) => Ok((1, map, 0)),
+            (None, None, Some(prog)) => Ok((2, prog, 0)),
+            _ => Err(format!("not a BPF map, program or link: {info:?}")),
+        }
     }
 
     /// External bug hunt BUG13 (lot 290's fix, lot 293's check): a
