@@ -313,7 +313,15 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   (below).
 - `chain_lines_unverified` is written each time a read verb leaves out
   another number of rows of a file than the last time; the ERROR is in the
-  journal every time.
+  journal every time. One read tries at most 1000 rows that fail; the rows
+  it already verified are still served once those are spent (lot 297,
+  external bug hunt BUG59: an archive read next dropped them, and
+  `nn-admin detections` came back empty).
+- A file of the detection or status-event set that cannot be read — a
+  directory at its path, a disk error — ends that file's part of the read;
+  the other files are still read, and a line that is not UTF-8 is skipped
+  (lot 297, BUG69, BUG74: the read looped for ever and `nn-admin
+  detections` hung).
 - A rotating log whose checkpoint is unreachable keeps failing
   `nn-admin chain verify` until that generation leaves retention (the
   evidence is still missing; that is the point).
