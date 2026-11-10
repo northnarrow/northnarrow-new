@@ -1033,6 +1033,50 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- What an interpreter runs is read from its argv with that interpreter's
+  own option table (lot 292; external bug hunt, editions 1.2/1.3: BUG-44,
+  BUG-42; `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`). One option rule for
+  every interpreter took Python's `-O` and Perl's `-X`/`-W` for options with
+  an argument and Node's `-r` for one without: `python3 -O /tmp/steal.py
+  /usr/bin/aws` was the AWS client (NN-L-FIM-011's kill silent, FIM-003's
+  kill a record, ransomware writers trusted, the fan-out and copy-guard
+  exemptions), and a shell's `-e` (errexit, `#!/bin/sh -e`) an inline
+  program. Each family (python, perl, ruby, node, bash/dash/sh; zsh, ksh
+  and mono by the options every one of them reads alike) now has its table,
+  and the answer has three values (`posture::script_args::Runs`): a script,
+  nothing named (inline, standard input — a shell's `-s` too —, an
+  interactive shell), or not known when an option is not in the table or
+  its argument is missing — then no client, no installed or packaged
+  program, and no ancestor that vouches; a detection that looks for a
+  staged script still reads the argument that may be it.
+- A packaged tool started by a program no package installed is judged
+  (lot 292, BUG-49; `docs/design/RANSOMWARE_DECISIVE.md`): the ransomware
+  signal's and the copy guard's trust asked the package database for the
+  writer only and took any ancestor in a root-owned tree (`/opt/x`,
+  `/usr/local/bin/x`) as vouching for it. Every ancestor above the writer
+  and its own forked copies now vouches only when a package installed its
+  program (and, for an interpreter, its script), or when it is an
+  interpreter a package installed running no named script (an interactive
+  shell, `sh -c`); with no package database, a root-owned tree stands in as
+  before. The copy guard's filter asks the database (cached by path) for a
+  trusted writer's ancestors.
+- The image a process older than the agent ran before a later exec is its
+  past again (lot 292, BUG-56): the start the agent's scan, a fork or an
+  orphan entry read from `/proc` (rounded to a tick) never equalled the
+  exec's exact start, so an event before that exec had no known lineage.
+  Two entries of a pid are now one process when the start's ticks show the
+  exact start.
+- A lineage that cannot be read keeps the ransomware window of the writer's
+  pid (lot 292, BUG-72): "(lineage unknown)" counted as another program
+  and dropped the shapes already counted; a window opened under it is the
+  actor's once its program is read; two programs read under one pid still
+  start over.
+- A kernel module path component of 31 bytes (the sensor's slot, a longer
+  name cut to it) ends in `…` (lot 292, BUG-52), and R018 records a load
+  the kernel did not judge from such a path as unverifiable (High), never
+  as the packaged module whose name its first 31 bytes spell.
+- The exploit guard's reasoning names every i386 call it knows (lot 292,
+  BUG-82: 22 of 31 were "system call N").
 - The agent's stop ends in bounded time, in COMBAT or not (lot 288, #125;
   `docs/operator/COMBAT_RECOVERY.md`, "A stop in COMBAT"). The unit's
   `TimeoutStopSec=5s` must hold the stop and the kernel's release of the
