@@ -201,6 +201,7 @@ up 60 s enables the kind again. The manifest's state (`ready`,
 | `… spinning: N% of a CPU …` | the worker burnt the CPU with nothing to do | as above |
 | `… pid N could not be taken out of PROTECTED_PIDS …` | the agent keeps the dead worker unreaped (its pid cannot be reused) and tries again | look at the pinned maps (`nn-admin status`) |
 | `… exit status 78 (the sandbox could not be entered)` | the worker refused to run unconfined (the journal line before it says which step; `refusing to enter with N threads` since lot 277: something started a thread before the sandbox) | report it with the kernel and `lsm=` |
+| `… protocol violation: bounds: dns_answers: more answers than bytes`, after a DNS response whose records are owned by the root (`.`) | before lot 291 (external bug hunt 1.2, BUG02) the agent counted 2 bytes for a record's owner where the root takes 1: the honest worker's answer was a violation, and five such responses — which any unprivileged process can have its own DNS server send — disabled the worker and left every DNS name of the host without a decode. Fixed: the floor is the parser's | upgrade; on an older agent, the failures and the `disabled` row say it happened |
 | `worker_parse: disabled: 5 failures in a row …` | the kind is off until a worker stays up 60 s | look at the failures above it |
 
 ## 5. Lab

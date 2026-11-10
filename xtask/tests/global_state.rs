@@ -227,6 +227,12 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "crates/nn-core/src/decision/rules/net.rs",
+        "FLOOD_LIVE_EVICTIONS",
+        Telemetry,
+        "a rule window's evictions, `status --key` (bug hunt 1.3, BUG65)",
+    ),
+    kept(
+        "crates/nn-core/src/decision/rules/net.rs",
         "QNAME_HASH_KEYS",
         Process,
         "the process's random SipHash keys of the qname hash (NETR-012): stable within the \

@@ -480,4 +480,38 @@ mod tests {
         assert!(matches!(answer(&Request::DebugCrash), Answer::Refused(_)));
         assert!(matches!(answer(&Request::DebugHang), Answer::Refused(_)));
     }
+
+    /// The response to a question for the root (type `qtype`), with one
+    /// record owned by the root: its type, its data.
+    fn root_owned_response(qtype: u8, rtype: u8, rdata: &[u8]) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend_from_slice(&[0, 0, qtype, 0, 1]);
+        m.extend_from_slice(&[0, 0, rtype, 0, 1, 0, 0, 0, 0x3c, 0]);
+        m.push(rdata.len() as u8);
+        m.extend_from_slice(rdata);
+        m
+    }
+
+    /// Bug hunt 1.2, BUG02, end to end: the honest worker's answer
+    /// to a response whose record is owned by the root (1 byte) must pass
+    /// the core's check (else the worker is killed as a violator) — an A
+    /// (15 bytes), an AAAA (27) and a CNAME to the root (12), each at the
+    /// floor exactly.
+    #[test]
+    fn worker_answer_to_root_owned_record_passes_check() {
+        for (bytes, len) in [
+            (root_owned_response(1, 1, &[192, 0, 2, 1]), 17 + 15),
+            (root_owned_response(28, 28, &[0x20; 16]), 17 + 27),
+            (root_owned_response(1, 5, &[0]), 17 + 12),
+        ] {
+            assert_eq!(bytes.len(), len);
+            let req = Request::DnsAnswers(bytes);
+            let a = answer(&req);
+            assert!(
+                matches!(&a, Answer::DnsAnswers(Some(o)) if o.records.len() == 1),
+                "{a:?}"
+            );
+            assert_eq!(check_response(&req, &a), Ok(()), "{a:?}");
+        }
+    }
 }

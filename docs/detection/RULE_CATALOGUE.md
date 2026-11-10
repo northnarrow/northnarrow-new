@@ -1491,13 +1491,13 @@ DNS qname high-entropy label (tunnelling) — category `net_high`.
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0085 Network Traffic Content |
 | Validation | unit |
 
-**Observes.** A DNS query whose first label is 25 characters or more with a Shannon entropy of 3.8 bits per character or more. One such label is recorded (Medium); 8 distinct ones under one parent domain from one process within a minute kill it (High). A forwarded leg with no attributable originator is recorded only.
+**Observes.** A DNS query whose first label is 25 characters or more with a Shannon entropy of 3.8 bits per character or more. One such label is recorded (Medium); 8 distinct ones under one registrable domain (`evil.example`, `evil.co.uk`: the payload may run over several labels, a random label more and the letters' case change nothing) from one process within a minute kill it (High). A forwarded leg with no attributable originator is recorded only.
 
-**Known false positives.** A long varied name of words (`my-company-prod-backups-archive`) reaches the threshold and is recorded; the kill needs a tunnel's volume of distinct labels (NETR-002). The local resolvers are never the target (FP-3).
+**Known false positives.** A long varied name of words (`my-company-prod-backups-archive`) reaches the threshold and is recorded; the kill needs a tunnel's volume of distinct labels (NETR-002). The sites under a public suffix — a country's registry, an object store, a CDN or cloud platform of the built-in list — are each a domain of their own; under a suffix the list lacks, they add up. The local resolvers are never the target (FP-3).
 
 **How to test.** Look up 8 random base32 labels under one parent from one process: `for i in $(seq 8); do echo "$(head -c 20 /dev/urandom | base32 | tr -d = | tr A-Z a-z).nn-tunnel.example.com"; done > /tmp/q; dig -f /tmp/q +short`. `dig` is killed; one label alone is recorded.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_014_kills_a_tunnel_of_distinct_labels_under_one_parent`, `crates/nn-core/src/decision/rules/net.rs::net_014_records_a_single_high_entropy_label`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_014_kills_a_tunnel_of_distinct_labels_under_one_parent`, `crates/nn-core/src/decision/rules/net.rs::net_014_records_a_single_high_entropy_label`, `crates/nn-core/src/decision/rules/net.rs::tunnel_with_payload_over_two_labels_is_killed`, `crates/nn-core/src/decision/rules/net.rs::high_entropy_names_of_sites_under_one_public_suffix_are_not_a_tunnel`
 
 **ATT&CK note.** DNS tunnelling carries C2 or exfiltrated data alike; the rule cannot tell them apart and is mapped to the DNS channel (T1071.004) only.
 

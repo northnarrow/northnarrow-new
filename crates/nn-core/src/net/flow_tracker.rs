@@ -56,8 +56,8 @@
 //! - periodically ([`FlowTracker::due_snapshots`]): a flow still pending
 //!   past [`SnapshotPolicy::min_age_ns`] is handed out again every
 //!   [`SnapshotPolicy::interval_ns`], at most
-//!   [`SnapshotPolicy::max_per_tick`] per tick (the least recently
-//!   snapshotted first, the rest counted as deferred), so a precursor
+//!   [`SnapshotPolicy::max_per_tick`] per tick (the longest due first, the
+//!   rest counted as deferred: bug hunt 1.3, BUG76), so a precursor
 //!   recorded after the connect, or an image the process executed since,
 //!   is judged while the session is open ([`FlowPhase::Snapshot`]). The
 //!   snapshot carries no byte counters: the kernel's are read at close.
@@ -151,8 +151,8 @@ pub struct SnapshotPolicy {
     /// It is not snapshotted before it has been open this long (the
     /// connect-time verdict covers the start).
     pub min_age_ns: u64,
-    /// At most this many snapshots per tick; the others are deferred,
-    /// least recently snapshotted first.
+    /// At most this many snapshots per tick; the others are deferred, the
+    /// longest due first (bug hunt 1.3, BUG76).
     pub max_per_tick: usize,
 }
 
@@ -299,6 +299,10 @@ struct PendingFlow {
     /// pump read it ([`FlowTracker::attach_tls_pending`]): its snapshots
     /// and its closed row carry it.
     tls: Option<TlsFingerprint>,
+    /// External bug hunt (edition 1.3), BUG43: the DNS name the connect was
+    /// given ([`FlowTracker::on_tcp_connect_named`]); its snapshots and its
+    /// closed row carry it when the DNS cache no longer holds it.
+    hostname: Option<String>,
 }
 
 /// One process's pending connects, oldest first (lazy deletion).
@@ -453,6 +457,25 @@ impl<H: DecisionHost> FlowTracker<H> {
     /// row for the rules to judge now, while it is open; `None` when the
     /// close was already seen (its row is out).
     pub fn on_tcp_connect(&mut self, info: &TcpConnectInfo) -> Option<NetFlowEvent> {
+        self.on_tcp_connect_named(info, None)
+    }
+
+    /// [`Self::on_tcp_connect`] of a connect the DNS cache named
+    /// (`hostname`, looked up at the connect): its rows carry the name.
+    ///
+    /// External bug hunt (edition 1.3), BUG43: the snapshots and the close
+    /// looked the name up again in the DNS cache, with the connect's time —
+    /// but the cache drops a pid whose newest query is past its TTL (300 s),
+    /// so a flow open longer than that, from a process that resolved
+    /// nothing since, lost its name at its snapshots and its close: the
+    /// netflow log, `nn-admin net` and the export, and the rules that judge
+    /// the name of an open flow (NN-L-NET-002) on its snapshots. A name
+    /// found again still wins (a query read after the connect's lookup).
+    pub fn on_tcp_connect_named(
+        &mut self,
+        info: &TcpConnectInfo,
+        hostname: Option<String>,
+    ) -> Option<NetFlowEvent> {
         let key = Self::corr_id(info.start_ns, info.sk_ptr);
         if self.recent_synth.contains(&key) {
             // The close already produced this flow's row (see
@@ -471,6 +494,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             key,
             PendingFlow {
                 tls: None,
+                hostname: hostname.clone(),
                 announced: false,
                 last_snapshot_ns: 0,
                 start_ns: info.start_ns,
@@ -489,7 +513,9 @@ impl<H: DecisionHost> FlowTracker<H> {
         );
         self.link(info.pid, key);
         self.evict_to_capacity();
-        Some(Self::open_row(info, FlowPhase::Connect, info.start_ns))
+        let mut row = Self::open_row(info, FlowPhase::Connect, info.start_ns);
+        row.resolved_hostname = hostname;
+        Some(row)
     }
 
     /// Lab PR 224 (CM-02 c): the row of a connect the `socket_connect`
@@ -531,10 +557,19 @@ impl<H: DecisionHost> FlowTracker<H> {
     /// Lab PR 224 (CM-02 b): the pending flows open at least
     /// `policy.min_age_ns` at `now_ns` and not handed out within
     /// `policy.interval_ns`, as [`FlowPhase::Snapshot`] rows, at most
-    /// `policy.max_per_tick` (the least recently snapshotted first; the
-    /// others are counted as deferred and come first next time). Each
-    /// one handed out is stamped `now_ns`. The image and the DNS name are
-    /// the connect's: the caller refreshes them.
+    /// `policy.max_per_tick`: the longest due first (the others are counted
+    /// as deferred, and stay longer due than any flow that becomes due
+    /// after them). Each one handed out is stamped `now_ns`. The image and
+    /// the DNS name are the connect's: the caller refreshes them.
+    ///
+    /// External bug hunt (edition 1.3), BUG76: the order was the last
+    /// snapshot's time, 0 for a flow never handed out — so every new flow
+    /// went before every flow snapshotted once, and with `max_per_tick` new
+    /// long-lived flows per tick (about 51 a second at the defaults) a flow
+    /// deferred once was never judged again while open: a long C2 session
+    /// the precursor of a chain came after. The order is now when each flow
+    /// became due: `start + min_age` for one never handed out,
+    /// `last + interval` for the others.
     pub fn due_snapshots(&mut self, now_ns: u64, policy: &SnapshotPolicy) -> SnapshotBatch {
         let mut due: Vec<(u64, u64, CorrId)> = self
             .pending
@@ -544,7 +579,14 @@ impl<H: DecisionHost> FlowTracker<H> {
                     && (p.last_snapshot_ns == 0
                         || now_ns.saturating_sub(p.last_snapshot_ns) >= policy.interval_ns)
             })
-            .map(|(k, p)| (p.last_snapshot_ns, p.start_ns, *k))
+            .map(|(k, p)| {
+                let due_at = if p.last_snapshot_ns == 0 {
+                    p.start_ns.saturating_add(policy.min_age_ns)
+                } else {
+                    p.last_snapshot_ns.saturating_add(policy.interval_ns)
+                };
+                (due_at, p.start_ns, *k)
+            })
             .collect();
         let deferred = due.len().saturating_sub(policy.max_per_tick);
         if deferred > 0 {
@@ -575,7 +617,7 @@ impl<H: DecisionHost> FlowTracker<H> {
                 proc_start_ns: p.proc_start_ns,
                 bytes_sent: 0,
                 bytes_recv: 0,
-                resolved_hostname: None,
+                resolved_hostname: p.hostname.clone(),
                 tls_fingerprint: p.tls.clone(),
                 flow_id: String::new(),
                 close_reason: 0,
@@ -640,7 +682,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             proc_start_ns: pending.proc_start_ns,
             bytes_sent: info.bytes_sent,
             bytes_recv: info.bytes_recv,
-            resolved_hostname: None,
+            resolved_hostname: pending.hostname,
             tls_fingerprint: pending.tls,
             flow_id,
             close_reason: info.close_reason,
@@ -966,6 +1008,39 @@ mod tests {
             bytes_recv: recv,
             close_reason: reason,
         }
+    }
+
+    /// Bug hunt 1.3, BUG43: a flow open past the DNS cache's TTL keeps the
+    /// name its connect was given, on its connect row, its snapshots and its
+    /// closed row; a connect the cache could not name carries none.
+    #[test]
+    fn long_flow_keeps_its_name_at_close() {
+        let mut t = FlowTracker::default();
+        let c = connect_fixture(10 * S, 0xC2, 100, v4(203, 0, 113, 5), 443);
+        let row = t
+            .on_tcp_connect_named(&c, Some("c2.example".into()))
+            .expect("connect row");
+        assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
+        let snap = t.due_snapshots(410 * S, &SnapshotPolicy::default());
+        assert_eq!(snap.flows.len(), 1);
+        assert_eq!(
+            snap.flows[0].resolved_hostname.as_deref(),
+            Some("c2.example"),
+            "snapshot 400 s after the connect"
+        );
+        let corr = FlowTracker::corr_id(10 * S, 0xC2);
+        let closed = t
+            .on_tcp_close(&close_fixture(410 * S, corr, 1, 2, 0))
+            .expect("closed row");
+        assert_eq!(closed.resolved_hostname.as_deref(), Some("c2.example"));
+        // a connect with no name: none at its close
+        let c = connect_fixture(20 * S, 0xC3, 101, v4(203, 0, 113, 6), 443);
+        assert_eq!(t.on_tcp_connect(&c).unwrap().resolved_hostname, None);
+        let corr = FlowTracker::corr_id(20 * S, 0xC3);
+        let closed = t
+            .on_tcp_close(&close_fixture(30 * S, corr, 1, 2, 0))
+            .unwrap();
+        assert_eq!(closed.resolved_hostname, None);
     }
 
     /// Lot 275: the ClientHello fingerprint the TLS pump attaches to a
@@ -1633,5 +1708,62 @@ mod tests {
         assert!(snapshot_value_weakens("never"));
         assert!(!snapshot_value_weakens("30"));
         assert!(!snapshot_value_weakens("60"));
+    }
+
+    /// Bug hunt 1.3, BUG76: a flow deferred at one tick comes
+    /// first at the next, before a never-snapshotted flow that became due
+    /// after it.
+    #[test]
+    fn a_deferred_flow_comes_first_next_tick() {
+        let mut t = FlowTracker::default();
+        let p = SnapshotPolicy {
+            interval_ns: 60 * S,
+            min_age_ns: 60 * S,
+            max_per_tick: 1,
+        };
+        t.on_tcp_connect(&connect_fixture(1000 * S, 0xA, 4242, v4(10, 0, 0, 1), 443));
+        t.on_tcp_connect(&connect_fixture(1050 * S, 0xB1, 1, v4(10, 0, 0, 2), 443));
+        let b = t.due_snapshots(1060 * S, &p);
+        assert_eq!((b.flows.len(), b.flows[0].pid, b.deferred), (1, 4242, 0));
+        t.on_tcp_connect(&connect_fixture(1110 * S, 0xB2, 2, v4(10, 0, 0, 3), 443));
+        let b = t.due_snapshots(1120 * S, &p);
+        assert_eq!((b.flows[0].pid, b.deferred), (1, 1), "B1 out, A deferred");
+        let b = t.due_snapshots(1180 * S, &p);
+        assert_eq!(
+            b.flows[0].pid, 4242,
+            "the flow deferred at the previous tick comes first"
+        );
+    }
+
+    /// Bug hunt BUG76: an open flow keeps being re-judged while new flows
+    /// become due at every tick (one per tick, the bound one).
+    #[test]
+    fn a_snapshotted_flow_is_not_starved_by_new_flows() {
+        let mut t = FlowTracker::default();
+        let p = SnapshotPolicy {
+            interval_ns: 60 * S,
+            min_age_ns: 60 * S,
+            max_per_tick: 1,
+        };
+        t.on_tcp_connect(&connect_fixture(1000 * S, 0xA, 4242, v4(10, 0, 0, 1), 443));
+        let b = t.due_snapshots(1060 * S, &p);
+        assert_eq!(b.flows[0].pid, 4242);
+        let mut again = 0;
+        for k in 1..=60u64 {
+            let now = 1060 * S + k * 60 * S;
+            // a new flow open 70 s at this tick
+            t.on_tcp_connect(&connect_fixture(
+                now - 70 * S,
+                0x1000 + k,
+                10 + k as u32,
+                v4(10, 1, 0, k as u8),
+                443,
+            ));
+            let b = t.due_snapshots(now, &p);
+            if b.flows.iter().any(|f| f.pid == 4242) {
+                again += 1;
+            }
+        }
+        assert!(again > 0, "flow A never snapshotted again in 60 ticks");
     }
 }
