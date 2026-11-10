@@ -4928,6 +4928,16 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// Lot 297 (BUG67): `--agent-bin` replaces argv[0] as it is, a path
+    /// that is not UTF-8 too.
+    #[test]
+    fn a_non_utf8_agent_bin_replaces_argv0_as_it_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let bin = Path::new(std::ffi::OsStr::from_bytes(b"/opt/nn/ag\xe8nt"));
+        let argv = agent_argv_from_proc(std::process::id(), Some(bin)).unwrap();
+        assert_eq!(argv[0].as_bytes(), b"/opt/nn/ag\xe8nt");
+    }
+
     /// Lot 297 (BUG58, BUG67): the argv the exec backend records for a
     /// later watchdog start comes back the same, an empty and a non-UTF-8
     /// argument included, and the fallback that reads it keeps them.
