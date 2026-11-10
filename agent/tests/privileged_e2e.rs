@@ -1790,11 +1790,6 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     let links = common::raw_bpf::own_link_ids()
         .unwrap_or_else(|e| panic!("the agent's link ids: {e}\n{}", log_tail(&log)));
     std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
-    assert!(
-        common::raw_bpf::own_link_ids().is_err(),
-        "OWN_BPF_IDS read through a read-only handle outside a window in enforce mode (lot 290: \
-         refused)"
-    );
     assert_eq!(
         common::raw_bpf::link_fd_by_id(links[0]),
         Err(libc::EPERM),
@@ -1818,6 +1813,16 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
             log_tail(&log)
         );
     }
+
+    // 4b. Lot 290: outside the window the same read-only handles are refused.
+    //     After the log's checks: it opens every map of the host, and each of
+    //     the agent's is a refusal (a burst the denial budget holds, which
+    //     would hide the bpf_link line above — CI's second run).
+    assert!(
+        common::raw_bpf::own_link_ids().is_err(),
+        "OWN_BPF_IDS read through a read-only handle outside a window in enforce mode (lot 290: \
+         refused)"
+    );
 
     // 5. TST-010: the fixtures' teardown fails and names the refusal; the
     //    agent is untouched.
