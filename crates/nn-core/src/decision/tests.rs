@@ -2085,3 +2085,310 @@ fn decisions_are_deterministic_across_threads() {
         assert_eq!(t.join().unwrap(), first);
     }
 }
+// ── Bug hunt 1.3 (editions 1.2/1.3): BUG45, BUG62 ───────────────────────
+
+/// What [`bug45_run`] saw: the decision at the connect, the flows in the
+/// ledger after it, the snapshot's decision and its chain matches.
+struct Bug45 {
+    at_connect: Option<super::combine::Decision>,
+    noted: usize,
+    snapshot: Option<super::combine::Decision>,
+    chains: Vec<&'static str>,
+}
+
+/// BUG45: a `/tmp` dropper re-executes the store's own client (same
+/// process, LD_PRELOAD): its flows are no longer a staged image's
+/// (NN-L-NET-008), its read is the client's (FIM-017 leaves it alone), the
+/// `TmpExec` stays on its key (NN-L-CHAIN-002). It connects (CHAIN-002 at
+/// the connect, as `policy` makes it), then reads a key while the session
+/// is open (`read`), and the flow is snapshotted (CM-02 b).
+fn bug45_run(policy: &str, read: bool) -> Bug45 {
+    use nn_model::telemetry::{FimOp, FlowPhase};
+    let p = prod(policy);
+    let start = 100 * SEC;
+    let mut exec = spawn_as(1000, "dropper", "/tmp/dropper");
+    if let Event::ProcessSpawn {
+        pid,
+        start_ns,
+        timestamp_ns,
+        ..
+    } = &mut exec
+    {
+        *pid = 4500;
+        *start_ns = start - SEC;
+        *timestamp_ns = start - SEC;
+    }
+    let _ = p.decide(&exec);
+    let mut reexec = exec.clone();
+    if let Event::ProcessSpawn {
+        comm,
+        filename,
+        timestamp_ns,
+        ..
+    } = &mut reexec
+    {
+        *comm = "gpg".into();
+        *filename = "/usr/bin/gpg".into();
+        *timestamp_ns = start - SEC / 2;
+    }
+    let _ = p.decide(&reexec);
+    let row = |phase| tcp_row(4500, "/usr/bin/gpg", "93.184.216.34", 443, start, phase);
+    let at_connect = p.decide(&row(FlowPhase::Connect));
+    let noted = p.engine.open_flows_with_verdicts();
+    if read {
+        let read = fim_event(
+            "/root/.gnupg/private-keys-v1.d/abc.key",
+            FimOp::Opened,
+            4500,
+            1000,
+            start + 30 * SEC,
+        );
+        assert!(
+            p.decide(&read)
+                .is_none_or(|d| d.verdict.action == ResponseAction::Log),
+            "the client's read is not acted on"
+        );
+    }
+    let snapshot = p.decide(&row(FlowPhase::Snapshot));
+    let chains = snapshot
+        .as_ref()
+        .map(|d| {
+            ids(d)
+                .into_iter()
+                .filter(|id| id.starts_with("NN-L-CHAIN-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    Bug45 {
+        at_connect,
+        noted,
+        snapshot,
+        chains,
+    }
+}
+
+const CHAIN_001: &str = "NN-L-CHAIN-001_CredReadThenEgress";
+const CHAIN_002: &str = "NN-L-CHAIN-002_TmpExecThenEgress";
+const CHAIN_007: &str = "NN-L-CHAIN-007_TmpCredExfilSequence";
+
+fn kills(d: &Option<super::combine::Decision>) -> bool {
+    d.as_ref()
+        .is_some_and(|d| d.verdict.action == ResponseAction::KillProcessTree)
+}
+
+/// BUG45: under a signed policy that turns NN-L-CHAIN-002 `off` (or
+/// exempts the process's uid from it), the dropper's connect draws no
+/// chain verdict; the credential read it makes while the session is open
+/// completes CHAIN-001/CHAIN-007 at the snapshot, and the process tree is
+/// killed. On main the off match took the flow's chain verdict: nothing.
+#[test]
+fn an_off_chain_at_the_connect_leaves_the_flow_to_the_other_chains() {
+    for policy in [
+        "off NN-L-CHAIN-002_TmpExecThenEgress\n",
+        "exempt NN-L-CHAIN-002_TmpExecThenEgress uid 1000\n",
+    ] {
+        let r = bug45_run(policy, true);
+        assert!(
+            r.at_connect.as_ref().is_none_or(|d| !d
+                .matches
+                .iter()
+                .any(|m| m.rule_id.starts_with("NN-L-CHAIN-") && m.acts())),
+            "{policy}: no chain acts at the connect"
+        );
+        assert!(
+            r.chains.contains(&CHAIN_001) && r.chains.contains(&CHAIN_007),
+            "{policy}: {:?} (ledger {})",
+            r.chains,
+            r.noted
+        );
+        assert!(kills(&r.snapshot), "{policy}");
+    }
+}
+
+/// BUG45: a rule the policy turns off, or whose exemption covers the
+/// actor, leaves nothing in the flow ledger (on main the off chain left
+/// the flow noted).
+#[test]
+fn an_off_rule_alone_leaves_no_flow_in_the_ledger() {
+    for policy in [
+        "off NN-L-CHAIN-002_TmpExecThenEgress\n",
+        "exempt NN-L-CHAIN-002_TmpExecThenEgress uid 1000\n",
+    ] {
+        let r = bug45_run(policy, false);
+        assert_eq!(r.noted, 0, "{policy}");
+    }
+    // control: the built-in CHAIN-002 answers the flow at the connect (a
+    // kill), and it is noted
+    let r = bug45_run("", false);
+    assert!(kills(&r.at_connect));
+    assert_eq!(r.noted, 1);
+    assert!(r.chains.is_empty(), "one chain verdict per flow");
+}
+
+/// BUG45 (decision of 10/11/2026): CHAIN-002 in `alert` (a `Log` at the
+/// connect, its kill not run) keeps the flow's chains for a verdict that
+/// acts: the read on the open session draws CHAIN-001/CHAIN-007's kill at
+/// the snapshot. The alert chain itself is not repeated there.
+#[test]
+fn an_alert_chain_at_the_connect_does_not_take_a_later_kill() {
+    let r = bug45_run("alert NN-L-CHAIN-002_TmpExecThenEgress\n", true);
+    let at_connect = r.at_connect.as_ref().expect("CHAIN-002 alerts");
+    assert_eq!(ids(at_connect), [CHAIN_002]);
+    assert_eq!(at_connect.verdict.action, ResponseAction::Log);
+    assert_eq!(r.noted, 1);
+    assert!(kills(&r.snapshot), "{:?}", r.chains);
+    assert!(r.chains.contains(&CHAIN_001) && r.chains.contains(&CHAIN_007));
+    assert!(!r.chains.contains(&CHAIN_002), "{:?}", r.chains);
+}
+
+/// BUG45: a chain answer that was only a record holds the flow against
+/// another record — no read, no new chain verdict at the snapshot: the
+/// alert CHAIN-002 is not recorded again (same strength), as before.
+#[test]
+fn a_record_only_chain_answer_is_not_repeated_on_the_open_flow() {
+    let r = bug45_run("alert NN-L-CHAIN-002_TmpExecThenEgress\n", false);
+    assert_eq!(r.noted, 1);
+    assert!(r.chains.is_empty(), "{:?}", r.chains);
+}
+
+/// Related to BUG45 (the triage, default config): the store's own client
+/// (FIM-017 leaves its reads alone) running the attacker's code. An aged
+/// NN-L-CHAIN-001 record at the connect (a read 400 s before it: High,
+/// Log) no longer keeps a fresh credential read on the open session from
+/// CHAIN-001's kill at the snapshot (CM-02 b). Once that kill answered the
+/// flow, no chain answers it again.
+#[test]
+fn an_aged_chain_record_does_not_take_a_fresh_reads_kill() {
+    use nn_model::telemetry::{FimOp, FlowPhase};
+    let p = prod("");
+    let s0 = 1_000 * SEC;
+    let mut exec = spawn_as(1000, "gpg", "/usr/bin/gpg");
+    if let Event::ProcessSpawn {
+        pid,
+        start_ns,
+        timestamp_ns,
+        ..
+    } = &mut exec
+    {
+        *pid = 4600;
+        *start_ns = s0;
+        *timestamp_ns = s0;
+    }
+    let _ = p.decide(&exec);
+    let read = |ts| {
+        fim_event(
+            "/root/.gnupg/private-keys-v1.d/abc.key",
+            FimOp::Opened,
+            4600,
+            1000,
+            ts,
+        )
+    };
+    assert!(p
+        .decide(&read(s0 + SEC))
+        .is_none_or(|d| d.verdict.action == ResponseAction::Log));
+    let connect = s0 + 401 * SEC;
+    let row = |phase| tcp_row(4600, "/usr/bin/gpg", "93.184.216.34", 443, connect, phase);
+    let at_connect = p.decide(&row(FlowPhase::Connect)).expect("the aged record");
+    assert_eq!(ids(&at_connect), [CHAIN_001]);
+    assert_eq!(
+        (
+            at_connect.verdict.action.clone(),
+            at_connect.verdict.severity
+        ),
+        (ResponseAction::Log, Severity::High)
+    );
+    // no new read: the aged record is not repeated
+    assert!(p
+        .decide(&row(FlowPhase::Snapshot))
+        .is_none_or(|d| !ids(&d).iter().any(|id| id.starts_with("NN-L-CHAIN-"))));
+    assert!(p
+        .decide(&read(connect + 30 * SEC))
+        .is_none_or(|d| d.verdict.action == ResponseAction::Log));
+    let snap = p.decide(&row(FlowPhase::Snapshot));
+    assert!(
+        kills(&snap),
+        "a fresh read on the open session drew no kill"
+    );
+    assert_eq!(snap.as_ref().map(ids), Some(vec![CHAIN_001]));
+    // the kill answered the flow: no chain again, at a snapshot or the close
+    for phase in [FlowPhase::Snapshot, FlowPhase::Closed] {
+        assert!(
+            p.decide(&row(phase))
+                .is_none_or(|d| !ids(&d).iter().any(|id| id.starts_with("NN-L-CHAIN-"))),
+            "{phase:?}"
+        );
+    }
+}
+
+/// BUG62 on the production engine: a process (the store's own client, so
+/// FIM-017 does not act) reads a credential store, re-executes an image
+/// named `su` 15, 16 or 64 times (same pid and start: that many `PrivEsc`
+/// on its key), then connects: CHAIN-001 kills it every time. On main the
+/// kill was gone from 16 re-execs on, and nothing on the way acted.
+#[test]
+fn sixteen_su_reexecs_keep_chain001_on_the_production_engine() {
+    use nn_model::telemetry::{FimOp, FlowPhase};
+    let run = |reexecs: u64| {
+        let p = prod("");
+        let s0 = 1_000 * SEC;
+        let exec_as = |comm: &str, path: &str, ts: u64| {
+            let mut e = spawn_as(1000, comm, path);
+            if let Event::ProcessSpawn {
+                pid,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                *pid = 4700;
+                *start_ns = s0;
+                *timestamp_ns = ts;
+            }
+            e
+        };
+        let mut acted = Vec::new();
+        let mut judge = |e: &Event| {
+            if let Some(d) = p.decide(e) {
+                if d.verdict.action != ResponseAction::Log {
+                    acted.push((ids(&d), d.verdict.action.clone()));
+                }
+            }
+        };
+        judge(&exec_as("gpg", "/usr/bin/gpg", s0));
+        judge(&fim_event(
+            "/root/.gnupg/private-keys-v1.d/abc.key",
+            FimOp::Opened,
+            4700,
+            1000,
+            s0 + SEC,
+        ));
+        for i in 0..reexecs {
+            judge(&exec_as(
+                "su",
+                "/home/u/.local/bin/su",
+                s0 + 2 * SEC + i * SEC / 10,
+            ));
+        }
+        let connect = s0 + 30 * SEC;
+        let d = p.decide(&tcp_row(
+            4700,
+            "/usr/bin/gpg",
+            "93.184.216.34",
+            443,
+            connect,
+            FlowPhase::Connect,
+        ));
+        (acted, d.map(|d| (ids(&d), d.verdict.action.clone())))
+    };
+    for reexecs in [15, 16, 64] {
+        let (acted, at_connect) = run(reexecs);
+        assert!(acted.is_empty(), "{reexecs}: {acted:?}");
+        assert!(
+            at_connect.as_ref().is_some_and(
+                |(ids, a)| ids.contains(&CHAIN_001) && *a == ResponseAction::KillProcessTree
+            ),
+            "{reexecs}: {at_connect:?}"
+        );
+    }
+}

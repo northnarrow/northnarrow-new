@@ -1214,39 +1214,35 @@ fn recon_pattern(focal: &Event, recent: Recent<'_>) -> bool {
             return true;
         }
     }
-    let Event::TcpConnect {
-        pid: focal_pid,
-        timestamp_ns: focal_ts,
-        ..
-    } = focal
-    else {
-        return false;
-    };
-    distinct_dst_ports_in_window(*focal_pid, *focal_ts, recent, RECON_WINDOW_NS)
-        + 1 // include the focal event itself
-        >= RECON_DISTINCT_PORTS_MIN
+    distinct_dst_ports_in_window(focal, recent, RECON_WINDOW_NS) >= RECON_DISTINCT_PORTS_MIN
 }
 
 fn heavy_recon(focal: &Event, recent: Recent<'_>) -> bool {
+    distinct_dst_ports_in_window(focal, recent, HEAVY_RECON_WINDOW_NS)
+        >= HEAVY_RECON_DISTINCT_PORTS_MIN
+}
+
+/// The distinct destination ports of the focal `TcpConnect`'s process
+/// within `window_ns` of it, the focal's own port included (0 for any other
+/// event).
+///
+/// Bug hunt 1.3, BUG40/BUG50: the focal used to be added as `+ 1` on top of
+/// the ports of the recent connects, so a focal back on a port already
+/// counted was counted twice: 80, 443 and 443 again raised Reconnaissance
+/// (three ports wanted), nine ports and the ninth again
+/// HeavyReconnaissance (ten wanted). The focal's port now joins the set.
+fn distinct_dst_ports_in_window(focal: &Event, recent: Recent<'_>, window_ns: u64) -> usize {
     let Event::TcpConnect {
-        pid: focal_pid,
+        pid,
+        dst_port: focal_port,
         timestamp_ns: focal_ts,
         ..
     } = focal
     else {
-        return false;
+        return 0;
     };
-    distinct_dst_ports_in_window(*focal_pid, *focal_ts, recent, HEAVY_RECON_WINDOW_NS) + 1
-        >= HEAVY_RECON_DISTINCT_PORTS_MIN
-}
-
-fn distinct_dst_ports_in_window(
-    pid: u32,
-    focal_ts: u64,
-    recent: Recent<'_>,
-    window_ns: u64,
-) -> usize {
-    let mut ports: HashSet<u16> = HashSet::new();
+    let (pid, focal_ts) = (*pid, *focal_ts);
+    let mut ports: HashSet<u16> = HashSet::from([*focal_port]);
     for e in recent.iter() {
         if let Event::TcpConnect {
             pid: p,
@@ -1493,14 +1489,46 @@ fn lolbas_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     if !SHELL_COMMS.iter().any(|c| child_comm == c) {
         return false;
     }
-    // Find a recent ProcessSpawn whose pid == focal.ppid and whose
-    // comm matches a network-loader.
-    recent.iter().any(|e| match e {
-        Event::ProcessSpawn { pid, comm, .. } => {
-            *pid == *ppid && NETLOAD_COMMS.iter().any(|c| comm == c)
+    // The parent is a network loader when the image it ran last before the
+    // focal spawn is one: its latest recent `ProcessSpawn` (by kernel time)
+    // at or before the focal.
+    //
+    // Bug hunt 1.3, BUG51: any past spawn of the parent's pid used to do —
+    // a `curl` the parent ran before it executed `python3`, or a `curl` of
+    // a day ago whose pid the parent took since. Now only the parent's
+    // latest exec counts, and, when both starts are known, only an exec of
+    // the parent's own incarnation (its `start_ns` is the focal's
+    // `parent_start_ns`).
+    let Event::ProcessSpawn {
+        parent_start_ns,
+        timestamp_ns: focal_ts,
+        ..
+    } = focal
+    else {
+        return false;
+    };
+    let same_incarnation =
+        |start_ns: u64| *parent_start_ns == 0 || start_ns == 0 || start_ns == *parent_start_ns;
+    let mut latest: Option<(u64, &str)> = None;
+    for e in recent.iter() {
+        if let Event::ProcessSpawn {
+            pid,
+            comm,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = e
+        {
+            if *pid == *ppid
+                && *timestamp_ns <= *focal_ts
+                && same_incarnation(*start_ns)
+                && latest.is_none_or(|(ts, _)| *timestamp_ns >= ts)
+            {
+                latest = Some((*timestamp_ns, comm.as_str()));
+            }
         }
-        _ => false,
-    })
+    }
+    latest.is_some_and(|(_, comm)| NETLOAD_COMMS.contains(&comm))
 }
 
 fn exploit_attempt(focal: &Event) -> bool {
@@ -2278,8 +2306,9 @@ fn exfiltration_pattern(focal: &Event, recent: Recent<'_>, allow: &EscalationAll
     if !matches!(*dst_port, 80 | 443) {
         return false;
     }
-    // BUG-039: public dst (NOT internal) for v4 or v6.
-    if is_internal(dst_addr, *family) {
+    // BUG-039: public dst (NOT internal) for v4 or v6. Bug hunt 1.3,
+    // BUG41: and off the host and its link ([`is_external`]).
+    if !is_external(dst_addr, *family) {
         return false;
     }
     // BUG-032 count-filter: connections to an allowlisted (comm,dst)
@@ -2303,9 +2332,8 @@ fn exfiltration_pattern(focal: &Event, recent: Recent<'_>, allow: &EscalationAll
         } = e
         {
             if *pid == *focal_pid
-                && is_inet_family(*fam)
                 && matches!(*dp, 80 | 443)
-                && !is_internal(dst, *fam)
+                && is_external(dst, *fam)
                 && within(*focal_ts, *timestamp_ns, EXFIL_WINDOW_NS)
                 && counts(dst, *fam, *dp)
             {
@@ -2334,6 +2362,39 @@ fn is_inet_family(family: u8) -> bool {
 fn is_internal(addr: &[u8; 16], family: u8) -> bool {
     is_inet_family(family)
         && nn_model::netaddr::is_internal(nn_model::netaddr::canonical_ip(family, addr))
+}
+
+/// Is `addr` (a 16-byte wire address) a destination off the host and its
+/// link, for the exfiltration pattern? An inet `family`, and not
+/// [`is_internal`] (RFC 1918, unique-local, IPv6 link-local), loopback
+/// (`127/8`, `::1`), unspecified, multicast, nor IPv4 link-local
+/// (`169.254/16`, where a cloud instance's metadata service answers); an
+/// IPv4-mapped address is judged as the IPv4 address it maps.
+///
+/// Bug hunt 1.3, BUG41: the pattern counted every destination that was not
+/// internal, so twenty connects of a service to `127.0.0.1:443` (a local
+/// proxy, a health check) raised ExfiltrationPattern, an ENGAGED trigger
+/// that corroborates another class's heuristic of the same scope up to
+/// COMBAT and the ladder's kill of the process. CGNAT (`100.64/10`) stays
+/// external, as `nn_model::netaddr::is_internal` leaves it (external audit
+/// NET-011): a carrier's or an overlay network's peer is off the host —
+/// unlike `nn_model::netaddr::is_public`, which leaves it out.
+fn is_external(addr: &[u8; 16], family: u8) -> bool {
+    if !is_inet_family(family) {
+        return false;
+    }
+    let ip = nn_model::netaddr::canonical_ip(family, addr);
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || nn_model::netaddr::is_internal(ip)
+    {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_link_local(),
+        std::net::IpAddr::V6(_) => true,
+    }
 }
 
 fn is_write_open(flags: u32) -> bool {
@@ -5903,5 +5964,262 @@ mod tests {
         assert!(det
             .detect(&own_burst(1, 0, f, own_data::UNIT_BASE, 10), &[])
             .contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    // ── Bug hunt 1.3 (editions 1.2/1.3): BUG40, BUG41, BUG50, BUG51 ───
+
+    /// BUG40: ports {80, 443} and a focal that repeats 443 are two
+    /// distinct ports, below RECON_DISTINCT_PORTS_MIN (3); a focal on a
+    /// third port still fires.
+    #[test]
+    fn recon_counts_the_focal_port_once() {
+        let det = TriggerDetector::new();
+        let recent = vec![
+            tcp_v4(42, [127, 0, 0, 1], 80, 100),
+            tcp_v4(42, [127, 0, 0, 1], 443, 200),
+        ];
+        let focal = tcp_v4(42, [127, 0, 0, 1], 443, 300);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::Reconnaissance),
+            "2 distinct ports raised Reconnaissance: {hits:?}"
+        );
+        let focal = tcp_v4(42, [127, 0, 0, 1], 22, 300);
+        assert!(det
+            .detect(&focal, &recent)
+            .contains(&TriggerType::Reconnaissance));
+    }
+
+    /// BUG50: nine distinct ports (1..=9) and a focal back on port 9 are
+    /// nine, below HEAVY_RECON_DISTINCT_PORTS_MIN (10). A focal on a tenth
+    /// port fires; another process's ports and ports past the hour do not
+    /// count.
+    #[test]
+    fn heavy_recon_nine_ports_focal_repeats_one() {
+        let det = TriggerDetector::new();
+        const SEC: u64 = 1_000_000_000;
+        let recent: Vec<Event> = (1..=9u16)
+            .map(|p| tcp_v4(42, [127, 0, 0, 1], p, u64::from(p) * SEC))
+            .collect();
+        let focal = tcp_v4(42, [127, 0, 0, 1], 9, 10 * SEC);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::HeavyReconnaissance),
+            "9 distinct ports raised HeavyReconnaissance: {hits:?}"
+        );
+        let tenth = tcp_v4(42, [127, 0, 0, 1], 10, 10 * SEC);
+        assert!(det
+            .detect(&tenth, &recent)
+            .contains(&TriggerType::HeavyReconnaissance));
+        let other_pid = tcp_v4(43, [127, 0, 0, 1], 10, 10 * SEC);
+        assert!(!det
+            .detect(&other_pid, &recent)
+            .contains(&TriggerType::HeavyReconnaissance));
+        let past_the_hour = tcp_v4(42, [127, 0, 0, 1], 10, 3_602 * SEC);
+        assert!(!det
+            .detect(&past_the_hour, &recent)
+            .contains(&TriggerType::HeavyReconnaissance));
+    }
+
+    /// BUG41: twenty connects from one pid to a loopback, unspecified,
+    /// multicast or IPv4 link-local destination on 80/443 never leave the
+    /// host or its link: no ExfiltrationPattern ("20 external 80/443
+    /// connects"). Controls: a public and a CGNAT destination still fire,
+    /// an internal one does not (as before).
+    #[test]
+    fn exfil_ignores_loopback_and_link_local() {
+        let det = TriggerDetector::new();
+        const SEC: u64 = 1_000_000_000;
+        let v6addr = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let mut fired = Vec::new();
+        let v4 = |dst: [u8; 4], port: u16| -> (Event, Vec<Event>) {
+            let recent = (1..20u64)
+                .map(|i| tcp_v4_comm(7, "app", dst, port, i * SEC))
+                .collect();
+            (tcp_v4_comm(7, "app", dst, port, 20 * SEC), recent)
+        };
+        let v6 = |dst: [u8; 16], port: u16| -> (Event, Vec<Event>) {
+            let recent = (1..20u64)
+                .map(|i| tcp_v6(7, "app", dst, port, i * SEC))
+                .collect();
+            (tcp_v6(7, "app", dst, port, 20 * SEC), recent)
+        };
+        let fires = |(f, r): (Event, Vec<Event>)| {
+            det.detect(&f, &r)
+                .contains(&TriggerType::ExfiltrationPattern)
+        };
+        for (name, case) in [
+            ("127.0.0.1:80", v4([127, 0, 0, 1], 80)),
+            ("127.8.9.10:443", v4([127, 8, 9, 10], 443)),
+            ("169.254.169.254:80", v4([169, 254, 169, 254], 80)),
+            ("0.0.0.0:443", v4([0, 0, 0, 0], 443)),
+            ("224.0.0.251:443", v4([224, 0, 0, 251], 443)),
+            ("[::1]:443", v6(v6addr("::1"), 443)),
+            ("[::]:443", v6(v6addr("::"), 443)),
+            ("[ff02::1]:443", v6(v6addr("ff02::1"), 443)),
+            ("[::ffff:127.0.0.1]:80", v6(v6addr("::ffff:127.0.0.1"), 80)),
+            (
+                "[::ffff:169.254.169.254]:80",
+                v6(v6addr("::ffff:169.254.169.254"), 80),
+            ),
+            ("10.0.0.5:443", v4([10, 0, 0, 5], 443)),
+            ("[fe80::1]:443", v6(v6addr("fe80::1"), 443)),
+        ] {
+            if fires(case) {
+                fired.push(name);
+            }
+        }
+        assert!(
+            fired.is_empty(),
+            "ExfiltrationPattern on host-local destinations: {fired:?}"
+        );
+        // controls: a public and a CGNAT destination still fire
+        for (name, case) in [
+            ("203.0.113.9:443", v4([203, 0, 113, 9], 443)),
+            ("100.64.0.1:443", v4([100, 64, 0, 1], 443)),
+            ("[2001:db8::1]:443", v6(v6addr("2001:db8::1"), 443)),
+            (
+                "[::ffff:100.64.0.1]:80",
+                v6(v6addr("::ffff:100.64.0.1"), 80),
+            ),
+        ] {
+            assert!(fires(case), "{name}");
+        }
+    }
+
+    /// BUG41: loopback connects in the window do not count toward a public
+    /// destination's twenty either.
+    #[test]
+    fn exfil_counts_only_external_connects_in_the_window() {
+        let det = TriggerDetector::new();
+        const SEC: u64 = 1_000_000_000;
+        let mut recent: Vec<Event> = (1..10u64)
+            .map(|i| tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, i * SEC))
+            .collect();
+        recent.extend((10..20u64).map(|i| tcp_v4_comm(7, "app", [127, 0, 0, 1], 443, i * SEC)));
+        let focal = tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, 20 * SEC);
+        assert!(!det
+            .detect(&focal, &recent)
+            .contains(&TriggerType::ExfiltrationPattern));
+        // nineteen public connects, then a loopback one judged: not the
+        // twentieth (the public twentieth raises it)
+        let public: Vec<Event> = (1..20u64)
+            .map(|i| tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, i * SEC))
+            .collect();
+        let lo = tcp_v4_comm(7, "app", [127, 0, 0, 1], 443, 20 * SEC);
+        assert!(!det
+            .detect(&lo, &public)
+            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(det
+            .detect(&focal, &public)
+            .contains(&TriggerType::ExfiltrationPattern));
+        // a connect of another family (not inet) does not count either
+        let mut other_family = recent.clone();
+        other_family.extend((10..20u64).map(|i| {
+            let mut e = tcp_v6(
+                7,
+                "app",
+                "2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+                443,
+                i * SEC,
+            );
+            if let Event::TcpConnect { family, .. } = &mut e {
+                *family = 1;
+            }
+            e
+        }));
+        assert!(!det
+            .detect(&focal, &other_family)
+            .contains(&TriggerType::ExfiltrationPattern));
+        recent.extend((10..20u64).map(|i| tcp_v4_comm(7, "app", [100, 64, 1, 2], 80, i * SEC)));
+        assert!(det
+            .detect(&focal, &recent)
+            .contains(&TriggerType::ExfiltrationPattern));
+    }
+
+    /// BUG51: pid 7 ran curl, then python3; the parent of the shell is
+    /// python3 when it spawns it — not a network loader. A shell spawned
+    /// between the two execs is curl's (in kernel time, whatever order the
+    /// recent events are in).
+    #[test]
+    fn lolbas_parent_latest_exec_is_not_a_loader() {
+        let det = TriggerDetector::new();
+        let recent = vec![
+            spawn(7, 1, "curl", "/usr/bin/curl", 1),
+            spawn(7, 1, "python3", "/usr/bin/python3", 3),
+        ];
+        let focal = spawn(8, 7, "sh", "/usr/bin/sh", 4);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::Lolbas),
+            "Lolbas for python3 -> sh (pid 7's older curl exec): {hits:?}"
+        );
+        let between = spawn(8, 7, "sh", "/usr/bin/sh", 2);
+        assert!(det.detect(&between, &recent).contains(&TriggerType::Lolbas));
+        let reversed: Vec<Event> = recent.iter().rev().cloned().collect();
+        assert!(!det.detect(&focal, &reversed).contains(&TriggerType::Lolbas));
+        assert!(det
+            .detect(&between, &reversed)
+            .contains(&TriggerType::Lolbas));
+        // two execs stamped alike: the one recorded last is the latest
+        let tie = vec![
+            spawn(7, 1, "curl", "/usr/bin/curl", 3),
+            spawn(7, 1, "python3", "/usr/bin/python3", 3),
+        ];
+        assert!(!det.detect(&focal, &tie).contains(&TriggerType::Lolbas));
+        let tie: Vec<Event> = tie.into_iter().rev().collect();
+        assert!(det.detect(&focal, &tie).contains(&TriggerType::Lolbas));
+    }
+
+    /// BUG51: a curl of a day ago whose pid a later process took (its
+    /// start is not the shell's parent's start) is not the shell's parent;
+    /// the curl of the parent's own start is, and so is one whose start is
+    /// not known (on either side).
+    #[test]
+    fn lolbas_reused_parent_pid_a_day_later() {
+        let det = TriggerDetector::new();
+        const DAY: u64 = 24 * 3600 * 1_000_000_000;
+        let curl_started = |start: u64, ts: u64| {
+            let mut curl = spawn(7, 1, "curl", "/usr/bin/curl", ts);
+            if let Event::ProcessSpawn { start_ns, .. } = &mut curl {
+                *start_ns = start;
+            }
+            curl
+        };
+        let sh_of = |parent_start: u64| {
+            let mut focal = spawn(8, 7, "sh", "/usr/bin/sh", DAY + 500);
+            if let Event::ProcessSpawn {
+                parent_start_ns, ..
+            } = &mut focal
+            {
+                *parent_start_ns = parent_start;
+            }
+            focal
+        };
+        let lolbas = |focal: &Event, recent: &[Event]| {
+            det.detect(focal, recent).contains(&TriggerType::Lolbas)
+        };
+        let old_curl = curl_started(100, 110);
+        assert!(
+            !lolbas(&sh_of(DAY), std::slice::from_ref(&old_curl)),
+            "Lolbas from a day-old curl whose pid was reused"
+        );
+        assert!(lolbas(&sh_of(DAY), &[curl_started(DAY, DAY + 10)]));
+        assert!(lolbas(&sh_of(0), std::slice::from_ref(&old_curl)));
+        assert!(lolbas(&sh_of(DAY), &[curl_started(0, 110)]));
+        // the reused pid's own exec (not a loader) is the latest
+        assert!(!lolbas(
+            &sh_of(DAY),
+            &[old_curl, curl_started(0, 110), {
+                let mut py = spawn(7, 1, "python3", "/usr/bin/python3", DAY + 10);
+                if let Event::ProcessSpawn { start_ns, .. } = &mut py {
+                    *start_ns = DAY;
+                }
+                py
+            }]
+        ));
     }
 }

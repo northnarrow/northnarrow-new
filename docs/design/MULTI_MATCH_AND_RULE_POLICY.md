@@ -35,7 +35,8 @@ kill through"); multi-match makes it unnecessary.
 
 For each event the engine evaluates **every** rule, in registration order
 (the flow ledger of lab PR 224 still skips a rule that already answered the
-same flow). Every rule's `evaluate` runs, so every stateful rule (chains,
+same flow, and a chain once a chain's answer acted on it — bug hunt 1.3,
+BUG45, below). Every rule's `evaluate` runs, so every stateful rule (chains,
 windows, accumulators, the correlation store) sees every event: the state is
 updated by every rule, not only a winner. Each verdict is a **match**.
 
@@ -81,7 +82,23 @@ The decision is computed from the set:
   primary's first (lab PR 221's ordering inside each). `matches` is absent
   on a single-match record, so such a line keeps its bytes.
 - **flow ledger**: every matched rule is noted for the flow (lab PR 224), so
-  none answers the same flow twice.
+  none answers the same flow twice, with whether its response ran (after the
+  policy and the legacy ceiling). Bug hunt 1.3, BUG45 (decision of
+  10/11/2026): a match the policy turns `off`, or whose exemption covers the
+  actor, is not noted — it is no answer, and an `off` NN-L-CHAIN-002 at a
+  connect no longer takes the flow's chain verdict from the CHAIN-001 or
+  CHAIN-007 kill a credential read on the open session completes at the
+  next snapshot. The flow's one chain verdict is held by a chain answer that
+  **acted**; one that was only a record (an aged precursor's High `Log`, an
+  `alert` or `audit` mode, NN-L-CHAIN-008's `Log`, a kill held by a switch
+  or the ceiling) leaves the chains judging the later phases, and a chain
+  match there is kept only if it acts — the same chain's included (an aged
+  read at the connect, a fresh one on the open session). A chain match that
+  would again be only a record is dropped before the combination, as an
+  excluded rule is. Other rules still answer a flow once. An exempt match is
+  judged again in the later phases: its audit record may repeat (the
+  detection budget bounds it), and an exemption revoked meanwhile (lot 281)
+  no longer hides the flow from the rule.
 
 ### 2.1 The legacy ceiling
 

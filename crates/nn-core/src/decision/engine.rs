@@ -292,7 +292,6 @@ impl<H: DecisionHost> RuleEngine<H> {
         let policy = self.policy.current();
         // The event's actor, for a uid exemption (read once, if asked).
         let principal = std::cell::OnceCell::new();
-        let mut matched: Vec<&'static str> = Vec::new();
         let mut matches = Vec::new();
         for (index, rule) in self.rules.iter().enumerate() {
             if fired
@@ -307,7 +306,6 @@ impl<H: DecisionHost> RuleEngine<H> {
             };
             let v = posture_floor::hold(rule.id(), v, posture, event, H::account_kind);
             let held = response_policy::take_held();
-            matched.push(rule.id());
             let facts = &*self.facts;
             let exempt = |v: &Verdict| {
                 let p = principal
@@ -315,15 +313,18 @@ impl<H: DecisionHost> RuleEngine<H> {
                 let uid = (p.pid == v.event_pid).then_some(p.uid);
                 rule_policy::exempt(policy.exemptions(rule.id()), v.event_pid, uid, facts)
             };
-            matches.push(combine::apply_policy(
-                index,
-                rule.id(),
-                rule.attack(),
-                v,
-                held,
-                &policy,
-                exempt,
-            ));
+            let m =
+                combine::apply_policy(index, rule.id(), rule.attack(), v, held, &policy, exempt);
+            // Bug hunt 1.3, BUG45: on a flow a chain answered with a
+            // record only, a chain's match that would again be a record is
+            // dropped (one that acts answers the flow).
+            if fired
+                .as_deref()
+                .is_some_and(|f| flow_ledger::suppressed(rule.id(), m.acts(), f))
+            {
+                continue;
+            }
+            matches.push(m);
         }
         let mut decision = combine::combine(matches);
         match (flow, key) {
@@ -332,9 +333,11 @@ impl<H: DecisionHost> RuleEngine<H> {
                 match nf.phase {
                     // The flow is over: nothing more will name it.
                     FlowPhase::Closed => ledger.forget(&key),
+                    // Bug hunt 1.3, BUG45: what each match answered.
                     FlowPhase::Connect | FlowPhase::Snapshot => {
-                        for id in &matched {
-                            ledger.record(key, id);
+                        let matched = decision.iter().flat_map(|d| d.matches.iter());
+                        for a in matched.filter_map(flow_ledger::answer_of) {
+                            ledger.record(key, a.rule_id, a.acted);
                         }
                     }
                     // No flow follows a refused connect.
@@ -350,10 +353,15 @@ impl<H: DecisionHost> RuleEngine<H> {
             _ => {
                 if let Some(d) = &decision {
                     for m in &d.matches {
-                        if m.rule_id.starts_with("NN-L-CHAIN-") && m.verdict.timestamp_ns != 0 {
-                            self.flow_ledger
-                                .lock()
-                                .record((m.verdict.event_pid, m.verdict.timestamp_ns), m.rule_id);
+                        if !m.rule_id.starts_with("NN-L-CHAIN-") || m.verdict.timestamp_ns == 0 {
+                            continue;
+                        }
+                        if let Some(a) = flow_ledger::answer_of(m) {
+                            self.flow_ledger.lock().record(
+                                (m.verdict.event_pid, m.verdict.timestamp_ns),
+                                a.rule_id,
+                                a.acted,
+                            );
                         }
                     }
                 }
