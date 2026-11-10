@@ -36,6 +36,16 @@
 //! signed [`ActionRow::Interrupted`] row: whether that action took effect is
 //! not known, and the operator is told (a WARN, the status, and the boot's
 //! signed `response_interrupted` audit row).
+//!
+//! Lot 296 (lot 295's finding): the chain's rows are written by the response
+//! threads (role actuator), which may not lift the state directory's `+i`
+//! (`CAP_LINUX_IMMUTABLE`, the writer role's). Their rotation sealed the
+//! active file, failed the rename, and every later row was lost. Now such a
+//! thread seals nothing: its rows go on past the cap and the rotation is
+//! owed ([`crate::chainlog::RotatingChainLog::rotate_owed`]) to the chain's
+//! rotation thread ([`ROTOR_THREAD`], role writer), which the journal starts
+//! when it is bound and wakes when a row leaves a rotation owed. The
+//! actuator is given no capability for it.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +153,17 @@ struct Inner {
     writer: Mutex<Writer>,
     counters: Counters,
     clock: Arc<dyn Clock>,
+    /// Lot 296: the rotation thread's wake-up ([`ROTOR_THREAD`]); `None`
+    /// before [`ActionJournal::bind`], or when it could not start.
+    rotor: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Lot 296: the rotation thread's last rotation failed (said once).
+    rotor_failed: std::sync::atomic::AtomicBool,
 }
+
+/// Lot 296: the `actions` chain's rotation thread (role writer: it may lift
+/// the state directory's `+i`): it rotates the chain when a response
+/// thread's row left a rotation owed.
+pub const ROTOR_THREAD: &str = "nn-actions-rotate";
 
 /// The writer of the `actions` chain (see the module's doc). Cheap to
 /// clone: every clone writes the same chain.
@@ -181,6 +201,8 @@ impl ActionJournal {
                 writer: Mutex::new(writer),
                 counters: Counters::default(),
                 clock,
+                rotor: Mutex::new(None),
+                rotor_failed: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -237,6 +259,7 @@ impl ActionJournal {
             }
         };
         *self.inner.writer.lock() = Writer::Log(Box::new(log));
+        self.start_rotor();
         for open in unanswered_intents(&rows, &self.inner.run) {
             let what = open
                 .intent
@@ -249,6 +272,41 @@ impl ActionJournal {
             recovery.open.push((open.run.clone(), open.action, what));
         }
         recovery
+    }
+
+    /// Lot 296: start the chain's rotation thread (once). It must be started
+    /// by a thread that holds the core's sets — the start's, which binds the
+    /// journal: it inherits its creator's, and takes the writer's role. When
+    /// it cannot start, a rotation owed waits for a thread that may rotate
+    /// (the run's last row, at the stop), the rows past the cap kept.
+    fn start_rotor(&self) {
+        let mut rotor = self.inner.rotor.lock();
+        if rotor.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::downgrade(&self.inner);
+        let started = std::thread::Builder::new()
+            .name(ROTOR_THREAD.to_string())
+            .spawn(move || {
+                crate::caps::enter_or_report(crate::caps::Role::Writer);
+                // ends with the journal: its sender dropped with it
+                while rx.recv().is_ok() {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    rotate_owed(&inner);
+                }
+            });
+        match started {
+            Ok(_) => *rotor = Some(tx),
+            Err(e) => error!(
+                target: "response.journal",
+                error = %e,
+                "the actions chain's rotation thread did not start — a rotation a response \
+                 thread cannot do waits for the stop; its rows go on past the cap"
+            ),
+        }
     }
 
     /// R12c-3: the run's start, once the boot signed its audit row of
@@ -289,10 +347,10 @@ impl ActionJournal {
                 .counters
                 .interrupted
                 .fetch_add(1, Ordering::Relaxed);
-            write_row(&mut w, &self.inner.counters, row);
+            write_row(&mut w, &self.inner, row);
         }
         let started = self.run_row(ActionRow::RunStarted);
-        write_row(&mut w, &self.inner.counters, started);
+        write_row(&mut w, &self.inner, started);
         self.commit(w);
     }
 
@@ -300,7 +358,7 @@ impl ActionJournal {
     pub fn end_run(&self) {
         let mut w = self.inner.writer.lock();
         let ended = self.run_row(ActionRow::RunEnded);
-        write_row(&mut w, &self.inner.counters, ended);
+        write_row(&mut w, &self.inner, ended);
         self.commit(w);
     }
 
@@ -328,7 +386,7 @@ impl ActionJournal {
             noted_by: None,
         };
         let mut w = self.inner.writer.lock();
-        write_row(&mut w, &self.inner.counters, row);
+        write_row(&mut w, &self.inner, row);
         self.commit(w);
     }
 
@@ -379,7 +437,7 @@ impl ActionJournal {
                 overflow: None,
                 noted_by: None,
             };
-            let written = write_row(&mut w, &self.inner.counters, row);
+            let written = write_row(&mut w, &self.inner, row);
             if written {
                 self.inner.counters.intents.fetch_add(1, Ordering::Relaxed);
             }
@@ -418,7 +476,7 @@ impl ActionJournal {
             noted_by: None,
         };
         let mut w = self.inner.writer.lock();
-        if write_row(&mut w, &self.inner.counters, row) {
+        if write_row(&mut w, &self.inner, row) {
             self.inner
                 .counters
                 .overflow_rows
@@ -554,7 +612,7 @@ impl ActionJournal {
             noted_by: None,
         };
         let mut w = self.inner.writer.lock();
-        if write_row(&mut w, &self.inner.counters, row) {
+        if write_row(&mut w, &self.inner, row) {
             self.inner.counters.outcomes.fetch_add(1, Ordering::Relaxed);
         }
         if durable {
@@ -681,16 +739,26 @@ pub(crate) fn test_intent() -> Intent {
 /// Append `row`, written, not synced (the caller's [`ActionJournal::commit`]
 /// syncs). A row the writer cannot take is logged whole at ERROR and
 /// counted. Returns whether it is in the chain (or the memory journal).
-fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord) -> bool {
+fn write_row(w: &mut Writer, inner: &Inner, row: ActionRecord) -> bool {
+    let counters = &inner.counters;
     let why = match w {
         Writer::Memory(rows) => {
             rows.push(row);
             return true;
         }
-        Writer::Log(log) => match log.append_deferred(row.clone()) {
-            Ok(_) => return true,
-            Err(e) => format!("{e:#}"),
-        },
+        Writer::Log(log) => {
+            let appended = log.append_deferred(row.clone());
+            if log.rotation_owed() {
+                // lot 296: to the thread that may rotate
+                if let Some(rotor) = &*inner.rotor.lock() {
+                    let _ = rotor.send(());
+                }
+            }
+            match appended {
+                Ok(_) => return true,
+                Err(e) => format!("{e:#}"),
+            }
+        }
         Writer::Late => "the actions chain is not open yet".to_string(),
         Writer::Off(why) => why.clone(),
     };
@@ -704,6 +772,39 @@ fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord) -> bool {
          action proceeds"
     );
     false
+}
+
+/// Lot 296: the rotation a response thread's row left owed, on the rotation
+/// thread. A failure is said once (ERROR), and again only after a rotation
+/// went through: the rows go on past the cap meanwhile, none lost.
+fn rotate_owed(inner: &Inner) {
+    let mut w = inner.writer.lock();
+    let Writer::Log(log) = &mut *w else {
+        return;
+    };
+    match log.rotate_owed() {
+        Ok(true) => {
+            inner.rotor_failed.store(false, Ordering::Relaxed);
+            let (file, bytes) = log.position();
+            tracing::info!(
+                target: "response.journal",
+                file,
+                bytes,
+                "the actions chain rotated on its rotation thread"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            if !inner.rotor_failed.swap(true, Ordering::Relaxed) {
+                error!(
+                    target: "response.journal",
+                    error = %format!("{e:#}"),
+                    "the actions chain could not rotate on its rotation thread — its rows go \
+                     on past the cap, none lost; tried again at the next row"
+                );
+            }
+        }
+    }
 }
 
 /// The rows of the chain's newest archive and active file, in chain order
@@ -1232,5 +1333,260 @@ mod tests {
         ] {
             assert!(!synced_before_action(r), "{r}");
         }
+    }
+
+    /// Lot 296: the state directory's protection as the agent's threads meet
+    /// it — only the writer's role may lift it: here, the rotation thread.
+    struct OnlyTheRotor;
+
+    impl crate::chainlog::ProtectionManager for OnlyTheRotor {
+        fn with_mutable_dir(
+            &self,
+            f: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            if std::thread::current().name() != Some(ROTOR_THREAD) {
+                anyhow::bail!(
+                    "lifting immutability on the state directory: FS_IOC_SETFLAGS: Operation \
+                     not permitted (os error 1)"
+                );
+            }
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lot 296 (lot 295's finding in the lab): the response threads may not
+    /// lift the state directory, so the chain's rotation sealed its file,
+    /// failed, and every later action's rows were lost (an ERROR each).
+    /// Rows written by such threads past the cap are kept, the rotation
+    /// thread rotates the chain, and every row is in it, verifiable.
+    #[test]
+    fn actions_past_the_cap_rotate_and_the_chain_stays_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("k");
+        let log = ActionJournal::open_log(
+            &active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: 16 * 1024,
+                max_archives: 500,
+                file_mode: 0o600,
+            },
+            Arc::new(OnlyTheRotor),
+        )
+        .unwrap();
+        let j = ActionJournal::late();
+        j.bind(log, &active);
+        // a burst from response threads, past the cap several times
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let j = j.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("nn-response-{t}"))
+                    .spawn(move || {
+                        for n in 0..60 {
+                            j.intent(intent_row("KillProcess", 1000 * t + n)).finish(
+                                ActionResult::Success,
+                                "Killed".into(),
+                                None,
+                            );
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // the rotation thread's last rotation, then one more row
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while match &*j.inner.writer.lock() {
+            Writer::Log(log) => log.rotation_owed(),
+            _ => false,
+        } {
+            assert!(
+                Instant::now() < deadline,
+                "the rotation thread never rotated"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        j.intent(intent_row("KillProcess", 9999)).finish(
+            ActionResult::Success,
+            "Killed".into(),
+            None,
+        );
+        let counts = j.counts();
+        assert_eq!(counts.unwritten, 0, "no row lost");
+        assert_eq!((counts.intents, counts.outcomes), (241, 241));
+        let archives = crate::chainlog::archives_newest_first(&active);
+        assert!(archives.len() >= 2, "rotated: {archives:?}");
+        let pk = crate::keys::AgentSigningKey::load_or_bootstrap(&key_path)
+            .unwrap()
+            .verifying_key();
+        drop(j);
+        let r = crate::chainlog::verify_log_set::<ActionRecord>(&active, &pk);
+        assert!(
+            r.as_ref().is_ok_and(|r| r.total_records == 2 * 241),
+            "{r:?}"
+        );
+    }
+
+    /// A writer for one test's log lines.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A protection that refuses while `0` is set.
+    struct Refusing(std::sync::atomic::AtomicBool);
+
+    impl crate::chainlog::ProtectionManager for Refusing {
+        fn with_mutable_dir(
+            &self,
+            f: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            if self.0.load(Ordering::Relaxed) {
+                anyhow::bail!("Operation not permitted (os error 1)");
+            }
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lot 296: no line per row — a thread that may not rotate says so once
+    /// (WARN), keeping its rows; a rotation the rotation thread cannot do
+    /// either is said once (ERROR), and again only after one went through.
+    /// Its log lines are read in a process of its own (the helper below): a
+    /// test thread's subscriber misses events the other tests' threads
+    /// raced it to.
+    #[test]
+    fn a_rotation_that_cannot_be_done_is_said_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "response::journal::tests::said_once_helper",
+                "--test-threads=1",
+            ])
+            .env("NN_JOURNAL_SAID_ONCE_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the helper: {st}");
+        assert!(
+            dir.path().join("done").exists(),
+            "the helper ran its checks"
+        );
+    }
+
+    /// The body of [`a_rotation_that_cannot_be_done_is_said_once`], in a
+    /// process of its own. A no-op without its variable.
+    #[test]
+    #[ignore = "a helper: run by a_rotation_that_cannot_be_done_is_said_once"]
+    fn said_once_helper() {
+        let Some(dir) = std::env::var_os("NN_JOURNAL_SAID_ONCE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let active = dir.join("actions.jsonl");
+        let prot = Arc::new(Refusing(std::sync::atomic::AtomicBool::new(false)));
+        let log = ActionJournal::open_log(
+            &active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(&dir.join("k")).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: 16 * 1024,
+                max_archives: 50,
+                file_mode: 0o600,
+            },
+            prot.clone(),
+        )
+        .unwrap();
+        // bound without its rotation thread: the test calls it
+        let j = ActionJournal::late();
+        *j.inner.writer.lock() = Writer::Log(Box::new(log));
+        prot.0.store(true, Ordering::Relaxed);
+        let lines = |f: &mut dyn FnMut()| {
+            let out = Captured::default();
+            let sub = tracing_subscriber::fmt()
+                .with_writer(out.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(sub, f);
+            let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+            text
+        };
+        let burst = |j: &ActionJournal, from: u32| {
+            for n in 0..40 {
+                j.intent(intent_row("KillProcess", from + n)).finish(
+                    ActionResult::Success,
+                    "Killed".into(),
+                    None,
+                );
+            }
+        };
+        let text = lines(&mut || burst(&j, 0));
+        assert_eq!(j.counts().unwritten, 0, "rows kept past the cap");
+        assert_eq!(
+            text.matches("go on past the cap until").count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("ERROR"), "{text}");
+        let text = lines(&mut || {
+            for _ in 0..3 {
+                rotate_owed(&j.inner);
+            }
+        });
+        assert_eq!(
+            text.matches("could not rotate on its rotation thread")
+                .count(),
+            1,
+            "{text}"
+        );
+        // the rotation goes through, then cannot again: said again, once
+        prot.0.store(false, Ordering::Relaxed);
+        rotate_owed(&j.inner);
+        assert_eq!(crate::chainlog::archives_newest_first(&active).len(), 1);
+        prot.0.store(true, Ordering::Relaxed);
+        let text = lines(&mut || {
+            burst(&j, 100);
+            rotate_owed(&j.inner);
+            rotate_owed(&j.inner);
+        });
+        assert_eq!(
+            text.matches("go on past the cap until").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("could not rotate on its rotation thread")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(j.counts().unwritten, 0);
+        std::fs::write(dir.join("done"), b"").unwrap();
     }
 }

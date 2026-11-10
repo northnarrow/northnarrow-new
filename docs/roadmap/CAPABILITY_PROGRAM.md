@@ -8329,6 +8329,193 @@ number in parentheses is a lab PR.
     registration) and the held maps and programs left out (every map and
     program the agent holds is its object's, registered already).
   - Level unchanged (C23 2, provisional): a fix inside the capability.
+- **Lot 296 — the chain writers, the audit log and the export after a failed
+  write: the external bug hunt's lot 6** (`fix/w4-bh-chain-writers`; the
+  triage of editions 1.2/1.3, lot 6: P1 BUG15; then BUG17, BUG27, BUG39,
+  BUG10, BUG31; and lot 295's finding, the actions chain that could not
+  rotate, added by the coordinator).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): a full disk stops a row part-way
+    and the writer's next row was glued to the fragment — the audit log
+    refused at the next start, so the agent did not start in enforce mode
+    (BUG15, P1), a rotating log broken for good (BUG17); after a failed
+    fsync of a row written whole the next row forked the chain (BUG27);
+    a torn tail was cut before its repair was attested, and a failed
+    attestation was never written again (BUG39); a retention pass that
+    failed part-way lost the `Evicted` rows of what it had removed, and an
+    entry at the oldest archive's name stopped every later pass (BUG10);
+    the JSONL export glued a retried batch to the start of a line its failed
+    write left (BUG31).
+  - What changed (`EVIDENCE_CHAINS.md` "What the agent did about it",
+    `EXPORT.md` §3 and §8, upgrade notes §20): a writer is poisoned by any
+    failed write or fsync, and its next append reads its tail again as the
+    open does — the start of a row cut and the cut attested (the audit
+    chain's `chain_tail_repaired`, a manifest's `torn_tail_repaired`), a row
+    written whole adopted, a seal written whole finishing its rotation; the
+    active file's torn tail attested before it is cut, the manifest's own
+    replaced by its attesting row in one positioned write; each rotating
+    log's manifest created at its open (empty), so the actions chain's
+    response threads, which may not lift the state directory's
+    immutability, can attest a repair (found by the lab's first round); a
+    failed eviction keeps the rows of what it removed, a non-regular entry
+    at an archive's name is left in place and passed; the JSONL sink closes
+    the start of a line its last write left, and the worker keeps its sink
+    across the error. The actions chain: a thread the protection refuses
+    (the response threads hold no `CAP_LINUX_IMMUTABLE`) seals nothing, its
+    rows go on past the cap and the rotation is owed to the chain's
+    rotation thread (`nn-actions-rotate`, the writer's role) — it was sealed,
+    the rename refused, and every later action row lost. `ChainHost` gains `append_all` and `sync_all` (std's
+    calls by default): the tests' host fails them part-way.
+  - The lab, as measured (our own guest under lease k296, **Ubuntu 24.04**
+    `6.8.0-147-generic`, clean at the start: no agent, no pin, no overlay;
+    the root filesystem — the state directories' — filled as root with
+    `fallocate` and `dd` to ENOSPC, 4,091–4,093 blocks left in ext4's own
+    reserve, while R001 killed `www-data` execs from `/tmp` and
+    `nn-admin response status` wrote audit rows, every 3 s for about 70 s,
+    then the space given back; the agent uninstalled and the guest powered
+    off at each round's end):
+    - Round r1 (9aaed551): the audit log took **6** `chain_tail_repaired`
+      rows (the row's fragment, then the attestations' own, each 349 bytes
+      at one block's end) and verified; the detections and heartbeat logs
+      one `torn_tail_repaired` each and verified; the netflow log ended in
+      a fragment until its next row, 50 s after the space came back, then
+      repaired and attested. **The actions chain stalled**: opened empty, it
+      had no manifest, and its repair, run on a response thread, had to
+      create one inside the `+i` lift (EPERM: the thread may not lift it,
+      lot 295's finding for its rotation) — every later action row lost
+      (an ERROR each) and the fragment left; fixed in fc8ae59c (the
+      manifest at the open). The cold boot after: the agent active, its
+      pin root and LSM programs (bootcheck OK) — the audit log with its
+      repairs opened.
+    - Round r2 (fc8ae59c, this PR's code): the six rotating logs' manifests
+      there from the open, empty; while full the audit log, the actions,
+      detections, heartbeat and netflow logs each ended in a fragment (the
+      kernel's short write at a block's end); with the space back (and a few
+      TCP connects for the netflow log) **every chain ends in a whole line
+      and `nn-admin chain verify` is OK for all ten** (rc 0): the audit log
+      9 `chain_tail_repaired` rows, the four logs one `torn_tail_repaired`
+      each (115 to 1,073 bytes cut), 21 action rows lost while the disk was
+      full (ENOSPC, an ERROR each) and **none** after. The cold boot: the
+      bootcheck OK, `chain verify` OK again (10 heads anchored, a checkpoint
+      reachable in each log written).
+    - Round r3 (5b2eba78, the actions chain's rotation, added by the
+      coordinator from lot 295's finding): `NN_ACTIONS_CAP_BYTES` at 1 MiB,
+      **1,150 R001 kills** of `www-data` execs in bursts of 50: the response
+      threads' rows went past the cap (WARN `this thread may not rotate
+      the log`, once), the rotation thread `nn-actions-rotate` rotated the
+      chain (INFO, once; archive 1 of 1,050,105 bytes), **1,150 intents and
+      1,150 outcomes in the chain, 0 rows not in it** (`nn-admin status`),
+      `nn-admin chain verify --log actions` OK (2,303 records, 1 archive, 3
+      checkpoints). After the cold boot: bootcheck OK, all ten chains OK.
+      On `main` the same burst past the cap loses every later row (the
+      host test: 445 of 480 rows lost).
+    - Not measured in the lab: the export (off by default; its sink's short
+      write is the kernel's in the host test), a failed fsync (no failing
+      device), a retention pass (the host tests).
+  - Host: a named test for each bug; on `main` (d8ae57f1, the lot's tests
+    that need no new API, as at 3dc7bc08) 8 of them fail — among them the agent's host with the kernel's own short
+    write (`RLIMIT_FSIZE`, a helper process: the audit log refused at the
+    reopen, `line 2 (558 bytes) is not an audit row`) — and 1 control
+    passes; the rest need the new host seam and fail with their fix
+    reverted. Mutation on the fixes: 59 mutants on the final code, all
+    caught by a named test (6 survivors of the first pass named, or their
+    code removed as unreachable; the actions chain's rotation 12 of 12).
+    The CI's privileged run on the PR found the open's manifest lifting the
+    installed agent's state directory from every test agent (the
+    protection's directory is the fixed one): the installed agent's ladder
+    killed the later suites and isolated the guest; the manifest is now
+    created without a lift where its directory takes a new name. Gates on the PR's tree: eBPF, the four clippy runs,
+    fmt, 94 suites (one failure in the first run: xtask's pure-crate check
+    on two of this lot's tests, which named `std::os` in nn-evidence —
+    moved, rerun green), the privileged no-run, the debug-trigger builds,
+    the eBPF maps (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage, golden ×5
+    (57 files, the same bytes), MSRV 1.89, the fuzz replay (14), portable
+    (5), the lockfiles unchanged.
+  - Open: a fragment left by an export worker that ended in the middle of a
+    write is not closed (the worker cannot read its files); an idle chain
+    shows its fragment to `nn-admin chain verify` until its next row or the
+    next start; the flat chains of nn-linux (canary registry and access
+    log, FIM baseline, the listener log) keep their own `write_all`
+    without a re-read (not in this lot's bugs; a follow-up); the actions
+    chain's rotation is the rotation thread's (a rotation it cannot do
+    either leaves the rows past the cap, said once).
+  - Levels unchanged (C21 1, C23 2 provisional): an evidence-integrity gap
+    of the writers closed and measured on one kernel — not a new
+    capability.
+
+- **Lot 297 — the agent's stores and the watchdog's respawn argv: the
+  external bug hunt's lot 7** (`fix/w4-bh-agent-stores-watchdog`; the triage
+  of editions 1.2/1.3, lot 7: BUG64, BUG48, BUG63, BUG59, BUG61, BUG69,
+  BUG74, BUG58, BUG67, BUG81 documentation only; all P2/P3).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): one `index.jsonl` line cut inside a
+    multi-byte character made the copy-on-first-write replay fail whole, and
+    the start deleted every copy of the scope as an orphan (BUG64); the
+    guard kept each writer's first write-open, so a restore of a later copy
+    overwrote that writer's later edit (BUG48); a name that is not UTF-8
+    ended the search for the attack's renamed copy (BUG63); the detection
+    read dropped the rows it had verified once its failure budget was spent
+    (BUG59), and both chain readers looped for ever on a read error — a
+    directory at a path, EIO — with `nn-admin detections` hung (BUG69,
+    BUG74); a tree kill whose root was not killed hid what it left running
+    (BUG61); the watchdog's exec respawn dropped empty arguments and
+    rewrote non-UTF-8 ones (BUG58, BUG67). BUG81's report fix (the two
+    "in a row" counters resetting each other) is harmful — a frozen agent
+    whose socket root removes and puts back at every ping would never be
+    recovered — and was not applied: the texts are corrected and a test
+    pins the behaviour.
+  - What changed (`COPY_ON_FIRST_WRITE.md` §2.4/§2.5, `EVIDENCE_CHAINS.md`,
+    `WATCHDOG_RESPAWN_V2_DESIGN.md`, upgrade notes §21): the replay reads
+    the bytes line by line (a bad line skipped and counted, a cut last line
+    ended at the open), a read error leaves the scope out of the run with
+    its copies kept; each writer's latest write-open, the most recent of 8;
+    the readers skip a non-UTF-8 line and end a file on any other read
+    error; the verified rows stay past the budget; the root's outcome and
+    the tree's partial outcome both said; the respawn argv is `OsString`
+    from `/proc` to `spawn` and to `agent.argv`. Found by this lot's lab:
+    the agent aborted at its start on an argument (or a variable) that is
+    not UTF-8 — its self-integrity check read `std::env::args()`/`vars()` —
+    so a byte-exact argv could not run; both read lossy now.
+  - The lab, as measured (our own guest under lease k297, Ubuntu 24.04
+    `6.8.0-147-generic`; clean at the start: no agent, no pin, no overlay;
+    no agent installed — the two privileged e2e tests start their own; the
+    control is `main` da55b9ec with the lot's two e2e tests only):
+    - **The cow store, real guard** (`cow_privileged_e2e::
+      a_torn_index_line_keeps_the_guards_copies`: fanotify on a tmpfs scope,
+      `sh` writers, 10 copies, `index.jsonl` cut inside "Universit\xC3",
+      restart, a second writer's 10 copies, restart): control **FAILED** —
+      the restart's replay failed whole ("read index.jsonl: stream did not
+      contain valid UTF-8"; the copies' deletion that follows is measured on
+      the host test, not in the lab); the lot (r2 6ffd33d1, r3 8a5a742d)
+      **passed**: the 10 copies and entries as they were, one unreadable
+      line, and the 20 there at the start after.
+    - **The watchdog's exec respawn** (`privileged_e2e::
+      a_respawned_agent_has_its_first_launchs_argv_byte_for_byte`: the
+      agent started with `--ade-prompt '' --ade-model /nonexistent/mod\xe8le`,
+      SIGKILLed, the watchdog's respawn compared from `/proc/<pid>/cmdline`):
+      control **FAILED** (its verdict line not kept by the round's log);
+      r2 (6ffd33d1) **FAILED** on the agent itself — it aborted at its start
+      (`panicked at …/std/src/env.rs:168`), the self-integrity check's
+      `std::env::args()` on the non-UTF-8 argument: fixed (8a5a742d);
+      r3 **passed**: respawn attempt 1, `argc=47`, the new agent's
+      cmdline equal to the first launch's byte for byte.
+    - The guest: nine `*-e2etest-*` copies from earlier lots (2026-10-14,
+      2026-11-04) found in `/usr/local/bin` and removed after a cold boot;
+      the failed runs' pins (77, held by their attached programs) gone with
+      a power cycle; at the end no agent, no pin, no copy, no overlay,
+      powered off.
+  - Host: the triage's 9 named tests fail on `main` da55b9ec (9 of 9) and
+    pass; 14 more (the replay's tolerance and its EIO seam, the slot per
+    writer, the restore of a later copy, the readers over a mid-file EIO
+    and a non-UTF-8 line, the recorded argv, `--agent-bin`, the lossy
+    self-integrity reads, the BUG81 guard, the two e2e). Mutation on the
+    fixes: 33 mutants, all caught by a named test (one survivor of the first pass,
+    `--agent-bin` made lossy, got its test); the report's BUG81 fix, as two
+    mutants, caught by `alternating_timeout_and_vanished_still_trips_stuck`.
+  - Levels unchanged (C19 1, C23 2 provisional): defects of the experimental
+    rollback journal, of the operator's detection read and of the
+    watchdog's non-systemd backend closed and measured on one kernel — not
+    a new capability.
 - **Lot 299 — FIM, the admin tools and minor findings: the external bug
   hunt's lot 9** (`fix/w4-bh-fim-admin`; the triage of editions 1.2/1.3,
   lot 9: BUG73, 66, 20, 22, 34, 38, 36, 78, 79; P2/P3).

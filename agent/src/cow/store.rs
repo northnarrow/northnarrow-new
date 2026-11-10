@@ -182,7 +182,8 @@ pub struct Store {
 
 impl Store {
     /// Open every scope's journal and read its index back. A scope whose
-    /// journal cannot be opened is reported and left unprotected.
+    /// journal cannot be opened, or whose index cannot be read, is reported
+    /// and left unprotected.
     pub fn open(cfg: CowConfig, pin_root: Option<std::path::PathBuf>) -> (Arc<Self>, Vec<String>) {
         let budgets: Vec<u64> = cfg.scopes.iter().map(|s| s.budget).collect();
         let mut ix = JournalIndex::new(
@@ -202,7 +203,22 @@ impl Store {
                             "{}: {bad} unreadable line(s) of index.jsonl skipped",
                             s.journal.display()
                         )),
-                        Err(e) => problems.push(format!("{}: {e:#}", s.journal.display())),
+                        Err(e) => {
+                            // Lot 297 (external bug hunt BUG64): the index
+                            // could not be read (EIO): the copies it names
+                            // are unknown, so the scope sits this run out —
+                            // the orphan sweep and the compaction would
+                            // delete every copy and empty the index. Its
+                            // files stay as they are for the next start.
+                            problems.push(format!(
+                                "{}: {e:#}; the scope is not protected in this run, its copies \
+                                 are kept",
+                                s.journal.display()
+                            ));
+                            fds.push(-1);
+                            journals.push(None);
+                            continue;
+                        }
                     }
                     fds.push(j.objects_fd());
                     journals.push(Some(Mutex::new(j)));
@@ -970,11 +986,17 @@ fn write_new(dir: RawFd, name: &str, object: RawFd, e: &Entry) -> io::Result<Opt
 }
 
 /// The name of the entry of `dir` with inode (`dev`, `ino`), if any (at
-/// most 100 000 entries read).
+/// most 100 000 entries read). Lot 297 (external bug hunt BUG63): a name
+/// that is not UTF-8 is passed over; it ended the whole search, and the
+/// attack's renamed copy read after it stayed beside the file instead of
+/// going to the journal's evidence. A renamed copy whose own name is not
+/// UTF-8 is still not found (it stays where it is; nothing is lost).
 fn find_inode(dir: RawFd, dev: u64, ino: u64) -> Option<String> {
     let rd = std::fs::read_dir(format!("/proc/self/fd/{dir}")).ok()?;
     for ent in rd.take(100_000).filter_map(|e| e.ok()) {
-        let name = ent.file_name().to_str()?.to_string();
+        let Some(name) = ent.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
         if let Ok(st) = fstatat_nofollow(dir, &name) {
             if st.st_dev == dev && st.st_ino == ino && st.st_mode & libc::S_IFMT == libc::S_IFREG {
                 return Some(name);
@@ -1320,5 +1342,243 @@ mod tests {
         assert_eq!(get("answer_copy_us_total"), 100);
         assert_eq!(get("answer_copy_us_max"), 60);
         assert_eq!(get("copies_reflink"), 0);
+    }
+
+    // ── Lot 297: the external bug hunt (editions 1.2/1.3) ──────────────
+
+    /// Lot 297 (BUG63): a non-UTF-8 name read before the attack's renamed
+    /// copy does not end the search: the renamed copy goes to evidence.
+    #[test]
+    fn non_utf8_name_hides_the_renamed_copy() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let l = lab();
+        std::fs::write(l.scope.join("report.docx"), b"original").unwrap();
+        let e = journal_file(&l, "report.docx", ATTACKER);
+        std::fs::write(l.scope.join("report.docx"), b"encrypted junk").unwrap();
+        // readdir order is the filesystem's: add non-UTF-8 names (before and
+        // after the rename) until one is read before the renamed copy
+        let order = |dir: &Path| -> (Option<usize>, Option<usize>) {
+            let mut bad = None;
+            let mut target = None;
+            for (i, ent) in std::fs::read_dir(dir).unwrap().enumerate() {
+                let n = ent.unwrap().file_name();
+                if n.to_str().is_none() && bad.is_none() {
+                    bad = Some(i);
+                }
+                if n == "report.docx.locked" {
+                    target = Some(i);
+                }
+            }
+            (bad, target)
+        };
+        let mk = |k: u32| {
+            let mut raw = vec![0xFFu8];
+            raw.extend_from_slice(format!("note{k}.txt").as_bytes());
+            std::fs::write(l.scope.join(OsString::from_vec(raw)), b"x").unwrap();
+        };
+        for k in 0..5 {
+            mk(k);
+        }
+        std::fs::rename(
+            l.scope.join("report.docx"),
+            l.scope.join("report.docx.locked"),
+        )
+        .unwrap();
+        let mut k = 5;
+        loop {
+            match order(&l.scope) {
+                (Some(b), Some(t)) if b < t => break,
+                _ if k >= 2000 => panic!("could not arrange the readdir order"),
+                _ => {
+                    mk(k);
+                    k += 1;
+                }
+            }
+        }
+        let rep = l.store.restore(&sel(), false, &by());
+        assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
+        assert_eq!(
+            std::fs::read(l.scope.join("report.docx")).unwrap(),
+            b"original"
+        );
+        assert!(
+            rep.rows[0].evidence.is_some() && !l.scope.join("report.docx.locked").exists(),
+            "renamed copy of entry {} not found: row {:?}",
+            e.id,
+            rep.rows[0]
+        );
+    }
+
+    /// Lot 297 (BUG64): an index.jsonl with a torn last line (cut inside a
+    /// multi-byte character: a lone 0xC3 byte, not UTF-8) is replayed line
+    /// by line: the copies it records stay, the cut line alone is counted.
+    /// The whole read failed, and the open deleted every copy as an orphan.
+    #[test]
+    fn failed_replay_keeps_the_recorded_copies() {
+        let l = lab();
+        std::fs::write(l.scope.join("a"), b"original").unwrap();
+        let e = journal_file(&l, "a", ATTACKER);
+        let cfg = l.store.cfg.clone();
+        drop(l.store);
+        let jdir = l.scope.join(".northnarrow-cow");
+        let object = jdir.join("objects").join(format!("{:016x}", e.object));
+        let index = jdir.join("index.jsonl");
+        assert!(object.exists());
+        let before = std::fs::metadata(&index).unwrap().len();
+        assert!(before > 0);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            b"{\"op\":\"entry\",\"entry\":{\"id\":2,\"object\":2,\"scope\":0,\"path\":\"/srv/t/Universit\xC3",
+        )
+        .unwrap();
+        drop(f);
+        let (store, problems) = Store::open(cfg, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let objects_left = object.exists();
+        let index_len = std::fs::metadata(&index).unwrap().len();
+        let replayed = store.index.lock().entry(e.id).cloned();
+        drop(store);
+        assert!(
+            objects_left,
+            "the recorded copy was deleted as an orphan (problems: {problems:?}); index.jsonl {before} -> {index_len} bytes"
+        );
+        assert_eq!(replayed.as_ref(), Some(&e), "the entry is replayed");
+        assert!(
+            problems[0].contains("1 unreadable line(s) of index.jsonl skipped"),
+            "{problems:?}"
+        );
+    }
+
+    /// Lot 297 (BUG64): the torn line is ended at the open, so the record
+    /// written next is a line of its own: a copy taken after the restart
+    /// survives the start after it. Glued to the fragment, its `object`
+    /// line was unreadable and the copy deleted as an orphan.
+    #[test]
+    fn a_torn_last_line_costs_that_line_only() {
+        let l = lab();
+        std::fs::write(l.scope.join("a"), b"original a").unwrap();
+        let ea = journal_file(&l, "a", ATTACKER);
+        let cfg = l.store.cfg.clone();
+        drop(l.store);
+        let index = l.scope.join(".northnarrow-cow/index.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"op\":\"object\",\"id\":9,\"by").unwrap();
+        drop(f);
+        // the restart: the cut line ended, then a copy of b
+        let (store, problems) = Store::open(cfg.clone(), None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let l = Lab {
+            _t: l._t,
+            scope: l.scope,
+            store,
+        };
+        std::fs::write(l.scope.join("b"), b"original b").unwrap();
+        let eb = journal_file(&l, "b", ATTACKER);
+        drop(l.store);
+        // the start after: both copies, one unreadable line
+        let (store, problems) = Store::open(cfg, None);
+        let ix = store.index.lock();
+        assert_eq!(ix.entry(ea.id), Some(&ea));
+        assert_eq!(
+            ix.entry(eb.id),
+            Some(&eb),
+            "the copy taken after the restart"
+        );
+        drop(ix);
+        let objects = l.scope.join(".northnarrow-cow/objects");
+        for e in [&ea, &eb] {
+            assert!(objects.join(format!("{:016x}", e.object)).exists(), "{e:?}");
+        }
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("1 unreadable line(s)"), "{problems:?}");
+    }
+
+    /// Lot 297 (BUG64): an index.jsonl that cannot be read (EIO) leaves its
+    /// scope out of the run: no copy deleted, the index as it was, the
+    /// problem reported. The scope stayed protected with an empty index,
+    /// and the open deleted every copy and emptied the index.
+    #[test]
+    fn an_unreadable_index_keeps_its_scope_out_of_the_run() {
+        let l = lab();
+        std::fs::write(l.scope.join("a"), b"original").unwrap();
+        let e = journal_file(&l, "a", ATTACKER);
+        let cfg = l.store.cfg.clone();
+        drop(l.store);
+        let jdir = l.scope.join(".northnarrow-cow");
+        let object = jdir.join("objects").join(format!("{:016x}", e.object));
+        let index = jdir.join("index.jsonl");
+        let body = std::fs::read(&index).unwrap();
+        super::super::journal::REPLAY_READ_FAILS.with(|f| f.set(true));
+        let (store, problems) = Store::open(cfg, None);
+        assert!(store.journals[0].is_none(), "the scope is left out");
+        assert_eq!(store.objects_fds[0], -1);
+        assert_eq!(store.index.lock().entry_count(0), 0);
+        drop(store);
+        assert!(object.exists(), "the copy is kept");
+        assert_eq!(std::fs::read(&index).unwrap(), body, "the index as it was");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("not protected in this run"),
+            "{problems:?}"
+        );
+    }
+
+    /// Lot 297 (BUG48): the restore of a later copy does not overwrite a
+    /// legitimate edit made after it by a writer seen before it (its first
+    /// write-open was the one kept, older than the copy): the original
+    /// goes beside the file.
+    #[test]
+    fn a_later_copy_does_not_hide_a_known_writers_later_edit() {
+        const OTHER: ProcId = ProcId {
+            pid: 4_000_001,
+            start: 999_999_999,
+        };
+        const OWNER: ProcId = ProcId {
+            pid: 1234,
+            start: 1,
+        };
+        let l = lab();
+        std::fs::write(l.scope.join("doc.txt"), b"v1").unwrap();
+        // a first copy (another writer), then the owner's edit
+        journal_file(&l, "doc.txt", OTHER);
+        let edit = |at_ms: u64| PostWrite {
+            at_ms,
+            writer: OWNER,
+            program: "/usr/bin/vim.basic".into(),
+            trusted: true,
+        };
+        let first = now_ms();
+        let m = std::fs::metadata(l.scope.join("doc.txt")).unwrap();
+        l.store.record_post_write(m.dev(), m.ino(), edit(first));
+        std::fs::write(l.scope.join("doc.txt"), b"v2 by the owner").unwrap();
+        // the attack's copy, strictly after the owner's first write-open
+        while now_ms() <= first {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let e = journal_file(&l, "doc.txt", ATTACKER);
+        assert!(e.taken_at_ms > first);
+        std::fs::write(l.scope.join("doc.txt"), b"encrypted junk").unwrap();
+        // the owner edits it again after the attack
+        l.store
+            .record_post_write(e.file.dev, e.file.ino, edit(e.taken_at_ms + 10));
+        std::fs::write(l.scope.join("doc.txt"), b"junk + the owner's later edit").unwrap();
+        let rep = l.store.restore(&sel(), false, &by());
+        assert_eq!(rep.rows.len(), 1, "{:?}", rep.rows);
+        assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+        assert_eq!(
+            std::fs::read(l.scope.join("doc.txt")).unwrap(),
+            b"junk + the owner's later edit",
+            "never overwritten"
+        );
+        let beside = l.scope.join(format!("doc.txt.nn-restored-{}", e.id));
+        assert_eq!(std::fs::read(&beside).unwrap(), b"v2 by the owner");
     }
 }

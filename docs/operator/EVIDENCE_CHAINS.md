@@ -86,6 +86,18 @@ log not open: no key, a write refused) is logged whole at ERROR (`an
 action's row is NOT in the signed actions chain — this line is its
 record`) and counted (`rows not in the chain`); the action still runs.
 
+Its rotation (lot 296): the rows are written by the response threads, which
+may not lift the state directory's `+i` (they hold no
+`CAP_LINUX_IMMUTABLE`). Before lot 296 their rotation sealed the active
+file, failed the rename, and every later row was lost (the ERROR above,
+one per row) until the next start. Now such a thread seals nothing: its row
+goes on in the active file past the cap (WARN `this thread may not rotate
+the log`, once), and the chain's rotation thread `nn-actions-rotate` (the
+writer's role) rotates it within moments (INFO `the actions chain rotated
+on its rotation thread`). If even that thread cannot (ERROR `could not
+rotate on its rotation thread`, once), the rows still go on past the cap,
+none lost; the heartbeat's signed head shows the file's size.
+
 ### The heartbeat chain (R12c-2, lab PR 270)
 
 `/var/lib/northnarrow/heartbeat.jsonl` (`--heartbeat-file`; 4 MiB × 4
@@ -313,7 +325,49 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   (below).
 - `chain_lines_unverified` is written each time a read verb leaves out
   another number of rows of a file than the last time; the ERROR is in the
-  journal every time.
+  journal every time. One read tries at most 1000 rows that fail; the rows
+  it already verified are still served once those are spent (lot 297,
+  external bug hunt BUG59: an archive read next dropped them, and
+  `nn-admin detections` came back empty).
+- A write the disk stopped part-way (full: the first `write` takes what
+  fits, the next fails) or whose `fsync` failed (lot 296): before its next
+  row the writer reads the file's tail again, as a start does. The start
+  of a row left at the end is cut, and the cut attested with the length and
+  SHA-256 of what was cut — `chain_tail_repaired` in the audit chain for
+  `audit.log`; `torn_tail_repaired` in a rotating log's manifest, role
+  `active` (written before the cut) or `manifest` (the attesting row takes
+  the fragment's place in one write). A row the failure wrote whole stays,
+  and the chain goes on from it; a seal written whole finishes its rotation
+  (never a second seal). The row whose append failed is not in the chain
+  unless it was written whole (a rotating log's journal says which: WARN
+  `chainlog: tail read again after a failed write`, with what was cut and
+  what kept). While the tail cannot be read again, or the cut not
+  attested, every append of that chain fails and writes nothing. The repair
+  is made at that chain's next row, or at the next start: until then a
+  chain idle since the failure ends in the fragment, and `nn-admin chain
+  verify` reports it `BROKEN` (`malformed line N: … EOF while parsing`, its
+  last line) — the lab's netflow log for 50 s after the disk had room
+  again. A rotating log's manifest exists from its first start, empty until
+  its first row, so a writer that may not create a name in the protected
+  state directory (the actions chain's response threads) can still write
+  the attestation there. Before lot
+  296 the next row was glued to the fragment, or chained off the row before
+  the one written whole: an audit log the next start refused (the agent did
+  not start in enforce mode), a rotating log `BROKEN` in `nn-admin chain
+  verify` for as long as that generation was kept.
+- Retention (lot 296): a pass that cannot remove an archive keeps the
+  `Evicted` rows of those it removed before it, and stops there (removing
+  newer ones past it would leave a gap); the ERROR `archive eviction failed
+  post-rotate` names it. An entry at an archive's name that is not a
+  regular file (a directory, a link) is not the log's: it is left in place
+  (ERROR `a foreign entry holds an archive name past the retention`, and
+  `nn-admin chain verify` names it) and the eviction goes on past it — it
+  used to stop every later pass.
+- A file of the detection or status-event set that cannot be read — a
+  directory at its path, a disk error — ends that file's part of the read;
+  the other files are still read, and a line that is not UTF-8 is skipped
+  (lot 297, BUG69, BUG74: the read looped for ever and `nn-admin
+  detections` hung).
 - A rotating log whose checkpoint is unreachable keeps failing
   `nn-admin chain verify` until that generation leaves retention (the
   evidence is still missing; that is the point).

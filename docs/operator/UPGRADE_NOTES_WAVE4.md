@@ -963,6 +963,77 @@ holding a flow against a later kill (BUG45). After the upgrade:
   a reason that is not a clean stop's followed by the next start is
   `DEGRADED`. A beat's `interval_secs` is taken within 5 to 300 s. A state
   file of an earlier verifier is read as it is.
+## 20. The chain writers after a failed write (lot 296)
+
+- **A full disk, or a failed fsync, no longer breaks a chain** (external
+  bug hunt BUG15, BUG17, BUG27). Before its next row the writer reads the
+  file's tail again: the start of a row a write left at the end is cut and
+  the cut attested — `chain_tail_repaired` in the audit chain,
+  `torn_tail_repaired` in a rotating log's manifest (role `active` or
+  `manifest`), each with the length and SHA-256 of what was cut —; a row
+  written whole stays. Expect these rows after a disk was full: they are
+  the repair, not tampering (`EVIDENCE_CHAINS.md`, "What the agent did
+  about it"). An audit log an earlier version left with a row glued to a
+  fragment (a disk full then) is still refused at the start: a line before
+  the end that is not a row is corruption (`BOOT_INTEGRITY.md`, gate
+  `audit_log`); keep it as evidence (`EVIDENCE_CHAINS.md`, "When a check
+  fails").
+- **Each rotating log's manifest** (`<log>.manifest.jsonl`) now exists from
+  the agent's first start after the upgrade, empty until its first row:
+  created by the start inside the protected directory's `+i` lift, so the
+  actions chain's response threads, which may not lift it, can attest a
+  repair there (lot 296's lab: without it, every action row after a full
+  disk was lost until the next start).
+- **The actions chain rotates** (lot 295's finding, added to this lot):
+  its rows are written by the response threads, which may not lift the
+  state directory; past its cap (16 MiB, `NN_ACTIONS_CAP_BYTES`) every row
+  was lost until the next start. A response thread now keeps its row past
+  the cap and the chain's rotation thread (`nn-actions-rotate`, role
+  writer) rotates it. Nothing to configure. An install that lost rows that
+  way has the ERRORs `an action's row is NOT in the signed actions chain`
+  with `lifting immutability` in the journal, and an active file ending in
+  a terminator that the next start's open archived.
+- **Retention** (BUG10): an entry at an archive's name that is not a
+  regular file is left in place and passed (ERROR in the journal; `chain
+  verify` names it); a pass that fails keeps the `Evicted` rows of what it
+  removed.
+- **The JSONL export** (BUG31): a write stopped part-way leaves one line
+  that is not a record, then the batch whole. A fragment left by a worker
+  that ended in the middle of a write is not closed (`EXPORT.md` §8).
+- Nothing to configure; the files' formats are unchanged (an `nn-admin` of
+  an earlier version reads the new rows).
+
+## 21. The agent's stores and the watchdog's respawn argv (lot 297)
+
+- **The copy-on-first-write journal (EXPERIMENTAL) keeps its copies across
+  a crash** (external bug hunt BUG64). A start after a crash during an
+  append to `index.jsonl` reads every line it can: expect one signed
+  `subsystem_degraded` `journal_open` "1 unreadable line(s) of index.jsonl
+  skipped" — the cut line, nothing lost; the line is ended at that start.
+  An index the agent cannot read at all (a disk error) leaves its scope
+  unprotected for that run (`journal_open: false` in the guard's start row,
+  the same signed `journal_open` naming the error): its copies stay on
+  disk for the next start — check the disk. Before, either case deleted
+  every copy of the scope. A restore keeps both (`<name>.nn-restored-<id>`)
+  when a writer seen before the copy restored wrote again after it (BUG48).
+- **The `response` of a tree kill whose root was not killed** (BUG61) now
+  also names what was left running, after a `;`: `KillProcessTree (already
+  gone; partial: 2 not killed, 1 spared, walk truncated)`. A reader matching
+  the whole string `KillProcessTree (already gone)` misses these; the action
+  stays the first word. Records written before keep their text.
+- **`nn-admin detections` returns** with a directory at a chain path or a
+  failing disk (BUG69, BUG74), and serves the rows it verified when a
+  thousand forged rows came first (BUG59). Nothing to configure.
+- **The watchdog's exec backend** (non-systemd hosts, `--respawn-backend
+  exec`; BUG58, BUG67): the respawned agent gets the first launch's argv
+  byte for byte, an empty argument (`--flag ''`) and one that is not UTF-8
+  included; `/run/northnarrow/agent.argv` keeps them the same way (its
+  format is unchanged). The systemd backend (the default with systemd) was
+  never affected. The agent itself no longer aborts at its start on such an
+  argument, or on an environment variable that is not UTF-8. The `admin_socket_vanished` record says "on N STATUS
+  pings since it last answered" (BUG81: a timeout between two of those
+  pings does not start the count over — that was always so; the text said
+  "in a row").
 
 ## 22. FIM, the admin tools and minor findings of the external bug hunt (lot 299)
 

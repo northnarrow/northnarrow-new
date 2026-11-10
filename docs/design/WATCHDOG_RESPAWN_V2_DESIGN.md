@@ -35,13 +35,13 @@ pub enum RespawnBackend {
     /// `systemctl start <unit>` (default when /run/systemd/system exists).
     SystemdUnit { unit: String },
     /// Fork-exec with a persisted argv (non-systemd hosts, dev VMs).
-    ForkExec { argv: Vec<String> },
+    ForkExec { argv: Vec<OsString> },
 }
 ```
 
 - CLI: `--respawn-backend {systemd,exec}` (default: auto — `systemd` if `/run/systemd/system` is a directory, else `exec`), `--agent-unit northnarrow-agent.service`.
 - `SystemdUnit` runs `/usr/bin/systemctl start --no-block <unit>` via `Command` (exit status + stderr logged). No D-Bus crate: `systemctl` is present on every systemd host, the call is one line, and `CAP_*` are not involved — unit control is authorised by uid 0 (the watchdog runs as root). `--no-block` returns as soon as the job is queued; readiness is still observed by the existing `wait_for_new_agent_pid` (pidfile written after every LSM hook is attached) — unchanged.
-- `ForkExec` keeps today's `spawn_agent`, but **argv is the full first-launch argv**: on startup the watchdog reads `/proc/<agent_pid>/cmdline` (the agent is in PROTECTED_OBSERVERS, the watchdog is an observer — no EACCES) and persists it; `--agent-bin` becomes an override for `argv[0]` only. This also closes `combat-avail-1` for non-systemd hosts.
+- `ForkExec` keeps today's `spawn_agent`, but **argv is the full first-launch argv**: on startup the watchdog reads `/proc/<agent_pid>/cmdline` (the agent is in PROTECTED_OBSERVERS, the watchdog is an observer — no EACCES) and persists it; `--agent-bin` becomes an override for `argv[0]` only. This also closes `combat-avail-1` for non-systemd hosts. Every argument is kept byte for byte, an empty one and one that is not UTF-8 included (lot 297, external bug hunt BUG58/BUG67: empty ones were dropped, shifting the argv into one the agent's parser refused, and the others rewritten with U+FFFD).
 - `respawn_cycle` is unchanged after the spawn step: wait pidfile → `pidfd_open` → defensive PROTECTED_PIDS reinsert.
 
 ### 3.2 Unit changes (`northnarrow-watchdog.service`)

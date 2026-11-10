@@ -25,6 +25,7 @@
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -1180,17 +1181,17 @@ impl Default for RestartBackoff {
 /// the agent's own unit `Restart=no` means systemd-direct journal
 /// only sees the agent's first crash before the watchdog took
 /// over respawn).
-pub fn spawn_agent(argv: &[String]) -> Result<Child> {
+pub fn spawn_agent(argv: &[OsString]) -> Result<Child> {
     let bin = argv
         .first()
         .ok_or_else(|| anyhow!("spawn_agent: empty argv (need at least the binary path)"))?;
     let child = Command::new(bin)
         .args(&argv[1..])
         .spawn()
-        .with_context(|| format!("Command::spawn({bin})"))?;
+        .with_context(|| format!("Command::spawn({})", bin.to_string_lossy()))?;
     info!(
         target: "watchdog.respawn",
-        bin,
+        bin = %bin.to_string_lossy(),
         argc = argv.len(),
         new_pid = child.id(),
         "agent respawned"
@@ -1224,8 +1225,14 @@ pub enum RespawnBackendChoice {
 /// WHEN (backoff, ceiling, shutdown marker); this is only the HOW.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RespawnBackend {
-    SystemdUnit { unit: String },
-    ForkExec { argv: Vec<String> },
+    SystemdUnit {
+        unit: String,
+    },
+    /// The first launch's argv, byte for byte (lot 297, external bug hunt
+    /// BUG67: an argument that is not UTF-8 too).
+    ForkExec {
+        argv: Vec<OsString>,
+    },
 }
 
 impl RespawnBackend {
@@ -1236,7 +1243,9 @@ impl RespawnBackend {
             RespawnBackend::ForkExec { argv } => {
                 format!(
                     "exec:{} (argc={})",
-                    argv.first().map(String::as_str).unwrap_or("?"),
+                    argv.first()
+                        .map(|a| a.to_string_lossy())
+                        .unwrap_or("?".into()),
                     argv.len()
                 )
             }
@@ -1256,7 +1265,7 @@ pub fn select_backend(
     choice: RespawnBackendChoice,
     systemd_booted: bool,
     unit: &str,
-    exec_argv: impl FnOnce() -> Result<Vec<String>>,
+    exec_argv: impl FnOnce() -> Result<Vec<OsString>>,
 ) -> Result<RespawnBackend> {
     let use_systemd = match choice {
         RespawnBackendChoice::Systemd => true,
@@ -1283,12 +1292,24 @@ pub fn select_backend(
 }
 
 /// Split a `/proc/<pid>/cmdline` body (NUL-separated, NUL-terminated)
-/// into argv. An empty body (zombie / kernel thread) yields an empty vec.
-pub fn parse_proc_cmdline(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
+/// into argv. An empty body (zombie / kernel thread), or one with no
+/// binary (an empty `argv[0]`), yields an empty vec.
+///
+/// Lot 297 (external bug hunt BUG58, BUG67): every argument as it is,
+/// byte for byte — an empty one included (only the terminating NUL ends
+/// the body), and one that is not UTF-8 kept as such. Empty ones were
+/// dropped, which shifted the respawn argv (`--tenant '' --detect-only`
+/// became `--tenant --detect-only`: refused by the agent's parser, a
+/// respawn loop up to the ceiling), and the others were rewritten with
+/// U+FFFD.
+pub fn parse_proc_cmdline(bytes: &[u8]) -> Vec<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let body = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if body.first().is_none_or(|&b| b == 0) {
+        return Vec::new();
+    }
+    body.split(|&b| b == 0)
+        .map(|part| OsString::from_vec(part.to_vec()))
         .collect()
 }
 
@@ -1298,7 +1319,7 @@ pub fn parse_proc_cmdline(bytes: &[u8]) -> Vec<String> {
 /// Tappa 7 design asked for and what closes `combat-avail-1`: every
 /// flag — `--combat-rules`, `--admin-pub`, `--detect-only`, … —
 /// survives the respawn.
-pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<String>> {
+pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<OsString>> {
     let path = format!("/proc/{pid}/cmdline");
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let mut argv = parse_proc_cmdline(&bytes);
@@ -1308,7 +1329,7 @@ pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<St
         ));
     }
     if let Some(bin) = agent_bin {
-        argv[0] = bin.to_string_lossy().into_owned();
+        argv[0] = bin.as_os_str().to_owned();
     }
     Ok(argv)
 }
@@ -1329,7 +1350,8 @@ pub fn agent_argv_record_path(agent_pidfile: &Path) -> PathBuf {
 
 /// Keep a successful capture: NUL-separated like `/proc/<pid>/cmdline`,
 /// 0600, with the AUT-003 writer (never through a link at the name).
-pub fn persist_agent_argv(path: &Path, argv: &[String]) -> Result<()> {
+pub fn persist_agent_argv(path: &Path, argv: &[OsString]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     let mut body = Vec::new();
     for arg in argv {
         body.extend_from_slice(arg.as_bytes());
@@ -1342,7 +1364,7 @@ pub fn persist_agent_argv(path: &Path, argv: &[String]) -> Result<()> {
 /// The argv [`persist_agent_argv`] kept: a regular file (a link is not
 /// followed), owned by the watchdog's user, closed to others, at most
 /// [`AGENT_ARGV_MAX_BYTES`], with at least the binary.
-pub fn read_persisted_agent_argv(path: &Path) -> Result<Vec<String>> {
+pub fn read_persisted_agent_argv(path: &Path) -> Result<Vec<OsString>> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new()
@@ -1401,7 +1423,7 @@ pub fn exec_respawn_argv(
     verified_bin: &Path,
     agent_pidfile: &Path,
     hold_path: &Path,
-) -> Vec<String> {
+) -> Vec<OsString> {
     let record = agent_argv_record_path(agent_pidfile);
     let capture_error = match agent_argv_from_proc(agent_pid, agent_bin) {
         Ok(argv) => {
@@ -1419,14 +1441,14 @@ pub fn exec_respawn_argv(
     };
     let (argv, source) = match read_persisted_agent_argv(&record) {
         Ok(mut argv) => {
-            argv[0] = verified_bin.to_string_lossy().into_owned();
+            argv[0] = verified_bin.as_os_str().to_owned();
             (argv, format!("the argv recorded at {}", record.display()))
         }
         Err(e) => (
             vec![
-                verified_bin.to_string_lossy().into_owned(),
-                "--pid-file".to_string(),
-                agent_pidfile.to_string_lossy().into_owned(),
+                verified_bin.as_os_str().to_owned(),
+                "--pid-file".into(),
+                agent_pidfile.as_os_str().to_owned(),
             ],
             format!(
                 "the minimal argv (flags such as --detect-only / --admin-pub do NOT survive a \
@@ -2096,11 +2118,14 @@ pub fn ping_ticker(period: Duration) -> tokio::time::Interval {
 /// page-fault storms, brief schedlatency.
 pub const STATUS_PING_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Per §4: two consecutive timeouts in a row promote "stuck"
+/// Per §4: two timeouts with no answer in between promote "stuck"
 /// to "dead" and trigger the recovery path. One timeout could
-/// be a CPU steal spike or a long pause of the agent; two in a row
-/// (60 s gap with the 30 s interval) is strong evidence the
-/// agent's main loop is not making progress.
+/// be a CPU steal spike or a long pause of the agent; two (at least
+/// 30 s apart with the 30 s interval) is strong evidence the
+/// agent's main loop is not making progress. A ping that found the
+/// socket gone between them does not start the count over — only an
+/// answer does (lot 297, external bug hunt BUG81; see
+/// [`StatusPingTracker`]).
 pub const STATUS_PING_CONSECUTIVE_TIMEOUT_THRESHOLD: u8 = 2;
 
 /// Per §4.1 recovery sequence: after SIGINT, wait this long
@@ -2116,9 +2141,9 @@ pub enum PingOutcome {
     /// First timeout in a row — log WARN, continue (per §4.1
     /// "STATUS reply timeout × 1 only → log WARN, continue").
     TimeoutOnce,
-    /// Threshold reached (default 2 consecutive timeouts, or
+    /// Threshold reached (default 2 timeouts, or
     /// [`STATUS_PING_VANISHED_STUCK_AFTER`] pings without the agent's
-    /// socket after it had answered). Caller should kick off the
+    /// socket, since the agent last answered). Caller should kick off the
     /// stuck-recovery sequence ([`stuck_recovery`]).
     StuckDetected,
     /// Nothing that is the agent listens at the admin socket path, and the
@@ -2249,8 +2274,8 @@ pub const STATUS_PING_ABSENT_ERROR_AFTER: u32 = 4;
 /// thresholds below; the watchdog does not wait on it.
 pub const AGENT_SOCKET_REBIND_WITHIN: Duration = Duration::from_secs(10);
 
-/// External audit WDG-007: a vanished socket on this many pings in a row
-/// (≥ 30 s without the socket, three times
+/// External audit WDG-007: a vanished socket on this many pings since the
+/// agent last answered (≥ 30 s from the first, three times
 /// [`AGENT_SOCKET_REBIND_WITHIN`]) is reported as tamper — an ERROR on
 /// `watchdog.tamper` and a record the agent signs
 /// ([`nn_proto::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED`]). Not on the
@@ -2258,9 +2283,9 @@ pub const AGENT_SOCKET_REBIND_WITHIN: Duration = Duration::from_secs(10);
 /// its exit, or inside the rebind window.
 pub const STATUS_PING_VANISHED_TAMPER_AFTER: u32 = 2;
 
-/// External audit WDG-007: a vanished socket on this many pings in a row
-/// (≥ 60 s without the socket an agent rebinds within 10 s) is a stuck
-/// agent: a frozen one cannot bind it again, and its STATUS ping —
+/// External audit WDG-007: a vanished socket on this many pings since the
+/// agent last answered (≥ 60 s from the first; an agent rebinds within
+/// 10 s) is a stuck agent: a frozen one cannot bind it again, and its STATUS ping —
 /// what recovers a frozen agent — would otherwise never fail again.
 pub const STATUS_PING_VANISHED_STUCK_AFTER: u32 = 3;
 
@@ -2268,6 +2293,15 @@ pub const STATUS_PING_VANISHED_STUCK_AFTER: u32 = 3;
 /// STATUS-ping timeouts. Reset on any successful ping. Threshold
 /// configurable for tests so we don't have to hardcode 2 in
 /// every assertion.
+///
+/// Lot 297 (external bug hunt BUG81): "in a row" means with no answer in
+/// between. The timeout and the vanished-socket counters each count their
+/// failures since the agent's last answer, and a failure of one kind does
+/// not reset the other: timeout, socket gone, timeout is stuck. That only
+/// brings forward the recovery of an agent that answers nothing — never of
+/// one that answers (an answer resets both). Resetting each other would
+/// let a frozen agent whose socket root removes and puts back at every
+/// ping (timeout, gone, timeout, gone…) never reach the threshold.
 ///
 /// External audit WDG-007 (NN-AUD-358): it also remembers whether the
 /// agent it watches answered once. A socket that never came up is a
@@ -2332,7 +2366,8 @@ impl StatusPingTracker {
     /// with a missing combat-rules.v4, 2026-10-08). After it answered, the
     /// socket was taken away while it ran (external audit WDG-007):
     /// [`PingOutcome::SocketVanished`], and
-    /// [`STATUS_PING_VANISHED_STUCK_AFTER`] in a row are
+    /// [`STATUS_PING_VANISHED_STUCK_AFTER`] since its last answer (a
+    /// timeout between them does not reset the count) are
     /// [`PingOutcome::StuckDetected`].
     pub fn record_socket_absent(&mut self) -> PingOutcome {
         if !self.answered {
@@ -2354,8 +2389,9 @@ impl StatusPingTracker {
     /// Record a ping failure (reply timeout OR transport error
     /// — both are "agent not responding" from the watchdog's
     /// perspective). Returns [`PingOutcome::TimeoutOnce`] for
-    /// the first failure in a row, [`PingOutcome::StuckDetected`]
-    /// when the threshold is met.
+    /// the first failure since the agent's last answer,
+    /// [`PingOutcome::StuckDetected`] when the threshold is met (a
+    /// vanished socket between them does not reset the count).
     pub fn record_timeout(&mut self) -> PingOutcome {
         self.consecutive_absent = 0;
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
@@ -4044,7 +4080,7 @@ mod tests {
         let bin = Path::new("/usr/local/bin/northnarrow-agent");
         // A capture that works (this process) is recorded, 0600.
         let own = exec_respawn_argv(std::process::id(), Some(bin), bin, &pidfile, &holds);
-        assert_eq!(own[0], bin.to_string_lossy());
+        assert_eq!(own[0], bin.as_os_str());
         let record = agent_argv_record_path(&pidfile);
         assert_eq!(record, dir.path().join(AGENT_ARGV_FILE_NAME));
         use std::os::unix::fs::PermissionsExt;
@@ -4058,10 +4094,10 @@ mod tests {
         persist_agent_argv(
             &record,
             &[
-                "/old/northnarrow-agent".to_string(),
-                "--detect-only".to_string(),
-                "--admin-pub".to_string(),
-                "/etc/northnarrow/admin.pub".to_string(),
+                "/old/northnarrow-agent".into(),
+                "--detect-only".into(),
+                "--admin-pub".into(),
+                "/etc/northnarrow/admin.pub".into(),
             ],
         )
         .unwrap();
@@ -4098,9 +4134,9 @@ mod tests {
         assert_eq!(
             argv,
             [
-                verified.to_string_lossy().into_owned(),
-                "--pid-file".to_string(),
-                pidfile.to_string_lossy().into_owned()
+                verified.as_os_str(),
+                "--pid-file".as_ref(),
+                pidfile.as_os_str()
             ]
         );
         let body = std::fs::read_to_string(&holds).unwrap();
@@ -4122,7 +4158,7 @@ mod tests {
         assert!(read_persisted_agent_argv(&record).is_err());
         // A record others can write is not the watchdog's.
         std::fs::remove_file(&record).unwrap();
-        persist_agent_argv(&record, &["/a".to_string()]).unwrap();
+        persist_agent_argv(&record, &["/a".into()]).unwrap();
         assert_eq!(read_persisted_agent_argv(&record).unwrap(), ["/a"]);
         std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(read_persisted_agent_argv(&record).is_err());
@@ -4860,5 +4896,110 @@ mod tests {
         let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, RUN_DIR_MODE, "{mode:o}");
         assert_eq!(read_pid_from_file(&run.join("watchdog.pid")).unwrap(), 42);
+    }
+
+    // ── Lot 297: the external bug hunt (editions 1.2/1.3) ──────────────
+
+    /// Lot 297 (BUG58): an empty argument of the agent is an element of its
+    /// own, in the middle and at the end; dropping it shifts the respawn
+    /// argv. An argv with no binary is still none.
+    #[test]
+    fn empty_argument_survives_the_parse() {
+        assert_eq!(
+            parse_proc_cmdline(b"agent\0--tenant\0\0--detect-only\0"),
+            vec!["agent", "--tenant", "", "--detect-only"],
+        );
+        assert_eq!(
+            parse_proc_cmdline(b"agent\0--tenant\0\0"),
+            vec!["agent", "--tenant", ""],
+        );
+        assert!(parse_proc_cmdline(b"\0--detect-only\0").is_empty());
+        assert!(parse_proc_cmdline(b"\0").is_empty());
+    }
+
+    /// Lot 297 (BUG67): a non-UTF-8 argument reaches the respawn byte for
+    /// byte.
+    #[test]
+    fn non_utf8_argument_survives_the_parse() {
+        use std::os::unix::ffi::OsStrExt;
+        let argv = parse_proc_cmdline(b"agent\0--rules\0/etc/r\xe8gles\0");
+        let got: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
+        let want: Vec<&[u8]> = vec![b"agent", b"--rules", b"/etc/r\xe8gles"];
+        assert_eq!(got, want);
+    }
+
+    /// Lot 297 (BUG67): `--agent-bin` replaces argv[0] as it is, a path
+    /// that is not UTF-8 too.
+    #[test]
+    fn a_non_utf8_agent_bin_replaces_argv0_as_it_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let bin = Path::new(std::ffi::OsStr::from_bytes(b"/opt/nn/ag\xe8nt"));
+        let argv = agent_argv_from_proc(std::process::id(), Some(bin)).unwrap();
+        assert_eq!(argv[0].as_bytes(), b"/opt/nn/ag\xe8nt");
+    }
+
+    /// Lot 297 (BUG58, BUG67): the argv the exec backend records for a
+    /// later watchdog start comes back the same, an empty and a non-UTF-8
+    /// argument included, and the fallback that reads it keeps them.
+    #[test]
+    fn the_recorded_argv_keeps_every_argument_as_it_is() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = TempDir::new().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        let holds = dir.path().join("watchdog.hold");
+        let record = agent_argv_record_path(&pidfile);
+        let argv: Vec<OsString> = vec![
+            "/old/northnarrow-agent".into(),
+            "--ade-prompt".into(),
+            "".into(),
+            "--ade-model".into(),
+            OsString::from_vec(b"/m\xe8del".to_vec()),
+            "--detect-only".into(),
+            "".into(),
+        ];
+        persist_agent_argv(&record, &argv).unwrap();
+        assert_eq!(read_persisted_agent_argv(&record).unwrap(), argv);
+        let verified = Path::new("/usr/local/bin/northnarrow-agent");
+        let got = exec_respawn_argv(NO_SUCH_PID, None, verified, &pidfile, &holds);
+        let mut want = argv;
+        want[0] = verified.into();
+        assert_eq!(got, want);
+    }
+
+    /// Lot 297 (BUG81, the report's fix NOT applied): an agent that never
+    /// answers stays stuck whatever its failures alternate between — a
+    /// timeout, then its socket gone, then a timeout… Both counters count
+    /// the failures since its last answer, and neither resets the other:
+    /// the report's mutual reset would let a frozen agent whose socket root
+    /// removes and puts back at every ping (WDG-007) never be recovered.
+    #[test]
+    fn alternating_timeout_and_vanished_still_trips_stuck() {
+        let mut t = StatusPingTracker::new();
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(
+            t.record_socket_absent(),
+            PingOutcome::SocketVanished { consecutive: 1 }
+        );
+        assert_eq!(t.record_timeout(), PingOutcome::StuckDetected);
+        // the other way round: stuck within four pings
+        let mut t = StatusPingTracker::new();
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        assert_eq!(
+            t.record_socket_absent(),
+            PingOutcome::SocketVanished { consecutive: 1 }
+        );
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(
+            t.record_socket_absent(),
+            PingOutcome::SocketVanished { consecutive: 2 }
+        );
+        assert_eq!(t.record_timeout(), PingOutcome::StuckDetected);
+        // an answer in between starts over
+        let mut t = StatusPingTracker::new();
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
     }
 }
