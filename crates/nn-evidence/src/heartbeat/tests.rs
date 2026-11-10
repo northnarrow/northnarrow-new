@@ -1483,7 +1483,14 @@ fn an_abnormal_stop_followed_by_a_start_is_degraded() {
     }
     let r = run(None);
     assert!(r.alerts[0].detail().contains("(no reason given)"), "{r:?}");
-    for clean in CLEAN_STOP_REASONS {
+    // the agent's clean stops (its run loop's reasons that end with Ok)
+    for clean in [
+        "admin_shutdown",
+        "system_shutdown",
+        "sigterm",
+        "sigint",
+        "sighup",
+    ] {
         let r = run(Some(clean));
         assert!(r.alerts.is_empty(), "{clean}: {r:?}");
     }

@@ -163,3 +163,35 @@ fn stop_result(stop_reason: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lot 295: the heartbeat's verifier tells a clean stop by its reason
+    /// (`CLEAN_STOP_REASONS`): the stops this agent ends with `Ok` are those,
+    /// the failures it ends with an error (the watchdog restarts it) are not
+    /// — a failed stop followed by the next start is DEGRADED off the host.
+    #[test]
+    fn the_verifier_s_clean_stops_are_the_agent_s() {
+        use nn_evidence::heartbeat::CLEAN_STOP_REASONS;
+        for r in [
+            "admin_shutdown",
+            "system_shutdown",
+            "sigterm",
+            "sigint",
+            "sighup",
+        ] {
+            assert!(stop_result(r).is_ok(), "{r}");
+            assert!(CLEAN_STOP_REASONS.contains(&r), "{r}");
+        }
+        for r in [
+            "sensor_pump_exited",
+            "response_dispatcher_exited",
+            "decision_thread_failed",
+        ] {
+            assert!(stop_result(r).is_err(), "{r}");
+            assert!(!CLEAN_STOP_REASONS.contains(&r), "{r}");
+        }
+    }
+}
