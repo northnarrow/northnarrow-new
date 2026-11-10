@@ -716,23 +716,10 @@ fn read_bounded<H: ChainHost>(path: &Path, max: u64) -> std::io::Result<Option<V
     Ok(Some(buf))
 }
 
-/// The heads of every target, read from disk now. A chain whose head
-/// cannot be read (an I/O error, or [`read_file_head`]'s bounds) is left
-/// out, with a warning.
-pub fn collect_heads<H: ChainHost>(
-    targets: &[ChainTarget],
-    pk: &VerifyingKey,
-) -> Vec<AnchoredHead> {
-    let now = read_heads::<H>(targets, pk);
-    for (chain, why) in &now.unread {
-        warn!(chain = %chain, error = %why, "chain head: file not read");
-    }
-    now.heads
-}
-
-/// Lot 295 (BUG26): what one read of every target's head found — the
-/// heads, and apart the chains whose head is not known (not the same as a
-/// file with no head: the anchor keeps such a chain's anchored head).
+/// The heads of every target, read from disk now (it was `collect_heads`,
+/// which left out a chain whose head it could not read). Lot 295 (BUG26):
+/// the heads, and apart the chains whose head is not known — not the same
+/// as a file with no head: the anchor keeps such a chain's anchored head.
 struct HeadsNow {
     heads: Vec<AnchoredHead>,
     /// `chain` (`x`, `x.manifest`) and why its head is not known.

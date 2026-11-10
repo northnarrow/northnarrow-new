@@ -895,3 +895,37 @@ ancestors trusted by the tree they lie in (BUG-49). After the upgrade:
 - **The exploit guard and `setgroups`** (BUG71): a uid or gid gain inside
   `setgroups` is an anomaly (NN-L-EPG-001); a `setgroups` that changes only
   the groups, as logins and privilege drops do, is not.
+
+## 18. The chains' head anchor and the heartbeat's verifier (lot 295)
+
+- **A chain cut while the agent runs is a finding of the running agent**
+  (BUG25). Every 5 minutes and at the stop, the head anchor checks the heads
+  it anchored last: one cut, emptied, rewritten or deleted since is a signed
+  `integrity_drift` with `at_boot: false` (`chain_truncated`,
+  `chain_rewritten`, `chain_missing`, `chain_archives_missing`), written
+  before the anchor takes the head as it is now — it used to take it
+  silently, and the next start found nothing. When the audit log cannot
+  take the row, the old head stays anchored (the ERROR every 5 minutes) and
+  the next start reports the loss. Nothing to configure;
+  `EVIDENCE_CHAINS.md` says what to do with one.
+- **A head the agent cannot read again stays anchored** (BUG26): more than
+  64 lines shaped like the chain's that do not verify after it (or 16 MiB
+  of lines that are not the chain's) no longer take the chain out of the
+  anchor — WARN `chain head: not known — the anchored head is kept while it
+  is still in its file`, once.
+- **An archive is evicted only when its manifest says so** (BUG08): at the
+  start, an archive that held an anchored head or checkpoint and is gone is
+  `chain_missing` unless the manifest's signed `Evicted` row for it is in
+  its last 256 KiB; a foreign `<log>.<higher number>` no longer hides a
+  deleted generation.
+- **The heartbeat's verifier** (`nn-admin heartbeat watch`, BUG18, BUG30,
+  BUG01, BUG12, BUG32): use the `nn-admin` of this release on the
+  verifier's host. It reads every new beat, not only the newest: a cut the
+  agent declared (`kept: false`) or a head that went back in any beat of a
+  fetch is `REPLAY`; a head gone from the beats is `REPLAY` once (not at
+  every check while it stays gone; its state file keeps it as
+  `heads_gone`) and compared when it comes back; the loss and health of a
+  run that ended between two checks are `LOSS`/`DEGRADED`, and a stop with
+  a reason that is not a clean stop's followed by the next start is
+  `DEGRADED`. A beat's `interval_secs` is taken within 5 to 300 s. A state
+  file of an earlier verifier is read as it is.
