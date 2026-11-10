@@ -6243,9 +6243,9 @@ mod tests {
     /// the valid one after it wins.
     #[test]
     fn a_malformed_row_with_the_name_is_ignored() {
-        let body = "root:x:0:0::/root:/bin/sh\nsyslog:x\nsyslog:x:104:110::/home/syslog:/usr/sbin/nologin\n";
+        let body = "root:x:0:0::/root:/bin/sh\nsyslog:x\nsyslog:x:104:110::/nonexistent:/usr/sbin/nologin\n";
         assert_eq!(parse_passwd_uid(body, "syslog"), Some(104));
-        let body = "syslog:x:abc:110:::\nsyslog:x:104:110::/home/syslog:/usr/sbin/nologin\n";
+        let body = "syslog:x:abc:110:::\nsyslog:x:104:110::/nonexistent:/usr/sbin/nologin\n";
         assert_eq!(
             parse_passwd_uid(body, "syslog"),
             Some(104),
