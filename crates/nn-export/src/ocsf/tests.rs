@@ -614,3 +614,122 @@ fn an_inbound_flow_is_inbound_with_its_traffic_from_the_peer() {
         .get("inbound")
         .is_none());
 }
+
+/// The interrupted row an agent before lot 298 wrote (`Journal::start_run`:
+/// no `intent`, an `outcome` of result `unknown`).
+fn legacy_interrupted() -> String {
+    use nn_evidence::action_payload::{ActionOutcome, ActionRecord, ActionResult, ActionRow};
+    let rec = ActionRecord {
+        row: ActionRow::Interrupted,
+        run: "00112233aabbccdd".into(),
+        action: 8,
+        ts: "2026-10-31T23:59:00.004000Z".into(),
+        intent: None,
+        outcome: Some(ActionOutcome {
+            result: ActionResult::Unknown,
+            outcome: "KillProcessTree pid 4242 (R001): not known".into(),
+            reason: Some("the agent stopped between the action's intent and its outcome".into()),
+            elapsed_us: 0,
+            intent_written: true,
+        }),
+        overflow: None,
+        noted_by: Some("ffeeddccbbaa9988".into()),
+    };
+    sealed(&serde_json::to_string(&rec).unwrap())
+}
+
+fn action_row(line: u64, raw: &str) -> Row<'_> {
+    Row {
+        chain: ExportChain::Actions,
+        file: 3,
+        line,
+        end: 1000 * line,
+        raw: raw.as_bytes(),
+        rotate: None,
+        verified: true,
+        prev_hash: Some("0".repeat(64)),
+        entry_hash: Some("1".repeat(64)),
+    }
+}
+
+/// Lot 298 (external bug hunt, BUG19): an interrupted row without its
+/// intent (EXPORT.md: "action `interrupted` | its intent's class | status
+/// Error") mapped by the worker that saw the intent is its intent's class,
+/// with the intent's signed row attached as an outcome's is — it came out
+/// as 7001/Unknown, "action ?".
+#[test]
+fn interrupted_row_as_journal_writes_it_is_its_intents_class() {
+    let intent = sealed(
+        r#"{"row":"intent","run":"00112233aabbccdd","action":8,"ts":"2026-10-31T23:59:00.000000Z","intent":{"source":"rule","response":"KillProcessTree","pid":4242,"start_ns":0,"severity":"high","why":["R001"],"queued_us":0}}"#,
+    );
+    let interrupted = legacy_interrupted();
+    let mut m = Mapper::new();
+    let first = m.map(&ctx(), &action_row(1, &intent));
+    assert_eq!(first[0]["class_uid"], 7003);
+    let recs = m.map(&ctx(), &action_row(2, &interrupted));
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(
+        r["class_uid"], 7003,
+        "the intent's class, not the generic one"
+    );
+    assert_eq!(r["activity_id"], 2, "Evict, as its intent");
+    assert_eq!(r["process"]["pid"], 4242);
+    assert_eq!(r["status_id"], 6, "Error: interrupted");
+    assert_eq!(r["severity_id"], 4);
+    assert_eq!(r["message"], "rule KillProcessTree pid 4242");
+    assert_eq!(r["unmapped"]["northnarrow"]["kind"], "interrupted");
+    assert_eq!(
+        r["unmapped"]["northnarrow"]["intent_raw"],
+        intent.as_str(),
+        "the intent's signed row, as an outcome carries it"
+    );
+    assert_eq!(r["unmapped"]["northnarrow"]["intent_row"]["line"], 1);
+    let errs = check_record(r);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    // a mapper that has not seen the intent: the generic class, nothing
+    // attached (as an outcome without its intent)
+    let alone = Mapper::new().map(&ctx(), &action_row(2, &interrupted));
+    assert_eq!(
+        (
+            alone[0]["class_uid"].as_u64(),
+            alone[0]["activity_id"].as_u64()
+        ),
+        (Some(7001), Some(0))
+    );
+    assert!(alone[0]["unmapped"]["northnarrow"]
+        .get("intent_raw")
+        .is_none());
+}
+
+/// Lot 298 (BUG19): the interrupted row the journal writes since lot 298
+/// carries its intent: a mapper that never saw the intent (a worker
+/// restarted since) maps it to the intent's class from the row alone, and
+/// attaches nothing (the facts are the row's own, signed).
+#[test]
+fn an_interrupted_row_with_its_intent_needs_no_mapper_state() {
+    let interrupted = sealed(
+        r#"{"row":"interrupted","run":"00112233aabbccdd","action":8,"ts":"2026-10-31T23:59:00.004000Z","intent":{"source":"rule","response":"KillProcessTree","pid":4242,"start_ns":0,"severity":"high","why":["R001"],"queued_us":0},"outcome":{"result":"unknown","outcome":"KillProcessTree pid 4242 (R001): not known","reason":"the agent stopped between the action's intent and its outcome","elapsed_us":0},"noted_by":"ffeeddccbbaa9988"}"#,
+    );
+    let r = &Mapper::new().map(&ctx(), &action_row(2, &interrupted))[0];
+    assert_eq!(
+        (r["class_uid"].as_u64(), r["activity_id"].as_u64()),
+        (Some(7003), Some(2))
+    );
+    assert_eq!(r["process"]["pid"], 4242);
+    assert_eq!(r["status_id"], 6);
+    assert!(r["unmapped"]["northnarrow"].get("intent_raw").is_none());
+    // a mapper that kept another intent for this action does not replace
+    // the row's own
+    let mut m = Mapper::new();
+    m.map(
+        &ctx(),
+        &action_row(
+            1,
+            &sealed(
+                r#"{"row":"intent","run":"00112233aabbccdd","action":8,"ts":"2026-10-31T23:59:00.000000Z","intent":{"source":"combat","response":"Isolate","pid":0,"start_ns":0,"severity":"critical","why":["ISOLATE"],"queued_us":0}}"#,
+            ),
+        ),
+    );
+    assert_eq!(m.map(&ctx(), &action_row(2, &interrupted))[0], *r);
+}

@@ -1066,7 +1066,10 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     regular_file(&f, path)?;
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
+    // Lot 298 (BUG16): the last row of the run that booted last — not of a
+    // start refused after it, which is no run.
     let mut last_ts = String::new();
+    let mut in_run = true;
     let mut previous = PreviousRun::None;
     let mut second_key_added = false;
     let mut verified_boot = false;
@@ -1093,7 +1096,14 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
             seq_break.get_or_insert_with(|| format!("{}: {b}", path.display()));
         }
         match entry.op.as_str() {
+            // Lot 298 (BUG16): a refused start (`result` `refused`, the
+            // process exits without `agent_stop`) is not a run: it neither
+            // ends the run before it nor starts one. It made the next boot
+            // sign `previous_run` "abrupt" (the SIGKILL/OOM warning) after a
+            // clean stop.
+            "agent_boot" if entry.result == "refused" => in_run = false,
             "agent_boot" => {
+                in_run = true;
                 if entry.result == "success"
                     && entry.extra.get("binary_integrity").and_then(|v| v.as_str())
                         == Some("verified")
@@ -1119,7 +1129,9 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
             "rotate_keys_add" if entry.result == "success" => second_key_added = true,
             _ => {}
         }
-        last_ts = entry.ts.clone();
+        if in_run {
+            last_ts = entry.ts.clone();
+        }
         last = Some(entry.entry_hash);
         last_agent_id = Some(entry.agent_id);
     }
@@ -1726,6 +1738,87 @@ mod tests {
             other => panic!("expected Clean, got {other:?}"),
         }
         assert!(verify_chain_ok(&log_path));
+    }
+
+    /// Lot 298 (external bug hunt, BUG16): a refused start (no
+    /// `agent_stop`) is not a run that was killed: the next boot keeps the
+    /// last real run's clean ending.
+    #[test]
+    fn refused_boot_is_not_an_abrupt_previous_run() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("sigterm", 42).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert!(matches!(log.previous_run(), PreviousRun::Clean { .. }));
+        let refused = log
+            .boot_refused_by(
+                "bpf_lsm",
+                "verified",
+                "source-tree",
+                "gate said no",
+                &test_build(),
+            )
+            .unwrap();
+        assert_eq!(
+            (refused.op.as_str(), refused.result.as_str()),
+            ("agent_boot", "refused")
+        );
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert_eq!(
+            boot.extra["previous_run"]["ended"], "clean",
+            "signed previous_run after a refused start: {}",
+            boot.extra["previous_run"]
+        );
+        assert_eq!(boot.extra["previous_run"]["reason"], "sigterm");
+        assert!(verify_chain_ok(&log_path));
+    }
+
+    /// Lot 298 (BUG16): a run killed, then a refused start: the next boot
+    /// says the killed run ended abruptly — its own boot and its own last
+    /// row, not the refused start's.
+    #[test]
+    fn killed_then_refused_keeps_the_killed_run_s_boot_time() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let clock = Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-11-10T08:00:00.000000Z",
+        ));
+        let stamps = || AuditStamps {
+            clock: clock.clone(),
+            self_pid: 4_200_000,
+        };
+        let open = || AuditLog::open_with(&log_path, key(), [0u8; 16], stamps()).unwrap();
+        let mut log = open();
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        clock.advance(chrono::TimeDelta::seconds(5));
+        let last = log.append(sample_draft(1)).unwrap();
+        // killed: no stop row; the next start, a minute later, is refused
+        clock.advance(chrono::TimeDelta::seconds(60));
+        let mut log = open();
+        let refused = log
+            .boot_refused_by("bpf_lsm", "verified", "source-tree", "no", &test_build())
+            .unwrap();
+        assert!(refused.ts > last.ts && last.ts > boot.ts);
+        clock.advance(chrono::TimeDelta::seconds(60));
+        let log = open();
+        match log.previous_run() {
+            PreviousRun::Abrupt {
+                booted_at,
+                last_entry_at,
+            } => {
+                assert_eq!(booted_at, &boot.ts, "the killed run's boot");
+                assert_eq!(last_entry_at, &last.ts, "the killed run's last row");
+            }
+            other => panic!("expected Abrupt, got {other:?}"),
+        }
     }
 
     /// Lab PR 218: a refused boot names the gate that refused it.

@@ -367,7 +367,20 @@ pub fn check_head<H: ChainHost>(path: &Path, head: &FileHead) -> std::io::Result
     if len < head.bytes {
         return Ok(HeadCheck::Shorter { len });
     }
-    let end = head.bytes;
+    Ok(match line_ending_at(&mut f, head.bytes)? {
+        Some(line) => line_has_hash(&line, &head.tail_hash),
+        None => HeadCheck::Changed,
+    })
+}
+
+/// The line of `f` that ends at byte `end` (its newline the byte before
+/// `end`; `0 < end <= ` the file's length), newline excluded: read
+/// backwards from `end` in a window that grows from 64 KiB by 4 up to
+/// [`HEAD_WINDOW_MAX`] and past it once (16 MiB). `None`: no line ends
+/// there, or its start is not within that window. [`check_head`]'s read,
+/// shared with [`crate::chainlog::holds_line_ending_at`] (lot 298, BUG11:
+/// that one read a fixed 64 KiB, so a longer intact line was "not held").
+pub(crate) fn line_ending_at(f: &mut std::fs::File, end: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut window = HEAD_WINDOW.min(end);
     loop {
         let start = end - window;
@@ -375,17 +388,17 @@ pub fn check_head<H: ChainHost>(path: &Path, head: &FileHead) -> std::io::Result
         f.seek(SeekFrom::Start(start))?;
         f.read_exact(&mut buf)?;
         if buf.last() != Some(&b'\n') {
-            return Ok(HeadCheck::Changed);
+            return Ok(None);
         }
-        let body = &buf[..buf.len() - 1];
-        if let Some(nl) = body.iter().rposition(|&c| c == b'\n') {
-            return Ok(line_has_hash(&body[nl + 1..], &head.tail_hash));
+        buf.pop();
+        if let Some(nl) = buf.iter().rposition(|&c| c == b'\n') {
+            return Ok(Some(buf.split_off(nl + 1)));
         }
         if start == 0 {
-            return Ok(line_has_hash(body, &head.tail_hash));
+            return Ok(Some(buf));
         }
         if window >= HEAD_WINDOW_MAX {
-            return Ok(HeadCheck::Changed);
+            return Ok(None);
         }
         window = window.saturating_mul(4).min(end);
     }
@@ -503,7 +516,10 @@ pub fn flat_rows<T: serde::de::DeserializeOwned>(
     };
     let mut rows = Vec::new();
     let mut raws = Vec::new();
-    for (i, l) in body.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+    // Lot 298 (BUG09): split on '\n' only — `str::lines` also drops a '\r'
+    // before it, so a numbered row followed by "\r\n" passed the canonical
+    // form check (the bytes on disk are not what the agent wrote).
+    for (i, l) in body.split('\n').enumerate().filter(|(_, l)| !l.is_empty()) {
         rows.push(serde_json::from_str(l).map_err(|e| format!("line {}: {e}", i + 1))?);
         raws.push(l.to_string());
     }
@@ -2727,5 +2743,67 @@ mod tests {
             .open(path)
             .unwrap();
         f.write_all(bytes).unwrap();
+    }
+
+    // ── lot 298: the external bug hunt's flat-chain reader (BUG09) ──
+
+    #[derive(Serialize, Deserialize)]
+    struct CrlfRow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        token: String,
+    }
+
+    /// BUG09: `flat_rows` split with `str::lines`, which drops the `\r` of
+    /// a `\r\n` end: a numbered row with a byte appended passed the
+    /// canonical-form check.
+    #[test]
+    fn numbered_row_with_crlf_is_not_canonical() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("canaries.jsonl");
+        let mut bytes = serde_json::to_vec(&CrlfRow {
+            seq: Some(0),
+            token: "abc".into(),
+        })
+        .unwrap();
+        bytes.extend_from_slice(b"\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let (rows, raws) = flat_rows::<CrlfRow>(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            canonical_rows(&rows, &raws, |r| r.seq.is_some()).is_err(),
+            "the line on disk ends with \\r: not the bytes the agent wrote (raw kept: {:?})",
+            raws[0]
+        );
+    }
+
+    /// BUG09: a row without `seq` (the format from before numbering) with
+    /// a `\r` is counted as not canonical, not refused; rows in their
+    /// bytes are canonical.
+    #[test]
+    fn legacy_row_with_crlf_is_counted_not_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("canaries.jsonl");
+        let row = |seq: Option<u64>| {
+            serde_json::to_vec(&CrlfRow {
+                seq,
+                token: "abc".into(),
+            })
+            .unwrap()
+        };
+        let mut bytes = row(None);
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(&row(None));
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&row(Some(0)));
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let (rows, raws) = flat_rows::<CrlfRow>(&path).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            canonical_rows(&rows, &raws, |r| r.seq.is_some()),
+            Ok(1),
+            "{raws:?}"
+        );
     }
 }
