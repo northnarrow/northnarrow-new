@@ -293,6 +293,45 @@ mod tests {
         assert!(excluded(C001, &fired) && excluded(C007, &fired));
     }
 
+    /// Bug hunt 1.3, BUG45: what a match answers a flow — nothing when the
+    /// policy turned the rule off or its exemption covers the actor (`off`
+    /// matches leave the decision before the ledger reads it, the function
+    /// says so on its own); otherwise whether it acts.
+    #[test]
+    fn an_off_or_exempt_match_answers_nothing() {
+        use super::super::combine::apply_policy;
+        use super::super::rule_policy::{parse, Exempt};
+        use nn_model::{ResponseAction, Severity};
+        let m = |policy: &str, action: ResponseAction, exempt: Option<Exempt>| {
+            let v = Verdict {
+                rule_id: C002.into(),
+                rule_name: String::new(),
+                category: String::new(),
+                action,
+                severity: Severity::Critical,
+                reasoning: String::new(),
+                event_pid: 7,
+                event_filename: String::new(),
+                timestamp_ns: 1,
+            };
+            let policy = parse(policy).unwrap();
+            apply_policy(0, C002, &[], v, None, &policy, |_| exempt)
+        };
+        let kill = ResponseAction::KillProcessTree;
+        let off = "off NN-L-CHAIN-002_TmpExecThenEgress\n";
+        let exempt = "exempt NN-L-CHAIN-002_TmpExecThenEgress uid 1000\n";
+        let alert = "alert NN-L-CHAIN-002_TmpExecThenEgress\n";
+        assert_eq!(answer_of(&m(off, kill.clone(), None)), None);
+        let holds = Some(Exempt::Holds("uid 1000".into()));
+        assert_eq!(answer_of(&m(exempt, kill.clone(), holds)), None);
+        assert_eq!(answer_of(&m("", kill.clone(), None)), Some(acted(C002)));
+        assert_eq!(answer_of(&m(alert, kill, None)), Some(recorded(C002)));
+        assert_eq!(
+            answer_of(&m("", ResponseAction::Log, None)),
+            Some(recorded(C002))
+        );
+    }
+
     /// Lab PR 246: a trip's connection stays owned past its close (a row
     /// may follow the close from another task), the claim is bounded,
     /// oldest out, and it is the trip's connection only.

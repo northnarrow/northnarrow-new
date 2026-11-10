@@ -6062,6 +6062,18 @@ mod tests {
         assert!(!det
             .detect(&focal, &recent)
             .contains(&TriggerType::ExfiltrationPattern));
+        // nineteen public connects, then a loopback one judged: not the
+        // twentieth (the public twentieth raises it)
+        let public: Vec<Event> = (1..20u64)
+            .map(|i| tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, i * SEC))
+            .collect();
+        let lo = tcp_v4_comm(7, "app", [127, 0, 0, 1], 443, 20 * SEC);
+        assert!(!det
+            .detect(&lo, &public)
+            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(det
+            .detect(&focal, &public)
+            .contains(&TriggerType::ExfiltrationPattern));
         // a connect of another family (not inet) does not count either
         let mut other_family = recent.clone();
         other_family.extend((10..20u64).map(|i| {
@@ -6113,6 +6125,14 @@ mod tests {
         assert!(det
             .detect(&between, &reversed)
             .contains(&TriggerType::Lolbas));
+        // two execs stamped alike: the one recorded last is the latest
+        let tie = vec![
+            spawn(7, 1, "curl", "/usr/bin/curl", 3),
+            spawn(7, 1, "python3", "/usr/bin/python3", 3),
+        ];
+        assert!(!det.detect(&focal, &tie).contains(&TriggerType::Lolbas));
+        let tie: Vec<Event> = tie.into_iter().rev().collect();
+        assert!(det.detect(&focal, &tie).contains(&TriggerType::Lolbas));
     }
 
     /// BUG51: a curl of a day ago whose pid a later process took (its
