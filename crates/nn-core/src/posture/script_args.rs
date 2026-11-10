@@ -575,3 +575,50 @@ fn guess(argv: &[String], from: usize, shell: bool) -> Option<Box<str>> {
 fn octal_digits(s: &str) -> usize {
     s.bytes().take_while(|b| (b'0'..=b'7').contains(b)).count()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every family reads any cluster of up to three characters — ASCII,
+    /// a multi-byte one, the option letters of every table — without a
+    /// panic, and a script it names is in that argument (no argument past
+    /// the argv's end).
+    #[test]
+    fn any_cluster_is_read_without_a_panic() {
+        let alphabet: Vec<char> = "abcdeEfFhiIklmMnoOprsStTuvVwWxX0179:=-+.é…"
+            .chars()
+            .collect();
+        let exes = [
+            "/usr/bin/python3",
+            "/usr/bin/perl",
+            "/usr/bin/ruby",
+            "/usr/bin/node",
+            "/usr/bin/bash",
+            "/usr/bin/zsh",
+            "/usr/bin/mono",
+        ];
+        let mut clusters = vec![String::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for c in &clusters {
+                for a in &alphabet {
+                    next.push(format!("{c}{a}"));
+                }
+            }
+            clusters.extend(next);
+        }
+        for exe in exes {
+            for c in &clusters {
+                for prefix in ["-", "--", "+", ""] {
+                    let argv = vec!["x".to_string(), format!("{prefix}{c}")];
+                    match runs_of(Path::new(exe), &argv) {
+                        // the argument itself, or the module `-m` names in it
+                        Runs::Script(s) => assert!(argv[1].ends_with(&*s), "{exe} {argv:?}"),
+                        Runs::Inline | Runs::Unknown(_) => {}
+                    }
+                }
+            }
+        }
+    }
+}
