@@ -1578,12 +1578,15 @@ fn connect_events(
                 .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
         return vec![Event::NetFlow(row)];
     }
-    let row = w.flow_tracker.lock().on_tcp_connect(&info);
+    // External bug hunt (edition 1.3), BUG43: the name is looked up now
+    // and kept with the pending flow — the DNS cache may have dropped the
+    // process by the flow's snapshots and its close (its TTL, 300 s).
+    let name = w
+        .dns_cache
+        .lookup_for_connect(info.pid, info.start_ns, info.proc_start_ns);
+    let row = w.flow_tracker.lock().on_tcp_connect_named(&info, name);
     let mut out = vec![Event::from(raw)];
     if let Some(mut row) = row {
-        row.resolved_hostname =
-            w.dns_cache
-                .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
         // Lot 275 (NN-L-NET-028): did the lineage resolve the destination
         row.dns_resolution = crate::net::resolved::judge(
             &w.resolved,
@@ -2322,6 +2325,74 @@ mod tests {
             Some("/usr/bin/python3.12")
         );
         assert_eq!(exe_at(30_000, 0xcafe).as_deref(), Some("/usr/sbin/nginx"));
+    }
+
+    /// Bug hunt 1.3, BUG43: a flow open 400 s, its process resolving
+    /// nothing since its connect while 256 others resolve: the DNS cache
+    /// drops the process (its TTL, 300 s), and the flow's snapshot still
+    /// names the destination its connect resolved — the connect pump gave
+    /// the name to the tracker. Before, the snapshot (and the close) looked
+    /// it up again and found nothing.
+    #[test]
+    fn a_long_flow_keeps_its_connect_name_past_the_cache_ttl() {
+        use crate::net::flow_tracker::SnapshotPolicy;
+        const S: u64 = 1_000_000_000;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // a process started at 1 s (100 ticks), its stat as /proc shows it
+        let dir = tmp.path().join("4600");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            "4600 (p) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n",
+        )
+        .unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(4600, 1, "/usr/bin/python3.12", 1);
+        let w = wiring(lineage);
+        let stub: std::net::IpAddr = "127.0.0.53".parse().unwrap();
+        w.dns_cache
+            .on_dns_query(4600, "c2.example".into(), 1, stub, 10 * S);
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4600;
+        raw.family = nn_model::netaddr::AF_INET;
+        raw.dst_port = 443;
+        raw.dst_addr[..4].copy_from_slice(&[203, 0, 113, 5]);
+        raw.timestamp_ns = 10 * S + 1_000;
+        raw.sk_ptr = 0xc2c2;
+        let events = connect_events(&raw, Some(&w), true);
+        let Event::NetFlow(row) = &events[1] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
+        // 400 s later: 256 other processes resolve, the cache prunes 4600
+        for k in 0..256u64 {
+            w.dns_cache.on_dns_query(
+                5_000 + k as u32,
+                format!("other{k}.example"),
+                1,
+                stub,
+                400 * S + k * 1_000_000,
+            );
+        }
+        assert_eq!(
+            w.dns_cache
+                .lookup_for_connect(4600, raw.timestamp_ns, row.proc_start_ns),
+            None,
+            "the cache dropped the process"
+        );
+        let snaps = crate::net::drain::due_snapshot_rows(
+            &w.flow_tracker,
+            &w.dns_cache,
+            &w.lineage,
+            &SnapshotPolicy::default(),
+            410 * S,
+        );
+        assert_eq!(snaps.len(), 1, "{snaps:?}");
+        assert_eq!(
+            snaps[0].resolved_hostname.as_deref(),
+            Some("c2.example"),
+            "the snapshot of a flow open 400 s"
+        );
     }
 
     /// Lab PR 246: a connect is announced to the flow tracker only once its

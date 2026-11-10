@@ -672,7 +672,8 @@ fn monotonic_ns() -> u64 {
 /// (it started after the connect), is not handed out: its socket may live
 /// on in a child, but nothing names it. The image is read again — the
 /// process may have executed another since its connect — and so is the
-/// DNS name.
+/// DNS name; when the DNS cache no longer holds it, the connect's (bug
+/// hunt 1.3, BUG43).
 pub(crate) fn due_snapshot_rows(
     flow_tracker: &Mutex<FlowTracker>,
     dns_cache: &DnsCache,
@@ -700,8 +701,12 @@ pub(crate) fn due_snapshot_rows(
         if let Some(image) = lineage.image_path_at(row.pid, row.start_ns) {
             row.exe = Some(image);
         }
-        row.resolved_hostname =
-            dns_cache.lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        // External bug hunt (edition 1.3), BUG43: a name found again wins;
+        // else the connect's, which the tracker kept (the cache drops a
+        // process past its TTL while its flow stays open).
+        if let Some(name) = dns_cache.lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns) {
+            row.resolved_hostname = Some(name);
+        }
         out.push(row);
     }
     out
@@ -939,7 +944,9 @@ async fn process_close_record(
     // window per design §6.2. Hit populates `resolved_hostname`;
     // miss leaves it None (IP-literal destination, or DNS query
     // never observed within the TTL). External audit NET-016: only the
-    // queries made since the connecting process started.
+    // queries made since the connecting process started. External bug
+    // hunt (edition 1.3), BUG43: a miss keeps the name the connect was
+    // given (the tracker's), the cache having dropped the process since.
     if let Some(qname) =
         dns_cache.lookup_for_connect(event.pid, event.start_ns, event.proc_start_ns)
     {
@@ -2257,6 +2264,52 @@ mod tests {
             )
             .await;
         }
+    }
+
+    /// Bug hunt 1.3, BUG43: the closed row of a flow open 400 s keeps the
+    /// name its connect was given, the DNS cache having dropped the process
+    /// since (its TTL, 300 s) — the close looked it up again and wrote no
+    /// name to the netflow log, the export and `nn-admin net`.
+    #[tokio::test]
+    async fn a_long_flows_closed_row_keeps_its_connect_name() {
+        const S: u64 = 1_000_000_000;
+        let mut h = harness();
+        let (tx, mut rx) = crate::sensors::bus::channel();
+        let stub: IpAddr = "127.0.0.53".parse().unwrap();
+        // an old connect: its close waits for nothing
+        let t0 = monotonic_ns().saturating_sub(500 * S);
+        h.dns
+            .on_dns_query(9825, "c2.example".into(), 1, stub, t0 - 1_000);
+        {
+            // the connect pump: the name looked up at the connect
+            let c = refused_connect(t0, 0xc2);
+            let name = h.dns.lookup_for_connect(c.pid, c.start_ns, c.proc_start_ns);
+            assert_eq!(name.as_deref(), Some("c2.example"));
+            let mut t = h.tracker.lock();
+            assert!(t.on_tcp_connect_named(&c, name).is_some());
+            t.announce(&FlowTracker::corr_id(t0, 0xc2));
+        }
+        for k in 0..256u64 {
+            h.dns.on_dns_query(
+                5_000 + k as u32,
+                format!("other{k}.example"),
+                1,
+                stub,
+                t0 + 400 * S + k,
+            );
+        }
+        assert_eq!(h.dns.lookup_for_connect(9825, t0, 0), None, "pruned");
+        let mut close = refused_close(t0, 0xc2);
+        close.timestamp_ns = t0 + 400 * S;
+        h.close(&close, &tx).await;
+        drop(tx);
+        let mut names = Vec::new();
+        while let Some(ev) = rx.recv().await.map(|r| r.envelope.event) {
+            if let Event::NetFlow(nf) = ev {
+                names.push(nf.resolved_hostname);
+            }
+        }
+        assert_eq!(names, [Some("c2.example".to_string())]);
     }
 
     /// `comm` as the kernel can hand it: a name, its NUL, then a byte left

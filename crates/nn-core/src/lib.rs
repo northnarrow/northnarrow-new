@@ -149,6 +149,9 @@ pub mod net {
     // The `nameserver`s of the host's `resolv.conf`, re-read when they
     // change (lab PR 224).
     pub mod resolvers;
+    // The registrable domain of a DNS name: NN-L-NET-014's corroboration
+    // key (external bug hunt 1.3, BUG55).
+    pub mod registrable;
 }
 
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's

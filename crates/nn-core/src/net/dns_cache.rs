@@ -372,9 +372,14 @@ impl<I: Default> DnsCache<I> {
     /// Also opportunistically prunes expired entries for this
     /// PID — keeps memory bounded under long-lived agent runs.
     /// Drop every pid whose NEWEST query is older than the TTL (its
-    /// entries could never attribute a connect again), then, if the map
-    /// is still above [`DEFAULT_MAX_PIDS`], evict the pids with the
-    /// oldest newest-query until it fits. Called from `on_dns_query`
+    /// entries can attribute no new connect), then, if the map is still
+    /// above [`DEFAULT_MAX_PIDS`], evict the pids with the oldest
+    /// newest-query until it fits. A flow open longer than the TTL is looked
+    /// up again at its snapshots and its close, with its connect's time,
+    /// and may find nothing here then: the name its connect was given is
+    /// the flow tracker's to keep (`FlowTracker::on_tcp_connect_named`;
+    /// external bug hunt 1.3, BUG43 — "could never attribute a connect
+    /// again" said here, and was not so). Called from `on_dns_query`
     /// every [`PRUNE_EVERY`] inserts, so the amortised cost per query is
     /// a fraction of a scan.
     fn prune_pids(g: &mut DnsCacheInner, now_ns: u64, ttl_ns: u64) {

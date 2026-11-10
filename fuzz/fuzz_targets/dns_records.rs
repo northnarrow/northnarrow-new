@@ -14,8 +14,17 @@
 //!   least its least wire size inside the message (an owner name of one
 //!   byte, the root's — the CI smoke run's crash-8a7b232e, a root-named A
 //!   record, read in 15 bytes; then the 10 fixed bytes and its data), every
-//!   name printable ASCII of at most 1,020 bytes.
+//!   name printable ASCII of at most 1,020 bytes;
+//! - external bug hunt (edition 1.2), BUG02: the parse worker's honest
+//!   answer to a response passes the core's check of it
+//!   (`nn_proto::ipc::check_response`). The core's floor counted an owner
+//!   of 2 bytes where this parser reads one: the honest worker was killed
+//!   as a violator for a root-owned record, and disabled after five.
 use libfuzzer_sys::fuzz_target;
+use nn_proto::ipc::{
+    check_response, Answer as IpcAnswer, DnsAnswersOut, DnsRecordOut, Request,
+    MAX_DNS_ANSWER_IN,
+};
 use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
 use nn_parse::dns_response::{parse_response, AnswerRecord, MAX_RECORDS};
 use nn_parse::dns_qname::{QnameLabel, QnameLabels, decode_dns_qname, qname_wire_end};
@@ -84,6 +93,40 @@ fuzz_target!(|data: &[u8]| {
     }
 
     if let Some(r) = parse_response(data) {
+        // BUG02: what the parse worker answers (`worker::serve`'s
+        // conversion) is accepted by the core for the bytes it was sent
+        if data.len() <= MAX_DNS_ANSWER_IN {
+            let honest = IpcAnswer::DnsAnswers(Some(DnsAnswersOut {
+                qname: r.qname.clone(),
+                qtype: r.qtype,
+                rcode: r.rcode,
+                records: r
+                    .answers
+                    .iter()
+                    .map(|a| match a.clone() {
+                        AnswerRecord::A { name, ttl, addr } => DnsRecordOut::A {
+                            name,
+                            ttl,
+                            addr: addr.octets(),
+                        },
+                        AnswerRecord::Aaaa { name, ttl, addr } => DnsRecordOut::Aaaa {
+                            name,
+                            ttl,
+                            addr: addr.octets(),
+                        },
+                        AnswerRecord::Cname { name, ttl, target } => {
+                            DnsRecordOut::Cname { name, ttl, target }
+                        }
+                    })
+                    .collect(),
+                complete: r.complete,
+            }));
+            assert_eq!(
+                check_response(&Request::DnsAnswers(data.to_vec()), &honest),
+                Ok(()),
+                "{r:?}"
+            );
+        }
         assert!(r.answers.len() <= MAX_RECORDS);
         let least: usize = r
             .answers

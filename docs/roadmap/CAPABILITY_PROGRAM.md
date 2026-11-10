@@ -7693,3 +7693,66 @@ number in parentheses is a lab PR.
     (one removed from the code), 1 named and caught.
   - Levels unchanged (C12 2, C23 2 provisional): a new kernel deny,
     measured on two kernels, in capabilities already at their level.
+
+- **Lot 291 — DNS, tunnels and flows: ten bugs of the external bug hunt
+  (editions 1.2 and 1.3; C07, C14; Wave 4 phase 3, the bug hunt's lot 1).**
+  - What was open (our triage of 10/11/2026, its fix guidance followed where
+    it differs from the report's): NN-L-NET-014's corroboration took
+    everything after the first label as the parent domain, so a tunnel with
+    its payload over two labels, or a random label more, was never killed
+    (BUG55, P0); the core's floor of a DNS answer counted a 2-byte owner, so
+    an honest parse worker was killed for a root-owned record, and disabled
+    after five, every DNS name of the host then without a decode (BUG02,
+    P0); the open-flow snapshots ordered by their last snapshot, starving a
+    deferred flow (BUG76, P1); a flow open past the DNS cache's TTL lost its
+    name (BUG43); NN-L-NET-028's state lost a pid's new binding, evicted
+    live names behind one long TTL and stopped its askers' scan at the
+    first out-of-order one (BUG46, BUG57, BUG80); NN-L-NET-026's per-key
+    bound hid hosts (BUG47), a stale sample stayed counted (BUG70), and
+    NN-L-NET-020/021 cleared every window at their bound (BUG65).
+  - What changed: the corroboration keys on the registrable domain
+    (`nn_core::net::registrable`, a curated list of 383 multi-label public
+    suffixes — the country codes' registries and the cloud platforms'
+    zones; the repository has no Public Suffix List), never finer than the
+    old key, the zone and the label case-insensitive; the answer's floor is
+    the parser's (11+4, 11+16, 11+1), and the fuzz target `dns_records`
+    asserts that the honest answer passes the core's check; the snapshots
+    by when each flow became due; the connect's name kept with the pending
+    flow; a binding's first and two latest times; the names' bound at the
+    event's time, a name as long as its answer, addresses or CNAMEs; one
+    second of slack in the askers' scan; a duplicate host's sample first
+    out of the per-key bound; a sample past the window on arrival counted
+    nowhere; one window out of a full held-record map, the one holding the
+    least, counted.
+  - The lab, as measured (our own guest under lease k291; round r1 at
+    e357178d; the agent uninstalled and the guest powered off at its end):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`). The guest clean at the start
+      (no agent, no pin, no overlay). The benign corpus: containers (13
+      steps, rootless podman, docker, k3s with a pod) and dev (24 steps)
+      rc 0 but the dev corpus' own control (R001's kill of a program from
+      `/tmp` run as `www-data`, by design): **0 NN-L-NET-014 and 0
+      NN-L-NET-002 verdicts**. A DNS tunnel's queries from an unprivileged
+      `python3` to a local port 53, 100 ms apart: the payload over two
+      labels (50+50 characters of base32 under `t.nn291-tunnel.example`),
+      a short last chunk (50+12), a random label more (40+4) — each sender
+      killed at its eighth distinct label (rc 137, NN-L-NET-014
+      `KillProcess` High after 7 Medium records); one label, as before:
+      killed. 56 high-entropy names, 7 under each of 8 sites of `co.uk`:
+      rc 0, no kill. BUG02's response (an A record owned by the root) sent
+      8 times by a server of its own to an unprivileged receiver: 8 of 8
+      received, the DNS response pump `records=8 decoded=8`, 0 protocol
+      violations, 0 `disabled`, and a long name sent afterwards decoded
+      (NN-L-NET-004's record).
+  - Host: a named test for each bug, failing on `main` (the triage's 14
+    nn-core tests at f66e6680, and each fix reverted by a mutant);
+    mutation on the fixes: 48 mutants, 44 caught at the first run, 3
+    survivors named and caught (BUG46's helpers), 1 argued equivalent
+    (BUG70: the window expired against its newest sample or against an
+    out-of-order one expires the same).
+  - Open: a tunnel whose first label is short or of low entropy is not
+    scored at all, and one rotating over 8 or more registrable domains
+    stays under each one's count (both before this lot); a suffix the list
+    lacks keys its sites one level coarser (more names add up); CoreDNS is
+    not among the forwarders NN-L-NET-004/014 spare (noticed, not this
+    lot's).
+  - Levels unchanged (C07 2, C14 2): fixes in capabilities at their level.

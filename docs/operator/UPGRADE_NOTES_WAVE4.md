@@ -749,3 +749,41 @@ others. What an operator sees change:
   `/run`, `/usr/local/lib`, `/lib` and `/usr/lib` `modprobe.d`; an
   unmodified `fim-paths.v1` of an earlier release is replaced by the
   install, as for every shipped list.
+
+## 14. DNS tunnels, the parse worker and the open flows (lot 291)
+
+Ten bugs of the external bug hunt (editions 1.2 and 1.3), as our triage
+verified them; `CHANGELOG.md` has each one.
+
+- **NN-L-NET-014 kills more tunnels.** Its eight distinct high-entropy
+  labels within a minute now add up under the name's **registrable
+  domain** (`evil.example`, `evil.co.uk`), whatever lies between the
+  payload's first label and it: a payload over several labels (iodine,
+  dnscat2), a random label more, letters in another case. Before, the
+  parent was everything after the first label, and such a tunnel was only
+  recorded. The registrable domain comes from a built-in list of public
+  suffixes (the country codes' second-level registries, the large cloud
+  platforms' zones: `s3.amazonaws.com`, `blob.core.windows.net`,
+  `azurewebsites.net`, `github.io` …); the key is never finer than
+  before. **What to check after the upgrade:** a process that resolves,
+  within a minute, eight or more distinct names of 25 characters or more
+  of high entropy under one registrable domain the list does not split —
+  a security product's reputation lookups by hash in DNS, a client of
+  many hashed sub-domains of one company's domain — is now killed where
+  before only names of the very same parent were counted. The records of
+  the old agent show it: NN-L-NET-014 Medium records of one process under
+  one domain, many a minute.
+- **The parse worker stays up** for a DNS response whose records name the
+  root (`.`): the agent counted it as a protocol violation, and five
+  disabled the worker — every DNS name of the host without a decode until
+  a worker stayed up 60 s. On an older agent `worker_parse: … protocol
+  violation: bounds: dns_answers: more answers than bytes` followed by
+  `worker_parse: disabled` was the sign (`WORKERS.md` §4).
+- **Open flows**: a flow open longer than 300 s keeps its DNS name on its
+  snapshots and in its closed row of the netflow log (it lost it when its
+  process resolved nothing since its connect), and a flow deferred by the
+  snapshots' per-tick bound comes first at the next tick.
+- **`net_window_evictions_total`** also counts a host NN-L-NET-026/027's
+  per-process bound dropped while still in its window, and a live window
+  of NN-L-NET-020/021 evicted when 4,096 are held (they were all cleared
+  before).

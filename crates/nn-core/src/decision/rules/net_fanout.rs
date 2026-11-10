@@ -224,27 +224,64 @@ struct Window {
 }
 
 impl Window {
-    fn drop_front(&mut self) {
-        if let Some((_, h, p)) = self.samples.pop_front() {
+    fn drop_at(&mut self, i: usize) {
+        if let Some((_, h, p)) = self.samples.remove(i) {
             dec(&mut self.hosts, h);
             dec(&mut self.pairs, (h, p));
         }
     }
 
-    fn push(&mut self, ts: u64, h: IpAddr, p: u16, window_ns: u64) {
+    /// Add a sample. `true` when the per-key bound took a sample whose host
+    /// no other sample counted (a host lost while still in the window).
+    ///
+    /// External bug hunt (edition 1.3):
+    /// - BUG70: the window expired from its front against the sample's own
+    ///   time, so a sample older than the window, read after a newer one,
+    ///   stayed counted. A sample already past the window when it comes is
+    ///   counted nowhere; one a little out of order goes in its place in
+    ///   time (found from the back: the disorder of two rings is
+    ///   milliseconds), and the window expires against its newest sample.
+    /// - BUG47: past [`MAX_SAMPLES_PER_KEY`] the oldest sample went, its host
+    ///   with it when it was that host's last — three ports a host, and
+    ///   NN-L-NET-026 never counted more than about 342 hosts: its kill tier
+    ///   (512) never came. The oldest sample of a host counted again later
+    ///   goes first; only a window of distinct hosts loses one (the oldest).
+    fn push(&mut self, ts: u64, h: IpAddr, p: u16, window_ns: u64) -> bool {
+        let newest = self.samples.back().map_or(ts, |(t, _, _)| (*t).max(ts));
+        if newest.saturating_sub(ts) > window_ns {
+            return false;
+        }
         while self
             .samples
             .front()
-            .is_some_and(|(t, _, _)| ts.saturating_sub(*t) > window_ns)
+            .is_some_and(|(t, _, _)| newest.saturating_sub(*t) > window_ns)
         {
-            self.drop_front();
+            self.drop_at(0);
         }
-        self.samples.push_back((ts, h, p));
+        let at = self
+            .samples
+            .iter()
+            .rposition(|(t, _, _)| *t <= ts)
+            .map_or(0, |i| i + 1);
+        self.samples.insert(at, (ts, h, p));
         *self.hosts.entry(h).or_default() += 1;
         *self.pairs.entry((h, p)).or_default() += 1;
+        let mut host_lost = false;
         while self.samples.len() > MAX_SAMPLES_PER_KEY {
-            self.drop_front();
+            let hosts = &self.hosts;
+            match self
+                .samples
+                .iter()
+                .position(|(_, h, _)| hosts.get(h).is_some_and(|c| *c > 1))
+            {
+                Some(i) => self.drop_at(i),
+                None => {
+                    self.drop_at(0);
+                    host_lost = true;
+                }
+            }
         }
+        host_lost
     }
 }
 
@@ -289,8 +326,18 @@ impl Windows {
         self.order.touch(key);
         let w = self.keys.entry(key).or_default();
         let before = w.samples.len();
-        w.push(ts, h, p, window_ns);
+        let host_lost = w.push(ts, h, p, window_ns);
         self.total = (self.total + w.samples.len()).saturating_sub(before);
+        // BUG47: a host the per-key bound took while in the window is
+        // counted with the evicted keys
+        if host_lost && self.lost.bump() {
+            tracing::warn!(
+                pid = key.pid(),
+                evicted = self.lost.count(),
+                cap = MAX_SAMPLES_PER_KEY,
+                "NN-L-NET-026/027 fan-out window full: dropped a host still inside its window"
+            );
+        }
         while self.total > MAX_TOTAL_SAMPLES {
             // never the key just sampled while others remain
             let Some(victim) = self.order.pop_oldest() else {
@@ -990,5 +1037,121 @@ mod tests {
             attempt_text(&connect(1, [127, 0, 0, 2], 9, 1)).as_deref(),
             Some("tcp 127.0.0.2:9 attempt")
         );
+    }
+
+    /// Bug hunt 1.3, BUG47: one process connects to 600 distinct
+    /// addresses in 30 s, three ports per host, host after host. Every
+    /// address is inside the 60 s window: the kill tier (512 addresses)
+    /// must be reached; the per-key sample cap must not hide addresses.
+    fn sweep_600_hosts_3_ports(r: &NnLNet026ScanFanOut) -> Vec<(u32, ResponseAction)> {
+        let mut out = Vec::new();
+        let mut n = 0u32;
+        for h in 0..600u32 {
+            let host = [10, 0, (1 + h / 250) as u8, (1 + h % 250) as u8];
+            for port in [22u16, 80, 443] {
+                let ts = S + u64::from(n) * 16_666_666;
+                if let Some(v) = r.evaluate(&connect(100, host, port, ts)) {
+                    out.push((n, v.action));
+                }
+                n += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn three_ports_per_host_still_reach_the_kill_tier() {
+        let r = NnLNet026ScanFanOut::new(ctx(FanoutConfig {
+            scan_kill: response_policy::NET_026_KILL.enabled(),
+            ..FanoutConfig::default()
+        }));
+        let got = sweep_600_hosts_3_ports(&r);
+        assert!(
+            got.iter().any(|(_, a)| *a == ResponseAction::KillProcess),
+            "600 addresses in 30 s, kill enabled, no KillProcess: {got:?}"
+        );
+    }
+
+    #[test]
+    fn default_config_gives_the_held_kill_tier_record() {
+        let r = NnLNet026ScanFanOut::new(ctx(FanoutConfig::default()));
+        let got = sweep_600_hosts_3_ports(&r);
+        assert_eq!(
+            got.len(),
+            2,
+            "the record at 64 hosts, then the kill tier's (held) at 512: {got:?}"
+        );
+    }
+
+    /// Bug hunt 1.3, BUG70: a sample older than the window, pushed
+    /// after a newer one, must not stay counted.
+    #[test]
+    fn a_stale_out_of_order_sample_leaves_the_window() {
+        let mut w = Window::default();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        w.push(100 * S, ip("10.0.0.1"), 443, 60 * S);
+        w.push(10 * S, ip("10.0.0.2"), 53, 60 * S);
+        assert_eq!(
+            (w.hosts.len(), w.samples.len()),
+            (1, 1),
+            "a sample past the window when it comes is counted nowhere"
+        );
+        w.push(159 * S, ip("10.0.0.3"), 443, 60 * S);
+        let stale: Vec<u64> = w
+            .samples
+            .iter()
+            .map(|(t, _, _)| *t)
+            .filter(|t| 159 * S - *t > 60 * S)
+            .map(|t| t / S)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "samples past the 60 s window still counted: {stale:?}"
+        );
+        assert_eq!((w.hosts.len(), w.pairs.len(), w.samples.len()), (2, 2, 2));
+    }
+
+    /// Bug hunt 1.3, BUG70: a sample a little out of order, inside the
+    /// window, goes in its place in time and expires in its turn — not
+    /// after the newer sample read before it.
+    #[test]
+    fn a_late_sample_in_the_window_expires_in_its_turn() {
+        let mut w = Window::default();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        w.push(100 * S, ip("10.0.0.1"), 443, 60 * S);
+        w.push(95 * S, ip("10.0.0.2"), 53, 60 * S);
+        let times: Vec<u64> = w.samples.iter().map(|(t, _, _)| *t / S).collect();
+        assert_eq!(times, [95, 100]);
+        w.push(156 * S, ip("10.0.0.3"), 443, 60 * S);
+        let times: Vec<u64> = w.samples.iter().map(|(t, _, _)| *t / S).collect();
+        assert_eq!(times, [100, 156], "95 s is 61 s before the newest");
+        assert!(!w.hosts.contains_key(&ip("10.0.0.2")));
+    }
+
+    /// Bug hunt 1.3, BUG47: at the per-key bound a sample of a host counted
+    /// again later goes first; a window of distinct hosts only loses its
+    /// oldest, and says so.
+    #[test]
+    fn the_per_key_bound_keeps_the_distinct_hosts() {
+        let mut w = Window::default();
+        let host = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        let mut lost = false;
+        for i in 0..MAX_SAMPLES_PER_KEY as u32 {
+            for port in [22u16, 80] {
+                lost |= w.push(
+                    S + u64::from(i) * 1_000 + u64::from(port),
+                    host(i),
+                    port,
+                    60 * S,
+                );
+            }
+        }
+        assert!(!lost);
+        assert_eq!(w.samples.len(), MAX_SAMPLES_PER_KEY);
+        assert_eq!(w.hosts.len(), MAX_SAMPLES_PER_KEY, "every host kept once");
+        // all distinct now: the next one takes the oldest host
+        assert!(w.push(2 * S, host(5_000), 443, 60 * S));
+        assert_eq!(w.hosts.len(), MAX_SAMPLES_PER_KEY);
+        assert!(!w.hosts.contains_key(&host(0)));
     }
 }

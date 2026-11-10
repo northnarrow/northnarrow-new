@@ -430,14 +430,22 @@ pub enum DnsRecordOut {
 }
 
 impl DnsRecordOut {
-    /// The bytes the record takes at least on the wire: a pointer as its
-    /// owner (2), type, class, TTL and length (10), its data (4, 16, or a
-    /// pointer as the target).
+    /// The bytes the record takes at least on the wire: its owner (1, the
+    /// root's name: a pointer takes 2), type, class, TTL and length (10),
+    /// its data (4, 16, or a target of 1, the root's name).
+    ///
+    /// External bug hunt (edition 1.2), BUG02: the owner was counted as a
+    /// pointer of 2 bytes, so an honest answer to a response whose records
+    /// name the root (`dig @own-server . A`, any unprivileged process) was a
+    /// "violation" — the parse worker killed for it, and disabled after
+    /// five, every DNS name of the host then without a decode. nn-parse
+    /// reads such a record in 15 bytes (its fuzz target `dns_records`
+    /// asserts the same floor).
     pub const fn min_wire_bytes(&self) -> usize {
         match self {
-            DnsRecordOut::A { .. } => 12 + 4,
-            DnsRecordOut::Aaaa { .. } => 12 + 16,
-            DnsRecordOut::Cname { .. } => 12 + 2,
+            DnsRecordOut::A { .. } => 11 + 4,
+            DnsRecordOut::Aaaa { .. } => 11 + 16,
+            DnsRecordOut::Cname { .. } => 11 + 1,
         }
     }
 
@@ -1423,8 +1431,9 @@ mod tests {
                 addr: [0; 16],
             },
         ];
-        // 12 + 5, a CNAME 14, two A 16 each, an AAAA 28
-        assert_eq!(min_dns_answer_bytes(&records), 17 + 14 + 32 + 28);
+        // 12 + 5, a CNAME 12, two A 15 each, an AAAA 27: an owner and a
+        // target of one byte each (the root's name; bug hunt 1.2, BUG02)
+        assert_eq!(min_dns_answer_bytes(&records), 17 + 12 + 30 + 27);
         let out = |records: Vec<DnsRecordOut>| {
             Answer::DnsAnswers(Some(DnsAnswersOut {
                 qname: "www.example".into(),
@@ -1441,6 +1450,11 @@ mod tests {
         let mut more = records.clone();
         more.push(a("edge.example"));
         assert!(check_response(&req, &out(more)).is_err());
+        // the floor exactly: one byte fewer cannot hold them
+        let exact = Request::DnsAnswers(vec![0; 86]);
+        assert_eq!(check_response(&exact, &out(records.clone())), Ok(()));
+        let short = Request::DnsAnswers(vec![0; 85]);
+        assert!(check_response(&short, &out(records.clone())).is_err());
         // past the bound, whatever the bytes
         let big = Request::DnsAnswers(vec![0; MAX_DNS_ANSWER_IN]);
         assert!(check_response(&big, &out(vec![a("x"); MAX_DNS_RECORDS])).is_ok());
@@ -1776,5 +1790,68 @@ mod tests {
             assert!(k.comm().len() <= 15 && k.comm().starts_with("nn-worker-"));
         }
         assert!(level().summary().contains("landlock abi 4 full (fs, net)"));
+    }
+
+    /// Bug hunt 1.2, BUG02: a record whose owner is the root (one
+    /// byte) is read by the honest parser in 15 bytes (A) / 27 (AAAA) / 12
+    /// (CNAME root to root); the core's floor must not refuse it.
+    #[test]
+    fn root_owner_record_not_a_violation() {
+        let bytes: Vec<u8> = vec![
+            0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, //
+            0, 0, 1, 0, 1, //
+            0, 0, 1, 0, 1, 0, 0, 0, 0x3c, 0, 4, 0xc0, 0, 2, 1,
+        ];
+        assert_eq!(bytes.len(), 32);
+        let honest = Answer::DnsAnswers(Some(DnsAnswersOut {
+            qname: String::new(),
+            qtype: 1,
+            rcode: 0,
+            records: vec![DnsRecordOut::A {
+                name: String::new(),
+                ttl: 60,
+                addr: [192, 0, 2, 1],
+            }],
+            complete: true,
+        }));
+        assert_eq!(check_response(&Request::DnsAnswers(bytes), &honest), Ok(()));
+        let bytes: Vec<u8> = vec![
+            0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, //
+            0, 0, 1, 0, 1, //
+            0, 0, 5, 0, 1, 0, 0, 0, 0x3c, 0, 1, 0,
+        ];
+        assert_eq!(bytes.len(), 29);
+        let honest = Answer::DnsAnswers(Some(DnsAnswersOut {
+            qname: String::new(),
+            qtype: 1,
+            rcode: 0,
+            records: vec![DnsRecordOut::Cname {
+                name: String::new(),
+                ttl: 60,
+                target: String::new(),
+            }],
+            complete: true,
+        }));
+        assert_eq!(check_response(&Request::DnsAnswers(bytes), &honest), Ok(()));
+        let mut bytes: Vec<u8> = vec![
+            0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, //
+            0, 0, 0x1c, 0, 1, //
+            0, 0, 0x1c, 0, 1, 0, 0, 0, 0x3c, 0, 16,
+        ];
+        bytes.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        bytes.extend_from_slice(&[0; 12]);
+        assert_eq!(bytes.len(), 44);
+        let honest = Answer::DnsAnswers(Some(DnsAnswersOut {
+            qname: String::new(),
+            qtype: 28,
+            rcode: 0,
+            records: vec![DnsRecordOut::Aaaa {
+                name: String::new(),
+                ttl: 60,
+                addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }],
+            complete: true,
+        }));
+        assert_eq!(check_response(&Request::DnsAnswers(bytes), &honest), Ok(()));
     }
 }
