@@ -3084,11 +3084,12 @@ mod tests {
     fn file_ioctl_compat_is_selected_from_the_kernels_btf() {
         use super::super::filesystem::{attach_optional, OptionalHook, OPTIONAL_LSM_PROGRAMS};
         for (kernel, compat, acl, expected) in [
-            ("6.8, 6.12", true, true, 21 + 3),
-            ("6.6.15", true, true, 21 + 3),
-            ("6.6.14", false, true, 21 + 2),
-            ("6.1.76, 5.15.149", true, false, 21 + 1),
-            ("6.1.75, 5.15.148", false, false, 21),
+            // lot 293: 22 required deny hooks (file_send_sigiotask)
+            ("6.8, 6.12", true, true, 22 + 3),
+            ("6.6.15", true, true, 22 + 3),
+            ("6.6.14", false, true, 22 + 2),
+            ("6.1.76, 5.15.149", true, false, 22 + 1),
+            ("6.1.75, 5.15.148", false, false, 22),
         ] {
             let r = hooks_only(&ioctl_btf(compat, acl, 0));
             assert_eq!(

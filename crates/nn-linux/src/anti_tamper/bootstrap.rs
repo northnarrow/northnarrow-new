@@ -304,12 +304,14 @@ pub fn compute_sentinel_content(install_nonce: &[u8], admin_pub_bytes: &[u8]) ->
 /// `admin_auth::parse_admin_line`'s caller; duplicated here as a
 /// lightweight count (we don't need to parse the pubkeys, just
 /// count valid candidate lines).
+///
+/// External bug hunt BUG03: whatever bytes it holds. A file that is not
+/// all UTF-8 counted 0 lines — with a Latin-1 comment beside two keys the
+/// gate would have read a one-key install and let a leftover sentinel
+/// through (fail-open), once the agent kept such a file's bytes.
 fn count_admin_pub_keys(bytes: &[u8]) -> usize {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    text.lines()
+    String::from_utf8_lossy(bytes)
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .count()
@@ -556,6 +558,12 @@ mod tests {
     /// comments still counts as 1.
     #[test]
     fn count_admin_pub_keys_ignores_comments_and_blanks() {
+        // External bug hunt BUG03: a comment that is not UTF-8 (Latin-1)
+        // beside two keys still leaves two
+        let latin1 = b"# chiave di Jos\xE9\n\
+                      1111111111111111111111111111111111111111111111111111111111111111\n\
+                      2222222222222222222222222222222222222222222222222222222222222222\n";
+        assert_eq!(count_admin_pub_keys(latin1), 2);
         let body = "# Header comment\n\
                     \n\
                     # Another comment\n\

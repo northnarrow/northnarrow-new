@@ -289,6 +289,16 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
 
 #[inline(always)]
 fn pid1_granted(sig: c_int) -> bool {
+    kill_grant_allows(sig)
+}
+
+/// The live [`KILL_GRANT`] of a signed trusted-installer window lets `sig`
+/// through: one of its stop signals, before its deadline, under this
+/// boot's session nonce. `task_kill` asks it for PID 1 only; lot 293's
+/// `file_send_sigiotask` hook (`crate::sigio_guard`), which has no sender to
+/// compare, for any delivery.
+#[inline(always)]
+pub(crate) fn kill_grant_allows(sig: c_int) -> bool {
     let session = match AGENT_SESSION.get(0) {
         Some(v) => *v,
         None => return false,

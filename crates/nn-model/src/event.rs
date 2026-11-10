@@ -1161,6 +1161,13 @@ pub enum FsProtectOperation {
     /// Lot 290: NOT a refusal — a BPF program present at the agent's start,
     /// the cross-view's baseline, signed once (fields as `BpfUnseen`).
     BpfBaseline,
+    /// Lot 293 (external bug hunt BUG14): a signal to a protected pid
+    /// through a file's owner (`F_SETOWN` / `O_ASYNC`: SIGIO or the
+    /// `F_SETSIG` signal, SIGURG) refused by the `file_send_sigiotask`
+    /// hook; `target_ino` the tgid, `target_dev` the signal. The event's
+    /// pid is the process whose I/O raised it, not necessarily the one
+    /// that armed it.
+    Sigio,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1212,6 +1219,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_BPF_PROG_OPT_OUT => Self::BpfProgOptOut,
             crate::wire::FS_OP_BPF_UNSEEN => Self::BpfUnseen,
             crate::wire::FS_OP_BPF_BASELINE => Self::BpfBaseline,
+            crate::wire::FS_OP_SIGIO => Self::Sigio,
             other => Self::Unknown(other),
         }
     }
@@ -1261,6 +1269,7 @@ impl FsProtectOperation {
             Self::BpfProgOptOut => "bpf_prog_opt_out",
             Self::BpfUnseen => "bpf_unseen",
             Self::BpfBaseline => "bpf_baseline",
+            Self::Sigio => "sigio",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1969,6 +1978,8 @@ mod tests {
                 FsProtectOperation::BpfBaseline,
                 "bpf_baseline",
             ),
+            // Lot 293
+            (crate::wire::FS_OP_SIGIO, FsProtectOperation::Sigio, "sigio"),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);

@@ -1225,8 +1225,35 @@ pub const FS_OP_BPF_UNSEEN: u8 = 42;
 /// once; the fields as [`FS_OP_BPF_UNSEEN`].
 pub const FS_OP_BPF_BASELINE: u8 = 43;
 
+/// Lot 293 (external bug hunt BUG14): a signal to a protected pid through a
+/// file's owner — `F_SETOWN`/`F_SETOWN_EX`/`FIOSETOWN`/`SIOCSPGRP` and
+/// `O_ASYNC`/`FIOASYNC` (SIGIO, or the `F_SETSIG` signal), a lease break,
+/// a dnotify event, SIGURG — refused by the `file_send_sigiotask` hook: the
+/// kernel delivers it without `task_kill`, so root killed the agent and the
+/// watchdog with it. `target_ino` = the target tgid, `target_dev` = the
+/// signal (SIGIO, 29, for the plain one). The event's pid is the process
+/// whose I/O raised it, which may be any process (a socket's data arrives
+/// in a softirq): the arming process is not known.
+pub const FS_OP_SIGIO: u8 = 44;
+
+/// `SIGIO` (x86-64 and aarch64 alike).
+pub const SIGIO: i32 = 29;
+
+/// Lot 293 (external bug hunt BUG14): the signal a `file_send_sigiotask`
+/// check is about, from the `sig` the hook receives — the owner's
+/// `F_SETSIG` signal, SIGURG for out-of-band data, or 0, which the kernel
+/// delivers as SIGIO. The hook judges, and the record carries, this one.
+#[inline(always)]
+pub const fn sigio_signal(sig: i32) -> i32 {
+    if sig == 0 {
+        SIGIO
+    } else {
+        sig
+    }
+}
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_BPF_BASELINE;
+pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -1446,6 +1473,8 @@ pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
         BPF_PROG_DETACH => "prog_detach",
         BPF_PROG_GET_FD_BY_ID => "prog_get_fd_by_id",
         BPF_MAP_GET_FD_BY_ID => "map_get_fd_by_id",
+        // External bug hunt BUG05: an attach the `bpf` hook now records.
+        BPF_RAW_TRACEPOINT_OPEN => "raw_tracepoint_open",
         BPF_BTF_LOAD => "btf_load",
         BPF_LINK_CREATE => "link_create",
         BPF_LINK_UPDATE => "link_update",
@@ -1477,11 +1506,13 @@ pub const fn io_uring_opcode_class(op: u8) -> u32 {
         // OPENAT, OPENAT2
         18 | 28 => IOURING_CLASS_FILE_OPEN,
         // READV WRITEV READ_FIXED WRITE_FIXED READ WRITE SPLICE TEE READ_MULTISHOT
-        1 | 2 | 4 | 5 | 22 | 23 | 30 | 33 | 49 => IOURING_CLASS_FILE_RW,
+        // READV_FIXED WRITEV_FIXED (6.15; external bug hunt BUG68: they were
+        // OTHER, and NN-L-IOU-002 never saw the file half)
+        1 | 2 | 4 | 5 | 22 | 23 | 30 | 33 | 49 | 60 | 61 => IOURING_CLASS_FILE_RW,
         // ACCEPT CONNECT SOCKET BIND LISTEN
         13 | 16 | 45 | 56 | 57 => IOURING_CLASS_NET_CONNECT,
-        // SENDMSG RECVMSG SEND RECV SEND_ZC SENDMSG_ZC
-        9 | 10 | 26 | 27 | 47 | 48 => IOURING_CLASS_NET_SENDRECV,
+        // SENDMSG RECVMSG SEND RECV SEND_ZC SENDMSG_ZC RECV_ZC (6.15, BUG68)
+        9 | 10 | 26 | 27 | 47 | 48 | 58 => IOURING_CLASS_NET_SENDRECV,
         // FALLOCATE RENAMEAT UNLINKAT MKDIRAT SYMLINKAT LINKAT FSETXATTR SETXATTR FTRUNCATE
         17 | 35 | 36 | 37 | 38 | 39 | 41 | 42 | 55 => IOURING_CLASS_FS_MUTATE,
         _ => IOURING_CLASS_OTHER,
@@ -1889,6 +1920,31 @@ mod tests {
             "the zeroed slot grants nothing"
         );
     }
+    /// Lot 293 (external bug hunt BUG14): what the `file_send_sigiotask`
+    /// hook judges — the plain SIGIO arrives as 0 and is SIGIO; inside a
+    /// window the grant lets through its stop signals only, so the plain
+    /// SIGIO, SIGURG and a real-time `F_SETSIG` signal stay refused there.
+    #[test]
+    fn a_sigio_delivery_is_judged_as_the_signal_it_delivers() {
+        assert_eq!(sigio_signal(0), SIGIO);
+        assert_eq!(SIGIO, 29);
+        for s in [9, 15, 23, 29, 34, 64] {
+            assert_eq!(sigio_signal(s), s);
+        }
+        let g = KillGrant {
+            nonce: 7,
+            sig_mask: KillGrant::STOP_SIGNALS,
+            expires_ns: 1_000,
+        };
+        let let_through = |sig: i32| g.allows(sigio_signal(sig), 10, 7);
+        assert!(let_through(9) && let_through(15) && let_through(18));
+        for refused in [0, SIGIO, 23, 2, 19, 34] {
+            assert!(!let_through(refused), "{refused} let through in a window");
+        }
+        // outside the window nothing passes
+        assert!(!g.allows(sigio_signal(9), 1_000, 7));
+    }
+
     /// External audit ATP-003: the window is bounded by its session and
     /// its deadline in the kernel itself.
     #[test]
@@ -2301,6 +2357,7 @@ mod tests {
             FS_OP_BPF_PROG_OPT_OUT,
             FS_OP_BPF_UNSEEN,
             FS_OP_BPF_BASELINE,
+            FS_OP_SIGIO,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         for (i, a) in ops.iter().enumerate() {
@@ -2534,5 +2591,34 @@ mod tests {
         assert_eq!(FLOW_SOCK_COUNT_SLOTS, 2);
         assert_eq!(flow_sock_slot::INSERTED, 0);
         assert_eq!(flow_sock_slot::REMOVED, 1);
+    }
+
+    // ── external bug hunt (editions 1.2/1.3) ────────────────────────
+
+    /// BUG68: IORING_OP_READV_FIXED (60) and IORING_OP_WRITEV_FIXED (61),
+    /// uapi 6.15, are file read/write — the eBPF sensor classifies with this
+    /// function, and NN-L-IOU-002 wants the file half and the network half.
+    #[test]
+    fn readv_writev_fixed_are_file_rw() {
+        assert_eq!(
+            io_uring_opcode_class(60),
+            IOURING_CLASS_FILE_RW,
+            "READV_FIXED"
+        );
+        assert_eq!(
+            io_uring_opcode_class(61),
+            IOURING_CLASS_FILE_RW,
+            "WRITEV_FIXED"
+        );
+    }
+
+    /// BUG68, the same gap on the network side: IORING_OP_RECV_ZC (58,
+    /// 6.15) receives from a socket. EPOLL_WAIT (59) and PIPE (62, 6.16)
+    /// stay OTHER: neither reads nor writes a file or a socket.
+    #[test]
+    fn recv_zc_is_net_sendrecv() {
+        assert_eq!(io_uring_opcode_class(58), IOURING_CLASS_NET_SENDRECV);
+        assert_eq!(io_uring_opcode_class(59), IOURING_CLASS_OTHER);
+        assert_eq!(io_uring_opcode_class(62), IOURING_CLASS_OTHER);
     }
 }

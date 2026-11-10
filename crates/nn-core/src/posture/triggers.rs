@@ -920,7 +920,16 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
             ) {
-                hits.push(if *pid == 1 {
+                hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
+                    // Lot 293 (external bug hunt BUG14): a refused signal
+                    // through a file's owner names the process whose I/O
+                    // raised it — any process a softirq interrupted, PID 1
+                    // included — not the one that armed the file: refused
+                    // and signed, ENGAGED, and never a COMBAT offender (an
+                    // attacker's socket must not steer the ladder at an
+                    // innocent process).
+                    TriggerType::DefenseImpairment
+                } else if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
                 } else if is_package_file_operation(*operation)
                     && self
@@ -3054,6 +3063,36 @@ mod tests {
         ] {
             assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }
+    }
+
+    /// Lot 293 (external bug hunt BUG14): a refused SIGIO-path signal
+    /// impairs (ENGAGED) whatever process its record names — PID 1 and a
+    /// shell alike — and is never the decisive trigger: the process named
+    /// raised the I/O, it did not necessarily arm the file. A refused
+    /// `kill` stays decisive.
+    #[test]
+    fn a_refused_sigio_impairs_and_names_no_offender() {
+        let det = TriggerDetector::new();
+        let ev = |pid, operation| Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "sshd".into(),
+            target_dev: 9,
+            target_ino: 77,
+            operation,
+            timestamp_ns: 1,
+        };
+        for pid in [1, 4242] {
+            assert_eq!(
+                det.detect(&ev(pid, nn_model::FsProtectOperation::Sigio), &[]),
+                vec![TriggerType::DefenseImpairment],
+                "pid {pid}"
+            );
+        }
+        assert_eq!(
+            det.detect(&ev(4242, nn_model::FsProtectOperation::Signal), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
     }
 
     #[test]

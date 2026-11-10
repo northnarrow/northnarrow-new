@@ -457,6 +457,31 @@ fn rename_shapes() {
     assert!(c.rename_burst, "originals of many kinds");
 }
 
+/// External bug hunt BUG54 (documentation): the kernel counts an atomic
+/// save whose temporary carries its own extension (`data.tmp` →
+/// `data.json`: replaced, nothing appended) — the shape of an encryptor's
+/// staging, so it stays counted — and a burst of them is no encryptor's
+/// shape here: one origin extension, no append, `.json` no marker. No
+/// signal, no verdict, as RANSOMWARE_DECISIVE.md now says.
+#[test]
+fn an_atomic_save_burst_replacing_the_extension_is_not_shaped() {
+    let h = Host::new();
+    h.exec(300, 200, "/home/u/bin/editor", &["editor"]);
+    let t = h.tracker(Fixed::high("/home/u/proj/"));
+    let a = t
+        .assess(&renames(300, T0, "/home/u/proj/data.json", 0, 0))
+        .unwrap();
+    assert!(
+        !a.rename_burst && a.added.is_empty() && !a.decisive,
+        "{a:?}"
+    );
+    // the staged ciphertext of the same shape under a marker is one
+    let b = t
+        .assess(&renames(300, T0 + S, "/home/u/proj/data.locked", 0, 0))
+        .unwrap();
+    assert!(b.rename_burst, "a listed marker extension is a shape");
+}
+
 /// Shapes further apart than the window do not combine.
 #[test]
 fn shapes_outside_the_window_do_not_combine() {

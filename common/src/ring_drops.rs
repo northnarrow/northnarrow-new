@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 28;
+pub const RING_DROP_SLOTS: u32 = 29;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -78,6 +78,13 @@ pub mod ring_slot {
     /// Lot 275: ClientHellos over a process's or a user's record budget,
     /// not recorded (held back before the ring).
     pub const TLS_RATE: u32 = 27;
+    /// Lot 293 (external bug hunt BUG37): the anti-tamper refusals signed
+    /// at every attempt — a protected inode's unlink, rename, change, new
+    /// entry, write-open or read-open, a refused open of a protected cgroup
+    /// file — over their per-CPU record budget, not recorded (held back before the `fs_protect` ring,
+    /// apart from the task denials' budget so that a loop of them never
+    /// buries a refused signal or ptrace; the deny itself still applies).
+    pub const DENIAL_RATE: u32 = 28;
 }
 
 /// Human names, indexed by slot.
@@ -110,6 +117,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "dns_answer_rate",
     "tls",
     "tls_rate",
+    "denial_rate",
 ];
 
 #[cfg(test)]
@@ -152,7 +160,11 @@ mod tests {
         assert_eq!(RING_DROP_NAMES[ring_slot::EXECPOL as usize], "execpol");
         assert_eq!(RING_DROP_NAMES[ring_slot::INBOUND as usize], "inbound");
         assert_eq!(RING_DROP_NAMES[ring_slot::TLS_RATE as usize], "tls_rate");
-        assert_eq!(ring_slot::TLS_RATE + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::DENIAL_RATE as usize],
+            "denial_rate"
+        );
+        assert_eq!(ring_slot::DENIAL_RATE + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -189,6 +201,7 @@ mod tests {
             (ring_slot::DNS_ANSWER_RATE, "dns_answer_rate"),
             (ring_slot::TLS, "tls"),
             (ring_slot::TLS_RATE, "tls_rate"),
+            (ring_slot::DENIAL_RATE, "denial_rate"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
