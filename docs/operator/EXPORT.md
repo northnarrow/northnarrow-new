@@ -157,6 +157,15 @@ export account's (0755; its files 0600: a shipper reads them as root).
 A shipper behind the rotation misses what rotated out: the chains are the
 record, the files the bound.
 
+A write the disk stops part-way (full: the first `write` takes what fits,
+the next fails) leaves the start of a record's line in the active file. The
+batch is not delivered (the sink Down, its back-off) and is written again by
+the same sink, which first closes that start with a newline (lot 296): a
+reader sees one line that is not a record (`nn-admin export verify`: a
+malformed line), then every delivered record whole on a line of its own.
+Before lot 296 the batch's first record was glued to that start —
+delivered, its cursor moved past it, and no longer a line of its own.
+
 A signed configuration with **fewer or smaller files** holds from the
 sink's open, at the next start: the `export.jsonl.N` an earlier
 configuration left at or past the new `file_max_files` are removed —
@@ -434,6 +443,13 @@ fuzz/Cargo.lock): the lot's note lists them.
   43 and 31 behind one that never read). Reading the peer's advertised window
   (`TCP_INFO`'s `tcpi_snd_wnd`, recent kernels) could hold such rows back
   until the receiver read them; RELP's acknowledgement would on all.
+- The start of a line left by a worker that ended in the middle of a write
+  (a crash, a kill, a power loss) is not closed (lot 296 closes the one a
+  failed write of the running worker leaves): the worker cannot read its
+  files (no `read` of them in its seccomp list), so the next one does not
+  know where the file ends, and its first record is glued to that start.
+  The record is still in its chain; `nn-admin export verify` names the line
+  malformed.
 - No client certificate (mTLS): the receiver is authenticated, the agent
   is by its signed rows only.
 - The receiver must speak TLS 1.3 with X25519: one that offers only

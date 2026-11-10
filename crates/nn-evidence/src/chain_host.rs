@@ -12,7 +12,9 @@
 //!   creates, a rename that never replaces (`renameat2(RENAME_NOREPLACE)`),
 //!   a positioned write (`pwrite`), and the anchoring of a log's directory
 //!   (review entry 44). Each is the call the chain code made itself before
-//!   (lab PR 241 moved the calls, not their arguments);
+//!   (lab PR 241 moved the calls, not their arguments). Lot 296: the append
+//!   of a row and the `fsync` too, with `std`'s calls as their default — a
+//!   test host fails them as a full disk or a failing device does;
 //! - [`ChainSigner`]: the key the writers sign with, and the host its
 //!   chains live on. No key material is kept by the chain code.
 //!
@@ -61,6 +63,19 @@ pub trait ChainHost: 'static {
     /// later mount over the directory cannot divert a log's writes (review
     /// entry 44). Returned unchanged when the host does not anchor it.
     fn anchor(path: &Path) -> PathBuf;
+
+    /// Write all of `buf` at the end of `file`, opened to append. Lot 296: a
+    /// full disk stops it part-way (the first `write` takes what fits, the
+    /// next fails): the writers re-read their tail before their next row.
+    fn append_all(file: &mut File, buf: &[u8]) -> io::Result<()> {
+        io::Write::write_all(file, buf)
+    }
+
+    /// `fsync` of `file`. Lot 296: it can fail after its row was written
+    /// whole; the writers re-read their tail before their next row.
+    fn sync_all(file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
 }
 
 /// The key a chain writer signs with.
@@ -173,6 +188,147 @@ pub(crate) mod testing {
 
     impl ChainSigner for TestKey {
         type Host = PortableHost;
+        fn sign(&self, msg: &[u8]) -> Signature {
+            self.0.sign(msg)
+        }
+        fn verifying_key(&self) -> VerifyingKey {
+            self.0.verifying_key()
+        }
+    }
+
+    /// Lot 296: a fault [`FaultyHost`] injects, once, into the next call it
+    /// matches (the tests' threads each have their own).
+    #[derive(Debug, Clone)]
+    pub(crate) enum Fault {
+        /// The next append of a row starting with `prefix` writes its first
+        /// `keep` bytes to the file, then fails (`ENOSPC`): what a full disk
+        /// leaves.
+        ShortWrite { prefix: &'static [u8], keep: usize },
+        /// The next append of a row starting with `prefix` is written whole,
+        /// then its fsync fails (`EIO`).
+        SyncFails { prefix: &'static [u8] },
+        /// The next open of a path ending in `suffix` fails (`EIO`).
+        OpenFails { suffix: &'static str },
+        /// The next positioned write writes its first `keep` bytes, then
+        /// fails (`ENOSPC`).
+        ShortWriteAt { keep: usize },
+    }
+
+    thread_local! {
+        static FAULTS: std::cell::RefCell<Vec<Fault>> = const { std::cell::RefCell::new(Vec::new()) };
+        static SYNC_FAILS_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static LEFT: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Arm `fault` for this thread's next matching call.
+    pub(crate) fn inject(fault: Fault) {
+        FAULTS.with(|f| f.borrow_mut().push(fault));
+    }
+
+    /// The faults armed and not fired yet on this thread.
+    pub(crate) fn armed() -> usize {
+        FAULTS.with(|f| f.borrow().len())
+    }
+
+    /// What each short write fired on this thread left in its file, in
+    /// order (taken).
+    pub(crate) fn left_behind() -> Vec<Vec<u8>> {
+        LEFT.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    fn take_fault(matches: impl Fn(&Fault) -> bool) -> Option<Fault> {
+        FAULTS.with(|f| {
+            let mut f = f.borrow_mut();
+            let i = f.iter().position(matches)?;
+            Some(f.remove(i))
+        })
+    }
+
+    fn open_fault(path: &Path) -> io::Result<()> {
+        let p = path.to_string_lossy();
+        match take_fault(|f| matches!(f, Fault::OpenFails { suffix } if p.ends_with(suffix))) {
+            Some(_) => Err(io::Error::from_raw_os_error(5)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`PortableHost`] with the [`Fault`]s armed on the thread.
+    pub(crate) struct FaultyHost;
+
+    impl ChainHost for FaultyHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<File> {
+            open_fault(path)?;
+            PortableHost::open_read_nofollow(path)
+        }
+        fn is_symlink_refusal(err: &io::Error) -> bool {
+            PortableHost::is_symlink_refusal(err)
+        }
+        fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
+            open_fault(path)?;
+            PortableHost::open_with_mode(options, mode, path)
+        }
+        fn open_with_mode_nofollow(
+            options: &mut OpenOptions,
+            mode: u32,
+            path: &Path,
+        ) -> io::Result<File> {
+            open_fault(path)?;
+            PortableHost::open_with_mode_nofollow(options, mode, path)
+        }
+        fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {
+            PortableHost::create_dir_all_with_mode(dir, mode)
+        }
+        fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+            PortableHost::rename_noreplace(from, to)
+        }
+        fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+            if let Some(Fault::ShortWriteAt { keep }) =
+                take_fault(|f| matches!(f, Fault::ShortWriteAt { .. }))
+            {
+                let keep = keep.min(buf.len());
+                PortableHost::write_all_at(file, &buf[..keep], offset)?;
+                LEFT.with(|l| l.borrow_mut().push(buf[..keep].to_vec()));
+                return Err(io::Error::from_raw_os_error(28));
+            }
+            PortableHost::write_all_at(file, buf, offset)
+        }
+        fn anchor(path: &Path) -> PathBuf {
+            PortableHost::anchor(path)
+        }
+        fn append_all(file: &mut File, buf: &[u8]) -> io::Result<()> {
+            match take_fault(|f| match f {
+                Fault::ShortWrite { prefix, .. } | Fault::SyncFails { prefix } => {
+                    buf.starts_with(prefix)
+                }
+                _ => false,
+            }) {
+                Some(Fault::ShortWrite { keep, .. }) => {
+                    let keep = keep.min(buf.len());
+                    file.write_all(&buf[..keep])?;
+                    LEFT.with(|l| l.borrow_mut().push(buf[..keep].to_vec()));
+                    Err(io::Error::from_raw_os_error(28))
+                }
+                Some(_) => {
+                    file.write_all(buf)?;
+                    SYNC_FAILS_NEXT.with(|s| s.set(true));
+                    Ok(())
+                }
+                None => file.write_all(buf),
+            }
+        }
+        fn sync_all(file: &File) -> io::Result<()> {
+            if SYNC_FAILS_NEXT.with(|s| s.replace(false)) {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            file.sync_all()
+        }
+    }
+
+    /// A [`TestKey`] whose chains live on the [`FaultyHost`].
+    pub(crate) struct FaultyKey(pub(crate) TestKey);
+
+    impl ChainSigner for FaultyKey {
+        type Host = FaultyHost;
         fn sign(&self, msg: &[u8]) -> Signature {
             self.0.sign(msg)
         }

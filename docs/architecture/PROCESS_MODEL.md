@@ -321,7 +321,7 @@ role …`):
 |---|---|---|---|---|
 | decision | `nn-decision` | `CAP_SYS_PTRACE` | the same, for good | it reads `/proc/<pid>/exe` of the process it judges (the rules' trusted actor, the COMBAT guard, the lineage), which `ptrace_may_access` refuses for another user's or a more privileged process without it |
 | actuator | `nn-response-*`, `nn-response-watch` | `CAP_KILL CAP_NET_ADMIN CAP_SETFCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE` | the bounding set | kill, `pidfd_send_signal`, `cgroup.kill`; nft and iptables; the strip; quarantine; `/proc/1/root` and the target's `/proc/<pid>/exe` (plan §3.2's own entry for `CAP_SYS_PTRACE`) |
-| writer | `nn-canary-log` | `CAP_LINUX_IMMUTABLE` | the bounding set | the state directory's `chattr +i` lifted for a new chain file |
+| writer | `nn-canary-log`, `nn-actions-rotate` | `CAP_LINUX_IMMUTABLE` | the bounding set | the state directory's `chattr +i` lifted for a new chain file; `nn-actions-rotate` (lot 296) rotates the actions chain, whose rows the actuator writes but may not rotate: a response thread's row past the cap is kept and wakes it |
 | supervisor | `nn-workers` | `CAP_SETUID CAP_SETGID CAP_KILL CAP_BPF` | the bounding set | the worker's account, set in the child before `exec`; the worker's signals (another user); its pid's role in `PROTECTED_PIDS` |
 | loader | the start's thread while the eBPF object loads, its programs attach and its maps are pinned (`caps::lower`) | `CAP_BPF CAP_PERFMON` (and `CAP_SYS_ADMIN` where the Debian drop-in grants it) | the bounding set | load, attach, pin; tracepoint attach under `perf_event_paranoid` 3 |
 | errands | `nn-errands` | `CAP_BPF` | the bounding set | what the decision's filter refuses it, done for it (below) |
