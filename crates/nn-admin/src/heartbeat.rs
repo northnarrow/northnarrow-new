@@ -100,6 +100,8 @@ const POLL_STEP: Duration = Duration::from_millis(50);
 /// Bytes of the source command's stderr kept for a failure's reason: its
 /// end, where the last line is.
 const STDERR_KEPT: usize = 4096;
+/// The most one read takes from a pipe.
+const READ_CHUNK: usize = 16 * 1024;
 
 /// One of the source command's pipes, read as its bytes come.
 struct Pipe {
@@ -110,15 +112,24 @@ struct Pipe {
     /// so the command never waits on it).
     cap: usize,
     tail: bool,
+    /// The most one read takes ([`READ_CHUNK`]; the tests take less, so the
+    /// command's exit is seen with its bytes still in the pipe).
+    chunk: usize,
 }
 
 impl Pipe {
-    fn new(fd: Option<impl Into<std::os::fd::OwnedFd>>, cap: usize, tail: bool) -> Self {
+    fn new(
+        fd: Option<impl Into<std::os::fd::OwnedFd>>,
+        cap: usize,
+        tail: bool,
+        chunk: usize,
+    ) -> Self {
         Self {
             fd: fd.map(|f| std::fs::File::from(f.into())),
             buf: Vec::new(),
             cap,
             tail,
+            chunk: chunk.clamp(1, READ_CHUNK),
         }
     }
 
@@ -127,8 +138,8 @@ impl Pipe {
         let Some(f) = self.fd.as_mut() else {
             return;
         };
-        let mut chunk = [0u8; 16 * 1024];
-        match f.read(&mut chunk) {
+        let mut chunk = [0u8; READ_CHUNK];
+        match f.read(&mut chunk[..self.chunk]) {
             Ok(0) => self.fd = None,
             Ok(n) if self.tail => {
                 self.buf.extend_from_slice(&chunk[..n]);
@@ -197,6 +208,11 @@ fn read_ready(out: &mut Pipe, err: &mut Pipe, wait: Duration) -> bool {
 ///   `watch` with it, waited for it without a bound, with no OK and no
 ///   ALERT.
 fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    run_reading(cmd, timeout, READ_CHUNK)
+}
+
+/// [`run_with_timeout`], its pipes read `chunk` bytes at a time at most.
+fn run_reading(cmd: &str, timeout: Duration, chunk: usize) -> Result<Vec<u8>, String> {
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
@@ -206,8 +222,8 @@ fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         .spawn()
         .map_err(|e| format!("the source command did not start: {e}"))?;
     let deadline = Instant::now() + timeout;
-    let mut out = Pipe::new(child.stdout.take(), FETCH_MAX_BYTES as usize, false);
-    let mut err = Pipe::new(child.stderr.take(), STDERR_KEPT, true);
+    let mut out = Pipe::new(child.stdout.take(), FETCH_MAX_BYTES as usize, false, chunk);
+    let mut err = Pipe::new(child.stderr.take(), STDERR_KEPT, true, chunk);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -592,7 +608,7 @@ mod tests {
             let (r, mut w) = std::io::pipe().unwrap();
             w.write_all(&bytes).unwrap();
             drop(w);
-            let mut p = Pipe::new(Some(r), 4096, tail);
+            let mut p = Pipe::new(Some(r), 4096, tail, READ_CHUNK);
             for _ in 0..100 {
                 p.read_once();
                 if p.fd.is_none() {
@@ -613,14 +629,16 @@ mod tests {
     }
 
     /// Lot 299: what the command wrote to stdout before it exited is read
-    /// whole, however much was still in the pipe at its exit (the fetch
-    /// reads it once the exit is seen).
+    /// whole, however much was still in the pipe when its exit was seen
+    /// (read 64 bytes at a time, a pipe's 64 KiB are there at the exit).
     #[test]
     fn the_whole_answer_written_before_the_exit_is_read() {
         for _ in 0..3 {
             let out =
-                run_with_timeout("head -c 1000000 /dev/zero", Duration::from_secs(10)).unwrap();
+                run_reading("head -c 1000000 /dev/zero", Duration::from_secs(20), 64).unwrap();
             assert_eq!(out.len(), 1_000_000);
         }
+        let out = run_with_timeout("head -c 1000000 /dev/zero", Duration::from_secs(10)).unwrap();
+        assert_eq!(out.len(), 1_000_000);
     }
 }
