@@ -1340,9 +1340,6 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             )?;
             truncate_file(&self.active_path, rec.clean_len)?;
         }
-        if let Some(reason) = &rec.unverified {
-            self.attest_tail_unverified("active", &rec.tail_hash, reason);
-        }
         let before = self.active_bytes;
         if let Some(seq) = rec.sealed_seq {
             // the seal is on file: the next append finishes that rotation
@@ -1773,13 +1770,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         if rec.torn {
             self.replace_torn_manifest_tail(&rec)?;
         } else {
-            self.manifest_last_hash = rec.tail_hash.clone();
-        }
-        if let Some(reason) = &rec.unverified {
-            self.attest_tail_unverified("manifest", &rec.tail_hash, reason);
-            if let Some(e) = &self.manifest_poison {
-                return Err(anyhow!("{e}"));
-            }
+            self.manifest_last_hash = rec.tail_hash;
         }
         Ok(())
     }
@@ -7234,5 +7225,72 @@ mod tests {
         drop(log);
         let r = verify_log_set::<TestPayload>(&active, &pk);
         assert!(r.as_ref().is_ok_and(|r| r.total_records == 2), "{r:?}");
+    }
+
+    /// A line kept after its failed fsync is counted in its file's records:
+    /// the seal and its `Rotated` row say how many lines the file holds.
+    #[test]
+    fn a_line_kept_after_its_failed_fsync_is_counted_in_the_seal() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = faulty_log(&active, &kp, 2000);
+        log.append(payload(0)).unwrap();
+        host::inject(Fault::SyncFails { prefix: b"{\"ts\"" });
+        assert!(log.append(payload(1)).is_err(), "premise: the fsync fails");
+        let mut i = 2;
+        while list_archive_seqs(&active).unwrap().is_empty() {
+            log.append(payload(i)).unwrap();
+            i += 1;
+            assert!(i < 100);
+        }
+        drop(log);
+        let lines = fs::read_to_string(archive_path(&active, 1))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("\"rotate\""))
+            .count() as u64;
+        let records: Vec<u64> = manifest_events(&active)
+            .iter()
+            .filter_map(|e| match e {
+                ManifestEvent::Rotated { records, .. } => Some(*records),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records, [lines], "the kept line counted");
+    }
+
+    /// A manifest whose tail cannot be read again after a failed write keeps
+    /// the writer poisoned: its next row is not glued to the fragment once
+    /// the manifest reads again.
+    #[test]
+    fn a_manifest_that_cannot_be_read_again_keeps_its_next_rows_out() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = faulty_log(&active, &kp, 1 << 30);
+        log.append(payload(0)).unwrap();
+        log.checkpoint().unwrap();
+        log.append(payload(1)).unwrap();
+        host::inject(Fault::ShortWrite {
+            prefix: b"{\"manifest\"",
+            keep: 25,
+        });
+        assert!(log.checkpoint().is_err(), "premise: the disk is full");
+        // the manifest cannot be read: a directory in its place for a while
+        let manifest = manifest_path_for(&active);
+        let aside = dir.path().join("aside");
+        fs::rename(&manifest, &aside).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        log.append(payload(2)).unwrap();
+        assert!(log.checkpoint().is_err(), "its tail cannot be read");
+        fs::remove_dir(&manifest).unwrap();
+        fs::rename(&aside, &manifest).unwrap();
+        log.append(payload(3)).unwrap();
+        log.checkpoint().unwrap();
+        drop(log);
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(torn_repairs(&active).len(), 1);
     }
 }

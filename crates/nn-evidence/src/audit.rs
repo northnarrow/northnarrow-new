@@ -382,8 +382,8 @@ pub struct AuditLog<K> {
     /// the tail again first ([`Self::recover_after_failed_append`]).
     poisoned: Option<String>,
     /// Lot 296: fragments cut from the end of the log whose
-    /// `chain_tail_repaired` row is not written yet (its own append failed):
-    /// written before the next row.
+    /// `chain_tail_repaired` row is not written yet (its own append failed,
+    /// so the log is still poisoned): written before the next row.
     unattested: Vec<crate::chainlog::TailRepair>,
 }
 
@@ -737,7 +737,7 @@ impl<K: ChainSigner> AuditLog<K> {
     /// row is never glued to a fragment (a log the next start refuses) nor
     /// chained off a row that is no longer the tail.
     pub fn append(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
-        if self.memory.is_none() && (self.poisoned.is_some() || !self.unattested.is_empty()) {
+        if self.memory.is_none() && self.poisoned.is_some() {
             self.recover_after_failed_append()?;
         }
         let entry = build_signed_entry(
@@ -797,7 +797,8 @@ impl<K: ChainSigner> AuditLog<K> {
     /// (`chain_tail_repaired`, the fragment's length and SHA-256); a row it
     /// wrote whole (its fsync failed) is the chain's tail, and the next row
     /// chains off it. A cut whose attestation fails is attested at the next
-    /// append (kept here until then).
+    /// append (kept here until then; one written whole whose fsync failed is
+    /// then written twice — the same cut, said again).
     fn recover_after_failed_append(&mut self) -> Result<()> {
         let cause = self.poisoned.take();
         let reread = (|| -> Result<Option<crate::chainlog::TailRepair>> {
@@ -837,6 +838,7 @@ impl<K: ChainSigner> AuditLog<K> {
             if let Err(e) = self.attest_tail_repair(&path, &r) {
                 self.unattested.push(r);
                 self.unattested.extend(pending);
+                self.poisoned.get_or_insert_with(|| format!("{e:#}"));
                 return Err(e);
             }
         }
@@ -3219,29 +3221,58 @@ mod tests {
 
     /// A row its failed fsync left whole in the file counts as written: its
     /// number, and what it records (the second key, the numbering's start),
-    /// as the next open would read them.
+    /// as the next open would read them — from the re-read on, even when the
+    /// row after it fails too.
     #[test]
     fn a_row_kept_after_its_failed_fsync_counts_as_written() {
         let (_d, key_path, log_path) = fresh_paths();
         let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        let draft = |op: &str| AuditEntryDraft {
+            op: op.to_string(),
+            ..sample_draft(0)
+        };
+        let numbering = crate::chain_anchor::NUMBERING_STARTED_OP;
         assert!(!log.numbered() && !log.second_key_added() && !log.anchoring_started());
-        for op in ["rotate_keys_add", crate::chain_anchor::NUMBERING_STARTED_OP] {
-            host::inject(Fault::SyncFails { prefix: b"{" });
-            let draft = AuditEntryDraft {
-                op: op.to_string(),
-                ..sample_draft(0)
-            };
-            assert!(log.append(draft).is_err(), "premise: the fsync fails");
-        }
-        // the second append's re-read took the first row as written
-        assert!(log.second_key_added() && !log.anchoring_started());
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        assert!(
+            log.append(draft("rotate_keys_add")).is_err(),
+            "premise: fsync"
+        );
+        // the next row's re-read takes it as written; that row is cut short
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 40,
+        });
+        assert!(
+            log.append(draft(numbering)).is_err(),
+            "premise: a full disk"
+        );
+        assert_eq!(log.rows(), 1);
+        assert!(log.numbered() && log.second_key_added() && !log.anchoring_started());
+        // space back: the cut attested, then a row
         log.append(sample_draft(3)).unwrap();
-        assert_eq!(log.rows(), 3);
-        assert!(log.numbered() && log.second_key_added() && log.anchoring_started());
+        // the numbering's row whole, its fsync failed
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        assert!(log.append(draft(numbering)).is_err(), "premise: fsync");
+        assert!(!log.anchoring_started());
+        log.append(sample_draft(5)).unwrap();
+        assert_eq!(log.rows(), 5);
+        assert!(log.anchoring_started());
         let rows = every_line_a_row(&log_path);
+        let ops: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "rotate_keys_add",
+                CHAIN_TAIL_REPAIRED_OP,
+                "test_op_3",
+                numbering,
+                "test_op_5"
+            ]
+        );
         assert_eq!(
             rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            [Some(0), Some(1), Some(2)]
+            (0..5).map(Some).collect::<Vec<_>>()
         );
         whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
     }

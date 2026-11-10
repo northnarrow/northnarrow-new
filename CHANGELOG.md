@@ -29,6 +29,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- A chain writer whose write the disk stopped part-way (full) or whose
+  fsync failed reads its file's tail again before its next row (lot 296,
+  external bug hunt BUG15 P1, BUG17, BUG27): the start of a row left at
+  the end is cut and the cut attested (`chain_tail_repaired` in the audit
+  chain, `torn_tail_repaired` in a rotating log's manifest, with the cut
+  bytes' length and SHA-256), a row written whole is the chain's tail, a
+  seal written whole finishes its rotation. The next row used to be glued
+  to the fragment — an audit log the next start refused, so the agent did
+  not start in enforce mode; a rotating log broken for good — or, after a
+  failed fsync, chained off the row before (a fork).
+- A torn tail is attested before it is cut (lot 296, BUG39): the active
+  file's at the open, after its manifest row; a manifest's own by its
+  attesting row written over the fragment, the file cut after it. A cut
+  whose attestation failed once was attested by no later open.
+- A retention pass that fails part-way keeps the `Evicted` rows of the
+  archives it removed (they read as evictions no row attests, for good),
+  and an entry at an archive's name that is not a regular file is left in
+  place and passed instead of stopping every later pass (lot 296, BUG10).
+- The JSONL export sink closes the start of a line its failed write left
+  before the batch is written again, and the worker keeps its sink across
+  the error: the first record of the batch was glued to that start (lot
+  296, BUG31).
 - `BPF_RAW_TRACEPOINT_OPEN` is observed by the `bpf` hook and judged by
   NN-L-BPF-001 as an attach (lot 293, BUG05).
 - io_uring's `READV_FIXED`/`WRITEV_FIXED` (60, 61) are file I/O and

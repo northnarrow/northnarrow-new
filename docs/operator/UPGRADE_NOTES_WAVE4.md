@@ -929,3 +929,28 @@ holding a flow against a later kill (BUG45). After the upgrade:
 - NN-L-CHAIN-007 completed by a credential read processed after the egress
   needs the staging exec within 300 s of the egress (BUG75): a flow whose
   exec was older gets NN-L-CHAIN-001 alone, as in the kernel's order.
+
+## 20. The chain writers after a failed write (lot 296)
+
+- **A full disk, or a failed fsync, no longer breaks a chain** (external
+  bug hunt BUG15, BUG17, BUG27). Before its next row the writer reads the
+  file's tail again: the start of a row a write left at the end is cut and
+  the cut attested — `chain_tail_repaired` in the audit chain,
+  `torn_tail_repaired` in a rotating log's manifest (role `active` or
+  `manifest`), each with the length and SHA-256 of what was cut —; a row
+  written whole stays. Expect these rows after a disk was full: they are
+  the repair, not tampering (`EVIDENCE_CHAINS.md`, "What the agent did
+  about it"). An audit log an earlier version left with a row glued to a
+  fragment (a disk full then) is still refused at the start: a line before
+  the end that is not a row is corruption (`BOOT_INTEGRITY.md`, gate
+  `audit_log`); keep it as evidence (`EVIDENCE_CHAINS.md`, "When a check
+  fails").
+- **Retention** (BUG10): an entry at an archive's name that is not a
+  regular file is left in place and passed (ERROR in the journal; `chain
+  verify` names it); a pass that fails keeps the `Evicted` rows of what it
+  removed.
+- **The JSONL export** (BUG31): a write stopped part-way leaves one line
+  that is not a record, then the batch whole. A fragment left by a worker
+  that ended in the middle of a write is not closed (`EXPORT.md` §8).
+- Nothing to configure; the files' formats are unchanged (an `nn-admin` of
+  an earlier version reads the new rows).
