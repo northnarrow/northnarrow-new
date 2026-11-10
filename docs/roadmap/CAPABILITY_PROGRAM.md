@@ -8496,7 +8496,7 @@ number in parentheses is a lab PR.
     without `--`, recorded as not run, not as caught), 0 survivors, 0 argued
     equivalent (code that no test could tell apart was removed before:
     `soft_cap.max(1)`, a `\r` strip `record_of` already did, a null-intent
-    guard). A trial merge with lot 296 (#522): the code merges cleanly, its
+    guard). With lot 296 (#522, merged first): the code merges cleanly, its
     tests and this lot's pass (the BUG28 retry test made independent of
     which dance fails first: #522 probes the directory before it seals).
   - Gates on the PR's tree: eBPF, the four clippy runs (+ nn-admin's
