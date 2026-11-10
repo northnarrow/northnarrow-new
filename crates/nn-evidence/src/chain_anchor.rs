@@ -233,7 +233,16 @@ pub type LineCheck = fn(&[u8], &VerifyingKey) -> bool;
 
 /// The head of `path`: its newest complete line that `genuine` accepts,
 /// looked for in a bounded window from the end. `None` when the file is
-/// missing, empty, or holds no such line in the window.
+/// missing, empty, or holds no such line at all.
+///
+/// Lot 295 (BUG26): when the search stops at its bounds — more than
+/// [`MAX_HEAD_PROBES`] chain-shaped lines at the end that do not verify, or
+/// a window past [`HEAD_WINDOW_MAX`] (it grows by 4: 16 MiB) read without
+/// one that does, before the file's start — the head is not known: an
+/// error ([`std::io::ErrorKind::InvalidData`]), never `None`. Lines
+/// appended after the head must not make a file read as one without a
+/// head: the anchor would drop the chain, and a cut made later would not
+/// be found.
 pub fn read_file_head<H: ChainHost>(
     path: &Path,
     genuine: &dyn Fn(&[u8]) -> bool,
@@ -278,7 +287,13 @@ pub fn read_file_head<H: ChainHost>(
             };
             probes += 1;
             if probes > MAX_HEAD_PROBES {
-                return Ok(None);
+                return Err(head_not_found(
+                    path,
+                    &format!(
+                        "the last {MAX_HEAD_PROBES} chain-shaped lines do not verify (lines \
+                         appended after the head)"
+                    ),
+                ));
             }
             if genuine(line) {
                 return Ok(Some(FileHead {
@@ -288,11 +303,24 @@ pub fn read_file_head<H: ChainHost>(
                 }));
             }
         }
-        if start == 0 || window >= HEAD_WINDOW_MAX {
+        if start == 0 {
             return Ok(None);
+        }
+        if window >= HEAD_WINDOW_MAX {
+            return Err(head_not_found(
+                path,
+                &format!("no genuine line in its last {window} bytes"),
+            ));
         }
         window = window.saturating_mul(4).min(size);
     }
+}
+
+fn head_not_found(path: &Path, why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{}: the head is not known: {why}", path.display()),
+    )
 }
 
 /// `entry_hash` (chain-shaped) and `seq` of a raw line.
@@ -688,65 +716,78 @@ fn read_bounded<H: ChainHost>(path: &Path, max: u64) -> std::io::Result<Option<V
     Ok(Some(buf))
 }
 
-/// The heads of every target, read from disk now.
-pub fn collect_heads<H: ChainHost>(
-    targets: &[ChainTarget],
-    pk: &VerifyingKey,
-) -> Vec<AnchoredHead> {
-    let mut out = Vec::new();
+/// The heads of every target, read from disk now (it was `collect_heads`,
+/// which left out a chain whose head it could not read). Lot 295 (BUG26):
+/// the heads, and apart the chains whose head is not known — not the same
+/// as a file with no head: the anchor keeps such a chain's anchored head.
+struct HeadsNow {
+    heads: Vec<AnchoredHead>,
+    /// `chain` (`x`, `x.manifest`) and why its head is not known.
+    unread: Vec<(String, String)>,
+}
+
+impl HeadsNow {
+    fn unread(&self, chain: &str) -> bool {
+        self.unread.iter().any(|(c, _)| c == chain)
+    }
+}
+
+fn read_heads<H: ChainHost>(targets: &[ChainTarget], pk: &VerifyingKey) -> HeadsNow {
+    let mut now = HeadsNow {
+        heads: Vec::new(),
+        unread: Vec::new(),
+    };
     for t in targets {
         let genuine = |l: &[u8]| (t.genuine)(l, pk);
-        let head =
-            |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head::<H>(path, check) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(error = %e, path = %path.display(), "chain head: file not read");
-                    None
-                }
-            };
+        let mut put = |chain: String,
+                       path: &Path,
+                       generation: Option<u64>,
+                       head: std::io::Result<Option<FileHead>>| match head {
+            Ok(Some(h)) => now.heads.push(AnchoredHead {
+                chain,
+                path: path.display().to_string(),
+                generation,
+                head: h,
+            }),
+            Ok(None) => {}
+            Err(e) => now.unread.push((chain, e.to_string())),
+        };
         match t.kind {
-            ChainKind::Flat => {
-                if let Some(h) = head(&t.path, &genuine) {
-                    out.push(AnchoredHead {
-                        chain: t.chain.to_string(),
-                        path: t.path.display().to_string(),
-                        generation: None,
-                        head: h,
-                    });
-                }
-            }
+            ChainKind::Flat => put(
+                t.chain.to_string(),
+                &t.path,
+                None,
+                read_file_head::<H>(&t.path, &genuine),
+            ),
             ChainKind::Rotating => {
                 // A rotation between reading the generation and the head
                 // would anchor the head under the wrong file: the
                 // generation must be the same before and after.
                 let stable = (0..3).find_map(|_| {
                     let before = crate::chainlog::current_generation(&t.path);
-                    let h = head(&t.path, &genuine);
+                    let h = read_file_head::<H>(&t.path, &genuine);
                     (crate::chainlog::current_generation(&t.path) == before).then_some((before, h))
                 });
-                if let Some((generation, Some(h))) = stable {
-                    out.push(AnchoredHead {
-                        chain: t.chain.to_string(),
-                        path: t.path.display().to_string(),
-                        generation: Some(generation),
-                        head: h,
-                    });
+                match stable {
+                    Some((generation, h)) => put(t.chain.to_string(), &t.path, Some(generation), h),
+                    None => put(
+                        t.chain.to_string(),
+                        &t.path,
+                        None,
+                        Err(std::io::Error::other(
+                            "the log rotated at every read: its generation not known",
+                        )),
+                    ),
                 }
                 let manifest = crate::chainlog::manifest_path(&t.path);
                 let kind = t.payload_kind.unwrap_or_default();
                 let mcheck = |l: &[u8]| crate::chainlog::manifest_line_is_genuine(l, kind, pk);
-                if let Some(h) = head(&manifest, &mcheck) {
-                    out.push(AnchoredHead {
-                        chain: format!("{}.manifest", t.chain),
-                        path: manifest.display().to_string(),
-                        generation: None,
-                        head: h,
-                    });
-                }
+                let h = read_file_head::<H>(&manifest, &mcheck);
+                put(format!("{}.manifest", t.chain), &manifest, None, h);
             }
         }
     }
-    out
+    now
 }
 
 // ── findings ────────────────────────────────────────────────────────
@@ -765,6 +806,9 @@ pub struct ChainFinding {
     /// `chain_heads_unverified`.
     pub kind: &'static str,
     pub detail: String,
+    /// Found by the start's check (`true`), or by the running agent's
+    /// anchor (lot 295: a head that went back while it ran).
+    pub at_boot: bool,
 }
 
 impl ChainFinding {
@@ -779,7 +823,14 @@ impl ChainFinding {
             file: file.to_path_buf(),
             kind,
             detail: detail.into(),
+            at_boot: true,
         }
+    }
+
+    /// The same finding, made by the running agent (lot 295).
+    pub fn at_run_time(mut self) -> Self {
+        self.at_boot = false;
+        self
     }
 
     /// The signed `integrity_drift` entry.
@@ -791,7 +842,7 @@ impl ChainFinding {
                 "chain": self.chain,
                 "file": self.file.display().to_string(),
                 "detail": self.detail,
-                "at_boot": true,
+                "at_boot": self.at_boot,
             }),
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
@@ -803,8 +854,9 @@ impl ChainFinding {
         }
     }
 
-    /// ERROR in the journal, then the signed entry.
-    pub fn attest<K: ChainSigner>(&self, log: Option<&mut AuditLog<K>>) {
+    /// ERROR in the journal, then the signed entry. `true` when the entry
+    /// is in the audit chain.
+    pub fn attest<K: ChainSigner>(&self, log: Option<&mut AuditLog<K>>) -> bool {
         error!(
             kind = self.kind,
             chain = %self.chain,
@@ -812,10 +864,13 @@ impl ChainFinding {
             detail = %self.detail,
             "chain integrity: evidence missing or altered — see the runbook (chain verification failed)"
         );
-        if let Some(log) = log {
-            if let Err(e) = log.append(self.draft()) {
+        match log.map(|log| log.append(self.draft())) {
+            Some(Ok(_)) => true,
+            Some(Err(e)) => {
                 warn!(error = %format!("{e:#}"), "attesting a chain finding failed");
+                false
             }
+            None => false,
         }
     }
 
@@ -904,7 +959,9 @@ pub fn boot_check<H: ChainHost>(
     }
     if let Some(prev) = &out.previous {
         for h in &prev.heads {
-            check_anchored::<H>(h, &prev.ts, targets, &mut out.findings);
+            if let Anchored::Lost(f) = check_anchored::<H>(h, &prev.ts, targets, pk, false) {
+                out.findings.push(f);
+            }
         }
     }
     for t in targets
@@ -924,16 +981,20 @@ pub fn boot_check<H: ChainHost>(
 /// `active`, now: the active file, an archive, or nothing.
 enum Holder {
     File(PathBuf),
-    /// Archived then dropped by retention (the verifier checks the
-    /// manifest's `Evicted` rows).
+    /// Archived then dropped by retention: the manifest's signed `Evicted`
+    /// row for it says so (the verifier checks every one).
     Evicted,
+    /// Lot 295 (BUG08): the archive is gone and no signed `Evicted` row
+    /// says retention dropped it.
+    Gone(PathBuf),
     /// Generations past what is on disk.
     RolledBack {
         now: u64,
     },
 }
 
-fn holder(active: &Path, generation: u64) -> Holder {
+/// `evicted(g)`: the manifest holds a genuine `Evicted` row for archive `g`.
+fn holder(active: &Path, generation: u64, evicted: &dyn Fn(u64) -> bool) -> Holder {
     let now = crate::chainlog::current_generation(active);
     if generation == now {
         return Holder::File(active.to_path_buf());
@@ -945,45 +1006,89 @@ fn holder(active: &Path, generation: u64) -> Holder {
     if archive.exists() {
         return Holder::File(archive);
     }
-    let earliest = crate::chainlog::earliest_archive(active);
-    if earliest.is_some_and(|e| generation < e) {
+    // Lot 295 (BUG08): an archive below the earliest on disk was taken for
+    // evicted — so a foreign `<active>.000009` made a generation deleted
+    // with every archive look dropped by retention. Only the manifest's
+    // signed row says that; past its tail window (256 KiB) the archive is
+    // reported gone, the safe side.
+    if evicted(generation) {
         Holder::Evicted
     } else {
-        Holder::File(archive)
+        Holder::Gone(archive)
     }
 }
 
+/// Whether `tail` (from [`crate::chainlog::manifest_tail_events`]) holds a
+/// genuine `Evicted` row for archive `seq`.
+fn evicted_in(tail: &[crate::chainlog::ManifestEvent], seq: u64) -> bool {
+    tail.iter()
+        .any(|e| matches!(e, crate::chainlog::ManifestEvent::Evicted { seq: s, .. } if *s == seq))
+}
+
+/// What a head anchored earlier is now.
+enum Anchored {
+    /// Still where it was: in its file, or in an archive retention dropped
+    /// (attested), or of a chain this build no longer anchors.
+    Held,
+    /// Cut, rewritten, deleted, or its archives removed.
+    Lost(ChainFinding),
+    /// Not checked (an I/O error, warned).
+    Unknown,
+}
+
+/// `running`: the check of the running agent's anchor, while the writers
+/// run — an archive gone without its `Evicted` row may be a retention in
+/// progress (the row follows the unlink): not known yet, the start's check
+/// decides.
 fn check_anchored<H: ChainHost>(
     h: &AnchoredHead,
     anchored_at: &str,
     targets: &[ChainTarget],
-    findings: &mut Vec<ChainFinding>,
-) {
+    pk: &VerifyingKey,
+    running: bool,
+) -> Anchored {
     let base = h.chain.trim_end_matches(".manifest");
     let Some(t) = targets.iter().find(|t| t.chain == base) else {
-        return; // a chain this build no longer anchors
+        return Anchored::Held; // a chain this build no longer anchors
     };
     let path = if h.chain.ends_with(".manifest") {
         crate::chainlog::manifest_path(&t.path)
     } else {
         match (t.kind, h.generation) {
-            (ChainKind::Rotating, Some(g)) => match holder(&t.path, g) {
-                Holder::File(p) => p,
-                Holder::Evicted => return,
-                Holder::RolledBack { now } => {
-                    findings.push(ChainFinding::new(
-                        h.chain.clone(),
-                        &t.path,
-                        "chain_archives_missing",
-                        format!(
-                            "the head anchored at {anchored_at} is in generation {g}, but only \
-                             {} archive(s) are on disk: the newest archives were removed",
-                            now.saturating_sub(1)
-                        ),
-                    ));
-                    return;
+            (ChainKind::Rotating, Some(g)) => {
+                let evicted = |seq: u64| {
+                    let kind = t.payload_kind.unwrap_or_default();
+                    evicted_in(
+                        &crate::chainlog::manifest_tail_events::<H>(&t.path, kind, pk),
+                        seq,
+                    )
+                };
+                match holder(&t.path, g, &evicted) {
+                    Holder::File(p) => p,
+                    Holder::Evicted => return Anchored::Held,
+                    Holder::Gone(_) if running => return Anchored::Unknown,
+                    Holder::Gone(archive) => {
+                        return Anchored::Lost(archive_gone(
+                            &h.chain,
+                            &archive,
+                            g,
+                            &format!("the head anchored at {anchored_at}"),
+                        ))
+                    }
+                    Holder::RolledBack { now } => {
+                        return Anchored::Lost(ChainFinding::new(
+                            h.chain.clone(),
+                            &t.path,
+                            "chain_archives_missing",
+                            format!(
+                                "the head anchored at {anchored_at} is in generation {g}, but \
+                                 only {} archive(s) are on disk: the newest archives were removed",
+                                now.saturating_sub(1)
+                            ),
+                        ))
+                    }
                 }
-            },
+            }
             _ => t.path.clone(),
         }
     };
@@ -992,24 +1097,31 @@ fn check_anchored<H: ChainHost>(
         &path,
         &h.head,
         &format!("anchored at {anchored_at}"),
-        findings,
-    );
+    )
 }
 
-fn report_head<H: ChainHost>(
-    chain: &str,
-    path: &Path,
-    head: &FileHead,
-    source: &str,
-    findings: &mut Vec<ChainFinding>,
-) {
+/// Lot 295 (BUG08): archive `g`, which holds a head, is gone, and no signed
+/// `Evicted` row says retention dropped it.
+fn archive_gone(chain: &str, archive: &Path, g: u64, source: &str) -> ChainFinding {
+    ChainFinding::new(
+        chain,
+        archive,
+        "chain_missing",
+        format!(
+            "archive {g} is gone and the manifest holds no signed Evicted row for it; {source} \
+             is in that archive: it was deleted"
+        ),
+    )
+}
+
+fn report_head<H: ChainHost>(chain: &str, path: &Path, head: &FileHead, source: &str) -> Anchored {
     let row = head.seq.map(|s| format!("row {s}, ")).unwrap_or_default();
     let what = format!(
         "the head {source} ends at byte {} ({row}entry_hash {})",
         head.bytes, head.tail_hash
     );
     let finding = match check_head::<H>(path, head) {
-        Ok(HeadCheck::Intact) => return,
+        Ok(HeadCheck::Intact) => return Anchored::Held,
         Ok(HeadCheck::Missing) => ("chain_missing", format!("the file is gone; {what}")),
         Ok(HeadCheck::Shorter { len }) => (
             "chain_truncated",
@@ -1021,10 +1133,10 @@ fn report_head<H: ChainHost>(
         ),
         Err(e) => {
             warn!(error = %e, path = %path.display(), "chain head: file not checked");
-            return;
+            return Anchored::Unknown;
         }
     };
-    findings.push(ChainFinding::new(chain, path, finding.0, finding.1));
+    Anchored::Lost(ChainFinding::new(chain, path, finding.0, finding.1))
 }
 
 /// The newest manifest checkpoint, and a missing active file, of one
@@ -1051,15 +1163,20 @@ fn check_rotating<H: ChainHost>(
         )),
         _ => None,
     }) {
-        match holder(&t.path, seq) {
-            Holder::File(p) => report_head::<H>(
-                t.chain,
-                &p,
-                &head,
-                &format!("checkpointed in the manifest (generation {seq})"),
-                findings,
-            ),
+        let source = format!("checkpointed in the manifest (generation {seq})");
+        match holder(&t.path, seq, &|g| evicted_in(&tail, g)) {
+            Holder::File(p) => {
+                if let Anchored::Lost(f) = report_head::<H>(t.chain, &p, &head, &source) {
+                    findings.push(f);
+                }
+            }
             Holder::Evicted => {}
+            Holder::Gone(archive) => findings.push(archive_gone(
+                t.chain,
+                &archive,
+                seq,
+                &format!("the head {source}"),
+            )),
             Holder::RolledBack { now } => findings.push(ChainFinding::new(
                 t.chain,
                 &t.path,
@@ -1100,6 +1217,16 @@ pub struct Anchor<K> {
     /// Lab PR 249: the time each snapshot is stamped with (the host's
     /// unless [`Self::with_clock`] gave another).
     clock: Arc<dyn crate::clock::Clock>,
+    /// Lot 295 (BUG25): `last` is a snapshot this anchor wrote, its heads
+    /// compared at every refresh. Not the `previous` one the start read:
+    /// the boot check compared that one (and attests what it found).
+    own: bool,
+    /// Lot 295: the findings of the last refresh not in the audit chain
+    /// yet (their heads stay anchored until they are).
+    unattested: Vec<ChainFinding>,
+    /// Lot 295 (BUG26): the chains whose head was not known at the last
+    /// refresh (warned when one becomes so).
+    unread: Vec<String>,
 }
 
 impl<K: ChainSigner> Anchor<K> {
@@ -1125,6 +1252,9 @@ impl<K: ChainSigner> Anchor<K> {
             protection: None,
             marker_pending: !anchoring_started,
             clock: Arc::new(crate::clock::SystemClock),
+            own: false,
+            unattested: Vec::new(),
+            unread: Vec::new(),
         }
     }
 
@@ -1187,10 +1317,75 @@ impl<K: ChainSigner> Anchor<K> {
         Ok(())
     }
 
+    /// [`Self::refresh_attesting`] with nothing to attest in: a head that
+    /// went back stays anchored ([`Self::unattested`]).
+    pub fn refresh(&mut self, force: bool, second_key_added: bool) -> Result<Vec<AnchoredHead>> {
+        self.refresh_attesting(force, second_key_added, &mut |_| false)
+    }
+
+    /// The findings of the last refresh that `attest` did not put in the
+    /// audit chain: their heads are still the anchored ones.
+    pub fn unattested(&self) -> &[ChainFinding] {
+        &self.unattested
+    }
+
     /// Re-read every head; write a snapshot when `force` or one moved
     /// (or the sticky flag turned on). Returns the heads that moved.
-    pub fn refresh(&mut self, force: bool, second_key_added: bool) -> Result<Vec<AnchoredHead>> {
-        let heads = collect_heads::<K::Host>(&self.targets, &self.key.verifying_key());
+    ///
+    /// Lot 295 (BUG25, BUG26): a head never leaves the anchor, nor goes
+    /// back, without a signed finding. Each head of the last snapshot this
+    /// anchor wrote that is not read again as it was is checked first. One
+    /// no longer in its file — cut, emptied, rewritten, its file or its
+    /// archives removed while the agent ran — is a finding
+    /// (`at_boot: false`) handed to `attest`, which signs it and says
+    /// whether it is in the audit chain; until it is, the snapshot keeps
+    /// that head, so the next start finds the loss too. A head that cannot
+    /// be read now (lines that do not verify appended after it,
+    /// [`read_file_head`]) stays anchored while it is still in its file.
+    pub fn refresh_attesting(
+        &mut self,
+        force: bool,
+        second_key_added: bool,
+        attest: &mut dyn FnMut(&ChainFinding) -> bool,
+    ) -> Result<Vec<AnchoredHead>> {
+        let pk = self.key.verifying_key();
+        let mut now = read_heads::<K::Host>(&self.targets, &pk);
+        let mut kept: Vec<AnchoredHead> = Vec::new();
+        let mut signed = false;
+        self.unattested.clear();
+        if let Some(last) = &self.last {
+            for o in last.heads.iter().filter(|o| !now.heads.contains(o)) {
+                match self.check_moved(o, &last.ts, &pk) {
+                    Anchored::Held if now.unread(&o.chain) => kept.push(o.clone()),
+                    Anchored::Held => {}
+                    Anchored::Unknown => kept.push(o.clone()),
+                    // the start's check compared the snapshot it read
+                    Anchored::Lost(_) if !self.own => {}
+                    Anchored::Lost(f) => {
+                        let f = f.at_run_time();
+                        if attest(&f) {
+                            signed = true;
+                        } else {
+                            kept.push(o.clone());
+                            self.unattested.push(f);
+                        }
+                    }
+                }
+            }
+        }
+        if signed {
+            // the findings moved the audit chain's head: this snapshot
+            // anchors it past them
+            now = read_heads::<K::Host>(&self.targets, &pk);
+        }
+        self.note_unread(&now);
+        let mut heads = now.heads;
+        for o in kept {
+            match heads.iter_mut().find(|h| h.chain == o.chain) {
+                Some(h) => *h = o,
+                None => heads.push(o),
+            }
+        }
         let flag = self.second_key_added || second_key_added;
         // Sticky in memory even if the write below fails.
         self.second_key_added = flag;
@@ -1232,7 +1427,43 @@ impl<K: ChainSigner> Anchor<K> {
         }
         self.second_key_added = flag;
         self.last = Some(snapshot);
+        self.own = true;
         Ok(moved)
+    }
+
+    /// Lot 295 (BUG25): where a head of the last snapshot is now. A
+    /// rotating log's head is checked under one generation: a rotation
+    /// while it is checked moves it into an archive, and is checked again.
+    fn check_moved(&self, o: &AnchoredHead, anchored_at: &str, pk: &VerifyingKey) -> Anchored {
+        let generation = || {
+            let base = o.chain.trim_end_matches(".manifest");
+            self.targets
+                .iter()
+                .find(|t| t.chain == base && matches!(t.kind, ChainKind::Rotating))
+                .map(|t| crate::chainlog::current_generation(&t.path))
+        };
+        for _ in 0..3 {
+            let before = generation();
+            // (the writers run once this anchor has written: before, the
+            // start's own check, as the boot check did)
+            let found = check_anchored::<K::Host>(o, anchored_at, &self.targets, pk, self.own);
+            if generation() == before {
+                return found;
+            }
+        }
+        Anchored::Unknown
+    }
+
+    /// Lot 295 (BUG26): a chain whose head is not known now, warned once
+    /// (its anchored head is kept while it is still in its file).
+    fn note_unread(&mut self, now: &HeadsNow) {
+        for (chain, why) in &now.unread {
+            if !self.unread.contains(chain) {
+                warn!(chain = %chain, error = %why,
+                    "chain head: not known — the anchored head is kept while it is still in its file");
+            }
+        }
+        self.unread = now.unread.iter().map(|(c, _)| c.clone()).collect();
     }
 }
 
@@ -1739,5 +1970,762 @@ mod tests {
         let after = crate::audit::format_ts(chrono::Utc::now());
         let ts = read(&host).ts;
         assert!(before <= ts && ts <= after, "{before} <= {ts} <= {after}");
+    }
+
+    // ── lot 295: the anchor's head never leaves it nor goes back without a
+    // signed finding (external bug hunt, editions 1.2/1.3: BUG08, BUG25, BUG26) ──
+
+    fn flat_target(path: &Path) -> ChainTarget {
+        ChainTarget {
+            chain: "canary_access",
+            path: path.to_path_buf(),
+            kind: ChainKind::Flat,
+            genuine: crate::audit::row_is_genuine,
+            recent: None,
+            full: full_audit,
+            payload_kind: None,
+        }
+    }
+
+    fn cut_last_rows(path: &Path, rows: usize) {
+        let body = std::fs::read(path).unwrap();
+        let mut end = body.len();
+        for _ in 0..rows {
+            end = body[..end - 1].iter().rposition(|&c| c == b'\n').unwrap() + 1;
+        }
+        std::fs::write(path, &body[..end]).unwrap();
+    }
+
+    /// BUG08: with the anchored generation (the active file) and every
+    /// archive deleted while the agent is down, an empty foreign
+    /// `<active>.000009` made `holder` call the anchored generation
+    /// "evicted" (below the earliest archive on disk) and the boot check
+    /// said nothing. Only a signed `Evicted` row says that now.
+    #[test]
+    fn fake_higher_archive_hides_the_deleted_anchored_generation() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("e.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 300);
+        let mut n = 0;
+        while crate::chainlog::current_generation(&active) < 5 {
+            log.append(p(n)).unwrap();
+            n += 1;
+            assert!(n < 500);
+        }
+        drop(log);
+        assert!(std::fs::metadata(&active).unwrap().len() > 0);
+        Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        let t = || vec![rotating_target(&active)];
+        assert!(boot_check::<PortableHost>(&t(), &heads, &pk)
+            .findings
+            .is_empty());
+        // agent down: the active file and every archive deleted
+        for s in 1..=4u64 {
+            std::fs::remove_file(crate::chainlog::archive_path_for(&active, s)).unwrap();
+        }
+        std::fs::remove_file(&active).unwrap();
+        // control: without the foreign name the deletion is found
+        let control = boot_check::<PortableHost>(&t(), &heads, &pk);
+        assert!(
+            control
+                .findings
+                .iter()
+                .any(|f| f.kind == "chain_archives_missing"),
+            "{:?}",
+            control.findings
+        );
+        // an empty foreign `<active>.000009`: generation 5 is below the
+        // earliest archive on disk, and no signed `Evicted` row says
+        // retention dropped it (it was taken for evicted)
+        std::fs::write(crate::chainlog::archive_path_for(&active, 9), b"").unwrap();
+        let tail = crate::chainlog::manifest_tail_events::<PortableHost>(&active, "test_log", &pk);
+        assert!(matches!(
+            holder(&active, 5, &|g| evicted_in(&tail, g)),
+            Holder::Gone(_)
+        ));
+        // the full verifier (nn-admin chain verify) still refuses the set
+        assert!((rotating_target(&active).full)(&active, &pk).is_err());
+        let found = boot_check::<PortableHost>(&t(), &heads, &pk);
+        assert!(
+            !found.findings.is_empty(),
+            "the anchored generation 5 was deleted, no Evicted row attests it, yet the boot check \
+             is silent"
+        );
+    }
+
+    /// BUG25 (rotating log, the report's case): the active file emptied
+    /// while the agent runs; the periodic refresh signed a snapshot without
+    /// its head and the next boot found nothing. With nothing to sign the
+    /// finding in, the anchored head stays: the next boot finds the loss.
+    #[test]
+    fn active_emptied_while_running_is_reanchored_silently() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("b.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 0..3 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let mut anchor = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        assert!(
+            boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk)
+                .findings
+                .is_empty()
+        );
+        std::fs::write(&active, b"").unwrap(); // emptied while the agent runs
+        anchor.refresh(false, false).unwrap(); // the ANCHOR_SECS tick
+        assert_eq!(
+            anchor
+                .unattested()
+                .iter()
+                .map(|f| (f.kind, f.at_boot))
+                .collect::<Vec<_>>(),
+            [("chain_truncated", false)]
+        );
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        assert!(
+            found.findings.iter().any(|f| f.kind == "chain_truncated"),
+            "the anchored head was replaced without a finding: {:?}",
+            found.findings
+        );
+    }
+
+    /// BUG25 (flat chain): rows cut from a flat chain while the agent runs
+    /// were re-anchored at the next tick, the boot check silent. The cut is
+    /// a finding of the running anchor now: until it is signed the anchored
+    /// head stays (the next boot finds the cut too); once it is, the
+    /// shorter head is anchored, the next boot is quiet, and it is not
+    /// signed again.
+    #[test]
+    fn flat_chain_cut_while_running_is_reanchored_silently() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let path = dir.path().join("flat.log");
+        let mut log = AuditLog::open(&path, key(&dir), [1; 16]).unwrap();
+        for n in 0..5 {
+            log.append(draft(n)).unwrap();
+        }
+        drop(log);
+        let mut anchor = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![flat_target(&path)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        cut_last_rows(&path, 2); // rows 3 and 4 removed while running
+        let mut offered = Vec::new();
+        let moved = anchor
+            .refresh_attesting(false, false, &mut |f| {
+                offered.push(f.clone());
+                false // the audit chain did not take it
+            })
+            .unwrap();
+        assert!(moved.is_empty(), "not signed: the anchored head stays");
+        assert_eq!(
+            offered
+                .iter()
+                .map(|f| (f.chain.as_str(), f.kind, f.at_boot))
+                .collect::<Vec<_>>(),
+            [("canary_access", "chain_truncated", false)]
+        );
+        assert!(offered[0].detail.contains("row 4"), "{:?}", offered[0]);
+        assert_eq!(anchor.unattested(), &offered[..]);
+        let found = boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk);
+        assert!(
+            found.findings.iter().any(|f| f.kind == "chain_truncated"),
+            "rows cut below the anchored head, re-anchored without a finding: {:?}",
+            found.findings
+        );
+        // signed: the shorter head is anchored
+        let mut signed = Vec::new();
+        let moved = anchor
+            .refresh_attesting(false, false, &mut |f| {
+                signed.push(f.kind);
+                true
+            })
+            .unwrap();
+        assert_eq!(signed, ["chain_truncated"]);
+        assert_eq!(moved.len(), 1, "the shorter head is anchored as a move");
+        assert_eq!(moved[0].head.seq, Some(2));
+        assert!(anchor.unattested().is_empty());
+        assert!(
+            boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk)
+                .findings
+                .is_empty()
+        );
+        let again = anchor
+            .refresh_attesting(true, false, &mut |f| panic!("signed twice: {f:?}"))
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// BUG26 (the report's case): 64 chain-shaped lines that do not verify
+    /// after the genuine head: `read_file_head` returned `Ok(None)`, as for
+    /// an empty file. The head is not known: an error, never "no head".
+    #[test]
+    fn forged_tail_lines_hide_the_head() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let path = dir.path().join("audit.log");
+        let mut log = AuditLog::open(&path, k, [1; 16]).unwrap();
+        for n in 0..5 {
+            log.append(draft(n)).unwrap();
+        }
+        let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
+        let before = read_file_head::<PortableHost>(&path, &ok).unwrap().unwrap();
+        for _ in 0..MAX_HEAD_PROBES {
+            append_raw(&path, b"{\"entry_hash\":\"");
+            append_raw(&path, "ab".repeat(32).as_bytes());
+            append_raw(&path, b"\"}\n");
+        }
+        let after = read_file_head::<PortableHost>(&path, &ok);
+        // a fix may return the head or an error the caller warns about;
+        // `Ok(None)` ("no head", as for an empty file) is the defect
+        assert!(
+            !matches!(after, Ok(None)),
+            "the genuine head ({before:?}) is in the window, yet the file reads as one without a \
+             head: {after:?}"
+        );
+    }
+
+    /// BUG26 (effect): the forged tail is in place when the stop snapshot
+    /// is taken; the chain left the anchor, and a cut made while the agent
+    /// was down was not found at the next boot. The anchored head is kept
+    /// while it is still in its file.
+    #[test]
+    fn forged_tail_then_cut_while_down_is_not_found_at_boot() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let path = dir.path().join("flat.log");
+        let mut log = AuditLog::open(&path, key(&dir), [1; 16]).unwrap();
+        for n in 0..5 {
+            log.append(draft(n)).unwrap();
+        }
+        drop(log);
+        let mut anchor = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![flat_target(&path)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        let genuine_len = std::fs::metadata(&path).unwrap().len();
+        for _ in 0..=MAX_HEAD_PROBES {
+            append_raw(&path, b"{\"entry_hash\":\"");
+            append_raw(&path, "ab".repeat(32).as_bytes());
+            append_raw(&path, b"\"}\n");
+        }
+        anchor.refresh(true, false).unwrap(); // the snapshot at stop
+                                              // agent down: forged lines and the last two genuine rows removed
+        let body = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &body[..genuine_len as usize]).unwrap();
+        cut_last_rows(&path, 2);
+        let found = boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk);
+        assert!(
+            found.findings.iter().any(|f| f.kind == "chain_truncated"),
+            "the chain left the anchor and its cut is not found: {:?}",
+            found.findings
+        );
+    }
+
+    fn flat_named(chain: &'static str, path: &Path) -> ChainTarget {
+        ChainTarget {
+            chain,
+            ..flat_target(path)
+        }
+    }
+
+    fn rotating_log_kept(
+        path: &Path,
+        key: TestKey,
+        cap: u64,
+        max_archives: usize,
+    ) -> crate::chainlog::RotatingChainLog<P, TestKey> {
+        crate::chainlog::RotatingChainLog::<P, _>::open(
+            path,
+            key,
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: cap,
+                max_archives,
+                file_mode: 0o600,
+            },
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap()
+    }
+
+    /// BUG08, the positive control: retention dropping the anchored
+    /// generation (its signed `Evicted` row in the manifest) stays silent at
+    /// the next boot, and the full verification agrees.
+    #[test]
+    fn a_genuine_eviction_of_the_anchored_generation_stays_silent() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("g.jsonl");
+        let mut log = rotating_log_kept(&active, key(&dir), 300, 2);
+        let mut n = 0;
+        while crate::chainlog::current_generation(&active) < 3 {
+            log.append(p(n)).unwrap();
+            n += 1;
+        }
+        log.append(p(n)).unwrap();
+        n += 1;
+        let g = crate::chainlog::current_generation(&active);
+        Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        // the agent runs on: generation g sealed, then dropped by retention
+        while crate::chainlog::current_generation(&active) <= g
+            || crate::chainlog::archive_path_for(&active, g).exists()
+        {
+            log.append(p(n)).unwrap();
+            n += 1;
+            assert!(n < 1000);
+        }
+        drop(log);
+        let tail = crate::chainlog::manifest_tail_events::<PortableHost>(&active, "test_log", &pk);
+        assert!(evicted_in(&tail, g), "{tail:?}");
+        let now = crate::chainlog::current_generation(&active);
+        assert!(
+            !evicted_in(&tail, now),
+            "the active file's generation: {tail:?}"
+        );
+        assert!(matches!(
+            holder(&active, g, &|s| evicted_in(&tail, s)),
+            Holder::Evicted
+        ));
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        assert!(found.findings.is_empty(), "{:?}", found.findings);
+        assert!((rotating_target(&active).full)(&active, &pk).is_ok());
+    }
+
+    /// BUG25, the quiet the fix must keep: chains that only grow, rotate
+    /// and drop archives by retention while the agent runs give no finding
+    /// at any tick, and every tick anchors their new heads.
+    #[test]
+    fn chains_that_only_grow_and_rotate_give_no_finding() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("q.jsonl");
+        let flat = dir.path().join("audit.log");
+        let mut log = rotating_log_kept(&active, key(&dir), 400, 2);
+        let mut audit = AuditLog::open(&flat, key(&dir), [1; 16]).unwrap();
+        let targets = || vec![flat_named("audit", &flat), rotating_target(&active)];
+        let mut anchor = Anchor::new(heads.clone(), k, [1; 16], targets(), None, false);
+        log.append(p(0)).unwrap();
+        audit.append(draft(0)).unwrap();
+        anchor.refresh(true, false).unwrap();
+        let mut n = 1;
+        for round in 0..6 {
+            // a few rows (round 3: enough for the anchored generation to be
+            // sealed and dropped by retention between two ticks)
+            let rows = if round == 3 { 40 } else { 3 };
+            for _ in 0..rows {
+                log.append(p(n)).unwrap();
+                audit.append(draft(n as u32)).unwrap();
+                n += 1;
+            }
+            let moved = anchor
+                .refresh_attesting(false, false, &mut |f| panic!("round {round}: {f:?}"))
+                .unwrap();
+            assert!(!moved.is_empty(), "round {round}: the heads moved");
+            assert!(anchor.unattested().is_empty());
+            let anchored = match HeadsStore::read::<PortableHost>(&heads, &pk) {
+                HeadsRead::Valid(s) => s,
+                other => panic!("{other:?}"),
+            };
+            let data = anchored
+                .heads
+                .iter()
+                .find(|h| h.chain == "test_log")
+                .expect("the log's head");
+            assert_eq!(
+                data.generation,
+                Some(crate::chainlog::current_generation(&active)),
+                "round {round}: the new generation's head, not the old one kept"
+            );
+        }
+        assert!(crate::chainlog::current_generation(&active) > 4);
+        assert!(boot_check::<PortableHost>(&targets(), &heads, &pk)
+            .findings
+            .is_empty());
+    }
+
+    /// BUG25: the running anchor's finding is signed before the head is
+    /// replaced, and the snapshot written then anchors the audit chain past
+    /// the finding's own row (cut while the agent is down, it is found).
+    #[test]
+    fn a_cut_found_while_running_is_signed_and_its_row_anchored() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let audit_path = dir.path().join("audit.log");
+        let canary = dir.path().join("canary_access.jsonl");
+        let mut audit = AuditLog::open(&audit_path, key(&dir), [1; 16]).unwrap();
+        let mut other = AuditLog::open(&canary, key(&dir), [2; 16]).unwrap();
+        for n in 0..4 {
+            audit.append(draft(n)).unwrap();
+            other.append(draft(n)).unwrap();
+        }
+        drop(other);
+        let targets = || vec![flat_named("audit", &audit_path), flat_target(&canary)];
+        let mut anchor = Anchor::new(heads.clone(), k, [1; 16], targets(), None, false);
+        anchor.refresh(true, false).unwrap();
+        cut_last_rows(&canary, 1);
+        anchor
+            .refresh_attesting(false, false, &mut |f| f.attest(Some(&mut audit)))
+            .unwrap();
+        let body = std::fs::read_to_string(&audit_path).unwrap();
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last["op"], crate::audit::INTEGRITY_DRIFT_OP);
+        assert_eq!(last["extra"]["kind"], "chain_truncated");
+        assert_eq!(last["extra"]["chain"], "canary_access");
+        assert_eq!(last["extra"]["at_boot"], false);
+        let anchored = match HeadsStore::read::<PortableHost>(&heads, &pk) {
+            HeadsRead::Valid(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let audit_head = anchored.heads.iter().find(|h| h.chain == "audit").unwrap();
+        assert_eq!(
+            audit_head.head.tail_hash,
+            last["entry_hash"].as_str().unwrap(),
+            "the snapshot anchors the finding's row"
+        );
+        assert!(boot_check::<PortableHost>(&targets(), &heads, &pk)
+            .findings
+            .is_empty());
+        // the finding's row cut while the agent is down: found
+        cut_last_rows(&audit_path, 1);
+        let found = boot_check::<PortableHost>(&targets(), &heads, &pk);
+        assert!(
+            found
+                .findings
+                .iter()
+                .any(|f| f.chain == "audit" && f.kind == "chain_truncated"),
+            "{:?}",
+            found.findings
+        );
+    }
+
+    /// BUG25: the snapshot the start read was compared by the boot check
+    /// (which signs what it found): the start's anchor does not sign it
+    /// again, and anchors the files as they are.
+    #[test]
+    fn the_start_s_own_findings_are_not_signed_again_by_its_anchor() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let path = dir.path().join("flat.log");
+        let mut log = AuditLog::open(&path, key(&dir), [1; 16]).unwrap();
+        for n in 0..5 {
+            log.append(draft(n)).unwrap();
+        }
+        drop(log);
+        Anchor::new(
+            heads.clone(),
+            key(&dir),
+            [1; 16],
+            vec![flat_target(&path)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        cut_last_rows(&path, 2); // while the agent is down
+        let boot = boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk);
+        assert_eq!(boot.findings.len(), 1, "{:?}", boot.findings);
+        let mut start = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![flat_target(&path)],
+            boot.previous.clone(),
+            true,
+        );
+        let moved = start
+            .refresh_attesting(true, false, &mut |f| panic!("signed again: {f:?}"))
+            .unwrap();
+        assert_eq!(moved.len(), 1, "the files as they are");
+        assert!(
+            boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk)
+                .findings
+                .is_empty()
+        );
+    }
+
+    /// BUG25: an archive that holds the anchored head, older than the
+    /// newest, deleted while the agent runs without a signed `Evicted` row,
+    /// may be a retention in progress (the row follows the unlink): no
+    /// finding of the running anchor, the head stays anchored, and the next
+    /// start reports it. The newest archive deleted is a finding at once
+    /// (retention never drops it: the generation goes back).
+    #[test]
+    fn an_archive_deleted_while_running_is_left_to_the_next_start() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("r.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 400);
+        log.append(p(0)).unwrap();
+        let mut anchor = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        let g = crate::chainlog::current_generation(&active);
+        let mut n = 1;
+        while crate::chainlog::current_generation(&active) < g + 3 {
+            log.append(p(n)).unwrap();
+            n += 1;
+        }
+        drop(log);
+        std::fs::remove_file(crate::chainlog::archive_path_for(&active, g)).unwrap();
+        anchor
+            .refresh_attesting(false, false, &mut |f| panic!("{f:?}"))
+            .unwrap();
+        // (the next tick still waits for the row, and the head stays)
+        anchor
+            .refresh_attesting(true, false, &mut |f| panic!("{f:?}"))
+            .unwrap();
+        let anchored = match HeadsStore::read::<PortableHost>(&heads, &pk) {
+            HeadsRead::Valid(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            anchored
+                .heads
+                .iter()
+                .any(|h| h.chain == "test_log" && h.generation == Some(g)),
+            "{anchored:?}"
+        );
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        assert!(
+            found
+                .findings
+                .iter()
+                .any(|f| f.kind == "chain_missing" && f.detail.contains("no signed Evicted row")),
+            "{:?}",
+            found.findings
+        );
+        // that start's anchor takes the files as they are: the start after
+        // it is quiet (the start's check signed the loss once)
+        Anchor::new(
+            heads.clone(),
+            key(&dir),
+            [1; 16],
+            vec![rotating_target(&active)],
+            found.previous.clone(),
+            true,
+        )
+        .refresh_attesting(true, false, &mut |f| panic!("signed again: {f:?}"))
+        .unwrap();
+        let again = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        assert!(
+            !again
+                .findings
+                .iter()
+                .any(|f| f.detail.contains("the head anchored at")),
+            "{:?}",
+            again.findings
+        );
+        // the newest archive deleted while the agent runs, the anchored
+        // head in it: a finding of the running anchor
+        let active = dir.path().join("s.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 400);
+        log.append(p(0)).unwrap();
+        let mut anchor = Anchor::new(
+            dir.path().join("s_heads.json"),
+            key(&dir),
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        let g = crate::chainlog::current_generation(&active);
+        let mut n = 1;
+        while crate::chainlog::current_generation(&active) == g {
+            log.append(p(n)).unwrap();
+            n += 1;
+        }
+        drop(log);
+        std::fs::remove_file(crate::chainlog::archive_path_for(&active, g)).unwrap();
+        let mut offered = Vec::new();
+        anchor
+            .refresh_attesting(false, false, &mut |f| {
+                offered.push(f.kind);
+                true
+            })
+            .unwrap();
+        assert_eq!(offered.len(), 1, "{offered:?}");
+    }
+
+    /// BUG26: the head past the search's window — more than
+    /// `HEAD_WINDOW_MAX` bytes of lines that are not the chain's after it —
+    /// is not known (an error, not "no head"), and the anchor keeps it while
+    /// it is in its file. A small file with no genuine line has no head.
+    #[test]
+    fn junk_past_the_window_after_the_head_is_not_a_file_without_a_head() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let path = dir.path().join("flat.log");
+        let mut log = AuditLog::open(&path, key(&dir), [1; 16]).unwrap();
+        for n in 0..3 {
+            log.append(draft(n)).unwrap();
+        }
+        drop(log);
+        let mut anchor = Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![flat_target(&path)],
+            None,
+            false,
+        );
+        anchor.refresh(true, false).unwrap();
+        // (the window grows by 4 up to the first size past HEAD_WINDOW_MAX:
+        // 16 MiB)
+        let line = format!("{}\n", "x".repeat(1023));
+        let junk = line.repeat((2 * HEAD_WINDOW_MAX / 1024) as usize + 2);
+        append_raw(&path, junk.as_bytes());
+        let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
+        let read = read_file_head::<PortableHost>(&path, &ok);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{read:?}"
+        );
+        assert!(anchor
+            .refresh_attesting(true, false, &mut |f| panic!("{f:?}"))
+            .unwrap()
+            .is_empty());
+        let body = std::fs::read(&path).unwrap();
+        let genuine = body.len() - junk.len();
+        std::fs::write(&path, &body[..genuine]).unwrap();
+        cut_last_rows(&path, 1);
+        let found = boot_check::<PortableHost>(&[flat_target(&path)], &heads, &pk);
+        assert!(
+            found.findings.iter().any(|f| f.kind == "chain_truncated"),
+            "{:?}",
+            found.findings
+        );
+        // a whole file read, no genuine line in it: no head
+        let forged = dir.path().join("forged.log");
+        for _ in 0..3 {
+            append_raw_create(&forged, b"{\"entry_hash\":\"");
+            append_raw_create(&forged, "ab".repeat(32).as_bytes());
+            append_raw_create(&forged, b"\"}\n");
+        }
+        assert_eq!(read_file_head::<PortableHost>(&forged, &ok).unwrap(), None);
+    }
+
+    /// BUG08 (the manifest's checkpoint, no snapshot to compare): the
+    /// checkpointed generation deleted with every archive while the agent
+    /// is down, and a foreign `<active>.000009` planted, is still found.
+    #[test]
+    fn a_fake_higher_archive_does_not_hide_the_checkpointed_generation() {
+        let dir = TempDir::new().unwrap();
+        let pk = key(&dir).verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("h.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 300);
+        let mut n = 0;
+        while crate::chainlog::current_generation(&active) < 5 {
+            log.append(p(n)).unwrap();
+            n += 1;
+        }
+        log.append(p(n)).unwrap();
+        drop(log);
+        drop(rotating_log(&active, key(&dir), 300)); // the open's checkpoint
+        let tail = crate::chainlog::manifest_tail_events::<PortableHost>(&active, "test_log", &pk);
+        let checkpointed = tail
+            .iter()
+            .find_map(|e| match e {
+                crate::chainlog::ManifestEvent::ActiveCheckpoint { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .expect("a checkpoint");
+        assert_eq!(checkpointed, crate::chainlog::current_generation(&active));
+        for s in 1..checkpointed {
+            std::fs::remove_file(crate::chainlog::archive_path_for(&active, s)).unwrap();
+        }
+        std::fs::remove_file(&active).unwrap();
+        std::fs::write(
+            crate::chainlog::archive_path_for(&active, checkpointed + 4),
+            b"",
+        )
+        .unwrap();
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        let want = format!("checkpointed in the manifest (generation {checkpointed})");
+        assert!(
+            found
+                .findings
+                .iter()
+                .any(|f| f.kind == "chain_missing" && f.detail.contains(&want)),
+            "{:?}",
+            found.findings
+        );
+    }
+
+    fn append_raw_create(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(bytes).unwrap();
     }
 }

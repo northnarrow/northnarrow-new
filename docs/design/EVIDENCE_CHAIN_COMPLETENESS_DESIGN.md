@@ -83,6 +83,25 @@ and when it stops (after `agent_stop`). Each anchored head is also an INFO
 line in the journal (`chain.head` target) for operators who forward the
 journal off the host.
 
+Lot 295 (external bug hunt BUG25, BUG26): a head never leaves the anchor,
+nor goes back, without a signed finding. Before a snapshot replaces one,
+every head of the last snapshot the running agent wrote that is not read
+again unchanged is checked where it was (`check_head`, in the active file
+or its archive). One no longer there — cut, emptied, rewritten, its file
+or its newest archives removed while the agent ran — is an
+`integrity_drift` of the running agent (`at_boot: false`), signed in the
+audit chain before the snapshot takes the new head; the heads are then read
+again, so the snapshot anchors the audit chain past that row. While the
+finding cannot be signed the snapshot keeps the anchored head, so the next
+start finds the loss too. An archive older than the newest that is gone
+without its `Evicted` row is left to the next start (a retention writes the
+row after the unlink). A head that cannot be read again (`read_file_head`:
+more than 64 chain-shaped lines that do not verify after it, or a 16 MiB
+window with none that does) is an error, not "no head": the anchor keeps
+the anchored head while it is still in its file. The start's own snapshot
+(`previous`) was compared by the boot check, which signs what it found:
+the start's anchor anchors the files as they are.
+
 **Start record.** Once the first snapshot is on disk, the agent appends
 `chain_numbering_started` to the audit chain: the head of every flat chain
 at that point (the legacy rows) and the anchor's path. Its presence says
@@ -93,7 +112,11 @@ the anchor must exist.
 - **Boot check** (`chain_anchor::boot_check`, before the attach, before any
   writer opens): every head of the last snapshot, the newest checkpoint of
   every rotating log, and a rotating log's active file missing after a
-  recorded rotation. O(window) per file. Findings are signed
+  recorded rotation. O(window) per file. An archive gone is evicted only
+  when its signed `Evicted` row is in the manifest's last 256 KiB (lot 295,
+  BUG08: a foreign `<active>.<higher seq>` made a deleted generation look
+  dropped by retention); otherwise it is `chain_missing`, the safe side.
+  Findings are signed
   `integrity_drift` entries (`chain_truncated`, `chain_rewritten`,
   `chain_missing`, `chain_archives_missing`, `active_file_missing`,
   `chain_heads_unverified`, then `chain_heads_missing` once the audit log
