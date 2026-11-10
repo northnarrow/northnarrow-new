@@ -281,6 +281,7 @@ mod tests {
             probe_gaps: None,
             degradations: Vec::new(),
             heads: Default::default(),
+            heads_gone: Default::default(),
             stopped: false,
             seen_at: "2026-11-01T10:00:01.000000Z".into(),
             uptime_ms: 1,

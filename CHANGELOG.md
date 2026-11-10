@@ -6,6 +6,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- A chain's head never leaves the head anchor, nor goes back, without a
+  signed finding (lot 295, external bug hunt BUG25, BUG26, BUG08;
+  `docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`). A chain cut,
+  emptied, rewritten or deleted while the agent ran was re-anchored as it
+  was at the next 5-minute anchor or the stop's, and the next start found
+  nothing; it is now a signed `integrity_drift` (`at_boot: false`), written
+  before the anchor takes the new head — while it cannot be signed the old
+  head stays anchored and the next start reports it. 64 forged lines after
+  a chain's head no longer take the chain out of the anchor (the head is
+  kept while it is still in its file), and a foreign `<log>.<higher seq>`
+  no longer makes a deleted generation look dropped by retention: only the
+  manifest's signed `Evicted` row says so.
+- The heartbeat's verifier reads every new beat (lot 295, BUG18, BUG30,
+  BUG01; `docs/operator/HEARTBEAT.md`). A chain's cut the agent declared
+  (`kept: false`), or a head that went back, in a beat that was not the
+  newest of a fetch was never alerted; a head gone from the beats and back
+  lower was not compared; the loss and health of a run that ended between
+  two checks (a stop beat and a quick restart, a host rebooted) were never
+  read. Each is `REPLAY`, `LOSS` or `DEGRADED` now, as is a stop with a
+  reason that is not a clean stop's followed by the next run's start; a
+  head gone from the beats is said once.
 - A signal through a file's owner is refused to the agent, the watchdog
   and the workers (lot 293, external bug hunt BUG14, P0;
   `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 293"). A root process killed
@@ -29,6 +50,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The heartbeat's verifier takes a beat's interval within the agent's own
+  bounds (5 to 300 s), compares every bound without overflow, and cuts a
+  hash at a character's boundary in its messages: a signed beat with a huge
+  interval, an operator's `--max-silence-secs 18446744073709551615`, or a
+  head hash that is not ASCII no longer gives a false `SILENT`, wraps or
+  panics (lot 295, BUG12, BUG32).
 - A chain writer whose write the disk stopped part-way (full) or whose
   fsync failed reads its file's tail again before its next row (lot 296,
   external bug hunt BUG15 P1, BUG17, BUG27): the start of a row left at

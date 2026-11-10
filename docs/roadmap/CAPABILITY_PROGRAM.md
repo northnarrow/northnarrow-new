@@ -8173,6 +8173,94 @@ number in parentheses is a lab PR.
     the boot of the `main` run (r2) did not count: a second fixture agent
     on one boot is refused by the `agent_mounts` gate.
   - Levels unchanged (C23): a fix inside the capability at its level.
+- **Lot 295 — the chains' head anchor and the heartbeat's verifier: the
+  external bug hunt's lot 5** (`fix/w4-bh-anchor-heartbeat`; the triage of
+  editions 1.2/1.3, lot 5: P1 BUG25, BUG26, BUG08, BUG01, BUG18; then
+  BUG30, BUG12, BUG32).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): the running agent's anchor
+    re-signed a chain cut, emptied or deleted while it ran, and the next
+    start found nothing (BUG25); 64 forged lines after a head made the file
+    read as one with no head, so the chain left the anchor and a cut made
+    later while the agent was down was not found (BUG26); a foreign
+    `<log>.000009` made a deleted generation look dropped by retention
+    (BUG08); the heartbeat's verifier compared the newest beat only — a
+    cut the agent declared, or a head that went back, in an earlier beat of
+    a fetch vanished (BUG18), a head gone and back lower was not compared
+    (BUG30), and the loss and health of a run that ended between two checks
+    were never read (BUG01); bounds without saturating arithmetic (BUG12)
+    and a hash cut inside a character (BUG32).
+  - What changed (`EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`, `EVIDENCE_CHAINS.md`,
+    `HEARTBEAT.md`, upgrade notes §19): a head never leaves the anchor, nor
+    goes back, without a signed finding — the anchor checks the heads of its
+    own last snapshot, and one no longer in its file is an `integrity_drift`
+    with `at_boot: false`, signed before the snapshot takes the new head
+    (unsigned, the old head stays anchored); a head past `read_file_head`'s
+    bounds is not known, not absent, and stays anchored while it is in its
+    file; an archive is evicted only by its manifest's signed `Evicted`
+    row. The verifier walks every new beat with one map of heads per chain
+    (a gone head kept, said once), compares each run of the new beats with
+    its own count (a stop with a reason that is not a clean stop's,
+    followed by the next start, DEGRADED), takes a beat's interval within
+    the agent's bounds (5 to 300 s) and cuts a hash at a character's
+    boundary.
+  - The lab, as measured (our own guest under lease k295, Ubuntu 24.04
+    `6.8.0-147-generic`; clean at the start: no agent, no pin, no overlay;
+    the verifier `nn-admin heartbeat watch` run on the host over the lab's
+    SSH, the lot's build and `main`'s as the control, both on the same
+    fetched lines; the agent uninstalled and the guest powered off at each
+    round's end):
+    - Round r1c (20d37f69, the fix before the per-head REPLAY): **a normal
+      rotation stays silent** — the detections log at 1 MiB for the run
+      rotated (archive 1) under 200 R001 kills, the anchor's ticks across
+      it and a clean stop and start: **0 chain findings** (the six
+      `integrity_drift` rows of the window are the cap knob's
+      `weakening_env`, the lab key's `admin_key_on_host` and the known
+      `module_load` self-test, two each). **A row cut while the agent runs**
+      (the actions chain's last row, in a signed window, after the anchor
+      had anchored it): the running anchor's `integrity_drift`
+      `chain_rewritten`, `chain: actions`, `at_boot: false`, at its next
+      tick; every later beat said `kept: false` (the writer's position no
+      longer ends a line), the lot's verifier one REPLAY per beat — six —
+      `main`'s one: since then one per head (two on the same fetch).
+      **A foreign higher archive** (the detections log's active file and
+      archive deleted while the agent was down, `detections.jsonl.000009`
+      planted): the next start's `chain_missing` "archive 2 is gone and the
+      manifest holds no signed Evicted row for it"; `nn-admin chain verify`
+      the same. The cold boot after: the agent and the watchdog active, the
+      pin root and the LSM programs (bootcheck OK).
+    - Round r2 (0e1f914a, this PR's code): **a cut while the agent is down,
+      then rows past it** (BUG18 as the triage found it): beat 6 the stop,
+      beat 7 the start `kept: false`, beats 8–11 `kept: true` past the
+      position seen; on one fetch the lot's verifier **REPLAY (beat 7)**,
+      `main`'s **none** (LOSS only); the start's `chain_truncated` on
+      actions. **65 forged lines after an idle chain's head** (the FIM drift
+      log), the agent stopped: WARN `chain head: not known — the anchored
+      head is kept while it is still in its file`, the stop's snapshot
+      written; the forged lines and one genuine row removed while it was
+      down: the next start's `chain_truncated` on `fim_drift` (BUG26).
+      Cold boot: bootcheck OK.
+    - Not measured: a retention eviction in the lab (eight 1 MiB archives
+      in one 5-minute tick; the host tests evict between two ticks and
+      across a boot). Found on the way, **pre-existing** (reported, not
+      this lot's): the actions chain cannot rotate — its rows are written by
+      the response threads, whose capabilities (role `actuator`) lack
+      `CAP_LINUX_IMMUTABLE`, so the rotation's `+i` dance fails with EPERM
+      and every later action row is lost to the chain (an ERROR each);
+      round r1b met it with `NN_ACTIONS_CAP_BYTES=1 MiB`, the default cap
+      is 16 MiB.
+  - Host: a named test for each bug, failing on `main` (the triage's 13
+    nn-evidence tests at 7110d403), and 18 more; mutation on the fixes: 59
+    mutants, 58 caught by a named test, 1 argued equivalent (the silence
+    bound's eager `unwrap_or` once the interval is clamped). Gates on the
+    PR's tree: eBPF, the four clippy runs (+ nn-admin's debug-trigger), fmt,
+    93 suites with 0 failed, the privileged no-run, the debug-trigger
+    builds, the eBPF maps (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage,
+    golden ×5 (57 files, the same bytes), MSRV 1.89, the fuzz replay (14),
+    portable (5), the lockfiles unchanged.
+  - Levels unchanged (C22 0, C23 2 provisional): an evidence-integrity gap
+    of the anchor and of the verifier closed and measured on one kernel —
+    not a new capability.
 - **Lot 296 — the chain writers, the audit log and the export after a failed
   write: the external bug hunt's lot 6** (`fix/w4-bh-chain-writers`; the
   triage of editions 1.2/1.3, lot 6: P1 BUG15; then BUG17, BUG27, BUG39,
