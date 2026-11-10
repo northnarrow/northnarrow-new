@@ -7950,3 +7950,56 @@ number in parentheses is a lab PR.
     survivor (an orphan's ticks) named and caught.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
+- **Lot 300 — the sensor self-test's `module_load` no longer missed on
+  every host (a regression of lot 285; C23).**
+  - What was open: on Ubuntu 22.04 the self-test found `module_load`
+    missed from the first round and signed an alert at the second, every
+    round after it still silent (lot 293's lab on 5.15 and 6.12; the same on
+    main). Its attach check reads the agent's own links — the ones it holds
+    and the pin root's `link_*` pins (`bpf_defense::live_links`) — and
+    since lot 285 (the write history kept through a restart) the module
+    files' write history, `module_write_observe` on `file_open`, is pinned
+    in a directory of its own beside the root, its link dropped once
+    pinned: "loaded, and no link of the agent runs it: detached", on every
+    kernel. The same view registers the agent's links with the BPF guard:
+    that link was not registered (a foreign handle on it not refused, its
+    loss not noticed by the link self-check). The hook itself attaches and
+    works on 5.15 (lot 285's rounds r3 and r5): nothing is unavailable.
+  - What changed: `antitamper_bpf::reattach_fresh_held` hands back the
+    link it pins, and the write history keeps it open beside its pin, as
+    the `cgroup/sysctl` judge does; `reattach_fresh` is that, the link
+    dropped. Named tests: the module-load programs the agent attaches and
+    the ones the attach check names agree, each linked where the check
+    reads (host); the first round's `module_load` word is `seen`, no
+    self-test miss logged or signed (privileged e2e,
+    `the_sensor_self_test_finds_the_module_load_programs_linked`).
+  - The lab, as measured (our own guests under lease k300, one at a time;
+    agents uninstalled, the guests clean and off at the end):
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, r1, this PR's code): installed,
+      the agent up about 470 s with no self-test miss in its journal, no
+      `sensor_selftest` row signed, `module_load` `ok`, word `seen`,
+      evidence `attach_check` (the script's one-second poll did not see the
+      probe files, which live under a second: the rounds are not counted
+      in this part); after a cold boot (bootcheck OK) three rounds, two
+      counted by inotify, the same; the e2e on a fresh boot passed (23 s).
+      Round r3 (the same code), with the counter that sees the
+      probe files: five rounds counted, the same (no miss, no row,
+      `module_load` `seen`).
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, r2): first, `main` with
+      only this lot's e2e — the e2e FAILS: `module_load` `pending →
+      missed`, "its program module_write_observe (id 66) is loaded and no
+      link of the agent runs it: detached" (the bug is not 5.15's). Then,
+      after a cold boot, the fix installed: five rounds counted (the probe
+      files' creations, inotify), no self-test miss in the journal, no
+      `sensor_selftest` row signed, `module_load` `ok`, `seen`,
+      `attach_check`; the write history's link pinned beside the root.
+  - Mutations (a catch is a named test failing): 3 on the host, caught by
+    the host test (the held link dropped, the old `reattach_fresh` call, a
+    program missing from the check's list); 2 kernel-side ones caught by
+    the e2e on Ubuntu 24.04, each on a boot of its own (r4): the link
+    handed back as `None` (the e2e's `pending → missed`, "detached", as on
+    `main`) and `reattach_fresh` attaching nothing (the agent refuses its
+    start, gate `deny_self_test`: no round). A first run of these two on
+    the boot of the `main` run (r2) did not count: a second fixture agent
+    on one boot is refused by the `agent_mounts` gate.
+  - Levels unchanged (C23): a fix inside the capability at its level.

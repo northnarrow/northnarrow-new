@@ -422,6 +422,23 @@ pub fn reattach_fresh(
     btf: &Btf,
     pin_root: Option<&Path>,
 ) -> Result<()> {
+    reattach_fresh_held(ebpf, program_name, hook_name, btf, pin_root).map(drop)
+}
+
+/// Lot 300: [`reattach_fresh`], the fresh link handed back once pinned —
+/// its descriptor still open while the caller keeps it (`None` without a
+/// pin root: the program object holds the transient link). The agent's
+/// links are the ones it holds and the `link_*` pins of its pin root (the
+/// BPF guard's registration and the sensor self-test's attach check read
+/// those); a caller that pins in a directory of its own keeps the link, or
+/// it is "detached" to both.
+pub fn reattach_fresh_held(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    hook_name: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<Option<PinnedLink>> {
     let Some(root) = pin_root else {
         attach_transient(ebpf, program_name, hook_name, btf)?;
         warn!(
@@ -429,7 +446,7 @@ pub fn reattach_fresh(
             "anti-tamper: deny hook attached WITHOUT pin (no bpffs) — no \
              cross-restart persistence"
         );
-        return Ok(());
+        return Ok(None);
     };
     let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
 
@@ -464,7 +481,7 @@ pub fn reattach_fresh(
         .take_link(link_id)
         .with_context(|| format!("taking ownership of fresh `{hook_name}` LSM link"))?;
     let fd_link: FdLink = link.into();
-    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+    let pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
         format!(
             "pinning fresh LSM link `{hook_name}` to {}",
             link_path.display()
@@ -474,7 +491,7 @@ pub fn reattach_fresh(
         hook = hook_name,
         "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
     );
-    Ok(())
+    Ok(Some(pinned))
 }
 
 /// Lot 273: [`reattach_fresh`] for an `fexit` program of the deny set (the

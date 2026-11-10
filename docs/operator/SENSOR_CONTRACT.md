@@ -229,7 +229,13 @@ The three attach checks, and why: loading a module is neither cheap nor
 harmless; the exploit guard's event is an exploit's post-condition; a DNS
 response comes from port 53, which the unit cannot bind (no
 `CAP_NET_BIND_SERVICE`), and a query to the host's resolver is what
-EVD-015 removed. The state directory is `chattr +i`: a create there is
+EVD-015 removed. An attach check reads the agent's own links: the ones it
+holds and the `link_*` pins of its pin root. A program pinned in a
+directory of its own beside the root — `module_load`'s write history
+(`module_write_observe`, lot 285) — has its link held by the agent as
+well (lot 300): before, its link was dropped once pinned, and
+`module_load` was `missed` in every round on every host (an alert at the
+second round) while its programs ran. The state directory is `chattr +i`: a create there is
 refused by the kernel before any LSM hook runs, so the deny step creates in
 `/etc/northnarrow` (registered `NOCREATE`, not immutable).
 
