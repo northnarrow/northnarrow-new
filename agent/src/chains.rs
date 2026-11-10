@@ -294,8 +294,38 @@ impl UnverifiedRows {
         match &self.audit_log {
             Some(log) => finding.attest(Some(&mut log.lock())),
             None => finding.attest(None::<&mut AuditLog>),
-        }
+        };
     }
+}
+
+/// Lot 295 (BUG25): a finding of the running anchor (a head that went back
+/// while the agent ran), ERROR in the journal and signed in the audit
+/// chain; `true` when it is there — until then the anchor keeps the head.
+/// The anchor's lock is held: the audit log's is taken after it, never the
+/// other way round.
+pub fn attest_anchor_finding(
+    audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>,
+    f: &ChainFinding,
+) -> bool {
+    match audit_log {
+        Some(log) => f.attest(Some(&mut log.lock())),
+        None => f.attest(None::<&mut AuditLog>),
+    }
+}
+
+/// Lot 295 (BUG25): the running agent's anchor — every [`ANCHOR_SECS`]
+/// (`force` false: written when a head moved) and at the stop (`force`):
+/// a head that went back is signed in `audit_log` before the snapshot takes
+/// the new one. Returns the one-time start record, when it is due.
+pub fn refresh_anchor(
+    anchor: &parking_lot::Mutex<Anchor>,
+    audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>,
+    force: bool,
+) -> anyhow::Result<Option<AuditEntryDraft>> {
+    let second = audit_log.is_some_and(|l| l.lock().second_key_added());
+    let mut a = anchor.lock();
+    a.refresh_attesting(force, second, &mut |f| attest_anchor_finding(audit_log, f))?;
+    Ok(a.take_marker())
 }
 
 /// Re-anchor every [`ANCHOR_SECS`] the heads that moved.
@@ -308,15 +338,10 @@ pub fn spawn(
         tick.tick().await; // the boot already anchored
         loop {
             tick.tick().await;
-            let second = audit_log
-                .as_ref()
-                .is_some_and(|l| l.lock().second_key_added());
             let a = Arc::clone(&anchor);
-            let r = tokio::task::spawn_blocking(move || {
-                let mut a = a.lock();
-                a.refresh(false, second).map(|_| a.take_marker())
-            })
-            .await;
+            let log = audit_log.clone();
+            let r =
+                tokio::task::spawn_blocking(move || refresh_anchor(&a, log.as_ref(), false)).await;
             match r {
                 Ok(Ok(marker)) => {
                     if let (Some(d), Some(log)) = (marker, audit_log.as_ref()) {
@@ -608,6 +633,91 @@ mod tests {
         assert_eq!(found.findings[0].chain, "canary_access");
         assert_eq!(found.findings[0].kind, "chain_truncated");
         assert!(found.audit_history_lost().is_none(), "not the audit chain");
+    }
+
+    /// Lot 295 (BUG25): the canary access log cut while the agent runs. The
+    /// tick's anchor signs the cut (`integrity_drift`, `at_boot: false`)
+    /// before it anchors the shorter head; with no audit log to sign it in,
+    /// the anchored head stays and the next start finds the cut.
+    #[test]
+    fn a_canary_chain_cut_while_running_is_signed_before_it_is_reanchored() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let paths = paths(&dir);
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let audit = Arc::new(parking_lot::Mutex::new(
+            AuditLog::open(&paths.audit, key(&dir), [1; 16]).unwrap(),
+        ));
+        audit.lock().append(draft(0)).unwrap();
+        let mut db = crate::canary::access_log::CanaryAccessDb::open(
+            &paths.canary_access,
+            key(&dir),
+            [1; 16],
+        )
+        .unwrap();
+        for n in 0..5 {
+            db.append(crate::canary::access_log::CanaryAccessDraft {
+                canary_id: format!("c{n}"),
+                canary_name: "decoy".into(),
+                canary_type: nn_model::CanaryTypeTag::File,
+                access_kind: nn_model::CanaryAccessKind::FileOpen,
+                accessor_pid: 1,
+                accessor_uid: 0,
+                accessor_comm: "cat".into(),
+                accessor_exe: None,
+                first_trip: n == 0,
+            })
+            .unwrap();
+        }
+        drop(db);
+        let mut anchor = Anchor::new(heads.clone(), k, [1; 16], paths.targets(), None, false);
+        anchor.refresh(true, false).unwrap();
+        let cut = |path: &Path, keep: usize| {
+            let body = std::fs::read_to_string(path).unwrap();
+            let kept: String = body.lines().take(keep).map(|l| format!("{l}\n")).collect();
+            std::fs::write(path, kept).unwrap();
+        };
+        cut(&paths.canary_access, 3);
+        let anchor = parking_lot::Mutex::new(anchor);
+        // no audit log: nothing signed, the anchored head stays
+        refresh_anchor(&anchor, None, false).unwrap();
+        assert_eq!(anchor.lock().unattested().len(), 1);
+        let found = boot_check::<LinuxHost>(&paths.targets(), &heads, &pk);
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert_eq!(found.findings[0].kind, "chain_truncated");
+        // the tick with the audit log: signed, then re-anchored
+        refresh_anchor(&anchor, Some(&audit), false).unwrap();
+        assert!(anchor.lock().unattested().is_empty());
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&paths.audit)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let drift: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["op"] == "integrity_drift")
+            .collect();
+        assert_eq!(drift.len(), 1, "{rows:?}");
+        assert_eq!(drift[0]["extra"]["kind"], "chain_truncated");
+        assert_eq!(drift[0]["extra"]["chain"], "canary_access");
+        assert_eq!(drift[0]["extra"]["at_boot"], false);
+        assert!(boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
+            .findings
+            .is_empty());
+        // the stop's snapshot (forced) after a cut since the last tick:
+        // signed first, as at the tick
+        cut(&paths.canary_access, 2);
+        refresh_anchor(&anchor, Some(&audit), true).unwrap();
+        let drift = std::fs::read_to_string(&paths.audit)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"integrity_drift\""))
+            .count();
+        assert_eq!(drift, 2);
+        assert!(boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
+            .findings
+            .is_empty());
     }
 
     /// EVD-007 (NN-AUD-273): `nn-admin chain verify` refuses a numbered row

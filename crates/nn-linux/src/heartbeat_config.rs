@@ -20,7 +20,11 @@ pub fn interval_from_env() -> Duration {
 pub fn interval_of(value: Option<&str>) -> Duration {
     let secs = value
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| (5..=300).contains(s))
+        .filter(|s| {
+            (nn_evidence::heartbeat::BEAT_INTERVAL_MIN_SECS
+                ..=nn_evidence::heartbeat::BEAT_INTERVAL_MAX_SECS)
+                .contains(s)
+        })
         .unwrap_or(DEFAULT_INTERVAL_SECS);
     Duration::from_secs(secs)
 }

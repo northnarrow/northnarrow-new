@@ -86,10 +86,10 @@ pub(crate) fn stop(
     // next start.
     deadline.stage("anchor");
     if let Some(a) = &chain_anchor {
-        let second = audit_log
-            .as_ref()
-            .is_some_and(|l| l.lock().second_key_added());
-        match a.lock().refresh(true, second) {
+        // lot 295 (BUG25): a head that went back since the last tick is
+        // signed before the stop's snapshot takes the new one (a start
+        // record still due is the next start's, as before)
+        match northnarrow_agent::chains::refresh_anchor(a, audit_log.as_ref(), true) {
             Ok(_) => info!("chain heads anchored at stop"),
             Err(e) => warn!(
                 error = format!("{e:#}"),

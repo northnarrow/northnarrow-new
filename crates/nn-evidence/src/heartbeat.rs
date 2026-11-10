@@ -32,7 +32,7 @@
 //! SCHEMA FREEZE (as the other chains' payloads): field names, order and
 //! types are frozen from this version; only additive `Option` fields.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -367,8 +367,14 @@ pub struct WatchState {
     pub actions: BeatActions,
     pub probe_gaps: Option<u64>,
     pub degradations: Vec<String>,
-    /// The chains' heads, by chain.
+    /// The chains' heads, by chain: the newest seen of each (lot 295,
+    /// BUG30: one gone from the beats is kept, to compare when it comes
+    /// back).
     pub heads: BTreeMap<String, BeatHead>,
+    /// Lot 295: the chains of [`Self::heads`] gone from the newest beat
+    /// (said once, when they went).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub heads_gone: BTreeSet<String>,
     /// The last beat was a stop.
     pub stopped: bool,
     /// Review of #478 (X1): when the verifier first saw that beat — on the
@@ -540,11 +546,42 @@ fn parse_ts(ts: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// The beats' silence bound for `interval_secs`.
+/// The beats' period the agent takes (`NN_HEARTBEAT_SECS`): 5 to 300 s.
+pub const BEAT_INTERVAL_MIN_SECS: u64 = 5;
+pub const BEAT_INTERVAL_MAX_SECS: u64 = 300;
+
+/// Lot 295 (BUG12): a beat's `interval_secs` as the verifier believes it —
+/// within the agent's own bounds, whatever a beat says (a signed beat with
+/// a huge interval would otherwise turn SILENT off, or overflow the
+/// late-beat and stall thresholds).
+pub fn beat_interval(interval_secs: u64) -> u64 {
+    interval_secs.clamp(BEAT_INTERVAL_MIN_SECS, BEAT_INTERVAL_MAX_SECS)
+}
+
+/// The beats' silence bound for `interval_secs`: the operator's, or two of
+/// the beats' intervals plus 15 s.
 pub fn silence_bound(cfg: &WatchConfig, interval_secs: u64) -> u64 {
     cfg.max_silence_secs
-        .unwrap_or(2 * interval_secs.max(1) + 15)
+        .unwrap_or_else(|| 2 * beat_interval(interval_secs) + 15)
 }
+
+/// Whether `age` (s) is past `bound` (s): a bound past `i64::MAX` is never
+/// reached (lot 295, BUG12: `u64::MAX as i64` is -1).
+fn past(age: i64, bound: u64) -> bool {
+    i64::try_from(bound).is_ok_and(|b| age > b)
+}
+
+/// The agent's clean stops ([`HeartbeatRecord::stop_reason`]): an admin's
+/// shutdown, the host's, a signal (only from `systemd-shutdown` or a signed
+/// trusted-installer window). Any other reason — a pump that exited, the
+/// decision or response thread lost — is a failure the watchdog restarts.
+pub const CLEAN_STOP_REASONS: [&str; 5] = [
+    "admin_shutdown",
+    "system_shutdown",
+    "sigterm",
+    "sigint",
+    "sighup",
+];
 
 /// Check the newest lines of the chain (`lines`, in chain order, as fetched;
 /// `None`: the source could not be read, `why`) against `last` at `now`.
@@ -569,7 +606,7 @@ pub fn check(
             if let Some(t) = parse_ts(&l.seen_at).or_else(|| parse_ts(&l.ts)) {
                 let age = (now - t).num_seconds();
                 out.age_secs = Some(age);
-                if age > bound as i64 {
+                if past(age, bound) {
                     out.alerts.push(Alert::Silent(format!(
                         "no beat newer than seq {} for {age} s (bound {bound} s){why}",
                         l.seq
@@ -670,6 +707,14 @@ pub fn check(
         )),
         Some(_) => {}
     }
+    // the chains' heads the state keeps: the newest beat's when this check
+    // anchors, else every new beat's walked (below)
+    let mut heads: BTreeMap<String, BeatHead> = newest
+        .heads
+        .iter()
+        .map(|h| (h.chain.clone(), h.clone()))
+        .collect();
+    let mut heads_gone = BTreeSet::new();
     // against what was seen last
     if let Some(l) = last {
         if newest.seq < l.seq {
@@ -727,36 +772,14 @@ pub fn check(
                 }
             }
         }
-        for (chain, seen) in &l.heads {
-            let Some(h) = newest.heads.iter().find(|h| &h.chain == chain) else {
-                // a chain whose head was in the beats is gone from them: the
-                // agent could not open it (cut, removed, its key refused)
-                out.alerts.push(Alert::Replay(format!(
-                    "the {chain} chain's head, {} {} seen, is not in the beat any more (the \
-                     chain not open on the host: cut, removed, or refused)",
-                    seen.at(),
-                    short(&seen.hash)
-                )));
-                continue;
-            };
-            if h.kept == Some(false) {
-                out.alerts.push(Alert::Replay(format!(
-                    "the {chain} chain no longer holds the head the agent's previous beat named \
-                     (its tail cut or rewritten on the host), now {} {}",
-                    h.at(),
-                    short(&h.hash)
-                )));
-            } else if h.went_back(seen) {
-                out.alerts.push(Alert::Replay(format!(
-                    "the {chain} chain's head went back: {} {} seen, now {} {} (a tail cut \
-                     from the chain, or the chain rolled back, on the host)",
-                    seen.at(),
-                    short(&seen.hash),
-                    h.at(),
-                    short(&h.hash)
-                )));
-            }
-        }
+        // Lot 295 (BUG18, BUG30): the heads of EVERY new beat, in order,
+        // each against the newest one seen of its chain before it: a cut the
+        // agent declared, or a head that went back, in a beat that is not
+        // the newest of this fetch is seen too. A head gone from the beats
+        // is said once and kept: compared when it comes back.
+        let (h, g) = walk_heads(&l.heads, &l.heads_gone, &beats, l.seq, &mut out.alerts);
+        heads = h;
+        heads_gone = g;
     } else {
         out.anchored = true;
     }
@@ -786,53 +809,76 @@ pub fn check(
                 newest.seq, newest.ts
             )));
         }
-    } else if age > bound as i64 {
+    } else if past(age, bound) {
         out.alerts.push(Alert::Silent(format!(
             "the newest beat (seq {}) is {age} s old (bound {bound} s)",
             newest.seq
         )));
     }
-    // loss and health against the beat seen last, when it is of the same
-    // run (its counters are the run's since it started); a new run's start
-    // from zero. The first check only anchors: what the run counted before
-    // it is not an alert of this verifier's.
-    let (prev_loss, prev_actions, prev_gaps, prev_deg): (
-        Vec<Option<u64>>,
-        BeatActions,
-        Option<u64>,
-        Vec<String>,
-    ) = match last {
-        None => (
-            newest.loss.clone(),
-            newest.actions.clone(),
-            newest.probe_gaps,
-            newest.degradations.clone(),
-        ),
-        Some(l) if l.run == newest.run => (
-            l.loss.clone(),
-            l.actions.clone(),
-            l.probe_gaps,
-            l.degradations.clone(),
-        ),
-        Some(_) => (
-            vec![Some(0); STAGE_NAMES.len()],
-            BeatActions::default(),
-            Some(0),
-            Vec::new(),
-        ),
-    };
+    // Lot 295 (BUG01): loss and health per run of the new beats — each
+    // run's newest beat against the beat seen last when it is that run's
+    // (its counters are the run's since it started), from zero for a run
+    // that began after it: a run that ended between two checks is read
+    // too, a whole run between them from zero. The first check only
+    // anchors: what the run counted before it is not an alert of this
+    // verifier's.
     let mut lost = Vec::new();
-    for (i, n) in newest.loss.iter().enumerate() {
-        let before = prev_loss.get(i).copied().flatten().unwrap_or(0);
-        if let Some(n) = n {
-            if *n > before {
-                lost.push(format!(
-                    "stage {} ({}) +{}",
-                    i + 1,
-                    STAGE_NAMES.get(i).copied().unwrap_or("?"),
-                    n - before
-                ));
+    let mut health = Vec::new();
+    for end in run_ends(last, &beats) {
+        let zero_loss = vec![Some(0); STAGE_NAMES.len()];
+        let zero_actions = BeatActions::default();
+        let (prev_loss, prev_actions, prev_gaps, prev_deg): (
+            &[Option<u64>],
+            &BeatActions,
+            Option<u64>,
+            &[String],
+        ) = match last {
+            Some(l) if l.run == end.run => (&l.loss, &l.actions, l.probe_gaps, &l.degradations),
+            _ => (&zero_loss, &zero_actions, Some(0), &[]),
+        };
+        let of = if end.run == newest.run {
+            String::new()
+        } else {
+            format!(" (run {}, ended at beat {})", end.run, end.seq)
+        };
+        for (i, n) in end.loss.iter().enumerate() {
+            let before = prev_loss.get(i).copied().flatten().unwrap_or(0);
+            if let Some(n) = n {
+                if *n > before {
+                    lost.push(format!(
+                        "stage {} ({}) +{}{of}",
+                        i + 1,
+                        STAGE_NAMES.get(i).copied().unwrap_or("?"),
+                        n - before
+                    ));
+                }
             }
+        }
+        if let (Some(n), b) = (end.probe_gaps, prev_gaps.unwrap_or(0)) {
+            if n > b {
+                health.push(format!("{} new telemetry gap(s) of the probe{of}", n - b));
+            }
+        }
+        if end.actions.unwritten > prev_actions.unwritten {
+            health.push(format!(
+                "{} action row(s) not in the signed actions chain{of}",
+                end.actions.unwritten - prev_actions.unwritten
+            ));
+        }
+        if end.actions.interrupted_at_boot > prev_actions.interrupted_at_boot {
+            health.push(format!(
+                "{} action(s) of an earlier run interrupted between intent and outcome{of}",
+                end.actions.interrupted_at_boot - prev_actions.interrupted_at_boot
+            ));
+        }
+        let new_deg: Vec<&str> = end
+            .degradations
+            .iter()
+            .filter(|d| !prev_deg.contains(d))
+            .map(String::as_str)
+            .collect();
+        if !new_deg.is_empty() {
+            health.push(format!("degradations{of}: {}", new_deg.join("; ")));
         }
     }
     if !lost.is_empty() {
@@ -867,7 +913,8 @@ pub fn check(
                 && b.kind != BeatKind::Start
                 && b.run == prun
                 && pu != 0
-                && b.uptime_ms.saturating_sub(pu) > (b.interval_secs + LATE_BEAT_SLACK_SECS) * 1000
+                && b.uptime_ms.saturating_sub(pu)
+                    > (beat_interval(b.interval_secs) + LATE_BEAT_SLACK_SECS) * 1000
             {
                 degraded.push(format!(
                     "beat {} came {} s after beat {ps} (every {} s, the agent's uptime): the \
@@ -877,29 +924,34 @@ pub fn check(
                     b.interval_secs
                 ));
             }
+            // Lot 295: a stop that is not the newest beat was followed by
+            // the next run's start: STOPPED never named its reason — one
+            // that is not a clean stop (a pump that exited, a thread lost)
+            // is a failure the agent came back from
+            if b.kind == BeatKind::Stop && b.seq != newest.seq && !stop_is_clean(b) {
+                degraded.push(format!(
+                    "the agent stopped at beat {} ({}) and started again: not a clean stop",
+                    b.seq,
+                    b.stop_reason.as_deref().unwrap_or("no reason given")
+                ));
+            }
             prev = (b.seq, b.uptime_ms, b.kind == BeatKind::Stop, b.run.as_str());
         }
     }
     degraded.extend(clock);
     if newest.kind != BeatKind::Stop
-        && newest.decision_since_last_ms > cfg.stall_intervals * newest.interval_secs * 1000
+        && newest.decision_since_last_ms
+            > cfg
+                .stall_intervals
+                .saturating_mul(beat_interval(newest.interval_secs))
+                .saturating_mul(1000)
     {
         degraded.push(format!(
             "the decision thread's last round is {} ms old",
             newest.decision_since_last_ms
         ));
     }
-    if let (Some(n), b) = (newest.probe_gaps, prev_gaps.unwrap_or(0)) {
-        if n > b {
-            degraded.push(format!("{} new telemetry gap(s) of the probe", n - b));
-        }
-    }
-    if newest.actions.unwritten > prev_actions.unwritten {
-        degraded.push(format!(
-            "{} action row(s) not in the signed actions chain",
-            newest.actions.unwritten - prev_actions.unwritten
-        ));
-    }
+    degraded.append(&mut health);
     // lot 276: an export configured and not running, or a sink of it that
     // cannot work as configured (a sink down is the receiver's: its rows
     // wait in the chains, stage 8 counts what they lose)
@@ -910,27 +962,6 @@ pub fn check(
         for k in e.sinks.iter().filter(|k| k.state == "failed") {
             degraded.push(format!("the export's {} sink failed", k.sink));
         }
-    }
-    if newest.actions.interrupted_at_boot > prev_actions.interrupted_at_boot {
-        degraded.push(format!(
-            "{} action(s) of an earlier run interrupted between intent and outcome",
-            newest.actions.interrupted_at_boot - prev_actions.interrupted_at_boot
-        ));
-    }
-    let new_deg: Vec<&String> = newest
-        .degradations
-        .iter()
-        .filter(|d| !prev_deg.contains(d))
-        .collect();
-    if !new_deg.is_empty() {
-        degraded.push(format!(
-            "degradations: {}",
-            new_deg
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
     }
     // R13 (lab PR 271): the capability manifest — a settled hash other
     // than the last one seen is a change of what the agent runs with
@@ -1049,11 +1080,8 @@ pub fn check(
         actions: newest.actions.clone(),
         probe_gaps: newest.probe_gaps,
         degradations: newest.degradations.clone(),
-        heads: newest
-            .heads
-            .iter()
-            .map(|h| (h.chain.clone(), h.clone()))
-            .collect(),
+        heads,
+        heads_gone,
         stopped: newest.kind == BeatKind::Stop,
         seen_at: crate::audit::format_ts(seen_at),
         uptime_ms: newest.uptime_ms,
@@ -1064,6 +1092,94 @@ pub fn check(
         manifest_versions,
     });
     out
+}
+
+/// Lot 295 (BUG18, BUG30): the heads of the beats newer than `after`, in
+/// order, each against the newest one seen of its chain before it — from
+/// `seen` (the state's; those in `gone` no longer in the beats). A cut the
+/// agent declared (`kept: false`) or a head that went back is REPLAY in
+/// whichever beat it is; a head gone from a beat is REPLAY once, then kept
+/// and compared when it comes back. Returns the heads after those beats and
+/// the chains gone from the newest.
+fn walk_heads(
+    seen: &BTreeMap<String, BeatHead>,
+    gone: &BTreeSet<String>,
+    beats: &[(usize, &HeartbeatRecord)],
+    after: u64,
+    alerts: &mut Vec<Alert>,
+) -> (BTreeMap<String, BeatHead>, BTreeSet<String>) {
+    let mut heads = seen.clone();
+    let mut gone = gone.clone();
+    for (_, b) in beats.iter().filter(|(_, b)| b.seq > after) {
+        for h in &b.heads {
+            let chain = &h.chain;
+            let back = if gone.remove(chain) {
+                " after it was gone from the beats"
+            } else {
+                ""
+            };
+            if h.kept == Some(false) {
+                alerts.push(Alert::Replay(format!(
+                    "the {chain} chain no longer holds the head the agent's previous beat named \
+                     (its tail cut or rewritten on the host), now {} {} (beat {})",
+                    h.at(),
+                    short(&h.hash),
+                    b.seq
+                )));
+            } else if let Some(s) = heads.get(chain).filter(|s| h.went_back(s)) {
+                alerts.push(Alert::Replay(format!(
+                    "the {chain} chain's head went back{back}: {} {} seen, now {} {} (beat {}; a \
+                     tail cut from the chain, or the chain rolled back, on the host)",
+                    s.at(),
+                    short(&s.hash),
+                    h.at(),
+                    short(&h.hash),
+                    b.seq
+                )));
+            }
+            heads.insert(chain.clone(), h.clone());
+        }
+        for (chain, s) in &heads {
+            if !b.heads.iter().any(|h| &h.chain == chain) && gone.insert(chain.clone()) {
+                // a chain whose head was in the beats is gone from them: the
+                // agent could not open it (cut, removed, its key refused)
+                alerts.push(Alert::Replay(format!(
+                    "the {chain} chain's head, {} {} seen, is not in the beat any more (beat {}; \
+                     the chain not open on the host: cut, removed, or refused)",
+                    s.at(),
+                    short(&s.hash),
+                    b.seq
+                )));
+            }
+        }
+    }
+    (heads, gone)
+}
+
+/// Lot 295 (BUG01): the newest beat of each run among the beats newer than
+/// the one seen last, in order — none at the first check (it anchors).
+fn run_ends<'a>(
+    last: Option<&WatchState>,
+    beats: &[(usize, &'a HeartbeatRecord)],
+) -> Vec<&'a HeartbeatRecord> {
+    let Some(l) = last else {
+        return Vec::new();
+    };
+    let mut ends: Vec<&HeartbeatRecord> = Vec::new();
+    for &(_, b) in beats.iter().filter(|(_, b)| b.seq > l.seq) {
+        match ends.last_mut() {
+            Some(e) if e.run == b.run => *e = b,
+            _ => ends.push(b),
+        }
+    }
+    ends
+}
+
+/// Whether a stop beat's reason is one of [`CLEAN_STOP_REASONS`].
+fn stop_is_clean(b: &HeartbeatRecord) -> bool {
+    b.stop_reason
+        .as_deref()
+        .is_some_and(|r| CLEAN_STOP_REASONS.contains(&r))
 }
 
 /// `nn-admin heartbeat export`'s read: the last `count` lines of the chain
@@ -1095,8 +1211,10 @@ fn trim(l: &[u8]) -> &[u8] {
     l
 }
 
+/// The first 16 characters of `h`, for a message (lot 295, BUG32: cut at a
+/// character's boundary — a signed hash that is not ASCII panicked here).
 fn short(h: &str) -> &str {
-    &h[..h.len().min(16)]
+    h.char_indices().nth(16).map_or(h, |(i, _)| &h[..i])
 }
 
 #[cfg(test)]

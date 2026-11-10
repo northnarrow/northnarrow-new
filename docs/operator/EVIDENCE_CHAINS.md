@@ -16,6 +16,7 @@ repository, not shipped with the release):
 | When | What | Where the result goes |
 |---|---|---|
 | every start, before anything opens | anchored heads and checkpoints compared with the files | ERROR `chain integrity: evidence missing or altered` + signed `integrity_drift` |
+| every 5 minutes while the agent runs, and at its stop (the head anchor; lot 295) | every anchored head that moved: is it still in its file? | a head cut, emptied, rewritten or deleted while the agent ran: ERROR + signed `integrity_drift` with `at_boot: false`, before the anchor takes the head as it is now |
 | every start, at open | canary registry rows (all), canary access rows (last 256), audit row numbers | same |
 | every start, after the canary chains open | the access log's first-trip rows of the canaries the registry holds armed (lab PR 260) | a trip the registry does not record: ERROR `canary: a trip the registry did not record` + signed `canary_trip_recovered` + a `trip` row; the canary stays tripped |
 | a start refused while the audit log cannot take the refusal (it is the gate: not writable, its chain broken) | the refusal signed with the agent's key in a chain of its own, a new file in `boot-refusals/` beside the pid file (`/run/northnarrow/boot-refusals/refusal-<random>.jsonl`), its first row `boot_refusal_fallback` naming the audit log's head (lab PR 262, review #466; `BOOT_INTEGRITY.md` §7) | ERROR `refused boot recorded in the fallback chain`; `sudo nn-admin audit verify --from <that file>` |
@@ -217,7 +218,7 @@ after this version has written is not supported.
    | Kind | Meaning |
    |---|---|
    | `chain_truncated` | the file is shorter than its anchored head or checkpoint: rows were cut from its end (an emptied file too) |
-   | `chain_missing` | the file is gone |
+   | `chain_missing` | the file is gone — or an archive that held an anchored head or checkpoint is gone and no signed `Evicted` row of its manifest says retention dropped it (lot 295) |
    | `chain_rewritten` | long enough, but the anchored line is not where it was: the file was rewritten |
    | `chain_archives_missing` | a rotating log has fewer archives than when it was anchored |
    | `active_file_missing` | a rotating log's active file was deleted after a rotation |
@@ -290,6 +291,19 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   `chain_rewritten`, …) are written once, at the start that found them;
   the anchor then records the files as they are, so the next start is
   quiet. The signed `integrity_drift` stays in the audit chain.
+- A head that went back while the agent ran (lot 295) is the same finding
+  with `at_boot: false`, written once, before the anchor takes the head as
+  it is now (and the snapshot written then anchors the audit chain past
+  that row). When it cannot be signed (the audit log not writable), the
+  anchor keeps the old head — the ERROR comes back every 5 minutes — and
+  the next start reports the loss. An archive older than the newest that
+  is gone while the agent runs, without its `Evicted` row, is left to the
+  next start (retention writes that row just after the unlink). A head
+  the agent cannot read again — more than 64 lines shaped like the chain's
+  that do not verify after it, or 16 MiB of lines that are not the
+  chain's — stays anchored while it is still in its file (WARN `chain
+  head: not known`, once): lines appended after the head no longer take
+  the chain out of the anchor.
 - `chain_verify_failed` is written at every start while the failing lines
   are in the last 4 MiB of the active file — the evidence is still bad —
   and `nn-admin chain verify` keeps failing until their generation leaves
