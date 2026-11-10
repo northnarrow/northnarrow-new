@@ -247,11 +247,16 @@ impl AdminAuth {
     /// startup (`main.rs`) is the intended caller; the value is
     /// the return of [`crate::agent_id::load_or_bootstrap`].
     pub fn load_with_agent_id(config_path: &Path, agent_id: [u8; 16]) -> Result<Self> {
-        let content = std::fs::read_to_string(config_path)
+        let bytes = std::fs::read(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
 
         // External audit AUT-004: a malformed line costs its own key, not
-        // the admin socket.
+        // the admin socket. External bug hunt BUG03: a byte that is not
+        // UTF-8 too — read as text it failed the whole file (an ISO-8859-1
+        // comment, `# chiave di José`, disabled the admin socket until a
+        // restart); now it costs its own line: nothing in a comment, the
+        // key in a key line (skipped, signed).
+        let content = String::from_utf8_lossy(&bytes);
         let parsed = admin_quorum::parse_admin_pub_lenient(&content);
         report_skipped(config_path, &parsed.skipped);
         let pub_keys = parsed.keys;
@@ -274,7 +279,8 @@ impl AdminAuth {
         }
 
         let mut auth = Self::build_entries_with_agent_id(pub_keys, agent_id);
-        *auth.loaded_admin_pub.write() = content.as_bytes().to_vec();
+        // the bytes as read: the bootstrap gate hashes and counts them
+        *auth.loaded_admin_pub.write() = bytes;
         *auth.skipped_lines.write() = parsed.skipped;
         // A13: remember the file we loaded from so the
         // rotate-keys dispatcher can atomically rewrite + reload
@@ -306,9 +312,10 @@ impl AdminAuth {
     /// dispatch layer; defending in depth here keeps the
     /// in-memory state non-empty.
     pub fn reload(&self, config_path: &Path) -> Result<()> {
-        let content = std::fs::read_to_string(config_path)
+        let bytes = std::fs::read(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
-        let parsed = admin_quorum::parse_admin_pub_lenient(&content);
+        // External bug hunt BUG03: as `load_with_agent_id`.
+        let parsed = admin_quorum::parse_admin_pub_lenient(&String::from_utf8_lossy(&bytes));
         report_skipped(config_path, &parsed.skipped);
         let new_keys = parsed.keys;
         if new_keys.is_empty() {
@@ -318,7 +325,7 @@ impl AdminAuth {
             ));
         }
         *self.pub_keys.write() = new_keys;
-        *self.loaded_admin_pub.write() = content.into_bytes();
+        *self.loaded_admin_pub.write() = bytes;
         *self.skipped_lines.write() = parsed.skipped;
         Ok(())
     }
@@ -1294,11 +1301,14 @@ pub fn atomic_rewrite_admin_pub_add(
     new_pubkey: &VerifyingKey,
     roles: &[Role],
 ) -> std::result::Result<(), RotateKeysError> {
-    let body = std::fs::read_to_string(config_path).map_err(RotateKeysError::Io)?;
+    // External bug hunt BUG03: the file's bytes, a line not UTF-8 kept as
+    // it is (a comment is never rewritten with U+FFFD).
+    let body = std::fs::read(config_path).map_err(RotateKeysError::Io)?;
     let new_fp = fingerprint(new_pubkey);
     let mut collision = false;
-    for raw in body.lines() {
-        let line = raw.trim();
+    for raw in byte_lines(&body) {
+        let text = String::from_utf8_lossy(raw);
+        let line = text.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -1317,15 +1327,15 @@ pub fn atomic_rewrite_admin_pub_add(
         });
     }
     let mut new_body = body;
-    if !new_body.is_empty() && !new_body.ends_with('\n') {
-        new_body.push('\n');
+    if !new_body.is_empty() && !new_body.ends_with(b"\n") {
+        new_body.push(b'\n');
     }
-    new_body.push_str(&hex::encode(new_pubkey.to_bytes()));
+    new_body.extend_from_slice(hex::encode(new_pubkey.to_bytes()).as_bytes());
     if !roles.is_empty() {
-        new_body.push(' ');
-        new_body.push_str(&format_role_list(roles));
+        new_body.push(b' ');
+        new_body.extend_from_slice(format_role_list(roles).as_bytes());
     }
-    new_body.push('\n');
+    new_body.push(b'\n');
     write_admin_pub_atomically(config_path, &new_body)?;
     Ok(())
 }
@@ -1345,17 +1355,19 @@ pub fn atomic_rewrite_admin_pub_revoke(
     config_path: &Path,
     target_fp: [u8; 4],
 ) -> std::result::Result<(), RotateKeysError> {
-    let body = std::fs::read_to_string(config_path).map_err(RotateKeysError::Io)?;
+    // External bug hunt BUG03: on the bytes, as the add.
+    let body = std::fs::read(config_path).map_err(RotateKeysError::Io)?;
     let target_hex = hex::encode(target_fp);
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut kept_keys = 0usize;
     let mut removed: Vec<[u8; 32]> = Vec::new();
-    for raw in body.lines() {
-        let line = raw.trim();
+    for raw in byte_lines(&body) {
+        let text = String::from_utf8_lossy(raw);
+        let line = text.trim();
         if line.is_empty() || line.starts_with('#') {
             // Preserve blank / comment lines unchanged.
-            out.push_str(raw);
-            out.push('\n');
+            out.extend_from_slice(raw);
+            out.push(b'\n');
             continue;
         }
         if let Ok(entry) = parse_admin_line(line) {
@@ -1368,8 +1380,8 @@ pub fn atomic_rewrite_admin_pub_revoke(
             }
             kept_keys += 1;
         }
-        out.push_str(raw);
-        out.push('\n');
+        out.extend_from_slice(raw);
+        out.push(b'\n');
     }
     if removed.is_empty() {
         return Err(RotateKeysError::KeyNotFound {
@@ -1403,11 +1415,23 @@ fn format_role_list(roles: &[Role]) -> String {
 /// plan §2.4), under its path here.
 pub use nn_proto::admin_quorum::role_keyword;
 
-fn write_admin_pub_atomically(config_path: &Path, body: &str) -> std::io::Result<()> {
+fn write_admin_pub_atomically(config_path: &Path, body: &[u8]) -> std::io::Result<()> {
     // 0644 matches the pre-rotation admin.pub layout (design §6.5 / §8.1:
     // world-readable so non-root admin tools can inspect, root-only
     // writable). External audit AUT-003: never through a planted link.
-    crate::atomic_file::replace(config_path, body.as_bytes(), 0o644)
+    crate::atomic_file::replace(config_path, body, 0o644)
+}
+
+/// External bug hunt BUG03: `bytes` cut into lines the way `str::lines`
+/// cuts a text — at each `\n`, a final one ending the last line, a `\r`
+/// before it not the line's — without asking them to be UTF-8.
+fn byte_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    (!bytes.is_empty())
+        .then_some(body)
+        .into_iter()
+        .flat_map(|b| b.split(|&c| c == b'\n'))
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3114,5 +3138,95 @@ mod tests {
             Err(AdminAuthError::TooManySignatures { .. })
         ));
         assert_eq!(conn.failures.get(), 2);
+    }
+
+    /// External bug hunt BUG03: a non-UTF-8 byte in a comment of
+    /// admin.pub (an ISO-8859-1 comment) must cost nothing (AUT-004), not
+    /// the whole file and with it the admin socket; the bytes the gate
+    /// reads are the file's, unchanged.
+    #[test]
+    fn non_utf8_comment_does_not_cost_admin_pub() {
+        let (_, vk) = make_keypair();
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"# chiave di Jos\xE9\n").unwrap();
+        writeln!(f, "{}", hex::encode(vk.to_bytes())).unwrap();
+        f.flush().unwrap();
+        let auth = AdminAuth::load(f.path())
+            .expect("AUT-004: a malformed line costs its own key, not the admin socket");
+        assert_eq!(auth.pub_keys.read().len(), 1);
+        assert!(
+            auth.skipped_lines().is_empty(),
+            "a comment is no skipped key"
+        );
+        assert_eq!(auth.loaded_admin_pub(), std::fs::read(f.path()).unwrap());
+        auth.reload(f.path())
+            .expect("the reload reads it the same way");
+        assert_eq!(auth.pub_keys.read().len(), 1);
+    }
+
+    /// External bug hunt BUG03: a byte that is not UTF-8 in a key line
+    /// costs that line only — skipped and reported — and the other keys
+    /// load.
+    #[test]
+    fn non_utf8_byte_in_a_key_line_costs_that_line_only() {
+        let (_, a) = make_keypair();
+        let (_, b) = make_keypair();
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "{}", hex::encode(a.to_bytes())).unwrap();
+        f.write_all(hex::encode(b.to_bytes()).as_bytes()).unwrap();
+        f.write_all(b" unlock\xFF\n").unwrap();
+        f.flush().unwrap();
+        let auth = AdminAuth::load(f.path()).expect("one good key is enough");
+        assert_eq!(auth.pub_keys.read().len(), 1);
+        let skipped = auth.skipped_lines();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].0, 2);
+    }
+
+    /// External bug hunt BUG03: rotate-keys' add and revoke work on a file
+    /// with a Latin-1 comment, and keep that comment's bytes as they were
+    /// (never rewritten with U+FFFD).
+    #[test]
+    fn rotate_keys_keep_a_latin1_comment_byte_for_byte() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let a = SigningKey::generate(&mut OsRng);
+        let mut body = b"# chiave di Jos\xE9\n".to_vec();
+        body.extend_from_slice(hex::encode(a.verifying_key().to_bytes()).as_bytes());
+        body.extend_from_slice(b" unlock\n");
+        std::fs::write(&admin_pub, &body).unwrap();
+        let b = SigningKey::generate(&mut OsRng);
+        atomic_rewrite_admin_pub_add(&admin_pub, &b.verifying_key(), &[Role::Unlock])
+            .expect("add beside a Latin-1 comment");
+        let after = std::fs::read(&admin_pub).unwrap();
+        assert!(after.starts_with(&body), "the old bytes kept as they were");
+        assert!(after.starts_with(b"# chiave di Jos\xE9\n"));
+        let err = atomic_rewrite_admin_pub_add(&admin_pub, &b.verifying_key(), &[Role::Unlock])
+            .expect_err("the key is in the file now");
+        assert!(matches!(err, RotateKeysError::KeyAlreadyPresent { .. }));
+        atomic_rewrite_admin_pub_revoke(&admin_pub, fingerprint_bytes(&a.verifying_key()))
+            .expect("revoke beside a Latin-1 comment");
+        let after = std::fs::read(&admin_pub).unwrap();
+        assert!(after.starts_with(b"# chiave di Jos\xE9\n"), "{after:?}");
+        // no U+FFFD written in its place (EF BF BD)
+        assert!(
+            !after.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+            "{after:?}"
+        );
+        let text = String::from_utf8_lossy(&after);
+        assert!(text.contains(&hex::encode(b.verifying_key().to_bytes())));
+        assert!(!text.contains(&hex::encode(a.verifying_key().to_bytes())));
+    }
+
+    /// BUG03: the byte lines are `str::lines`'s, on bytes.
+    #[test]
+    fn byte_lines_cut_as_str_lines_does() {
+        for text in ["", "\n", "a", "a\n", "a\n\n", "a\r\nb", "a\nb\r\n", "\r\n"] {
+            let ours: Vec<&[u8]> = byte_lines(text.as_bytes()).collect();
+            let std: Vec<&[u8]> = text.lines().map(str::as_bytes).collect();
+            assert_eq!(ours, std, "{text:?}");
+        }
+        let raw: Vec<&[u8]> = byte_lines(b"x\xE9\ny").collect();
+        assert_eq!(raw, [&b"x\xE9"[..], &b"y"[..]]);
     }
 }

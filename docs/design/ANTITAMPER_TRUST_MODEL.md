@@ -2244,3 +2244,140 @@ type: the host's inventory of foreign BPF.
 - A program pinned under another path through a bind mount of the bpffs is
   refused on its object (maps, programs); a link pin through it is matched
   by its final name only, behind the detach/update refusal.
+
+## Lot 293 — a signal through a file's owner (external bug hunt, editions 1.2/1.3)
+
+**Goal.** No root process kills or stops the agent, the watchdog or a worker
+with a signal the kernel delivers through a file's owner; every refusal
+signed. The other self-defence findings of the hunt that this lot closes
+are listed at the end.
+
+**What it closed (BUG14, P0).** A file's owner — set by `fcntl(F_SETOWN)`,
+`F_SETOWN_EX` (a thread, a process or a process group), `FIOSETOWN` or
+`SIOCSPGRP` on a socket — receives a signal when the file is ready for I/O
+in asynchronous mode (`O_ASYNC` through `F_SETFL`, or `FIOASYNC`): SIGIO,
+or the signal `F_SETSIG` chose, SIGKILL included. A lease break, a dnotify
+event and out-of-band data (SIGURG) signal the owner the same way. The
+kernel delivers these from `send_sigio_to_task()` / `send_sigurg_to_task()`
+(`fs/fcntl.c`), which ask `sigio_perm()`: the owner's credentials (an euid
+of 0 passes) and `security_file_send_sigiotask()` — never
+`security_task_kill()`. So `fcntl(r, F_SETOWN, <agent>)`, `O_ASYNC` and one
+byte written into the pipe killed the agent from a root shell (the default
+action of SIGIO terminates), with no refusal and no record: the `task_kill`
+hook, deny-by-default since `task-kill-signals-1`, never saw it.
+
+### Mechanism
+
+A BPF-LSM deny program on `file_send_sigiotask`
+(`agent-ebpf/src/sigio_guard.rs`, `file_send_sigiotask_deny`, the 22nd deny
+hook): towards a protected tgid (`PROTECTED_PIDS`: the agent, the watchdog,
+a worker; the task the hook is asked about is each thread or each member
+of a process group in turn, so `F_OWNER_TID` and `F_OWNER_PGRP` are judged
+by the same tgid) every such signal is refused, `-EPERM` from the hook, and
+`sigio_perm()` drops it.
+
+- **No exemption by caller.** The hook runs in the context of the process
+  whose I/O completed — for a socket, whatever process a softirq
+  interrupted. Neither "the target itself" nor "the agent's family" tells
+  anything there: an attacker's socket armed on the agent would be fired by
+  the agent's own write to it. The agent, the watchdog and the workers
+  never arm a file's owner (`xtask/tests/self_defense.rs` reads their
+  code: no `O_ASYNC`, `FASYNC`, `F_SETOWN`, `F_SETOWN_EX`, `F_SETSIG`,
+  `FIOASYNC`, `FIOSETOWN`, `SIOCSPGRP`, `F_SETLEASE`, `F_NOTIFY`).
+- **The window.** Inside a signed trusted-installer window the window's
+  signal grant (`KILL_GRANT`: SIGTERM, SIGCONT, SIGKILL, until its
+  deadline, under this boot's session nonce) lets those signals through
+  this path too — the test `task_kill` asks for PID 1
+  (`task_kill::kill_grant_allows`). Root may already stop the agent inside
+  a window with `systemctl kill`, which PID 1 relays, so this widens
+  nothing; the plain SIGIO, SIGURG and every other signal stay refused
+  inside a window. PID 1 is not asked for: this path has no sender.
+- **The record.** `FS_OP_SIGIO` (`sigio`, NN-L-AT-001, High, Log):
+  `target_ino` the tgid, `target_dev` the signal as it would have been
+  delivered (29, SIGIO, for the plain one — the hook receives 0), behind
+  the task denials' dedup (one record per caller and operation a second)
+  and budget. The process the record names raised the I/O; it did not
+  necessarily arm the file. The posture raises `DefenseImpairment`
+  (ENGAGED) for it, whatever that process is (PID 1 included), never the
+  decisive `AntiTamperDenial`: a socket's softirq must not steer the
+  ladder at an innocent process.
+- **A pidfd.** `pidfd_send_signal()` goes through `kill_pid_info_type()` →
+  `check_kill_permission()` → `security_task_kill()`: the `task_kill` hook
+  refuses it (the lab's signal cases already send through a pidfd; the
+  privileged e2e checks EPERM).
+- **Fail-open.** A target whose tgid cannot be read is let through and
+  counted (`deny_fail_open`, slot `file_send_sigiotask`). The hook is a
+  deny hook: not attached, the start is refused unless
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`.
+
+### The other findings of the lot
+
+- **BUG37 (P2): the per-attempt refusals had no budget.** A protected
+  inode's unlink, rename, change, new entry, write-open or read-open, and a
+  protected cgroup file's open, wrote a record at every attempt: a root
+  loop of `rm` filled the 64 KiB `fs_protect` ring and every other denial
+  record — a refused `kill`, a refused ptrace — was lost with it (counted,
+  not kept). They now go behind a per-CPU budget of their own
+  (`ATTEMPT_DENIAL_RATE`, 50 a second per CPU, no dedup by caller), never
+  the task denials' (`TASK_DENIAL_RATE`); one held back is counted in
+  `RING_DROPS` (`denial_rate`), a security ring: signed, and telemetry loss
+  past the threshold. The refusal never depends on the record. The BPF
+  guard's refusals (`bpf_handle`, `bpf_prog_type`, `bpf_map`, `bpf_link`)
+  are not behind it: lot 290 records one per object on purpose (a
+  `bpftool prog list` outside a window is a burst of them); their budget is
+  a follow-up with its own measure.
+- **BUG05 (P2):** `BPF_RAW_TRACEPOINT_OPEN` (17) attaches a program — a raw
+  tracepoint, and through it `tp_btf`, `fentry`/`fexit` and LSM programs —
+  and the `bpf` hook did not look at it: an attach that way left no record
+  (the load's stayed). It is observed now (`raw_tracepoint_open`),
+  NN-L-BPF-001 judges it as an attach, and the flood cap never holds it.
+- **BUG71 (P1, `common::epg`):** `setgroups` was in the exploit guard's
+  table of the calls that may change the ids: an id gain made through
+  `commit_creds` while the thread is inside `setgroups` (a kernel write
+  timed against a userns that allows it) was no anomaly. `setgroups`
+  changes only the supplementary groups, which the guard does not compare;
+  it is out of the table (x86-64, x32, both ia32 numbers).
+- **BUG68 (P2, `common::wire`):** io_uring's `READV_FIXED` and
+  `WRITEV_FIXED` (60, 61, 6.15) are file reads and writes, `RECV_ZC` (58)
+  a socket receive — they were "other", and NN-L-IOU-002 missed the file
+  or the network half.
+- **BUG54 (documentation):** `RANSOMWARE_DECISIVE.md` promised the rename
+  counter "never counts the renames of an atomic write"; an atomic save
+  whose temporary carries its own extension (`data.tmp → data.json`) is
+  counted — an encryptor's staging (`a.pdf.tmp → a.pdf.locked`) has that
+  shape, so the code stays and the document says it (a burst of such
+  saves gives no verdict: no `RenameExtension` signal).
+- **BUG21 (P2):** the supervisor killed a worker it ended from the thread
+  that ended it — the export thread for the export worker, which has no
+  CAP_KILL over the worker's uid: EPERM, ignored, and a worker that
+  ignored its channel's close stayed alive and protected. `bury`, which the
+  supervisor's tick runs, kills a graveyard worker still alive again.
+- **BUG03 (P2):** a byte that is not UTF-8 in `admin.pub` (an ISO-8859-1
+  comment) failed the whole file and disabled the admin socket; it costs
+  its own line now (nothing in a comment, the key in a key line), the
+  bootstrap gate counts the lines of any bytes, and rotate-keys keeps such
+  a comment byte for byte.
+- **BUG35 (P2):** `run_bounded` joined its stdin writer without a bound: a
+  descendant that inherited the pipe and never read it held the response
+  chain. Past a grace the child's process group is killed (the writer gets
+  EPIPE); a holder outside the group is not waited for past a second grace.
+- **BUG33 (P3):** a worker's escaped stderr line could reach 206 bytes
+  against its 200; the cut mark is inside the bound now, never in the
+  middle of a `\xHH`.
+- **BUG13 (P0)** was closed by lot 290 (#514); the enforce-mode privileged
+  e2e also asks a read-only handle through the `PROTECTED_PIDS` pin now
+  (EPERM).
+
+### Residual
+
+- The record names the process whose I/O raised the signal; the process
+  that armed the file is not known to the hook (`fown_struct` keeps its
+  credentials, not its pid). The armed descriptor is one whose owner is a
+  protected pid: `/proc/<pid>/fdinfo/<fd>` of the suspects (`flags` with
+  `O_ASYNC`, 020000) finds it.
+- Other kernel-sent signals no `task_kill` hook sees stay out of this hook:
+  a tty's job-control and hangup signals reach a process only in a session
+  with that controlling terminal (the units have none); a child's exit
+  signal and `PR_SET_PDEATHSIG` are a parent's and a child's own; the
+  limits, the OOM score and the cgroup files are lot 273's, 273b's and
+  273c's.

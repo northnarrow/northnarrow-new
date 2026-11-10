@@ -822,10 +822,18 @@ pub const RENAME_APPENDED: u32 = 2;
 /// Lab PR 225: what a rename of a regular file is to the burst counter.
 /// Counted: the old name with an extension appended, or with its own
 /// extension replaced by another; never a rotation's digits. Not counted,
-/// by construction: a temporary file renamed to its final name (`x.py.dpkg-new` → `x.py`,
-/// rsync's `.x.c.AbC123` → `x.c`, `sed -i`'s `sedAbc12` → `x.conf`, the
-/// interpreter's `x.pyc.140234` → `x.pyc`), a move to another directory
-/// under the same name, a random new name. Names longer than
+/// by construction: a temporary file renamed to its final name when the
+/// temporary appends to it or has a name of its own (`x.py.dpkg-new` →
+/// `x.py`, rsync's `.x.c.AbC123` → `x.c`, `sed -i`'s `sedAbc12` → `x.conf`,
+/// the interpreter's `x.pyc.140234` → `x.pyc`), a move to another directory
+/// under the same name, a random new name. Counted, though (external bug
+/// hunt BUG54): an atomic save whose temporary carries its own extension
+/// in place of the final one (`data.tmp` → `data.json`, `a.part` → `a.iso`)
+/// — the very shape of an encryptor staging its ciphertext (`a.pdf.tmp` →
+/// `a.pdf.locked`), which an exception for the old extension would let
+/// through; a burst of such saves is not an encryptor's shape to the
+/// ransomware tracker (nothing appended, one origin extension, the new one
+/// not a marker) and gives no verdict on its own. Names longer than
 /// [`NAME_HEAD_LEN`] − 1 are compared on that prefix.
 #[inline(always)]
 pub fn rename_shape(old: &NameParts, new: &NameParts) -> u32 {
@@ -1891,5 +1899,58 @@ mod tests {
         assert_eq!(unlink_step(&mut w, 2 * S), 0);
         assert_eq!(unlink_step(&mut w, 62 * S), 0, "a new window");
         assert_eq!(w.count, 1);
+    }
+
+    // ── external bug hunt (editions 1.2/1.3) ────────────────────────
+
+    /// BUG54 (documentation): an atomic save whose temporary's extension
+    /// stands in place of the final one (`data.tmp` -> `data.json`) IS
+    /// counted as a replacement — the promise "never counts the renames of
+    /// an atomic write" was wrong, and is corrected, not the code: the
+    /// shape is an encryptor's staging's too (the test below). That a
+    /// burst of them gives no verdict is the tracker's (nn-core
+    /// `impact::tests::an_atomic_save_burst_replacing_the_extension_is_not_shaped`).
+    #[test]
+    fn an_atomic_save_replacing_the_extension_is_counted_but_not_shaped() {
+        for (a, b) in [
+            ("data.tmp", "data.json"),
+            ("a.part", "a.iso"),
+            ("f.crdownload", "f.zip"),
+        ] {
+            assert_eq!(
+                rename_shape(&parts(a), &parts(b)),
+                RENAME_REPLACED,
+                "{a} -> {b}"
+            );
+        }
+        // the atomic writes the promise names stay uncounted
+        for (a, b) in [
+            ("x.py.dpkg-new", "x.py"),
+            (".x.c.AbC123", "x.c"),
+            ("sedAbc12", "x.conf"),
+            ("x.pyc.140234", "x.pyc"),
+        ] {
+            assert_eq!(
+                rename_shape(&parts(a), &parts(b)),
+                RENAME_OTHER,
+                "{a} -> {b}"
+            );
+        }
+    }
+
+    /// BUG54: ransomware staging its ciphertext in a temporary and
+    /// renaming it to the marker extension has the very same shape — the
+    /// report's fix (old extension `tmp` -> not counted) would drop it, so
+    /// it is counted, and the plain append too.
+    #[test]
+    fn staged_ciphertext_renamed_to_a_marker_is_counted() {
+        assert_eq!(
+            rename_shape(&parts("a.pdf.tmp"), &parts("a.pdf.locked")),
+            RENAME_REPLACED
+        );
+        assert_eq!(
+            rename_shape(&parts("a.pdf"), &parts("a.pdf.locked")),
+            RENAME_APPENDED
+        );
     }
 }

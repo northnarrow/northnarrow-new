@@ -199,8 +199,10 @@ const fn allowed_x64(nr_: u32) -> u32 {
         | nr::SETRESUID
         | nr::SETRESGID
         | nr::SETFSUID
-        | nr::SETFSGID
-        | nr::SETGROUPS => IDS,
+        | nr::SETFSGID => IDS,
+        // Bug hunt BUG71: not `setgroups` — it changes the supplementary
+        // groups only, which the guard does not compare; listed, an id gain
+        // through its `commit_creds` was no anomaly.
         nr::CAPSET => CAPS,
         nr::EXECVE | nr::EXECVEAT => IDS | CAPS,
         nr::UNSHARE => CAPS | USERNS | NSPROXY | FS | ROOT,
@@ -218,14 +220,12 @@ const fn allowed_ia32(nr_: u32) -> u32 {
         | nr32::SETGID16
         | nr32::SETREUID16
         | nr32::SETREGID16
-        | nr32::SETGROUPS16
         | nr32::SETFSUID16
         | nr32::SETFSGID16
         | nr32::SETRESUID16
         | nr32::SETRESGID16
         | nr32::SETREUID
         | nr32::SETREGID
-        | nr32::SETGROUPS
         | nr32::SETRESUID
         | nr32::SETRESGID
         | nr32::SETUID
@@ -1700,7 +1700,6 @@ mod tests {
                 nr::SETGID,
                 nr::SETREUID,
                 nr::SETREGID,
-                nr::SETGROUPS,
                 nr::SETRESUID,
                 nr::SETRESGID,
                 nr::SETFSUID,
@@ -1714,7 +1713,8 @@ mod tests {
             ]
         );
         let ia32 = (0..512u32).filter(|c| allowed(abi::IA32, *c) != 0).count();
-        assert_eq!(ia32, 25);
+        // Bug hunt BUG71: 23, the two `setgroups` out.
+        assert_eq!(ia32, 23);
         // no call grants a credential change it cannot make through
         // commit_creds, and only unshare an fs_struct
         for c in 0..512u32 {
@@ -1733,6 +1733,94 @@ mod tests {
         assert_eq!(
             counter::NAMES[counter::LAZY_BASELINES as usize],
             "lazy_baselines"
+        );
+    }
+
+    // ── external bug hunt (editions 1.2/1.3) ────────────────────────
+
+    /// BUG71: an id gain (uid 1000 -> 0, no capability) through
+    /// `commit_creds` inside `setgroups` — which never changes a compared
+    /// id — is an anomaly, as `allowed()`'s docstring says: an exploit that
+    /// writes the ids while the thread is inside `setgroups` (a userns that
+    /// allows it) gained root with no record. A gid gain alike.
+    #[test]
+    fn an_id_gain_inside_setgroups_is_an_anomaly() {
+        let mut ids_only = user();
+        for i in [id::UID, id::SUID, id::EUID, id::FSUID] {
+            ids_only.ids[i] = 0;
+        }
+        let mut gids_only = user();
+        for i in [id::GID, id::SGID, id::EGID, id::FSGID] {
+            gids_only.ids[i] = 0;
+        }
+        for (a, n) in [
+            (abi::X64, nr::SETGROUPS),
+            (abi::X32, nr::SETGROUPS),
+            (abi::IA32, nr32::SETGROUPS16),
+            (abi::IA32, nr32::SETGROUPS),
+        ] {
+            assert_eq!(
+                judge_exit(&exit(a, n, user(), ids_only, mech::COMMIT_CREDS)),
+                Some(kind::CRED_FROM_SYSCALL),
+                "judge_exit abi {a} nr {n}"
+            );
+            assert_eq!(
+                judge_commit(cred_gain(&user(), &ids_only), a, n, true),
+                Some(kind::CRED_FROM_SYSCALL),
+                "judge_commit abi {a} nr {n}"
+            );
+            assert_eq!(
+                judge_exit(&exit(a, n, user(), gids_only, mech::COMMIT_CREDS)),
+                Some(kind::CRED_FROM_SYSCALL),
+                "judge_exit gids abi {a} nr {n}"
+            );
+            assert_eq!(allowed_in_table(a, n), 0, "abi {a} nr {n} in the table");
+        }
+    }
+
+    /// BUG71: a `setgroups` the way a login or a privilege drop makes it —
+    /// through `commit_creds`, no compared id changed — is no anomaly.
+    #[test]
+    fn a_legitimate_setgroups_is_not_an_anomaly() {
+        for (a, n) in [
+            (abi::X64, nr::SETGROUPS),
+            (abi::X32, nr::SETGROUPS),
+            (abi::IA32, nr32::SETGROUPS16),
+            (abi::IA32, nr32::SETGROUPS),
+        ] {
+            assert_eq!(
+                judge_exit(&exit(a, n, user(), user(), mech::COMMIT_CREDS)),
+                None,
+                "abi {a} nr {n}"
+            );
+            assert_eq!(judge_commit(cred_gain(&user(), &user()), a, n, true), None);
+        }
+        // root dropping its groups before its ids (a daemon's drop): a loss
+        assert_eq!(
+            judge_exit(&exit(
+                abi::X64,
+                nr::SETGROUPS,
+                root(),
+                root(),
+                mech::COMMIT_CREDS
+            )),
+            None
+        );
+    }
+
+    /// BUG71 control: the same gain with the capabilities (a full root
+    /// credential) is caught inside `setgroups`, as it was before the fix.
+    #[test]
+    fn a_full_root_gain_inside_setgroups_is_caught() {
+        assert_eq!(
+            judge_exit(&exit(
+                abi::X64,
+                nr::SETGROUPS,
+                user(),
+                root(),
+                mech::COMMIT_CREDS
+            )),
+            Some(kind::CRED_FROM_SYSCALL)
         );
     }
 }

@@ -1069,12 +1069,23 @@ impl Workers {
     /// F3: every dead worker of the graveyard evicted from `PROTECTED_PIDS`,
     /// then reaped; one whose eviction fails stays a zombie (its pid taken)
     /// until it succeeds, reported once, signed.
+    ///
+    /// External bug hunt BUG21: one still alive is sent SIGKILL again. The
+    /// first kill ([`Self::end_child`]) may run on a thread without
+    /// CAP_KILL — the export thread (`Role::Export`) ends the export worker,
+    /// which runs as another uid — and its EPERM was ignored: a worker that
+    /// ignored its channel's close (stuck, or condemned for what it sent)
+    /// stayed alive and protected until the agent stopped. `bury` also runs
+    /// on the supervisor's tick, whose thread may kill; the pid is still
+    /// ours (never reaped before it is dead).
     fn bury(&self, kind: WorkerKind, s: &mut SlotState) {
         let roles = self.roles();
         let mut failed: Vec<(u32, String)> = Vec::new();
         s.graveyard.retain_mut(|g| {
             if ended(g.pid).is_none() {
-                return true; // not dead yet: next pass
+                // not dead yet: killed again, judged at the next pass
+                let _ = g.child.kill();
+                return true;
             }
             match roles.evict(g.pid) {
                 Ok(()) => {
@@ -1393,18 +1404,28 @@ fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> usize {
 }
 
 /// A worker's stderr line for the agent's log: printable ASCII, the rest
-/// as `\xHH`, at most [`STDERR_LINE_MAX`] bytes.
+/// as `\xHH`, at most [`STDERR_LINE_MAX`] bytes — a line cut ends with
+/// '…' inside that bound, never in the middle of a `\xHH`. External bug
+/// hunt BUG33: the bound was tested before each piece and the mark added
+/// after it, up to 206 bytes.
 pub fn escape_line(line: &[u8]) -> String {
+    const CUT: char = '…';
     let mut out = String::new();
+    // the end of the last whole piece that leaves room for the mark
+    let mut fits_with_mark = 0;
     for &b in line {
-        if out.len() >= STDERR_LINE_MAX {
-            out.push('…');
-            break;
-        }
         if (0x20..=0x7e).contains(&b) && b != b'\\' {
             out.push(char::from(b));
         } else {
             out.push_str(&format!("\\x{b:02x}"));
+        }
+        if out.len() > STDERR_LINE_MAX {
+            out.truncate(fits_with_mark);
+            out.push(CUT);
+            break;
+        }
+        if out.len() + CUT.len_utf8() <= STDERR_LINE_MAX {
+            fits_with_mark = out.len();
         }
     }
     out

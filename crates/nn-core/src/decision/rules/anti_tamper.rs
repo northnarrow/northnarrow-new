@@ -339,6 +339,28 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::BpfUnseen | FsProtectOperation::BpfBaseline => {
                 return Some(crossview_verdict(self, event, *operation, comm, *target_dev, *target_ino));
             }
+            // Lot 293 (external bug hunt BUG14): the kernel delivers it
+            // without `task_kill`; the process named is the one whose I/O
+            // raised it, which may not be the one that armed the file.
+            FsProtectOperation::Sigio => {
+                let reasoning = format!(
+                    "Signal {target_dev} to protected pid {target_ino} through a file's owner \
+                     (F_SETOWN / F_SETOWN_EX / FIOSETOWN with O_ASYNC or F_SETSIG: SIGIO, \
+                     SIGURG, a lease or dnotify signal) — a path to kill the agent that no \
+                     `kill` takes; the kernel refused it. Raised by the I/O of `{comm}` (pid \
+                     {pid}), which is not necessarily the process that armed the file: a \
+                     socket's data arrives in whatever process the kernel interrupted. The \
+                     armed descriptor is one whose owner is pid {target_ino} (`fdinfo` flags \
+                     with O_ASYNC, 020000)."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -606,6 +628,7 @@ mod tests {
             FsProtectOperation::Lockdown,
             FsProtectOperation::SysctlRootAttach,
             FsProtectOperation::SysctlRootProg,
+            FsProtectOperation::Sigio,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -617,6 +640,37 @@ mod tests {
             .evaluate(&denial(FsProtectOperation::Signal))
             .unwrap();
         assert!(v.reasoning.contains("signal 9 to protected pid 709"));
+    }
+
+    /// Lot 293 (external bug hunt BUG14): a refused SIGIO-path signal is
+    /// signed with the signal, the target and the process whose I/O raised
+    /// it — named as such, not as the one that armed the file — and never
+    /// as a relayed `systemctl` when that process is PID 1 (a softirq can
+    /// interrupt it).
+    #[test]
+    fn a_refused_sigio_names_the_path_and_not_an_arming_process() {
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::Sigio))
+            .expect("verdict");
+        assert!(
+            v.reasoning
+                .contains("Signal 9 to protected pid 709 through a file's owner"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v
+            .reasoning
+            .contains("Raised by the I/O of `bash` (pid 4242)"));
+        assert!(v
+            .reasoning
+            .contains("not necessarily the process that armed the file"));
+        let mut e = denial(FsProtectOperation::Sigio);
+        if let Event::FsProtectDenial { pid, .. } = &mut e {
+            *pid = 1;
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).unwrap();
+        assert!(!v.reasoning.contains("systemctl"), "{}", v.reasoning);
+        assert!(v.reasoning.contains("through a file's owner"));
     }
 
     /// Lot 277: a move into an exempt cgroup is signed as what it is — not

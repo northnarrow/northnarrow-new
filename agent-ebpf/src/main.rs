@@ -49,6 +49,7 @@ mod open_sensor;
 mod ptrace_check;
 mod read_repeat;
 mod sensor_probe;
+mod sigio_guard;
 mod socket_connect;
 mod stdio;
 mod sysctl_guard;

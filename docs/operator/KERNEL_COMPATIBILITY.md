@@ -989,6 +989,34 @@ refusals do not depend on it.
   `name` 528 (resolved at boot). No HID-BPF program; systemd 249 loads its
   cgroup programs unnamed.
 
+## A signal through a file's owner (lot 293)
+
+**What it needs.** The `file_send_sigiotask` LSM hook (in the BPF LSM since
+5.7; its arguments `(task_struct *, fown_struct *, int)` unchanged since —
+the task is checked at boot, `HOOK_ARG_CHECKS`). The program reads the
+target's `tgid` only; the `fown_struct`, whose place in `struct file`
+changed in recent kernels (allocated on demand), is not read. A deny hook: where it cannot attach, the start is refused
+unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`.
+
+**As measured** (our lab guests, lot 293):
+- **Ubuntu 24.04** (`6.8.0-147-generic`): `verifier-check` 105 programs,
+  103 OK, 2 not counted, 0 failing — `file_send_sigiotask_deny` 331
+  instructions (431 processed, stack 48 bytes); 28 of 28 deny hooks; the
+  refusals of tamper cases C112–C112x as expected (below); the hook pinned
+  and attached again after a cold boot.
+- **Ubuntu 22.04** (`5.15.0-202-generic`): `verifier-check` 105 programs,
+  99 OK, 6 not counted, 0 failing — the program the same 331 instructions;
+  26 of 26 deny hooks; C112–C112x as on 6.8. The per-attempt budget (lot
+  293, BUG37): a loop of refused creates in `/etc/northnarrow` on one CPU
+  for 2 s — 324,273 records held back (`denial_rate`), 0 lost by the ring
+  (`fs_protect`), 0 by the task denials' budget; a refused ptrace of the
+  agent in the middle of it recorded.
+- **Debian 13** (`6.12.115+deb13.1-cloud-amd64`): `verifier-check` 105
+  programs, 102 OK, 3 not counted, 0 failing — the program 363
+  instructions (431 processed); 28 of 28 deny hooks; C112–C112x as on 6.8;
+  the same loop of refused creates: 264,890 records held back, 0 lost by
+  the ring or the task denials' budget, the ptrace's recorded.
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest

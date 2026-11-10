@@ -1999,13 +1999,13 @@ BPF program loaded or attached by an unlisted process — category `defense_evas
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0021 OS API Execution |
 | Validation | unit+lab |
 
-**Observes.** A bpf() program load, attach or link creation by a process outside the known BPF tooling and the process allowlist (the `bpf` LSM observer), judged on the executable the kernel ran.
+**Observes.** A bpf() program load, attach or link creation by a process outside the known BPF tooling and the process allowlist (the `bpf` LSM observer), judged on the executable the kernel ran; lot 293: an attach through BPF_RAW_TRACEPOINT_OPEN too.
 
 **Known false positives.** BPF tooling not in the list: bpftool, bpftrace, BCC tools, an observability or security agent; add it to process-comm-allowlist.local.
 
 **How to test.** `bpftool feature probe kernel` loads test programs (anti-tamper.sh case C10).
 
-**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::program_load_by_unlisted_logs_medium_and_known_tooling_is_exempt`, `deploy/lab/adversarial/anti-tamper.sh::case C10`
+**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::program_load_by_unlisted_logs_medium_and_known_tooling_is_exempt`, `crates/nn-core/src/decision/rules/bpf.rs::raw_tracepoint_open_by_unlisted_is_an_attach`, `deploy/lab/adversarial/anti-tamper.sh::case C10`
 
 **ATT&CK note.** A kernel-resident program from an unknown loader is the eBPF rootkit shape (T1014). The reasoning text also named T1562, revoked in v19, until lab PR 221; a program that blinds a sensor would be T1685, which a load alone does not show.
 
@@ -2041,13 +2041,13 @@ Attempt on the agent refused by an anti-tamper hook — category `anti_tamper`.
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0035 Process Access, DC0061 File Modification, DC0040 File Deletion, DC0055 File Access, DC0021 OS API Execution |
 | Validation | unit+lab |
 
-**Observes.** Every action on the agent an anti-tamper LSM hook refused: a signal to a protected pid, a ptrace or /proc/&lt;pid&gt;/mem access, a write, unlink, rename or new entry in its protected files, a handle to its BPF maps, programs or links, a kexec load, a read of its signing key; lot 290: a load of a `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF program outside a window (High; one the signed per-loader opt-out lets through, Low), and the kernel-state round's cross-view — a BPF program present at the agent's start (Low, High for those types) or one its hook never saw loading (High). Also the not-refused records of lots 277–281 (a move into an exempt cgroup, a sysctl opt-out's write Low, a kernel taint Critical or High, an injection into an exempt process High or Critical). Issued by process_event outside the engine.
+**Observes.** Every action on the agent an anti-tamper LSM hook refused: a signal to a protected pid (lot 293: one through a file's owner too, F_SETOWN and O_ASYNC — `sigio`), a ptrace or /proc/&lt;pid&gt;/mem access, a write, unlink, rename or new entry in its protected files, a handle to its BPF maps, programs or links, a kexec load, a read of its signing key; lot 290: a load of a `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF program outside a window (High; one the signed per-loader opt-out lets through, Low), and the kernel-state round's cross-view — a BPF program present at the agent's start (Low, High for those types) or one its hook never saw loading (High). Also the not-refused records of lots 277–281 (a move into an exempt cgroup, a sysctl opt-out's write Low, a kernel taint Critical or High, an injection into an exempt process High or Critical). Issued by process_event outside the engine.
 
 **Known false positives.** An administrator's `systemctl stop` or `kill` of the agent, or an upgrade, outside a trusted-installer window; a debugger or `strace -p` on the agent. Lot 283b: `deb-systemd-helper`, when a package with units is purged, tries `rmdir` on the empty directories under /etc/systemd/system — the agent's four drop-in directories among them (`northnarrow-agent.service.d`, `northnarrow-watchdog.service.d`, `northnarrow-.service.d`, `northnarrow.slice.d`), the agent's own inodes, refused so a drop-in cannot be made in a directory the agent does not guard; the purge completes (the helper ignores the error). No path of another package is refused. The kernel refused the action either way; the record is Log only.
 
 **How to test.** `kill -9` the agent from a root shell (anti-tamper.sh case C01) or read /proc/&lt;agent&gt;/mem (case C03): the record names the refused operation (deny=signal, deny=ptrace).
 
-**Tests.** `crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed`, `deploy/lab/malsim/foreign-bpf-check.sh::F2`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
+**Tests.** `crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `crates/nn-core/src/decision/rules/anti_tamper.rs::a_refused_sigio_names_the_path_and_not_an_arming_process`, `deploy/lab/adversarial/anti-tamper.sh::case C112`, `crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed`, `deploy/lab/malsim/foreign-bpf-check.sh::F2`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
 
 **ATT&CK note.** Killing, stopping or rewriting the sensor is T1685. A ptrace or /proc/&lt;pid&gt;/mem access on the agent is the injection attempt the V2 rows TQ13 and TQ15 expect denied (T1055.008, T1055.009); a read of the signing key is T1552.004.
 

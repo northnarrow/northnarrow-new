@@ -119,7 +119,8 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&i, "try_protected_open_deny"),
         &[
             "if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_OPEN) {",
-            "if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {\n            emit_denial(op, key);\n            return -EPERM;\n        }",
+            // lot 293 (BUG37): signed behind the attempt budget
+            "if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {\n            emit_attempt(op, key);\n            return -EPERM;\n        }",
             "\n    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {",
             "return -EPERM;",
         ],
@@ -330,7 +331,8 @@ fn the_inode_deny_lets_only_init_remove_a_unit_cgroup_and_signs_by_effect() {
     .unwrap();
     in_order(
         body(&i, "deny_if_protected"),
-        &["Some((op, key)) => {", "emit_denial(op, key);", "true"],
+        // lot 293 (BUG37): signed behind the attempt budget
+        &["Some((op, key)) => {", "emit_attempt(op, key);", "true"],
     )
     .unwrap();
 }
