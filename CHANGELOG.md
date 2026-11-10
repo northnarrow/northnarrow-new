@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- `nn-admin heartbeat watch` answers whatever its source command leaves
+  behind (lot 299, external bug hunt BUG34, BUG38, BUG22;
+  `docs/operator/HEARTBEAT.md`). A process the `--from-cmd` command started
+  that kept its stdout or stderr open (`cmd &`, an ssh `ControlPersist`
+  master) held the fetch without a bound — no `OK`, no `ALERT`, the
+  verifier silent while the agent might be down — and a stderr of more than
+  a pipe (64 KiB) stopped the command until the 30 s timeout. Both pipes
+  are read together now, as their bytes come, and the fetch is over when
+  the command exits.
 - A chain's head never leaves the head anchor, nor goes back, without a
   signed finding (lot 295, external bug hunt BUG25, BUG26, BUG08;
   `docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`). A chain cut,
@@ -63,6 +72,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- NN-L-FIM-001 no longer kills the writer of the agent's own unit (or of a
+  drop-in of it) in the vendor directory `/usr/lib/systemd/system/` inside
+  an open trusted-installer window: that write is NN-L-FIM-009's Log/Low
+  record, the authorised upgrade (lot 299, BUG73;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md`). A closed window, another unit
+  or file under `/usr/lib/`, and a permission change granting power over
+  our unit still kill.
+- NN-L-FIM-005's rsyslogd carve-out no longer turns off because a malformed
+  `/etc/passwd` row named `syslog` comes before the good one (lot 299,
+  BUG66).
+- The syslog/TLS export's stall counts from the first row written on an
+  idle connection: after a quiet time longer than the stall (30 s), the
+  first row was dropped with the connection, and written again, whenever
+  its acknowledgement took more than 100 ms (lot 299, BUG20).
+- The refusal of a `sysctl-allow` line lists only the names the line takes
+  (it offered `debug.kprobes-optimization`, always refused) (lot 299,
+  BUG78).
+- The latency percentiles of `nn-admin status` past 2^29 µs (≈ 537 s) are
+  the largest wait seen, no longer 536870911 µs (lot 299, BUG79).
+- The heartbeat verifier's failed fetch says the last line of the source
+  command's stderr (it read the first 4 KiB) (lot 299).
 - The heartbeat's verifier takes a beat's interval within the agent's own
   bounds (5 to 300 s), compares every bound without overflow, and cuts a
   hash at a character's boundary in its messages: a signed beat with a huge
@@ -121,6 +151,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   slots moved by six), wire codes 39–43, `BPF_ITER_CREATE`.
 
 ### Changed
+- The admin protocol's versioned envelope (not on the live wire, which is
+  the bare frame) is judged by its version before its message: a newer
+  peer's envelope is `ProtocolVersionUnsupported` even with a message
+  variant unknown here, and `version: 0` is refused (lot 299, BUG36). Its v0
+  fallback, `decode_versioned_or_legacy_frame`, is retired, as its own
+  documentation planned: it guessed from bytes that can be both, and took
+  a v2 envelope for a v0 `Status`. It had no production caller (the fuzz
+  target `admin_frame` reads the envelope through the strict decoder).
 - R011's record of the system's `modprobe` asked for modules by name by
   root, its environment read clean, is Low (was High; backlog lot 289: a
   lab round left 369 such lines). The rest keeps its severity.

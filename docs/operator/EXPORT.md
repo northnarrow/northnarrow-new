@@ -144,8 +144,11 @@ connection open without reading for longer than the settle and then died.
 export's own thread**: each request to the worker has a budget (1 s); the
 worker never blocks on the network (non-blocking sockets, `ppoll`), keeps
 at most 1 MiB of records in flight, drops a connection on which nothing was
-acknowledged for 30 s, a handshake not done in 10 s, a receiver that sends
-application data; a sink that fails backs off (1, 2, 4 … 60 s). One
+acknowledged for 30 s (counted from the oldest row still waiting — on a
+connection idle for longer, from the first row written; lot 299, BUG20: an
+idle connection's first row was dropped, and written again, when its
+acknowledgement took more than 100 ms), a handshake not done in 10 s, a
+receiver that sends application data; a sink that fails backs off (1, 2, 4 … 60 s). One
 connection carries at most 64 MiB, then a fresh one takes over.
 
 The JSONL files: `/var/log/northnarrow/export/export.jsonl`, rotated to

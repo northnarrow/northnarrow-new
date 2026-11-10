@@ -963,3 +963,25 @@ holding a flow against a later kill (BUG45). After the upgrade:
   a reason that is not a clean stop's followed by the next start is
   `DEGRADED`. A beat's `interval_secs` is taken within 5 to 300 s. A state
   file of an earlier verifier is read as it is.
+
+## 22. FIM, the admin tools and minor findings of the external bug hunt (lot 299)
+
+- **Our own vendor units inside a window** (BUG73). A write in place of
+  the agent's own unit, or of a drop-in of it, under
+  `/usr/lib/systemd/system/` inside an open trusted-installer window is
+  NN-L-FIM-009's Log/Low record only: NN-L-FIM-001 (`/usr/lib/` prefix)
+  killed the writer's tree beside it. Nothing to configure; outside a
+  window, and for any other unit or file under `/usr/lib/`, NN-L-FIM-001
+  kills as before.
+- **The heartbeat's verifier** (`nn-admin heartbeat watch --from-cmd`,
+  BUG22, BUG34, BUG38): use the `nn-admin` of this release on the
+  verifier's host. The fetch is over when the source command exits — a
+  process it left holding its output (an ssh `ControlPersist` master) no
+  longer holds `watch` — and a long stderr no longer stops the command. A
+  failed fetch says the last line of the command's stderr.
+- **The syslog/TLS export** (BUG20): after a quiet time the first row is no
+  longer dropped and written again on a receiver whose acknowledgement
+  takes more than 100 ms; the receiver sees fewer duplicates.
+- **The admin protocol's envelope** (BUG36): not on the live wire (the
+  bare frame); its v0 fallback `decode_versioned_or_legacy_frame` is
+  removed from `nn-proto`. Nothing to do on a host.

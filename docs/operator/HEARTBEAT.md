@@ -156,6 +156,17 @@ the `ALERT` lines are in that unit's journal. Or run it continuously
 (`--every 15`) under a supervisor that forwards its output. An exported
 copy of the chain read from shared storage works too (`--from-file`).
 
+The `--from-cmd` command runs with `sh -c`; `watch` reads its stdout (at
+most 4 MiB — past that the fetch fails) and its stderr together, and the
+fetch is over when the command exits: its answer is what it wrote to
+stdout by then, a failure's reason the last line of its stderr. Past 30 s
+the command is killed and the fetch fails. A process the command leaves
+behind holding its output (`cmd &`, an ssh `ControlPersist` master) holds
+neither the answer nor the failure (lot 299, external bug hunt BUG22,
+BUG34, BUG38: a stderr of more than 64 KiB stopped the command until the
+timeout, and such a process held `watch` — no `OK`, no `ALERT` — for as long
+as it lived).
+
 ## Why this transport
 
 - **No new listening service on the agent's host.** The beats leave the

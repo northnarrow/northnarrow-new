@@ -1368,6 +1368,16 @@ precision its first judge of the host's drop-ins lacked.
     (`ProtectSystem=strict` keeps `/usr` read-only to the agent: signed
     `own_dropin_not_moved`), and that directory is not NOCREATE (the
     package's own) — a drop-in written there inside a window stays.
+    Lot 299 (external bug hunt, edition 1.3: BUG73): the vendor directory
+    is also under NN-L-FIM-001's `/usr/lib/` prefix, whose kill
+    (KillProcessTree, Critical) stayed for our unit files and drop-ins
+    written in place there inside a window — NN-L-FIM-009's Log/Low and,
+    beside it, the writer's tree killed. NN-L-FIM-001 now answers nothing
+    for that write: the same condition as NN-L-FIM-009's exemption, one
+    function for both rules (`own_unit_under_open_window`), and the same
+    op (`Modified`, NN-L-FIM-009's record). A closed window, another unit
+    or file under `/usr/lib/`, and a permission change that grants power
+    over our unit (which NN-L-FIM-009 does not record) still kill.
   - **The short re-check of #497.** A harmful drop-in from before the
     install — a package's configure step runs the check only as a warning
     (`install.sh --package-configure`) — is never moved by the round, and
