@@ -111,16 +111,29 @@ writer is **trusted** (not copied) when:
   `nvim`, `nano`, `emacs`, `gedit`, `gnome-text-editor`, `kate`, `mousepad`,
   `soffice.bin`, `git`, plus the overlay's `trusted_writer` lines — matched by
   `ExecIdentity::is_client` (the executable in a root-owned system tree), and
-  no ancestor is **foreign**: every hop up to PID 1 is a program root
-  installed (`ExecIdentity::is_installed_program`) or an installed
-  interpreter running no named script (an interactive shell, `sh -c`).
+  every ancestor **vouches** for it: every hop up to PID 1 above the writer
+  and its own forked copies is a program a package installed — the host's
+  package database, asked as the ransomware signal asks it
+  (`impact::trust::vouches`; with no database, a root-owned system tree
+  stands in) — or an interpreter a package installed running no named script
+  (an interactive shell, `sh -c`). Lot 292 (BUG-49): a binary in `/opt` or
+  `/usr/local` that no package installed vouches for nothing; before, the
+  ancestors were judged by tree alone.
+
+What an interpreter runs is read with its own option table (lot 292, BUG-44
+and BUG-42: `posture/script_args.rs`): `python3 -O x.py /usr/bin/vim` runs
+`x.py` and is no editor, `bash -e x.sh` runs `x.sh` and vouches for nothing;
+an option the table does not hold leaves what it runs not known — no trusted
+writer, and no ancestor that vouches.
 
 Everything else is copied for: generic tools (`cp`, `dd`, `tar`, `rsync`,
 `openssl`, `gpg`, `sed`) are what an intruder rewrites files with, a script
 from a home directory or a binary from `/tmp` is foreign, and an unreadable
 lineage fails toward copying. Interpreters are refused as trusted writers
 (`python3` with no script would trust every `python3 -c`). Verdicts are
-cached 10 s per (pid, start, exe).
+cached 10 s per (pid, start, exe); the package database's answers are
+cached by path until dpkg's status changes, and it is asked only for a
+trusted writer's ancestors.
 
 ### 2.3 Copy on *first* write
 

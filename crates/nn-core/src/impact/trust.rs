@@ -13,15 +13,18 @@
 //!   FIM rules' own test): `apt install`, `dnf upgrade`, their maintainer
 //!   scripts; or
 //! - it is a **packaged program** — its executable (for an interpreter, the
-//!   script it runs, by an absolute path) is listed by the host's package
-//!   database ([`ProgramOwners`]) — **and** no hop of its lineage is foreign
-//!   ([`is_foreign`]): every ancestor up to PID 1 is a program root
-//!   installed or an installed interpreter running no named script (an
-//!   interactive shell, `sh -c`). `rsync`, `tar`, `git`, `cp`, a compiler,
-//!   a package-installed backup agent or database, started by a person or a
+//!   script it runs as well, by an absolute path) is listed by the host's
+//!   package database ([`ProgramOwners`]) — **and** every hop of its lineage
+//!   vouches for it ([`vouches`], lot 292, BUG-49): every ancestor up to
+//!   PID 1 above the writer and its forked copies is a program a package
+//!   installed, or an interpreter a package installed running no named
+//!   script (an interactive shell, `sh -c`), and none is foreign
+//!   ([`is_foreign`]). `rsync`, `tar`, `git`, `cp`, a compiler, a
+//!   package-installed backup agent or database, started by a person or a
 //!   unit, are trusted this way; the same programs started by a script from
-//!   a home directory or `/tmp`, by a dropped binary or by a deleted
-//!   executable are not.
+//!   a home directory or `/tmp`, by a binary in `/opt` or `/usr/local` no
+//!   package installed, by an interpreter whose arguments do not tell what
+//!   it runs (lot 292, BUG-44) or by a deleted executable are not.
 //!
 //! Everything else is judged: a binary no package installed (`/root/x`,
 //! `/opt/x`, `/usr/local/bin/x`, `/tmp/x`), an interpreter running an

@@ -14,6 +14,7 @@
 /usr/bin/ssh
 /usr/bin/kill
 /usr/bin/su
+/usr/bin/sudo
 /usr/bin/id
 /usr/sbin/auditctl
 /usr/lib/cni/bridge

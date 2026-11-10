@@ -259,6 +259,19 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
                 ),
             );
         }
+        if nn_model::module_path_is_cut(p) {
+            // Lot 292 (BUG-52): a component the kernel's read may have cut
+            // (31 bytes): the path names no file exactly — a longer name
+            // cut to a packaged module's is not that module.
+            return log(
+                Severity::High,
+                format!(
+                    "Kernel module loaded from a path with a component the sensor read only in \
+                     part ({p}) by '{loader_comm}' (parent '{parent_comm}') — origin \
+                     unverifiable; {kernel}. Alert."
+                ),
+            );
+        }
         // External audit PROC-005: a file no package installed and DKMS
         // did not build was put there by hand.
         match self.owners.of(p) {
@@ -360,6 +373,69 @@ mod tests {
                 .evaluate(&ev(&raw(MODULE_LOAD_FINIT, loader, "bash", 0, &packaged)))
                 .is_none());
         }
+    }
+
+    /// Lot 292 (BUG-52): a load the kernel did not judge, from a module
+    /// directory, whose file name the sensor read only in part: a longer
+    /// name whose first 31 bytes are a packaged module's
+    /// (`vendor-storage-controller-hb.ko.backdoor`) is not that module — it
+    /// is recorded as unverifiable, never passed as packaged; the packaged
+    /// module itself (a name of 30 bytes) is not recorded. Under a
+    /// non-standard path the cut changes nothing: still the kill.
+    #[test]
+    fn a_cut_component_is_not_the_packaged_module_it_starts_like() {
+        let host = tempfile::TempDir::new().unwrap();
+        let info = host.path().join("var/lib/dpkg/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(host.path().join("var/lib/dpkg/status"), "").unwrap();
+        std::fs::write(
+            info.join("vendor-dkms.list"),
+            "/lib/modules/6.8.0/extra/vendor-storage-controller-hb.ko\n\
+             /lib/modules/6.8.0/extra/vendor-storage-ctrl-hb.ko.zst\n",
+        )
+        .unwrap();
+        let r = R018KernelModuleLoad::with_owners(ModuleOwners::new(host.path()));
+        let cut = [
+            "/",
+            "lib",
+            "modules",
+            "6.8.0",
+            "extra",
+            "vendor-storage-controller-hb.ko.backdoor",
+        ];
+        let v = r
+            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &cut)))
+            .expect("a cut name is recorded, not passed as the packaged module");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(v.reasoning.contains("read only in part"), "{}", v.reasoning);
+        let packaged = [
+            "/",
+            "lib",
+            "modules",
+            "6.8.0",
+            "extra",
+            "vendor-storage-ctrl-hb.ko.zst",
+        ];
+        assert!(r
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "modprobe",
+                "bash",
+                0,
+                &packaged
+            )))
+            .is_none());
+        let staged = ["/", "tmp", "vendor-storage-controller-hb.ko.backdoor"];
+        let v = r
+            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &staged)))
+            .expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical)
+        );
     }
 
     /// External audit PROC-005: a component that is not UTF-8 is kept, and

@@ -492,7 +492,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    deeper than any module directory, refused or not. Recorded: any other \
                    untrusted file or buffer, an unattested DKMS or akmods build (High), a load \
                    a window or an opt-out let through (Medium); a load the kernel did not judge \
-                   (the agent's first seconds) by the path and the package database.",
+                   (the agent's first seconds) by the path and the package database — a path \
+                   with a component the sensor read only in part (31 bytes, marked …) is \
+                   unverifiable, High (lot 292).",
         false_positives: "None measured on the benign corpus (lot 285: udev's and the services' \
                           loads, docker's, k3s', a DKMS build under apt). A module built by \
                           hand outside the DKMS and akmods directories (`make \
@@ -520,6 +522,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              r018_comm_allowlist_removed",
             "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
              fire_nonstandard_path_is_critical_killtree",
+            "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
+             a_cut_component_is_not_the_packaged_module_it_starts_like",
             "deploy/lab/adversarial/anti-tamper.sh::case C58",
         ],
         attack_note: "",

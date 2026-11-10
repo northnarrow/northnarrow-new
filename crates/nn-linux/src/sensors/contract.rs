@@ -471,7 +471,8 @@ pub const SOURCES: [SourceContract; 16] = [
             Truncation {
                 field: "module path, each component",
                 max_bytes: 31,
-                marked: "path_truncated (too deep, unreadable); a cut path starts with …/",
+                marked: "path_truncated (too deep, unreadable); a cut path starts with …/; a \
+                         component that may be cut (31 bytes) ends with … (lot 292)",
             },
             COMM,
         ],
