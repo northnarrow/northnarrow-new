@@ -4080,6 +4080,17 @@ mod tests {
             (1001..=1010u64).rev().collect::<Vec<_>>(),
             "verified rows dropped once an archive is read"
         );
+        // a forged archive row with a higher id than the verified ones: not
+        // checked (the budget is spent), and the verified rows after it in
+        // the read's order still served
+        std::fs::write(
+            crate::chainlog::archive_path_for(&path, 1),
+            forged_line(mk_id(5000)) + "\n",
+        )
+        .unwrap();
+        let (got, unverified) = read_last_n_verified(&path, 50, &filter, Some(&pk));
+        assert_eq!(unverified, MAX_UNVERIFIED_PER_READ);
+        assert_eq!(ids(&got), (1001..=1010u64).rev().collect::<Vec<_>>());
     }
 
     /// Lot 297 (BUG61): a tree kill whose root was not killed still says

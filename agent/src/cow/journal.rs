@@ -574,6 +574,41 @@ mod tests {
         );
     }
 
+    /// Lot 297 (BUG64): a last line cut by a crash is ended at the open
+    /// (counted as a line), and a whole index is left as it is.
+    #[test]
+    fn a_torn_last_line_is_ended_at_the_open() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path().join(".northnarrow-cow");
+        let mut j = Journal::open(&p).unwrap();
+        j.append(&[Record::Drop { object: 1 }]).unwrap();
+        drop(j);
+        let index = p.join("index.jsonl");
+        let whole = std::fs::read(&index).unwrap();
+        let j = Journal::open(&p).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            whole,
+            "a whole index untouched"
+        );
+        assert_eq!(j.lines(), 1);
+        drop(j);
+        let mut torn = whole.clone();
+        torn.extend_from_slice(b"{\"op\":\"drop\",\"obj\xC3");
+        std::fs::write(&index, &torn).unwrap();
+        let mut j = Journal::open(&p).unwrap();
+        torn.push(b'\n');
+        assert_eq!(std::fs::read(&index).unwrap(), torn, "the cut line ended");
+        assert_eq!(j.lines(), 2);
+        j.append(&[Record::Drop { object: 2 }]).unwrap();
+        assert_eq!(j.lines(), 3);
+        let mut ix = JournalIndex::new(&[1000], u64::MAX, 0);
+        assert_eq!(j.replay(&mut ix, 0).unwrap(), 1, "the cut line alone");
+        let body = std::fs::read(&index).unwrap();
+        assert_eq!(body.iter().filter(|c| **c == b'\n').count(), 3);
+        assert!(body.ends_with(b"{\"op\":\"drop\",\"object\":2}\n"));
+    }
+
     #[test]
     fn a_planted_link_or_foreign_dir_is_refused() {
         let t = tempfile::TempDir::new().unwrap();

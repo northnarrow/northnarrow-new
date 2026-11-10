@@ -497,9 +497,8 @@ impl JournalIndex {
             return;
         }
         let v = self.post_writes.entry((dev, ino)).or_default();
-        if let Some(i) = v.iter().position(|p| p.writer == w.writer) {
-            v.remove(i);
-        } else if v.len() >= POST_WRITES_PER_INODE {
+        v.retain(|p| p.writer != w.writer);
+        if v.len() >= POST_WRITES_PER_INODE {
             v.remove(0);
         }
         v.push(w);
