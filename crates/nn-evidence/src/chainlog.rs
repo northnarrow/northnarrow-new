@@ -7458,4 +7458,48 @@ mod tests {
         assert!(!log.rotation_owed());
         assert!(list_archive_seqs(&active).unwrap().is_empty());
     }
+
+    /// A seal whose rename failed is a rotation owed too: the thread that
+    /// may rotate (woken by it) finishes it, and the next line goes on.
+    #[test]
+    fn a_seal_waiting_for_its_rename_is_owed() {
+        struct FailSecond(std::sync::atomic::AtomicU32);
+        impl ProtectionManager for FailSecond {
+            fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                let n = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                if n > 0 {
+                    self.0.store(n - 1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 1 {
+                        return Err(anyhow!("simulated dance failure"));
+                    }
+                }
+                f()
+            }
+            fn register_active(&self, _path: &Path) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let prot = std::sync::Arc::new(FailSecond(std::sync::atomic::AtomicU32::new(0)));
+        let mut log = open_log_with(&active, &kp, 2000, prot.clone());
+        let mut i = 0;
+        while log.active_bytes + 400 < 2000 {
+            log.append(payload(i)).unwrap();
+            i += 1;
+        }
+        assert!(!log.rotation_owed());
+        prot.0.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(log.append(payload(i)).is_err(), "sealed, not renamed");
+        assert!(log.rotation_owed(), "the seal's rename is owed");
+        assert!(log.rotate_owed().unwrap());
+        assert!(!log.rotation_owed());
+        log.append(payload(i + 1)).unwrap();
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), [1]);
+        let r = verify_log_set::<TestPayload>(&active, &pk);
+        assert!(r.as_ref().is_ok_and(|r| r.total_records == i + 1), "{r:?}");
+    }
 }
