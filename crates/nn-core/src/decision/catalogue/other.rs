@@ -390,8 +390,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    protected pid, a ptrace or /proc/<pid>/mem access, a write, unlink, rename \
                    or new entry in its protected files, a handle to its BPF maps, programs or \
                    links, a kexec load, a read of its signing key; lot 290: a load of a \
-                   `kprobe`, `tracing`, `lsm`, `ext` or `struct_ops` BPF program outside a \
-                   window (High; one the signed per-loader opt-out lets through, Low), and the \
+                   `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, \
+                   `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF \
+                   program outside a window (High; one the signed per-loader opt-out lets through, Low), and the \
                    kernel-state round's cross-view — a BPF program present at the agent's \
                    start (Low, High for those types) or one its hook never saw loading (High). \
                    Also the not-refused records of lots 277–281 (a move into an exempt cgroup, \

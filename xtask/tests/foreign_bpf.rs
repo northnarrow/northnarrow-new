@@ -84,10 +84,15 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
     assert!(c.contains(
         "pub static BPF_LOADER_OPTOUT: HashMap<InodeKey, u32> = HashMap::pinned(64, 0);"
     ));
-    // the types are common's, the hook calls its function
+    // the types are common's, the hook calls its function: the nine, the
+    // tracepoint and perf_event ones among them (the coordinator's decision
+    // after the benign corpus)
     let k = code("common/src/bpf_prog_class.rs");
     assert!(k.contains(
-        "PROG_TYPE_KPROBE | PROG_TYPE_TRACING | PROG_TYPE_STRUCT_OPS | PROG_TYPE_EXT | PROG_TYPE_LSM"
+        "        PROG_TYPE_KPROBE\n            | PROG_TYPE_TRACEPOINT\n            \
+         | PROG_TYPE_PERF_EVENT\n            | PROG_TYPE_RAW_TRACEPOINT\n            \
+         | PROG_TYPE_RAW_TRACEPOINT_WRITABLE\n            | PROG_TYPE_TRACING\n            \
+         | PROG_TYPE_STRUCT_OPS\n            | PROG_TYPE_EXT\n            | PROG_TYPE_LSM\n    )"
     ));
 }
 

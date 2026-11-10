@@ -4,7 +4,9 @@
 # "ERR <errno name> <errno>".
 #
 #   bpf-probe.py load-kprobe-write-user [--pin PATH] [--name NAME]
-#       BPF_PROG_LOAD of a kprobe program that calls bpf_probe_write_user
+#       [--type kprobe|tracepoint|perf_event|raw_tracepoint]
+#       BPF_PROG_LOAD of a program that calls bpf_probe_write_user, a
+#       kprobe unless --type names another tracing type that may call it
 #       (never attached: the load itself is what the agent judges)
 #   bpf-probe.py load-socket-filter [--pin PATH] [--name NAME]
 #       BPF_PROG_LOAD of a socket filter (a type the agent lets through)
@@ -29,6 +31,7 @@ BPF_PROG_GET_FD_BY_ID = 13
 BPF_F_RDONLY = 1 << 3
 PROG_TYPE_SOCKET_FILTER = 1
 PROG_TYPE_KPROBE = 2
+WRITE_USER_TYPES = {"kprobe": 2, "tracepoint": 5, "perf_event": 7, "raw_tracepoint": 17}
 
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -105,7 +108,11 @@ def main(argv):
                 insn(0xB7, dst=0, imm=0),  # r0 = 0
                 insn(0x95),  # exit
             ]
-            t, name = PROG_TYPE_KPROBE, opt(args, "--name", "k290_wu")
+            kind = opt(args, "--type", "kprobe")
+            if kind not in WRITE_USER_TYPES:
+                print(f"unknown --type {kind}", file=sys.stderr)
+                return 2
+            t, name = WRITE_USER_TYPES[kind], opt(args, "--name", "k290_wu")
         else:
             insns = [insn(0xB7, dst=0, imm=0), insn(0x95)]
             t, name = PROG_TYPE_SOCKET_FILTER, opt(args, "--name", "k290_sf")

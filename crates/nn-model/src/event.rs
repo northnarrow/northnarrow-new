@@ -1147,7 +1147,8 @@ pub enum FsProtectOperation {
     /// program, 0 a path; `target_ino` the id).
     BpfHandle,
     /// Lot 290: a load of a program type refused by default (kprobe,
-    /// tracing, LSM, extension, struct_ops) outside the family and a window,
+    /// tracepoint, perf_event, raw_tracepoint, raw_tracepoint_writable,
+    /// tracing, struct_ops, extension, LSM) outside the family and a window,
     /// without the signed per-loader opt-out (`target_ino` the type).
     BpfProgType,
     /// Lot 290: NOT a refusal — such a load let through by the signed

@@ -5,12 +5,13 @@
 #
 #  F1  the cross-view runs: its status file (/run/northnarrow/bpf-foreign)
 #      names the host's foreign programs; the start's baseline signed;
-#  F2  a kprobe program calling bpf_probe_write_user, loaded outside a
-#      window: refused (EPERM), signed bpf_prog_type High; inside a window
-#      loaded;
+#  F2  a kprobe, a tracepoint, a perf_event and a raw_tracepoint program
+#      calling bpf_probe_write_user, loaded outside a window: each refused
+#      (EPERM), signed bpf_prog_type High; inside a window each loaded;
 #  F3  bpftrace outside a window: refused (bpf_prog_type); inside a window:
-#      runs; with a signed `bpf-loader-allow <bpftrace> kprobe,tracing`:
-#      runs outside a window, each type's load signed bpf_prog_opt_out (Low);
+#      runs; with a signed `bpf-loader-allow <bpftrace>
+#      kprobe,tracing,tracepoint,perf_event,raw_tracepoint`: runs outside a
+#      window, each type's load signed bpf_prog_opt_out (Low);
 #  F4  (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1) the agent's objects
 #      off limits outside a window: BPF_MAP_GET_FD_BY_ID of the tracker's
 #      map (read-write and read-only), BPF_PROG_GET_FD_BY_ID of one of the
@@ -82,17 +83,23 @@ if want F1; then
 fi
 
 if want F2; then
-    echo "== F2. a kprobe program with bpf_probe_write_user"
+    echo "== F2. programs with bpf_probe_write_user (kprobe, tracepoint, perf_event, raw_tracepoint)"
+    F2_TYPES="kprobe tracepoint perf_event raw_tracepoint"
     no_window
     n0=$(lines "$DET")
-    out=$(sudo $PROBE load-kprobe-write-user --name k290_wu)
-    [[ $out == "ERR EPERM"* ]] && pass "F2 refused outside a window ($out)" || bad "F2 outside a window: $out"
+    for t in $F2_TYPES; do
+        out=$(sudo $PROBE load-kprobe-write-user --type "$t" --name "k290_wu_${t:0:6}")
+        [[ $out == "ERR EPERM"* ]] && pass "F2 $t refused outside a window ($out)" || bad "F2 $t outside a window: $out"
+        sleep 1
+    done
     sleep 2
-    (( $(count "$n0" bpf_prog_type) >= 1 )) && pass "F2 signed bpf_prog_type ($(sev_of "$n0" bpf_prog_type))" || bad "F2 no bpf_prog_type record"
-    recs "$n0" bpf_prog_type | head -1 | grep -o '"reasoning":"[^"]*' | cut -c1-260 | sed 's/^/    /'
+    (( $(count "$n0" bpf_prog_type) >= 4 )) && pass "F2 signed bpf_prog_type, one a type ($(sev_of "$n0" bpf_prog_type))" || bad "F2 $(count "$n0" bpf_prog_type) bpf_prog_type records for 4 types"
+    recs "$n0" bpf_prog_type | grep -o '"reasoning":"[^"]*' | cut -c1-200 | sed 's/^/    /'
     window 60
-    out=$(sudo $PROBE load-kprobe-write-user --name k290_wu)
-    [[ $out == OK* ]] && pass "F2 loaded inside a window ($out)" || bad "F2 inside a window: $out"
+    for t in $F2_TYPES; do
+        out=$(sudo $PROBE load-kprobe-write-user --type "$t" --name "k290_wu_${t:0:6}")
+        [[ $out == OK* ]] && pass "F2 $t loaded inside a window ($out)" || bad "F2 $t inside a window: $out"
+    done
     no_window
 fi
 
@@ -113,7 +120,7 @@ if want F3; then
     [[ $o == *k290-hit* ]] && pass "F3 bpftrace runs inside a window" || bad "F3 inside a window (rc $rc): $(echo "$o" | tail -2 | tr '\n' ' ')"
     no_window
     # the signed per-loader opt-out
-    printf 'bpf-loader-allow %s kprobe,tracing\n' "$BT" > /tmp/k290-rp.local
+    printf 'bpf-loader-allow %s kprobe,tracing,tracepoint,perf_event,raw_tracepoint\n' "$BT" > /tmp/k290-rp.local
     sudo "$NNADMIN" policy set --file /tmp/k290-rp.local --key "$KEY" 2>&1 | tail -1 | sed 's/^/    /'
     n0=$(lines "$DET")
     o=$(sudo timeout 60 bpftrace -e 'kprobe:do_nanosleep { printf("k290-hit\n"); exit(); }' -c '/bin/sleep 0.2' 2>&1); rc=$?

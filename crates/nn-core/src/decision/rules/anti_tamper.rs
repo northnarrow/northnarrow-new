@@ -358,8 +358,9 @@ impl Rule for NnLAt001AntiTamperDenial {
 /// Lot 290: the severity of a cross-view finding — High for an object the
 /// `bpf` hook never saw loading after the start; for one present at the
 /// start (the baseline, loaded while the agent was not running), High when
-/// it is of a type refused outside a window (kprobe, tracing, LSM,
-/// extension, struct_ops), Low otherwise (systemd's and the container
+/// it is of a type refused outside a window (kprobe, tracepoint,
+/// perf_event, raw_tracepoint, raw_tracepoint_writable, tracing,
+/// struct_ops, extension, LSM), Low otherwise (systemd's and the container
 /// runtimes' cgroup programs).
 pub fn crossview_severity(
     operation: FsProtectOperation,

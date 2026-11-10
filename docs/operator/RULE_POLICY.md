@@ -551,11 +551,12 @@ Outside a trusted-installer window the agent refuses (`EPERM`) a
 `BPF_PROG_LOAD` of the program types that can rewrite a process's memory
 (`bpf_probe_write_user`), override a kernel function's return
 (`bpf_override_return`, `fmod_ret`), signal a process (`bpf_send_signal`)
-or take one of the agent's hooks' place: `kprobe`, `tracing` (fentry,
-fexit, fmod_ret, iterators), `lsm`, `ext` (freplace) and `struct_ops`.
-Every other type — the cgroup device, skb, sock and sysctl programs of
-systemd and the container runtimes, tc and XDP networking, socket filters,
-tracepoints, perf events — is let through and recorded; inside a window
+or take one of the agent's hooks' place — nine types: `kprobe`,
+`tracepoint`, `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`,
+`tracing` (fentry, fexit, fmod_ret, iterators), `struct_ops`, `ext`
+(freplace) and `lsm`. Every other type — the cgroup device, skb, sock and
+sysctl programs of systemd and the container runtimes, tc and XDP
+networking, socket filters — is let through and recorded; inside a window
 everything is let through and recorded (the trust model's lot 290,
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md).
 A host that runs bpftrace, Falco, Tetragon, Cilium or another BPF tool of
@@ -563,13 +564,18 @@ those types outside a window says so in the policy:
 
 ```
 # rule-policy.local — signed by config-manage
-bpf-loader-allow /usr/bin/bpftrace kprobe,tracing
-bpf-loader-allow /usr/bin/falco kprobe,tracing
+bpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing
+bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
 ```
 
 - The executable is an absolute path (no `.` or `..` component); the types
-  are among the five above, each once. Any other type refuses the file:
-  there is nothing to opt out of. One line per executable, 32 at most.
+  are among the nine above, each once (the file reads them back in that
+  order). Any other type refuses the file: there is nothing to opt out of.
+  One line per executable, 32 at most. bpftrace loads a `kprobe` for
+  `kprobe:`, a `tracepoint` for `tracepoint:`, a `perf_event` for
+  `interval:`/`profile:`/`software:`/`hardware:`, a `raw_tracepoint` for
+  `rawtracepoint:` and a `tracing` program for `fentry:`/`kfunc:` and its
+  `iter:` probes: name the ones the host's scripts use.
 - **By device and inode.** When the policy is applied (the agent's start,
   `nn-admin policy set`) the path is resolved — a symlink followed to the
   file the kernel runs — and the kernel matches the loader's executable by
@@ -592,6 +598,14 @@ bpf-loader-allow /usr/bin/falco kprobe,tracing
   given — opt out a tool only where its use outside a window is routine.
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 BPF loader opt-out`).
+- **bpftool needs a window, not an opt-out.** Its `pids` column comes from
+  an iterator it loads (a `tracing` program: refused outside a window, the
+  column left empty), and in enforce mode — a production build's default —
+  `bpftool prog|map|link show` stops at the first object of the agent's
+  (bpftool gives up a listing at a refused handle; the handles are not a
+  load and no opt-out reaches them). Inspect the host's BPF inside a
+  trusted-installer window, or read `/run/northnarrow/bpf-own-ids` and
+  `/run/northnarrow/bpf-foreign` outside one.
 
 ### 2.4 Kernel module loads judged in the kernel (lot 285)
 

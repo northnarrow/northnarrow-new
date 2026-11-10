@@ -1202,7 +1202,8 @@ pub const FS_OP_BPF_HANDLE: u8 = 39;
 /// Lot 290: a `BPF_PROG_LOAD` of a program type that can rewrite user
 /// memory, override a kernel function's return, signal a process or
 /// replace a hook (`crate::bpf_prog_class::denied_by_default`: kprobe,
-/// tracing, LSM, extension, struct_ops) by a caller outside the agent's
+/// tracepoint, perf_event, raw_tracepoint, raw_tracepoint_writable,
+/// tracing, struct_ops, extension, LSM) by a caller outside the agent's
 /// family, outside a window and without the signed per-loader opt-out —
 /// refused by the `bpf` hook (`target_ino` = the program type).
 pub const FS_OP_BPF_PROG_TYPE: u8 = 40;

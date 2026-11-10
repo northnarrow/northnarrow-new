@@ -9,8 +9,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - Foreign BPF (lot 290; `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 290",
   `docs/operator/RULE_POLICY.md` §2.5). The `bpf` hook refuses (`EPERM`),
   outside a signed trusted-installer window and in every mode, a
-  `BPF_PROG_LOAD` of a `kprobe`, `tracing`, `lsm`, `ext` or `struct_ops`
-  program by a process outside the agent's family, unless a signed
+  `BPF_PROG_LOAD` of a `kprobe`, `tracepoint`, `perf_event`,
+  `raw_tracepoint`, `raw_tracepoint_writable`, `tracing`, `struct_ops`,
+  `ext` or `lsm` program by a process outside the agent's family, unless a
+  signed
   `bpf-loader-allow <executable> <types>` line (new rule-policy directive:
   the executable by the device and inode its path names when the policy is
   applied) names the loader and the type (let through, recorded Low,
@@ -27,7 +29,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   unit has no `CAP_SYS_ADMIN`) and compares them with the loads its hook saw
   since its start (`SEEN_PROGS`, written by the `bpf_prog` hook): the
   start's foreign programs signed once (`bpf_baseline`, Low, High for the
-  five types), one that appears later unseen High (`bpf_unseen`, with its
+  nine types), one that appears later unseen High (`bpf_unseen`, with its
   type, name, tag and attach point); `/run/northnarrow/bpf-foreign` lists
   them and every load seen with its loader. `BPF_MAP_FREEZE` on
   `BPF_DEFENSE_MODE`, `OWN_EXE_INODES`, `OWN_PIN_NAMES`,

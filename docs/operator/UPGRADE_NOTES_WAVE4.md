@@ -752,15 +752,18 @@ others. What an operator sees change:
 
 ## 14. Foreign BPF (lot 290)
 
-- **A load of a `kprobe`, `tracing`, `lsm`, `ext` or `struct_ops` BPF
+- **A load of a `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`,
+  `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` BPF
   program is refused outside a signed trusted-installer window** (`EPERM`)
   to every process outside the agent's family, in every mode of the BPF
   guard (`NN_BPF_DEFENSE_OBSERVE=1` included). bpftrace, Falco, Tetragon,
   Cilium's agent and the like stop loading outside a window: before the
   upgrade, sign a `bpf-loader-allow <executable> <types>` line for each
-  tool the host runs outside one (`RULE_POLICY.md` §2.5). Every other
-  program type (systemd's and the container runtimes' cgroup programs, tc,
-  XDP, socket filters, tracepoints, perf events) loads as before, recorded.
+  tool the host runs outside one (`RULE_POLICY.md` §2.5: bpftrace's
+  `tracepoint:` and `interval:` probes are `tracepoint` and `perf_event`
+  programs — name them too). Every other program type (systemd's and the
+  container runtimes' cgroup programs, tc, XDP, socket filters) loads as
+  before, recorded.
   A refusal is NN-L-AT-001 `bpf_prog_type` (High, ENGAGED), a load the
   opt-out lets through `bpf_prog_opt_out` (Low).
 - **The agent's maps and programs are off limits outside a window** (the
@@ -776,7 +779,7 @@ others. What an operator sees change:
 - **New records of the kernel-state round** (5 s, not refusals, no posture
   trigger): at each start every BPF program not the agent's that its `bpf`
   hook did not see loading is signed once, NN-L-AT-001 `bpf_baseline` — Low,
-  High for one of the five types above (one loaded while no agent ran); a
+  High for one of the nine types above (one loaded while no agent ran); a
   program or link that appears later and the hook never saw is
   `bpf_unseen`, High. A host with many container or systemd programs has
   as many Low baseline records at each agent start; the kernel's own

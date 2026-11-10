@@ -164,11 +164,12 @@ pub struct RulePolicy {
     /// Lot 290: `bpf-loader-allow <executable> <type>[,<type>…]` — the
     /// signed per-loader opt-out of the `bpf` hook's refusal of the program
     /// types that can rewrite user memory, override a kernel function's
-    /// return, signal a process or take a hook's place (kprobe, tracing,
-    /// lsm, ext, struct_ops): that executable, by the device and inode its
-    /// absolute path names when the policy is applied, may load those types
-    /// outside a window, each load recorded. The agent honours it only from
-    /// a policy whose signature it verified.
+    /// return, signal a process or take a hook's place (kprobe,
+    /// tracepoint, perf_event, raw_tracepoint, raw_tracepoint_writable,
+    /// tracing, struct_ops, ext, lsm): that executable, by the device and
+    /// inode its absolute path names when the policy is applied, may load
+    /// those types outside a window, each load recorded. The agent honours
+    /// it only from a policy whose signature it verified.
     bpf_loader_allow: BTreeMap<String, u32>,
     /// Where it came from (`built-in defaults`, `<path> (signed, sha256 …)`).
     pub source: String,
@@ -327,7 +328,8 @@ fn bpf_loader_opt_out(path: &str, types: &str) -> Result<(String, u32), String> 
     for t in types.split(',') {
         let Some(ty) = common::bpf_prog_class::opt_out_type(t) else {
             return Err(format!(
-                "`{t}` is not a type refused by default (kprobe, tracing, lsm, ext, struct_ops)"
+                "`{t}` is not a type refused by default ({})",
+                common::bpf_prog_class::mask_names(common::bpf_prog_class::DENIED_MASK)
             ));
         };
         let bit = common::bpf_prog_class::type_bit(ty);
@@ -783,11 +785,11 @@ fn parse_as(
                 }
             }
             ["bpf-loader-allow", ..] => {
-                return Err(err(
+                return Err(err(format!(
                     "`bpf-loader-allow <absolute executable path> <type>[,<type>…]` (types: \
-                     kprobe, tracing, lsm, ext, struct_ops)"
-                        .to_string(),
-                ))
+                     {})",
+                    common::bpf_prog_class::mask_names(common::bpf_prog_class::DENIED_MASK)
+                )))
             }
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
@@ -1156,14 +1158,16 @@ mod tests {
     }
 
     /// Lot 290 (named): the signed per-loader opt-out — an absolute
-    /// executable and types refused by default, each once; read back as
-    /// written, counted, shown as honoured only signed; a relative path, a
-    /// `..`, a type not refused (xdp), a duplicate refused.
+    /// executable and types refused by default (the nine, the tracepoint
+    /// and perf_event ones among them), each once; read back in uapi
+    /// order, counted, shown as honoured only signed; a relative path, a
+    /// `..`, a type not refused (xdp, the error naming the nine), a
+    /// duplicate refused.
     #[test]
     fn a_bpf_loader_opt_out_names_an_executable_and_refused_types() {
         use common::bpf_prog_class::type_bit;
         let p = parse(
-            "bpf-loader-allow /usr/bin/bpftrace kprobe,tracing   # the SRE's tracing\n\
+            "bpf-loader-allow /usr/bin/bpftrace kprobe,tracing,tracepoint,perf_event,raw_tracepoint   # the SRE's tracing\n\
              bpf-loader-allow /usr/bin/falco lsm\n",
         )
         .unwrap();
@@ -1171,14 +1175,19 @@ mod tests {
         assert_eq!(
             p.bpf_loader_opt_outs().collect::<Vec<_>>(),
             [
-                ("/usr/bin/bpftrace", type_bit(2) | type_bit(26)),
+                (
+                    "/usr/bin/bpftrace",
+                    type_bit(2) | type_bit(5) | type_bit(7) | type_bit(17) | type_bit(26)
+                ),
                 ("/usr/bin/falco", type_bit(29)),
             ]
         );
         assert_eq!(parse(&p.render()).unwrap(), p);
         assert!(p
             .render()
-            .contains("bpf-loader-allow /usr/bin/bpftrace kprobe,tracing\n"));
+            .contains(
+                "bpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n"
+            ));
         assert!(
             p.summary().ends_with(", 2 BPF loader opt-outs"),
             "{}",
@@ -1199,7 +1208,13 @@ mod tests {
             ("bpf-loader-allow /usr/bin/x/ kprobe\n", "absolute path"),
             (
                 "bpf-loader-allow /usr/bin/x xdp\n",
-                "not a type refused by default",
+                "not a type refused by default (kprobe,tracepoint,perf_event,raw_tracepoint,\
+                 raw_tracepoint_writable,tracing,struct_ops,ext,lsm)",
+            ),
+            (
+                "bpf-loader-allow /usr/bin/x\n",
+                "(types: kprobe,tracepoint,perf_event,raw_tracepoint,raw_tracepoint_writable,\
+                 tracing,struct_ops,ext,lsm)",
             ),
             (
                 "bpf-loader-allow /usr/bin/x kprobe,kprobe\n",

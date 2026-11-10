@@ -7707,7 +7707,10 @@ number in parentheses is a lab PR.
     lines in one lab round).
   - What changed (trust model "Lot 290", `RULE_POLICY.md` §2.5): outside a
     window a caller outside the family gets `EPERM` on a `BPF_PROG_LOAD` of
-    `kprobe`, `tracing`, `lsm`, `ext` or `struct_ops`, in every mode
+    `kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`,
+    `raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` (the
+    four tracepoint and perf-event types added by the coordinator's decision
+    after the benign corpus), in every mode
     (NN-L-AT-001 `bpf_prog_type`, High, ENGAGED), unless a signed
     `bpf-loader-allow <executable> <types>` names it by device and inode
     (`bpf_prog_opt_out`, Low); the root `cgroup/sysctl` attach refusal holds
@@ -7719,7 +7722,7 @@ number in parentheses is a lab PR.
     round: the agent's own iterators (`iter/bpf_prog`, `iter/bpf_link`; the
     unit has no `CAP_SYS_ADMIN`) against the loads its hook saw since the
     start (`SEEN_PROGS`): the start's foreign programs signed once
-    (`bpf_baseline`: Low, High for the five types, Low for the kernel's
+    (`bpf_baseline`: Low, High for the nine types, Low for the kernel's
     own), one appearing later unseen High (`bpf_unseen`, type, name, tag,
     attach point); `/run/northnarrow/bpf-foreign`. R011's plain root record
     Low. `OWN_BPF_IDS` 256 → 1024.
@@ -7814,10 +7817,11 @@ number in parentheses is a lab PR.
     (a partial iterator record, the event's early bit); a third survivor
     was a check the pending set already made, removed from the code (the
     mutation of the set itself caught).
-  - Open: the handle refusals hold in enforce mode only; `tracepoint`,
-    `raw_tracepoint` and `perf_event` programs (which can call
-    `bpf_probe_write_user` and `bpf_send_signal`) are let through and
-    recorded; a program that lives less than a round is not seen by the
+  - Open: the handle refusals hold in enforce mode only (a production
+    build's default; observe in a `debug-trigger` build or with the signed
+    weakening `NN_BPF_DEFENSE_OBSERVE=1`); a tracer or profiler that loads
+    one of the nine types outside a window needs a signed opt-out; a
+    program that lives less than a round is not seen by the
     cross-view; the `bpf` and `bpf_prog` hooks are not pinned (a gap only a
     window opens: the next start's baseline signs what it left); a link pin
     reached through a bind mount is matched by its name only.

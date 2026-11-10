@@ -881,7 +881,8 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     // Lot 290: a program type that can rewrite user memory, override a
     // kernel function's return, signal a process or take a hook's place
-    // (kprobe, tracing, LSM, extension, struct_ops), loaded by a caller
+    // (kprobe, tracepoint, perf_event, raw_tracepoint and its writable
+    // form, tracing, struct_ops, extension, LSM), loaded by a caller
     // outside the family (returned above) outside a window — refused, in
     // every mode, unless the signed per-loader opt-out names the caller's
     // executable and the type (let through, recorded once a second). A

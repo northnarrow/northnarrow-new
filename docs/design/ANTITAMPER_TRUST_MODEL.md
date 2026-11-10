@@ -2150,8 +2150,10 @@ needs ptrace access to it — refused by the agent's `ptrace_access_check`
 deny.
 
 **The rootkit-grade types.** Outside a window a `BPF_PROG_LOAD` of `kprobe`,
-`tracing` (fentry, fexit, fmod_ret, iterators), `lsm`, `ext` and
-`struct_ops` by a caller outside the family is refused (`EPERM`, NN-L-AT-001
+`tracepoint`, `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`
+(each can call `bpf_probe_write_user` and `bpf_send_signal`), `tracing`
+(fentry, fexit, fmod_ret, iterators), `struct_ops`, `ext` and `lsm` by a
+caller outside the family is refused (`EPERM`, NN-L-AT-001
 `bpf_prog_type`, High, ENGAGED) — **in every mode**: the observe mode
 relaxes only the guard of the agent's own objects. Lot 280b's root
 `cgroup/sysctl` attach refusal holds in every mode too now. The other types
@@ -2220,13 +2222,19 @@ type: the host's inventory of foreign BPF.
   such tools.
 
 **What stays open.**
-- The refusals of handles hold in enforce mode only (a production build;
-  `NN_BPF_DEFENSE_OBSERVE=1` is a signed weakening that refuses the start
-  without the degraded-mode override); the lab's build observes them.
-- `tracepoint`, `raw_tracepoint` and `perf_event` programs can call
-  `bpf_probe_write_user` and `bpf_send_signal` too; they are let through and
-  recorded (the brief's list; bpftrace's tracepoints and the profilers' perf
-  events use them) — a candidate for a later lot with the corpus's data.
+- The refusals of handles hold in enforce mode only — a production build's
+  default (a release build without `debug-trigger`, the unit setting no
+  `NN_BPF_DEFENSE_OBSERVE`); `NN_BPF_DEFENSE_OBSERVE=1` is a signed
+  weakening that refuses the start without the degraded-mode override; the
+  lab's `debug-trigger` build observes them unless `NN_BPF_DEFENSE_ENFORCE=1`.
+  The type refusal holds in every mode.
+- `tracepoint`, `raw_tracepoint`, `raw_tracepoint_writable` and
+  `perf_event` are refused with the others (the coordinator's decision
+  after the benign corpus, whose workloads loaded none of the nine): a
+  profiler or tracer that loads them outside a window (bpftrace's
+  `tracepoint:` and `interval:` probes, perf-event profilers) stops there
+  unless a signed `bpf-loader-allow` names it — the cost accepted for
+  `bpf_probe_write_user` and `bpf_send_signal` from a root process.
 - A program that lives less than a round is not seen by the cross-view
   (the light part of it); one loaded while the agent was stopped is in the
   baseline, signed at the next start, not refused.

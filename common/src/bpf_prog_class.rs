@@ -12,13 +12,25 @@
 //! function's return (`bpf_override_return`, `fmod_ret`), signal a
 //! process (`bpf_send_signal`) or take a hook's place — `kprobe`,
 //! `tracing` (fentry, fexit, fmod_ret, iterators), `lsm`, `ext`
-//! (freplace) and `struct_ops`. The other types (cgroup device, skb,
-//! sock and sysctl programs of systemd and the container runtimes, tc and
-//! XDP networking, socket filters, tracepoints, perf events) are let
+//! (freplace) and `struct_ops`; and `tracepoint`, `raw_tracepoint`,
+//! `raw_tracepoint_writable` and `perf_event`, which can call
+//! `bpf_probe_write_user` and `bpf_send_signal` too (no workload of the
+//! benign corpus loaded any of the nine; its harness's bpftrace probe now
+//! loads inside a window). The other types
+//! (cgroup device, skb, sock and sysctl programs of systemd and the
+//! container runtimes, tc and XDP networking, socket filters) are let
 //! through and recorded.
 
 /// `BPF_PROG_TYPE_KPROBE`.
 pub const PROG_TYPE_KPROBE: u32 = 2;
+/// `BPF_PROG_TYPE_TRACEPOINT`.
+pub const PROG_TYPE_TRACEPOINT: u32 = 5;
+/// `BPF_PROG_TYPE_PERF_EVENT`.
+pub const PROG_TYPE_PERF_EVENT: u32 = 7;
+/// `BPF_PROG_TYPE_RAW_TRACEPOINT`.
+pub const PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
+/// `BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE`.
+pub const PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
 /// `BPF_PROG_TYPE_TRACING` (fentry, fexit, fmod_ret, iterators).
 pub const PROG_TYPE_TRACING: u32 = 26;
 /// `BPF_PROG_TYPE_STRUCT_OPS`.
@@ -32,8 +44,12 @@ pub const PROG_TYPE_LSM: u32 = 29;
 pub const ATTACH_TRACE_ITER: u32 = 28;
 
 /// The types refused by default, in uapi order.
-pub const DENIED_BY_DEFAULT: [u32; 5] = [
+pub const DENIED_BY_DEFAULT: [u32; 9] = [
     PROG_TYPE_KPROBE,
+    PROG_TYPE_TRACEPOINT,
+    PROG_TYPE_PERF_EVENT,
+    PROG_TYPE_RAW_TRACEPOINT,
+    PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
     PROG_TYPE_TRACING,
     PROG_TYPE_STRUCT_OPS,
     PROG_TYPE_EXT,
@@ -48,7 +64,15 @@ pub const DENIED_BY_DEFAULT: [u32; 5] = [
 pub const fn denied_by_default(prog_type: u32) -> bool {
     matches!(
         prog_type,
-        PROG_TYPE_KPROBE | PROG_TYPE_TRACING | PROG_TYPE_STRUCT_OPS | PROG_TYPE_EXT | PROG_TYPE_LSM
+        PROG_TYPE_KPROBE
+            | PROG_TYPE_TRACEPOINT
+            | PROG_TYPE_PERF_EVENT
+            | PROG_TYPE_RAW_TRACEPOINT
+            | PROG_TYPE_RAW_TRACEPOINT_WRITABLE
+            | PROG_TYPE_TRACING
+            | PROG_TYPE_STRUCT_OPS
+            | PROG_TYPE_EXT
+            | PROG_TYPE_LSM
     )
 }
 
@@ -65,6 +89,10 @@ pub const fn type_bit(prog_type: u32) -> u32 {
 
 /// Every type [`denied_by_default`] names, as a mask.
 pub const DENIED_MASK: u32 = type_bit(PROG_TYPE_KPROBE)
+    | type_bit(PROG_TYPE_TRACEPOINT)
+    | type_bit(PROG_TYPE_PERF_EVENT)
+    | type_bit(PROG_TYPE_RAW_TRACEPOINT)
+    | type_bit(PROG_TYPE_RAW_TRACEPOINT_WRITABLE)
     | type_bit(PROG_TYPE_TRACING)
     | type_bit(PROG_TYPE_STRUCT_OPS)
     | type_bit(PROG_TYPE_EXT)
@@ -214,8 +242,9 @@ pub fn link_type_name(link_type: u32) -> String {
         .unwrap_or_else(|| format!("link type {link_type}"))
 }
 
-/// The type a `bpf-loader-allow` line names (`kprobe`, `tracing`, `lsm`,
-/// `ext`, `struct_ops`): only the types refused by default.
+/// The type a `bpf-loader-allow` line names (`kprobe`, `tracepoint`,
+/// `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`, `tracing`,
+/// `struct_ops`, `ext`, `lsm`): only the types refused by default.
 #[cfg(feature = "std")]
 pub fn opt_out_type(name: &str) -> Option<u32> {
     DENIED_BY_DEFAULT
@@ -440,15 +469,16 @@ mod tests {
         assert_eq!(ATTACH_TYPES[ATTACH_TRACE_ITER as usize], "BPF_TRACE_ITER");
     }
 
-    /// Lot 290 (named): exactly the five types are refused by default —
+    /// Lot 290 (named): exactly the nine types are refused by default —
     /// the vehicles of `bpf_probe_write_user`, `bpf_override_return`,
-    /// `bpf_send_signal` and of a hook's replacement — and the types of
-    /// systemd's and the container runtimes' programs, of networking and
-    /// of socket filters are not.
+    /// `bpf_send_signal` and of a hook's replacement, the tracepoint and
+    /// perf_event types among them (the coordinator's decision after the
+    /// benign corpus) — and the types of systemd's and the container
+    /// runtimes' programs, of networking and of socket filters are not.
     #[test]
     fn only_the_rootkit_grade_types_are_refused_by_default() {
         let refused: Vec<u32> = (0..64).filter(|t| denied_by_default(*t)).collect();
-        assert_eq!(refused, vec![2, 26, 27, 28, 29]);
+        assert_eq!(refused, vec![2, 5, 7, 17, 24, 26, 27, 28, 29]);
         assert_eq!(refused, DENIED_BY_DEFAULT.to_vec());
         for allowed in [
             "socket_filter",
@@ -463,9 +493,12 @@ mod tests {
             "cgroup_sockopt",
             "sk_lookup",
             "flow_dissector",
-            "tracepoint",
-            "raw_tracepoint",
-            "perf_event",
+            "lirc_mode2",
+            "sk_msg",
+            "sk_skb",
+            "sock_ops",
+            "netfilter",
+            "syscall",
         ] {
             let t = PROG_TYPES
                 .iter()
@@ -476,9 +509,30 @@ mod tests {
                 .unwrap_or_else(|| panic!("{allowed}")) as u32;
             assert!(!denied_by_default(t), "{allowed}");
         }
+        // the coordinator's extension: the tracepoint family and perf
+        // events (bpf_probe_write_user, bpf_send_signal)
+        for refused in [
+            "tracepoint",
+            "raw_tracepoint",
+            "raw_tracepoint_writable",
+            "perf_event",
+        ] {
+            assert!(
+                opt_out_type(refused).is_some_and(denied_by_default),
+                "{refused}"
+            );
+        }
         assert_eq!(
             DENIED_MASK,
-            (1 << 2) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
+            (1 << 2)
+                | (1 << 5)
+                | (1 << 7)
+                | (1 << 17)
+                | (1 << 24)
+                | (1 << 26)
+                | (1 << 27)
+                | (1 << 28)
+                | (1 << 29)
         );
         assert_eq!(type_bit(31), 1 << 31);
         assert_eq!(type_bit(32), 0);

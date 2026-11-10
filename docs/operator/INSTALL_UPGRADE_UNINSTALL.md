@@ -637,9 +637,10 @@ programs to detach before copying binaries.
 Diagnosis mode: `NN_BPF_DEFENSE_OBSERVE=1` in the unit environment turns
 the guard of the agent's own objects into an observer (nothing of them
 denied, a `foreign_map_write` record instead; lot 290: the refusal of a
-`kprobe`, `tracing`, `lsm`, `ext` or `struct_ops` load and of a
-`cgroup/sysctl` attach to the root cgroup outside a window hold in every
-mode); test builds (`debug-trigger`) run in that mode because the e2e
+`kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`,
+`raw_tracepoint_writable`, `tracing`, `struct_ops`, `ext` or `lsm` load and
+of a `cgroup/sysctl` attach to the root cgroup outside a window hold in
+every mode); test builds (`debug-trigger`) run in that mode because the e2e
 fixtures unprotect pids with `bpftool`; `NN_BPF_DEFENSE_ENFORCE=1` forces
 the deny in a test build (lab checks of the deny path; the privileged e2e
 `bpf_guard_enforce_refuses_protected_pids_write` asserts it). The guard counts in the LSM
