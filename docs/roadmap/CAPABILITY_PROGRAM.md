@@ -8329,3 +8329,55 @@ number in parentheses is a lab PR.
     registration) and the held maps and programs left out (every map and
     program the agent holds is its object's, registered already).
   - Level unchanged (C23 2, provisional): a fix inside the capability.
+- **Lot 298 — the evidence readers and verifiers, and the export's check:
+  the external bug hunt's lot 8** (`fix/w4-bh-readers-export`; the triage
+  of editions 1.2/1.3, lot 8, all P2/P3: BUG29, BUG09, BUG11, BUG28, BUG04,
+  BUG06, BUG07, BUG16, BUG19, BUG23, BUG24).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): `chain verify` accepted and
+    counted genuine lines replayed after an archive's terminator (BUG29); a
+    numbered canary row ending in `\r` passed the canonical-form check
+    (BUG09); the head read-back (the heartbeat's `kept`, the export's
+    cursor) read a fixed 64 KiB, so a longer intact line was "not held"
+    (BUG11); a foreign archive slot the rotation's probe skipped before the
+    seal got no `ForeignArchive` row (BUG28); the read verbs returned an
+    older row while newer ones were left out for the room (BUG04), stopped
+    before the archives at one row stamped before `--since` after newer ones
+    (the clock stepped back) without `truncated` (BUG06), and skipped an
+    unreadable archive without it (BUG07); a start refused by a gate made
+    the next boot sign `previous_run: abrupt` (BUG16); an `interrupted`
+    action row carried no intent and exported as 7001/Unknown, the report's
+    fix (the mapper's kept intents) not enough since the worker restarts
+    (BUG19); `export verify` ended at a line that is not UTF-8 (BUG23) and
+    said `OK` for an exec detection's launch record without its Detection
+    Finding (BUG24).
+  - What changed (`EVIDENCE_CHAINS.md`, `EXPORT.md` §6, upgrade notes §22):
+    the verifier's `LineAfterTerminator`; the flat rows split on the newline
+    alone; the read-back through `chain_anchor::line_ending_at`, the anchor's
+    own window (64 KiB growing to 16 MiB), now shared by `check_head`; the
+    probe's foreign slots kept by the writer (`foreign_before_seal`, not in
+    `PendingSeal`, which lot 296 builds elsewhere) and attested by the
+    rotation's finish, retried or not; the tail reader cuts a line at the
+    frame, not at the room, an out-of-order row no longer stops the descent
+    and sets `truncated`, an archive there and unreadable sets it and ends
+    the answer; `read_tail` takes a refused `agent_boot` for no run; the
+    journal's interrupted row carries the intent it answers (a new value of
+    an existing optional field, its line pinned), and the mapper maps an
+    older one with the intent it kept, attaching it as an outcome's, which
+    `export verify` accepts on its own (else a NOTICE, as an outcome without
+    its intent); `export verify` reads bytes (a line not UTF-8 is
+    `MALFORMED`), says a row's companion without its first record `BROKEN`
+    and the first without its companion a `NOTICE`, and the JSONL sink
+    keeps a row's records in one file (a rotation between them would have
+    made a single file `BROKEN`).
+  - Not changed (and said): a row stamped before `--since` at the very head
+    of a file still stops the read (it cannot be told from rows in order);
+    the active file's tail check at the start (`verify_recent`) does not
+    look for lines after a terminator — `chain verify` does.
+  - No lab (host tests suffice, the brief's call). Host: a named test for
+    each bug, each failing on `main` for its reason (25 tests; the lot's
+    tests on `main`'s code, a local tree), the golden of the interrupted
+    row's line and 2 controls passing there; @MUT@
+  - Gates on the PR's tree: @GATES@
+  - Levels unchanged (C21 1): correctness of the chains' readers and of the
+    receiver's check, measured by host tests — not a new capability.

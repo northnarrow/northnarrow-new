@@ -963,3 +963,40 @@ holding a flow against a later kill (BUG45). After the upgrade:
   a reason that is not a clean stop's followed by the next start is
   `DEGRADED`. A beat's `interval_secs` is taken within 5 to 300 s. A state
   file of an earlier verifier is read as it is.
+
+## 22. The evidence readers, verifiers and the export's check (lot 298)
+
+External bug hunt (editions 1.2/1.3), the triage's lot 8. Nothing to
+configure; use the `nn-admin` of this release where the export is checked.
+
+- **`nn-admin chain verify`** refuses a line after a file's terminator
+  (`a line after the file's terminator`, BUG29): genuine lines replayed
+  after an archive's seal were counted twice. A chain this agent wrote has
+  none; one that says it was edited. The canary chains' rows ending in
+  `\r` are refused where they are numbered (BUG09).
+- **The read verbs** (`fim report`, `net flows`, `net listeners`, `canary
+  list`): the answer is always the newest rows, contiguous (BUG04); an
+  unreadable archive (BUG07) or, with `--since`, a row out of time order
+  (the clock stepped back, BUG06) sets `truncated`, and such a row no longer
+  hides the archives' rows.
+- **The audit chain's `previous_run`**: a start refused by a gate is not a
+  run (BUG16): the next boot no longer signs `abrupt` (and the SIGKILL/OOM
+  warning) after a clean stop and a refused start; after a killed run, it
+  names the killed run's boot and last row.
+- **The actions chain's `interrupted` rows** carry the intent they answer
+  (BUG19): a new value of an existing optional field, the line's form
+  pinned (`an_interrupted_row_with_its_intent_is_pinned`); the rows an
+  older agent wrote still read and verify. The export maps them to their
+  intent's class from the row; an older one with the intent the worker
+  kept, attached as an outcome's.
+- **`nn-admin export verify`** (BUG23, BUG24): a line that is not UTF-8 is
+  `MALFORMED`, the other records verified (it ended the check, exit 1); an
+  exec detection's companion record without its Detection Finding is
+  `BROKEN` (exit 11), the finding without its companion a `NOTICE`. The
+  export's JSONL files keep a row's records in one file; check a
+  receiver's files together, in order. `--json`: the report's fields are
+  unchanged (the findings are `breaks` and `notices`).
+- **The head read-back** of the heartbeat's `kept` and of the export's
+  cursor reads a line up to 16 MiB back (BUG11; it read 64 KiB), and a
+  foreign entry skipped at an archive slot before a rotation's seal is
+  attested (`ForeignArchive`, BUG28) as one met at the rename was.

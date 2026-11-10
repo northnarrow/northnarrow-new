@@ -27,7 +27,7 @@ The mapping, row by row:
 | detection of the `Exec` sensor | + 1007 Process Activity / Launch | the process, its parent as `actor` |
 | action `intent` | 7003 / 7002 / 7004 / 7001 by its response (`Kill*` Evict, `Quarantine` Isolate, `StripFileCapability` Harden, `BlockOutbound`/`Isolate` Isolate, `Release` Restore, `Throttle` Other) | `command_uid` `<run>/<action>`, the target (process pid, file, connection direction), `remediation.desc` (why), status Other "intended" |
 | action `outcome` | the class of its intent (7001 when the worker has not seen it) | status Success / Failure / Partial / Other (would execute, not run) / Error (abandoned), `status_detail`, `duration`; `metadata.correlation_uid` shared with its intent, the intent's row named in `unmapped.northnarrow.intent_row` |
-| action `interrupted` | its intent's class | status Error: the agent stopped between the intent and its outcome |
+| action `interrupted` | its intent's class — from the intent the row carries (lot 298); a row of an agent before lot 298 carries none: the intent the worker kept (its row attached as an outcome's is), else 7001 | status Error: the agent stopped between the intent and its outcome |
 | action `overflow`, `stalled`, `run_started`, `run_ended` | 0 Base Event / Other | the row as `raw_data` |
 | FIM drift | 1001 / by its op: Modified Update, Created/Linked Create, Deleted Delete, Renamed Rename, Opened Open, CapabilitySet Set Security, AttrChanged Set Attributes | the file (path, SHA-256 of its new content), the modifier as `actor.process` |
 | netflow | 4001 / Traffic | `src_endpoint`, `dst_endpoint` (its resolved name), `connection_info` (protocol, IP version; direction Inbound for an inbound connection's row, lot 275's `"inbound": true` — the peer that connected is the source, the local listener the destination —, Outbound for every other row: a connection the host made), `traffic` (bytes in, out: OCSF's `bytes_out` from the source to the destination), `duration`, status by its close; JA3, JA4, SNI and `inbound` in `unmapped.northnarrow` |
@@ -150,7 +150,9 @@ connection carries at most 64 MiB, then a fresh one takes over.
 
 The JSONL files: `/var/log/northnarrow/export/export.jsonl`, rotated to
 `export.jsonl.1` … once it would pass `file_max_bytes`, the oldest removed:
-at most `file_max_files × file_max_bytes` on disk. The directory is the
+at most `file_max_files × file_max_bytes` on disk. A row's records stay in
+one file (lot 298: the rotation comes before a row, never between an exec
+detection's finding and its launch record). The directory is the
 export account's (0755; its files 0600: a shipper reads them as root).
 A shipper behind the rotation misses what rotated out: the chains are the
 record, the files the bound.
@@ -338,7 +340,27 @@ kept the frames) — and checks:
   before it's `entry_hash`; across a rotation through the terminator the
   first row of the next file carries — a first row without it is `BROKEN`
   (the file before's tail is not shown complete);
-- a record delivered twice is counted (`duplicates`), not refused.
+- a record delivered twice is counted (`duplicates`), not refused;
+- lot 298 (external bug hunt BUG24): a row that maps to two records (a
+  detection of the exec sensor: its Detection Finding, then its launch's
+  Process Activity, `uid` `…/1`) whose finding is not in the input while
+  its companion is, is `BROKEN` (`the row's first record (its Detection
+  Finding) is not in the input, its companion record is`): a relay that
+  took the finding out left an `OK`. The finding without its companion is
+  said (`NOTICE line N: … companion record not in the input`, counted in
+  the `OK` verdict; exit 0: the alert is whole). The agent's JSONL files
+  keep a row's records together; a capture that starts between them (a
+  receiver's own file rotation) is `BROKEN` at its first row — verify the
+  receiver's files in order, together (`cat` them into `verify`);
+- lot 298 (BUG23): a line that is not UTF-8 is a line that is no record
+  (`MALFORMED line N: not UTF-8 …`, exit 2), and every other record is
+  verified; it used to end the check (exit 1, no report);
+- lot 298 (BUG19): an interrupted row carries its intent (an agent from lot
+  298 on): its record is the row's mapping, nothing attached. One of an
+  older agent's (no intent of its own), mapped by the worker that kept the
+  intent, carries the intent's row (`intent_raw`, `intent_row`) as an
+  outcome does, checked the same way; mapped without it, it is said as an
+  outcome without its intent (`NOTICE … intent not attached`).
 
 Exit 0 (`OK`), 13 a record that does not verify (`TAMPERED`: a row not
 signed by the agent's key, or not the one it names; or fields that are not
