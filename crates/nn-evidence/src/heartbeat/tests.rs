@@ -1691,3 +1691,40 @@ fn short_cuts_at_a_character_boundary() {
     assert_eq!(short(&"€".repeat(20)), "€".repeat(16));
     assert_eq!(short(&"ab".repeat(32)), "ab".repeat(8));
 }
+
+/// BUG18 (the lab's case, lot 295 round r1c): a tail cut while the agent
+/// runs leaves every later beat `kept: false` (the writer's position named
+/// no longer ends a line of the file) — one REPLAY per head named, not one
+/// per beat; a new head named `kept: false` after it is said too.
+#[test]
+fn a_cut_named_by_every_later_beat_is_said_once_per_head() {
+    let actions = |bytes: u64, h: u8, kept: Option<bool>| BeatHead {
+        chain: "actions".into(),
+        file: Some(2),
+        bytes: Some(bytes),
+        hash: format!("{h:02x}").repeat(32),
+        kept,
+        ..BeatHead::default()
+    };
+    let mut c = Chain::new();
+    let mut b1 = beat(1, 0);
+    b1.heads.push(actions(230_779, 1, Some(true)));
+    c.push(b1);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    for (seq, bytes, h) in [
+        (2, 230_779, 1),
+        (3, 230_779, 1),
+        (4, 251_259, 2),
+        (5, 251_259, 2),
+    ] {
+        let mut b = beat(seq, 30 * (seq as i64 - 1));
+        b.heads.push(actions(bytes, h, Some(false)));
+        c.push(b);
+    }
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(121), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY", "REPLAY"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("(beat 2)"), "{r:?}");
+    assert!(r.alerts[1].detail().contains("(beat 4)"), "{r:?}");
+}

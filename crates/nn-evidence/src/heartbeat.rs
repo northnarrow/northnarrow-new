@@ -1110,6 +1110,10 @@ fn walk_heads(
 ) -> (BTreeMap<String, BeatHead>, BTreeSet<String>) {
     let mut heads = seen.clone();
     let mut gone = gone.clone();
+    // the head each chain's last `kept: false` named, in this walk: beats
+    // that go on naming it say the same cut (the lab's: a tail cut while
+    // the agent runs leaves every later beat `kept: false`) — said once
+    let mut cut_said: BTreeMap<&str, &str> = BTreeMap::new();
     for (_, b) in beats.iter().filter(|(_, b)| b.seq > after) {
         for h in &b.heads {
             let chain = &h.chain;
@@ -1119,6 +1123,9 @@ fn walk_heads(
                 ""
             };
             if h.kept == Some(false) {
+                if cut_said.insert(chain, &h.hash) == Some(h.hash.as_str()) {
+                    continue; // the head already in `heads`, said
+                }
                 alerts.push(Alert::Replay(format!(
                     "the {chain} chain no longer holds the head the agent's previous beat named \
                      (its tail cut or rewritten on the host), now {} {} (beat {})",
