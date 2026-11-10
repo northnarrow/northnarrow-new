@@ -7910,6 +7910,46 @@ number in parentheses is a lab PR.
     not among the forwarders NN-L-NET-004/014 spare (noticed, not this
     lot's).
   - Levels unchanged (C07 2, C14 2): fixes in capabilities at their level.
+- **Lot 292 — script identity and trust (C06, C14, C19; Wave 4 phase 3,
+  the external bug hunt's lot 2: BUG-44 P0, BUG-42, 49, 56, 72, 52, 82).**
+  - What was open: an interpreter's script was read with one option rule
+    for every interpreter — `python3 -O /tmp/x.py /usr/bin/aws` was the AWS
+    client (NN-L-FIM-011's kill silent), `node -r m x.js` was `m`, `sh -e
+    x.sh` an inline program; a writer's ancestors were trusted by the tree
+    they lie in (`/opt/x` vouched for `openssl`); a seeded process's image
+    was not the past of its later exec (the start rounded to a tick); an
+    unreadable lineage reset the ransomware window; a cut module path
+    component read as a complete path; 22 i386 calls had no name.
+  - What changed: per-interpreter option tables with a three-way answer
+    (`posture::script_args::Runs`: a script, nothing named, not known — not
+    known is no client, no installed or packaged program, and vouches for
+    nothing); every ancestor above a ransomware writer or a copy guard's
+    editor vouches only when a package installed its program; the entries
+    read from `/proc` keep their ticks and are the same process as an exec
+    those ticks show; `(lineage unknown)` keeps the pid's window; the cut
+    mark and R018's "unverifiable"; the i386 names.
+  - The lab, as measured (our own guest under lease k292; one round, r1
+    at 6bf9effe — the production code of this PR; the agent uninstalled,
+    the guest clean and off at the end):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`): a canary `/root/.aws/credentials` (fake
+      values) in place before the agent's start; a harmless reader of it
+      run as `python3 -O <reader> /usr/bin/aws`, `perl -X <reader>
+      /usr/bin/aws`, `python3 -Wignore <reader> /usr/bin/aws` (no `aws` on
+      the guest: only the argv names it) and plainly: NN-L-FIM-011
+      KillProcess for each of the four, the python readers killed (rc 137),
+      perl's already gone. Before this lot the first two drew no verdict
+      (the unit test on main).
+    - The benign corpus: dev (24 steps) and containers (13 steps: rootless
+      podman, docker, k3s install, a pod, uninstall), rc 0 (the dev
+      corpus's `www-data` control 137, as designed). Kills: the dev
+      control's R001 only, as in lot 290's round on the same guest; 0 in
+      containers; no NN-L-IMP-001/-002 record in containers, one
+      NN-L-IMP-001 in the dev corpus's `go test` (held, as before).
+  - Host: named tests for each bug (the triage's eleven fail on main, re-run
+    on f66e6680); 64 mutations on the new code, 63 caught at first, the
+    survivor (an orphan's ticks) named and caught.
+  - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
+    their level.
 - **Lot 293 — the external bug hunt's self-defence findings (bug hunt lot
   3): a signal through a file's owner refused, the per-attempt refusals'
   budget, and the guards in `common`** (`fix/w4-bh-self-defense`; the

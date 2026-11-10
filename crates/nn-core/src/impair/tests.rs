@@ -535,6 +535,40 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     }
 }
 
+/// Lot 292: a listed tool that is a script (`fail2ban-server`, Python) is
+/// registered from its exec when its interpreter's options are read, and
+/// when they are not (what it may run is still looked at: registering a
+/// process to watch trusts nothing).
+#[test]
+fn a_script_tool_is_registered_whatever_its_options() {
+    let h = host();
+    assert!(h
+        .run(
+            4960,
+            1,
+            "/usr/bin/python3.12",
+            &[
+                "/usr/bin/python3",
+                "-s",
+                "/usr/bin/fail2ban-server",
+                "-xf",
+                "start"
+            ],
+        )
+        .is_none());
+    assert!(h
+        .run(
+            4961,
+            1,
+            "/usr/bin/python3.12",
+            &["/usr/bin/python3", "-Z", "/usr/bin/fail2ban-server"],
+        )
+        .is_none());
+    let d = h.det.defenders.lock();
+    assert_eq!(d.get(&4960).map(|(t, _)| t.as_str()), Some("fail2ban"));
+    assert_eq!(d.get(&4961).map(|(t, _)| t.as_str()), Some("fail2ban"));
+}
+
 #[test]
 fn kills_of_a_tools_process() {
     let h = host();
@@ -745,6 +779,33 @@ fn sanctioned_and_suspicious_lineages() {
     assert_eq!(
         f.suspicious,
         Some((500, "/usr/bin/bash /tmp/.x/init.sh".to_string()))
+    );
+    // lot 292: an interpreter whose options its table cannot read still
+    // shows the staged script it may run — the detection looks at it
+    h.lineage.ingest_exec(
+        600,
+        200,
+        "/usr/bin/node",
+        &[
+            "node".into(),
+            "--frobnicate".into(),
+            "/tmp/.x/init.js".into(),
+        ],
+        99 * S,
+        99 * S,
+        0,
+    );
+    let f = h
+        .run(
+            601,
+            600,
+            "/usr/bin/systemctl",
+            &["systemctl", "stop", "aegis"],
+        )
+        .unwrap();
+    assert_eq!(
+        f.suspicious,
+        Some((600, "/usr/bin/node /tmp/.x/init.js".to_string()))
     );
 }
 

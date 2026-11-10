@@ -13,12 +13,17 @@
 //! - it is a trusted writer — an entry of [`BUILTIN_TRUSTED_WRITERS`] or of
 //!   the signed overlay's `trusted_writer` lines, matched by
 //!   [`ExecIdentity::is_client`] (exe in a root-owned system tree) — **and**
-//!   no ancestor is foreign: every hop up to PID 1 is a program root
-//!   installed ([`ExecIdentity::is_installed_program`]) or an installed
-//!   interpreter running no named script (an interactive shell, `sh -c`).
-//!   An editor started by a script from a home directory, by a binary from
-//!   `/tmp` or by a deleted executable is not trusted: what started it is
-//!   not known to be the user's own hand.
+//!   every ancestor up to PID 1 vouches for it
+//!   ([`crate::impact::trust::vouches`], lot 292, BUG-49): a program a
+//!   package installed (the host's package database, as the ransomware
+//!   signal asks it; without one, a root-owned system tree stands in), or an
+//!   interpreter a package installed running no named script (an
+//!   interactive shell, `sh -c`). An editor started by a script from a home
+//!   directory, by a binary from `/tmp`, `/opt` or `/usr/local` that no
+//!   package installed, by an interpreter whose options could not be read
+//!   (lot 292, BUG-44) or by a deleted executable is not trusted: what
+//!   started it is not known to be the user's own hand. The copies of the
+//!   writer itself that forked it are its own program, not ancestors.
 //!
 //! Everything else is untrusted, including a lineage the walk cannot read
 //! (fail toward copying). Interpreters are refused as trusted writers:
@@ -31,8 +36,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
+use crate::impact::trust::{topmost_same, vouches, ProgramOwners};
 use crate::posture::lineage::{
-    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
+    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity, Runs,
 };
 
 /// Editors and the version-control client: programs a person runs to
@@ -133,28 +139,33 @@ impl Trust {
 }
 
 /// The program an identity names, for the record: the script an
-/// interpreter runs, else the executable.
+/// interpreter runs, else the executable ([`ExecIdentity::program`]).
 pub fn program_of(id: &ExecIdentity) -> String {
-    match &id.script {
-        Some(s) => s.clone(),
-        None => id.exe.to_string_lossy().into_owned(),
-    }
+    id.program()
 }
 
 /// A hop that vouches for nothing below it: neither a program root
-/// installed nor an installed interpreter running no named script.
+/// installed nor an installed interpreter running no named script. Lot
+/// 292 (BUG-44): an interpreter whose options could not be read is one.
 pub fn is_foreign(id: &ExecIdentity) -> bool {
     if id.is_installed_program() {
         return false;
     }
     let exe = id.exe.to_string_lossy();
-    !(id.script.is_none() && is_interpreter(&id.exe) && in_system_tree(&exe))
+    !(id.runs == Runs::Inline && is_interpreter(&id.exe) && in_system_tree(&exe))
 }
 
 /// The pure decision. `lineage`: the writer's identity at index 0, then its
 /// ancestors nearest first (`None`: unknown). `writers`: the trusted-writer
 /// entries. `package_tx`: the writer belongs to a root package transaction.
-pub fn judge(lineage: Option<&[(u32, ExecIdentity)]>, writers: &[&str], package_tx: bool) -> Trust {
+/// `owned`: who installed a file, from the package database (`None`: no
+/// database to ask).
+pub fn judge(
+    lineage: Option<&[(u32, ExecIdentity)]>,
+    writers: &[&str],
+    package_tx: bool,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> Trust {
     if package_tx {
         return Trust::Trusted(Trusted::PackageTransaction);
     }
@@ -168,7 +179,16 @@ pub fn judge(lineage: Option<&[(u32, ExecIdentity)]>, writers: &[&str], package_
     if !writer.is_client(writers) {
         return Trust::Untrusted(Untrusted::NotATrustedWriter(program));
     }
-    if let Some((_, foreign)) = hops[1..].iter().find(|(_, id)| is_foreign(id)) {
+    // BUG-49: the copies of the writer that forked it are its own program;
+    // every ancestor above them must vouch for it.
+    let own = topmost_same(hops, 0);
+    if let Some((_, foreign)) = hops
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(n, (_, id))| is_foreign(id) || (*n > own && !vouches(id, owned)))
+        .map(|(_, hop)| hop)
+    {
         return Trust::Untrusted(Untrusted::ForeignAncestor {
             writer: program,
             ancestor: program_of(foreign),
@@ -210,6 +230,8 @@ const CACHE_CAP: usize = 4096;
 pub struct TrustFilter {
     writers: Vec<String>,
     tracker: AuthSessionTracker,
+    /// Lot 292 (BUG-49): who installed an ancestor's program.
+    owners: ProgramOwners,
     proc_root: PathBuf,
     cache: Mutex<HashMap<CacheKey, (Instant, std::sync::Arc<WriterInfo>)>>,
 }
@@ -224,9 +246,17 @@ impl TrustFilter {
         Self {
             writers,
             tracker,
+            owners: ProgramOwners::default(),
             proc_root: PathBuf::from("/proc"),
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The package database of `owners` in place of the host's (tests).
+    #[cfg(test)]
+    fn with_owners(mut self, owners: ProgramOwners) -> Self {
+        self.owners = owners;
+        self
     }
 
     /// The trusted-writer entries in force.
@@ -250,10 +280,12 @@ impl TrustFilter {
         // of the bus: `AsOf::Now`, `/proc` on a cache miss).
         let lineage = self.tracker.lineage_identities(tgid, AsOf::Now);
         let writers: Vec<&str> = self.writers.iter().map(String::as_str).collect();
+        let owned = |p: &Path| self.owners.owned(p);
         let trust = judge(
             lineage.as_deref(),
             &writers,
             self.tracker.in_package_transaction(tgid, AsOf::Now),
+            &owned,
         );
         let program = lineage
             .as_ref()
@@ -308,8 +340,17 @@ mod tests {
     fn id(exe: &str, script: Option<&str>) -> ExecIdentity {
         ExecIdentity {
             exe: PathBuf::from(exe),
-            script: script.map(str::to_string),
+            runs: script.map_or(Runs::Inline, |s| Runs::Script(s.into())),
         }
+    }
+
+    /// A package database that installed `/usr/bin/*`, `/usr/sbin/*` and
+    /// `/usr/lib/*`.
+    fn distro(p: &Path) -> Option<bool> {
+        let s = p.to_string_lossy();
+        Some(
+            s.starts_with("/usr/bin/") || s.starts_with("/usr/sbin/") || s.starts_with("/usr/lib/"),
+        )
     }
 
     fn writers() -> Vec<&'static str> {
@@ -324,7 +365,7 @@ mod tests {
             (150, id("/usr/sbin/sshd", None)),
         ];
         assert_eq!(
-            judge(Some(&l), &writers(), false),
+            judge(Some(&l), &writers(), false, &distro),
             Trust::Trusted(Trusted::Writer("/usr/bin/vim.basic".into()))
         );
         // through sudo and `sh -c`
@@ -334,7 +375,7 @@ mod tests {
             (200, id("/usr/bin/sudo", None)),
             (150, id("/usr/bin/bash", None)),
         ];
-        assert!(judge(Some(&l), &writers(), false).is_trusted());
+        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
     }
 
     #[test]
@@ -347,14 +388,14 @@ mod tests {
         ] {
             let l = [(300, id(exe, None)), (200, id("/usr/bin/bash", None))];
             assert_eq!(
-                judge(Some(&l), &writers(), false),
+                judge(Some(&l), &writers(), false, &distro),
                 Trust::Untrusted(Untrusted::NotATrustedWriter(exe.into())),
                 "{exe}"
             );
         }
         // python running a user's script
         let l = [(300, id("/usr/bin/python3", Some("/home/u/sim.py")))];
-        assert!(!judge(Some(&l), &writers(), false).is_trusted());
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
     }
 
     #[test]
@@ -371,7 +412,7 @@ mod tests {
                 (250, id(exe, script)),
                 (200, id("/usr/bin/bash", None)),
             ];
-            match judge(Some(&l), &writers(), false) {
+            match judge(Some(&l), &writers(), false, &distro) {
                 Trust::Untrusted(Untrusted::ForeignAncestor { ancestor, .. }) => {
                     assert_eq!(ancestor, script.unwrap_or(exe))
                 }
@@ -384,14 +425,14 @@ mod tests {
     fn identity_not_comm_decides() {
         // a copy of vim outside the system trees
         let l = [(300, id("/tmp/vim", None))];
-        assert!(!judge(Some(&l), &writers(), false).is_trusted());
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
         // the lineage cannot be read: copied
         assert_eq!(
-            judge(None, &writers(), false),
+            judge(None, &writers(), false, &distro),
             Trust::Untrusted(Untrusted::LineageUnknown)
         );
         assert_eq!(
-            judge(Some(&[]), &writers(), false),
+            judge(Some(&[]), &writers(), false, &distro),
             Trust::Untrusted(Untrusted::LineageUnknown)
         );
     }
@@ -400,20 +441,20 @@ mod tests {
     fn a_package_transaction_is_trusted_and_an_operator_entry_counts() {
         let l = [(300, id("/usr/bin/cp", None))];
         assert_eq!(
-            judge(Some(&l), &writers(), true),
+            judge(Some(&l), &writers(), true, &distro),
             Trust::Trusted(Trusted::PackageTransaction)
         );
         assert_eq!(
-            judge(None, &writers(), true),
+            judge(None, &writers(), true, &distro),
             Trust::Trusted(Trusted::PackageTransaction)
         );
         let mut w = writers();
         w.push("rsync");
         let l = [(300, id("/usr/bin/rsync", None))];
-        assert!(judge(Some(&l), &w, false).is_trusted());
+        assert!(judge(Some(&l), &w, false, &distro).is_trusted());
         w.push("/opt/editor/");
         let l = [(300, id("/opt/editor/bin/ed2", None))];
-        assert!(judge(Some(&l), &w, false).is_trusted());
+        assert!(judge(Some(&l), &w, false, &distro).is_trusted());
     }
 
     #[test]
@@ -478,7 +519,7 @@ mod tests {
         let l = t.lineage_identities(300, AsOf::Now).unwrap();
         assert_eq!(l.len(), 2);
         assert_eq!(l[0].0, 300);
-        assert_eq!(l[0].1.script.as_deref(), Some("/home/u/sim.py"));
+        assert_eq!(l[0].1.script(), Some("/home/u/sim.py"));
         assert_eq!(l[1].0, 200);
         let f = TrustFilter::new(&[], t.clone());
         let info = f.evaluate(300, 0);
@@ -486,5 +527,169 @@ mod tests {
         assert_eq!(info.program, "/home/u/sim.py");
         assert_eq!(info.lineage.len(), 2);
         assert_eq!(info.lineage[1].pid, 200);
+    }
+
+    // ── Lot 292 (external bug hunt, editions 1.2/1.3): BUG-42, BUG-44,
+    // BUG-49 in the copy guard's filter ──────────────────────────────────
+
+    /// BUG-44: a script that names an editor after itself
+    /// (`python3 -O /tmp/enc.py /usr/bin/vim.basic`), or whose options
+    /// cannot be read, is no trusted writer: its opens are copied.
+    #[test]
+    fn a_skipped_script_is_not_a_trusted_writer() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for argv in [
+            &["python3", "-O", "/tmp/enc.py", "/usr/bin/vim.basic"][..],
+            &["perl", "-X", "/tmp/enc.pl", "/usr/bin/vim.basic"],
+            &["python3", "-Z", "/usr/bin/vim.basic"],
+        ] {
+            let exe = if argv[0] == "perl" {
+                "/usr/bin/perl"
+            } else {
+                "/usr/bin/python3"
+            };
+            let l = [
+                (300, ExecIdentity::of_exec(exe, &args(argv))),
+                (200, id("/usr/bin/bash", None)),
+            ];
+            assert!(
+                matches!(
+                    judge(Some(&l), &writers(), false, &distro),
+                    Trust::Untrusted(Untrusted::NotATrustedWriter(_))
+                ),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// BUG-42 and BUG-44: an editor started by a script run under errexit
+    /// (`bash -e /tmp/enc.sh`) or by an interpreter whose options cannot be
+    /// read is started by a foreign program.
+    #[test]
+    fn an_errexit_script_does_not_vouch_for_an_editor() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (exe, argv, ancestor) in [
+            (
+                "/usr/bin/bash",
+                &["bash", "-e", "/tmp/enc.sh"][..],
+                "/tmp/enc.sh",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-euo", "pipefail", "/tmp/enc.sh"],
+                "/tmp/enc.sh",
+            ),
+            (
+                "/usr/bin/zsh",
+                &["zsh", "-T", "/usr/bin/x", "/tmp/enc.sh"],
+                "/usr/bin/zsh /usr/bin/x (options not understood)",
+            ),
+        ] {
+            let l = [
+                (300, id("/usr/bin/vim.basic", None)),
+                (250, ExecIdentity::of_exec(exe, &args(argv))),
+                (200, id("/usr/bin/bash", None)),
+            ];
+            assert_eq!(
+                judge(Some(&l), &writers(), false, &distro),
+                Trust::Untrusted(Untrusted::ForeignAncestor {
+                    writer: "/usr/bin/vim.basic".into(),
+                    ancestor: ancestor.into(),
+                }),
+                "{argv:?}"
+            );
+        }
+        // `sh -c` and an interactive shell still vouch
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (
+                250,
+                ExecIdentity::of_exec("/usr/bin/dash", &args(&["sh", "-ec", "vim x"])),
+            ),
+            (200, id("/usr/bin/bash", None)),
+        ];
+        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+    }
+
+    /// BUG-49: an editor started by a binary no package installed, in
+    /// `/opt` or `/usr/local`, is started by a foreign program; with no
+    /// package database to ask, a root-owned tree stands in, as before.
+    #[test]
+    fn an_editor_under_an_unpackaged_opt_binary_is_not_trusted() {
+        for dropped in ["/opt/x/launcher", "/usr/local/bin/launcher"] {
+            let l = [
+                (300, id("/usr/bin/vim.basic", None)),
+                (250, id(dropped, None)),
+                (200, id("/usr/bin/bash", None)),
+            ];
+            assert_eq!(
+                judge(Some(&l), &writers(), false, &distro),
+                Trust::Untrusted(Untrusted::ForeignAncestor {
+                    writer: "/usr/bin/vim.basic".into(),
+                    ancestor: dropped.into(),
+                }),
+            );
+            let none = |_: &Path| None;
+            assert!(judge(Some(&l), &writers(), false, &none).is_trusted());
+        }
+        // an operator's editor tree: its own forked copies are no ancestors
+        let w = ["/opt/editor/"];
+        let l = [
+            (302, id("/opt/editor/bin/ed2", None)),
+            (301, id("/opt/editor/bin/ed2", None)),
+            (200, id("/usr/bin/bash", None)),
+        ];
+        assert!(judge(Some(&l), &w, false, &distro).is_trusted());
+    }
+
+    /// BUG-49 through the production filter: it asks the package database
+    /// it is given (dpkg's lists of a fixture root) for the ancestors.
+    #[test]
+    fn the_filter_asks_the_package_database_for_the_ancestors() {
+        let root = tempfile::TempDir::new().unwrap();
+        let info = root.path().join("var/lib/dpkg/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(root.path().join("var/lib/dpkg/status"), "Package: vim\n").unwrap();
+        std::fs::write(info.join("vim.list"), "/usr/bin/vim.basic\n").unwrap();
+        std::fs::write(info.join("bash.list"), "/bin/bash\n").unwrap();
+        let proc = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(200, 1, "/usr/bin/bash", &["bash".into()], 10, 5, 1000);
+        t.ingest_exec(
+            250,
+            200,
+            "/opt/x/launcher",
+            &["launcher".into()],
+            20,
+            15,
+            1000,
+        );
+        t.ingest_exec(
+            300,
+            250,
+            "/usr/bin/vim.basic",
+            &["vim".into()],
+            30,
+            25,
+            1000,
+        );
+        t.ingest_exec(
+            400,
+            200,
+            "/usr/bin/vim.basic",
+            &["vim".into()],
+            40,
+            35,
+            1000,
+        );
+        let f = TrustFilter::new(&[], t).with_owners(ProgramOwners::new(root.path()));
+        assert_eq!(
+            f.evaluate(300, 0).trust,
+            Trust::Untrusted(Untrusted::ForeignAncestor {
+                writer: "/usr/bin/vim.basic".into(),
+                ancestor: "/opt/x/launcher".into(),
+            })
+        );
+        assert!(f.evaluate(400, 0).trust.is_trusted());
     }
 }

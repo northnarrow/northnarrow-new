@@ -126,16 +126,16 @@ pub fn precursor_of<H: PostureHost>(
             continue;
         };
         let exe = id.exe.to_string_lossy();
+        // lot 292: an argv whose options could not be read still shows
+        // what may be its script — a detection looks at it
+        let script = id.runs.mentioned();
         if crate::decision::rules::is_staging_path(&exe)
-            || id
-                .script
-                .as_deref()
-                .is_some_and(crate::decision::rules::is_staging_path)
+            || script.is_some_and(crate::decision::rules::is_staging_path)
         {
             return Some("a staging-directory image among its ancestors");
         }
         let base = base_of(&exe);
-        let program = id.script.as_deref().map(base_of).unwrap_or(base);
+        let program = script.map(base_of).unwrap_or(base);
         if shell_below && EXPOSED_SERVICES.iter().any(|s| program_is(program, s)) {
             return Some("a shell started by an exposed network service");
         }
@@ -209,6 +209,29 @@ mod tests {
         assert_eq!(
             precursor_of(&s, &l, 21, 1_000, crate::posture::lineage::AsOf::Now),
             Some("an exec from a staging directory")
+        );
+    }
+
+    /// Lot 292: an ancestor whose options its interpreter's table cannot
+    /// read (`node --frobnicate /tmp/.x/c2.js`) still shows the staged
+    /// script it may run: the exemption is revoked as for a named one.
+    #[test]
+    fn an_unread_ancestor_s_staged_script_revokes_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let l = AuthSessionTracker::new(tmp.path());
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        l.ingest_spawn_with_argv(
+            50,
+            1,
+            "/usr/bin/node",
+            &argv(&["node", "--frobnicate", "/tmp/.x/c2.js"]),
+            1,
+        );
+        l.ingest_spawn_with_argv(51, 50, "/usr/bin/curl", &argv(&["curl"]), 2);
+        let s = store_of(&[(51, 50)]);
+        assert_eq!(
+            precursor_of(&s, &l, 51, 1_000, crate::posture::lineage::AsOf::Now),
+            Some("a staging-directory image among its ancestors")
         );
     }
 
