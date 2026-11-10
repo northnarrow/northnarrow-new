@@ -37,7 +37,8 @@
 //! later (a backup client, an agent-style helper) is not killed for it.
 //!
 //! External audit NETR-004: memory is bounded by a per-process ring
-//! capped at [`MAX_EVENTS_PER_PROC`] and a hard cap of
+//! capped at [`MAX_EVENTS_PER_KIND`] precursors of each kind (bug hunt 1.3,
+//! BUG62: per kind, so one kind never pushes out another) and a hard cap of
 //! [`MAX_TRACKED_PROCS`] keys, enforced in O(1) per insert with
 //! [`LazyLru`] queues. Keys that hold only `PrivEsc` (whose chain only
 //! logs) go first; evicting a key that still holds a `CredRead`,
@@ -90,10 +91,17 @@ pub enum ChainAge {
     Aged { age_ns: u64 },
 }
 
-/// Per-process precursor ring cap. A process that re-triggers the same
-/// precursor many times only needs the most recent few to answer
-/// "any/which precursor in window?".
-const MAX_EVENTS_PER_PROC: usize = 16;
+/// Per-process precursor ring cap, per kind: a process keeps at most this
+/// many precursors of each [`PrecursorKind`] (four kinds: at most 64). A
+/// process that re-triggers the same precursor many times only needs the
+/// most recent few to answer "any/which precursor in window?".
+///
+/// Bug hunt 1.3, BUG62: the cap was 16 for all kinds together, so sixteen
+/// re-execs of an image named `su` or `sudo` (sixteen `PrivEsc`, whose
+/// chain only logs) pushed a live credential read out of the ring, and
+/// CHAIN-001 no longer killed the process's egress — with nothing
+/// counted. A kind now only ever drops its own oldest.
+const MAX_EVENTS_PER_KIND: usize = 16;
 
 /// Distinct-process cap (hard, external audit NETR-004).
 const MAX_TRACKED_PROCS: usize = 4096;
@@ -353,8 +361,18 @@ impl<H: PostureHost> CorrelationStore<H> {
         }
         let q = self.per_proc.entry(key).or_default();
         q.push_back(precursor);
-        while q.len() > MAX_EVENTS_PER_PROC {
-            q.pop_front();
+        // BUG62: the oldest of its own kind makes room (the earliest
+        // recorded among equals), never a precursor of another kind.
+        if q.iter().filter(|p| p.kind == kind).count() > MAX_EVENTS_PER_KIND {
+            if let Some(oldest) = q
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.kind == kind)
+                .min_by_key(|(_, p)| p.ts_ns)
+                .map(|(i, _)| i)
+            {
+                q.remove(oldest);
+            }
         }
         if kind == PrecursorKind::PrivEsc && !self.protected.contains(&key) {
             self.privesc_only.touch(key);
@@ -414,13 +432,34 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// with; marked answered by it. Lab PR 267 (R12a): kept, not taken — a
     /// two-step chain that has not answered it may still (the read's own
     /// CHAIN-001, a late exec's CHAIN-002), as in order ([`NotedEgress`]).
+    ///
+    /// Bug hunt 1.3, BUG75: the chain's first step bounds it too — a
+    /// staging exec (`TmpExec`) of `key` at or before the read, within
+    /// `window_ns` of the egress, as the in-order verdict wants it
+    /// ([`Self::has_sequence`] at the egress). The window used to be
+    /// measured from the read: an exec 250 s before the read and a flow
+    /// 250 s after it (500 s from the exec) completed CHAIN-007 when the
+    /// read was processed last, never in kernel order. An egress the exec
+    /// is too old for is not marked.
     pub fn answer_sequence_after(
         &mut self,
         key: ProcKey,
         after_ns: u64,
         window_ns: u64,
     ) -> Option<EgressNote> {
-        self.answer_after(key, after_ns, window_ns, EgressChain::Sequence)
+        let exec_ns = self
+            .per_proc
+            .get(&key)?
+            .iter()
+            .filter(|p| p.kind == PrecursorKind::TmpExec && p.ts_ns <= after_ns)
+            .map(|p| p.ts_ns)
+            .max()?;
+        let q = self.egress.get_mut(&key)?;
+        let i = earliest_after(q, after_ns, window_ns, |a| !a.by(EgressChain::Sequence))
+            .filter(|&i| q[i].note.start_ns.saturating_sub(exec_ns) <= window_ns)?;
+        let n = &mut q[i];
+        n.answered.mark(EgressChain::Sequence);
+        Some(n.note.clone())
     }
 
     /// Lab PR 235: the earliest noted egress after `after_ns` that CHAIN-001
@@ -623,9 +662,18 @@ impl<H: PostureHost> CorrelationStore<H> {
 
     // ── querying ─────────────────────────────────────────────────────
 
-    /// `true` if `key` has a `kind` precursor within `window_ns` at or
-    /// before `now_ns`. Prunes out-of-window entries; drops the key
-    /// when its ring empties.
+    /// `true` if `key` has a `kind` precursor stamped within `window_ns`
+    /// before `now_ns`, **or after it**. Prunes out-of-window entries;
+    /// drops the key when its ring empties.
+    ///
+    /// No upper bound, on purpose (bug hunt 1.3, BUG77; the rejected
+    /// candidate 29 of edition 1.2): the chains pass the flow's connect time
+    /// (`NetFlowEvent::start_ns`) as `now_ns` in every phase of the flow, and
+    /// a precursor recorded after the connect of a session still open — a
+    /// credential read in the middle of a C2 session — must complete the
+    /// chain at the next open-flow snapshot (lab PR 224, CM-02 b;
+    /// `net::flow_tracker`). For a flow open a long time, a read hours after
+    /// its connect still counts as fresh.
     pub fn has_recent(
         &mut self,
         key: ProcKey,
@@ -656,7 +704,9 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// `true` if every kind in `kinds` appears, **in order**, among
     /// `key`'s in-window precursors (an ordered subsequence by
     /// timestamp). The N-event foundation for the D6 kill chains. An
-    /// empty `kinds` is vacuously `true`.
+    /// empty `kinds` is vacuously `true`. In window: stamped within
+    /// `window_ns` before `now_ns`, or after it, as in [`Self::has_recent`]
+    /// (bug hunt 1.3, BUG77).
     pub fn has_sequence(
         &mut self,
         key: ProcKey,
@@ -695,10 +745,11 @@ impl<H: PostureHost> CorrelationStore<H> {
 
     /// External audit NETR-014 (lab PR 213): what `key`'s precursors of
     /// `kind` are to an egress at `now_ns` — [`ChainAge::Fresh`] when one is
-    /// within [`CORRELATION_WINDOW_NS`], else [`ChainAge::Aged`] for the
-    /// first query that finds one within the kind's [`retention_ns`] (they
-    /// are then marked reported), else `None`. Prunes like
-    /// [`Self::has_recent`].
+    /// within [`CORRELATION_WINDOW_NS`] before `now_ns` or after it (bug hunt
+    /// 1.3, BUG77: a precursor after the connect of an open flow, as in
+    /// [`Self::has_recent`]), else [`ChainAge::Aged`] for the first query
+    /// that finds one within the kind's [`retention_ns`] (they are then
+    /// marked reported), else `None`. Prunes like [`Self::has_recent`].
     pub fn chain_age(
         &mut self,
         key: ProcKey,
@@ -871,20 +922,27 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// Lab PR 224 (CM-02 d): the first of `kinds` that `pid` or one of its
     /// ancestors holds and that could still complete a chain at `now_ns`
     /// (as [`Self::has_precursor_in_lineage`] reads it). Read-only.
+    ///
+    /// Bug hunt 1.3, BUG53: the first in the order of `kinds`, whichever
+    /// process of the lineage holds it; the order of the ring (the first
+    /// such precursor recorded) used to decide.
     pub fn precursor_in_lineage(
         &self,
         pid: u32,
         kinds: &[PrecursorKind],
         now_ns: u64,
     ) -> Option<PrecursorKind> {
-        let held = |key: &ProcKey| {
-            self.per_proc.get(key).and_then(|q| {
-                q.iter()
-                    .find(|p| kinds.contains(&p.kind) && p.can_complete(now_ns))
-                    .map(|p| p.kind)
-            })
+        let mut lineage = vec![self.current_key(pid)];
+        lineage.extend(self.tree.get_ancestors(pid));
+        let holds = |key: &ProcKey, kind: PrecursorKind| {
+            self.per_proc
+                .get(key)
+                .is_some_and(|q| q.iter().any(|p| p.kind == kind && p.can_complete(now_ns)))
         };
-        held(&self.current_key(pid)).or_else(|| self.tree.get_ancestors(pid).iter().find_map(held))
+        kinds
+            .iter()
+            .copied()
+            .find(|&kind| lineage.iter().any(|key| holds(key, kind)))
     }
 
     /// Read-only view of the ancestry tree (lineage queries / tests).
@@ -1252,13 +1310,13 @@ mod tests {
     #[test]
     fn bounded_events_per_proc() {
         let mut s = CorrelationStore::new();
-        for i in 0..(MAX_EVENTS_PER_PROC as u64 + 10) {
+        for i in 0..(MAX_EVENTS_PER_KIND as u64 + 10) {
             s.record_for_pid(7, PrecursorKind::CanaryTrip, (i + 1) * SEC);
         }
         let k = ProcKey::unresolved(7);
         assert_eq!(
             s.per_proc.get(&k).map(|q| q.len()),
-            Some(MAX_EVENTS_PER_PROC)
+            Some(MAX_EVENTS_PER_KIND)
         );
     }
 
@@ -1462,6 +1520,9 @@ mod tests {
         assert!(s
             .claim_egress_after(key(9825, 7), 99 * SEC, W)
             .is_some_and(|n| n.start_ns == 101 * SEC));
+        // Bug hunt 1.3, BUG75: CHAIN-007's late read needs the sequence's
+        // first step, a staging exec before it.
+        s.record(ProcKey::unresolved(9826), PrecursorKind::TmpExec, 98 * SEC);
         assert!(s
             .answer_sequence_after(ProcKey::unresolved(9826), 99 * SEC, W)
             .is_some());
@@ -1736,6 +1797,8 @@ mod tests {
         let k = key(42, SEC);
         let mut s = CorrelationStore::new();
         s.note_egress(k, note(42, 12 * SEC, 443));
+        // Bug hunt 1.3, BUG75: the staging exec CHAIN-007's late read needs.
+        s.record(k, PrecursorKind::TmpExec, 10 * SEC);
         s.claim_egress(k, 12 * SEC, PrecursorKind::TmpExec);
         assert!(
             s.exec_egresses(42, SEC, 10 * SEC, W).is_empty(),
@@ -1780,5 +1843,157 @@ mod tests {
             s.answer_sequence_after(k, 11 * SEC + 5, W).is_none(),
             "nor a late read's"
         );
+    }
+
+    // ── bug hunt 1.3 (editions 1.2/1.3) ─────────────────────────────
+
+    const KINDS: [PrecursorKind; 4] = [
+        PrecursorKind::CredRead,
+        PrecursorKind::TmpExec,
+        PrecursorKind::CanaryTrip,
+        PrecursorKind::PrivEsc,
+    ];
+
+    /// BUG53: the first of `kinds` held is returned (the docstring's
+    /// promise), not the first in the ring; an ancestor's precursor of an
+    /// earlier kind comes before the process's own of a later kind.
+    #[test]
+    fn precursor_in_lineage_follows_the_order_of_kinds() {
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(42, PrecursorKind::CredRead, SEC);
+        s.record_for_pid(42, PrecursorKind::TmpExec, 2 * SEC);
+        let order = [
+            PrecursorKind::TmpExec,
+            PrecursorKind::CredRead,
+            PrecursorKind::CanaryTrip,
+        ];
+        assert_eq!(
+            s.precursor_in_lineage(42, &order, 3 * SEC),
+            Some(PrecursorKind::TmpExec),
+            "first of kinds held"
+        );
+        let reversed = [
+            PrecursorKind::CanaryTrip,
+            PrecursorKind::CredRead,
+            PrecursorKind::TmpExec,
+        ];
+        assert_eq!(
+            s.precursor_in_lineage(42, &reversed, 3 * SEC),
+            Some(PrecursorKind::CredRead)
+        );
+        assert_eq!(
+            s.precursor_in_lineage(42, &[PrecursorKind::CanaryTrip], 3 * SEC),
+            None
+        );
+        // the parent holds a canary trip, the child a credential read
+        s.observe_spawn(43, 42, 0);
+        s.record_for_pid(43, PrecursorKind::CredRead, 2 * SEC);
+        s.record_for_pid(42, PrecursorKind::CanaryTrip, 2 * SEC);
+        assert_eq!(
+            s.precursor_in_lineage(43, &reversed, 3 * SEC),
+            Some(PrecursorKind::CanaryTrip)
+        );
+        assert_eq!(
+            s.precursor_in_lineage(43, &order, 3 * SEC),
+            Some(PrecursorKind::TmpExec),
+            "the parent's exec, before the child's read in `kinds`"
+        );
+        // one that can no longer complete a chain is not held
+        assert_eq!(
+            s.precursor_in_lineage(43, &[PrecursorKind::TmpExec], 400 * SEC),
+            None
+        );
+    }
+
+    /// BUG62: a flood of precursors of one kind on a key (sixty-four, four
+    /// times the cap) never pushes out a live precursor of another kind,
+    /// for every pair of kinds; nothing is lost.
+    #[test]
+    fn other_kinds_never_evict_a_live_precursor() {
+        for live in KINDS {
+            for flood in KINDS.into_iter().filter(|k| *k != live) {
+                let mut s = CorrelationStore::new();
+                let k = key(42, 5 * SEC);
+                s.record(k, live, 100 * SEC);
+                for i in 1..=(4 * MAX_EVENTS_PER_KIND as u64) {
+                    s.record(k, flood, 100 * SEC + i * SEC / 1_000);
+                }
+                assert_eq!(s.lost_precursor_keys(), 0);
+                assert!(
+                    s.has_recent(k, live, 120 * SEC, W),
+                    "a 20 s old {live:?} lost to {flood:?} on the same key"
+                );
+                assert_eq!(
+                    s.per_proc.get(&k).map(VecDeque::len),
+                    Some(MAX_EVENTS_PER_KIND + 1)
+                );
+            }
+        }
+    }
+
+    /// BUG62 control: a flood of one kind still drops its own oldest — the
+    /// ring keeps the newest [`MAX_EVENTS_PER_KIND`] of the kind, so a
+    /// credential read older than the sixteen that followed it no longer
+    /// opens CHAIN-007's sequence with the exec recorded between them.
+    #[test]
+    fn a_flood_of_one_kind_still_drops_its_own_oldest() {
+        let mut s = CorrelationStore::new();
+        let k = key(42, 5 * SEC);
+        let seq = [PrecursorKind::CredRead, PrecursorKind::TmpExec];
+        s.record(k, PrecursorKind::CredRead, 10 * SEC);
+        s.record(k, PrecursorKind::TmpExec, 11 * SEC);
+        for i in 1..MAX_EVENTS_PER_KIND as u64 {
+            s.record(k, PrecursorKind::CredRead, (11 + i) * SEC);
+        }
+        assert!(s.has_sequence(k, &seq, 30 * SEC, W), "sixteen reads kept");
+        s.record(k, PrecursorKind::CredRead, 40 * SEC);
+        assert!(
+            !s.has_sequence(k, &seq, 40 * SEC, W),
+            "the seventeenth read dropped the oldest"
+        );
+        assert!(s.has_recent(k, PrecursorKind::TmpExec, 40 * SEC, W));
+        assert_eq!(
+            s.per_proc.get(&k).map(VecDeque::len),
+            Some(MAX_EVENTS_PER_KIND + 1)
+        );
+        // by its time: a late read (an older stamp recorded last) is the
+        // one that goes, the newest sixteen stay
+        let k = key(43, 5 * SEC);
+        for i in 1..=MAX_EVENTS_PER_KIND as u64 {
+            s.record(k, PrecursorKind::CanaryTrip, (100 + i) * SEC);
+        }
+        s.record(k, PrecursorKind::TmpExec, 50 * SEC);
+        s.record(k, PrecursorKind::CanaryTrip, 60 * SEC);
+        assert!(s.per_proc.get(&k).is_some_and(|q| q
+            .iter()
+            .all(|p| p.kind != PrecursorKind::CanaryTrip || p.ts_ns > 100 * SEC)));
+        assert!(s.has_sequence(
+            k,
+            &[PrecursorKind::TmpExec, PrecursorKind::CanaryTrip],
+            110 * SEC,
+            W
+        ));
+    }
+
+    /// BUG77 (not a bug: the docstring said "at or before now_ns"): a
+    /// precursor stamped after `now_ns` — a credential read made after the
+    /// connect of a flow still open — counts for that flow, whose every
+    /// phase is judged at its connect's time (CM-02 b); so does an aged
+    /// query's fresh grade.
+    #[test]
+    fn a_precursor_after_the_connect_counts_for_the_open_flow() {
+        let mut s = CorrelationStore::new();
+        let k = key(42, 1);
+        let connect = 1_000 * SEC;
+        s.record(k, PrecursorKind::CredRead, connect + 30 * SEC);
+        assert!(s.has_recent(k, PrecursorKind::CredRead, connect, W));
+        assert!(s.has_sequence(k, &[PrecursorKind::CredRead], connect, W));
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, connect),
+            Some(ChainAge::Fresh)
+        );
+        // hours after the connect, still fresh for it
+        s.record(k, PrecursorKind::TmpExec, connect + 3 * 3_600 * SEC);
+        assert!(s.has_recent(k, PrecursorKind::TmpExec, connect, W));
     }
 }
