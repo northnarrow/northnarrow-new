@@ -787,13 +787,15 @@ pub const FLOOD_CAP_KEYS: usize = 4096;
 pub const FLOOD_CAP_SAMPLES: usize = 8;
 
 /// Review of #474: the `bpf()` commands the cap never holds back —
-/// NN-L-BPF-001's (a program loaded, attached, a link made). Each is judged
+/// NN-L-BPF-001's (a program loaded, attached, a link made; lot 293,
+/// external bug hunt BUG05: a raw tracepoint opened). Each is judged
 /// whatever else the same uid sends; a burst of them is bounded by P0's
 /// shares and its wait for room, as on R12a.
-pub const NEVER_CAPPED_BPF: [u32; 3] = [
+pub const NEVER_CAPPED_BPF: [u32; 4] = [
     common::bpf_cmd::BPF_PROG_LOAD,
     common::bpf_cmd::BPF_PROG_ATTACH,
     common::bpf_cmd::BPF_LINK_CREATE,
+    common::bpf_cmd::BPF_RAW_TRACEPOINT_OPEN,
 ];
 
 /// R12b: the allowance of a uid's `bpf()` records about the agent's own
@@ -1970,7 +1972,10 @@ mod tests {
     /// reported with its count.
     #[test]
     fn each_command_and_target_has_its_own_allowance() {
-        use common::bpf_cmd::{BPF_LINK_CREATE, BPF_MAP_CREATE, BPF_PROG_ATTACH, BPF_PROG_LOAD};
+        use common::bpf_cmd::{
+            BPF_LINK_CREATE, BPF_MAP_CREATE, BPF_PROG_ATTACH, BPF_PROG_LOAD,
+            BPF_RAW_TRACEPOINT_OPEN,
+        };
         let call = |cmd: u32| Event::BpfSyscall {
             pid: 7,
             uid: 0,
@@ -1979,7 +1984,12 @@ mod tests {
             arg: 0,
             timestamp_ns: 1,
         };
-        for cmd in [BPF_PROG_LOAD, BPF_PROG_ATTACH, BPF_LINK_CREATE] {
+        for cmd in [
+            BPF_PROG_LOAD,
+            BPF_PROG_ATTACH,
+            BPF_LINK_CREATE,
+            BPF_RAW_TRACEPOINT_OPEN,
+        ] {
             assert_eq!(CapKey::of(&call(cmd)), None, "cmd {cmd} is never capped");
         }
         let map = CapKey::of(&call(BPF_MAP_CREATE)).expect("a map create is counted");

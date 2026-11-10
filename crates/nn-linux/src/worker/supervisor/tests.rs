@@ -1061,11 +1061,10 @@ fn a_worker_s_stderr_is_escaped_cut_and_rate_limited() {
     assert_eq!(escape_line(b"<3>forged\x1b[31m"), "<3>forged\\x1b[31m");
     assert_eq!(escape_line(b"a\\b"), "a\\x5cb");
     let long = escape_line(&[b'x'; 1000]);
-    assert!(
-        long.len() <= STDERR_LINE_MAX + '…'.len_utf8(),
-        "{}",
-        long.len()
-    );
+    // External bug hunt BUG33: within the bound, the mark included (this
+    // assertion allowed the mark past it).
+    assert!(long.len() <= STDERR_LINE_MAX, "{}", long.len());
+    assert!(long.ends_with('…'));
     // a pipe of the worker's, drained by a pass
     let f = fixture(Script::Honest);
     assert!(tick_until(&f.workers, Health::Ready));
@@ -1447,4 +1446,73 @@ fn a_disabled_worker_leaves_queries_without_a_name() {
         }),
         None
     );
+}
+
+/// External bug hunt BUG33: `escape_line` promises at most
+/// STDERR_LINE_MAX bytes, also when its last piece is a `\xHH` and the
+/// line is cut with '…' (206 bytes before the fix); a line that fits is
+/// not cut, and a cut never splits a `\xHH`.
+#[test]
+fn escaped_stderr_line_within_its_bound() {
+    let mut line = vec![b'a'; STDERR_LINE_MAX - 1];
+    line.push(0x01);
+    line.push(b'b');
+    let out = escape_line(&line);
+    assert!(out.len() <= STDERR_LINE_MAX, "{} bytes: {out:?}", out.len());
+    assert!(out.ends_with('…') && !out.contains("\\x"), "{out:?}");
+    let out = escape_line(&[0u8; STDERR_LINE_MAX]);
+    assert!(out.len() <= STDERR_LINE_MAX, "{} bytes", out.len());
+    assert!(out.trim_end_matches('…').ends_with("\\x00"), "{out:?}");
+    // exactly the bound: whole, no mark
+    let exact = escape_line(&[b'z'; STDERR_LINE_MAX]);
+    assert_eq!(exact.len(), STDERR_LINE_MAX);
+    assert!(!exact.contains('…'));
+    // one byte more: cut, the mark inside the bound
+    let over = escape_line(&[b'z'; STDERR_LINE_MAX + 1]);
+    assert_eq!(over.len(), STDERR_LINE_MAX);
+    assert!(over.ends_with('…'));
+}
+
+/// External bug hunt BUG21: a worker the first SIGKILL did not reach (sent
+/// from the export thread, which has no CAP_KILL over the worker's uid:
+/// EPERM, ignored) is killed again by `bury`, which the supervisor's tick
+/// runs — then evicted and reaped as any dead worker. Before the fix it
+/// stayed alive, and protected, in the graveyard until the agent stopped.
+#[test]
+fn bury_kills_again_a_worker_the_first_kill_missed() {
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    // a live child in the graveyard, as `end_child` leaves one whose kill
+    // failed
+    let child = Command::new("sleep")
+        .arg("600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let slot = f.workers.slot(WorkerKind::Parse).unwrap();
+    {
+        let mut s = slot.s.lock();
+        s.graveyard.push(Grave {
+            child,
+            pid,
+            reported: false,
+        });
+        f.workers.bury(WorkerKind::Parse, &mut s);
+        assert_eq!(s.graveyard.len(), 1, "alive at the pass: kept");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while ended(pid).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the graveyard's live worker {pid} was not killed again"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut s = slot.s.lock();
+    f.workers.bury(WorkerKind::Parse, &mut s);
+    assert!(s.graveyard.is_empty(), "dead: evicted and reaped");
+    assert!(f.roles.evicted.lock().contains(&pid));
 }

@@ -631,6 +631,11 @@ pub(crate) fn process_event(
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootAttach {
                             "denied in kernel (the bpf LSM hook: an attach to the root cgroup)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::Sigio {
+                            "denied in kernel (file_send_sigiotask: a signal through a file's \
+                             owner, F_SETOWN / O_ASYNC; the pid raised the I/O, not necessarily \
+                             the arming)"
+                                .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlValue {
                             "denied in kernel (cgroup/sysctl on the root cgroup, the kernel's \
                              copy of the write)"

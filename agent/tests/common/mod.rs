@@ -1300,7 +1300,7 @@ pub fn strip_ansi(s: &str) -> String {
 pub mod raw_bpf {
     use ::common::bpf_cmd::{
         BPF_LINK_GET_FD_BY_ID, BPF_LINK_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID, BPF_MAP_GET_NEXT_ID,
-        BPF_MAP_GET_NEXT_KEY, BPF_OBJ_GET_INFO_BY_FD,
+        BPF_MAP_GET_NEXT_KEY, BPF_OBJ_GET, BPF_OBJ_GET_INFO_BY_FD,
     };
 
     /// uapi `BPF_F_RDONLY` (`open_flags` of `*_GET_FD_BY_ID`): a read-only
@@ -1403,6 +1403,18 @@ pub mod raw_bpf {
             return Err(format!("OWN_BPF_IDS ({maps} map(s)) lists no link"));
         }
         Ok(ids)
+    }
+
+    /// External bug hunt BUG13 (lot 290's fix, lot 293's check): a
+    /// read-only handle on the pinned object at `path` (`BPF_OBJ_GET`,
+    /// `file_flags` `BPF_F_RDONLY`; a granted one is closed at once).
+    pub fn pinned_rdonly(path: &std::path::Path) -> Result<(), i32> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+        let mut a: Attr = [0; 32];
+        set_ptr(&mut a, 0, c.as_ptr() as u64);
+        a[3] = BPF_F_RDONLY;
+        sys_bpf(BPF_OBJ_GET, &mut a).map(close)
     }
 
     /// `BPF_LINK_GET_FD_BY_ID` on `id` (a granted handle is closed at once).

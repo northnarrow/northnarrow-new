@@ -79,6 +79,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 280a: the writer of a guarded sysctl — a caller (the agent's
         // own restore passes as the family)
         ("sysctl_guard.rs", 0, 1),
+        // lot 293: the process a file's owner signal is for — a target; no
+        // caller is asked (the I/O's context is no sender)
+        ("sigio_guard.rs", 1, 0),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -105,6 +108,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "task_limits.rs",
             "cgroup_join.rs",
             "sysctl_guard.rs",
+            "sigio_guard.rs",
         ]
         .contains(&name.as_str())
         {

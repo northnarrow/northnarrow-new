@@ -268,6 +268,54 @@ const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;
 /// The budget's window.
 const TASK_DENIAL_WINDOW_NS: u64 = 1_000_000_000;
 
+/// Lot 293 (external bug hunt BUG37): the budget of the refusals signed at
+/// every attempt — [`deny_if_protected`]'s, the write-open deny's, a
+/// protected cgroup file's open — per CPU: `[window start
+/// (ns), records in the window]`. They had none: a root loop of `rm` on a
+/// protected file filled the 64 KiB ring and every other denial record
+/// (a refused `kill`, a refused ptrace) was lost with it. A budget of its
+/// own, apart from [`TASK_DENIAL_RATE`]: such a loop never takes the task
+/// denials' room. No dedup by caller: each refused attempt of a process is
+/// recorded until its CPU's budget is spent; one held back is counted in
+/// `RING_DROPS` (`ring_slot::DENIAL_RATE`), signed and, past the
+/// threshold, telemetry loss. The deny never depends on the record.
+#[map]
+static ATTEMPT_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1, 0);
+
+const ATTEMPT_DENIAL_PER_SEC: u64 = 50;
+
+/// Lot 293: whether this CPU's attempt budget ([`ATTEMPT_DENIAL_RATE`])
+/// has room for one more record, taking it; a record over it is counted
+/// (`ring_slot::DENIAL_RATE`) and must not be written.
+#[inline(always)]
+pub(crate) fn attempt_budget() -> bool {
+    let Some(rate) = ATTEMPT_DENIAL_RATE.get_ptr_mut(0) else {
+        return false;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    unsafe {
+        // SAFETY: this CPU's slot, owned by the program while it runs.
+        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
+            (*rate)[0] = now;
+            (*rate)[1] = 0;
+        }
+        if (*rate)[1] >= ATTEMPT_DENIAL_PER_SEC {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DENIAL_RATE);
+            return false;
+        }
+        (*rate)[1] += 1;
+    }
+    true
+}
+
+/// Lot 293: [`emit_denial`] behind the attempt budget ([`attempt_budget`]).
+#[inline(always)]
+pub(crate) fn emit_attempt(operation: u8, key: InodeKey) {
+    if attempt_budget() {
+        emit_denial(operation, key);
+    }
+}
+
 /// Evidence for a refused signal or ptrace attach on a protected pid
 /// (`FS_OP_SIGNAL` / `FS_OP_PTRACE`): same ring and record as the inode
 /// denials, `target_ino` = target tgid, `target_dev` = signal or ptrace
@@ -433,7 +481,7 @@ pub(crate) fn emit_denial(operation: u8, key: InodeKey) {
 unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> bool {
     match protected_verdict(operation, target, hook) {
         Some((op, key)) => {
-            emit_denial(op, key);
+            emit_attempt(op, key);
             true
         }
         None => false,
@@ -770,7 +818,7 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         // Lot 273b: PID 1's thaw (systemd 254/255 at every start and stop)
         // is judged at its write, by its value.
         if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {
-            emit_denial(op, key);
+            emit_attempt(op, key);
             return -EPERM;
         }
     }

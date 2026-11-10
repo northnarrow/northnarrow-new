@@ -526,6 +526,11 @@ pub(crate) const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("task_setscheduler_deny", "task_setscheduler"),
     ("task_setnice_deny", "task_setnice"),
     ("task_setioprio_deny", "task_setioprio"),
+    // Lot 293 (external bug hunt BUG14): a signal through a file's owner
+    // (`F_SETOWN` + `O_ASYNC`: SIGIO or the `F_SETSIG` signal, SIGURG),
+    // which the kernel delivers without `task_kill`
+    // (`agent-ebpf/src/sigio_guard.rs`).
+    ("file_send_sigiotask_deny", "file_send_sigiotask"),
 ];
 
 /// External audit EBPF-015: deny programs for hooks only newer kernels
@@ -2717,7 +2722,7 @@ mod tests {
             super::super::DENY_HOOKS.len(),
             "a hook listed twice"
         );
-        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 21);
+        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 22);
         // Lot 273: the optional set is the optional inode hooks and the
         // cgroup move guard's three programs.
         let optional: BTreeSet<&str> = OPTIONAL_LSM_PROGRAMS

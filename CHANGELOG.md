@@ -5,6 +5,49 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Security
+- A signal through a file's owner is refused to the agent, the watchdog
+  and the workers (lot 293, external bug hunt BUG14, P0;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 293"). A root process killed
+  them with `fcntl(F_SETOWN)` (or `F_SETOWN_EX`, `FIOSETOWN`), `O_ASYNC` and
+  one write — the kernel delivers that SIGIO (or the `F_SETSIG` signal)
+  through `file_send_sigiotask`, never `task_kill`, so nothing refused or
+  recorded it. A new deny hook (22 in all) refuses every such signal to a
+  protected pid whoever raised the I/O; inside a signed trusted-installer
+  window the window's signal grant (SIGTERM, SIGCONT, SIGKILL) applies, the
+  plain SIGIO stays refused. Signed NN-L-AT-001 `sigio` (High), the posture
+  ENGAGED (the record names the process whose I/O raised it, not the one
+  that armed the file). Wire code 44, fail-open slot 28.
+- The refusals signed at every attempt (a protected file's unlink, rename,
+  change, new entry, write-open or read-open; a protected cgroup file's
+  open) have a per-CPU budget of their own, 50 a second per CPU (lot 293,
+  BUG37): a root loop of them filled the denial ring and the records of a
+  refused `kill` or ptrace were lost. A record held back is counted
+  (`RING_DROPS` slot 28, `denial_rate`, a security ring).
+- The exploit guard judges an id gain inside `setgroups` (lot 293, BUG71):
+  the call was in the table of those that may change the ids, so a kernel
+  write of the ids timed inside it was no anomaly.
+
+### Fixed
+- `BPF_RAW_TRACEPOINT_OPEN` is observed by the `bpf` hook and judged by
+  NN-L-BPF-001 as an attach (lot 293, BUG05).
+- io_uring's `READV_FIXED`/`WRITEV_FIXED` (60, 61) are file I/O and
+  `RECV_ZC` (58) socket I/O for NN-L-IOU-002 (lot 293, BUG68).
+- A byte that is not UTF-8 in `admin.pub` costs its own line, not the admin
+  socket; the bootstrap gate counts the keys of any bytes, rotate-keys keeps
+  such a comment byte for byte (lot 293, BUG03).
+- The worker supervisor kills again, from its tick, a worker its first kill
+  missed (sent from the export thread without CAP_KILL: EPERM) (lot 293,
+  BUG21).
+- `run_bounded` kills the command's process group when its stdin writer
+  is still blocked after the child exited (a descendant holding the pipe
+  held the response chain) (lot 293, BUG35).
+- A worker's escaped stderr line stays within its 200 bytes (lot 293,
+  BUG33).
+- `RANSOMWARE_DECISIVE.md` no longer promises that no atomic save is
+  counted: one whose temporary carries its own extension is (an encryptor's
+  staging has that shape), and gives no verdict (lot 293, BUG54).
+
 ### Added
 - Foreign BPF (lot 290; `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 290",
   `docs/operator/RULE_POLICY.md` §2.5). The `bpf` hook refuses (`EPERM`),
@@ -1072,8 +1115,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ### Fixed
 - The sensor self-test no longer reports `module_load` missed, then an
-  alert, on every host (lot 300; found on Ubuntu 22.04, the same on every
-  kernel). Since lot 285 the module files' write history
+  alert, on every host (lot 300; found on Ubuntu 22.04, measured on 5.15
+  and 6.8: not a kernel matter). Since lot 285 the module files' write history
   (`module_write_observe`, `file_open`) is pinned in its own directory
   beside the pin root, and its link was dropped once pinned; the agent's
   view of its own links — the ones it holds and the root's `link_*` pins —

@@ -21,7 +21,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 28;
+pub const FAIL_OPEN_SLOTS: u32 = 29;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
@@ -66,6 +66,9 @@ pub mod hook {
     pub const TASK_SETSCHEDULER: u32 = 25;
     pub const TASK_SETNICE: u32 = 26;
     pub const TASK_SETIOPRIO: u32 = 27;
+    /// Lot 293 (external bug hunt BUG14): a signal through a file's owner
+    /// (SIGIO, SIGURG, the `F_SETSIG` signal) to a target it cannot tell.
+    pub const FILE_SEND_SIGIOTASK: u32 = 28;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -98,6 +101,7 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "task_setscheduler",
     "task_setnice",
     "task_setioprio",
+    "file_send_sigiotask",
 ];
 
 #[cfg(test)]
@@ -137,11 +141,12 @@ mod tests {
             (hook::TASK_SETSCHEDULER, "task_setscheduler"),
             (hook::TASK_SETNICE, "task_setnice"),
             (hook::TASK_SETIOPRIO, "task_setioprio"),
+            (hook::FILE_SEND_SIGIOTASK, "file_send_sigiotask"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::TASK_SETIOPRIO + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::FILE_SEND_SIGIOTASK + 1, FAIL_OPEN_SLOTS);
     }
 }

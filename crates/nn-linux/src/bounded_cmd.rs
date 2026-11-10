@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 pub const EXTERNAL_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the output pipes are read after the child exited (or was
-/// killed): a grandchild that kept them open cannot hold the caller.
+/// killed): a grandchild that kept them open cannot hold the caller. The
+/// stdin writer gets as long, then the child's group is killed (external
+/// bug hunt BUG35).
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Run `cmd`, feed it `stdin` (when given), and wait at most `timeout` for
@@ -46,11 +48,16 @@ pub fn run_bounded(
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn()?;
     // Written from a thread of its own: a child that does not read its
-    // stdin would otherwise block the write past the deadline.
+    // stdin would otherwise block the write past the deadline. Its end
+    // comes back on a channel, so the wait for it is bounded too.
     let writer = match (stdin, child.stdin.take()) {
         (Some(data), Some(mut pipe)) => {
             let data = data.to_vec();
-            Some(std::thread::spawn(move || pipe.write_all(&data)))
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(pipe.write_all(&data));
+            });
+            Some(rx)
         }
         _ => None,
     };
@@ -78,8 +85,19 @@ pub fn run_bounded(
     };
     if let Some(w) = writer {
         // A child that exits without reading all of it closes the pipe
-        // (EPIPE): its exit status says what happened.
-        let _ = w.join();
+        // (EPIPE): its exit status says what happened. External bug hunt
+        // BUG35: a descendant that inherited the pipe and never reads it
+        // kept the write — and the caller, the response chain — blocked
+        // for as long as it lived. Past the grace the child's group (it
+        // led one, `process_group(0)`) is killed: the pipe's last reader
+        // goes and the write ends with EPIPE. The caller does not wait for
+        // the writer again: a holder that left the group keeps only the
+        // writer's thread, which ends with it.
+        if let Err(mpsc::RecvTimeoutError::Timeout) = w.recv_timeout(DRAIN_GRACE) {
+            // SAFETY: kill(2) on the process group the child led; its
+            // number is not reused while a member of the group lives.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        }
     }
     Ok(Output {
         status,
@@ -156,5 +174,60 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    /// External bug hunt BUG35: a grandchild that inherited the stdin
+    /// pipe and never reads it must not hold the caller once the direct
+    /// child exited ("wait at most timeout"); it is killed with the group
+    /// the child led, so nothing of the command outlives the call.
+    #[test]
+    fn grandchild_holding_stdin_does_not_hold_caller() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = run_bounded(
+                sh("exec 3<&0; sleep 20 & echo $! >&2; exit 0"),
+                Some(&vec![b'x'; 1 << 20]),
+                Duration::from_secs(2),
+                "iptables-restore",
+            );
+            let _ = tx.send(res.map(|o| (o.status.code(), o.stderr)));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("run_bounded did not return: the stdin writer's join is unbounded");
+        let (code, stderr) = got.unwrap();
+        assert_eq!(code, Some(0));
+        let pid: u32 = String::from_utf8_lossy(&stderr)
+            .trim()
+            .parse()
+            .expect("the grandchild's pid on stderr");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let gone = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
+                .unwrap_or(true)
+        };
+        while !gone() {
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild {pid} outlived the call"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// BUG35 control: a command that reads all its stdin is not killed —
+    /// the group kill is for a writer still blocked after the grace.
+    #[test]
+    fn a_reading_command_keeps_its_output_and_status() {
+        let out = run_bounded(
+            sh("wc -c; exit 4"),
+            Some(&vec![b'x'; 1 << 20]),
+            Duration::from_secs(5),
+            "nft",
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1048576");
     }
 }

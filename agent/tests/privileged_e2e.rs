@@ -1823,6 +1823,17 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         "OWN_BPF_IDS read through a read-only handle outside a window in enforce mode (lot 290: \
          refused)"
     );
+    // Lot 293 (external bug hunt BUG13, closed by lot 290): and a read-only
+    // handle through the pin — the one a foreign program would be loaded
+    // against to rewrite PROTECTED_PIDS — is refused with EPERM (its record
+    // is the `bpf_handle` of step 4; the burst above may hold this one's in
+    // NN-L-AT-001's budget).
+    assert_eq!(
+        common::raw_bpf::pinned_rdonly(&common::protected_pids_pin()),
+        Err(libc::EPERM),
+        "a read-only handle on the pinned PROTECTED_PIDS from root was not refused in enforce \
+         mode (Ok = granted)"
+    );
 
     // 5. TST-010: the fixtures' teardown fails and names the refusal; the
     //    agent is untouched.
@@ -1849,6 +1860,292 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         let tail = log_tail(&run.log);
         fx.enforce_run = Some(run);
         panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+// ── Lot 293 — external bug hunt BUG14: a signal through a file's owner ─
+
+/// The ways a root process arms a file's owner on a protected process: the
+/// owner set by `F_SETOWN`, `F_SETOWN_EX` (a thread) or `FIOSETOWN` (a
+/// socket), the signal by `F_SETSIG` (0 = the plain SIGIO), the mode by
+/// `O_ASYNC` or `FIOASYNC`; then one byte written makes the kernel deliver
+/// it — through `file_send_sigiotask`, never `task_kill`.
+#[cfg(feature = "debug-trigger")]
+mod owner_signal {
+    use std::io;
+
+    /// `<asm-generic/ioctls.h>` / `<linux/sockios.h>`, and
+    /// `<asm-generic/fcntl.h>`'s (the libc crate lacks some of them).
+    const FIOASYNC: libc::c_ulong = 0x5452;
+    const FIOSETOWN: libc::c_ulong = 0x8901;
+    const F_SETSIG: libc::c_int = 10;
+    const F_SETOWN_EX: libc::c_int = 15;
+    const F_OWNER_TID: libc::c_int = 0;
+
+    /// `struct f_owner_ex`.
+    #[repr(C)]
+    struct OwnerEx {
+        kind: libc::c_int,
+        pid: libc::pid_t,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Owner {
+        /// `F_SETOWN` on a pipe's read end.
+        Pid,
+        /// `F_SETOWN_EX` with `F_OWNER_TID` (the target's main thread).
+        Tid,
+        /// `FIOSETOWN` + `FIOASYNC` on a socket.
+        Socket,
+    }
+
+    fn check(r: libc::c_int, what: &str) -> io::Result<()> {
+        if r < 0 {
+            Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!("{what}: {}", io::Error::last_os_error()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Arm a fresh descriptor's owner on `target` with `sig` (0: SIGIO),
+    /// make it ready (one byte), close everything.
+    pub fn fire(owner: Owner, target: u32, sig: libc::c_int) -> io::Result<()> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: plain syscalls on descriptors this function owns; the
+        // pointers passed point at live locals.
+        unsafe {
+            match owner {
+                Owner::Socket => check(
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
+                    "socketpair",
+                )?,
+                _ => check(libc::pipe(fds.as_mut_ptr()), "pipe")?,
+            }
+            let (armed, other) = (fds[0], fds[1]);
+            let res = (|| {
+                match owner {
+                    Owner::Pid => check(
+                        libc::fcntl(armed, libc::F_SETOWN, target as libc::c_int),
+                        "F_SETOWN",
+                    )?,
+                    Owner::Tid => {
+                        let ex = OwnerEx {
+                            kind: F_OWNER_TID,
+                            pid: target as libc::pid_t,
+                        };
+                        check(
+                            libc::fcntl(armed, F_SETOWN_EX, &ex as *const OwnerEx),
+                            "F_SETOWN_EX",
+                        )?
+                    }
+                    Owner::Socket => {
+                        let pid = target as libc::c_int;
+                        check(libc::ioctl(armed, FIOSETOWN, &pid), "FIOSETOWN")?
+                    }
+                }
+                if sig != 0 {
+                    check(libc::fcntl(armed, F_SETSIG, sig), "F_SETSIG")?;
+                }
+                match owner {
+                    Owner::Socket => {
+                        let on: libc::c_int = 1;
+                        check(libc::ioctl(armed, FIOASYNC, &on), "FIOASYNC")?
+                    }
+                    _ => {
+                        let fl = libc::fcntl(armed, libc::F_GETFL);
+                        check(fl, "F_GETFL")?;
+                        check(
+                            libc::fcntl(armed, libc::F_SETFL, fl | libc::O_ASYNC),
+                            "F_SETFL O_ASYNC",
+                        )?
+                    }
+                }
+                let n = libc::write(other, b"x".as_ptr().cast(), 1);
+                if n != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            libc::close(armed);
+            libc::close(other);
+            res
+        }
+    }
+
+    /// `pidfd_send_signal(pidfd_open(target), sig)`: the errno, or `Ok`.
+    pub fn pidfd_signal(target: u32, sig: libc::c_int) -> Result<(), i32> {
+        // SAFETY: raw syscalls; the descriptor is ours and closed.
+        unsafe {
+            let fd = libc::syscall(libc::SYS_pidfd_open, target as libc::pid_t, 0u32);
+            if fd < 0 {
+                return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+            let r = libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd as libc::c_int,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            );
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            libc::close(fd as libc::c_int);
+            if r < 0 {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The agent log's denial lines of the SIGIO path for signal `sig`.
+#[cfg(feature = "debug-trigger")]
+fn sigio_denials(log: &Path, pid: u32, sig: i32) -> usize {
+    let target = format!("target_ino={pid}");
+    let signal = format!("target_dev={sig}");
+    read_agent_log(log)
+        .lines()
+        .filter(|l| {
+            l.contains("ANTI-TAMPER DENIAL")
+                && l.contains("op=sigio")
+                && l.contains(&target)
+                && l.split_whitespace().any(|w| w == signal)
+        })
+        .count()
+}
+
+/// External bug hunt BUG14 (P0): root killed the agent and the watchdog
+/// through a file's owner — `F_SETOWN` + `F_SETSIG` + `O_ASYNC` on a pipe
+/// and one write; the kernel delivers that signal through
+/// `file_send_sigiotask`, never `task_kill`, so nothing refused it and
+/// nothing recorded it. Now: the plain SIGIO, an `F_SETSIG` SIGKILL, the
+/// `F_SETOWN_EX` thread owner and a socket's `FIOSETOWN` are refused — the
+/// agent lives and each refusal is signed (`op=sigio`) — and a pidfd's
+/// SIGKILL is refused by `task_kill` (EPERM). Inside a signed
+/// trusted-installer window the window's signal grant applies: a stop
+/// signal of its mask (SIGCONT, harmless) passes and is not recorded, the
+/// plain SIGIO is still refused.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn signals_through_a_file_s_owner_are_refused_and_signed() {
+    use owner_signal::{fire, pidfd_signal, Owner};
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("sigio", false).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let pid = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let alive = |fx: &mut GuardFixture| {
+        let run = fx.enforce_run.as_mut().expect("the sigio run");
+        matches!(run.child.try_wait(), Ok(None)) && Path::new(&format!("/proc/{pid}")).exists()
+    };
+
+    // 1. Outside a window. One second apart: the kernel signs one refusal
+    //    per caller and operation a second.
+    for (owner, sig, name) in [
+        (Owner::Pid, 0, "F_SETOWN + O_ASYNC, the plain SIGIO"),
+        (
+            Owner::Pid,
+            libc::SIGKILL,
+            "F_SETOWN + F_SETSIG(SIGKILL) + O_ASYNC",
+        ),
+        (
+            Owner::Tid,
+            libc::SIGKILL,
+            "F_SETOWN_EX(F_OWNER_TID) + F_SETSIG(SIGKILL)",
+        ),
+        (
+            Owner::Socket,
+            libc::SIGKILL,
+            "FIOSETOWN + F_SETSIG(SIGKILL) + FIOASYNC",
+        ),
+    ] {
+        let delivered = if sig == 0 { libc::SIGIO } else { sig };
+        let before = sigio_denials(&log, pid, delivered);
+        fire(owner, pid, sig).unwrap_or_else(|e| panic!("{name}: arming failed: {e}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            alive(&mut fx),
+            "{name}: the agent (pid {pid}) died — the signal through its file's owner was \
+             delivered\n{}",
+            log_tail(&log)
+        );
+        let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
+        while sigio_denials(&log, pid, delivered) <= before {
+            assert!(
+                Instant::now() < deadline,
+                "{name}: no signed refusal (op=sigio target_dev={delivered})\n{}",
+                log_tail(&log)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    // a pidfd's signal goes through task_kill: refused there
+    assert_eq!(
+        pidfd_signal(pid, libc::SIGKILL),
+        Err(libc::EPERM),
+        "pidfd_send_signal(SIGKILL) to the agent from root was not refused"
+    );
+    assert!(
+        alive(&mut fx),
+        "the agent is gone after the pidfd's SIGKILL"
+    );
+
+    // 2. Inside a window: the grant's stop signals pass (SIGCONT is one of
+    //    them, and harmless), the plain SIGIO does not.
+    const WINDOW_SECS: u32 = 8;
+    fx.grant_window("sigio", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    std::thread::sleep(Duration::from_millis(1200));
+    let cont_before = sigio_denials(&log, pid, libc::SIGCONT);
+    let io_before = sigio_denials(&log, pid, libc::SIGIO);
+    fire(Owner::Pid, pid, libc::SIGCONT).expect("SIGCONT armed inside the window");
+    std::thread::sleep(Duration::from_millis(1200));
+    fire(Owner::Pid, pid, 0).expect("SIGIO armed inside the window");
+    let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
+    while sigio_denials(&log, pid, libc::SIGIO) <= io_before {
+        assert!(
+            Instant::now() < deadline,
+            "inside the window the plain SIGIO was not refused and signed\n{}",
+            log_tail(&log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(alive(&mut fx), "the agent is gone after the window's SIGIO");
+    assert_eq!(
+        sigio_denials(&log, pid, libc::SIGCONT),
+        cont_before,
+        "inside the window the grant's SIGCONT was refused"
+    );
+    // the window's end
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 1));
+    fire(Owner::Pid, pid, libc::SIGCONT).expect("SIGCONT armed after the window");
+    let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
+    while sigio_denials(&log, pid, libc::SIGCONT) <= cont_before {
+        assert!(
+            Instant::now() < deadline,
+            "after the window SIGCONT through the file's owner was not refused\n{}",
+            log_tail(&log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // 3. The authorised stop. Drop then restores the guard's mode.
+    let mut run = fx.enforce_run.take().expect("the sigio run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the agent failed: {e}\n{tail}");
     }
 }
 

@@ -44,6 +44,12 @@ pub const BPF_PROG_GET_FD_BY_ID: u32 = 13;
 pub const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 /// `BPF_OBJ_GET_INFO_BY_FD`.
 pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+/// `BPF_RAW_TRACEPOINT_OPEN`: attaches a program — a raw tracepoint, and
+/// through it (libbpf before `LINK_CREATE` took them, and any caller since)
+/// `tp_btf`, `fentry`/`fexit`/`fmod_ret` and LSM programs. External bug hunt
+/// BUG05: the `bpf` hook did not look at it, so an attach this way left no
+/// record (the load's stayed).
+pub const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
 /// `BPF_BTF_LOAD`.
 pub const BPF_BTF_LOAD: u32 = 18;
 /// `BPF_MAP_FREEZE`: the agent freezes `BTF_OFFSETS` with it.
@@ -94,7 +100,7 @@ pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
 /// Every number above with its uapi name, for the checks against the
 /// header and the kernel's BTF. A command added above goes here too
 /// (`every_constant_is_listed` checks it).
-pub const UAPI: [(&str, u32); 20] = [
+pub const UAPI: [(&str, u32); 21] = [
     ("BPF_MAP_CREATE", BPF_MAP_CREATE),
     ("BPF_MAP_GET_NEXT_KEY", BPF_MAP_GET_NEXT_KEY),
     ("BPF_PROG_LOAD", BPF_PROG_LOAD),
@@ -107,6 +113,7 @@ pub const UAPI: [(&str, u32); 20] = [
     ("BPF_PROG_GET_FD_BY_ID", BPF_PROG_GET_FD_BY_ID),
     ("BPF_MAP_GET_FD_BY_ID", BPF_MAP_GET_FD_BY_ID),
     ("BPF_OBJ_GET_INFO_BY_FD", BPF_OBJ_GET_INFO_BY_FD),
+    ("BPF_RAW_TRACEPOINT_OPEN", BPF_RAW_TRACEPOINT_OPEN),
     ("BPF_BTF_LOAD", BPF_BTF_LOAD),
     ("BPF_MAP_FREEZE", BPF_MAP_FREEZE),
     ("BPF_LINK_CREATE", BPF_LINK_CREATE),
@@ -134,6 +141,7 @@ pub const fn observed(cmd: u32) -> bool {
             | BPF_PROG_DETACH
             | BPF_PROG_GET_FD_BY_ID
             | BPF_MAP_GET_FD_BY_ID
+            | BPF_RAW_TRACEPOINT_OPEN
             | BPF_BTF_LOAD
             | BPF_LINK_CREATE
             | BPF_LINK_UPDATE
@@ -443,6 +451,23 @@ mod tests {
         assert!(
             found.is_empty(),
             "bpf_cmd numbers defined outside common/src/bpf_cmd.rs: {found:?}"
+        );
+    }
+
+    /// External bug hunt BUG05: `BPF_RAW_TRACEPOINT_OPEN` (uapi 17)
+    /// attaches a program (raw_tp; tp_btf / fentry / fexit / LSM through
+    /// legacy libbpf), like `PROG_ATTACH` and `LINK_CREATE`: the `bpf`
+    /// hook promises a record for an attach. The number is the literal on
+    /// purpose (the test reads the same on a tree without the constant);
+    /// `bpf_cmd_values_match_the_uapi_header` ties the name to it.
+    #[test]
+    fn raw_tracepoint_open_is_observed() {
+        const RAW_TRACEPOINT_OPEN: u32 = 17; // include/uapi/linux/bpf.h
+        assert!(observed(BPF_PROG_ATTACH));
+        assert!(observed(BPF_LINK_CREATE));
+        assert!(
+            observed(RAW_TRACEPOINT_OPEN),
+            "BPF_RAW_TRACEPOINT_OPEN (17) attaches a program and the bpf hook does not look at it"
         );
     }
 }

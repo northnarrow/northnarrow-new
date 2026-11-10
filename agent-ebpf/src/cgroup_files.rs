@@ -651,7 +651,8 @@ unsafe fn proc_file_tgid(inode: *const c_void) -> Option<u32> {
 #[inline(always)]
 fn sign(phase: Phase, operation: u8, key: InodeKey) {
     match phase {
-        Phase::Open => crate::inode_protect::emit_denial(operation, key),
+        // Lot 293 (BUG37): behind the attempt budget.
+        Phase::Open => crate::inode_protect::emit_attempt(operation, key),
         Phase::Write => crate::inode_protect::emit_limited(operation, key),
     }
 }

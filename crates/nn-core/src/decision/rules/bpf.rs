@@ -24,6 +24,7 @@ use std::sync::Arc;
 use common::bpf_cmd::BPF_MAP_CREATE;
 use common::bpf_cmd::{
     BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_LOAD,
+    BPF_RAW_TRACEPOINT_OPEN,
 };
 use common::wire::{bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
@@ -103,7 +104,13 @@ impl<H: PostureHost> Rule for NnLBpf001BpfProgramLoaded<H> {
         else {
             return None;
         };
-        if !matches!(*cmd, BPF_PROG_LOAD | BPF_PROG_ATTACH | BPF_LINK_CREATE) {
+        // Lot 293 (external bug hunt BUG05): and a raw tracepoint opened —
+        // an attach of a raw_tp, and through it of a tp_btf, fentry/fexit or
+        // LSM program (libbpf before LINK_CREATE took them).
+        if !matches!(
+            *cmd,
+            BPF_PROG_LOAD | BPF_PROG_ATTACH | BPF_LINK_CREATE | BPF_RAW_TRACEPOINT_OPEN
+        ) {
             return None;
         }
         let judgement = judge(
@@ -118,6 +125,9 @@ impl<H: PostureHost> Rule for NnLBpf001BpfProgramLoaded<H> {
         let what = match *cmd {
             BPF_PROG_LOAD => format!("loaded a BPF program (prog_type {arg})"),
             BPF_PROG_ATTACH => format!("attached a BPF program (attach_type {arg})"),
+            BPF_RAW_TRACEPOINT_OPEN => {
+                format!("attached a BPF program through BPF_RAW_TRACEPOINT_OPEN (prog fd {arg})")
+            }
             _ => format!("created a BPF link (attach_type {arg})"),
         };
         let reasoning = format!(
@@ -268,6 +278,31 @@ mod tests {
         assert!(r1.evaluate(&ev("myobs", BPF_LINK_CREATE, 1)).is_none());
         // map create alone is not a load
         assert!(r1.evaluate(&ev("bpftool", BPF_MAP_CREATE, 1)).is_none());
+    }
+
+    /// Lot 293 (external bug hunt BUG05): an attach through
+    /// `BPF_RAW_TRACEPOINT_OPEN` by an unlisted process is NN-L-BPF-001's,
+    /// as an attach through `PROG_ATTACH` or `LINK_CREATE` is; the known
+    /// tooling stays exempt.
+    #[test]
+    fn raw_tracepoint_open_by_unlisted_is_an_attach() {
+        let (r1, r2) = rules();
+        let v = r1
+            .evaluate(&ev("implant", BPF_RAW_TRACEPOINT_OPEN, 5))
+            .expect("an attach through the raw tracepoint command fires");
+        assert_eq!(v.severity, Severity::Medium);
+        assert!(
+            v.reasoning
+                .contains("attached a BPF program through BPF_RAW_TRACEPOINT_OPEN (prog fd 5)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(r1
+            .evaluate(&ev("systemd", BPF_RAW_TRACEPOINT_OPEN, 5))
+            .is_none());
+        assert!(r2
+            .evaluate(&ev("implant", BPF_RAW_TRACEPOINT_OPEN, 5))
+            .is_none());
     }
 
     #[test]
