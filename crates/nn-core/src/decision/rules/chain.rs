@@ -2766,4 +2766,118 @@ mod tests {
         let fired = fire_ids(&rules, &flow(200, 443, 11 * SEC));
         assert!(!fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()));
     }
+
+    // ── bug hunt 1.3 (editions 1.2/1.3) ─────────────────────────────
+
+    fn exec_as(pid: u32, comm: &str, filename: &str, start_ns: u64, ts_ns: u64) -> Event {
+        let mut e = tmp_spawn(pid, ts_ns);
+        if let Event::ProcessSpawn {
+            comm: c,
+            filename: f,
+            start_ns: s,
+            ..
+        } = &mut e
+        {
+            *c = comm.to_string();
+            *f = filename.to_string();
+            *s = start_ns;
+        }
+        e
+    }
+
+    /// BUG62 on the rules: a process reads a credential store, then
+    /// re-executes an image named `sudo` 15, 16 or 64 times (same pid,
+    /// same start: that many `PrivEsc` on its key), then egresses:
+    /// CHAIN-001 fires every time (on main it was gone from 16 on).
+    #[test]
+    fn sixteen_privesc_reexecs_keep_chain001() {
+        for reexecs in [15u64, 16, 64] {
+            let rules = chain_rules();
+            let start = 5 * SEC;
+            fire_ids(
+                &rules,
+                &exec_as(42, "python3", "/usr/bin/python3", start, start),
+            );
+            fire_ids(&rules, &cred_fim(42, 100 * SEC));
+            for i in 1..=reexecs {
+                fire_ids(
+                    &rules,
+                    &exec_as(
+                        42,
+                        "sudo",
+                        "/home/u/bin/sudo",
+                        start,
+                        100 * SEC + i * SEC / 10,
+                    ),
+                );
+            }
+            let ids = fire_ids(&rules, &flow(42, 443, 120 * SEC));
+            assert!(
+                ids.iter().any(|id| id == C001),
+                "{reexecs} re-execs, CHAIN-001 lost: {ids:?}"
+            );
+        }
+    }
+
+    /// BUG75: processed flow -> exec -> read (kernel: exec 1000 s, read
+    /// 1250 s, flow 1500 s): exec -> egress is 500 s > 300 s, so the late
+    /// read completes no CHAIN-007 (in kernel order none fires), and
+    /// CHAIN-001 still answers the egress (the read is 250 s before it).
+    #[test]
+    fn a_late_read_measures_exec_to_egress() {
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &flow(42, 443, 1500 * SEC)).is_empty());
+        let on_exec = fire_ids(&rules, &tmp_spawn(42, 1000 * SEC));
+        assert!(on_exec.is_empty(), "{on_exec:?}");
+        let on_read = fire_ids(&rules, &cred_fim(42, 1250 * SEC));
+        assert_eq!(on_read, [C001], "the read's own two-step chain only");
+        // a second late read changes nothing
+        let again = fire_ids(&rules, &cred_fim(42, 1260 * SEC));
+        assert!(!again.iter().any(|id| id == C007), "{again:?}");
+        // control: the same three events in kernel order
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_spawn(42, 1000 * SEC));
+        fire_ids(&rules, &cred_fim(42, 1250 * SEC));
+        let ids = fire_ids(&rules, &flow(42, 443, 1500 * SEC));
+        assert!(!ids.iter().any(|id| id == C007), "{ids:?}");
+    }
+
+    /// BUG75 control: a late read whose exec is within the window of the
+    /// egress (exec 1000 s, read 1100 s, flow 1250 s; and at exactly
+    /// 300 s) still completes CHAIN-007 with the egress, as in kernel
+    /// order.
+    #[test]
+    fn a_late_read_within_the_window_still_completes_chain007() {
+        for flow_at in [1250 * SEC, 1300 * SEC] {
+            let rules = chain_rules();
+            assert!(fire_ids(&rules, &flow(42, 443, flow_at)).is_empty());
+            fire_ids(&rules, &tmp_spawn(42, 1000 * SEC));
+            let on_read = verdicts(&rules, &cred_fim(42, 1100 * SEC));
+            let ids: Vec<&str> = on_read.iter().map(|v| v.rule_id.as_str()).collect();
+            assert_eq!(ids, [C007, C001], "flow at {flow_at}");
+            assert_eq!(on_read[0].timestamp_ns, flow_at, "names the egress");
+            let rules = chain_rules();
+            fire_ids(&rules, &tmp_spawn(42, 1000 * SEC));
+            fire_ids(&rules, &cred_fim(42, 1100 * SEC));
+            let in_order = fire_ids(&rules, &flow(42, 443, flow_at));
+            assert!(in_order.iter().any(|id| id == C007), "{in_order:?}");
+        }
+    }
+
+    /// BUG75, the order of the steps: a read made before the staging exec
+    /// (kernel: read 100 s, exec 150 s, flow 200 s), processed last, is not
+    /// the sequence "exec, then read" — no CHAIN-007, as in kernel order.
+    #[test]
+    fn a_late_read_before_the_exec_completes_no_chain007() {
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &flow(42, 443, 200 * SEC)).is_empty());
+        fire_ids(&rules, &tmp_spawn(42, 150 * SEC));
+        let on_read = fire_ids(&rules, &cred_fim(42, 100 * SEC));
+        assert_eq!(on_read, [C001], "{on_read:?}");
+        let rules = chain_rules();
+        fire_ids(&rules, &cred_fim(42, 100 * SEC));
+        fire_ids(&rules, &tmp_spawn(42, 150 * SEC));
+        let in_order = fire_ids(&rules, &flow(42, 443, 200 * SEC));
+        assert!(!in_order.iter().any(|id| id == C007), "{in_order:?}");
+    }
 }

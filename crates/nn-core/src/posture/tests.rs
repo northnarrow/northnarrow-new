@@ -188,3 +188,67 @@ fn a_machine_runs_on_its_clock() {
         1_767_225_600 + ALERTED_DECAY.as_secs()
     );
 }
+
+/// The machine of [`loopback_burst_after_another_class_stays_engaged`]:
+/// pid 42 of `app.service` (no login), its combat entries heard.
+fn service_machine(
+    tmp: &tempfile::TempDir,
+) -> (
+    PostureMachine,
+    Arc<parking_lot::Mutex<Vec<super::CombatEntry>>>,
+) {
+    use super::{AuthSessionTracker, CombatEntry, ExemptPids};
+    let d = tmp.path().join("42");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("cgroup"), "0::/system.slice/app.service\n").unwrap();
+    std::fs::write(d.join("loginuid"), "4294967295").unwrap();
+    let heard = Arc::new(parking_lot::Mutex::new(Vec::<CombatEntry>::new()));
+    let h = Arc::clone(&heard);
+    let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(move |e: &CombatEntry| h.lock().push(e.clone())),
+        Arc::new(|_, _| Ok(String::new())),
+        ExemptPids::default(),
+        AuthSessionTracker::new(tmp.path()),
+    );
+    (m, heard)
+}
+
+/// Bug hunt 1.3, BUG41 (downstream): twenty connects to 127.0.0.1:443 by
+/// pid 42 of a service, after an offensive-tool exec in the same service
+/// (ENGAGED), never left the host: no ExfiltrationPattern, so the posture
+/// stays ENGAGED and no combat entry names pid 42. The triage's design
+/// test asserted the old path (COMBAT, an entry with pid 42 as the
+/// offender, then INVESTIGATE and NEUTRALIZE's kill); it is inverted here.
+/// The control: the same burst to a public address still corroborates the
+/// exec's class up to COMBAT.
+#[test]
+fn loopback_burst_after_another_class_stays_engaged() {
+    use nn_model::posture_types::TriggerType;
+    let burst = |m: &PostureMachine, dst: [u8; 4]| {
+        let recent: Vec<Event> = (0..20u64).map(|i| tcp_v4(42, dst, 443, i + 1)).collect();
+        m.observe(&tcp_v4(42, dst, 443, 100), &recent);
+    };
+    for lo in [[127, 0, 0, 1], [127, 1, 2, 3], [169, 254, 169, 254]] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (m, heard) = service_machine(&tmp);
+        m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+        assert_eq!(m.current_kind(), PostureKind::Engaged);
+        burst(&m, lo);
+        assert_eq!(m.current_kind(), PostureKind::Engaged, "{lo:?}");
+        assert!(heard.lock().is_empty(), "{lo:?}: {:?}", heard.lock());
+    }
+    // control: a public destination still reaches COMBAT
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (m, heard) = service_machine(&tmp);
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+    burst(&m, [203, 0, 113, 9]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    let heard = heard.lock().clone();
+    assert_eq!(heard.len(), 1);
+    let super::CombatCause::Trigger(t) = &heard[0].cause else {
+        panic!("{:?}", heard[0].cause)
+    };
+    assert_eq!(t.trigger, TriggerType::ExfiltrationPattern);
+    assert!(!t.locked);
+    assert_eq!(heard[0].offender.map(|p| p.pid), Some(42));
+}

@@ -851,6 +851,21 @@ What it does not cover:
   `LD_PRELOAD` in its unit, a writable memory mapping shared with another
   process: not an access the kernel checks as `ptrace`.
 
+### 2.6 Modes on an open flow (lot 294)
+
+Bug hunt 1.3, BUG45. A TCP flow is judged at its connect, in snapshots while
+it stays open and at its close, and a rule that answered it is not asked
+again. An `off` match and an exempt one are no answer: they leave the flow
+to the other rules (an `off` NN-L-CHAIN-002 at the connect used to take the
+flow's chain verdict, so the CHAIN-001/CHAIN-007 kill of a credential read
+on the open session never came). A chain answer that ran no response —
+`alert`, `audit`, an aged precursor's record, NN-L-CHAIN-008's `Log` — does
+not keep a chain's kill from a later phase of the flow; another record of a
+chain on that flow is not written. An exempt rule is judged again in the
+later phases, so its recorded-only match may be written again (bounded by
+the detection budget), and it acts there if the exemption no longer holds
+(§2.3).
+
 ## 3. Testing it before it is signed
 
 `nn-admin policy test` replays sample events through an offline engine (the

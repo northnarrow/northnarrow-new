@@ -8047,6 +8047,79 @@ number in parentheses is a lab PR.
   - Levels unchanged (C23 2 provisional): a self-defence gap closed and
     the evidence channel bounded, measured on 5.15, 6.8 and 6.12 — not a new
     capability.
+- **Lot 294 — posture triggers and chain correlation (C14; Wave 4 phase 3,
+  the external bug hunt's lot 4: BUG41 P1, BUG62 P1, 40, 50, 51, 45, 53, 75,
+  60, 77-doc).**
+  - What was open (our triage of 10/11/2026): the posture's
+    ExfiltrationPattern counted loopback and `169.254/16` as external, so
+    twenty local connects after another class's trigger in the same unit
+    reached COMBAT and the ladder's kill (BUG41, P1); the correlation
+    store's 16-precursor ring was shared by every kind, so sixteen re-execs
+    named `su`/`sudo` pushed out a live credential read and NN-L-CHAIN-001
+    no longer killed (BUG62, P1); the recon triggers counted the focal's
+    port twice (BUG40, BUG50); Lolbas took any past spawn of the parent's
+    pid (BUG51); an `off`, exempt, `alert` or aged chain answer at a connect
+    took the flow's chain verdict from a later kill (BUG45); CHAIN-007's
+    late read measured its window from the read (BUG75); the transfer
+    tools' precursor came in the ring's order (BUG53); the detection budget
+    forgot a pair owed to its next record (BUG60); BUG77's docstring
+    promised a bound the chains must not have.
+  - What changed: `is_external` (not internal, loopback, unspecified,
+    multicast, IPv4 link-local; CGNAT external); the focal's port in the
+    set; the parent's latest exec of its own start; 16 precursors **per
+    kind**, a kind dropping its own oldest by time; the flow ledger notes
+    whether each answer acted, `off` and exempt leave none, and a
+    record-only chain answer holds the flow only against another record
+    (decision of 10/11/2026); CHAIN-007's late read needs its exec within
+    the egress's window, checked before the egress is marked; the kinds'
+    order; `idle` reads `held_since_record`; the docstrings. A new
+    privileged e2e for the same-PID CHAIN-001.
+  - The lab, as measured (our own guest under lease k294; one round, r1 at
+    b1c668bc — the production code of this PR; the agent uninstalled, the
+    guest clean and off at the end):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`), the agent installed and
+      enabled as the operator does, fresh (OBSERVING). Bursts of 25 TCP
+      connects by one process each, run as root from the lab user's
+      session: `127.0.0.1:80`, `[::1]:443`, `[::ffff:127.0.0.1]:80` (a
+      listener on each, 25 of 25 accepted) and `169.254.169.254:80` (no
+      listener): the posture read OBSERVING after each, and the agent's
+      journal (its `northnarrow` namespace) has no transition during the
+      four bursts. The control, the same burst to `1.1.1.1:443`: OBSERVING
+      → ENGAGED, trigger ExfiltrationPattern, scope the lab user's login —
+      the round's only ExfiltrationPattern, and no Reconnaissance at all.
+      On `main` a loopback burst raised that trigger (the unit test).
+    - The benign corpus: dev (24 steps) and containers (13 steps: rootless
+      podman, docker, k3s install, a pod, uninstall), rc 0 (the dev
+      corpus's `www-data` control 137, as designed). Posture transitions as
+      in lots 291 and 292 on the same guest: dev ENGAGED by
+      ConfirmedIntrusion (`go test`'s mass write); containers ALERTED by
+      SensitiveFileAccess (`podman pull`), ENGAGED by PersistenceMechanism
+      (k3s). Kills: the dev control's R001 only; 0 in containers. NN-L-CHAIN-008
+      ×4 (Medium, Log) in k3s's install, as before.
+    - MS-23 (`ransom-check --only MS23`): 18 PASS, 0 FAIL — NN-L-IMP-001
+      recorded Critical, kill held, ENGAGED (in place, copy-delete,
+      presized copies), and the nine negatives without a record.
+    - The chain e2e (`nn-lab.sh test-one
+      detection_rules_at_scale_privileged_e2e`, the installed agent stopped,
+      each test its own detect-only agent): 19 passed, 0 failed — the new
+      same-PID NN-L-CHAIN-001, CHAIN-002 (and its negative), CHAIN-004,
+      -005, -006, -007 (the three-step one, `#[ignore]`d as flaky since
+      T10.6.2, run here and green) and -008, with the suite's FIM, network
+      and process rules.
+    - The guest clean at the start (no agent, no pin, no overlay) and at
+      the end (uninstalled, 0 pins, no overlay, no listener left).
+  - Host: a named test for each bug (the triage's 15 failing tests fail on
+    f4566719, the branch's base); the triage's design test of BUG41's old
+    path inverted (said in the PR); mutation on the fixes: 51 mutants, 47
+    caught at the first run, 3 survivors named and caught (two execs
+    stamped alike, a loopback focal after nineteen public connects,
+    `answer_of` on an `off` match), 1 mis-written (compile-only), redefined
+    and caught.
+  - Open: a chain re-judged on a flow whose chain answer was a record can
+    mark an aged precursor processed after the connect as reported (its
+    record dropped as same-strength); an exempt rule's record may repeat at
+    a long flow's snapshots (budget-bounded) — both said in the docs.
+  - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 300 — the sensor self-test's `module_load` no longer missed on
   every host (a regression of lot 285; C23).**
   - What was open: on Ubuntu 22.04 the self-test found `module_load`

@@ -1220,6 +1220,48 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   as the packaged module whose name its first 31 bytes spell.
 - The exploit guard's reasoning names every i386 call it knows (lot 292,
   BUG-82: 22 of 31 were "system call N").
+- Posture triggers and chain correlation: ten bugs of the external bug hunt
+  (editions 1.2 and 1.3), as our triage verified them (lot 294).
+  - ExfiltrationPattern counts only destinations off the host and its link
+    (BUG41, P1): loopback (`127/8`, `::1`, mapped), unspecified, multicast
+    and `169.254/16` counted as external, so twenty connects of a service to
+    `127.0.0.1:443` raised an ENGAGED trigger that corroborated another
+    class's heuristic of the same scope (an `nc` in the unit) up to COMBAT
+    and the ladder's kill of the process. CGNAT (`100.64/10`) still counts.
+  - The per-process precursor ring of the correlation store holds 16 of
+    each kind (BUG62, P1): 16 for all kinds together let sixteen re-execs of
+    an image named `su`/`sudo` (their chain only logs) push out a live
+    credential read, and NN-L-CHAIN-001 no longer killed the egress, with
+    nothing counted. A kind drops only its own oldest.
+  - Reconnaissance and HeavyReconnaissance count the focal connect's port
+    once (BUG40, BUG50): 80, 443 and 443 again was three ports, nine ports
+    and the ninth again ten.
+  - Lolbas reads the parent's latest exec at or before the shell's spawn,
+    of the parent's own start when both are known (BUG51): any earlier
+    `curl` of the pid did, a reused pid's a day old included.
+  - An answer that ran no response no longer takes a flow from a stronger
+    one (BUG45; `docs/operator/RULE_POLICY.md`, "Modes on an open flow"):
+    a rule the signed policy turns `off`, or whose exemption covers the
+    actor, leaves nothing in the flow ledger (an `off` NN-L-CHAIN-002 at a
+    connect took the flow's chain verdict, and the credential read on the
+    open session drew no CHAIN-001/CHAIN-007 kill); a chain answer that was
+    only a record (an aged precursor's High record, `alert`, `audit`,
+    NN-L-CHAIN-008) leaves the flow's later phases to a chain verdict that
+    acts — another record of a chain is not written. An exempt rule is
+    judged again in a flow's later phases.
+  - NN-L-CHAIN-007 completed by a late credential read needs its staging
+    exec at or before the read and within 300 s of the egress (BUG75): the
+    window was measured from the read (an exec 500 s before the egress
+    completed it when the read was processed last; a read before the exec
+    too). The response was the same (CHAIN-001's kill); the story is now the
+    kernel order's.
+  - The transfer tools' reasoning names the first precursor in their order
+    of kinds (BUG53), and the detection budget no longer forgets, on a full
+    table, a pair whose next record owes a held count (BUG60:
+    `suppressed_before` said 0).
+  - The correlation store's docstrings say what the chains rely on: a
+    precursor stamped after the connect of an open flow counts for it
+    (BUG77, not a bug: CM-02 b).
 - The agent's stop ends in bounded time, in COMBAT or not (lot 288, #125;
   `docs/operator/COMBAT_RECOVERY.md`, "A stop in COMBAT"). The unit's
   `TimeoutStopSec=5s` must hold the stop and the kernel's release of the

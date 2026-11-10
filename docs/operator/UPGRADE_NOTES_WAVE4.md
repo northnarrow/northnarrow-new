@@ -895,3 +895,37 @@ ancestors trusted by the tree they lie in (BUG-49). After the upgrade:
 - **The exploit guard and `setgroups`** (BUG71): a uid or gid gain inside
   `setgroups` is an anomaly (NN-L-EPG-001); a `setgroups` that changes only
   the groups, as logins and privilege drops do, is not.
+
+## 18. Posture triggers and the flows' chain verdicts (lot 294)
+
+The external bug hunt (editions 1.2/1.3) found the posture's exfiltration
+pattern counting connects that never leave the host (BUG41), the correlation
+store's ring shared by all precursor kinds (BUG62) and a record-only answer
+holding a flow against a later kill (BUG45). After the upgrade:
+
+- **ExfiltrationPattern counts only destinations off the host and its
+  link.** Twenty connects of one process to `127.0.0.1`, `::1`, an
+  IPv4-mapped loopback, the unspecified address, a multicast group or
+  `169.254.0.0/16` (a cloud instance's metadata service) on 80/443 no
+  longer raise it: a local proxy or health check no longer moves the
+  posture to ENGAGED, nor, with another class's signal in the same unit or
+  session, to COMBAT. CGNAT (`100.64.0.0/10`, Tailscale and carriers) still
+  counts. Reconnaissance (3 ports) and HeavyReconnaissance (10) count the
+  connect being judged once; Lolbas reads the shell's parent's latest exec.
+- **A process's chain precursors no longer push each other out**: 16 of
+  each kind are kept (64 at most), so sixteen re-execs of an image named
+  `su` or `sudo` no longer hide a credential read from NN-L-CHAIN-001.
+- **A rule the signed policy turns `off`, or whose exemption covers the
+  actor, no longer answers an open flow**, and a chain answer that ran no
+  response (an aged precursor's High record, `alert`, `audit`,
+  NN-L-CHAIN-008) no longer keeps a chain's kill from the flow's later
+  phases (`RULE_POLICY.md`, "Modes on an open flow"). Two visible effects:
+  a credential read made while a flow is open can now draw NN-L-CHAIN-001's
+  kill at the next snapshot (every 60 s) under a policy with a chain `off`
+  or in `alert`, or after an aged record at the connect; and an **exempt
+  rule's recorded-only match may be written again** at a flow's snapshots
+  and its close (the detection budget bounds the repeats), where it was
+  written once at the connect.
+- NN-L-CHAIN-007 completed by a credential read processed after the egress
+  needs the staging exec within 300 s of the egress (BUG75): a flow whose
+  exec was older gets NN-L-CHAIN-001 alone, as in the kernel's order.
