@@ -9148,3 +9148,54 @@ number in parentheses is a lab PR.
     be read are moved and killed); with its mutant the new one fails.
   - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
     proved beyond it.
+- **Lot 317 — the exec quarantine's stop and its partial failures (third
+  bug hunt, edition 1.4: BUG-118, BUG-124, BUG-116, BUG-115; all P3; C13
+  and C17, no level change).**
+  - What was open: the stop resumed only the held processes whose report
+    the controller had read (BUG-118: one the kernel stopped after the last
+    read stayed in state T until the next start of an agent with the guard
+    on); a held process whose capture (`ProcRef`) failed was taken for one
+    that had ended at four sites — no `SIGCONT`, no `SIGKILL`, its pid out
+    of `EXECQ_STOPPED`, the record "ended while held" or "already ended"
+    (BUG-124); the dispatcher of slow work prepared its whole queue at the
+    stop and the stop threw the assessments away (BUG-116), and its
+    `catch_unwind` branch, alive only in unwinding builds, dropped the
+    burst saying it was judged (BUG-115).
+  - What changed: `ProcRef::liveness()` (live, gone, not captured) and a
+    ratchet (`xtask/tests/process_liveness.rs`); the controller captures
+    again and owes a decision it cannot carry out (the process stays held
+    and in the map; a signed `deferred` entry when it is carried out); the
+    stop clears the heartbeat, waits for the exec programs that read it
+    (`membarrier` `MEMBARRIER_CMD_GLOBAL`), then resumes the entries, the
+    owed decisions and the rest of `EXECQ_STOPPED` (`stopping`:
+    `unreported`, `recaptured`, `killed`, `left`); the slow work stops
+    before its next burst, hands back what it prepared with its assessment
+    and drops nothing; `xtask/tests/unwind_fallbacks.rs` lists the four
+    `catch_unwind` left.
+  - Measured on the host: 21 new named tests (the controller 11, the slow
+    work 4, nn-linux 4 of which 1 privileged, the e2e 1, the quiesce 1) and
+    the two ratchets; mutation 28 mutants, 28 caught by a named test (M26,
+    the tree kill's root through the kill cgroup, by the privileged test on
+    the 7.0 guest; M13 and M17 rewritten after a compile error).
+  - Lab, measured (the privileged e2e `execq_stop_privileged_e2e`: enforce
+    mode, a scanner that never says ready, a burst of new binaries from
+    four threads, a signed 2-of-N shutdown 1.5 s in, then every process of
+    the burst must end, no new process in state T, the cgroup not frozen):
+    - Ubuntu 24.04 (6.8.0-147), guest clean at boot (no agent, no overlay,
+      no pin): `main` 4c864565 with the test 3 runs, 2 failed — 1,065 and
+      1,061 execs held at the stop, one process of the burst still in state
+      T 15 s later; the fix 6 of 6 passed (964–997 held, 1,711–1,870
+      resumed, none left).
+    - Ubuntu 26.04 (7.0.0-43): `main` 4c864565 5 runs, 1 failed (974 held,
+      one left in T); the fix 5 of 5 passed (944–1,039 held, 1,419–1,664
+      resumed, none left); @ATTRIB@
+    - Every run's `unreported` was 0 (8 runs that print it): no run met a
+      process stopped without an entry; that path is proven on the host
+      (the fake kernel's map) only.
+    - Every guest left powered off with no agent installed, no process in
+      state T, no test cgroup, no leftover file.
+  - Not done: the recovery of what a previous agent left stopped when the
+    next agent's guard is off or cannot start (documented limit, §2 of the
+    design; a follow-up); the systemd watch's relayed signals still waiting
+    at the decision loop's stop are not judged (mini-hunt, a follow-up).
+  - Level unchanged.

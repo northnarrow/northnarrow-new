@@ -1148,3 +1148,29 @@ configure; use the `nn-admin` of this release where the export is checked.
   monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
   to keep it; that load, seen by the agent, is signed Low.
 
+
+## 26. The exec quarantine's stop and a process it cannot capture (lot 317)
+
+Only for hosts that run the exec quarantine (`--exec-quarantine enforce`,
+EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md)).
+
+- **A stop leaves nothing stopped.** The agent's stop now also resumes the
+  processes the kernel stopped after the agent last read its reports; they
+  stayed in state T until the next start of an agent with the guard on (or
+  a `kill -CONT` by hand). The signed `exec_quarantine` entry `stopping`
+  gains `unreported` (those, among `resumed`), `killed` (kills owed, see
+  below) and `left` (not captured: still stopped, resumed by the next
+  start).
+- **New responses in the records**: `resume deferred: …` and `kill
+  deferred: …` — the agent could not capture the held process
+  (`pidfd_open` out of descriptors or memory). The process stays held (a
+  block-listed one never runs) and the decision is carried out once it is
+  captured, with a new signed `exec_quarantine` entry, `deferred` (`pid`,
+  `action`, `result`, `waited_ms`). These records used to say `ended while
+  held` or `already ended`, and the process stayed stopped for good. A SIEM
+  rule that reads `already ended` as "the rules' kill landed first" keeps
+  its meaning; one counting `ended while held` sees fewer of them only
+  where they were false.
+- `recovered_at_boot` gains `deferred`: processes a previous agent left
+  stopped that could not be captured at the boot (no longer counted in
+  `gone`), resumed once they are.

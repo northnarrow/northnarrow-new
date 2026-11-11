@@ -406,6 +406,24 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
             .sum()
     };
     let (resumed, unreported, left_in_map) = (count("resumed"), count("unreported"), count("left"));
+    let recaptured = count("recaptured");
+    // a process left stopped: what the agent's log says of its pid
+    let named: Vec<String> = {
+        let text = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
+        left.iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .flat_map(|pid| {
+                let needle = format!("pid={pid}");
+                text.lines()
+                    .filter(|l| {
+                        l.split(|c: char| c.is_whitespace() || c == ',')
+                            .any(|w| w == needle)
+                    })
+                    .map(|l| l.chars().take(300).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
     // past the harness's capture (a passing test's `eprintln!` is not
     // shown): the lab reads this line
     {
@@ -413,9 +431,10 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
         let _ = writeln!(
             std::io::stderr().lock(),
             "execq stop e2e: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
-             stopping entries: {} — resumed {resumed}, of which {unreported} without an entry, \
-             {left_in_map} left in the map; after the stop {} of the burst still running, {} not \
-             exit 0, {} new process(es) in state T, cgroup frozen {frozen:?}",
+             stopping entries: {} — resumed {resumed}, of which {unreported} without an entry \
+             and {recaptured} captured again, {left_in_map} left in the map; after the stop {} of \
+             the burst still running, {} not exit 0, {} new process(es) in state T, cgroup frozen \
+             {frozen:?}; the agent's log on them: {named:?}",
             stopping.len(),
             left.len(),
             failed.len(),

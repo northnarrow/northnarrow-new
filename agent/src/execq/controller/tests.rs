@@ -964,6 +964,7 @@ fn the_stop_resumes_a_held_process_once() {
     let a = w.rec.audits.lock();
     assert_eq!(a[0]["resumed"], serde_json::json!([h.pid]), "{}", a[0]);
     assert_eq!(a[0]["unreported"], serde_json::json!([]), "{}", a[0]);
+    assert_eq!(a[0]["recaptured"], serde_json::json!([]), "{}", a[0]);
     assert!(w.k.0.lock().left.is_empty());
 }
 
@@ -1197,6 +1198,30 @@ fn the_stop_leaves_a_process_it_cannot_capture_in_the_kernels_map() {
     assert_eq!(a[0]["kind"], "stopping");
     assert_eq!(a[0]["left"], serde_json::json!([h.pid]), "{}", a[0]);
     assert_eq!(a[0]["resumed"], serde_json::json!([]));
+}
+
+/// BUG-124: a held process whose capture failed when its report was read
+/// is captured again at the stop and resumed, named in `recaptured`. On
+/// main its `SIGCONT` failed with the capture's error, its pid left the
+/// map, and it stayed stopped.
+#[test]
+fn the_stop_captures_again_and_resumes_a_process_it_could_not_capture() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    let broken = w.break_capture();
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.push(raw_for(&h, class::HOME));
+    w.ctl.step(Instant::now());
+    broken.store(false, Ordering::Relaxed);
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "still {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["resumed"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["recaptured"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["left"], serde_json::json!([]), "{}", a[0]);
 }
 
 /// BUG-124: a kill owed when the agent stops is carried out if the

@@ -1251,6 +1251,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let mut killed = Vec::new();
         let mut left = Vec::new();
         let mut unreported = Vec::new();
+        let mut recaptured = Vec::new();
         let mut seen = HashSet::new();
         // the processes held for a decision
         for (_, mut p) in std::mem::take(&mut self.entries) {
@@ -1258,13 +1259,17 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 continue;
             }
             seen.insert(p.raw.pid);
+            let was_uncaptured = matches!(p.proc_ref.liveness(), Liveness::Uncaptured(_));
             match recheck(&mut self.capture, &mut p) {
                 Liveness::Uncaptured(_) => {
                     left.push(p.raw.pid);
                     continue;
                 }
                 Liveness::Live if p.proc_ref.signal(libc::SIGCONT).is_ok() => {
-                    resumed.push(p.raw.pid)
+                    resumed.push(p.raw.pid);
+                    if was_uncaptured {
+                        recaptured.push(p.raw.pid);
+                    }
                 }
                 Liveness::Live | Liveness::Gone => {}
             }
@@ -1332,6 +1337,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     // BUG-118: of the resumed, those whose report the
                     // agent had not read (held without an entry)
                     "unreported": unreported,
+                    // BUG-124: of the resumed, those held for a decision
+                    // whose capture had failed until the stop
+                    "recaptured": recaptured,
                     "op": AUDIT_OP,
                 }),
                 "success",
