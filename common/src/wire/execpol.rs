@@ -589,7 +589,10 @@ mod tests {
         r.file_uid = 0;
         r.uid = 0;
         assert!(r.target_setid());
-        assert!(!r.at_secure(), "root running a set-uid-root file: no change");
+        assert!(
+            !r.at_secure(),
+            "root running a set-uid-root file: no change"
+        );
         r.uid = 1000;
         assert!(r.at_secure(), "a user running a set-uid-root file");
         r.file_uid = 1000;
@@ -598,7 +601,10 @@ mod tests {
         assert!(r.at_secure(), "root running a set-uid file of another user");
         r.file_mode = 0o102755;
         r.file_uid = 0;
-        assert!(r.at_secure(), "set-gid: the file's group is not in the record");
+        assert!(
+            r.at_secure(),
+            "set-gid: the file's group is not in the record"
+        );
         r.file_mode = 0o106755;
         assert!(r.at_secure());
         r.file_mode = 0o100755;

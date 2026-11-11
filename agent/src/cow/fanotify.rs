@@ -812,16 +812,31 @@ mod lot315 {
         let stat = |comm: &str, flags: u64| {
             format!("4242 ({comm}) S 1 4242 4242 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0\n")
         };
-        assert_eq!(io_thread_in_stat(&stat("iou-wrk-4242", 0x404050)), Some(true));
+        assert_eq!(
+            io_thread_in_stat(&stat("iou-wrk-4242", 0x404050)),
+            Some(true)
+        );
         assert_eq!(io_thread_in_stat(&stat("enc", 0x10)), Some(true));
         // a comm that says so is not the flag
-        assert_eq!(io_thread_in_stat(&stat("iou-wrk-4242", 0x404040)), Some(false));
+        assert_eq!(
+            io_thread_in_stat(&stat("iou-wrk-4242", 0x404040)),
+            Some(false)
+        );
         // nor one that hides fields (spaces, a parenthesis, `0x10`)
-        assert_eq!(io_thread_in_stat(&stat("a) S 1 1 1 0 -1 16", 0x400040)), Some(false));
-        assert_eq!(io_thread_in_stat(&stat("x) R 1 1 1 0 -1 0", 0x10)), Some(true));
+        assert_eq!(
+            io_thread_in_stat(&stat("a) S 1 1 1 0 -1 16", 0x400040)),
+            Some(false)
+        );
+        assert_eq!(
+            io_thread_in_stat(&stat("x) R 1 1 1 0 -1 0", 0x10)),
+            Some(true)
+        );
         assert_eq!(io_thread_in_stat("4242 (x) S 1"), None);
         assert_eq!(io_thread_in_stat(""), None);
-        assert_eq!(io_thread_in_stat(&stat("x", 0).replace(" 0 -1 0 ", " 0 -1 zz ")), None);
+        assert_eq!(
+            io_thread_in_stat(&stat("x", 0).replace(" 0 -1 0 ", " 0 -1 zz ")),
+            None
+        );
     }
 
     /// BUG-102: the flag decides before the line — an io_uring worker
@@ -830,14 +845,28 @@ mod lot315 {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bug102_the_flag_decides_before_the_syscall_line() {
-        let read_line = || Some("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string());
-        let worker = "4243 (iou-wrk-4242) S 1 4242 4242 0 -1 2097232 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
+        let read_line =
+            || Some("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string());
+        let worker =
+            "4243 (iou-wrk-4242) S 1 4242 4242 0 -1 2097232 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
         let thread = "4242 (enc) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
-        assert!(matches!(open_intent(Some(worker), read_line), OpenIntent::Unknown(_)));
-        assert!(matches!(open_intent(None, read_line), OpenIntent::Unknown(_)));
-        assert!(matches!(open_intent(Some("4242 (x"), read_line), OpenIntent::Unknown(_)));
+        assert!(matches!(
+            open_intent(Some(worker), read_line),
+            OpenIntent::Unknown(_)
+        ));
+        assert!(matches!(
+            open_intent(None, read_line),
+            OpenIntent::Unknown(_)
+        ));
+        assert!(matches!(
+            open_intent(Some("4242 (x"), read_line),
+            OpenIntent::Unknown(_)
+        ));
         assert_eq!(open_intent(Some(thread), read_line), OpenIntent::ReadOnly);
-        assert!(matches!(open_intent(Some(thread), || None), OpenIntent::Unknown(_)));
+        assert!(matches!(
+            open_intent(Some(thread), || None),
+            OpenIntent::Unknown(_)
+        ));
     }
 
     /// BUG-102 on this host's kernel: a real io_uring worker of this
@@ -852,7 +881,10 @@ mod lot315 {
             return;
         };
         let workers = ring.workers();
-        assert!(!workers.is_empty(), "no io_uring worker seen in /proc/self/task");
+        assert!(
+            !workers.is_empty(),
+            "no io_uring worker seen in /proc/self/task"
+        );
         for tid in &workers {
             // the process renames its worker: still a worker
             let _ = std::fs::write(format!("/proc/self/task/{tid}/comm"), "enc");
@@ -905,9 +937,8 @@ mod lot315 {
             let mut p = [0u32; 30];
             // SAFETY: io_uring_setup(entries, params) on a zeroed params
             // buffer of the struct's size.
-            let ring = unsafe {
-                libc::syscall(libc::SYS_io_uring_setup, 4u32, p.as_mut_ptr()) as i32
-            };
+            let ring =
+                unsafe { libc::syscall(libc::SYS_io_uring_setup, 4u32, p.as_mut_ptr()) as i32 };
             if ring < 0 {
                 return None;
             }

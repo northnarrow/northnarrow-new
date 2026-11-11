@@ -633,8 +633,7 @@ impl Runtime {
             return self.allow_fast(fd, read_at, &s.allowed_outside_scope);
         }
         let key = (id, writer);
-        if self.inflight.lock().contains(&key)
-            || self.store.index.lock().has_entry_for(&id, writer)
+        if self.inflight.lock().contains(&key) || self.store.index.lock().has_entry_for(&id, writer)
         {
             return self.allow_fast(fd, read_at, &s.allowed_already_copied);
         }

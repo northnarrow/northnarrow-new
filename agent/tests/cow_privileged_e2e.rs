@@ -282,7 +282,10 @@ fn two_writers_of_one_tree_are_its_attack() {
         .expect("the guard starts");
     // each writer's copy committed before the next one opens the file (a
     // write-open is recorded for a file the index holds)
-    let scripts = ["printf 'half encrypted' > \"$0\"", "printf ' and the rest' >> \"$0\""];
+    let scripts = [
+        "printf 'half encrypted' > \"$0\"",
+        "printf ' and the rest' >> \"$0\"",
+    ];
     for (i, script) in scripts.iter().enumerate() {
         let ok = Command::new("sh")
             .arg("-c")
@@ -316,7 +319,8 @@ fn two_writers_of_one_tree_are_its_attack() {
         .clone();
     let post = store.index.lock().post_writes(&first.file.id(), 0);
     assert!(
-        post.iter().any(|p| p.in_tree_of(me) && p.file.may_be(&first.file.id())),
+        post.iter()
+            .any(|p| p.in_tree_of(me) && p.file.may_be(&first.file.id())),
         "the second writer's write-open, with its lineage: {post:?}"
     );
     let rep = store.restore(

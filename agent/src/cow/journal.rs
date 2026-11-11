@@ -651,8 +651,7 @@ mod tests {
         let j = Journal::open(&t.path().join(".j")).unwrap();
         let f = t.path().join("old.tar.locked");
         std::fs::write(&f, b"junk").unwrap();
-        let year_ago =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+        let year_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
         std::fs::File::options()
             .write(true)
             .open(&f)
@@ -660,7 +659,8 @@ mod tests {
             .set_modified(year_ago)
             .unwrap();
         let d = open_dir(t.path()).unwrap();
-        j.move_to_evidence(d.as_raw_fd(), "old.tar.locked", 3).unwrap();
+        j.move_to_evidence(d.as_raw_fd(), "old.tar.locked", 3)
+            .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -119,20 +119,23 @@ fn the_guard_compares_inode_numbers_in_one_place() {
     let mut files = Vec::new();
     rs_files(&dir, &mut files);
     files.sort();
-    assert!(files.len() >= 10, "{} files under agent/src/cow", files.len());
+    assert!(
+        files.len() >= 10,
+        "{} files under agent/src/cow",
+        files.len()
+    );
     let mut bad = Vec::new();
     let mut helper_seen = false;
     for f in &files {
-        let rel = f
-            .strip_prefix(repo_root())
-            .unwrap()
-            .display()
-            .to_string();
+        let rel = f.strip_prefix(repo_root()).unwrap().display().to_string();
         let code = std::fs::read_to_string(f).unwrap();
         if rel == HELPER {
             helper_seen = true;
             // the helper does compare: the scan sees it
-            assert!(!violations(&code).is_empty(), "{HELPER}: the scan sees nothing");
+            assert!(
+                !violations(&code).is_empty(),
+                "{HELPER}: the scan sees nothing"
+            );
             continue;
         }
         for (line, text) in violations(&code) {

@@ -481,7 +481,13 @@ mod lot315 {
             sha256: "ab".into(),
             writer: w,
             writer_program: "/home/u/enc.py".into(),
-            lineage: vec![w, ProcId { pid: 100, start: 10 }],
+            lineage: vec![
+                w,
+                ProcId {
+                    pid: 100,
+                    start: 10,
+                },
+            ],
             taken_at_ms: at,
             method: Method::Copy,
         }
@@ -489,7 +495,10 @@ mod lot315 {
 
     fn tree() -> Selector {
         Selector {
-            roots: vec![ProcId { pid: 100, start: 10 }],
+            roots: vec![ProcId {
+                pid: 100,
+                start: 10,
+            }],
             since_ms: None,
         }
     }
@@ -526,7 +535,10 @@ mod lot315 {
         let mut more = all.to_vec();
         more.push(entry(3, "/srv/b", Some(200), 103, 1500));
         more.push(entry(4, "/srv/a", Some(100), 104, 500));
-        let ids: Vec<u64> = pick(more.iter().rev(), &tree()).iter().map(|e| e.id).collect();
+        let ids: Vec<u64> = pick(more.iter().rev(), &tree())
+            .iter()
+            .map(|e| e.id)
+            .collect();
         assert_eq!(ids, [3, 4]);
     }
 
@@ -574,15 +586,21 @@ mod lot315 {
         assert!(sel.in_attack_write(&weighed, &write_by(102, vec![])));
         assert!(!sel.in_attack_write(&picked, &write_by(102, vec![])));
         // a writer with no copy of its own, of the tree by its lineage
-        let root = ProcId { pid: 100, start: 10 };
+        let root = ProcId {
+            pid: 100,
+            start: 10,
+        };
         assert!(sel.in_attack_write(&picked, &write_by(103, vec![root])));
-        assert!(sel.in_attack_write(
-            &picked,
-            &write_by(103, vec![ProcId { pid: 100, start: 0 }])
-        ));
+        assert!(sel.in_attack_write(&picked, &write_by(103, vec![ProcId { pid: 100, start: 0 }])));
         assert!(!sel.in_attack_write(
             &picked,
-            &write_by(103, vec![ProcId { pid: 100, start: 11 }])
+            &write_by(
+                103,
+                vec![ProcId {
+                    pid: 100,
+                    start: 11
+                }]
+            )
         ));
         assert!(!sel.in_attack_write(&picked, &write_by(103, vec![])));
         // --since alone: the picked copies, and no lineage

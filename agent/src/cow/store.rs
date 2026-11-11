@@ -1677,7 +1677,15 @@ mod tests {
                 btime_ns: crate::cow::fanotify::btime(f.as_raw_fd(), None),
             });
             l.store
-                .commit(r, file, writer, "/home/u/enc.py".into(), lineage, at, method)
+                .commit(
+                    r,
+                    file,
+                    writer,
+                    "/home/u/enc.py".into(),
+                    lineage,
+                    at,
+                    method,
+                )
                 .unwrap()
         }
 
@@ -1798,7 +1806,14 @@ mod tests {
             let t1 = now_ms();
             take(&l, "plan.txt", None, C1, vec![C1, ROOT], t1);
             std::fs::write(l.scope.join("plan.txt"), b"half encrypted").unwrap();
-            take(&l, "plan.txt", None, running, vec![running, ROOT], t1 + 1000);
+            take(
+                &l,
+                "plan.txt",
+                None,
+                running,
+                vec![running, ROOT],
+                t1 + 1000,
+            );
             std::fs::write(l.scope.join("plan.txt"), b"fully encrypted").unwrap();
             // another file of the tree, its only writer gone: restored
             std::fs::write(l.scope.join("other.txt"), b"other original").unwrap();
@@ -1811,9 +1826,17 @@ mod tests {
                 std::fs::read(l.scope.join("other.txt")).unwrap(),
                 b"other original"
             );
-            let plan = rep.rows.iter().find(|r| r.path.ends_with("plan.txt")).unwrap();
+            let plan = rep
+                .rows
+                .iter()
+                .find(|r| r.path.ends_with("plan.txt"))
+                .unwrap();
             assert_eq!(plan.action, "skipped");
-            assert!(plan.detail.contains(&format!("pid {me}")), "{}", plan.detail);
+            assert!(
+                plan.detail.contains(&format!("pid {me}")),
+                "{}",
+                plan.detail
+            );
             assert_eq!(
                 std::fs::read(l.scope.join("plan.txt")).unwrap(),
                 b"fully encrypted",
@@ -1927,7 +1950,8 @@ mod tests {
             let d = l.scope.join("d.txt");
             std::fs::write(&d, b"unpacked from last year's backup").unwrap();
             // `tar -x` puts the archived mtime back: a year ago
-            let year_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+            let year_ago =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
             std::fs::File::options()
                 .write(true)
                 .open(&d)
