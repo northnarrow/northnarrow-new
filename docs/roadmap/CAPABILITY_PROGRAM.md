@@ -9117,3 +9117,36 @@ number in parentheses is a lab PR.
     five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
     V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
     deny proof in a privileged e2e; then a third party's validation.
+- **Lot 315 — the copy-on-first-write guard and the exec policy trust the
+  kernel's data, not a name or a number (C19, C13, C23; the third bug
+  hunt's lot 6, family F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's
+  record half, BUG-113, the triage's N2, and the lot's mini-hunt; no level
+  changes).**
+  - What was open: N2, data loss — the restore looked for "the attack's
+    renamed copy" of a deleted file by device and inode number alone: a new
+    file of the owner's that had inherited the number (one open: `cp`,
+    `tar`, a download) was moved into the journal's evidence, and the
+    evidence's expiry, by the file's own mtime, deleted it (at once with an
+    old mtime kept). The same number-only identity in four more places
+    (BUG-110's `pick`, copy on first write, shared copies, the write-opens
+    after a copy). BUG-93: a restore of a process tree weighed a file's
+    later writers against the copies it picked, one per file: a second
+    writer of the tree was "another writer". BUG-102: an io_uring worker's
+    open read as its creator's syscall. BUG-109: a file named `x (deleted)`
+    taken for an unlinked one. BUG-101: `AT_SECURE` claimed by the set-id
+    bits alone. BUG-113: the watchdog's start read after its exe only.
+  - What changed: `cow/identity.rs` (`FileId`: device, inode number, birth
+    time; three questions, each wrong only on the side that loses nothing)
+    holds every comparison of the guard, and `xtask/tests/cow_file_identity.rs`
+    refuses any other (it flags the 20 sites of `main`); the renamed copy is
+    the file only by a birth time known on both sides; the evidence ages from
+    its move; a restore with roots weighs every copy of the tree and each
+    write-open's lineage (`--since` alone unchanged); `PF_IO_WORKER` from
+    `/proc/<tid>/stat` and cleared registers make a write; liveness of an
+    event's file is `st_nlink`, its path told by a cached `lstat` against
+    `fstat` (a hard link left keeps the opened name: a mini-hunt variant);
+    `ExecPolRaw::at_secure`; the watchdog's start read before and after.
+  - Measured on our guests: @LAB315@
+  - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
+    by default (C19, C13); BUG-101's kernel half (the deny skipped for every
+    set-id target) is lot 318's.

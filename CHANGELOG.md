@@ -6,6 +6,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- The copy-on-first-write guard and the exec policy trust the kernel's
+  data, not a name or a number (lot 315, the third bug hunt's lot 6, family
+  F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's record half, BUG-113;
+  the triage's N2; `docs/design/COPY_ON_FIRST_WRITE.md` §2.1, §2.3-2.5, §3,
+  `docs/design/EXEC_POLICY.md` §2):
+  - a file is its device, inode number and birth time in the whole guard
+    (`agent/src/cow/identity.rs`, and a ratchet,
+    `xtask/tests/cow_file_identity.rs`). N2, data loss: the restore took the
+    owner's new file that inherited the inode number of a file the attack
+    deleted for "the attack's renamed copy" and moved it into the journal's
+    evidence, which the expiry deleted (at once when the file kept an old
+    mtime: `tar -x`, `rsync -a`, `cp -p`). The renamed copy is that file by
+    its birth time now; one whose birth time cannot be compared is named in
+    the row and left in place. The same identity in `pick` (BUG-110: the
+    second file's entry was dropped without a row), copy on first write (a
+    writer of the deleted file got no copy of the new one), shared copies
+    and the write-opens after a copy; the evidence ages from its move;
+  - a restore of a process tree weighs every copy of the tree and the
+    lineage of each write-open (BUG-93: a second writer of the tree was
+    "another writer", the file kept both and the automatic restore said
+    Success; a writer of the tree still running did not stop it); `--since`
+    alone is unchanged (the report's fix would overwrite a later edit);
+  - an io_uring worker's open is a write (BUG-102: its `syscall` line is
+    its creator's — a creator in `openat(…, O_RDONLY)` made the worker's
+    `O_WRONLY|O_TRUNC` opens reads, written without a copy): known by
+    `PF_IO_WORKER` in `/proc/<tid>/stat`, never by its `comm`;
+  - a live file named `x (deleted)` has a path (BUG-109: written without a
+    copy, `skipped_unresolved_path`): liveness is `st_nlink`, the path is
+    told from the kernel's mark by a cached `lstat` against `fstat`; a file
+    whose opened name was unlinked while a hard link remains is copied too;
+  - `EXECENV-001` says `AT_SECURE` only when the exec changes the
+    credentials (BUG-101's record half: root running `su` with a preload
+    was "ignored by the loader" — it is honoured); the kernel's half is lot
+    318;
+  - the watchdog's start is read before and after its exe (BUG-113: a PID
+    recycled between the reads was verified with the newcomer's start).
 - The kernel module judge sees a compressed module's load on 7.0 (lot 303;
   `docs/operator/RULE_POLICY.md` §2.4). 7.0 reads the file of a
   `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` — kmod's load of a
