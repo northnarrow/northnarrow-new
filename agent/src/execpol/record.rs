@@ -907,7 +907,7 @@ mod bughunt3 {
             let session = rng.one_in(2);
             match rng.below(5) {
                 0..=1 => {
-                    let mut r = tunables_at_su(rng.pick(&tunables));
+                    let mut r = tunables_at_su(rng.pick::<String>(&tunables));
                     r.uid = uid;
                     if !session {
                         r.tier = tier::SERVICE;
@@ -928,7 +928,7 @@ mod bughunt3 {
                     r.env_action = action::RECORD;
                     let v = rng.pick(&hist);
                     r.hist[..v.len()].copy_from_slice(v.as_bytes());
-                    let path = rng.pick(&["/usr/bin/sh", "/usr/bin/bash"]);
+                    let path = rng.pick::<&str>(&["/usr/bin/sh", "/usr/bin/bash"]);
                     (r, su_event(uid, path))
                 }
                 _ => {
