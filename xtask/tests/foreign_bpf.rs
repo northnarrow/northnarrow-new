@@ -330,8 +330,15 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
     in_order(
         body(&k, "spawn"),
         &[
-            "let mut found = round(&mut w, Path::new(\"/\"));",
-            "if let Some(c) = cross.as_mut() {\n                found.extend(crossview_round(c, &mut failing));",
+            // lot 304: the cross-view first (the root's programs are told
+            // by its enumeration of the round), its findings sent after
+            // the round's
+            "let crossed = match cross.as_mut() {",
+            "Some(c) => crossview_round(c, &mut failing, agent_start),",
+            "common::bpf_prog_class::KnownLink::RootCgroupSysctl,",
+            "c.watch.program(id).as_ref(),",
+            "round(&mut w, Path::new(\"/\"), &known)",
+            "found.extend(crossed);",
             "tx.send(event_of(&f, monotonic_ns()))",
         ],
     )
@@ -340,6 +347,9 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
         body(&k, "crossview_round"),
         &[
             "match cross.round() {",
+            // lot 304: a known system program's baseline marked first
+            "mark_known_baselines(&mut found, &|id, link| {",
+            "cross.watch.program(id).as_ref(),",
             "found.into_iter().map(Finding::Bpf).collect()",
             "crate::boot::degradation::report(DEGRADATION, &line)",
         ],

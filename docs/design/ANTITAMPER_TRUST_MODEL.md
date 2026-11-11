@@ -2100,7 +2100,9 @@ NN-L-AT-001 `sysctl_root_attach`, ENGAGED. One attached inside a window or
 before the start is found by the kernel-state round (`BPF_PROG_QUERY` of
 the root) and signed once per program (`sysctl_root_prog`, High); a root
 the judge's attach no longer finds as it left it (our program gone, the
-mode no longer multi) is a signed degradation while it holds.
+mode no longer multi) is a signed degradation while it holds. Lot 304:
+systemd-networkd's own `sysctl_monitor` (systemd 257+), its loader proven,
+is signed Low instead and is no degradation (below, "Lot 304").
 
 **What stays open.**
 - A birth the fentry missed is not known, and the marks' epoch is reset
@@ -2208,6 +2210,8 @@ loading is
   prog id 2 on the 6.8 guest, loaded when udev loads `hid` in the
   initramfs — the lab's rounds signed it High at every start;
   `bpf_preload`'s iterators); the same name attached elsewhere is not one;
+  Low with its loader's proof for a known system program (lot 304: PID 1's
+  `restrict_filesystems`, below);
 - **unseen** when it appears later — loaded through a path the hook does not
   see, or hidden from it: NN-L-AT-001 `bpf_unseen`, High, with its type,
   name, tag and attach point.
@@ -2447,3 +2451,64 @@ upgrade's gap, which only a window opens — nothing refuses one. A pinned
 object the agent cannot prove its own by id (an earlier build's map left in
 a pin directory) is reported, not protected by id; its path stays refused by
 the prefix.
+
+## Lot 304 — the known system programs: told by their loader, never by their name
+
+**Goal.** A systemd host loads two BPF programs at boot, before the agent
+starts, that the agent signed as foreign at every start (Debian 13,
+systemd 257; Ubuntu 26.04, systemd 259; measured on our guests):
+systemd-networkd's `sysctl_monitor` on the root cgroup's `cgroup/sysctl`
+slot (`sysctl_root_prog`, High, and the sysctl judge's degradation — the
+trust level degraded at every start) and PID 1's `restrict_filesystems`
+LSM program (`RestrictFileSystems=`, the cross-view's baseline, High: an
+LSM program's type is refused outside a window). Neither is an attack; an
+attacker's program must not pass for one.
+
+**What the kernel says of them** (the guests): `sysctl_monitor` is
+created by uid `systemd-network`, and networkd's main process holds its
+program's descriptor and the descriptor of its cgroup link to the root
+(`/proc/<pid>/fdinfo`: `link_type cgroup`, `cgroup_id 1`, `attach_type
+18`) — not PID 1, as the brief assumed; PID 1 holds `restrict_filesystems`'
+tracing link (`attach_type 27`, `BPF_LSM_MAC`, on `bpf_lsm_file_open`).
+
+**The criterion** (`crates/nn-linux/src/known_system_prog.rs`,
+`common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS`). A program is a known
+system program only when all of this holds, each from the kernel:
+- the cross-view's enumeration gives it an entry's name, type and attach
+  function (`sysctl_monitor`, `cgroup_sysctl`; `restrict_filesy` — the
+  kernel keeps 15 bytes — `lsm` on `bpf_lsm_file_open`);
+- a process holds a descriptor of the link that attaches THAT program the
+  entry's way: a cgroup link to the root cgroup as `cgroup_sysctl`, or an
+  LSM tracing link — the loader keeps it, or the program detaches;
+- that process runs the entry's packaged executable: `/proc/<pid>/exe` has
+  the device and the inode of `/usr/lib/systemd/systemd-networkd` (or
+  `/usr/lib/systemd/systemd`), a regular file owned by root and writable by
+  no one else, stat'ed at the judgement; the process the same throughout
+  (its start read before and after);
+- it was running when the program was loaded (its start no later than the
+  program's load time, both on the boot clock);
+- the program was loaded before the agent started, or the agent's `bpf`
+  hook saw that very process load it (`SEEN_PROGS`) — and then its root
+  attach was one the hook lets through only inside a trusted-installer
+  window.
+
+Such a program is signed Low, `sysctl_root_prog` or `bpf_baseline` as
+before, with its loader as the record's principal (pid, uid, name) and the
+proof in the reasoning; the start's sysctl judge degradation leaves it out
+(weighed once the cross-view's iterators are set up). Anything else — the
+same name from another loader, a copy of the loader (its own inode), a
+load after the start the hook did not see that process make — is signed as
+before (High). The refusals do not change: a root `cgroup/sysctl` attach
+and an LSM load outside a window are refused whoever asks, networkd and
+PID 1 included.
+
+**What stays open.**
+- The criterion trusts the packaged file at the entry's path and the
+  loader process: a root that replaced the file before the agent started,
+  or that steers the loader (a debugger attached to it, a descriptor slid
+  into it), is not told apart here.
+- networkd restarted outside a window (an upgrade of systemd, an operator's
+  `systemctl restart systemd-networkd`) has its root attach refused
+  (`sysctl_root_attach`, High, ENGAGED): it runs without its sysctl monitor
+  until it is restarted inside a window, or at the next boot.
+

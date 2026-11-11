@@ -8816,6 +8816,76 @@ number in parentheses is a lab PR.
   - Mutations (a catch is a named test failing): 11 on the new code, 11
     caught; `origin/main`'s logic under the new tests caught by 4 named
     tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
+- **Lot 304 (B) — systemd's own BPF programs told by their loader: no
+  NN-L-AT-001 High at the start on Debian 13 and Ubuntu 26.04.**
+  - What was open: at every start on a systemd 257+ host the agent signed
+    systemd-networkd's `sysctl_monitor`, linked to the root cgroup's
+    `cgroup/sysctl` slot, as a program not its own (`sysctl_root_prog`,
+    High) with a sysctl judge degradation (the trust level "degraded"), and
+    PID 1's `restrict_filesystems` LSM program as a High baseline of the
+    cross-view (`bpf_baseline`: an LSM program's type is refused outside a
+    window). Measured on our guests: `sysctl_monitor` is loaded by
+    systemd-networkd (created by uid `systemd-network`; networkd's main
+    process holds its descriptor and its cgroup link to the root, `cgroup_id
+    1`, `attach_type 18`), not by PID 1; PID 1 holds `restrict_filesystems`'
+    tracing link (`attach_type 27`, `BPF_LSM_MAC`).
+  - What changed: `crates/nn-linux/src/known_system_prog.rs` and
+    `common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS` (the two programs). A
+    program is a known system program only when the kernel says all of it:
+    the enumeration's name, type and attach function of an entry; a process
+    holding the link that attaches that program the entry's way; that
+    process running the packaged executable (`/proc/<pid>/exe`'s device
+    and inode those of `/usr/lib/systemd/systemd-networkd` or
+    `/usr/lib/systemd/systemd`, root's, writable by no one else), started
+    no later than the load; the load before the agent's start, or seen by
+    the agent's `bpf` hook from that very process. Then it is signed Low —
+    `sysctl_root_prog` or `bpf_baseline` as before, the loader the record's
+    principal, the proof in the reasoning — and the start's sysctl judge
+    degradation leaves it out. Anything else is signed as before; the
+    refusals do not change.
+  - The lab, as measured (our own guests under lease k304, one agent at a
+    time; `debian13` 6.12.115, systemd 257.13; `ubuntu2604` 7.0.0-43,
+    systemd 259.5):
+    - Before (`main` 02b8e853, installed and started): on each guest 2
+      NN-L-AT-001 High at the start — `sysctl_root_prog` (`sysctl_monitor`,
+      ids 35 and 72) and `bpf_baseline` (`restrict_filesy`, ids 21 and 49)
+      — and the degradation "other cgroup/sysctl programs on the root
+      cgroup" (`nn-admin status`: L2, degraded).
+    - After (this lot, installed, then a cold boot: the bootcheck OK, the
+      agent started after networkd): 0 NN-L-AT-001 High or Critical at the
+      start; `sysctl_root_prog` Low, its principal `systemd-network` (pids
+      633 and 868, uid 998); `bpf_baseline` Low for `restrict_filesy`
+      (principal pid 1) and for `sysctl_monitor`; no sysctl judge
+      degradation (Debian 13 L3; Ubuntu 26.04 only lot 303b's `dns_answer`,
+      not merged).
+    - A program named `sysctl_monitor` linked to the root by a probe of
+      ours (`BPF_LINK_CREATE`, as networkd does): outside a window refused
+      (`EPERM`, `sysctl_root_attach` High); inside a window, from the probe
+      and from a copy of it installed as `/usr/local/libexec/systemd-networkd`
+      (its name `systemd-network`): `sysctl_root_prog` High, the reason
+      logged "does not run /usr/lib/systemd/systemd-networkd" — on both
+      guests.
+    - networkd restarted inside a window: its new program Low, "seen
+      loading by that process"; outside a window its attach refused and
+      networkd runs on without it ("Unable to attach sysctl monitor BPF
+      program to cgroup, ignoring: Operation not permitted"): the residual,
+      in `ANTITAMPER_TRUST_MODEL.md`. Agents uninstalled, the monitor
+      restored, the guests clean and off.
+    - Residual, measured (Ubuntu 26.04 only; a later lot of the
+      coordinator's takes it): two feature probes of systemd 259 are refused
+      outside a window and signed `bpf_prog_type` High — the user manager
+      (`systemd --user`, uid 1000) loading a `tracepoint` program at the
+      first login after boot, and systemd-networkd loading a `kprobe`
+      program at a restart. Neither is the start's record; Debian 13
+      (systemd 257) showed neither.
+  - Mutations (a catch is a named test failing; every run's baseline green):
+    70 on the new code, 70 caught — the table's lookup, the records'
+    encodings, each condition of the judgement (the executable, the start,
+    the load's time, the hook's loader, the packaged file's mode, owner and
+    kind), the fdinfo's fields, the `/proc` reader (a pid reused during the
+    scan), the host reader, the round's and the cross-view's marks, the
+    events, the start degradation, the two verdicts; 8 survivors of the
+    first round got a test.
   - Level unchanged.
 - **Lot 305 — rustix 1.1.6 for RUSTSEC-2026-0486 (C27; dependency
   maintenance, no level changes).**

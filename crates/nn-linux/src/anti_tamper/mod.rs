@@ -581,23 +581,35 @@ fn attach_reporting(
     // write — cgroup/sysctl linked to the root cgroup (multi), pinned beside
     // the pin root. Not a deny hook of the count: without it the write deny
     // judges alone (the fallback), a signed degradation.
-    match crate::sysctl_cgroup::attach(ebpf, pin_root) {
-        crate::sysctl_cgroup::Judge::Attached { others } if !others.is_empty() => {
+    // Lot 304: the other programs found on the root are weighed once the
+    // BPF cross-view's iterators are set up (below): a known system
+    // program, its loader proven, is no degradation.
+    let sysctl_others = match crate::sysctl_cgroup::attach(ebpf, pin_root) {
+        crate::sysctl_cgroup::Judge::Attached { others } => others,
+        crate::sysctl_cgroup::Judge::Fallback(why) => {
             report.degraded.push(format!(
-                "sysctl judge: other cgroup/sysctl programs on the root cgroup (ids {others:?}): \
-                 attached after ours they run after it and could rewrite the value it judged \
-                 (the integrity round puts a harmful value back within 5 s)"
-            ))
+                "sysctl judge: cgroup/sysctl not attached ({why}): {}",
+                crate::sysctl_cgroup::FALLBACK_EFFECT
+            ));
+            Vec::new()
         }
-        crate::sysctl_cgroup::Judge::Attached { .. } => {}
-        crate::sysctl_cgroup::Judge::Fallback(why) => report.degraded.push(format!(
-            "sysctl judge: cgroup/sysctl not attached ({why}): {}",
-            crate::sysctl_cgroup::FALLBACK_EFFECT
-        )),
-    }
+    };
 
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
+    if let Some(line) = sysctl_others_degraded(&sysctl_others, &|id| {
+        let prog = bpf_guard.census_program(id)?;
+        // at the attach the hook has seen no load of this start's yet
+        crate::known_system_prog::judge_on_host(
+            id,
+            common::bpf_prog_class::KnownLink::RootCgroupSysctl,
+            Some(&prog),
+            crate::known_system_prog::agent_start_ns(),
+            None,
+        )
+    }) {
+        report.degraded.push(line);
+    }
     for (program, why) in bd.deny_failures {
         deny.missing_hook(program, why);
     }
@@ -812,6 +824,37 @@ impl DenyHealth {
     fn is_empty(&self) -> bool {
         self.missing.is_empty() && self.infra.is_empty()
     }
+}
+
+/// Lot 280a / 304: the degradation of the root's other `cgroup/sysctl`
+/// programs found at the attach — those `known` does not prove a known
+/// system program (systemd-networkd's `sysctl_monitor`, its loader proven:
+/// [`crate::known_system_prog`]); none when every one is.
+fn sysctl_others_degraded(
+    others: &[u32],
+    known: &dyn Fn(u32) -> Result<crate::known_system_prog::Known, String>,
+) -> Option<String> {
+    let unknown: Vec<u32> = others
+        .iter()
+        .copied()
+        .filter(|id| match known(*id) {
+            Ok(k) => {
+                info!(id, loader_pid = k.pid, loader = %k.comm, "sysctl judge: a known system program on the root cgroup (its loader proven)");
+                false
+            }
+            Err(why) => {
+                info!(id, why = %why, "sysctl judge: a root cgroup/sysctl program not proven a known system program");
+                true
+            }
+        })
+        .collect();
+    (!unknown.is_empty()).then(|| {
+        format!(
+            "sysctl judge: other cgroup/sysctl programs on the root cgroup (ids {unknown:?}): \
+             attached after ours they run after it and could rewrite the value it judged \
+             (the integrity round puts a harmful value back within 5 s)"
+        )
+    })
 }
 
 /// What [`attach`] found (R11c, lab PR 264: it returns it, for the start's
@@ -1563,6 +1606,38 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 304 (named): the start's degradation of the root's other
+    /// `cgroup/sysctl` programs names only those not proven known system
+    /// programs; none when every one is (systemd-networkd's
+    /// `sysctl_monitor` alone, as on Debian 13 and Ubuntu 26.04).
+    #[test]
+    fn a_known_root_program_is_no_degradation_of_the_sysctl_judge() {
+        let known = |id: u32| {
+            if id == 35 {
+                Ok(crate::known_system_prog::Known {
+                    id,
+                    entry: 0,
+                    link_id: 3,
+                    pid: 631,
+                    uid: 998,
+                    comm: "systemd-network".into(),
+                    seen: false,
+                })
+            } else {
+                Err("not proven".to_string())
+            }
+        };
+        assert_eq!(sysctl_others_degraded(&[], &known), None);
+        assert_eq!(sysctl_others_degraded(&[35], &known), None);
+        let line = sysctl_others_degraded(&[35, 812, 900], &known).unwrap();
+        assert!(
+            line.contains("other cgroup/sysctl programs on the root cgroup (ids [812, 900])"),
+            "{line}"
+        );
+        let line = sysctl_others_degraded(&[812], &known).unwrap();
+        assert!(line.contains("(ids [812])"), "{line}");
+    }
 
     /// R13 (lab PR 271): the anti-tamper attach's notes for the manifest —
     /// the deny hooks counted, a missing observe hook named, none attached.

@@ -144,6 +144,20 @@ impl BpfGuard {
         self.0.own_progs.lock().clone()
     }
 
+    /// Lot 304: program `id` as one enumeration of the cross-view's
+    /// iterators has it now (before the kernel-state round takes them), or
+    /// why not.
+    pub fn census_program(&self, id: u32) -> Result<crate::known_system_prog::Program, String> {
+        let census = self.0.census.lock();
+        let parts = census.as_ref().ok_or("no BPF cross-view iterators")?;
+        let en = parts.enumerate()?;
+        en.progs
+            .iter()
+            .find(|p| p.id == id)
+            .map(crate::bpf_crossview::program_of)
+            .ok_or_else(|| format!("program {id} not in the enumeration"))
+    }
+
     /// Lot 290: the cross-view for the kernel-state round (its kernel parts
     /// taken once; `None` when the attach could not set them up — a signed
     /// degradation then), its status file at `status`.
