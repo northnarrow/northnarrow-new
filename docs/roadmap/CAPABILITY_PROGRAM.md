@@ -42,7 +42,7 @@ number in parentheses is a lab PR.
 | C11 | Containers and Kubernetes | 1 | the agent on a container host (`docs/operator/CONTAINER_HOST_DEPLOY.md`); R013 and EPG-002 detect an escape to the host; no container or pod id in the records | 3 |
 | C12 | Synchronous inline blocking | 2 | the exec policy at `bprm_check_security`: `-EACCES` per file class and lineage, LD_PRELOAD and LD_AUDIT, `mmap_file`; armed on 4 kernels, MS-01/02/03/32 refused (226); the `socket_connect` deny of the blocklist (224); EPG enforce, SIGKILL in the kernel (219); exec quarantine (223). All EXPERIMENTAL and off by default (`docs/design/EXEC_POLICY.md`); the behaviour proofs on one kernel | 3 |
 | C13 | Malware prevention | 1 | exec quarantine with a confined scanner (223), its signed hash list shipped empty (`docs/design/EXEC_QUARANTINE.md`), the default ELF heuristics resume the process; the exec policy refuses execs from memfd, deleted files and `/dev/shm` (226); EXPERIMENTAL, off by default | 3 |
-| C14 | Behavioural detection and correlation | 2 (lot B2, 11/11) | 95 rules (`docs/detection/RULE_CATALOGUE.md`); the multi-match engine (236); chains with late execs (235, 244, 294); the posture and the COMBAT ladder, no COMBAT and no ladder kill on the benign corpus (282, 283a–c: `docs/validation/BENIGN_CORPUS.md`); R009 in COMBAT only (278), R011 by the command line (279, 287); golden replay of 29 decision and 12 posture cases (228, 243); the priority bus (267). Not 3: no detection rate measured (the V2 matrix empty, 0 `campaign` rows), no rule for T1003.007 (#119); lots 278, 283b, 283c, 287, 291, 292, 294 and 299 measured on 6.8 only, 282 on 5.15 only; the nightly on Ubuntu 26.04 (7.0) fails the R011/R018 and NN-L-NET-028 e2e every night since 05/11, Debian 13 not run since 07/11, AlmaLinux 9 not in Wave 4; no third party | 3 |
+| C14 | Behavioural detection and correlation | 2 (lot B2, 11/11) | 95 rules (`docs/detection/RULE_CATALOGUE.md`); the multi-match engine (236); chains with late execs (235, 244, 294); the posture and the COMBAT ladder, no COMBAT and no ladder kill on the benign corpus (282, 283a–c: `docs/validation/BENIGN_CORPUS.md`); R009 in COMBAT only (278), R011 by the command line (279, 287); golden replay of 29 decision and 12 posture cases (228, 243); the priority bus (267). Not 3: no detection rate measured (the V2 matrix empty, 0 `campaign` rows), no rule for T1003.007 (#119); lots 278, 283b, 283c, 287, 291, 292, 294 and 299 measured on 6.8 only, 282 on 5.15 only; the nightly on Ubuntu 26.04 (7.0) fails the R011/R018 and NN-L-NET-028 e2e every night since 05/11 and in the dispatch of 11/11 (#530 open), AlmaLinux 9 not in Wave 4; no third party | 3 |
 | C15 | Custom rules, declarative format | 1 | the rules are compiled Rust; the operator has signed overlays only: per-rule off/audit/alert/enforce with exemptions (`docs/operator/RULE_POLICY.md`, 236), the lists, the exec policy's cells | 3 |
 | C16 | Structured ATT&CK mapping | 2 | `Rule::attack()` is mandatory: 93 of 93 rules on 66 techniques and 12 tactics of ATT&CK 20.0, pinned by the STIX bundle's commit and sha256 (`docs/detection/ATTACK_COVERAGE.md`); `mitre` and `mitre_version` in every record, a revoked or unlisted id fails the tests; the records of 44 rules carried their typed ids on 4 guests (221). The coverage is not measured: 0 `campaign` rows, the V2 campaign not run | 3 |
 | C17 | Response on processes and files | 2 | NEUTRALIZE on every offender, a signed outcome and unlock (217); intent and outcome signed per action, the actions in parallel: 400 kills' longest wait 19 s → 1.6 s (270); the quarantine vault v2 with restore (238) | 3 |
@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 1 (lot 276) | the signed chains exported as OCSF 1.9.0 to rotating JSONL files and to syslog over TLS (RFC 5425), off by default, each record carrying its signed row, checked by `nn-admin export verify` against the agent's key alone; a cursor per chain, at least once, an unprivileged export worker (`docs/operator/EXPORT.md`); measured on Ubuntu 26.04 and Debian 12 (lot 276's note); no application acknowledgement (RELP, OTLP), no reload | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional; lot B2, 11/11) | 28 BPF-LSM deny hooks on 6.8 (26 on 5.15) and the move, sysctl and module judges: 27 of their 32 programs proved by a harmless attempt every round, five by an attach check, the BPF guard pinned through a restart (302); the units' cgroups, limits, slice, drop-ins and eight sysctls refused outside a window (273–273d; the judge on the kernel's copy, 280a); the blinding switches (280b); every sensor's self-test (280c); exemptions bound to a start and revoked on code injection (277, 281); module loads judged in the kernel (285); foreign BPF and the agent's own objects (290, 301); SIGIO (293); the chains and the heartbeat (295–297); the watchdog, the boot gates, the workers (216, 218, 272). The reason of 03/11 is closed: systemd 257's `cgroup.kill` refused on the five guests (273), its last lot reviewed (273d, #497). Provisional for a new one: the nightly at f66e6680 is red on Debian 13 (the agent's unit fails at the install since 07/11, on the image of the green 06/11) and on Ubuntu 26.04 (7.0: a self-move after a DAC-refused move of the agent refused since 04/11, an injection into an exempt process not revoked since 07/11), neither explained; lots 290–302 not yet in a nightly. Not 3: also AlmaLinux 9 not in Wave 4, most lots on 5.15 and 6.8 only, #120 and #121 open, no third party | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional; lot B2, 11/11) | 28 BPF-LSM deny hooks on 6.8 (26 on 5.15) and the move, sysctl and module judges: 27 of their 32 programs proved by a harmless attempt every round, five by an attach check, the BPF guard pinned through a restart (302); the units' cgroups, limits, slice, drop-ins and eight sysctls refused outside a window (273–273d; the judge on the kernel's copy, 280a); the blinding switches (280b); every sensor's self-test (280c); exemptions bound to a start and revoked on code injection (277, 281); module loads judged in the kernel (285); foreign BPF and the agent's own objects (290, 301); SIGIO (293); the chains and the heartbeat (295–297); the watchdog, the boot gates, the workers (216, 218, 272). The reason of 03/11 is closed: systemd 257's `cgroup.kill` refused on the five guests (273), its last lot reviewed (273d, #497). Provisional for a new one: no nightly green on the five guests since 31/10; the dispatch on 02b8e853 (run 42958638508) is green on 4 of 5, Debian 13 included (its failed start since 07/11, `OWN_BPF_IDS` full, closed by #514), and red on Ubuntu 26.04 (7.0: a self-move after a DAC-refused move of the agent refused, an injection into an exempt process not revoked), in correction by #530. Not 3: also AlmaLinux 9 not in Wave 4, most lots on 5.15 and 6.8 only, #120 and #121 open, no third party | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host unless the operator signs an export overlay (lot 276: off by default; the detections and the responses by default, the flows, file drift and canary reads only each named; the exact fields that leave, `docs/operator/EXPORT.md` §1a); no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -8730,6 +8730,41 @@ number in parentheses is a lab PR.
     nothing after its close).
   - Level unchanged (C23 2, provisional): the re-assessment is not this
     lot's.
+- **Lot 304 (A) — the heartbeat verifier's 4 MiB bound holds whatever the
+  source command's exit status (the CI's `test` job unblocked).**
+  - What was open: lot 299's `run_reading` closed the source command's
+    stdout at `FETCH_MAX_BYTES` and returned what it had read as the
+    answer whenever the command exited 0 — the "never an answer cut short"
+    rested on the command dying of the closed pipe. One that exits 0 on
+    `EPIPE` (uutils' `head`, the default of Ubuntu 26.04, the image of the
+    CI's `ubuntu-latest` runners since 11/11: run 42978372590, `Image:
+    ubuntu-26.04`), that ignores it, or that had its last bytes in the pipe
+    before it was closed gave the first 4 MiB as a whole answer — the newest
+    beats cut off. `heartbeat::tests::a_source_past_the_bound_is_a_failed_fetch`
+    failed on those runners almost every time (#529, #530, #531).
+  - What changed: the stdout pipe keeps reading at exactly the bound and
+    marks the answer cut when a byte past it comes (`Pipe::cut`: from the
+    bytes read alone, never from the exit); a cut fetch is a failed fetch
+    whatever the exit status, its reason the bound, and the command is
+    killed at once instead of waited for. Exactly 4 MiB stays a whole
+    answer.
+  - Measured on the host (Ubuntu 24.04, GNU `head` 9.4): `origin/main`'s
+    `run_with_timeout` returned `Ok` with 4,194,304 bytes for each of the
+    three sources that exit 0 after the bound (`head -c 4194305; exit 0`,
+    `head -c 5194304; exit 0`, `trap '' PIPE; head …; exit 0`), 5 runs out
+    of 5 — the bug without uutils; with the fix each is an `Err` naming the
+    bound; the heartbeat module's 15 tests 40 runs out of 40.
+  - Measured on our Ubuntu 26.04 guest (uutils `head` 0.10.0, the CI's
+    conditions; lease k304): `main`'s heartbeat tests failed 4 runs out of
+    5 (`a_source_past_the_bound_is_a_failed_fetch`, `Ok` instead of `Err`);
+    with the fix 35 runs out of 35 green. The guest's whole unprivileged
+    `cargo test --workspace`: nn-admin green, 34 failures all in `xtask
+    --test install_scripts` (the guest's `target/tmp` left owned by root
+    by an earlier privileged run), none of this change's.
+  - Mutations (a catch is a named test failing): 11 on the new code, 11
+    caught; `origin/main`'s logic under the new tests caught by 4 named
+    tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
+  - Level unchanged.
 - **Lot B2 — C14 and C23 re-assessed on `main` at `02b8e853`
   (documentation only, no product change; made apart from the lab PRs
   and read-only, as lot 274's docs (lot B), but not by a third party).**
@@ -8774,21 +8809,25 @@ number in parentheses is a lab PR.
     the eBPF code; each lot a mutation round (280a 74, 280b 57, 290 80,
     293 44, 302 28). Lot 302 proves 27 of the 32 deny programs by an
     attempt each round, five by an attach check, as lot 280c's note
-    asked. The new
-    reason is the multi-kernel gate: from 03/11 to 10/11 no nightly was
-    green (Ubuntu 22.04 and 24.04 8 of 8, Debian 12 6 of 8, Debian 13 4
-    of 8, Ubuntu 26.04 0 of 8). On Debian 13 — systemd 257, where the old
-    reason was found — the agent's unit fails at `nn-lab.sh install`
-    since 07/11 at f66e6680, on the same image (sha512 `d25999de…`) as the
-    green 06/11 at b75f3cf9 (between them: lots 280a–c, 281 and 285),
-    and nothing on the job says why. On 26.04
-    `a_move_the_dac_refused_leaves_no_record_behind` fails since 04/11
-    (the self-move refused `EPERM`: a false refusal) and lot 281's
+    asked. The new reason is the multi-kernel gate. From 03/11 to 10/11
+    no nightly was green (Ubuntu 22.04 and 24.04 8 of 8, Debian 12 6 of 8,
+    Debian 13 4 of 8, Ubuntu 26.04 0 of 8): Debian 13's agent unit failed
+    at `nn-lab.sh install` from 07/11 at f66e6680, and on 26.04 (7.0)
+    `a_move_the_dac_refused_leaves_no_record_behind` failed from 04/11 (the
+    self-move refused `EPERM`: a false refusal), lot 281's
     `a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed` and
-    `process_vm_writev_revokes` since 07/11 ("no signed revocation"). No
-    note or issue records them. Lots 290–302 merged after the last
-    nightly (10/11, on f66e6680); their PR runs are green on 5.15 and 6.8
-    only.
+    `process_vm_writev_revokes` from 07/11 ("no signed revocation"). The
+    gate dispatched by hand on `main` 02b8e853 on 11/11 (run 42958638508,
+    lots 290–302 in it) is green on 4 guests of 5, 142 passed and 0
+    failed on each, Debian 13 included: the start's cause, the agent's
+    `OWN_BPF_IDS` full at 256 entries (the start refused, as lot 290's
+    round r1 met it on its own guest), was closed by lot 290 (#514, 256 →
+    1024) before this re-assessment; the failed jobs' logs do not show the
+    refusal itself. Ubuntu 26.04 still fails the same five tests there
+    (137 passed); lot 303b (#530, open, its review to follow) addresses
+    their four causes: compressed module loads (`READING_MODULE_COMPRESSED`),
+    the move guard's clear, NN-L-NET-028's sensor on 7.0, and the
+    injection tests on uutils.
   - Not 3, besides the gate: AlmaLinux 9 (5.14 el9) last verified 10/10,
     no Wave 4 lot on it (285: no RPM guest; 273d: `rpm -qf` not run);
     280a–c, 281, 285, 290, 300–302 measured on 5.15 and 6.8 only, 288 and
@@ -8804,8 +8843,8 @@ number in parentheses is a lab PR.
     founder commissioned with AI tools, not an independent human
     validation; there is no red team (C29 0).
   - What moves them: C23's provisional ends with a nightly or a dispatch
-    green on the five guests at a head with 290–302, the Debian 13 start
-    and the two 26.04 failures explained and fixed. Toward 3, both: the
+    green on the five guests at a head with 290–302, the 26.04 failures
+    fixed (#530). Toward 3, both: the
     five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
     V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
     deny proof in a privileged e2e; then a third party's validation.
