@@ -19,7 +19,10 @@
 //!   inside a window, or before the agent's start) is a signed High
 //!   detection (`FsProtectOperation::SysctlRootProg`), once per program;
 //!   a root the attach no longer finds as it left it (our program gone, the
-//!   mode no longer multi) is a signed degradation while it holds.
+//!   mode no longer multi) is a signed degradation while it holds. Lot 304:
+//!   one whose loader proves it a known system program
+//!   ([`crate::known_system_prog`]: systemd-networkd's `sysctl_monitor`) is
+//!   signed Low with that proof instead.
 //!
 //! * Lot 290: the light cross-view of the host's BPF programs and links
 //!   ([`crate::bpf_crossview`]): an object the `bpf` hook never saw loading
@@ -125,6 +128,8 @@ pub enum Finding {
     Taint { new: u64, mask: u64 },
     /// A program not ours on the root's `cgroup/sysctl` slot.
     RootProgram(u32),
+    /// Lot 304: one that is a known system program, its loader proven.
+    KnownRootProgram(crate::known_system_prog::Known),
     /// Lot 290: the cross-view's finding.
     Bpf(crate::bpf_crossview::Finding),
 }
@@ -141,12 +146,14 @@ impl Watch {
     }
 
     /// One read of the root's report ([`crate::sysctl_cgroup::root_report`]):
-    /// each program not ours not signed before; the root's degradation set
-    /// or cleared (`Some(Some(line))` set, `Some(None)` cleared, `None`
-    /// unchanged).
+    /// each program not ours not signed before — a known system program
+    /// when `known` proves it one (lot 304), else a program not ours; the
+    /// root's degradation set or cleared (`Some(Some(line))` set,
+    /// `Some(None)` cleared, `None` unchanged).
     pub fn root(
         &mut self,
         report: Result<Option<Vec<u32>>, String>,
+        known: &dyn Fn(u32) -> Result<crate::known_system_prog::Known, String>,
     ) -> (Vec<Finding>, Option<Option<String>>) {
         match report {
             Ok(others) => {
@@ -154,7 +161,13 @@ impl Watch {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|id| self.reported.insert(*id))
-                    .map(Finding::RootProgram)
+                    .map(|id| match known(id) {
+                        Ok(k) => Finding::KnownRootProgram(k),
+                        Err(why) => {
+                            info!(id, why = %why, "kernel state: a root cgroup/sysctl program not proven a known system program");
+                            Finding::RootProgram(id)
+                        }
+                    })
                     .collect();
                 let cleared = self.root_degraded.take().map(|_| None);
                 (found, cleared)
@@ -187,12 +200,25 @@ fn monotonic_ns() -> u64 {
 }
 
 /// The event a finding is signed as (NN-L-AT-001): the kernel's own act,
-/// no process behind it (pid 0, `kernel`).
+/// no process behind it (pid 0, `kernel`) — but a known system program's
+/// (lot 304), whose record names its loader (pid, uid; the root program's
+/// name the loader's).
 pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
     let mut comm = "kernel".to_string();
+    let (mut pid, mut uid) = (0, 0);
     let (operation, target_dev, target_ino) = match f {
         Finding::Taint { new, mask } => (FsProtectOperation::KernelTaint, *new, *mask),
         Finding::RootProgram(id) => (FsProtectOperation::SysctlRootProg, 0, u64::from(*id)),
+        // lot 304: the loader proven, its pid, uid and name the record's
+        Finding::KnownRootProgram(k) => {
+            (pid, uid) = (k.pid, k.uid);
+            comm = k.comm.clone();
+            (
+                FsProtectOperation::SysctlRootProg,
+                common::bpf_prog_class::root_prog_known_dev(k.entry as u16, k.seen, k.link_id),
+                u64::from(k.id),
+            )
+        }
         Finding::Bpf(b) => {
             use crate::bpf_crossview::Finding as B;
             let (op, o) = match b {
@@ -200,16 +226,25 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
                 B::Unseen(o) => (FsProtectOperation::BpfUnseen, o),
             };
             comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
+            // lot 304: a known system program's loader, and the bit
+            let known = match o.known {
+                Some((p, u)) => {
+                    (pid, uid) = (p, u);
+                    common::bpf_prog_class::CROSSVIEW_KNOWN_BIT
+                }
+                None => 0,
+            };
             (
                 op,
                 o.tag,
-                common::bpf_prog_class::crossview_ino(o.is_link, o.early, o.object_type, o.id),
+                common::bpf_prog_class::crossview_ino(o.is_link, o.early, o.object_type, o.id)
+                    | known,
             )
         }
     };
     Event::FsProtectDenial {
-        pid: 0,
-        uid: 0,
+        pid,
+        uid,
         comm,
         target_dev,
         target_ino,
@@ -218,16 +253,29 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
     }
 }
 
-/// One round under `root` (`/`): the findings to sign.
-pub fn round(w: &mut Watch, root: &Path) -> Vec<Finding> {
+/// One round under `root` (`/`): the findings to sign. `known` tells a
+/// root program that is a known system program (lot 304).
+pub fn round(
+    w: &mut Watch,
+    root: &Path,
+    known: &dyn Fn(u32) -> Result<crate::known_system_prog::Known, String>,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     if let Some(f) = w.taint(tainted(root)) {
         warn!(finding = ?f, "kernel state: a taint flag of code entering the kernel appeared");
         out.push(f);
     }
-    let (found, degradation) = w.root(crate::sysctl_cgroup::root_report());
+    let (found, degradation) = w.root(crate::sysctl_cgroup::root_report(), known);
     for f in &found {
-        warn!(finding = ?f, "kernel state: a cgroup/sysctl program not the agent's on the root cgroup");
+        match f {
+            Finding::KnownRootProgram(k) => info!(
+                finding = ?k,
+                "kernel state: a known system program on the root cgroup's cgroup/sysctl slot, its loader proven"
+            ),
+            _ => {
+                warn!(finding = ?f, "kernel state: a cgroup/sysctl program not the agent's on the root cgroup")
+            }
+        }
     }
     out.extend(found);
     match degradation {
@@ -252,10 +300,22 @@ pub fn round(w: &mut Watch, root: &Path) -> Vec<Finding> {
 pub fn crossview_round(
     cross: &mut crate::bpf_crossview::CrossView,
     failing: &mut Option<String>,
+    agent_start: Option<u64>,
 ) -> Vec<Finding> {
     use crate::bpf_crossview::DEGRADATION;
     match cross.round() {
-        Ok(found) => {
+        Ok(mut found) => {
+            // lot 304: a baseline program a known system program's loader
+            // is proven to hold (PID 1's restrict_filesystems)
+            mark_known_baselines(&mut found, &|id, link| {
+                crate::known_system_prog::judge_on_host(
+                    id,
+                    link,
+                    cross.watch.program(id).as_ref(),
+                    agent_start,
+                    None,
+                )
+            });
             if failing.take().is_some() {
                 info!("kernel state: the BPF cross-view runs again");
                 crate::boot::degradation::withdraw(DEGRADATION, &[]);
@@ -283,6 +343,41 @@ pub fn crossview_round(
     }
 }
 
+/// Lot 304: each baseline program of `found` that `known` proves a known
+/// system program (held one of the two ways) gets its loader's pid and uid
+/// — signed Low with that proof; an unseen one, a link, or one not proven
+/// is left as it was. A program the hook saw loading is no finding at all.
+pub fn mark_known_baselines(
+    found: &mut [crate::bpf_crossview::Finding],
+    known: &dyn Fn(
+        u32,
+        common::bpf_prog_class::KnownLink,
+    ) -> Result<crate::known_system_prog::Known, String>,
+) {
+    use common::bpf_prog_class::KnownLink;
+    for f in found.iter_mut() {
+        let crate::bpf_crossview::Finding::Baseline(o) = f else {
+            continue;
+        };
+        if o.is_link {
+            continue;
+        }
+        let mut why = Vec::new();
+        for link in [KnownLink::Lsm, KnownLink::RootCgroupSysctl] {
+            match known(o.id, link) {
+                Ok(k) => {
+                    o.known = Some((k.pid, k.uid));
+                    break;
+                }
+                Err(e) => why.push(e),
+            }
+        }
+        if o.known.is_none() {
+            tracing::debug!(id = o.id, why = ?why, "kernel state: a baseline program not proven a known system program");
+        }
+    }
+}
+
 /// Start the round: every [`PERIOD`], its findings sent on `tx` (the
 /// `fs_protect` source). The first read is the baseline of the taint mask.
 /// Lot 290: and `cross`, the BPF cross-view, when the attach set it up.
@@ -291,12 +386,29 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
         let mut w = Watch::default();
         let mut failing: Option<String> = None;
         let mut tick = tokio::time::interval(PERIOD);
+        let agent_start = crate::known_system_prog::agent_start_ns();
         loop {
             tick.tick().await;
-            let mut found = round(&mut w, Path::new("/"));
-            if let Some(c) = cross.as_mut() {
-                found.extend(crossview_round(c, &mut failing));
-            }
+            // lot 304: the cross-view first — the root's programs are told
+            // by its enumeration of this round and the loads its hook saw
+            let crossed = match cross.as_mut() {
+                Some(c) => crossview_round(c, &mut failing, agent_start),
+                None => Vec::new(),
+            };
+            let mut found = {
+                let known = |id: u32| match cross.as_ref() {
+                    Some(c) => crate::known_system_prog::judge_on_host(
+                        id,
+                        common::bpf_prog_class::KnownLink::RootCgroupSysctl,
+                        c.watch.program(id).as_ref(),
+                        agent_start,
+                        c.watch.seen().get(&id),
+                    ),
+                    None => Err("no BPF cross-view on this host".to_string()),
+                };
+                round(&mut w, Path::new("/"), &known)
+            };
+            found.extend(crossed);
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
@@ -407,32 +519,113 @@ mod tests {
     #[test]
     fn a_foreign_root_program_is_found_once_and_a_wrong_root_degrades() {
         let mut w = Watch::default();
-        assert_eq!(w.root(Ok(None)), (Vec::new(), None));
-        assert_eq!(w.root(Ok(Some(Vec::new()))), (Vec::new(), None));
+        let n = &not_known;
+        assert_eq!(w.root(Ok(None), n), (Vec::new(), None));
+        assert_eq!(w.root(Ok(Some(Vec::new())), n), (Vec::new(), None));
         assert_eq!(
-            w.root(Ok(Some(vec![812]))),
+            w.root(Ok(Some(vec![812])), n),
             (vec![Finding::RootProgram(812)], None)
         );
-        assert_eq!(w.root(Ok(Some(vec![812]))), (Vec::new(), None), "once");
+        assert_eq!(w.root(Ok(Some(vec![812])), n), (Vec::new(), None), "once");
         assert_eq!(
-            w.root(Ok(Some(vec![812, 900]))),
+            w.root(Ok(Some(vec![812, 900])), n),
             (vec![Finding::RootProgram(900)], None)
         );
-        let (f, d) = w.root(Err(
-            "our program (id 7) is not among the root cgroup's".into()
-        ));
+        let (f, d) = w.root(
+            Err("our program (id 7) is not among the root cgroup's".into()),
+            n,
+        );
         assert!(f.is_empty());
         let line = d.expect("set").expect("a line");
         assert!(line.contains("our program (id 7)"), "{line}");
         assert_eq!(
-            w.root(Err(
-                "our program (id 7) is not among the root cgroup's".into()
-            )),
+            w.root(
+                Err("our program (id 7) is not among the root cgroup's".into()),
+                n
+            ),
             (Vec::new(), None),
             "the same line once"
         );
-        assert_eq!(w.root(Ok(Some(Vec::new()))), (Vec::new(), Some(None)));
-        assert_eq!(w.root(Ok(Some(Vec::new()))), (Vec::new(), None));
+        assert_eq!(w.root(Ok(Some(Vec::new())), n), (Vec::new(), Some(None)));
+        assert_eq!(w.root(Ok(Some(Vec::new())), n), (Vec::new(), None));
+    }
+
+    fn not_known(_: u32) -> Result<crate::known_system_prog::Known, String> {
+        Err("not proven".into())
+    }
+
+    fn networkd_monitor(id: u32) -> crate::known_system_prog::Known {
+        crate::known_system_prog::Known {
+            id,
+            entry: 0,
+            link_id: 3,
+            pid: 631,
+            uid: 998,
+            comm: "systemd-network".into(),
+            seen: false,
+        }
+    }
+
+    /// Lot 304 (named): a root program `known` proves a known system
+    /// program is found once as one, the others beside it as programs not
+    /// the agent's; its event is the loader's — pid, uid, name — with the
+    /// proof in `target_dev` and the program's id, the operation the same.
+    #[test]
+    fn a_known_root_program_is_found_once_with_its_loader() {
+        let mut w = Watch::default();
+        let known = |id: u32| {
+            if id == 35 {
+                Ok(networkd_monitor(35))
+            } else {
+                Err("not proven".to_string())
+            }
+        };
+        assert_eq!(
+            w.root(Ok(Some(vec![35, 812])), &known),
+            (
+                vec![
+                    Finding::KnownRootProgram(networkd_monitor(35)),
+                    Finding::RootProgram(812)
+                ],
+                None
+            )
+        );
+        assert_eq!(
+            w.root(Ok(Some(vec![35, 812])), &known),
+            (Vec::new(), None),
+            "once"
+        );
+        let e = event_of(&Finding::KnownRootProgram(networkd_monitor(35)), 7);
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial {
+                    pid: 631,
+                    uid: 998,
+                    comm,
+                    target_dev,
+                    target_ino: 35,
+                    operation: FsProtectOperation::SysctlRootProg,
+                    timestamp_ns: 7,
+                } if comm == "systemd-network"
+                    && *target_dev == common::bpf_prog_class::root_prog_known_dev(0, false, 3)
+            ),
+            "{e:?}"
+        );
+        let seen = crate::known_system_prog::Known {
+            seen: true,
+            ..networkd_monitor(90)
+        };
+        assert!(matches!(
+            event_of(&Finding::KnownRootProgram(seen), 7),
+            Event::FsProtectDenial { target_dev, target_ino: 90, .. }
+                if common::bpf_prog_class::root_prog_known_of(target_dev) == Some((0, true, 3))
+        ));
+        // a program not proven: the kernel's act, no proof
+        assert!(matches!(
+            event_of(&Finding::RootProgram(812), 7),
+            Event::FsProtectDenial { pid: 0, uid: 0, target_dev: 0, ref comm, .. } if comm == "kernel"
+        ));
     }
 
     /// Lot 280b: the events — the kernel's act, the taint's new flags and
@@ -473,6 +666,7 @@ mod tests {
             tag: 0xabcd,
             attach: "bpf_lsm_file_open".into(),
             early: false,
+            known: None,
         };
         let e = event_of(
             &Finding::Bpf(crate::bpf_crossview::Finding::Unseen(o.clone())),
@@ -511,5 +705,103 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Lot 304 (named): a baseline program proven a known system program
+    /// (PID 1's `restrict_filesystems`) carries its loader — the record's
+    /// pid and uid, the known bit beside its type and id; an unseen program
+    /// of the same name, a link, and a baseline program not proven are left
+    /// as they were.
+    #[test]
+    fn a_known_baseline_program_carries_its_loader() {
+        use crate::bpf_crossview::{Finding as B, Object};
+        use common::bpf_prog_class::{crossview_ino, KnownLink, CROSSVIEW_KNOWN_BIT};
+        let o = |id: u32, is_link: bool| Object {
+            is_link,
+            id,
+            object_type: 29,
+            name: "restrict_filesy".into(),
+            tag: 0xe893,
+            attach: "bpf_lsm_file_open".into(),
+            early: false,
+            known: None,
+        };
+        let mut found = vec![
+            B::Baseline(o(21, false)),
+            B::Unseen(o(22, false)),
+            B::Baseline(o(23, true)),
+            B::Baseline(o(24, false)),
+        ];
+        let asked = std::cell::RefCell::new(Vec::new());
+        mark_known_baselines(&mut found, &|id, link| {
+            asked.borrow_mut().push((id, link));
+            if id == 21 && link == KnownLink::Lsm || id == 24 && link == KnownLink::RootCgroupSysctl
+            {
+                Ok(crate::known_system_prog::Known {
+                    id,
+                    entry: 1,
+                    link_id: 2,
+                    pid: if id == 21 { 1 } else { 631 },
+                    uid: if id == 21 { 0 } else { 998 },
+                    comm: "systemd".into(),
+                    seen: false,
+                })
+            } else {
+                Err("not proven".into())
+            }
+        });
+        assert_eq!(
+            found,
+            vec![
+                B::Baseline(Object {
+                    known: Some((1, 0)),
+                    ..o(21, false)
+                }),
+                B::Unseen(o(22, false)),
+                B::Baseline(o(23, true)),
+                B::Baseline(Object {
+                    known: Some((631, 998)),
+                    ..o(24, false)
+                }),
+            ]
+        );
+        // only the baseline programs were asked, each kind until one proves it
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                (21, KnownLink::Lsm),
+                (24, KnownLink::Lsm),
+                (24, KnownLink::RootCgroupSysctl)
+            ]
+        );
+        let e = event_of(&Finding::Bpf(found[0].clone()), 3);
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial {
+                    pid: 1,
+                    uid: 0,
+                    operation: FsProtectOperation::BpfBaseline,
+                    target_ino,
+                    ..
+                } if *target_ino == crossview_ino(false, false, 29, 21) | CROSSVIEW_KNOWN_BIT
+            ),
+            "{e:?}"
+        );
+        // not proven: the kernel's act, no bit
+        let e = event_of(&Finding::Bpf(found[3].clone()), 3);
+        assert!(
+            matches!(&e, Event::FsProtectDenial { pid: 631, .. }),
+            "{e:?}"
+        );
+        let e = event_of(&Finding::Bpf(B::Baseline(o(24, false))), 3);
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial { pid: 0, uid: 0, target_ino, .. }
+                    if *target_ino & CROSSVIEW_KNOWN_BIT == 0
+            ),
+            "{e:?}"
+        );
     }
 }

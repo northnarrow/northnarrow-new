@@ -225,6 +225,9 @@ pub struct Object {
     /// module's init (`common::bpf_prog_class::KERNEL_PROGRAMS`: HID-BPF's
     /// `hid_tail_call` on its attach function).
     pub early: bool,
+    /// Lot 304: a baseline program proven a known system program
+    /// ([`crate::known_system_prog`]): its loader's pid and uid.
+    pub known: Option<(u32, u32)>,
 }
 
 /// A finding to sign.
@@ -252,6 +255,24 @@ pub struct Watch {
     /// When user space started (PID 1's start, boot-time ns): a program
     /// loaded before it is the kernel's own.
     pub user_space_since: Option<u64>,
+    /// Lot 304: the programs of the last enumeration, by id (the
+    /// kernel-state round tells a root `cgroup/sysctl` program by them).
+    progs: BTreeMap<u32, ProgRecord>,
+}
+
+/// Lot 304: what the known-program judgement reads of a record — its
+/// type, name, attach function (when read) and load time.
+pub fn program_of(p: &ProgRecord) -> crate::known_system_prog::Program {
+    crate::known_system_prog::Program {
+        prog_type: p.prog_type,
+        name: text(&p.name),
+        attach: if p.attach_read == 1 {
+            text(&p.attach)
+        } else {
+            String::new()
+        },
+        load_time: p.load_time,
+    }
 }
 
 /// A program record's attach point.
@@ -302,6 +323,12 @@ impl Watch {
         &self.seen
     }
 
+    /// Lot 304: program `id` as the last enumeration had it — its type,
+    /// name and load time.
+    pub fn program(&self, id: u32) -> Option<crate::known_system_prog::Program> {
+        self.progs.get(&id).map(program_of)
+    }
+
     /// Enumerations done.
     pub fn rounds(&self) -> u32 {
         self.rounds
@@ -331,6 +358,7 @@ pub fn judge(
     own: &BTreeSet<u32>,
 ) -> (Vec<Finding>, Vec<Object>) {
     w.seen.extend(seen_now);
+    w.progs = en.progs.iter().map(|p| (p.id, *p)).collect();
     let mut link_types: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for l in en.links.iter().flatten() {
         link_types
@@ -351,6 +379,7 @@ pub fn judge(
             early: (p.load_time != 0 && w.user_space_since.is_some_and(|t| p.load_time < t))
                 || (p.attach_read == 1
                     && common::bpf_prog_class::is_kernel_program(&p.name, &p.attach)),
+            known: None,
         });
     }
     // a link is judged through its program; one whose program the program
@@ -367,6 +396,7 @@ pub fn judge(
             tag: 0,
             attach: format!("program {} not enumerated", l.prog_id),
             early: false,
+            known: None,
         });
     }
     let candidates: BTreeMap<(bool, u32), &Object> = foreign
@@ -542,6 +572,59 @@ mod tests {
                 Finding::Unseen(o) => ('U', o.is_link, o.id),
             })
             .collect()
+    }
+
+    /// Lot 304 (named): the programs of the last enumeration, kept with
+    /// their type, name, attach function and load time for the known-program
+    /// judge; the next enumeration replaces them.
+    #[test]
+    fn the_last_enumeration_s_programs_are_kept_for_the_known_judge() {
+        let own: BTreeSet<u32> = [1].into();
+        let mut w = Watch::default();
+        let rfs = with_attach(prog(21, 29, "restrict_filesy"), "bpf_lsm_file_open");
+        let mon = prog(35, 23, "sysctl_monitor");
+        assert_eq!(w.program(21), None, "before any enumeration");
+        judge(
+            &mut w,
+            vec![],
+            &en(vec![prog(1, 29, "nn_hook"), rfs, mon], None),
+            &own,
+        );
+        assert_eq!(
+            w.program(21),
+            Some(crate::known_system_prog::Program {
+                prog_type: 29,
+                name: "restrict_filesy".into(),
+                attach: "bpf_lsm_file_open".into(),
+                load_time: 9_000_000_000,
+            })
+        );
+        // an attach function not read: none named, whatever the bytes
+        assert_eq!(w.program(35).map(|p| p.attach), Some(String::new()));
+        let mut unread = with_attach(prog(36, 23, "x"), "bpf_lsm_file_open");
+        unread.attach_read = 0;
+        assert_eq!(program_of(&unread).attach, "");
+        assert_eq!(program_of(&with_attach(prog(36, 23, "x"), "f")).attach, "f");
+        // the agent's own are enumerated too (the root judge asks by id)
+        assert!(w.program(1).is_some());
+        // the round proves no program known (the kernel-state round does):
+        // its baseline objects carry no loader
+        let (f, _) = judge(
+            &mut w,
+            vec![],
+            &en(vec![prog(1, 29, "nn_hook"), rfs, mon], None),
+            &own,
+        );
+        assert_eq!(f.len(), 2);
+        assert!(
+            f.iter()
+                .all(|f| matches!(f, Finding::Baseline(o) if o.known.is_none())),
+            "{f:?}"
+        );
+        // the next enumeration replaces it: a program gone is gone
+        judge(&mut w, vec![], &en(vec![mon], None), &own);
+        assert_eq!(w.program(21), None);
+        assert_eq!(w.program(35).map(|p| p.name), Some("sysctl_monitor".into()));
     }
 
     /// Lot 290 (named): what was there at the start is the baseline,

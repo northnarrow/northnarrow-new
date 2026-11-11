@@ -415,6 +415,9 @@ pub mod host_dropins;
 /// change — its taint flags and livepatches, the root cgroup's
 /// `cgroup/sysctl` programs — read every 5 s.
 pub mod kernel_state;
+/// Lot 304: a known system program (systemd-networkd's `sysctl_monitor`,
+/// PID 1's `restrict_filesystems`), told by its loader.
+pub mod known_system_prog;
 /// Lot 285: the module files' write history pinned beside the pin root
 /// (kept through an agent restart and an upgrade within the boot).
 pub mod module_writes;

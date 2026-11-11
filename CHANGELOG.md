@@ -94,6 +94,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- systemd's own BPF programs are no longer signed as foreign at every start
+  (lot 304; `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 304"). On
+  Debian 13 and Ubuntu 26.04 (systemd 257+) systemd-networkd's
+  `sysctl_monitor` on the root cgroup's `cgroup/sysctl` slot was a High
+  `sysctl_root_prog` and a degradation of the sysctl judge (the trust level
+  degraded), and PID 1's `restrict_filesystems` LSM program a High
+  `bpf_baseline`. A program is now a known system program, signed Low with
+  its loader's proof, only when its packaged loader holds its link: the
+  name, type and attach function of an entry, a process holding the link
+  that attaches it, running the packaged executable (`/proc/<pid>/exe`'s
+  device and inode those of `/usr/lib/systemd/systemd-networkd` or
+  `/usr/lib/systemd/systemd`), started before the load, and the load
+  before the agent's start or seen by the agent's `bpf` hook from that
+  process. The same name from another loader stays High; the refusals do
+  not change.
 - NN-L-FIM-001 no longer kills the writer of the agent's own unit (or of a
   drop-in of it) in the vendor directory `/usr/lib/systemd/system/` inside
   an open trusted-installer window: that write is NN-L-FIM-009's Log/Low

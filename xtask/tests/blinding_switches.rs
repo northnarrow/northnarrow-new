@@ -173,7 +173,9 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
         body(&k, "round"),
         &[
             "w.taint(tainted(root))",
-            "w.root(crate::sysctl_cgroup::root_report())",
+            // lot 304: with the known-program judge (a known system
+            // program, its loader proven, is signed Low)
+            "w.root(crate::sysctl_cgroup::root_report(), known)",
             "crate::boot::degradation::report(ROOT_DEGRADATION, &line)",
         ],
     )
