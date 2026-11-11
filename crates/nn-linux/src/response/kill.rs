@@ -1002,13 +1002,33 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let kid: u32 = line.trim().parse().unwrap();
-        let comm = format!("/proc/{kid}/comm");
-        for _ in 0..500 {
-            if std::fs::read(&comm).is_ok_and(|c| c.starts_with(b"\xff")) {
+        // the precondition: the kid runs the link (its `comm` the link's
+        // name) as a child of the shell — waited for, at most 10 s
+        let stat = format!("/proc/{kid}/stat");
+        let ready = |s: &[u8]| {
+            let parent = s.iter().rposition(|b| *b == b')').and_then(|i| {
+                String::from_utf8_lossy(&s[i + 1..])
+                    .split_whitespace()
+                    .nth(1)
+                    .map(str::to_string)
+            });
+            s.windows(3).any(|w| w == b"(\xff\xfe") && parent == Some(sh.id().to_string())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            seen = std::fs::read(&stat).unwrap_or_default();
+            if ready(&seen) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(
+            ready(&seen),
+            "precondition: the kid {kid} of sh {} is not running the link: {:?}",
+            sh.id(),
+            String::from_utf8_lossy(&seen)
+        );
         let (primary, rest) = kill_process_tree(
             sh.id(),
             &protected_with(&[]),
