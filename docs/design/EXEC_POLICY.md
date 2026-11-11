@@ -59,6 +59,22 @@ which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
 and one on a separate `/home` is `home`. The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
+Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
+is read as bytes (`nn_linux::mountinfo`). Read as text, one mount whose point
+or source is not UTF-8 — an unprivileged user's FUSE mount (`fusermount3`)
+at `~/\xff` — emptied it: the roots removed, and here the slices unpublished
+(every caller `UNKNOWN`, `NO_SLICES`: a service's deny became an audit). A
+table that cannot be read at all leaves the slices and roots last published
+in force, never zeros or an empty set, with a degradation
+(`execpol_mounts`, `execq_roots`) while it fails, withdrawn at the next good
+read. A btrfs subvolume mounted at a guarded point (`/home` on Fedora and
+openSUSE: `subvol=/home`) is published although its root field is not `/`,
+when no mount of that filesystem is its root (a bind mount of a directory of
+a filesystem mounted elsewhere stays out); the kernel's walk to it is lot 9's
+(the userland half only here). A user's FUSE mount at a guarded point that
+root cannot `stat` (no `allow_other`) is keyed from the table: its device
+and FUSE's root inode (1).
+
 ## 3. Lineage tiers
 
 Computed in the kernel at the exec, from signals a process cannot set for

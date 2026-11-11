@@ -1543,7 +1543,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if ppid != 1 && !could.iter().any(|e| self.is_cached_ancestor(ppid, e.ppid)) {
             return None;
         }
-        let uid = H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status"))
+        let uid = H::read_state(self.inner.proc_root.join(pid.to_string()).join("status"))
             .ok()
             .and_then(|t| parse_real_uid(&t))
             .unwrap_or(first.uid);
@@ -1667,7 +1667,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if exe != parent.exe {
             return None;
         }
-        let uid = H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status"))
+        let uid = H::read_state(self.inner.proc_root.join(pid.to_string()).join("status"))
             .ok()
             .and_then(|t| parse_real_uid(&t))
             .unwrap_or(parent.uid);
@@ -1717,8 +1717,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
     /// after the `(comm)` field.
     fn proc_parent_and_start(&self, pid: u32) -> Option<(u32, u64)> {
-        let stat =
-            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let stat = H::read_state(self.inner.proc_root.join(pid.to_string()).join("stat")).ok()?;
         let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
         Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
     }
@@ -1967,7 +1966,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `/etc/passwd`).
     fn storage_users(&self, uid: u32) -> Vec<u32> {
         let mut users = vec![uid];
-        let read = |f: &str| H::read_to_string(self.inner.host_root.join(f)).unwrap_or_default();
+        let read = |f: &str| H::read_state(self.inner.host_root.join(f)).unwrap_or_default();
         let subuid = read("etc/subuid");
         let mut passwd: Option<String> = None;
         for line in subuid.lines() {
@@ -2074,7 +2073,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return None;
         }
         let text =
-            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("mountinfo")).ok()?;
+            H::read_state(self.inner.proc_root.join(pid.to_string()).join("mountinfo")).ok()?;
         let (dev, upper, work) = root_overlay(&text)?;
         (self.in_container_storage(&format!("{upper}/"), uid, users)
             && self.in_container_storage(&format!("{work}/"), uid, users))
@@ -2229,15 +2228,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 {
             return None;
         }
-        let text =
-            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+        let text = H::read_state(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
         placing_cgroup(&text).map(str::to_string)
     }
 
     /// `PPid:` of `/proc/<pid>/status`.
     fn proc_ppid(&self, pid: u32) -> Option<u32> {
-        let text =
-            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status")).ok()?;
+        let text = H::read_state(self.inner.proc_root.join(pid.to_string()).join("status")).ok()?;
         parse_ppid(&text)
     }
 
@@ -2276,7 +2273,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if !H::is_dir(&dir) {
             return false;
         }
-        let Ok(stat) = H::read_to_string(dir.join("stat")) else {
+        let Ok(stat) = H::read_state(dir.join("stat")) else {
             return true;
         };
         let state = stat
@@ -2312,7 +2309,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return false;
         }
         let path = self.inner.proc_root.join(pid.to_string()).join("stat");
-        let Ok(stat) = H::read_to_string(path) else {
+        let Ok(stat) = H::read_state(path) else {
             return false;
         };
         stat.rsplit_once(')')
@@ -2799,7 +2796,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `starttime`, field 22 of `/proc/<name>/stat`, counted after the
     /// `(comm)` field, which may itself hold spaces or parentheses.
     fn proc_start_ticks_of(&self, name: &str) -> Option<u64> {
-        let stat = H::read_to_string(self.inner.proc_root.join(name).join("stat")).ok()?;
+        let stat = H::read_state(self.inner.proc_root.join(name).join("stat")).ok()?;
         stat.rsplit_once(')')?
             .1
             .split_whitespace()
@@ -2856,7 +2853,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return None;
         }
         let path = self.inner.proc_root.join(pid.to_string()).join("loginuid");
-        let raw = H::read_to_string(&path).ok()?;
+        let raw = H::read_state(&path).ok()?;
         match raw.trim().parse::<u32>() {
             Ok(v) if v != LOGINUID_UNSET => Some(v),
             _ => None,
@@ -3025,7 +3022,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return None;
         }
         let status_path = self.inner.proc_root.join(&pid_str).join("status");
-        let text = H::read_to_string(&status_path).ok()?;
+        let text = H::read_state(&status_path).ok()?;
         let ppid = parse_ppid(&text)?;
         Some((ppid, exe, parse_real_uid(&text)))
     }
@@ -5298,6 +5295,90 @@ mod tests {
         t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
         t.ingest_spawn(200, 100, "/usr/sbin/useradd", 3);
         (tmp, t)
+    }
+
+    /// Lot 311 (N6): rewrite a fixture process's `comm` in its `stat` and
+    /// `status` to bytes that are not UTF-8 (`\xff\xfe`), as the kernel
+    /// shows a process that named itself so (`prctl(PR_SET_NAME)`, the
+    /// name of the file it executed): no privilege needed.
+    fn rename_not_utf8(dir: &Path, pid: u32) {
+        let d = dir.join(pid.to_string());
+        if let Ok(stat) = fs::read(d.join("stat")) {
+            let open = stat.iter().position(|b| *b == b'(').unwrap();
+            let close = stat.iter().rposition(|b| *b == b')').unwrap();
+            let mut out = stat[..=open].to_vec();
+            out.extend_from_slice(b"\xff\xfe");
+            out.extend_from_slice(&stat[close..]);
+            fs::write(d.join("stat"), out).unwrap();
+        }
+        if let Ok(status) = fs::read(d.join("status")) {
+            let end = status.iter().position(|b| *b == b'\n').unwrap();
+            let mut out = b"Name:\t\xff\xfe".to_vec();
+            out.extend_from_slice(&status[end..]);
+            fs::write(d.join("status"), out).unwrap();
+        }
+    }
+
+    /// Lot 311 (N6): a session whose processes named themselves with bytes
+    /// that are not UTF-8 keeps its lineage. On main every `/proc` read of
+    /// such a process failed: the start's scan skipped it, the sweep marked
+    /// it gone while it ran (and dropped it once the map was full), a fork
+    /// of it was never entered — the walks from its children lost the
+    /// session.
+    #[test]
+    fn a_session_whose_comms_are_not_utf8_keeps_its_lineage() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 700, "/usr/sbin/sshd");
+        write_status_uid(proc.path(), 700, 1, 0);
+        write_started(proc.path(), "700", 1, 100);
+        write_exe(proc.path(), 701, "/usr/bin/bash");
+        write_status_uid(proc.path(), 701, 700, 1000);
+        write_started(proc.path(), "701", 700, 110);
+        for pid in [700, 701] {
+            rename_not_utf8(proc.path(), pid);
+        }
+        let t =
+            AuthSessionTracker::new(proc.path()).with_bounds(64, 1024, std::time::Duration::ZERO);
+        assert_eq!(t.seed_from_proc(), 2, "the start's scan enters both");
+        for i in 0..300u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
+        }
+        // a subshell the session forked, named so too
+        write_exe(proc.path(), 703, "/usr/bin/bash");
+        write_status_uid(proc.path(), 703, 701, 1000);
+        write_started(proc.path(), "703", 701, 40_000);
+        rename_not_utf8(proc.path(), 703);
+        let report = t.sweep();
+        assert_eq!(report.gone, 300, "the running session is not gone");
+        assert_eq!(report.forks, 1, "the subshell is entered");
+        t.ingest_exec(702, 701, "/usr/bin/cp", &[], 500 * S, 500 * S, 1000);
+        let judged = AsOf::Judged(600 * S);
+        assert!(t.is_auth_mediated(702, judged));
+        assert!(t.is_auth_mediated(703, judged));
+        assert_eq!(
+            t.exec_identity(701, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
+    }
+
+    /// Lot 311 (N6): the admin session's terminal and liveness are read
+    /// from a `stat` whose `comm` is not UTF-8. On main the terminal read
+    /// failed: a sudo session's tool that named itself was "not an
+    /// interactive admin".
+    #[test]
+    fn an_admin_session_whose_comm_is_not_utf8_is_still_told() {
+        let (tmp, t) = admin_session(34816, 1000);
+        rename_not_utf8(tmp.path(), 200);
+        assert!(t.is_interactive_admin(200, AsOf::Now));
+        assert_eq!(t.interactive_admin_status(200, AsOf::Now), Some(true));
     }
 
     #[test]

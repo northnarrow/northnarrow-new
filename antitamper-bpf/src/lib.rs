@@ -302,8 +302,11 @@ fn is_bpffs(p: &Path) -> bool {
 /// the trailing newline stripped. Returns an error if the file is
 /// missing or unreadable — both shouldn't happen for our own PID.
 pub fn read_self_comm() -> Result<String> {
-    let raw = std::fs::read_to_string("/proc/self/comm").context("reading /proc/self/comm")?;
-    Ok(raw.trim_end_matches('\n').to_string())
+    // lot 311 (N6): read as bytes — a `comm` need not be UTF-8
+    let raw = std::fs::read("/proc/self/comm").context("reading /proc/self/comm")?;
+    Ok(String::from_utf8_lossy(&raw)
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 /// Read `/proc/<pid>/comm` and return it as an owned `String`.
@@ -319,10 +322,12 @@ pub fn read_self_comm() -> Result<String> {
 /// motivated attacker — comm is a sanity check for PID recycling
 /// race, not a security primitive.
 pub fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/comm");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim_end_matches('\n').to_string())
+    // lot 311 (N6): read as bytes — a `comm` need not be UTF-8
+    std::fs::read(format!("/proc/{pid}/comm")).ok().map(|s| {
+        String::from_utf8_lossy(&s)
+            .trim_end_matches('\n')
+            .to_string()
+    })
 }
 
 /// bpffs pin paths for one LSM hook. Keeps the path key the

@@ -231,7 +231,9 @@ fn own_harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
             .map(|(n, _)| format!("{n} set in our units' environment")),
         "EnvironmentFile" => {
             let p = value.trim().trim_start_matches('-');
-            let text = std::fs::read_to_string(p).unwrap_or_default();
+            // lot 311 (F4): read as bytes — a byte that is not UTF-8 hid
+            // the whole file
+            let text = crate::state_read::read_state(p).unwrap_or_default();
             env_file_assignments(&text)
                 .into_iter()
                 .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
@@ -304,7 +306,9 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                 {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(&from) else {
+                // lot 311 (F4): read as bytes — a drop-in with one byte that
+                // is not UTF-8 was skipped whole
+                let Ok(text) = crate::state_read::read_state(&from) else {
                     continue;
                 };
                 for (k, v) in effective(directives(&text)) {
@@ -315,7 +319,9 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                             if !under_env_dir(p) {
                                 continue;
                             }
-                            env_file_assignments(&std::fs::read_to_string(p).unwrap_or_default())
+                            env_file_assignments(
+                                &crate::state_read::read_state(p).unwrap_or_default(),
+                            )
                         }
                         _ => continue,
                     };
@@ -1592,6 +1598,41 @@ mod tests {
         assert_eq!(
             s("NORTHNARROW_DRY_RUN", "1").record(),
             ("own_dropin_weakening", true)
+        );
+    }
+
+    /// Lot 311 (the mini-hunt of bug hunt 1.4's F4): an `NN_` setting in a
+    /// drop-in with a byte that is not UTF-8 (a Latin-1 comment) is still
+    /// named — on main the drop-in was skipped whole, a weakening switch
+    /// unlisted; a loader variable in such an `EnvironmentFile=` is still
+    /// harmful.
+    #[test]
+    fn a_latin1_comment_does_not_hide_an_nn_setting_or_a_loader() {
+        let root = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        std::fs::write(
+            ag.join("41-off.conf"),
+            b"# r\xe9glage\n[Service]\nEnvironment=NN_FILE_OPEN_SENSOR=tracepoint\n",
+        )
+        .unwrap();
+        let n = nn_settings(&[root.path()]);
+        assert!(
+            n.iter()
+                .any(|s| s.name == "NN_FILE_OPEN_SENSOR" && s.weakens),
+            "{n:?}"
+        );
+        let env = root.path().join("env");
+        std::fs::write(&env, b"# r\xe9glage\nLD_PRELOAD=/tmp/x.so\n").unwrap();
+        let found = own_harms(
+            Reach::Services,
+            "EnvironmentFile",
+            &env.display().to_string(),
+            &host(),
+        );
+        assert!(
+            found.as_deref().is_some_and(|w| w.contains("LD_PRELOAD")),
+            "{found:?}"
         );
     }
 }

@@ -93,6 +93,19 @@ begins: a sender can rewrite it meanwhile, as it can shape its hello like
 another client's. A ClientHello sent with the connect (TCP Fast Open) is not
 seen.
 
+Lot 311 (the mini-hunt of the third bug hunt's BUG-98): the `open_sensor`
+and the exec sensor place a record's path through the agent's mount table
+(`mountinfo`: the filesystem root the kernel names, the mount point it is
+at). The table is read as bytes now. Read as text, one mount whose point or
+source is not UTF-8 — an unprivileged user's FUSE mount (`fusermount3`,
+setuid on Ubuntu 24.04) at `~/\xff` — emptied it while the mount stood:
+every opened file was unplaced (`mnt[<major>:<minor>:<inode>]…`), and the
+credential-read rules' owner check, made on the placed path, could not run
+(lab, Ubuntu 24.04: NN-L-FIM-011 on another account's `~/.aws/credentials`
+was recorded with no response, killed once the mount was gone). A table that
+cannot be read at all keeps the roots last read, with a degradation
+(`mount_table`) while it fails.
+
 R14b: a `dns_query` event's name is decoded by the agent's parse worker
 (`WORKERS.md`), not by the agent's core. While the worker is down or
 disabled the events still come, with no name (`qname_partial`), and the

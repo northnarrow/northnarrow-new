@@ -319,7 +319,10 @@ impl TrustFilter {
 /// `starttime`, field 22 of `/proc/<pid>/stat` (after the `(comm)` field,
 /// which may hold spaces or parentheses).
 pub fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    // lot 311 (N6): read as bytes — a writer's `comm` is its own choice
+    let stat = std::fs::read(proc_root.join(pid.to_string()).join("stat"))
+        .map(nn_core::posture::host::state_text)
+        .ok()?;
     parse_stat_start(&stat)
 }
 

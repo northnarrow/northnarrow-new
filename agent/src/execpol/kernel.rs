@@ -126,19 +126,15 @@ impl Kernel {
     }
 }
 
-/// The cgroup v2 mount point in a `mountinfo` text (`/sys/fs/cgroup`, or
-/// `/sys/fs/cgroup/unified` on a hybrid host).
-pub fn cgroup2_mount(mountinfo: &str) -> Option<String> {
-    mountinfo.lines().find_map(|line| {
-        let (pre, post) = line.split_once(" - ")?;
-        let fstype = post.split(' ').next()?;
-        if fstype != "cgroup2" {
-            return None;
-        }
-        pre.split(' ')
-            .nth(4)
-            .map(crate::sensors::open_sensor::unescape_octal)
-    })
+/// The cgroup v2 mount point in a mount table (`/sys/fs/cgroup`, or
+/// `/sys/fs/cgroup/unified` on a hybrid host); lot 311: the table read as
+/// bytes ([`nn_linux::mountinfo`]).
+pub fn cgroup2_mount(table: &nn_linux::mountinfo::MountTable) -> Option<std::path::PathBuf> {
+    table
+        .entries
+        .iter()
+        .find(|m| m.fstype == "cgroup2")
+        .map(|m| m.mount_point.clone())
 }
 
 /// The cgroup ids of `system.slice`, `user.slice` and (lot 273d, NB5)
@@ -235,17 +231,23 @@ mod tests {
 
     #[test]
     fn the_cgroup2_mount() {
+        let t = |text: &str| nn_linux::mountinfo::parse(text.as_bytes());
         let unified = "24 1 0:22 / /sys/fs/cgroup rw,nosuid shared:9 - cgroup2 cgroup2 rw\n";
-        assert_eq!(cgroup2_mount(unified).as_deref(), Some("/sys/fs/cgroup"));
+        assert_eq!(
+            cgroup2_mount(&t(unified)).as_deref(),
+            Some(std::path::Path::new("/sys/fs/cgroup"))
+        );
         let hybrid = "24 1 0:22 / /sys/fs/cgroup ro shared:9 - tmpfs tmpfs ro\n\
                       25 24 0:23 / /sys/fs/cgroup/unified rw shared:10 - cgroup2 cgroup2 rw\n\
                       26 24 0:24 / /sys/fs/cgroup/systemd rw shared:11 - cgroup cgroup rw,name=systemd\n";
         assert_eq!(
-            cgroup2_mount(hybrid).as_deref(),
-            Some("/sys/fs/cgroup/unified")
+            cgroup2_mount(&t(hybrid)).as_deref(),
+            Some(std::path::Path::new("/sys/fs/cgroup/unified"))
         );
         assert_eq!(
-            cgroup2_mount("26 24 0:24 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw\n"),
+            cgroup2_mount(&t(
+                "26 24 0:24 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw\n"
+            )),
             None,
             "v1 only: no tiers"
         );

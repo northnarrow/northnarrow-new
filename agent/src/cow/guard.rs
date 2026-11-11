@@ -185,19 +185,29 @@ fn probe_reflink(objects: i32) -> bool {
     ok
 }
 
-/// The scope is a mount point in the host's mount namespace.
+/// The scope is a mount point in the host's mount namespace. Lot 311 (bug
+/// hunt 1.4, F4): the table read as bytes ([`nn_linux::mountinfo`]) — a
+/// user's FUSE mount named with bytes that are not UTF-8 made it unreadable,
+/// and a mount scope was refused at the start.
 fn is_mount_point(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string("/proc/1/mountinfo")
-        .or_else(|_| std::fs::read_to_string("/proc/self/mountinfo"))
+    is_mount_point_in(
+        path,
+        &[
+            Path::new("/proc/1/mountinfo"),
+            Path::new("/proc/self/mountinfo"),
+        ],
+    )
+}
+
+/// [`is_mount_point`] in the first table of `tables` that can be read.
+fn is_mount_point_in(path: &Path, tables: &[&Path]) -> bool {
+    let Some(table) = tables
+        .iter()
+        .find_map(|t| nn_linux::mountinfo::read(t).ok())
     else {
         return false;
     };
-    let want = path.to_string_lossy();
-    text.lines().any(|l| {
-        l.split_whitespace()
-            .nth(4)
-            .is_some_and(|mp| mp.replace("\\040", " ") == want)
-    })
+    table.entries.iter().any(|m| m.mount_point == path)
 }
 
 impl Runtime {
@@ -1042,5 +1052,36 @@ impl Runtime {
     pub fn reader_idle_ms(&self) -> u64 {
         self.mono_ms()
             .saturating_sub(self.heartbeat.load(Ordering::Relaxed))
+    }
+}
+
+/// Lot 311 (bug hunt 1.4, F4).
+#[cfg(test)]
+mod lot311 {
+    use super::*;
+
+    /// A mount scope is found in a table that holds a user's FUSE mount
+    /// named with bytes that are not UTF-8 — on main the table was
+    /// unreadable as text and the scope refused at the start. A mount
+    /// point with such bytes is matched by them.
+    #[test]
+    fn a_non_utf8_mount_does_not_hide_a_mount_scope() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("mountinfo");
+        std::fs::write(
+            &t,
+            b"30 1 8:2 / /srv/data rw - ext4 /dev/sdb rw\n\
+              57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n",
+        )
+        .unwrap();
+        let missing = d.path().join("absent");
+        assert!(is_mount_point_in(Path::new("/srv/data"), &[&missing, &t]));
+        assert!(is_mount_point_in(
+            Path::new(std::ffi::OsStr::from_bytes(b"/home/u/\xff")),
+            &[&t]
+        ));
+        assert!(!is_mount_point_in(Path::new("/srv"), &[&t]));
+        assert!(!is_mount_point_in(Path::new("/srv/data"), &[&missing]));
     }
 }

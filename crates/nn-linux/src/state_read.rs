@@ -28,6 +28,72 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
     std::fs::read(path).map(nn_core::posture::host::state_text)
 }
 
+/// Lot 311 (F4): the rule of a reader that publishes what it read of the
+/// kernel's state (the guarded roots, the slices): when a read fails, what
+/// it last published stays in force — never an empty set in its place —
+/// and the failure is a degradation of `source` (the registry: listed by
+/// `nn-admin status`, signed in the audit chain), reported once while the
+/// reads fail and withdrawn at the next good one. The caller publishes on
+/// a good read only; this keeps the account.
+#[derive(Debug)]
+pub struct LastGood {
+    source: &'static str,
+    what: &'static str,
+    failing: bool,
+}
+
+impl LastGood {
+    /// A reader of `what` (the file, in words) for the part `source`.
+    pub const fn new(source: &'static str, what: &'static str) -> Self {
+        LastGood {
+            source,
+            what,
+            failing: false,
+        }
+    }
+
+    /// The degradation's text.
+    pub fn detail(&self) -> String {
+        format!(
+            "{} could not be read: what was last read of it stays in force",
+            self.what
+        )
+    }
+
+    /// A read failed: logged and reported (once while the reads fail).
+    pub fn failed(&mut self, e: &io::Error) {
+        if self.failing {
+            return;
+        }
+        self.failing = true;
+        tracing::warn!(
+            source = self.source,
+            what = self.what,
+            error = %e,
+            "kernel state unreadable — the last good reading stays in force"
+        );
+        crate::boot::degradation::report(self.source, &self.detail());
+    }
+
+    /// A read succeeded: a degradation reported for the failures is
+    /// withdrawn (its signed record stays in the chain).
+    pub fn ok(&mut self) {
+        if std::mem::take(&mut self.failing) {
+            tracing::info!(
+                source = self.source,
+                what = self.what,
+                "kernel state readable again"
+            );
+            crate::boot::degradation::withdraw(self.source, &[]);
+        }
+    }
+
+    /// The reads fail now.
+    pub fn failing(&self) -> bool {
+        self.failing
+    }
+}
+
 /// Test doors: a process whose `comm` is not UTF-8.
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing {
@@ -63,6 +129,33 @@ pub mod testing {
             let _ = self.child.wait();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// A fixture process table's `<root>/<pid>/stat`, `status` and `comm`
+    /// for a process whose `comm` is [`NON_UTF8_COMM`], as the kernel writes
+    /// them: parent `ppid`, real uid `uid`, start `ticks` (field 22).
+    pub fn write_non_utf8_proc(root: &std::path::Path, pid: u32, ppid: u32, uid: u32, ticks: u64) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let mut stat = format!("{pid} (").into_bytes();
+        stat.extend_from_slice(NON_UTF8_COMM);
+        stat.extend_from_slice(
+            format!(") S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n")
+                .as_bytes(),
+        );
+        std::fs::write(dir.join("stat"), stat).expect("fixture stat");
+        let mut status = b"Name:\t".to_vec();
+        status.extend_from_slice(NON_UTF8_COMM);
+        status.extend_from_slice(
+            format!(
+                "\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nThreads:\t1\n"
+            )
+            .as_bytes(),
+        );
+        std::fs::write(dir.join("status"), status).expect("fixture status");
+        let mut comm = NON_UTF8_COMM.to_vec();
+        comm.push(b'\n');
+        std::fs::write(dir.join("comm"), comm).expect("fixture comm");
     }
 
     /// Start one, sleeping `secs`, and wait until the kernel shows its
@@ -122,5 +215,31 @@ mod tests {
         let text = read_state(&status).unwrap();
         assert!(text.lines().any(|l| l.starts_with("PPid:")), "{text}");
         assert!(read_state("/proc/nonexistent-n6").is_err());
+    }
+
+    /// Lot 311 (F4): a failed read is one degradation of its source while
+    /// the reads fail, withdrawn by the next good one.
+    #[test]
+    fn a_failed_read_is_one_degradation_until_a_good_one() {
+        let mut r = LastGood::new("lot311_test_reader", "the test table");
+        let has = || {
+            crate::boot::degradation::entries()
+                .iter()
+                .filter(|d| d.source == "lot311_test_reader")
+                .count()
+        };
+        r.ok();
+        assert_eq!(has(), 0);
+        let e = io::Error::from_raw_os_error(libc::EMFILE);
+        r.failed(&e);
+        r.failed(&e);
+        assert!(r.failing());
+        assert_eq!(has(), 1);
+        assert!(crate::boot::degradation::entries()
+            .iter()
+            .any(|d| d.source == "lot311_test_reader" && d.detail == r.detail()));
+        r.ok();
+        assert!(!r.failing());
+        assert_eq!(has(), 0);
     }
 }

@@ -215,8 +215,9 @@ fn is_cgroup2(p: &Path) -> bool {
 
 /// [`UnitCgroup`] of process `pid`, on this host's cgroup v2 mount.
 pub fn unit_cgroup_of(pid: u32) -> UnitCgroup {
-    let text = match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
-        Ok(t) => t,
+    // lot 311 (F4): read as bytes — a cgroup's name is its creator's
+    let text = match std::fs::read(format!("/proc/{pid}/cgroup")) {
+        Ok(t) => String::from_utf8_lossy(&t).into_owned(),
         Err(e) => {
             return UnitCgroup::Unavailable {
                 why: format!("/proc/{pid}/cgroup: {e}"),

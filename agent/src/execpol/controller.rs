@@ -100,6 +100,9 @@ pub struct Controller<K: KernelIo> {
     /// Slice ids last published (a change is logged).
     slices: (u64, u64, u64),
     skipped_logged: bool,
+    /// Lot 311 (bug hunt 1.4, BUG-98's sibling): a mount table that cannot
+    /// be read leaves the slices and roots last published in force, signed.
+    mounts_read: nn_linux::state_read::LastGood,
 }
 
 impl<K: KernelIo> Controller<K> {
@@ -112,26 +115,43 @@ impl<K: KernelIo> Controller<K> {
             last_refresh: None,
             slices: (0, 0, 0),
             skipped_logged: false,
+            mounts_read: nn_linux::state_read::LastGood::new("execpol_mounts", "the mount table"),
         }
     }
 
     /// Publish the slices, images and roots now (before the first exec the
     /// policy judges); the slice ids published.
     pub fn refresh(&mut self, now: Instant) -> (u64, u64, u64) {
-        let text = std::fs::read_to_string(&self.s.mountinfo).unwrap_or_default();
-        let ids = kernel::cgroup2_mount(&text)
-            .map(|mp| kernel::slice_ids(std::path::Path::new(&mp)))
-            .unwrap_or((0, 0, 0));
-        if ids != self.slices {
-            debug!(
-                system_slice = ids.0,
-                user_slice = ids.1,
-                our_slice = ids.2,
-                "exec policy: systemd slices published"
-            );
-            self.slices = ids;
+        // lot 311 (BUG-98's sibling): the table read as bytes — one FUSE
+        // mount of a user's, named with bytes that are not UTF-8, emptied
+        // it: the slices unpublished (every caller UNKNOWN, a service's
+        // deny an audit) and the roots removed; a table that cannot be read
+        // at all keeps what was last published
+        let table = match nn_linux::mountinfo::read(&self.s.mountinfo) {
+            Ok(table) => {
+                self.mounts_read.ok();
+                Some(table)
+            }
+            Err(e) => {
+                self.mounts_read.failed(&e);
+                None
+            }
+        };
+        if let Some(table) = &table {
+            let ids = kernel::cgroup2_mount(table)
+                .map(|mp| kernel::slice_ids(&mp))
+                .unwrap_or((0, 0, 0));
+            if ids != self.slices {
+                debug!(
+                    system_slice = ids.0,
+                    user_slice = ids.1,
+                    our_slice = ids.2,
+                    "exec policy: systemd slices published"
+                );
+                self.slices = ids;
+            }
+            self.k.set_slices(ids.0, ids.1, ids.2);
         }
-        self.k.set_slices(ids.0, ids.1, ids.2);
         let mut skipped = Vec::new();
         let images = kernel::image_entries(&self.s.exempt, &self.s.proc_root, &mut skipped);
         if !skipped.is_empty() && !self.skipped_logged {
@@ -139,12 +159,12 @@ impl<K: KernelIo> Controller<K> {
             self.skipped_logged = true;
         }
         self.k.set_images(&images);
-        if self.s.own_roots {
+        if let (true, Some(table)) = (self.s.own_roots, &table) {
             self.k
-                .set_roots(&crate::execq::kernel::guarded_roots(&text));
+                .set_roots(&crate::execq::kernel::guarded_roots(table));
         }
         self.last_refresh = Some(now);
-        ids
+        self.slices
     }
 
     /// One pass: refresh when due, the ring into records, the counters.
@@ -326,5 +346,64 @@ mod tests {
         assert_eq!(got[0].evidence.policy, "server profile (built in)");
         drop(got);
         assert!(crate::execpol::snapshot().denied >= 2);
+    }
+
+    /// Lot 311 (bug hunt 1.4, BUG-98's sibling): a mount table that is not
+    /// UTF-8 (one FUSE mount point with a 0xff byte, which an unprivileged
+    /// user makes with `fusermount3`) does not unpublish the slices (every
+    /// caller UNKNOWN, NO_SLICES) nor the guarded roots.
+    #[test]
+    fn a_non_utf8_mount_point_keeps_slices_and_roots() {
+        let d = tempfile::tempdir().unwrap();
+        let s = settings(d.path(), true);
+        let mut text = std::fs::read(&s.mountinfo).unwrap();
+        text.extend_from_slice(
+            b"57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n",
+        );
+        std::fs::write(&s.mountinfo, &text).unwrap();
+        let mut c = Controller::new(FakeKernel::default(), Box::new(VecRecorder::default()), s);
+        let ids = c.refresh(Instant::now());
+        assert!(
+            ids.0 != 0 && ids.1 != 0,
+            "slices unpublished by one non-UTF-8 line: {ids:?}"
+        );
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::fs::metadata("/tmp").unwrap().ino();
+        assert!(
+            c.k.roots.iter().any(|(k, _)| k.ino == tmp),
+            "guarded roots emptied: {:?}",
+            c.k.roots
+        );
+    }
+
+    /// Lot 311 (F4): a mount table that cannot be read at all leaves the
+    /// slices and roots last published in force (never zeros, never an
+    /// empty set), with a degradation while it fails; the next good read
+    /// publishes again and withdraws it.
+    #[test]
+    fn an_unreadable_mount_table_keeps_what_was_published() {
+        let d = tempfile::tempdir().unwrap();
+        let s = settings(d.path(), true);
+        let mi = s.mountinfo.clone();
+        let mut c = Controller::new(FakeKernel::default(), Box::new(VecRecorder::default()), s);
+        let good = c.refresh(Instant::now());
+        let roots = c.k.roots.clone();
+        assert!(good.0 != 0 && !roots.is_empty());
+        let degraded = || {
+            nn_linux::boot::degradation::entries()
+                .iter()
+                .any(|d| d.source == "execpol_mounts")
+        };
+        let saved = std::fs::read(&mi).unwrap();
+        std::fs::remove_file(&mi).unwrap();
+        c.k.slices = (7, 7, 7);
+        assert_eq!(c.refresh(Instant::now()), good, "the last good slices");
+        assert_eq!(c.k.slices, (7, 7, 7), "nothing written over the kernel's");
+        assert_eq!(c.k.roots, roots, "the roots kept");
+        assert!(degraded());
+        std::fs::write(&mi, saved).unwrap();
+        assert_eq!(c.refresh(Instant::now()), good);
+        assert_eq!(c.k.slices, good, "published again");
+        assert!(!degraded(), "withdrawn");
     }
 }

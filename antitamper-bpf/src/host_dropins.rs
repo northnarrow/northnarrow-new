@@ -138,12 +138,19 @@ pub struct HostLimits {
     pub controllers: Vec<String>,
 }
 
+/// Lot 311 (F4): a configuration file read as bytes, what is not UTF-8
+/// replaced (U+FFFD): a byte in a comment no longer hides the file's
+/// directives from the judge.
+pub fn read_lossy(path: &Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 impl HostLimits {
     /// This host's (a value that cannot be read is taken as large: a
     /// percentage of it is then not judged harmful).
     pub fn read() -> Self {
         let f = crate::cgroup_floors::Host::read();
-        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let read = |p: &str| read_lossy(Path::new(p)).unwrap_or_default();
         let words = |t: String| {
             t.split([',', ' ', '\n'])
                 .filter(|w| !w.is_empty())
@@ -626,7 +633,9 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         }),
         "EnvironmentFile" => {
             let p = v.trim_start_matches('-');
-            let text = std::fs::read_to_string(p).unwrap_or_default();
+            // lot 311 (F4): read as bytes — a byte that is not UTF-8 (a
+            // Latin-1 comment) hid the whole file and its LD_PRELOAD
+            let text = read_lossy(Path::new(p)).unwrap_or_default();
             text.lines().find_map(|l| {
                 let var = l
                     .trim()
@@ -844,7 +853,10 @@ pub fn harmful(roots: &[&Path], host: &HostLimits) -> Vec<Harm> {
                 if path.extension().and_then(|x| x.to_str()) != Some("conf") {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(&path) else {
+                // lot 311 (F4): read as bytes — a drop-in with one byte that
+                // is not UTF-8 (a Latin-1 comment) was skipped whole, its
+                // harmful directives unseen
+                let Ok(text) = read_lossy(&path) else {
                     continue;
                 };
                 for (key, value) in effective(directives(&text)) {
@@ -1156,6 +1168,36 @@ mod tests {
         assert_eq!(
             directives("[Service]\n# MemoryMax=4K\n; TasksMax=1\nEnvironment=A=1 \\\n  NN_X=1\n"),
             vec![("Environment".to_string(), "A=1  NN_X=1".to_string())]
+        );
+    }
+
+    /// Lot 311 (the mini-hunt of bug hunt 1.4's F4): a drop-in with one byte
+    /// that is not UTF-8 (a Latin-1 comment) is still judged — on main its
+    /// read failed and the whole file was skipped, its harmful directive
+    /// unseen; an `EnvironmentFile=` with such a byte still shows its
+    /// `LD_PRELOAD`.
+    #[test]
+    fn a_latin1_comment_does_not_hide_a_harmful_drop_in() {
+        let root = tempfile::tempdir().unwrap();
+        let svc = root.path().join("service.d");
+        std::fs::create_dir_all(&svc).unwrap();
+        let mem = svc.join("50-mem.conf");
+        std::fs::write(&mem, b"# r\xe9glage\n[Service]\nMemoryMax=4K\n").unwrap();
+        let r = harmful(&[root.path()], &host());
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(
+            (r[0].path.as_path(), r[0].kind),
+            (mem.as_path(), Kind::Harmful)
+        );
+        let env = root.path().join("env");
+        std::fs::write(&env, b"# r\xe9glage\nLD_PRELOAD=/tmp/x.so\n").unwrap();
+        let found = h(
+            Reach::Services,
+            &format!("EnvironmentFile={}", env.display()),
+        );
+        assert!(
+            found.as_deref().is_some_and(|w| w.contains("LD_PRELOAD")),
+            "{found:?}"
         );
     }
 }

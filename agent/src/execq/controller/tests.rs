@@ -30,6 +30,8 @@ struct KState {
     unstopped: Vec<u32>,
     left: Vec<(u32, ExecqStopped)>,
     counters: [u64; counter::SLOTS as usize],
+    /// Lot 311 (BUG-98): the roots last written.
+    roots: Option<Vec<(ExecqKey, u32)>>,
 }
 
 #[derive(Clone, Default)]
@@ -54,7 +56,9 @@ impl KernelIo for FakeKernel {
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
         self.0.lock().left.clone()
     }
-    fn set_roots(&mut self, _roots: &[(ExecqKey, u32)]) {}
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
+        self.0.lock().roots = Some(roots.to_vec());
+    }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         self.0.lock().counters
     }
@@ -867,4 +871,51 @@ fn observe_mode_says_a_script_would_be_refused() {
     );
     assert!(state(h.pid).is_some_and(|s| s != 'Z'), "observe killed it");
     assert_eq!(w.k.0.lock().known.len(), 1, "one record per content");
+}
+
+// ── lot 311 (bug hunt 1.4): BUG-98 ───────────────────────────────────
+
+/// BUG-98: a mount table the controller cannot read as UTF-8 (a FUSE mount
+/// point with a 0xff byte, which the kernel writes as it is) does not
+/// remove the guarded roots of the other lines; and (F4) a table that
+/// cannot be read at all leaves the roots last published, signed.
+#[test]
+fn a_non_utf8_mount_point_does_not_remove_the_guarded_roots() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let mi = w.dir.path().join("mountinfo");
+    let good: &[u8] = b"30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n";
+    std::fs::write(&mi, good).unwrap();
+    w.ctl.roots_source = mi.clone();
+    let tmp = std::fs::metadata("/tmp").unwrap();
+    let t0 = Instant::now();
+    w.ctl.step(t0);
+    let first = w.k.0.lock().roots.clone().unwrap();
+    assert!(
+        first.iter().any(|(k, _)| k.ino == tmp.ino()),
+        "fixture: /tmp published, {first:?}"
+    );
+    // a user's FUSE mount at /home/u/<0xff> appears
+    let mut odd = good.to_vec();
+    odd.extend_from_slice(b"57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n");
+    std::fs::write(&mi, &odd).unwrap();
+    w.ctl.step(t0 + ROOTS_EVERY + Duration::from_millis(1));
+    let now = w.k.0.lock().roots.clone().unwrap();
+    assert!(
+        now.iter().any(|(k, _)| k.ino == tmp.ino()),
+        "EXECQ_ROOTS emptied by one non-UTF-8 line of mountinfo: {now:?}"
+    );
+    // the table gone: nothing written, a degradation while it fails
+    std::fs::remove_file(&mi).unwrap();
+    w.k.0.lock().roots = None;
+    w.ctl.step(t0 + 2 * ROOTS_EVERY + Duration::from_millis(2));
+    assert_eq!(w.k.0.lock().roots, None, "the roots last published stay");
+    assert!(nn_linux::boot::degradation::entries()
+        .iter()
+        .any(|d| d.source == "execq_roots"));
+    std::fs::write(&mi, good).unwrap();
+    w.ctl.step(t0 + 3 * ROOTS_EVERY + Duration::from_millis(3));
+    assert!(w.k.0.lock().roots.is_some());
+    assert!(!nn_linux::boot::degradation::entries()
+        .iter()
+        .any(|d| d.source == "execq_roots"));
 }

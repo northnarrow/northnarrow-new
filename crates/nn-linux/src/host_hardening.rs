@@ -571,7 +571,7 @@ pub fn render_table(checks: &[Check]) -> String {
 
 fn read(root: &Path, rel: &str) -> Option<String> {
     let p: PathBuf = root.join(rel.trim_start_matches('/'));
-    std::fs::read_to_string(p)
+    crate::state_read::read_state(p)
         .ok()
         .map(|s| s.trim().to_string())
 }
@@ -762,25 +762,26 @@ fn kexec_load_disabled(root: &Path) -> Check {
 }
 
 fn bpffs_mounts(root: &Path) -> Check {
-    let mounts = read(root, "/proc/self/mountinfo").unwrap_or_default();
-    let bpf: Vec<&str> = mounts
-        .lines()
-        .filter(|l| {
-            // mountinfo: … - <fstype> <source> <options>
-            l.split(" - ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                == Some("bpf")
-        })
-        .collect();
+    // lot 311 (bug hunt 1.4, F4): the table read as bytes — a user's FUSE
+    // mount named with bytes that are not UTF-8 made it unreadable, and the
+    // check said "not mounted"; a table that cannot be read is said so
+    let table = crate::mountinfo::read(&root.join("proc/self/mountinfo"));
+    let bpf: Vec<&crate::mountinfo::MountEntry> = match &table {
+        Ok(t) => t.entries.iter().filter(|m| m.fstype == "bpf").collect(),
+        Err(_) => Vec::new(),
+    };
     let at_std = bpf
         .iter()
-        .any(|l| l.split_whitespace().nth(4) == Some("/sys/fs/bpf"));
-    let (status, value) = match bpf.len() {
-        0 => (Status::Warn, "not mounted".to_string()),
-        1 if at_std => (Status::Ok, "mounted once at /sys/fs/bpf".to_string()),
-        1 => (Status::Warn, "mounted once, not at /sys/fs/bpf".to_string()),
-        n => (
+        .any(|m| m.mount_point == Path::new("/sys/fs/bpf"));
+    let (status, value) = match (&table, bpf.len()) {
+        (Err(e), _) => (
+            Status::Warn,
+            format!("the mount table could not be read: {e}"),
+        ),
+        (_, 0) => (Status::Warn, "not mounted".to_string()),
+        (_, 1) if at_std => (Status::Ok, "mounted once at /sys/fs/bpf".to_string()),
+        (_, 1) => (Status::Warn, "mounted once, not at /sys/fs/bpf".to_string()),
+        (_, n) => (
             Status::Warn,
             format!("mounted {n}× — a second bpffs can hide pinned objects from the inventory"),
         ),
@@ -1401,6 +1402,29 @@ mod tests {
         assert!(table.contains("recommended on every host"));
         assert!(table.contains("mounted 2×"));
         assert!(table.contains("/etc/northnarrow/admin.key"));
+    }
+
+    /// Lot 311 (bug hunt 1.4, F4): a user's FUSE mount named with bytes that
+    /// are not UTF-8 does not blind the bpffs check — on main the table was
+    /// unreadable as text and the check said "not mounted" (or missed a
+    /// second bpffs).
+    #[test]
+    fn a_non_utf8_mount_does_not_hide_the_bpffs() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let fuse: &[u8] = b"57 25 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n";
+        let mut once = b"36 25 0:30 / /sys/fs/bpf rw shared:17 - bpf bpf rw\n".to_vec();
+        once.extend_from_slice(fuse);
+        w(r, "proc/self/mountinfo", &once);
+        assert_eq!(bpffs_mounts(r).status, Status::Ok);
+        let mut twice = once.clone();
+        twice.extend_from_slice(b"37 25 0:32 / /mnt/bpf2 rw - bpf bpf rw\n");
+        w(r, "proc/self/mountinfo", &twice);
+        let c = bpffs_mounts(r);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.value.contains("mounted 2"), "{}", c.value);
+        let e = tempfile::tempdir().unwrap();
+        assert!(bpffs_mounts(e.path()).value.contains("could not be read"));
     }
 
     #[test]

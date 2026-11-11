@@ -166,7 +166,9 @@ fn read_md5sums(info: &Path) -> HashMap<String, [u8; 16]> {
         if entry.path().extension().is_none_or(|e| e != "md5sums") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+        // lot 311 (F4): read as bytes — a package that ships one file whose
+        // name is not UTF-8 had all its sums skipped
+        let Ok(text) = nn_linux::state_read::read_state(entry.path()) else {
             continue;
         };
         for line in text.lines() {

@@ -196,8 +196,10 @@ impl RuleInputs {
         let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut carveout = own(MASS_WRITE_CARVEOUT_PREFIXES);
         carveout.extend(extras.carveout.iter().cloned());
-        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-        let login_defs = std::fs::read_to_string("/etc/login.defs").unwrap_or_default();
+        // lot 311 (F4): read as bytes — one account whose GECOS is not
+        // UTF-8 (a Latin-1 full name) hid every home and service account
+        let passwd = crate::state_read::read_state("/etc/passwd").unwrap_or_default();
+        let login_defs = crate::state_read::read_state("/etc/login.defs").unwrap_or_default();
         let (svc_homes, caches) = account_dirs(&passwd, crate::accounts::uid_min(&login_defs));
         let mut svc_data = vec![(PathBuf::from("/var/lib"), None)];
         svc_data.extend(svc_homes.into_iter().map(|(h, uid)| (h, Some(uid))));
@@ -1094,6 +1096,9 @@ pub struct MountTable {
     watch: Option<std::fs::File>,
     /// A change was polled and the table not re-read yet.
     changed: bool,
+    /// Lot 311 (F4): a table that cannot be read leaves the roots last
+    /// read in force, signed.
+    read: crate::state_read::LastGood,
 }
 
 impl Default for MountTable {
@@ -1104,6 +1109,7 @@ impl Default for MountTable {
             source: PathBuf::from("/proc/self/mountinfo"),
             watch: None,
             changed: false,
+            read: crate::state_read::LastGood::new("mount_table", "the mount table"),
         }
     }
 }
@@ -1148,11 +1154,30 @@ impl MountTable {
         t
     }
 
+    /// Lot 311 (the mini-hunt of bug hunt 1.4's BUG-98): the table is read
+    /// as bytes ([`crate::mountinfo`]). Read as strict text, one mount whose
+    /// point or source is not UTF-8 — a user's FUSE mount (`fusermount3`)
+    /// at `~/\xff` — emptied it: no opened file had its path (FIM's rules
+    /// matched none), and an exec's kernel-resolved file was unplaced, its
+    /// rules back on the caller's string. A table that cannot be read at
+    /// all keeps the roots last read (signed), never none.
     pub fn refresh(&mut self) {
-        let text = std::fs::read_to_string(&self.source).unwrap_or_default();
+        let table = match crate::mountinfo::read(&self.source) {
+            Ok(table) => {
+                self.read.ok();
+                table
+            }
+            Err(e) => {
+                self.read.failed(&e);
+                self.loaded = Some(Instant::now());
+                self.changed = false;
+                return;
+            }
+        };
         let mut roots = HashMap::new();
-        for mp in mount_points(&text) {
-            if let Ok(m) = std::fs::metadata(&mp) {
+        for m in &table.entries {
+            let mp = m.mount_point.to_string_lossy().into_owned();
+            if let Ok(m) = std::fs::metadata(&m.mount_point) {
                 let k = key_of(&m);
                 // The shortest mount point wins (a bind mount of the same
                 // root elsewhere is an alias).
@@ -1289,7 +1314,7 @@ fn owner_of(path: &str, opened: InodeKey) -> Option<u32> {
 /// that has already exited counts as not capable.
 fn reader_dac_capable(pid: u32) -> bool {
     const DAC_CAPS: u64 = (1 << 1) | (1 << 2); // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+    let Ok(status) = crate::state_read::read_state(format!("/proc/{pid}/status")) else {
         return false;
     };
     let caps = crate::response::caps_preflight::parse_cap_eff(&status).unwrap_or(0);
@@ -1849,6 +1874,37 @@ mod tests {
     fn root_of(p: &Path) -> (u64, u64) {
         let k = key_of(&std::fs::metadata(p).unwrap());
         (k.dev, k.ino)
+    }
+
+    /// Lot 311 (the mini-hunt of BUG-98): a mount whose point (or source)
+    /// is not UTF-8 — a user's FUSE mount at `~/\xff` — does not empty the
+    /// table: the other mounts still place their files (on main no file
+    /// had its path, every one `mnt[…]`); and a table that cannot be read
+    /// keeps the roots last read.
+    #[test]
+    fn a_non_utf8_mount_does_not_empty_the_table() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, info) = (t.path().join("a"), t.path().join("mi"));
+        std::fs::create_dir(&a).unwrap();
+        let mut text = format!("40 22 0:45 / {} rw - tmpfs tmpfs rw\n", a.display()).into_bytes();
+        text.extend_from_slice(
+            b"57 22 0:46 / /home/u/\xff rw,nosuid - fuse.x \xff rw,user_id=1000\n",
+        );
+        std::fs::write(&info, &text).unwrap();
+        let mut mounts = MountTable::load_from(&info);
+        let root = root_of(&a);
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", a.display()))
+        );
+        std::fs::remove_file(&info).unwrap();
+        mounts.loaded = Instant::now().checked_sub(MOUNT_HIT_TTL);
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", a.display())),
+            "the roots last read stay"
+        );
+        assert!(mounts.read.failing());
     }
 
     /// External audit SNS-004: a hit was never checked again — a

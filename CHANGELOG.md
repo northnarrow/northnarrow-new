@@ -6,6 +6,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- A read of the kernel's state never fails on its encoding, and a failed
+  read never empties a protection (lot 311b, the third bug hunt's family
+  F4: BUG-98, its exec policy sibling, BUG-105, BUG-95, BUG-108's userland
+  half, N6's other readers, N8, the partials BUG03 and BUG69;
+  `docs/design/EXEC_POLICY.md` §2, `docs/operator/SENSOR_CONTRACT.md` §3).
+  A process names itself (`comm`), a user names its cgroups and its FUSE
+  mounts: a strict text read refused each file whole. Now:
+  - the lineage reads `/proc` as bytes (the posture hosts' one reader,
+    `read_state`): a process that named itself `\xff\xfe` was skipped by
+    the start's scan, marked gone by the sweep while it ran (and dropped
+    once the map was full), its forks never entered, its admin session's
+    terminal unread; the ancestry tree took it for dead, the watchdog's and
+    a defender's start went unread;
+  - the exec quarantine's and the exec policy's mount table is read as
+    bytes: one unprivileged FUSE mount named with a byte that is not UTF-8
+    emptied `EXECQ_ROOTS` and unpublished the slices (every caller
+    `UNKNOWN`, a service's deny an audit); a table that cannot be read
+    keeps what was published, with a signed degradation; a btrfs
+    subvolume at a guarded point (`/home` on Fedora) and a user's FUSE
+    mount root cannot `stat` are published;
+  - the sensors' mount table likewise (the mini-hunt): while such a mount
+    stood, no opened file had its path and NN-L-FIM-011's kill of a read of
+    another account's `~/.aws/credentials` became a record (lab, Ubuntu
+    24.04);
+  - a Latin-1 comment no longer hides a drop-in, or an `EnvironmentFile=`,
+    from the drop-in judges (the host's and our units'), a package's
+    `.list` or `.md5sums` from the package trust, an account from the
+    resolvers' and the carve-outs' `/etc/passwd` reads, a resolver from
+    `resolv.conf` (a resolver file there but unreadable keeps the set);
+  - a quarantine index that is not UTF-8 is kept aside and rebuilt like any
+    index that does not parse (every quarantine failed after it); the
+    watchdog and `nn-admin verify-keys` read `admin.pub` as the agent does
+    (a Latin-1 comment refused every signed shutdown marker);
+    `nn-admin fim status` ends its count at a read error instead of
+    spinning on it.
+  `xtask/tests/state_reads.rs` keeps it so: no `/proc` entry of a process
+  is read as strict text in the security crates, and a read whose failure
+  becomes a default is listed with its reason.
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

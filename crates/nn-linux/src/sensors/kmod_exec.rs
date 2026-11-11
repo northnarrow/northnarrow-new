@@ -275,7 +275,7 @@ fn initramfs_builder(
             return None;
         }
         let dir = proc.join(p.to_string());
-        let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+        let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
         let ticks = stat_start_ticks(&stat)?;
         if hop == 0 && !started_at(ticks, parent_start_ns) {
             return None;
@@ -321,7 +321,7 @@ fn interpreter(
         .zip(std::fs::metadata(&link).ok());
     // after the image: still the exec's process (a pid is reused only once
     // it is reaped), with its memory
-    let stat = std::fs::read_to_string(dir.join("stat")).ok();
+    let stat = crate::state_read::read_state(dir.join("stat")).ok();
     let ours = stat
         .as_deref()
         .and_then(stat_start_ticks)
@@ -401,7 +401,7 @@ const LINEAGE_HOPS: usize = 32;
 /// The parent of the process at `dir` (`stat`'s fourth field, after the
 /// command name in parentheses, which may hold anything).
 fn ppid(dir: &Path) -> Option<u32> {
-    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
     ppid_of(&stat)
 }
 
@@ -413,7 +413,7 @@ fn ppid_of(stat: &str) -> Option<u32> {
 
 /// The real uid of the process at `dir` (`status`' `Uid:` line).
 fn real_uid(dir: &Path) -> Option<u32> {
-    let status = std::fs::read_to_string(dir.join("status")).ok()?;
+    let status = crate::state_read::read_state(dir.join("status")).ok()?;
     status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
@@ -482,7 +482,7 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
     };
     // The pidfd holds the process: `/proc/<pid>` describes it while it runs
     // (checked after the reads — a pid is not reused before it is reaped).
-    let stat = || std::fs::read_to_string(proc.join(format!("{pid}/stat"))).ok();
+    let stat = || crate::state_read::read_state(proc.join(format!("{pid}/stat"))).ok();
     match stat().as_deref().and_then(stat_start_ticks) {
         Some(ticks) if started_at(ticks, start_ns) => {}
         // the exec's process was reaped and its pid reused
@@ -548,7 +548,8 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
         }
     };
     let runs = |tid: &std::ffi::OsStr| {
-        std::fs::read_to_string(task.join(tid).join("stat")).is_ok_and(|stat| has_memory(&stat))
+        crate::state_read::read_state(task.join(tid).join("stat"))
+            .is_ok_and(|stat| has_memory(&stat))
     };
     let Some(tid) = threads
         .filter_map(Result::ok)
@@ -591,7 +592,7 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
 /// The threads the kernel counts in the process `pid` — its leader among
 /// them while it is a zombie (`Threads:` of `/proc/<pid>/status`).
 fn thread_count(proc: &Path, pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(proc.join(format!("{pid}/status"))).ok()?;
+    let status = crate::state_read::read_state(proc.join(format!("{pid}/status"))).ok()?;
     status
         .lines()
         .find_map(|line| line.strip_prefix("Threads:"))
@@ -2085,5 +2086,18 @@ mod tests {
             "{refused} refused; the first exit: {first:?}"
         );
         assert!(refused > 0);
+    }
+
+    /// Lot 311 (N6): a module tool's process (or a parent) whose `comm` is
+    /// not UTF-8 — `modprobe` run through a link of such a name — has its
+    /// parent, uid and threads read; on main none was.
+    #[test]
+    fn a_tool_whose_comm_is_not_utf8_is_read() {
+        let t = tempfile::tempdir().unwrap();
+        crate::state_read::testing::write_non_utf8_proc(t.path(), 4304, 66, 0, 1);
+        let dir = t.path().join("4304");
+        assert_eq!(ppid(&dir), Some(66));
+        assert_eq!(real_uid(&dir), Some(0));
+        assert_eq!(thread_count(t.path(), 4304), Some(1));
     }
 }

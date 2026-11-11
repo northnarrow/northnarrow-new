@@ -303,7 +303,7 @@ pub fn user_space_start_ns(stat: &str, clk_tck: u64) -> Option<u64> {
 
 /// [`user_space_start_ns`] of this host.
 pub fn host_user_space_start_ns() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/1/stat").ok()?;
+    let stat = crate::state_read::read_state("/proc/1/stat").ok()?;
     // SAFETY: sysconf has no preconditions.
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     user_space_start_ns(&stat, u64::try_from(tck).ok()?)

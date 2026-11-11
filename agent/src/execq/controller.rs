@@ -239,6 +239,9 @@ pub struct Controller<K: KernelIo, B: Backend> {
     last_beat: Option<Instant>,
     last_roots: Option<Instant>,
     roots_source: std::path::PathBuf,
+    /// Lot 311 (bug hunt 1.4, BUG-98): a mount table that cannot be read
+    /// leaves the roots last published in force, signed.
+    roots_read: nn_linux::state_read::LastGood,
     /// Since when the scanner holds requests without a word.
     busy_since: Option<Instant>,
     /// The last signed degradation of the scanner (its cause, when) and
@@ -290,6 +293,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             last_beat: None,
             last_roots: None,
             roots_source: "/proc/self/mountinfo".into(),
+            roots_read: nn_linux::state_read::LastGood::new("execq_roots", "the mount table"),
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
@@ -352,8 +356,16 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             .last_roots
             .is_none_or(|t| now.duration_since(t) >= ROOTS_EVERY)
         {
-            let text = std::fs::read_to_string(&self.roots_source).unwrap_or_default();
-            self.k.set_roots(&kernel::guarded_roots(&text));
+            // lot 311 (BUG-98): the table read as bytes (a FUSE mount of a
+            // user's, named with bytes that are not UTF-8, emptied it); one
+            // that cannot be read at all keeps the roots last published
+            match nn_linux::mountinfo::read(&self.roots_source) {
+                Ok(table) => {
+                    self.k.set_roots(&kernel::guarded_roots(&table));
+                    self.roots_read.ok();
+                }
+                Err(e) => self.roots_read.failed(&e),
+            }
             self.last_roots = Some(now);
         }
         for ev in self.b.tick(now) {

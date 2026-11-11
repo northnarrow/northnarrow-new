@@ -1008,7 +1008,7 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     }
     // R14c: the process's (its first thread's: the decision thread's own
     // filter is that thread's)
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+    if let Ok(status) = crate::state_read::read_state("/proc/self/status") {
         for (name, field) in [(LIMIT_NNP, "NoNewPrivs"), (LIMIT_SECCOMP, "Seccomp")] {
             if let Some(x) = status_field(&status, field) {
                 v.push((name.to_string(), x));
@@ -1050,7 +1050,9 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
 /// The shutdown markers the watchdog refused, one JSON line each
 /// ([`nn_proto::shutdown_marker::RejectedRecord`]) at `path`.
 pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
-    let Ok(body) = std::fs::read_to_string(path) else {
+    // lot 311 (F4): read as bytes — one byte that is not UTF-8 hid every
+    // line of the file; a line that does not parse costs itself only
+    let Ok(body) = crate::state_read::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1085,7 +1087,8 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
 /// after its recovery) and `respawn_argv_degraded` (WDG-008: the exec
 /// backend respawns with a recorded or the minimal argv).
 pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
-    let Ok(body) = std::fs::read_to_string(path) else {
+    // lot 311 (F4): read as bytes, as `rejected_shutdowns`
+    let Ok(body) = crate::state_read::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1279,7 +1282,7 @@ fn mem_total_bytes() -> Option<u64> {
 
 /// The agent's own cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
 fn own_cgroup() -> Option<String> {
-    std::fs::read_to_string("/proc/self/cgroup")
+    crate::state_read::read_state("/proc/self/cgroup")
         .ok()?
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(str::to_string))
@@ -2206,6 +2209,14 @@ mod tests {
         assert!(f.iter().all(|x| x.kind == "shutdown_marker_rejected"));
         assert!(f[0].detail.contains("agent pid 4242"), "{}", f[0].detail);
         assert!(f[1].detail.contains("not json"), "{}", f[1].detail);
+        // lot 311 (F4): a line with a byte that is not UTF-8 costs itself
+        // only (on main the whole file read as nothing: no finding at all)
+        let mut body = serde_json::to_string(&rec).unwrap().into_bytes();
+        body.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&path, body).unwrap();
+        let f = rejected_shutdowns(&path);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].detail.contains("agent pid 4242"), "{}", f[0].detail);
     }
 
     /// External audit DEP-004: a hold the watchdog recorded becomes a

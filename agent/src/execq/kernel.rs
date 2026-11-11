@@ -190,35 +190,66 @@ pub fn root_kind_of(mp: &str) -> u32 {
     k
 }
 
-/// The roots of the guarded mounts in a `mountinfo` text: mounts of a
-/// filesystem's own root (field 4 is `/`; a bind mount of a directory is
-/// not the root the kernel's walk ends on) at a guarded mount point, with
-/// the point's kind ([`root_kind_of`]).
-pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
-    let mut out = Vec::new();
-    for line in mountinfo.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        let (Some(root), Some(mp)) = (f.get(3), f.get(4)) else {
-            continue;
-        };
-        if *root != "/" {
+/// The roots of the guarded mounts in a mount table (read as bytes, lot
+/// 311: [`nn_linux::mountinfo`]), with the point's kind ([`root_kind_of`]):
+///
+/// - a mount of a filesystem's own root (field 4 is `/`) at a guarded
+///   mount point;
+/// - lot 311 (bug hunt 1.4, BUG-108, the userland half): a mount of a
+///   directory of a filesystem none of whose mounts is its root — a btrfs
+///   subvolume (`/home` on Fedora and openSUSE: `subvol=/home`, field 4
+///   `/home`); a bind mount of a directory of a filesystem mounted at its
+///   root elsewhere (`/srv/data` bound at `/home`) is not a root the
+///   kernel's walk ends on, and is left out as before;
+/// - lot 311 (N8): a FUSE mount root cannot `stat` (a user's mount without
+///   `allow_other`: `EACCES`) is keyed from the table — its device, and
+///   inode 1, FUSE's root (`FUSE_ROOT_ID`).
+///
+/// A mount point that is not UTF-8 is classed by its text with the bytes
+/// replaced and `stat`ed by its bytes.
+pub fn guarded_roots(table: &nn_linux::mountinfo::MountTable) -> Vec<(ExecqKey, u32)> {
+    let mut out: Vec<(ExecqKey, u32)> = Vec::new();
+    for m in &table.entries {
+        let own_root = m.root == std::path::Path::new("/");
+        if !own_root
+            && table
+                .entries
+                .iter()
+                .any(|o| o.same_dev(m) && o.root == std::path::Path::new("/"))
+        {
             continue;
         }
-        let mp = crate::sensors::open_sensor::unescape_octal(mp);
+        let mp = m.mount_point.to_string_lossy();
         if !guarded_mount_point(&mp) {
             continue;
         }
-        if let Ok(m) = std::fs::metadata(&mp) {
-            let key = ExecqKey {
-                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
-                ino: m.ino(),
-            };
-            if !out.iter().any(|(k, _)| *k == key) {
-                out.push((key, root_kind_of(&mp)));
-            }
+        let key = match std::fs::metadata(&m.mount_point) {
+            Ok(st) => ExecqKey {
+                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),
+                ino: st.ino(),
+            },
+            Err(_) if own_root && is_fuse(&m.fstype) => ExecqKey {
+                dev: (u64::from(m.major) << 20) | u64::from(m.minor),
+                ino: FUSE_ROOT_ID,
+            },
+            Err(_) => continue,
+        };
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, root_kind_of(&mp)));
         }
     }
     out
+}
+
+/// The inode number of a FUSE filesystem's root (`FUSE_ROOT_ID`,
+/// include/uapi/linux/fuse.h): the kernel gives the root that number
+/// whatever the daemon answers.
+const FUSE_ROOT_ID: u64 = 1;
+
+/// A FUSE filesystem's type in the table: `fuse`, `fuseblk`, `fuse.<name>`.
+fn is_fuse(fstype: &std::ffi::OsStr) -> bool {
+    let t = fstype.as_encoded_bytes();
+    t == b"fuse" || t == b"fuseblk" || t.starts_with(b"fuse.")
 }
 
 #[cfg(test)]
@@ -251,7 +282,7 @@ mod tests {
              2 1 0:5 / /tmp rw - tmpfs tmpfs rw\n\
              3 1 8:1 /srv/data /home rw - ext4 /dev/sda1 rw\n\
              4 1 0:6 / /usr rw - tmpfs tmpfs rw\n";
-        let roots = guarded_roots(text);
+        let roots = guarded_roots(&nn_linux::mountinfo::parse(text.as_bytes()));
         assert_eq!(roots.len(), 1, "{roots:?}");
         let m = std::fs::metadata("/tmp").unwrap();
         assert_eq!(roots[0].0.ino, m.ino());
@@ -280,5 +311,85 @@ mod tests {
         assert_eq!(root_kind_of("/root"), root_kind::GUARDED | root_kind::HOME);
         assert_eq!(root_kind_of("/run/user/1000"), root_kind::GUARDED);
         assert_eq!(root_kind_of("/tmpx"), root_kind::GUARDED);
+    }
+
+    /// Lot 311 (bug hunt 1.4, BUG-108, the userland half; the kernel half —
+    /// the walk ends on the btrfs top-level root, which no mount names — is
+    /// lot 9's): Fedora Workstation's layout, `/` and `/home` subvolumes of
+    /// one btrfs (field 4 the subvolume, not `/`). The mount at `/home` is
+    /// a guarded mount whose root is published.
+    #[test]
+    fn a_btrfs_home_subvolume_is_a_guarded_root() {
+        let text = "29 1 0:35 /root / rw,relatime shared:1 - btrfs /dev/vda3 rw,subvol=/root\n\
+             41 29 0:35 /home /home rw,relatime shared:2 - btrfs /dev/vda3 rw,subvol=/home\n";
+        let roots = guarded_roots(&nn_linux::mountinfo::parse(text.as_bytes()));
+        let home = std::fs::metadata("/home").unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|(k, v)| k.ino == home.ino() && v & root_kind::HOME != 0),
+            "the /home subvolume is not a guarded root: {roots:?}"
+        );
+    }
+
+    /// Lot 311 (N8): a user's FUSE mount under a guarded point that root
+    /// cannot `stat` (no `allow_other`: `EACCES`) is keyed from the table —
+    /// its device and FUSE's root inode — instead of left without a class.
+    /// A mount point that is not UTF-8 is `stat`ed by its bytes.
+    #[test]
+    fn a_fuse_mount_root_cannot_stat_is_keyed_from_the_table() {
+        let text = b"57 1 0:44 / /home/u/nn-lot311-absent/\xffmnt rw,nosuid,nodev - fuse.sshfs u@h:/ rw,user_id=1000\n\
+             58 1 0:45 / /tmp/nn-lot311-absent rw - ext4 /dev/vdb rw\n";
+        let roots = guarded_roots(&nn_linux::mountinfo::parse(text));
+        assert_eq!(
+            roots,
+            vec![(
+                ExecqKey { dev: 44, ino: 1 },
+                root_kind::GUARDED | root_kind::HOME
+            )],
+            "the FUSE root keyed from the table, the other unreadable root left out"
+        );
+        assert!(is_fuse(std::ffi::OsStr::new("fuse")));
+        assert!(is_fuse(std::ffi::OsStr::new("fuseblk")));
+        assert!(!is_fuse(std::ffi::OsStr::new("fusectl")));
+    }
+
+    /// Lot 311 (BUG-108, the lab's check): the mount at
+    /// `NN_LOT311_GUARDED_MP` (a btrfs subvolume or a FUSE mount the lab
+    /// made at a guarded point) is among the guarded roots read from this
+    /// process's own mount table. A no-op without the variable.
+    #[test]
+    #[ignore = "lab: a mount at a guarded point named by NN_LOT311_GUARDED_MP"]
+    fn a_real_guarded_mount_is_a_guarded_root() {
+        let Some(mp) = std::env::var_os("NN_LOT311_GUARDED_MP") else {
+            return;
+        };
+        let table =
+            nn_linux::mountinfo::read(std::path::Path::new("/proc/self/mountinfo")).unwrap();
+        let entry = table
+            .entries
+            .iter()
+            .find(|m| m.mount_point.as_os_str() == mp)
+            .unwrap_or_else(|| panic!("{mp:?} is not a mount point"));
+        let roots = guarded_roots(&table);
+        let key = std::fs::metadata(&entry.mount_point)
+            .map(|st| ExecqKey {
+                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),
+                ino: st.ino(),
+            })
+            .unwrap_or(ExecqKey {
+                dev: (u64::from(entry.major) << 20) | u64::from(entry.minor),
+                ino: FUSE_ROOT_ID,
+            });
+        println!(
+            "mount {mp:?}: root {:?} fstype {:?} key {key:?}; guarded roots {roots:?}",
+            entry.root, entry.fstype
+        );
+        assert!(
+            roots.iter().any(|(k, _)| *k == key),
+            "{mp:?} ({:?} of {:?}) is not a guarded root",
+            entry.root,
+            entry.fstype
+        );
     }
 }

@@ -289,7 +289,18 @@ pub const RESOLVER_USERS: &[&str] = &[
 /// The uids of [`RESOLVER_USERS`] in the host's `/etc/passwd` (lot 275, the
 /// second review of #495, R1: the DNS response pump's resolver identity).
 pub fn host_resolver_uids() -> Vec<u32> {
-    resolver_uids(&std::fs::read_to_string("/etc/passwd").unwrap_or_default())
+    resolver_uids(&passwd())
+}
+
+/// Lot 311 (F4): `/etc/passwd` read as bytes — one account whose GECOS is
+/// not UTF-8 (a Latin-1 full name) hid every resolver's uid.
+fn passwd() -> String {
+    passwd_at(std::path::Path::new("/etc/passwd"))
+}
+
+/// [`passwd`] at `path` (tests: a fixture).
+fn passwd_at(path: &std::path::Path) -> String {
+    crate::state_read::read_state(path).unwrap_or_default()
 }
 
 /// The uids of [`RESOLVER_USERS`] in a `/etc/passwd` body.
@@ -307,7 +318,7 @@ fn resolver_uids(passwd: &str) -> Vec<u32> {
 
 /// Write the resolvers' uids into the kernel's `DNS_EXEMPT_UIDS`.
 fn exempt_resolvers(ebpf: &mut Ebpf) {
-    let uids = resolver_uids(&std::fs::read_to_string("/etc/passwd").unwrap_or_default());
+    let uids = resolver_uids(&passwd());
     {
         let Some(map) = ebpf.map_mut("DNS_EXEMPT_UIDS") else {
             warn!("DNS budget: no DNS_EXEMPT_UIDS map — local resolvers are paced too");
@@ -585,6 +596,21 @@ mod tests {
         raw.qname_len = 5; // the string read does not count the root label
         raw.query_name[..qname.len()].copy_from_slice(qname);
         assert_eq!(dns_fields(event(&raw)), ("host".into(), 28, false));
+    }
+
+    /// Lot 311 (F4): an account whose GECOS is not UTF-8 does not hide the
+    /// resolvers' uids (on main the whole file read as empty).
+    #[test]
+    fn a_latin1_account_does_not_hide_the_resolvers() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("passwd");
+        std::fs::write(
+            &p,
+            b"u:x:1000:1000:J\xe9r\xf4me,,,:/home/u:/bin/bash\n\
+              systemd-resolve:x:991:991:systemd Resolver:/:/usr/sbin/nologin\n",
+        )
+        .unwrap();
+        assert_eq!(resolver_uids(&passwd_at(&p)), vec![991]);
     }
 
     #[test]

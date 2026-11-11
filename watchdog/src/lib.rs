@@ -1951,9 +1951,13 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
     // External audit AUT-004: the agent's key set — a malformed line costs
     // its own key, as in the agent, so both judge the marker with the same
     // keys.
-    let keys = match std::fs::read_to_string(c.admin_pub)
-        .map(|body| nn_proto::admin_quorum::parse_admin_pub_lenient(&body).keys)
-    {
+    // Lot 311 (bug hunt 1.4, partial BUG03): read as bytes, as the agent
+    // reads it — a byte that is not UTF-8, even in a comment, failed the
+    // whole file here and every signed marker was refused (the agent
+    // relaunched after an authorised stop)
+    let keys = match std::fs::read(c.admin_pub).map(|body| {
+        nn_proto::admin_quorum::parse_admin_pub_lenient(&String::from_utf8_lossy(&body)).keys
+    }) {
         Ok(k) if !k.is_empty() => k,
         Ok(_) => {
             return refuse(
@@ -2052,12 +2056,14 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// (clock ticks since boot) over `/proc/stat`'s `btime`. Read while the
 /// process runs; `None` when either cannot be read.
 pub fn process_start_unix(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // lot 311 (N6): read as bytes — the `(comm)` field is the process's own
+    // choice and need not be UTF-8; the fields after it are ASCII
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let stat = String::from_utf8_lossy(&stat);
     // Fields after the parenthesised comm, which may contain spaces.
     let rest = stat.rsplit_once(')')?.1;
     let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    let btime: u64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
+    let btime: u64 = String::from_utf8_lossy(&std::fs::read("/proc/stat").ok()?)
         .lines()
         .find_map(|l| l.strip_prefix("btime "))?
         .trim()
@@ -3474,6 +3480,63 @@ mod tests {
         }
     }
 
+    /// Lot 311 (bug hunt 1.4, partial BUG03): an `admin.pub` with a byte
+    /// that is not UTF-8 in a comment (`# chiave di Jos\xe9`) — the agent
+    /// takes its keys — is read here too: a quorum-signed marker stands
+    /// the watchdog down. On main the read failed and the marker was
+    /// refused (the agent relaunched after an authorised stop).
+    #[test]
+    fn a_latin1_comment_in_admin_pub_does_not_refuse_a_signed_marker() {
+        use nn_proto::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::shutdown_marker::ShutdownMarker;
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("agent.shutdown_authorised");
+        let admin_pub = dir.path().join("admin.pub");
+        let agent_id_file = dir.path().join("agent_id");
+        let a = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let b = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let mut body = b"# chiave di Jos\xe9\n".to_vec();
+        body.extend_from_slice(
+            format!(
+                "{} shutdown\n{} unlock\n",
+                hex::encode(a.verifying_key().to_bytes()),
+                hex::encode(b.verifying_key().to_bytes())
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&admin_pub, body).unwrap();
+        std::fs::write(&agent_id_file, format!("{}\n", "07".repeat(16))).unwrap();
+        let check = ShutdownCheck {
+            marker: &marker,
+            admin_pub: &admin_pub,
+            agent_id_file: &agent_id_file,
+            agent_pid: 4242,
+            agent_started: None,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // a fresh nonce, as an operator's tool draws one
+        let mut drawn = Vec::with_capacity(32);
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(std::fs::File::open("/dev/urandom").unwrap(), 32),
+            &mut drawn,
+        )
+        .unwrap();
+        let nonce: [u8; 32] = drawn.try_into().unwrap();
+        let payload = SignedPayload::new_shutdown(nonce, now, [7; 16], 30);
+        let sigs = [sign(&payload, &a).unwrap(), sign(&payload, &b).unwrap()];
+        std::fs::write(
+            &marker,
+            ShutdownMarker::new(&payload, &sigs, 4242)
+                .unwrap()
+                .to_line(),
+        )
+        .unwrap();
+        assert_eq!(check_shutdown_marker(&check), ShutdownVerdict::Authorised);
+    }
+
     /// External audit WDG-001 / TST-003: only a marker the admin quorum
     /// signed for this agent stands the watchdog down. The old shape —
     /// which this test used to prove was accepted — is refused, recorded
@@ -3569,6 +3632,36 @@ mod tests {
             .as_secs();
         assert!(me <= now && now - me < 24 * 3600, "start {me}, now {now}");
         assert_eq!(process_start_unix(u32::MAX), None);
+    }
+
+    /// Lot 311 (N6): the start of a process whose `comm` is not UTF-8 (run
+    /// through a link named `\xff\xfe`) is read — on main it was not.
+    #[test]
+    fn process_start_is_read_whatever_the_comm() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("nn-wdg-n6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        let _ = std::fs::remove_file(&link);
+        // a shell through the link, looping on `sleep 1` (a multicall
+        // coreutils — uutils, Ubuntu 26.04 — dispatches on `argv[0]`)
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        let mut child = std::process::Command::new(&link)
+            .args(["-c", "while :; do sleep 1; done"])
+            .spawn()
+            .unwrap();
+        let comm = format!("/proc/{}/comm", child.id());
+        for _ in 0..500 {
+            if std::fs::read(&comm).is_ok_and(|c| c.starts_with(b"\xff")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let start = process_start_unix(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(start.is_some());
     }
 
     // ── Supplementary W4 tests (anchors for forward-compat) ────────
