@@ -526,8 +526,9 @@ sysctl-allow kernel.pid_max 4096..32767
   them: a window lets a write of it through), and so is
   `debug.kprobes-optimization` (lot 280b: 0 makes every kprobe a breakpoint
   trap). Any other name refuses the
-  file. One line per sysctl; the value a decimal integer, the range's ends
-  included and in order.
+  file; the refusal lists the names the line takes (lot 299, BUG78: it
+  listed `debug.kprobes-optimization` too). One line per sysctl; the value
+  a decimal integer, the range's ends included and in order.
 - **Honoured only with a valid signature.** The agent writes the range to
   the kernel only from a policy whose signature it verified for the very
   text it applies, at its start or through `nn-admin policy set`. A policy

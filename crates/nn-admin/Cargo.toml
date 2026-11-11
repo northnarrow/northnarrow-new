@@ -54,8 +54,10 @@ libc = "0.2"
 # The private key's owner check (external audit AUT-002): the effective uid,
 # through rustix's safe `geteuid` — nn-admin forbids unsafe code, and the
 # agent called libc's directly (`process`: a feature the workspace's build
-# already enables, procfs's).
-rustix = { version = "1", features = ["process"] }
+# already enables, procfs's). Lot 299: `event`, the safe `poll(2)` that reads
+# `heartbeat watch`'s source command's stdout and stderr together (a feature
+# with no dependency of its own: the lockfile is the same).
+rustix = { version = "1", features = ["process", "event"] }
 
 [features]
 # Exposes the `debug force-posture` subcommand (`DebugForcePosture` is

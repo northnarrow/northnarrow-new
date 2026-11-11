@@ -371,6 +371,15 @@ pub struct VersionedAdminMessage {
 - **Migration path** (v0 → v1): the v1 server accepts an unframed
   v0 `AdminMessage` for `unlock`/`status`/`ChallengeRequest` for
   one release cycle (Tappa 8.x), then v0 is dropped.
+  - *Lot 299 (external bug hunt, edition 1.2: BUG36).* The live wire
+    never moved to the envelope (it is still the bare frame), and the
+    envelope's v0 tolerance — `decode_versioned_or_legacy_frame`, the
+    bare body tried when the envelope did not decode — is dropped: it
+    guessed from bytes that can be both (a v2 envelope with a variant
+    unknown here decoded as a v0 `Status`). The envelope's decoder reads
+    the `version` first and refuses one outside `1..=PROTOCOL_VERSION`
+    whatever the message. A migration of the live wire tells the two
+    shapes apart by something only one of them can hold.
 
 ### 6.3 Signed-payload structure (NEW)
 
