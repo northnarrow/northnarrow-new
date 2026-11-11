@@ -192,6 +192,9 @@ enum Opt {
     /// syntax (`perl -c`, `node -c`, `ruby -c`) or reads without executing
     /// (a shell's `-n`, bash's `-D`): what it runs is [`Runs::Unknown`].
     NoRun,
+    /// Ruby's `-v`: the version printed, then the script run — with none,
+    /// nothing runs ([`Runs::Unknown`]).
+    NoRunAlone,
     /// The rest of its argument, possibly empty (`perl -x`, `ruby -i.bak`).
     Rest,
     /// Lot 310 (the review of #539, finding 1): perl's `-i`, `-F`, `-C`:
@@ -292,11 +295,27 @@ struct Table {
     /// ends the argument). Any other family: whitespace in a cluster is no
     /// option it has ([`Runs::Unknown`]).
     space_continues: bool,
+    /// Lot 310 (the review of #539, finding 11): the names a shell's `-o`
+    /// (and bash's `-O`) take — another one it refuses, and nothing runs
+    /// ([`Runs::Unknown`]). The names every supported version has; one only
+    /// some have (dash's `pipefail`) is not known either.
+    names: &'static [(char, &'static [&'static str])],
     /// What a lone `-` means.
     dash: Dash,
 }
 
 impl Table {
+    /// `value` is a name option `c` takes; `true` for an option with no list.
+    fn names_ok(&self, c: char, value: &str) -> bool {
+        match self.names.iter().find(|(o, _)| *o == c) {
+            None => true,
+            Some((_, names)) => {
+                let v = value.to_ascii_lowercase();
+                names.contains(&v.as_str()) || names.contains(&v.replace('_', "").as_str())
+            }
+        }
+    }
+
     fn short(&self, c: char) -> Option<Opt> {
         self.short
             .iter()
@@ -345,6 +364,7 @@ const PYTHON: Table = Table {
     underscores: false,
     plus: false,
     space_continues: false,
+    names: &[],
     dash: Dash::Stdin,
 };
 
@@ -369,6 +389,7 @@ const PERL: Table = Table {
     underscores: false,
     plus: false,
     space_continues: true,
+    names: &[],
     dash: Dash::Stdin,
 };
 
@@ -376,7 +397,8 @@ const PERL: Table = Table {
 /// if one is given.
 const RUBY: Table = Table {
     short: &[
-        ("apndyvwslSU", Opt::Flag),
+        ("apndywslSU", Opt::Flag),
+        ("v", Opt::NoRunAlone),
         ("hc", Opt::NoRun),
         ("rI", Opt::Loads),
         ("CXE", Opt::Arg),
@@ -420,6 +442,7 @@ const RUBY: Table = Table {
     underscores: false,
     plus: false,
     space_continues: false,
+    names: &[],
     dash: Dash::Stdin,
 };
 
@@ -593,8 +616,51 @@ const NODE: Table = Table {
     underscores: true,
     plus: false,
     space_continues: false,
+    names: &[],
     dash: Dash::Stdin,
 };
+
+/// bash 5.2's `set -o` names.
+const BASH_SET_O: &[&str] = &[
+    "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace", "hashall",
+    "histexpand", "history", "ignoreeof", "interactive-comments", "keyword", "monitor",
+    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd", "physical",
+    "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+];
+
+/// bash 5.2's `shopt` names (`-O`).
+const BASH_SHOPT: &[&str] = &[
+    "assoc_expand_once", "autocd", "cdable_vars", "cdspell", "checkhash", "checkjobs",
+    "checkwinsize", "cmdhist", "compat31", "compat32", "compat40", "compat41", "compat42",
+    "compat43", "compat44", "complete_fullquote", "direxpand", "dirspell", "dotglob",
+    "execfail", "expand_aliases", "extdebug", "extglob", "extquote", "failglob",
+    "force_fignore", "globasciiranges", "globskipdots", "globstar", "gnu_errfmt",
+    "histappend", "histreedit", "histverify", "hostcomplete", "huponexit",
+    "inherit_errexit", "interactive_comments", "lastpipe", "lithist", "localvar_inherit",
+    "localvar_unset", "login_shell", "mailwarn", "no_empty_cmd_completion", "nocaseglob",
+    "nocasematch", "noexpand_translation", "nullglob", "patsub_replacement", "progcomp",
+    "progcomp_alias", "promptvars", "restricted_shell", "shift_verbose", "sourcepath",
+    "varredir_close", "xpg_echo",
+];
+
+/// dash's `set -o` names (0.5.12; `pipefail` came later: not known).
+const DASH_SET_O: &[&str] = &[
+    "errexit", "noglob", "ignoreeof", "interactive", "monitor", "noexec", "stdin", "xtrace",
+    "verbose", "vi", "emacs", "noclobber", "allexport", "notify", "nounset", "privileged",
+    "nolog",
+];
+
+/// busybox ash's `set -o` names (1.36).
+const ASH_SET_O: &[&str] = &[
+    "errexit", "noglob", "ignoreeof", "interactive", "monitor", "noexec", "stdin", "xtrace",
+    "verbose", "vi", "emacs", "noclobber", "allexport", "notify", "nounset", "pipefail",
+];
+
+/// The `-o` names zsh, mksh and ksh93 all read (each has more: not known).
+const OTHER_SET_O: &[&str] = &[
+    "errexit", "noglob", "ignoreeof", "monitor", "noexec", "xtrace", "verbose", "vi",
+    "emacs", "noclobber", "allexport", "notify", "nounset", "pipefail",
+];
 
 /// bash's `shell.c` (5.2): the `set` flags, `-i`, `-l`, `-r`, `-s`, `-c`,
 /// `-D` (dump strings, no run); `-o` and `-O` take the next argument
@@ -632,6 +698,7 @@ const BASH: Table = Table {
     underscores: false,
     plus: true,
     space_continues: false,
+    names: &[('o', BASH_SET_O), ('O', BASH_SHOPT)],
     dash: Dash::EndOfOptions,
 };
 
@@ -653,6 +720,7 @@ const DASH: Table = Table {
     underscores: false,
     plus: true,
     space_continues: false,
+    names: &[('o', DASH_SET_O)],
     dash: Dash::EndOfOptions,
 };
 
@@ -666,6 +734,7 @@ const BUSYBOX_ASH: Table = Table {
     underscores: false,
     plus: true,
     space_continues: false,
+    names: &[('o', ASH_SET_O)],
     dash: Dash::EndOfOptions,
 };
 
@@ -686,6 +755,7 @@ const OTHER_SHELL: Table = Table {
     underscores: false,
     plus: true,
     space_continues: false,
+    names: &[('o', OTHER_SET_O)],
     dash: Dash::Unknown,
 };
 
@@ -708,6 +778,7 @@ const MONO: Table = Table {
     underscores: false,
     plus: false,
     space_continues: false,
+    names: &[],
     dash: Dash::Stdin,
 };
 
@@ -723,7 +794,7 @@ pub(crate) fn runs_of(exe: &Path, argv: &[String]) -> Runs {
 /// Lot 310: the program an interpreter's argv carries inline (`-c CMD`,
 /// `-e CODE`, `--eval=CODE`), for a record; `None` when it runs none, or
 /// its options could not be read.
-pub(crate) fn inline_program<'a>(exe: &Path, argv: &'a [String]) -> Option<&'a str> {
+pub fn inline_program<'a>(exe: &Path, argv: &'a [String]) -> Option<&'a str> {
     let r = reading(exe, argv);
     if r.runs != Runs::Code {
         return None;
@@ -808,6 +879,8 @@ fn reading(exe: &Path, argv: &[String]) -> Reading {
 struct Seen {
     loads: bool,
     no_run: bool,
+    /// Ruby's `-v`: nothing runs unless a program is named.
+    no_run_alone: bool,
 }
 
 impl Seen {
@@ -816,6 +889,9 @@ impl Seen {
     /// [`Runs::Unknown`] (the script kept for a record), before nothing
     /// named → [`Runs::Code`].
     fn finish(&self, r: Reading) -> Reading {
+        if self.no_run_alone && r.runs == Runs::Inline {
+            return Runs::Unknown(None).into();
+        }
         if self.no_run {
             return match r.runs {
                 Runs::Script(s) => Runs::Unknown(Some(s)).into(),
@@ -932,8 +1008,8 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
             },
         };
         words = false;
-        // the arguments `Next` letters of this cluster take
-        let mut next = 0;
+        // the letters of this cluster that take the next arguments
+        let mut next: Vec<char> = Vec::new();
         let mut pos = 0;
         while let Some(c) = letters[pos..].chars().next() {
             pos += c.len_utf8();
@@ -959,7 +1035,8 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
             match opt {
                 Opt::Flag => {}
                 Opt::NoRun => seen.no_run = true,
-                Opt::Next => next += 1,
+                Opt::NoRunAlone => seen.no_run_alone = true,
+                Opt::Next => next.push(c),
                 Opt::Stdin => return Runs::Code.into(),
                 // the rest of the cluster is options too, then its operands
                 Opt::ShellCode => shell_code = true,
@@ -1001,6 +1078,9 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     if opt == Opt::Module {
                         return Runs::Script(value.into()).into();
                     }
+                    if !table.names_ok(c, value) {
+                        return unknown();
+                    }
                     seen.loads |= opt == Opt::Loads;
                     break;
                 }
@@ -1020,10 +1100,15 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 }
             }
         }
-        if argv.len() < i + next {
+        if argv.len() < i + next.len() {
             return unknown();
         }
-        i += next;
+        for (k, c) in next.iter().enumerate() {
+            if !table.names_ok(*c, &argv[i + k]) {
+                return unknown();
+            }
+        }
+        i += next.len();
     }
     if shell_code {
         // `bash -c` with no program: bash refuses
@@ -1334,7 +1419,11 @@ mod tests {
     }
 
     /// `-o name` separate, and bash's `-o` (the next argument) unchanged:
-    /// `bash -ovi` is `-o` then `-v -i`, as bash reads it.
+    /// `bash -ovi` is `-o` then `-v -i`, as bash reads it. Lot 310, the
+    /// review of #539: the name `-o` takes is checked — `bash -ovi /tmp/s`
+    /// takes `/tmp/s` for an option's name, refuses it and runs nothing
+    /// (`invalid option name`, status 2), so it reads as unknown, not as an
+    /// interactive shell; `bash -ovi vi` is the interactive one.
     #[test]
     fn bug100_guard_separate_o_and_bash() {
         assert_eq!(
@@ -1354,9 +1443,16 @@ mod tests {
         assert_eq!(
             runs_of(
                 Path::new("/usr/bin/bash"),
-                &argv(&["bash", "-ovi", "/tmp/s"])
+                &argv(&["bash", "-ovi", "vi"])
             ),
             Runs::Inline
+        );
+        assert_eq!(
+            runs_of(
+                Path::new("/usr/bin/bash"),
+                &argv(&["bash", "-ovi", "/tmp/s"])
+            ),
+            Runs::Unknown(Some("/tmp/s".into()))
         );
     }
 

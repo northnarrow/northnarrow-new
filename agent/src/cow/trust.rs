@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
-use crate::impact::trust::{topmost_same, vouches, ProgramOwners};
+use crate::impact::trust::{is_user_manager, topmost_same, vouches, ProgramOwners};
 use crate::posture::lineage::{
     in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
 };
@@ -184,7 +184,9 @@ pub fn judge(
         .iter()
         .enumerate()
         .skip(1)
-        .find(|(n, (_, id))| is_foreign(id) || (*n > own && !vouches(id, owned)))
+        .find(|(n, (pid, id))| {
+            is_foreign(id) || (*n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
+        })
         .map(|(_, hop)| hop)
     {
         return Trust::Untrusted(Untrusted::ForeignAncestor {

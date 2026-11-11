@@ -53,17 +53,53 @@ pub(crate) fn lexical_form(path: &str) -> Option<String> {
     })
 }
 
-/// The link a path (in [`lexical_form`]) goes through:
-/// `/proc/<pid>[/task/<tid>]/` (or `self`, `thread-self`) then `cwd`, `root`
-/// or `exe` (the link itself or anything under it), or an entry of `fd/` or
-/// `map_files/` (each reopens the file it names); and (lot 286)
-/// `/dev/fd/<n>`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, links into
-/// `/proc/self/fd/` that the `/dev/` prefix carved out. Any second segment
-/// matches: no other entry of `/proc` holds such names, and a path that only
-/// looks like one counts.
+/// The link a path goes through: `/proc/<pid>[/task/<tid>]/` (or `self`,
+/// `thread-self`) then `cwd`, `root` or `exe` (the link itself or anything
+/// under it), or an entry of `fd/` or `map_files/` (each reopens the file it
+/// names); and (lot 286) `/dev/fd/<n>`, `/dev/stdin`, `/dev/stdout`,
+/// `/dev/stderr`, links into `/proc/self/fd/` that the `/dev/` prefix carved
+/// out. Any second segment matches: no other entry of `/proc` holds such
+/// names, and a path that only looks like one counts.
+///
+/// Lot 310 (the review of #539, finding 6): the path is folded first — `.`
+/// and empty segments dropped, a `..` folded with the segment before it
+/// (`/home/u/dev/../bin/tool` is `/home/u/bin/tool`, no link) — except a
+/// `..` under `/proc/<x>/` or `/dev/<x>/`, where links lead elsewhere and
+/// the kernel climbs from there (`/proc/self/task/../fd/3`, `/proc/net/..`):
+/// where it leads is not known, and it counts as a descriptor. And
+/// `/proc/<x>/root/` is the process's root: what follows is read again as
+/// a path from it (`/proc/self/root/proc/self/fd/3` reopens descriptor 3).
 pub(crate) fn proc_link(path: &str) -> Option<ProcLink> {
-    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    let rest = match segs.as_slice() {
+    match folded(path) {
+        Some(segs) => link_of(&segs),
+        None => Some(ProcLink::Descriptor),
+    }
+}
+
+/// `path`'s segments folded as the text shows it ([`proc_link`]); `None`
+/// for a `..` inside `/proc/<x>/` or `/dev/<x>/`. A relative path keeps its
+/// segments (a leading `..` dropped: its directory is not known) and is
+/// read as from the root.
+fn folded(path: &str) -> Option<Vec<&str>> {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if segs.len() >= 2 && matches!(segs[0], "proc" | "dev") {
+                    return None;
+                }
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    Some(segs)
+}
+
+/// The link of folded segments ([`proc_link`]).
+fn link_of(segs: &[&str]) -> Option<ProcLink> {
+    let rest = match segs {
         ["dev", "fd", _, ..] | ["dev", "stdin" | "stdout" | "stderr", ..] => {
             return Some(ProcLink::Descriptor)
         }
@@ -71,29 +107,27 @@ pub(crate) fn proc_link(path: &str) -> Option<ProcLink> {
         _ => return None,
     };
     match rest {
-        ["cwd" | "root", ..] => Some(ProcLink::View),
+        // the process's root: the rest is a path from it
+        ["root", more @ ..] => link_of(more).or(Some(ProcLink::View)),
+        ["cwd", ..] => Some(ProcLink::View),
         ["exe", ..] => Some(ProcLink::Exe),
         ["fd" | "map_files", _, ..] => Some(ProcLink::Descriptor),
         _ => None,
     }
 }
 
-/// A path (in [`lexical_form`]) through a link the kernel follows to a
-/// process's view of the filesystem ([`proc_link`]).
+/// A path through a link the kernel follows to a process's view of the
+/// filesystem ([`proc_link`]).
 pub(crate) fn through_proc_link(path: &str) -> bool {
     proc_link(path).is_some()
 }
 
 /// Lot 310 (BUG-88): an exec path, as the caller wrote it, that reopens a
-/// descriptor ([`ProcLink::Descriptor`]): what fexecve(3) and its kin pass.
-/// A `..` segment hides where the links lead ([`lexical_form`]): a path with
-/// one that goes through `/proc` or `/dev` at all is taken for one
-/// (`/proc/self/task/../fd/3` is `/proc/self/fd/3`).
+/// descriptor ([`ProcLink::Descriptor`]): what fexecve(3) and its kin pass,
+/// in every spelling the text shows ([`proc_link`]'s folding and its
+/// `root/` chains).
 pub(crate) fn reopens_a_descriptor(path: &str) -> bool {
-    match lexical_form(path) {
-        Some(p) => proc_link(&p) == Some(ProcLink::Descriptor),
-        None => path.split('/').any(|s| matches!(s, "proc" | "dev")),
-    }
+    proc_link(path) == Some(ProcLink::Descriptor)
 }
 
 #[cfg(test)]
@@ -165,5 +199,41 @@ mod tests {
         ] {
             assert!(!reopens_a_descriptor(p), "{p}");
         }
+    }
+
+    /// The review of #539 (finding 6): a `..` outside a `/proc` or `/dev`
+    /// link is folded — a source tree's `dev` directory is no descriptor
+    /// (lot 310's first reader killed `execve("/home/u/dev/../bin/tool")`);
+    /// one inside such a link is not known and counts; a process's `root`
+    /// is read again from there.
+    #[test]
+    fn a_dot_dot_is_folded_outside_links_and_root_chains_are_followed() {
+        for p in [
+            "/home/u/dev/../bin/tool",
+            "../dev/run.sh",
+            "/opt/app/dev/../run.sh",
+            "/home/u/proc/../bin/x",
+            "/proc/../usr/bin/x",
+            "/dev/../usr/bin/x",
+            "dev/../bin/x",
+        ] {
+            assert_eq!(proc_link(p), None, "{p}");
+            assert!(!reopens_a_descriptor(p), "{p}");
+        }
+        for p in [
+            "/proc/self/root/proc/self/fd/3",
+            "/proc/1/root/proc/self/fd/3",
+            "/proc/self/root/dev/stdin",
+            "/proc/self/root/proc/self/root/dev/fd/4",
+            "/proc/self/task/../fd/3",
+            "/proc/net/../fd/3",
+            "/dev/fd/../fd/3",
+            "/proc/self/cwd/../fd/3",
+        ] {
+            assert!(reopens_a_descriptor(p), "{p}");
+            assert!(through_proc_link(p), "{p}");
+        }
+        assert_eq!(proc_link("/proc/self/root/usr/bin/ls"), Some(ProcLink::View));
+        assert_eq!(proc_link("/proc/self/root/proc/self/exe"), Some(ProcLink::Exe));
     }
 }

@@ -167,6 +167,17 @@ pub fn vouches(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool
         || (id.runs == Runs::Inline && is_interpreter(&id.exe) && owned_file(&id.exe, owned))
 }
 
+/// Lot 310 (the review of #539, finding 7): a `systemd --user` manager — the
+/// manager's program at a pid other than 1 — vouches for nothing it starts:
+/// the user chooses what it runs (`systemd-run --user /usr/bin/openssl enc
+/// …` was a lineage of installed programs end to end, no inline program in
+/// it). PID 1 runs units from root's unit files and an administrator's
+/// `systemd-run`, and still vouches.
+pub fn is_user_manager(pid: u32, id: &ExecIdentity) -> bool {
+    const MANAGERS: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
+    pid != 1 && id.runs == Runs::Inline && MANAGERS.iter().any(|m| id.exe == Path::new(m))
+}
+
 /// Why a hop that is not trusted is not: what it runs is not known, it runs
 /// the caller's inline program (lot 310), or no package installed it.
 fn not_installed(id: &ExecIdentity) -> &'static str {
@@ -204,20 +215,38 @@ pub fn judge(
     if let Some(i) = hops
         .iter()
         .enumerate()
-        .position(|(n, (_, id))| is_foreign(id) || (n > own && !vouches(id, owned)))
+        .position(|(n, (pid, id))| {
+            is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
+        })
     {
-        let (actor, id) = &hops[topmost_same(hops, i)];
+        // lot 310: a user's service manager is not what to kill (its whole
+        // session's services with it): the unit's process it started is.
+        // Its own parent runs the same file (PID 1's systemd), so the hop
+        // is taken as is, never climbed to the copies above it.
+        let manager = i > 0 && is_user_manager(hops[i].0, &hops[i].1);
+        let (actor, id) = if manager {
+            (hops[i - 1].0, &hops[i].1)
+        } else {
+            let (a, id) = &hops[topmost_same(hops, i)];
+            (*a, id)
+        };
         // A foreign writer's shapes add up with its forked workers'; a
         // packaged tool's under a foreign program count for that tool's
         // process alone: two tools a user's script runs one after the
         // other (`tar x` deleting, `rsync --inplace` rewriting) are not one
         // burst. The kill reaches the foreign program either way.
-        let key = if i == 0 { *actor } else { hops[0].0 };
+        let key = if i == 0 { actor } else { hops[0].0 };
         let why = if i == 0 {
             not_installed(id).to_string()
         } else if matches!(id.runs, Runs::Unknown(_)) {
             format!(
                 "{} was started by {}, whose arguments do not tell what it runs",
+                program_of(writer),
+                program_of(id)
+            )
+        } else if manager {
+            format!(
+                "{} was started by a user's service manager ({}), which runs what the user asks",
                 program_of(writer),
                 program_of(id)
             )
@@ -235,7 +264,7 @@ pub fn judge(
             )
         };
         return Judged::Untrusted {
-            actor: *actor,
+            actor,
             key,
             program: program_of(id),
             why,
@@ -614,6 +643,69 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
+    /// Lot 310, the review of #539 (finding 7): a user's service manager
+    /// (`systemd --user`, the systemd file at a pid other than 1) runs what
+    /// the user asks — `systemd-run --user /usr/bin/openssl enc …` was a
+    /// lineage of installed programs end to end. It vouches for nothing; the
+    /// process it started is the actor (never the manager, never PID 1 above
+    /// it, which runs the same file), and PID 1's units still vouch.
+    #[test]
+    fn a_user_s_service_manager_vouches_for_nothing() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        match judge(500, Some(&l), false, &distro) {
+            Judged::Untrusted {
+                actor,
+                key,
+                program,
+                why,
+            } => {
+                assert_eq!((actor, key), (500, 500));
+                assert_eq!(program, "/usr/lib/systemd/systemd");
+                assert!(why.contains("a user's service manager"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // its forked workers: the topmost copy of the program it started
+        let l = [
+            (502, id("/usr/bin/openssl", None)),
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert!(matches!(
+            judge(502, Some(&l), false, &distro),
+            Judged::Untrusted { actor: 500, key: 502, .. }
+        ));
+        // `/lib/systemd/systemd` (a split `/usr`) is the same manager
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, id("/lib/systemd/systemd", None)),
+            (1, id("/lib/systemd/systemd", None)),
+        ];
+        assert!(matches!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Untrusted { actor: 500, .. }
+        ));
+        // PID 1's unit
+        let l = [(500, id("/usr/bin/openssl", None)), (1, systemd())];
+        assert_eq!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into()))
+        );
+        assert!(is_user_manager(1200, &systemd()));
+        assert!(!is_user_manager(1, &systemd()));
+        assert!(!is_user_manager(1200, &id("/usr/bin/bash", None)));
+        assert!(!is_user_manager(
+            1200,
+            &id("/usr/lib/systemd/systemd", Some("/tmp/x"))
+        ));
+    }
+
     /// Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running
     /// an inline program or its standard input vouches for nothing — the
     /// LOTL ransomware of the triage, a webshell's `sh -c 'openssl enc …'`,
@@ -711,7 +803,7 @@ mod tests {
         let l = [
             (400, id("/usr/bin/tar", None)),
             (300, id("/usr/bin/python3", Some("/usr/lib/borg/backup.py"))),
-            (200, id("/usr/lib/systemd/systemd", None)),
+            (1, id("/usr/lib/systemd/systemd", None)),
         ];
         assert!(matches!(
             judge(400, Some(&l), false, &distro),

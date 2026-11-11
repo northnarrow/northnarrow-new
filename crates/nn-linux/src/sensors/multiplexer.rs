@@ -1321,7 +1321,10 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
 /// pump's order, before any exec its process forks.
 fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
     crate::sensors::kmod_exec::read_and_keep(&e);
-    let (e, carried) = resolved(raw, e);
+    let (mut e, carried) = resolved(raw, e);
+    // lot 310 (the review of #539): the image, its directory, an
+    // interpreter's environment and standard input, read while it runs
+    crate::sensors::exec_facts::read(&mut e);
     crate::sensors::kmod_exec::note_exec(&e);
     (e, carried)
 }

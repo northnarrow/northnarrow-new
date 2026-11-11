@@ -459,6 +459,29 @@ impl ExecIdentity {
         Self { exe: path, runs }
     }
 
+    /// Lot 310 (the review of #539): the identity of an exec event's own
+    /// process ([`Self::of_exec`]) with what the agent's exec pump read of
+    /// its process at the exec: an environment that loads the caller's
+    /// code before a named script (`PYTHONPATH`, `NODE_OPTIONS`, …: what it
+    /// runs is then not known, the script kept for a record), a standard
+    /// input that is no terminal for an interpreter naming no program
+    /// (`bash < file`: the caller's code, [`Runs::Code`]). `None` for any
+    /// other event.
+    pub fn of_spawn(event: &Event) -> Option<Self> {
+        let Event::ProcessSpawn {
+            filename,
+            argv,
+            exe,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut id = Self::of_exec(exe.path_or(filename), argv);
+        id.runs = with_pump_facts(id.runs, &id.exe, exe.flags);
+        Some(id)
+    }
+
     /// Lot 292: the identity of a process known by its executable only (no
     /// argv): an interpreter's is not known ([`Runs::Unknown`]).
     pub fn of_exe(exe: impl Into<PathBuf>) -> Self {
@@ -796,6 +819,10 @@ struct InnerState {
     uid_count: HashMap<u32, usize>,
     by_uid: HashMap<u32, VecDeque<u32>>,
     by_uid_len: usize,
+    /// Lot 310: the processes the start's scan found running an image
+    /// unlinked since (not entered): pid → (its start, the image's
+    /// identity), at most [`TRACKER_CAP`]; a later exec of the pid drops it.
+    seeded_images: HashMap<u32, (u64, (u64, u64))>,
 }
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
@@ -974,6 +1001,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     uid_count: HashMap::new(),
                     by_uid: HashMap::new(),
                     by_uid_len: 0,
+                    seeded_images: HashMap::new(),
                 }),
                 proc_root,
                 live,
@@ -1095,19 +1123,30 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         else {
             return false;
         };
-        // lot 310: the file's identity, from the LSM program
-        let image = exe
-            .has(common::wire::exe::exe_flags::KNOWN)
+        use common::wire::exe::exe_flags::{KNOWN, PROC_EXE, ROOT_DIR};
+        // lot 310: the file's identity (the LSM program's, or the exec
+        // pump's from `/proc` in tracepoint mode), kept only when no user
+        // could have unlinked the image (its directory root's only: the
+        // review of #539, finding 5)
+        let image = (exe.flags & (KNOWN | PROC_EXE) != 0
+            && exe.has(ROOT_DIR)
+            && (exe.dev, exe.ino) != (0, 0))
             .then_some((exe.dev, exe.ino));
-        self.ingest_exec_image(
+        let path = exe.path_or(filename);
+        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let runs = with_pump_facts(runs_of(Path::new(path), argv), Path::new(path), exe.flags);
+        self.ingest_inner(
             *pid,
             *ppid,
-            exe.path_or(filename),
-            argv,
+            path,
+            argv_npm_cli,
+            runs,
             *timestamp_ns,
-            (*start_ns, *uid),
+            (*start_ns, None),
+            *uid,
             image,
         );
+        let _ = filename;
         true
     }
 
@@ -1126,21 +1165,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         start_ns: u64,
         uid: u32,
     ) {
-        self.ingest_exec_image(pid, ppid, exe, argv, spawn_ns, (start_ns, uid), None);
-    }
-
-    /// [`Self::ingest_exec`] with the executed file's identity (lot 310).
-    #[allow(clippy::too_many_arguments)]
-    fn ingest_exec_image(
-        &self,
-        pid: u32,
-        ppid: u32,
-        exe: &str,
-        argv: &[String],
-        spawn_ns: u64,
-        (start_ns, uid): (u64, u32),
-        image: Option<(u64, u64)>,
-    ) {
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
@@ -1152,7 +1176,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
-            image,
+            None,
         );
     }
 
@@ -1186,7 +1210,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             if pid == 0 || self.holds(pid) {
                 continue;
             }
+            // lot 310 (the review of #539, finding 5): the image a process
+            // older than the agent runs, by its identity, when no user could
+            // have unlinked it — kept even for an image unlinked since (an
+            // upgraded browser re-executing itself), which is not entered
+            let image = self.seed_image(pid);
             let Some((ppid, exe, uid)) = self.lookup_proc(pid) else {
+                if let (Some(image), Some(ticks)) = (image, self.proc_start_ticks(pid)) {
+                    let start_ns = ticks.saturating_mul(tick).saturating_sub(suspended).max(1);
+                    let mut s = self.inner.state.write();
+                    if s.seeded_images.len() < TRACKER_CAP {
+                        s.seeded_images.insert(pid, (start_ns, image));
+                    }
+                }
                 continue;
             };
             let Some(ticks) = self.proc_start_ticks(pid) else {
@@ -1208,11 +1244,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
-                None,
+                image,
             );
             seeded += 1;
         }
         seeded
+    }
+
+    /// Lot 310: the identity of the image `pid` runs (`/proc/<pid>/exe`,
+    /// the device in the kernel's form), when the directory it was executed
+    /// from is root's only ([`PostureHost::dir_is_root_only`]); at the
+    /// start's scan, off the decision path.
+    fn seed_image(&self, pid: u32) -> Option<(u64, u64)> {
+        let link = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let text = H::read_link(&link).ok()?;
+        let text = text.to_string_lossy();
+        let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
+        if !H::dir_is_root_only(path.parent()?) {
+            return None;
+        }
+        let (dev, ino) = H::file_id(&link)?;
+        Some((common::wire::exe::kernel_dev(dev), ino))
+    }
+
+    /// Lot 310 (the review of #539, finding 3): the cache holds an exec of
+    /// `pid` by the process that started at `start_ns` before `before_ns`
+    /// — its exec at `before_ns` is not the first since its fork.
+    pub fn execed_before(&self, pid: u32, start_ns: u64, before_ns: u64) -> bool {
+        let s = self.inner.state.read();
+        let cur = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
+        let past = s.history.get(&pid).into_iter().flatten();
+        past.chain(cur)
+            .any(|e| e.start_ns == start_ns && e.spawn_ns != 0 && e.spawn_ns < before_ns)
     }
 
     /// The spawn cache holds an exec of `pid`.
@@ -1281,6 +1344,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // review of #475: an exec of the pid — a process that runs (its
         // old entry, if the sweep had found it gone, is history now)
         s.exited.remove(&pid);
+        // lot 310: the start's record of an unlinked image is that process's
+        s.seeded_images.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;
         // any other spawn reusing the pid invalidates a stale copy there.
         if is_system_daemon_binary(&entry.exe) {
@@ -2963,7 +3028,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) | CachedAt::Past(e) => e.image,
-            CachedAt::LaterOnly | CachedAt::Absent => None,
+            CachedAt::LaterOnly => None,
+            // lot 310: a process older than the agent whose image was
+            // unlinked before the start's scan (not entered)
+            CachedAt::Absent => {
+                let s = self.inner.state.read();
+                let (start, image) = s.seeded_images.get(&pid).copied()?;
+                as_of.time().is_none_or(|t| t >= start).then_some(image)
+            }
         }
     }
 
@@ -3153,6 +3225,22 @@ fn is_elevation_binary(exe: &Path) -> bool {
 fn is_node_exe(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     NODE_EXES.iter().any(|p| s == *p)
+}
+
+/// Lot 310 (the review of #539, findings 2 and 7): what an exec pump's
+/// facts (`common::wire::exe::exe_flags`) change in what an interpreter
+/// runs: an environment that loads the caller's code before a named
+/// script leaves the script named but not all that runs
+/// ([`Runs::Unknown`]); an interpreter naming no program whose standard
+/// input is no terminal runs its input ([`Runs::Code`]).
+pub fn with_pump_facts(runs: Runs, exe: &Path, flags: u32) -> Runs {
+    use common::wire::exe::exe_flags::{ENV_LOADS, STDIN_PROGRAM};
+    match runs {
+        Runs::Script(s) if flags & ENV_LOADS != 0 => Runs::Unknown(Some(s)),
+        Runs::Inline if flags & ENV_LOADS != 0 && is_interpreter(exe) => Runs::Code,
+        Runs::Inline if flags & STDIN_PROGRAM != 0 && is_interpreter(exe) => Runs::Code,
+        r => r,
+    }
 }
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
@@ -4554,7 +4642,9 @@ mod tests {
     }
 
     /// Lot 310: the lineage keeps the executed file's identity the LSM
-    /// program gave (none in tracepoint mode), and a fork the sweep enters,
+    /// program gave (none in tracepoint mode without the exec pump's
+    /// `/proc/<pid>/exe`), when its directory is root's only, and a fork the
+    /// sweep enters,
     /// or an orphan of a gone process's image, runs that image's identity.
     #[test]
     fn a_fork_and_an_orphan_carry_the_identity_of_the_image_they_run() {
@@ -4576,7 +4666,9 @@ mod tests {
                     path: exe.into(),
                     dev: id.map_or(0, |i| i.0),
                     ino: id.map_or(0, |i| i.1),
-                    flags: id.map_or(0, |_| common::wire::exe::exe_flags::KNOWN),
+                    flags: id.map_or(0, |_| {
+                        common::wire::exe::exe_flags::KNOWN | common::wire::exe::exe_flags::ROOT_DIR
+                    }),
                     ..Default::default()
                 },
                 argv_truncated: false,
@@ -4591,6 +4683,15 @@ mod tests {
         assert_eq!(t.exec_image(600, AsOf::Now), Some((8, 600)));
         assert_eq!(t.exec_image(610, AsOf::Now), None, "tracepoint: none");
         assert_eq!(t.exec_image(611, AsOf::Now), None, "not held");
+        // the review of #539 (finding 5): an image in a directory a user
+        // can write (no `ROOT_DIR`) could be unlinked and replaced by its
+        // owner — its identity is not kept
+        let mut user_s = exec(612, 1, "/home/u/bin/tool", 10 * S, Some((8, 612)));
+        if let Event::ProcessSpawn { exe, .. } = &mut user_s {
+            exe.flags &= !common::wire::exe::exe_flags::ROOT_DIR;
+        }
+        assert!(t.ingest_spawn_event(&user_s));
+        assert_eq!(t.exec_image(612, AsOf::Now), None, "a user's directory");
         write_exe(proc.path(), 600, "/usr/bin/dpkg");
         write_status(proc.path(), 600, 1);
         write_started(proc.path(), "600", 1, 1_000);

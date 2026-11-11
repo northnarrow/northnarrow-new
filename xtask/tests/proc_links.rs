@@ -8,94 +8,98 @@
 //! `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N` and `/dev/stdin`
 //! ran an unlinked file without its kill. A new site that matches such a
 //! path by hand fails here until it calls the reader (`through_proc_link`,
-//! `proc_link`, `reopens_a_descriptor`) or is listed in [`KNOWN`] with why it
-//! matches nothing a caller wrote.
+//! `proc_link`, `reopens_a_descriptor`) or its file is listed in [`KNOWN`]
+//! with why it matches nothing a caller wrote.
 //!
-//! The scan is lexical (comments blanked, test items and test files left
-//! out) over the production code of the crates that judge events. What it
-//! counts ([`MARKERS`]): a prefix test of a `/proc` or `/dev/fd` path, the
-//! names only a `/proc` link holds (`thread-self`, `map_files`), the `/dev`
-//! links to descriptors, and a slice pattern on a path's `proc` segment.
-//! Building a path to the agent's own descriptor (`format!("/proc/self/fd/
-//! {fd}")`) matches nothing and is not counted.
+//! Lot 310, the independent review of #539 (finding 9): the first ratchet
+//! missed `contains("/proc/thread-self/fd/")`, a `const` holding the prefix
+//! and a slice pattern `["", "proc", _, "fd", _]`. It scans every product
+//! crate now ([`support::product_code`]) and counts ([`count`]):
+//!
+//! - every string literal naming a `/proc` or `/dev` link (`/fd`,
+//!   `thread-self`, `map_files`, `/task/`, `/exe`, `/cwd`, `/root`,
+//!   `/dev/std…`) without a `{` (a path the agent builds with `format!` to
+//!   read its own process is no match);
+//! - every `"proc"` segment literal (a slice pattern on a path's segments);
+//! - a prefix or substring test of `"/proc` or `"/dev/fd`.
 
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use support::{is_test_file, production, repo_root, rs_files, strip_comments};
+use support::{product_code, repo_root, string_literals};
 
 /// The one reader.
 const READER: &str = "crates/nn-core/src/posture/proc_link.rs";
 
-/// The production trees scanned.
-const TREES: &[&str] = &[
-    "crates/nn-core/src",
-    "crates/nn-linux/src",
-    "agent/src",
-    "common/src",
-    "watchdog/src",
+/// The names only a `/proc` or `/dev` link holds.
+const LINK_NAMES: &[&str] = &[
+    "/fd", "thread-self", "map_files", "/task/", "/exe", "/cwd", "/root", "/dev/std",
 ];
 
-/// What a `/proc` link matched by hand looks like.
-const MARKERS: &[&str] = &[
+/// A literal naming a link of `/proc` or `/dev`, or a path segment `proc`.
+fn is_link_literal(s: &str) -> bool {
+    if s == "proc" {
+        return true;
+    }
+    !s.contains('{')
+        && (s.starts_with("/proc") || s.starts_with("/dev") || s.contains("thread-self"))
+        && LINK_NAMES.iter().any(|n| s.contains(n))
+}
+
+/// The tests of a path's text against `/proc` or `/dev/fd`.
+const TESTS: &[&str] = &[
     "strip_prefix(\"/proc",
     "starts_with(\"/proc",
+    "contains(\"/proc",
     "strip_prefix(\"/dev/fd",
     "starts_with(\"/dev/fd",
-    "strip_prefix(\"self/",
-    "starts_with(\"self/",
-    "\"thread-self",
-    "\"map_files",
-    "\"/dev/stdin\"",
-    "\"/dev/stdout\"",
-    "\"/dev/stderr\"",
-    "[\"proc\",",
+    "contains(\"/dev/fd",
 ];
 
-/// The files that hold markers: how many, and why none matches a path a
-/// caller wrote.
-const KNOWN: &[(&str, usize, &str)] = &[(
-    "crates/nn-linux/src/response/quarantine.rs",
-    1,
-    "the restore's destination as the kernel resolved it: the agent's own descriptor of the \
-     directory it opened through PID 1's root (`/proc/1/root/…`, `on_host_path`), read back \
-     and mapped to the host's path — the kernel's answer, no path a caller wrote",
-)];
-
 fn count(text: &str) -> usize {
-    MARKERS.iter().map(|m| text.matches(m).count()).sum()
-}
-
-fn which(text: &str) -> Vec<(&'static str, usize)> {
-    MARKERS
+    let literals = string_literals(text)
         .iter()
-        .map(|m| (*m, text.matches(m).count()))
-        .filter(|(_, n)| *n > 0)
-        .collect()
+        .filter(|l| is_link_literal(l))
+        .count();
+    let tests: usize = TESTS.iter().map(|t| text.matches(t).count()).sum();
+    literals + tests
 }
 
-/// The production code of [`TREES`], comments and tests blanked, by file.
-fn tree_code(root: &Path) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for t in TREES {
-        let mut files = Vec::new();
-        rs_files(&root.join(t), &mut files);
-        for f in files {
-            let rel = f
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_file(&rel) || rel.contains("/tests/") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{rel}: {e}"));
-            out.insert(rel, production(&strip_comments(&text)));
-        }
-    }
-    out
+/// The files that hold sites: how many, and why none matches a path a
+/// caller wrote.
+const KNOWN: &[(&str, usize, &str)] = &[
+    (
+        "crates/nn-linux/src/response/quarantine.rs",
+        2,
+        "the restore's destination as the kernel resolved it: the agent's own descriptor of the \
+         directory it opened through PID 1's root (`/proc/1/root/…`, `on_host_path`), read back \
+         and mapped to the host's path — the kernel's answer, no path a caller wrote",
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        2,
+        "the security-tool list's `proc` key (a field of the signed list), no path segment",
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        1,
+        "the agent's own descriptors listed (`/proc/self/fd`): read, no match",
+    ),
+    (
+        "agent/src/boot/attach.rs",
+        2,
+        "the agent's own image (`/proc/self/exe`): read, no match",
+    ),
+];
+
+fn which(text: &str) -> String {
+    let lits: Vec<String> = string_literals(text)
+        .into_iter()
+        .filter(|l| is_link_literal(l))
+        .collect();
+    let tests: Vec<&&str> = TESTS.iter().filter(|t| text.contains(**t)).collect();
+    format!("literals {lits:?}; tests {tests:?}")
 }
 
 fn violations(code: &BTreeMap<String, String>) -> Vec<String> {
@@ -108,14 +112,14 @@ fn violations(code: &BTreeMap<String, String>) -> Vec<String> {
         let n = count(text);
         match known.get(file.as_str()) {
             None if n > 0 => out.push(format!(
-                "{file}: {:?} — a `/proc` link matched by hand: read it with \
+                "{file}: {n} site(s), {} — a `/proc` link matched by hand: read it with \
                  `posture::proc_link` (`through_proc_link`, `proc_link`, \
                  `reopens_a_descriptor`), or list the file in KNOWN with why it matches \
                  nothing a caller wrote",
                 which(text)
             )),
             Some(&pin) if n > pin => out.push(format!(
-                "{file}: {n} sites, {pin} known — {:?}: a new one",
+                "{file}: {n} sites, {pin} known — {}: a new one",
                 which(text)
             )),
             Some(&pin) if n < pin => out.push(format!(
@@ -135,7 +139,7 @@ fn violations(code: &BTreeMap<String, String>) -> Vec<String> {
 /// No `/proc` link is matched outside the reader.
 #[test]
 fn proc_links_are_matched_by_the_one_reader() {
-    let code = tree_code(&repo_root());
+    let code = product_code(&repo_root());
     assert!(code.contains_key(READER), "the reader is scanned");
     // the reader holds what it is the only one to hold
     assert!(count(&code[READER]) > 0, "the reader's markers");
@@ -146,22 +150,51 @@ fn proc_links_are_matched_by_the_one_reader() {
     }
 }
 
-/// The ratchet fails on planted violations: R004's twin as it was (BUG-88)
-/// and a per-thread name matched by hand; the agent's own descriptor's path
-/// built (no match) and the reader itself are not counted.
+/// Prints each file's count (`NN_PRINT_COUNTS=1`); a no-op without it.
+#[test]
+#[ignore = "prints the counts; NN_PRINT_COUNTS=1, run by hand when the table moves"]
+fn print_the_counts() {
+    if std::env::var_os("NN_PRINT_COUNTS").is_none() {
+        return;
+    }
+    for (file, text) in product_code(&repo_root()) {
+        let n = count(&text);
+        if n > 0 && file != READER {
+            println!("{n}\t{file}\t{}", which(&text));
+        }
+    }
+}
+
+/// The ratchet fails on planted violations: R004's twin as it was (BUG-88),
+/// and the review of #539's — `contains("/proc/thread-self/fd/")`, a `const`
+/// prefix and its test, a slice pattern on the `proc` segment; the agent's
+/// own descriptor's path built (`format!`) and the reader itself are not
+/// counted.
 #[test]
 fn the_ratchet_fails_on_planted_violations() {
-    let mut code = tree_code(&repo_root());
-    code.insert(
-        format!("crates/nn-core/src/decision/rules/{}.rs", "r004_twin"),
-        "fn is_proc_fd_path(p: &str) -> bool { p.strip_prefix(\"/proc/\").is_some() || \
-         p.starts_with(\"/dev/fd/\") }"
-            .to_string(),
-    );
-    code.insert(
-        format!("crates/nn-core/src/posture/{}.rs", "thread"),
-        "fn t(p: &str) -> bool { p.contains(\"thread-self\") }".to_string(),
-    );
+    let mut code = product_code(&repo_root());
+    let planted: &[(&str, &str)] = &[
+        (
+            "r004_twin",
+            "fn a(p: &str) -> bool { p.strip_prefix(\"/proc/\").is_some() || \
+             p.starts_with(\"/dev/fd/\") }",
+        ),
+        ("contains", "fn a(p: &str) -> bool { p.contains(\"/proc/thread-self/fd/\") }"),
+        (
+            "konst",
+            "const FD: &str = \"/proc/self/fd/\";\nfn a(p: &str) -> bool { p.starts_with(FD) }",
+        ),
+        (
+            "slice",
+            "fn a(s: &[&str]) -> bool { matches!(s, [\"\", \"proc\", _, \"fd\", _]) }",
+        ),
+    ];
+    for (name, body) in planted {
+        code.insert(
+            format!("crates/nn-core/src/decision/rules/{}.rs", format_args!("twin_{name}")),
+            body.to_string(),
+        );
+    }
     code.insert(
         format!("crates/nn-linux/src/{}.rs", "own_fd"),
         "fn o(fd: i32) -> String { format!(\"/proc/self/fd/{fd}\") }".to_string(),
@@ -170,7 +203,8 @@ fn the_ratchet_fails_on_planted_violations() {
         .unwrap()
         .push_str("\nfn h(p: &str) -> bool { p.starts_with(\"/proc/\") }\n");
     let v = violations(&code);
-    assert_eq!(v.len(), 2, "{v:#?}");
-    assert!(v.iter().any(|x| x.contains("r004_twin.rs")));
-    assert!(v.iter().any(|x| x.contains("thread.rs")));
+    assert_eq!(v.len(), planted.len(), "{v:#?}");
+    for (name, _) in planted {
+        assert!(v.iter().any(|x| x.contains(&format!("twin_{name}.rs"))), "{name}");
+    }
 }

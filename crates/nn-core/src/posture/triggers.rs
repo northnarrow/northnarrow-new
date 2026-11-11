@@ -3866,7 +3866,7 @@ mod tests {
                 path: "/opt/google/chrome/chrome".into(),
                 dev: 2049,
                 ino: 4242,
-                flags: exe_flags::KNOWN,
+                flags: exe_flags::KNOWN | exe_flags::ROOT_DIR,
                 ..Default::default()
             },
             argv_truncated: false,
