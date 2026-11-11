@@ -9117,6 +9117,37 @@ number in parentheses is a lab PR.
     five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
     V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
     deny proof in a privileged e2e; then a third party's validation.
+- **Lot 311a — a kill reaches a process whatever it names itself (C17;
+  the third bug hunt's triage, N6; no level changes).**
+  - What was open: a process whose `comm` is not UTF-8 — set with
+    `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`, or by executing a
+    file of that name, no privilege needed — has a `/proc/<pid>/stat` and
+    `status` that `std::fs::read_to_string` refuses. The response's capture
+    (`ProcRef`) read `stat` so and took the refusal for "running, no
+    identity": every kill and tree kill of such a process was signed
+    `Failed` (errno 5) and it ran on; a killed cgroup's member whose `stat`
+    was unreadable was counted killed. The judgement itself held (the exec
+    event is the kernel's).
+  - What changed: the response reads `/proc/<pid>/stat` as bytes
+    (`nn_linux::state_read`, the fields after the last `)`), and the COMBAT
+    ladder's `status` and `cgroup` reads too; a running process whose entry
+    cannot be read for another reason (the agent out of memory or
+    descriptors) is captured by its pidfd alone and signalled, never left
+    untouched; a member of a killed cgroup is dead only when its PID names
+    no process, another process or a zombie. The lineage, the ancestry and
+    the other `/proc` readers are lot 311b's.
+  - Measured on our guests (R001's kill tree of a `www-data` exec from
+    `/tmp`): on `main`, Ubuntu 24.04 (`6.8.0-147-generic`), a payload named
+    `\xff\xfe` and one renaming itself so at its first instruction were
+    recorded and each kill signed `Failed { errno: 5 }`, both ran their
+    8 s; with this lot both are killed (`rc 137`, the tree frozen and
+    killed in a cgroup of its own), the control and a renamed parent's
+    child as before. Ubuntu 26.04 (`7.0.0-43-generic`): the same,
+    the four cases as on 24.04. The kill cgroup's privileged tests on 24.04
+    (root): 4 of 4, the new one included (descendants whose `stat` cannot
+    be read are moved and killed); with its mutant the new one fails.
+  - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
+    proved beyond it.
 - **Lot 314 — the state machines of the third external bug hunt, tested as
   such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,
   family F3 "state, windows and counts"; no level changes).**
