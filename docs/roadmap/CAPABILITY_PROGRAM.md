@@ -8886,3 +8886,29 @@ number in parentheses is a lab PR.
     caught; `origin/main`'s logic under the new tests caught by 4 named
     tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
   - Level unchanged.
+- **Lot 305 — rustix 1.1.6 for RUSTSEC-2026-0486 (C27; dependency
+  maintenance, no level changes).**
+  - What was open: RUSTSEC-2026-0486 (GHSA-jh2m-fhpj-3vr7, published
+    2026-10-27, `informational = "unsound"`): in rustix 1.0.0 to 1.1.5 the
+    xattr functions of `rustix::fs` marked as initialized as many bytes as
+    the size query of a zero-length buffer returned. Both `Cargo.lock` and
+    `fuzz/Cargo.lock` locked 1.1.5, and the CI's `cargo audit --deny
+    unsound` failed on every branch. Dependabot's #483 (1.1.5 → 1.1.6) was
+    closed by Dependabot itself on 11/11.
+  - What changed: rustix 1.1.6 (the advisory's `patched = [">= 1.1.6"]`,
+    the latest release) in both lockfiles, its version and checksum only.
+    Its requirements are all met by what is locked (bitflags `^2.9.2` by
+    2.13.2, windows-sys `>=0.52, <0.62` by 0.61.2); `cargo update -p rustix
+    --precise 1.1.6` would also have moved the `windows-sys` edges of
+    errno, rustix and tempfile from 0.61.2 to 0.52.0 (Windows targets only),
+    and so did #483 in `fuzz/Cargo.lock`: not taken. `agent-ebpf/Cargo.lock`
+    has no rustix.
+  - Reachability: no call. The only direct dependent, `nn-admin`, uses
+    `rustix::process::geteuid` and `rustix::event::poll` (features `process`
+    and `event`, no `fs` of its own); `procfs` 0.18.0 and `tempfile` 3.27.0
+    (a dev-dependency) contain no xattr call; no source of the workspace or
+    the fuzz harness names one of the six functions.
+  - Measured on the host: `cargo audit --deny unsound --deny unmaintained`
+    on the three lockfiles (advisory database of 11/11) exits 0, with the
+    nine recorded exceptions unexpired; the full gates in the PR.
+  - Level unchanged.
