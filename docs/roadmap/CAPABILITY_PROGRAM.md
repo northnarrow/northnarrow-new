@@ -8574,7 +8574,8 @@ number in parentheses is a lab PR.
     tests and this lot's pass (the BUG28 retry test made independent of
     which dance fails first: #522 probes the directory before it seals).
   - Gates on the PR's tree: eBPF, the four clippy runs (+ nn-admin's
-    debug-trigger), fmt, 93 suites with 4,383 passed and 0 failed, the
+    debug-trigger), fmt, 94 suites with 4,442 passed and 0 failed (with
+    lots 296 and 297 merged in), the
     privileged no-run, the debug-trigger builds, the eBPF maps
     (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage, golden ×5 (57 files, the
     same bytes), MSRV 1.89, the fuzz replay (14), portable (5), the
