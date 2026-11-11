@@ -8730,3 +8730,45 @@ number in parentheses is a lab PR.
     nothing after its close).
   - Level unchanged (C23 2, provisional): the re-assessment is not this
     lot's.
+- **Lot 303a — the nightly's red Debian 13 install: why, and the gate says
+  why next time (lab).**
+  - What was open: the nightly `lab-vm.yml` failed `nn-lab.sh install` on
+    its Debian 13 guest (systemd 257, `6.12.115+deb13.1`) from 07/11 to
+    10/11 on f66e6680 with systemd's "control process exited with error
+    code" alone — the same image had passed on 06/11, and lots 280a–c, 281
+    and 285 had landed in between. Neither the job log, the serial console
+    nor the gate log named a reason, and the lab's shared Debian 13 guest
+    installed the same tree (lot 293; this lot's first round on `main`).
+  - Reproduced on a fresh guest (the vendor's current image, sha512
+    `d25999de…`, the CI's 4 vCPUs and 12 GiB, a lab directory of its own,
+    not the shared guest's disk), at f66e6680: the agent refused its start,
+    exit 78, gate `deny_hooks` — "BPF self-defence: own-object registration
+    FAILED … registering own link id 62: `bpf_map_update_elem` failed:
+    Argument list too long (E2BIG)": the agent's own maps, programs and
+    links had outgrown the 256 entries of `OWN_BPF_IDS` (the object: 232
+    maps and programs on b75f3cf9, 247 on f66e6680), and the bpf() map
+    guard, with nothing registered, was a missing deny hook. How many
+    objects a start registers depends on the host (the shared guest stayed
+    under 256). Lot 290 (#514, a67c0712) had met the same `E2BIG` on its own
+    first start and raised the map to 1024, with
+    `xtask/tests/foreign_bpf.rs::the_own_ids_map_holds_every_object_of_the_agent`
+    (at least twice the object's maps and programs; it fails on f66e6680's
+    256). `main` 02b8e853 on the same fresh guest: installed, both units
+    active, 280 objects registered (155 maps, 62 programs, 63 links); the
+    dispatched `lab-vm.yml` run 42958638508 on 02b8e853 installs on its
+    Debian 13 guest too.
+  - What changed: `nn-lab.sh install` starts the units in a block of its
+    own (`lab_start_units`); a start that fails prints the units' status,
+    this boot's `ERROR` and `WARN` lines of both units from their journal
+    namespace and their last lines before the error, so the CI job log
+    carries the agent's refusal and its gate
+    (`docs/integration-test-runbook.md`, "The CI VM gate"). The level is
+    read in the line's text: the units log to stdout, journald files every
+    line at priority info — the first version's `-p warning` printed
+    nothing on the fresh guest (below). Named test:
+    `xtask/tests/lab_host_safety.rs::a_unit_that_does_not_start_prints_the_agent_s_refusal`
+    (the block run with its remote command executed here against
+    `sudo`/`systemctl`/`journalctl` shims: the refusal, the status and the
+    last lines printed and the error raised on a failed start, no priority
+    filter, no journal read on a started one); 5 mutants, 5 caught.
+  - Level unchanged: a diagnosis and a gate's output, no capability.
