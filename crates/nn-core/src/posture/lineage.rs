@@ -493,11 +493,20 @@ impl ExecIdentity {
         if !in_system_tree(&self.exe.to_string_lossy()) {
             return false;
         }
-        if !is_interpreter(&self.exe) {
+        if !self.interprets() {
             return true;
         }
         self.script()
             .is_some_and(|s| s.starts_with('/') && in_system_tree(s))
+    }
+
+    /// Lot 310: the identity runs a program its argv names or carries — an
+    /// interpreter ([`is_interpreter`]), or a binary of many programs
+    /// running one of its shells (busybox as `sh`: [`Runs`] other than
+    /// [`Runs::Inline`]). busybox's other programs (`busybox wget`) are the
+    /// installed binary they are.
+    pub fn interprets(&self) -> bool {
+        is_interpreter(&self.exe) || self.runs != Runs::Inline
     }
 
     /// A rule's built-in client: the executed file itself is one of
@@ -3150,8 +3159,13 @@ fn is_node_exe(exe: &Path) -> bool {
 /// what they run is named by their arguments, not by their exe. Lot 292:
 /// each family reads them with its own option table
 /// ([`crate::posture::script_args`]).
+///
+/// Lot 310 (the review of #539, finding 11): busybox is no interpreter by
+/// its executable — a binary of many programs, most of them no
+/// interpreter (`wget`, `httpd`, `ntpd`); its shells are told by what an
+/// identity runs ([`ExecIdentity::interprets`]).
 pub fn is_interpreter(exe: &Path) -> bool {
-    family_of(exe).is_some()
+    family_of(exe).is_some_and(|f| f != super::script_args::Family::Busybox)
 }
 
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
@@ -6484,6 +6498,12 @@ mod tests {
     fn family_option_arguments_are_paired_per_interpreter() {
         let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a)).runs;
         let script = |s: &str| Runs::Script(s.into());
+        // lot 310 (the review of #539, finding 2): an option that loads the
+        // caller's code before the script (`node -r`, `--require`, `perl
+        // -I`, `-M`, `-d:`, `ruby -r`, `-I`) leaves the script named but not
+        // all that runs: not known (it was `Script`; the arity this test is
+        // about is unchanged — the script read is the same)
+        let loaded = |s: &str| Runs::Unknown(Some(s.into()));
         let mut wrong = Vec::new();
         for (exe, a, want) in [
             (
@@ -6494,12 +6514,12 @@ mod tests {
             (
                 "/usr/bin/node",
                 &["node", "-r", "/usr/lib/x.js", "/tmp/e.js"][..],
-                script("/tmp/e.js"),
+                loaded("/tmp/e.js"),
             ),
             (
                 "/usr/bin/node",
                 &["node", "--require", "/usr/lib/x.js", "/tmp/e.js"][..],
-                script("/tmp/e.js"),
+                loaded("/tmp/e.js"),
             ),
             // lot 292: the rest of each family's table
             (
@@ -6535,12 +6555,12 @@ mod tests {
             (
                 "/usr/bin/perl",
                 &["perl", "-I", "/usr/share/perl5", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
                 &["perl", "-Mstrict", "-wT", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
@@ -6561,7 +6581,7 @@ mod tests {
             (
                 "/usr/bin/perl",
                 &["perl", "-d:NYTProf", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
@@ -6571,12 +6591,12 @@ mod tests {
             (
                 "/usr/bin/ruby3.2",
                 &["ruby", "-r", "json", "/tmp/e.rb", "/usr/bin/x"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/ruby3.2",
                 &["ruby", "-I", "/usr/lib/ruby/x", "-rjson", "/tmp/e.rb"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/ruby3.2",
@@ -6612,7 +6632,7 @@ mod tests {
             (
                 "/usr/bin/ruby",
                 &["ruby", "-W:no-deprecated", "-rjson", "/tmp/e.rb"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/perl",

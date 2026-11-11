@@ -121,16 +121,22 @@ pub(crate) enum Family {
     Perl,
     Ruby,
     Node,
-    /// bash, dash and `sh`: one table, their union (an option one of them
-    /// refuses stops it before it runs anything).
+    /// bash, dash and `sh`. Lot 310 (the review of #539): each its own
+    /// table — bash's long options with one hyphen are bash's only (dash
+    /// reads `-posix` as letters) — and `sh`, whose shell its name does not
+    /// tell (tracepoint mode reads the caller's path), read with both: where
+    /// they differ, what it runs is not known.
     Shell,
     /// zsh and the ksh family: the options common to every shell only.
     OtherShell,
     Mono,
     /// Lot 310: busybox, a binary of many programs: the one `argv[0]` names
-    /// (`sh` when it is `/bin/sh`), or `argv[1]` after `busybox` itself. Its
-    /// shells (`sh`, `ash`, `hush`, `bash`) are read as shells; any other
-    /// program runs nothing named.
+    /// (`sh` when it is `/bin/sh`), or, after a name starting with
+    /// `busybox` (busybox's `is_prefixed_with`), the next argument's — again
+    /// and again (`busybox busybox sh`). Its shells (`sh`, `ash`, `hush`,
+    /// `bash`) are read as shells; any other program is a binary
+    /// ([`Runs::Inline`]: busybox is no interpreter by its executable,
+    /// [`crate::posture::lineage::is_interpreter`]).
     Busybox,
 }
 
@@ -138,7 +144,7 @@ pub(crate) enum Family {
 /// digits and dots (`python3.12`, `perl5.36`), or (lot 310, BUG-104) one of
 /// the names the kernel resolves an interpreter's usual name to
 /// (`/usr/bin/mono` is a link to `mono-sgen`, Alpine's `/bin/sh` one to
-/// `busybox`); `None` for any other executable.
+/// `busybox`, `busybox.static`); `None` for any other executable.
 pub(crate) fn family_of(exe: &Path) -> Option<Family> {
     let base = exe.file_name()?.to_string_lossy();
     const NAMES: &[(&str, Family)] = &[
@@ -159,14 +165,14 @@ pub(crate) fn family_of(exe: &Path) -> Option<Family> {
         ("mono", Family::Mono),
     ];
     /// What the kernel executes for an interpreter's usual name: Mono's
-    /// runtimes (upstream's install and Debian's alternatives), busybox.
-    const RESOLVED: &[(&str, Family)] = &[
-        ("mono-sgen", Family::Mono),
-        ("mono-boehm", Family::Mono),
-        ("busybox", Family::Busybox),
-    ];
+    /// runtimes (upstream's install and Debian's alternatives).
+    const RESOLVED: &[(&str, Family)] =
+        &[("mono-sgen", Family::Mono), ("mono-boehm", Family::Mono)];
     if let Some((_, family)) = RESOLVED.iter().find(|(name, _)| base == *name) {
         return Some(*family);
+    }
+    if base.starts_with("busybox") {
+        return Some(Family::Busybox);
     }
     NAMES.iter().find_map(|(name, family)| {
         base.strip_prefix(name)
@@ -181,18 +187,33 @@ enum Opt {
     /// No argument: the letters after it are options too (`-O`, a shell's
     /// `-e`, `perl -w`).
     Flag,
-    /// The rest of its argument, possibly empty (`perl -i.bak`, `-x`,
-    /// `-F:`).
+    /// Lot 310: no argument, and the interpreter runs no program with it —
+    /// it prints and exits (`--version`, `-h`), only checks the program's
+    /// syntax (`perl -c`, `node -c`, `ruby -c`) or reads without executing
+    /// (a shell's `-n`, bash's `-D`): what it runs is [`Runs::Unknown`].
+    NoRun,
+    /// The rest of its argument, possibly empty (`perl -x`, `ruby -i.bak`).
     Rest,
-    /// The rest of its argument, which must not be empty (`perl -MFoo`:
-    /// the interpreter refuses `-M` alone).
-    RestRequired,
+    /// Lot 310 (the review of #539, finding 1): perl's `-i`, `-F`, `-C`:
+    /// their value runs to the first whitespace, and perl reads switches
+    /// again after a space (`perl.c`, `moreswitches`: `'-i -e CODE'` in one
+    /// argument is `-i` then `-e CODE`).
+    UntilSpace,
+    /// Perl's `-D`: its value is the word characters after it.
+    WordChars,
     /// The octal digits after it, then more letters (`perl -l`, `-0777`,
     /// `ruby -T`).
     Digits,
     /// The rest of its argument, else the next argument (`python -W
-    /// ignore`, `-Wignore`, `perl -I dir`, `ruby -r lib`, zsh's `-ovi`).
+    /// ignore`, `-Wignore`, zsh's `-ovi`).
     Arg,
+    /// Lot 310 (finding 2): [`Opt::Arg`] that loads the caller's code
+    /// before the program (`node -r`, `ruby -r`, `-I`, `perl -I`): the
+    /// program named is not all that runs ([`Runs::Unknown`]).
+    Loads,
+    /// The rest of its argument, which must not be empty, loading code
+    /// (`perl -MFoo`, `-mFoo`: perl refuses `-M` alone).
+    LoadsRest,
     /// The next argument; the letters after it are options too (a shell's
     /// `-o pipefail`, bash's `-O extglob`: `-euo pipefail`).
     Next,
@@ -213,7 +234,8 @@ enum Opt {
     /// letters.
     RubyWarn,
     /// Perl's `-d`: `t`, then `:module` or `=…` (the rest), else more
-    /// letters (`perl -de 0`).
+    /// letters (`perl -de 0`). The debugger (`perl5db.pl`, or `Devel::X`)
+    /// runs commands of its own: it loads code (lot 310).
     PerlDebug,
 }
 
@@ -223,8 +245,13 @@ enum Long {
     /// No argument (with `=value`, the value is its own: `node
     /// --inspect=9229`).
     Flag,
+    /// Lot 310: no program runs ([`Opt::NoRun`]).
+    NoRun,
     /// It takes the next argument, unless written `--name=value`.
     Arg,
+    /// Lot 310 (finding 2): [`Long::Arg`] that loads the caller's code
+    /// (`node --require`, `--import`, `--loader`, `--env-file`).
+    Loads,
     /// Its argument is the program ([`Runs::Code`]): `node --eval`,
     /// `--print`, `--run`, written either way.
     Code,
@@ -260,6 +287,11 @@ struct Table {
     underscores: bool,
     /// A shell: `+` clusters (`+e`, `+o name`, busybox's `+c`).
     plus: bool,
+    /// Lot 310 (finding 1): perl reads switches again after a space inside
+    /// one argument (a space, then `-`, then more switches; anything else
+    /// ends the argument). Any other family: whitespace in a cluster is no
+    /// option it has ([`Runs::Unknown`]).
+    space_continues: bool,
     /// What a lone `-` means.
     dash: Dash,
 }
@@ -294,23 +326,25 @@ impl Table {
 /// `python3 --help` (3.8–3.14), and 2.7's -3, -t, -R, -U, -Q.
 const PYTHON: Table = Table {
     short: &[
-        ("bBdEhiIOPqsSuvVxRtU3?", Opt::Flag),
+        ("bBdEiIOPqsSuvxRtU3", Opt::Flag),
+        ("hV?", Opt::NoRun),
         ("WXQ", Opt::Arg),
         ("c", Opt::Code),
         ("m", Opt::Module),
     ],
     long: &[
-        ("help", Long::Flag),
-        ("help-all", Long::Flag),
-        ("help-env", Long::Flag),
-        ("help-xoptions", Long::Flag),
-        ("version", Long::Flag),
+        ("help", Long::NoRun),
+        ("help-all", Long::NoRun),
+        ("help-env", Long::NoRun),
+        ("help-xoptions", Long::NoRun),
+        ("version", Long::NoRun),
         ("check-hash-based-pycs", Long::Arg),
     ],
     long_prefixes: &[],
     words: false,
     underscores: false,
     plus: false,
+    space_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -318,27 +352,34 @@ const PYTHON: Table = Table {
 /// `--help` and `--version` and refuses any other long option.
 const PERL: Table = Table {
     short: &[
-        ("acfgnpsStTuUvwWXh?", Opt::Flag),
+        ("afgnpsStTuUwWX", Opt::Flag),
+        ("cvhV?", Opt::NoRun),
         ("l0", Opt::Digits),
-        ("ixDCVF", Opt::Rest),
-        ("mM", Opt::RestRequired),
+        ("iFC", Opt::UntilSpace),
+        ("D", Opt::WordChars),
+        ("x", Opt::Rest),
+        ("mM", Opt::LoadsRest),
         ("d", Opt::PerlDebug),
-        ("I", Opt::Arg),
+        ("I", Opt::Loads),
         ("eE", Opt::Code),
     ],
-    long: &[("help", Long::Flag), ("version", Long::Flag)],
+    long: &[("help", Long::NoRun), ("version", Long::NoRun)],
     long_prefixes: &[],
     words: false,
     underscores: false,
     plus: false,
+    space_continues: true,
     dash: Dash::Stdin,
 };
 
-/// `ruby.c` (`proc_options`).
+/// `ruby.c` (`proc_options`). `-v` prints the version and runs the script
+/// if one is given.
 const RUBY: Table = Table {
     short: &[
-        ("apndyvwcslSUh", Opt::Flag),
-        ("rICXE", Opt::Arg),
+        ("apndyvwslSU", Opt::Flag),
+        ("hc", Opt::NoRun),
+        ("rI", Opt::Loads),
+        ("CXE", Opt::Arg),
         ("ixF", Opt::Rest),
         ("0T", Opt::Digits),
         ("K", Opt::OneChar),
@@ -346,10 +387,10 @@ const RUBY: Table = Table {
         ("e", Opt::Code),
     ],
     long: &[
-        ("copyright", Long::Flag),
-        ("version", Long::Flag),
+        ("copyright", Long::NoRun),
+        ("version", Long::NoRun),
+        ("help", Long::NoRun),
         ("verbose", Long::Flag),
-        ("help", Long::Flag),
         ("yydebug", Long::Flag),
         ("debug", Long::Flag),
         ("jit", Long::Flag),
@@ -378,6 +419,7 @@ const RUBY: Table = Table {
     words: false,
     underscores: false,
     plus: false,
+    space_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -385,27 +427,37 @@ const RUBY: Table = Table {
 /// with `_` or `-`). One that takes a value takes the next argument unless
 /// it is written `--name=value`; `--no-…` negates a flag. `-pe` is `-p`:
 /// inline. Lot 310 (N3): `--run <task>` runs a task of the working
-/// directory's `package.json` — the caller's, no file it names.
+/// directory's `package.json` — the caller's, no file it names. Lot 310
+/// (the review of #539): a preload (`-r`, `--require`, `--import`,
+/// `--loader`), an environment file (`--env-file`: its `NODE_OPTIONS`), an
+/// OpenSSL configuration (it loads engines), a snapshot or a configuration
+/// file loads the caller's code ([`Long::Loads`]).
 const NODE: Table = Table {
-    short: &[("icvh", Opt::Flag), ("rC", Opt::Arg), ("ep", Opt::Code)],
+    short: &[
+        ("i", Opt::Flag),
+        ("cvh", Opt::NoRun),
+        ("r", Opt::Loads),
+        ("C", Opt::Arg),
+        ("ep", Opt::Code),
+    ],
     long: &[
         ("eval", Long::Code),
         ("print", Long::Code),
         ("run", Long::Code),
-        ("require", Long::Arg),
-        ("import", Long::Arg),
-        ("loader", Long::Arg),
-        ("experimental-loader", Long::Arg),
+        ("require", Long::Loads),
+        ("import", Long::Loads),
+        ("loader", Long::Loads),
+        ("experimental-loader", Long::Loads),
         ("conditions", Long::Arg),
         ("input-type", Long::Arg),
-        ("env-file", Long::Arg),
-        ("env-file-if-exists", Long::Arg),
+        ("env-file", Long::Loads),
+        ("env-file-if-exists", Long::Loads),
         ("title", Long::Arg),
         ("inspect-port", Long::Arg),
         ("debug-port", Long::Arg),
         ("inspect-publish-uid", Long::Arg),
         ("icu-data-dir", Long::Arg),
-        ("openssl-config", Long::Arg),
+        ("openssl-config", Long::Loads),
         ("redirect-warnings", Long::Arg),
         ("report-dir", Long::Arg),
         ("report-directory", Long::Arg),
@@ -426,7 +478,7 @@ const NODE: Table = Table {
         ("experimental-default-type", Long::Arg),
         ("experimental-specifier-resolution", Long::Arg),
         ("experimental-sea-config", Long::Arg),
-        ("experimental-config-file", Long::Arg),
+        ("experimental-config-file", Long::Loads),
         ("heapsnapshot-signal", Long::Arg),
         ("heapsnapshot-near-heap-limit", Long::Arg),
         ("max-http-header-size", Long::Arg),
@@ -437,7 +489,7 @@ const NODE: Table = Table {
         ("heap-prof-name", Long::Arg),
         ("heap-prof-interval", Long::Arg),
         ("localstorage-file", Long::Arg),
-        ("snapshot-blob", Long::Arg),
+        ("snapshot-blob", Long::Loads),
         ("watch-path", Long::Arg),
         ("allow-fs-read", Long::Arg),
         ("allow-fs-write", Long::Arg),
@@ -454,12 +506,12 @@ const NODE: Table = Table {
         ("max-semi-space-size", Long::Arg),
         ("stack-size", Long::Arg),
         ("stack-trace-limit", Long::Arg),
-        ("help", Long::Flag),
-        ("version", Long::Flag),
-        ("v8-options", Long::Flag),
-        ("completion-bash", Long::Flag),
+        ("help", Long::NoRun),
+        ("version", Long::NoRun),
+        ("v8-options", Long::NoRun),
+        ("completion-bash", Long::NoRun),
         ("interactive", Long::Flag),
-        ("check", Long::Flag),
+        ("check", Long::NoRun),
         ("inspect", Long::Flag),
         ("inspect-brk", Long::Flag),
         ("inspect-wait", Long::Flag),
@@ -484,7 +536,7 @@ const NODE: Table = Table {
         ("test-only", Long::Flag),
         ("zero-fill-buffers", Long::Flag),
         ("prof", Long::Flag),
-        ("prof-process", Long::Flag),
+        ("prof-process", Long::NoRun),
         ("cpu-prof", Long::Flag),
         ("heap-prof", Long::Flag),
         ("frozen-intrinsics", Long::Flag),
@@ -540,18 +592,19 @@ const NODE: Table = Table {
     words: false,
     underscores: true,
     plus: false,
+    space_continues: false,
     dash: Dash::Stdin,
 };
 
-/// bash's `shell.c` and dash's `options.c`, and busybox's ash and hush: the
-/// set flags, bash's `-l`, `-r`, `-D`, dash's `-I`, `-V`, `-E`; `-o` (and
-/// bash's `-O`) take the next argument (`-ovi` is `-o` then `-v -i`); `-c`
-/// and `-s` with either sign (busybox reads `+c` as `-c`). bash's long
-/// options (`long_args` in `shell.c`, 5.2), with one hyphen or two, before
-/// the first cluster ([`Table::words`]); dash and busybox refuse them.
-const SHELL: Table = Table {
+/// bash's `shell.c` (5.2): the `set` flags, `-i`, `-l`, `-r`, `-s`, `-c`,
+/// `-D` (dump strings, no run); `-o` and `-O` take the next argument
+/// (`-ovi` is `-o` then `-v -i`); `-c` and `-s` with either sign. Its long
+/// options (`long_args`), with one hyphen or two, before the first cluster
+/// ([`Table::words`]).
+const BASH: Table = Table {
     short: &[
-        ("abefhiklmnprtuvxBCDEHIPTV", Opt::Flag),
+        ("abefhiklmprtuvxBCEHPT", Opt::Flag),
+        ("nD", Opt::NoRun),
         ("oO", Opt::Next),
         ("c", Opt::ShellCode),
         ("s", Opt::Stdin),
@@ -559,18 +612,18 @@ const SHELL: Table = Table {
     long: &[
         ("debug", Long::Flag),
         ("debugger", Long::Flag),
-        ("dump-po-strings", Long::Flag),
-        ("dump-strings", Long::Flag),
-        ("help", Long::Flag),
         ("login", Long::Flag),
         ("noediting", Long::Flag),
         ("noprofile", Long::Flag),
         ("norc", Long::Flag),
         ("posix", Long::Flag),
-        ("pretty-print", Long::Flag),
         ("restricted", Long::Flag),
         ("verbose", Long::Flag),
-        ("version", Long::Flag),
+        ("help", Long::NoRun),
+        ("version", Long::NoRun),
+        ("dump-po-strings", Long::NoRun),
+        ("dump-strings", Long::NoRun),
+        ("pretty-print", Long::NoRun),
         ("init-file", Long::Arg),
         ("rcfile", Long::Arg),
     ],
@@ -578,6 +631,41 @@ const SHELL: Table = Table {
     words: true,
     underscores: false,
     plus: true,
+    space_continues: false,
+    dash: Dash::EndOfOptions,
+};
+
+/// dash's `options.c` (0.5.12): its option letters (`-I` ignoreeof, `-V`
+/// vi, `-E` emacs …), `-o` the next argument, `-c`, `-s`, `-l`; no long
+/// option (`-posix` is `-p -o six`: `-o` takes the next argument as its
+/// name). Lot 310 (the review of #539, finding 10): it had bash's table.
+const DASH: Table = Table {
+    short: &[
+        ("abeflimpuvxCEIV", Opt::Flag),
+        ("n", Opt::NoRun),
+        ("o", Opt::Next),
+        ("c", Opt::ShellCode),
+        ("s", Opt::Stdin),
+    ],
+    long: &[],
+    long_prefixes: &[],
+    words: false,
+    underscores: false,
+    plus: true,
+    space_continues: false,
+    dash: Dash::EndOfOptions,
+};
+
+/// busybox's ash and hush (`ash.c`, `options`): dash's letters, `+c` read
+/// as `-c`, and one long option, `--login`.
+const BUSYBOX_ASH: Table = Table {
+    short: DASH.short,
+    long: &[("login", Long::Flag)],
+    long_prefixes: &[],
+    words: false,
+    underscores: false,
+    plus: true,
+    space_continues: false,
     dash: Dash::EndOfOptions,
 };
 
@@ -586,7 +674,8 @@ const SHELL: Table = Table {
 /// shwordsplit`; ksh's getopt). Lot 310 (BUG-100): it had bash's arity.
 const OTHER_SHELL: Table = Table {
     short: &[
-        ("aefhilmnuvxC", Opt::Flag),
+        ("aefhilmuvxC", Opt::Flag),
+        ("n", Opt::NoRun),
         ("o", Opt::Arg),
         ("c", Opt::ShellCode),
         ("s", Opt::Stdin),
@@ -596,12 +685,13 @@ const OTHER_SHELL: Table = Table {
     words: false,
     underscores: false,
     plus: true,
+    space_continues: false,
     dash: Dash::Unknown,
 };
 
 /// mono(1).
 const MONO: Table = Table {
-    short: &[("vVh", Opt::Flag)],
+    short: &[("v", Opt::Flag), ("Vh", Opt::NoRun)],
     long: &[
         ("debug", Long::Flag),
         ("verbose", Long::Flag),
@@ -609,14 +699,15 @@ const MONO: Table = Table {
         ("desktop", Long::Flag),
         ("llvm", Long::Flag),
         ("nollvm", Long::Flag),
-        ("version", Long::Flag),
-        ("help", Long::Flag),
+        ("version", Long::NoRun),
+        ("help", Long::NoRun),
         ("config", Long::Arg),
     ],
     long_prefixes: &[],
     words: false,
     underscores: false,
     plus: false,
+    space_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -633,11 +724,16 @@ pub(crate) fn runs_of(exe: &Path, argv: &[String]) -> Runs {
 /// `-e CODE`, `--eval=CODE`), for a record; `None` when it runs none, or
 /// its options could not be read.
 pub(crate) fn inline_program<'a>(exe: &Path, argv: &'a [String]) -> Option<&'a str> {
-    let (at, from) = reading(exe, argv).code?;
+    let r = reading(exe, argv);
+    if r.runs != Runs::Code {
+        return None;
+    }
+    let (at, from) = r.code?;
     argv.get(at)?.get(from..)
 }
 
 /// What one argv reads as.
+#[derive(Debug, PartialEq, Eq)]
 struct Reading {
     runs: Runs,
     /// With [`Runs::Code`], where the program is: an argument, and the
@@ -652,40 +748,100 @@ impl From<Runs> for Reading {
 }
 
 fn reading(exe: &Path, argv: &[String]) -> Reading {
+    let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
     let table = match family_of(exe) {
         None => return Runs::Inline.into(),
         Some(Family::Python) => &PYTHON,
         Some(Family::Perl) => &PERL,
         Some(Family::Ruby) => &RUBY,
         Some(Family::Node) => &NODE,
-        Some(Family::Shell) => &SHELL,
         Some(Family::OtherShell) => &OTHER_SHELL,
         Some(Family::Mono) => &MONO,
+        Some(Family::Shell) => {
+            let name = exe.file_name().map(|n| n.to_string_lossy().into_owned());
+            match name.as_deref() {
+                Some(n) if n.starts_with("bash") => &BASH,
+                Some(n) if n.starts_with("dash") => &DASH,
+                // `sh`: bash or dash, the name does not tell; both must read
+                // it alike
+                _ => {
+                    let (b, d) = (read(&BASH, argv, 1), read(&DASH, argv, 1));
+                    if b == d {
+                        return b;
+                    }
+                    return Runs::Unknown(guess(argv, 1, true)).into();
+                }
+            }
+        }
         Some(Family::Busybox) => {
             // busybox's `main`: the program `argv[0]` names (a login
-            // shell's `-` dropped), or with `busybox` itself the next
-            // argument's (one starting with `-` is busybox's own option)
-            let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
-            let named = argv.first().map(|a| base(a.strip_prefix('-').unwrap_or(a)));
-            let (program, from) = match named.as_deref() {
-                Some("busybox") => match argv.get(1) {
-                    Some(a) if !a.starts_with('-') => (base(a), 2),
-                    _ => return Runs::Inline.into(),
-                },
-                Some(p) => (p.to_string(), 1),
-                None => return Runs::Inline.into(),
+            // shell's `-` dropped); a name starting with `busybox` is
+            // busybox itself (`is_prefixed_with`), and the next argument
+            // names the program — one starting with `-` is busybox's own
+            // option (`--list`, `--help`)
+            let Some(first) = argv.first() else {
+                return Runs::Inline.into();
             };
+            let mut at = 0;
+            let mut program = base(first.strip_prefix('-').unwrap_or(first));
+            while program.starts_with("busybox") {
+                match argv.get(at + 1) {
+                    Some(a) if !a.starts_with('-') => {
+                        at += 1;
+                        program = base(a);
+                    }
+                    _ => return Runs::Inline.into(),
+                }
+            }
             if !BUSYBOX_SHELLS.contains(&program.as_str()) {
                 return Runs::Inline.into();
             }
-            return read(&SHELL, argv, from);
+            return read(&BUSYBOX_ASH, argv, at + 1);
         }
     };
     read(table, argv, 1)
 }
 
+/// What the options seen so far change in what an interpreter runs (lot
+/// 310): a preload of the caller's code, or a program that does not run.
+#[derive(Default)]
+struct Seen {
+    loads: bool,
+    no_run: bool,
+}
+
+impl Seen {
+    /// The reading, with what the options said: no program runs →
+    /// [`Runs::Unknown`]; the caller's code loaded before a named script →
+    /// [`Runs::Unknown`] (the script kept for a record), before nothing
+    /// named → [`Runs::Code`].
+    fn finish(&self, r: Reading) -> Reading {
+        if self.no_run {
+            return match r.runs {
+                Runs::Script(s) => Runs::Unknown(Some(s)).into(),
+                Runs::Unknown(s) => Runs::Unknown(s).into(),
+                Runs::Inline | Runs::Code => Runs::Unknown(None).into(),
+            };
+        }
+        if self.loads {
+            return match r.runs {
+                Runs::Script(s) => Runs::Unknown(Some(s)).into(),
+                Runs::Inline => Runs::Code.into(),
+                Runs::Code | Runs::Unknown(_) => r,
+            };
+        }
+        r
+    }
+}
+
 /// The one reader: `argv` from `from` on, through `table`.
 fn read(table: &Table, argv: &[String], from: usize) -> Reading {
+    let mut seen = Seen::default();
+    let r = read_options(table, argv, from, &mut seen);
+    seen.finish(r)
+}
+
+fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) -> Reading {
     let mut i = from;
     // bash: its long options with one hyphen, before the first cluster
     let mut words = table.words;
@@ -710,7 +866,11 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
                 match table.long(two.unwrap_or(name)) {
                     // never `=value`: `--rcfile=f` is no option of bash's
                     Some(Long::Flag) => continue,
-                    Some(Long::Arg) => {
+                    Some(Long::NoRun) => {
+                        seen.no_run = true;
+                        continue;
+                    }
+                    Some(Long::Arg | Long::Loads) => {
                         if argv.get(i).is_none() {
                             return unknown();
                         }
@@ -735,13 +895,18 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
             };
             match table.long(name) {
                 Some(Long::Flag) => continue,
-                Some(Long::Arg) => {
+                Some(Long::NoRun) => {
+                    seen.no_run = true;
+                    continue;
+                }
+                Some(long @ (Long::Arg | Long::Loads)) => {
                     if value.is_none() {
                         if argv.get(i).is_none() {
                             return unknown();
                         }
                         i += 1;
                     }
+                    seen.loads |= long == Long::Loads;
                     continue;
                 }
                 Some(Long::Code) => {
@@ -773,11 +938,27 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
         while let Some(c) = letters[pos..].chars().next() {
             pos += c.len_utf8();
             let rest = &letters[pos..];
+            if c.is_whitespace() {
+                // perl: a space, then `-` and more switches; anything else
+                // ends the argument (`moreswitches`, case ' '). A tab or a
+                // newline perl refuses; any other family has no such option
+                if table.space_continues && c == ' ' {
+                    match rest.trim_start_matches(' ').strip_prefix('-') {
+                        Some(more) => {
+                            pos = letters.len() - more.len();
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                return unknown();
+            }
             let Some(opt) = table.short(c) else {
                 return unknown();
             };
             match opt {
                 Opt::Flag => {}
+                Opt::NoRun => seen.no_run = true,
                 Opt::Next => next += 1,
                 Opt::Stdin => return Runs::Code.into(),
                 // the rest of the cluster is options too, then its operands
@@ -795,9 +976,19 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
                     };
                 }
                 Opt::Rest => break,
-                Opt::RestRequired if rest.is_empty() => return unknown(),
-                Opt::RestRequired => break,
-                Opt::Arg | Opt::Module => {
+                Opt::LoadsRest if rest.is_empty() => return unknown(),
+                Opt::LoadsRest => {
+                    seen.loads = true;
+                    break;
+                }
+                Opt::UntilSpace => pos += rest.find(char::is_whitespace).unwrap_or(rest.len()),
+                Opt::WordChars => {
+                    pos += rest
+                        .bytes()
+                        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        .count()
+                }
+                Opt::Arg | Opt::Loads | Opt::Module => {
                     let value = if rest.is_empty() {
                         let Some(v) = argv.get(i) else {
                             return unknown();
@@ -810,6 +1001,7 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
                     if opt == Opt::Module {
                         return Runs::Script(value.into()).into();
                     }
+                    seen.loads |= opt == Opt::Loads;
                     break;
                 }
                 // Perl's `-0x1F`: the `x` then reads as `-x`, which takes
@@ -819,6 +1011,7 @@ fn read(table: &Table, argv: &[String], from: usize) -> Reading {
                 Opt::RubyWarn if rest.starts_with(':') => break,
                 Opt::RubyWarn => pos += octal_digits(rest).min(1),
                 Opt::PerlDebug => {
+                    seen.loads = true;
                     let after_t = rest.strip_prefix('t').unwrap_or(rest);
                     if after_t.starts_with([':', '=']) {
                         break;
@@ -956,7 +1149,7 @@ mod tests {
             &["bash", "-rcfile", "/etc/x", "/tmp/steal.sh"],
             &["bash", "-init-file", "/etc/x", "/tmp/steal.sh"],
             &["bash", "-login", "-noediting", "/tmp/steal.sh"],
-            &["bash", "-debug", "-pretty-print", "/tmp/steal.sh"],
+            &["bash", "-debug", "-noediting", "/tmp/steal.sh"],
             &["bash", "-norc", "--noprofile", "-e", "/tmp/steal.sh"],
         ] {
             let got = runs_of(Path::new("/usr/bin/bash"), &argv(a));
@@ -1064,12 +1257,14 @@ mod tests {
             runs_of(node, &argv(&["node", "--eval", "steal()", "/usr/bin/aws"])),
             Runs::Code
         );
+        // a preload: the script read, but not all that runs (lot 310, the
+        // review of #539)
         assert_eq!(
             runs_of(
                 node,
                 &argv(&["node", "--require=/usr/lib/x.js", "/tmp/e.js"])
             ),
-            Runs::Script("/tmp/e.js".into())
+            Runs::Unknown(Some("/tmp/e.js".into()))
         );
         assert_eq!(
             runs_of(
@@ -1242,7 +1437,10 @@ mod tests {
         ] {
             let id = ExecIdentity::of_exec(bb, &argv(a));
             assert_eq!(id.runs, want, "{a:?}");
-            assert!(!id.is_installed_program(), "{a:?}");
+            // the review of #539 (finding 11): a program of busybox that
+            // names nothing is the installed binary (it was "no installed
+            // program" for every form); a script or an inline program never
+            assert_eq!(id.is_installed_program(), want == Runs::Inline, "{a:?}");
             assert!(!id.is_client(&["aws"]), "{a:?}");
         }
     }
@@ -1294,5 +1492,222 @@ mod tests {
         assert_eq!(p("/bin/sh", &["sh", "/tmp/x"]), None);
         assert_eq!(p("/bin/sh", &["sh", "-c"]), None);
         assert_eq!(p("/usr/bin/cat", &["cat", "-c", "x"]), None);
+    }
+    // ── Lot 310, the independent review of #539 ─────────────────────────
+
+    /// Finding 1: perl reads switches again after a space inside one
+    /// argument, and `-i`, `-F`, `-C` end at whitespace, `-D` at a non-word
+    /// character (`perl.c`: `moreswitches`). `perl '-i -e CODE' /usr/bin/aws`
+    /// runs CODE: it read as the `aws` script. Checked with perl 5.38.2.
+    #[test]
+    fn review_perl_switches_after_a_space_in_one_argument() {
+        use crate::posture::lineage::ExecIdentity;
+        for a in [
+            "-i -e x()",
+            "-i.bak -e x()",
+            "-F: -e x()",
+            "-CSD -e x()",
+            "-C -e x()",
+            "-D -e x()",
+            "-Dx -e x()",
+            "-w -e x()",
+            "-wl -e x()",
+            "- -e x()",
+            "-i  -e x()",
+        ] {
+            let id = ExecIdentity::of_exec("/usr/bin/perl", &argv(&["perl", a, "/usr/bin/aws"]));
+            assert_eq!(id.runs, Runs::Code, "{a:?}");
+            assert!(
+                !id.is_client(&["aws"]) && !id.is_installed_program(),
+                "{a:?}"
+            );
+        }
+        // a space then no `-`: the rest of the argument is ignored
+        assert_eq!(
+            runs_of(
+                Path::new("/usr/bin/perl"),
+                &argv(&["perl", "-i x", "/tmp/s"])
+            ),
+            Runs::Script("/tmp/s".into())
+        );
+        // a tab perl refuses; whitespace in any other family's cluster is no
+        // option of its
+        for (exe, a) in [
+            ("/usr/bin/perl", "-i\t-e x()"),
+            ("/usr/bin/python3", "-O -c x()"),
+            ("/usr/bin/ruby", "-w -e x()"),
+            ("/usr/bin/bash", "-e -c x"),
+            ("/usr/bin/node", "-i -e x"),
+        ] {
+            let a = a.replace("\\t", "\t");
+            let got = runs_of(Path::new(exe), &argv(&["x", &a, "/usr/bin/aws"]));
+            assert!(matches!(got, Runs::Unknown(_)), "{exe} {a:?}: {got:?}");
+        }
+    }
+
+    /// Finding 2: an option that loads the caller's code before the script
+    /// (`node -r`, `--require`, `--import`, `--loader`, `--env-file`; perl
+    /// `-M`, `-m`, `-I`, `-d`; ruby `-r`, `-I`) leaves the script named but
+    /// not all that runs: no client, no installed program. Node 18 runs
+    /// `--require /tmp/x.js` before the named script.
+    #[test]
+    fn review_a_preload_is_not_the_named_program() {
+        use crate::posture::lineage::ExecIdentity;
+        for (exe, a) in [
+            (
+                "/usr/bin/node",
+                &["node", "--require", "/tmp/x.js", "/usr/bin/aws"][..],
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "-r", "/tmp/x.js", "/usr/bin/aws"],
+            ),
+            ("/usr/bin/node", &["node", "-r/tmp/x.js", "/usr/bin/aws"]),
+            (
+                "/usr/bin/node",
+                &["node", "--import=data:text/javascript,x", "/usr/bin/aws"],
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--loader", "/tmp/l.mjs", "/usr/bin/aws"],
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--experimental-loader=/tmp/l.mjs", "/usr/bin/aws"],
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--env-file=/tmp/e", "/usr/bin/aws"],
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--openssl-config", "/tmp/c", "/usr/bin/aws"],
+            ),
+            ("/usr/bin/perl", &["perl", "-MEvil", "/usr/bin/aws"]),
+            ("/usr/bin/perl", &["perl", "-mEvil", "/usr/bin/aws"]),
+            ("/usr/bin/perl", &["perl", "-I/tmp", "/usr/bin/aws"]),
+            ("/usr/bin/perl", &["perl", "-d:Evil", "/usr/bin/aws"]),
+            ("/usr/bin/perl", &["perl", "-d", "/usr/bin/aws"]),
+            ("/usr/bin/ruby", &["ruby", "-r/tmp/x", "/usr/bin/aws"]),
+            ("/usr/bin/ruby", &["ruby", "-I", "/tmp", "/usr/bin/aws"]),
+        ] {
+            let id = ExecIdentity::of_exec(exe, &argv(a));
+            assert_eq!(id.runs, Runs::Unknown(Some("/usr/bin/aws".into())), "{a:?}");
+            assert!(
+                !id.is_client(&["aws"]) && !id.is_installed_program(),
+                "{a:?}"
+            );
+        }
+        // a preload before nothing named: the caller's code
+        assert_eq!(
+            runs_of(
+                Path::new("/usr/bin/node"),
+                &argv(&["node", "-r", "/tmp/x.js"])
+            ),
+            Runs::Code
+        );
+        // an option with a value that loads nothing keeps the script
+        assert_eq!(
+            runs_of(
+                Path::new("/usr/bin/node"),
+                &argv(&["node", "--title", "x", "/usr/bin/aws"])
+            ),
+            Runs::Script("/usr/bin/aws".into())
+        );
+    }
+
+    /// An option with which no program runs (it prints and exits, checks the
+    /// syntax only, or reads without executing) runs nothing: not known.
+    #[test]
+    fn review_an_option_that_runs_nothing_is_not_known() {
+        for (exe, a) in [
+            ("/usr/bin/bash", &["bash", "-n", "/tmp/s"][..]),
+            ("/usr/bin/bash", &["bash", "--version"]),
+            ("/usr/bin/bash", &["bash", "-pretty-print", "/tmp/s"]),
+            ("/usr/bin/bash", &["bash", "-D", "/tmp/s"]),
+            ("/usr/bin/dash", &["sh", "-n", "/tmp/s"]),
+            ("/usr/bin/python3", &["python3", "-V"]),
+            ("/usr/bin/python3", &["python3", "--help", "/tmp/s"]),
+            ("/usr/bin/perl", &["perl", "-c", "/tmp/s"]),
+            ("/usr/bin/perl", &["perl", "-v"]),
+            ("/usr/bin/node", &["node", "--check", "/tmp/s"]),
+            ("/usr/bin/node", &["node", "-v"]),
+            ("/usr/bin/ruby", &["ruby", "-c", "/tmp/s"]),
+            ("/usr/bin/ruby", &["ruby", "--version"]),
+        ] {
+            let got = runs_of(Path::new(exe), &argv(a));
+            assert!(matches!(got, Runs::Unknown(_)), "{a:?}: {got:?}");
+        }
+        // ruby's -v prints the version and runs the script given
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/ruby"), &argv(&["ruby", "-v", "/tmp/s"])),
+            Runs::Script("/tmp/s".into())
+        );
+    }
+
+    /// Finding 10: dash has no long options — `sh -posix vi -c CODE` is `-p`,
+    /// `-o` (taking `vi`), `-s`, `-i`, `-x`, then `-c`: dash runs CODE (dash
+    /// 0.5.12). bash reads `-posix` as its long option. `sh`, whose shell its
+    /// name does not tell, is read by both: where they differ, not known.
+    #[test]
+    fn review_dash_is_not_read_with_bash_s_long_options() {
+        let a = argv(&["sh", "-posix", "vi", "-c", "x"]);
+        assert_eq!(runs_of(Path::new("/usr/bin/dash"), &a), Runs::Code);
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/bash"), &a),
+            Runs::Script("vi".into())
+        );
+        assert!(matches!(
+            runs_of(Path::new("/bin/sh"), &a),
+            Runs::Unknown(_)
+        ));
+        // where they agree, the reading stands
+        assert_eq!(
+            runs_of(Path::new("/bin/sh"), &argv(&["sh", "-e", "/tmp/s"])),
+            Runs::Script("/tmp/s".into())
+        );
+        assert_eq!(
+            runs_of(Path::new("/bin/sh"), &argv(&["sh", "-c", "x"])),
+            Runs::Code
+        );
+        // dash refuses bash's words: `-norc` is letters there
+        assert!(!matches!(
+            runs_of(
+                Path::new("/usr/bin/dash"),
+                &argv(&["sh", "-norc", "/tmp/s"])
+            ),
+            Runs::Script(_)
+        ));
+    }
+
+    /// Finding 11: busybox runs busybox's own `main` for any name starting
+    /// with `busybox` (`busybox.static`, `busybox busybox sh`); its other
+    /// programs are the installed binary they are (a `busybox httpd` on a
+    /// common port keeps the installed program's exemption).
+    #[test]
+    fn review_busybox_names_and_programs() {
+        use crate::posture::lineage::ExecIdentity;
+        for (exe, a) in [
+            ("/bin/busybox", &["busybox", "busybox", "sh", "-c", "x"][..]),
+            ("/bin/busybox", &["busybox.static", "sh", "-c", "x"]),
+            ("/bin/busybox.static", &["busybox.static", "ash", "-c", "x"]),
+            ("/bin/busybox", &["busyboxX", "sh", "-c", "x"]),
+        ] {
+            let id = ExecIdentity::of_exec(exe, &argv(a));
+            assert_eq!(id.runs, Runs::Code, "{a:?}");
+            assert!(id.interprets() && !id.is_installed_program(), "{a:?}");
+        }
+        for a in [
+            &["wget", "http://x"][..],
+            &["busybox", "httpd", "-p", "80"],
+            &["httpd"],
+        ] {
+            let id = ExecIdentity::of_exec("/bin/busybox", &argv(a));
+            assert_eq!(id.runs, Runs::Inline, "{a:?}");
+            assert!(!id.interprets() && id.is_installed_program(), "{a:?}");
+        }
+        assert!(!crate::posture::lineage::is_interpreter(Path::new(
+            "/bin/busybox"
+        )));
     }
 }

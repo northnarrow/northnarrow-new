@@ -146,7 +146,7 @@ fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
     if !owned_file(&id.exe, owned) {
         return false;
     }
-    if !is_interpreter(&id.exe) {
+    if !id.interprets() {
         return true;
     }
     match id.script() {
@@ -249,7 +249,7 @@ pub fn judge(
         actor: *actor,
         key: *actor,
         program: program_of(writer),
-        why: if is_interpreter(&writer.exe) {
+        why: if writer.interprets() {
             "an interpreter running an inline program or an unpackaged script".to_string()
         } else {
             not_installed(writer).to_string()
