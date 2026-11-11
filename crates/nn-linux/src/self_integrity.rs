@@ -298,6 +298,35 @@ pub fn jittered(base: Duration) -> Duration {
     Duration::from_millis(ms - span + x % (2 * span + 1))
 }
 
+/// `args` as strings, a byte that is not UTF-8 replaced (U+FFFD): the
+/// flags [`weakening_flags`] looks for are ASCII.
+///
+/// Lot 297 (the lab, round r2): the check read `std::env::args()`, which
+/// panics on an argument that is not UTF-8 — one the agent's parser
+/// accepts (a path) — and the agent (`panic = "abort"`) died at every
+/// start; the watchdog's exec respawn keeps such an argument (BUG67).
+pub fn lossy_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<String> {
+    args.into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// `vars` as strings, as [`lossy_args`] (lot 297: `std::env::vars()`
+/// panics on a variable that is not UTF-8); the names
+/// [`weakening_env`] looks for are ASCII.
+pub fn lossy_vars(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
 /// Environment variables of this process that weaken it.
 pub fn weakening_env(vars: &[(String, String)]) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -2088,7 +2117,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     overlay_gate: Option<Arc<G>>,
     own_guard: Option<OwnDropinGuard>,
 ) {
-    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let vars = lossy_vars(std::env::vars_os());
     let mut own_files = Vec::new();
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
@@ -2111,7 +2140,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
     }
-    let args: Vec<String> = std::env::args().collect();
+    let args = lossy_args(std::env::args_os());
     for f in weakening_flags(&args) {
         checker.report_once(f, true);
     }
@@ -2405,6 +2434,35 @@ mod tests {
     /// Lab PR 224: a weaker fan-out or snapshot value given as a flag is a
     /// weakening as the variable is; a stronger one, or another flag's
     /// value that looks like one, is not.
+    /// Lot 297 (the lab, round r2): an argument or a variable that is not
+    /// UTF-8 is read (lossy) beside the others, and a weakening flag or
+    /// variable next to it is still found.
+    #[test]
+    fn arguments_and_variables_that_are_not_utf8_are_read() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let args = lossy_args([
+            OsString::from("northnarrow-agent"),
+            OsString::from("--ade-model"),
+            OsString::from_vec(b"/m\xe8del".to_vec()),
+            OsString::from("--net-scan-hosts=1000"),
+        ]);
+        assert_eq!(args[2], "/m\u{FFFD}del");
+        assert_eq!(weakening_flags(&args).len(), 1, "{args:?}");
+        let vars = lossy_vars([
+            (
+                OsString::from("LANG"),
+                OsString::from_vec(b"x\xff".to_vec()),
+            ),
+            (
+                OsString::from("NN_ANTI_TAMPER_ALLOW_DEGRADED"),
+                OsString::from("1"),
+            ),
+        ]);
+        assert_eq!(vars[0].1, "x\u{FFFD}");
+        assert_eq!(weakening_env(&vars).len(), 1, "{vars:?}");
+    }
+
     #[test]
     fn weakening_flags_are_reported_like_the_variables() {
         let args: Vec<String> = [

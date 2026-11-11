@@ -111,6 +111,23 @@ fn ensure_private_dir(p: &Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests (lot 297, BUG64): the next read of `index.jsonl` by a replay
+    /// on this thread fails with EIO.
+    pub(crate) static REPLAY_READ_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The bytes of `index.jsonl` for a replay.
+fn read_index(p: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if REPLAY_READ_FAILS.with(|f| f.replace(false)) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    std::fs::read(p)
+}
+
 /// A scope's journal, open.
 pub struct Journal {
     /// The configured path (logs, status).
@@ -144,10 +161,28 @@ impl Journal {
         let root = open_dir(&host).with_context(|| format!("open {}", host.display()))?;
         let objects = open_dir(&host.join("objects"))?;
         let evidence = open_dir(&host.join("evidence"))?;
-        let index = Self::open_index(&root)?;
-        let lines = std::fs::read(host.join("index.jsonl"))
-            .map(|b| b.iter().filter(|c| **c == b'\n').count() as u64)
-            .unwrap_or(0);
+        let mut index = Self::open_index(&root)?;
+        let (mut lines, torn) = std::fs::read(host.join("index.jsonl"))
+            .map(|b| {
+                let lines = b.iter().filter(|c| **c == b'\n').count() as u64;
+                (lines, b.last().is_some_and(|c| *c != b'\n'))
+            })
+            .unwrap_or((0, false));
+        if torn {
+            // Lot 297 (external bug hunt BUG64): a last line cut by a crash
+            // or a full disk is ended here, so the next record is a line of
+            // its own; the cut one alone is unreadable at the replay. Glued
+            // to it, the next record (a copy's `object` line) was lost too,
+            // and its copy deleted as an orphan at the start after.
+            match index.write_all(b"\n") {
+                Ok(()) => lines += 1,
+                Err(e) => tracing::warn!(
+                    journal = %path.display(),
+                    error = %e,
+                    "copy on first write: the torn last line of index.jsonl could not be ended"
+                ),
+            }
+        }
         Ok(Self {
             path: path.to_path_buf(),
             host,
@@ -232,18 +267,28 @@ impl Journal {
     }
 
     /// Read `index.jsonl` back into `ix` as scope `scope`. Returns the
-    /// lines that did not parse (reported, skipped).
+    /// lines that did not parse (reported, skipped); an error only when the
+    /// file could not be read (`ix` untouched).
+    ///
+    /// Lot 297 (external bug hunt BUG64): line by line on the bytes. One
+    /// line that is not UTF-8 — the last one cut inside a multi-byte
+    /// character by a crash — made the whole read fail, the index came up
+    /// empty and the open deleted every copy of the scope as an orphan.
+    /// Now that line alone is skipped and counted.
     pub fn replay(&self, ix: &mut JournalIndex, scope: usize) -> Result<usize> {
-        let text = match std::fs::read_to_string(self.host.join("index.jsonl")) {
-            Ok(t) => t,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        let bytes = match read_index(&self.host.join("index.jsonl")) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).context("read index.jsonl"),
         };
         let mut objects: std::collections::BTreeMap<u64, ObjectInfo> = Default::default();
         let mut entries: Vec<Entry> = Vec::new();
         let mut bad = 0usize;
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            match serde_json::from_str::<Record>(line) {
+        for line in bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.trim_ascii().is_empty())
+        {
+            match serde_json::from_slice::<Record>(line) {
                 Ok(Record::Object {
                     id,
                     bytes,
@@ -527,6 +572,41 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Lot 297 (BUG64): a last line cut by a crash is ended at the open
+    /// (counted as a line), and a whole index is left as it is.
+    #[test]
+    fn a_torn_last_line_is_ended_at_the_open() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path().join(".northnarrow-cow");
+        let mut j = Journal::open(&p).unwrap();
+        j.append(&[Record::Drop { object: 1 }]).unwrap();
+        drop(j);
+        let index = p.join("index.jsonl");
+        let whole = std::fs::read(&index).unwrap();
+        let j = Journal::open(&p).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            whole,
+            "a whole index untouched"
+        );
+        assert_eq!(j.lines(), 1);
+        drop(j);
+        let mut torn = whole.clone();
+        torn.extend_from_slice(b"{\"op\":\"drop\",\"obj\xC3");
+        std::fs::write(&index, &torn).unwrap();
+        let mut j = Journal::open(&p).unwrap();
+        torn.push(b'\n');
+        assert_eq!(std::fs::read(&index).unwrap(), torn, "the cut line ended");
+        assert_eq!(j.lines(), 2);
+        j.append(&[Record::Drop { object: 2 }]).unwrap();
+        assert_eq!(j.lines(), 3);
+        let mut ix = JournalIndex::new(&[1000], u64::MAX, 0);
+        assert_eq!(j.replay(&mut ix, 0).unwrap(), 1, "the cut line alone");
+        let body = std::fs::read(&index).unwrap();
+        assert_eq!(body.iter().filter(|c| **c == b'\n').count(), 3);
+        assert!(body.ends_with(b"{\"op\":\"drop\",\"object\":2}\n"));
     }
 
     #[test]

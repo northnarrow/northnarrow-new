@@ -484,15 +484,20 @@ impl JournalIndex {
         old
     }
 
-    /// A write-open of a journaled inode, after its copy.
+    /// A write-open of a journaled inode, after its copy: the latest one of
+    /// each writer, the last [`POST_WRITES_PER_INODE`] writers.
+    ///
+    /// Lot 297 (external bug hunt BUG48): a writer seen before kept its
+    /// FIRST write-open, so its write after a later copy was lost to
+    /// `post_writes(since that copy)` — and the restore of that copy
+    /// rewrote the file in place over the legitimate change. The newer
+    /// write-open replaces the older one and becomes the most recent.
     pub fn record_post_write(&mut self, dev: u64, ino: u64, w: PostWrite) {
         if !self.by_inode.contains_key(&(dev, ino)) {
             return;
         }
         let v = self.post_writes.entry((dev, ino)).or_default();
-        if v.iter().any(|p| p.writer == w.writer) {
-            return;
-        }
+        v.retain(|p| p.writer != w.writer);
         if v.len() >= POST_WRITES_PER_INODE {
             v.remove(0);
         }
@@ -695,6 +700,110 @@ mod tests {
         assert!(back.next_object_id() > e.object);
         let (r, _) = back.reserve(0, 1, 6).unwrap();
         assert!(r.object > e.object);
+    }
+
+    /// Lot 297 (external bug hunt BUG48): a rewrite by a writer already in
+    /// the post-write list, after a later copy, is still seen by
+    /// `post_writes(since)` and keeps the restore of that later copy from
+    /// overwriting it.
+    #[test]
+    fn rewrite_after_later_copy() {
+        use super::super::restore::{decide, pick, Context, Current, Plan, Selector};
+        let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
+        let mk = |ix: &mut JournalIndex, pid: u32, at: u64| {
+            let (r, _) = ix.reserve(0, 10, at).unwrap();
+            ix.commit(
+                r,
+                file(7, 10),
+                "ab".into(),
+                w(pid),
+                "/x".into(),
+                vec![w(pid), w(1)],
+                at,
+                Method::Copy,
+            )
+        };
+        let pw = |at: u64| PostWrite {
+            at_ms: at,
+            writer: w(50),
+            program: "vim".into(),
+            trusted: true,
+        };
+        mk(&mut ix, 10, 100);
+        ix.record_post_write(8, 7, pw(150));
+        let b = mk(&mut ix, 20, 200);
+        ix.record_post_write(8, 7, pw(250));
+        let post = ix.post_writes(8, 7, 200);
+        let sel = Selector {
+            roots: vec![w(20)],
+            since_ms: None,
+        };
+        let picked = pick(ix.entries(), &sel);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, b.id);
+        let in_attack = |p: ProcId| sel.in_attack(&picked, p);
+        let cur = Current {
+            exists: true,
+            regular: true,
+            dev: 8,
+            ino: 7,
+            mtime_ns: 9_999,
+            btime_ns: None,
+        };
+        let plan = decide(
+            picked[0],
+            &cur,
+            &Context {
+                object_ok: true,
+                content_is_original: Some(false),
+                post_writes: &post,
+                in_attack: &in_attack,
+                predates_run: false,
+            },
+        );
+        assert_eq!(
+            post.len(),
+            1,
+            "post_writes(since 200) lost pid 50's write-open at 250: {post:?}; plan {plan:?}"
+        );
+        assert!(matches!(plan, Plan::KeepBoth(_)), "{plan:?}");
+        // one slot per writer: its latest write-open only
+        assert_eq!(ix.post_writes(8, 7, 0), vec![pw(250)]);
+    }
+
+    /// Lot 297 (BUG48): a writer seen again keeps one slot, its latest
+    /// write-open, and becomes the most recent: the bound evicts the
+    /// writer seen longest ago, not it.
+    #[test]
+    fn a_writer_seen_again_is_the_most_recent() {
+        let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
+        take(&mut ix, 1, 10, 5).unwrap();
+        let pw = |pid: u32, at: u64| PostWrite {
+            at_ms: at,
+            writer: w(pid),
+            program: "vim".into(),
+            trusted: true,
+        };
+        for pid in 0..POST_WRITES_PER_INODE as u32 {
+            ix.record_post_write(8, 1, pw(pid, 10 + u64::from(pid)));
+        }
+        ix.record_post_write(8, 1, pw(0, 30));
+        let pids = |ix: &JournalIndex| -> Vec<(u32, u64)> {
+            ix.post_writes(8, 1, 0)
+                .iter()
+                .map(|p| (p.writer.pid, p.at_ms))
+                .collect()
+        };
+        let mut want: Vec<(u32, u64)> = (1..POST_WRITES_PER_INODE as u32)
+            .map(|pid| (pid, 10 + u64::from(pid)))
+            .collect();
+        want.push((0, 30));
+        assert_eq!(pids(&ix), want, "writer 0 once, at 30, the most recent");
+        // a new writer evicts the one seen longest ago (1), not writer 0
+        ix.record_post_write(8, 1, pw(100, 40));
+        want.remove(0);
+        want.push((100, 40));
+        assert_eq!(pids(&ix), want);
     }
 
     #[test]

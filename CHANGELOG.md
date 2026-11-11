@@ -63,6 +63,38 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The copy-on-first-write journal keeps its copies across a crash (lot 297,
+  external bug hunt BUG64; `docs/design/COPY_ON_FIRST_WRITE.md` §2.4): an
+  `index.jsonl` whose last line was cut inside a multi-byte character made
+  the whole replay fail, the index came up empty and the start deleted
+  every copy of the scope as an orphan. The replay reads line by line (the
+  cut line skipped and counted, a signed `journal_open`), a cut last line
+  is ended at the open, and an index that cannot be read (EIO) leaves its
+  scope out of that run with its copies kept.
+- A restore no longer overwrites a legitimate edit made after a later copy
+  by a writer seen before it (lot 297, BUG48): the guard kept each writer's
+  first write-open, now its latest. The attack's renamed copy is moved to
+  `evidence/` even when a name that is not UTF-8 is read before it (BUG63).
+- `nn-admin detections` returns (lot 297, BUG69, BUG74; `EVIDENCE_CHAINS.md`):
+  a directory at a detection or status-event file's path, or a disk error,
+  made the read loop for ever on a runtime worker at 100 % CPU; a read
+  error now ends that file, a line that is not UTF-8 is skipped. The rows
+  already verified stay served once the read's 1000 failures are spent
+  (BUG59: the archive read next dropped them, and the view came back empty).
+- A tree kill whose root was not killed names what it left running (lot
+  297, BUG61): `KillProcessTree (already gone; partial: 2 not killed, 1
+  spared)`, where the record said only `(already gone)`.
+- The watchdog's exec backend respawns the agent with its first launch's
+  argv byte for byte (lot 297, BUG58, BUG67): an empty argument was dropped
+  — the argv shifted into one the agent refused, a respawn loop up to the
+  ceiling — and an argument that is not UTF-8 was rewritten with U+FFFD,
+  in the respawn and in `agent.argv`. The agent no longer aborts at its
+  start on an argument or an environment variable that is not UTF-8 (its
+  self-integrity check read them with `std::env::args()`/`vars()`, which
+  panic on one; found by this lot's lab). Its STATUS ping counters are
+  described as they work (BUG81: failures since the agent last answered,
+  a timeout and a vanished socket counted together — the report's change
+  would never recover a frozen agent whose socket is removed and put back).
 - The evidence readers and verifiers, and the export's check (lot 298,
   external bug hunt; `docs/operator/EVIDENCE_CHAINS.md`, `EXPORT.md` §6,
   upgrade notes §22). `nn-admin chain verify` refuses a line after a file's
