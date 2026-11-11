@@ -8771,4 +8771,14 @@ number in parentheses is a lab PR.
     `sudo`/`systemctl`/`journalctl` shims: the refusal, the status and the
     last lines printed and the error raised on a failed start, no priority
     filter, no journal read on a started one); 5 mutants, 5 caught.
+  - The lab, as measured (the fresh Debian 13 guest, lease k303; it was
+    powered off at the end): f66e6680 with this lot's first `nn-lab.sh`:
+    `install` failed and printed the units' status (`status=78`), its
+    journal part empty (`-p warning`: every line of the units is at
+    priority info); with the fixed one: the job log shows "own-object
+    registration FAILED … `bpf_map_update_elem` failed: Argument list too
+    long", "DENY HOOK SHORTFALL … deny_attached=26 deny_expected=27" and
+    `start refused gate="deny_hooks" exit=78`. With lot 303b, the same
+    fresh guest's full gate (`install`, a cold boot, `test-ignored`) passes:
+    100 suites, 142 passed, 0 failed.
   - Level unchanged: a diagnosis and a gate's output, no capability.
