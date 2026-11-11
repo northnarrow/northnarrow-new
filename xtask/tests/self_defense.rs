@@ -112,18 +112,60 @@ fn the_agent_and_the_watchdog_never_arm_a_file_s_owner() {
         support::rs_files(&root.join(dir), &mut files);
         assert!(files.len() > before, "{dir}: no source read");
     }
+    // Lot 302: the one exception — the deny self-test's child
+    // (`northnarrow-agent --telemetry-probe`: neither the agent, nor the
+    // watchdog, nor a worker) arms a pipe of its own, owned by the
+    // self-test's target process, to be refused by this very hook; the pipe
+    // is closed at once. Its uses are inside `fn sigio_step` only, which
+    // only the child's attempts call (below).
+    let child_rel = "crates/nn-linux/src/telemetry_probe/deny.rs";
+    let mut child_uses = 0;
     let mut found = Vec::new();
     for f in &files {
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
         let c = strip_comments(&fs::read_to_string(f).unwrap());
+        let excepted = if rel == child_rel {
+            let start = c.find("fn sigio_step(").expect("fn sigio_step");
+            let open = start + c[start..].find('{').unwrap();
+            let end = open + support::matching_brace(&c[open..]);
+            Some((
+                c[..start].matches('\n').count() + 1,
+                c[..end].matches('\n').count() + 1,
+            ))
+        } else {
+            None
+        };
         for name in OWNER_SIGNAL_NAMES {
             for line in uses_of(&c, name) {
-                found.push(format!(
-                    "{}:{line}: {name}",
-                    f.strip_prefix(&root).unwrap().display()
-                ));
+                if excepted.is_some_and(|(a, b)| (a..=b).contains(&line)) {
+                    child_uses += 1;
+                    continue;
+                }
+                found.push(format!("{rel}:{line}: {name}"));
             }
         }
     }
+    assert!(
+        child_uses >= 2,
+        "the deny self-test's owner step: {child_uses} uses"
+    );
+    // the step is the child's: called by its attempts only, which only the
+    // child's run calls, which only the probe child's entry point calls
+    let d = code(child_rel);
+    let callers = |hay: &str, callee: &str| -> Vec<String> {
+        hay.match_indices(&format!("{callee}("))
+            .filter(|(at, _)| !hay[..*at].ends_with("fn "))
+            .map(|(at, _)| {
+                let f = hay[..at].rfind("\nfn ").max(hay[..at].rfind("\npub fn "));
+                let f = f.map_or("", |i| &hay[i + 1..]);
+                f[..f.find('(').unwrap_or(0)].to_string()
+            })
+            .collect()
+    };
+    assert_eq!(callers(&d, "sigio_step"), ["fn attempt_one"]);
+    assert_eq!(callers(&d, "attempt_one"), ["pub fn run_steps"]);
+    let t = code("crates/nn-linux/src/telemetry_probe.rs");
+    assert_eq!(callers(&t, "deny::run_steps"), ["pub fn run_child"]);
     assert!(
         found.is_empty(),
         "the agent's or the watchdog's code arms a file's owner — a signal the \
@@ -282,4 +324,93 @@ fn the_ransomware_design_says_which_atomic_saves_are_counted() {
     ] {
         assert!(flat.contains(needle), "missing: {needle}");
     }
+}
+
+/// Lot 302 (named: the self-test's denials never consume the denial rate
+/// budget of lot 293): the kernel records the deny self-test's child's
+/// refusals outside the attempt refusals' budget, the task refusals' budget
+/// and the per-caller dedup — the child is named by a per-boot map the
+/// agent writes around each round, read by the two emitters before either
+/// budget, and by nothing that decides a verdict. The lab spends both
+/// budgets on every CPU before a round (`debug-deny-budget-spent`) and the
+/// round's refusals still arrive, none held back.
+#[test]
+fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    assert!(
+        i.contains("pub static SELFTEST_TGID: Array<u32> = Array::with_max_entries(1, 0);"),
+        "per boot, never pinned"
+    );
+    in_order(
+        body(&i, "caller_is_self_test"),
+        &[
+            "if tgid == 0 {",
+            "return false;",
+            "SELFTEST_TGID.get(0)",
+            "*t == tgid",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&i, "emit_attempt"),
+        &[
+            "if caller_is_self_test() {",
+            "emit_denial(operation, key);",
+            "return;",
+            "if attempt_budget() {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&i, "emit_limited"),
+        &[
+            "if caller_is_self_test() {",
+            "emit_denial(operation, key);",
+            "return;",
+            "TASK_DENIAL_SEEN",
+            "TASK_DENIAL_RATE",
+        ],
+    )
+    .unwrap();
+    // the mark decides no verdict: read by the two emitters only
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let mut uses = Vec::new();
+    for f in &files {
+        let c = strip_comments(&fs::read_to_string(f).unwrap());
+        for (at, _) in c.match_indices("caller_is_self_test()") {
+            let fun = c[..at].rfind("fn ").map_or("", |p| &c[p..]);
+            uses.push(fun[..fun.find('(').unwrap_or(0)].to_string());
+        }
+        assert!(
+            !c.contains("SELFTEST_TGID") || f.ends_with("inode_protect.rs"),
+            "{}: reads the mark",
+            f.display()
+        );
+    }
+    uses.sort();
+    assert_eq!(
+        uses,
+        [
+            "fn caller_is_self_test",
+            "fn emit_attempt",
+            "fn emit_limited"
+        ],
+        "the self-test's mark read outside the two emitters"
+    );
+    // the agent marks the child before it may begin, and clears the mark
+    // once it is reaped
+    let t = code("crates/nn-linux/src/telemetry_probe.rs");
+    in_order(
+        body(&t, "run_round"),
+        &[
+            "let pid = child.id();",
+            "m.set(pid)",
+            "stdin.write_all(&go)",
+            "reap(pid, CHILD_TIMEOUT)",
+            "m.set(0)",
+        ],
+    )
+    .unwrap();
 }

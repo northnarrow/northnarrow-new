@@ -6,6 +6,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Every deny hook proves it denies, every round (lot 302;
+  `docs/operator/SENSOR_CONTRACT.md` §5b). The sensor self-test exercised
+  two deny hooks (a signal to the agent, a create in `/etc/northnarrow`);
+  its child now makes one harmless attempt per deny hook — 27 attempts on
+  Ubuntu 24.04 (the task and signal hooks, the ptrace hook in attach mode,
+  every file hook, the move guard, the BPF guard's three) — on targets of
+  its own (a protected target process, a protected directory, the guard's
+  own objects), never the agent; each must be refused and its refusal must
+  arrive. A hook that lets its attempt through, or whose refusal does not
+  arrive, is a signed `deny_selftest` degradation, two rounds in a row an
+  alert. The hooks with no safe attempt (the 32-bit `ioctl`, the move
+  guard's two halves, the sysctl judge, the module judge) are attach checks,
+  declared with their reason. The kernel records the self-test's refusals
+  outside the denials' budgets: it takes no room of a real attempt's
+  record, and a flood hides none of its refusals.
+- The bpf() guard is pinned like the deny hooks (lot 302): the `bpf` and
+  `bpf_prog` hooks went with the agent, so through a restart or an
+  upgrade's gap a handle by id on the start-in-cgroup tracker's links (and
+  on the agent's maps and programs) was given to root, and a kprobe or LSM
+  program loaded unrefused (lot 301's residual). Where the guard enforces
+  (production builds) the previous start's guard now refuses until the new
+  one runs.
 - `nn-admin heartbeat watch` answers whatever its source command leaves
   behind (lot 299, external bug hunt BUG34, BUG38, BUG22;
   `docs/operator/HEARTBEAT.md`). A process the `--from-cmd` command started

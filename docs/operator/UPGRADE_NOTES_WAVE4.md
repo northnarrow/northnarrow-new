@@ -1093,3 +1093,38 @@ configure; use the `nn-admin` of this release where the export is checked.
   cursor reads a line up to 16 MiB back (BUG11; it read 64 KiB), and a
   foreign entry skipped at an archive slot before a rotation's seal is
   attested (`ForeignArchive`, BUG28) as one met at the rename was.
+
+## 24. Every deny hook proves it denies; the bpf() guard pinned (lot 302)
+
+- **The deny self-test** (`docs/operator/SENSOR_CONTRACT.md` §5b). Each
+  sensor self-test round now makes one harmless attempt per deny hook on
+  targets of its own — a target process it starts and registers as a
+  worker, `/run/northnarrow/selftest` and its files (protected), a
+  throwaway cgroup `/sys/fs/cgroup/northnarrow-deny-selftest` (removed
+  after each round; `uninstall.sh` removes a leftover) — never the agent:
+  the `SIGURG` the agent itself received each round is gone. A hook that
+  lets its attempt through, or whose refusal does not arrive, is a signed
+  `subsystem_degraded` (source `deny_selftest`, the hook named), two rounds
+  in a row `deny_selftest_alert`; refused again, `deny_selftest_restored`.
+  An alerting rule on the audit log that watches `sensor_selftest_alert`
+  should watch `deny_selftest_alert` too. `fs_protect`'s own word in the
+  manifest is now the round's refusals arriving (a hook let through is the
+  hook's miss, not the source's). `bpf_map` and `bpf_prog` are attempted
+  where the BPF guard enforces (production builds); a hook the kernel does
+  not have, or a trusted-installer window, is "not exercised".
+- **The bpf() guard pinned.** The pin root holds four new entries:
+  `prog_bpf`, `link_bpf`, `prog_bpf_prog`, `link_bpf_prog` (the `bpf` and
+  `bpf_prog` hooks, like `bpf_map`'s), where the guard enforces (every
+  production build; an observing guard — `NN_BPF_DEFENSE_OBSERVE=1`, a
+  `debug-trigger` build — is attached for the agent's life, as before). Through a restart or an upgrade's
+  gap the previous start's guard keeps refusing a handle on the agent's
+  objects (the start-in-cgroup tracker's links among them) and a load of a
+  program type it refuses outside the family; outside a trusted-installer
+  window, a `bpftool prog load` of such a type while no agent runs is
+  refused too (inside one it is let through, as with an agent running).
+  Nothing to configure: the upgrade's window (`install.sh --upgrade
+  --grant-key`) and `uninstall.sh` handle the new pins like the others.
+- **The agent registers itself earlier.** The agent enters
+  `PROTECTED_PIDS` right after its eBPF object loads, before its first
+  program loads (the previous start's pinned guard judges those loads).
+

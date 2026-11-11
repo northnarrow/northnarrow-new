@@ -404,7 +404,8 @@ pub(crate) fn wire(
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
     // Lot 280c: every source proves it is alive each round — the deny
     // steps not exercised in a trusted-installer window, the attach checks
-    // read from the program-id list and the pin root.
+    // read from the program-id list and the pin root. Lot 302: and every
+    // deny hook proves it denies (one attempt each, on targets of its own).
     let window = Arc::clone(installer_override);
     let telemetry_probe = northnarrow_agent::telemetry_probe::spawn(
         audit_log.clone(),
@@ -412,6 +413,11 @@ pub(crate) fn wire(
             window_open: Some(Arc::new(move || window.is_window_open())),
             own_ids_file: super::attach::own_prog_ids_file(cli),
             pin_root: installer_override.bpffs_root().map(|p| p.to_path_buf()),
+            // lot 302: the deny self-test — the kernel's mark of its child,
+            // and whether the BPF guard's handle refusals are attempted
+            mark: sensor.selftest_mark(),
+            bpf_enforce: northnarrow_agent::anti_tamper::bpf_defense::enforce_mode(),
+            budget: sensor.budget_spender(),
         },
     );
     // Lot 280b: the kernel's taint flags and livepatches and the root

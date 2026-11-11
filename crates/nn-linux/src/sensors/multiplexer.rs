@@ -211,6 +211,11 @@ pub struct SensorMultiplexer<G> {
     /// until then).
     ring_drops: crate::sensors::ring_drops::RingDrops,
     fail_open: crate::anti_tamper::fail_open::FailOpen,
+    /// Lot 302: the kernel's mark of the deny self-test's child
+    /// ([`Self::selftest_mark`]).
+    selftest_mark: Option<crate::telemetry_probe::deny::SelfTestMark>,
+    /// Lot 302: the denials' budgets (a debug-trigger build only).
+    budget_spender: Option<crate::telemetry_probe::deny::BudgetSpender>,
     /// R11c (lab PR 264): the BPF guard's record of this object's own maps,
     /// programs and links ([`Self::bpf_guard`]; process-wide statics until
     /// then).
@@ -339,6 +344,24 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // Lot 285: the history's maps checked or pinned, and frozen, before
         // the module-load judge's controller takes them.
         let _ = crate::module_writes::after_load(&mut ebpf, pin_root);
+        // Lot 302: this process in `PROTECTED_PIDS` (the agent's role, the
+        // pinned map the load just reused) before any program of the object
+        // is loaded. The bpf() guard is pinned since this lot: the previous
+        // start's keeps judging until `anti_tamper::attach` attaches this
+        // start's, and it lets an exempt caller's loads through on any thread
+        // however long the start takes. Without it the loads before the
+        // anti-tamper attach (the sensors') rested on the guard's allowance
+        // for a fresh instance (the main thread, its first minute, the same
+        // executable as the previous agent's). `anti_tamper::attach`
+        // registers the agent again first thing; a failure here is that
+        // allowance's only.
+        if let Err(e) = crate::anti_tamper::register_self_before_load(&mut ebpf) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper: the agent not registered in PROTECTED_PIDS before its programs \
+                 load — the previous start's bpf() guard judges them as a fresh instance's"
+            );
+        }
         // External audit ATP-013: every map's id, before the ring buffers
         // and RING_DROPS are taken out of the object below — the BPF guard
         // registers them as the agent's own from this record (R11c, lab PR
@@ -377,6 +400,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let ring_drops = crate::sensors::ring_drops::install(&mut ebpf);
         // Lab PR 215: the deny hooks' fail-open counters.
         let fail_open = crate::anti_tamper::fail_open::install(&mut ebpf);
+        // Lot 302: the kernel's mark of the deny self-test's child, and (a
+        // debug-trigger build) the denials' budgets the lab spends.
+        let selftest_mark = crate::telemetry_probe::deny::install_mark(&mut ebpf);
+        let budget_spender = crate::telemetry_probe::deny::install_budget_spender(&mut ebpf);
         // Lab PR 164: FLOW_SOCK_MAP's occupancy for `nn-admin net status`.
         crate::sensors::flow_sock::install(&mut ebpf);
 
@@ -748,6 +775,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 guards: PhantomData,
                 ring_drops,
                 fail_open,
+                selftest_mark,
+                budget_spender,
                 bpf_guard,
                 attach_points,
                 dns_mode,
@@ -794,6 +823,18 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// started, whose audit log the start binds once it exists.
     pub fn fail_open(&self) -> &crate::anti_tamper::fail_open::FailOpen {
         &self.fail_open
+    }
+
+    /// Lot 302: the kernel's mark of the deny self-test's child (`None`: the
+    /// object has no `SELFTEST_TGID`).
+    pub fn selftest_mark(&self) -> Option<crate::telemetry_probe::deny::SelfTestMark> {
+        self.selftest_mark.clone()
+    }
+
+    /// Lot 302: the denials' budgets the lab spends (a debug-trigger build;
+    /// `None` otherwise).
+    pub fn budget_spender(&self) -> Option<crate::telemetry_probe::deny::BudgetSpender> {
+        self.budget_spender.clone()
     }
 
     /// Tappa 9 C8 — mutable access to the underlying [`Ebpf`] object

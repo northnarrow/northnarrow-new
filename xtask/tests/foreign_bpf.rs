@@ -160,15 +160,99 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
     assert!(
         c.contains("#[lsm(hook = \"bpf_prog\")]\npub fn bpf_prog_guard(ctx: LsmContext) -> i32 {")
     );
-    // the agent attaches it and registers it as its own
+    // the agent attaches it and registers it as its own (lot 302: pinned,
+    // the bpf() guard with it — `the_bpf_guard_s_hooks_are_pinned`)
     let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    // whitespace aside (rustfmt breaks a long call over lines)
+    let flat = |t: &str| t.replace(char::is_whitespace, "");
     in_order(
-        body(&u, "attach"),
+        &flat(body(&u, "attach")),
         &[
-            "antitamper_bpf::attach_transient(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf)",
-            "antitamper_bpf::attach_transient(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf)",
-            "crate::bpf_crossview::Parts::setup(ebpf, btf)",
+            "attach_guard_hook(ebpf,OBSERVE_PROGRAM,OBSERVE_HOOK,btf,pin_root,enforce",
+            "attach_guard_hook(ebpf,PROG_GUARD_PROGRAM,PROG_GUARD_HOOK,btf,pin_root,enforce",
+            "crate::bpf_crossview::Parts::setup(ebpf,btf)",
         ],
+    )
+    .unwrap();
+}
+
+/// Lot 302 (named, the host half of "the bpf guard denies during the gap"):
+/// the BPF guard's three LSM hooks are pinned under the pin root like the
+/// deny hooks and re-attached fresh (attach before purge: the previous
+/// start's keeps refusing until this start's runs) — the `bpf` hook was
+/// attached for the agent's life only, so through a restart or an
+/// upgrade's gap a handle on one of the agent's links (the start-in-cgroup
+/// tracker's, pinned beside the root and running all along) was given by
+/// id (lot 301's residual). And the agent is an exempt caller of the
+/// previous start's guard before its first program loads (registered in
+/// `PROTECTED_PIDS` right after the object's load), whatever thread loads
+/// and however long the start takes. The lab checks the gap
+/// (`deny-selftest-check.sh` G).
+#[test]
+fn the_bpf_guard_s_hooks_are_pinned() {
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let a = body(&u, "attach");
+    assert!(
+        a.contains(
+            "antitamper_bpf::reattach_fresh(ebpf, GUARD_PROGRAM, GUARD_HOOK, btf, pin_root)"
+        ),
+        "the map guard pinned"
+    );
+    in_order(a, &["let enforce = enforce_mode();"]).unwrap();
+    let flat = a.replace(char::is_whitespace, "");
+    for (program, hook) in [
+        ("OBSERVE_PROGRAM", "OBSERVE_HOOK"),
+        ("PROG_GUARD_PROGRAM", "PROG_GUARD_HOOK"),
+    ] {
+        assert!(
+            flat.contains(&format!(
+                "attach_guard_hook(ebpf,{program},{hook},btf,pin_root,enforce"
+            )),
+            "{program} pinned where the guard enforces"
+        );
+    }
+    assert!(
+        !a.contains("attach_transient"),
+        "no guard hook for the agent's life only"
+    );
+    // pinned where the guard enforces; an observing guard (the lab's and the
+    // tests' builds) lives with the agent and retires an earlier start's pins
+    in_order(
+        body(&u, "attach_guard_hook"),
+        &[
+            "Some(root) if enforce => {",
+            "antitamper_bpf::reattach_fresh(ebpf, program, hook, btf, Some(root))",
+            "antitamper_bpf::attach_transient(ebpf, program, hook, btf)?;",
+            "antitamper_bpf::purge_stale_pin(&link_pin);",
+            "antitamper_bpf::purge_stale_pin(&prog_pin);",
+        ],
+    )
+    .unwrap();
+    let lib = code("antitamper-bpf/src/lib.rs");
+    in_order(
+        body(&lib, "reattach_fresh_held"),
+        &[
+            "prog.attach()",
+            "purge_stale_pin(&link_path);",
+            "prog.pin(&prog_path)",
+            "fd_link.pin(&link_path)",
+        ],
+    )
+    .unwrap();
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    in_order(
+        &m,
+        &[
+            ".load(EBPF_BYTES)",
+            "crate::anti_tamper::register_self_before_load(&mut ebpf)",
+            "attach_exec_tracepoint(&mut ebpf, &attach_points)?;",
+        ],
+    )
+    .unwrap();
+    let t = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&t, "register_self_before_load"),
+        &["register_protected_pids(ebpf, &[std::process::id()])"],
     )
     .unwrap();
 }

@@ -683,6 +683,15 @@ none trips a rule or reaches the export (`SENSOR_CONTRACT.md` §5a).
 `NN_TELEMETRY_PROBE_SECS` in the unit environment changes the period; `0`
 disables the self-test.
 
+Lot 302: the same round makes one harmless attempt per **deny hook**, on
+targets of its own (a protected target process, `/run/northnarrow/selftest`,
+the BPF guard's objects), never the agent; each must be refused and its
+refusal must arrive. A hook that does not deny, or does not report, is a
+signed degradation (source `deny_selftest`, the hook named), two rounds in a
+row an alert (`ERROR DENY SELF-TEST ALERT`, `op=deny_selftest_alert`),
+`op=deny_selftest_restored` when it refuses again (`SENSOR_CONTRACT.md`
+§5b).
+
 At boot the agent also proves its deny hooks run (lab PR 218): right
 after they attach, a child of its binary (`--deny-self-test`, hidden flag)
 signals the agent and must be refused. Every degradation of the run (a

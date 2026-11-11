@@ -204,9 +204,9 @@ const PTRACE_OVERRIDE_MAP_NAME: &str = "PTRACE_OVERRIDE";
 /// hook/program names stay agent-side because only the agent
 /// loads the LSM hooks.
 const TASK_KILL_PROGRAM: &str = "task_kill";
-const TASK_KILL_HOOK: &str = "task_kill";
+pub(crate) const TASK_KILL_HOOK: &str = "task_kill";
 const PTRACE_PROGRAM: &str = "ptrace_access_check";
-const PTRACE_HOOK: &str = "ptrace_access_check";
+pub(crate) const PTRACE_HOOK: &str = "ptrace_access_check";
 
 /// Populate `PROTECTED_PIDS` and attach the two Tappa 7 LSM hooks.
 ///
@@ -1335,6 +1335,14 @@ fn write_array_u32(ebpf: &mut Ebpf, map_name: &str, value: u32) -> Result<()> {
 /// and the watchdog share one canonical map-mutation code path.
 /// `BPF_ANY` upsert semantics are preserved by the handle — an
 /// entry that already exists is overwritten.
+/// Lot 302: this process in `PROTECTED_PIDS` with the agent's role, right
+/// after the object's load and before any of its programs is loaded (the
+/// pinned bpf() guard of the previous start judges those loads until this
+/// start attaches its own).
+pub(crate) fn register_self_before_load(ebpf: &mut Ebpf) -> Result<()> {
+    register_protected_pids(ebpf, &[std::process::id()])
+}
+
 fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
     let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
     for &pid in pids {
