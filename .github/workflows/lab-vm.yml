@@ -205,6 +205,10 @@ jobs:
           for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
             if getent hosts "$h" >/dev/null; then echo "resolves: $h"; else echo "does not resolve: $h"; fi
           done
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null && ! getent hosts archive.ubuntu.com >/dev/null; then
+            echo "::error::the runner resolves no Ubuntu mirror (DNS): nothing this job can install; the failure is the runner's, not the product's"
+            exit 1
+          fi
           if ! getent hosts azure.archive.ubuntu.com >/dev/null && getent hosts archive.ubuntu.com >/dev/null; then
             echo "apt: the Azure mirror does not resolve, using archive.ubuntu.com"
             printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
