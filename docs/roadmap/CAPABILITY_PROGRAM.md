@@ -9169,7 +9169,7 @@ number in parentheses is a lab PR.
   - What changed: `cow/identity.rs` (`FileId`: device, inode number, birth
     time; three questions, each wrong only on the side that loses nothing)
     holds every comparison of the guard, and `xtask/tests/cow_file_identity.rs`
-    refuses any other (it flags the 20 sites of `main`); the renamed copy is
+    refuses any other (it flags the 19 sites of `main`); the renamed copy is
     the file only by a birth time known on both sides; the evidence ages from
     its move; a restore with roots weighs every copy of the tree and each
     write-open's lineage (`--since` alone unchanged); `PF_IO_WORKER` from

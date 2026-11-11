@@ -505,7 +505,7 @@ Loader variable naming a staging path at exec — category `malware_prevention`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | no proof |
 
-**Observes.** A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging path: refused (enforce) or recorded; a set-id target is recorded (the kernel sets AT_SECURE and the loader ignores it).
+**Observes.** A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging path: refused (enforce) or recorded; a set-id target is recorded (when the exec changes the credentials the kernel sets AT_SECURE and the loader ignores it; root running a set-uid-root file changes none, and the record says the loader honours it).
 
 **Known false positives.** A developer's own preload from a build tree in a session (Low).
 
