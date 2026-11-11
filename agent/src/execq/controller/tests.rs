@@ -1018,6 +1018,25 @@ fn a_held_process_that_cannot_be_captured_is_not_taken_for_ended() {
     assert_eq!(w.rec.audits.lock().len(), 1, "paid once");
 }
 
+/// BUG-124: a capture that failed when the report was read is tried again
+/// at the decision — the failure (descriptors, memory) is the agent's, and
+/// passes: the process is resumed then, nothing deferred.
+#[test]
+fn a_capture_that_failed_at_the_report_is_tried_again_at_the_decision() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let broken = w.break_capture();
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.push(raw_for(&h, class::HOME));
+    w.ctl.step(Instant::now());
+    assert!(w.records().is_empty(), "decided before the rules");
+    broken.store(false, Ordering::Relaxed);
+    w.ledger.judged(h.pid, h.start_ns);
+    w.run_until(|w| !w.records().is_empty());
+    assert_eq!(w.records()[0].response, "resumed");
+    assert!(wait_state(h.pid, |s| s == Some('S') || s == Some('R')));
+    assert!(w.rec.audits.lock().is_empty(), "nothing deferred");
+}
+
 /// BUG-124: a block-list kill on a held process the agent cannot capture
 /// is not "already ended": the process stays held — it never runs — and
 /// is killed once it can be captured; each attempt is a signed action. On
