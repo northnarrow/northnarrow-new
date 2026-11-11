@@ -991,8 +991,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut sh = Command::new("sh")
-            .args(["-c", "\"$0\" 30 & echo $!; wait"])
+        // bash's `exec -a`: argv[0] stays `sleep` (a multicall coreutils —
+        // uutils on Ubuntu 26.04, the CI's image — dispatches on it), the
+        // kernel takes `comm` from the file's name
+        let mut sh = Command::new("bash")
+            .args(["-c", "(exec -a sleep \"$0\" 30) & echo $!; wait"])
             .arg(&link)
             .stdout(Stdio::piped())
             .spawn()

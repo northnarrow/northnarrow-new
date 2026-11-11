@@ -32,6 +32,7 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
@@ -78,7 +79,11 @@ pub mod testing {
             .find(|p| std::path::Path::new(p).exists())
             .expect("sleep(1)");
         std::os::unix::fs::symlink(sleep, &link).expect("n6 symlink");
+        // argv[0] stays `sleep`: a multicall coreutils (uutils, Ubuntu
+        // 26.04 — the CI's image) dispatches on it, and would not run as
+        // `\xff\xfe`; the kernel takes `comm` from the file's name
         let child = Command::new(&link)
+            .arg0("sleep")
             .arg(secs.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
