@@ -264,6 +264,19 @@ which GitHub sets for every job):
 - The workflow gives the guest 12 GiB (`NN_LAB_MEM=12288`; the lab's are
   8 GiB) and a 20-minute boot bound.
 
+**A unit that does not start says why** (lot 303). `install` starts both
+units the operator's way (`systemctl enable --now`); when one does not
+start, it prints the units' status, this boot's `ERROR` and `WARN` lines of
+both units from their journal namespace (`journalctl --namespace=northnarrow
+-b`; the units log to stdout, so journald files every line at priority info
+and the level is read in the text, not with `-p`) and their last lines, then
+fails, so the job log carries the agent's refusal and its gate. Before, the step showed systemd's "control process exited
+with error code" alone: the nightly's Debian 13 guest failed there from
+07/11 to 10/11 (f66e6680), and the reason — exit 78, the `deny_hooks` gate:
+the agent's own BPF objects past the 256 entries of `OWN_BPF_IDS`, `E2BIG`
+at the 257th registration — was found only by reproducing it on a fresh
+lab guest; lot 290 had already raised the map to 1024 on `main`.
+
 `test-ignored` now frames each of its five cargo runs with
 `nn-lab: test-ignored run <n>/5 start: …` and `… end: …: exit <status>`
 lines, in the lab too (output only): `gate-summary` reads them to tell a run

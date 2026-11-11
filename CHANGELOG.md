@@ -106,6 +106,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The lab's `install` (and so the nightly CI VM gate's install step) prints
+  why a unit did not start — the units' status, this boot's error and
+  warning lines of both units from their journal namespace (the agent's
+  refusal and its gate among them) and their last lines — before it fails (lot 303;
+  `docs/integration-test-runbook.md`, "The CI VM gate"). The nightly's
+  Debian 13 guest failed that step four nights running (07/11-10/11,
+  f66e6680) with systemd's "control process exited with error code" alone;
+  reproduced on a fresh lab guest, the agent had refused its start (exit
+  78, gate `deny_hooks`): its own BPF maps, programs and links past the 256
+  entries `OWN_BPF_IDS` had, `E2BIG` at the 257th registration (`main`
+  registers 280 on that guest). Lot 290 had raised the map to 1024 on
+  `main`; the dispatched run of `main` installs there again.
 - `nn-admin heartbeat watch` fails a fetch whose `--from-cmd` command
   writes more than 4 MiB to stdout whatever the command's exit status (lot
   304; `docs/operator/HEARTBEAT.md`). The failure rested on the command

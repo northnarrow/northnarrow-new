@@ -597,10 +597,18 @@ fn anti_tamper_reports_what_only_asked_for() {
 fn the_lab_enables_what_it_installs_and_every_upgrade_check_ends_with_a_cold_boot() {
     let lab = read(NN_LAB);
     let install = section(&lab, "cmd_install() {", "\n}\n");
+    // lot 303: the units are started by lab_start_units (a failed start
+    // prints why), which the install step calls once install.sh is done
     assert!(
-        install.contains("sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog"),
+        install.contains("|| die \"install.sh failed (its output above)\"\n    lab_start_units"),
+        "the install step starts the units after install.sh"
+    );
+    let start = section(&lab, "lab_start_units() {", "\n}\n");
+    assert!(
+        start.contains("sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog"),
         "the install step enables the units"
     );
+    assert!(!start.contains("sudo systemctl start northnarrow-agent"));
     assert!(!install.contains("sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status"));
     let upgrade = section(&lab, "cmd_upgrade_check() {", "\ncmd_uninstall_check() {");
     let enabled = upgrade

@@ -1161,8 +1161,30 @@ cmd_install() {
     guest_provision_nftables
     # External audit DEP-007: the lab installs its synced source tree (no
     # MANIFEST.sha256), which install.sh now refuses without --source-tree.
-    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload && sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
+    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload' || die "install.sh failed (its output above)"
+    lab_start_units
 }
+
+# >>> start-units (xtask/tests/lab_host_safety.rs runs this block)
+# Lot 303: both units started the operator's way (enable --now). A start
+# that fails prints why before the error: systemd's status, the units'
+# warning and error lines of this boot from their journal namespace (the
+# agent's refusal names its gate) and their last lines. The nightly's Debian 13 guest failed
+# here from 07/11 to 10/11 with nothing but systemd's "control process
+# exited with error code": the reason (exit 78, the deny_hooks gate:
+# OWN_BPF_IDS full, E2BIG) was only found on a fresh lab guest.
+lab_start_units() {
+    if vcargo 'sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'; then
+        return 0
+    fi
+    log "the units did not start — their status and this boot's warnings and errors (journal namespace northnarrow):"
+    # The units log to stdout: journald gives every line the priority info,
+    # so `-p warning` finds nothing (lot 303's first run on a fresh guest);
+    # the level is in the line's text. The last lines follow, whatever they say.
+    vssh 'sudo systemctl --no-pager --lines=0 status northnarrow-agent northnarrow-watchdog 2>&1 | grep -E "Loaded|Active|Main PID|Process:"; j=$(sudo journalctl --namespace=northnarrow -b -u northnarrow-agent -u northnarrow-watchdog --no-pager -n 400 2>&1); printf "%s\n" "$j" | grep -E " (ERROR|WARN) |refus" | tail -n 40; echo "-- the last lines:"; printf "%s\n" "$j" | tail -n 8' >&2 || true
+    die "the units did not start (the agent's refusal above names its gate)"
+}
+# <<< start-units
 
 cmd_respawn_check() {
     vm_running || die "guest is not running"
