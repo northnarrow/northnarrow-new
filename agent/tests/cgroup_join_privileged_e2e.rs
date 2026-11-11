@@ -844,16 +844,82 @@ for _ in sys.stdin:
     print(c, flush=True)
 "#;
 
-/// Lot 281: the exemption the injection tests give `/usr/bin/sleep` (by its
-/// digest): a process running it is exempt — until code is injected into it.
-fn sleep_exemption() -> String {
-    let out = Command::new("sha256sum")
-        .arg("/usr/bin/sleep")
-        .output()
-        .expect("sha256sum");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let hex = text.split_whitespace().next().expect("a digest");
-    format!("exempt NN-L-IMP-001 exe /usr/bin/sleep sha256 {hex}\n")
+/// Lot 281: the exempt executable of the injection tests (by its digest):
+/// a process running it is exempt — until code is injected into it.
+///
+/// Lot 303: a copy of `sleep` of its own, named `sleep`, in a root-owned
+/// directory of the system tree (an `exe` exemption names the path the
+/// kernel gives as the process's executable, `/proc/<pid>/exe`). Lot 281
+/// exempted `/usr/bin/sleep`, which on Ubuntu 26.04 — the nightly's 7.0
+/// guest — is a link to uutils' multi-call `coreutils`: the kernel names
+/// the multi-call binary, the exemption matched nothing, the attach
+/// revoked nothing ("no signed revocation") and the read-only test passed
+/// on a process that was never exempt. A copy keeps the name the
+/// multi-call binary dispatches on, and is no other utility's path.
+struct ExemptSleep {
+    dir: PathBuf,
+    exe: PathBuf,
+    sha256: String,
+}
+
+impl ExemptSleep {
+    fn install() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(format!(
+            "/usr/local/lib/nn-e2etest-303-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir the exempt executable's directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = dir.join("sleep");
+        std::fs::copy("/usr/bin/sleep", &exe).expect("copy sleep");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new("sha256sum")
+            .arg(&exe)
+            .output()
+            .expect("sha256sum");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let sha256 = text
+            .split_whitespace()
+            .next()
+            .expect("a digest")
+            .to_string();
+        ExemptSleep { dir, exe, sha256 }
+    }
+
+    fn exemption(&self) -> String {
+        format!(
+            "exempt NN-L-IMP-001 exe {} sha256 {}\n",
+            self.exe.display(),
+            self.sha256
+        )
+    }
+
+    /// The copy running `sleep 60` in its own process group — the
+    /// executable the kernel names for it is the one the exemption names
+    /// (a test of a revocation, or of none, on a process never exempt
+    /// proves nothing).
+    fn spawn(&self) -> Child {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new(&self.exe)
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("the exempt sleep");
+        let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("its exe");
+        assert_eq!(
+            exe, self.exe,
+            "the kernel names another executable than the exemption's"
+        );
+        child
+    }
+}
+
+impl Drop for ExemptSleep {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// A `sleep 60` of its own process group.
@@ -944,8 +1010,9 @@ fn revoked_line(fx: &Fixture, target: u32) -> bool {
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
 fn a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed() {
-    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
-    let mut target = sleeper();
+    let exempt = ExemptSleep::install();
+    let fx = Fixture::setup_full(&[], Some(&exempt.exemption()));
+    let mut target = exempt.spawn();
     let tpid = target.id();
     assert_eq!(mark(tpid), None, "a clean start");
     let out = run_py(ATTACH, &[&tpid.to_string()]);
@@ -968,8 +1035,9 @@ fn a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed() {
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
 fn a_read_only_proc_mem_open_does_not_revoke() {
-    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
-    let mut target = sleeper();
+    let exempt = ExemptSleep::install();
+    let fx = Fixture::setup_full(&[], Some(&exempt.exemption()));
+    let mut target = exempt.spawn();
     let tpid = target.id();
     run_py(PEEK, &[&tpid.to_string()]);
     let read = run_py(VM_RW, &[&tpid.to_string(), "read"]);
@@ -1017,8 +1085,9 @@ fn a_proc_mem_write_handle_revokes() {
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
 fn process_vm_writev_revokes() {
-    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
-    let mut target = sleeper();
+    let exempt = ExemptSleep::install();
+    let fx = Fixture::setup_full(&[], Some(&exempt.exemption()));
+    let mut target = exempt.spawn();
     let tpid = target.id();
     let out = run_py(VM_RW, &[&tpid.to_string(), "write"]);
     let injector: u32 = out.split_whitespace().nth(1).unwrap().parse().unwrap();

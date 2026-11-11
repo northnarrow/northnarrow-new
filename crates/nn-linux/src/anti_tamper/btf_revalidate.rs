@@ -40,9 +40,8 @@ use std::sync::OnceLock;
 use common::btf_offsets::{
     EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, JoinTarget, OffsetSpec, BTF_MODULE_STRUCTS,
     BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_JOIN_OFFSETS, CGROUP_JOIN_TARGETS,
-    CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES, FENTRY_TARGETS,
-    FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, REVALIDATE,
-    SLOT_TABLE,
+    CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES, FEXIT_TARGETS, HOOK_ARGS,
+    HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, NO_ARG_TARGETS, REVALIDATE, SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -179,6 +178,11 @@ pub struct ResolvedOffsets {
     /// kernel (a target of another shape or absent, an offset absent);
     /// `None` when it can.
     pub cgroup_join_unavailable: Option<String>,
+    /// Lot 303: the module-load hooks' ids (`common::module_judge::READ_IDS`)
+    /// that this kernel's BTF gives otherwise, or lacks — one line each;
+    /// non-empty, the two hooks are left out (signed): a judge built for
+    /// other ids would refuse what it must not, or judge nothing.
+    pub read_id_drift: Vec<String>,
 }
 
 impl ResolvedOffsets {
@@ -679,6 +683,7 @@ fn resolve_with(
         .iter()
         .filter_map(|f| btf.param_count(f).map(|n| (*f, n)))
         .collect();
+    let read_id_drift = read_id_drift(btf);
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
             values,
@@ -689,10 +694,17 @@ fn resolve_with(
             optional_deny_hooks,
             func_params,
             cgroup_join_unavailable,
+            read_id_drift,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
     }
+}
+
+/// Lot 303: [`common::module_judge::read_id_drift`] against `btf`'s
+/// `enum kernel_read_file_id` and `enum kernel_load_data_id`.
+fn read_id_drift(btf: &Btf) -> Vec<String> {
+    common::module_judge::read_id_drift(|e, n| btf.resolve_enum(e, n).ok().map(i64::from))
 }
 
 /// tracefs roots tried in order for the tracepoint `format` files.
@@ -1374,7 +1386,7 @@ impl Btf {
                     if let Some(nm) = name_of(name_off) {
                         if nm.starts_with(LSM_FUNC_PREFIX)
                             || FEXIT_TARGETS.iter().any(|t| t.func == nm)
-                            || FENTRY_TARGETS.iter().any(|f| *f == nm)
+                            || NO_ARG_TARGETS.iter().any(|f| *f == nm)
                             || common::btf_offsets::PARAM_COUNT_FUNCS.contains(&nm.as_str())
                             || CGROUP_JOIN_TARGETS
                                 .iter()
@@ -3134,9 +3146,11 @@ mod tests {
     /// of another shape is recorded (signed degraded at the attach), an
     /// absent one only not attached.
     ///
-    /// Lot 273b: and where `cgroup_procs_write_finish` is there too (the
-    /// third program drops a record at the end of the write); without it
-    /// the guard is not attached, and why is recorded.
+    /// Lot 273b: and where the function the third program drops a record
+    /// at is there too (lot 303: `cgroup_file_write`, the end of every
+    /// cgroup file's write); without it the guard is not attached, and why
+    /// is recorded. 7.0 still has `cgroup_procs_write_finish` (lot 273b's)
+    /// but inlines it: that one alone does not do.
     #[test]
     fn the_move_guard_is_selected_from_the_kernels_btf() {
         fn btf_with(target: Option<(usize, bool)>, finish: bool) -> Btf {
@@ -3158,8 +3172,14 @@ mod tests {
                     &args[..params],
                 );
             }
+            // 7.0 keeps lot 273b's function (an out-of-line copy for
+            // cgroup v1): never the third program's.
+            b.func("cgroup_procs_write_finish", int, &[p_task, int]);
             if finish {
-                b.func("cgroup_procs_write_finish", int, &[p_task, int]);
+                let of = b.composite(Some("kernfs_open_file"), false, false, &[]);
+                let p_of = b.ptr(of);
+                let long = b.int("long");
+                b.func("cgroup_file_write", long, &[p_of, p_char, long, long]);
             }
             Btf::parse(&b.build()).expect("cgroup fixture parses")
         }
@@ -3188,11 +3208,11 @@ mod tests {
             ),
             ("no such function", None, true, false, None),
             (
-                "no write_finish",
+                "no cgroup_file_write",
                 Some((3, true)),
                 false,
                 false,
-                Some("no cgroup_procs_write_finish"),
+                Some("no cgroup_file_write"),
             ),
         ] {
             let r = hooks_only(&btf_with(target, finish));
@@ -3248,7 +3268,7 @@ mod tests {
             let p_int = b.ptr(int);
             if drop != Drop::Write {
                 b.func("cgroup_procs_write_start", p_task, &[p_char, int, p_int]);
-                b.func("cgroup_procs_write_finish", int, &[p_task, int]);
+                b.func("cgroup_file_write", int, &[p_char, p_char, int, int]);
             }
             if drop != Drop::PostFork {
                 let second = if drop == Drop::KargsInt { int } else { p_kargs };
@@ -3476,6 +3496,69 @@ mod tests {
         assert_eq!(
             bpf_cmd_mismatches(&btf, &[("BPF_LINK_DETACH", 34)]),
             vec![("BPF_LINK_DETACH", 34, None)]
+        );
+    }
+
+    /// Lot 303 (named): the module-load hooks' ids read from the kernel's
+    /// BTF — 7.0's enum (the compressed module's id appended) passes, so
+    /// does 6.x's without it; an id that moved is named.
+    #[test]
+    fn the_load_ids_are_checked_against_the_btf() {
+        let build = |read: &[(&str, i32)]| {
+            let mut b = BtfBuilder::new();
+            b.enumeration("kernel_read_file_id", read);
+            b.enumeration(
+                "kernel_load_data_id",
+                &[
+                    ("LOADING_UNKNOWN", 0),
+                    ("LOADING_FIRMWARE", 1),
+                    ("LOADING_MODULE", 2),
+                    ("LOADING_KEXEC_IMAGE", 3),
+                ],
+            );
+            Btf::parse(&b.build()).expect("fixture parses")
+        };
+        let v6 = [
+            ("READING_UNKNOWN", 0),
+            ("READING_FIRMWARE", 1),
+            ("READING_MODULE", 2),
+            ("READING_KEXEC_IMAGE", 3),
+            ("READING_KEXEC_INITRAMFS", 4),
+            ("READING_POLICY", 5),
+            ("READING_X509_CERTIFICATE", 6),
+            ("READING_MAX_ID", 7),
+        ];
+        assert!(read_id_drift(&build(&v6)).is_empty());
+        let mut v7 = v6.to_vec();
+        v7.pop();
+        v7.extend([("READING_MODULE_COMPRESSED", 7), ("READING_MAX_ID", 8)]);
+        assert!(read_id_drift(&build(&v7)).is_empty());
+        let mut moved = v6.to_vec();
+        moved.insert(3, ("READING_MODULE_COMPRESSED", 3));
+        let moved: Vec<(&str, i32)> = moved
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (*n, i as i32))
+            .collect();
+        let d = read_id_drift(&build(&moved));
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d[0].contains("READING_KEXEC_IMAGE is 4"), "{d:?}");
+        assert!(d[1].contains("READING_MODULE_COMPRESSED is 3"), "{d:?}");
+    }
+
+    /// Lot 303: the ids match the running kernel's BTF (skipped without
+    /// one).
+    #[test]
+    fn the_load_ids_match_the_running_kernels_btf() {
+        let Ok(data) = fs::read(VMLINUX_BTF) else {
+            eprintln!("no {VMLINUX_BTF}: skipped");
+            return;
+        };
+        let btf = Btf::parse(&data).expect("host BTF parses");
+        let d = read_id_drift(&btf);
+        assert!(
+            d.is_empty(),
+            "load ids that differ from {VMLINUX_BTF}: {d:?}"
         );
     }
 

@@ -57,7 +57,8 @@ pub mod hook {
     /// opened before its inode was registered, a resource file's value.
     pub const FILE_PERMISSION: u32 = 22;
     /// Lot 273b: the move guard's third program, which clears a thread's
-    /// stashed move when the write ends.
+    /// stashed move when the write ends (lot 303: at `cgroup_file_write`'s
+    /// return; the constant keeps its name, the slot its number).
     pub const CGROUP_PROCS_WRITE_FINISH: u32 = 23;
     /// Lot 273c (the review of #490): another process's change of a
     /// protected process's limits, scheduling, nice value or I/O priority;
@@ -96,7 +97,9 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "inode_permission",
     "cgroup_procs_write_start",
     "file_permission",
-    "cgroup_procs_write_finish",
+    // Lot 303: the move guard's clear, at `cgroup_file_write`'s return
+    // (lot 273b: `cgroup_procs_write_finish`); the slot itself unchanged.
+    "cgroup_file_write",
     "task_setrlimit",
     "task_setscheduler",
     "task_setnice",
@@ -136,7 +139,7 @@ mod tests {
             (hook::INODE_PERMISSION, "inode_permission"),
             (hook::CGROUP_PROCS_WRITE_START, "cgroup_procs_write_start"),
             (hook::FILE_PERMISSION, "file_permission"),
-            (hook::CGROUP_PROCS_WRITE_FINISH, "cgroup_procs_write_finish"),
+            (hook::CGROUP_PROCS_WRITE_FINISH, "cgroup_file_write"),
             (hook::TASK_SETRLIMIT, "task_setrlimit"),
             (hook::TASK_SETSCHEDULER, "task_setscheduler"),
             (hook::TASK_SETNICE, "task_setnice"),

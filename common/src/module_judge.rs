@@ -117,6 +117,96 @@ pub mod write_flag {
     pub const TAINT: u32 = 2;
 }
 
+/// Lot 303: the ids the two load hooks are called with
+/// (include/linux/kernel_read_file.h: `enum kernel_read_file_id`, and
+/// `enum kernel_load_data_id`, generated from the same list). The list is
+/// appended to, never reordered, from 5.10 (which dropped
+/// `READING_FIRMWARE_PREALLOC_BUFFER`) to 7.3 — the agent's kernels (5.14
+/// el9 and later); the boot checks every value against the running
+/// kernel's BTF ([`READ_IDS`]) and leaves the hooks out where one differs
+/// (a judge built for other ids would refuse what it must not, or judge
+/// nothing).
+pub mod read_id {
+    /// `READING_MODULE`: the file `finit_module(2)` reads.
+    pub const MODULE: u32 = 2;
+    /// `READING_KEXEC_IMAGE` (and `LOADING_KEXEC_IMAGE`): refused outside a
+    /// window (review 82).
+    pub const KEXEC_IMAGE: u32 = 3;
+    /// `READING_MODULE_COMPRESSED` (7.0, appended): the file a
+    /// `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` reads — kmod's
+    /// load of a `.ko.zst` / `.ko.xz` the kernel decompresses itself, every
+    /// module of Ubuntu 26.04. The nightly's 7.0 guest recorded no module
+    /// load and judged none (lot 303). Before 7.0 the value is
+    /// `READING_MAX_ID`, which no caller passes.
+    pub const MODULE_COMPRESSED: u32 = 7;
+    /// `LOADING_MODULE`: the buffer `init_module(2)` copied.
+    pub const LOADING_MODULE: u32 = 2;
+}
+
+/// Lot 303: `(enum, enumerator, the value the programs compare against,
+/// required)`: the boot's BTF check of [`read_id`]. An optional one may be
+/// absent from the kernel (`READING_MODULE_COMPRESSED` before 7.0), never
+/// of another value.
+pub const READ_IDS: &[(&str, &str, u32, bool)] = &[
+    (
+        "kernel_read_file_id",
+        "READING_MODULE",
+        read_id::MODULE,
+        true,
+    ),
+    (
+        "kernel_read_file_id",
+        "READING_KEXEC_IMAGE",
+        read_id::KEXEC_IMAGE,
+        true,
+    ),
+    (
+        "kernel_read_file_id",
+        "READING_MODULE_COMPRESSED",
+        read_id::MODULE_COMPRESSED,
+        false,
+    ),
+    (
+        "kernel_load_data_id",
+        "LOADING_MODULE",
+        read_id::LOADING_MODULE,
+        true,
+    ),
+    (
+        "kernel_load_data_id",
+        "LOADING_KEXEC_IMAGE",
+        read_id::KEXEC_IMAGE,
+        true,
+    ),
+];
+
+/// Lot 303: whether a `kernel_read_file` call reads a module file — plain
+/// (`READING_MODULE`) or one the kernel decompresses
+/// (`READING_MODULE_COMPRESSED`, 7.0+): both are judged by the file.
+pub const fn reads_module_file(id: u32) -> bool {
+    id == read_id::MODULE || id == read_id::MODULE_COMPRESSED
+}
+
+/// Lot 303: what differs between [`READ_IDS`] and a kernel whose values
+/// `lookup(enum, enumerator)` gives (`None`: absent) — one line per
+/// enumerator, empty when the hooks may be attached.
+#[cfg(feature = "std")]
+pub fn read_id_drift(
+    lookup: impl Fn(&str, &str) -> Option<i64>,
+) -> alloc::vec::Vec<alloc::string::String> {
+    READ_IDS
+        .iter()
+        .filter_map(|(e, name, ours, required)| match lookup(e, name) {
+            Some(v) if v == i64::from(*ours) => None,
+            None if !*required => None,
+            Some(v) => Some(alloc::format!(
+                "{e}.{name} is {v} on this kernel, {ours} in the programs"
+            )),
+            None => Some(alloc::format!("{e}.{name} is not in this kernel's BTF")),
+        })
+        .collect()
+}
+
 /// The hops the write history's lineage and tree walks take at most.
 pub const WALK_HOPS: usize = 12;
 
@@ -311,6 +401,80 @@ pub fn module_name_of(file_name: &str) -> Option<alloc::string::String> {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    /// Lot 303 (named): a compressed module's read (7.0's
+    /// `READING_MODULE_COMPRESSED`, every `.ko.zst` kmod loads on Ubuntu
+    /// 26.04) is a module read like the plain one — the nightly's 7.0 guest
+    /// judged and recorded none; no other id is (firmware, the kexec image
+    /// and initramfs, a policy, a certificate, `READING_MAX_ID` before 7.0
+    /// is 7 too, and no caller passes it).
+    #[test]
+    fn a_compressed_module_s_read_is_judged_like_a_plain_one() {
+        assert!(reads_module_file(read_id::MODULE));
+        assert!(reads_module_file(read_id::MODULE_COMPRESSED));
+        assert_eq!((read_id::MODULE, read_id::MODULE_COMPRESSED), (2, 7));
+        for other in [0, 1, 3, 4, 5, 6, 8, u32::MAX] {
+            assert!(!reads_module_file(other), "{other}");
+        }
+        assert_eq!(read_id::KEXEC_IMAGE, 3);
+        assert_eq!(read_id::LOADING_MODULE, 2);
+    }
+
+    /// Lot 303 (named): the boot's check of the ids — the enum of 6.x
+    /// (no compressed id) and of 7.0 pass; a value that moved, or a
+    /// required one gone, is named and keeps the hooks out.
+    #[test]
+    fn read_ids_that_drift_from_the_kernel_are_named() {
+        let v6 = |e: &str, n: &str| -> Option<i64> {
+            match (e, n) {
+                ("kernel_read_file_id", "READING_MODULE") => Some(2),
+                ("kernel_read_file_id", "READING_KEXEC_IMAGE") => Some(3),
+                ("kernel_load_data_id", "LOADING_MODULE") => Some(2),
+                ("kernel_load_data_id", "LOADING_KEXEC_IMAGE") => Some(3),
+                _ => None,
+            }
+        };
+        assert!(read_id_drift(v6).is_empty());
+        let v7 = |e: &str, n: &str| {
+            if n == "READING_MODULE_COMPRESSED" {
+                Some(7)
+            } else {
+                v6(e, n)
+            }
+        };
+        assert!(read_id_drift(v7).is_empty());
+        let inserted = |e: &str, n: &str| match n {
+            "READING_MODULE_COMPRESSED" => Some(3),
+            "READING_KEXEC_IMAGE" => Some(4),
+            _ => v6(e, n),
+        };
+        assert_eq!(
+            read_id_drift(inserted),
+            vec![
+                "kernel_read_file_id.READING_KEXEC_IMAGE is 4 on this kernel, 3 in the programs"
+                    .to_string(),
+                "kernel_read_file_id.READING_MODULE_COMPRESSED is 3 on this kernel, 7 in the \
+                 programs"
+                    .to_string()
+            ]
+        );
+        let gone = |e: &str, n: &str| {
+            if n == "LOADING_MODULE" {
+                None
+            } else {
+                v6(e, n)
+            }
+        };
+        assert_eq!(
+            read_id_drift(gone),
+            vec!["kernel_load_data_id.LOADING_MODULE is not in this kernel's BTF".to_string()]
+        );
+        assert_eq!(
+            READ_IDS.iter().filter(|r| !r.3).count(),
+            1,
+            "one optional id"
+        );
+    }
 
     fn tail(s: &str) -> [u8; NAME_TAIL] {
         let mut t = [0u8; NAME_TAIL];

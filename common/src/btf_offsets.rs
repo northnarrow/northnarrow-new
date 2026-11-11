@@ -2417,17 +2417,22 @@ pub const CGROUP_MOVE_RET_ARG: usize = CGROUP_MOVE_TARGET.params as usize;
 /// Every [`FexitTarget`] the agent checks.
 pub const FEXIT_TARGETS: &[FexitTarget] = &[CGROUP_MOVE_TARGET];
 
-/// Lot 273b: `void cgroup_procs_write_finish(struct task_struct *task,
-/// <lock state>)`, called at the end of every write
-/// [`CGROUP_MOVE_TARGET`] returned a task for (cgroup v2 and v1); the move
-/// guard's fentry program drops the thread's stashed move there. It reads
-/// no argument: only the function's presence in the kernel's BTF is
+/// Lot 303: where the move guard's third program drops the thread's
+/// stashed move — the return of `cgroup_file_write`, the kernfs `write`
+/// operation of every cgroup file (v1 and v2, `cgroup.procs` and
+/// `cgroup.threads` among them), which kernfs calls through a pointer, so
+/// no compiler can inline it into its caller. Lot 273b attached an fentry
+/// to `cgroup_procs_write_finish`, which 7.0 made two lines long and its
+/// compiler inlines into `__cgroup_procs_write` (the out-of-line copy is
+/// called by cgroup v1 alone): on the nightly's 7.0 guest a write the DAC
+/// refused left its record, and the thread's next own move was refused. It
+/// reads no argument: only the function's presence in the kernel's BTF is
 /// checked.
-pub const CGROUP_MOVE_FINISH: &str = "cgroup_procs_write_finish";
+pub const CGROUP_MOVE_FINISH: &str = "cgroup_file_write";
 
-/// Every function an fentry program of the agent's deny set is attached
-/// to (presence checked, no argument read).
-pub const FENTRY_TARGETS: &[&str] = &[CGROUP_MOVE_FINISH];
+/// Every function a program of the agent's deny set is attached to without
+/// reading an argument (presence checked).
+pub const NO_ARG_TARGETS: &[&str] = &[CGROUP_MOVE_FINISH];
 
 /// Lot 275 (C07): the functions the network sensors' fexit programs trace
 /// whose parameter count changed across the supported kernels — the return
@@ -2664,7 +2669,7 @@ mod tests {
         assert_eq!(CGROUP_MOVE_RET_ARG, CGROUP_MOVE_TARGET.params as usize);
         assert!((CGROUP_MOVE_RET_ARG as u32) < HOOK_ARG_MAX);
         assert_eq!(FEXIT_TARGETS.len(), 1);
-        assert_eq!(FENTRY_TARGETS, &["cgroup_procs_write_finish"]);
+        assert_eq!(NO_ARG_TARGETS, &["cgroup_file_write"]);
         assert!(FEXIT_TARGETS
             .iter()
             .all(|t| !t.func.starts_with("bpf_lsm_")));

@@ -27,10 +27,15 @@
 //!
 //! The move guard is an optional deny set: attached where the kernel's
 //! BTF has `cgroup_procs_write_start` in the shape the fexit reads and
-//! `cgroup_procs_write_finish` (every kernel from 5.14 checked), and signed
-//! degraded where it has not. Lot 273b: its third program,
-//! `cgroup_move_clear` (fentry `cgroup_procs_write_finish`), drops a
-//! thread's stashed move when the write ends; the stash is a map that
+//! `cgroup_file_write` (every kernel from 5.14), and signed degraded where
+//! it has not. Lot 273b: its third program, `cgroup_move_clear`, drops a
+//! thread's stashed move when the write ends — lot 303: at the return of
+//! `cgroup_file_write` (fexit), the kernfs `write` operation of every
+//! cgroup file, which no compiler can inline; lot 273b's fentry on
+//! `cgroup_procs_write_finish` saw no cgroup v2 write on 7.0, which inlines
+//! that function into its v2 caller, and a write the DAC refused left its
+//! record for the thread's next check (the nightly's 7.0 guest: the
+//! thread's own move refused). The stash is a map that
 //! never evicts; the refusal consumes a stashed move only on a cgroup v2
 //! `cgroup.procs` / `cgroup.threads`; and the boot's self-test checks the
 //! guard refuses a move (`agent/src/boot/deny_selftest.rs`).
@@ -64,9 +69,14 @@ pub(crate) const MOVE_DENY_PROGRAM: &str = "cgroup_move_deny";
 pub const MOVE_DENY_HOOK: &str = "inode_permission";
 
 /// Lot 273b: the move guard's third program, which drops a thread's
-/// stashed move when the write ends, and its kernel function.
+/// stashed move when the write ends, and its kernel function (lot 303:
+/// `cgroup_file_write`, fexit).
 pub(crate) const MOVE_CLEAR_PROGRAM: &str = "cgroup_move_clear";
 pub const MOVE_CLEAR_HOOK: &str = CGROUP_MOVE_FINISH;
+/// Lot 303: the function lot 273b's agents attached the clear to (fentry):
+/// a pin of theirs (`prog_` / `link_cgroup_procs_write_finish`) goes at
+/// this start, as a prior boot's pins of a hook do.
+pub(crate) const MOVE_CLEAR_LEGACY_HOOK: &str = "cgroup_procs_write_finish";
 
 /// The three "hooks" of the move guard, as `OPTIONAL_DENY_HOOKS` names them.
 pub const GUARD_HOOKS: [&str; 3] = [MOVE_DENY_HOOK, MOVE_STASH_HOOK, MOVE_CLEAR_HOOK];
@@ -109,7 +119,7 @@ pub(crate) fn attach_move_guard(
         // A prior boot's pins of the pair go too: a program of an older
         // agent must not stay attached where this one would not attach.
         if let Some(root) = pin_root {
-            for hook in GUARD_HOOKS {
+            for hook in GUARD_HOOKS.iter().chain([&MOVE_CLEAR_LEGACY_HOOK]) {
                 let (prog, link) = antitamper_bpf::lsm_pin_paths(root, hook);
                 antitamper_bpf::purge_stale_pin(&link);
                 antitamper_bpf::purge_stale_pin(&prog);
@@ -134,14 +144,21 @@ pub(crate) fn attach_move_guard(
         ));
         return health;
     }
-    if let Err(e) = antitamper_bpf::reattach_fresh_fentry(
+    // Lot 303: an older agent's clear (fentry, pinned under its function's
+    // name) goes first: this one is attached elsewhere.
+    if let Some(root) = pin_root {
+        let (prog, link) = antitamper_bpf::lsm_pin_paths(root, MOVE_CLEAR_LEGACY_HOOK);
+        antitamper_bpf::purge_stale_pin(&link);
+        antitamper_bpf::purge_stale_pin(&prog);
+    }
+    if let Err(e) = antitamper_bpf::reattach_fresh_fexit(
         ebpf,
         MOVE_CLEAR_PROGRAM,
         MOVE_CLEAR_HOOK,
         btf,
         pin_root,
     ) {
-        warn!(program = MOVE_CLEAR_PROGRAM, function = MOVE_CLEAR_HOOK, error = %format!("{e:#}"), "anti-tamper cgroup: fentry attach FAILED");
+        warn!(program = MOVE_CLEAR_PROGRAM, function = MOVE_CLEAR_HOOK, error = %format!("{e:#}"), "anti-tamper cgroup: fexit attach FAILED");
         health.failures.push((MOVE_CLEAR_PROGRAM, format!("{e:#}")));
         // Without it a record a write left behind would stay: the lookup
         // half is not attached either (the refusal half alone refuses
@@ -624,7 +641,9 @@ mod tests {
     fn the_move_guard_is_an_optional_deny_pair() {
         assert_eq!(MOVE_STASH_HOOK, "cgroup_procs_write_start");
         assert_eq!(MOVE_DENY_HOOK, "inode_permission");
-        assert_eq!(MOVE_CLEAR_HOOK, "cgroup_procs_write_finish");
+        assert_eq!(MOVE_CLEAR_HOOK, "cgroup_file_write");
+        assert_eq!(MOVE_CLEAR_LEGACY_HOOK, "cgroup_procs_write_finish");
+        assert!(!GUARD_HOOKS.contains(&MOVE_CLEAR_LEGACY_HOOK));
         assert_eq!(GUARD_HOOKS.len(), 3);
         for h in GUARD_HOOKS {
             assert!(super::super::OPTIONAL_DENY_HOOKS.contains(&h), "{h}");

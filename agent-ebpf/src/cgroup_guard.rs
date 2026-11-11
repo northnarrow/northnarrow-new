@@ -28,8 +28,14 @@
 //!   check of that thread, the migration's, and signs it
 //!   (`FS_OP_CGROUP_MOVE`, rate-limited as a signal is).
 //!
-//! * [`cgroup_move_clear`] (fentry `cgroup_procs_write_finish`, lot 273b)
+//! * [`cgroup_move_clear`] (fexit `cgroup_file_write`; lot 273b, lot 303)
 //!   drops the thread's record when the write ends, whatever it did.
+//!   `cgroup_file_write` is the kernfs `write` operation of every cgroup
+//!   file, called through a pointer: never inlined. Lot 273b's fentry on
+//!   `cgroup_procs_write_finish` missed every cgroup v2 write on 7.0, whose
+//!   compiler inlines the two-line function into `__cgroup_procs_write`
+//!   (lot 303: a write the DAC refused left its record, and the thread's
+//!   next own move was refused).
 //!
 //! The write check runs in the same thread right after the lookup, and the
 //! stash is consumed by it. Lot 273b: a record lives only from the lookup
@@ -48,9 +54,9 @@
 use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel, generated},
-    macros::{fentry, fexit, lsm, map},
+    macros::{fexit, lsm, map},
     maps::HashMap,
-    programs::{FEntryContext, FExitContext, LsmContext},
+    programs::{FExitContext, LsmContext},
     EbpfContext,
 };
 use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
@@ -150,14 +156,18 @@ unsafe fn try_cgroup_move_stash(ctx: &FExitContext) {
     }
 }
 
-/// Lot 273b: `void cgroup_procs_write_finish(struct task_struct *task,
-/// <lock state>)` ends every write `cgroup_procs_write_start` returned a
-/// task for — the move done, refused by the permission check (ours or the
-/// DAC's), or failed — on cgroup v2 and on v1 alike. The thread's record
-/// goes with it: a write that never reached the permission check leaves
-/// nothing for a later check of the thread to consume.
-#[fentry(function = "cgroup_procs_write_finish")]
-pub fn cgroup_move_clear(_ctx: FEntryContext) -> i32 {
+/// Lot 273b, lot 303: `ssize_t cgroup_file_write(struct kernfs_open_file *,
+/// char *, size_t, loff_t)` returns at the end of every write of a cgroup
+/// file, the `cgroup.procs` / `cgroup.threads` writes
+/// `cgroup_procs_write_start` returned a task for among them — the move
+/// done, refused by the permission check (ours or the DAC's), or failed —
+/// on cgroup v2 and on v1 alike. The thread's record goes with it: a write
+/// that never reached the permission check leaves nothing for a later
+/// check of the thread to consume. Kernfs calls the function through its
+/// `write` pointer, so it is never inlined (lot 303: 7.0 inlines lot
+/// 273b's `cgroup_procs_write_finish` into its cgroup v2 caller).
+#[fexit(function = "cgroup_file_write")]
+pub fn cgroup_move_clear(_ctx: FExitContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let _ = CGROUP_MOVES.remove(&pid_tgid);
     0

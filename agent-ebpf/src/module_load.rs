@@ -16,7 +16,7 @@
 //!
 //! | Hook | Syscall | What it gives |
 //! |---|---|---|
-//! | `kernel_read_file` (id = READING_MODULE) | `finit_module(2)` (modern) | `struct file*` → **source path** + loader |
+//! | `kernel_read_file` (id = READING_MODULE, or 7.0's READING_MODULE_COMPRESSED) | `finit_module(2)` (modern) | `struct file*` → **source path** + loader |
 //! | `kernel_load_data` (id = LOADING_MODULE) | `init_module(2)` (legacy buffer) | loader only (no file, no path) |
 //!
 //! Why a load hook, not more file-watching: FIM-008 watches a `.ko`
@@ -58,7 +58,8 @@ use aya_ebpf::{
 };
 
 use northnarrow_common::module_judge::{
-    conf_slot, finit_verdict, init_verdict, mode, module_file_name, refuses, write_step, FileFacts,
+    conf_slot, finit_verdict, init_verdict, mode, module_file_name, read_id, reads_module_file,
+    refuses, write_step, FileFacts,
     ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_PKG_SCRIPTS_MAX, MODULE_TRUST_MAX,
     MODULE_WRITES_MAX, NAME_TAIL, WALK_HOPS,
 };
@@ -76,13 +77,13 @@ use crate::btf_offsets::{
     TASK_STRUCT_TGID_OFFSET,
 };
 
-/// `enum kernel_read_file_id::READING_MODULE` (vmlinux BTF, 6.8).
-const READING_MODULE: c_int = 2;
-/// `enum kernel_load_data_id::LOADING_MODULE` (vmlinux BTF, 6.8).
-const LOADING_MODULE: c_int = 2;
+/// `enum kernel_load_data_id::LOADING_MODULE` (`common::module_judge::read_id`;
+/// lot 303: the boot checks every id against the kernel's BTF and leaves
+/// these hooks out where one differs).
+const LOADING_MODULE: c_int = read_id::LOADING_MODULE as c_int;
 /// `READING_KEXEC_IMAGE` / `LOADING_KEXEC_IMAGE`: the same value in both
 /// enums, on every kernel the agent supports (include/linux/kernel_read_file.h).
-const KEXEC_IMAGE: c_int = 3;
+const KEXEC_IMAGE: c_int = read_id::KEXEC_IMAGE as c_int;
 /// Linux `EPERM`.
 const EPERM: c_int = 1;
 /// `FMODE_WRITE` / `FMODE_CREATED` (include/linux/fs.h; the latter since
@@ -247,7 +248,10 @@ unsafe fn try_read_file(ctx: &LsmContext) -> i32 {
     if id == KEXEC_IMAGE {
         return deny_kexec(id);
     }
-    if id != READING_MODULE {
+    // Lot 303: `READING_MODULE`, or 7.0's `READING_MODULE_COMPRESSED` (a
+    // `finit_module` the kernel decompresses: every `.ko.zst` kmod loads on
+    // Ubuntu 26.04), judged by the file alike.
+    if !reads_module_file(id as u32) {
         return 0;
     }
     let file: *const c_void = ctx.arg(0);

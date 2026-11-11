@@ -58,6 +58,9 @@ pub const ARITY_VARIANTS: &[(&str, &str, usize)] = &[
     ("dns_answer_v4_ret5", "udp_recvmsg", 5),
     ("dns_answer_v6_ret6", "udpv6_recvmsg", 6),
     ("dns_answer_v6_ret5", "udpv6_recvmsg", 5),
+    // Lot 303: 7.1+ (and Ubuntu 26.04's 7.0) dropped `addr_len`.
+    ("dns_answer_v4_ret4", "udp_recvmsg", 4),
+    ("dns_answer_v6_ret4", "udpv6_recvmsg", 4),
 ];
 
 /// The variant of `func`'s fexit built for `params` parameters.
@@ -830,6 +833,32 @@ mod tests {
             assert!(src[at..].starts_with(&format!("pub fn {p}(ctx: FExitContext)")));
             let body = &src[at..at + 200];
             assert!(body.contains(&format!("ctx.arg({n})")), "{p}: {body}");
+        }
+    }
+
+    /// Lot 303 (named): the four-parameter `udp_recvmsg` / `udpv6_recvmsg`
+    /// (`addr_len` gone: 7.1, and Ubuntu 26.04's 7.0, the nightly's guest)
+    /// has its program — the nightly found the sensor not attached there
+    /// ("udp_recvmsg has 4 parameters: no program is built for that") and
+    /// NN-L-NET-028 judging nothing; every count the kernels have, one
+    /// program each, the same function for both families.
+    #[test]
+    fn a_four_parameter_recvmsg_has_its_program() {
+        assert_eq!(variant_for("udp_recvmsg", 4), Some("dns_answer_v4_ret4"));
+        assert_eq!(variant_for("udpv6_recvmsg", 4), Some("dns_answer_v6_ret4"));
+        assert_eq!(other_arity("dns_answer_v4_ret4", Some(4)), None);
+        assert!(other_arity("dns_answer_v4_ret5", Some(4))
+            .unwrap()
+            .contains("this kernel's has 4"));
+        for f in ["udp_recvmsg", "udpv6_recvmsg"] {
+            for n in [4, 5, 6] {
+                let p = variant_for(f, n).unwrap_or_else(|| panic!("{f} with {n}"));
+                assert_eq!(
+                    ARITY_VARIANTS.iter().filter(|(q, _, _)| *q == p).count(),
+                    1,
+                    "{p} listed once"
+                );
+            }
         }
     }
 
