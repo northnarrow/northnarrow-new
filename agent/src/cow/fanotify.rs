@@ -347,14 +347,14 @@ pub fn io_thread_in_stat(stat: &str) -> Option<bool> {
 pub fn read_open_intent(tid: i32) -> OpenIntent {
     let stat = read_task_stat(tid);
     open_intent(stat.as_deref(), || {
-        std::fs::read_to_string(format!("/proc/{tid}/syscall")).ok()
+        std::fs::read_to_string(format!("/proc/{tid}/syscall"))
     })
 }
 
 /// [`read_open_intent`] from the task's `stat` text (`None`: unreadable)
 /// and its `syscall` line, read only for a task that is not an io_uring
 /// thread.
-fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> Option<String>) -> OpenIntent {
+fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> io::Result<String>) -> OpenIntent {
     match stat.map(io_thread_in_stat) {
         Some(Some(false)) => {}
         Some(Some(true)) => {
@@ -363,8 +363,8 @@ fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> Option<String>) -> 
         _ => return OpenIntent::Unknown("/proc/<tid>/stat unreadable"),
     }
     match syscall() {
-        Some(text) => classify_syscall_line(&text),
-        None => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
+        Ok(text) => classify_syscall_line(&text),
+        Err(_) => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
     }
 }
 
@@ -845,8 +845,9 @@ mod lot315 {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bug102_the_flag_decides_before_the_syscall_line() {
-        let read_line =
-            || Some("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string());
+        let read_line = || -> io::Result<String> {
+            Ok("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string())
+        };
         let worker =
             "4243 (iou-wrk-4242) S 1 4242 4242 0 -1 2097232 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
         let thread = "4242 (enc) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
@@ -864,7 +865,9 @@ mod lot315 {
         ));
         assert_eq!(open_intent(Some(thread), read_line), OpenIntent::ReadOnly);
         assert!(matches!(
-            open_intent(Some(thread), || None),
+            open_intent(Some(thread), || Err(io::Error::from_raw_os_error(
+                libc::EPERM
+            ))),
             OpenIntent::Unknown(_)
         ));
     }

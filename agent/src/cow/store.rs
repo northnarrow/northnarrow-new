@@ -2002,6 +2002,51 @@ mod tests {
             );
         }
 
+        /// The in-place write refuses a file that is not the one judged
+        /// (another inode, or the same number reborn: another birth time) —
+        /// the file changed between the restore's `lstat` and its open.
+        #[test]
+        fn write_in_place_refuses_a_file_that_changed_under_it() {
+            let l = lab();
+            std::fs::write(l.scope.join("w.txt"), b"w original").unwrap();
+            let e = take(&l, "w.txt", None, ATTACKER, vec![ATTACKER], now_ms());
+            std::fs::write(l.scope.join("w.txt"), b"w encrypted").unwrap();
+            let dir = open_dir(&l.scope).unwrap();
+            let object = l.store.journals[0]
+                .as_ref()
+                .unwrap()
+                .lock()
+                .open_object(e.object)
+                .unwrap();
+            let judged = |ino_delta: u64, btime: Option<i64>| Current {
+                exists: true,
+                regular: true,
+                dev: e.file.dev,
+                ino: e.file.ino + ino_delta,
+                mtime_ns: 0,
+                btime_ns: btime,
+            };
+            for cur in [
+                judged(1, e.file.btime_ns),
+                judged(0, e.file.btime_ns.map(|b| b + 1).or(Some(1))),
+            ] {
+                let err = write_in_place(dir.as_raw_fd(), "w.txt", &cur, object.as_raw_fd(), &e)
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("changed under the restore"),
+                    "{err}"
+                );
+                assert_eq!(
+                    std::fs::read(l.scope.join("w.txt")).unwrap(),
+                    b"w encrypted",
+                    "not written"
+                );
+            }
+            let same = judged(0, e.file.btime_ns);
+            write_in_place(dir.as_raw_fd(), "w.txt", &same, object.as_raw_fd(), &e).unwrap();
+            assert_eq!(std::fs::read(l.scope.join("w.txt")).unwrap(), b"w original");
+        }
+
         /// N2 guard: the attack's renamed copy — the same file, its birth
         /// time known — still goes to the evidence.
         #[test]
