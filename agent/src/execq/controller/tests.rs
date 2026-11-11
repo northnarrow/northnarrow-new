@@ -186,7 +186,8 @@ impl Drop for Held {
 }
 
 fn state(pid: u32) -> Option<char> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // lot 317: lot 311's reader, which no `comm` makes fail
+    let s = nn_linux::state_read::read_state(format!("/proc/{pid}/stat")).ok()?;
     s.rsplit_once(')')?
         .1
         .split_whitespace()

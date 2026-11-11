@@ -54,13 +54,12 @@ const BURST_AFTER_STOP: Duration = Duration::from_millis(300);
 /// budget ends, so a binary run again is held again).
 const BINARIES: usize = 16;
 
-/// The state of process `pid` (`/proc/<pid>/stat`'s third field), read as
-/// bytes: a process names itself, and a `comm` that is not UTF-8 must not
-/// hide one from the check.
+/// The state of process `pid` (`/proc/<pid>/stat`'s third field), read by
+/// lot 311's reader (`nn_linux::state_read`): a process names itself, and a
+/// `comm` that is not UTF-8 must not hide one from the check.
 fn proc_state(pid: u32) -> Option<u8> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    let close = stat.iter().rposition(|&b| b == b')')?;
-    stat.get(close + 2).copied()
+    let stat = nn_linux::state_read::read_state(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim_start().bytes().next()
 }
 
 /// Every process of the host in state T (stopped), with what it runs.
