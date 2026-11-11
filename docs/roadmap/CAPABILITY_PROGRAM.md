@@ -8832,6 +8832,17 @@ number in parentheses is a lab PR.
       a cold boot — bootcheck OK at once and 30 s later: 77 pins, 48 LSM
       programs —, `test-ignored`): `gate-summary` PASS, 100 suites, 142
       passed, 0 failed (the nightly on `main`: 137 passed, 5 failed).
+    - **Debian 13** (`6.12.115+deb13.1`, a fresh guest built like the
+      nightly's: the vendor's current image, 4 vCPUs, 12 GiB), the full gate
+      with lot 303a: `install`, the cold boot (bootcheck OK at once and 30 s
+      later: 77 pins, 48 LSM programs, 79 own ids), `test-ignored`:
+      `gate-summary` PASS, 100 suites, 142 passed, 0 failed.
+    - **Ubuntu 24.04** (`6.8.0-147-generic`), the regression round:
+      `install`, the cold boot (bootcheck OK twice: 77 pins, 47 LSM
+      programs), the four targets 4/4, 16/16, 8/8, 19/19, `verifier-check`
+      107 programs, 105 OK, 2 not counted, 0 failing (`cgroup_move_clear` on
+      fexit `cgroup_file_write` OK). 5.15 and 6.1: the pull request's CI
+      (22.04) and the nightly (Debian 12).
   - Levels unchanged (C07 2, C14 2, C23 2 provisional): the checks hold
     on 7.0 as on 5.15 and 6.8; the re-assessment is not this lot's.
   - Not changed (and said): systemd 257+ attaches its own `sysctl_monitor`
