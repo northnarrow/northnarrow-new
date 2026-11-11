@@ -233,7 +233,7 @@ fn own_harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
             let p = value.trim().trim_start_matches('-');
             // lot 311 (F4): read as bytes — a byte that is not UTF-8 hid
             // the whole file
-            let text = crate::state_read::read_state(p).unwrap_or_default();
+            let text = crate::state_read::read_config(Path::new(p)).unwrap_or_default();
             env_file_assignments(&text)
                 .into_iter()
                 .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
@@ -308,7 +308,7 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                 }
                 // lot 311 (F4): read as bytes — a drop-in with one byte that
                 // is not UTF-8 was skipped whole
-                let Ok(text) = crate::state_read::read_state(&from) else {
+                let Ok(text) = crate::state_read::read_config(&from) else {
                     continue;
                 };
                 for (k, v) in effective(directives(&text)) {
@@ -320,7 +320,7 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                                 continue;
                             }
                             env_file_assignments(
-                                &crate::state_read::read_state(p).unwrap_or_default(),
+                                &crate::state_read::read_config(Path::new(p)).unwrap_or_default(),
                             )
                         }
                         _ => continue,

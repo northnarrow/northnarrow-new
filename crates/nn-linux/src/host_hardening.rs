@@ -786,6 +786,18 @@ fn bpffs_mounts(root: &Path) -> Check {
             format!("mounted {n}× — a second bpffs can hide pinned objects from the inventory"),
         ),
     };
+    // lot 311 (the review of #538, F2): lines not in the kernel's shape are
+    // said, never dropped in silence (a bpffs among them is not counted)
+    let (status, value) = match &table {
+        Ok(t) if !t.malformed.is_empty() => (
+            Status::Warn,
+            format!(
+                "{value}; {} line(s) of the mount table not in the kernel's shape, not counted",
+                t.malformed.len()
+            ),
+        ),
+        _ => (status, value),
+    };
     Check {
         id: "bpffs",
         name: "bpffs mounted once at /sys/fs/bpf",
@@ -1425,6 +1437,17 @@ mod tests {
         assert!(c.value.contains("mounted 2"), "{}", c.value);
         let e = tempfile::tempdir().unwrap();
         assert!(bpffs_mounts(e.path()).value.contains("could not be read"));
+        // the review of #538 (F2): a source `-` is a mount; a line not in
+        // the kernel's shape is said
+        let mut dash = b"36 25 0:30 / /sys/fs/bpf rw shared:17 - bpf bpf rw\n".to_vec();
+        dash.extend_from_slice(b"57 25 0:44 / /home/u/m rw - fuse.x - rw\n");
+        w(r, "proc/self/mountinfo", &dash);
+        assert_eq!(bpffs_mounts(r).status, Status::Ok);
+        dash.extend_from_slice(b"58 25 0:45 / /tmp/x rw tmpfs x rw\n");
+        w(r, "proc/self/mountinfo", &dash);
+        let c = bpffs_mounts(r);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.value.contains("not in the kernel's shape"), "{}", c.value);
     }
 
     #[test]

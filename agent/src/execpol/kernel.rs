@@ -109,10 +109,11 @@ impl Kernel {
         }
     }
 
-    /// Replace the guarded mount roots (only when this side owns them).
-    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
+    /// Replace the guarded mount roots (only when this side owns them);
+    /// how many the kernel's map refused (lot 311, the review of #538, F3).
+    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
         let Some(map) = self.roots.as_mut() else {
-            return;
+            return 0;
         };
         let old: Vec<AyaKey> = map.keys().filter_map(|k| k.ok()).collect();
         for k in old {
@@ -120,9 +121,10 @@ impl Kernel {
                 let _ = map.remove(&k);
             }
         }
-        for (k, v) in roots {
-            let _ = map.insert(AyaKey(*k), *v, 0);
-        }
+        roots
+            .iter()
+            .filter(|(k, v)| map.insert(AyaKey(*k), *v, 0).is_err())
+            .count()
     }
 }
 

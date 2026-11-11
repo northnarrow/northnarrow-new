@@ -30,7 +30,8 @@ pub trait KernelIo {
     fn drain(&mut self, out: &mut Vec<ExecPolRaw>);
     fn set_slices(&mut self, system: u64, user: u64, ours: u64);
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]);
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]);
+    /// How many roots the kernel's map refused.
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize;
     fn counters(&self) -> [u64; counter::SLOTS as usize];
 }
 
@@ -55,7 +56,7 @@ impl KernelIo for kernel::Kernel {
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
         kernel::Kernel::set_images(self, entries)
     }
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
         kernel::Kernel::set_roots(self, roots)
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
@@ -103,6 +104,10 @@ pub struct Controller<K: KernelIo> {
     /// Lot 311 (bug hunt 1.4, BUG-98's sibling): a mount table that cannot
     /// be read leaves the slices and roots last published in force, signed.
     mounts_read: nn_linux::state_read::LastGood,
+    /// Lot 311 (the review of #538): lines of the table not in the
+    /// kernel's shape, and roots the kernel's map refused, signed.
+    mounts_rows: nn_linux::state_read::Condition,
+    roots_full: nn_linux::state_read::Condition,
 }
 
 impl<K: KernelIo> Controller<K> {
@@ -116,6 +121,8 @@ impl<K: KernelIo> Controller<K> {
             slices: (0, 0, 0),
             skipped_logged: false,
             mounts_read: nn_linux::state_read::LastGood::new("execpol_mounts", "the mount table"),
+            mounts_rows: nn_linux::state_read::Condition::new("execpol_mounts_rows"),
+            roots_full: nn_linux::state_read::Condition::new("execpol_roots_full"),
         }
     }
 
@@ -130,6 +137,7 @@ impl<K: KernelIo> Controller<K> {
         let table = match nn_linux::mountinfo::read(&self.s.mountinfo) {
             Ok(table) => {
                 self.mounts_read.ok();
+                nn_linux::state_read::mount_rows(&mut self.mounts_rows, &table, "the exec policy");
                 Some(table)
             }
             Err(e) => {
@@ -160,8 +168,9 @@ impl<K: KernelIo> Controller<K> {
         }
         self.k.set_images(&images);
         if let (true, Some(table)) = (self.s.own_roots, &table) {
-            self.k
-                .set_roots(&crate::execq::kernel::guarded_roots(table));
+            let roots = crate::execq::kernel::guarded_roots(table);
+            let refused = self.k.set_roots(&roots);
+            roots_published(&mut self.roots_full, refused, roots.len());
         }
         self.last_refresh = Some(now);
         self.slices
@@ -212,6 +221,24 @@ impl<K: KernelIo> Controller<K> {
     }
 }
 
+/// Lot 311 (the review of #538, F3): roots the kernel's map refused
+/// (`EXECQ_ROOTS` holds 64) are a degradation of `full` while they are —
+/// a mount past the 64th left without its class, never in silence.
+pub(crate) fn roots_published(
+    full: &mut nn_linux::state_read::Condition,
+    refused: usize,
+    of: usize,
+) {
+    if refused == 0 {
+        full.ended();
+    } else {
+        full.holds(format!(
+            "{refused} of {of} guarded mount roots not published: the kernel's map \
+             (EXECQ_ROOTS, 64 entries) refused them — exec from those mounts has no mount class"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +253,8 @@ mod tests {
         images: Vec<(ExecqKey, u32)>,
         roots: Vec<(ExecqKey, u32)>,
         counters: [u64; counter::SLOTS as usize],
+        /// Lot 311 (F3): the roots map's size (`None`: unbounded).
+        cap: Option<usize>,
     }
 
     impl KernelIo for FakeKernel {
@@ -241,8 +270,11 @@ mod tests {
         fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
             self.images = entries.to_vec();
         }
-        fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
-            self.roots = roots.to_vec();
+        fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
+            // lot 311 (F3): a map of `cap` entries refuses the rest
+            let cap = self.cap.unwrap_or(usize::MAX);
+            self.roots = roots.iter().take(cap).copied().collect();
+            roots.len().saturating_sub(cap)
         }
         fn counters(&self) -> [u64; counter::SLOTS as usize] {
             self.counters
@@ -258,8 +290,9 @@ mod tests {
         std::fs::write(
             &mi,
             format!(
-                "24 1 0:22 / {} rw shared:9 - cgroup2 cgroup2 rw\n30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n",
-                cg.display()
+                "24 1 0:22 / {} rw shared:9 - cgroup2 cgroup2 rw\n{}",
+                cg.display(),
+                crate::execq::kernel::tmp_mount_line(30)
             ),
         )
         .unwrap();
@@ -389,21 +422,47 @@ mod tests {
         let good = c.refresh(Instant::now());
         let roots = c.k.roots.clone();
         assert!(good.0 != 0 && !roots.is_empty());
-        let degraded = || {
-            nn_linux::boot::degradation::entries()
-                .iter()
-                .any(|d| d.source == "execpol_mounts")
-        };
+        // the controller's own account (the registry is shared by the tests)
         let saved = std::fs::read(&mi).unwrap();
         std::fs::remove_file(&mi).unwrap();
         c.k.slices = (7, 7, 7);
         assert_eq!(c.refresh(Instant::now()), good, "the last good slices");
         assert_eq!(c.k.slices, (7, 7, 7), "nothing written over the kernel's");
         assert_eq!(c.k.roots, roots, "the roots kept");
-        assert!(degraded());
+        assert!(c.mounts_read.failing());
         std::fs::write(&mi, saved).unwrap();
         assert_eq!(c.refresh(Instant::now()), good);
         assert_eq!(c.k.slices, good, "published again");
-        assert!(!degraded(), "withdrawn");
+        assert!(!c.mounts_read.failing(), "withdrawn");
+    }
+
+    /// Lot 311 (the review of #538, F2, F3): a FUSE mount whose source is
+    /// `-` keeps the slices and is a root (by its device); a line not in the
+    /// kernel's shape, and roots the map refuses, are degradations.
+    #[test]
+    fn a_dash_source_line_keeps_slices_and_roots_and_losses_are_signed() {
+        let d = tempfile::tempdir().unwrap();
+        let s = settings(d.path(), true);
+        let mi = s.mountinfo.clone();
+        let mut text = std::fs::read(&mi).unwrap();
+        text.extend_from_slice(b"57 1 0:44 / /home/u/mnt rw,nosuid - fuse.x - rw,user_id=1000\n");
+        std::fs::write(&mi, &text).unwrap();
+        let mut c = Controller::new(FakeKernel::default(), Box::new(VecRecorder::default()), s);
+        let ids = c.refresh(Instant::now());
+        assert!(ids.0 != 0 && ids.1 != 0, "{ids:?}");
+        assert!(c.k.roots.iter().any(|(k, _)| *k
+            == ExecqKey {
+                dev: 44,
+                ino: crate::execq::kernel::FUSE_BY_DEVICE
+            }));
+        assert!(!c.mounts_rows.holding());
+        let mut odd = text.clone();
+        odd.extend_from_slice(b"58 1 0:45 / /tmp/x rw tmpfs x rw\n");
+        std::fs::write(&mi, &odd).unwrap();
+        c.refresh(Instant::now());
+        assert!(c.mounts_rows.holding(), "a dropped line is signed");
+        c.k.cap = Some(0);
+        c.refresh(Instant::now());
+        assert!(c.roots_full.holding(), "refused roots are signed");
     }
 }

@@ -60,150 +60,592 @@ const PROC_ENTRIES: &[&str] = &[
     "environ\"",
 ];
 
-/// The files holding rule 2's sites: how many, and why (lot 311: none of
-/// them reads a file a process or a user names, and none publishes an
-/// empty set on a failed read).
-const KNOWN: &[(&str, usize, &str)] = &[
+/// Why a process's own `/proc` entry may default: read as bytes, its read
+/// fails only when the process is gone (`ENOENT`, `ESRCH`) or the host is
+/// out of something, and the caller answers "unknown" — no identity, no
+/// start, no exemption, no ancestor — never an emptied protection.
+const PROC: &str = "a process's own /proc entry, read as bytes: a failed read is the process \
+                    gone or unknown, and the caller answers unknown (no identity, start, \
+                    exemption or ancestor), never an emptied protection";
+/// Why a kernel-written ASCII file may default.
+const KNOB: &str = "written by the kernel in ASCII (/proc/sys, /sys, meminfo, /proc/stat, fdinfo, \
+                    the boot id, the agent's own /proc/self): no user writes it; unreadable, the \
+                    built-in value applies (a bound, a new boot, no finding)";
+/// Why a file of the agent's own may default.
+const OWN: &str = "a file the agent or the watchdog writes itself (its state, records, markers, \
+                   journal, vault, pidfile): unreadable, the stricter answer (start afresh, \
+                   nothing honoured, nothing trusted, no finding made from nothing)";
+/// Why lab tooling may default.
+const LAB: &str = "lab, golden-replay or debug-trigger tooling, or the feasibility probe: not \
+                   the product's judgement";
+/// Why a file given to the operator's tools may default.
+const OPER: &str = "a file the operator hands nn-admin, or the operator's signed allow list: the \
+                    tool reports what it reads; an unreadable allow list is an empty one (never \
+                    an open one)";
+/// Why a drop-in judge may default.
+const CONFIG: &str =
+    "a drop-in or an EnvironmentFile= the drop-in judges read (bounded, a regular \
+                      file, its bytes made text): one that cannot be read has nothing to judge, \
+                      and the file is still listed by the directory scan that found it";
+/// Why a package list may default.
+const PKG: &str = "a package's file list or sums (dpkg's .list and .md5sums, a file rpm \
+                   recorded): unreadable, its files are not owned — no trust is lent, the \
+                   stricter side";
+/// Why the account files may default.
+const ACCT: &str = "root's account files (/etc/passwd, login.defs, subuid/subgid), read as \
+                    bytes: a read that fails (an I/O error, which no user provokes) yields no \
+                    account — no carve-out is lent; the file-open sensor's homes are then \
+                    /root only for that start (the review of #538, F9: accepted, not a user's \
+                    lever)";
+/// Why our own cgroup knobs may default.
+const CGROUP: &str = "our own units' cgroup files, written and read back by the agent: a value \
+                      that cannot be read is not confirmed (reported), never a floor dropped";
+/// Why the copy-on-write guard's scope check may default.
+const MOUNT: &str = "the copy-on-write guard's start: with no mount table readable a mount scope \
+                     is refused as no mount point, and the guard's start reports the refusal";
+
+/// Rule 2's sites, each by its read as written (spaces dropped): `(file,
+/// read, why)` — none reads a file a process or a user names into an empty
+/// answer that a protection then publishes. The readers that keep the last
+/// good state (`LastGood`, a `Condition` in the error's arm) are not sites.
+const KNOWN: &[(&str, &str, &str)] = &[
     (
-        "agent/src/cow/guard.rs",
-        1,
-        "a probe at the guard's start: whether `/proc/1/syscall` can be read (its error says why every open is then treated as a write — the stricter side)",
+        "agent/src/admin/transport.rs",
+        "read_state(format!(\"/proc/{pid}/comm\"))",
+        PROC,
     ),
     (
-        "agent/src/decision/golden.rs",
-        1,
-        "the golden replay's comparison with its committed file (a missing or unreadable file is a difference, written anew)",
+        "agent/src/boot/manifest.rs",
+        "read_to_string(\"/proc/sys/kernel/osrelease\")",
+        KNOB,
+    ),
+    (
+        "agent/src/cow/fanotify.rs",
+        "read_state(format!(\"/proc/{tid}/status\"))",
+        PROC,
+    ),
+    ("agent/src/cow/guard.rs", "mountinfo::read(t)", MOUNT),
+    (
+        "agent/src/cow/journal.rs",
+        "fs::read(host.join(\"index.jsonl\"))",
+        OWN,
+    ),
+    (
+        "agent/src/cow/trust.rs",
+        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),
+    (
+        "agent/src/decision/validation_registry.rs",
+        "read_to_string(repo_path(rel))",
+        LAB,
+    ),
+    ("agent/src/detection_store.rs", "read_state(path)", OWN),
+    (
+        "agent/src/detection_store.rs",
+        "read_state(dir.join(\"comm\"))",
+        PROC,
+    ),
+    (
+        "agent/src/execq/pkgtrust.rs",
+        "read_state(entry.path())",
+        PKG,
     ),
     (
         "agent/src/export/controller.rs",
-        1,
-        "`/proc/sys/kernel/hostname` for the export's records: a kernel knob, ASCII; unreadable it names no host, nothing is protected by it",
+        "read_to_string(\"/proc/sys/kernel/hostname\")",
+        KNOB,
     ),
     (
         "agent/src/heartbeat.rs",
-        1,
-        "`/proc/sys/kernel/random/boot_id`: written by the kernel, ASCII hex; unreadable, a new boot is assumed",
+        "read_to_string(\"/proc/sys/kernel/random/boot_id\")",
+        KNOB,
+    ),
+    ("agent/src/heartbeat.rs", "read_state(path)", OWN),
+    (
+        "agent/src/module_trust/mod.rs",
+        "read_to_string(\"/proc/sys/kernel/osrelease\")",
+        KNOB,
     ),
     (
         "agent/src/module_trust/mod.rs",
-        1,
-        "`/proc/sys/kernel/osrelease`: a kernel knob, ASCII; unreadable, no release's tree is vouched for (the stricter side)",
+        "read_state(\"/proc/stat\")",
+        KNOB,
     ),
+    ("agent/src/module_trust/scan.rs", "fs::read(file)", PKG),
     (
         "agent/src/posture/golden.rs",
-        2,
-        "the golden replay's own audit file and its comparison with the committed file (lab and test tooling, our files)",
+        "read_to_string(&self.audit_path)",
+        LAB,
     ),
+    ("agent/src/posture/golden.rs", "read_to_string(&path)", LAB),
+    ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
     (
-        "agent/src/run_loop.rs",
-        3,
-        "the lab builds' trigger files (`debug-trigger`): absent or unreadable, nothing is triggered",
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "read_to_string(&path)",
+        CGROUP,
     ),
     (
         "antitamper-bpf/src/cgroup_floors.rs",
-        5,
-        "`/proc/meminfo` and `/sys/devices/system/cpu/online` (kernel-written ASCII; unreadable, the host is taken as large: no floor judged harmful for it), and our units' own cgroup files the floor writes and reads back (a read-back that fails is a floor not confirmed: reported)",
+        "read_to_string(&d.path)",
+        CGROUP,
     ),
     (
-        "crates/nn-admin/src/cli.rs",
-        2,
-        "the operator's own signed overlay, read after its signature was accepted, for the summary it prints (the agent judges the file itself)",
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "read_to_string(\"/proc/meminfo\")",
+        KNOB,
+    ),
+    (
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "read_to_string(\"/sys/devices/system/cpu/online\")",
+        KNOB,
+    ),
+    (
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "read_to_string(p)",
+        CGROUP,
+    ),
+    (
+        "antitamper-bpf/src/cgroup_guard.rs",
+        "fs::read(path)",
+        CGROUP,
+    ),
+    (
+        "antitamper-bpf/src/host_dropins.rs",
+        "read_lossy(Path::new(p))",
+        CONFIG,
+    ),
+    (
+        "antitamper-bpf/src/host_dropins.rs",
+        "read_lossy(&path)",
+        CONFIG,
+    ),
+    (
+        "antitamper-bpf/src/lib.rs",
+        "fs::read(format!(\"/proc/{pid}/comm\"))",
+        PROC,
+    ),
+    ("crates/nn-admin/src/cli.rs", "read_to_string(&file)", OPER),
+    ("crates/nn-admin/src/cli.rs", "read_to_string(path)", OPER),
+    (
+        "crates/nn-core/src/anti_tamper/combat_allow.rs",
+        "read_to_string(path)",
+        OPER,
+    ),
+    (
+        "crates/nn-core/src/decision/correlation/ancestry.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/decision/rules/module_provenance.rs",
+        "fs::read(entry.path())",
+        PKG,
+    ),
+    ("crates/nn-core/src/fim/rules.rs", "fs::read(path)", ACCT),
+    (
+        "crates/nn-core/src/impact/trust.rs",
+        "fs::read(entry.path())",
+        PKG,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/exempt.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.host_root.join(f))",
+        ACCT,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"mountinfo\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(path)",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(name).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(&path)",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(&status_path)",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/agent_id.rs",
+        "fs::read(\"/proc/sys/kernel/random/boot_id\")",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
-        1,
-        "`/proc/self/fdinfo/<fd>` of the agent's own BPF descriptors: kernel-written ASCII",
+        "read_to_string(format!(\"/proc/self/fdinfo/{fd}\"))",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/btf_revalidate.rs",
+        "fs::read(d.join(m))",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
-        1,
-        "our units' own cgroup files, compared with the configured value and written back when they differ (a read that fails is a difference: written)",
+        "read_to_string(&path)",
+        CGROUP,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/mod.rs",
+        "read_to_string(path)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/trusted_installer.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/bpf_crossview.rs",
+        "read_state(\"/proc/1/stat\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/caps/mod.rs",
+        "read_state(\"/proc/self/status\")",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/cgroup_join.rs",
-        4,
-        "the kernel's pid limits under `/proc/sys` and the boot id (ASCII; unreadable, the built-in bounds and a new boot), and the join judge's own state file (unreadable, the judge starts afresh: every join after the start is judged)",
+        "read_to_string(STATE_PATH)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/cgroup_join.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/cgroup_join.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/cgroup_join.rs",
+        "read_to_string(p)",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/cgroup_join.rs",
+        "read_to_string(\"/proc/sys/kernel/random/boot_id\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/combat/actuator.rs",
+        "read_state(dir.join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/combat/protected.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/combat/protected.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/decision_host_linux.rs",
+        "read_state(self.root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/decision_host_linux.rs",
+        "read_state(self.root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/fim/honeypot.rs",
-        1,
-        "`/proc/sys/kernel/random/boot_id`: kernel-written ASCII; unreadable, the honeypots are laid again",
+        "read_to_string(\"/proc/sys/kernel/random/boot_id\")",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/host_hardening.rs",
-        1,
-        "the install manifest we wrote, for the hardening report's provenance line (unreadable: the line says so, a Warn)",
+        "read_to_string(root.join(INSTALL_MANIFEST_REL))",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/host_hardening.rs",
+        "read_state(p)",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/kernel_state.rs",
-        1,
-        "a livepatch's `enabled`/`transition` flags under `/sys/kernel/livepatch` (kernel-written `0`/`1`); the patch itself is listed whatever they read",
+        "read_to_string(p.join(f))",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/known_system_prog.rs",
-        1,
-        "`/proc/<pid>/fdinfo/<fd>` (kernel-written ASCII): a descriptor that cannot be read proves no link — the program is then not told a known system one (the stricter side)",
+        "read_to_string(pdir.join(\"fdinfo\").join(fd.file_name()))",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/known_system_prog.rs",
+        "read_state(p)",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/known_system_prog.rs",
+        "read_state(pdir.join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/known_system_prog.rs",
+        "read_state(pdir.join(\"comm\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/module_writes.rs",
-        1,
-        "the judge's own state file (unreadable, it starts afresh: every write after the start is judged)",
+        "read_to_string(STATE_PATH)",
+        OWN,
     ),
     (
         "crates/nn-linux/src/own_dropins.rs",
-        1,
-        "`/proc/sys/kernel/pid_max`: a kernel knob, ASCII; unreadable, the built-in bound",
+        "read_to_string(\"/proc/sys/kernel/pid_max\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/own_dropins.rs",
+        "read_config(Path::new(p))",
+        CONFIG,
+    ),
+    (
+        "crates/nn-linux/src/own_dropins.rs",
+        "read_config(&from)",
+        CONFIG,
+    ),
+    (
+        "crates/nn-linux/src/own_dropins.rs",
+        "fs::read(&from)",
+        CONFIG,
+    ),
+    (
+        "crates/nn-linux/src/response/containment.rs",
+        "read_state(format!(\"/proc/{pid}/cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/response/containment.rs",
+        "read_to_string(path)",
+        OWN,
     ),
     (
         "crates/nn-linux/src/response/kill.rs",
-        1,
-        "a thread's `children` (kernel-written pid numbers): unreadable, the process is not taken as childless",
+        "read_to_string(t.ok()?.path().join(\"children\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/response/quarantine.rs",
-        1,
-        "a vault entry's `.meta`, written by us in UTF-8: unreadable, the entry is not shown (the vault's file stays)",
+        "read_to_string(cfg.quarantine_dir.join(\"vault\").join(format!(\"{vault_id}.meta\")),)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/response/quarantine.rs",
+        "fs::read(e.path())",
+        OWN,
     ),
     (
         "crates/nn-linux/src/response/throttle.rs",
-        1,
-        "our throttle cgroup's own knobs, read back after the write (a value that cannot be read is not confirmed)",
+        "read_to_string(dir.join(knob))",
+        CGROUP,
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
-        3,
-        "kernel-written ASCII: `oom_score_adj` of the agent and the watchdog, `/proc/self/limits`, `/proc/meminfo` — an unreadable value is not compared (no finding made from nothing)",
+        "read_state(\"/proc/self/status\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_to_string(\"/proc/self/limits\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_state(path)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_to_string(\"/proc/meminfo\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_state(\"/proc/self/cgroup\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_to_string(path)",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/sensor_feasibility.rs",
-        1,
-        "`/proc/kallsyms`, in the lab-only feasibility probe (`test-privileged`)",
+        "read_to_string(\"/proc/sys/kernel/osrelease\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensor_feasibility.rs",
+        "read_to_string(\"/proc/kallsyms\")",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/sensors/bus.rs",
-        1,
-        "`/proc/sys/kernel/random/boot_id` (kernel-written ASCII): unreadable, a new boot",
+        "read_to_string(\"/proc/sys/kernel/random/boot_id\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensors/dns_sensor.rs",
+        "read_state(path)",
+        ACCT,
     ),
     (
         "crates/nn-linux/src/sensors/epg.rs",
-        2,
-        "`pid_max` and `threads-max` under `/proc/sys`: kernel knobs, ASCII; unreadable, the built-in bounds",
+        "read_to_string(\"/proc/sys/kernel/pid_max\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensors/epg.rs",
+        "read_to_string(\"/proc/sys/kernel/threads-max\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(dir.join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(format!(\"{pid}/stat\")))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(format!(\"{pid}/status\")))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/multiplexer.rs",
+        "read_to_string(\"/proc/sys/kernel/perf_event_paranoid\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "read_state(format!(\"/proc/{pid}/status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "read_state(\"/etc/passwd\")",
+        ACCT,
+    ),
+    (
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "read_state(\"/etc/login.defs\")",
+        ACCT,
+    ),
+    (
+        "crates/nn-linux/src/sensors/ring_drops.rs",
+        "read_state(base.join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/ring_drops.rs",
+        "fs::read(base.join(\"cmdline\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/sysctl_guard.rs",
-        1,
-        "a sysctl under `/proc/sys` (kernel-written ASCII), compared with its floor: unreadable, it is not judged changed",
+        "read_to_string(root.join(p.trim_start_matches('/')))",
+        KNOB,
     ),
     (
         "crates/nn-linux/src/telemetry_probe.rs",
-        4,
-        "the self-test's own files (the agent's own-ids file, the lab's `debug-*` files) and `/proc/modules` (kernel-written ASCII)",
+        "read_to_string(p)",
+        LAB,
     ),
     (
-        "watchdog/src/lib.rs",
-        1,
-        "the watchdog's own record of the markers it honoured (unreadable: none honoured, so a replayed marker is refused — the stricter side)",
+        "crates/nn-linux/src/telemetry_probe.rs",
+        "read_to_string(\"/proc/modules\")",
+        KNOB,
     ),
+    (
+        "crates/nn-linux/src/telemetry_probe.rs",
+        "read_to_string(dir.join(\"debug-deny-detach\"))",
+        LAB,
+    ),
+    (
+        "crates/nn-linux/src/telemetry_probe.rs",
+        "read_to_string(dir.join(\"debug-probe-blind\"))",
+        LAB,
+    ),
+    (
+        "crates/nn-linux/src/verifier_check.rs",
+        "read_to_string(\"/proc/sys/kernel/osrelease\")",
+        KNOB,
+    ),
+    (
+        "crates/nn-linux/src/worker/supervisor.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
+        PROC,
+    ),
+    ("watchdog/src/lib.rs", "read_to_string(&honoured_path)", OWN),
+    (
+        "watchdog/src/lib.rs",
+        "fs::read(format!(\"/proc/{pid}/stat\"))",
+        PROC,
+    ),
+    ("watchdog/src/lib.rs", "fs::read(\"/proc/stat\")", KNOB),
 ];
 
 /// The argument list of the call whose `(` is at `open` in `code`.
@@ -225,75 +667,327 @@ fn arguments(code: &str, open: usize) -> &str {
     &code[open + 1..]
 }
 
-/// The statement from `at`: up to the next `;` (at most 400 bytes).
-fn statement(code: &str, at: usize) -> &str {
-    let rest = &code[at..];
-    let end = rest.find(';').unwrap_or(rest.len()).min(400);
-    let mut end = end.min(rest.len());
-    while !rest.is_char_boundary(end) {
-        end -= 1;
+/// `at` moved down to a char boundary of `code`.
+fn floor(code: &str, mut at: usize) -> usize {
+    at = at.min(code.len());
+    while !code.is_char_boundary(at) {
+        at -= 1;
     }
-    &rest[..end]
+    at
 }
 
-/// Rule 1's violations in one file's production code: the lines of a
-/// `read_to_string` of a process's `/proc` entry — named in its argument,
-/// or in the `let` that bound the variable it is given (within the 400
-/// bytes before the call).
+/// The start of the function `at` is in (its `fn `), or the file's start.
+fn function_start(code: &str, at: usize) -> usize {
+    code[..at].rfind("fn ").unwrap_or(0)
+}
+
+/// The statement the call at `at` is in, before it: from the statement's
+/// start (the last `;`, `{` or `}` — never before the function's start).
+fn head(code: &str, at: usize) -> &str {
+    let from = function_start(code, at);
+    let h = &code[from..at];
+    // the last `;`, `{` or `}` outside a string literal (`format!("{pid}")`)
+    let mut cut = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in h.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_str => escaped = true,
+            '"' => in_str = !in_str,
+            ';' | '{' | '}' if !in_str => cut = i + 1,
+            _ => {}
+        }
+    }
+    &h[cut..]
+}
+
+/// The statement the call at `at` is in, from it: to its `;` at its own
+/// depth, or the end of the block it is in, at most 800 bytes and never
+/// into the next function — a `match` or an `if let` block whole.
+fn tail(code: &str, at: usize) -> &str {
+    let b = code.as_bytes();
+    let stop = floor(code, at + 800);
+    let mut depth: i32 = 0;
+    let mut i = at;
+    while i < stop {
+        match b[i] {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+            }
+            b';' if depth == 0 => break,
+            b'f' if code[i..].starts_with("fn ") && i > at => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    &code[at..floor(code, i)]
+}
+
+/// The calls named `names` in `code`: `(position, name)`, a definition
+/// (`fn name(`) left out; a longer name is not the shorter one's (`read(`
+/// inside `read_state(` is not a read).
+fn calls<'a>(code: &str, names: &[&'a str]) -> Vec<(usize, &'a str)> {
+    let mut out: Vec<(usize, &str)> = Vec::new();
+    for name in names {
+        for (i, _) in code.match_indices(&format!("{name}(")) {
+            let before = code[..i].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            if code[..i].ends_with("fn ") {
+                continue;
+            }
+            out.push((i, name));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A path expression that names a process's own `/proc` entry or the mount
+/// table: a literal of [`PROC_ENTRIES`], or a per-process path whose last
+/// component is a variable (`format!("/proc/{pid}/{entry}")`).
+fn names_proc_entry(text: &str) -> bool {
+    PROC_ENTRIES.iter().any(|e| text.contains(e))
+        || text.contains("\"/proc/{") && text.contains("}/{")
+}
+
+/// The literal a path expression stands for in `code`, when the expression
+/// is a variable bound in the same function (`let x = …`), a `const`, or a
+/// field initialised with a literal (`field: "…"`, `field = "…"`).
+fn resolved<'a>(code: &'a str, at: usize, expr: &str) -> Vec<&'a str> {
+    let word: String = expr
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("self.")
+        .trim_start_matches("Path::new(")
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    let leaf = word.rsplit('.').next().unwrap_or("").to_string();
+    if leaf.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let from = function_start(code, at);
+    let body = &code[from..at];
+    for pat in [format!("let {leaf} "), format!("let mut {leaf} ")] {
+        if let Some(j) = body.rfind(&pat) {
+            out.push(tail(code, from + j));
+        }
+    }
+    for pat in [
+        format!("const {leaf}:"),
+        format!("static {leaf}:"),
+        format!("{leaf}: \""),
+        format!("{leaf} = \""),
+        format!("{leaf}: PathBuf::from(\""),
+        format!("{leaf}: Path::new(\""),
+    ] {
+        for (j, _) in code.match_indices(&pat) {
+            out.push(tail(code, j));
+        }
+    }
+    out
+}
+
+/// Rule 1's violations in one file's production code (their lines): a
+/// strict text read — `read_to_string` (a function or a reader's method),
+/// `String::from_utf8` of a read, `lines()` of a reader — of a process's
+/// `/proc` entry or the mount table, named in the read's argument or bound
+/// to it (a `let`, a `const`, a field's literal).
 fn strict_proc_reads(code: &str) -> Vec<usize> {
-    code.match_indices("read_to_string(")
-        .filter(|(i, m)| {
-            let args = arguments(code, i + m.len() - 1);
-            let names = |t: &str| PROC_ENTRIES.iter().any(|e| t.contains(e));
-            if names(args) {
-                return true;
+    let line = |i: usize| code[..i].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    for (i, name) in calls(code, &["read_to_string", "String::from_utf8", "lines"]) {
+        let args = arguments(code, i + name.len());
+        // the path: the call's argument, or what the statement opened
+        let mut exprs: Vec<&str> = vec![args];
+        let stmt = format!("{}{}", head(code, i), tail(code, i));
+        for opener in ["File::open(", ".open(", "fs::read(", "BufReader::new("] {
+            for (j, _) in stmt.match_indices(opener) {
+                exprs.push(arguments(&stmt, j + opener.len() - 1));
             }
-            let var = args.trim().trim_start_matches('&');
-            if var.is_empty() || !var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                return false;
+        }
+        if name == "lines" || args.trim_start().starts_with("&mut") {
+            // a reader's method: the reader bound earlier in the function
+            let recv: String = head(code, i)
+                .chars()
+                .rev()
+                .skip_while(|c| *c == '.' || c.is_whitespace())
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !recv.is_empty() {
+                exprs.extend(resolved(code, i, &recv));
             }
-            let mut from = i.saturating_sub(400);
-            while !code.is_char_boundary(from) {
-                from += 1;
-            }
-            let before = &code[from..*i];
-            before
-                .rfind(&format!("let {var} "))
-                .or_else(|| before.rfind(&format!("let mut {var} ")))
-                .is_some_and(|at| !before[at..].contains("fn ") && names(statement(before, at)))
-        })
-        .map(|(i, _)| code[..i].matches('\n').count() + 1)
-        .collect()
+        }
+        let mut texts: Vec<String> = Vec::new();
+        for e in &exprs {
+            texts.push(e.to_string());
+            texts.extend(resolved(code, i, e).into_iter().map(str::to_string));
+        }
+        if name == "String::from_utf8" && !stmt.contains("read") {
+            continue;
+        }
+        if name == "lines"
+            && !stmt.contains("open")
+            && !texts.iter().skip(1).any(|t| t.contains("open"))
+        {
+            continue;
+        }
+        if texts.iter().any(|t| names_proc_entry(t)) {
+            out.push(line(i));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
-/// Rule 2's sites in one file's production code: a `read_to_string(…)`
-/// whose statement takes `.ok()` or `.unwrap_or_default()`, or that a
-/// `let Ok(…) = … else` binds; a `lines()` loop that `continue`s on an
-/// error.
-fn defaulted_reads(code: &str) -> usize {
-    let reads = code
-        .match_indices("read_to_string(")
-        .filter(|(i, _)| {
-            let s = statement(code, *i);
-            let mut from = i.saturating_sub(120);
-            while !code.is_char_boundary(from) {
-                from += 1;
+/// The reads rule 2 looks at: the strict and the tolerant text reads, the
+/// byte read, the mount table's read.
+const READS: &[&str] = &[
+    "read_to_string",
+    "read_state",
+    "read_config",
+    "read_lossy",
+    "mountinfo::read",
+    "fs::read",
+];
+
+/// Whether the statement of a read turns its failure into a default.
+fn defaults(head: &str, tail: &str) -> bool {
+    let h = head.replace(char::is_whitespace, "");
+    let t = tail.replace(char::is_whitespace, "");
+    if h.contains("ifletOk(")
+        || h.contains("whileletOk(")
+        || h.contains("letOk(") && t.contains("else")
+    {
+        return true;
+    }
+    // the read's own method chain: up to the block a `match` or an `if`
+    // opens (its arms are looked at below), not into them
+    let mut depth = 0i32;
+    let mut chain_end = t.len();
+    for (i, c) in t.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '{' if depth == 0 => {
+                chain_end = i;
+                break;
             }
-            let head = &code[from..*i];
-            let bound = head
-                .rfind("let Ok(")
-                .is_some_and(|at| !head[at..].contains(';') && s.contains("else"));
-            s.contains(".ok()") || s.contains(".unwrap_or_default()") || bound
-        })
-        .count();
-    let loops = code
-        .match_indices("let Ok(")
-        .filter(|(i, _)| {
-            let s = &code[*i..code.len().min(i + 80)];
-            s.contains("= line else") && s.contains("continue")
-        })
-        .count();
-    reads + loops
+            _ => {}
+        }
+    }
+    let chain = &t[..chain_end];
+    if [
+        ".ok()",
+        ".unwrap_or_default()",
+        ".unwrap_or(",
+        ".unwrap_or_else(",
+        "map_while(Result::ok)",
+    ]
+    .iter()
+    .any(|d| chain.contains(d))
+    {
+        return true;
+    }
+    // a `match` arm that turns the error into an empty or a default value
+    // (`Err(_) => return Vec::new()`, `Err(e) => { warn!(..); None }`,
+    // `=> continue`), not into an error or an outcome of its own
+    t.match_indices("Err(").any(|(j, _)| {
+        let arm = &t[j..];
+        let Some(arrow) = arm.find("=>") else {
+            return false;
+        };
+        if arm[..arrow].contains("Ok(") {
+            return false;
+        }
+        let body = &arm[arrow + 2..arm.len().min(arrow + 2 + 160)];
+        // the arm's end: the next arm (`Ok(`, `_ =>`) or the block's end
+        let end = ["Ok(", "_=>", "}}"]
+            .iter()
+            .filter_map(|m| body.find(m))
+            .min()
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        if body.contains(".failed(") || body.contains(".holds(") || body.contains("Err(") {
+            return false;
+        }
+        [
+            "Vec::new()",
+            "String::new()",
+            "Default::default()",
+            "HashMap::new()",
+            "BTreeMap::new()",
+            "HashSet::new()",
+            "BTreeSet::new()",
+            "vec![]",
+            "None",
+            "continue",
+            "false",
+            "true",
+            "\"\"",
+        ]
+        .iter()
+        .any(|d| body.contains(d))
+            || body
+                .trim_start_matches("return")
+                .trim_start_matches('{')
+                .starts_with('0')
+    })
+}
+
+/// Rule 2's sites in one file's production code: `(line, key)` — a read of
+/// [`READS`] whose statement turns its failure into a default (`.ok()`,
+/// `unwrap_or*`, `if let Ok`, `let Ok(…) else`, a `match` arm that is no
+/// error), and a `lines()` loop that skips its read errors. The key is the
+/// read as written, spaces dropped (what [`KNOWN`] names).
+fn defaulted_reads(code: &str) -> Vec<(usize, String)> {
+    let line = |i: usize| code[..i].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    for (i, name) in calls(code, READS) {
+        if !defaults(head(code, i), tail(code, i)) {
+            continue;
+        }
+        let call = format!("{name}({})", arguments(code, i + name.len()));
+        let key: String = call
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .take(120)
+            .collect();
+        out.push((line(i), key));
+    }
+    for (i, _) in code.match_indices(".lines()") {
+        let t: String = code[i..floor(code, i + 300)]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let skips = t.starts_with(".lines().flatten()")
+            || t.starts_with(".lines().map_while(Result::ok)")
+            || t.starts_with(".lines().filter_map(Result::ok)")
+            || t.starts_with(".lines().filter_map(|l|l.ok())")
+            || (t.contains("Err(_)=>continue")
+                || t.contains("else{continue") && t.contains("letOk(line)"))
+                && t.find("Err(_)=>continue")
+                    .or_else(|| t.find("else{continue"))
+                    .is_some_and(|j| j < 200);
+        if skips {
+            out.push((line(i), "lines()".to_string()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The production code of every file of [`SCAN`], by path.
@@ -343,89 +1037,195 @@ fn no_process_entry_is_read_as_strict_text() {
 fn reads_that_default_on_failure_are_known() {
     let code = scan_code(&repo_root());
     let mut problems = Vec::new();
+    let mut used = vec![0usize; KNOWN.len()];
     for (file, text) in &code {
-        let n = defaulted_reads(text);
-        let known = KNOWN.iter().find(|(f, _, _)| f == file);
-        match (n, known) {
-            (0, None) => {}
-            (0, Some(_)) => problems.push(format!("{file}: in KNOWN, holds no site any more")),
-            (n, None) => problems.push(format!(
-                "{file}: {n} read(s) whose failure becomes a default — keep the last good \
-                 state (nn_linux::state_read::LastGood) or list the file with its reason"
-            )),
-            (n, Some((_, k, _))) if n != *k => {
-                problems.push(format!("{file}: {n} site(s), KNOWN says {k}"))
+        for (line, key) in defaulted_reads(text) {
+            match KNOWN.iter().position(|(f, k, _)| f == file && *k == key) {
+                Some(n) => used[n] += 1,
+                None => problems.push(format!(
+                    "{file}:{line}: `{key}` turns a failed read into a default — keep the last \
+                     good state (nn_linux::state_read::LastGood, a Condition) or list the site \
+                     in KNOWN with its reason"
+                )),
             }
-            _ => {}
         }
     }
-    for (file, _, why) in KNOWN {
+    for ((file, key, why), n) in KNOWN.iter().zip(&used) {
         assert!(code.contains_key(*file), "{file}: in KNOWN, not scanned");
         assert!(why.len() > 20, "{file}: give the reason");
+        if *n == 0 {
+            problems.push(format!("{file}: `{key}` in KNOWN, no such site any more"));
+        }
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
-/// Each rule fails on a planted violation.
+/// Rule 1 fails on every strict form and path source the review of #538
+/// (F4) planted, and not on the tolerant readers.
 #[test]
-fn the_rules_catch_planted_violations() {
+fn rule_one_catches_every_planted_strict_read() {
     let planted = r#"
-fn ppid(pid: u32) -> Option<u32> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse(&s)
+const MI: &str = "/proc/self/mountinfo";
+struct Ctl { roots_source: PathBuf }
+impl Ctl {
+    fn new() -> Self { Ctl { roots_source: "/proc/self/mountinfo".into() } }
+    fn roots(&self) -> String {
+        std::fs::read_to_string(&self.roots_source)?
+    }
 }
-fn uid(dir: &Path) -> Option<u32> {
-    let s = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
-    parse(&s)
+fn a(pid: u32) -> io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
 }
-fn count(r: impl BufRead) -> usize {
+fn b() -> io::Result<String> {
+    std::fs::read_to_string(MI)
+}
+fn c(pid: u32) -> io::Result<String> {
+    let mut s = String::new();
+    File::open(format!("/proc/{pid}/status"))?.read_to_string(&mut s)?;
+    Ok(s)
+}
+fn d(pid: u32) -> io::Result<String> {
+    Ok(String::from_utf8(fs::read(format!("/proc/{pid}/stat"))?).map_err(io::Error::other)?)
+}
+fn e(pid: u32, entry: &str) -> io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/{entry}"))
+}
+fn f() -> usize {
+    let r = BufReader::new(File::open("/proc/self/mountinfo").unwrap());
+    r.lines().count()
+}
+fn g(pid: u32) -> io::Result<String> {
+    let path = format!("/proc/{pid}/comm");
+    std::fs::read_to_string(path)
+}
+"#;
+    assert_eq!(
+        strict_proc_reads(planted),
+        vec![7, 11, 14, 18, 22, 25, 29, 33]
+    );
+    let clean = r#"
+fn a(pid: u32) -> io::Result<String> {
+    nn_linux::state_read::read_state(format!("/proc/{pid}/stat"))
+}
+fn b() -> io::Result<String> {
+    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+}
+fn c() -> io::Result<MountTable> {
+    nn_linux::mountinfo::read(Path::new("/proc/self/mountinfo"))
+}
+"#;
+    assert!(
+        strict_proc_reads(clean).is_empty(),
+        "{:?}",
+        strict_proc_reads(clean)
+    );
+}
+
+/// Rule 2 fails on every default the review of #538 (F4) planted — the
+/// tolerant readers' included — and not on a read whose error is
+/// propagated or that keeps the last good state.
+#[test]
+fn rule_two_catches_every_planted_default() {
+    let planted = r#"
+fn a(p: &Path) -> String {
+    if let Ok(t) = std::fs::read_to_string(p) { return t; }
+    String::new()
+}
+fn b(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_else(|_| String::new())
+}
+fn c(p: &Path) -> Vec<String> {
+    match std::fs::read_to_string(p) {
+        Ok(t) => t.lines().map(str::to_string).collect(),
+        Err(_) => return Vec::new(),
+    }
+}
+fn d(p: &Path) -> Vec<String> {
+    std::fs::read_to_string(p).map(|t| vec![t]).unwrap_or(Vec::new())
+}
+fn e(r: impl BufRead) -> usize {
     let mut n = 0;
     for line in r.lines() {
-        let Ok(line) = line else { continue };
-        n += line.len();
+        match line {
+            Ok(l) => n += l.len(),
+            Err(_) => continue,
+        }
     }
     n
 }
-fn ours() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/pid_max").unwrap_or_default()
+fn f(r: impl BufRead) -> usize {
+    r.lines().map_while(Result::ok).count()
 }
-fn comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/comm");
-    std::fs::read_to_string(path).ok()
+fn g(p: &Path) -> String {
+    nn_linux::state_read::read_state(p).unwrap_or_default()
 }
-fn dropins(files: &[PathBuf]) {
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        judge(&text);
+fn h(&self) -> Vec<Root> {
+    guarded_roots(&nn_linux::mountinfo::read(&self.roots_source).unwrap_or_default())
+}
+fn i(p: &Path) -> String {
+    read_lossy(p).unwrap_or_default()
+}
+fn j(p: &Path) -> Option<Vec<u8>> {
+    std::fs::read(p).ok()
+}
+fn k(p: &Path) -> String {
+    let Ok(t) = std::fs::read_to_string(p) else {
+        return String::new();
+    };
+    t
+}
+fn l(p: &Path) -> String {
+    match std::fs::read_to_string(p) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("{e}");
+            String::new()
+        }
     }
 }
 "#;
-    assert_eq!(strict_proc_reads(planted), vec![3, 7, 23]);
-    assert_eq!(defaulted_reads(planted), 6);
+    let lines: Vec<usize> = defaulted_reads(planted)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![3, 7, 10, 16, 20, 29, 32, 35, 38, 41, 44, 50],
+        "{lines:?}"
+    );
     let clean = r#"
-fn ppid(pid: u32) -> Option<u32> {
-    let s = nn_linux::state_read::read_state(format!("/proc/{pid}/stat")).ok()?;
-    parse(&s)
+fn a(p: &Path) -> io::Result<String> {
+    let t = std::fs::read_to_string(p)?;
+    Ok(t)
+}
+fn b(p: &Path) -> io::Result<String> {
+    match std::fs::read_to_string(p) {
+        Ok(t) => Ok(t),
+        Err(e) => return Err(e),
+    }
+}
+fn c(&mut self) {
+    match nn_linux::mountinfo::read(&self.source) {
+        Ok(t) => self.publish(&t),
+        Err(e) => self.read.failed(&e),
+    }
 }
 "#;
-    assert!(strict_proc_reads(clean).is_empty());
-    assert_eq!(defaulted_reads(clean), 0);
+    let found = defaulted_reads(clean);
+    assert!(found.is_empty(), "{found:?}");
 }
 
-/// The site counts of every scanned file (to fill [`KNOWN`]): a no-op
-/// unless `NN_PRINT_STATE_READS=1`.
+/// The sites of every scanned file (to fill [`KNOWN`]): a no-op unless
+/// `NN_PRINT_STATE_READS=1`.
 #[test]
-#[ignore = "prints the counts; NN_PRINT_STATE_READS=1, run by hand when the table moves"]
-fn print_the_counts() {
+#[ignore = "prints the sites; NN_PRINT_STATE_READS=1, run by hand when the table moves"]
+fn print_the_sites() {
     if std::env::var("NN_PRINT_STATE_READS").as_deref() != Ok("1") {
         return;
     }
     for (file, text) in scan_code(&repo_root()) {
-        let n = defaulted_reads(&text);
-        if n > 0 {
-            println!("{n:>3} {file}");
+        for (line, key) in defaulted_reads(&text) {
+            println!("SITE {file}:{line}\t{key}");
         }
         for l in strict_proc_reads(&text) {
             println!("STRICT {file}:{l}");

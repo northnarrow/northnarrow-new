@@ -28,27 +28,81 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
     std::fs::read(path).map(nn_core::posture::host::state_text)
 }
 
+/// Lot 311 (the review of #538, F9): a configuration file a judge reads (a
+/// drop-in, an `EnvironmentFile=`) — a regular file only, opened without
+/// blocking, at most `antitamper_bpf`'s 1 MiB, its bytes made text
+/// ([`antitamper_bpf::host_dropins::read_lossy`]): a FIFO no longer stalls
+/// the judge, nor `/dev/zero` exhausts it.
+pub fn read_config(path: &Path) -> io::Result<String> {
+    antitamper_bpf::host_dropins::read_lossy(path)
+}
+
+/// Lot 311 (the review of #538): a condition a part of the agent finds and
+/// sees end — a table it cannot read, lines of it it cannot parse, roots the
+/// kernel's map refuses. While it holds it is a degradation of `source`
+/// (listed by `nn-admin status`, counted against the trust level, signed in
+/// the audit chain): reported once, again only when what it says changes;
+/// withdrawn when it ends — and signed before that (`degradation::withdraw`
+/// signs what the flush has not yet), so a condition shorter than the
+/// flush period still leaves its record in the chain.
+#[derive(Debug)]
+pub struct Condition {
+    source: &'static str,
+    holding: Option<String>,
+}
+
+impl Condition {
+    pub const fn new(source: &'static str) -> Self {
+        Condition {
+            source,
+            holding: None,
+        }
+    }
+
+    /// It holds, as `detail` says.
+    pub fn holds(&mut self, detail: String) {
+        if self.holding.as_deref() == Some(detail.as_str()) {
+            return;
+        }
+        if self.holding.is_some() {
+            crate::boot::degradation::withdraw(self.source, &[]);
+        }
+        tracing::warn!(source = self.source, detail = %detail, "degraded");
+        crate::boot::degradation::report(self.source, &detail);
+        self.holding = Some(detail);
+    }
+
+    /// It ended: withdrawn (its signed record stays in the chain).
+    pub fn ended(&mut self) {
+        if self.holding.take().is_some() {
+            tracing::info!(source = self.source, "no longer degraded");
+            crate::boot::degradation::withdraw(self.source, &[]);
+        }
+    }
+
+    /// It holds now.
+    pub fn holding(&self) -> bool {
+        self.holding.is_some()
+    }
+}
+
 /// Lot 311 (F4): the rule of a reader that publishes what it read of the
 /// kernel's state (the guarded roots, the slices): when a read fails, what
 /// it last published stays in force — never an empty set in its place —
-/// and the failure is a degradation of `source` (the registry: listed by
-/// `nn-admin status`, signed in the audit chain), reported once while the
-/// reads fail and withdrawn at the next good one. The caller publishes on
-/// a good read only; this keeps the account.
+/// and the failure is a [`Condition`] of `source` while the reads fail.
+/// The caller publishes on a good read only; this keeps the account.
 #[derive(Debug)]
 pub struct LastGood {
-    source: &'static str,
     what: &'static str,
-    failing: bool,
+    unread: Condition,
 }
 
 impl LastGood {
     /// A reader of `what` (the file, in words) for the part `source`.
     pub const fn new(source: &'static str, what: &'static str) -> Self {
         LastGood {
-            source,
             what,
-            failing: false,
+            unread: Condition::new(source),
         }
     }
 
@@ -62,35 +116,47 @@ impl LastGood {
 
     /// A read failed: logged and reported (once while the reads fail).
     pub fn failed(&mut self, e: &io::Error) {
-        if self.failing {
-            return;
+        if !self.unread.holding() {
+            tracing::warn!(
+                what = self.what,
+                error = %e,
+                "kernel state unreadable — the last good reading stays in force"
+            );
         }
-        self.failing = true;
-        tracing::warn!(
-            source = self.source,
-            what = self.what,
-            error = %e,
-            "kernel state unreadable — the last good reading stays in force"
-        );
-        crate::boot::degradation::report(self.source, &self.detail());
+        let detail = self.detail();
+        self.unread.holds(detail);
     }
 
-    /// A read succeeded: a degradation reported for the failures is
-    /// withdrawn (its signed record stays in the chain).
+    /// A read succeeded: the degradation is withdrawn.
     pub fn ok(&mut self) {
-        if std::mem::take(&mut self.failing) {
-            tracing::info!(
-                source = self.source,
-                what = self.what,
-                "kernel state readable again"
-            );
-            crate::boot::degradation::withdraw(self.source, &[]);
-        }
+        self.unread.ended();
     }
 
     /// The reads fail now.
     pub fn failing(&self) -> bool {
-        self.failing
+        self.unread.holding()
+    }
+}
+
+/// Lot 311 (the review of #538, F2): the lines of a mount table that are
+/// not in the kernel's shape are a [`Condition`] (`rows`) while there are
+/// any — never dropped in silence: their mounts are not judged by the
+/// caller (`what`, in words).
+pub fn mount_rows(rows: &mut Condition, table: &crate::mountinfo::MountTable, what: &str) {
+    match table.malformed.first() {
+        None => rows.ended(),
+        Some(first) => rows.holds(format!(
+            "{} line(s) of the mount table are not in the kernel's shape ({}, line {}{}): \
+             {what} does not judge their mounts",
+            table.malformed.len(),
+            first.why,
+            first.line,
+            first
+                .mount_point
+                .as_ref()
+                .map(|p| format!(", mount point {}", p.to_string_lossy()))
+                .unwrap_or_default()
+        )),
     }
 }
 
@@ -221,6 +287,7 @@ mod tests {
     /// the reads fail, withdrawn by the next good one.
     #[test]
     fn a_failed_read_is_one_degradation_until_a_good_one() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let mut r = LastGood::new("lot311_test_reader", "the test table");
         let has = || {
             crate::boot::degradation::entries()
@@ -241,5 +308,39 @@ mod tests {
         r.ok();
         assert!(!r.failing());
         assert_eq!(has(), 0);
+    }
+
+    /// Lot 311 (the review of #538, F2): lines of a mount table that are
+    /// not in the kernel's shape are a degradation while there are any —
+    /// never dropped in silence — and it ends with them.
+    #[test]
+    fn unparsed_mount_lines_are_a_degradation_while_they_last() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let mut rows = Condition::new("lot311_test_rows");
+        let mine = || {
+            crate::boot::degradation::entries()
+                .into_iter()
+                .filter(|d| d.source == "lot311_test_rows")
+                .map(|d| d.detail)
+                .collect::<Vec<_>>()
+        };
+        let good = crate::mountinfo::parse(b"30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n");
+        mount_rows(&mut rows, &good, "the test");
+        assert!(mine().is_empty());
+        let odd = crate::mountinfo::parse(
+            b"30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n57 1 0:44 / /home/u/mnt rw fuse.x x rw\n",
+        );
+        mount_rows(&mut rows, &odd, "the test");
+        let d = mine();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].contains("1 line(s)") && d[0].contains("/home/u/mnt"),
+            "{d:?}"
+        );
+        mount_rows(&mut rows, &odd, "the test");
+        assert_eq!(mine().len(), 1, "reported once");
+        mount_rows(&mut rows, &good, "the test");
+        assert!(mine().is_empty(), "withdrawn");
+        assert!(!rows.holding());
     }
 }

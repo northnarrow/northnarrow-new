@@ -207,7 +207,15 @@ fn is_mount_point_in(path: &Path, tables: &[&Path]) -> bool {
     else {
         return false;
     };
+    // lot 311 (the review of #538, F2): a line not in the kernel's shape is
+    // signed, and one that still names the scope as its mount point counts
+    let mut rows = nn_linux::state_read::Condition::new("cow_mount_scope_rows");
+    nn_linux::state_read::mount_rows(&mut rows, &table, "the copy-on-write guard's scopes");
     table.entries.iter().any(|m| m.mount_point == path)
+        || table
+            .malformed
+            .iter()
+            .any(|m| m.mount_point.as_deref() == Some(path))
 }
 
 impl Runtime {
@@ -1083,5 +1091,14 @@ mod lot311 {
         ));
         assert!(!is_mount_point_in(Path::new("/srv"), &[&t]));
         assert!(!is_mount_point_in(Path::new("/srv/data"), &[&missing]));
+        // the review of #538 (F2): a source `-`, and a line not in the
+        // kernel's shape that still names the scope
+        std::fs::write(
+            &t,
+            b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n32 1 8:3 / /srv/odd rw ext4 x rw\n",
+        )
+        .unwrap();
+        assert!(is_mount_point_in(Path::new("/srv/fuse"), &[&t]));
+        assert!(is_mount_point_in(Path::new("/srv/odd"), &[&t]));
     }
 }

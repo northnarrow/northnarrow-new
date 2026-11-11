@@ -141,17 +141,20 @@ impl Kernel {
         out
     }
 
-    /// Replace the guarded mount roots with `roots`.
-    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
+    /// Replace the guarded mount roots with `roots`; how many the kernel's
+    /// map refused (lot 311, the review of #538, F3: `EXECQ_ROOTS` holds 64
+    /// — the caller signs a refusal instead of losing the root in silence).
+    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
         let old: Vec<AyaKey> = self.roots.keys().filter_map(|k| k.ok()).collect();
         for k in old {
             if !roots.iter().any(|(r, _)| *r == k.0) {
                 let _ = self.roots.remove(&k);
             }
         }
-        for (k, v) in roots {
-            let _ = self.roots.insert(AyaKey(*k), *v, 0);
-        }
+        roots
+            .iter()
+            .filter(|(k, v)| self.roots.insert(AyaKey(*k), *v, 0).is_err())
+            .count()
     }
 }
 
@@ -194,45 +197,50 @@ pub fn root_kind_of(mp: &str) -> u32 {
 /// 311: [`nn_linux::mountinfo`]), with the point's kind ([`root_kind_of`]):
 ///
 /// - a mount of a filesystem's own root (field 4 is `/`) at a guarded
-///   mount point;
+///   mount point, keyed by its root ([`nn_linux::mountinfo::MountEntry::
+///   root_key`]: read without following a link, and only while the mount
+///   point shows the mount's device — a user who swapped the point for a
+///   link to another filesystem's root does not get that root published);
 /// - lot 311 (bug hunt 1.4, BUG-108, the userland half): a mount of a
 ///   directory of a filesystem none of whose mounts is its root — a btrfs
 ///   subvolume (`/home` on Fedora and openSUSE: `subvol=/home`, field 4
 ///   `/home`); a bind mount of a directory of a filesystem mounted at its
 ///   root elsewhere (`/srv/data` bound at `/home`) is not a root the
 ///   kernel's walk ends on, and is left out as before;
-/// - lot 311 (N8): a FUSE mount root cannot `stat` (a user's mount without
-///   `allow_other`: `EACCES`) is keyed from the table — its device, and
-///   inode 1, FUSE's root (`FUSE_ROOT_ID`).
+/// - lot 311 (N8, and the review of #538, F1): every FUSE mount, wherever
+///   it is mounted — classed by its type, never by its root's inode, which
+///   its daemon (the user) names and changes at will: keyed by its device
+///   alone, `(dev, FUSE_BY_DEVICE)`. The kernel's half (lot 318) tells a
+///   FUSE file by its superblock's magic and looks its device up so.
 ///
 /// A mount point that is not UTF-8 is classed by its text with the bytes
-/// replaced and `stat`ed by its bytes.
+/// replaced.
 pub fn guarded_roots(table: &nn_linux::mountinfo::MountTable) -> Vec<(ExecqKey, u32)> {
     let mut out: Vec<(ExecqKey, u32)> = Vec::new();
     for m in &table.entries {
-        let own_root = m.root == std::path::Path::new("/");
-        if !own_root
-            && table
-                .entries
-                .iter()
-                .any(|o| o.same_dev(m) && o.root == std::path::Path::new("/"))
-        {
-            continue;
-        }
         let mp = m.mount_point.to_string_lossy();
-        if !guarded_mount_point(&mp) {
-            continue;
-        }
-        let key = match std::fs::metadata(&m.mount_point) {
-            Ok(st) => ExecqKey {
-                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),
-                ino: st.ino(),
-            },
-            Err(_) if own_root && is_fuse(&m.fstype) => ExecqKey {
-                dev: (u64::from(m.major) << 20) | u64::from(m.minor),
-                ino: FUSE_ROOT_ID,
-            },
-            Err(_) => continue,
+        let key = if nn_linux::mountinfo::is_fuse(&m.fstype) {
+            ExecqKey {
+                dev: m.kernel_dev(),
+                ino: FUSE_BY_DEVICE,
+            }
+        } else {
+            let own_root = m.root == std::path::Path::new("/");
+            if !own_root
+                && table
+                    .entries
+                    .iter()
+                    .any(|o| o.same_dev(m) && o.root == std::path::Path::new("/"))
+            {
+                continue;
+            }
+            if !guarded_mount_point(&mp) {
+                continue;
+            }
+            let Some((dev, ino)) = m.root_key() else {
+                continue;
+            };
+            ExecqKey { dev, ino }
         };
         if !out.iter().any(|(k, _)| *k == key) {
             out.push((key, root_kind_of(&mp)));
@@ -241,16 +249,22 @@ pub fn guarded_roots(table: &nn_linux::mountinfo::MountTable) -> Vec<(ExecqKey, 
     out
 }
 
-/// The inode number of a FUSE filesystem's root (`FUSE_ROOT_ID`,
-/// include/uapi/linux/fuse.h): the kernel gives the root that number
-/// whatever the daemon answers.
-const FUSE_ROOT_ID: u64 = 1;
-
-/// A FUSE filesystem's type in the table: `fuse`, `fuseblk`, `fuse.<name>`.
-fn is_fuse(fstype: &std::ffi::OsStr) -> bool {
-    let t = fstype.as_encoded_bytes();
-    t == b"fuse" || t == b"fuseblk" || t.starts_with(b"fuse.")
+/// Tests: the mount line of this host's `/tmp` with its own device (lot 311:
+/// a root is published only while its mount point shows the line's
+/// device), mount id `id`.
+#[cfg(test)]
+pub(crate) fn tmp_mount_line(id: u32) -> String {
+    let dev = std::fs::metadata("/tmp").unwrap().dev();
+    format!(
+        "{id} 1 {}:{} / /tmp rw - tmpfs tmpfs rw\n",
+        libc::major(dev),
+        libc::minor(dev)
+    )
 }
+
+/// Lot 311 (the review of #538, F1): the inode of a FUSE filesystem's key
+/// in `EXECQ_ROOTS` — no inode is 0: the key names the device alone.
+pub const FUSE_BY_DEVICE: u64 = 0;
 
 #[cfg(test)]
 mod tests {
@@ -278,10 +292,13 @@ mod tests {
     fn only_filesystem_roots_at_guarded_points_are_kept() {
         // a bind mount of a subdirectory (root field not `/`) and an
         // unguarded mount are ignored; /tmp itself exists on every host
-        let text = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
-             2 1 0:5 / /tmp rw - tmpfs tmpfs rw\n\
+        let text = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             {}\
              3 1 8:1 /srv/data /home rw - ext4 /dev/sda1 rw\n\
-             4 1 0:6 / /usr rw - tmpfs tmpfs rw\n";
+             4 1 0:6 / /usr rw - tmpfs tmpfs rw\n",
+            tmp_mount_line(2)
+        );
         let roots = guarded_roots(&nn_linux::mountinfo::parse(text.as_bytes()));
         assert_eq!(roots.len(), 1, "{roots:?}");
         let m = std::fs::metadata("/tmp").unwrap();
@@ -332,26 +349,49 @@ mod tests {
         );
     }
 
-    /// Lot 311 (N8): a user's FUSE mount under a guarded point that root
-    /// cannot `stat` (no `allow_other`: `EACCES`) is keyed from the table —
-    /// its device and FUSE's root inode — instead of left without a class.
-    /// A mount point that is not UTF-8 is `stat`ed by its bytes.
+    /// Lot 311 (N8, and the review of #538, F1 and F2): a FUSE mount — a
+    /// user's, root cannot `stat` it (no `allow_other`), and its daemon
+    /// names its root's inode at will — is classed by its type and keyed by
+    /// its device alone, wherever it is mounted; one whose source is `-`
+    /// (`fsname=-`) or empty too. A mount point that is not UTF-8 is read
+    /// by its bytes; another mount whose point does not show its device is
+    /// left out.
     #[test]
-    fn a_fuse_mount_root_cannot_stat_is_keyed_from_the_table() {
+    fn a_fuse_mount_is_keyed_by_its_device_whatever_its_root_or_source() {
         let text = b"57 1 0:44 / /home/u/nn-lot311-absent/\xffmnt rw,nosuid,nodev - fuse.sshfs u@h:/ rw,user_id=1000\n\
-             58 1 0:45 / /tmp/nn-lot311-absent rw - ext4 /dev/vdb rw\n";
-        let roots = guarded_roots(&nn_linux::mountinfo::parse(text));
+             58 1 0:45 / /tmp/nn-lot311-absent rw - ext4 /dev/vdb rw\n\
+             59 1 0:46 / /run/lock/u rw,nosuid,nodev - fuse.x - rw,user_id=1000\n\
+             60 1 0:47 / /tmp/nn-lot311-y rw,nosuid,nodev - fuse  rw,user_id=1000\n";
+        let table = nn_linux::mountinfo::parse(text);
+        assert!(table.malformed.is_empty(), "{:?}", table.malformed);
+        let roots = guarded_roots(&table);
         assert_eq!(
             roots,
-            vec![(
-                ExecqKey { dev: 44, ino: 1 },
-                root_kind::GUARDED | root_kind::HOME
-            )],
-            "the FUSE root keyed from the table, the other unreadable root left out"
+            vec![
+                (
+                    ExecqKey {
+                        dev: 44,
+                        ino: FUSE_BY_DEVICE
+                    },
+                    root_kind::GUARDED | root_kind::HOME
+                ),
+                (
+                    ExecqKey {
+                        dev: 46,
+                        ino: FUSE_BY_DEVICE
+                    },
+                    root_kind::GUARDED
+                ),
+                (
+                    ExecqKey {
+                        dev: 47,
+                        ino: FUSE_BY_DEVICE
+                    },
+                    root_kind::GUARDED | root_kind::TMP
+                ),
+            ],
+            "every FUSE mount by its device, the unreadable ext4 root left out"
         );
-        assert!(is_fuse(std::ffi::OsStr::new("fuse")));
-        assert!(is_fuse(std::ffi::OsStr::new("fuseblk")));
-        assert!(!is_fuse(std::ffi::OsStr::new("fusectl")));
     }
 
     /// Lot 311 (BUG-108, the lab's check): the mount at
@@ -372,15 +412,15 @@ mod tests {
             .find(|m| m.mount_point.as_os_str() == mp)
             .unwrap_or_else(|| panic!("{mp:?} is not a mount point"));
         let roots = guarded_roots(&table);
-        let key = std::fs::metadata(&entry.mount_point)
-            .map(|st| ExecqKey {
-                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),
-                ino: st.ino(),
-            })
-            .unwrap_or(ExecqKey {
-                dev: (u64::from(entry.major) << 20) | u64::from(entry.minor),
-                ino: FUSE_ROOT_ID,
-            });
+        let key = if nn_linux::mountinfo::is_fuse(&entry.fstype) {
+            ExecqKey {
+                dev: entry.kernel_dev(),
+                ino: FUSE_BY_DEVICE,
+            }
+        } else {
+            let (dev, ino) = entry.root_key().expect("the mount's root key");
+            ExecqKey { dev, ino }
+        };
         println!(
             "mount {mp:?}: root {:?} fstype {:?} key {key:?}; guarded roots {roots:?}",
             entry.root, entry.fstype

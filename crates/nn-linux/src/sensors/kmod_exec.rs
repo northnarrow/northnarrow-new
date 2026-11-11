@@ -62,6 +62,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -362,12 +363,17 @@ fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
     f.take(256).read_to_end(&mut head).ok()?;
     let line = head.strip_prefix(b"#!")?;
     let line = line.split(|b| *b == b'\n').next()?;
-    let path = std::str::from_utf8(line)
-        .ok()?
-        .split([' ', '\t'])
+    // lot 311 (the review of #538, F9): the interpreter's word read as
+    // bytes — an argument after it that is not UTF-8 hid the interpreter
+    let path = line
+        .split(|b| *b == b' ' || *b == b'\t')
         .find(|w| !w.is_empty())?;
-    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
-    Some((path.to_string(), (stat_dev_to_kernel_dev(m.dev()), m.ino())))
+    let rel = std::ffi::OsStr::from_bytes(path.strip_prefix(b"/").unwrap_or(path));
+    let m = std::fs::metadata(root.join(rel)).ok()?;
+    Some((
+        String::from_utf8_lossy(path).into_owned(),
+        (stat_dev_to_kernel_dev(m.dev()), m.ino()),
+    ))
 }
 
 /// Lot 283b: the nearest package manager proper in `pid`'s lineage — `pid`
@@ -2099,5 +2105,31 @@ mod tests {
         assert_eq!(ppid(&dir), Some(66));
         assert_eq!(real_uid(&dir), Some(0));
         assert_eq!(thread_count(t.path(), 4304), Some(1));
+    }
+
+    /// Lot 311 (the review of #538, F9): a `#!` line whose argument is not
+    /// UTF-8 still names its interpreter (on main the whole line was
+    /// refused: the interpreter hidden).
+    #[test]
+    fn a_shebang_with_a_non_utf8_argument_names_its_interpreter() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("usr/bin")).unwrap();
+        std::fs::write(t.path().join("usr/bin/interp"), b"x").unwrap();
+        std::fs::write(t.path().join("script"), b"#!/usr/bin/interp -\xff\nbody\n").unwrap();
+        let m = std::fs::metadata(t.path().join("script")).unwrap();
+        let exe = ExeIdentity {
+            dev: stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+            path: "/script".to_string(),
+            ..Default::default()
+        };
+        let i = std::fs::metadata(t.path().join("usr/bin/interp")).unwrap();
+        assert_eq!(
+            shebang(t.path(), &exe),
+            Some((
+                "/usr/bin/interp".to_string(),
+                (stat_dev_to_kernel_dev(i.dev()), i.ino())
+            ))
+        );
     }
 }
