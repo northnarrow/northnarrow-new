@@ -278,7 +278,8 @@ fn two_writers_of_one_tree_are_its_attack() {
     .unwrap();
     let (store, problems) = Store::open(cfg, None);
     assert!(problems.is_empty(), "{problems:?}");
-    let guard = Runtime::start(Arc::clone(&store), AuthSessionTracker::new(dir.path()))
+    // the host's /proc: the writers' lineage is read as the agent reads it
+    let guard = Runtime::start(Arc::clone(&store), AuthSessionTracker::new("/proc"))
         .expect("the guard starts");
     // each writer's copy committed before the next one opens the file (a
     // write-open is recorded for a file the index holds)
