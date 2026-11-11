@@ -1975,3 +1975,104 @@ fn range_bootstrap_checks_first_and_records_what_it_installed() {
     assert!(read("deploy/adversarial/00_config.sh")
         .contains(": \"${RANGE_PROVENANCE:=/root/range-provenance.txt}\""));
 }
+
+// ── Lot 303: a unit that does not start says why (nn-lab.sh install) ──────
+
+/// `lab_start_units` with the guest stubbed: `vcargo` exits `start_rc`;
+/// `vssh` runs its command here, with `sudo`, `systemctl` and `journalctl`
+/// shims on the PATH (journalctl prints an agent's start that refused, as
+/// the namespace journal holds it: every line at priority info, the level
+/// in its text), and records it.
+fn start_units(dir: &Path, start_rc: i32) -> Output {
+    let bin = dir.join("bin");
+    write_exec(&bin.join("sudo"), "#!/bin/sh\nexec \"$@\"\n");
+    write_exec(
+        &bin.join("systemctl"),
+        "#!/bin/sh\necho '     Active: failed (Result: exit-code)'\necho '   Main PID: 9 (code=exited, status=78)'\n",
+    );
+    let mut journal = String::from("#!/bin/sh\n");
+    for i in 0..60 {
+        journal.push_str(&format!("echo 'agent[9]: INFO boot step {i}'\n"));
+    }
+    journal.push_str(
+        "echo 'agent[9]: 2026-11-11T04:40:18Z ERROR start refused gate=\"deny_hooks\" exit=78'\n\
+         echo 'agent[9]: INFO anti-tamper: the refused start pid withdrawn'\n",
+    );
+    // the watchdog's lines after it: the refusal is not among the last ones
+    for i in 0..12 {
+        journal.push_str(&format!("echo 'watchdog[10]: INFO waiting {i}'\n"));
+    }
+    write_exec(&bin.join("journalctl"), &journal);
+    let script = format!(
+        "{prelude}{block}\n\
+         vcargo() {{ echo \"vcargo: $*\" >> {calls:?}; return {start_rc}; }}\n\
+         vssh() {{ echo \"vssh: $*\" >> {calls:?}; PATH={bin:?}:$PATH bash -c \"$*\"; }}\n\
+         lab_start_units\necho started\n",
+        prelude = fn_prelude(),
+        block = block(NN_LAB, "start-units"),
+        calls = dir.join("calls").display().to_string(),
+        bin = bin.display().to_string(),
+    );
+    bash(&script, &[], &[])
+}
+
+/// Lot 303 (named): the nightly's Debian 13 guest failed `install` four
+/// nights running with systemd's "control process exited with error code"
+/// alone — the agent's refusal (exit 78, the deny_hooks gate: OWN_BPF_IDS
+/// full) was in its journal namespace, which nothing printed. A start that
+/// fails now prints the units' status, this boot's error and warning lines
+/// of both units from that namespace and their last lines, then fails; a
+/// start that succeeds reads no journal. The units log to stdout, so the
+/// journal holds every line at priority info: the level is read in the
+/// text (a `-p warning` filter printed nothing on the fresh guest).
+#[test]
+fn a_unit_that_does_not_start_prints_the_agent_s_refusal() {
+    let dir = case_dir("start-units");
+    let out = start_units(&dir, 1);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(!t.contains("started"), "{t}");
+    assert!(
+        t.contains("ERROR start refused gate=\"deny_hooks\" exit=78"),
+        "the refusal is printed: {t}"
+    );
+    assert!(t.contains("status=78"), "the unit's status: {t}");
+    assert!(t.contains("waiting 11"), "the last lines: {t}");
+    assert!(
+        !t.contains("boot step 3\n") && !t.contains("waiting 2\n"),
+        "the INFO lines are not all printed: {t}"
+    );
+    assert!(
+        t.contains(
+            "nn-lab: ERROR: the units did not start (the agent's refusal above names its gate)"
+        ),
+        "{t}"
+    );
+    let calls = fs::read_to_string(dir.join("calls")).unwrap();
+    let vssh = calls
+        .lines()
+        .find(|l| l.starts_with("vssh: "))
+        .unwrap_or_else(|| panic!("no journal read: {calls}"));
+    for want in [
+        "journalctl --namespace=northnarrow -b",
+        "-u northnarrow-agent -u northnarrow-watchdog",
+    ] {
+        assert!(vssh.contains(want), "{want}: {vssh}");
+    }
+    assert!(
+        !vssh.contains(" -p "),
+        "a priority filter finds nothing: {vssh}"
+    );
+    assert!(calls.contains("enable --now northnarrow-agent"), "{calls}");
+
+    let ok = case_dir("start-units-ok");
+    let out = start_units(&ok, 0);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("started") && !t.contains("start refused"), "{t}");
+    let calls = fs::read_to_string(ok.join("calls")).unwrap();
+    assert!(
+        !calls.contains("vssh: "),
+        "a started unit reads no journal: {calls}"
+    );
+}
