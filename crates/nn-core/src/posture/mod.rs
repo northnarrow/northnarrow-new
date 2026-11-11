@@ -1170,12 +1170,9 @@ impl<H: DecisionHost> PostureMachine<H> {
             "debug-trigger force_state_for_test".into()
         });
         drop(guard);
-        let after = target;
-        if before != after {
-            if before != PostureKind::Combat && after == PostureKind::Combat {
-                if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
-                    hook(&CombatEntry::forced(CombatCause::DebugForce));
-                }
+        if before != PostureKind::Combat && target == PostureKind::Combat {
+            if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
+                hook(&CombatEntry::forced(CombatCause::DebugForce));
             }
         }
     }

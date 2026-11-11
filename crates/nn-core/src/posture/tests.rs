@@ -460,7 +460,10 @@ fn a_lock_a_later_signal_acquires_is_a_transition_row() {
     let log = m.transition_log();
     assert_eq!(log.len(), rows + 1, "one row: {log:?}");
     let row = log.last().unwrap();
-    assert_eq!((row.from, row.to), (PostureKind::Combat, PostureKind::Combat));
+    assert_eq!(
+        (row.from, row.to),
+        (PostureKind::Combat, PostureKind::Combat)
+    );
     assert!(row.reason.starts_with("COMBAT locked: "), "{}", row.reason);
     assert_eq!(heard.lock().len(), 1, "the ladder is not engaged again");
 }
