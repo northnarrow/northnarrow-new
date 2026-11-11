@@ -10,6 +10,7 @@
 #   sudo bash deploy/lab/cow/cow-check.sh auto     [--fs ext4|xfs]
 #   sudo bash deploy/lab/cow/cow-check.sh negative [--fs ext4|xfs]
 #   sudo bash deploy/lab/cow/cow-check.sh bench    [--fs ext4|xfs] [--bench-bin PATH]
+#   sudo bash deploy/lab/cow/cow-check.sh reuse    [--fs ext4|xfs]
 #   sudo bash deploy/lab/cow/cow-check.sh cleanup
 #
 # setup:    the test tree's filesystem (xfs: a 2 GiB loop image, reflink=1),
@@ -31,6 +32,13 @@
 #           then `cp` (not a trusted writer) over a few: copies taken (the
 #           guard is live).
 # bench:    cow_bench outside and inside the scope (guard off / on).
+# reuse:    lot 315 (the triage's N2): an attack process rewrites a file (its
+#           copy is taken) and deletes it; the owner's new file in the same
+#           directory, copied in with an old mtime (`cp -p`), inherits the
+#           inode number (tried until the filesystem hands it out again);
+#           `remediate ransomware --pid` must recreate the attack's file and
+#           leave the owner's file where it is — never move it into the
+#           journal's evidence, whose expiry would delete it.
 #
 # Exit: 0 PASS, 1 FAIL, 2 NOT RUN (a prerequisite is missing).
 set -u
@@ -347,6 +355,60 @@ bench() {
     rm -rf "$off" "$on"
 }
 
+reuse() {
+    guard_status | head -1 | grep -q ': running' || notrun "the guard is not running (setup first)"
+    local dir=$TREE/docs try ino_x ino_d pid sum_d src
+    [[ -d $dir ]] || notrun "no $dir (run setup and make_tree first: a marked directory)"
+    find "$dir" -mindepth 1 -delete 2>/dev/null
+    src=/home/$LAB_USER/nn-reuse-src.bin
+    sudo -u "$LAB_USER" bash -c "head -c 4096 /dev/urandom > $src && touch -d '2025-01-01 00:00' $src"
+    for try in $(seq 1 30); do
+        sudo -u "$LAB_USER" bash -c "printf 'x original %s\\n' $try > $dir/x.txt; head -c 8192 /dev/zero | tr '\\0' x >> $dir/x.txt"
+        ino_x=$(stat -c %i "$dir/x.txt")
+        sum_x=$(sha256sum < "$dir/x.txt" | cut -d' ' -f1)
+        # the attack: a write-open (the guard copies first), junk, then the file deleted
+        pid=$(sudo -u "$LAB_USER" python3 -I -c '
+import os, sys
+p = sys.argv[1]
+with open(p, "r+b") as f:
+    f.write(os.urandom(8192))
+os.unlink(p)
+print(os.getpid())' "$dir/x.txt")
+        sleep 1
+        # the owner: a new file, one open, its old mtime kept
+        sudo -u "$LAB_USER" cp -p "$src" "$dir/d.bin"
+        ino_d=$(stat -c %i "$dir/d.bin")
+        [[ $ino_d == "$ino_x" ]] && break
+        say "try $try: the owner's file got inode $ino_d, not $ino_x: again"
+        rm -f "$dir/d.bin"
+        ino_d=
+    done
+    [[ -n $ino_d ]] || notrun "the filesystem never handed inode $ino_x out again"
+    sum_d=$(sha256sum < "$dir/d.bin" | cut -d' ' -f1)
+    say "try $try: the attack (pid $pid) rewrote and deleted x.txt (inode $ino_x); the owner's d.bin has inode $ino_d, mtime $(stat -c %y "$dir/d.bin")"
+    sleep 2
+    "$NN" remediate ransomware --pid "$pid" "${A[@]}" | head -8
+    local ok=1
+    if [[ -f $dir/x.txt && $(sha256sum < "$dir/x.txt" | cut -d' ' -f1) == "$sum_x" ]]; then
+        say "x.txt recreated with its original content"
+    else
+        say "MISMATCH: x.txt not recreated"; ok=0
+    fi
+    if [[ -f $dir/d.bin && $(sha256sum < "$dir/d.bin" | cut -d' ' -f1) == "$sum_d" ]]; then
+        say "the owner's d.bin is in place, unchanged"
+    else
+        say "LOST: the owner's d.bin is not in place"; ok=0
+    fi
+    local moved
+    moved=$(find "$TREE/.northnarrow-cow/evidence" -name '*-d.bin' 2>/dev/null)
+    [[ -z $moved ]] || { say "MOVED into the evidence: $moved (mtime $(stat -c %y $moved)) — the expiry deletes evidence older than the retention"; ok=0; }
+    grep '"op":"cow_restore"' $ETC/audit.log | tail -1 | grep -oE '"(action|detail|evidence)":("[^"]*"|null)' | sed 's/^/  /'
+    rm -f "$src"
+    find "$dir" -mindepth 1 -delete 2>/dev/null
+    (( ok )) || fail "the owner's file was taken for the attack's renamed copy"
+    say "PASS"
+}
+
 cleanup() {
     window 300
     rm -f $ETC/cow-guard.local $ETC/cow-guard.local.sig
@@ -367,6 +429,7 @@ case "$MODE" in
     auto) auto ;;
     negative) negative ;;
     bench) bench ;;
+    reuse) reuse ;;
     cleanup) cleanup ;;
-    *) sed -n '2,32p' "$0"; exit 2 ;;
+    *) sed -n '2,40p' "$0"; exit 2 ;;
 esac
