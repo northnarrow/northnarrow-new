@@ -930,6 +930,7 @@ fn stopping_resumes_what_the_kernel_holds_without_an_entry() {
     let a = w.rec.audits.lock();
     assert_eq!(a[0]["kind"], "stopping");
     assert_eq!(a[0]["resumed"][0], h.pid, "{}", a[0]);
+    assert_eq!(a[0]["unreported"], serde_json::json!([h.pid]), "{}", a[0]);
 }
 
 /// BUG-118: the stop reads the kernel's map only once nothing more can
@@ -961,6 +962,7 @@ fn the_stop_resumes_a_held_process_once() {
     assert!(wait_state(h.pid, |s| s == Some('S') || s == Some('R')));
     let a = w.rec.audits.lock();
     assert_eq!(a[0]["resumed"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["unreported"], serde_json::json!([]), "{}", a[0]);
     assert!(w.k.0.lock().left.is_empty());
 }
 

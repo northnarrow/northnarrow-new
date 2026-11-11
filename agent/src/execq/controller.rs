@@ -99,7 +99,9 @@ impl KernelIo for kernel::Kernel {
         kernel::Kernel::counters(self)
     }
     fn quiesce(&mut self) {
-        kernel::quiesce()
+        if !kernel::quiesce() {
+            debug!("exec quarantine stop: membarrier refused — waited a fixed time instead");
+        }
     }
 }
 
@@ -1248,6 +1250,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let mut resumed = Vec::new();
         let mut killed = Vec::new();
         let mut left = Vec::new();
+        let mut unreported = Vec::new();
         let mut seen = HashSet::new();
         // the processes held for a decision
         for (_, mut p) in std::mem::take(&mut self.entries) {
@@ -1301,7 +1304,10 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     left.push(pid);
                     continue;
                 }
-                Liveness::Live if pr.signal(libc::SIGCONT).is_ok() => resumed.push(pid),
+                Liveness::Live if pr.signal(libc::SIGCONT).is_ok() => {
+                    resumed.push(pid);
+                    unreported.push(pid);
+                }
                 Liveness::Live | Liveness::Gone => {}
             }
             self.k.unstop(pid);
@@ -1323,6 +1329,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     // captured, left in the pinned map for the next start
                     "killed": killed,
                     "left": left,
+                    // BUG-118: of the resumed, those whose report the
+                    // agent had not read (held without an entry)
+                    "unreported": unreported,
                     "op": AUDIT_OP,
                 }),
                 "success",

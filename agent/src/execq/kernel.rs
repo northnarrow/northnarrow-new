@@ -140,14 +140,15 @@ pub const QUIESCE_FALLBACK: std::time::Duration = std::time::Duration::from_mill
 /// `MEMBARRIER_CMD_GLOBAL` is `synchronize_rcu()`: it returns after every
 /// such section that began before the call has ended. Where it is refused
 /// (`EINVAL` with `nohz_full` CPUs) a sleep of [`QUIESCE_FALLBACK`] stands
-/// in for it.
-pub fn quiesce() {
+/// in for it. True: the kernel's grace period; false: the sleep.
+pub fn quiesce() -> bool {
     // SAFETY: membarrier(2) with a command, flags 0 and cpu 0 (unused
     // without MEMBARRIER_CMD_FLAG_CPU), no pointers.
     let rc = unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) };
     if rc != 0 {
         std::thread::sleep(QUIESCE_FALLBACK);
     }
+    rc == 0
 }
 
 impl Kernel {
@@ -250,6 +251,20 @@ pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 317 (BUG-118): the stop's wait for the exec programs is the
+    /// kernel's grace period (`membarrier` GLOBAL), not the fallback's
+    /// sleep, where the kernel offers it (`MEMBARRIER_CMD_QUERY`).
+    #[test]
+    fn quiesce_waits_on_the_kernel_not_on_a_sleep() {
+        // SAFETY: membarrier(2) MEMBARRIER_CMD_QUERY (0), no pointers.
+        let cmds = unsafe { libc::syscall(libc::SYS_membarrier, 0, 0, 0) };
+        if cmds < 0 || cmds & MEMBARRIER_CMD_GLOBAL == 0 {
+            eprintln!("membarrier GLOBAL not offered here ({cmds}): the fallback sleeps");
+            return;
+        }
+        assert!(quiesce(), "membarrier GLOBAL refused: the fallback slept");
+    }
 
     #[test]
     fn guarded_mount_points() {
