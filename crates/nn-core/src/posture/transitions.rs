@@ -214,6 +214,49 @@ mod tests {
         assert!(s2.is_combat_locked());
     }
 
+    /// Lot 314 (BUG-84): a force toward the kind the posture is in leaves
+    /// it as it is — its timers too — except an unlocked COMBAT, locked with
+    /// its entry time kept; toward another kind, that kind from `now`.
+    #[test]
+    fn a_force_toward_the_current_kind_keeps_the_state() {
+        let t = now();
+        let later = t + Duration::from_secs(3540);
+        let alerted = PostureState::Alerted {
+            since: t,
+            last_trigger: t,
+        };
+        match forced(&alerted, PostureKind::Alerted, later) {
+            PostureState::Alerted {
+                since,
+                last_trigger,
+            } => assert_eq!((since, last_trigger), (t, t)),
+            other => panic!("{other:?}"),
+        }
+        let unlocked = PostureState::Combat {
+            since: t,
+            locked: false,
+        };
+        match forced(&unlocked, PostureKind::Combat, later) {
+            PostureState::Combat { since, locked } => assert_eq!((since, locked), (t, true)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            forced(&PostureState::Observing, PostureKind::Observing, later),
+            PostureState::Observing
+        ));
+        match forced(&alerted, PostureKind::Engaged, later) {
+            PostureState::Engaged {
+                since,
+                last_trigger,
+            } => assert_eq!((since, last_trigger), (later, later)),
+            other => panic!("{other:?}"),
+        }
+        match forced(&PostureState::Observing, PostureKind::Combat, later) {
+            PostureState::Combat { since, locked } => assert_eq!((since, locked), (later, true)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn observing_does_not_decay() {
         let s = PostureState::Observing;

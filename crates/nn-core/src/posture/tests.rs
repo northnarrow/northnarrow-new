@@ -436,3 +436,31 @@ mod bug94 {
         assert_eq!(m.tick_decay().map(|s| s.kind()), Some(PostureKind::Engaged));
     }
 }
+
+/// Lot 314, the mini-hunt's variant of BUG-84: a lock a later signal
+/// acquires on an unlocked COMBAT (a kernel denial: decisive, it locks) is a
+/// transition row of its own, COMBAT → COMBAT, naming it — it was a WARN of
+/// the journal only, and the transition log said nothing of it.
+#[test]
+fn a_lock_a_later_signal_acquires_is_a_transition_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (m, heard) = service_machine(&tmp);
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+    let recent: Vec<Event> = (0..20u64)
+        .map(|i| tcp_v4(42, [203, 0, 113, 9], 443, i + 1))
+        .collect();
+    m.observe(&tcp_v4(42, [203, 0, 113, 9], 443, 100), &recent);
+    assert!(!m.is_combat_locked(), "precondition: a heuristic COMBAT");
+    let rows = m.transition_log().len();
+    assert!(
+        m.observe(&fs_protect_denial(42, 200), &[]).is_none(),
+        "no change of kind"
+    );
+    assert!(m.is_combat_locked());
+    let log = m.transition_log();
+    assert_eq!(log.len(), rows + 1, "one row: {log:?}");
+    let row = log.last().unwrap();
+    assert_eq!((row.from, row.to), (PostureKind::Combat, PostureKind::Combat));
+    assert!(row.reason.starts_with("COMBAT locked: "), "{}", row.reason);
+    assert_eq!(heard.lock().len(), 1, "the ladder is not engaged again");
+}
