@@ -42,7 +42,6 @@ impl Rule for NnLAt001AntiTamperDenial {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::FsProtectDenial {
             pid,
-            uid,
             comm,
             target_dev,
             target_ino,
@@ -287,7 +286,7 @@ impl Rule for NnLAt001AntiTamperDenial {
                 if common::bpf_prog_class::root_prog_known_of(*target_dev).is_some() =>
             {
                 return Some(known_root_program_verdict(
-                    self, event, *pid, *uid, comm, *target_dev, *target_ino,
+                    self, event, *pid, comm, *target_dev, *target_ino,
                 ));
             }
             FsProtectOperation::SysctlRootProg => {
@@ -350,7 +349,7 @@ impl Rule for NnLAt001AntiTamperDenial {
                 // Lot 304: a baseline program proven a known system
                 // program (its loader the record's pid and uid): Low.
                 if let Some(v) = known_baseline_verdict(
-                    self, event, *operation, *pid, *uid, comm, *target_dev, *target_ino,
+                    self, event, *operation, *pid, comm, *target_dev, *target_ino,
                 ) {
                     return Some(v);
                 }
@@ -395,12 +394,12 @@ impl Rule for NnLAt001AntiTamperDenial {
 }
 
 /// Lot 304: a known system program on the root cgroup's `cgroup/sysctl`
-/// slot — Low, with the proof the kernel-state round established.
+/// slot — Low, with the proof the kernel-state round established (the
+/// loader's uid is the record's principal, not repeated here).
 fn known_root_program_verdict(
     rule: &NnLAt001AntiTamperDenial,
     event: &Event,
     pid: u32,
-    uid: u32,
     comm: &str,
     target_dev: u64,
     id: u64,
@@ -416,10 +415,10 @@ fn known_root_program_verdict(
     };
     let reasoning = format!(
         "A known system program on the root cgroup's cgroup/sysctl slot: `{}` (id {id}), {}. \
-         The loader proven: pid {pid} (`{comm}`, uid {uid}) holds its link to the root cgroup \
-         (link id {link}), runs the packaged {} (its device and inode), and was running when \
-         the program was loaded; {when}. Not refused; the same program from any other loader \
-         is High.",
+         The loader proven: pid {pid} (`{comm}`, the record's principal) holds its link to the \
+         root cgroup (link id {link}), runs the packaged {} (its device and inode), and was \
+         running when the program was loaded; {when}. Not refused; the same program from any \
+         other loader is High.",
         k.name, k.what, k.loader
     );
     build_verdict(rule, event, ResponseAction::Log, Severity::Low, &reasoning)
@@ -459,7 +458,6 @@ fn known_baseline_verdict(
     event: &Event,
     operation: FsProtectOperation,
     pid: u32,
-    uid: u32,
     comm: &str,
     target_dev: u64,
     target_ino: u64,
@@ -477,7 +475,7 @@ fn known_baseline_verdict(
     let k = c::KNOWN_SYSTEM_PROGRAMS[entry];
     let reasoning = format!(
         "A known system program: BPF program id {id} `{name}` (type `{}`, tag {}, attached at \
-         {attach}), {}. The loader proven: pid {pid} (uid {uid}) holds its link, runs the \
+         {attach}), {}. The loader proven: pid {pid} (the record's principal) holds its link, runs the \
          packaged {} (its device and inode), and was running when the program was loaded, \
          before the agent started — the cross-view's baseline, signed once. Not refused; the \
          same program from any other loader is signed as before.",
@@ -1124,7 +1122,7 @@ mod tests {
             "known system program",
             "`sysctl_monitor` (id 35)",
             "systemd-networkd's sysctl monitor",
-            "pid 631 (`systemd-network`, uid 998)",
+            "pid 631 (`systemd-network`, the record's principal)",
             "(link id 3)",
             "the packaged /usr/lib/systemd/systemd-networkd",
             "loaded before the agent started",
@@ -1189,7 +1187,7 @@ mod tests {
             "A known system program: BPF program id 21 `restrict_filesy`",
             "tag e8932b6bae2b9745",
             "systemd's RestrictFileSystems=",
-            "pid 1 (uid 0) holds its link",
+            "pid 1 (the record's principal) holds its link",
             "the packaged /usr/lib/systemd/systemd",
             "before the agent started",
         ] {
