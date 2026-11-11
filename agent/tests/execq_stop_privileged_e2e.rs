@@ -400,10 +400,29 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
     drop(burst);
 
     let stopping = audit_objects(&state.audit_log(), "stopping");
-    eprintln!(
-        "execq stop e2e: {total} execs, {held_at_stop} held 1.5 s into the burst; stopping: \
-         {stopping:?}"
-    );
+    let count = |field: &str| -> usize {
+        stopping
+            .iter()
+            .filter_map(|s| s.get(field).and_then(|r| r.as_array()).map(Vec::len))
+            .sum()
+    };
+    let (resumed, unreported, left_in_map) = (count("resumed"), count("unreported"), count("left"));
+    // past the harness's capture (a passing test's `eprintln!` is not
+    // shown): the lab reads this line
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "execq stop e2e: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
+             stopping entries: {} — resumed {resumed}, of which {unreported} without an entry, \
+             {left_in_map} left in the map; after the stop {} of the burst still running, {} not \
+             exit 0, {} new process(es) in state T, cgroup frozen {frozen:?}",
+            stopping.len(),
+            left.len(),
+            failed.len(),
+            new_stopped.len()
+        );
+    }
     assert!(
         held_at_stop > 0,
         "no exec of the burst was held: the guard did not hold (the test proves nothing)\n{}",
@@ -423,25 +442,12 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
         failed.is_empty(),
         "processes of the burst that did not exit 0 (killed?): {failed:?}"
     );
-    let resumed = stopping
-        .iter()
-        .filter_map(|s| s.get("resumed").and_then(|r| r.as_array()).map(Vec::len))
-        .sum::<usize>();
     assert!(
         resumed > 0,
         "the signed `stopping` entry names no resumed process ({stopping:?}): the stop did not \
          find the burst held\n{}",
         tail()
     );
-    let unreported: usize = stopping
-        .iter()
-        .filter_map(|s| s.get("unreported").and_then(|r| r.as_array()).map(Vec::len))
-        .sum();
-    eprintln!("execq stop e2e: resumed {resumed}, of which {unreported} without an entry");
-    let left_in_map: usize = stopping
-        .iter()
-        .filter_map(|s| s.get("left").and_then(|r| r.as_array()).map(Vec::len))
-        .sum();
     assert_eq!(left_in_map, 0, "{stopping:?}");
     drop(scanner);
     drop(nn_admin);

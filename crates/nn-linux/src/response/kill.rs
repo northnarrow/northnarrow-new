@@ -957,6 +957,47 @@ mod tests {
         }
     }
 
+    /// Lot 317 (BUG-124's family; privileged: root, cgroup v2 with
+    /// `cgroup.kill`): a tree kill whose root the agent could not capture
+    /// goes process by process, and reports the capture's error — through
+    /// the kill cgroup it would read as "already gone" (the root's PID is
+    /// checked by its capture there), the process running on.
+    #[test]
+    #[ignore = "privileged: root, cgroup v2 with cgroup.kill"]
+    fn a_tree_kill_whose_root_was_not_captured_reports_its_error() {
+        let (mut sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let scope = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/northnarrow-test.slice/blocked.scope/neutralize-u{}",
+            std::process::id()
+        ));
+        let (primary, _rest) = kill_tree(
+            &ProcRef::uncaptured_for_test(root, 0, libc::EMFILE),
+            &HashSet::new(),
+            &|_| None,
+            Some(&scope),
+            &super::super::journal::test_intent(),
+        );
+        let alive = ProcRef::open(root).liveness();
+        let _ = sh.kill();
+        let _ = sh.wait();
+        for kid in &kids {
+            // SAFETY: plain kill(2) on the test's own sleepers.
+            unsafe { libc::kill(*kid as i32, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir(&scope);
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice/blocked.scope");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice");
+        assert_eq!(
+            primary,
+            ExecutionOutcome::Failed {
+                pid: root,
+                errno: libc::EMFILE
+            }
+        );
+        assert_eq!(alive, super::super::proc_ref::Liveness::Live, "reached");
+    }
+
     /// External audit CMB-019 (privileged: root, cgroup v2, kernel 5.14+):
     /// a tree whose processes keep forking is killed whole through its
     /// kill cgroup — no process carrying the test's marker survives.
