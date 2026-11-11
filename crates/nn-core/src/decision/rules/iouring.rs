@@ -138,6 +138,12 @@ impl<H: PostureHost> NnLIou002IoUringFileAndNetwork<H> {
             fired: Mutex::new(OncePerProcess::new(IOU002_FIRED_CAP)),
         }
     }
+
+    /// The processes it holds a fired-for record of (tests: the cap).
+    #[cfg(test)]
+    fn fired_len(&self) -> usize {
+        self.fired.lock().len()
+    }
 }
 
 impl<H: PostureHost> Rule for NnLIou002IoUringFileAndNetwork<H> {
@@ -414,5 +420,158 @@ mod bug83 {
             ev(NC | FRW, 22), // periodic READ
         ];
         assert_eq!(fired_on(&records), vec![1], "periodic records re-fire");
+    }
+}
+
+/// Lot 314 (F3, [`crate::model_check`]): NN-L-IOU-002 as a "once" machine.
+/// A seeded generator draws, for a few pids, processes that start (a
+/// `stat` with their start in the rule's `/proc`) and exit, the records the
+/// sensor sends for them (a new class, a periodic one) and the reader that
+/// takes them later — some after their process exited. After every record
+/// read: at most one verdict per (pid, start); a record read while its
+/// process runs fires exactly when its process has none yet; one read
+/// after its process exited fires only for a pid never fired for.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use crate::model_check::{check, Rng, SEQUENCES};
+    use crate::posture::host::testing::TestHost as H;
+    use common::wire::{
+        IOURING_CLASS_FILE_OPEN as FO, IOURING_CLASS_FILE_RW as FRW,
+        IOURING_CLASS_NET_CONNECT as NC, IOURING_CLASS_NET_SENDRECV as NS,
+    };
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::path::Path;
+
+    const PIDS: [u32; 4] = [100, 101, 102, 103];
+    /// An opcode of each class (OPENAT, READ, CONNECT, SEND) and of none (NOP).
+    const OPS: [(u32, u8); 5] = [(FO, 18), (FRW, 22), (NC, 16), (NS, 26), (0, 0)];
+
+    fn write_stat(proc: &Path, pid: u32, start: u64) {
+        let d = proc.join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!("{pid} (evil) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n"),
+        )
+        .unwrap();
+    }
+
+    fn record(pid: u32, classes: u32, last_opcode: u8, ts: u64) -> Event {
+        Event::IoUring {
+            created: false,
+            pid,
+            uid: 1000,
+            comm: "evil".to_string(),
+            classes,
+            count: 1,
+            last_opcode,
+            sq_thread: false,
+            timestamp_ns: ts,
+        }
+    }
+
+    fn run(rng: &mut Rng, proc: &Path, next_start: &mut u64) -> Result<(), String> {
+        for pid in PIDS {
+            let _ = std::fs::remove_dir_all(proc.join(pid.to_string()));
+        }
+        let tracker = crate::posture::lineage::AuthSessionTracker::<H>::new(proc);
+        let al = Arc::new(CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()).with_identity(tracker));
+        let rule = NnLIou002IoUringFileAndNetwork::new(al);
+        // pid -> (start, classes) of the process running now
+        let mut live: BTreeMap<u32, (u64, u32)> = BTreeMap::new();
+        // records written, not read yet: (pid, start of their process, the event)
+        let mut queue: VecDeque<(u32, u64, Event)> = VecDeque::new();
+        let mut verdicts: BTreeSet<(u32, u64)> = BTreeSet::new();
+        let mut fired_pids: BTreeSet<u32> = BTreeSet::new();
+        let mut ts = 1u64;
+        for step in 0..40 {
+            ts += 1;
+            let pid = *rng.pick(&PIDS);
+            match rng.below(10) {
+                0 => {
+                    // A new process takes the pid once the records of the
+                    // last one are read: the start is read when the record
+                    // is, so a record read after its pid went to another
+                    // process is taken for that one's (the limit of a start
+                    // the record does not carry; the reader runs
+                    // milliseconds behind, a pid comes back after the whole
+                    // pid space).
+                    if !live.contains_key(&pid) && queue.iter().all(|(p, _, _)| *p != pid) {
+                        *next_start += 1;
+                        write_stat(proc, pid, *next_start);
+                        live.insert(pid, (*next_start, 0));
+                    }
+                }
+                1 => {
+                    if live.remove(&pid).is_some() {
+                        std::fs::remove_dir_all(proc.join(pid.to_string())).unwrap();
+                    }
+                }
+                2..=5 => {
+                    if let Some((start, classes)) = live.get_mut(&pid) {
+                        let (class, op) = *rng.pick(&OPS);
+                        let new = *classes | class != *classes;
+                        *classes |= class;
+                        // a new class is sent at once; the same ones at most
+                        // once a second (here: one draw in three)
+                        if *classes != 0 && (new || rng.one_in(3)) {
+                            queue.push_back((pid, *start, record(pid, *classes, op, ts)));
+                        }
+                    }
+                }
+                _ => {
+                    let Some((pid, start, e)) = queue.pop_front() else {
+                        continue;
+                    };
+                    let Event::IoUring { classes, .. } = e else {
+                        unreachable!()
+                    };
+                    let both = classes & FILE_CLASSES != 0 && classes & NET_CLASSES != 0;
+                    let running = live.get(&pid).is_some_and(|(s, _)| *s == start);
+                    let fired = rule.evaluate(&e).is_some();
+                    let want = both
+                        && if running {
+                            !verdicts.contains(&(pid, start))
+                        } else {
+                            !fired_pids.contains(&pid)
+                        };
+                    if fired && !verdicts.insert((pid, start)) {
+                        return Err(format!("step {step}: a second verdict for ({pid}, {start})"));
+                    }
+                    if fired != want {
+                        return Err(format!(
+                            "step {step}: ({pid}, {start}) classes {classes:#x} running \
+                             {running}: fired {fired}, the oracle says {want}"
+                        ));
+                    }
+                    if fired {
+                        fired_pids.insert(pid);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nn_l_iou_002_fires_at_most_once_per_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut next_start = 1_000;
+        check("NN-L-IOU-002 once", 0x3142_0000, SEQUENCES, |rng| {
+            run(rng, tmp.path(), &mut next_start)
+        });
+    }
+
+    /// The rule's memory has a cap: a flood of distinct pids keeps
+    /// [`IOU002_FIRED_CAP`] of them.
+    #[test]
+    fn nn_l_iou_002_s_memory_is_capped() {
+        let al = Arc::new(CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()));
+        let rule = NnLIou002IoUringFileAndNetwork::new(al);
+        for pid in 1..=(IOU002_FIRED_CAP as u32 * 2) {
+            assert!(rule.evaluate(&record(pid, FO | NC, 16, 1)).is_some());
+        }
+        assert_eq!(rule.fired_len(), IOU002_FIRED_CAP);
     }
 }

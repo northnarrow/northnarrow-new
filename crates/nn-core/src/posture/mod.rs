@@ -51,6 +51,8 @@ pub mod transitions;
 pub mod triggers;
 
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;

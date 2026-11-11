@@ -1100,4 +1100,85 @@ mod tests {
         l.record(TriggerType::ExploitAttempt, now, unit("x.service"));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Unattributed));
     }
+
+    /// Lot 314 (F3, [`crate::model_check`]): the ledger as a state machine.
+    /// Sequences of records (placed, privileged, pending) in a few scopes at
+    /// times that mostly move on and sometimes go back, prunes, placements
+    /// of the pending writers and clears; after every step the last signal
+    /// is the latest time recorded since the last clear (an oracle of the
+    /// model's own: a prune and the bounds never move it back, BUG-94), and
+    /// the bounds hold.
+    #[test]
+    fn the_ledger_keeps_its_invariants() {
+        use crate::model_check::{check, SEQUENCES};
+        let scopes: Vec<Scope> = (0..24)
+            .map(|i| unit(&format!("u{i}.service")))
+            .chain([Scope::Login(1000), Scope::Unattributed])
+            .collect();
+        let triggers = [
+            TriggerType::ExploitAttempt,
+            TriggerType::ExfiltrationPattern,
+            TriggerType::CriticalFileModification,
+            TriggerType::PersistenceMechanism,
+        ];
+        let base = Instant::now();
+        check("corroboration ledger", 0x3141_0000, SEQUENCES, |rng| {
+            let mut l = CorroborationLedger::new();
+            let mut oracle: Option<Instant> = None;
+            let mut t = base + Duration::from_secs(3600);
+            for step in 0..40 {
+                match rng.below(10) {
+                    0..=4 => {
+                        // mostly on, sometimes back (a late-read event)
+                        let at = if rng.one_in(4) {
+                            t - Duration::from_secs(rng.range(1, 1800))
+                        } else {
+                            t
+                        };
+                        let trigger = *rng.pick(&triggers);
+                        let scope = rng.pick(&scopes).clone();
+                        if rng.one_in(5) {
+                            l.record_pending(trigger, at, scope, rng.range(1, 9) as u32, false);
+                        } else {
+                            l.record_with(
+                                trigger,
+                                trigger.evidence_class(),
+                                at,
+                                scope,
+                                rng.one_in(6),
+                            );
+                        }
+                        oracle = oracle.max(Some(at));
+                    }
+                    5..=6 => t += Duration::from_secs(rng.range(1, 40 * 60)),
+                    7 => l.prune(t),
+                    8 => {
+                        let to = rng.pick(&scopes).clone();
+                        let admin = rng.one_in(2);
+                        l.resolve_pending(|w| (w % 3 != 0).then(|| (admin, to.clone())));
+                    }
+                    _ => {
+                        if rng.one_in(4) {
+                            l.clear();
+                            oracle = None;
+                        }
+                    }
+                }
+                if l.last_signal() != oracle {
+                    return Err(format!(
+                        "step {step}: last signal {:?}, the oracle says {:?}",
+                        l.last_signal().map(|x| x.duration_since(base)),
+                        oracle.map(|x| x.duration_since(base))
+                    ));
+                }
+                if l.len() > LEDGER_CAP || l.scopes.values().any(|e| e.len() > SCOPE_CAP) {
+                    return Err(format!("step {step}: past a bound ({} entries)", l.len()));
+                }
+                if l.len() != l.scopes.values().map(Vec::len).sum::<usize>() {
+                    return Err(format!("step {step}: the count drifted"));
+                }
+            }
+            Ok(())
+        });
+    }
 }
