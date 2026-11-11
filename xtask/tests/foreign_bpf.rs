@@ -163,12 +163,14 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
     // the agent attaches it and registers it as its own (lot 302: pinned,
     // the bpf() guard with it — `the_bpf_guard_s_hooks_are_pinned`)
     let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    // whitespace aside (rustfmt breaks a long call over lines)
+    let flat = |t: &str| t.replace(char::is_whitespace, "");
     in_order(
-        body(&u, "attach"),
+        &flat(body(&u, "attach")),
         &[
-            "antitamper_bpf::reattach_fresh(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf, pin_root)",
-            "antitamper_bpf::reattach_fresh(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf, pin_root)",
-            "crate::bpf_crossview::Parts::setup(ebpf, btf)",
+            "attach_guard_hook(ebpf,OBSERVE_PROGRAM,OBSERVE_HOOK,btf,pin_root,enforce",
+            "attach_guard_hook(ebpf,PROG_GUARD_PROGRAM,PROG_GUARD_HOOK,btf,pin_root,enforce",
+            "crate::bpf_crossview::Parts::setup(ebpf,btf)",
         ],
     )
     .unwrap();
@@ -190,22 +192,42 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
 fn the_bpf_guard_s_hooks_are_pinned() {
     let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
     let a = body(&u, "attach");
+    assert!(
+        a.contains(
+            "antitamper_bpf::reattach_fresh(ebpf, GUARD_PROGRAM, GUARD_HOOK, btf, pin_root)"
+        ),
+        "the map guard pinned"
+    );
+    in_order(a, &["let enforce = enforce_mode();"]).unwrap();
+    let flat = a.replace(char::is_whitespace, "");
     for (program, hook) in [
-        ("GUARD_PROGRAM", "GUARD_HOOK"),
         ("OBSERVE_PROGRAM", "OBSERVE_HOOK"),
         ("PROG_GUARD_PROGRAM", "PROG_GUARD_HOOK"),
     ] {
         assert!(
-            a.contains(&format!(
-                "antitamper_bpf::reattach_fresh(ebpf, {program}, {hook}, btf, pin_root)"
+            flat.contains(&format!(
+                "attach_guard_hook(ebpf,{program},{hook},btf,pin_root,enforce"
             )),
-            "{program} pinned"
+            "{program} pinned where the guard enforces"
         );
     }
     assert!(
         !a.contains("attach_transient"),
         "no guard hook for the agent's life only"
     );
+    // pinned where the guard enforces; an observing guard (the lab's and the
+    // tests' builds) lives with the agent and retires an earlier start's pins
+    in_order(
+        body(&u, "attach_guard_hook"),
+        &[
+            "Some(root) if enforce => {",
+            "antitamper_bpf::reattach_fresh(ebpf, program, hook, btf, Some(root))",
+            "antitamper_bpf::attach_transient(ebpf, program, hook, btf)?;",
+            "antitamper_bpf::purge_stale_pin(&link_pin);",
+            "antitamper_bpf::purge_stale_pin(&prog_pin);",
+        ],
+    )
+    .unwrap();
     let lib = code("antitamper-bpf/src/lib.rs");
     in_order(
         body(&lib, "reattach_fresh_held"),

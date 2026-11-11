@@ -1114,7 +1114,9 @@ configure; use the `nn-admin` of this release where the export is checked.
   not have, or a trusted-installer window, is "not exercised".
 - **The bpf() guard pinned.** The pin root holds four new entries:
   `prog_bpf`, `link_bpf`, `prog_bpf_prog`, `link_bpf_prog` (the `bpf` and
-  `bpf_prog` hooks, like `bpf_map`'s). Through a restart or an upgrade's
+  `bpf_prog` hooks, like `bpf_map`'s), where the guard enforces (every
+  production build; an observing guard — `NN_BPF_DEFENSE_OBSERVE=1`, a
+  `debug-trigger` build — is attached for the agent's life, as before). Through a restart or an upgrade's
   gap the previous start's guard keeps refusing a handle on the agent's
   objects (the start-in-cgroup tracker's links among them) and a load of a
   program type it refuses outside the family; outside a trusted-installer

@@ -462,7 +462,12 @@ in [the capability programme, lot 302](https://github.com/northnarrow/northnarro
 **The bpf() guard pinned** (lot 302): the BPF guard's three LSM hooks —
 `bpf_map` (since Tappa 10.8), `bpf` and `bpf_prog` — are pinned under the
 pin root (`prog_<hook>`, `link_<hook>`) and re-attached fresh at each
-start, the previous start's kept until this start's runs. Through a
+start, the previous start's kept until this start's runs — `bpf` and
+`bpf_prog` where the guard enforces (production builds; an observing guard,
+a `debug-trigger` build or `NN_BPF_DEFENSE_OBSERVE=1`, lives with the
+agent: its type refusals, which hold in every mode, would otherwise outlive
+a stopped lab or test agent, and it retires an enforcing start's pins).
+Through a
 restart's or an upgrade's gap the previous start's guard still refuses a
 handle by id on one of the agent's links (the start-in-cgroup tracker's,
 pinned beside the root and running all along: lot 301's residual), its

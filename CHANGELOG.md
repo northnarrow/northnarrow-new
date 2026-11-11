@@ -25,8 +25,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `bpf_prog` hooks went with the agent, so through a restart or an
   upgrade's gap a handle by id on the start-in-cgroup tracker's links (and
   on the agent's maps and programs) was given to root, and a kprobe or LSM
-  program loaded unrefused (lot 301's residual). The previous start's guard
-  now refuses until the new one runs.
+  program loaded unrefused (lot 301's residual). Where the guard enforces
+  (production builds) the previous start's guard now refuses until the new
+  one runs.
 - `nn-admin heartbeat watch` answers whatever its source command leaves
   behind (lot 299, external bug hunt BUG34, BUG38, BUG22;
   `docs/operator/HEARTBEAT.md`). A process the `--from-cmd` command started

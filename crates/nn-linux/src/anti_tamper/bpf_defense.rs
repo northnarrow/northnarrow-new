@@ -236,7 +236,8 @@ pub(crate) fn observe_shortfall(enforce: bool, debug_build: bool) -> Option<Stri
 /// health accounting, not returned: the anti-tamper health decides the
 /// fail-closed outcome. Lot 302: the three LSM hooks of the guard
 /// (`bpf_map`, `bpf`, `bpf_prog`) are pinned under `pin_root` and
-/// re-attached fresh, the previous start's kept until this start's runs.
+/// re-attached fresh, the previous start's kept until this start's runs —
+/// `bpf` and `bpf_prog` where the guard enforces ([`attach_guard_hook`]).
 pub(crate) fn attach(
     guard: &BpfGuard,
     ebpf: &mut Ebpf,
@@ -244,6 +245,7 @@ pub(crate) fn attach(
     pin_root: Option<&Path>,
 ) -> BpfDefenseHealth {
     let mut health = BpfDefenseHealth::default();
+    let enforce = enforce_mode();
     match antitamper_bpf::reattach_fresh(ebpf, GUARD_PROGRAM, GUARD_HOOK, btf, pin_root) {
         Ok(()) => info!(
             program = GUARD_PROGRAM,
@@ -298,11 +300,11 @@ pub(crate) fn attach(
     // start's program keeps refusing until this one is attached; its maps
     // (the own ids, the mode) live as long as its pin. A failure is still
     // an observe failure (the start goes on, signed).
-    match antitamper_bpf::reattach_fresh(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf, pin_root) {
+    match attach_guard_hook(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf, pin_root, enforce) {
         Ok(()) => info!(
             program = OBSERVE_PROGRAM,
             hook = OBSERVE_HOOK,
-            pinned = pin_root.is_some(),
+            pinned = pin_root.is_some() && enforce,
             "BPF self-defence: bpf() syscall guard attached"
         ),
         Err(e) => {
@@ -318,11 +320,18 @@ pub(crate) fn attach(
     // Lot 302: pinned too (`prog_bpf_prog`, `link_bpf_prog`): a handle on
     // one of the agent's programs through a path the bpf() guard does not
     // read (a relative one, a bind mount) stays refused through the gap.
-    match antitamper_bpf::reattach_fresh(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf, pin_root) {
+    match attach_guard_hook(
+        ebpf,
+        PROG_GUARD_PROGRAM,
+        PROG_GUARD_HOOK,
+        btf,
+        pin_root,
+        enforce,
+    ) {
         Ok(()) => info!(
             program = PROG_GUARD_PROGRAM,
             hook = PROG_GUARD_HOOK,
-            pinned = pin_root.is_some(),
+            pinned = pin_root.is_some() && enforce,
             "BPF self-defence: program-handle guard attached"
         ),
         Err(e) => {
@@ -346,6 +355,39 @@ pub(crate) fn attach(
         }
     }
     health
+}
+
+/// Lot 302: the `bpf` or `bpf_prog` hook, pinned and re-attached fresh
+/// where the guard enforces (production builds) — the previous start's
+/// keeps refusing through a restart's or an upgrade's gap. An observing
+/// guard (a `debug-trigger` build, `NN_BPF_DEFENSE_OBSERVE=1`) lives with
+/// the agent, as before: its type refusals, which hold in every mode, would
+/// otherwise outlive a stopped lab or test agent and refuse every later
+/// kprobe or tracepoint load on the host (the KVM CI's in-process sensor
+/// tests). A guard an earlier, enforcing start pinned is retired once this
+/// start's runs (attach before purge).
+fn attach_guard_hook(
+    ebpf: &mut Ebpf,
+    program: &str,
+    hook: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+    enforce: bool,
+) -> Result<()> {
+    match pin_root {
+        Some(root) if enforce => {
+            antitamper_bpf::reattach_fresh(ebpf, program, hook, btf, Some(root))
+        }
+        _ => {
+            antitamper_bpf::attach_transient(ebpf, program, hook, btf)?;
+            if let Some(root) = pin_root {
+                let (prog_pin, link_pin) = antitamper_bpf::lsm_pin_paths(root, hook);
+                antitamper_bpf::purge_stale_pin(&link_pin);
+                antitamper_bpf::purge_stale_pin(&prog_pin);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Attach the liveness watch and pin its link (`link_role_exit`): it must

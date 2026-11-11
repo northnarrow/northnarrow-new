@@ -8667,7 +8667,11 @@ number in parentheses is a lab PR.
     refusals outside the denials' budgets and dedup (a per-boot map the
     agent writes around the round, read by the two emitters only), and the
     probe's tap takes them before any judge. The `bpf` and `bpf_prog` hooks
-    are pinned and re-attached fresh like the deny hooks; the agent enters
+    are pinned and re-attached fresh like the deny hooks where the guard
+    enforces (production builds: an observing guard lives with the agent —
+    pinned, its type refusals outlived the KVM CI's stopped fixture agents
+    and refused the in-process sensor tests' tracepoint loads, found on the
+    PR's first CI run); the agent enters
     `PROTECTED_PIDS` right after its object's load, an exempt caller of the
     previous start's guard from its first program load.
   - The lab, as measured (our own guests under lease k302, one at a time;
