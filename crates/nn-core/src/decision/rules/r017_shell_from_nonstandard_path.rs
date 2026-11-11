@@ -134,8 +134,19 @@ impl<H: PostureHost> Rule for R017ShellFromNonstandardPath<H> {
         // CMD` name it too); the copy's own name decides its table, as
         // `comm` (a shell's name) said above.
         let shell = std::path::Path::new(comm.as_str());
-        if crate::posture::script_args::runs_of(shell, argv) == crate::posture::lineage::Runs::Code
-        {
+        // a cut argv had more past the cut: `sh -e … -c` there names a
+        // program the cut hid (the reader alone reads a `-c` with nothing
+        // after it as refused)
+        let past_the_cut = |mut a: Vec<String>| {
+            a.push(String::new());
+            a
+        };
+        let read = if super::argv_cut_note(event).is_some() {
+            crate::posture::script_args::runs_of(shell, &past_the_cut(argv.clone()))
+        } else {
+            crate::posture::script_args::runs_of(shell, argv)
+        };
+        if read == crate::posture::lineage::Runs::Code {
             reasoning = match crate::posture::script_args::inline_program(shell, argv) {
                 Some(payload) => format!("{reasoning} — inline command (-c): {payload}"),
                 None => format!("{reasoning} — inline -c command"),

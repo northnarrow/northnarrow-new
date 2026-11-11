@@ -19,8 +19,9 @@
 //!   word the generator made, `x`): nothing ran;
 //! - `Code` with the inline program the generator wrote: it ran (a module
 //!   the argv loads may run beside it: `Code` vouches for nothing); with
-//!   another text: it did not; with none (an option that loads the
-//!   caller's code, then the standard input): something ran;
+//!   another text: it did not; with none (the standard input, or a module
+//!   loaded before it: the caller's code either way, which vouches for
+//!   nothing): counted, not judged;
 //! - `Inline` (nothing named): nothing ran, or the standard input's
 //!   program alone (a shell or a REPL reading it: the exec pump's
 //!   `STDIN_PROGRAM` reads it as code);
@@ -81,9 +82,10 @@ struct Interp {
     fixed: &'static [&'static [&'static str]],
 }
 
-const SHELL_MARKER: &str = "printf 'NAME\\n' >> \"$NN_DIFF_OUT\"\n";
-const SHELL_CODE: &str = "printf 'C\\n' >> \"$NN_DIFF_OUT\"";
-const SHELL_STDIN: &str = "printf 'STDIN\\n' >> \"$NN_DIFF_OUT\"\n";
+// `tee -a`, no redirection: a restricted shell (`-r`) refuses `>>`
+const SHELL_MARKER: &str = "printf 'NAME\\n' | tee -a \"$NN_DIFF_OUT\"\n";
+const SHELL_CODE: &str = "printf 'C\\n' | tee -a \"$NN_DIFF_OUT\"";
+const SHELL_STDIN: &str = "printf 'STDIN\\n' | tee -a \"$NN_DIFF_OUT\"\n";
 const SHELL_VOCAB: &[&str] = &[
     "S1",
     "S2",
@@ -190,7 +192,9 @@ const SHELL_FIXED: &[&[&str]] = &[
 const PYTHON_MARKER: &str =
     "# marker\nimport os\nopen(os.environ['NN_DIFF_OUT'], 'a').write('NAME\\n')\n";
 const PYTHON_CODE: &str = "import os; open(os.environ['NN_DIFF_OUT'], 'a').write('C\\n')";
-const PYTHON_STDIN: &str = "import os; open(os.environ['NN_DIFF_OUT'], 'a').write('STDIN\\n')\n";
+// two lines: `-x` skips the first
+const PYTHON_STDIN: &str =
+    "# stdin\nimport os; open(os.environ['NN_DIFF_OUT'], 'a').write('STDIN\\n')\n";
 const PYTHON_VOCAB: &[&str] = &[
     "S1",
     "S2",
@@ -246,9 +250,13 @@ const PYTHON_FIXED: &[&[&str]] = &[
     &["-W", "", "S1"],
 ];
 
-const PERL_MARKER: &str = "#!perl\nopen(my $f, '>>', $ENV{NN_DIFF_OUT}); print $f \"NAME\\n\";\n";
-const PERL_CODE: &str = "open(my $f, '>>', $ENV{NN_DIFF_OUT}); print $f \"C\\n\";";
-const PERL_STDIN: &str = "open(my $f, '>>', $ENV{NN_DIFF_OUT}); print $f \"STDIN\\n\";\n";
+// in a `BEGIN` block (run once, at compile time: `-n` and `-p` loop over
+// input there may be none of), the variable untainted (`-T`), a `#!perl`
+// line first (`-x`)
+const PERL_MARKER: &str = "#!perl\nBEGIN { my ($p) = $ENV{NN_DIFF_OUT} =~ /(.*)/s; open(my $f, '>>', $p); print $f \"NAME\\n\"; }\n";
+const PERL_CODE: &str =
+    "BEGIN { my ($p) = $ENV{NN_DIFF_OUT} =~ /(.*)/s; open(my $f, '>>', $p); print $f \"C\\n\"; }";
+const PERL_STDIN: &str = "#!perl\nBEGIN { my ($p) = $ENV{NN_DIFF_OUT} =~ /(.*)/s; open(my $f, '>>', $p); print $f \"STDIN\\n\"; }\n";
 const PERL_VOCAB: &[&str] = &[
     "S1",
     "S2",
@@ -366,9 +374,12 @@ const NODE_FIXED: &[&[&str]] = &[
     &["-"],
 ];
 
-const RUBY_MARKER: &str = "File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'NAME' }\n";
-const RUBY_CODE: &str = "File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'C' }";
-const RUBY_STDIN: &str = "File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'STDIN' }\n";
+// a `BEGIN` block (`-n`, `-p`), a `#!ruby` line first (`-x`)
+const RUBY_MARKER: &str =
+    "#!ruby\nBEGIN { File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'NAME' } }\n";
+const RUBY_CODE: &str = "BEGIN { File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'C' } }";
+const RUBY_STDIN: &str =
+    "#!ruby\nBEGIN { File.open(ENV['NN_DIFF_OUT'], 'a') { |f| f.puts 'STDIN' } }\n";
 const RUBY_VOCAB: &[&str] = &[
     "S1",
     "S2",
@@ -591,7 +602,9 @@ fn agrees(
         Runs::Code => match inline_program(exe, argv) {
             Some(prog) if prog == i.code => ran.iter().any(|r| r == "C"),
             Some(_) => !ran.iter().any(|r| r == "C"),
-            None => !ran.is_empty(),
+            // the standard input or a module loaded: the caller's code
+            // either way, which vouches for nothing — not judged
+            None => return None,
         },
         Runs::Inline => ran.is_empty() || only("STDIN"),
         Runs::Unknown(_) => return None,
@@ -638,7 +651,7 @@ fn the_option_tables_agree_with_the_real_interpreters() {
         report.insert(i.exe, (cases.len(), judged, unknown));
     }
     for (exe, (n, judged, unknown)) in &report {
-        eprintln!("{exe}: {n} argvs, {judged} judged, {unknown} Unknown (not judged)");
+        eprintln!("{exe}: {n} argvs, {judged} judged, {unknown} not judged (Unknown, or Code with no program text)");
     }
     assert!(!report.is_empty(), "no interpreter found");
     assert!(

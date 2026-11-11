@@ -306,11 +306,26 @@ struct Table {
     /// ([`Runs::Unknown`]). The names every supported version has; one only
     /// some have (dash's `pipefail`) is not known either.
     names: &'static [(char, &'static [&'static str])],
+    /// The values a long option takes, when it has a list (python's
+    /// `--check-hash-based-pycs`): another one it refuses, and nothing runs.
+    long_names: &'static [(&'static str, &'static [&'static str])],
+    /// perl and ruby: after `-e CODE` the switches go on (`perl -e A -e B
+    /// -n`, `-e A -c`), up to the program's arguments; any other family
+    /// ends its options with the program.
+    code_continues: bool,
     /// What a lone `-` means.
     dash: Dash,
 }
 
 impl Table {
+    /// `value` is one long option `name` takes; `true` for one with no list.
+    fn long_value_ok(&self, name: &str, value: &str) -> bool {
+        self.long_names
+            .iter()
+            .find(|(n, _)| *n == name)
+            .is_none_or(|(_, values)| values.contains(&value))
+    }
+
     /// `value` is a name option `c` takes; `true` for an option with no list.
     fn names_ok(&self, c: char, value: &str) -> bool {
         match self.names.iter().find(|(o, _)| *o == c) {
@@ -372,6 +387,8 @@ const PYTHON: Table = Table {
     plus: false,
     space_continues: false,
     names: &[],
+    long_names: &[("check-hash-based-pycs", &["default", "always", "never"])],
+    code_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -379,8 +396,9 @@ const PYTHON: Table = Table {
 /// `--help` and `--version` and refuses any other long option.
 const PERL: Table = Table {
     short: &[
-        ("afgnpsStTuUwWX", Opt::Flag),
-        ("cvhV?", Opt::NoRun),
+        ("afgnpsStTUwWX", Opt::Flag),
+        // `-u` dumps core after compiling: the program does not run
+        ("cuvhV?", Opt::NoRun),
         ("l0", Opt::Digits),
         ("iFC", Opt::UntilSpace),
         ("D", Opt::WordChars),
@@ -397,6 +415,8 @@ const PERL: Table = Table {
     plus: false,
     space_continues: true,
     names: &[],
+    long_names: &[],
+    code_continues: true,
     dash: Dash::Stdin,
 };
 
@@ -450,6 +470,8 @@ const RUBY: Table = Table {
     plus: false,
     space_continues: false,
     names: &[],
+    long_names: &[],
+    code_continues: true,
     dash: Dash::Stdin,
 };
 
@@ -624,6 +646,8 @@ const NODE: Table = Table {
     plus: false,
     space_continues: false,
     names: &[],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -815,6 +839,8 @@ const BASH: Table = Table {
     plus: true,
     space_continues: false,
     names: &[('o', BASH_SET_O), ('O', BASH_SHOPT)],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::EndOfOptions,
 };
 
@@ -837,6 +863,8 @@ const DASH: Table = Table {
     plus: true,
     space_continues: false,
     names: &[('o', DASH_SET_O)],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::EndOfOptions,
 };
 
@@ -851,6 +879,8 @@ const BUSYBOX_ASH: Table = Table {
     plus: true,
     space_continues: false,
     names: &[('o', ASH_SET_O)],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::EndOfOptions,
 };
 
@@ -872,6 +902,8 @@ const OTHER_SHELL: Table = Table {
     plus: true,
     space_continues: false,
     names: &[('o', OTHER_SET_O)],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::Unknown,
 };
 
@@ -895,6 +927,8 @@ const MONO: Table = Table {
     plus: false,
     space_continues: false,
     names: &[],
+    long_names: &[],
+    code_continues: false,
     dash: Dash::Stdin,
 };
 
@@ -1046,16 +1080,29 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
     let mut words = table.words;
     // a shell's `-c`: its program is the first operand after the options
     let mut shell_code = false;
+    // a shell's `-s`: its program is its standard input, its operands the
+    // positional parameters
+    let mut stdin = false;
+    // perl's and ruby's first `-e`, the switches going on after it
+    let mut code: Option<(usize, usize)> = None;
     while let Some(a) = argv.get(i) {
         i += 1;
         let unknown = move || Runs::Unknown(guess(argv, i, table.plus)).into();
         if a == "--" {
-            return operand(argv, i, shell_code);
+            // `python3 -- -`: the standard input's program still
+            if table.dash == Dash::Stdin && code.is_none() && argv.get(i).is_some_and(|n| n == "-")
+            {
+                return Runs::Code.into();
+            }
+            return end(argv, i, shell_code, stdin, code);
         }
         if a == "-" {
             return match table.dash {
-                Dash::EndOfOptions => operand(argv, i, shell_code),
-                Dash::Stdin => Runs::Script(a.as_str().into()).into(),
+                Dash::EndOfOptions => end(argv, i, shell_code, stdin, code),
+                // the program is the standard input (lot 310, the review's
+                // differential test: it was taken for a script named `-`)
+                Dash::Stdin if code.is_none() => Runs::Code.into(),
+                Dash::Stdin => end(argv, i, shell_code, stdin, code),
                 Dash::Unknown => unknown(),
             };
         }
@@ -1099,11 +1146,18 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     continue;
                 }
                 Some(long @ (Long::Arg | Long::Loads)) => {
-                    if value.is_none() {
-                        if argv.get(i).is_none() {
-                            return unknown();
+                    let value = match value {
+                        Some(v) => v,
+                        None => {
+                            let Some(v) = argv.get(i) else {
+                                return unknown();
+                            };
+                            i += 1;
+                            v.as_str()
                         }
-                        i += 1;
+                    };
+                    if !table.long_value_ok(name, value) {
+                        return unknown();
                     }
                     seen.loads |= long == Long::Loads;
                     continue;
@@ -1111,7 +1165,9 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 Some(Long::Code) => {
                     let code = match value {
                         Some(_) => Some((i - 1, a.len() - value.map_or(0, str::len))),
-                        None => argv.get(i).map(|_| (i, 0)),
+                        // the interpreter refuses an option with no program
+                        None if argv.get(i).is_none() => return unknown(),
+                        None => Some((i, 0)),
                     };
                     return Reading {
                         runs: Runs::Code,
@@ -1127,7 +1183,7 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 // a shell's `+e`, `+o name`
                 Some("") => return unknown(),
                 Some(l) => l,
-                None => return operand(argv, i - 1, shell_code),
+                None => return end(argv, i - 1, shell_code, stdin, code),
             },
         };
         words = false;
@@ -1161,20 +1217,30 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 Opt::NoRunAlone => seen.no_run_alone = true,
                 Opt::Inspect => seen.inspect = true,
                 Opt::Next => next.push(c),
-                Opt::Stdin => return Runs::Code.into(),
+                Opt::Stdin => stdin = true,
                 // the rest of the cluster is options too, then its operands
                 Opt::ShellCode => shell_code = true,
                 Opt::Code => {
                     let start = a.len() - rest.len();
-                    let code = if rest.is_empty() {
-                        argv.get(i).map(|_| (i, 0))
+                    let at = if rest.is_empty() {
+                        // the interpreter refuses an option with no program
+                        if argv.get(i).is_none() {
+                            return unknown();
+                        }
+                        i += 1;
+                        (i - 1, 0)
                     } else {
-                        Some((i - 1, start))
+                        (i - 1, start)
                     };
-                    return Reading {
-                        runs: Runs::Code,
-                        code,
-                    };
+                    if !table.code_continues {
+                        return Reading {
+                            runs: Runs::Code,
+                            code: Some(at),
+                        };
+                    }
+                    // perl, ruby: the switches go on after the program
+                    code.get_or_insert(at);
+                    break;
                 }
                 Opt::Rest => break,
                 Opt::LoadsRest if rest.is_empty() => return unknown(),
@@ -1200,6 +1266,11 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                         rest
                     };
                     if opt == Opt::Module {
+                        // a module's name, never a path (python refuses
+                        // one: nothing runs)
+                        if value.is_empty() || value.contains('/') {
+                            return unknown();
+                        }
                         return Runs::Script(value.into()).into();
                     }
                     if !table.names_ok(c, value) {
@@ -1234,21 +1305,39 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
         }
         i += next.len();
     }
-    if shell_code {
-        // `bash -c` with no program: bash refuses
-        return Runs::Code.into();
+    end(argv, i, shell_code, stdin, code)
+}
+
+/// The end of the options, at `at`: perl's or ruby's `-e` program if one
+/// was read (the rest is its arguments), else [`operand`].
+fn end(
+    argv: &[String],
+    at: usize,
+    shell_code: bool,
+    stdin: bool,
+    code: Option<(usize, usize)>,
+) -> Reading {
+    if code.is_some() {
+        return Reading {
+            runs: Runs::Code,
+            code,
+        };
     }
-    Runs::Inline.into()
+    operand(argv, at, shell_code, stdin)
 }
 
 /// The first argument that is not an option, at `at`: the script; after a
-/// shell's `-c`, its program ([`Runs::Code`]); none, [`Runs::Inline`].
-fn operand(argv: &[String], at: usize, shell_code: bool) -> Reading {
+/// shell's `-c`, its program ([`Runs::Code`]; none: the shell refuses,
+/// [`Runs::Unknown`]); after `-s`, the standard input's ([`Runs::Code`]);
+/// none, [`Runs::Inline`].
+fn operand(argv: &[String], at: usize, shell_code: bool, stdin: bool) -> Reading {
     match argv.get(at) {
-        _ if shell_code => Reading {
+        Some(_) if shell_code => Reading {
             runs: Runs::Code,
-            code: argv.get(at).map(|_| (at, 0)),
+            code: Some((at, 0)),
         },
+        None if shell_code => Runs::Unknown(None).into(),
+        _ if stdin => Runs::Code.into(),
         Some(s) => Runs::Script(s.as_str().into()).into(),
         None => Runs::Inline.into(),
     }
@@ -1831,6 +1920,76 @@ mod tests {
             ),
             Runs::Script("/usr/bin/aws".into())
         );
+    }
+
+    /// The review of #539's differential test, with a program on standard
+    /// input and a strict oracle (`agent/tests/interpreter_differential.rs`):
+    /// an option the interpreter refuses for want of its program, or whose
+    /// value it refuses, runs nothing (not known, never `Code`); `-` is the
+    /// standard input's program, not a script named `-`; a shell's `-s`
+    /// reads its cluster to the end (dash's `-posix S1` refuses `S1` as
+    /// `-o`'s name); perl's and ruby's switches go on after `-e CODE`.
+    #[test]
+    fn review_the_strict_differential_s_findings() {
+        let (perl, py, bash, dash, ruby) = (
+            Path::new("/usr/bin/perl"),
+            Path::new("/usr/bin/python3"),
+            Path::new("/usr/bin/bash"),
+            Path::new("/usr/bin/dash"),
+            Path::new("/usr/bin/ruby"),
+        );
+        let unknown = |exe: &Path, a: &[&str]| {
+            let r = runs_of(exe, &argv(a));
+            assert!(matches!(r, Runs::Unknown(_)), "{exe:?} {a:?}: {r:?}");
+        };
+        // no program for the option: refused
+        unknown(perl, &["perl", "-e"]);
+        unknown(perl, &["perl", "-T", "-C -e"]);
+        unknown(perl, &["perl", "-E", "CODE", "-s", "-E"]);
+        unknown(py, &["python3", "-c"]);
+        unknown(py, &["python3", "-Ic"]);
+        unknown(bash, &["bash", "-c"]);
+        unknown(bash, &["bash", "-ec", "-p"]);
+        unknown(Path::new("/usr/bin/node"), &["node", "-e"]);
+        unknown(Path::new("/usr/bin/node"), &["node", "--eval"]);
+        // a value refused
+        unknown(py, &["python3", "--check-hash-based-pycs", "-O", "/tmp/s"]);
+        unknown(py, &["python3", "-m", "/tmp/s"]);
+        unknown(dash, &["sh", "-posix", "/tmp/s"]);
+        unknown(dash, &["sh", "-s", "-C", "-l", "-P"]);
+        unknown(bash, &["bash", "-f", "-restricted", "-I"]);
+        // perl -u dumps core: the program does not run
+        unknown(perl, &["perl", "-u", "/tmp/s"]);
+        // the switches after `-e CODE`
+        unknown(perl, &["perl", "-lane", "CODE", "-n", "-c"]);
+        assert_eq!(
+            runs_of(
+                py,
+                &argv(&["python3", "--check-hash-based-pycs", "always", "/tmp/s"])
+            ),
+            Runs::Script("/tmp/s".into())
+        );
+        for (exe, a) in [
+            (perl, &["perl", "-"][..]),
+            (perl, &["perl", "-w", "-", "/tmp/s"]),
+            (py, &["python3", "-"]),
+            (py, &["python3", "-O", "-", "/tmp/s"]),
+            (py, &["python3", "-Wignore", "--", "-", "-O"]),
+            (bash, &["bash", "-s", "/tmp/s", "x"]),
+            (dash, &["sh", "-s"]),
+        ] {
+            assert_eq!(runs_of(exe, &argv(a)), Runs::Code, "{a:?}");
+        }
+        for (exe, a, prog) in [
+            (perl, &["perl", "-e", "A", "-e", "B", "/tmp/s"][..], "A"),
+            (perl, &["perl", "-e", "A", "-n", "/tmp/s"], "A"),
+            (perl, &["perl", "-e", "A", "-"], "A"),
+            (ruby, &["ruby", "-e", "A", "-w", "/tmp/s"], "A"),
+        ] {
+            let a = argv(a);
+            assert_eq!(runs_of(exe, &a), Runs::Code, "{a:?}");
+            assert_eq!(inline_program(exe, &a), Some(prog), "{a:?}");
+        }
     }
 
     /// The review of #539's differential test: `python3 -i S` runs `S`,

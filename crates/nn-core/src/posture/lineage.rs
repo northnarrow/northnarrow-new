@@ -6652,10 +6652,13 @@ mod tests {
                 &["python3", "--check-hash-based-pycs", "never", "/tmp/e.py"][..],
                 script("/tmp/e.py"),
             ),
+            // lot 310, the review of #539's differential test: `-` is the
+            // standard input's program, the caller's (it read as a script
+            // named `-`)
             (
                 "/usr/bin/python3.12",
                 &["python3", "-", "/usr/bin/aws"][..],
-                script("-"),
+                Runs::Code,
             ),
             (
                 "/usr/bin/perl",
