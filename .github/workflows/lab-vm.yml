@@ -197,8 +197,21 @@ jobs:
         if: steps.kvm.outputs.available == 'true'
         timeout-minutes: 15
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          # 11/11/2026: the runners could not resolve the Azure mirror
+          # (azure.archive.ubuntu.com) and every job hung here until the
+          # step's timeout. Name what resolves, and when the Azure mirror does
+          # not, install from archive.ubuntu.com instead; apt gives up on a
+          # dead mirror after a bounded wait rather than the step's 15 min.
+          for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            if getent hosts "$h" >/dev/null; then echo "resolves: $h"; else echo "does not resolve: $h"; fi
+          done
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null && getent hosts archive.ubuntu.com >/dev/null; then
+            echo "apt: the Azure mirror does not resolve, using archive.ubuntu.com"
+            printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends \
             qemu-system-x86 qemu-utils seabios ipxe-qemu cloud-image-utils \
             gnupg gpgv openssh-client rsync curl iproute2 >/dev/null
           qemu-system-x86_64 --version | head -1
