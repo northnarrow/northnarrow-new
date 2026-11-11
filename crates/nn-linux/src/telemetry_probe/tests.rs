@@ -1,4 +1,5 @@
 use super::*;
+use nn_model::FsProtectOperation;
 
 use crate::audit::AgentSigningKey;
 use crate::boot::degradation;
@@ -6,7 +7,7 @@ use crate::boot::degradation;
 const AGENT: u32 = 4_000;
 const CHILD: u32 = 4_242;
 const EXE: &str = "/usr/local/bin/northnarrow-agent";
-const DENY: (u64, u64) = (0x0080_0001, 77);
+const TARGET: u32 = 4_300;
 const FROM: u64 = 1_000_000;
 const UNTIL: u64 = 2_000_000;
 const TS: u64 = 1_500_000;
@@ -19,16 +20,51 @@ fn window() -> Window {
     }
 }
 
+/// Lot 302: the slots of the deny hooks a round attempts (every one that
+/// is not an attach check).
+fn attempt_slots() -> Vec<usize> {
+    (0..deny::HOOK_COUNT)
+        .filter(|i| matches!(deny::HOOKS[*i].check, deny::Check::Attempt { .. }))
+        .collect()
+}
+
+/// Lot 302: the self-test's targets' keys in a test.
+fn keys() -> deny::TargetKeys {
+    deny::TargetKeys {
+        dir: (0x0080_0001, 77),
+        files: deny::file::PROTECTED
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (*f, (0x0080_0001, 100 + i as u64)))
+            .collect(),
+    }
+}
+
+/// Lot 302: the refusals of a round whose every deny attempt ran.
+fn deny() -> deny::DenyExpect {
+    deny::DenyExpect::new(&attempt_slots(), &keys(), TARGET, None)
+}
+
 fn probe_with_round(nonce: &str) -> TelemetryProbe {
     let p = TelemetryProbe::for_tests(Duration::from_secs(60));
-    p.open_round_for_tests(nonce, AGENT, EXE, window(), Some(DENY));
+    p.open_round_for_tests(nonce, AGENT, EXE, window(), Some(deny()));
     p
 }
 
-/// The child's report of a round whose every step ran.
+/// The child's report of a round whose every step ran (lot 302: every deny
+/// attempt refused; the owner's signal is refused silently, `sent`).
 fn full_report_text() -> String {
-    "file=ok\ndns=ok\ntcp=ok\nio_uring=ok\nbpf=ok\nfim=ok\ndeny_signal=refused\ndeny_create=refused\n"
-        .to_string()
+    let mut s = "file=ok\ndns=ok\ntcp=ok\nio_uring=ok\nbpf=ok\nfim=ok\n".to_string();
+    for i in attempt_slots() {
+        let h = &deny::HOOKS[i];
+        let w = if h.hook == "file_send_sigiotask" {
+            "sent"
+        } else {
+            "refused"
+        };
+        s.push_str(&format!("deny.{}={w}\n", h.hook));
+    }
+    s
 }
 
 fn full_report() -> ChildReport {
@@ -129,17 +165,42 @@ fn the_probe_s_word_on_each_sensor() {
 fn each_sensor_s_self_test_sees_its_event() {
     let nonce = &make_nonce().unwrap();
     let probe = probe_with_round(nonce);
-    for (sensor, e) in round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, DENY) {
+    for (sensor, e) in round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, Some(&deny())) {
         assert!(probe.observe(&e), "{sensor:?} not taken: {e:?}");
     }
     let live: Vec<Sensor> = Sensor::ALL.into_iter().filter(|s| s.live()).collect();
     assert_eq!(probe.seen_for_tests(), live, "every live sensor, each once");
-    let notes = probe.end_round_for_tests(&full_report(), &checks_ok(), Duration::ZERO, None);
+    let attempted: Vec<&str> = attempt_slots()
+        .into_iter()
+        .map(|i| deny::HOOKS[i].hook)
+        .collect();
+    assert_eq!(
+        probe.deny_seen_for_tests(),
+        attempted,
+        "lot 302: every deny hook's refusal, each once"
+    );
+    let (notes, deny_notes) =
+        probe.end_round_for_tests(&full_report(), &checks_ok(), Duration::ZERO, None);
     assert!(notes.is_empty(), "{notes:?}");
+    // no link state in the test: the attach checks say nothing
+    assert!(
+        deny_notes.iter().all(|n| matches!(
+            n,
+            deny::Note::NotExercised { slot, .. }
+                if matches!(deny::HOOKS[*slot].check, deny::Check::AttachOnly { .. })
+        )),
+        "{deny_notes:?}"
+    );
     assert!(probe.states().iter().all(|(_, w)| *w == ProbeState::Seen));
-    // the deny is seen only with both of its refusals
+    for (hook, w) in probe.deny_states() {
+        if attempted.contains(&hook.as_str()) {
+            assert_eq!(w, ProbeState::Seen, "{hook}");
+        }
+    }
+    // lot 302: one refusal arrived — `fs_protect`'s word (the round's
+    // refusals reach the pipeline), and that hook's only
     let probe = probe_with_round(nonce);
-    let events = round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, DENY);
+    let events = round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, Some(&deny()));
     let signal = events
         .iter()
         .find(|(_, e)| {
@@ -153,9 +214,11 @@ fn each_sensor_s_self_test_sees_its_event() {
         })
         .unwrap();
     assert!(probe.observe(&signal.1));
+    assert!(probe.seen_for_tests().contains(&Sensor::Deny));
+    assert_eq!(probe.deny_seen_for_tests(), ["task_kill"]);
     assert!(
-        !probe.seen_for_tests().contains(&Sensor::Deny),
-        "half of it"
+        !probe.observe(&signal.1),
+        "matched once: a second is judged"
     );
 }
 
@@ -166,7 +229,7 @@ fn each_sensor_s_self_test_sees_its_event() {
 #[test]
 fn only_the_child_s_own_events_of_its_steps_are_taken() {
     let nonce = &make_nonce().unwrap();
-    let events = round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, DENY);
+    let events = round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, Some(&deny()));
     let of = |s: Sensor| {
         events
             .iter()
@@ -176,19 +239,23 @@ fn only_the_child_s_own_events_of_its_steps_are_taken() {
             .clone()
     };
     // another pid, the same time
-    let other = round_events_for_tests(nonce, AGENT, EXE, CHILD + 1, TS, DENY);
+    let other = round_events_for_tests(nonce, AGENT, EXE, CHILD + 1, TS, Some(&deny()));
     let probe = probe_with_round(nonce);
     for (s, e) in &other {
+        // (lot 302: the target's spawn is the target's, whoever the child)
         let by_content = matches!(
             s,
             Some(Sensor::Exec) | Some(Sensor::FileOpen) | Some(Sensor::Dns)
-        ) || matches!(e, Event::FileOpen { .. } | Event::ExecCheck { .. });
+        ) || matches!(
+            e,
+            Event::FileOpen { .. } | Event::ExecCheck { .. } | Event::ProcessSpawn { .. }
+        );
         if !by_content {
             assert!(!probe.observe(e), "another pid's {s:?} taken");
         }
     }
     // outside the child's lifetime: after its reap the pid may be anyone's
-    let late = round_events_for_tests(nonce, AGENT, EXE, CHILD, UNTIL + 1, DENY);
+    let late = round_events_for_tests(nonce, AGENT, EXE, CHILD, UNTIL + 1, Some(&deny()));
     let probe = probe_with_round(nonce);
     for (s, e) in &late {
         if !matches!(
@@ -235,7 +302,7 @@ fn only_the_child_s_own_events_of_its_steps_are_taken() {
     // another round's nonce, another parent
     let other = make_nonce().unwrap();
     assert_ne!(other, *nonce);
-    let wrong = round_events_for_tests(&other, AGENT + 1, EXE, CHILD, TS, DENY);
+    let wrong = round_events_for_tests(&other, AGENT + 1, EXE, CHILD, TS, Some(&deny()));
     let probe = probe_with_round(nonce);
     for (s, e) in &wrong {
         if matches!(
@@ -291,7 +358,25 @@ fn only_the_child_s_own_events_of_its_steps_are_taken() {
     let probe = probe_with_round(nonce);
     probe.end_round_for_tests(&full_report(), &checks_ok(), Duration::ZERO, None);
     assert!(probe.observe(&of(Sensor::Bpf)), "late, still the child's");
-    assert_eq!(probe.tracker.lock().late_taken, 1);
+    // lot 302: a late refusal of the round just ended: taken, never counted
+    // for the open one
+    let next = Window {
+        pid: CHILD + 7,
+        from_ns: UNTIL + 1,
+        until_ns: u64::MAX,
+    };
+    probe.open_round_for_tests(nonce, AGENT, EXE, next, Some(deny()));
+    assert!(probe.observe(&of(Sensor::Deny)), "late refusal taken");
+    assert!(
+        !probe.seen_for_tests().contains(&Sensor::Deny),
+        "the open round's word untouched"
+    );
+    assert!(probe.deny_seen_for_tests().is_empty());
+    assert_eq!(
+        probe.tracker.lock().late_taken,
+        2,
+        "the bpf row, the refusal"
+    );
     assert!(probe.states()[Sensor::Bpf as usize].1 == ProbeState::Missed);
     degradation::reset_for_tests();
 }
@@ -388,14 +473,16 @@ fn a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert
     };
     let round = |dropped: bool| {
         let nonce = make_nonce().unwrap();
-        probe.open_round_for_tests(&nonce, AGENT, EXE, window(), Some(DENY));
-        for (s, e) in round_events_for_tests(&nonce, AGENT, EXE, CHILD, TS, DENY) {
+        probe.open_round_for_tests(&nonce, AGENT, EXE, window(), Some(deny()));
+        for (s, e) in round_events_for_tests(&nonce, AGENT, EXE, CHILD, TS, Some(&deny())) {
             if dropped && s == Some(Sensor::TcpConnect) {
                 continue; // the tcp_connect ring's events dropped
             }
             assert!(probe.observe(&e));
         }
-        probe.end_round_for_tests(&full_report(), &checks_ok(), Duration::ZERO, Some(&log))
+        probe
+            .end_round_for_tests(&full_report(), &checks_ok(), Duration::ZERO, Some(&log))
+            .0
     };
     // round 1: the signed degradation
     let notes = round(true);
@@ -493,7 +580,9 @@ fn a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed() {
     let o = outcomes(&all_seen, &full_report(), true, &checks_ok(), &runs);
     assert!(matches!(&o[Sensor::Deny as usize], Outcome::NotExercised(w) if w.contains("window")));
     // io_uring switched off
-    let r = ChildReport::parse("file=ok\ndns=ok\ntcp=ok\nio_uring=skipped: errno 1 (EPERM)\nbpf=ok\nfim=ok\ndeny_signal=refused\ndeny_create=refused\n");
+    let r = ChildReport::parse(
+        &full_report_text().replace("io_uring=ok", "io_uring=skipped: errno 1 (EPERM)"),
+    );
     let o = outcomes(&all_seen, &r, false, &checks_ok(), &runs);
     assert!(
         matches!(&o[Sensor::IoUring as usize], Outcome::NotExercised(w) if w.contains("errno 1"))
@@ -513,15 +602,9 @@ fn a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed() {
         ),
         ("bpf", &[Sensor::Bpf]),
         ("fim", &[Sensor::Fim]),
-        ("deny_signal", &[Sensor::Deny]),
-        ("deny_create", &[Sensor::Deny]),
     ] {
         let text =
             full_report_text().replace(&format!("{key}=ok"), &format!("{key}=skipped: errno 30"));
-        let text = text.replace(
-            &format!("{key}=refused"),
-            &format!("{key}=skipped: errno 30"),
-        );
         let o = outcomes(
             &all_seen,
             &ChildReport::parse(&text),
@@ -537,13 +620,58 @@ fn a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed() {
             );
         }
     }
-    // a deny step let through: missed, whatever was seen
-    let r = ChildReport::parse(
-        "file=ok\ndns=ok\ntcp=ok\nio_uring=ok\nbpf=ok\nfim=ok\ndeny_signal=refused\ndeny_create=done\n",
+    // lot 302: `fs_protect`'s word is the round's refusals arriving — a
+    // deny attempt let through is its hook's miss (the deny self-test's),
+    // not the source's; no attempt refused: not exercised; refused and none
+    // arrived: missed
+    let one_done =
+        full_report_text().replace("deny.inode_create=refused", "deny.inode_create=done");
+    let o = outcomes(
+        &all_seen,
+        &ChildReport::parse(&one_done),
+        false,
+        &checks_ok(),
+        &runs,
     );
-    let o = outcomes(&all_seen, &r, false, &checks_ok(), &runs);
+    assert_eq!(o[Sensor::Deny as usize], Outcome::Seen);
+    let none: String = full_report_text()
+        .lines()
+        .map(|l| match l.split_once('=') {
+            Some((k, _)) if k.starts_with("deny.") => format!("{k}=done\n"),
+            _ => format!("{l}\n"),
+        })
+        .collect();
+    let o = outcomes(
+        &all_seen,
+        &ChildReport::parse(&none),
+        false,
+        &checks_ok(),
+        &runs,
+    );
     assert!(
-        matches!(&o[Sensor::Deny as usize], Outcome::Missed(w) if w.contains("deny_create step was not refused"))
+        matches!(&o[Sensor::Deny as usize], Outcome::NotExercised(w) if w.contains("no deny attempt was refused")),
+        "{:?}",
+        o[Sensor::Deny as usize]
+    );
+    let mut no_record = all_seen;
+    no_record[Sensor::Deny as usize] = false;
+    let o = outcomes(&no_record, &full_report(), false, &checks_ok(), &runs);
+    assert!(matches!(&o[Sensor::Deny as usize], Outcome::Missed(_)));
+    // the owner's signal is refused silently (`sent`): a round whose only
+    // attempt it was ran, and its refusal must arrive
+    let only_sent =
+        "file=ok\ndns=ok\ntcp=ok\nio_uring=ok\nbpf=ok\nfim=ok\ndeny.file_send_sigiotask=sent\n";
+    let o = outcomes(
+        &no_record,
+        &ChildReport::parse(only_sent),
+        false,
+        &checks_ok(),
+        &runs,
+    );
+    assert!(
+        matches!(&o[Sensor::Deny as usize], Outcome::Missed(_)),
+        "{:?}",
+        o[Sensor::Deny as usize]
     );
     // a step the child did not report (it died): not exercised
     let o = outcomes(
@@ -919,4 +1047,71 @@ fn every_source_of_the_contract_has_a_self_test_word() {
         );
         assert_eq!(s.live(), s.programs().is_empty(), "{s:?}");
     }
+}
+
+/// Lot 302: the target's exec and the child's are told apart — the target
+/// starts before the child's window opens, its pid possibly not known yet
+/// when its events reach the tap: an exec check before the child's window
+/// is the target's (taken, no word), one in it the child's (the
+/// `exec_check` word); the target's spawn is taken by its shape.
+#[test]
+fn the_target_s_exec_is_not_the_child_s() {
+    let nonce = &make_nonce().unwrap();
+    let mut pending = deny();
+    pending.target = 0; // the target's pid not known yet
+    let p = TelemetryProbe::for_tests(Duration::from_secs(60));
+    p.open_round_for_tests(nonce, AGENT, EXE, window(), Some(pending));
+    let check = |pid: u32, ts: u64| Event::ExecCheck {
+        pid,
+        ppid: AGENT,
+        uid: 0,
+        comm: "northnarrow-age".into(),
+        filename: EXE.to_string(),
+        timestamp_ns: ts,
+        exe: Default::default(),
+    };
+    assert!(
+        p.observe(&check(TARGET, FROM - 1)),
+        "the target's, before the child's window"
+    );
+    assert!(!p.seen_for_tests().contains(&Sensor::ExecCheck));
+    assert!(p.observe(&check(CHILD, TS)), "the child's");
+    assert!(p.seen_for_tests().contains(&Sensor::ExecCheck));
+    // the target's pid known: its exec check in the child's window is not
+    // the child's
+    let p = probe_with_round(nonce);
+    assert!(!p.observe(&check(TARGET, TS)), "not the child's word");
+    assert!(!p.seen_for_tests().contains(&Sensor::ExecCheck));
+    // the target's spawn, by its shape, and its exec check: at most those
+    let spawn = deny_events_for_tests(AGENT, EXE, CHILD, TS, &deny())
+        .into_iter()
+        .find(|(_, e)| matches!(e, Event::ProcessSpawn { .. }))
+        .unwrap()
+        .1;
+    assert!(p.observe(&spawn));
+    assert!(p.observe(&check(TARGET, FROM - 1)));
+    assert!(!p.observe(&spawn), "no third event of the target's");
+}
+
+/// Lot 302 (the first lab round's `exec_check` miss): the child's window
+/// opens before its spawn — its exec check reaches the tap before the spawn
+/// returns its pid, and an event before the window is the target's or no
+/// one's. The window opened after the spawn missed the child's exec check
+/// every round.
+#[test]
+fn the_child_s_window_opens_before_its_spawn() {
+    let code = include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/crates/nn-linux/src/telemetry_probe.rs"
+    ));
+    let run = &code[code.find("async fn run_round(").unwrap()..];
+    let open = run
+        .find("r.id.child.from_ns = from_ns;")
+        .expect("the window opened");
+    let spawn = run.find("cmd.spawn()").expect("the spawn");
+    assert!(open < spawn, "the child's window opens before its spawn");
+    let target = run
+        .find("prepare_deny(probe, env")
+        .expect("the target started");
+    assert!(target < open, "the target's exec before the child's window");
 }

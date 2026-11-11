@@ -1328,7 +1328,11 @@ fn the_event_loop_wires_the_bus_as_modelled() {
 }
 
 /// Lot 280c (the brief's third named test): the sensor self-test's events
-/// never trigger the rules or the posture. Each event one round's child
+/// never trigger the rules or the posture. Lot 302 (named: the self-test's
+/// denials are invisible to the rules, the posture and the export): every
+/// deny hook's refusal of the round, its other rows and its target's exec,
+/// taken the same way — no rule (no detection, so nothing the export
+/// reads), no posture move. Each event one round's child
 /// makes (as the pipeline decodes it) is taken by the probe's tap, which
 /// the decision thread offers every event first (pinned above: a taken
 /// event returns before `process_event`); offered as the thread offers
@@ -1337,7 +1341,7 @@ fn the_event_loop_wires_the_bus_as_modelled() {
 /// on the agent): what the take prevents.
 #[test]
 fn self_test_events_never_trigger_rules_or_the_posture() {
-    use crate::telemetry_probe::{round_events_for_tests, TelemetryProbe, Window};
+    use crate::telemetry_probe::{deny, round_events_for_tests, TelemetryProbe, Window};
     use nn_model::posture_types::PostureKind;
     let case: Case =
         serde_json::from_value(json!({"about": "lot 280c: the sensor self-test", "items": []}))
@@ -1348,8 +1352,31 @@ fn self_test_events_never_trigger_rules_or_the_posture() {
     let nonce = &crate::telemetry_probe::make_nonce().unwrap();
     let (agent, child, ts) = (4_000, 4_242, 1_500_000);
     let exe = "/usr/local/bin/northnarrow-agent";
-    let deny = (0x0080_0001, 77);
-    let events = round_events_for_tests(nonce, agent, exe, child, ts, deny);
+    // lot 302: one refusal per deny hook the round attempts, on the
+    // self-test's own targets (a target process, a protected directory and
+    // its files, the BPF guard's objects), the deny steps' other rows and
+    // the target's exec
+    let attempted: Vec<usize> = (0..deny::HOOK_COUNT)
+        .filter(|i| matches!(deny::HOOKS[*i].check, deny::Check::Attempt { .. }))
+        .collect();
+    let keys = deny::TargetKeys {
+        dir: (0x0080_0001, 77),
+        files: deny::file::PROTECTED
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (*f, (0x0080_0001, 100 + i as u64)))
+            .collect(),
+    };
+    let expect = deny::DenyExpect::new(&attempted, &keys, 4_300, None);
+    let events = round_events_for_tests(nonce, agent, exe, child, ts, Some(&expect));
+    assert!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::FsProtectDenial { .. }))
+            .count()
+            == attempted.len(),
+        "one refusal per attempted deny hook"
+    );
     let probe = TelemetryProbe::for_tests(Duration::from_secs(60));
     probe.open_round_for_tests(
         nonce,
@@ -1360,7 +1387,7 @@ fn self_test_events_never_trigger_rules_or_the_posture() {
             from_ns: 1_000_000,
             until_ns: 2_000_000,
         },
-        Some(deny),
+        Some(expect),
     );
     let posture = crate::posture::PostureMachine::new();
     let mut recent: Vec<Event> = Vec::new();

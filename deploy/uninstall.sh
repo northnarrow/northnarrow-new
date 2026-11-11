@@ -421,6 +421,12 @@ for f in "$ETC_DIR"/{agent.dev.lock,kill_switch.conf,maintenance.mode,debug_disa
     [[ -e "$f" ]] && rm -f "$f"
 done
 [[ -d "$RUN_DIR" ]] && { log "removing $RUN_DIR"; rm -rf "$RUN_DIR"; }
+# Lot 302: the deny self-test's throwaway cgroup (removed after each round;
+# left by an agent stopped in the middle of one) and the boot's move-guard
+# self-test's (lot 273b) — empty, at the cgroup v2 root.
+for d in /sys/fs/cgroup/northnarrow-deny-selftest /sys/fs/cgroup/northnarrow-move-selftest; do
+    if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed $d"; fi
+done
 systemctl daemon-reload
 
 # ── 5. config + state ─────────────────────────────────────────────────

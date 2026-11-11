@@ -2098,6 +2098,49 @@ fn register_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     Ok(())
 }
 
+/// Lot 302: the deny self-test's targets (`(key, flags)` each), registered
+/// in the pinned `PROTECTED_INODES` under `pin_root` once the start's
+/// registrations are done, and kept by a later stale-key prune like the
+/// start's own (`BOOT_KEYS`).
+pub(crate) fn register_runtime_inodes(pin_root: &Path, regs: &[((u64, u64), u8)]) -> Result<()> {
+    let mut handle = ProtectedInodesHandle::open(pin_root)?;
+    for ((dev, ino), flags) in regs {
+        handle.register(
+            InodeKey {
+                dev: *dev,
+                ino: *ino,
+            },
+            *flags,
+        )?;
+        BOOT_KEYS
+            .lock()
+            .get_or_insert_with(Default::default)
+            .insert((*dev, *ino));
+    }
+    Ok(())
+}
+
+/// Lot 302: the deny self-test's targets of an earlier round, made again
+/// (an attempt on them went through): their keys out of `PROTECTED_INODES`
+/// and of the start's set, so a hook let through round after round does not
+/// fill the map. A key already gone is no error.
+pub(crate) fn release_runtime_inodes(pin_root: &Path, keys: &[(u64, u64)]) -> Result<()> {
+    let mut handle = ProtectedInodesHandle::open(pin_root)?;
+    for (dev, ino) in keys {
+        let key = InodeKey {
+            dev: *dev,
+            ino: *ino,
+        };
+        if handle.contains(key) {
+            handle.remove(key)?;
+        }
+        if let Some(k) = BOOT_KEYS.lock().as_mut() {
+            k.remove(&(*dev, *ino));
+        }
+    }
+    Ok(())
+}
+
 /// Lot 277 (the third review of #494, R2-b): `path`, a file the agent
 /// keeps its state in, protected like its other files — no write, unlink,
 /// rename or setattr by a foreign caller outside the trusted-installer

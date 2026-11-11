@@ -8640,3 +8640,89 @@ number in parentheses is a lab PR.
     lockfiles unchanged.
   - Levels unchanged (C21 1): correctness of the chains' readers and of the
     receiver's check, measured by host tests — not a new capability.
+- **Lot 302 — every deny hook proves it denies, every round; the bpf()
+  guard pinned (C23).**
+  - What was open: the sensor self-test (lot 280c) exercised two of the
+    deny hooks each round, on the agent itself (`SIGURG` to the agent, a
+    create in `/etc/northnarrow`); the others were checked at their attach
+    only, so a hook attached and not run, or whose record was lost, went
+    unnoticed. And lot 301's residual: the BPF guard's `bpf` hook (and lot
+    290's `bpf_prog`) lived as long as the agent, so through a restart's or
+    an upgrade's gap a handle by id on the start-in-cgroup tracker's links
+    was given to root, and a kprobe or LSM program loaded unrefused.
+  - What changed: each round the self-test's child makes one harmless
+    attempt per deny hook on targets of its own — a target process it
+    starts and registers as a worker (protected, never exempt), a protected
+    directory in the unit's runtime directory and its files, a throwaway
+    cgroup, the guard's own objects by relative paths — never the agent: 27
+    attempts where the kernel has every hook (the ptrace hook in attach
+    mode, `/proc/<pid>/mem`: it refuses a read-mode access without a
+    record). Each must be refused and its refusal must arrive as the
+    self-test's; a deny that does not deny or does not report is a signed
+    `deny_selftest` degradation, two rounds in a row
+    `deny_selftest_alert`. Five hooks with no safe attempt are attach checks,
+    declared with their reason (`SENSOR_CONTRACT.md` §5b): the 32-bit
+    `ioctl`, the move guard's two halves, the sysctl judge (the write deny
+    refuses first), the module judge. The kernel records the child's
+    refusals outside the denials' budgets and dedup (a per-boot map the
+    agent writes around the round, read by the two emitters only), and the
+    probe's tap takes them before any judge. The `bpf` and `bpf_prog` hooks
+    are pinned and re-attached fresh like the deny hooks; the agent enters
+    `PROTECTED_PIDS` right after its object's load, an exempt caller of the
+    previous start's guard from its first program load.
+  - The lab, as measured (our own guests under lease k302, one at a time;
+    agents uninstalled, the guests clean and off at the end;
+    `nn-lab.sh deny-selftest-check` puts the guard in enforce mode for its
+    run):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`), round 1 (before two fixes):
+      `verifier-check` 105 programs, 103 OK, 2 not counted, 0 failing; the
+      agent restarted in a window through the previous start's pinned
+      guard (enforce; `link_bpf`, `link_bpf_prog` pinned). It found two
+      bugs, fixed: the child's window opened after its spawn, so its exec
+      check reached the tap before it and `exec_check` was missed every
+      round; and the ptrace step read `/proc/<pid>/environ`, a read-mode
+      access the hook refuses without a record by design (`ps` makes them
+      all day) — refused, never reported, the hook missed every round; the
+      step now opens `/proc/<pid>/mem` (attach mode, recorded). Every other
+      hook (26 of the 27 attempted) was refused and reported in each of the
+      10 rounds; no rule, no posture move, no record held back; with both
+      budgets spent on every CPU before two rounds, every refusal arrived,
+      none held back; `inode_mknod` unpinned on purpose: the signed
+      `deny_selftest` degradation in 55 s, `deny_selftest_alert` in 120 s
+      (and the link self-check's `bpf_link_missing`), attached again by a
+      restart; through a restart gap (the units stopped inside a window, the
+      window over, no agent) a handle by id on each of the tracker's 7
+      links, on the agent's `task_kill` program and a kprobe load were
+      refused (`EPERM`), and the agent started again through the pinned
+      guard (28 of 28 deny hooks, enforce); `upgrade-check` (28 of 28 after
+      the upgrade, then the cold boot: agent and watchdog active, 81 pins,
+      47 LSM programs), the bootcheck twice 30 s apart, uninstalled, clean.
+    - **Ubuntu 24.04**, round 2 (the fix): 10 rounds, every sensor seen in
+      each and every deny hook attempted (27) refused and reported in each;
+      cost at most 10.2 ms of the child's and the target's CPU and 8.9 ms of
+      the agent's checks a round (the budget: 50 ms), the slowest event
+      28 ms; no rule, no posture move, nothing held back; budgets spent
+      before two rounds: every refusal arrived, none held back;
+      `inode_mknod` unpinned: degradation in 55 s, alert in 121 s; the
+      restart gap: the tracker's 7 links, the agent's program and a kprobe
+      load refused, the agent up again through the pinned guard (28 of 28,
+      enforce). Uninstalled, clean.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, the fix): `verifier-check`
+      105 programs, 99 OK, 6 not counted, 0 failing; 10 rounds, every
+      sensor seen in each and every deny hook attempted (25: the ACL hooks
+      are not on 5.15) refused and reported in each; cost at most 7.3 ms of
+      the child's and the target's CPU and 5.5 ms of the agent's checks a
+      round, the slowest event 15 ms; no rule, no posture move, nothing held
+      back; with both budgets spent before two rounds every refusal arrived.
+      Uninstalled, clean.
+  - Mutations (a catch is a named test failing): 28 on the new code, 27 caught by named tests
+    (the matcher, each expectation's target, the verdicts, the episode's
+    alert and return, the plan, the exact program names, the child's and
+    the target's exec, the targets' change, the target's role, the kernel
+    bypass in both emitters and the mark's order, the pinned guard hooks,
+    the early registration; `fs_protect`'s word for a round whose only
+    refusal is the owner's signal, once its test was added); 1 argued
+    equivalent (a late refusal marking the ended round's word, read by
+    nothing after its close).
+  - Level unchanged (C23 2, provisional): the re-assessment is not this
+    lot's.

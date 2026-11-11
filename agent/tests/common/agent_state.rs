@@ -241,9 +241,12 @@ pub const HOST_PATHS: &[(&str, &str)] = &[
     ),
     (
         "/run/northnarrow",
-        "the telemetry probe's directory; containment.json (a block or throttle only); the \
-         baits; the watchdog's refused-marker and hold records and install.sh's rollback \
-         marker, read and removed (signed into the test's audit log)",
+        "the telemetry probe's directory (lot 302: and the deny self-test's, `selftest/`, \
+         protected while an agent runs and made again at its start; its throwaway cgroup is \
+         `/sys/fs/cgroup/northnarrow-deny-selftest`, removed after each round); \
+         containment.json (a block or throttle only); the baits; the watchdog's \
+         refused-marker and hold records and install.sh's rollback marker, read and removed \
+         (signed into the test's audit log)",
     ),
 ];
 

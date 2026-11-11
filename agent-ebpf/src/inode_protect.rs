@@ -156,6 +156,31 @@ pub static FS_GRANT: Array<FsGrant> = Array::pinned(1, 0);
 #[map]
 pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+/// Lot 302: the tgid of the deny self-test's child while its round runs
+/// (0 otherwise), written by the agent around each round
+/// (`nn_linux::telemetry_probe::deny::SelfTestMark`). The child is the
+/// agent's own binary, spawned and reaped by the agent, so its pid is not
+/// another process's before the agent writes 0 again. Its refusals are
+/// decided like any caller's — the mark changes no verdict — and recorded
+/// outside the denials' budgets ([`ATTEMPT_DENIAL_RATE`], lot 293;
+/// [`TASK_DENIAL_RATE`]) and the per-caller dedup: the self-test never
+/// takes the room a real attempt's record needs, and a flood that spends
+/// the budgets never hides the self-test's own refusals. Per boot, not
+/// pinned: an earlier boot's programs never read this boot's mark.
+#[map]
+pub static SELFTEST_TGID: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Lot 302: the calling process is the deny self-test's child of this
+/// round ([`SELFTEST_TGID`]).
+#[inline(always)]
+pub(crate) fn caller_is_self_test() -> bool {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if tgid == 0 {
+        return false;
+    }
+    matches!(SELFTEST_TGID.get(0), Some(t) if *t == tgid)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — common pointer-chase logic for every hook.
 // ---------------------------------------------------------------------------
@@ -311,6 +336,11 @@ pub(crate) fn attempt_budget() -> bool {
 /// Lot 293: [`emit_denial`] behind the attempt budget ([`attempt_budget`]).
 #[inline(always)]
 pub(crate) fn emit_attempt(operation: u8, key: InodeKey) {
+    // Lot 302: the deny self-test's refusal, outside the budget
+    if caller_is_self_test() {
+        emit_denial(operation, key);
+        return;
+    }
     if attempt_budget() {
         emit_denial(operation, key);
     }
@@ -337,6 +367,12 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// and operation a second.
 #[inline(always)]
 pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
+    // Lot 302: the deny self-test's refusal, outside the dedup and the
+    // budget (it takes no slot of either)
+    if caller_is_self_test() {
+        emit_denial(operation, key);
+        return;
+    }
     let now = unsafe { bpf_ktime_get_ns() };
     let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
     let seen = (caller << 8) | operation as u64;

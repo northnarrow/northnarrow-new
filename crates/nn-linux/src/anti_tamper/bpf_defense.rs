@@ -2,7 +2,10 @@
 //!
 //! * attaches `bpf_map_guard` (deny set — counted in the fail-closed LSM
 //!   health like every other deny hook) and `bpf_syscall_observe`
-//!   (observe set);
+//!   (observe set: its attach failure does not refuse the start), and lot
+//!   290's `bpf_prog_guard`; lot 302: the three pinned under the pin root
+//!   like the deny hooks (`prog_<hook>`, `link_<hook>`), so the previous
+//!   start's keep refusing through a restart or an upgrade's gap;
 //! * registers the ids of every map and program of the loaded object in
 //!   `OWN_BPF_IDS`, so the hooks recognise the agent's own objects;
 //! * sets the mode: **enforce** in production, **observe** in
@@ -231,7 +234,9 @@ pub(crate) fn observe_shortfall(enforce: bool, debug_build: bool) -> Option<Stri
 
 /// Attach both hooks (deny + observe). Errors are reported to the caller's
 /// health accounting, not returned: the anti-tamper health decides the
-/// fail-closed outcome.
+/// fail-closed outcome. Lot 302: the three LSM hooks of the guard
+/// (`bpf_map`, `bpf`, `bpf_prog`) are pinned under `pin_root` and
+/// re-attached fresh, the previous start's kept until this start's runs.
 pub(crate) fn attach(
     guard: &BpfGuard,
     ebpf: &mut Ebpf,
@@ -284,11 +289,21 @@ pub(crate) fn attach(
                 .push((ROLE_EXIT_PROGRAM, format!("{e:#}")));
         }
     }
-    match antitamper_bpf::attach_transient(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf) {
+    // Lot 302: the bpf() guard pinned like the deny hooks (`prog_bpf`,
+    // `link_bpf` under the pin root, attach-before-purge): it went with the
+    // agent, so through a restart or an upgrade's gap a handle on one of the
+    // agent's links (the start-in-cgroup tracker's, pinned beside the root
+    // and running all along) was given by id, and a kprobe or LSM program
+    // was loaded unrefused (lot 301's residual). Pinned, the previous
+    // start's program keeps refusing until this one is attached; its maps
+    // (the own ids, the mode) live as long as its pin. A failure is still
+    // an observe failure (the start goes on, signed).
+    match antitamper_bpf::reattach_fresh(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf, pin_root) {
         Ok(()) => info!(
             program = OBSERVE_PROGRAM,
             hook = OBSERVE_HOOK,
-            "BPF self-defence: bpf() syscall observer attached"
+            pinned = pin_root.is_some(),
+            "BPF self-defence: bpf() syscall guard attached"
         ),
         Err(e) => {
             dump_verifier_log(OBSERVE_PROGRAM, &e);
@@ -300,10 +315,14 @@ pub(crate) fn attach(
     }
     // Lot 290: the program-handle guard (and the seen loads' recorder), and
     // the cross-view's iterators.
-    match antitamper_bpf::attach_transient(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf) {
+    // Lot 302: pinned too (`prog_bpf_prog`, `link_bpf_prog`): a handle on
+    // one of the agent's programs through a path the bpf() guard does not
+    // read (a relative one, a bind mount) stays refused through the gap.
+    match antitamper_bpf::reattach_fresh(ebpf, PROG_GUARD_PROGRAM, PROG_GUARD_HOOK, btf, pin_root) {
         Ok(()) => info!(
             program = PROG_GUARD_PROGRAM,
             hook = PROG_GUARD_HOOK,
+            pinned = pin_root.is_some(),
             "BPF self-defence: program-handle guard attached"
         ),
         Err(e) => {

@@ -220,7 +220,7 @@ stated as such (`evidence: attach_check`):
 | `io_uring` | a ring of one entry made and closed | live (not exercised where io_uring is switched off) |
 | `bpf_syscall` | a one-entry array map made and closed (`BPF_MAP_CREATE`) | live |
 | `fim_drain` | a file created in the probe directory, which the FIM watches | live |
-| `fs_protect` | `SIGURG` to the agent and a file created in `/etc/northnarrow`: both must be refused and their denials must arrive — two of the deny hooks (`task_kill`, `inode_create`); a step let through is a miss by itself; not exercised in a trusted-installer window, where nothing is refused by design | live |
+| `fs_protect` | lot 302: one attempt per deny hook on the self-test's own targets (§5b) — the source's word is the round's refusals reaching the pipeline (missed: attempts refused and none arrived); each hook has a word of its own (§5b); not exercised in a trusted-installer window, where nothing is refused by design | live |
 | `module_load` | each of its programs still linked, and a load reported for each module new in `/proc/modules` since the last round | attach check |
 | `exploit_guard` | each of its loaded programs still linked | attach check |
 | `dns_answer` | each of its programs still linked | attach check |
@@ -237,7 +237,8 @@ well (lot 300): before, its link was dropped once pinned, and
 `module_load` was `missed` in every round on every host (an alert at the
 second round) while its programs ran. The state directory is `chattr +i`: a create there is
 refused by the kernel before any LSM hook runs, so the deny step creates in
-`/etc/northnarrow` (registered `NOCREATE`, not immutable).
+`/etc/northnarrow` (registered `NOCREATE`, not immutable); since lot 302
+the deny steps use targets of their own, never the agent (§5b).
 
 **A source missed** — its event did not come, its attach check failed, a
 deny step was let through: at the round's end a signed degradation
@@ -283,8 +284,10 @@ can be switched off as a whole through debugfs
 (`/sys/kernel/debug/kprobes/enabled`: refused outside a window since lot
 280b, below); an attach check proves a program linked, not that the kernel
 runs it (a BPF LSM program without `bpf` in the active LSM list is the
-manifest's other word, §6); and the deny step exercises two deny hooks of
-the twenty-one each round. Against a root on the host the deny hooks (the
+manifest's other word, §6); and (since lot 302) the deny steps prove each
+deny hook on the self-test's own targets — a root that serves the child
+can let its attempts be refused and still detach the hook for every other
+process. Against a root on the host the deny hooks (the
 agent's own files, maps and processes) and the heartbeat's verifier off the
 host are the defence: the manifest says what the agent can see, not what
 it cannot.
@@ -372,6 +375,105 @@ the verifier's next check (its timer, 30 s in the example of
 self-test whose rounds stop is `stale` after 149 s. For the three sources
 with an attach check the bound holds for a detach; their blinding by a root
 that leaves the attach in place is not seen.
+
+## 5b. The deny self-test: every deny hook proves it denies (lot 302)
+
+The sensor self-test's child (§5a) makes, each round, ONE harmless attempt
+per deny hook — against targets of the self-test's own, never the agent:
+
+- **a target process**: a child of the agent's binary started for the
+  round (`--move-guard-self-test-target`, the boot's move-guard target),
+  registered in `PROTECTED_PIDS` as a worker (protected, never exempt),
+  killed, reaped and evicted at the round's end;
+- **a target directory**, `/run/northnarrow/selftest` (the unit's runtime
+  directory: a tmpfs; the state directory is `chattr +i`, where the kernel
+  refuses before any hook), registered `MUTATE | NOCREATE`, and its files,
+  registered `MUTATE | WRITE` — made again when an attempt on them went
+  through;
+- **the BPF guard's own objects**: a pin of the pin root reached by a
+  relative path (the `bpf` hook judges the absolute ones first), and a
+  program type the guard refuses outside the family.
+
+Each attempt must be refused (`EPERM`; `EACCES` for the ptrace access,
+which the kernel returns for a refused one) **and** its refusal must reach
+the agent as the self-test's: the child's pid within its lifetime, the
+hook's operation, its own target. The kernel records the child's refusals
+outside the denials' budgets and the per-caller dedup (lot 293's
+`denial_rate`, the task denials' `task_denial_rate`): the agent names the
+child to the kernel for the round (`SELFTEST_TGID`, per boot), which
+changes no verdict — the self-test never takes the room of a real attempt's
+record, and a flood that spent the budgets hides none of its refusals.
+Like the sensor self-test's events, they are taken before the decision
+engine: never the rules, the posture or the export.
+
+| Hook | The round's attempt (on the self-test's targets) | Record |
+|---|---|---|
+| `task_kill` | `kill(SIGURG)` of the target process | `signal` |
+| `ptrace_access_check` | a read-only open of the target's `/proc/<pid>/mem` (attach mode: the hook records those; it refuses a read-mode access — `environ`, what `ps` makes all day — without a record; the unit's seccomp filter refuses the `ptrace` syscall itself) | `ptrace` |
+| `inode_unlink`, `inode_rmdir`, `inode_rename` | an unlink, an rmdir of an empty directory, a rename in the self-test directory | `unlink`, `rmdir`, `rename` |
+| `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`, `inode_link` | a file, a directory, a FIFO, a symlink, a hard link made in it | `create` … `link` |
+| `inode_setattr`, `file_ioctl` | a protected file's mode set to its own, its inode flags set to their own (`FS_IOC_SETFLAGS`) | `setattr`, `ioctl` |
+| `inode_setxattr`, `inode_removexattr` | a `user.` attribute set on one protected file, removed from another | `xattr` |
+| `inode_set_acl`, `inode_remove_acl` (6.2+) | a POSIX ACL equal to the file's mode set on one, removed from another | `xattr` |
+| `file_open` | a write-open of a protected file | `write` |
+| `file_permission` | a write of 0 bytes through a descriptor of a protected file the agent opened and handed to the child (fd 3) | `write` |
+| `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio` | the target's core limit set to 0, its policy to the one it has, its nice value to 19, its I/O priority to best effort 7 | `rlimit`, `sched`, `nice`, `ioprio` |
+| `file_send_sigiotask` | `SIGURG` through a pipe whose owner is the target (`F_SETOWN`, `F_SETSIG`, `O_ASYNC`): the kernel drops the signal silently, the record is the proof | `sigio` |
+| the move guard (`inode_permission`, where the kernel has it) | the target's pid written to the `cgroup.procs` of a throwaway cgroup (`/sys/fs/cgroup/northnarrow-deny-selftest`, removed after the round) | `cgroup_move` |
+| `bpf` | a load of a two-instruction kprobe program (a type refused outside the family in every mode) | `bpf_prog_type` |
+| `bpf_map` | a read-only handle on one of the agent's maps (`ROLE_TGIDS`) by a relative path — where the guard enforces | `bpf_handle` |
+| `bpf_prog` | a handle on one of the agent's programs (`prog_task_kill`) by a relative path — where the guard enforces | `bpf_handle` |
+
+Declared **attach check only** — no safe attempt; their programs must be
+linked:
+
+| Hook | Why no attempt |
+|---|---|
+| `file_ioctl_compat` | only a 32-bit process's `ioctl` reaches it, and the agent is a 64-bit binary |
+| `cgroup_procs_write_start` (fexit), `cgroup_procs_write_finish` (fentry) | the move guard's lookup half and its third program refuse nothing themselves: the move's refusal reads what the first stashed |
+| the sysctl judge (`cgroup/sysctl` on the root cgroup) | every write it would refuse is refused before it by the write deny (`file_permission` runs in `rw_verify_area`, before `proc_sys_call_handler`): reaching it alone takes a race on the writer's buffer, the race it closes |
+| `kernel_read_file`, `kernel_load_data` (the module judge) | a module or a kexec image read: the self-test never loads one, and `finit_module`, `init_module` and `kexec_file_load` are refused by the unit's seccomp filter (nor has it `CAP_SYS_MODULE` or `CAP_SYS_BOOT`); `kernel_load_data` is checked with `module_load`'s attach check |
+
+The opt-in policy denies (the exec policy's and the exec quarantine's
+`bprm_check_security` and `mmap_file`, the connect deny's
+`socket_connect`) refuse by an operator's policy, not on the agent's own
+objects: they are not in the self-test.
+
+**Not exercised** (a WARN once, the round says nothing of the hook): a
+trusted-installer window open; the BPF guard observing (a debug build, or
+`NN_BPF_DEFENSE_OBSERVE=1`) for `bpf_map` and `bpf_prog`; a hook the
+kernel does not have (its program not loaded); no target process or no
+protected directory this round (no bpffs pin root).
+
+**A deny that does not deny, or does not report**: its attempt went
+through, or its refusal did not arrive within 5 s — a signed degradation
+(`subsystem_degraded`, source `deny_selftest`, the hook and the step
+named); two rounds in a row an alert (`deny_selftest_alert`, ERROR in the
+journal); refused again, `deny_selftest_restored` and the degradation
+withdrawn. An attach check whose program is loaded and not linked is a
+miss the same way. The journal's summary every ten rounds counts the rounds
+whose every attempt was refused and reported (`deny_all_refused`) and the
+most hooks a round attempted (`deny_attempted_max`).
+
+**Its cost** is the round's (§5a): the child's CPU now includes its deny
+attempts and the target process's start and end; the lab's measurement is
+in [the capability programme, lot 302](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md).
+
+**The bpf() guard pinned** (lot 302): the BPF guard's three LSM hooks —
+`bpf_map` (since Tappa 10.8), `bpf` and `bpf_prog` — are pinned under the
+pin root (`prog_<hook>`, `link_<hook>`) and re-attached fresh at each
+start, the previous start's kept until this start's runs. Through a
+restart's or an upgrade's gap the previous start's guard still refuses a
+handle by id on one of the agent's links (the start-in-cgroup tracker's,
+pinned beside the root and running all along: lot 301's residual), its
+maps and programs, and a load of a refused program type; a new agent is an
+exempt caller of it from its first program load (it registers in
+`PROTECTED_PIDS` right after its object's load).
+
+`debug-trigger` builds only, for the lab: `/run/northnarrow/debug-deny-detach`
+names hooks whose `link_<hook>` each round unpins (the hook really
+detached until the next start); `/run/northnarrow/debug-deny-budget-spent`
+spends both budgets on every CPU before each round.
 
 ## 6. A kernel without `bpf` in `lsm=` (EXP-37)
 

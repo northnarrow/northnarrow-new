@@ -284,7 +284,9 @@ fn run_command(mut cmd: Command, what: &str) -> (SelfTestOutcome, ExpectedDenial
 }
 
 /// Lot 273b: the move guard's children's flags (hidden from `--help`).
-pub const MOVE_TARGET_FLAG: &str = "--move-guard-self-test-target";
+/// Lot 302: the deny self-test's target each round too (one flag, the
+/// sensor self-test's).
+pub const MOVE_TARGET_FLAG: &str = crate::telemetry_probe::deny::TARGET_FLAG;
 pub const MOVE_FLAG: &str = "--move-guard-self-test";
 /// The throwaway cgroup the mover writes to, at the hierarchy's root.
 pub const MOVE_SELFTEST_CGROUP: &str = "northnarrow-move-selftest";

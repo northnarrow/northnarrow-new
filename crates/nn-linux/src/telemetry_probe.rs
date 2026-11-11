@@ -21,8 +21,13 @@
 //! - **bpf**: a one-entry array map made and closed (`bpf_syscall`);
 //! - **FIM**: a file created in the probe directory, which the FIM watches
 //!   (`fim_drain`);
-//! - **deny**: a signal to the agent and a file created in
-//!   `/etc/northnarrow`, both refused by the deny hooks (`fs_protect`).
+//! - **deny** (lot 302, [`deny`]): one harmless attempt per deny hook
+//!   against targets of the self-test's own — a process it starts and
+//!   protects, a directory and files it protects, the BPF guard's own
+//!   objects — never the agent: each must be refused and its refusal reach
+//!   the pipeline. `fs_protect`'s word is the round's refusals arriving;
+//!   each hook has its own (a signed `deny_selftest` degradation, then an
+//!   alert).
 //!
 //! Three sources have no cheap, harmless event, and get a check of their
 //! attach instead ([`Sensor::live`] false): `module_load` (loading a module
@@ -102,7 +107,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nn_model::{Event, FsProtectOperation};
+use nn_model::Event;
 use parking_lot::Mutex;
 use rand::rngs::SysRng;
 use rand::TryRng;
@@ -138,14 +143,6 @@ pub const DEGRADATION_SOURCE: &str = "sensor_selftest";
 pub const AUDIT_OP_ALERT: &str = "sensor_selftest_alert";
 /// Lot 280c: a sensor missed is seen again.
 pub const AUDIT_OP_RESTORED: &str = "sensor_selftest_restored";
-/// The directory the deny step creates a file in: the agent's
-/// configuration directory, registered `NOCREATE` and not `chattr +i` (the
-/// state directory is: there the kernel refuses a create before any LSM
-/// hook runs, and the deny would never be exercised).
-pub const DENY_DIR: &str = crate::anti_tamper::filesystem::CONFIG_DIR;
-/// The signal the deny step sends the agent (ignored by default, no
-/// handler: let through by a blind hook, it changes nothing).
-pub const DENY_SIGNAL: i32 = libc::SIGURG;
 /// The round's budget (lot 280c): the child's CPU time and the agent's own
 /// checks, per round. The lab measured at most 3.9 ms of the child's CPU
 /// and 6.5 ms of the agent's checks a round on Ubuntu 24.04, 2.6 and 3.1 ms
@@ -159,11 +156,14 @@ pub const CHILD_TIMEOUT: Duration = Duration::from_secs(3);
 /// A journal line with the rounds' cost every this many rounds.
 pub const SUMMARY_EVERY: u64 = 10;
 /// The go byte the parent writes once the child's pid is recorded: every
-/// step.
+/// step; the deny self-test's plan follows it ([`deny::Plan`], lot 302),
+/// to the end of the child's standard input.
 pub const GO_ALL: u8 = b'g';
 /// The go byte while a trusted-installer window is open: the deny steps
 /// skipped (nothing is refused in a window, by design).
 pub const GO_NO_DENY: u8 = b'w';
+/// Lot 302: the most bytes of plan the child reads.
+const PLAN_MAX: u64 = 4096;
 
 /// The sources a round exercises, in slot order: the live tests first,
 /// then the attach checks.
@@ -265,7 +265,10 @@ impl Sensor {
             Sensor::IoUring => "an io_uring of one entry made and closed",
             Sensor::Bpf => "a one-entry BPF array map made and closed",
             Sensor::Fim => "a file created in the watched probe directory",
-            Sensor::Deny => "a signal to the agent and a file created in /etc/northnarrow, refused",
+            Sensor::Deny => {
+                "one attempt per deny hook on the self-test's own targets, its refusals reaching \
+                 the pipeline (each hook's word: the deny self-test)"
+            }
             Sensor::ModuleLoad => {
                 "its programs linked, and a load reported for each module new in /proc/modules"
             }
@@ -301,13 +304,22 @@ impl Sensor {
 /// The slot of the network rows the child's connection and datagram leave
 /// (`NetFlow`): taken, never a sensor's word.
 const SLOT_FLOW: usize = SENSORS;
-const SLOTS: usize = SENSORS + 1;
+/// Lot 302: the slot of the child's other rows of the deny steps (the opens
+/// of the self-test's files, of the target's `/proc` and of the throwaway
+/// cgroup; the bpf() calls by a relative path): taken, never a word.
+const SLOT_DENY_EXTRA: usize = SENSORS + 1;
+/// Lot 302: the slot of the target process's exec (its spawn and its exec
+/// check).
+const SLOT_TARGET: usize = SENSORS + 2;
+const SLOTS: usize = SENSORS + 3;
 
 /// At most this many events of a slot are taken per round: what the step
 /// makes (the exec check: one per binfmt pass; the file opens: the probe
 /// file and the FIM file; io_uring: the creation and an activity record;
-/// the inbound accept and its close; the two deny refusals; the rows of
-/// the two TCP sockets and the datagram).
+/// the inbound accept and its close; the rows of the two TCP sockets and
+/// the datagram; lot 302: the deny steps' opens and relative bpf() calls,
+/// the target's spawn and exec check — the deny refusals are matched one
+/// each, [`deny::DenyExpect`]).
 const fn take_max(slot: usize) -> u8 {
     match slot {
         s if s == Sensor::FileOpen as usize => 3,
@@ -315,8 +327,9 @@ const fn take_max(slot: usize) -> u8 {
         s if s == Sensor::NetInbound as usize => 2,
         s if s == Sensor::IoUring as usize => 2,
         s if s == Sensor::Fim as usize => 2,
-        s if s == Sensor::Deny as usize => 2,
         SLOT_FLOW => 4,
+        SLOT_DENY_EXTRA => 8,
+        SLOT_TARGET => 2,
         _ => 1,
     }
 }
@@ -347,6 +360,13 @@ impl Window {
     /// `pid`'s, at `ts_ns`.
     pub fn holds(&self, pid: u32, ts_ns: u64) -> bool {
         self.pid != 0 && pid == self.pid && self.from_ns <= ts_ns && ts_ns <= self.until_ns
+    }
+
+    /// Lot 302: [`Self::holds`], or `pid` may be its while its pid is not
+    /// known yet (an exec's events can reach the tap before the spawn
+    /// returns the pid).
+    fn holds_or_pending(&self, pid: u32, ts_ns: u64) -> bool {
+        (self.pid == 0 || pid == self.pid) && self.from_ns <= ts_ns && ts_ns <= self.until_ns
     }
 }
 
@@ -409,8 +429,12 @@ struct RoundId {
     /// The path the child is executed by (`bprm->filename`).
     exe: String,
     child: Window,
-    /// `(dev, ino)` of [`DENY_DIR`], kernel form.
-    deny_dir: Option<(u64, u64)>,
+    /// Lot 302: the deny self-test's target process (its pid from its
+    /// spawn; [`Window::default`]: none this round).
+    target: Window,
+    /// Lot 302: the refusals the round expects, and the child's other rows
+    /// of the deny steps (`None`: no deny attempt this round).
+    deny: Option<deny::DenyExpect>,
 }
 
 /// One open round: what has been seen, and taken.
@@ -418,26 +442,29 @@ struct RoundId {
 struct Round {
     id: RoundId,
     seen: [bool; SENSORS],
-    /// The deny step's two refusals: the signal's, the create's.
-    deny: [bool; 2],
+    /// Lot 302: each deny hook's refusal arrived.
+    deny_seen: [bool; deny::HOOK_COUNT],
     taken: [u8; SLOTS],
 }
 
-/// What a taken event is: its slot, the sensor it speaks for (none for a
-/// row the step also makes) and, for the deny, which refusal.
+/// What a taken event is: its slot and the sensor it speaks for (none for
+/// a row the step also makes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Taken {
     slot: usize,
     sensor: Option<Sensor>,
-    deny_part: Option<usize>,
 }
 
 fn taken(sensor: Sensor) -> Option<Taken> {
     Some(Taken {
         slot: sensor as usize,
         sensor: Some(sensor),
-        deny_part: None,
     })
+}
+
+/// A row the steps make, taken in `slot` (never a sensor's word).
+fn row(slot: usize) -> Option<Taken> {
+    Some(Taken { slot, sensor: None })
 }
 
 /// A loopback address in the kernel's 16-byte form of `family`.
@@ -463,21 +490,35 @@ pub fn fim_file(nonce: &str) -> PathBuf {
     PathBuf::from(PROBE_DIR).join(format!("{nonce}.fim"))
 }
 
-/// The file the deny step tries to create.
-pub fn deny_file(nonce: &str) -> PathBuf {
-    PathBuf::from(DENY_DIR).join(format!(".nn-selftest-{nonce}"))
-}
-
-/// Whether `e` is one of the round's own events, and which.
+/// Whether `e` is one of the round's own events, and which (the deny
+/// refusals are matched by [`Round::take`], one each).
 fn classify(e: &Event, id: &RoundId) -> Option<Taken> {
     let w = &id.child;
     match e {
-        Event::ProcessSpawn { argv, ppid, .. } => (argv.len() >= 3
-            && argv[1] == PROBE_FLAG
-            && argv[2] == id.nonce
-            && *ppid == id.agent_pid)
-            .then(|| taken(Sensor::Exec))
-            .flatten(),
+        Event::ProcessSpawn {
+            argv,
+            ppid,
+            pid,
+            timestamp_ns,
+            ..
+        } => {
+            if argv.len() >= 3
+                && argv[1] == PROBE_FLAG
+                && argv[2] == id.nonce
+                && *ppid == id.agent_pid
+            {
+                taken(Sensor::Exec)
+            } else if argv.len() >= 2
+                && argv[1] == deny::TARGET_FLAG
+                && *ppid == id.agent_pid
+                && id.target.holds_or_pending(*pid, *timestamp_ns)
+            {
+                // lot 302: the deny self-test's target
+                row(SLOT_TARGET)
+            } else {
+                None
+            }
+        }
         Event::ExecCheck {
             pid,
             ppid,
@@ -485,25 +526,38 @@ fn classify(e: &Event, id: &RoundId) -> Option<Taken> {
             timestamp_ns,
             ..
         } => {
+            if *ppid != id.agent_pid || *filename != id.exe {
+                return None;
+            }
+            // lot 302: the target's, started before the child: before its
+            // window
+            if id.target.holds_or_pending(*pid, *timestamp_ns) && *timestamp_ns < w.from_ns {
+                return row(SLOT_TARGET);
+            }
             // its event can reach the tap before the spawn returns the
             // child's pid: the agent's child, the agent's path, the round
-            (*ppid == id.agent_pid
-                && *filename == id.exe
-                && (w.pid == 0 || *pid == w.pid)
+            ((w.pid == 0 || *pid == w.pid)
+                && (id.target.pid == 0 || *pid != id.target.pid)
                 && w.from_ns <= *timestamp_ns
                 && *timestamp_ns <= w.until_ns)
                 .then(|| taken(Sensor::ExecCheck))
                 .flatten()
         }
-        Event::FileOpen { filename, .. } => {
+        Event::FileOpen {
+            filename,
+            pid,
+            timestamp_ns,
+            ..
+        } => {
             if filename.as_str() == probe_file(&id.nonce).to_string_lossy() {
                 taken(Sensor::FileOpen)
             } else if filename.as_str() == fim_file(&id.nonce).to_string_lossy() {
-                Some(Taken {
-                    slot: Sensor::FileOpen as usize,
-                    sensor: None,
-                    deny_part: None,
-                })
+                row(Sensor::FileOpen as usize)
+            } else if id.deny.as_ref().is_some_and(|d| {
+                w.holds(*pid, *timestamp_ns) && d.paths.iter().any(|p| filename.starts_with(p))
+            }) {
+                // lot 302: the deny steps' opens
+                row(SLOT_DENY_EXTRA)
             } else {
                 None
             }
@@ -541,51 +595,33 @@ fn classify(e: &Event, id: &RoundId) -> Option<Taken> {
         } => w.holds(*pid, *timestamp_ns).then(|| Taken {
             slot: Sensor::IoUring as usize,
             sensor: created.then_some(Sensor::IoUring),
-            deny_part: None,
         }),
         Event::BpfSyscall {
             pid,
             cmd,
             timestamp_ns,
             ..
-        } => (w.holds(*pid, *timestamp_ns) && *cmd == common::bpf_cmd::BPF_MAP_CREATE)
-            .then(|| taken(Sensor::Bpf))
-            .flatten(),
+        } => {
+            if !w.holds(*pid, *timestamp_ns) {
+                None
+            } else if *cmd == common::bpf_cmd::BPF_MAP_CREATE {
+                taken(Sensor::Bpf)
+            } else if *cmd == common::bpf_cmd::BPF_OBJ_GET && id.deny.is_some() {
+                // lot 302: the bpf_map and bpf_prog steps' relative paths,
+                // which the bpf() hook records and lets through
+                row(SLOT_DENY_EXTRA)
+            } else {
+                None
+            }
+        }
         Event::Fim(f) => (w.holds(f.modifier_pid, f.timestamp_ns)
             && f.path.starts_with(&format!("{PROBE_DIR}/")))
         .then(|| taken(Sensor::Fim))
         .flatten(),
-        Event::FsProtectDenial {
-            pid,
-            operation,
-            target_dev,
-            target_ino,
-            timestamp_ns,
-            ..
-        } => {
-            if !w.holds(*pid, *timestamp_ns) {
-                return None;
-            }
-            let part = match operation {
-                FsProtectOperation::Signal
-                    if *target_dev == DENY_SIGNAL as u64 && *target_ino == id.agent_pid as u64 =>
-                {
-                    0
-                }
-                FsProtectOperation::Create if id.deny_dir == Some((*target_dev, *target_ino)) => 1,
-                _ => return None,
-            };
-            Some(Taken {
-                slot: Sensor::Deny as usize,
-                sensor: Some(Sensor::Deny),
-                deny_part: Some(part),
-            })
-        }
         Event::NetFlow(f) => (w.holds(f.pid, f.start_ns.max(f.end_ns)) && f.dst_addr.is_loopback())
             .then_some(Taken {
                 slot: SLOT_FLOW,
                 sensor: None,
-                deny_part: None,
             }),
         _ => None,
     }
@@ -601,8 +637,30 @@ impl Round {
 
     /// Take `e` when it is the round's own and its slot has room; counted
     /// as seen when `count` (an open round; a late event of the round
-    /// before is taken, not counted).
+    /// before is taken, not counted). Lot 302: a refusal of the child's is
+    /// taken when it is one the deny steps expect, not matched yet — the
+    /// hook's word, and `fs_protect`'s (the round's refusals arrive).
     fn take(&mut self, e: &Event, count: bool) -> bool {
+        if let Event::FsProtectDenial {
+            pid, timestamp_ns, ..
+        } = e
+        {
+            if !self.id.child.holds(*pid, *timestamp_ns) {
+                return false;
+            }
+            let Some(d) = self.id.deny.as_ref() else {
+                return false;
+            };
+            let Some(k) = d.matches(e, &self.deny_seen) else {
+                return false;
+            };
+            let slot = d.records[k].slot;
+            self.deny_seen[slot] = true;
+            if count {
+                self.seen[Sensor::Deny as usize] = true;
+            }
+            return true;
+        }
         let Some(t) = classify(e, &self.id) else {
             return false;
         };
@@ -611,13 +669,7 @@ impl Round {
         }
         self.taken[t.slot] += 1;
         if let (true, Some(s)) = (count, t.sensor) {
-            match t.deny_part {
-                Some(p) => {
-                    self.deny[p] = true;
-                    self.seen[s as usize] = self.deny.iter().all(|d| *d);
-                }
-                None => self.seen[s as usize] = true,
-            }
+            self.seen[s as usize] = true;
         }
         true
     }
@@ -697,6 +749,13 @@ struct State {
     loads_at_round: u64,
     /// The cost of the rounds since the last summary.
     cost: CostWindow,
+    /// Lot 302: the deny self-test's words and episodes.
+    deny: deny::State,
+    /// Lot 302: the self-test's protected targets (`None`: not made yet,
+    /// or to be made again — a round let an attempt through).
+    deny_keys: Option<deny::TargetKeys>,
+    /// Lot 302: why the targets could not be made (journal once).
+    deny_unready: Option<String>,
 }
 
 /// The cost of a window of rounds (the journal's summary).
@@ -707,9 +766,35 @@ pub struct CostWindow {
     pub child_cpu_us_max: u64,
     pub checks_us_max: u64,
     pub latency_ms_max: u64,
+    /// Lot 302: rounds whose every attempted deny hook was refused and
+    /// reported, and the most hooks a round attempted.
+    pub deny_all_refused: u64,
+    pub deny_attempted_max: u64,
 }
 
 static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Lot 302: what the round's deny self-test hands its end.
+#[derive(Clone, Debug, Default)]
+pub struct DenyRoundEnd {
+    /// Each hook's plan ([`deny::plan_hooks`]): attempted, or why not
+    /// (another length: none was).
+    pub planned: Vec<Result<(), String>>,
+    /// Each hook's link state ([`deny::link_state`]; `None`: the agent's
+    /// program-id list is not readable).
+    pub links: Option<Vec<Option<Result<(), String>>>>,
+}
+
+/// What a round's end gives the signer and the summary.
+struct RoundEnd {
+    notes: Vec<Note>,
+    all_seen: bool,
+    open: Vec<String>,
+    deny_notes: Vec<deny::Note>,
+    deny_open: Vec<String>,
+    deny_attempted: u64,
+    deny_all_refused: bool,
+}
 
 /// The running probe (R11c, lab PR 264): what [`spawn`] gives the start,
 /// whose decision thread offers it every event ([`Self::observe`]). It was a
@@ -857,32 +942,71 @@ impl TelemetryProbe {
 
     /// The round ends: each sensor's outcome from what it saw, the child's
     /// report, the window and the attach checks; the state's words, and
-    /// what to sign (the round kept for its late events). Returns the
-    /// notes, whether no sensor was missed, and the degradations still
-    /// open.
+    /// what to sign (the round kept for its late events). Lot 302: and each
+    /// deny hook's, from the plan, the child's words and the refusals that
+    /// arrived (`deny`).
     fn close_round(
         &self,
         report: &ChildReport,
         window: bool,
         checks: &[(Sensor, Outcome)],
         cpu: Duration,
-    ) -> (Vec<Note>, bool, Vec<String>) {
+        deny: &DenyRoundEnd,
+    ) -> RoundEnd {
         let mut st = self.tracker.lock();
         let round = st.round.take();
         #[allow(unused_mut)]
         let mut seen = round.as_ref().map(|r| r.seen).unwrap_or_default();
+        let deny_seen = round.as_ref().map(|r| r.deny_seen).unwrap_or_default();
         #[cfg(feature = "debug-trigger")]
         debug_blind(&mut seen);
         let outs = outcomes(&seen, report, window, checks, &|s| self.source_runs(s));
         let notes = apply(&mut st, &outs, cpu);
+        let planned: Vec<Result<(), String>> = if deny.planned.len() == deny::HOOK_COUNT {
+            deny.planned.clone()
+        } else {
+            vec![Err("no deny attempt was planned this round".to_string()); deny::HOOK_COUNT]
+        };
+        let douts = deny::outcomes(&planned, report, &deny_seen, deny.links.as_deref(), window);
+        let deny_notes = st.deny.apply(&douts);
         st.last = round;
-        let all_seen = !outs.iter().any(|o| matches!(o, Outcome::Missed(_)));
-        (notes, all_seen, open_details(&st))
+        let attempted: Vec<usize> = (0..deny::HOOK_COUNT)
+            .filter(|i| planned[*i].is_ok())
+            .collect();
+        RoundEnd {
+            all_seen: !outs.iter().any(|o| matches!(o, Outcome::Missed(_))),
+            notes,
+            open: open_details(&st),
+            deny_all_refused: !window
+                && attempted
+                    .iter()
+                    .all(|i| matches!(douts[*i], deny::Outcome::Seen)),
+            deny_attempted: if window { 0 } else { attempted.len() as u64 },
+            deny_notes,
+            deny_open: st.deny.open_details(),
+        }
+    }
+
+    /// Lot 302: each deny hook's word (`pending` before its first round).
+    pub fn deny_states(&self) -> Vec<(String, ProbeState)> {
+        let st = self.tracker.lock();
+        deny::HOOKS
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                (
+                    h.hook.to_string(),
+                    st.deny.word[i].unwrap_or(ProbeState::Pending),
+                )
+            })
+            .collect()
     }
 
     /// Tests only: the open round ends as [`run_round`] ends it — the
-    /// child's `report`, no window, the attach checks `checks`, `cpu` —
-    /// and what it found is signed into `audit_log`.
+    /// child's `report`, no window, the attach checks `checks`, `cpu`, the
+    /// deny hooks the open round expects attempted (no link state) — and
+    /// what it found is signed into `audit_log`. The sensors' notes, then
+    /// the deny hooks'.
     #[cfg(any(test, feature = "test-util"))]
     pub fn end_round_for_tests(
         &self,
@@ -890,26 +1014,49 @@ impl TelemetryProbe {
         checks: &[(Sensor, Outcome)],
         cpu: Duration,
         audit_log: Option<&Arc<Mutex<AuditLog>>>,
-    ) -> Vec<Note> {
-        let nonce = self
-            .tracker
-            .lock()
-            .round
-            .as_ref()
-            .map(|r| r.id.nonce.clone())
-            .unwrap_or_default();
-        let (notes, _, open) = self.close_round(report, false, checks, cpu);
-        sign(&notes, &nonce, &open, audit_log);
-        notes
+    ) -> (Vec<Note>, Vec<deny::Note>) {
+        let (nonce, planned) = {
+            let st = self.tracker.lock();
+            let r = st.round.as_ref();
+            let slots: Vec<usize> = r
+                .and_then(|r| r.id.deny.as_ref())
+                .map(|d| d.records.iter().map(|e| e.slot).collect())
+                .unwrap_or_default();
+            let planned = (0..deny::HOOK_COUNT)
+                .map(|i| {
+                    if slots.contains(&i) {
+                        Ok(())
+                    } else {
+                        Err("not attempted in this test".to_string())
+                    }
+                })
+                .collect();
+            (r.map(|r| r.id.nonce.clone()).unwrap_or_default(), planned)
+        };
+        let end = self.close_round(
+            report,
+            false,
+            checks,
+            cpu,
+            &DenyRoundEnd {
+                planned,
+                links: None,
+            },
+        );
+        sign(&end.notes, &nonce, &end.open, audit_log);
+        deny::sign(&end.deny_notes, &nonce, &end.deny_open, audit_log);
+        (end.notes, end.deny_notes)
     }
 
-    /// Tests only: a round open for `nonce`, its child `child` (the agent:
-    /// `agent_pid`, its path `exe`, the deny directory `deny_dir`).
+    /// Tests only: a probe that never runs a round.
     #[cfg(any(test, feature = "test-util"))]
     pub fn for_tests(every: Duration) -> Self {
         Self::new(every)
     }
 
+    /// Tests only: a round open for `nonce`, its child `child` (the agent:
+    /// `agent_pid`, its path `exe`), the deny refusals it expects `deny`
+    /// (lot 302: their target process's window open for the round).
     #[cfg(any(test, feature = "test-util"))]
     pub fn open_round_for_tests(
         &self,
@@ -917,16 +1064,34 @@ impl TelemetryProbe {
         agent_pid: u32,
         exe: &str,
         child: Window,
-        deny_dir: Option<(u64, u64)>,
+        deny: Option<deny::DenyExpect>,
     ) {
+        let target = deny.as_ref().map_or_else(Window::default, |d| Window {
+            pid: d.target,
+            from_ns: 0,
+            until_ns: u64::MAX,
+        });
         self.tracker.lock().round = Some(Round::new(RoundId {
             nonce: nonce.to_string(),
             agent_pid,
             exe: exe.to_string(),
             child,
-            deny_dir,
+            target,
+            deny,
         }));
         self.tag.open(child);
+    }
+
+    /// Tests only: the deny hooks whose refusal the open round has seen.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn deny_seen_for_tests(&self) -> Vec<&'static str> {
+        let st = self.tracker.lock();
+        deny::HOOKS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| st.round.as_ref().is_some_and(|r| r.deny_seen[*i]))
+            .map(|(_, h)| h.hook)
+            .collect()
     }
 
     /// Tests only: the sensors the open round has seen.
@@ -1002,8 +1167,53 @@ pub struct SelfTestEnv {
     pub window_open: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// The agent's program-id list (`bpf-own-ids`), for the attach checks.
     pub own_ids_file: Option<PathBuf>,
-    /// The bpffs pin root (the pinned links).
+    /// The bpffs pin root (the pinned links; lot 302: the protected pids
+    /// and inodes the deny self-test's targets are registered in).
     pub pin_root: Option<PathBuf>,
+    /// Lot 302: the kernel's mark of the round's child (its refusals
+    /// outside the denials' budgets).
+    pub mark: Option<deny::SelfTestMark>,
+    /// Lot 302: the BPF guard enforces (its handle refusals are
+    /// attempted).
+    pub bpf_enforce: bool,
+    /// Lot 302: `debug-trigger` builds only — the denials' budgets, spent
+    /// before a round while `/run/northnarrow/debug-deny-budget-spent`
+    /// exists (`None` otherwise).
+    pub budget: Option<deny::BudgetSpender>,
+}
+
+/// Lot 302: the program-id list and the agent's live links, read once a
+/// round (the deny self-test's plan and the attach checks).
+struct AttachView {
+    own: Option<String>,
+    live: HashSet<u32>,
+}
+
+impl AttachView {
+    fn read(env: &SelfTestEnv) -> Self {
+        AttachView {
+            own: env
+                .own_ids_file
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok()),
+            live: crate::anti_tamper::bpf_defense::live_links(env.pin_root.as_deref())
+                .into_iter()
+                .filter(|(_, prog)| *prog != 0)
+                .map(|(_, prog)| prog)
+                .collect(),
+        }
+    }
+
+    /// Each deny hook's link state (`None`: the list is not readable).
+    fn deny_links(&self) -> Option<Vec<Option<Result<(), String>>>> {
+        let own = self.own.as_deref()?;
+        Some(
+            deny::HOOKS
+                .iter()
+                .map(|h| deny::link_state(h.programs, own, &self.live))
+                .collect(),
+        )
+    }
 }
 
 /// Start the periodic probe (the start's late binding, once the audit log
@@ -1037,13 +1247,6 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>, env: SelfTestEnv) -> Optio
     Some(probe)
 }
 
-/// The `(dev, ino)` of `path` in the kernel's form (an event's target).
-fn kernel_key(path: &Path) -> Option<(u64, u64)> {
-    crate::fim::attach::key_for_path(path)
-        .ok()
-        .map(|k| (k.dev, k.ino))
-}
-
 /// The child's report of its steps: one `step=result` line each.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChildReport(Vec<(String, String)>);
@@ -1068,8 +1271,22 @@ impl ChildReport {
 
 /// The child's report on `sensor`'s step: `None` when it ran, `Some(why)`
 /// when it could not (not exercised), or `Err(why)` when it ran and failed
-/// in a way that is a miss by itself (a deny step not refused).
+/// in a way that is a miss by itself. Lot 302: `fs_protect`'s step is the
+/// deny attempts' — it ran when one of them was refused (each hook's word
+/// is the deny self-test's: a hook let through is its miss, not the
+/// source's).
 fn step_result(sensor: Sensor, report: &ChildReport) -> Result<Option<String>, String> {
+    if sensor == Sensor::Deny {
+        let refused = report
+            .0
+            .iter()
+            .any(|(k, v)| k.starts_with("deny.") && matches!(v.as_str(), "refused" | "sent"));
+        return Ok((!refused).then(|| {
+            "no deny attempt was refused this round: each hook's word (the deny self-test) says \
+             why"
+            .to_string()
+        }));
+    }
     let keys: &[&str] = match sensor {
         Sensor::FileOpen => &["file"],
         Sensor::Dns => &["dns"],
@@ -1077,18 +1294,12 @@ fn step_result(sensor: Sensor, report: &ChildReport) -> Result<Option<String>, S
         Sensor::IoUring => &["io_uring"],
         Sensor::Bpf => &["bpf"],
         Sensor::Fim => &["fim"],
-        Sensor::Deny => &["deny_signal", "deny_create"],
         _ => &[],
     };
     for k in keys {
         match report.get(k) {
             None => return Ok(Some(format!("the child did not report its {k} step"))),
-            Some("ok") | Some("refused") => {}
-            Some("done") => {
-                return Err(format!(
-                    "its {k} step was not refused: the deny hook is attached and did not run"
-                ))
-            }
+            Some("ok") => {}
             Some(other) => return Ok(Some(format!("{k}: {other}"))),
         }
     }
@@ -1266,34 +1477,61 @@ async fn run_round(
     };
     let window_open = || env.window_open.as_ref().is_some_and(|f| f());
     let window_before = window_open();
-    let from_ns = monotonic_ns();
+    #[cfg(feature = "debug-trigger")]
+    debug_detach(env.pin_root.as_deref());
     let started = Instant::now();
+    // Lot 302: the program-id list and the links, once: the deny hooks'
+    // plan now, the attach checks at the end (the agent's own cost)
+    let view_started = Instant::now();
+    let view = AttachView::read(env);
+    let links = view.deny_links();
+    let mut checks_cost = view_started.elapsed();
     {
         let mut st = probe.tracker.lock();
         st.round = Some(Round::new(RoundId {
             nonce: nonce.clone(),
             agent_pid: std::process::id(),
             exe: exe.to_string_lossy().into_owned(),
+            // the child's window opens at its spawn (the target's exec, before
+            // it, is not the child's)
             child: Window {
                 pid: 0,
-                from_ns,
+                from_ns: u64::MAX,
                 until_ns: u64::MAX,
             },
-            deny_dir: kernel_key(Path::new(DENY_DIR)),
+            target: Window::default(),
+            deny: None,
         }));
     }
-    let spawned = Command::new(&exe)
-        .arg(PROBE_FLAG)
+    // Lot 302: the deny self-test's targets and plan (none in a window)
+    let deny_run = (!window_before).then(|| prepare_deny(probe, env, &exe, links.as_deref()));
+    let planned: Vec<Result<(), String>> = deny_run
+        .as_ref()
+        .map(|d| d.planned.clone())
+        .unwrap_or_default();
+    // the child's window opens before its exec (its exec check can reach
+    // the tap before the spawn returns its pid; the target's, before this)
+    let from_ns = monotonic_ns();
+    if let Some(r) = probe.tracker.lock().round.as_mut() {
+        r.id.child.from_ns = from_ns;
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.arg(PROBE_FLAG)
         .arg(&nonce)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match spawned {
+        .stderr(Stdio::null());
+    if let Some(raw) = deny_run.as_ref().and_then(DenyRun::write_fd) {
+        hand_over_write_fd(&mut cmd, raw);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, exe = %exe.display(), "telemetry probe: cannot spawn the probe child — round skipped");
             probe.tracker.lock().round = None;
+            if let Some(d) = deny_run {
+                d.finish().await;
+            }
             let _ = std::fs::remove_file(&file);
             return;
         }
@@ -1310,11 +1548,28 @@ async fn run_round(
         }
         probe.tag.open(w);
     }
+    // Lot 302: the kernel's mark of the child — its refusals recorded
+    // outside the denials' budgets and dedup — before it may begin
+    let marked = deny_run.is_some() && env.mark.as_ref().is_some_and(|m| m.set(pid));
+    if deny_run.is_some() && !marked {
+        warn!(
+            pid,
+            "deny self-test: the kernel's mark of the child is not set — its refusals go \
+             through the denials' budgets this round"
+        );
+    }
+    #[cfg(feature = "debug-trigger")]
+    if deny_run.is_some() {
+        debug_spend_budgets(env);
+    }
     // The pid is recorded: the child may begin (the deny steps skipped in a
     // window). A child whose stdin cannot be written ends at once.
     if let Some(mut stdin) = child.stdin.take() {
-        let go = if window_before { GO_NO_DENY } else { GO_ALL };
-        let _ = stdin.write_all(&[go]);
+        let mut go = vec![if window_before { GO_NO_DENY } else { GO_ALL }];
+        if let Some(d) = &deny_run {
+            go.extend_from_slice(d.plan.render().as_bytes());
+        }
+        let _ = stdin.write_all(&go);
     }
     let mut stdout = child.stdout.take();
     // Reap the child off the async thread, with its CPU time; it exits in
@@ -1323,11 +1578,25 @@ async fn run_round(
         .await
         .ok()
         .flatten();
+    if marked && env.mark.as_ref().is_some_and(|m| !m.set(0)) {
+        error!(
+            pid,
+            "deny self-test: the kernel's mark of the reaped child could not be cleared"
+        );
+    }
     let until_ns = monotonic_ns();
     if let Some(r) = probe.tracker.lock().round.as_mut() {
         r.id.child.until_ns = until_ns;
     }
     probe.tag.close(until_ns);
+    // the target ended (killed, reaped, evicted) and its cgroup removed
+    let target_cpu = match deny_run {
+        Some(d) => d.finish().await,
+        None => Duration::ZERO,
+    };
+    if let Some(r) = probe.tracker.lock().round.as_mut() {
+        r.id.target.until_ns = r.id.target.until_ns.min(monotonic_ns());
+    }
     let mut text = String::new();
     if let Some(out) = stdout.as_mut() {
         let _ = out.take(4096).read_to_string(&mut text);
@@ -1335,7 +1604,8 @@ async fn run_round(
     drop(child);
     let report = ChildReport::parse(&text);
     let window = window_before || window_open();
-    // Wait for the pipeline, up to the deadline: every live step that ran.
+    // Wait for the pipeline, up to the deadline: every live step that ran,
+    // every deny attempt refused (lot 302).
     let expected: Vec<Sensor> = Sensor::ALL
         .into_iter()
         .filter(|s| {
@@ -1344,13 +1614,20 @@ async fn run_round(
                 && !(*s == Sensor::Deny && window)
         })
         .collect();
+    let deny_expected: Vec<usize> = (0..deny::HOOK_COUNT)
+        .filter(|i| {
+            planned.get(*i).is_some_and(Result::is_ok)
+                && matches!(
+                    report.get(&format!("deny.{}", deny::HOOKS[*i].hook)),
+                    Some("refused") | Some("sent")
+                )
+        })
+        .collect();
     loop {
-        let all = probe
-            .tracker
-            .lock()
-            .round
-            .as_ref()
-            .is_none_or(|r| expected.iter().all(|s| r.seen[*s as usize]));
+        let all = probe.tracker.lock().round.as_ref().is_none_or(|r| {
+            expected.iter().all(|s| r.seen[*s as usize])
+                && deny_expected.iter().all(|i| r.deny_seen[*i])
+        });
         if all || started.elapsed() >= Duration::from_secs(DEADLINE_SECS) {
             break;
         }
@@ -1359,18 +1636,28 @@ async fn run_round(
     let latency = started.elapsed();
     // The attach checks and the module count (the agent's own cost).
     let checks_started = Instant::now();
-    let checks = attach_checks(probe, env);
-    let checks_cost = checks_started.elapsed();
-    let child_cpu = reaped.map(|(_, cpu)| cpu).unwrap_or_default();
-    let (notes, words_all_seen, open) =
-        probe.close_round(&report, window, &checks, child_cpu + checks_cost);
+    let checks = attach_checks(probe, &view);
+    checks_cost += checks_started.elapsed();
+    let child_cpu = reaped.map(|(_, cpu)| cpu).unwrap_or_default() + target_cpu;
+    let end = probe.close_round(
+        &report,
+        window,
+        &checks,
+        child_cpu + checks_cost,
+        &DenyRoundEnd {
+            planned: planned.clone(),
+            links,
+        },
+    );
     {
         let mut st = probe.tracker.lock();
         st.cost.rounds += 1;
-        st.cost.all_seen += u64::from(words_all_seen);
+        st.cost.all_seen += u64::from(end.all_seen);
         st.cost.child_cpu_us_max = st.cost.child_cpu_us_max.max(child_cpu.as_micros() as u64);
         st.cost.checks_us_max = st.cost.checks_us_max.max(checks_cost.as_micros() as u64);
         st.cost.latency_ms_max = st.cost.latency_ms_max.max(latency.as_millis() as u64);
+        st.cost.deny_all_refused += u64::from(end.deny_all_refused);
+        st.cost.deny_attempted_max = st.cost.deny_attempted_max.max(end.deny_attempted);
         if st.cost.rounds >= SUMMARY_EVERY {
             let c = std::mem::take(&mut st.cost);
             info!(
@@ -1381,27 +1668,257 @@ async fn run_round(
                 latency_ms_max = c.latency_ms_max,
                 late_taken = st.late_taken,
                 rows_skipped = probe.tag.skipped(),
+                deny_all_refused = c.deny_all_refused,
+                deny_attempted_max = c.deny_attempted_max,
                 budget_us = ROUND_CPU_BUDGET.as_micros() as u64,
-                "sensor self-test: the rounds' cost (child CPU, the agent's checks, the slowest \
-                 event)"
+                "sensor self-test: the rounds' cost (child CPU with the deny target's, the \
+                 agent's checks, the slowest event; the rounds whose every deny attempt was \
+                 refused and reported)"
             );
         }
     }
     debug!(
         nonce,
-        all_seen = words_all_seen,
+        all_seen = end.all_seen,
+        deny_attempted = end.deny_attempted,
+        deny_all_refused = end.deny_all_refused,
         child_cpu_us = child_cpu.as_micros() as u64,
         checks_us = checks_cost.as_micros() as u64,
         latency_ms = latency.as_millis() as u64,
         "sensor self-test: round ended"
     );
-    sign(&notes, &nonce, &open, audit_log);
-    // The round's files; the deny step's only when its create was not
-    // refused (the agent is exempt: it removes it).
+    sign(&end.notes, &nonce, &end.open, audit_log);
+    deny::sign(&end.deny_notes, &nonce, &end.deny_open, audit_log);
+    // The round's files; lot 302: the deny targets made again at the next
+    // round when an attempt on them went through
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(fim_file(&nonce));
-    if report.get("deny_create") == Some("done") {
-        let _ = std::fs::remove_file(deny_file(&nonce));
+    let touched = deny::HOOKS.iter().enumerate().any(|(i, h)| {
+        planned.get(i).is_some_and(Result::is_ok)
+            && matches!(
+                h.check,
+                deny::Check::Attempt {
+                    expect: deny::Expect::Dir | deny::Expect::File(_),
+                    ..
+                }
+            )
+            && report.get(&format!("deny.{}", h.hook)) != Some("refused")
+    });
+    if touched {
+        probe.tracker.lock().deny_keys = None;
+    }
+}
+
+/// Lot 302: a round's deny self-test — its target process, the protected
+/// file's descriptor handed to the child, the throwaway cgroup, the plan.
+struct DenyRun {
+    target: Option<deny::TargetProcess>,
+    wfd: Option<std::fs::File>,
+    cgroup: Option<PathBuf>,
+    planned: Vec<Result<(), String>>,
+    plan: deny::Plan,
+}
+
+impl DenyRun {
+    fn write_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.wfd.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    /// The target ended (its CPU time), the descriptor closed, the cgroup
+    /// removed.
+    async fn finish(self) -> Duration {
+        drop(self.wfd);
+        let cpu = match self.target {
+            Some(t) => tokio::task::spawn_blocking(move || t.end())
+                .await
+                .unwrap_or_default(),
+            None => Duration::ZERO,
+        };
+        if let Some(c) = self.cgroup {
+            let _ = std::fs::remove_dir(&c);
+        }
+        cpu
+    }
+}
+
+/// Lot 302: the protected file's descriptor at [`deny::WRITE_FD`] in the
+/// child (`dup2` between the fork and the exec: no other child inherits
+/// it).
+fn hand_over_write_fd(cmd: &mut Command, raw: std::os::fd::RawFd) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: dup2 and fcntl are async-signal-safe; `raw` stays open in the
+    // parent until the spawn has returned.
+    unsafe {
+        cmd.pre_exec(move || {
+            if raw == deny::WRITE_FD {
+                let fl = libc::fcntl(raw, libc::F_GETFD);
+                if fl < 0 || libc::fcntl(raw, libc::F_SETFD, fl & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(raw, deny::WRITE_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Lot 302: the round's deny self-test made ready — the targets (made and
+/// protected again when an attempt went through), the target process
+/// started and protected, the protected file opened for the child, the
+/// throwaway cgroup where the move guard runs, each hook planned — and the
+/// refusals the round's tap expects.
+fn prepare_deny(
+    probe: &TelemetryProbe,
+    env: &SelfTestEnv,
+    exe: &Path,
+    links: Option<&[Option<Result<(), String>>]>,
+) -> DenyRun {
+    let dir = Path::new(deny::TARGET_DIR);
+    let keys = {
+        let mut st = probe.tracker.lock();
+        let intact = st
+            .deny_keys
+            .as_ref()
+            .is_some_and(|k| deny::targets_intact(dir, k));
+        if !intact {
+            // the previous targets' keys out first (made again below)
+            if let (Some(old), Some(root)) = (st.deny_keys.take(), env.pin_root.as_deref()) {
+                if let Err(why) = deny::release_targets(root, &old) {
+                    warn!(
+                        why,
+                        "deny self-test: the previous targets' keys not released"
+                    );
+                }
+            }
+            match env.pin_root.as_deref() {
+                None => {
+                    st.deny_unready =
+                        Some("no bpffs pin root: no protected target can be registered".into())
+                }
+                Some(root) => match deny::prepare_targets(dir, Some(root)) {
+                    Ok(k) => {
+                        st.deny_keys = Some(k);
+                        st.deny_unready = None;
+                    }
+                    Err(why) => {
+                        if st.deny_unready.as_deref() != Some(why.as_str()) {
+                            warn!(why, "deny self-test: its targets could not be made");
+                        }
+                        st.deny_unready = Some(why);
+                    }
+                },
+            }
+        }
+        st.deny_keys.clone()
+    };
+    // the target's window open before its exec (its events can reach the
+    // tap before the spawn returns its pid)
+    let target_from = monotonic_ns();
+    if let Some(r) = probe.tracker.lock().round.as_mut() {
+        r.id.target = Window {
+            pid: 0,
+            from_ns: target_from,
+            until_ns: u64::MAX,
+        };
+    }
+    let target =
+        env.pin_root
+            .as_deref()
+            .and_then(|root| match deny::TargetProcess::start(exe, root) {
+                Ok(t) => Some(t),
+                Err(why) => {
+                    warn!(why, "deny self-test: no target process this round");
+                    None
+                }
+            });
+    let target_pid = target.as_ref().map_or(0, deny::TargetProcess::pid);
+    let mut planned = deny::plan_hooks(links, env.bpf_enforce, target.is_some(), keys.is_some());
+    let linked = |hook: &str| {
+        deny::slot_of(hook)
+            .and_then(|i| links.and_then(|l| l.get(i).cloned().flatten()))
+            .is_some_and(|r| r.is_ok())
+    };
+    let set_err = |planned: &mut Vec<Result<(), String>>, hook: &str, why: &str| {
+        if let Some(i) = deny::slot_of(hook) {
+            if planned[i].is_ok() {
+                planned[i] = Err(why.to_string());
+            }
+        }
+    };
+    let move_hook = crate::anti_tamper::cgroup_guard::MOVE_DENY_HOOK;
+    let cgroup = if target.is_some() && linked(move_hook) {
+        deny::make_move_cgroup()
+    } else {
+        None
+    };
+    if cgroup.is_none() {
+        set_err(
+            &mut planned,
+            move_hook,
+            "no throwaway cgroup this round (no target, the move guard not linked, or no cgroup \
+             v2 root)",
+        );
+    }
+    let wfd = keys.as_ref().and_then(|_| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(deny::file::WRITE_FD))
+            .ok()
+    });
+    if wfd.is_none() {
+        set_err(
+            &mut planned,
+            "file_permission",
+            "the protected file could not be opened for the child",
+        );
+    }
+    let bpffs = env.pin_root.as_deref().and_then(|r| {
+        Some((
+            r.parent()?.to_path_buf(),
+            r.file_name()?.to_string_lossy().into_owned(),
+        ))
+    });
+    if bpffs.is_none() {
+        for h in ["bpf_map", "bpf_prog"] {
+            set_err(&mut planned, h, "no bpffs pin root");
+        }
+    }
+    let hooks: Vec<usize> = (0..deny::HOOK_COUNT)
+        .filter(|i| planned[*i].is_ok())
+        .collect();
+    let expect = deny::DenyExpect::new(
+        &hooks,
+        &keys.clone().unwrap_or_default(),
+        target_pid,
+        cgroup.as_deref(),
+    );
+    if let Some(r) = probe.tracker.lock().round.as_mut() {
+        r.id.target = if target_pid != 0 {
+            Window {
+                pid: target_pid,
+                from_ns: target_from,
+                until_ns: u64::MAX,
+            }
+        } else {
+            Window::default()
+        };
+        r.id.deny = Some(expect);
+    }
+    DenyRun {
+        plan: deny::Plan {
+            target: target_pid,
+            dir: dir.to_path_buf(),
+            hooks,
+            write_fd: wfd.is_some(),
+            move_procs: cgroup.as_ref().map(|c| c.join("cgroup.procs")),
+            bpffs,
+        },
+        target,
+        wfd,
+        cgroup,
+        planned,
     }
 }
 
@@ -1440,22 +1957,13 @@ fn reap(pid: u32, timeout: Duration) -> Option<(i32, Duration)> {
 
 /// The attach checks of the sensors that are not live, and the module
 /// count (the kernel's module list against the loads the tap counted).
-fn attach_checks(probe: &TelemetryProbe, env: &SelfTestEnv) -> Vec<(Sensor, Outcome)> {
-    let own = env
-        .own_ids_file
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok());
-    let live: HashSet<u32> = crate::anti_tamper::bpf_defense::live_links(env.pin_root.as_deref())
-        .into_iter()
-        .filter(|(_, prog)| *prog != 0)
-        .map(|(_, prog)| prog)
-        .collect();
+fn attach_checks(probe: &TelemetryProbe, view: &AttachView) -> Vec<(Sensor, Outcome)> {
     let mut out: Vec<(Sensor, Outcome)> = Sensor::ALL
         .into_iter()
         .filter(|s| !s.live())
         .map(|s| {
-            let o = match &own {
-                Some(text) => attach_check(s, text, &live),
+            let o = match &view.own {
+                Some(text) => attach_check(s, text, &view.live),
                 None => Outcome::NotExercised(
                     "the agent's program-id list (bpf-own-ids) is not readable".to_string(),
                 ),
@@ -1660,6 +2168,58 @@ fn debug_skip() -> bool {
     skip
 }
 
+/// `debug-trigger` builds only (lot 302, the lab's deny self-test check):
+/// while `/run/northnarrow/debug-deny-detach` names deny hooks
+/// ([`deny::HookTest::hook`]; whitespace between several), each round
+/// starts by unpinning their `link_<hook>` from the pin root — the hook
+/// really detached (the agent holds no other reference to it) until the
+/// next start re-attaches it.
+#[cfg(feature = "debug-trigger")]
+fn debug_detach(pin_root: Option<&Path>) {
+    let (Some(root), Some(dir)) = (pin_root, Path::new(PROBE_DIR).parent()) else {
+        return;
+    };
+    let Ok(names) = std::fs::read_to_string(dir.join("debug-deny-detach")) else {
+        return;
+    };
+    for hook in names.split_whitespace() {
+        let (_, link) = antitamper_bpf::lsm_pin_paths(root, hook);
+        if std::fs::symlink_metadata(&link).is_err() {
+            continue;
+        }
+        match std::fs::remove_file(&link) {
+            Ok(()) => warn!(
+                hook,
+                pin = %link.display(),
+                "debug-trigger: a deny hook's link unpinned on purpose — the hook is detached"
+            ),
+            Err(e) => warn!(hook, error = %e, "debug-trigger: the deny hook's link not unpinned"),
+        }
+    }
+}
+
+/// `debug-trigger` builds only (lot 302, the lab's deny self-test check):
+/// while `/run/northnarrow/debug-deny-budget-spent` exists, the denials'
+/// per-CPU budgets are spent on every CPU right before the child begins —
+/// a flood's effect, without the flood: the child's refusals must still
+/// arrive, none counted as held back.
+#[cfg(feature = "debug-trigger")]
+fn debug_spend_budgets(env: &SelfTestEnv) {
+    let Some(dir) = Path::new(PROBE_DIR).parent() else {
+        return;
+    };
+    if !dir.join("debug-deny-budget-spent").exists() {
+        return;
+    }
+    match env.budget.as_ref().map(|b| b.spend(monotonic_ns())) {
+        Some(Ok(())) => {
+            warn!("debug-trigger: the denials' budgets spent on every CPU before the round")
+        }
+        Some(Err(e)) => warn!(error = e, "debug-trigger: the denials' budgets not spent"),
+        None => warn!("debug-trigger: no handle on the denials' budgets"),
+    }
+}
+
 /// `debug-trigger` builds only (R13, lab PR 271: the lab's runtime change
 /// of the capability manifest): while `/run/northnarrow/debug-probe-blind`
 /// names a sensor ([`Sensor::name`]; whitespace between several), each
@@ -1718,6 +2278,13 @@ pub fn run_child(nonce: &str) -> i32 {
     if !matches!(std::io::stdin().read(&mut go), Ok(1)) {
         return 2;
     }
+    // lot 302: the deny self-test's plan, to the end of the input
+    let mut plan_text = String::new();
+    if go[0] == GO_ALL {
+        let _ = std::io::stdin()
+            .take(PLAN_MAX)
+            .read_to_string(&mut plan_text);
+    }
     let mut out = String::new();
     // the open is the step, whatever it answers
     let _ = std::fs::read(probe_file(nonce));
@@ -1731,12 +2298,10 @@ pub fn run_child(nonce: &str) -> i32 {
     out.push_str(&format!("io_uring={}\n", io_uring_step()));
     out.push_str(&format!("bpf={}\n", bpf_step()));
     out.push_str(&format!("fim={}\n", fim_step(nonce)));
+    // lot 302: one attempt per deny hook, on the self-test's own targets
+    // (none in a trusted-installer window: nothing is refused in it)
     if go[0] == GO_ALL {
-        out.push_str(&format!("deny_signal={}\n", deny_signal_step()));
-        out.push_str(&format!("deny_create={}\n", deny_create_step(nonce)));
-    } else {
-        out.push_str("deny_signal=skipped: a trusted-installer window is open\n");
-        out.push_str("deny_create=skipped: a trusted-installer window is open\n");
+        out.push_str(&deny::run_steps(nonce, &deny::Plan::parse(&plan_text)));
     }
     print!("{out}");
     let _ = std::io::stdout().flush();
@@ -1881,41 +2446,6 @@ fn fim_step(nonce: &str) -> String {
     }
 }
 
-/// [`DENY_SIGNAL`] to the agent (the parent): `refused` (EPERM: the
-/// `task_kill` deny ran), `done` (delivered: it did not).
-fn deny_signal_step() -> String {
-    // SAFETY: plain libc calls.
-    let parent = unsafe { libc::getppid() };
-    if parent <= 1 {
-        return "skipped: no parent".to_string();
-    }
-    // SAFETY: a signal to our parent, the agent.
-    let r = unsafe { libc::kill(parent, DENY_SIGNAL) };
-    if r == 0 {
-        return "done".to_string();
-    }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EPERM) {
-        "refused".to_string()
-    } else {
-        errno_word(&e)
-    }
-}
-
-/// A file created in [`DENY_DIR`]: `refused` (EPERM: the `inode_create`
-/// deny ran), `done` (created: it did not — the agent removes it).
-fn deny_create_step(nonce: &str) -> String {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(deny_file(nonce))
-    {
-        Ok(_) => "done".to_string(),
-        Err(e) if e.raw_os_error() == Some(libc::EPERM) => "refused".to_string(),
-        Err(e) => errno_word(&e),
-    }
-}
-
 /// Send the probe datagram for `name` to `to` from [`PROBE_DNS_SOURCE`].
 /// `to` is [`PROBE_DNS_DEST`] outside the tests.
 pub fn send_dns_probe(name: &str, to: SocketAddr) -> std::io::Result<usize> {
@@ -1952,9 +2482,11 @@ pub fn dns_probe_packet(name: &str) -> Vec<u8> {
 
 /// Tests only: what one round's child makes, as the pipeline decodes it —
 /// `agent` its parent, `exe` its path, `child` its pid, `ts` a time within
-/// its lifetime, `deny_dir` the deny directory's `(dev, ino)`. The live
-/// steps' events (one each, the deny's two) and the rows the steps also
-/// make (the second file open, the inbound close, the flows).
+/// its lifetime, `deny` the refusals its deny attempts make (lot 302). The
+/// live steps' events (one each; one refusal per deny hook, `fs_protect`'s)
+/// and the rows the steps also make (the second file open, the inbound
+/// close, the flows; the deny steps' opens and relative bpf() call, the
+/// target's spawn and exec check).
 #[cfg(any(test, feature = "test-util"))]
 pub fn round_events_for_tests(
     nonce: &str,
@@ -1962,7 +2494,7 @@ pub fn round_events_for_tests(
     exe: &str,
     child: u32,
     ts: u64,
-    deny_dir: (u64, u64),
+    deny: Option<&deny::DenyExpect>,
 ) -> Vec<(Option<Sensor>, Event)> {
     use serde_json::json;
     let lo4 = |last: u8| -> [u8; 16] {
@@ -1982,7 +2514,7 @@ pub fn round_events_for_tests(
             .expect("a flow")
         };
     let comm = || "northnarrow-age".to_string();
-    vec![
+    let mut events = vec![
         (
             Some(Sensor::Exec),
             Event::ProcessSpawn {
@@ -2138,34 +2670,100 @@ pub fn round_events_for_tests(
                 .expect("a FIM event"),
             ),
         ),
-        (
-            Some(Sensor::Deny),
-            Event::FsProtectDenial {
-                pid: child,
-                uid: 0,
-                comm: comm(),
-                target_dev: DENY_SIGNAL as u64,
-                target_ino: agent as u64,
-                operation: FsProtectOperation::Signal,
-                timestamp_ns: ts,
-            },
-        ),
-        (
-            Some(Sensor::Deny),
-            Event::FsProtectDenial {
-                pid: child,
-                uid: 0,
-                comm: comm(),
-                target_dev: deny_dir.0,
-                target_ino: deny_dir.1,
-                operation: FsProtectOperation::Create,
-                timestamp_ns: ts,
-            },
-        ),
         (None, Event::NetFlow(flow(ts, ts + 2, 40001, 6))),
         (None, Event::NetFlow(flow(ts, ts + 3, 53, 17))),
-    ]
+    ];
+    if let Some(d) = deny {
+        events.extend(deny_events_for_tests(agent, exe, child, ts, d));
+    }
+    events
 }
+
+/// Tests only: lot 302 — one refusal of `child` per record `deny` expects
+/// (a field it leaves open: the ptrace mode 9, the object id 1234), the
+/// rows the deny steps make (an open in the self-test directory, one of the
+/// target's memory, a relative `BPF_OBJ_GET`) and the target's exec.
+#[cfg(any(test, feature = "test-util"))]
+pub fn deny_events_for_tests(
+    agent: u32,
+    exe: &str,
+    child: u32,
+    ts: u64,
+    deny: &deny::DenyExpect,
+) -> Vec<(Option<Sensor>, Event)> {
+    let comm = || "northnarrow-age".to_string();
+    let mut v: Vec<(Option<Sensor>, Event)> = deny
+        .records
+        .iter()
+        .map(|e| {
+            (
+                Some(Sensor::Deny),
+                Event::FsProtectDenial {
+                    pid: child,
+                    uid: 0,
+                    comm: comm(),
+                    target_dev: e.dev.unwrap_or(9),
+                    target_ino: e.ino.unwrap_or(1234),
+                    operation: e.op,
+                    timestamp_ns: ts,
+                },
+            )
+        })
+        .collect();
+    let open = |filename: String| Event::FileOpen {
+        pid: child,
+        uid: 0,
+        gid: 0,
+        comm: comm(),
+        filename,
+        flags: 1,
+        timestamp_ns: ts,
+        path_from_user: false,
+        kernel_class: 0,
+    };
+    v.push((
+        None,
+        open(format!("{}/{}", deny::TARGET_DIR, deny::file::WRITE_OPEN)),
+    ));
+    v.push((None, open(format!("/proc/{}/mem", deny.target))));
+    v.push((
+        None,
+        Event::BpfSyscall {
+            pid: child,
+            uid: 0,
+            comm: comm(),
+            cmd: common::bpf_cmd::BPF_OBJ_GET,
+            arg: 0,
+            timestamp_ns: ts,
+        },
+    ));
+    if deny.target != 0 {
+        v.push((
+            None,
+            Event::ProcessSpawn {
+                pid: deny.target,
+                ppid: agent,
+                uid: 0,
+                gid: 0,
+                comm: comm(),
+                filename: exe.to_string(),
+                timestamp_ns: ts,
+                argv: vec![exe.to_string(), deny::TARGET_FLAG.to_string()],
+                parent_comm: comm(),
+                parent_start_ns: 0,
+                start_ns: ts,
+                parent_is_kthread: false,
+                exe: Default::default(),
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            },
+        ));
+    }
+    v
+}
+
+pub mod deny;
 
 #[cfg(test)]
 mod tests;
