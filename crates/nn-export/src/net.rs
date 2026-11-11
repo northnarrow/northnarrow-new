@@ -311,6 +311,10 @@ struct Conn {
     in_flight: usize,
     /// The last row written into this connection, per chain.
     committed: HashMap<ExportChain, (u64, u64)>,
+    /// When the oldest bytes still waiting for an acknowledgement began to
+    /// wait: the last acknowledgement, the session's start, or (lot 299,
+    /// BUG-20) the request that wrote after a time with nothing waiting —
+    /// what [`Limits::stall`] counts from.
     last_progress: Instant,
     peer_bytes: u64,
     established: bool,
@@ -572,6 +576,15 @@ impl SyslogSink {
         let acked_to = self.acked.get(&chain).copied();
         let c = self.conn.as_mut().ok_or(SinkFault::Closed)?;
         pump_in(c, lim.peer_bytes)?;
+        // Lot 299 (external bug hunt, edition 1.2: BUG-20): a stall is rows
+        // written and none acknowledged for `lim.stall`. On a session with
+        // nothing waiting the count starts again here, before the first row
+        // this request writes: an idle session's last progress may be older
+        // than the stall, and its first row was cut `ack_wait` after its
+        // write (reset, backoff, the row written twice).
+        if !c.flights.iter().any(|f| f.acked_at.is_none()) {
+            c.last_progress = Instant::now();
+        }
         let mut wrote = false;
         for r in rows {
             let p = pos(r);

@@ -493,7 +493,9 @@ impl<T> ClassQueues<T> {
 /// within 1/8 of its octave (12.5 %).
 const SUB_BITS: u32 = 3;
 const SUB: usize = 1 << SUB_BITS;
-/// Octaves of microseconds kept (2^26 µs ≈ 67 s; longer is the last bucket).
+/// Octaves of microseconds kept: the last bucket ends at 2^29 µs ≈ 537 s
+/// and holds every longer latency too (lot 299, BUG-79: the comment said
+/// 2^26 µs ≈ 67 s).
 const OCTAVES: usize = 27;
 
 /// Latencies in microseconds, by bucket (8 per power of two), for the
@@ -526,8 +528,14 @@ impl LatencyHistogram {
         (((octave - SUB_BITS + 1) as usize) * SUB + sub).min(OCTAVES * SUB - 1)
     }
 
-    /// The largest value of a bucket.
+    /// The largest value of a bucket. Lot 299 (external bug hunt, edition
+    /// 1.3: BUG-79): the last bucket has none — it holds every latency past
+    /// the octaves kept, so a quantile there is the largest seen (it was
+    /// 2^29 - 1 µs, below a longer value and below p100).
     fn upper(b: usize) -> u64 {
+        if b >= OCTAVES * SUB - 1 {
+            return u64::MAX;
+        }
         if b < SUB {
             return b as u64;
         }
@@ -550,8 +558,9 @@ impl LatencyHistogram {
     }
 
     /// The `q` quantile (0.0–1.0) in microseconds: the upper end of the
-    /// bucket that holds it (at most 12.5 % above the value), never above
-    /// the largest seen. `None` before the first latency.
+    /// bucket that holds it (at most 12.5 % above the value; in the last
+    /// bucket, the largest seen), never above the largest seen. `None`
+    /// before the first latency.
     pub fn quantile_us(&self, q: f64) -> Option<u64> {
         if self.count == 0 {
             return None;
@@ -2232,5 +2241,44 @@ mod tests {
                 assert!(LatencyHistogram::upper(b - 1) < us, "{us} in bucket {b}");
             }
         }
+    }
+
+    /// Lot 299 (external bug hunt, edition 1.3: BUG-79): a latency past the
+    /// last bucket's start (2^29 us, ~537 s) gave a quantile below the
+    /// value, and p100 below the largest seen.
+    #[test]
+    fn quantile_past_the_last_bucket_is_the_largest_seen() {
+        let mut h = LatencyHistogram::default();
+        h.record_ns(600 * 1_000_000_000);
+        h.record_ns(2_000 * 1_000_000_000);
+        assert_eq!(h.max_us(), 2_000_000_000);
+        assert_eq!(
+            h.quantile_us(1.0),
+            Some(h.max_us()),
+            "p100 is the largest seen"
+        );
+        let q = h.quantile_us(0.5).unwrap();
+        assert!(q >= 600_000_000, "p50 {q} us below the 600 s value");
+    }
+
+    /// Lot 299 (BUG-79), the other side: only the last bucket answers the
+    /// largest seen. A latency in the bucket before it (480 s) still gets
+    /// its own bucket's upper end, within 12.5 % of it, however long the
+    /// largest.
+    #[test]
+    fn a_quantile_before_the_last_bucket_stays_in_its_bucket() {
+        let mut h = LatencyHistogram::default();
+        h.record_ns(480 * 1_000_000_000);
+        h.record_ns(2_000 * 1_000_000_000);
+        assert_eq!(
+            LatencyHistogram::bucket(480_000_000),
+            OCTAVES * SUB - 2,
+            "the bucket before the last"
+        );
+        let q = h.quantile_us(0.5).unwrap();
+        assert!(
+            (480_000_000..=540_000_000).contains(&q),
+            "p50 {q} us: not within its bucket"
+        );
     }
 }
