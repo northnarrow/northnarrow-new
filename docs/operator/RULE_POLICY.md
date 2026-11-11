@@ -317,7 +317,7 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `audit <rule>` | recorded only (no alert line, not counted) |
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
 | `exempt <rule> uid <uid>` | that uid's matches of the rule are recorded only (not uid 0) |
-| `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest — while **no code was injected** into the process (§2.3) |
+| `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest — while **no code was injected** into the process (§2.3). The path is the one the kernel gives as the process's executable (`/proc/<pid>/exe`), symbolic links resolved: on Ubuntu 26.04 `/usr/bin/sleep` is a link to uutils' `/usr/lib/cargo/bin/coreutils/sleep` (one file for every utility, hard-linked), and an exemption of `/usr/bin/sleep` covers nothing (lot 303) |
 | `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) and **not injected into** (§2.3) |
 | `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) and **not injected into** (§2.3) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
@@ -613,8 +613,15 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
 A root user loads a module without any tool — `finit_module(2)` on a file of
 their choice, `init_module(2)` on a buffer — so the prevention is the
 kernel's. The agent's two module-load hooks (`kernel_read_file` for
-`READING_MODULE`, `kernel_load_data` for `LOADING_MODULE`) judge the FILE,
-never who loads it:
+`READING_MODULE` and, from 7.0, `READING_MODULE_COMPRESSED` — the file a
+`finit_module` with `MODULE_INIT_COMPRESSED_FILE` reads, kmod's load of a
+`.ko.zst` or `.ko.xz` the kernel decompresses, every module of Ubuntu 26.04
+(lot 303: before it, those loads were neither judged nor recorded on 7.0);
+`kernel_load_data` for `LOADING_MODULE`) judge the FILE, never who loads it.
+The boot checks the ids the hooks compare against with the running kernel's
+BTF; where one differs, both hooks are left out and that is signed (module
+loads neither judged nor recorded, a kexec image not refused) rather than
+judge the wrong reads:
 
 - **Trusted** (loads, no record): a regular file owned by root that neither
   its group nor others may write, whose inode the agent found walking the

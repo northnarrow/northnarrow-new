@@ -8730,6 +8730,127 @@ number in parentheses is a lab PR.
     nothing after its close).
   - Level unchanged (C23 2, provisional): the re-assessment is not this
     lot's.
+- **Lot 303b — the nightly's four red checks on 7.0 (Ubuntu 26.04), each
+  found on our guest and fixed (C07, C14, C23).**
+  - What was open: the nightly `lab-vm.yml`'s Ubuntu 26.04 guest
+    (`7.0.0-38-generic`, systemd 259, uutils coreutils) had five red tests
+    since 04/11–07/11, none of them run by the pull requests' CI (5.15 and
+    6.8 only), and the dispatched run 42958638508 of `main` 02b8e853 still
+    had them (137 passed, 5 failed).
+  - The causes, measured on our own `ubuntu2604` guest (lease k303; read
+    with `bpftool`, `ftrace`, `strace` and `/proc`, the guest put back):
+    - **`a_move_the_dac_refused_leaves_no_record_behind`** (red from 04/11):
+      7.0's `cgroup_procs_write_finish` is two lines long and inlined into
+      `__cgroup_procs_write` (the symbol stays, for cgroup v1's caller).
+      ftrace on two cgroup v2 `cgroup.procs` writes: `cgroup_procs_write_start`
+      twice (from `__cgroup_procs_write`), `cgroup_file_write` twice (from
+      `kernfs_fop_write_iter`), `cgroup_procs_write_finish` never. The move
+      guard's clear (lot 273b, fentry on it) never ran on a v2 write: a
+      write the DAC refused left its record, and the thread's own next move
+      was refused, signed as a move of the agent.
+    - **`r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options`**
+      (red from 05/11, "no R018 record"): 7.0 added
+      `READING_MODULE_COMPRESSED` (7) to `enum kernel_read_file_id`, and
+      `finit_module` with `MODULE_INIT_COMPRESSED_FILE` reads its file with
+      it (`strace modprobe dummy`: `finit_module(3, …,
+      MODULE_INIT_COMPRESSED_FILE)` on `dummy.ko.zst`; kmod 34.2). The
+      `kernel_read_file` hook judged `READING_MODULE` (2) alone: on 7.0 no
+      compressed module's load was judged, refused or recorded — an
+      untrusted one included — and the `module_load` self-test missed every
+      round.
+    - **`net_connect_without_dns_is_recorded_and_a_resolved_one_is_not`**
+      (red from 05/11): `udp_recvmsg` and `udpv6_recvmsg` take four
+      parameters on Ubuntu's 7.0 (BTF `FUNC_PROTO` vlen 4: `sk, msg, len,
+      flags`; mainline from 7.1), and the object had programs for six and
+      five: the DNS response sensor was not attached, NN-L-NET-028 judged
+      nothing.
+    - **`a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed`,
+      `process_vm_writev_revokes`** (red from their first night, 07/11):
+      the kernel's taint worked (the mark `HOW_INJECTED`, by the injector);
+      the fixture exempted `exe /usr/bin/sleep`, which on 26.04 is a link to
+      `/usr/lib/cargo/bin/coreutils/sleep` (uutils, 116 hard links of one
+      binary): `/proc/<pid>/exe` names the target, the exemption covered
+      nothing, so nothing was revoked or signed — and
+      `a_read_only_proc_mem_open_does_not_revoke` passed on a process that
+      was never exempt. The test's expectation was right, its fixture wrong
+      for that host; the agent's matching (the kernel's path) is kept: an
+      exemption of the link's target would cover every uutils utility.
+  - What changed:
+    - The clear runs at the return of `cgroup_file_write` (fexit), the
+      kernfs `write` operation of every cgroup file, which kernfs calls
+      through a pointer — no compiler inlines it; a pin of the older fentry
+      (`prog_`/`link_cgroup_procs_write_finish`) is removed at the start,
+      and where the guard is not attached. The BTF gate asks for
+      `cgroup_file_write` (`CGROUP_MOVE_FINISH`); the fail-open slot keeps
+      its number, relabelled.
+    - The read hook judges `READING_MODULE` and `READING_MODULE_COMPRESSED`
+      by the file alike (`common::module_judge::read_id`, the one copy); the
+      boot checks every id the two load hooks compare against with the
+      kernel's BTF (`READ_IDS`: `READING_MODULE` 2, `READING_KEXEC_IMAGE` 3,
+      `READING_MODULE_COMPRESSED` 7 or absent, `LOADING_MODULE` 2,
+      `LOADING_KEXEC_IMAGE` 3) and leaves both hooks out, signed, a prior
+      boot's pins purged, where one differs.
+    - `dns_answer_v4_ret4` and `dns_answer_v6_ret4` (the return value in
+      slot 4), chosen by the parameter count as the others.
+    - The injection e2e exempt a copy of `sleep` of their own
+      (`/usr/local/lib/nn-e2etest-303-<pid>/sleep`, its digest) and check
+      the kernel names that path before injecting; `RULE_POLICY.md` says an
+      `exe` exemption names the path `/proc/<pid>/exe` gives.
+  - Host: named tests —
+    `common::module_judge::tests::a_compressed_module_s_read_is_judged_like_a_plain_one`,
+    `read_ids_that_drift_from_the_kernel_are_named`,
+    `btf_revalidate::tests::the_load_ids_are_checked_against_the_btf` (and
+    `the_load_ids_match_the_running_kernels_btf`),
+    `filesystem::tests::a_kernel_with_other_load_ids_keeps_the_module_hooks_out`,
+    `xtask/tests/load_ids.rs` (the read hook's order and ids, the attach
+    leaving the hooks out), `net_telemetry::tests::a_four_parameter_recvmsg_has_its_program`,
+    the move guard's BTF fixture with 7.0's shape (lot 273b's function
+    present, `cgroup_file_write` absent: not attached) and the xtask source
+    checks of the clear (fexit `cgroup_file_write`, no fentry, the legacy
+    pins purged). Mutations (a catch is a named test failing): 21 on the
+    new code, 21 caught (two of them in the eBPF source closure re-run with
+    the object rebuilt: the first run stopped at the staleness guard,
+    recorded as no test run, not as caught), 0 survivors.
+  - The lab, as measured (our own guests under lease k303, one at a time;
+    agents uninstalled, guests clean and off at the end):
+    - **Ubuntu 26.04** (`7.0.0-38-generic`), `main` 02b8e853 first (the
+      nightly's reds on our guest): `cgroup_guard_privileged_e2e` 3 of 4
+      (the DAC test: `ok errno=EACCES errno=EPERM`),
+      `cgroup_join_privileged_e2e` 14 of 16 (both injection tests),
+      `net_privileged_e2e` 7 of 8 (NET-028), `detection_rules_at_scale_…`
+      18 of 19 (R011/R018); the DNS response sensor not attached ("udp_recvmsg
+      has 4 parameters"); with the agent installed in its default deny mode,
+      an untrusted compressed copy of `dummy.ko.zst` in the tree **loaded**.
+    - **Ubuntu 26.04**, the lot: those four targets 4/4, 16/16, 8/8, 19/19;
+      `verifier-check` 107 programs, 102 OK, 5 not counted, 0 failing
+      (`dns_answer_v4_ret4`, `dns_answer_v6_ret4`, `cgroup_move_clear` on
+      fexit `cgroup_file_write` among the OK); installed: the DNS response
+      sensor attached, `dummy.ko.zst` (packaged) loads, the untrusted
+      compressed copy is **refused** (`EPERM`) and signed R018 High, no
+      `module_load` or `dns_answer` self-test miss, the manifest `missing=0`,
+      28 of 28 deny hooks. The full gate as the nightly runs it (`install`,
+      a cold boot — bootcheck OK at once and 30 s later: 77 pins, 48 LSM
+      programs —, `test-ignored`): `gate-summary` PASS, 100 suites, 142
+      passed, 0 failed (the nightly on `main`: 137 passed, 5 failed).
+    - **Debian 13** (`6.12.115+deb13.1`, a fresh guest built like the
+      nightly's: the vendor's current image, 4 vCPUs, 12 GiB), the full gate
+      with lot 303a: `install`, the cold boot (bootcheck OK at once and 30 s
+      later: 77 pins, 48 LSM programs, 79 own ids), `test-ignored`:
+      `gate-summary` PASS, 100 suites, 142 passed, 0 failed.
+    - **Ubuntu 24.04** (`6.8.0-147-generic`), the regression round:
+      `install`, the cold boot (bootcheck OK twice: 77 pins, 47 LSM
+      programs), the four targets 4/4, 16/16, 8/8, 19/19, `verifier-check`
+      107 programs, 105 OK, 2 not counted, 0 failing (`cgroup_move_clear` on
+      fexit `cgroup_file_write` OK). 5.15 and 6.1: the pull request's CI
+      (22.04) and the nightly (Debian 12).
+  - Levels unchanged (C07 2, C14 2, C23 2 provisional): the checks hold
+    on 7.0 as on 5.15 and 6.8; the re-assessment is not this lot's.
+  - Not changed (and said): systemd 257+ attaches its own `sysctl_monitor`
+    (`cgroup/sysctl`, multi) to the root cgroup at boot (Debian 13: id 35;
+    26.04: id 65); lot 280b's kernel-state round signs it at every start as
+    a foreign program on the root's slot (NN-L-AT-001, High, Log) on both.
+    No test fails on it; telling systemd's program from a planted one
+    needs its own design (a name is the planter's to choose) — a follow-up.
 - **Lot 303a — the nightly's red Debian 13 install: why, and the gate says
   why next time (lab).**
   - What was open: the nightly `lab-vm.yml` failed `nn-lab.sh install` on

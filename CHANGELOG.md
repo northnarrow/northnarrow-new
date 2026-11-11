@@ -6,6 +6,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- The kernel module judge sees a compressed module's load on 7.0 (lot 303;
+  `docs/operator/RULE_POLICY.md` §2.4). 7.0 reads the file of a
+  `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` — kmod's load of a
+  `.ko.zst` or `.ko.xz` the kernel decompresses, every module of Ubuntu
+  26.04 — with a new id, `READING_MODULE_COMPRESSED`, which the
+  `kernel_read_file` hook skipped: on 7.0 no such load was judged, refused
+  or recorded, an untrusted module included (the nightly's 7.0 guest: the
+  R018 e2e red from 05/11, the `module_load` self-test missed every round).
+  Both ids are judged by the file now; the boot checks every id the two load
+  hooks compare against with the kernel's BTF and leaves both hooks out,
+  signed, where one differs, rather than judge the wrong reads.
+- The cgroup move guard no longer refuses a thread's own move after a move
+  the DAC refused it, on 7.0 (lot 303). The program that drops a stashed
+  move at the end of a `cgroup.procs` write was an fentry on
+  `cgroup_procs_write_finish`, which 7.0 inlines into its cgroup v2 caller:
+  the record of a write the DAC refused stayed, and the thread's next own
+  move was refused and signed as a move of the agent. It runs at the return
+  of `cgroup_file_write` now, the kernfs `write` operation of every cgroup
+  file, called through a pointer (no compiler inlines it); a pin of the
+  older program is removed at the start.
 - Dependencies: `rustix` 1.1.6 instead of 1.1.5, in `Cargo.lock` and
   `fuzz/Cargo.lock` alike (lot 305; RUSTSEC-2026-0486, GHSA-jh2m-fhpj-3vr7,
   unsound: `rustix::fs`'s `getxattr`, `lgetxattr`, `fgetxattr`,
@@ -106,6 +126,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The DNS response sensor attaches on kernels whose `udp_recvmsg` and
+  `udpv6_recvmsg` take four parameters (7.1, and Ubuntu 26.04's 7.0, which
+  carries the change; lot 303; `docs/operator/KERNEL_COMPATIBILITY.md`): it
+  was not attached there ("udp_recvmsg has 4 parameters: no program is
+  built for that"), so NN-L-NET-028 judged no connect (the nightly's 7.0
+  guest, red from 05/11). The object carries a program for each count (6,
+  5, 4).
+- The privileged injection e2e (lot 281) exempts a copy of `sleep` of its
+  own instead of `/usr/bin/sleep`, which on Ubuntu 26.04 is a link to
+  uutils' multi-call binary: the kernel names the target as the process's
+  executable, so the exemption matched nothing — two tests red there and the
+  read-only one passing on a process never exempt (lot 303). The tests now
+  check the kernel names the exempt path before they inject;
+  `docs/operator/RULE_POLICY.md` says an `exe` exemption names that path.
 - The lab's `install` (and so the nightly CI VM gate's install step) prints
   why a unit did not start — the units' status, this boot's error and
   warning lines of both units from their journal namespace (the agent's

@@ -96,8 +96,8 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
      273c: another process's limits and priorities of a protected one), file_send_sigiotask (lot \
      293: a signal through a file's owner, F_SETOWN and O_ASYNC); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
      has them; bpf (the agent's links); kernel_read_file and kernel_load_data (kexec); the cgroup \
-     move guard, inode_permission, fexit cgroup_procs_write_start and fentry \
-     cgroup_procs_write_finish, where the kernel has the functions in the shape it reads";
+     move guard, inode_permission, fexit cgroup_procs_write_start and fexit \
+     cgroup_file_write, where the kernel has the functions in the shape it reads";
 
 /// Lot 273b (the review of #489): the deny hooks' cost on the host where it
 /// is more than noise, as the lab measured it (Ubuntu 24.04, 6.8; A/B
@@ -464,9 +464,10 @@ pub const SOURCES: [SourceContract; 16] = [
         fallbacks: &[],
         // Lot 285: the load judged in the kernel, by the file
         sync_verdict: SyncVerdict::KernelDeny {
-            hooks: "kernel_read_file (READING_MODULE: a file the agent does not vouch for) and \
-                    kernel_load_data (LOADING_MODULE: a buffer), outside a signed window, in \
-                    the deny mode (lot 285)",
+            hooks: "kernel_read_file (READING_MODULE, and 7.0's READING_MODULE_COMPRESSED, \
+                    lot 303: a file the agent does not vouch for) and kernel_load_data \
+                    (LOADING_MODULE: a buffer), outside a signed window, in the deny mode (lot \
+                    285)",
         },
         opt_in: None,
         on_failure: FailureMode::Blind,

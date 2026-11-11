@@ -601,9 +601,10 @@ agent runs without it.
   `common/src/btf_offsets.rs`; `verifier-check` lists the other as built
   for another kernel's count, not a failure).
 - **`dns_answer`**: fexit on `udp_recvmsg` and `udpv6_recvmsg`, six
-  parameters up to 5.18 (`noblock` among them) and five from 5.19
-  (`dns_answer_v4_ret6`/`_ret5`, `dns_answer_v6_ret6`/`_ret5`), chosen the
-  same way. Without `udpv6_recvmsg` the source is `partial` (IPv6
+  parameters up to 5.18 (`noblock` among them), five from 5.19 and four
+  from 7.1 (`addr_len` went; Ubuntu 26.04's 7.0 carries that change, lot
+  303) (`dns_answer_v4_ret6`/`_ret5`/`_ret4`,
+  `dns_answer_v6_ret6`/`_ret5`/`_ret4`), chosen the same way. Without `udpv6_recvmsg` the source is `partial` (IPv6
   responses not seen). The response is read from the receiver's buffer
   through the iterator's base (`ITER_UBUF` from 6.0, a one-segment
   `ITER_IOVEC` before), the offsets of the DNS query sensor.

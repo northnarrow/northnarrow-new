@@ -6,16 +6,20 @@
 //! application itself on a stub-resolver host (glibc to `127.0.0.53`), or
 //! the local resolver for its upstream leg. The return value follows the
 //! parameters in the fexit context: six up to 5.18 (`sk, msg, len,
-//! noblock, flags, addr_len`), five from 5.19 (`noblock` went). The agent
-//! loads the six-parameter programs first; the verifier refuses them where
-//! the function has five, and the agent loads the others.
+//! noblock, flags, addr_len`), five from 5.19 (`noblock` went), four from
+//! 7.1 (`addr_len` went: the function sets `msg->msg_namelen` itself) and
+//! on Ubuntu 26.04's 7.0, which carries that change (lot 303: the nightly's
+//! 7.0 guest had no DNS response sensor). The agent reads the count from
+//! the kernel's BTF and loads the program built for it.
 //!
 //! The datagram is a response when it came from port 53: its source is the
 //! `msg_name` the kernel filled for the caller (`recvfrom`, `recvmsg`), or
 //! the connected socket's peer when the caller asked for no address
 //! (`recv` on a connected socket: a connected UDP socket only receives from
-//! its peer). `msg_namelen` is not set yet when the function returns (its
-//! caller sets it), so the address's family says whether it was filled.
+//! its peer). `msg_namelen` is not set yet when the five- and
+//! six-parameter functions return (their caller sets it; the four-parameter
+//! one sets it itself), so on every kernel the address's family says
+//! whether it was filled.
 //! The bytes are read from the receiver's own buffer — the kernel's copy of
 //! a response in page fragments (a virtio NIC's) would have needed the
 //! fragments walked — up to [`DNS_ANSWER_CAP`]; the parse worker decodes
@@ -29,7 +33,7 @@
 //! `msg_name`'s pointer and one of its first four bytes, or, with no
 //! `msg_name`, two of the socket's — the address is read only for port 53
 //! (review of #495, D5). The bytes read are the receiver's buffer's: at
-//! most the buffer's length (`len`, the third parameter in both arities)
+//! most the buffer's length (`len`, the third parameter in every arity)
 //! — `MSG_TRUNC` makes the return value the datagram's length, longer than
 //! the buffer (N1) — and a datagram longer than what was read is
 //! `TRUNCATED`.
@@ -99,6 +103,15 @@ pub fn dns_answer_v4_ret5(ctx: FExitContext) -> i32 {
     0
 }
 
+/// Lot 303: `udp_recvmsg` with four parameters (7.1+, and Ubuntu 26.04's
+/// 7.0): the return value is slot 4.
+#[fexit(function = "udp_recvmsg")]
+pub fn dns_answer_v4_ret4(ctx: FExitContext) -> i32 {
+    let ret: i32 = ctx.arg(4);
+    unsafe { try_answer(&ctx, ret) };
+    0
+}
+
 /// `udpv6_recvmsg`, six parameters.
 #[fexit(function = "udpv6_recvmsg")]
 pub fn dns_answer_v6_ret6(ctx: FExitContext) -> i32 {
@@ -111,6 +124,14 @@ pub fn dns_answer_v6_ret6(ctx: FExitContext) -> i32 {
 #[fexit(function = "udpv6_recvmsg")]
 pub fn dns_answer_v6_ret5(ctx: FExitContext) -> i32 {
     let ret: i32 = ctx.arg(5);
+    unsafe { try_answer(&ctx, ret) };
+    0
+}
+
+/// Lot 303: `udpv6_recvmsg`, four parameters.
+#[fexit(function = "udpv6_recvmsg")]
+pub fn dns_answer_v6_ret4(ctx: FExitContext) -> i32 {
+    let ret: i32 = ctx.arg(4);
     unsafe { try_answer(&ctx, ret) };
     0
 }
@@ -260,8 +281,8 @@ unsafe fn try_answer(ctx: &FExitContext, ret: i32) {
             _ => return,
         },
     };
-    // N1: the receiver's buffer's length, the third parameter in both
-    // arities (`MSG_TRUNC` returns the datagram's length, longer)
+    // N1: the receiver's buffer's length, the third parameter in every
+    // arity (`MSG_TRUNC` returns the datagram's length, longer)
     let buf_len: u64 = ctx.arg(2);
     let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;

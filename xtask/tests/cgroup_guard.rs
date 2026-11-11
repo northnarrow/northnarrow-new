@@ -92,7 +92,11 @@ fn the_move_guard_records_only_a_refusable_move_and_refuses_its_check() {
     assert!(!g.contains("LruHashMap"));
     assert!(g.contains("const MOVE_STASH_ENTRIES: u32 = 64;"));
     assert!(g.contains("const STASH_TTL_NS: u64 = 1_000_000_000;"));
-    assert!(g.contains("#[fentry(function = \"cgroup_procs_write_finish\")]"));
+    // lot 303: the clear at the end of every cgroup file's write, a function
+    // kernfs calls through a pointer (7.0 inlines lot 273b's
+    // `cgroup_procs_write_finish` into its cgroup v2 caller)
+    assert!(g.contains("#[fexit(function = \"cgroup_file_write\")]"));
+    assert!(!g.contains("#[fentry"));
     assert!(body(&g, "cgroup_move_clear").contains("CGROUP_MOVES.remove(&pid_tgid)"));
     // the file a migration checks: cgroup v2, a regular file, its name
     in_order(
@@ -366,9 +370,14 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
     in_order(
         body(&g, "attach_move_guard"),
         &[
+            // lot 303: where the guard is not attached, a prior boot's pins
+            // of its hooks go, and lot 273b's clear's
+            "for hook in GUARD_HOOKS.iter().chain([&MOVE_CLEAR_LEGACY_HOOK]) {",
             "reattach_fresh(ebpf, MOVE_DENY_PROGRAM, MOVE_DENY_HOOK, btf, pin_root)",
-            "reattach_fresh_fentry(",
-            "reattach_fresh_fexit(",
+            // lot 303: an older agent's clear (fentry) goes first
+            "lsm_pin_paths(root, MOVE_CLEAR_LEGACY_HOOK)",
+            "antitamper_bpf::reattach_fresh_fexit(\n        ebpf,\n        MOVE_CLEAR_PROGRAM,",
+            "antitamper_bpf::reattach_fresh_fexit(\n        ebpf,\n        MOVE_STASH_PROGRAM,",
         ],
     )
     .unwrap();

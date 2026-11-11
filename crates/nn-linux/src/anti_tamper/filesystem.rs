@@ -897,7 +897,24 @@ pub(crate) fn attach(
     // MODULE_LOAD_EVENTS producers — on the same reattach-fresh path as
     // the deny set above (zero-window + no ring split-brain on restart).
     // Observe-only; the rootkit verdict is userland's (stage-2 rule).
+    // Lot 303: the hooks compare the call's id with compiled values
+    // (`common::module_judge::read_id`); where the kernel's BTF gives one
+    // otherwise they are left out — and a prior boot's pins of theirs go —
+    // rather than judge the wrong reads.
+    let drift = super::btf_revalidate::resolved()
+        .map(|r| r.read_id_drift.clone())
+        .unwrap_or_default();
     for (program, hook) in MODULE_LOAD_PROGRAMS {
+        if let Some(why) = read_ids_refusal(&drift) {
+            warn!(program, hook, reason = %why, "anti-tamper FS: module-load LSM hook NOT attached (lot 303)");
+            if let Some(root) = pin_root {
+                let (prog, link) = antitamper_bpf::lsm_pin_paths(root, hook);
+                antitamper_bpf::purge_stale_pin(&link);
+                antitamper_bpf::purge_stale_pin(&prog);
+            }
+            health.observe_failures.push((program, why));
+            continue;
+        }
         if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             warn!(
                 program, hook, error = %e,
@@ -923,6 +940,19 @@ pub(crate) fn attach(
     }
 
     Ok(health)
+}
+
+/// Lot 303: why the module-load hooks are not attached on a kernel whose
+/// load ids differ from the programs' (`drift`, the boot's BTF check), or
+/// `None` when they match.
+pub(crate) fn read_ids_refusal(drift: &[String]) -> Option<String> {
+    (!drift.is_empty()).then(|| {
+        format!(
+            "not attached: the kernel's load ids are not the ones the programs compare against \
+             ({}) — module loads are neither judged nor recorded, a kexec image is not refused",
+            drift.join("; ")
+        )
+    })
 }
 
 /// How an optional deny hook ([`OPTIONAL_LSM_PROGRAMS`]) counts this boot.
@@ -3659,5 +3689,21 @@ mod tests {
             resolved[0].0, present,
             "the surviving entry is the present file"
         );
+    }
+
+    /// Lot 303 (named): a kernel whose load ids differ from the programs'
+    /// keeps the module-load hooks out, saying which ids and what is lost;
+    /// matching ids attach them.
+    #[test]
+    fn a_kernel_with_other_load_ids_keeps_the_module_hooks_out() {
+        assert_eq!(read_ids_refusal(&[]), None);
+        let why = read_ids_refusal(&[
+            "kernel_read_file_id.READING_KEXEC_IMAGE is 4 on this kernel, 3 in the programs"
+                .to_string(),
+        ])
+        .expect("refused");
+        assert!(why.starts_with("not attached: "), "{why}");
+        assert!(why.contains("READING_KEXEC_IMAGE is 4"), "{why}");
+        assert!(why.contains("neither judged nor recorded"), "{why}");
     }
 }

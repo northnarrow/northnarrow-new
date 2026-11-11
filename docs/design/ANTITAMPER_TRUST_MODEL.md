@@ -842,11 +842,19 @@ that never evicts, a guard proved to run at every boot.
   before. Tamper case C86 checks that a unit started and stopped in the
   agent's slice signs nothing.
 - **The move guard, made to hold.**
-  - A third program, `cgroup_move_clear` (fentry
-    `cgroup_procs_write_finish`), drops the thread's record when the
-    write ends — whatever it did: the move done, refused (by the guard or
-    by the DAC), failed, on v2 and on v1. A record lives only from the
-    lookup to the end of the write.
+  - A third program, `cgroup_move_clear`, drops the thread's record when
+    the write ends — whatever it did: the move done, refused (by the guard
+    or by the DAC), failed, on v2 and on v1. A record lives only from the
+    lookup to the end of the write. Lot 303: at the return of
+    `cgroup_file_write` (fexit), the kernfs `write` operation of every
+    cgroup file, which kernfs calls through a pointer — no compiler inlines
+    it. Lot 273b's fentry on `cgroup_procs_write_finish` saw no cgroup v2
+    write on 7.0: the function is two lines long there and inlined into
+    `__cgroup_procs_write` (the symbol stays, for cgroup v1's caller), so a
+    write the DAC refused left its record and the thread's next own move
+    was refused (the nightly's Ubuntu 26.04 guest; ftrace on our guest:
+    `cgroup_procs_write_start` and `cgroup_file_write` called for each
+    write, `cgroup_procs_write_finish` never).
   - The refusal consumes a record only on the file a migration's
     permission check is made on: a `cgroup.procs` (or `cgroup.threads`) of
     a cgroup v2 hierarchy (`s_magic`, a regular file, its kernfs name).
@@ -857,8 +865,8 @@ that never evicts, a guard proved to run at every boot.
     one record is live at a time, so neither the review's one-entry map
     (R3) nor two concurrent movers can push a live record out.
   - The guard needs both functions in the kernel's BTF
-    (`cgroup_procs_write_finish` too); without one it is not attached and
-    the absence is signed.
+    (`cgroup_file_write` too; lot 273b: `cgroup_procs_write_finish`);
+    without one it is not attached and the absence is signed.
   - **The boot's self-test** (`agent/src/boot/deny_selftest.rs`): right
     after the signal self-test, a child of the agent's binary, registered
     as a worker (protected, not exempt), and a second one, not registered,

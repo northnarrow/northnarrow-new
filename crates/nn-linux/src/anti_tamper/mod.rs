@@ -1025,7 +1025,7 @@ pub const DENY_HOOKS: [&str; 22] = [
 ///
 /// Lot 273: and the cgroup move guard's programs, attached together where
 /// the kernel's BTF has `cgroup_procs_write_start` in the shape its fexit
-/// reads and (lot 273b) `cgroup_procs_write_finish` ([`cgroup_guard`]);
+/// reads and (lot 273b, lot 303) `cgroup_file_write` ([`cgroup_guard`]);
 /// where it has not, the guard's absence is signed degraded.
 pub const OPTIONAL_DENY_HOOKS: [&str; 6] = [
     "inode_set_acl",

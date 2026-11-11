@@ -464,7 +464,8 @@ capabilities on that thread).
 
 Lot 273 added two anti-tamper ones (section 9): the cgroup move guard not
 attached (the kernel's BTF has no `cgroup_procs_write_start`, or one of
-another shape — since lot 273b, or no `cgroup_procs_write_finish`) and a
+another shape — since lot 273b, or no `cgroup_file_write`, `cgroup_procs_write_finish`
+before lot 303) and a
 unit cgroup not protected (a process in no cgroup v2, a host without the v2
 hierarchy, a cgroup that could not be read). Lot 273b added four: the move
 guard attached and not run (`move_guard_self_test`: its boot self-test
@@ -665,7 +666,8 @@ not verify, or a file that is not one — recorded and removed`.
   unified hierarchy; …)` or its WARN (`v1 hierarchies are mounted …`,
   `cgroup v1 writes NOT refused` with the reason), `anti-tamper cgroup:
   LIMIT_VALUES keys of earlier boots removed removed=…`, the fresh
-  re-attach lines of `file_permission` and `cgroup_procs_write_finish`,
+  re-attach lines of `file_permission` and `cgroup_file_write` (lot 303;
+  `cgroup_procs_write_finish` before),
   and the move guard's self-test: `move guard self-test: moving a
   protected process to another cgroup was refused — the move guard runs`,
   or its ERROR (`… attached but the kernel does not run it`) / WARN
