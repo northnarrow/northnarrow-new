@@ -107,11 +107,16 @@ const READ_CHUNK: usize = 16 * 1024;
 struct Pipe {
     fd: Option<std::fs::File>,
     buf: Vec<u8>,
-    /// The bytes kept: the first `cap` (stdout: past them the pipe is
-    /// closed, the answer cut), or the last `cap` (stderr: read to its end,
-    /// so the command never waits on it).
+    /// The bytes kept: the first `cap` (stdout: one byte past them and the
+    /// pipe is closed, the answer [`Pipe::cut`]), or the last `cap` (stderr:
+    /// read to its end, so the command never waits on it).
     cap: usize,
     tail: bool,
+    /// Lot 304: the command offered more than the first `cap` bytes — the
+    /// answer kept is cut short, whatever the command does next (it may
+    /// die of the closed pipe, or exit 0: uutils' `head` does on EPIPE).
+    /// Set from the bytes read alone, never from the command's exit.
+    cut: bool,
     /// The most one read takes ([`READ_CHUNK`]; the tests take less, so the
     /// command's exit is seen with its bytes still in the pipe).
     chunk: usize,
@@ -129,6 +134,7 @@ impl Pipe {
             buf: Vec::new(),
             cap,
             tail,
+            cut: false,
             chunk: chunk.clamp(1, READ_CHUNK),
         }
     }
@@ -147,9 +153,12 @@ impl Pipe {
                 self.buf.drain(..over);
             }
             Ok(n) => {
+                // exactly `cap` bytes is a whole answer: the pipe stays open
+                // until its end, or until a byte past the bound comes
                 let room = self.cap.saturating_sub(self.buf.len());
                 self.buf.extend_from_slice(&chunk[..n.min(room)]);
-                if self.buf.len() >= self.cap {
+                if n > room {
+                    self.cut = true;
                     self.fd = None;
                 }
             }
@@ -207,6 +216,14 @@ fn read_ready(out: &mut Pipe, err: &mut Pipe, wait: Duration) -> bool {
 ///   ssh master) holds neither its answer nor its failure — the fetch, and
 ///   `watch` with it, waited for it without a bound, with no OK and no
 ///   ALERT.
+///
+/// Lot 304: a command whose stdout passes [`FETCH_MAX_BYTES`] is a failed
+/// fetch as soon as the byte past the bound is read, whatever its exit
+/// status. Until then the "never an answer cut short" rested on the
+/// command dying of the pipe closed at the bound: one that exits 0 on EPIPE
+/// (uutils' `head`, the default on Ubuntu 26.04), or that had written its
+/// last bytes into the pipe before it was closed, gave the first 4 MiB as
+/// a whole answer.
 fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     run_reading(cmd, timeout, READ_CHUNK)
 }
@@ -244,10 +261,20 @@ fn run_reading(cmd: &str, timeout: Duration, chunk: usize) -> Result<Vec<u8>, St
             ));
         }
         read_ready(&mut out, &mut err, (deadline - now).min(POLL_STEP));
+        if out.cut {
+            // a failed fetch whatever it does next: it need not run on (its
+            // exit, seen at the next look, ends the loop; the one check
+            // below says why)
+            let _ = child.kill();
+        }
     };
     // it exited: what it wrote is in the pipes now — read that, not what a
     // process it started may write later
     while Instant::now() < deadline && read_ready(&mut out, &mut err, Duration::ZERO) {}
+    // lot 304: past the bound is a failed fetch whatever its exit status
+    if out.cut {
+        return Err(past_the_bound());
+    }
     if !status.success() {
         let err = String::from_utf8_lossy(&err.buf);
         let err = err.lines().last().unwrap_or("").to_string();
@@ -261,6 +288,14 @@ fn run_reading(cmd: &str, timeout: Duration, chunk: usize) -> Result<Vec<u8>, St
         ));
     }
     Ok(out.buf)
+}
+
+/// Why a source that offered more than [`FETCH_MAX_BYTES`] is a failed fetch.
+fn past_the_bound() -> String {
+    format!(
+        "the source command failed: its answer passed the bound of {FETCH_MAX_BYTES} bytes \
+         (cut there, so not verified)"
+    )
 }
 
 /// The state: `Ok(None)` when there is none yet (the first check anchors),
@@ -566,23 +601,107 @@ mod tests {
     }
 
     /// Lot 299: the answer stays bounded — a source past
-    /// [`FETCH_MAX_BYTES`] has its pipe closed at the bound, a failed fetch
-    /// (it dies of the closed pipe), never an answer cut short or read to
-    /// its end.
+    /// [`FETCH_MAX_BYTES`] has its pipe closed at the bound, a failed fetch,
+    /// never an answer cut short or read to its end. Lot 304: whatever its
+    /// exit status. Until then the failure came from the source dying of
+    /// the closed pipe: on the CI's Ubuntu 26.04 runners (uutils' `head`
+    /// exits 0 on EPIPE) the first 4 MiB were a whole answer. Each source
+    /// below but the first exits 0 after the bound, however and whenever it
+    /// meets the closed pipe; exactly the bound is a whole answer.
     #[test]
     fn a_source_past_the_bound_is_a_failed_fetch() {
-        let e = run_with_timeout(
-            &format!("head -c {} /dev/zero", FETCH_MAX_BYTES + 1_000_000),
-            Duration::from_secs(10),
-        )
-        .unwrap_err();
-        assert!(e.contains("failed"), "{e}");
+        let past = FETCH_MAX_BYTES + 1_000_000;
+        for cmd in [
+            // whatever this `head` does on EPIPE
+            format!("head -c {past} /dev/zero"),
+            // it dies of the closed pipe (or exits on EPIPE), the source 0
+            format!("head -c {past} /dev/zero; exit 0"),
+            // EPIPE without SIGPIPE, the source 0
+            format!("trap '' PIPE; head -c {past} /dev/zero 2>/dev/null; exit 0"),
+            // one byte past: often all in the pipe before it is closed
+            format!("head -c {} /dev/zero; exit 0", FETCH_MAX_BYTES + 1),
+        ] {
+            let e = run_with_timeout(&cmd, Duration::from_secs(10)).unwrap_err();
+            assert!(
+                e.contains("failed") && e.contains("passed the bound"),
+                "{cmd}: {e}"
+            );
+        }
         let out = run_with_timeout(
-            &format!("head -c {FETCH_MAX_BYTES} /dev/zero"),
+            &format!("head -c {FETCH_MAX_BYTES} /dev/zero; exit 0"),
             Duration::from_secs(10),
         )
         .unwrap();
         assert_eq!(out.len() as u64, FETCH_MAX_BYTES);
+    }
+
+    /// Lot 304: a source that runs on past the bound (EPIPE ignored, then
+    /// more to do) is not waited for: the fetch fails once the byte past
+    /// the bound is read, the bound its reason — not the timeout's.
+    #[test]
+    fn a_source_running_on_past_the_bound_fails_at_once() {
+        let started = Instant::now();
+        let e = run_with_timeout(
+            &format!(
+                "trap '' PIPE; head -c {} /dev/zero 2>/dev/null; exec sleep 30",
+                FETCH_MAX_BYTES + 1_000_000
+            ),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        let took = started.elapsed();
+        assert!(e.contains("passed the bound"), "{e}");
+        assert!(took < Duration::from_secs(8), "{took:?}");
+    }
+
+    /// Lot 304: stdout's bound is exact, whatever the reads' sizes — `cap`
+    /// bytes and then the pipe's end are a whole answer; one byte more is
+    /// an answer cut, the pipe closed at once; `cap` bytes with the pipe
+    /// still open are neither yet.
+    #[test]
+    fn the_bound_is_exact_one_byte_past_it_is_cut() {
+        use std::io::Write;
+        const CAP: usize = 4096;
+        let fill = |p: &mut Pipe| {
+            while p.buf.len() < CAP && p.fd.is_some() {
+                p.read_once();
+            }
+        };
+        for chunk in [1, 7, 64, CAP, READ_CHUNK] {
+            // exactly the bound, then the end
+            let (r, mut w) = std::io::pipe().unwrap();
+            w.write_all(&[b'a'; CAP]).unwrap();
+            let mut p = Pipe::new(Some(r), CAP, false, chunk);
+            fill(&mut p);
+            assert!(p.fd.is_some() && !p.cut, "chunk {chunk}: open, not cut");
+            drop(w);
+            p.read_once();
+            assert!(p.fd.is_none() && !p.cut, "chunk {chunk}: whole");
+            assert_eq!(p.buf, [b'a'; CAP]);
+            // exactly the bound, then one byte more
+            let (r, mut w) = std::io::pipe().unwrap();
+            w.write_all(&[b'b'; CAP]).unwrap();
+            let mut p = Pipe::new(Some(r), CAP, false, chunk);
+            fill(&mut p);
+            assert!(p.fd.is_some() && !p.cut, "chunk {chunk}: open, not cut");
+            w.write_all(b"c").unwrap();
+            p.read_once();
+            assert!(p.fd.is_none() && p.cut, "chunk {chunk}: cut, closed");
+            assert_eq!(p.buf, [b'b'; CAP]);
+            // well past the bound, in one go
+            let (r, mut w) = std::io::pipe().unwrap();
+            w.write_all(&[b'd'; CAP + 5000]).unwrap();
+            let mut p = Pipe::new(Some(r), CAP, false, chunk);
+            for _ in 0..=CAP + 1 {
+                if p.fd.is_none() {
+                    break;
+                }
+                p.read_once();
+            }
+            assert!(p.fd.is_none() && p.cut, "chunk {chunk}: cut, closed");
+            assert_eq!(p.buf, [b'd'; CAP]);
+            drop(w);
+        }
     }
 
     /// Lot 299: a source that closes its stdout first and then writes more
@@ -599,7 +718,7 @@ mod tests {
     }
 
     /// Lot 299: what a pipe keeps — stdout its first bytes up to the bound,
-    /// then closed; stderr its last bytes, read to its end.
+    /// then closed (lot 304: and cut); stderr its last bytes, read to its end.
     #[test]
     fn a_pipe_keeps_its_head_or_its_tail() {
         use std::io::Write;
@@ -619,6 +738,8 @@ mod tests {
                 p.fd.is_none(),
                 "tail={tail}: closed at its bound or its end"
             );
+            // lot 304: stdout's head is an answer cut; stderr's tail never
+            assert_eq!(p.cut, !tail, "tail={tail}");
             let want = if tail {
                 &bytes[bytes.len() - 4096..]
             } else {

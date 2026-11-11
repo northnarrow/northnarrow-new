@@ -8730,3 +8730,31 @@ number in parentheses is a lab PR.
     nothing after its close).
   - Level unchanged (C23 2, provisional): the re-assessment is not this
     lot's.
+- **Lot 304 (A) — the heartbeat verifier's 4 MiB bound holds whatever the
+  source command's exit status (the CI's `test` job unblocked).**
+  - What was open: lot 299's `run_reading` closed the source command's
+    stdout at `FETCH_MAX_BYTES` and returned what it had read as the
+    answer whenever the command exited 0 — the "never an answer cut short"
+    rested on the command dying of the closed pipe. One that exits 0 on
+    `EPIPE` (uutils' `head`, the default of Ubuntu 26.04, the image of the
+    CI's `ubuntu-latest` runners since 11/11: run 42978372590, `Image:
+    ubuntu-26.04`), that ignores it, or that had its last bytes in the pipe
+    before it was closed gave the first 4 MiB as a whole answer — the newest
+    beats cut off. `heartbeat::tests::a_source_past_the_bound_is_a_failed_fetch`
+    failed on those runners almost every time (#529, #530, #531).
+  - What changed: the stdout pipe keeps reading at exactly the bound and
+    marks the answer cut when a byte past it comes (`Pipe::cut`: from the
+    bytes read alone, never from the exit); a cut fetch is a failed fetch
+    whatever the exit status, its reason the bound, and the command is
+    killed at once instead of waited for. Exactly 4 MiB stays a whole
+    answer.
+  - Measured on the host (Ubuntu 24.04, GNU `head` 9.4): `origin/main`'s
+    `run_with_timeout` returned `Ok` with 4,194,304 bytes for each of the
+    three sources that exit 0 after the bound (`head -c 4194305; exit 0`,
+    `head -c 5194304; exit 0`, `trap '' PIPE; head …; exit 0`), 5 runs out
+    of 5 — the bug without uutils; with the fix each is an `Err` naming the
+    bound; the heartbeat module's 15 tests 40 runs out of 40.
+  - Mutations (a catch is a named test failing): 11 on the new code, 11
+    caught; `origin/main`'s logic under the new tests caught by 4 named
+    tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
+  - Level unchanged.
