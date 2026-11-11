@@ -39,9 +39,13 @@ pub const PROG_TYPE_STRUCT_OPS: u32 = 27;
 pub const PROG_TYPE_EXT: u32 = 28;
 /// `BPF_PROG_TYPE_LSM`.
 pub const PROG_TYPE_LSM: u32 = 29;
+/// `BPF_PROG_TYPE_CGROUP_SYSCTL` (lot 304).
+pub const PROG_TYPE_CGROUP_SYSCTL: u32 = 23;
 
 /// `BPF_TRACE_ITER` (`enum bpf_attach_type`): an iterator's link.
 pub const ATTACH_TRACE_ITER: u32 = 28;
+/// `BPF_LSM_MAC` (`enum bpf_attach_type`): an LSM program's link (lot 304).
+pub const ATTACH_LSM_MAC: u32 = 27;
 
 /// The types refused by default, in uapi order.
 pub const DENIED_BY_DEFAULT: [u32; 9] = [
@@ -289,6 +293,121 @@ pub fn is_kernel_program(name: &[u8], attach: &[u8]) -> bool {
         .any(|(kn, ka)| kn.as_bytes() == n && ka.as_bytes() == a)
 }
 
+/// Lot 304: how a known system program's loader holds it attached — the
+/// link whose descriptor proves the loader (its `/proc/<pid>/fdinfo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownLink {
+    /// A cgroup link of the program to the ROOT cgroup, `BPF_CGROUP_SYSCTL`.
+    RootCgroupSysctl,
+    /// A tracing link, `BPF_LSM_MAC` (on the entry's attach function).
+    Lsm,
+}
+
+/// Lot 304: a known system program — one a service the distribution ships
+/// loads at its start and keeps attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownSystemProgram {
+    /// The program's name as the kernel keeps it (`BPF_OBJ_NAME_LEN`: at
+    /// most 15 bytes, a longer name cut).
+    pub name: &'static str,
+    pub prog_type: u32,
+    /// Its attach function (an LSM program's); empty for a cgroup program.
+    pub attach: &'static str,
+    pub link: KnownLink,
+    /// The packaged executable that loads it and holds its link.
+    pub loader: &'static str,
+    /// What it is, for the record.
+    pub what: &'static str,
+}
+
+/// Lot 304: the known system programs (measured on Debian 13, systemd
+/// 257.13, and Ubuntu 26.04, systemd 259.5):
+/// - systemd-networkd's `sysctl_monitor` (systemd 257+), linked to the root
+///   cgroup's `cgroup/sysctl` slot (multi) at networkd's start: created by
+///   uid `systemd-network`, its descriptor and its link's held by
+///   networkd's main process — not PID 1;
+/// - PID 1's `restrict_filesystems` (`RestrictFileSystems=`, on a kernel
+///   with the BPF LSM), an LSM program on `bpf_lsm_file_open`, its tracing
+///   link held by PID 1.
+pub const KNOWN_SYSTEM_PROGRAMS: [KnownSystemProgram; 2] = [
+    KnownSystemProgram {
+        name: "sysctl_monitor",
+        prog_type: PROG_TYPE_CGROUP_SYSCTL,
+        attach: "",
+        link: KnownLink::RootCgroupSysctl,
+        loader: "/usr/lib/systemd/systemd-networkd",
+        what: "systemd-networkd's sysctl monitor (systemd 257+: it logs a write by another \
+               process to a sysctl networkd manages, and refuses nothing)",
+    },
+    KnownSystemProgram {
+        name: "restrict_filesy",
+        prog_type: PROG_TYPE_LSM,
+        attach: "bpf_lsm_file_open",
+        link: KnownLink::Lsm,
+        loader: "/usr/lib/systemd/systemd",
+        what: "systemd's RestrictFileSystems= (PID 1: it refuses a unit's process the opening \
+               of a file on a filesystem type its unit does not allow)",
+    },
+];
+
+/// Lot 304: the entry of [`KNOWN_SYSTEM_PROGRAMS`] a program of that name,
+/// type and attach function would be, held by a link of kind `link` (an
+/// entry of a cgroup link names no attach function).
+pub fn known_system_program(
+    name: &str,
+    prog_type: u32,
+    attach: &str,
+    link: KnownLink,
+) -> Option<usize> {
+    KNOWN_SYSTEM_PROGRAMS.iter().position(|k| {
+        k.link == link
+            && k.name == name
+            && k.prog_type == prog_type
+            && (k.attach.is_empty() || k.attach == attach)
+    })
+}
+
+/// Lot 304: `target_dev` of a `sysctl_root_prog` record whose program is a
+/// known system program, its loader proven ([`root_prog_known_dev`]); 0 is
+/// a program not proven one (High).
+pub const ROOT_PROG_KNOWN_BIT: u64 = 1 << 63;
+/// Lot 304: the loader was seen loading it by the agent's `bpf` hook (the
+/// root attach that followed is one the hook lets through only inside a
+/// trusted-installer window); without it the program was loaded before
+/// the agent's start.
+pub const ROOT_PROG_SEEN_BIT: u64 = 1 << 62;
+
+/// Lot 304: the `target_dev` of a known root program's record: the known
+/// bit, the seen bit, the entry of [`KNOWN_SYSTEM_PROGRAMS`] (bits 32–47)
+/// and the id of the link to the root its loader holds (bits 0–31).
+#[inline(always)]
+pub const fn root_prog_known_dev(entry: u16, seen: bool, link_id: u32) -> u64 {
+    let seen = if seen { ROOT_PROG_SEEN_BIT } else { 0 };
+    ROOT_PROG_KNOWN_BIT | seen | ((entry as u64) << 32) | link_id as u64
+}
+
+/// Lot 304: `(entry, seen, link id)` of a known root program's record, or
+/// `None` (a program not proven known, or an entry not in the table or
+/// not one of the root's `cgroup/sysctl` slot).
+#[inline(always)]
+pub const fn root_prog_known_of(target_dev: u64) -> Option<(usize, bool, u32)> {
+    let entry = ((target_dev >> 32) & 0xffff) as usize;
+    if target_dev & ROOT_PROG_KNOWN_BIT == 0
+        || entry >= KNOWN_SYSTEM_PROGRAMS.len()
+        || !matches!(
+            KNOWN_SYSTEM_PROGRAMS[entry].link,
+            KnownLink::RootCgroupSysctl
+        )
+    {
+        return None;
+    }
+    Some((
+        entry,
+        target_dev & ROOT_PROG_SEEN_BIT != 0,
+        target_dev as u32,
+    ))
+}
+
 /// Length of a program's name in the kernel (`BPF_OBJ_NAME_LEN`).
 pub const OBJ_NAME_LEN: usize = 16;
 /// The bytes of a program's attach function's name an iterator record
@@ -352,15 +471,21 @@ pub const CROSSVIEW_LINK_BIT: u64 = 1 << 63;
 /// A cross-view record's bit for a program the kernel loaded before user
 /// space started (its load time before PID 1's start): the kernel's own
 /// (HID-BPF's `hid_tail_call`), not one loaded while the agent was not
-/// running. The type takes bits 32–61.
+/// running. The type takes bits 32–60.
 pub const CROSSVIEW_EARLY_BIT: u64 = 1 << 62;
+/// Lot 304: a cross-view record's bit for a baseline program proven a
+/// known system program ([`KNOWN_SYSTEM_PROGRAMS`]): its loader holds its
+/// link and runs the packaged executable, and loaded it before the agent
+/// started (the record's pid and uid are the loader's). The types are far
+/// below 2^29: a record written before this bit never has it.
+pub const CROSSVIEW_KNOWN_BIT: u64 = 1 << 61;
 
 /// `target_ino` of a cross-view record.
 #[inline(always)]
 pub const fn crossview_ino(is_link: bool, early: bool, object_type: u32, id: u32) -> u64 {
     let link = if is_link { CROSSVIEW_LINK_BIT } else { 0 };
     let early = if early { CROSSVIEW_EARLY_BIT } else { 0 };
-    link | early | (((object_type as u64) & 0x3fff_ffff) << 32) | id as u64
+    link | early | (((object_type as u64) & 0x1fff_ffff) << 32) | id as u64
 }
 
 /// `(is_link, early, type, id)` of a cross-view record's `target_ino`.
@@ -369,7 +494,7 @@ pub const fn crossview_of(target_ino: u64) -> (bool, bool, u32, u32) {
     (
         target_ino & CROSSVIEW_LINK_BIT != 0,
         target_ino & CROSSVIEW_EARLY_BIT != 0,
-        ((target_ino >> 32) & 0x3fff_ffff) as u32,
+        ((target_ino >> 32) & 0x1fff_ffff) as u32,
         target_ino as u32,
     )
 }
@@ -466,7 +591,12 @@ mod tests {
         );
         assert_eq!(PROG_TYPES[PROG_TYPE_EXT as usize], "BPF_PROG_TYPE_EXT");
         assert_eq!(PROG_TYPES[PROG_TYPE_LSM as usize], "BPF_PROG_TYPE_LSM");
+        assert_eq!(
+            PROG_TYPES[PROG_TYPE_CGROUP_SYSCTL as usize],
+            "BPF_PROG_TYPE_CGROUP_SYSCTL"
+        );
         assert_eq!(ATTACH_TYPES[ATTACH_TRACE_ITER as usize], "BPF_TRACE_ITER");
+        assert_eq!(ATTACH_TYPES[ATTACH_LSM_MAC as usize], "BPF_LSM_MAC");
     }
 
     /// Lot 290 (named): exactly the nine types are refused by default —
@@ -612,6 +742,90 @@ mod tests {
         assert!(!is_kernel_program(b"hid_tail_cal", b"__hid_bpf_tail_call"));
         assert!(!is_kernel_program(b"rootkit", b"__hid_bpf_tail_call"));
         assert!(!is_kernel_program(b"", b""));
+    }
+
+    /// Lot 304 (named): a known root program's record carries its entry,
+    /// how its load was established and its link — and nothing else is
+    /// read as one: a record of 0 (a program not proven known), an entry
+    /// past the table, an entry that is not a root `cgroup/sysctl` one.
+    #[test]
+    fn a_known_root_program_s_record_round_trips() {
+        for (entry, seen, link) in [(0u16, false, 3u32), (0, true, u32::MAX), (0, false, 0)] {
+            let dev = root_prog_known_dev(entry, seen, link);
+            assert_eq!(root_prog_known_of(dev), Some((entry as usize, seen, link)));
+            assert_ne!(dev, 0);
+        }
+        assert_eq!(root_prog_known_of(0), None);
+        assert_eq!(root_prog_known_of(ROOT_PROG_SEEN_BIT | 3), None);
+        assert_eq!(
+            root_prog_known_of(root_prog_known_dev(
+                KNOWN_SYSTEM_PROGRAMS.len() as u16,
+                false,
+                3
+            )),
+            None
+        );
+        // the LSM entry is no root program's
+        assert_eq!(root_prog_known_of(root_prog_known_dev(1, false, 3)), None);
+        // the layout: the entry in bits 32-47, the link in bits 0-31
+        assert_eq!(
+            root_prog_known_dev(1, true, 3),
+            ROOT_PROG_KNOWN_BIT | ROOT_PROG_SEEN_BIT | (1 << 32) | 3
+        );
+    }
+
+    /// Lot 304 (named): the known system programs, by name, type, attach
+    /// function and link kind together — each alone is not one; the table
+    /// holds kernel names (at most 15 bytes) and packaged loaders.
+    #[test]
+    fn a_known_system_program_is_told_by_all_its_traits() {
+        use KnownLink::{Lsm, RootCgroupSysctl};
+        assert_eq!(
+            known_system_program("sysctl_monitor", 23, "", RootCgroupSysctl),
+            Some(0)
+        );
+        // a cgroup entry names no attach function: whatever the census says
+        assert_eq!(
+            known_system_program("sysctl_monitor", 23, "cgroup", RootCgroupSysctl),
+            Some(0)
+        );
+        assert_eq!(
+            known_system_program("restrict_filesy", 29, "bpf_lsm_file_open", Lsm),
+            Some(1)
+        );
+        for (n, t, a, l) in [
+            ("sysctl_monitor", 23, "", Lsm),
+            ("sysctl_monitor", 8, "", RootCgroupSysctl),
+            ("sysctl_monitox", 23, "", RootCgroupSysctl),
+            ("restrict_filesy", 29, "bpf_lsm_bprm_check_security", Lsm),
+            ("restrict_filesy", 26, "bpf_lsm_file_open", Lsm),
+            ("restrict_filesy", 29, "bpf_lsm_file_open", RootCgroupSysctl),
+            ("restrict_files", 29, "bpf_lsm_file_open", Lsm),
+        ] {
+            assert_eq!(known_system_program(n, t, a, l), None, "{n} {t} {a} {l:?}");
+        }
+        for k in KNOWN_SYSTEM_PROGRAMS {
+            assert!(!k.name.is_empty() && k.name.len() < OBJ_NAME_LEN, "{k:?}");
+            assert!(k.loader.starts_with("/usr/lib/systemd/"), "{k:?}");
+            assert_eq!(k.attach.is_empty(), k.link == RootCgroupSysctl, "{k:?}");
+        }
+        assert_eq!(
+            KNOWN_SYSTEM_PROGRAMS[0].loader,
+            "/usr/lib/systemd/systemd-networkd"
+        );
+        assert_eq!(KNOWN_SYSTEM_PROGRAMS[1].loader, "/usr/lib/systemd/systemd");
+        // the cross-view's known bit is none of the others, and a type
+        // keeps its bits below it
+        assert_eq!(
+            CROSSVIEW_KNOWN_BIT & (CROSSVIEW_LINK_BIT | CROSSVIEW_EARLY_BIT),
+            0
+        );
+        let k = crossview_ino(false, false, 0x1fff_ffff, 7) | CROSSVIEW_KNOWN_BIT;
+        assert_eq!(crossview_of(k), (false, false, 0x1fff_ffff, 7));
+        assert_eq!(
+            crossview_ino(false, false, PROG_TYPE_LSM, 21) & CROSSVIEW_KNOWN_BIT,
+            0
+        );
     }
 
     /// Lot 290: the iterators' records, as userland reads them.

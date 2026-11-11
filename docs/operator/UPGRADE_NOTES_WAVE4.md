@@ -1128,3 +1128,23 @@ configure; use the `nn-admin` of this release where the export is checked.
   `PROTECTED_PIDS` right after its eBPF object loads, before its first
   program loads (the previous start's pinned guard judges those loads).
 
+## 25. The known system programs (lot 304)
+
+- **systemd's own BPF programs are no longer foreign** ([the anti-tamper
+  trust model, "Lot
+  304"](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md)).
+  On a host with systemd 257 or later (Debian 13, Ubuntu 26.04) every start signed systemd-networkd's
+  `sysctl_monitor` (`sysctl_root_prog`, High), PID 1's
+  `restrict_filesystems` (`bpf_baseline`, High) and a sysctl judge
+  degradation (`nn-admin status`: the trust level "degraded"). Each is now
+  signed once a start as Low, its loader the record's principal
+  (`systemd-network` or `systemd`) and the proof in the reasoning, and the
+  degradation names only a program not proven one. A SIEM rule keyed on
+  `sysctl_root_prog` or `bpf_baseline` at High keeps firing for any other
+  program, the same name from another loader included.
+- **Restarting systemd-networkd** outside a trusted-installer window has
+  its sysctl monitor's attach to the root cgroup refused, as before
+  (`sysctl_root_attach`, High): networkd logs it and runs without the
+  monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
+  to keep it; that load, seen by the agent, is signed Low.
+

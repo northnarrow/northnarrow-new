@@ -280,6 +280,15 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 304: a known system program, its loader proven by the
+            // kernel-state round (`nn_linux::known_system_prog`): Low.
+            FsProtectOperation::SysctlRootProg
+                if common::bpf_prog_class::root_prog_known_of(*target_dev).is_some() =>
+            {
+                return Some(known_root_program_verdict(
+                    self, event, *pid, comm, *target_dev, *target_ino,
+                ));
+            }
             FsProtectOperation::SysctlRootProg => {
                 let reasoning = format!(
                     "A cgroup/sysctl program not the agent's (id {target_ino}) is attached to the \
@@ -337,6 +346,13 @@ impl Rule for NnLAt001AntiTamperDenial {
                 ));
             }
             FsProtectOperation::BpfUnseen | FsProtectOperation::BpfBaseline => {
+                // Lot 304: a baseline program proven a known system
+                // program (its loader the record's pid and uid): Low.
+                if let Some(v) = known_baseline_verdict(
+                    self, event, *operation, *pid, comm, *target_dev, *target_ino,
+                ) {
+                    return Some(v);
+                }
                 return Some(crossview_verdict(self, event, *operation, comm, *target_dev, *target_ino));
             }
             // Lot 293 (external bug hunt BUG14): the kernel delivers it
@@ -377,6 +393,37 @@ impl Rule for NnLAt001AntiTamperDenial {
     }
 }
 
+/// Lot 304: a known system program on the root cgroup's `cgroup/sysctl`
+/// slot — Low, with the proof the kernel-state round established (the
+/// loader's uid is the record's principal, not repeated here).
+fn known_root_program_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    pid: u32,
+    comm: &str,
+    target_dev: u64,
+    id: u64,
+) -> Verdict {
+    use common::bpf_prog_class::{root_prog_known_of, KNOWN_SYSTEM_PROGRAMS};
+    let (entry, seen, link) = root_prog_known_of(target_dev).unwrap_or((0, false, 0));
+    let k = KNOWN_SYSTEM_PROGRAMS[entry];
+    let when = if seen {
+        "the agent's `bpf` hook saw that process load it, and its attach to the root was \
+         let through, as the hook does only inside a trusted-installer window"
+    } else {
+        "it was loaded before the agent started"
+    };
+    let reasoning = format!(
+        "A known system program on the root cgroup's cgroup/sysctl slot: `{}` (id {id}), {}. \
+         The loader proven: pid {pid} (`{comm}`, the record's principal) holds its link to the \
+         root cgroup (link id {link}), runs the packaged {} (its device and inode), and was \
+         running when the program was loaded; {when}. Not refused; the same program from any \
+         other loader is High.",
+        k.name, k.what, k.loader
+    );
+    build_verdict(rule, event, ResponseAction::Log, Severity::Low, &reasoning)
+}
+
 /// Lot 290: the severity of a cross-view finding — High for an object the
 /// `bpf` hook never saw loading after the start; for one present at the
 /// start (the baseline, loaded while the agent was not running), High when
@@ -398,6 +445,52 @@ pub fn crossview_severity(
         }
         _ => Severity::High,
     }
+}
+
+/// Lot 304: a cross-view baseline program the kernel-state round proved a
+/// known system program (`CROSSVIEW_KNOWN_BIT`; the entry told again here by
+/// the record's name, type and attach point) — Low, with the proof. `None`
+/// for any other record: an unseen one, a link, one without the bit, one
+/// whose traits name no entry.
+#[allow(clippy::too_many_arguments)]
+fn known_baseline_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    operation: FsProtectOperation,
+    pid: u32,
+    comm: &str,
+    target_dev: u64,
+    target_ino: u64,
+) -> Option<Verdict> {
+    use common::bpf_prog_class as c;
+    if operation != FsProtectOperation::BpfBaseline || target_ino & c::CROSSVIEW_KNOWN_BIT == 0 {
+        return None;
+    }
+    let (is_link, _, t, id) = c::crossview_of(target_ino);
+    let (name, attach) = c::object_of_comm(comm);
+    let entry = [c::KnownLink::Lsm, c::KnownLink::RootCgroupSysctl]
+        .into_iter()
+        .find_map(|link| c::known_system_program(name, t, attach, link))
+        .filter(|_| !is_link)?;
+    let k = c::KNOWN_SYSTEM_PROGRAMS[entry];
+    let reasoning = format!(
+        "A known system program: BPF program id {id} `{name}` (type `{}`, tag {}, attached at \
+         {attach}), {}. The loader proven: pid {pid} (the record's principal) holds its link, runs the \
+         packaged {} (its device and inode), and was running when the program was loaded, \
+         before the agent started — the cross-view's baseline, signed once. Not refused; the \
+         same program from any other loader is signed as before.",
+        c::prog_type_name(t),
+        c::tag_hex(target_dev),
+        k.what,
+        k.loader
+    );
+    Some(build_verdict(
+        rule,
+        event,
+        ResponseAction::Log,
+        Severity::Low,
+        &reasoning,
+    ))
 }
 
 /// Lot 290: a cross-view finding's verdict (NN-L-AT-001, not a refusal).
@@ -996,6 +1089,180 @@ mod tests {
         let p = r(FsProtectOperation::SysctlRootProg);
         assert!(p.contains("(id 709)") && p.contains("Not refused"), "{p}");
         assert!(!p.contains("refused it"), "{p}");
+    }
+
+    /// Lot 304 (named): a root program the kernel-state round proved a
+    /// known system program is Low, named with its loader's proof — the
+    /// program, the loader's pid, name and uid, the link, the packaged
+    /// executable, when it was loaded; the same operation without the proof
+    /// (0), or with a proof naming no entry of the table, stays High.
+    #[test]
+    fn a_known_root_program_is_low_with_its_proof_and_any_other_high() {
+        use common::bpf_prog_class::{root_prog_known_dev, ROOT_PROG_KNOWN_BIT};
+        let ev = |pid, uid, comm: &str, dev| Event::FsProtectDenial {
+            pid,
+            uid,
+            comm: comm.into(),
+            target_dev: dev,
+            target_ino: 35,
+            operation: FsProtectOperation::SysctlRootProg,
+            timestamp_ns: 1,
+        };
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                631,
+                998,
+                "systemd-network",
+                root_prog_known_dev(0, false, 3),
+            ))
+            .unwrap();
+        assert_eq!(v.severity, Severity::Low);
+        assert_eq!(v.action, ResponseAction::Log);
+        for want in [
+            "known system program",
+            "`sysctl_monitor` (id 35)",
+            "systemd-networkd's sysctl monitor",
+            "pid 631 (`systemd-network`, the record's principal)",
+            "(link id 3)",
+            "the packaged /usr/lib/systemd/systemd-networkd",
+            "loaded before the agent started",
+            "Not refused",
+        ] {
+            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+        }
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                2001,
+                998,
+                "systemd-network",
+                root_prog_known_dev(0, true, 9),
+            ))
+            .unwrap();
+        assert_eq!(v.severity, Severity::Low);
+        assert!(
+            v.reasoning.contains("saw that process load it")
+                && v.reasoning.contains("inside a trusted-installer window")
+                && v.reasoning.contains("(link id 9)"),
+            "{}",
+            v.reasoning
+        );
+        // no proof, or a proof of no entry: High, as a program not ours
+        for dev in [0, ROOT_PROG_KNOWN_BIT | (7 << 32) | 3, 1 << 62] {
+            let v = NnLAt001AntiTamperDenial
+                .evaluate(&ev(631, 998, "systemd-network", dev))
+                .unwrap();
+            assert_eq!(v.severity, Severity::High, "{dev:#x}");
+            assert!(
+                v.reasoning.contains("not the agent's (id 35)"),
+                "{}",
+                v.reasoning
+            );
+        }
+    }
+
+    /// Lot 304 (named): a baseline LSM program proven a known system
+    /// program (PID 1's `restrict_filesystems`) is Low with its loader's
+    /// proof; without the bit, as an unseen program, as a link, or with
+    /// traits that name no entry, it is weighed as before (High for an LSM
+    /// program).
+    #[test]
+    fn a_known_baseline_program_is_low_and_any_other_weighed_as_before() {
+        use common::bpf_prog_class::{crossview_ino, object_comm, CROSSVIEW_KNOWN_BIT};
+        let ev = |op, pid, comm: &str, ino| Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: comm.into(),
+            target_dev: 0xe8932b6bae2b9745,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1,
+        };
+        let rfs = object_comm("restrict_filesy", "bpf_lsm_file_open");
+        let known = crossview_ino(false, false, 29, 21) | CROSSVIEW_KNOWN_BIT;
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(FsProtectOperation::BpfBaseline, 1, &rfs, known))
+            .unwrap();
+        assert_eq!(v.severity, Severity::Low);
+        for want in [
+            "A known system program: BPF program id 21 `restrict_filesy`",
+            "tag e8932b6bae2b9745",
+            "systemd's RestrictFileSystems=",
+            "pid 1 (the record's principal) holds its link",
+            "the packaged /usr/lib/systemd/systemd",
+            "before the agent started",
+        ] {
+            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+        }
+        // systemd-networkd's program, as a baseline record
+        let mon = object_comm("sysctl_monitor", "cgroup");
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::BpfBaseline,
+                631,
+                &mon,
+                crossview_ino(false, false, 23, 35) | CROSSVIEW_KNOWN_BIT,
+            ))
+            .unwrap();
+        assert!(
+            v.reasoning.contains("systemd-networkd's sysctl monitor"),
+            "{}",
+            v.reasoning
+        );
+        let high = |op, comm: &str, ino| {
+            let v = NnLAt001AntiTamperDenial
+                .evaluate(&ev(op, 1, comm, ino))
+                .unwrap();
+            assert_eq!(
+                v.severity,
+                Severity::High,
+                "{comm} {ino:#x}: {}",
+                v.reasoning
+            );
+            assert!(
+                !v.reasoning.contains("known system program"),
+                "{}",
+                v.reasoning
+            );
+        };
+        // no bit
+        high(
+            FsProtectOperation::BpfBaseline,
+            &rfs,
+            crossview_ino(false, false, 29, 21),
+        );
+        // unseen, with the bit
+        high(FsProtectOperation::BpfUnseen, &rfs, known);
+        // another attach point, another name, another type
+        high(
+            FsProtectOperation::BpfBaseline,
+            &object_comm("restrict_filesy", "bpf_lsm_bprm_check_security"),
+            known,
+        );
+        high(
+            FsProtectOperation::BpfBaseline,
+            &object_comm("rootkit", "bpf_lsm_file_open"),
+            known,
+        );
+        high(
+            FsProtectOperation::BpfBaseline,
+            &rfs,
+            crossview_ino(false, false, 26, 21) | CROSSVIEW_KNOWN_BIT,
+        );
+        // a link record with the bit is no known program (a link of a
+        // refused type stays as lot 290 weighs it: Low, never "known")
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::BpfBaseline,
+                1,
+                &rfs,
+                crossview_ino(true, false, 29, 21) | CROSSVIEW_KNOWN_BIT,
+            ))
+            .unwrap();
+        assert!(
+            !v.reasoning.contains("known system program"),
+            "{}",
+            v.reasoning
+        );
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load

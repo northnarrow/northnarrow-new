@@ -140,6 +140,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   read-only one passing on a process never exempt (lot 303). The tests now
   check the kernel names the exempt path before they inject;
   `docs/operator/RULE_POLICY.md` says an `exe` exemption names that path.
+- The lab's `install` (and so the nightly CI VM gate's install step) prints
+  why a unit did not start — the units' status, this boot's error and
+  warning lines of both units from their journal namespace (the agent's
+  refusal and its gate among them) and their last lines — before it fails (lot 303;
+  `docs/integration-test-runbook.md`, "The CI VM gate"). The nightly's
+  Debian 13 guest failed that step four nights running (07/11-10/11,
+  f66e6680) with systemd's "control process exited with error code" alone;
+  reproduced on a fresh lab guest, the agent had refused its start (exit
+  78, gate `deny_hooks`): its own BPF maps, programs and links past the 256
+  entries `OWN_BPF_IDS` had, `E2BIG` at the 257th registration (`main`
+  registers 280 on that guest). Lot 290 had raised the map to 1024 on
+  `main`; the dispatched run of `main` installs there again.
 - `nn-admin heartbeat watch` fails a fetch whose `--from-cmd` command
   writes more than 4 MiB to stdout whatever the command's exit status (lot
   304; `docs/operator/HEARTBEAT.md`). The failure rested on the command
@@ -148,6 +160,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   they moved to it) or ignores it gave its first 4 MiB as a whole answer —
   the newest beats cut off. The first byte past the bound now ends the
   fetch and stops the command; exactly 4 MiB is still a whole answer.
+- systemd's own BPF programs are no longer signed as foreign at every start
+  (lot 304; `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 304"). On
+  Debian 13 and Ubuntu 26.04 (systemd 257+) systemd-networkd's
+  `sysctl_monitor` on the root cgroup's `cgroup/sysctl` slot was a High
+  `sysctl_root_prog` and a degradation of the sysctl judge (the trust level
+  degraded), and PID 1's `restrict_filesystems` LSM program a High
+  `bpf_baseline`. A program is now a known system program, signed Low with
+  its loader's proof, only when its packaged loader holds its link: the
+  name, type and attach function of an entry, a process holding the link
+  that attaches it, running the packaged executable (`/proc/<pid>/exe`'s
+  device and inode those of `/usr/lib/systemd/systemd-networkd` or
+  `/usr/lib/systemd/systemd`), started before the load, and the load
+  before the agent's start or seen by the agent's `bpf` hook from that
+  process. The same name from another loader stays High; the refusals do
+  not change.
 - NN-L-FIM-001 no longer kills the writer of the agent's own unit (or of a
   drop-in of it) in the vendor directory `/usr/lib/systemd/system/` inside
   an open trusted-installer window: that write is NN-L-FIM-009's Log/Low

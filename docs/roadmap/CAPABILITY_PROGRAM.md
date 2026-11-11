@@ -42,7 +42,7 @@ number in parentheses is a lab PR.
 | C11 | Containers and Kubernetes | 1 | the agent on a container host (`docs/operator/CONTAINER_HOST_DEPLOY.md`); R013 and EPG-002 detect an escape to the host; no container or pod id in the records | 3 |
 | C12 | Synchronous inline blocking | 2 | the exec policy at `bprm_check_security`: `-EACCES` per file class and lineage, LD_PRELOAD and LD_AUDIT, `mmap_file`; armed on 4 kernels, MS-01/02/03/32 refused (226); the `socket_connect` deny of the blocklist (224); EPG enforce, SIGKILL in the kernel (219); exec quarantine (223). All EXPERIMENTAL and off by default (`docs/design/EXEC_POLICY.md`); the behaviour proofs on one kernel | 3 |
 | C13 | Malware prevention | 1 | exec quarantine with a confined scanner (223), its signed hash list shipped empty (`docs/design/EXEC_QUARANTINE.md`), the default ELF heuristics resume the process; the exec policy refuses execs from memfd, deleted files and `/dev/shm` (226); EXPERIMENTAL, off by default | 3 |
-| C14 | Behavioural detection and correlation | 2 | 93 rules; the multi-match engine (236); chains with late execs (235, 244); the posture and the COMBAT ladder; golden replay of 29 cases (228, 243); the priority bus: tamper rows lost 3,699 → 0 (267) | 3 |
+| C14 | Behavioural detection and correlation | 2 (lot B2, 11/11) | 95 rules (`docs/detection/RULE_CATALOGUE.md`); the multi-match engine (236); chains with late execs (235, 244, 294); the posture and the COMBAT ladder, no COMBAT and no ladder kill on the benign corpus (282, 283a–c: `docs/validation/BENIGN_CORPUS.md`); R009 in COMBAT only (278), R011 by the command line (279, 287); golden replay of 29 decision and 12 posture cases (228, 243); the priority bus (267). Not 3: no detection rate measured (the V2 matrix empty, 0 `campaign` rows), no rule for T1003.007 (#119); lots 278, 283b, 283c, 287, 291, 292, 294 and 299 measured on 6.8 only, 282 on 5.15 only; the nightly on Ubuntu 26.04 (7.0) fails the R011/R018 and NN-L-NET-028 e2e every night since 05/11 and in the dispatch of 11/11 (#530 open), AlmaLinux 9 not in Wave 4; no third party | 3 |
 | C15 | Custom rules, declarative format | 1 | the rules are compiled Rust; the operator has signed overlays only: per-rule off/audit/alert/enforce with exemptions (`docs/operator/RULE_POLICY.md`, 236), the lists, the exec policy's cells | 3 |
 | C16 | Structured ATT&CK mapping | 2 | `Rule::attack()` is mandatory: 93 of 93 rules on 66 techniques and 12 tactics of ATT&CK 20.0, pinned by the STIX bundle's commit and sha256 (`docs/detection/ATTACK_COVERAGE.md`); `mitre` and `mitre_version` in every record, a revoked or unlisted id fails the tests; the records of 44 rules carried their typed ids on 4 guests (221). The coverage is not measured: 0 `campaign` rows, the V2 campaign not run | 3 |
 | C17 | Response on processes and files | 2 | NEUTRALIZE on every offender, a signed outcome and unlock (217); intent and outcome signed per action, the actions in parallel: 400 kills' longest wait 19 s → 1.6 s (270); the quarantine vault v2 with restore (238) | 3 |
@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 1 (lot 276) | the signed chains exported as OCSF 1.9.0 to rotating JSONL files and to syslog over TLS (RFC 5425), off by default, each record carrying its signed row, checked by `nn-admin export verify` against the agent's key alone; a cursor per chain, at least once, an unprivileged export worker (`docs/operator/EXPORT.md`); measured on Ubuntu 26.04 and Debian 12 (lot 276's note); no application acknowledgement (RELP, OTLP), no reload | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102); lot 273d (the review of #492): the units in a slice of their own (`northnarrow.slice`), the reload confirmed, systemd's copy read before a respawn and instead of a skip, our own drop-ins judged at a window's close, the host's judged precisely and a degradation while harmful, `io.prio.class` and seven critical sysctls refused a harmful value (C78c, C97, C103–C105), provisional until its review | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional; lot B2, 11/11) | 28 BPF-LSM deny hooks on 6.8 (26 on 5.15) and the move, sysctl and module judges: 27 of their 32 programs proved by a harmless attempt every round, five by an attach check, the BPF guard pinned through a restart (302); the units' cgroups, limits, slice, drop-ins and eight sysctls refused outside a window (273–273d; the judge on the kernel's copy, 280a); the blinding switches (280b); every sensor's self-test (280c); exemptions bound to a start and revoked on code injection (277, 281); module loads judged in the kernel (285); foreign BPF and the agent's own objects (290, 301); SIGIO (293); the chains and the heartbeat (295–297); the watchdog, the boot gates, the workers (216, 218, 272). The reason of 03/11 is closed: systemd 257's `cgroup.kill` refused on the five guests (273), its last lot reviewed (273d, #497). Provisional for a new one: no nightly green on the five guests since 31/10; the dispatch on 02b8e853 (run 42958638508) is green on 4 of 5, Debian 13 included (its failed start since 07/11, `OWN_BPF_IDS` full, closed by #514), and red on Ubuntu 26.04 (7.0: a self-move after a DAC-refused move of the agent refused, an injection into an exempt process not revoked), in correction by #530. Not 3: also AlmaLinux 9 not in Wave 4, most lots on 5.15 and 6.8 only, #120 and #121 open, no third party | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host unless the operator signs an export overlay (lot 276: off by default; the detections and the responses by default, the flows, file drift and canary reads only each named; the exact fields that leave, `docs/operator/EXPORT.md` §1a); no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -8851,6 +8851,58 @@ number in parentheses is a lab PR.
     a foreign program on the root's slot (NN-L-AT-001, High, Log) on both.
     No test fails on it; telling systemd's program from a planted one
     needs its own design (a name is the planter's to choose) — a follow-up.
+- **Lot 303a — the nightly's red Debian 13 install: why, and the gate says
+  why next time (lab).**
+  - What was open: the nightly `lab-vm.yml` failed `nn-lab.sh install` on
+    its Debian 13 guest (systemd 257, `6.12.115+deb13.1`) from 07/11 to
+    10/11 on f66e6680 with systemd's "control process exited with error
+    code" alone — the same image had passed on 06/11, and lots 280a–c, 281
+    and 285 had landed in between. Neither the job log, the serial console
+    nor the gate log named a reason, and the lab's shared Debian 13 guest
+    installed the same tree (lot 293; this lot's first round on `main`).
+  - Reproduced on a fresh guest (the vendor's current image, sha512
+    `d25999de…`, the CI's 4 vCPUs and 12 GiB, a lab directory of its own,
+    not the shared guest's disk), at f66e6680: the agent refused its start,
+    exit 78, gate `deny_hooks` — "BPF self-defence: own-object registration
+    FAILED … registering own link id 62: `bpf_map_update_elem` failed:
+    Argument list too long (E2BIG)": the agent's own maps, programs and
+    links had outgrown the 256 entries of `OWN_BPF_IDS` (the object: 232
+    maps and programs on b75f3cf9, 247 on f66e6680), and the bpf() map
+    guard, with nothing registered, was a missing deny hook. How many
+    objects a start registers depends on the host (the shared guest stayed
+    under 256). Lot 290 (#514, a67c0712) had met the same `E2BIG` on its own
+    first start and raised the map to 1024, with
+    `xtask/tests/foreign_bpf.rs::the_own_ids_map_holds_every_object_of_the_agent`
+    (at least twice the object's maps and programs; it fails on f66e6680's
+    256). `main` 02b8e853 on the same fresh guest: installed, both units
+    active, 280 objects registered (155 maps, 62 programs, 63 links); the
+    dispatched `lab-vm.yml` run 42958638508 on 02b8e853 installs on its
+    Debian 13 guest too.
+  - What changed: `nn-lab.sh install` starts the units in a block of its
+    own (`lab_start_units`); a start that fails prints the units' status,
+    this boot's `ERROR` and `WARN` lines of both units from their journal
+    namespace and their last lines before the error, so the CI job log
+    carries the agent's refusal and its gate
+    (`docs/integration-test-runbook.md`, "The CI VM gate"). The level is
+    read in the line's text: the units log to stdout, journald files every
+    line at priority info — the first version's `-p warning` printed
+    nothing on the fresh guest (below). Named test:
+    `xtask/tests/lab_host_safety.rs::a_unit_that_does_not_start_prints_the_agent_s_refusal`
+    (the block run with its remote command executed here against
+    `sudo`/`systemctl`/`journalctl` shims: the refusal, the status and the
+    last lines printed and the error raised on a failed start, no priority
+    filter, no journal read on a started one); 5 mutants, 5 caught.
+  - The lab, as measured (the fresh Debian 13 guest, lease k303; it was
+    powered off at the end): f66e6680 with this lot's first `nn-lab.sh`:
+    `install` failed and printed the units' status (`status=78`), its
+    journal part empty (`-p warning`: every line of the units is at
+    priority info); with the fixed one: the job log shows "own-object
+    registration FAILED … `bpf_map_update_elem` failed: Argument list too
+    long", "DENY HOOK SHORTFALL … deny_attached=26 deny_expected=27" and
+    `start refused gate="deny_hooks" exit=78`. With lot 303b, the same
+    fresh guest's full gate (`install`, a cold boot, `test-ignored`) passes:
+    100 suites, 142 passed, 0 failed.
+  - Level unchanged: a diagnosis and a gate's output, no capability.
 - **Lot 304 (A) — the heartbeat verifier's 4 MiB bound holds whatever the
   source command's exit status (the CI's `test` job unblocked).**
   - What was open: lot 299's `run_reading` closed the source command's
@@ -8885,6 +8937,76 @@ number in parentheses is a lab PR.
   - Mutations (a catch is a named test failing): 11 on the new code, 11
     caught; `origin/main`'s logic under the new tests caught by 4 named
     tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
+- **Lot 304 (B) — systemd's own BPF programs told by their loader: no
+  NN-L-AT-001 High at the start on Debian 13 and Ubuntu 26.04.**
+  - What was open: at every start on a systemd 257+ host the agent signed
+    systemd-networkd's `sysctl_monitor`, linked to the root cgroup's
+    `cgroup/sysctl` slot, as a program not its own (`sysctl_root_prog`,
+    High) with a sysctl judge degradation (the trust level "degraded"), and
+    PID 1's `restrict_filesystems` LSM program as a High baseline of the
+    cross-view (`bpf_baseline`: an LSM program's type is refused outside a
+    window). Measured on our guests: `sysctl_monitor` is loaded by
+    systemd-networkd (created by uid `systemd-network`; networkd's main
+    process holds its descriptor and its cgroup link to the root, `cgroup_id
+    1`, `attach_type 18`), not by PID 1; PID 1 holds `restrict_filesystems`'
+    tracing link (`attach_type 27`, `BPF_LSM_MAC`).
+  - What changed: `crates/nn-linux/src/known_system_prog.rs` and
+    `common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS` (the two programs). A
+    program is a known system program only when the kernel says all of it:
+    the enumeration's name, type and attach function of an entry; a process
+    holding the link that attaches that program the entry's way; that
+    process running the packaged executable (`/proc/<pid>/exe`'s device
+    and inode those of `/usr/lib/systemd/systemd-networkd` or
+    `/usr/lib/systemd/systemd`, root's, writable by no one else), started
+    no later than the load; the load before the agent's start, or seen by
+    the agent's `bpf` hook from that very process. Then it is signed Low —
+    `sysctl_root_prog` or `bpf_baseline` as before, the loader the record's
+    principal, the proof in the reasoning — and the start's sysctl judge
+    degradation leaves it out. Anything else is signed as before; the
+    refusals do not change.
+  - The lab, as measured (our own guests under lease k304, one agent at a
+    time; `debian13` 6.12.115, systemd 257.13; `ubuntu2604` 7.0.0-43,
+    systemd 259.5):
+    - Before (`main` 02b8e853, installed and started): on each guest 2
+      NN-L-AT-001 High at the start — `sysctl_root_prog` (`sysctl_monitor`,
+      ids 35 and 72) and `bpf_baseline` (`restrict_filesy`, ids 21 and 49)
+      — and the degradation "other cgroup/sysctl programs on the root
+      cgroup" (`nn-admin status`: L2, degraded).
+    - After (this lot, installed, then a cold boot: the bootcheck OK, the
+      agent started after networkd): 0 NN-L-AT-001 High or Critical at the
+      start; `sysctl_root_prog` Low, its principal `systemd-network` (pids
+      633 and 868, uid 998); `bpf_baseline` Low for `restrict_filesy`
+      (principal pid 1) and for `sysctl_monitor`; no sysctl judge
+      degradation (Debian 13 L3; Ubuntu 26.04 only lot 303b's `dns_answer`,
+      not merged).
+    - A program named `sysctl_monitor` linked to the root by a probe of
+      ours (`BPF_LINK_CREATE`, as networkd does): outside a window refused
+      (`EPERM`, `sysctl_root_attach` High); inside a window, from the probe
+      and from a copy of it installed as `/usr/local/libexec/systemd-networkd`
+      (its name `systemd-network`): `sysctl_root_prog` High, the reason
+      logged "does not run /usr/lib/systemd/systemd-networkd" — on both
+      guests.
+    - networkd restarted inside a window: its new program Low, "seen
+      loading by that process"; outside a window its attach refused and
+      networkd runs on without it ("Unable to attach sysctl monitor BPF
+      program to cgroup, ignoring: Operation not permitted"): the residual,
+      in `ANTITAMPER_TRUST_MODEL.md`. Agents uninstalled, the monitor
+      restored, the guests clean and off.
+    - Residual, measured (Ubuntu 26.04 only; a later lot of the
+      coordinator's takes it): two feature probes of systemd 259 are refused
+      outside a window and signed `bpf_prog_type` High — the user manager
+      (`systemd --user`, uid 1000) loading a `tracepoint` program at the
+      first login after boot, and systemd-networkd loading a `kprobe`
+      program at a restart. Neither is the start's record; Debian 13
+      (systemd 257) showed neither.
+  - Mutations (a catch is a named test failing; every run's baseline green):
+    70 on the new code, 70 caught — the table's lookup, the records'
+    encodings, each condition of the judgement (the executable, the start,
+    the load's time, the hook's loader, the packaged file's mode, owner and
+    kind), the fdinfo's fields, the `/proc` reader (a pid reused during the
+    scan), the host reader, the round's and the cross-view's marks, the
+    events, the start degradation, the two verdicts; 8 survivors of the
+    first round got a test.
   - Level unchanged.
 - **Lot 305 — rustix 1.1.6 for RUSTSEC-2026-0486 (C27; dependency
   maintenance, no level changes).**
@@ -8912,3 +9034,86 @@ number in parentheses is a lab PR.
     on the three lockfiles (advisory database of 11/11) exits 0, with the
     nine recorded exceptions unexpired; the full gates in the PR.
   - Level unchanged.
+- **Lot B2 — C14 and C23 re-assessed on `main` at `02b8e853`
+  (documentation only, no product change; made apart from the lab PRs
+  and read-only, as lot 274's docs (lot B), but not by a third party).**
+  - What was open: the table gave C14 and C23 the levels of 03/11, and
+    about thirty lots touching them merged since (C14: 275, 278, 279, 282,
+    283a–c, 285, 287, 291, 292, 294, 299; C23: 273d, 277, 280a–c, 281, 285,
+    288, 290, 293, 295–297, 300–302). C23's "provisional" waited for lot
+    273's review.
+  - Method: each criterion of level 3 against the code, the tests, the
+    notes above, the operator and design documents, the issues and the
+    public CI runs of `lab-vm.yml`; no guest was run.
+  - C14 stays 2. Present and tested in the lab: 95 rules, the posture and
+    the ladder held on the benign corpus (282, 283a–c), chains and their
+    triggers fixed by the bug hunt's findings (291, 292, 294). Negative
+    tests: `nn-core` has 1,353 host tests (decision 602, posture 321),
+    the detection e2e 19 (CHAIN-002's negative among them), the golden
+    replay 29 decision and 12 posture cases, MS-23 nine negatives; each
+    lot a mutation round (282 110, 287 61, 292 64, 294 51), each catch a
+    named test. Sampled: `loopback_burst_after_another_class_stays_engaged`
+    keeps three loopback and link-local bursts silent beside a public
+    control that reaches COMBAT. Not 3, and not for want of a third party
+    alone: no detection rate is measured (`docs/validation/matrix.md` has
+    no data row, `ATTACK_COVERAGE.md` no `campaign` status, and its `lab`
+    means a script exists); T1003.007 has no rule (#119); correlation is
+    per actor scope, not per process tree (282); lots 278, 283b, 283c,
+    287, 291, 292, 294 and 299 ran on 6.8 only, 282 on 5.15 only, the
+    corpus on 6.8 (and `dev`, `ci` on 5.15); `UPGRADE_NOTES_WAVE4.md` does not say what 283b, 283c and 287
+    changed for an operator (kills turned records). The nightly on Ubuntu
+    26.04 (7.0) fails `r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options`
+    ("no R018 record of loader") and
+    `net_connect_without_dns_is_recorded_and_a_resolved_one_is_not` (0
+    NN-L-NET-028 records) every night from 05/11 to 10/11; both pass on
+    5.15 and 6.8.
+  - C23 stays 2, provisional, for a new reason. The reason of 03/11 is
+    closed: C31 and C33 refused on the five guests (273) and lot 273d
+    reviewed (#497, its re-review and re-check, no blocker). Negative
+    tests: `anti-tamper.sh` 91 cases, 9 of them allowed controls
+    (`tamper-check` 119–121 rows), the privileged suites
+    `boot_refusal` 8, `cgroup_guard` 4, `cgroup_join` 16, `fs_deny` 2,
+    `honeypot_tamper` 6; host tests in `nn-linux`'s `anti_tamper` 242,
+    `antitamper-bpf` 47, `boot` 53, the watchdog 60, the xtask readers of
+    the eBPF code; each lot a mutation round (280a 74, 280b 57, 290 80,
+    293 44, 302 28). Lot 302 proves 27 of the 32 deny programs by an
+    attempt each round, five by an attach check, as lot 280c's note
+    asked. The new reason is the multi-kernel gate. From 03/11 to 10/11
+    no nightly was green (Ubuntu 22.04 and 24.04 8 of 8, Debian 12 6 of 8,
+    Debian 13 4 of 8, Ubuntu 26.04 0 of 8): Debian 13's agent unit failed
+    at `nn-lab.sh install` from 07/11 at f66e6680, and on 26.04 (7.0)
+    `a_move_the_dac_refused_leaves_no_record_behind` failed from 04/11 (the
+    self-move refused `EPERM`: a false refusal), lot 281's
+    `a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed` and
+    `process_vm_writev_revokes` from 07/11 ("no signed revocation"). The
+    gate dispatched by hand on `main` 02b8e853 on 11/11 (run 42958638508,
+    lots 290–302 in it) is green on 4 guests of 5, 142 passed and 0
+    failed on each, Debian 13 included: the start's cause, the agent's
+    `OWN_BPF_IDS` full at 256 entries (the start refused, as lot 290's
+    round r1 met it on its own guest), was closed by lot 290 (#514, 256 →
+    1024) before this re-assessment; the failed jobs' logs do not show the
+    refusal itself. Ubuntu 26.04 still fails the same five tests there
+    (137 passed); lot 303b (#530, open, its review to follow) addresses
+    their four causes: compressed module loads (`READING_MODULE_COMPRESSED`),
+    the move guard's clear, NN-L-NET-028's sensor on 7.0, and the
+    injection tests on uutils.
+  - Not 3, besides the gate: AlmaLinux 9 (5.14 el9) last verified 10/10,
+    no Wave 4 lot on it (285: no RPM guest; 273d: `rpm -qf` not run);
+    280a–c, 281, 285, 290, 300–302 measured on 5.15 and 6.8 only, 288 and
+    295–297 on 6.8 only; lot 302's per-round proof has host tests and the
+    lab script, no privileged e2e; #120 (hidden processes, modules and
+    inodes, hook integrity; a Beta blocker) and #121 (the host's hardening
+    guide) open; the declared residuals above (without lockdown root can
+    rewrite the running kernel, an injection before the first start, a
+    harmful drop-in an operator reloads inside a window, `daemon-reexec`,
+    a soft-reboot).
+  - Third party: none. The audit of `16f7563` predates Wave 4 and its
+    report is not public; the bug hunt (editions 1.2, 1.3) is a review the
+    founder commissioned with AI tools, not an independent human
+    validation; there is no red team (C29 0).
+  - What moves them: C23's provisional ends with a nightly or a dispatch
+    green on the five guests at a head with 290–302, the 26.04 failures
+    fixed (#530). Toward 3, both: the
+    five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
+    V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
+    deny proof in a privileged e2e; then a third party's validation.

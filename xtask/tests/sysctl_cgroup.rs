@@ -257,13 +257,18 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
     )
     .unwrap();
     // the fallback and another program on the root are signed degradations
+    // (lot 304: another program not proven a known system program, weighed
+    // once the cross-view's iterators are set up)
     in_order(
         at,
         &[
-            "crate::sysctl_cgroup::Judge::Attached { others } if !others.is_empty() => {",
+            "crate::sysctl_cgroup::Judge::Attached { others } => others,",
+            "crate::sysctl_cgroup::Judge::Fallback(why) => {",
             "report.degraded.push(format!(",
-            "crate::sysctl_cgroup::Judge::Fallback(why) => report.degraded.push(format!(",
             "crate::sysctl_cgroup::FALLBACK_EFFECT",
+            "bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root)",
+            "sysctl_others_degraded(&sysctl_others,",
+            "report.degraded.push(line);",
         ],
     )
     .unwrap();
