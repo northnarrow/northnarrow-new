@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Dependencies: `rustix` 1.1.6 instead of 1.1.5, in `Cargo.lock` and
+  `fuzz/Cargo.lock` alike (lot 305; RUSTSEC-2026-0486, GHSA-jh2m-fhpj-3vr7,
+  unsound: `rustix::fs`'s `getxattr`, `lgetxattr`, `fgetxattr`,
+  `listxattr`, `llistxattr` and `flistxattr` marked as initialized bytes
+  the kernel never wrote when given a zero-length buffer — undefined
+  behaviour from safe code). Nothing in the graph calls them: our one
+  direct user, `nn-admin`, takes `rustix` for `geteuid` and `poll` only
+  (features `process` and `event`), and its other dependents, `procfs` and
+  `tempfile` (tests only), use no xattr function. The advisory failed
+  `cargo audit --deny unsound` on every branch all the same. Only rustix's
+  version and checksum move; no other crate, and no exception in
+  `.cargo/audit.toml`.
 - Every deny hook proves it denies, every round (lot 302;
   `docs/operator/SENSOR_CONTRACT.md` §5b). The sensor self-test exercised
   two deny hooks (a signal to the agent, a create in `/etc/northnarrow`);
