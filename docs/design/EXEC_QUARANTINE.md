@@ -145,6 +145,7 @@ For each candidate:
 | block list | kill + quarantine | no | Critical |
 | budget expired, not scannable, scanner unavailable | `--exec-quarantine-on-expiry` (resume) | no | Medium |
 | left stopped by an agent that died | resume | no | signed audit entry |
+| any decision, the process not captured (lot 317) | deferred: held until captured, then carried out | as the decision | the record (`… deferred`), then a signed audit entry `deferred` |
 | a `#!` script (lab PR 226) | refused at exec in enforce mode; observe: "would refuse" | observe only | Medium |
 
 A held process whose scanner cannot be back before its budget runs out is
@@ -155,7 +156,39 @@ clean verdict is cached. A request unanswered past its budget means a hung
 scanner: it is killed and restarted.
 
 Stopping the agent resumes every held process and clears the heartbeat
-(signed `exec_quarantine` entry, `stopping`).
+(signed `exec_quarantine` entry, `stopping`). Lot 317 (third bug hunt,
+BUG-118): every process `EXECQ_STOPPED` holds, too — one the kernel stopped
+after the agent last read the ring, whose report it never read, stayed
+stopped until the next start of an agent with the guard on. The heartbeat
+is cleared first; then the agent waits until every run of the exec program
+that read it has returned (`membarrier(2)` `MEMBARRIER_CMD_GLOBAL`, which is
+`synchronize_rcu()`; the program runs with preemption off; a fixed 50 ms
+where the call is refused), so nothing is stopped after the map is read;
+then it resumes what it held for a decision, carries out the decisions it
+owes (below: a kill still kills), and resumes the rest of the map — named in
+the entry's `unreported`.
+
+**A process that cannot be captured is not one that ended** (lot 317,
+BUG-124). The agent captures a held process by a pidfd (`ProcRef`); that
+capture can fail on the agent's side (`pidfd_open` out of descriptors or
+memory). Such a process was taken for one that had ended: no `SIGCONT`, no
+`SIGKILL`, its pid out of `EXECQ_STOPPED`, a record saying "ended while
+held" or "already ended" — and nothing would ever resume it. Now the
+capture is tried again at the decision; while it fails the decision is
+owed: the record's response says `resume deferred` or `kill deferred` with
+the error, the process stays held (a block-listed binary never runs), its
+pid stays in the map, the decision is retried at every pass of the
+controller, and once the process is captured it is carried out — a signed
+`exec_quarantine` entry `deferred` names the pid, the action, the result
+and the wait. A kill's attempt that failed on the capture is a signed
+action of its own (its intent, then a failure). The rules' verdict is
+awaited for such a process as for any other held one. At the boot, a
+process left stopped by a previous agent that cannot be captured is not
+counted gone (`recovered_at_boot`'s `deferred`) and is resumed once it can
+be; at the stop it stays in the pinned map (`stopping`'s `left`) for the
+next start. `ProcRef::liveness()` tells the three answers apart (live,
+gone, not captured), and `xtask/tests/process_liveness.rs` keeps every
+caller on it.
 
 ## 4. The scanner (`northnarrow-scan`)
 
@@ -285,7 +318,8 @@ SHA-256, format, the reasons (`code (+weight): detail`), the decision
 (`would …` in observe mode), its basis, the classes, whether the process was
 held and for how long. `response` says what was done (`resumed`, `killed
 while held; quarantined (vault …)`, `ended while held` when the rules killed
-it).
+it, `resume deferred: …` / `kill deferred: …` when the process could not be
+captured — lot 317).
 
 Signed audit entries: `subsystem_degraded` for a guard that cannot start
 (no scanner account, the exec sensor not on LSM, a kernel configuration that
@@ -295,7 +329,10 @@ events ring was full or the stop signal was refused (at most one per 10
 minutes, with the counts since the previous one; the ring's drops are also
 counted in its ring-drop slot `execq`, signed `ringbuf_drop`); a stale
 heartbeat (a dead controller) leaves nothing to report it but the counter;
-`exec_quarantine` for `recovered_at_boot` and `stopping`.
+`exec_quarantine` for `recovered_at_boot` (with `deferred`: the processes
+not captured yet, lot 317), `stopping` (with `unreported`, `killed` and
+`left`, lot 317) and `deferred` (a decision carried out once its process
+was captured, lot 317).
 
 `nn-admin status --key` (signed telemetry; appended fields of
 `StatusResponse`): `execq_state` (`off`, `enforce`, `observe`, `degraded:
