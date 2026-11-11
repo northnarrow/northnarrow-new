@@ -260,9 +260,23 @@ impl CombatActuator<LinuxHost> for SystemActuator {
             return;
         }
         let pid = target.pid();
-        if !target.is_live() {
-            info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
-            return;
+        // lot 317 (BUG-124's family): a capture that failed is not an exit
+        // (no block was applied to one: `soft_egress_block` failed on it)
+        match target.liveness() {
+            crate::response::proc_ref::Liveness::Live => {}
+            crate::response::proc_ref::Liveness::Gone => {
+                info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
+                return;
+            }
+            crate::response::proc_ref::Liveness::Uncaptured(errno) => {
+                info!(
+                    target: "combat.actuator",
+                    pid,
+                    error = %std::io::Error::from_raw_os_error(errno),
+                    "soft egress not released: the process could not be captured (no block was applied)"
+                );
+                return;
+            }
         }
         let intent = self.intent("Release", pid, "stand-down: soft egress released");
         let released =

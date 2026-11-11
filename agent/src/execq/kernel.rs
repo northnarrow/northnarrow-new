@@ -124,6 +124,32 @@ pub fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// `MEMBARRIER_CMD_GLOBAL` (`linux/membarrier.h`; `MEMBARRIER_CMD_SHARED`
+/// before 4.16): `synchronize_rcu()` for the caller.
+const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
+
+/// How long [`quiesce`] waits where `membarrier` is refused: a program
+/// run takes microseconds.
+pub const QUIESCE_FALLBACK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Lot 317 (bug hunt 1.4, BUG-118): return once every run of the exec
+/// programs that read the heartbeat before it was cleared has ended — the
+/// stop it decided is in `EXECQ_STOPPED`, where the agent's stop reads it.
+/// `maybe_stop` runs in the `sched_process_exec` tracepoint's program, with
+/// preemption off (a read-side section of RCU), and `membarrier(2)`'s
+/// `MEMBARRIER_CMD_GLOBAL` is `synchronize_rcu()`: it returns after every
+/// such section that began before the call has ended. Where it is refused
+/// (`EINVAL` with `nohz_full` CPUs) a sleep of [`QUIESCE_FALLBACK`] stands
+/// in for it.
+pub fn quiesce() {
+    // SAFETY: membarrier(2) with a command, flags 0 and cpu 0 (unused
+    // without MEMBARRIER_CMD_FLAG_CPU), no pointers.
+    let rc = unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) };
+    if rc != 0 {
+        std::thread::sleep(QUIESCE_FALLBACK);
+    }
+}
+
 impl Kernel {
     /// The heartbeat a stop needs (0: the kernel stops nothing).
     pub fn beat(&mut self, ns: u64) {

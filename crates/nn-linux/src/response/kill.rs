@@ -169,7 +169,9 @@ pub fn kill_tree(
     let root_spared =
         guard(root_pid).or(protected.contains(&root_pid).then_some("PID is protected"));
     if let (Some(dir), None) = (scope, root_spared) {
-        if root.is_live() {
+        // lot 317: a root not captured goes process by process, whose
+        // outcome carries the capture's error
+        if root.liveness() == super::proc_ref::Liveness::Live {
             match kill_tree_in_cgroup(root, protected, guard, dir) {
                 Ok(done) => return done,
                 Err(e) => tracing::warn!(
