@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use super::config::CowConfig;
 use super::copy::sha256_fd;
+use super::identity::FileId;
 use super::index::{Entry, FileState, JournalIndex, Method, PostWrite, Refusal, Reservation};
 use super::journal::{host_view, Journal, Record};
 use super::restore::{beside_name, decide, pick, Context, Current, Plan, Selector};
@@ -500,10 +501,10 @@ impl Store {
         Some(e)
     }
 
-    pub fn record_post_write(&self, dev: u64, ino: u64, w: PostWrite) {
+    pub fn record_post_write(&self, w: PostWrite) {
         let mut ix = self.index.lock();
-        if ix.has_inode(dev, ino) {
-            ix.record_post_write(dev, ino, w);
+        if ix.has_slot(&w.file) {
+            ix.record_post_write(w);
             Stats::bump(&self.stats.post_writes);
         }
     }
@@ -519,19 +520,24 @@ impl Store {
     pub fn restore(&self, sel: &Selector, dry_run: bool, by: &RestoreBy) -> RestoreReport {
         Stats::bump(&self.stats.restores);
         let mut report = RestoreReport::default();
-        let entries: Vec<Entry> = {
+        let (entries, weighed): (Vec<Entry>, Vec<Entry>) = {
             let ix = self.index.lock();
             if let Some(why) = ambiguous(ix.entries(), sel) {
                 report.refusal = Some(why);
                 return report;
             }
-            pick(ix.entries(), sel).into_iter().cloned().collect()
+            let picked = pick(ix.entries(), sel);
+            let weighed = sel.weighed(ix.entries(), &picked);
+            (
+                picked.into_iter().cloned().collect(),
+                weighed.into_iter().cloned().collect(),
+            )
         };
         if entries.is_empty() {
             report.refusal = Some("no copy in the journal matches".into());
             return report;
         }
-        let refs: Vec<&Entry> = entries.iter().collect();
+        let refs: Vec<&Entry> = weighed.iter().collect();
         for e in &entries {
             let row = self.restore_one(e, sel, &refs, dry_run);
             match row.action.trim_start_matches("would_") {
@@ -602,7 +608,7 @@ impl Store {
         };
         if let Some(w) = selected
             .iter()
-            .filter(|x| (x.file.dev, x.file.ino) == (e.file.dev, e.file.ino))
+            .filter(|x| x.file.id().may_be(&e.file.id()))
             .map(|x| x.writer)
             .find(|w| alive(*w))
         {
@@ -672,11 +678,8 @@ impl Store {
                     .map(|h| h == e.sha256)
             })
             .flatten();
-        let post = self
-            .index
-            .lock()
-            .post_writes(e.file.dev, e.file.ino, e.taken_at_ms);
-        let in_attack = |p: ProcId| sel.in_attack(selected, p);
+        let post = self.index.lock().post_writes(&e.file.id(), e.taken_at_ms);
+        let in_attack = |p: &PostWrite| sel.in_attack_write(selected, p);
         let plan = decide(
             e,
             &cur,
@@ -724,21 +727,28 @@ impl Store {
         }
         let mut detail = detail;
         if plan == Plan::Recreate {
-            // The attack's renamed copy of this inode, in the same directory.
-            if let Some(found) = find_inode(dir.as_raw_fd(), e.file.dev, e.file.ino) {
-                let others = post.iter().any(|p| !in_attack(p.writer));
-                if others {
-                    detail.push_str(&format!(
-                        "; its renamed copy {found} was written by others: left"
-                    ));
-                } else {
-                    match jm.lock().move_to_evidence(dir.as_raw_fd(), &found, e.id) {
-                        Ok(to) => row.evidence = Some(to),
-                        Err(err) => detail.push_str(&format!(
-                            "; its renamed copy {found} could not be moved to the journal ({err}): left"
-                        )),
+            // The attack's renamed copy of this file, in the same directory.
+            match find_file(dir.as_raw_fd(), &e.file.id()) {
+                Found::Surely(found) => {
+                    let others = post.iter().any(|p| !in_attack(p));
+                    if others {
+                        detail.push_str(&format!(
+                            "; its renamed copy {found} was written by others: left"
+                        ));
+                    } else {
+                        match jm.lock().move_to_evidence(dir.as_raw_fd(), &found, e.id) {
+                            Ok(to) => row.evidence = Some(to),
+                            Err(err) => detail.push_str(&format!(
+                                "; its renamed copy {found} could not be moved to the journal ({err}): left"
+                            )),
+                        }
                     }
                 }
+                Found::Unsure(found) => detail.push_str(&format!(
+                    "; {found} has its inode number, but no birth time tells the attack's \
+                     renamed copy from a new file that inherited the number: left"
+                )),
+                Found::Nothing => {}
             }
         }
         finish(row, plan.action(), detail)
@@ -944,8 +954,7 @@ fn write_in_place(
     e: &Entry,
 ) -> io::Result<Option<String>> {
     let fd = open_at(dir, name, libc::O_RDWR, 0)?;
-    let st = super::fanotify::fstat(fd.as_raw_fd())?;
-    if (st.st_dev, st.st_ino) != (cur.dev, cur.ino) {
+    if super::fanotify::file_id(fd.as_raw_fd())? != cur.id() {
         return Err(io::Error::other("the file changed under the restore"));
     }
     // SAFETY: valid descriptor.
@@ -985,25 +994,61 @@ fn write_new(dir: RawFd, name: &str, object: RawFd, e: &Entry) -> io::Result<Opt
     Ok(hash_after(fd.as_raw_fd()))
 }
 
-/// The name of the entry of `dir` with inode (`dev`, `ino`), if any (at
-/// most 100 000 entries read). Lot 297 (external bug hunt BUG63): a name
-/// that is not UTF-8 is passed over; it ended the whole search, and the
-/// attack's renamed copy read after it stayed beside the file instead of
-/// going to the journal's evidence. A renamed copy whose own name is not
-/// UTF-8 is still not found (it stays where it is; nothing is lost).
-fn find_inode(dir: RawFd, dev: u64, ino: u64) -> Option<String> {
-    let rd = std::fs::read_dir(format!("/proc/self/fd/{dir}")).ok()?;
+/// What [`find_file`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Found {
+    /// The file itself, by its birth time.
+    Surely(String),
+    /// A file with its inode number, which no birth time tells from a new
+    /// file that inherited the number (the filesystem records none).
+    Unsure(String),
+    Nothing,
+}
+
+/// The name of the regular file of `dir` that is `want`, if any (at most
+/// 100 000 entries read). Lot 297 (external bug hunt BUG63): a name that is
+/// not UTF-8 is passed over; it ended the whole search, and the attack's
+/// renamed copy read after it stayed beside the file instead of going to
+/// the journal's evidence. A renamed copy whose own name is not UTF-8 is
+/// still not found (it stays where it is; nothing is lost).
+///
+/// Lot 315 (the triage's N2): it is the file only by its birth time. By
+/// its device and inode number alone, a new file of the owner's that
+/// inherited the number of the file the attack deleted (`cp`, `tar`, a
+/// download: one open, no write-open seen after the copy) was taken for
+/// the attack's renamed copy and moved into the evidence, which the expiry
+/// then deleted — at once when the file kept an old mtime (`tar`,
+/// `rsync -a`). A file whose birth time is not known is reported, never
+/// moved.
+fn find_file(dir: RawFd, want: &FileId) -> Found {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{dir}")) else {
+        return Found::Nothing;
+    };
+    let mut unsure = None;
     for ent in rd.take(100_000).filter_map(|e| e.ok()) {
         let Some(name) = ent.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if let Ok(st) = fstatat_nofollow(dir, &name) {
-            if st.st_dev == dev && st.st_ino == ino && st.st_mode & libc::S_IFMT == libc::S_IFREG {
-                return Some(name);
-            }
+        let Ok(st) = fstatat_nofollow(dir, &name) else {
+            continue;
+        };
+        // the birth time is read for the inode number sought only
+        let number = FileId::new(st.st_dev, st.st_ino, None);
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG || !number.may_be(want) {
+            continue;
+        }
+        let id = FileId {
+            btime_ns: super::fanotify::btime(dir, Some(&name)),
+            ..number
+        };
+        if id.surely_is(want) {
+            return Found::Surely(name);
+        }
+        if unsure.is_none() && id.may_be(want) {
+            unsure = Some(name);
         }
     }
-    None
+    unsure.map_or(Found::Nothing, Found::Unsure)
 }
 
 #[cfg(test)]
@@ -1173,19 +1218,18 @@ mod tests {
         let e = journal_file(&l, "doc.txt", ATTACKER);
         std::fs::write(l.scope.join("doc.txt"), b"encrypted junk").unwrap();
         // the owner edits it afterwards with vim
-        l.store.record_post_write(
-            e.file.dev,
-            e.file.ino,
-            PostWrite {
-                at_ms: e.taken_at_ms + 10,
-                writer: ProcId {
-                    pid: 1234,
-                    start: 1,
-                },
-                program: "/usr/bin/vim.basic".into(),
-                trusted: true,
-            },
-        );
+        let owner = ProcId {
+            pid: 1234,
+            start: 1,
+        };
+        l.store.record_post_write(PostWrite {
+            file: e.file.id(),
+            at_ms: e.taken_at_ms + 10,
+            writer: owner,
+            program: "/usr/bin/vim.basic".into(),
+            trusted: true,
+            lineage: vec![owner],
+        });
         std::fs::write(
             l.scope.join("doc.txt"),
             b"encrypted junk + the owner's edit",
@@ -1549,15 +1593,18 @@ mod tests {
         std::fs::write(l.scope.join("doc.txt"), b"v1").unwrap();
         // a first copy (another writer), then the owner's edit
         journal_file(&l, "doc.txt", OTHER);
-        let edit = |at_ms: u64| PostWrite {
+        let edit = |file: FileId, at_ms: u64| PostWrite {
+            file,
             at_ms,
             writer: OWNER,
             program: "/usr/bin/vim.basic".into(),
             trusted: true,
+            lineage: vec![OWNER],
         };
         let first = now_ms();
-        let m = std::fs::metadata(l.scope.join("doc.txt")).unwrap();
-        l.store.record_post_write(m.dev(), m.ino(), edit(first));
+        let doc = std::fs::File::open(l.scope.join("doc.txt")).unwrap();
+        let doc_id = crate::cow::fanotify::file_id(doc.as_raw_fd()).unwrap();
+        l.store.record_post_write(edit(doc_id, first));
         std::fs::write(l.scope.join("doc.txt"), b"v2 by the owner").unwrap();
         // the attack's copy, strictly after the owner's first write-open
         while now_ms() <= first {
@@ -1568,7 +1615,7 @@ mod tests {
         std::fs::write(l.scope.join("doc.txt"), b"encrypted junk").unwrap();
         // the owner edits it again after the attack
         l.store
-            .record_post_write(e.file.dev, e.file.ino, edit(e.taken_at_ms + 10));
+            .record_post_write(edit(e.file.id(), e.taken_at_ms + 10));
         std::fs::write(l.scope.join("doc.txt"), b"junk + the owner's later edit").unwrap();
         let rep = l.store.restore(&sel(), false, &by());
         assert_eq!(rep.rows.len(), 1, "{:?}", rep.rows);
@@ -1580,5 +1627,366 @@ mod tests {
         );
         let beside = l.scope.join(format!("doc.txt.nn-restored-{}", e.id));
         assert_eq!(std::fs::read(&beside).unwrap(), b"v2 by the owner");
+    }
+
+    /// Lot 315 (external bug hunt 1.4: BUG-93; the triage's N2, a sibling
+    /// of BUG-110; variants of both met in the lot's mini-hunt).
+    mod lot315 {
+        use super::*;
+
+        /// A copy of `src`'s content as the guard takes it, filed as `file`
+        /// (the file's own state when `None`), for `writer` with `lineage`,
+        /// taken at `at` (ms).
+        fn take(
+            l: &Lab,
+            src: &str,
+            file: Option<FileState>,
+            writer: ProcId,
+            lineage: Vec<ProcId>,
+            at: u64,
+        ) -> Entry {
+            let p = l.scope.join(src);
+            let f = std::fs::File::open(&p).unwrap();
+            let st = crate::cow::fanotify::fstat(f.as_raw_fd()).unwrap();
+            let (r, evicted) = l.store.reserve(0, st.st_size as u64).unwrap();
+            l.store.forget_objects(&evicted);
+            let out = crate::cow::copy::snapshot(
+                f.as_raw_fd(),
+                &st,
+                l.store.objects_fds[0],
+                &Journal::object_name(r.object),
+                1 << 20,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            let method = match out {
+                crate::cow::copy::Snapshot::Reflinked { .. } => Method::Reflink,
+                crate::cow::copy::Snapshot::Copied { .. } => Method::Copy,
+                other => panic!("{other:?}"),
+            };
+            let m = std::fs::metadata(&p).unwrap();
+            let file = file.unwrap_or_else(|| FileState {
+                path: p.display().to_string(),
+                dev: m.dev(),
+                ino: m.ino(),
+                size: m.size(),
+                mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+                ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+                mode: m.mode(),
+                uid: m.uid(),
+                gid: m.gid(),
+                btime_ns: crate::cow::fanotify::btime(f.as_raw_fd(), None),
+            });
+            l.store
+                .commit(r, file, writer, "/home/u/enc.py".into(), lineage, at, method)
+                .unwrap()
+        }
+
+        // Processes that are not running (pid above any pid_max default,
+        // a start no process of this host has).
+        const ROOT: ProcId = ProcId {
+            pid: 4_000_100,
+            start: 999_999_910,
+        };
+        const C1: ProcId = ProcId {
+            pid: 4_000_101,
+            start: 999_999_911,
+        };
+        const C2: ProcId = ProcId {
+            pid: 4_000_102,
+            start: 999_999_912,
+        };
+
+        fn post(file: FileId, w: ProcId, lineage: Vec<ProcId>, at_ms: u64) -> PostWrite {
+            PostWrite {
+                file,
+                at_ms,
+                writer: w,
+                program: "/home/u/enc.py".into(),
+                trusted: false,
+                lineage,
+            }
+        }
+
+        fn tree() -> Selector {
+            Selector {
+                roots: vec![ROOT],
+                since_ms: None,
+            }
+        }
+
+        /// BUG-93: two processes of the attack's tree write-open the same
+        /// file one after the other; each gets its copy. Only the attack
+        /// wrote after the first copy: rule 8, restored in place (on main:
+        /// the second writer was "another writer", kept both).
+        #[test]
+        fn bug93_a_second_writer_of_the_tree_is_not_another_writer() {
+            let l = lab();
+            std::fs::write(l.scope.join("report.odt"), b"original").unwrap();
+            let t1 = now_ms();
+            let e1 = take(&l, "report.odt", None, C1, vec![C1, ROOT], t1);
+            std::fs::write(l.scope.join("report.odt"), b"half encrypted").unwrap();
+            // the second child of the tree opens it for writing: a
+            // write-open seen, and its own copy
+            l.store
+                .record_post_write(post(e1.file.id(), C2, vec![C2, ROOT], t1 + 1000));
+            take(&l, "report.odt", None, C2, vec![C2, ROOT], t1 + 1000);
+            std::fs::write(l.scope.join("report.odt"), b"fully encrypted").unwrap();
+            let rep = l.store.restore(&tree(), true, &by());
+            assert_eq!(rep.rows.len(), 1, "{:?}", rep.rows);
+            assert_eq!(
+                rep.rows[0].action, "would_restored_in_place",
+                "detail: {}",
+                rep.rows[0].detail
+            );
+            let rep = l.store.restore(&tree(), false, &by());
+            assert_eq!(rep.restored, 1, "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("report.odt")).unwrap(),
+                b"original"
+            );
+        }
+
+        /// BUG-93, a variant (lot 315's mini-hunt): a writer of the tree
+        /// whose own copy was not taken (the copy refused for room or
+        /// time: only its write-open recorded) is the tree's too — by the
+        /// lineage its write-open carries.
+        #[test]
+        fn bug93_a_tree_writer_without_its_own_copy_is_the_attacks() {
+            let l = lab();
+            std::fs::write(l.scope.join("ledger.ods"), b"original").unwrap();
+            let t1 = now_ms();
+            let e1 = take(&l, "ledger.ods", None, C1, vec![C1, ROOT], t1);
+            std::fs::write(l.scope.join("ledger.ods"), b"half encrypted").unwrap();
+            l.store
+                .record_post_write(post(e1.file.id(), C2, vec![C2, ROOT], t1 + 1000));
+            std::fs::write(l.scope.join("ledger.ods"), b"fully encrypted").unwrap();
+            let rep = l.store.restore(&tree(), true, &by());
+            assert_eq!(
+                rep.rows[0].action, "would_restored_in_place",
+                "detail: {}",
+                rep.rows[0].detail
+            );
+            // a writer outside the tree, by its lineage, still keeps both
+            l.store.record_post_write(post(
+                e1.file.id(),
+                ProcId {
+                    pid: 4_000_300,
+                    start: 999_999_930,
+                },
+                vec![ProcId {
+                    pid: 4_000_301,
+                    start: 999_999_931,
+                }],
+                t1 + 2000,
+            ));
+            let rep = l.store.restore(&tree(), true, &by());
+            assert_eq!(rep.rows[0].action, "would_kept_both", "{:?}", rep.rows);
+        }
+
+        /// BUG-93, a variant (lot 315's mini-hunt; store.rs:603-608 on
+        /// main): a writer of the tree still running skips the file even
+        /// when its copy is not the one picked (the earliest, another
+        /// writer's, whose process is gone). On main the restore wrote the
+        /// file back while that writer still ran.
+        #[test]
+        fn bug93_a_running_writer_of_the_tree_skips_the_file() {
+            let me = std::process::id();
+            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let running = ProcId { pid: me, start };
+            let l = lab();
+            std::fs::write(l.scope.join("plan.txt"), b"original").unwrap();
+            let t1 = now_ms();
+            take(&l, "plan.txt", None, C1, vec![C1, ROOT], t1);
+            std::fs::write(l.scope.join("plan.txt"), b"half encrypted").unwrap();
+            take(&l, "plan.txt", None, running, vec![running, ROOT], t1 + 1000);
+            std::fs::write(l.scope.join("plan.txt"), b"fully encrypted").unwrap();
+            let rep = l.store.restore(&tree(), false, &by());
+            assert_eq!(rep.skipped, 1, "{:?}", rep.rows);
+            assert!(
+                rep.rows[0].detail.contains(&format!("pid {me}")),
+                "{}",
+                rep.rows[0].detail
+            );
+            assert_eq!(
+                std::fs::read(l.scope.join("plan.txt")).unwrap(),
+                b"fully encrypted",
+                "not written while its writer runs"
+            );
+        }
+
+        /// Guard on the report's fix for BUG-93 (every matching entry as
+        /// `selected` whatever the selector): with `--since` alone, a later
+        /// write by a program that is not trusted and got its own copy (the
+        /// owner's edit after the attack) must still keep both — never
+        /// overwritten.
+        #[test]
+        fn bug93_guard_since_alone_does_not_overwrite_a_later_edit() {
+            const USER_APP: ProcId = ProcId {
+                pid: 4_000_201,
+                start: 999_999_921,
+            };
+            let l = lab();
+            std::fs::write(l.scope.join("doc.txt"), b"original").unwrap();
+            let t0 = now_ms();
+            let e1 = take(&l, "doc.txt", None, ATTACKER, vec![ATTACKER], t0 + 10);
+            std::fs::write(l.scope.join("doc.txt"), b"encrypted junk").unwrap();
+            // the owner, later, with a program the guard does not trust
+            l.store.record_post_write(PostWrite {
+                file: e1.file.id(),
+                at_ms: t0 + 1000,
+                writer: USER_APP,
+                program: "/home/u/.local/bin/editor".into(),
+                trusted: false,
+                lineage: vec![USER_APP],
+            });
+            take(&l, "doc.txt", None, USER_APP, vec![USER_APP], t0 + 1000);
+            std::fs::write(l.scope.join("doc.txt"), b"junk + the owner's later edit").unwrap();
+            let sel = Selector {
+                roots: vec![],
+                since_ms: Some(t0),
+            };
+            let rep = l.store.restore(&sel, false, &by());
+            assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("doc.txt")).unwrap(),
+                b"junk + the owner's later edit",
+                "never overwritten"
+            );
+        }
+
+        /// `x.txt`'s entry as if the file had `d.txt`'s inode number before
+        /// it: the attack deleted `x.txt` after its copy and the number went
+        /// to `d.txt`, a new file of the owner's in the same directory.
+        /// `known`: `x.txt` was born a second before `d.txt` (`None` where
+        /// this filesystem records no birth times); else its birth time is
+        /// not known.
+        fn x_had_ds_number(l: &Lab, known: bool) -> Option<Entry> {
+            std::fs::write(l.scope.join("x.txt"), b"x original").unwrap();
+            let d = std::fs::File::open(l.scope.join("d.txt")).unwrap();
+            let x_birth = if known {
+                Some(crate::cow::fanotify::btime(d.as_raw_fd(), None)? - 1_000_000_000)
+            } else {
+                None
+            };
+            let md = d.metadata().unwrap();
+            let mx = std::fs::metadata(l.scope.join("x.txt")).unwrap();
+            let file = FileState {
+                path: l.scope.join("x.txt").display().to_string(),
+                dev: md.dev(),
+                ino: md.ino(),
+                size: mx.size(),
+                mtime_ns: mx.mtime() * 1_000_000_000 + mx.mtime_nsec(),
+                ctime_ns: mx.ctime() * 1_000_000_000 + mx.ctime_nsec(),
+                mode: mx.mode(),
+                uid: mx.uid(),
+                gid: mx.gid(),
+                btime_ns: x_birth,
+            };
+            let e = take(l, "x.txt", Some(file), ATTACKER, vec![ATTACKER], now_ms());
+            std::fs::remove_file(l.scope.join("x.txt")).unwrap();
+            Some(e)
+        }
+
+        /// N2: the restore recreates `x.txt` and does not take `d.txt` for
+        /// "the attack's renamed copy" (on main it moved it into the
+        /// journal's evidence).
+        #[test]
+        fn n2_a_reused_inode_number_is_not_the_attacks_renamed_copy() {
+            let l = lab();
+            std::fs::write(l.scope.join("d.txt"), b"the owner's new file").unwrap();
+            if x_had_ds_number(&l, true).is_none() {
+                return; // no birth times here: see the next test
+            }
+            let rep = l.store.restore(&sel(), false, &by());
+            assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
+            assert_eq!(std::fs::read(l.scope.join("x.txt")).unwrap(), b"x original");
+            assert_eq!(
+                std::fs::read(l.scope.join("d.txt")).ok().as_deref(),
+                Some(&b"the owner's new file"[..]),
+                "the owner's file was moved away as the attack's renamed copy: {:?}",
+                rep.rows
+            );
+            assert_eq!(rep.rows[0].evidence, None, "{:?}", rep.rows);
+        }
+
+        /// N2, the loss: the owner's new file kept an old mtime (`tar -x`,
+        /// `rsync -a`, `cp -p`), and the evidence expires by a file's
+        /// mtime. On main the restore moved it into the evidence and the
+        /// next expiry deleted it: the file is gone, from its directory and
+        /// from the journal.
+        #[test]
+        fn n2_the_owners_new_file_is_not_lost() {
+            let l = lab();
+            let d = l.scope.join("d.txt");
+            std::fs::write(&d, b"unpacked from last year's backup").unwrap();
+            // `tar -x` puts the archived mtime back: a year ago
+            let year_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+            std::fs::File::options()
+                .write(true)
+                .open(&d)
+                .unwrap()
+                .set_modified(year_ago)
+                .unwrap();
+            if x_had_ds_number(&l, true).is_none() {
+                return; // no birth times here
+            }
+            let rep = l.store.restore(&sel(), false, &by());
+            l.store.expire(now_ms());
+            let in_evidence: Vec<_> = std::fs::read_dir(l.scope.join(".northnarrow-cow/evidence"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(
+                std::fs::read(&d).ok().as_deref(),
+                Some(&b"unpacked from last year's backup"[..]),
+                "the owner's file is lost (in the evidence after the restore: {:?}; there \
+                 now: {in_evidence:?})",
+                rep.rows.iter().map(|r| &r.evidence).collect::<Vec<_>>()
+            );
+        }
+
+        /// N2, a variant (lot 315's mini-hunt): a copy whose birth time is
+        /// not known (a filesystem that records none, or an entry written
+        /// before birth times were) cannot tell the attack's renamed copy
+        /// from a new file that inherited the number — the file with the
+        /// number is reported, never moved.
+        #[test]
+        fn n2_without_a_birth_time_the_file_is_left_and_reported() {
+            let l = lab();
+            std::fs::write(l.scope.join("d.txt"), b"the owner's new file").unwrap();
+            x_had_ds_number(&l, false).unwrap();
+            let rep = l.store.restore(&sel(), false, &by());
+            assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("d.txt")).unwrap(),
+                b"the owner's new file"
+            );
+            assert_eq!(rep.rows[0].evidence, None);
+            assert!(
+                rep.rows[0].detail.contains("d.txt has its inode number")
+                    && rep.rows[0].detail.contains("left"),
+                "{}",
+                rep.rows[0].detail
+            );
+        }
+
+        /// N2 guard: the attack's renamed copy — the same file, its birth
+        /// time known — still goes to the evidence.
+        #[test]
+        fn n2_guard_the_attacks_renamed_copy_still_goes_to_the_evidence() {
+            let l = lab();
+            std::fs::write(l.scope.join("y.txt"), b"y original").unwrap();
+            let e = take(&l, "y.txt", None, ATTACKER, vec![ATTACKER], now_ms());
+            if e.file.btime_ns.is_none() {
+                return;
+            }
+            std::fs::write(l.scope.join("y.txt"), b"y encrypted").unwrap();
+            std::fs::rename(l.scope.join("y.txt"), l.scope.join("y.txt.locked")).unwrap();
+            let rep = l.store.restore(&sel(), false, &by());
+            assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
+            assert!(rep.rows[0].evidence.is_some(), "{:?}", rep.rows);
+            assert!(!l.scope.join("y.txt.locked").exists());
+        }
     }
 }

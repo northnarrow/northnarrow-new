@@ -24,6 +24,8 @@ use std::path::Path;
 
 use parking_lot::Mutex;
 
+use super::identity::FileId;
+
 /// One event of the group's queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawEvent {
@@ -341,11 +343,103 @@ pub fn btime(fd: RawFd, name: Option<&str>) -> Option<i64> {
     Some(sx.stx_btime.tv_sec * 1_000_000_000 + sx.stx_btime.tv_nsec as i64)
 }
 
-/// The path of an event descriptor (`/proc/self/fd/<fd>`).
+/// The identity of the file open at `fd` (`fstat` and its birth time).
+pub fn file_id(fd: RawFd) -> io::Result<FileId> {
+    let st = fstat(fd)?;
+    Ok(FileId::new(st.st_dev, st.st_ino, btime(fd, None)))
+}
+
+/// The path of an event descriptor (`/proc/self/fd/<fd>`), while the file
+/// can be reached.
+///
+/// Lot 315 (external bug hunt 1.4, BUG-109): whether the file was deleted
+/// is the kernel's answer, never its name's. A file the writer renamed
+/// `x (deleted)` (a rename opens nothing: no event) was taken for an
+/// unlinked one by the name's ending alone, and written without a copy
+/// (`skipped_unresolved_path`) — ransomware against the guard, one rename
+/// per file. Now:
+/// - a file with no link left (`st_nlink` 0) has no path: once its writer
+///   closes it nothing reaches it, and there is nothing to keep;
+/// - the path the kernel shows is the file's when a lookup of it finds
+///   the descriptor's file (`lstat` of the path against `fstat` of the
+///   descriptor, [`lookup_cached`]) — a live file named `x (deleted)`;
+/// - otherwise the name it was opened by was unlinked while another link
+///   of the file remains (a hard link made first): the path is that name,
+///   the kernel's ` (deleted)` mark taken off. It was skipped too (a variant
+///   met in lot 315's mini-hunt): `ln f g`, then an open of `f` for writing
+///   and an unlink of `f` while the open waits on the guard.
 pub fn fd_path(fd: RawFd) -> Option<String> {
     let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
     let s = p.to_str()?.to_string();
-    (s.starts_with('/') && !s.ends_with(" (deleted)")).then_some(s)
+    if !s.starts_with('/') {
+        return None;
+    }
+    let st = fstat(fd).ok()?;
+    if st.st_nlink == 0 {
+        return None;
+    }
+    let Some(opened_by) = s.strip_suffix(" (deleted)") else {
+        return Some(s);
+    };
+    let me = FileId::new(st.st_dev, st.st_ino, btime(fd, None));
+    if lookup_cached(&s) == Some(me) {
+        return Some(s);
+    }
+    Some(opened_by.to_string())
+}
+
+/// The identity of the file at `path`, without following a link at its
+/// end — from the kernel's caches only: `openat2(O_PATH,
+/// RESOLVE_CACHED | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` and
+/// `statx(AT_STATX_DONT_SYNC)`. A lookup that needs the filesystem fails
+/// (`EAGAIN`) instead of waiting on it: the path is the writer's, and a
+/// user's FUSE mount over one of its directories (the descriptor still
+/// names the file below it) would otherwise hold the guard's reader for
+/// as long as the user's daemon does not answer. `None` when the path
+/// cannot be looked up so (a kernel before 5.12 too).
+pub fn lookup_cached(path: &str) -> Option<FileId> {
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `open_how` is plain integers; zero is a valid value.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_CACHED | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: a NUL-terminated path and an open_how of the right size.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a fresh descriptor, ours alone.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    // SAFETY: zeroed statx buffer filled by the kernel.
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: valid descriptor, an empty NUL-terminated path and a buffer.
+    let rc = unsafe {
+        libc::statx(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_INO | libc::STATX_BTIME,
+            &mut sx,
+        )
+    };
+    if rc < 0 || sx.stx_mask & libc::STATX_INO == 0 {
+        return None;
+    }
+    let btime = (sx.stx_mask & libc::STATX_BTIME != 0)
+        .then(|| sx.stx_btime.tv_sec * 1_000_000_000 + sx.stx_btime.tv_nsec as i64);
+    Some(FileId::new(
+        libc::makedev(sx.stx_dev_major, sx.stx_dev_minor),
+        sx.stx_ino,
+        btime,
+    ))
 }
 
 #[cfg(test)]
@@ -589,5 +683,95 @@ mod tests {
         }
         // read(2) is no open: unknown, never read-only
         assert!(classify_syscall_line(&text).may_write(), "{text}");
+    }
+}
+
+/// Lot 315 (external bug hunt 1.4: BUG-109, and a variant met in the lot's
+/// mini-hunt).
+#[cfg(test)]
+mod lot315 {
+    use super::*;
+
+    /// BUG-109: a live file named `… (deleted)` (one rename by the writer,
+    /// which opens nothing) is reachable at that path: `fd_path` names it
+    /// (on main: `None`, and the guard let it be written without a copy).
+    #[test]
+    fn bug109_a_live_file_named_deleted_has_its_path() {
+        let d = tempfile::tempdir().unwrap();
+        let victim = d.path().join("contract.docx");
+        std::fs::write(&victim, b"original content").unwrap();
+        let renamed = d.path().join("contract.docx (deleted)");
+        std::fs::rename(&victim, &renamed).unwrap();
+        let f = std::fs::File::open(&renamed).unwrap();
+        assert_eq!(fstat(f.as_raw_fd()).unwrap().st_nlink, 1);
+        assert_eq!(
+            fd_path(f.as_raw_fd()),
+            Some(renamed.display().to_string()),
+            "a live file whose name ends with \" (deleted)\" is taken for an unlinked one: \
+             the guard lets it be written without a copy (skipped_unresolved_path)"
+        );
+    }
+
+    /// BUG-109 guard: a file really unlinked has no path.
+    #[test]
+    fn bug109_guard_an_unlinked_file_has_no_path() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gone.txt");
+        std::fs::write(&p, b"x").unwrap();
+        let f = std::fs::File::open(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(fd_path(f.as_raw_fd()), None);
+        // named so, then unlinked: no path either
+        let q = d.path().join("q (deleted)");
+        std::fs::write(&q, b"x").unwrap();
+        let g = std::fs::File::open(&q).unwrap();
+        std::fs::remove_file(&q).unwrap();
+        assert_eq!(fd_path(g.as_raw_fd()), None);
+    }
+
+    /// BUG-109, a variant (lot 315's mini-hunt): `ln f g`, an open of `f`
+    /// for writing, and an unlink of `f` while the open waits on the guard.
+    /// The kernel names the descriptor `f (deleted)` while `g` still holds
+    /// the file: it is live, its path is the name it was opened by (on
+    /// main, and with an `lstat` compared alone: no path, no copy).
+    #[test]
+    fn bug109_a_file_whose_opened_name_was_unlinked_keeps_a_path_while_linked() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("budget.xlsx");
+        std::fs::write(&f, b"original").unwrap();
+        std::fs::hard_link(&f, d.path().join(".g")).unwrap();
+        let fd = std::fs::File::open(&f).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(fstat(fd.as_raw_fd()).unwrap().st_nlink, 1);
+        assert_eq!(fd_path(fd.as_raw_fd()), Some(f.display().to_string()));
+        // a live file named `x (deleted)` whose name was unlinked, another
+        // link left: the name it was opened by, mark and all
+        let x = d.path().join("x (deleted)");
+        std::fs::write(&x, b"original").unwrap();
+        std::fs::hard_link(&x, d.path().join(".h")).unwrap();
+        let fx = std::fs::File::open(&x).unwrap();
+        std::fs::remove_file(&x).unwrap();
+        assert_eq!(fd_path(fx.as_raw_fd()), Some(x.display().to_string()));
+    }
+
+    /// The cached lookup names the descriptor's file, by the same identity
+    /// `file_id` gives it (the device's encoding included), and another
+    /// file as another; a missing path is `None`.
+    #[test]
+    fn lookup_cached_names_the_descriptors_file() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let fa = std::fs::File::open(&a).unwrap();
+        let id = file_id(fa.as_raw_fd()).unwrap();
+        assert_eq!(lookup_cached(a.to_str().unwrap()), Some(id));
+        assert_ne!(lookup_cached(b.to_str().unwrap()), Some(id));
+        assert_eq!(lookup_cached(d.path().join("c").to_str().unwrap()), None);
+        // a link at the end is not followed (`lstat`: the link itself)
+        std::os::unix::fs::symlink(&a, d.path().join("l")).unwrap();
+        let l = lookup_cached(d.path().join("l").to_str().unwrap());
+        assert!(l.is_some_and(|l| l != id), "{l:?}");
     }
 }

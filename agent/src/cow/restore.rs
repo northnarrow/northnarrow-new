@@ -24,6 +24,7 @@
 //!    inode, links, extended attributes; content and modification time of
 //!    the original.
 
+use super::identity::FileId;
 use super::index::{Entry, PostWrite};
 use super::trust::ProcId;
 
@@ -49,15 +50,16 @@ impl Current {
         btime_ns: None,
     };
 
+    /// The file's identity (see [`super::identity`]).
+    pub const fn id(&self) -> FileId {
+        FileId::new(self.dev, self.ino, self.btime_ns)
+    }
+
     /// The same file as the copy's: same device and inode, and — where
     /// both are known — the same birth time (an inode number freed and
     /// given to a new file is another file).
     pub fn same_file(&self, f: &super::index::FileState) -> bool {
-        (self.dev, self.ino) == (f.dev, f.ino)
-            && match (self.btime_ns, f.btime_ns) {
-                (Some(a), Some(b)) => a == b,
-                _ => true,
-            }
+        self.id().may_be(&f.id())
     }
 }
 
@@ -90,10 +92,10 @@ pub struct Context<'a> {
     /// The current content's SHA-256 equals the original's (`None`: not
     /// computed — the file is missing or not a regular file).
     pub content_is_original: Option<bool>,
-    /// Write-opens of the inode seen after the copy.
+    /// Write-opens of the file seen after the copy.
     pub post_writes: &'a [PostWrite],
-    /// Is this process part of the attack being undone?
-    pub in_attack: &'a dyn Fn(ProcId) -> bool,
+    /// Is this write-open the attack's (see [`Selector::in_attack_write`])?
+    pub in_attack: &'a dyn Fn(&PostWrite) -> bool,
     /// The copy was taken before this run of the guard started.
     pub predates_run: bool,
 }
@@ -120,7 +122,7 @@ pub fn decide(entry: &Entry, cur: &Current, cx: &Context<'_>) -> Plan {
     if let Some(p) = cx
         .post_writes
         .iter()
-        .find(|p| p.at_ms >= entry.taken_at_ms && !(cx.in_attack)(p.writer))
+        .find(|p| p.at_ms >= entry.taken_at_ms && !(cx.in_attack)(p))
     {
         return Plan::KeepBoth(format!(
             "changed after the copy by {} writer {} (pid {})",
@@ -170,22 +172,60 @@ impl Selector {
             .any(|r| r.pid == p.pid && (r.start == 0 || p.start == 0 || r.start == p.start))
             || selected.iter().any(named)
     }
+
+    /// Is the write-open `w` the attack's? Its writer is (see
+    /// [`Self::in_attack`]); or, with roots, one of the roots was its
+    /// writer's ancestor when it opened the file — lot 315 (BUG-93): a
+    /// writer of the tree whose own copy was not taken (a copy shared,
+    /// refused for room or time) is the tree's too. Without roots
+    /// (`--since` alone) a lineage names no attack: a write-open is the
+    /// attack's only when its writer has a selected copy, so a later edit
+    /// by a program of the owner's that has its own copy is never taken
+    /// for the attack's and overwritten.
+    pub fn in_attack_write(&self, selected: &[&Entry], w: &PostWrite) -> bool {
+        self.in_attack(selected, w.writer) || self.roots.iter().any(|r| w.in_tree_of(*r))
+    }
+
+    /// The copies a restore weighs a file's writers against: with roots,
+    /// every copy the selector matches — lot 315 (BUG-93): two processes
+    /// of the tree that each took a copy of a file are both the attack's,
+    /// and a writer still running is one of them whichever copy was
+    /// picked; without roots (`--since` alone), the picked copies only
+    /// (a selected copy makes its writer the attack's, see
+    /// [`Self::in_attack_write`]).
+    pub fn weighed<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a Entry>,
+        picked: &[&'a Entry],
+    ) -> Vec<&'a Entry> {
+        if self.roots.is_empty() {
+            return picked.to_vec();
+        }
+        entries.filter(|e| self.matches(e)).collect()
+    }
 }
 
 /// The entries to restore: those `sel` matches, one per file — the
-/// earliest, the content from before the attack's first write.
+/// earliest, the content from before the attack's first write. Lot 315
+/// (BUG-110): one per *file* — two files that had the same inode number
+/// one after the other (birth times known and different) are two, and
+/// neither is dropped.
 pub fn pick<'a>(entries: impl Iterator<Item = &'a Entry>, sel: &Selector) -> Vec<&'a Entry> {
-    let mut by_inode: std::collections::BTreeMap<(u64, u64), &Entry> = Default::default();
+    let mut slots: std::collections::BTreeMap<super::identity::Slot, Vec<&Entry>> =
+        Default::default();
     for e in entries.filter(|e| sel.matches(e)) {
-        let key = (e.file.dev, e.file.ino);
-        match by_inode.get(&key) {
-            Some(prev) if (prev.taken_at_ms, prev.id) <= (e.taken_at_ms, e.id) => {}
-            _ => {
-                by_inode.insert(key, e);
+        slots.entry(e.file.id().slot()).or_default().push(e);
+    }
+    let mut v: Vec<&Entry> = Vec::new();
+    for mut same_slot in slots.into_values() {
+        same_slot.sort_by_key(|e| (e.taken_at_ms, e.id));
+        let first = v.len();
+        for e in same_slot {
+            if !v[first..].iter().any(|p| p.file.id().may_be(&e.file.id())) {
+                v.push(e);
             }
         }
     }
-    let mut v: Vec<&Entry> = by_inode.into_values().collect();
     v.sort_by_key(|e| e.id);
     v
 }
@@ -246,7 +286,7 @@ mod tests {
         }
     }
 
-    fn cx<'a>(post: &'a [PostWrite], in_attack: &'a dyn Fn(ProcId) -> bool) -> Context<'a> {
+    fn cx<'a>(post: &'a [PostWrite], in_attack: &'a dyn Fn(&PostWrite) -> bool) -> Context<'a> {
         Context {
             object_ok: true,
             content_is_original: Some(false),
@@ -256,18 +296,20 @@ mod tests {
         }
     }
 
-    fn attacker(p: ProcId) -> bool {
-        p.pid == 77
+    fn attacker(p: &PostWrite) -> bool {
+        p.writer.pid == 77
     }
 
     #[test]
     fn the_attacks_writes_only_are_restored_in_place() {
         let e = entry(1, 1, 77, 100);
         let post = [PostWrite {
+            file: e.file.id(),
             at_ms: 150,
             writer: ProcId { pid: 77, start: 50 },
             program: "/home/u/sim.py".into(),
             trusted: false,
+            lineage: vec![],
         }];
         assert_eq!(
             decide(&e, &same(&e, 9_999), &cx(&post, &attacker)),
@@ -279,10 +321,12 @@ mod tests {
     fn a_trusted_writer_after_the_attack_means_keep_both() {
         let e = entry(1, 1, 77, 100);
         let post = [PostWrite {
+            file: e.file.id(),
             at_ms: 200,
             writer: ProcId { pid: 90, start: 60 },
             program: "/usr/bin/vim.basic".into(),
             trusted: true,
+            lineage: vec![],
         }];
         match decide(&e, &same(&e, 9_999), &cx(&post, &attacker)) {
             Plan::KeepBoth(why) => {
@@ -404,5 +448,153 @@ mod tests {
         assert!(sel.in_attack(&picked, ProcId { pid: 77, start: 50 }));
         assert!(!sel.in_attack(&picked, ProcId { pid: 90, start: 1 }));
         assert_eq!(beside_name("a.txt", 4), "a.txt.nn-restored-4");
+    }
+}
+
+/// Lot 315 (external bug hunt 1.4: BUG-110, BUG-93).
+#[cfg(test)]
+mod lot315 {
+    use super::*;
+    use crate::cow::index::{FileState, Method};
+
+    fn entry(id: u64, path: &str, btime: Option<i64>, writer: u32, at: u64) -> Entry {
+        let w = ProcId {
+            pid: writer,
+            start: 50,
+        };
+        Entry {
+            id,
+            object: id,
+            scope: 0,
+            file: FileState {
+                path: path.into(),
+                dev: 1,
+                ino: 5,
+                size: 10,
+                mtime_ns: 1_000,
+                ctime_ns: 1_000,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                btime_ns: btime,
+            },
+            sha256: "ab".into(),
+            writer: w,
+            writer_program: "/home/u/enc.py".into(),
+            lineage: vec![w, ProcId { pid: 100, start: 10 }],
+            taken_at_ms: at,
+            method: Method::Copy,
+        }
+    }
+
+    fn tree() -> Selector {
+        Selector {
+            roots: vec![ProcId { pid: 100, start: 10 }],
+            since_ms: None,
+        }
+    }
+
+    /// BUG-110: /srv/a (inode 5, born at 100) copied, then deleted; /srv/b
+    /// gets inode number 5 (born at 200) and is copied too. Two files by the
+    /// project's own rule (`Current::same_file`): one entry each (on main
+    /// /srv/b was dropped without a row).
+    #[test]
+    fn bug110_pick_keeps_one_entry_per_file_not_per_inode_number() {
+        let all = [
+            entry(1, "/srv/a", Some(100), 101, 1000),
+            entry(2, "/srv/b", Some(200), 102, 2000),
+        ];
+        let b_now = Current {
+            exists: true,
+            regular: true,
+            dev: 1,
+            ino: 5,
+            mtime_ns: 1,
+            btime_ns: Some(200),
+        };
+        assert!(!b_now.same_file(&all[0].file), "two files for the project");
+        let paths: Vec<&str> = pick(all.iter(), &tree())
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["/srv/a", "/srv/b"],
+            "pick promises one entry per file: /srv/b is dropped without a row"
+        );
+        // and each file keeps its earliest copy, whatever the order read
+        let mut more = all.to_vec();
+        more.push(entry(3, "/srv/b", Some(200), 103, 1500));
+        more.push(entry(4, "/srv/a", Some(100), 104, 500));
+        let ids: Vec<u64> = pick(more.iter().rev(), &tree()).iter().map(|e| e.id).collect();
+        assert_eq!(ids, [3, 4]);
+    }
+
+    /// BUG-110 guard: one file, two writers (same birth time, or one not
+    /// known): the earliest copy only.
+    #[test]
+    fn bug110_guard_one_file_two_writers_is_one_entry() {
+        for (b1, b2) in [(Some(100), Some(100)), (None, Some(100)), (None, None)] {
+            let all = [
+                entry(1, "/srv/a", b1, 101, 1000),
+                entry(2, "/srv/a", b2, 102, 2000),
+            ];
+            let ids: Vec<u64> = pick(all.iter(), &tree()).iter().map(|e| e.id).collect();
+            assert_eq!(ids, [1], "{b1:?} {b2:?}");
+        }
+    }
+
+    fn write_by(pid: u32, lineage: Vec<ProcId>) -> PostWrite {
+        PostWrite {
+            file: FileId::new(1, 5, Some(100)),
+            at_ms: 3000,
+            writer: ProcId { pid, start: 50 },
+            program: "/home/u/enc.py".into(),
+            trusted: false,
+            lineage,
+        }
+    }
+
+    /// BUG-93: with roots, every copy the selector matches is weighed (a
+    /// second writer of the tree is the attack's whichever copy was
+    /// picked), and a write-open whose writer descends from a root is the
+    /// attack's; with `--since` alone, only the picked copies, and a
+    /// lineage names no attack.
+    #[test]
+    fn bug93_the_tree_is_weighed_from_its_roots_only() {
+        let all = [
+            entry(1, "/srv/a", Some(100), 101, 1000),
+            entry(2, "/srv/a", Some(100), 102, 2000),
+        ];
+        let sel = tree();
+        let picked = pick(all.iter(), &sel);
+        assert_eq!(picked.len(), 1);
+        let weighed = sel.weighed(all.iter(), &picked);
+        assert_eq!(weighed.iter().map(|e| e.id).collect::<Vec<_>>(), [1, 2]);
+        assert!(sel.in_attack_write(&weighed, &write_by(102, vec![])));
+        assert!(!sel.in_attack_write(&picked, &write_by(102, vec![])));
+        // a writer with no copy of its own, of the tree by its lineage
+        let root = ProcId { pid: 100, start: 10 };
+        assert!(sel.in_attack_write(&picked, &write_by(103, vec![root])));
+        assert!(sel.in_attack_write(
+            &picked,
+            &write_by(103, vec![ProcId { pid: 100, start: 0 }])
+        ));
+        assert!(!sel.in_attack_write(
+            &picked,
+            &write_by(103, vec![ProcId { pid: 100, start: 11 }])
+        ));
+        assert!(!sel.in_attack_write(&picked, &write_by(103, vec![])));
+        // --since alone: the picked copies, and no lineage
+        let since = Selector {
+            roots: vec![],
+            since_ms: Some(0),
+        };
+        let picked = pick(all.iter(), &since);
+        let weighed = since.weighed(all.iter(), &picked);
+        assert_eq!(weighed.iter().map(|e| e.id).collect::<Vec<_>>(), [1]);
+        assert!(!since.in_attack_write(&weighed, &write_by(102, vec![])));
+        assert!(!since.in_attack_write(&weighed, &write_by(103, vec![root])));
+        assert!(since.in_attack_write(&weighed, &write_by(101, vec![])));
     }
 }

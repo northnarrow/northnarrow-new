@@ -455,11 +455,18 @@ impl Journal {
             .to_string())
     }
 
-    /// Delete evidence files older than `cutoff` (Unix seconds).
+    /// Delete evidence files older than `cutoff` (Unix seconds). Lot 315
+    /// (a variant of the triage's N2, met in the lot's mini-hunt): a file's
+    /// age is counted from its move into the evidence (the rename sets its
+    /// ctime), not from its own mtime — a file that kept an old mtime
+    /// (`tar -x`, `rsync -a`, `cp -p`) was deleted at the first expiry after
+    /// its move, and the retention promised to the evidence never ran.
     pub fn expire_evidence(&self, cutoff_secs: i64) {
         if let Ok(rd) = std::fs::read_dir(self.host.join("evidence")) {
             for e in rd.filter_map(|e| e.ok()) {
-                if e.metadata().is_ok_and(|m| m.mtime() < cutoff_secs) {
+                if e.metadata()
+                    .is_ok_and(|m| m.mtime().max(m.ctime()) < cutoff_secs)
+                {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -634,5 +641,34 @@ mod tests {
             std::fs::read(t.path().join(".j/evidence/7-a.locked")).unwrap(),
             b"junk"
         );
+    }
+
+    /// Lot 315 (a variant of N2): evidence moved in with an old mtime is
+    /// kept for the retention from its move; past it, it goes.
+    #[test]
+    fn evidence_ages_from_its_move_not_its_mtime() {
+        let t = tempfile::TempDir::new().unwrap();
+        let j = Journal::open(&t.path().join(".j")).unwrap();
+        let f = t.path().join("old.tar.locked");
+        std::fs::write(&f, b"junk").unwrap();
+        let year_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(year_ago)
+            .unwrap();
+        let d = open_dir(t.path()).unwrap();
+        j.move_to_evidence(d.as_raw_fd(), "old.tar.locked", 3).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let moved = t.path().join(".j/evidence/3-old.tar.locked");
+        j.expire_evidence(now - 24 * 3600);
+        assert!(moved.exists(), "deleted at the first expiry after its move");
+        j.expire_evidence(now + 60);
+        assert!(!moved.exists(), "kept past the retention");
     }
 }
