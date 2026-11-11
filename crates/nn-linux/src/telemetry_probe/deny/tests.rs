@@ -442,7 +442,9 @@ fn a_hook_detached_gives_the_degradation_then_the_alert() {
             })
             .collect();
         let notes = st.apply(&o);
-        sign(&notes, "n", &st.open_details(), Some(&log));
+        // a nonce of the round's own (`make_nonce`): nothing compares it
+        let nonce = crate::telemetry_probe::make_nonce().unwrap();
+        sign(&notes, &nonce, &st.open_details(), Some(&log));
         notes
     };
     let n = round(&mut st, false);
@@ -581,7 +583,9 @@ fn with_no_hook_every_attempt_goes_through() {
         move_procs: None,
         bpffs: None,
     };
-    let text = run_steps("n0nce", &plan);
+    // a nonce of the round's own (`make_nonce`), as each round makes one
+    let nonce = crate::telemetry_probe::make_nonce().unwrap();
+    let text = run_steps(&nonce, &plan);
     let _ = target.kill();
     let _ = target.wait();
     let r = ChildReport::parse(&text);
@@ -607,12 +611,12 @@ fn with_no_hook_every_attempt_goes_through() {
     assert_eq!(r.get("deny.file_send_sigiotask"), Some("sent"), "{text}");
     // made: each attempt's own trace in the directory
     for (name, h) in [
-        ("c.n0nce", "create"),
-        ("d.n0nce", "mkdir"),
-        ("p.n0nce", "mknod"),
-        ("s.n0nce", "symlink"),
-        ("l.n0nce", "link"),
-        ("rename.n0nce", "rename"),
+        (format!("c.{nonce}"), "create"),
+        (format!("d.{nonce}"), "mkdir"),
+        (format!("p.{nonce}"), "mknod"),
+        (format!("s.{nonce}"), "symlink"),
+        (format!("l.{nonce}"), "link"),
+        (format!("rename.{nonce}"), "rename"),
     ] {
         assert!(dir.join(name).symlink_metadata().is_ok(), "{h}");
     }
@@ -628,7 +632,7 @@ fn with_no_hook_every_attempt_goes_through() {
     }
     // no target: the task steps skipped
     let none = run_steps(
-        "n0nce",
+        &nonce,
         &Plan {
             target: 0,
             hooks: vec![slot_of("task_kill").unwrap()],
