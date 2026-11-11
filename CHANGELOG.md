@@ -106,6 +106,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   entries `OWN_BPF_IDS` had, `E2BIG` at the 257th registration (`main`
   registers 280 on that guest). Lot 290 had raised the map to 1024 on
   `main`; the dispatched run of `main` installs there again.
+- `nn-admin heartbeat watch` fails a fetch whose `--from-cmd` command
+  writes more than 4 MiB to stdout whatever the command's exit status (lot
+  304; `docs/operator/HEARTBEAT.md`). The failure rested on the command
+  dying of the pipe closed at the bound: one that exits 0 on that error
+  (uutils' `head`, the default on Ubuntu 26.04, and the CI's runners since
+  they moved to it) or ignores it gave its first 4 MiB as a whole answer —
+  the newest beats cut off. The first byte past the bound now ends the
+  fetch and stops the command; exactly 4 MiB is still a whole answer.
 - NN-L-FIM-001 no longer kills the writer of the agent's own unit (or of a
   drop-in of it) in the vendor directory `/usr/lib/systemd/system/` inside
   an open trusted-installer window: that write is NN-L-FIM-009's Log/Low
