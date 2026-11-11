@@ -331,7 +331,11 @@ const PACKAGE_MANAGER_EXES: &[&str] = &[
 ];
 
 /// Package managers that are interpreter scripts (`/proc/<pid>/exe` is the
-/// interpreter): matched by `argv[1]`, root processes only.
+/// interpreter): matched by the script the interpreter runs, root processes
+/// only. Lot 310: read by the interpreters' one reader (`python3 -E
+/// /usr/bin/dnf` runs dnf; `cat /usr/bin/dnf` and `python3 -c …
+/// /usr/bin/dnf` run none) — it was the cmdline's second word, whatever the
+/// executable.
 const PACKAGE_MANAGER_SCRIPTS: &[&str] = &[
     "/usr/bin/dnf",
     "/usr/bin/dnf-3",
@@ -373,14 +377,17 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
         {
             return true;
         }
-        std::fs::read(base.join("cmdline"))
-            .ok()
-            .and_then(|c| {
-                c.split(|b| *b == 0)
-                    .nth(1)
-                    .map(|a| PACKAGE_MANAGER_SCRIPTS.iter().any(|p| a == p.as_bytes()))
-            })
-            .unwrap_or(false)
+        let Ok(cmdline) = std::fs::read(base.join("cmdline")) else {
+            return false;
+        };
+        let argv: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        nn_core::posture::lineage::ExecIdentity::of_exec(&exe.to_string_lossy(), &argv)
+            .script()
+            .is_some_and(|s| PACKAGE_MANAGER_SCRIPTS.contains(&s))
     })
 }
 
@@ -648,12 +655,30 @@ mod tests {
         std::fs::create_dir(root.join("self")).unwrap();
         assert!(!package_transaction_running(root));
 
+        // lot 310: what the interpreter runs, by its table — not the
+        // cmdline's second word of any executable, nor an inline program's
+        fake_proc(root, 103, 0, "/usr/bin/cat", &["cat", "/usr/bin/dnf"]);
+        fake_proc(
+            root,
+            105,
+            0,
+            "/usr/bin/python3.12",
+            &["python3", "-Z", "/usr/bin/dnf"],
+        );
+        fake_proc(
+            root,
+            104,
+            0,
+            "/usr/bin/python3.12",
+            &["python3", "-c", "x", "/usr/bin/dnf"],
+        );
+        assert!(!package_transaction_running(root));
         fake_proc(
             root,
             102,
             0,
             "/usr/bin/python3.12",
-            &["/usr/bin/python3", "/usr/bin/unattended-upgrade"],
+            &["/usr/bin/python3", "-E", "/usr/bin/unattended-upgrade"],
         );
         assert!(package_transaction_running(root));
 

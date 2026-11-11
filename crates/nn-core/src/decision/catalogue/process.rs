@@ -80,14 +80,24 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
-        observes: "A fileless exec: with the exec sensor's identity, a memfd, or an unlinked \
-                   file reached through a descriptor; without it (tracepoint mode), an exec \
-                   path of the form `/proc/self/fd/N`, `/proc/<pid>/fd/N`, `/dev/fd/N` or \
-                   `/memfd:`.",
-        false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is \
-                          exempt on what the kernel executed and on a systemd parent. Another \
+        observes: "A fileless exec: with the exec sensor's identity, a memfd or an unlinked \
+                   file (an `O_TMPFILE`, a file opened then deleted), whatever path reached it \
+                   (lot 310: `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, \
+                   `/dev/stdin`, a relative path, a symlink, `/proc/<pid>/exe` alike); without \
+                   it (tracepoint mode), an exec path that reopens a descriptor, read by the \
+                   posture's one reader of a `/proc` link (`/proc/<pid>[/task/<tid>]/fd/N`, \
+                   `map_files/`, `/dev/fd/N`, `/dev/std*`, folded) or `/memfd:`.",
+        false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is a \
+                          linked file, not fileless; after a systemd upgrade PID 1 launches \
+                          from the old, unlinked executor until its re-exec, exempt by that \
+                          file's identity (one the packaged executor had on the host, which \
+                          the agent records at its start and every minute) and a systemd \
+                          parent — never by its name. A process re-executing the very image \
+                          its parent runs (`/proc/self/exe` after an upgrade unlinked it: \
+                          Chromium's children, Docker's `reexec`) is not fileless. Another \
                           program that re-executes itself from a memfd (older runc versions \
-                          do, to protect their binary) is killed: nothing else is exempt.",
+                          do, to protect their binary), or that execs a file at the instant an \
+                          upgrade unlinks it, is killed: nothing else is exempt.",
         how_to_test: "`python3 -c 'import os; fd = os.memfd_create(\"x\"); \
                       os.write(fd, open(\"/bin/true\", \"rb\").read()); \
                       os.execv(\"/proc/self/fd/%d\" % fd, [\"x\"])'`.",
@@ -95,6 +105,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd",
             "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
              fires_on_a_memfd_whatever_path_reached_it",
+            "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
+             bug88_other_spellings_the_report_fix_still_misses",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              process_memfd_fileless_exec_trips_r004",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd",

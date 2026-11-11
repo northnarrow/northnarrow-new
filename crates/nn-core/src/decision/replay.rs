@@ -131,8 +131,9 @@ pub fn engine<H: DecisionHost>(host: HostParts<'_, H>) -> RuleEngine<H> {
         net_config,
         ransom,
         defense,
-        // R14a: the golden corpus has no worker launch
-        None,
+        // R14a: the golden corpus has no worker launch (lot 310: nor a
+        // systemd executor recorded)
+        Default::default(),
     )
     .with_policy(PolicyHandle::new(policy))
     .with_facts(H::actor_facts(proc_root))

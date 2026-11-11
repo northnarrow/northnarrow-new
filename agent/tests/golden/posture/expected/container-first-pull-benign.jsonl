@@ -2,9 +2,9 @@
 {"at_ms":105000,"event":{"kind":"ProcessSpawn","pid":7300101},"item":0,"seq":0,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":110000,"event":{"kind":"ProcessSpawn","pid":7300010},"item":1,"seq":1,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":110100,"event":{"kind":"ProcessSpawn","pid":7300011},"item":2,"seq":2,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
-{"assessed":{"ransomware":{"actor":7300011,"decisive":false,"program":"/usr/bin/podman","shapes":[],"trusted":"packaged program /usr/bin/podman started by installed programs only"}},"at_ms":112000,"event":{"kind":"MassWrite","pid":7300011},"item":3,"seq":3,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
+{"at_ms":112000,"event":{"kind":"MassWrite","pid":7300011},"item":3,"seq":3,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":113000,"event":{"kind":"ProcessSpawn","pid":7300012},"item":4,"seq":4,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":113100,"event":{"kind":"ProcessSpawn","pid":7300013},"item":5,"seq":5,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":120000,"event":{"kind":"ProcessSpawn","pid":7300020},"item":6,"seq":6,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
-{"assessed":{"ransomware":{"actor":7300020,"decisive":false,"program":"/usr/bin/podman","shapes":[],"trusted":"packaged program /usr/bin/podman started by installed programs only"}},"at_ms":122000,"event":{"kind":"MassWrite","pid":7300020},"item":7,"seq":7,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
+{"at_ms":122000,"event":{"kind":"MassWrite","pid":7300020},"item":7,"seq":7,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null}}
 {"at_ms":182000,"item":8,"seq":8,"state":{"ledger":0,"offenders":[],"posture":"OBSERVING","stage":null},"wait_secs":60}

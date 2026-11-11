@@ -84,15 +84,27 @@ construction; a host with neither database falls back to a root-owned system
 tree) — **and every hop of its lineage vouches for it**: every ancestor up to
 PID 1 above the writer and its own forked copies is a program a package
 installed (its executable, and for an interpreter the script it runs, by the
-same database) or an interpreter a package installed running no named script
-(an interactive shell, `sh -c`). Lying in a root-owned tree is not being
-installed by a package: a binary in `/opt` or `/usr/local` no package lists
-vouches for nothing it starts (lot 292, BUG-49; before, the ancestors were
-judged by tree alone). Never by `comm`, never by a name list.
+same database) or an interpreter a package installed running no program at
+all (an interactive shell). Lying in a root-owned tree is not being installed
+by a package: a binary in `/opt` or `/usr/local` no package lists vouches for
+nothing it starts (lot 292, BUG-49; before, the ancestors were judged by tree
+alone). Lot 310 (BUG-49, the decision of 11/11/2026): nor does an interpreter
+running an inline program (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node
+--eval`) or its standard input (`sh -s`) — that program is the caller's, and a
+webshell's `sh -c 'openssl enc …'` made the packaged `openssl` a trusted
+writer (the triage's LOTL case). A packaged tool such a shell starts is
+judged; a package transaction stays trusted. What this costs: a cron job, a
+unit's `ExecStart=/bin/sh -c …`, an administrator's non-interactive `ssh host
+'cmd'` (sshd runs `bash -c`) start their tools through an inline shell, and
+those tools' bursts now count — NN-L-IMP-001's kill stays held by default,
+its Critical record and the posture's `RansomwareEncryption` remain. Never
+by `comm`, never by a name list.
 
 What an interpreter runs is read from its argv with that interpreter's own
 option table (lot 292, BUG-44 and BUG-42: `python3 -O x.py` runs `x.py`,
-`node -r m x.js` runs `x.js`, `sh -e x.sh` runs `x.sh`). An option the table
+`node -r m x.js` runs `x.js`, `sh -e x.sh` runs `x.sh`), by one reader for
+every family (lot 310, BUG-97, BUG-99, BUG-100: `bash -noprofile x.sh`,
+`node --eval=…`, `zsh -ovi x.zsh`). An option the table
 does not hold, or one whose argument is missing, leaves what it runs **not
 known**: such a writer is no packaged program, and such an ancestor vouches
 for nothing (`crates/nn-core/src/posture/script_args.rs`).

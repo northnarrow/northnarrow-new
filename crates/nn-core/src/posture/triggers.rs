@@ -39,6 +39,7 @@ use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::host::{PostureAgent, PostureHost};
 use super::lineage::{AsOf, AuthSessionTracker};
+use super::proc_link::{lexical_form, through_proc_link};
 use crate::decision::host::{AccountKind, DecisionHost};
 
 /// The recent events the triggers scan, borrowed (review 72). The
@@ -181,52 +182,9 @@ fn is_mass_write_carveout_unresolved(filename: &str, extras: &[String]) -> bool 
         .is_some_and(|p| !through_proc_link(&p) && is_mass_write_carveout(&p, extras))
 }
 
-/// Lot 286: the form of an unresolved `path` a prefix test may judge —
-/// its `.` segments and repeated slashes folded — or `None` when it holds
-/// a `..` segment. The kernel climbs a `..` from wherever the links before
-/// it led, which the text does not show: `/proc/self/root/..` is `/` and
-/// `/proc/self/cwd/../..` the cwd's grandparent, both folded to `/proc`
-/// before (POS-004's fold judged them carved out); `/proc/net` is a link
-/// to `self/net`, so `/proc/net/../root/…` reaches the process's root; a
-/// sysfs link leads deeper or elsewhere in `/sys`, from where enough `..`
-/// leave it.
-fn lexical_form(path: &str) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => return None,
-            s => parts.push(s),
-        }
-    }
-    let joined = parts.join("/");
-    Some(if path.starts_with('/') {
-        format!("/{joined}")
-    } else {
-        joined
-    })
-}
-
-/// A path (in [`lexical_form`]) through a link the kernel follows to a
-/// process's view of the filesystem: `/proc/<pid>[/task/<tid>]/` (or
-/// `self`, `thread-self`) then `cwd`, `root` or `exe` (the link itself or
-/// anything under it), or an entry of `fd/` or `map_files/` (each reopens
-/// the file it names); and (lot 286) `/dev/fd/<n>`, `/dev/stdin`,
-/// `/dev/stdout`, `/dev/stderr`, links into `/proc/self/fd/` that the
-/// `/dev/` prefix carved out. Any second segment matches: no other entry
-/// of `/proc` holds such names, and a path that only looks like one counts.
-fn through_proc_link(path: &str) -> bool {
-    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    let rest = match segs.as_slice() {
-        ["dev", "fd", _, ..] | ["dev", "stdin" | "stdout" | "stderr", ..] => return true,
-        ["proc", _, "task", _, rest @ ..] | ["proc", _, rest @ ..] => rest,
-        _ => return false,
-    };
-    matches!(
-        rest,
-        ["cwd" | "root" | "exe", ..] | ["fd" | "map_files", _, ..]
-    )
-}
+// Lot 286's `lexical_form` and `through_proc_link` are the posture's one
+// reader of a path through a `/proc` link since lot 310 ([`super::proc_link`]),
+// shared with R004.
 
 /// A device node under `/dev` (not the `/dev/shm` and `/dev/mqueue`
 /// filesystems, which hold files).
@@ -778,34 +736,16 @@ impl<H: DecisionHost> TriggerDetector<H> {
         // tag in the same observe call). Stack-exempt spawns are
         // also recorded — they won't trip the auth allowlist and
         // recording them is cheap; consistency beats the conditional.
-        if let Event::ProcessSpawn {
-            pid,
-            ppid,
-            uid,
-            filename,
-            argv,
-            timestamp_ns,
-            exe,
-            start_ns,
-            ..
-        } = event
-        {
-            // FP-2: pass argv so the tracker can precompute the npm-CLI
-            // flag (node running npm-cli.js) for the mass-write exemption.
-            // Tappa 10.9 step 2: the file the kernel executed (review 61).
-            // External audit POS-003: and the process's own start, which
-            // orders its fork against its ancestors' execs. Lab PR 175:
-            // and the uid it executed as (a package transaction is root's).
-            self.auth.ingest_exec(
-                *pid,
-                *ppid,
-                exe.path_or(filename),
-                argv,
-                *timestamp_ns,
-                *start_ns,
-                *uid,
-            );
-        }
+        // FP-2: the argv, so the tracker can precompute the npm-CLI flag
+        // (node running npm-cli.js) for the mass-write exemption. Tappa
+        // 10.9 step 2: the file the kernel executed (review 61). External
+        // audit POS-003: and the process's own start, which orders its fork
+        // against its ancestors' execs. Lab PR 175: and the uid it executed
+        // as (a package transaction is root's). Lot 310: and the executed
+        // file's identity, `(dev, ino)` (R004 knows a re-exec of the
+        // parent's own image by it) — the one ingest of an exec event,
+        // `ingest_spawn_event`, as the bus's and the replay's.
+        self.auth.ingest_spawn_event(event);
 
         // Stack-exclusion: never raise a trigger on the NorthNarrow
         // stack's own events (the agent — PR #123 — and the verified
@@ -3897,30 +3837,51 @@ mod tests {
         det.detect(&focal, &recent)
     }
 
+    // lot 310: `dot_segments_fold_and_proc_links_are_doors` moved with the
+    // reader it tests (`posture::proc_link`)
+
+    /// Lot 310: the posture's ingest of an exec keeps the executed file's
+    /// identity the LSM program gave (R004 tells a re-exec of the parent's
+    /// own image by it); it ingested the path alone, and the lab's
+    /// re-execution of a parent's unlinked image (ubuntu2604, r1) was killed.
     #[test]
-    fn dot_segments_fold_and_proc_links_are_doors() {
-        assert_eq!(lexical_form("/home//u/./x").as_deref(), Some("/home/u/x"));
-        assert_eq!(lexical_form("a/./b").as_deref(), Some("a/b"));
-        // lot 286: a `..` is never folded (POS-004 folded both)
-        assert_eq!(lexical_form("/proc/../home//u/./x"), None);
-        assert_eq!(lexical_form("/a/b/../../.."), None);
-        assert!(through_proc_link("/proc/self/cwd/x"));
-        assert!(through_proc_link("/proc/42/task/43/root/etc/x"));
-        assert!(through_proc_link("/proc/thread-self/fd/3"));
-        // lot 286: the link itself (a directory: never opened to write)
-        assert!(through_proc_link("/proc/self/cwd"));
-        assert!(through_proc_link("/proc/self/exe"));
-        assert!(through_proc_link("/proc/7/task/8/map_files/1-2"));
-        assert!(through_proc_link("/proc/12/task/12/exe"));
-        assert!(through_proc_link("/dev/stdout"));
-        assert!(through_proc_link("/dev/stderr"));
-        assert!(through_proc_link("/dev/stdin"));
-        assert!(!through_proc_link("/dev/fd"));
-        assert!(!through_proc_link("/dev/null"));
-        assert!(!through_proc_link("/proc/self/fd"));
-        assert!(!through_proc_link("/proc/self/task"));
-        assert!(!through_proc_link("/proc/sys/vm/x"));
-        assert!(!through_proc_link("/proc/self/oom_score_adj"));
+    fn detect_ingests_the_executed_file_s_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::new(tmp.path());
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth.clone());
+        let mut e = nn_model::Event::ProcessSpawn {
+            pid: 4100,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            comm: "chrome".into(),
+            filename: "/opt/google/chrome/chrome".into(),
+            timestamp_ns: 10,
+            argv: vec!["chrome".into()],
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 10,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: "/opt/google/chrome/chrome".into(),
+                dev: 2049,
+                ino: 4242,
+                flags: exe_flags::KNOWN,
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let _ = det.detect(&e, &[]);
+        assert_eq!(auth.exec_image(4100, AsOf::Now), Some((2049, 4242)));
+        // tracepoint mode: no identity
+        if let nn_model::Event::ProcessSpawn { pid, exe, .. } = &mut e {
+            *pid = 4101;
+            exe.flags = 0;
+        }
+        let _ = det.detect(&e, &[]);
+        assert_eq!(auth.exec_image(4101, AsOf::Now), None);
     }
 
     // ── External audit POS-002 / POS-003 ────────────────────────────

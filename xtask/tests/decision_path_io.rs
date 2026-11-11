@@ -230,11 +230,8 @@ const KNOWN: &[(&str, usize, &str)] = &[
          (`ModuleOwners::refresh`, R12b); the decision reads its answer, and asks itself \
          only for a file no pump asked about (the replay, the tests)",
     ),
-    (
-        "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs",
-        1,
-        "R004 matches a `/proc/self/fd` path in the exec's string, no read",
-    ),
+    // lot 310: R004 matches no `/proc` path itself any more (the posture's
+    // one reader of a `/proc` link, `posture/proc_link.rs`, does: no read)
     (
         "crates/nn-core/src/impact/mod.rs",
         4,

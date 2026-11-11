@@ -6,6 +6,30 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- An interpreter's options are read by one reader, and a fileless exec is
+  judged on the executed file (lot 310; the external bug hunt's edition 1.4:
+  BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, and the
+  decision of 11/11/2026 on BUG-49; `docs/operator/UPGRADE_NOTES_WAVE4.md`
+  §26). `bash -noprofile /tmp/x.sh x /usr/bin/aws`, `node --eval=… /usr/bin/aws`,
+  `node --run task /usr/bin/aws` and `zsh -ovi /tmp/x /usr/bin/aws` were
+  taken for the `aws` client: their read of `~/.aws/credentials` drew no
+  NN-L-FIM-011 kill, and they vouched for what they started. One reader
+  (`posture/script_args.rs`, a table per family) reads bash's one-hyphen
+  long options, `--name=value`, zsh's attached `-o`, node's `--run`, and the
+  kernel-resolved names `mono-sgen`, `mksh` and busybox as `/bin/sh`;
+  anything outside the table is not known, never a script. An inline
+  program (`sh -c`, `python3 -c`) or standard input no longer vouches for
+  the packaged tools it starts (ransomware signal, copy guard). In LSM mode
+  R004 kills a memfd or unlinked file whatever path reached it
+  (`/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
+  relative path, a symlink: unprivileged evasions of a kill that holds in
+  every posture); systemd's unlinked executor is exempt by its identity, no
+  longer by its name (`/opt/app/systemd-executor` was), and a process
+  re-executing its parent's own image is not fileless. Two ratchets
+  (`xtask/tests/interpreter_options.rs`, `proc_links.rs`) keep option
+  parsing and `/proc` link matching in their one reader; an `#[ignore]`
+  differential test runs the tables against the real bash, dash, python3
+  and perl.
 - The kernel module judge sees a compressed module's load on 7.0 (lot 303;
   `docs/operator/RULE_POLICY.md` §2.4). 7.0 reads the file of a
   `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` — kmod's load of a

@@ -263,6 +263,22 @@ pub(crate) fn spawn_shutdown_exe_refresh() {
     });
 }
 
+/// Lot 310 (BUG-103): record the packaged `systemd-executor`'s identity
+/// every minute (an upgrade gives it a new inode; PID 1 runs the old one,
+/// unlinked, until its re-exec, and R004 tells it by the identity).
+pub(crate) fn spawn_executor_refresh(images: nn_core::decision::rules::ExecutorImages) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // seeded at the start
+        loop {
+            tick.tick().await;
+            if nn_linux::systemd_executor::refresh(&images) > 0 {
+                info!("R004: systemd-executor changed on disk — its new identity recorded");
+            }
+        }
+    });
+}
+
 /// The signed audit log, as the watchdog refresh gets it once it is open.
 pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 

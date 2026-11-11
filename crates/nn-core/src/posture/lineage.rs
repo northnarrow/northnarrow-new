@@ -431,6 +431,10 @@ struct Entry {
     /// event's, from the kernel's credentials; 0 for the plain ingest
     /// calls of tests and tools).
     uid: u32,
+    /// Lot 310: the executed file's `(st_dev, st_ino)` as the exec sensor's
+    /// LSM identity gave it (`None`: tracepoint mode, a process older than
+    /// the agent, the plain ingest calls). A fork runs its parent's.
+    image: Option<(u64, u64)>,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -545,8 +549,9 @@ impl ExecIdentity {
             }
             // A module run with `-m` resolves through the working directory
             // and PYTHONPATH, both the caller's: only a client's own runtime
-            // tree (above) vouches for it.
-            Runs::Script(_) | Runs::Unknown(_) => false,
+            // tree (above) vouches for it. Lot 310: nor is an inline program
+            // a client by the interpreter's name.
+            Runs::Script(_) | Runs::Code | Runs::Unknown(_) => false,
         }
     }
 }
@@ -1028,7 +1033,17 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// recorded. Tests and tools: the process is recorded as executed by
     /// root; the agent feeds [`Self::ingest_exec`], with the event's uid.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, Runs::Inline, spawn_ns, (0, None), 0);
+        self.ingest_inner(
+            pid,
+            ppid,
+            exe,
+            false,
+            Runs::Inline,
+            spawn_ns,
+            (0, None),
+            0,
+            None,
+        );
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -1071,14 +1086,18 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         else {
             return false;
         };
-        self.ingest_exec(
+        // lot 310: the file's identity, from the LSM program
+        let image = exe
+            .has(common::wire::exe::exe_flags::KNOWN)
+            .then_some((exe.dev, exe.ino));
+        self.ingest_exec_image(
             *pid,
             *ppid,
             exe.path_or(filename),
             argv,
             *timestamp_ns,
-            *start_ns,
-            *uid,
+            (*start_ns, *uid),
+            image,
         );
         true
     }
@@ -1098,6 +1117,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         start_ns: u64,
         uid: u32,
     ) {
+        self.ingest_exec_image(pid, ppid, exe, argv, spawn_ns, (start_ns, uid), None);
+    }
+
+    /// [`Self::ingest_exec`] with the executed file's identity (lot 310).
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_exec_image(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        argv: &[String],
+        spawn_ns: u64,
+        (start_ns, uid): (u64, u32),
+        image: Option<(u64, u64)>,
+    ) {
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
@@ -1109,6 +1143,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
+            image,
         );
     }
 
@@ -1164,6 +1199,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
+                None,
             );
             seeded += 1;
         }
@@ -1187,6 +1223,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
+        image: Option<(u64, u64)>,
     ) {
         if pid == 0 {
             return;
@@ -1200,6 +1237,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs,
             start_ticks,
             uid,
+            image,
         };
         let mut s = self.inner.state.write();
         // Lab PR 267 (R12a): an exec the cache already holds (its time and
@@ -1482,6 +1520,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
+                    e.image,
                 );
                 if orphan {
                     orphans += 1;
@@ -1569,6 +1608,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs: first.runs.clone(),
             start_ticks: Some(ticks),
             uid,
+            image: first.image,
         })
     }
 
@@ -1685,6 +1725,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs: parent.runs,
             start_ticks: Some(ticks),
             uid,
+            image: parent.image,
         })
     }
 
@@ -2899,6 +2940,22 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         let runs = self.proc_runs(pid, &exe);
         Some(ExecIdentity { exe, runs })
+    }
+
+    /// Lot 310: the identity (`(st_dev, st_ino)`) of the file `pid` executed,
+    /// as the exec sensor's LSM program gave it — from the spawn cache only
+    /// (no `/proc`: it is read on the decision path), as of `as_of`
+    /// ([`Self::exec_identity`]'s cache lookup); `None` when the cache does
+    /// not hold the exec, or holds no identity for it (tracepoint mode, a
+    /// process older than the agent).
+    pub fn exec_image(&self, pid: u32, as_of: AsOf) -> Option<(u64, u64)> {
+        if pid == 0 {
+            return None;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.image,
+            CachedAt::LaterOnly | CachedAt::Absent => None,
+        }
     }
 
     /// External audit NETR-008: the image `pid` runs, for a network row
@@ -4482,6 +4539,83 @@ mod tests {
         assert!(t.holds(602) && !t.holds(603));
     }
 
+    /// Lot 310: the lineage keeps the executed file's identity the LSM
+    /// program gave (none in tracepoint mode), and a fork the sweep enters,
+    /// or an orphan of a gone process's image, runs that image's identity.
+    #[test]
+    fn a_fork_and_an_orphan_carry_the_identity_of_the_image_they_run() {
+        let exec =
+            |pid: u32, ppid: u32, exe: &str, ns: u64, id: Option<(u64, u64)>| Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: ns,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: ns,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.map_or(0, |i| i.0),
+                    ino: id.map_or(0, |i| i.1),
+                    flags: id.map_or(0, |_| common::wire::exe::exe_flags::KNOWN),
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+        // a fork: dpkg's subshell, never executed
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        assert!(t.ingest_spawn_event(&exec(600, 1, "/usr/bin/dpkg", 10 * S, Some((8, 600)))));
+        assert!(t.ingest_spawn_event(&exec(610, 1, "/usr/bin/apt", 10 * S, None)));
+        assert_eq!(t.exec_image(600, AsOf::Now), Some((8, 600)));
+        assert_eq!(t.exec_image(610, AsOf::Now), None, "tracepoint: none");
+        assert_eq!(t.exec_image(611, AsOf::Now), None, "not held");
+        write_exe(proc.path(), 600, "/usr/bin/dpkg");
+        write_status(proc.path(), 600, 1);
+        write_started(proc.path(), "600", 1, 1_000);
+        write_exe(proc.path(), 602, "/usr/bin/dpkg");
+        write_status(proc.path(), 602, 600);
+        write_started(proc.path(), "602", 600, 1_200);
+        assert_eq!(t.sweep().forks, 1);
+        assert_eq!(t.exec_image(602, AsOf::Now), Some((8, 600)));
+        // an orphan: clamd executed by pid 1, forked 501, exited
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 1, "/usr/lib/systemd/systemd");
+        write_status(proc.path(), 1, 0);
+        write_started(proc.path(), "1", 0, 1);
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        assert_eq!(t.seed_from_proc(), 1);
+        assert!(t.ingest_spawn_event(&exec(500, 1, "/usr/sbin/clamd", 10 * S, Some((8, 500)))));
+        write_exe(proc.path(), 501, "/usr/sbin/clamd");
+        write_status_uid(proc.path(), 501, 1, 0);
+        write_started(proc.path(), "501", 1, 1_005);
+        assert_eq!(t.sweep().orphans, 1);
+        assert_eq!(
+            t.exec_image(501, AsOf::Judged(H::monotonic_ns())),
+            Some((8, 500))
+        );
+    }
+
+    /// Lot 310: an interpreter running an inline program is no client by
+    /// the interpreter's name (its program is the caller's); a binary, and
+    /// an interpreter running nothing, are named by their executable.
+    #[test]
+    fn an_inline_program_is_no_client_by_the_interpreter_s_name() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let py = ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3", "-c", "x"]));
+        assert_eq!(py.runs, Runs::Code);
+        assert!(!py.is_client(&["python3"]));
+        assert!(ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3"])).is_client(&["python3"]));
+        assert!(ExecIdentity::of_exec("/usr/bin/aws", &a(&["aws", "s3"])).is_client(&["aws"]));
+    }
+
     /// Review of #475: a session older than the agent (sshd and its shell,
     /// entered by the start's scan) still makes its processes auth-mediated
     /// after 2,100 other execs — an exec'd command and a forked subshell;
@@ -5909,7 +6043,8 @@ mod tests {
             t.exec_identity(200, AsOf::Now),
             Some(ExecIdentity {
                 exe: "/usr/bin/perl".into(),
-                runs: Runs::Inline,
+                // lot 310: an inline program (it was `Runs::Inline`)
+                runs: Runs::Code,
             })
         );
         assert_eq!(t.exec_identity(300, AsOf::Now), None, "unknown pid");
@@ -6281,6 +6416,8 @@ mod tests {
         }
         assert!(wrong.is_empty(), "errexit scripts not named: {wrong:?}");
         // controls: an inline program, or standard input, stays unnamed
+        // (lot 310: as `Runs::Code`, split from `Runs::Inline`, which keeps
+        // a shell running no program)
         for a in [
             &["sh", "-c", "echo"][..],
             &["bash", "-ec", "echo"],
@@ -6290,10 +6427,10 @@ mod tests {
             // arguments are its positional parameters — `/usr/bin/legit`
             // is not what runs
             &["sh", "-s", "/usr/bin/legit"],
-            &["bash"],
         ] {
-            assert_eq!(id("/usr/bin/bash", a).runs, Runs::Inline, "{a:?}");
+            assert_eq!(id("/usr/bin/bash", a).runs, Runs::Code, "{a:?}");
         }
+        assert_eq!(id("/usr/bin/bash", &["bash"]).runs, Runs::Inline);
         // a script `-e` names is installed only from a system tree
         assert!(id(
             "/bin/sh",
@@ -6498,39 +6635,35 @@ mod tests {
                 ][..],
                 script("/tmp/e.rb"),
             ),
-            // inline programs
+            // inline programs (lot 310: `Runs::Code`, split from `Runs::Inline`)
             (
                 "/usr/bin/perl",
                 &["perl", "-lane", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/perl",
                 &["perl", "-le", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
-            ("/usr/bin/perl", &["perl", "-de", "0"][..], Runs::Inline),
+            ("/usr/bin/perl", &["perl", "-de", "0"][..], Runs::Code),
             (
                 "/usr/bin/perl",
                 &["perl", "-CSD", "-E", "say 1"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/ruby",
                 &["ruby", "-ne", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/node",
                 &["node", "-pe", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
-            ("/usr/bin/node", &["node", "--eval", "1"][..], Runs::Inline),
-            (
-                "/usr/bin/python3",
-                &["python3", "-Ic", "1"][..],
-                Runs::Inline,
-            ),
+            ("/usr/bin/node", &["node", "--eval", "1"][..], Runs::Code),
+            ("/usr/bin/python3", &["python3", "-Ic", "1"][..], Runs::Code),
         ] {
             let got = id(exe, a);
             if got != want {
@@ -6656,6 +6789,7 @@ mod tests {
             runs: Runs::Inline,
             start_ticks,
             uid: 0,
+            image: None,
         };
         let exact = e(4_003_217_000, None);
         let seeded = e(4_000_000_000, Some(400));

@@ -1148,3 +1148,56 @@ configure; use the `nn-admin` of this release where the export is checked.
   monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
   to keep it; that load, seen by the agent, is signed Low.
 
+
+## 26. What an interpreter runs, and a fileless exec, read in one place (lot 310)
+
+- **One reader of an interpreter's options**
+  (`crates/nn-core/src/posture/script_args.rs`, the external bug hunt's
+  edition 1.4: BUG-97, BUG-99, BUG-100, N3). bash's long options written
+  with one hyphen before its first cluster (`bash -noprofile x.sh`, `-norc`,
+  `-rcfile F`, `-login`) are read as bash reads them, node's `--eval=…`,
+  `--print=…` and `--run <task>` as inline code, zsh's and ksh's `-ovi` as
+  `-o vi`. Each of them used to move the identity onto an argument the
+  caller chose: `bash -noprofile /tmp/x.sh x /usr/bin/aws` was taken for the
+  `aws` client and its read of `~/.aws/credentials` drew no NN-L-FIM-011.
+  An option the reader's table does not hold, `--name=value` included,
+  leaves what the interpreter runs not known ("(options not understood)"):
+  no client, no installed program, no trusted writer — report the option,
+  it joins the table.
+- **The kernel-resolved names of an interpreter are interpreters**
+  (BUG-104): `mono-sgen` and `mono-boehm` (what `/usr/bin/mono` resolves
+  to: KeePass 2's store read by its own process is its client again,
+  NN-L-FIM-016 no longer kills it), `mksh`, `lksh`, `pdksh`, `oksh`, and
+  busybox, which runs the program `argv[0]` names: as `/bin/sh` (Alpine,
+  its containers) a script it runs is that script, no longer the installed
+  `/bin/busybox`.
+- **An inline program vouches for nothing** (BUG-49, the decision of
+  11/11/2026). A shell or interpreter running a program its arguments carry
+  (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node --eval`) or its
+  standard input (`sh -s`) no longer vouches for the packaged tools it
+  starts: the ransomware signal judges them (NN-L-IMP-001/-002; the kill
+  held by default) and the copy guard copies an editor it starts. An
+  interactive shell (`-bash`, `bash -l`, `bash -i`) still vouches; a package
+  transaction is trusted as before. Expect more ransomware assessments of
+  the tools a cron job, a unit's `ExecStart=/bin/sh -c …` or a
+  non-interactive `ssh host 'cmd'` runs; a record names the shell ("which
+  runs an inline program").
+- **R004 decides on the executed file in LSM mode (the default)**
+  (BUG-88). A memfd or an unlinked file is a fileless exec whatever path
+  reached it: `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`,
+  `/dev/stdin`, a relative `fd/N`, a symlink to a descriptor,
+  `/proc/<pid>/exe` and `map_files/` ran an unlinked file without the kill
+  before. Tracepoint mode reads the path with the posture's one reader of a
+  `/proc` link (`crates/nn-core/src/posture/proc_link.rs`). Not fileless:
+  the agent's own worker, systemd's executor left unlinked by an upgrade —
+  by its identity (`(dev, ino)` of the packaged executor, which the agent
+  records at its start, from the managers' open copies too, and every
+  minute: "R004: systemd-executor known by its identity" in the journal)
+  and a systemd parent, no longer by a file *named* `systemd-executor`
+  anywhere in `/opt` or `/usr` (BUG-103) — and a process re-executing the
+  very image its parent runs (`/proc/self/exe` after a package upgrade
+  unlinked it: Chromium's and Electron's children, Docker's `reexec`).
+  Residual: a program re-executing itself in place (no fork) through
+  `/proc/self/exe` after an upgrade, or one whose parent started before the
+  agent, is killed; so is an exec that opens a binary at the instant an
+  upgrade renames its replacement over it (microseconds).

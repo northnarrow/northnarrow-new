@@ -17,8 +17,11 @@
 //!   ([`crate::impact::trust::vouches`], lot 292, BUG-49): a program a
 //!   package installed (the host's package database, as the ransomware
 //!   signal asks it; without one, a root-owned system tree stands in), or an
-//!   interpreter a package installed running no named script (an
-//!   interactive shell, `sh -c`). An editor started by a script from a home
+//!   interpreter a package installed running no program at all (an
+//!   interactive shell). Lot 310 (BUG-49): one running an inline program
+//!   (`sh -c`) or its standard input vouches for nothing — the ransomware
+//!   signal's one test ([`crate::impact::trust::is_foreign`]), the twin this
+//!   file kept until then. An editor started by a script from a home
 //!   directory, by a binary from `/tmp`, `/opt` or `/usr/local` that no
 //!   package installed, by an interpreter whose options could not be read
 //!   (lot 292, BUG-44) or by a deleted executable is not trusted: what
@@ -38,7 +41,7 @@ use parking_lot::Mutex;
 
 use crate::impact::trust::{topmost_same, vouches, ProgramOwners};
 use crate::posture::lineage::{
-    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity, Runs,
+    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
 };
 
 /// Editors and the version-control client: programs a person runs to
@@ -144,16 +147,11 @@ pub fn program_of(id: &ExecIdentity) -> String {
     id.program()
 }
 
-/// A hop that vouches for nothing below it: neither a program root
-/// installed nor an installed interpreter running no named script. Lot
-/// 292 (BUG-44): an interpreter whose options could not be read is one.
-pub fn is_foreign(id: &ExecIdentity) -> bool {
-    if id.is_installed_program() {
-        return false;
-    }
-    let exe = id.exe.to_string_lossy();
-    !(id.runs == Runs::Inline && is_interpreter(&id.exe) && in_system_tree(&exe))
-}
+/// A hop that vouches for nothing below it: the ransomware signal's test
+/// ([`crate::impact::trust::is_foreign`]; lot 310: this file's twin of it
+/// is gone). Lot 292 (BUG-44): an interpreter whose options could not be
+/// read is one; lot 310 (BUG-49): so is one running an inline program.
+pub use crate::impact::trust::is_foreign;
 
 /// The pure decision. `lineage`: the writer's identity at index 0, then its
 /// ancestors nearest first (`None`: unknown). `writers`: the trusted-writer
@@ -336,6 +334,7 @@ pub fn parse_stat_start(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::posture::lineage::Runs;
 
     fn id(exe: &str, script: Option<&str>) -> ExecIdentity {
         ExecIdentity {
@@ -368,7 +367,9 @@ mod tests {
             judge(Some(&l), &writers(), false, &distro),
             Trust::Trusted(Trusted::Writer("/usr/bin/vim.basic".into()))
         );
-        // through sudo and `sh -c`
+        // through sudo and a shell running no program (`sudo -s`); lot 310:
+        // `sh -c` vouches for nothing
+        // (`an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor`)
         let l = [
             (300, id("/usr/bin/git", None)),
             (250, id("/usr/bin/dash", None)),
@@ -599,16 +600,77 @@ mod tests {
                 "{argv:?}"
             );
         }
-        // `sh -c` and an interactive shell still vouch
+        // an interactive shell still vouches (lot 310: `sh -ec 'vim x'` no
+        // longer does, the decision of 11/11/2026 on BUG-49:
+        // `an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor`)
         let l = [
             (300, id("/usr/bin/vim.basic", None)),
             (
                 250,
-                ExecIdentity::of_exec("/usr/bin/dash", &args(&["sh", "-ec", "vim x"])),
+                ExecIdentity::of_exec("/usr/bin/bash", &args(&["-bash"])),
             ),
-            (200, id("/usr/bin/bash", None)),
+            (200, id("/usr/sbin/sshd", None)),
         ];
         assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+    }
+
+    /// Lot 310, the twin of the ransomware signal's tests: an editor
+    /// started by an inline shell (BUG-49, the decision of 11/11/2026), or
+    /// by a bash whose one-hyphen long option was read as letters (BUG-97:
+    /// `-noprofile`'s two `o` took two arguments and the identity became
+    /// `/usr/bin/aws`, an installed program that vouched), or by `zsh -ovi`
+    /// (BUG-100) or `node --eval=` (BUG-99), is started by a foreign
+    /// program: its writes are copied.
+    #[test]
+    fn an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (exe, argv, ancestor) in [
+            (
+                "/usr/bin/dash",
+                &["sh", "-ec", "vim x"][..],
+                "/usr/bin/dash",
+            ),
+            ("/usr/bin/bash", &["bash", "-s"], "/usr/bin/bash"),
+            (
+                "/usr/bin/bash",
+                &["bash", "-noprofile", "/tmp/steal.sh", "x", "/usr/bin/aws"],
+                "/tmp/steal.sh",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-rcfile", "/etc/x", "/tmp/steal.sh"],
+                "/tmp/steal.sh",
+            ),
+            (
+                "/usr/bin/zsh",
+                &["zsh", "-ovi", "/tmp/steal.zsh", "/usr/bin/aws"],
+                "/tmp/steal.zsh",
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--eval=x()", "/usr/bin/aws"],
+                "/usr/bin/node",
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--run", "build", "/usr/bin/aws"],
+                "/usr/bin/node",
+            ),
+        ] {
+            let l = [
+                (300, id("/usr/bin/vim.basic", None)),
+                (250, ExecIdentity::of_exec(exe, &args(argv))),
+                (200, id("/usr/sbin/sshd", None)),
+            ];
+            assert_eq!(
+                judge(Some(&l), &writers(), false, &distro),
+                Trust::Untrusted(Untrusted::ForeignAncestor {
+                    writer: "/usr/bin/vim.basic".into(),
+                    ancestor: ancestor.into(),
+                }),
+                "{argv:?}"
+            );
+        }
     }
 
     /// BUG-49: an editor started by a binary no package installed, in

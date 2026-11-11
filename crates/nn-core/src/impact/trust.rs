@@ -17,9 +17,14 @@
 //!   package database ([`ProgramOwners`]) — **and** every hop of its lineage
 //!   vouches for it ([`vouches`], lot 292, BUG-49): every ancestor up to
 //!   PID 1 above the writer and its forked copies is a program a package
-//!   installed, or an interpreter a package installed running no named
-//!   script (an interactive shell, `sh -c`), and none is foreign
-//!   ([`is_foreign`]). `rsync`, `tar`, `git`, `cp`, a compiler, a
+//!   installed, or an interpreter a package installed running no program
+//!   at all (an interactive shell), and none is foreign ([`is_foreign`]).
+//!   Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running
+//!   an inline program (`sh -c`, `python3 -c`, `perl -e`) or its standard
+//!   input (`sh -s`) vouches for nothing ([`Runs::Code`]): that program is
+//!   the caller's, and a webshell's `sh -c 'openssl enc …'` made the
+//!   packaged `openssl` a trusted writer. A package transaction stays
+//!   trusted as before (its own test, above). `rsync`, `tar`, `git`, `cp`, a compiler, a
 //!   package-installed backup agent or database, started by a person or a
 //!   unit, are trusted this way; the same programs started by a script from
 //!   a home directory or `/tmp`, by a binary in `/opt` or `/usr/local` no
@@ -106,9 +111,11 @@ pub fn program_of(id: &ExecIdentity) -> String {
 }
 
 /// A hop that vouches for nothing below it: neither a program root
-/// installed nor an installed interpreter running no named script (the
-/// test of lab PR 222's `cow::trust::is_foreign`). Lot 292 (BUG-44): an
-/// interpreter whose options could not be read ([`Runs::Unknown`]) is one.
+/// installed nor an installed interpreter running no program at all (the
+/// test of lab PR 222's copy on first write, which calls this one). Lot 292
+/// (BUG-44): an interpreter whose options could not be read
+/// ([`Runs::Unknown`]) is one; lot 310 (BUG-49): so is one running an
+/// inline program or its standard input ([`Runs::Code`]).
 pub fn is_foreign(id: &ExecIdentity) -> bool {
     if id.is_installed_program() {
         return false;
@@ -150,22 +157,23 @@ fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
 
 /// Lot 292 (BUG-49): an ancestor vouches for what it starts when a package
 /// installed its program ([`packaged`]), or when it is an interpreter a
-/// package installed running no named script (an interactive shell, `sh
-/// -c`). Lying in a root-owned tree (`/opt/x`, `/usr/local/bin/x`) is not
-/// being installed by a package, and an interpreter whose options could
-/// not be read vouches for nothing.
+/// package installed running no program at all (an interactive shell).
+/// Lying in a root-owned tree (`/opt/x`, `/usr/local/bin/x`) is not being
+/// installed by a package, an interpreter whose options could not be read
+/// vouches for nothing, and (lot 310) nor does one running an inline
+/// program (`sh -c`) or its standard input ([`Runs::Code`]).
 pub fn vouches(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
     packaged(id, owned)
         || (id.runs == Runs::Inline && is_interpreter(&id.exe) && owned_file(&id.exe, owned))
 }
 
-/// Why a hop that is not trusted is not: what it runs is not known, or no
-/// package installed it.
+/// Why a hop that is not trusted is not: what it runs is not known, it runs
+/// the caller's inline program (lot 310), or no package installed it.
 fn not_installed(id: &ExecIdentity) -> &'static str {
-    if matches!(id.runs, Runs::Unknown(_)) {
-        "its arguments do not tell what it runs"
-    } else {
-        "no package installed it"
+    match id.runs {
+        Runs::Unknown(_) => "its arguments do not tell what it runs",
+        Runs::Code => "it runs an inline program",
+        _ => "no package installed it",
     }
 }
 
@@ -210,6 +218,12 @@ pub fn judge(
         } else if matches!(id.runs, Runs::Unknown(_)) {
             format!(
                 "{} was started by {}, whose arguments do not tell what it runs",
+                program_of(writer),
+                program_of(id)
+            )
+        } else if id.runs == Runs::Code {
+            format!(
+                "{} was started by {}, which runs an inline program",
                 program_of(writer),
                 program_of(id)
             )
@@ -600,19 +614,87 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
-    /// BUG-49, what keeps vouching: an interactive shell or `sh -c` a
-    /// package installed, a packaged daemon, a packaged script; and with no
-    /// package database to ask, a root-owned tree, as before. An interpreter
-    /// no package installed vouches for nothing, even running no script.
+    /// Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running
+    /// an inline program or its standard input vouches for nothing — the
+    /// LOTL ransomware of the triage, a webshell's `sh -c 'openssl enc …'`,
+    /// is judged, and the kill reaches the inline shell. A package
+    /// transaction stays trusted, as before.
+    #[test]
+    fn an_inline_program_vouches_for_nothing() {
+        let inline = |exe: &str, a: &[&str]| {
+            ExecIdentity::of_exec(exe, &a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        for (shell, program) in [
+            (
+                inline("/usr/bin/dash", &["sh", "-c", "openssl enc -in x"]),
+                "/usr/bin/dash",
+            ),
+            (
+                inline("/usr/bin/bash", &["bash", "-ec", "gpg -c x"]),
+                "/usr/bin/bash",
+            ),
+            (inline("/usr/bin/bash", &["bash", "-s"]), "/usr/bin/bash"),
+            (
+                inline("/usr/bin/python3.12", &["python3", "-c", "import os"]),
+                "/usr/bin/python3.12",
+            ),
+            (
+                inline("/usr/bin/perl", &["perl", "-e", "system 1"]),
+                "/usr/bin/perl",
+            ),
+            (
+                inline("/usr/bin/node", &["node", "--eval=x"]),
+                "/usr/bin/node",
+            ),
+            (inline("/bin/busybox", &["sh", "-c", "x"]), "/bin/busybox"),
+        ] {
+            assert!(is_foreign(&shell), "{shell:?}");
+            assert!(!vouches(&shell, &distro), "{shell:?}");
+            let l = [
+                (400, id("/usr/bin/openssl", None)),
+                (300, shell.clone()),
+                (250, id("/usr/sbin/php-fpm8.2", None)),
+                (1, id("/usr/lib/systemd/systemd", None)),
+            ];
+            // (the messages name what was expected, not the verdict: CodeQL's
+            // cleartext-logging query reads a `Trusted` value as sensitive)
+            let got = judge(400, Some(&l), false, &distro);
+            assert!(
+                matches!(
+                    &got,
+                    Judged::Untrusted { actor: 300, key: 400, program: p, why }
+                        if p == program && why.ends_with("which runs an inline program")
+                ),
+                "{shell:?}: expected judged, actor 300 (the inline shell), key 400"
+            );
+            // the inline shell itself as the writer
+            assert!(matches!(
+                judge(300, Some(&l[1..]), false, &distro),
+                Judged::Untrusted { actor: 300, .. }
+            ));
+            // a package transaction is trusted, as before
+            assert_eq!(
+                judge(400, Some(&l), true, &distro),
+                Judged::Trusted(Trusted::PackageTransaction)
+            );
+        }
+    }
+
+    /// BUG-49, what keeps vouching: an interactive shell a package
+    /// installed, a packaged daemon, a packaged script; and with no package
+    /// database to ask, a root-owned tree, as before. An interpreter no
+    /// package installed vouches for nothing, even running no script. Lot
+    /// 310: `bash -c x` left this list (the decision of 11/11/2026, below:
+    /// [`an_inline_program_vouches_for_nothing`]); a login shell (`-bash`,
+    /// `bash -l`, `bash -i`) stays in it.
     #[test]
     fn an_installed_shell_and_packaged_programs_still_vouch() {
         for shell in [
             id("/usr/bin/bash", None),
             id("/usr/bin/dash", None),
-            ExecIdentity::of_exec(
-                "/usr/bin/bash",
-                &["bash".to_string(), "-c".into(), "x".into()],
-            ),
+            ExecIdentity::of_exec("/usr/bin/bash", &["-bash".to_string()]),
+            ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string(), "-l".into()]),
+            ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string(), "-i".into()]),
         ] {
             let l = [
                 (400, id("/usr/bin/openssl", None)),

@@ -9117,3 +9117,81 @@ number in parentheses is a lab PR.
     five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
     V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
     deny proof in a privileged e2e; then a third party's validation.
+- **Lot 310 — script and descriptor identity, one reader each (C06, C14,
+  C19; the third bug hunt's lot 1: BUG-97 P0, BUG-88 P0, BUG-99 P1,
+  BUG-100, BUG-103, BUG-104, N3; the decision of 11/11/2026 on BUG-49).**
+  - What was open: `bash -noprofile /tmp/x.sh x /usr/bin/aws` (bash's long
+    options with one hyphen read as letters), `node --eval=… /usr/bin/aws`
+    (`--name=value` skipped the table), `node --run task /usr/bin/aws`,
+    `zsh -ovi /tmp/x /usr/bin/aws` were the `aws` client — NN-L-FIM-011's
+    kill silent, and they vouched for what they started; `mono-sgen` and
+    busybox as `/bin/sh` were no interpreter; R004 knew three spellings of a
+    descriptor, so an unlinked file run by an unprivileged user through
+    `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
+    relative path or a symlink was not killed (in every posture), and any
+    file named `systemd-executor` in a root-owned tree (`/opt/app`) was
+    exempt; `sh -c` vouched for the packaged tools it ran (the triage's
+    LOTL ransomware).
+  - What changed: one getopt-style reader over a table per family
+    (`posture/script_args.rs`; anything outside it is not known, never a
+    script; `Runs::Code` for an inline program or standard input, which
+    vouches for nothing); one reader of a path through a `/proc` link
+    (`posture/proc_link.rs`); R004 in LSM mode on the executed file's flags
+    whatever the path, systemd's unlinked executor exempt by its identity
+    (recorded by the agent) and a systemd parent, a re-exec of the parent's
+    own image not fileless (the lineage keeps each exec's `(dev, ino)`); two
+    ratchets (`xtask/tests/interpreter_options.rs`, `proc_links.rs`); the
+    differential `#[ignore]` test against the real interpreters (move 3,
+    first stage). Found in the lab and fixed: the exec sensor's device is
+    the kernel's form (`MKDEV`), and R14a's worker image was compared in
+    `stat(2)`'s; the posture's ingest of an exec dropped its identity.
+  - The lab, as measured (our own guests under lease k310; the agent
+    uninstalled, the guests clean and off at the end):
+    - **Ubuntu 26.04** (`7.0.0-43-generic`, systemd 259; r1 at 7d4e03d1,
+      r2 at 9c73ff37). An unprivileged user's `O_TMPFILE` in its home,
+      executed through `/proc/self/fd/N`, `/proc/thread-self/fd/N`,
+      `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, `/dev/fd/N`, a relative
+      `fd/N` from `/proc/self`, a symlink in the home and `/proc//self/fd/N`:
+      R004 KillProcessTree for each, rc 137; an unlinked file named
+      `systemd-executor` under `/opt` (the user's): killed. Round r1 found
+      two faults, fixed before r2: a re-exec of the parent's own unlinked
+      image (bash copied to the home, removed, `/proc/self/exe` run from a
+      fork) was killed — the posture ingested execs without their
+      identity; and `systemd-run` through PID 1's unlinked executor (the
+      file replaced by an identical copy) drew R004's KillProcessTree (the
+      unit had finished) — the executor's identity was recorded in
+      `stat(2)`'s device form (`64769`) where the exec sensor reports the
+      kernel's (`MKDEV`). In r2 the re-exec ran (rc 0, no record), and
+      `systemd-run` through the unlinked executor ran with no record, both
+      with the identity recorded at the agent's start (1 identity) and after
+      an agent restart before PID 1's re-exec (2: the install path and PID
+      1's open copy); `daemon-reexec` after. NN-L-FIM-011 KillProcess (rc
+      137) on a canary `/root/.aws/credentials` (fake values, in place
+      before the agent's start) read by `bash -noprofile <reader> x
+      /usr/bin/aws`, `bash -rcfile /etc/hostname <reader> /usr/bin/aws` and
+      `node --eval=… /usr/bin/aws` (node 22.22, installed for the probe and
+      purged); a plain `cat`: recorded, as on main.
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255; r1 at 5345b5bb):
+      the same probe, the same outcomes (the eight spellings and the
+      `/opt` name killed; the parent's image re-executed ran; `systemd-run`
+      through the unlinked executor ran, at the start and after an agent
+      restart; FIM-011 killed the three misread readers, node 18.19). The
+      benign corpus: `dev` (24 steps, rc 0) — one kill, the `www-data`
+      control's R001 (rc 137), as designed and as in lots 283b and 292; the
+      records R001 High (go test, `go run`, the AppImage runs, the lab
+      user's control) and one NN-L-IMP-001 in `go test` (held), as before;
+      no R004, no new record. `ci` (15 steps, rc 0, transient units, docker
+      build and run) — no kill; R001 High for go test and `go run`, the
+      known NN-L-AT-001 ×24 of `deb-systemd-helper`'s `rmdir` of the
+      agent's drop-in directories during the cleanup's purge; no R004, no
+      NN-L-IMP record. The executor's file on both shared guests is now an
+      identical copy (`cp -p` then `mv`: same content and mode, another
+      inode).
+  - Host: named tests for each bug (the triage's versions fail on main
+    0cdfb6b; the differential test with main's reader finds BUG-97's 14
+    bash argvs, 0 on this branch over ~6,000 argvs of bash 5.2.21, dash
+    0.5.12, Python 3.12.3, perl 5.38.2); 44 mutations of the new code, 42
+    caught by named tests, 2 equivalent (removed from the code); the full
+    gates in the PR.
+  - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
+    their level.

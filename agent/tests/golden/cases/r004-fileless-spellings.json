@@ -1,0 +1,472 @@
+{
+ "about": "Lot 310 (external bug hunt, edition 1.4: BUG-88, BUG-103; the mini-hunt's variants): an unlinked file (an O_TMPFILE in the user's home) executed through every spelling of its descriptor a caller can write \u2014 /proc/thread-self/fd/N, /proc/self/task/<tid>/fd/N, /proc/<pid>/task/<tid>/fd/N, /dev/stdin, a relative fd/3 from a /proc/self working directory, a doubled slash, a `.` segment, a symlink in the home, /proc/<pid>/exe, map_files, /dev/fd/N \u2014 each R004's kill in LSM mode (the file's own flag decides); an unlinked file named systemd-executor under /opt/app or /usr/local, no identity of the packaged executor, killed; in tracepoint mode the per-thread names and /dev/stdin, killed. Controls: a memfd killed; systemd's launch of a unit (the linked executor through its descriptor) and an ordinary binary, nothing. On main the per-thread names, /dev/stdin, the relative path, the symlink, /proc/<pid>/exe and map_files ran the unlinked file without a verdict, and the files named systemd-executor were exempt.",
+ "fires": [
+  "R004_ExecFromProcSelfFd"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3599000000000,
+     "argv": [
+      "-bash"
+     ],
+     "parent_comm": "sshd",
+     "start_ns": 3598999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 500
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100011,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/thread-self/fd/3",
+     "timestamp_ns": 3601000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3600999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900001
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100012,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/task/6100012/fd/3",
+     "timestamp_ns": 3602000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3601999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900002
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100013,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/6100013/task/6100013/fd/3",
+     "timestamp_ns": 3603000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3602999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900003
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100014,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/dev/stdin",
+     "timestamp_ns": 3604000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3603999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900004
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100015,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "fd/3",
+     "timestamp_ns": 3605000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3604999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900005
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100016,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc//self/fd/3",
+     "timestamp_ns": 3606000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3605999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900006
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100017,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/./fd/3",
+     "timestamp_ns": 3607000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3606999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900007
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100018,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/home/u/link-to-proc-self-fd-3",
+     "timestamp_ns": 3608000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3607999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900008
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100019,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/6100001/exe",
+     "timestamp_ns": 3609000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3608999000000,
+     "exe": {
+      "path": "/home/u/.cache/x",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900009
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100020,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/map_files/7f0000000000-7f0000001000",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3609999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900010
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100021,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/dev/fd/5",
+     "timestamp_ns": 3611000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3610999000000,
+     "exe": {
+      "path": "/home/u/#5242934",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900011
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100031,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/fd/3",
+     "timestamp_ns": 3612000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3611999000000,
+     "exe": {
+      "path": "/opt/app/systemd-executor",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900012
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100032,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/fd/3",
+     "timestamp_ns": 3613000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3612999000000,
+     "exe": {
+      "path": "/usr/local/lib/x/systemd-executor",
+      "flags": 9,
+      "dev": 2049,
+      "ino": 900013
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100041,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/thread-self/fd/3",
+     "timestamp_ns": 3640000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3639999000000
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100042,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/task/6100042/fd/4",
+     "timestamp_ns": 3641000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3640999000000
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100043,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/dev/stdin",
+     "timestamp_ns": 3642000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3641999000000
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100051,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "payload",
+     "filename": "/proc/self/fd/3",
+     "timestamp_ns": 3614000000000,
+     "argv": [
+      "payload"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3613999000000,
+     "exe": {
+      "path": "/memfd:x",
+      "flags": 5,
+      "dev": 2049,
+      "ino": 900014
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100061,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "systemd-executor",
+     "filename": "/proc/self/fd/9",
+     "timestamp_ns": 3660000000000,
+     "argv": [
+      "/usr/lib/systemd/systemd-executor",
+      "--deserialize",
+      "68"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3659999000000,
+     "exe": {
+      "path": "/usr/lib/systemd/systemd-executor",
+      "flags": 17,
+      "dev": 2049,
+      "ino": 3000
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100062,
+     "ppid": 6100001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "ls",
+     "filename": "/usr/bin/ls",
+     "timestamp_ns": 3661000000000,
+     "argv": [
+      "ls"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3660999000000,
+     "exe": {
+      "path": "/usr/bin/ls",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 3001
+     }
+    }
+   }
+  }
+ ]
+}
