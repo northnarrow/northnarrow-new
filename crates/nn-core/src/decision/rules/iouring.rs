@@ -447,11 +447,13 @@ mod model {
     /// An opcode of each class (OPENAT, READ, CONNECT, SEND) and of none (NOP).
     const OPS: [(u32, u8); 5] = [(FO, 18), (FRW, 22), (NC, 16), (NS, 26), (0, 0)];
 
+    fn stat(proc: &Path, pid: u32) -> std::path::PathBuf {
+        proc.join(pid.to_string()).join("stat")
+    }
+
     fn write_stat(proc: &Path, pid: u32, start: u64) {
-        let d = proc.join(pid.to_string());
-        std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
-            d.join("stat"),
+            stat(proc, pid),
             format!("{pid} (evil) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n"),
         )
         .unwrap();
@@ -473,7 +475,7 @@ mod model {
 
     fn run(rng: &mut Rng, proc: &Path, next_start: &mut u64) -> Result<(), String> {
         for pid in PIDS {
-            let _ = std::fs::remove_dir_all(proc.join(pid.to_string()));
+            let _ = std::fs::remove_file(stat(proc, pid));
         }
         let tracker = crate::posture::lineage::AuthSessionTracker::<H>::new(proc);
         let al = Arc::new(CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()).with_identity(tracker));
@@ -505,7 +507,7 @@ mod model {
                 }
                 1 => {
                     if live.remove(&pid).is_some() {
-                        std::fs::remove_dir_all(proc.join(pid.to_string())).unwrap();
+                        std::fs::remove_file(stat(proc, pid)).unwrap();
                     }
                 }
                 2..=5 => {
@@ -557,6 +559,9 @@ mod model {
     #[test]
     fn nn_l_iou_002_fires_at_most_once_per_process() {
         let tmp = tempfile::TempDir::new().unwrap();
+        for pid in PIDS {
+            std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+        }
         let mut next_start = 1_000;
         check("NN-L-IOU-002 once", 0x3142_0000, SEQUENCES, |rng| {
             run(rng, tmp.path(), &mut next_start)

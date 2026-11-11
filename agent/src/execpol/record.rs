@@ -868,4 +868,107 @@ mod bughunt3 {
             rep.seen.len()
         );
     }
+
+    /// Lot 314 (F3, `nn_core::model_check`): the repeat table as a state
+    /// machine. A seeded generator draws record-only findings — a
+    /// `GLIBC_TUNABLES` benign or of the CVE-2023-4911 shape behind the same
+    /// shown characters, history disabled with a few `HISTFILE`s, by two
+    /// users in two tiers, from two programs — and exec denies, at times a
+    /// few minutes apart. After each: a record is admitted exactly when the
+    /// oracle (its whole record — rule, severity, uid, file, every field of
+    /// the evidence — last admitted at least a window ago, or never) says
+    /// so, a deny always; the table within its cap.
+    #[test]
+    fn the_repeat_table_keeps_its_invariants() {
+        use nn_core::model_check::{check, Rng, SEQUENCES};
+        use std::collections::HashMap;
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let tunables = [
+            format!("{prefix}glibc.malloc.tcache_m=1"),
+            format!("{prefix}glibc.malloc.mxfast=g=A"),
+            "glibc.malloc.arena_max=1".to_string(),
+        ];
+        let hist = ["/dev/null", "/a/1", "/a/2"];
+        let window = Duration::from_secs(600);
+        let draw = |rng: &mut Rng| -> (ExecPolRaw, Event) {
+            let uid = *rng.pick(&[1000u32, 1001]);
+            let session = rng.one_in(2);
+            match rng.below(5) {
+                0..=1 => {
+                    let mut r = tunables_at_su(rng.pick(&tunables));
+                    r.uid = uid;
+                    if !session {
+                        r.tier = tier::SERVICE;
+                    }
+                    (r, su_event(uid, "/usr/bin/su"))
+                }
+                2..=3 => {
+                    let mut r = ExecPolRaw::zeroed();
+                    r.kind = kind::EXEC;
+                    r.pid = 7000;
+                    r.uid = uid;
+                    r.tier = if session { tier::SESSION } else { tier::SERVICE };
+                    r.env_flags = env_flags::HISTSIZE_ZERO | env_flags::HISTFILE;
+                    r.env_action = action::RECORD;
+                    let v = rng.pick(&hist);
+                    r.hist[..v.len()].copy_from_slice(v.as_bytes());
+                    let path = rng.pick(&["/usr/bin/sh", "/usr/bin/bash"]);
+                    (r, su_event(uid, path))
+                }
+                _ => {
+                    let mut r = ExecPolRaw::zeroed();
+                    r.kind = kind::EXEC;
+                    r.pid = 7001;
+                    r.uid = uid;
+                    r.classes = class::MEMFD;
+                    r.action = action::DENY;
+                    r.tier = tier::SERVICE;
+                    r.file_mode = 0o100755;
+                    (r, su_event(uid, "/memfd:x (deleted)"))
+                }
+            }
+        };
+        check("exec policy repeats", 0x3143_0000, SEQUENCES, |rng| {
+            let mut rep = Repeats::new(window);
+            let mut oracle: HashMap<String, Instant> = HashMap::new();
+            let t0 = Instant::now();
+            let mut now = t0;
+            for step in 0..30 {
+                now += Duration::from_secs(rng.below(400));
+                let (raw, event) = draw(rng);
+                for rec in records_of(&raw, &event, "p") {
+                    let uid = match &rec.event {
+                        Event::ExecCheck { uid, .. } => *uid,
+                        _ => u32::MAX,
+                    };
+                    let key = format!(
+                        "{}|{:?}|{uid}|{}|{:?}",
+                        rec.verdict.rule_id,
+                        rec.verdict.severity,
+                        rec.verdict.event_filename,
+                        rec.evidence
+                    );
+                    let deny = rec.evidence.decision == "deny";
+                    let want = deny
+                        || oracle
+                            .get(&key)
+                            .is_none_or(|t| now.duration_since(*t) >= window);
+                    let got = rep.admit(&rec, now);
+                    if got != want {
+                        return Err(format!(
+                            "step {step}: {} {:?} admitted {got}, the oracle says {want}",
+                            rec.verdict.rule_id, rec.verdict.severity
+                        ));
+                    }
+                    if got && !deny {
+                        oracle.insert(key, now);
+                    }
+                }
+                if rep.seen.len() > rep.seen.cap() {
+                    return Err(format!("step {step}: the table past its cap"));
+                }
+            }
+            Ok(())
+        });
+    }
 }
