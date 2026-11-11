@@ -870,6 +870,17 @@ mod lot315 {
         ));
     }
 
+    /// BUG-102: the flags of a task whose `comm` is not UTF-8 (its own
+    /// choice) are read — a strict text read refused the whole `stat`,
+    /// and every open of that task then counted as a write (a copy each
+    /// time: safe, not cheap).
+    #[test]
+    fn bug102_the_flags_of_a_task_named_with_any_bytes_are_read() {
+        let p = nn_linux::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let stat = read_task_stat(p.pid() as i32).expect("its stat");
+        assert_eq!(io_thread_in_stat(&stat), Some(false), "{stat}");
+    }
+
     /// BUG-102 on this host's kernel: a real io_uring worker of this
     /// process (an `IOSQE_ASYNC` read of an empty pipe holds one) is known
     /// by its flags whatever its `comm`, and its opens count as writes; a

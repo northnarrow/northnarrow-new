@@ -360,11 +360,14 @@ reuse() {
     local dir=$TREE/docs try ino_x ino_d pid sum_d src
     [[ -d $dir ]] || notrun "no $dir (run setup and make_tree first: a marked directory)"
     find "$dir" -mindepth 1 -delete 2>/dev/null
+    # the owner's directory (setup made it root's; `run` hands it over too)
+    chown "$LAB_USER:$LAB_USER" "$TREE" "$dir"
     src=/home/$LAB_USER/nn-reuse-src.bin
     sudo -u "$LAB_USER" bash -c "head -c 4096 /dev/urandom > $src && touch -d '2025-01-01 00:00' $src"
     for try in $(seq 1 30); do
         sudo -u "$LAB_USER" bash -c "printf 'x original %s\\n' $try > $dir/x.txt; head -c 8192 /dev/zero | tr '\\0' x >> $dir/x.txt"
-        ino_x=$(stat -c %i "$dir/x.txt")
+        ino_x=$(stat -c %i "$dir/x.txt") || notrun "$LAB_USER cannot write $dir"
+        ino_d=
         sum_x=$(sha256sum < "$dir/x.txt" | cut -d' ' -f1)
         # the attack: a write-open (the guard copies first), junk, then the file deleted
         pid=$(sudo -u "$LAB_USER" python3 -I -c '
