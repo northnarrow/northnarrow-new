@@ -723,3 +723,119 @@ mod tests {
         assert!(rep.admit(&d, t0));
     }
 }
+
+/// Bug hunt 3 (edition 1.4), BUG-92, BUG-125: tests that
+/// assert the promised behaviour (they fail on 0cdfb6b where the defect is)
+/// and guards that must keep passing.
+#[cfg(test)]
+mod bughunt3 {
+    use super::*;
+    use common::wire::execpol::tier_sig;
+
+    fn su_event(uid: u32, path: &str) -> Event {
+        Event::ExecCheck {
+            pid: 5930,
+            ppid: 1,
+            uid,
+            comm: "su".into(),
+            filename: String::new(),
+            timestamp_ns: 7,
+            exe: ExeIdentity {
+                path: path.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The kernel's report of `GLIBC_TUNABLES=<v>` at the exec of the
+    /// set-uid-root `/usr/bin/su` by uid 1000 in a login session.
+    fn tunables_at_su(v: &str) -> ExecPolRaw {
+        let mut r = ExecPolRaw::zeroed();
+        r.kind = kind::EXEC;
+        r.pid = 5930;
+        r.uid = 1000;
+        r.file_uid = 0;
+        r.file_mode = 0o104755;
+        r.tier = tier::SESSION | tier_sig::LOGIN | tier_sig::TTY;
+        r.env_flags = env_flags::GLIBC_TUNABLES;
+        r.env_action = action::RECORD;
+        r.tunables[..v.len()].copy_from_slice(v.as_bytes());
+        r.tunables_len = v.len() as u32;
+        r
+    }
+
+    /// BUG-92: a Critical Looney Tunables record is not a "repeat" of a
+    /// Medium one whose first 96 shown characters and length are the same.
+    #[test]
+    fn bug92_critical_tunables_is_not_a_repeat_of_a_medium() {
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let benign = format!("{prefix}glibc.malloc.tcache_m=1");
+        let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
+        assert_eq!(benign.len(), exploit.len());
+        assert!(benign.len() > 96 && benign.len() < 127);
+        let medium = records_of(&tunables_at_su(&benign), &su_event(1000, "/usr/bin/su"), "p")
+            .remove(0);
+        let critical =
+            records_of(&tunables_at_su(&exploit), &su_event(1000, "/usr/bin/su"), "p").remove(0);
+        assert_eq!(medium.verdict.rule_id, RULE_ENV);
+        assert_eq!(medium.verdict.severity, Severity::Medium);
+        assert_eq!(critical.verdict.severity, Severity::Critical);
+        assert!(critical.verdict.reasoning.contains("CVE-2023-4911"));
+        // what the repeat key reads is the same in both records
+        assert_eq!(medium.evidence.values, critical.evidence.values);
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        assert!(rep.admit(&medium, t0), "the first record is new");
+        assert!(
+            rep.admit(&critical, t0 + Duration::from_secs(5)),
+            "the Critical CVE-2023-4911 record was held back as a repeat of the Medium one \
+             (key without severity; values cut at 96 characters)"
+        );
+    }
+
+    /// BUG-92 guard: a true repeat (same record, same severity) is still
+    /// held back within the window.
+    #[test]
+    fn bug92_guard_a_true_repeat_is_held_back() {
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
+        let critical =
+            records_of(&tunables_at_su(&exploit), &su_event(1000, "/usr/bin/su"), "p").remove(0);
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        assert!(rep.admit(&critical, t0));
+        assert!(!rep.admit(&critical, t0 + Duration::from_secs(5)));
+    }
+
+    /// BUG-125: the repeat table stays bounded however many distinct
+    /// record-only findings an unprivileged user makes in the window
+    /// (`HISTSIZE=0 HISTFILE=/a/N sh -c :`, N always different).
+    #[test]
+    fn bug125_the_repeat_table_is_bounded() {
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        for n in 0..20_000u32 {
+            let mut r = ExecPolRaw::zeroed();
+            r.kind = kind::EXEC;
+            r.pid = 7000 + n;
+            r.uid = 1000;
+            r.tier = tier::SESSION;
+            r.env_flags = env_flags::HISTSIZE_ZERO | env_flags::HISTFILE;
+            r.env_action = action::RECORD;
+            let v = format!("/a/{n}");
+            r.hist[..v.len()].copy_from_slice(v.as_bytes());
+            let mut ev = su_event(1000, "/usr/bin/sh");
+            if let Event::ExecCheck { pid, .. } = &mut ev {
+                *pid = r.pid;
+            }
+            let rec = records_of(&r, &ev, "p").remove(0);
+            assert!(rep.admit(&rec, t0 + Duration::from_millis(u64::from(n))));
+        }
+        assert!(
+            rep.seen.len() <= 4097,
+            "the repeat table has no ceiling: {} live keys after 20000 distinct findings in 20 s \
+             (admit's own threshold is 4096)",
+            rep.seen.len()
+        );
+    }
+}

@@ -324,3 +324,72 @@ mod tests {
         assert!(r2.evaluate(&by(804, false, "node", both, 16)).is_none());
     }
 }
+
+/// Triage bug hunt 3, BUG-83: NN-L-IOU-002 promises one verdict per
+/// process, on the record that completes the file+network pair
+/// (module doc line 21, comment at `evaluate`). The sensor
+/// (agent-ebpf/src/io_uring.rs:145-153) re-emits the full cumulative
+/// bitmap on every new class and at most once a second afterwards, with
+/// the opcode of that moment as `last_opcode`.
+#[cfg(test)]
+mod bug83 {
+    use super::*;
+    use crate::posture::host::testing::TestHost as H;
+    use common::wire::{
+        IOURING_CLASS_FILE_OPEN as FO, IOURING_CLASS_FILE_RW as FRW,
+        IOURING_CLASS_NET_CONNECT as NC, IOURING_CLASS_NET_SENDRECV as NS,
+    };
+
+    fn ev(classes: u32, last_opcode: u8) -> Event {
+        Event::IoUring {
+            created: false,
+            pid: 4242,
+            uid: 1000,
+            comm: "evil".to_string(),
+            classes,
+            count: 32,
+            last_opcode,
+            sq_thread: false,
+            timestamp_ns: 1,
+        }
+    }
+
+    fn fired_on(records: &[Event]) -> Vec<usize> {
+        let al = Arc::new(CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()));
+        let r = NnLIou002IoUringFileAndNetwork::new(al);
+        records
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| r.evaluate(e).is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn bug83_new_classes_and_periodic_records_do_not_refire() {
+        let records = [
+            ev(FO, 18),                 // OPENAT: file only
+            ev(FO | NC, 16),            // CONNECT: completes the pair
+            ev(FO | FRW | NC, 22),      // READ: new class
+            ev(FO | FRW | NC | NS, 26), // SEND: new class
+            ev(FO | FRW | NC | NS, 22), // periodic (1 s)
+            ev(FO | FRW | NC | NS, 26), // periodic (1 s)
+        ];
+        assert_eq!(
+            fired_on(&records),
+            vec![1],
+            "NN-L-IOU-002 must fire once per process, on the completing record"
+        );
+    }
+
+    #[test]
+    fn bug83_two_class_server_periodic_records_do_not_refire() {
+        let records = [
+            ev(NC, 13),       // ACCEPT
+            ev(NC | FRW, 22), // READ: completes the pair
+            ev(NC | FRW, 23), // periodic WRITE
+            ev(NC | FRW, 22), // periodic READ
+        ];
+        assert_eq!(fired_on(&records), vec![1], "periodic records re-fire");
+    }
+}

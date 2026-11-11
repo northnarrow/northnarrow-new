@@ -1642,4 +1642,70 @@ mod tests {
         assert_eq!(j.counts().unwritten, 0);
         std::fs::write(dir.join("done"), b"").unwrap();
     }
+
+    /// Bug hunt 3 triage (BUG-107): the head the heartbeat names right
+    /// after the rotation thread rotated the chain is (N, 0, H) — H the
+    /// terminator closing archive N-1. Its tail cut, the head is not held
+    /// (`holds` docs: "`false`: its tail was cut or rewritten since").
+    #[test]
+    fn bug107_a_head_named_right_after_a_rotation_is_not_held_once_the_tail_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let log = ActionJournal::open_log(
+            &active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: 8 * 1024,
+                max_archives: 8,
+                file_mode: 0o600,
+            },
+            Arc::new(OnlyTheRotor),
+        )
+        .unwrap();
+        let j = ActionJournal::late();
+        j.bind(log, &active);
+        let owed = |j: &ActionJournal| match &*j.inner.writer.lock() {
+            Writer::Log(log) => log.rotation_owed(),
+            _ => false,
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let mut pid = 1;
+        let (file, bytes, hash) = loop {
+            assert!(Instant::now() < deadline, "no head right after a rotation");
+            j.intent(intent_row("KillProcess", pid)).finish(
+                ActionResult::Success,
+                "Killed".into(),
+                None,
+            );
+            pid += 1;
+            while owed(&j) {
+                assert!(Instant::now() < deadline, "the rotation thread never rotated");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let h = j.head().unwrap();
+            if h.0 > 1 && h.1 == 0 {
+                break h;
+            }
+        };
+        let archive = crate::chainlog::archive_path_for(&active, file - 1);
+        let text = std::fs::read_to_string(&archive).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let last = lines.last().unwrap();
+        assert!(
+            last.contains("\"rotate\"") && last.contains(&hash),
+            "premise: the head names the terminator of archive {}: {last}",
+            file - 1
+        );
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0, "premise: active empty");
+        assert_eq!(j.holds(file, bytes, &hash), Some(true), "guard: intact, held");
+        // the archive's tail cut: its terminator and the last action's rows
+        let kept = lines[..lines.len() - 3].join("\n") + "\n";
+        std::fs::write(&archive, kept).unwrap();
+        assert_eq!(
+            j.holds(file, bytes, &hash),
+            Some(false),
+            "BUG-107: head ({file}, {bytes}) named after the rotation, archive {} tail cut",
+            file - 1
+        );
+    }
 }
