@@ -1800,13 +1800,20 @@ mod tests {
             std::fs::write(l.scope.join("plan.txt"), b"half encrypted").unwrap();
             take(&l, "plan.txt", None, running, vec![running, ROOT], t1 + 1000);
             std::fs::write(l.scope.join("plan.txt"), b"fully encrypted").unwrap();
+            // another file of the tree, its only writer gone: restored
+            std::fs::write(l.scope.join("other.txt"), b"other original").unwrap();
+            take(&l, "other.txt", None, C1, vec![C1, ROOT], t1 + 2000);
+            std::fs::write(l.scope.join("other.txt"), b"other encrypted").unwrap();
             let rep = l.store.restore(&tree(), false, &by());
             assert_eq!(rep.skipped, 1, "{:?}", rep.rows);
-            assert!(
-                rep.rows[0].detail.contains(&format!("pid {me}")),
-                "{}",
-                rep.rows[0].detail
+            assert_eq!(rep.restored, 1, "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("other.txt")).unwrap(),
+                b"other original"
             );
+            let plan = rep.rows.iter().find(|r| r.path.ends_with("plan.txt")).unwrap();
+            assert_eq!(plan.action, "skipped");
+            assert!(plan.detail.contains(&format!("pid {me}")), "{}", plan.detail);
             assert_eq!(
                 std::fs::read(l.scope.join("plan.txt")).unwrap(),
                 b"fully encrypted",

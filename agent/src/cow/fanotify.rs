@@ -345,16 +345,26 @@ pub fn io_thread_in_stat(stat: &str) -> Option<bool> {
 /// opens count as writes, and so does an open by a task whose flags cannot
 /// be read.
 pub fn read_open_intent(tid: i32) -> OpenIntent {
-    match read_task_stat(tid).as_deref().map(io_thread_in_stat) {
+    let stat = read_task_stat(tid);
+    open_intent(stat.as_deref(), || {
+        std::fs::read_to_string(format!("/proc/{tid}/syscall")).ok()
+    })
+}
+
+/// [`read_open_intent`] from the task's `stat` text (`None`: unreadable)
+/// and its `syscall` line, read only for a task that is not an io_uring
+/// thread.
+fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> Option<String>) -> OpenIntent {
+    match stat.map(io_thread_in_stat) {
         Some(Some(false)) => {}
         Some(Some(true)) => {
             return OpenIntent::Unknown("an io_uring thread: its syscall line is its creator's")
         }
         _ => return OpenIntent::Unknown("/proc/<tid>/stat unreadable"),
     }
-    match std::fs::read_to_string(format!("/proc/{tid}/syscall")) {
-        Ok(text) => classify_syscall_line(&text),
-        Err(_) => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
+    match syscall() {
+        Some(text) => classify_syscall_line(&text),
+        None => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
     }
 }
 
@@ -812,6 +822,22 @@ mod lot315 {
         assert_eq!(io_thread_in_stat("4242 (x) S 1"), None);
         assert_eq!(io_thread_in_stat(""), None);
         assert_eq!(io_thread_in_stat(&stat("x", 0).replace(" 0 -1 0 ", " 0 -1 zz ")), None);
+    }
+
+    /// BUG-102: the flag decides before the line — an io_uring worker
+    /// whose line reads as a user thread's `openat(…, O_RDONLY)` (registers
+    /// and all) is still a write; a task whose flags cannot be read too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bug102_the_flag_decides_before_the_syscall_line() {
+        let read_line = || Some("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string());
+        let worker = "4243 (iou-wrk-4242) S 1 4242 4242 0 -1 2097232 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
+        let thread = "4242 (enc) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
+        assert!(matches!(open_intent(Some(worker), read_line), OpenIntent::Unknown(_)));
+        assert!(matches!(open_intent(None, read_line), OpenIntent::Unknown(_)));
+        assert!(matches!(open_intent(Some("4242 (x"), read_line), OpenIntent::Unknown(_)));
+        assert_eq!(open_intent(Some(thread), read_line), OpenIntent::ReadOnly);
+        assert!(matches!(open_intent(Some(thread), || None), OpenIntent::Unknown(_)));
     }
 
     /// BUG-102 on this host's kernel: a real io_uring worker of this
