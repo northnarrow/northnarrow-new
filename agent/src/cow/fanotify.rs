@@ -368,12 +368,10 @@ fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> io::Result<String>)
     }
 }
 
-/// `/proc/<tid>/stat`, its `comm` whatever bytes the task chose.
+/// `/proc/<tid>/stat`, its `comm` whatever bytes the task chose (the byte
+/// reader of lot 311).
 fn read_task_stat(tid: i32) -> Option<String> {
-    // TODO(lot 315): nn_linux::state_read::read_state once #537 lands
-    std::fs::read(format!("/proc/{tid}/stat"))
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+    nn_linux::state_read::read_state(format!("/proc/{tid}/stat")).ok()
 }
 
 /// The thread `tid` belongs to this process.
