@@ -493,11 +493,11 @@ mod tests {
             proc_identity(tmp.path(), pid, uid, cgroup);
         }
         let g = guard(tmp.path(), 10, ExemptPids::with_agent(10));
-        for &(pid, uid, cgroup, protected) in cases {
+        for &(pid, _, cgroup, protected) in cases {
             assert_eq!(
                 g.protected_reason(pid).is_some(),
                 protected,
-                "uid {uid} in {cgroup}"
+                "case {pid} (its real id in the table above) in {cgroup}"
             );
         }
     }

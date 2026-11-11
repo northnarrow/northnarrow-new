@@ -1032,6 +1032,12 @@ mod tests {
             sh.id(),
             String::from_utf8_lossy(&seen)
         );
+        // what the walk sees, for the failure's message
+        let walk = collect_descendants(sh.id());
+        let seen_by_procfs = procfs::process::Process::new(kid as i32)
+            .and_then(|p| p.stat())
+            .map(|st| (st.ppid, st.comm));
+        let named = ProcRef::open(sh.id()).still_named_by_pid();
         let (primary, rest) = kill_process_tree(
             sh.id(),
             &protected_with(&[]),
@@ -1044,7 +1050,9 @@ mod tests {
         assert!(
             rest.iter()
                 .any(|o| matches!(o, ExecutionOutcome::Killed { pid } if *pid == kid)),
-            "the descendant must be killed: {rest:?}"
+            "the descendant {kid} must be killed: {rest:?}; before the kill the walk from {} \
+             found {walk:?}, procfs read the kid as {seen_by_procfs:?}, the root named: {named}",
+            sh.id()
         );
         let _ = sh.wait();
         let gone = ProcRef::open(kid);
