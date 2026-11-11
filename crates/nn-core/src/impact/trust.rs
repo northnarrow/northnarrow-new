@@ -167,15 +167,23 @@ pub fn vouches(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool
         || (id.runs == Runs::Inline && is_interpreter(&id.exe) && owned_file(&id.exe, owned))
 }
 
-/// Lot 310 (the review of #539, finding 7): a `systemd --user` manager — the
-/// manager's program at a pid other than 1 — vouches for nothing it starts:
-/// the user chooses what it runs (`systemd-run --user /usr/bin/openssl enc
-/// …` was a lineage of installed programs end to end, no inline program in
-/// it). PID 1 runs units from root's unit files and an administrator's
-/// `systemd-run`, and still vouches.
-pub fn is_user_manager(pid: u32, id: &ExecIdentity) -> bool {
+/// Lot 310 (the review of #539, finding 7): hop `n` of `hops` is a
+/// `systemd --user` manager — the manager's program at a pid other than 1,
+/// started by PID 1 (or of a parent not known) — which vouches for nothing
+/// it starts: the user chooses what it runs (`systemd-run --user
+/// /usr/bin/openssl enc …` was a lineage of installed programs end to end,
+/// no inline program in it). PID 1 runs units from root's unit files and an
+/// administrator's `systemd-run`, and still vouches; so does a container's
+/// systemd (its parent a container runtime, judged as every hop is).
+pub fn is_user_manager(hops: &[(u32, ExecIdentity)], n: usize) -> bool {
     const MANAGERS: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
-    pid != 1 && id.runs == Runs::Inline && MANAGERS.iter().any(|m| id.exe == Path::new(m))
+    let Some((pid, id)) = hops.get(n) else {
+        return false;
+    };
+    *pid != 1
+        && id.runs == Runs::Inline
+        && MANAGERS.iter().any(|m| id.exe == Path::new(m))
+        && hops.get(n + 1).is_none_or(|(parent, _)| *parent == 1)
 }
 
 /// Why a hop that is not trusted is not: what it runs is not known, it runs
@@ -212,14 +220,14 @@ pub fn judge(
     // BUG-49: the writer and the copies of itself that forked it are judged
     // below ([`packaged`]); every ancestor above them must vouch for it.
     let own = topmost_same(hops, 0);
-    if let Some(i) = hops.iter().enumerate().position(|(n, (pid, id))| {
-        is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
+    if let Some(i) = hops.iter().enumerate().position(|(n, (_, id))| {
+        is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(hops, n)))
     }) {
         // lot 310: a user's service manager is not what to kill (its whole
         // session's services with it): the unit's process it started is.
         // Its own parent runs the same file (PID 1's systemd), so the hop
         // is taken as is, never climbed to the copies above it.
-        let manager = i > 0 && is_user_manager(hops[i].0, &hops[i].1);
+        let manager = i > 0 && is_user_manager(hops, i);
         let (actor, id) = if manager {
             (hops[i - 1].0, &hops[i].1)
         } else {
@@ -697,12 +705,34 @@ mod tests {
             judge(500, Some(&l), false, &distro),
             Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into()))
         );
-        assert!(is_user_manager(1200, &systemd()));
-        assert!(!is_user_manager(1, &systemd()));
-        assert!(!is_user_manager(1200, &id("/usr/bin/bash", None)));
+        let under_pid1 = |id: ExecIdentity| [(1200, id), (1, systemd())];
+        assert!(is_user_manager(&under_pid1(systemd()), 0));
+        assert!(!is_user_manager(&under_pid1(systemd()), 1), "PID 1");
+        assert!(!is_user_manager(&under_pid1(id("/usr/bin/bash", None)), 0));
         assert!(!is_user_manager(
-            1200,
-            &id("/usr/lib/systemd/systemd", Some("/tmp/x"))
+            &under_pid1(id("/usr/lib/systemd/systemd", Some("/tmp/x"))),
+            0
+        ));
+        assert!(
+            is_user_manager(&[(1200, systemd())], 0),
+            "a parent not known"
+        );
+        assert!(is_user_manager(
+            &under_pid1(id("/lib/systemd/systemd", None)),
+            0
+        ));
+        // a container's systemd: its parent a container runtime, which is
+        // judged as every hop is (here installed: the lineage vouches)
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1100, id("/usr/bin/conmon", None)),
+            (1, systemd()),
+        ];
+        assert!(!is_user_manager(&l, 1));
+        assert!(matches!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Trusted(_)
         ));
     }
 

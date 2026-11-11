@@ -95,7 +95,8 @@ shell naming nothing whose standard input the exec pump finds a file, a pipe
 or a socket) — that program is the caller's, and a webshell's `sh -c
 'openssl enc …'` made the packaged `openssl` a trusted writer (the triage's
 LOTL case). Nor does a user's service manager (`systemd --user`, the systemd
-file at a pid other than 1; the independent review of #539):
+file at a pid other than 1 that PID 1 started — a container's systemd is
+judged as any hop; the independent review of #539):
 `systemd-run --user /usr/bin/openssl enc …` was a lineage of installed
 programs end to end. Its actor is the process it started, never the
 manager. A packaged tool such a shell or manager starts is judged; a package

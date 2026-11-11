@@ -584,7 +584,7 @@ fn agrees(
     };
     let only = |want: &str| ran.len() == 1 && ran[0] == want;
     Some(match runs {
-        Runs::Script(p) => match marker(p) {
+        Runs::Script(p) => match marker(Path::new(&**p)) {
             Some(n) => only(&n),
             None => ran.is_empty(),
         },

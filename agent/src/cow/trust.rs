@@ -184,8 +184,8 @@ pub fn judge(
         .iter()
         .enumerate()
         .skip(1)
-        .find(|(n, (pid, id))| {
-            is_foreign(id) || (*n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
+        .find(|(n, (_, id))| {
+            is_foreign(id) || (*n > own && (!vouches(id, owned) || is_user_manager(hops, *n)))
         })
         .map(|(_, hop)| hop)
     {
