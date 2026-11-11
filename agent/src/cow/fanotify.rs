@@ -260,12 +260,33 @@ pub fn classify_syscall_line(line: &str) -> OpenIntent {
         return OpenIntent::Unknown("not in a syscall");
     }
     let args: Option<Vec<u64>> = parts
+        .by_ref()
         .take(6)
         .map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
         .collect();
     let Some(args) = args else {
         return OpenIntent::Unknown("unreadable syscall arguments");
     };
+    // Lot 315 (external bug hunt 1.4, BUG-102): the user stack pointer and
+    // program counter follow the arguments. A thread the kernel made — an
+    // io_uring worker — never entered a syscall of its own: it shows its
+    // creator's registers (the syscall the creator sat in when the worker
+    // was made, an `openat(…, O_RDONLY)` if the creator chose so) with
+    // both cleared. Whatever the line says then, it is not the open that
+    // raised the event: counted as a write. (The worker is also known by
+    // its flags, [`read_open_intent`]; this holds where the line is read
+    // alone.)
+    let regs: Vec<Option<u64>> = parts
+        .take(2)
+        .map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+        .collect();
+    match regs[..] {
+        [Some(sp), Some(pc)] if sp != 0 && pc != 0 => {}
+        [Some(_), Some(_)] => {
+            return OpenIntent::Unknown("no user registers: a thread the kernel made")
+        }
+        _ => return OpenIntent::Unknown("unreadable user registers"),
+    }
     if TABLE.execs.contains(&nr) {
         return OpenIntent::ReadOnly;
     }
@@ -290,14 +311,59 @@ pub fn classify_syscall_line(line: &str) -> OpenIntent {
     }
 }
 
+/// `PF_IO_WORKER` (`include/linux/sched.h`): an io_uring worker (io-wq)
+/// or `SQPOLL` thread, made by the kernel inside a user process.
+const PF_IO_WORKER: u64 = 0x10;
+
+/// Whether a `/proc/<tid>/stat` text is an io_uring thread's: the task's
+/// flags (field 9, the sixth after the `(comm)` field, which may hold
+/// spaces or parentheses) carry `PF_IO_WORKER`. `None` when the text
+/// does not hold them.
+pub fn io_thread_in_stat(stat: &str) -> Option<bool> {
+    let flags: u64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(6)?
+        .parse()
+        .ok()?;
+    Some(flags & PF_IO_WORKER != 0)
+}
+
 /// Read and classify `/proc/<tid>/syscall` (needs `CAP_SYS_PTRACE` over
 /// the task; Yama's `ptrace_scope=3` refuses it — every open then counts
 /// as a write).
+///
+/// Lot 315 (external bug hunt 1.4, BUG-102): an io_uring worker's open
+/// (`IORING_OP_OPENAT`, `O_WRONLY | O_TRUNC`) is not in its `syscall`
+/// file, which shows the syscall its creator sat in when the worker was
+/// made — a creator that sat in `openat(fifo, O_RDONLY)` made every later
+/// open of that worker a "read", answered at once with no copy: the
+/// file truncated and rewritten unprotected. The worker is known by the
+/// kernel's flag on the task (`PF_IO_WORKER` in `/proc/<tid>/stat`), never
+/// by its `comm` (`iou-wrk-<pid>`, which the process may rename): its
+/// opens count as writes, and so does an open by a task whose flags cannot
+/// be read.
 pub fn read_open_intent(tid: i32) -> OpenIntent {
+    match read_task_stat(tid).as_deref().map(io_thread_in_stat) {
+        Some(Some(false)) => {}
+        Some(Some(true)) => {
+            return OpenIntent::Unknown("an io_uring thread: its syscall line is its creator's")
+        }
+        _ => return OpenIntent::Unknown("/proc/<tid>/stat unreadable"),
+    }
     match std::fs::read_to_string(format!("/proc/{tid}/syscall")) {
         Ok(text) => classify_syscall_line(&text),
         Err(_) => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
     }
+}
+
+/// `/proc/<tid>/stat`, its `comm` whatever bytes the task chose.
+fn read_task_stat(tid: i32) -> Option<String> {
+    // TODO(lot 315): nn_linux::state_read::read_state once #537 lands
+    std::fs::read(format!("/proc/{tid}/stat"))
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// The thread `tid` belongs to this process.
@@ -686,11 +752,240 @@ mod tests {
     }
 }
 
-/// Lot 315 (external bug hunt 1.4: BUG-109, and a variant met in the lot's
+/// Lot 315 (external bug hunt 1.4: BUG-102, BUG-109, and a variant met in the lot's
 /// mini-hunt).
 #[cfg(test)]
 mod lot315 {
     use super::*;
+
+    /// BUG-102: the `/proc/<tid>/syscall` line of an io_uring worker made
+    /// while the submitting thread sat in `openat(fifo, O_RDONLY)`: the
+    /// creator's syscall registers, user sp and pc cleared. The worker's
+    /// own open (`IORING_OP_OPENAT`, `O_WRONLY|O_TRUNC`) is not that one
+    /// (on main: ReadOnly, answered without a copy).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bug102_an_io_uring_worker_line_is_not_read_only() {
+        let line = "257 0xffffffffffffff9c 0x7fcb1d6112e0 0x0 0x0 0x7fcb239fce57 0xc1 0x0 0x0\n";
+        let intent = classify_syscall_line(line);
+        assert!(
+            intent.may_write(),
+            "an io_uring worker's line (sp = pc = 0) classified {intent:?}: {line:?}"
+        );
+        // one register cleared is no user thread either; none at all is
+        // not a line the kernel writes for a task in a syscall
+        for line in [
+            "257 0xffffff9c 0x7ffd1 0x0 0x0 0x0 0x0 0x0 0x7f12",
+            "257 0xffffff9c 0x7ffd1 0x0 0x0 0x0 0x0 0x7ffd 0x0",
+            "257 0xffffff9c 0x7ffd1 0x0 0x0 0x0 0x0",
+            "257 0xffffff9c 0x7ffd1 0x0 0x0 0x0 0x0 0x7ffd zz",
+        ] {
+            assert!(classify_syscall_line(line).may_write(), "{line}");
+        }
+    }
+
+    /// BUG-102 guard: a user thread blocked in `openat(…, O_RDONLY)` has a
+    /// user stack and pc: still a read.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bug102_guard_a_user_thread_read_open_stays_read_only() {
+        assert_eq!(
+            classify_syscall_line("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12\n"),
+            OpenIntent::ReadOnly
+        );
+    }
+
+    /// BUG-102: the worker is known by the kernel's flag on the task
+    /// (`PF_IO_WORKER`, field 9 of `stat`), never by its `comm`.
+    #[test]
+    fn bug102_the_flags_name_an_io_uring_thread() {
+        let stat = |comm: &str, flags: u64| {
+            format!("4242 ({comm}) S 1 4242 4242 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0\n")
+        };
+        assert_eq!(io_thread_in_stat(&stat("iou-wrk-4242", 0x404050)), Some(true));
+        assert_eq!(io_thread_in_stat(&stat("enc", 0x10)), Some(true));
+        // a comm that says so is not the flag
+        assert_eq!(io_thread_in_stat(&stat("iou-wrk-4242", 0x404040)), Some(false));
+        // nor one that hides fields (spaces, a parenthesis, `0x10`)
+        assert_eq!(io_thread_in_stat(&stat("a) S 1 1 1 0 -1 16", 0x400040)), Some(false));
+        assert_eq!(io_thread_in_stat(&stat("x) R 1 1 1 0 -1 0", 0x10)), Some(true));
+        assert_eq!(io_thread_in_stat("4242 (x) S 1"), None);
+        assert_eq!(io_thread_in_stat(""), None);
+        assert_eq!(io_thread_in_stat(&stat("x", 0).replace(" 0 -1 0 ", " 0 -1 zz ")), None);
+    }
+
+    /// BUG-102 on this host's kernel: a real io_uring worker of this
+    /// process (an `IOSQE_ASYNC` read of an empty pipe holds one) is known
+    /// by its flags whatever its `comm`, and its opens count as writes; a
+    /// thread of ours named like a worker is no worker. Skipped where
+    /// io_uring is not allowed (`io_uring_disabled`, a seccomp profile).
+    #[test]
+    fn bug102_a_real_io_uring_worker_is_known_by_its_flags() {
+        let Some(ring) = AsyncRead::start() else {
+            eprintln!("io_uring not available here: skipped");
+            return;
+        };
+        let workers = ring.workers();
+        assert!(!workers.is_empty(), "no io_uring worker seen in /proc/self/task");
+        for tid in &workers {
+            // the process renames its worker: still a worker
+            let _ = std::fs::write(format!("/proc/self/task/{tid}/comm"), "enc");
+            let stat = std::fs::read(format!("/proc/self/task/{tid}/stat")).unwrap();
+            assert_eq!(
+                io_thread_in_stat(&String::from_utf8_lossy(&stat)),
+                Some(true),
+                "{tid}"
+            );
+            assert!(
+                matches!(read_open_intent(*tid), OpenIntent::Unknown(_)),
+                "{tid}: {:?}",
+                read_open_intent(*tid)
+            );
+        }
+        // a thread of ours named like a worker is not one
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::Builder::new()
+            .name("iou-wrk-1".into())
+            .spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                tx.send(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
+                    .unwrap();
+                let _ = done_rx.recv();
+            })
+            .unwrap();
+        let tid = rx.recv().unwrap();
+        let stat = std::fs::read(format!("/proc/self/task/{tid}/stat")).unwrap();
+        let stat = String::from_utf8_lossy(&stat);
+        assert!(stat.contains("(iou-wrk-1)"), "{stat}");
+        assert_eq!(io_thread_in_stat(&stat), Some(false), "{stat}");
+        drop(done_tx);
+        h.join().unwrap();
+        drop(ring);
+    }
+
+    /// An io_uring of this process with one `IOSQE_ASYNC` read of an empty
+    /// pipe in flight: an io-wq worker blocks in it until the pipe is
+    /// written (on drop).
+    struct AsyncRead {
+        ring: i32,
+        pipe: [i32; 2],
+        maps: [(*mut libc::c_void, usize); 2],
+    }
+
+    impl AsyncRead {
+        fn start() -> Option<Self> {
+            // struct io_uring_params: 120 bytes; sq_off at byte 40
+            let mut p = [0u32; 30];
+            // SAFETY: io_uring_setup(entries, params) on a zeroed params
+            // buffer of the struct's size.
+            let ring = unsafe {
+                libc::syscall(libc::SYS_io_uring_setup, 4u32, p.as_mut_ptr()) as i32
+            };
+            if ring < 0 {
+                return None;
+            }
+            let (entries, tail_off, mask_off, array_off) = (p[0], p[11], p[12], p[16]);
+            let sq_len = array_off as usize + entries as usize * 4;
+            let sqes_len = entries as usize * 64;
+            let map = |len: usize, off: i64| {
+                // SAFETY: a shared mapping of the ring's own memory.
+                unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_POPULATE,
+                        ring,
+                        off,
+                    )
+                }
+            };
+            let sq = map(sq_len, 0);
+            let sqes = map(sqes_len, 0x1000_0000);
+            assert!(sq != libc::MAP_FAILED && sqes != libc::MAP_FAILED, "mmap");
+            let mut pipe = [0i32; 2];
+            // SAFETY: a two-int array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            // the worker writes into it after the drop wakes it: never freed
+            let buf: &'static mut [u8; 8] = Box::leak(Box::new([0u8; 8]));
+            // SAFETY: offsets the kernel gave for the rings just mapped;
+            // the sqe is one of `entries` 64-byte entries.
+            unsafe {
+                let tail = sq.cast::<u8>().add(tail_off as usize).cast::<u32>();
+                let mask = *sq.cast::<u8>().add(mask_off as usize).cast::<u32>();
+                let array = sq.cast::<u8>().add(array_off as usize).cast::<u32>();
+                let t = std::ptr::read_volatile(tail);
+                let i = t & mask;
+                let sqe = sqes.cast::<u8>().add(i as usize * 64);
+                std::ptr::write_bytes(sqe, 0, 64);
+                *sqe = 22; // IORING_OP_READ
+                *sqe.add(1) = 1 << 4; // IOSQE_ASYNC: an io-wq worker
+                sqe.add(4).cast::<i32>().write_unaligned(pipe[0]);
+                sqe.add(16)
+                    .cast::<u64>()
+                    .write_unaligned(buf.as_mut_ptr() as u64);
+                sqe.add(24).cast::<u32>().write_unaligned(1);
+                *array.add(i as usize) = i;
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                std::ptr::write_volatile(tail, t + 1);
+            }
+            let me = Self {
+                ring,
+                pipe,
+                maps: [(sq, sq_len), (sqes, sqes_len)],
+            };
+            // SAFETY: io_uring_enter(ring, to_submit 1, 0, 0, NULL, 0).
+            let n = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_enter,
+                    ring,
+                    1u32,
+                    0u32,
+                    0u32,
+                    std::ptr::null::<libc::c_void>(),
+                    0usize,
+                )
+            };
+            (n == 1).then_some(me)
+        }
+
+        /// The threads of this process whose flags say io_uring worker,
+        /// waited for up to 2 s.
+        fn workers(&self) -> Vec<i32> {
+            for _ in 0..200 {
+                let found: Vec<i32> = std::fs::read_dir("/proc/self/task")
+                    .unwrap()
+                    .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                    .filter(|tid: &i32| {
+                        std::fs::read(format!("/proc/self/task/{tid}/stat")).is_ok_and(|b| {
+                            io_thread_in_stat(&String::from_utf8_lossy(&b)) == Some(true)
+                        })
+                    })
+                    .collect();
+                if !found.is_empty() {
+                    return found;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Vec::new()
+        }
+    }
+
+    impl Drop for AsyncRead {
+        fn drop(&mut self) {
+            // SAFETY: our pipe, ring and mappings.
+            unsafe {
+                libc::write(self.pipe[1], b"x".as_ptr().cast(), 1);
+                for (m, len) in self.maps {
+                    libc::munmap(m, len);
+                }
+                libc::close(self.ring);
+                libc::close(self.pipe[0]);
+                libc::close(self.pipe[1]);
+            }
+        }
+    }
 
     /// BUG-109: a live file named `… (deleted)` (one rename by the writer,
     /// which opens nothing) is reachable at that path: `fd_path` names it
