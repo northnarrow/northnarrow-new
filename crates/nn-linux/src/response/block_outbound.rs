@@ -174,14 +174,14 @@ pub fn release_blocked_pid(
 
 /// Whether `/proc/<pid>/cgroup` places the process in the blocked scope.
 pub fn pid_in_blocked_scope(pid: u32, cfg: &ExecutorConfig) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
         .is_ok_and(|c| cgroup_is(&c, &cfg.blocked_cgroup_match()))
 }
 
 /// Whether the process is in the blocked scope or in a cgroup below it (a
 /// kill cgroup, `neutralize-*`): the drop holds in both.
 pub fn pid_under_blocked_scope(pid: u32, cfg: &ExecutorConfig) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
         .is_ok_and(|c| cgroup_is_or_below(&c, &cfg.blocked_cgroup_match()))
 }
 

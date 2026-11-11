@@ -374,6 +374,10 @@ pub mod worker;
 // byte, of the start's mount check and the self-integrity watcher.
 pub mod mountinfo;
 
+// Lot 311 (third bug hunt, F4 and N6): the kernel's state files read as
+// text that never fails on its encoding — a process sets its own `comm`.
+pub mod state_read;
+
 // systemd's readiness notification (`READY=1` on `$NOTIFY_SOCKET`, T7.10),
 // through the datagram `antitamper-bpf` shares with the watchdog (R09c, lab
 // PR 257; was the agent's `sd_notify`).

@@ -6,6 +6,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- A kill reaches a process whatever it names itself (lot 311, the third
+  bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
+  is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,
+  or simply the name of the file it executed, with no privilege — made its
+  `/proc/<pid>/stat` unreadable as text, and the response took that for a
+  process it could not capture: every kill and tree kill of it was signed
+  `Failed` (errno 5) and the process ran on. On Ubuntu 24.04 a `www-data`
+  exec from `/tmp` named `\xff\xfe`, or renaming itself so at its first
+  instruction, drew R001's record and outlived its kill tree. The response
+  reads `/proc` as bytes now (the `(comm)` field is skipped to its last
+  `)`), a running process whose entry cannot be read for another reason is
+  captured by its pidfd alone and still signalled, and a killed cgroup's
+  member whose `stat` cannot be read is no longer counted killed. The COMBAT
+  ladder's reads of a process's `status` and `cgroup` read bytes too.
 - The kernel module judge sees a compressed module's load on 7.0 (lot 303;
   `docs/operator/RULE_POLICY.md` §2.4). 7.0 reads the file of a
   `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` — kmod's load of a

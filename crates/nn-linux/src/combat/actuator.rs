@@ -471,7 +471,7 @@ pub fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
     let exe = std::fs::read_link(dir.join("exe"))
         .ok()
         .map(|p| shown(&p.to_string_lossy()));
-    let cgroup = std::fs::read_to_string(dir.join("cgroup"))
+    let cgroup = crate::state_read::read_state(dir.join("cgroup"))
         .ok()
         .and_then(|text| cgroup_path(&text).map(shown));
     ProcFacts { exe, cgroup }
@@ -503,6 +503,26 @@ mod tests {
         assert_eq!(f.exe.as_deref(), Some("/tmp/.x/payload (deleted)"));
         assert_eq!(f.cgroup.as_deref(), Some("/system.slice/apache2.service"));
         assert_eq!(read_proc_facts(tmp.path(), 4243), ProcFacts::default());
+    }
+
+    /// Lot 311: a cgroup a user named with bytes that are not UTF-8 (in the
+    /// subtree systemd delegates to it) is still shown in the ladder's row,
+    /// its bytes replaced. On main the read failed and the row had none.
+    #[test]
+    fn proc_facts_show_a_cgroup_whose_name_is_not_utf8() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path().join("4242");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("cgroup"),
+            b"0::/user.slice/user-1000.slice/user@1000.service/app.slice/\xff\xfe.scope\n",
+        )
+        .unwrap();
+        let f = read_proc_facts(tmp.path(), 4242);
+        assert_eq!(
+            f.cgroup.as_deref(),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/\u{fffd}\u{fffd}.scope")
+        );
     }
 
     /// External audit CMB-002: a tree is contained only when every
