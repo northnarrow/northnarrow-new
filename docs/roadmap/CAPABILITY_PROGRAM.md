@@ -8574,3 +8574,69 @@ number in parentheses is a lab PR.
     to mutate).
   - Levels unchanged (C06 2, C21 1, C23 2 provisional): fixes inside the
     capabilities.
+- **Lot 298 — the evidence readers and verifiers, and the export's check:
+  the external bug hunt's lot 8** (`fix/w4-bh-readers-export`; the triage
+  of editions 1.2/1.3, lot 8, all P2/P3: BUG29, BUG09, BUG11, BUG28, BUG04,
+  BUG06, BUG07, BUG16, BUG19, BUG23, BUG24).
+  - What was open (our triage of 10/11/2026, its fix guidance followed
+    where it differs from the report's): `chain verify` accepted and
+    counted genuine lines replayed after an archive's terminator (BUG29); a
+    numbered canary row ending in `\r` passed the canonical-form check
+    (BUG09); the head read-back (the heartbeat's `kept`, the export's
+    cursor) read a fixed 64 KiB, so a longer intact line was "not held"
+    (BUG11); a foreign archive slot the rotation's probe skipped before the
+    seal got no `ForeignArchive` row (BUG28); the read verbs returned an
+    older row while newer ones were left out for the room (BUG04), stopped
+    before the archives at one row stamped before `--since` after newer ones
+    (the clock stepped back) without `truncated` (BUG06), and skipped an
+    unreadable archive without it (BUG07); a start refused by a gate made
+    the next boot sign `previous_run: abrupt` (BUG16); an `interrupted`
+    action row carried no intent and exported as 7001/Unknown, the report's
+    fix (the mapper's kept intents) not enough since the worker restarts
+    (BUG19); `export verify` ended at a line that is not UTF-8 (BUG23) and
+    said `OK` for an exec detection's launch record without its Detection
+    Finding (BUG24).
+  - What changed (`EVIDENCE_CHAINS.md`, `EXPORT.md` §6, upgrade notes §23):
+    the verifier's `LineAfterTerminator`; the flat rows split on the newline
+    alone; the read-back through `chain_anchor::line_ending_at`, the anchor's
+    own window (64 KiB growing to 16 MiB), now shared by `check_head`; the
+    probe's foreign slots kept by the writer (`foreign_before_seal`, not in
+    `PendingSeal`, which lot 296 builds elsewhere) and attested by the
+    rotation's finish, retried or not; the tail reader cuts a line at the
+    frame, not at the room, an out-of-order row no longer stops the descent
+    and sets `truncated`, an archive there and unreadable sets it and ends
+    the answer; `read_tail` takes a refused `agent_boot` for no run; the
+    journal's interrupted row carries the intent it answers (a new value of
+    an existing optional field, its line pinned), and the mapper maps an
+    older one with the intent it kept, attaching it as an outcome's, which
+    `export verify` accepts on its own (else a NOTICE, as an outcome without
+    its intent); `export verify` reads bytes (a line not UTF-8 is
+    `MALFORMED`), says a row's companion without its first record `BROKEN`
+    and the first without its companion a `NOTICE`, and the JSONL sink
+    keeps a row's records in one file (a rotation between them would have
+    made a single file `BROKEN`).
+  - Not changed (and said): a row stamped before `--since` at the very head
+    of a file still stops the read (it cannot be told from rows in order);
+    the active file's tail check at the start (`verify_recent`) does not
+    look for lines after a terminator — `chain verify` does.
+  - No lab (host tests suffice, the brief's call). Host: a named test for
+    each bug, each failing on `main` for its reason (25 tests; the lot's
+    tests on `main`'s code, a local tree), the golden of the interrupted
+    row's line and 2 controls passing there; mutation on the fixes: 41
+    mutants, all 41 caught by a named test (3 of them, on the agent's host
+    and the journal, in a second run: the first gave cargo two test filters
+    without `--`, recorded as not run, not as caught), 0 survivors, 0 argued
+    equivalent (code that no test could tell apart was removed before:
+    `soft_cap.max(1)`, a `\r` strip `record_of` already did, a null-intent
+    guard). With lot 296 (#522, merged first): the code merges cleanly, its
+    tests and this lot's pass (the BUG28 retry test made independent of
+    which dance fails first: #522 probes the directory before it seals).
+  - Gates on the PR's tree: eBPF, the four clippy runs (+ nn-admin's
+    debug-trigger), fmt, 94 suites with 4,465 passed and 0 failed (with
+    lots 296, 297 and 299 merged in), the
+    privileged no-run, the debug-trigger builds, the eBPF maps
+    (`NN_REQUIRE_EBPF_OBJECT=1`), attack-coverage, golden ×5 (57 files, the
+    same bytes), MSRV 1.89, the fuzz replay (14), portable (5), the
+    lockfiles unchanged.
+  - Levels unchanged (C21 1): correctness of the chains' readers and of the
+    receiver's check, measured by host tests — not a new capability.

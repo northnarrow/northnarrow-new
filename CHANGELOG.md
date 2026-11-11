@@ -125,6 +125,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   described as they work (BUG81: failures since the agent last answered,
   a timeout and a vanished socket counted together — the report's change
   would never recover a frozen agent whose socket is removed and put back).
+- The evidence readers and verifiers, and the export's check (lot 298,
+  external bug hunt; `docs/operator/EVIDENCE_CHAINS.md`, `EXPORT.md` §6,
+  upgrade notes §23). `nn-admin chain verify` refuses a line after a file's
+  terminator: genuine lines replayed after an archive's seal verified and
+  were counted twice (BUG29); a numbered canary row ending in `\r` is not
+  canonical (BUG09). The read verbs' answers are the newest rows,
+  contiguous (BUG04), and say `truncated` past an archive that cannot be
+  read (BUG07) and, with `--since`, past a row out of time order, which no
+  longer hides the archives' rows (BUG06). A start refused by a gate is no
+  run: the next boot no longer signs `previous_run: abrupt` after a clean
+  stop (BUG16). An `interrupted` action row carries the intent it answers
+  and exports as its intent's class, not 7001/Unknown (BUG19). `nn-admin
+  export verify` takes a line that is not UTF-8 for a malformed line, not
+  the end of the check (BUG23), and says `BROKEN` when an exec detection's
+  launch record arrives without its Detection Finding (BUG24; the JSONL
+  files keep a row's records together). The head read-back reads a line up
+  to 16 MiB long (BUG11), and a foreign archive slot skipped before a
+  rotation's seal is attested (BUG28).
 - The heartbeat's verifier takes a beat's interval within the agent's own
   bounds (5 to 300 s), compares every bound without overflow, and cuts a
   hash at a character's boundary in its messages: a signed beat with a huge

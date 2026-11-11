@@ -479,7 +479,9 @@ mod tests {
     }
 
     /// A symlink or a FIFO at an archive name is not read; the active path
-    /// as a symlink neither (`chain_tail`'s test before lab PR 241).
+    /// as a symlink neither (`chain_tail`'s test before lab PR 241). Lot 298
+    /// (external bug hunt, BUG07): the answer says rows were left unread —
+    /// the symlink's open refused (`O_NOFOLLOW`), the FIFO no regular file.
     #[test]
     fn symlinked_and_special_files_are_not_read() {
         let dir = TempDir::new().unwrap();
@@ -500,10 +502,16 @@ mod tests {
         write_rows(&active, 0..2);
         let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![1, 0]);
+        assert!(t.truncated, "archive 000002 (a symlink) left unread");
+        // the FIFO alone: no regular file, said
+        std::fs::remove_file(dir.path().join("log.jsonl.000002")).unwrap();
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
+        assert_eq!((numbers(&t), t.truncated), (vec![1, 0], true));
         // The active path itself as a symlink is refused too.
         let link = dir.path().join("link.jsonl");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
-        assert_eq!(read_chain_tail::<LinuxHost>(&link, &all(1 << 20)).count, 0);
+        let t = read_chain_tail::<LinuxHost>(&link, &all(1 << 20));
+        assert_eq!((t.count, t.truncated), (0, true));
     }
 
     // ── Lot 296 (external bug hunt BUG15, BUG17): the kernel's own short

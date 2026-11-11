@@ -252,7 +252,9 @@ fn endpoint(addr: &str, port: Option<u64>) -> Option<Value> {
 /// record — the third check of #499). Bounded; a worker that has not seen
 /// the intent (restarted between them, the export started after it, the
 /// intent past [`MAX_INTENTS`]) writes the outcome without its intent's
-/// facts, and without its row.
+/// facts, and without its row. Lot 298 (BUG19): an interrupted row carries
+/// its intent (the journal writes it since lot 298) and is mapped from it;
+/// one without (an older agent's) is mapped as an outcome is.
 #[derive(Debug, Default)]
 pub struct Mapper {
     intents: HashMap<(String, u64), Value>,
@@ -289,7 +291,18 @@ impl Mapper {
         let key = (run.clone(), action);
         match kind.as_str() {
             "intent" | "interrupted" => {
-                let intent = v.get("intent").cloned().unwrap_or(Value::Null);
+                let intent = match v.get("intent") {
+                    Some(i) => i.clone(),
+                    // Lot 298 (external bug hunt, BUG19): an interrupted row
+                    // without its intent (an agent before lot 298 wrote
+                    // none) is mapped with the intent this mapper kept, as an
+                    // outcome is — its signed row attached (`intent_raw`);
+                    // without it, the generic class.
+                    _ if kind == "interrupted" => {
+                        self.intents.get(&key).cloned().unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                };
                 let rec = remediation(ctx, row, v, &intent, None, &kind);
                 if kind == "intent" {
                     if self.order.len() >= MAX_INTENTS {

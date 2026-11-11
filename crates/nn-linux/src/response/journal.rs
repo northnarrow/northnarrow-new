@@ -186,8 +186,9 @@ pub struct Recovery {
     /// Each intent of an earlier run without an outcome: its run, number,
     /// response and target, as answered by an interrupted row.
     pub interrupted: Vec<String>,
-    /// The same: (run, action, what), for [`ActionJournal::start_run`].
-    pub open: Vec<(String, u64, String)>,
+    /// The same: (run, action, what, the intent its row said), for
+    /// [`ActionJournal::start_run`].
+    pub open: Vec<(String, u64, String, Option<ActionIntent>)>,
     /// Why the scan could not read the chain (`None`: it read it).
     pub unread: Option<String>,
 }
@@ -269,7 +270,9 @@ impl ActionJournal {
             recovery
                 .interrupted
                 .push(format!("run {} action {}: {what}", open.run, open.action));
-            recovery.open.push((open.run.clone(), open.action, what));
+            recovery
+                .open
+                .push((open.run.clone(), open.action, what, open.intent.clone()));
         }
         recovery
     }
@@ -311,19 +314,25 @@ impl ActionJournal {
 
     /// R12c-3: the run's start, once the boot signed its audit row of
     /// `recovery` (`response_interrupted`): each open intent of an earlier
-    /// run answered by an interrupted row (WARNed, counted), then this
+    /// run answered by an interrupted row that carries that intent (lot 298,
+    /// external bug hunt BUG19: it carried none, and the export mapped it as
+    /// an unknown remediation) (WARNed, counted), then this
     /// run's `run_started` row. A crash before this leaves the intents
     /// open: the next start reports them again — the audit row is never
     /// missing for an interrupted row (the re-check of #476).
     pub fn start_run(&self, recovery: &Recovery) {
         let mut w = self.inner.writer.lock();
-        for (run, action, what) in &recovery.open {
+        for (run, action, what, intent) in &recovery.open {
             let row = ActionRecord {
                 row: ActionRow::Interrupted,
                 run: run.clone(),
                 action: *action,
                 ts: nn_evidence::clock::stamp(self.inner.clock.as_ref()),
-                intent: None,
+                // Lot 298 (external bug hunt, BUG19): the intent the row
+                // answers, as its intent row said it — the export maps the
+                // row to its intent's class from the row alone (a worker
+                // restarted since the intent has not seen it).
+                intent: intent.clone(),
                 outcome: Some(ActionOutcome {
                     result: ActionResult::Unknown,
                     outcome: format!("{what}: not known"),
@@ -1112,6 +1121,50 @@ mod tests {
         assert_eq!(rows[4].noted_by.as_deref(), Some(second.run()));
         assert_eq!(rows[4].run, rows[3].run);
         assert_eq!(rows[5].run, second.run());
+    }
+
+    /// Lot 298 (external bug hunt, BUG19): the interrupted row carries the
+    /// intent it answers, as the intent row said it (the export maps it to
+    /// that intent's class from the row alone).
+    #[test]
+    fn an_interrupted_row_carries_its_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("k");
+        let first = ActionJournal::late();
+        let rec = first.bind(log_at(&active, &key_path, u64::MAX), &active);
+        first.start_run(&rec);
+        std::mem::forget(first.intent(intent_row("KillProcessTree", 4242)));
+        let second = ActionJournal::late();
+        let rec = second.bind(log_at(&active, &key_path, u64::MAX), &active);
+        assert_eq!(rec.open.len(), 1, "{rec:?}");
+        second.start_run(&rec);
+        let rows = read_rows(&active).unwrap();
+        let intent = rows
+            .iter()
+            .find(|r| r.row == ActionRow::Intent)
+            .expect("the intent row");
+        let interrupted = rows
+            .iter()
+            .find(|r| r.row == ActionRow::Interrupted)
+            .expect("the interrupted row");
+        assert_eq!(
+            (interrupted.run.as_str(), interrupted.action),
+            (intent.run.as_str(), intent.action)
+        );
+        let carried = interrupted
+            .intent
+            .as_ref()
+            .expect("the interrupted row's intent");
+        assert_eq!(Some(carried), intent.intent.as_ref());
+        assert_eq!(
+            (carried.response.as_str(), carried.pid),
+            ("KillProcessTree", 4242)
+        );
+        assert_eq!(
+            interrupted.outcome.as_ref().map(|o| o.result),
+            Some(ActionResult::Unknown)
+        );
     }
 
     /// R12c-3: a run that crashed before its start answered the open

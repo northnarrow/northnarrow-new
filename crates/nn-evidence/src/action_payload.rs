@@ -382,6 +382,33 @@ mod tests {
         assert_eq!(ActionRecord::KIND, "actions");
     }
 
+    /// Lot 298 (external bug hunt, BUG19): the interrupted row the journal
+    /// writes since lot 298 carries the intent it answers — the same
+    /// `intent` field as an intent row's, between `ts` and `outcome` (the
+    /// form without it, an older agent's, is pinned above and still reads).
+    #[test]
+    fn an_interrupted_row_with_its_intent_is_pinned() {
+        let mut i = outcome("00112233aabbccdd", 7, ActionRow::Interrupted);
+        {
+            let o = i.outcome.as_mut().unwrap();
+            o.result = ActionResult::Unknown;
+            o.outcome = "KillProcessTree pid 4242 (NN-L-CANARY-001): not known".into();
+            o.reason = Some("the agent stopped between the action's intent and its outcome".into());
+            o.elapsed_us = 0;
+        }
+        i.intent = intent("00112233aabbccdd", 7).intent;
+        i.noted_by = Some("ffeeddccbbaa9988".into());
+        let line = serde_json::to_string(&i).unwrap();
+        assert_eq!(
+            line,
+            r#"{"row":"interrupted","run":"00112233aabbccdd","action":7,"ts":"2026-10-31T23:59:00.004000Z","intent":{"source":"rule","response":"KillProcessTree","pid":4242,"start_ns":1000000,"severity":"critical","why":["NN-L-CANARY-001"],"detail":"CanaryTripped by cat","queued_us":120},"outcome":{"result":"unknown","outcome":"KillProcessTree pid 4242 (NN-L-CANARY-001): not known","reason":"the agent stopped between the action's intent and its outcome","elapsed_us":0},"noted_by":"ffeeddccbbaa9988"}"#
+        );
+        assert_eq!(serde_json::from_str::<ActionRecord>(&line).unwrap(), i);
+        // it answers its intent as the form without one did
+        let rows = [intent("00112233aabbccdd", 7), i];
+        assert!(unanswered_intents(&rows, "bb").is_empty());
+    }
+
     /// An intent of an earlier run with neither an outcome nor an
     /// interrupted row is unanswered; this run's own intents are not (they
     /// are in flight), nor answered ones.

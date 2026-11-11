@@ -20,6 +20,15 @@
 //! (the third check of #499: a verdict that depended on the intent being
 //! before the outcome in the input let a reordered or cut capture rewrite
 //! those fields).
+//!
+//! Lot 298 (external bug hunt): a line that is not UTF-8 is a line that is
+//! no record, not the end of the check (BUG23); a row that maps to two
+//! records (a detection of the exec sensor) whose first record — the
+//! Detection Finding — is not in the input while its companion is, is
+//! BROKEN (BUG24: a relay that took the finding out left an `OK`); the
+//! finding without its companion is said (NOTICE). An interrupted row
+//! mapped with the intent the worker kept carries it as an outcome does
+//! (BUG19).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -72,7 +81,11 @@ pub struct Report {
     /// Action outcomes without their intent attached — genuine, but their
     /// class, target, reasons and severity are not in the record (a worker
     /// that had not seen the intent, or a relay that took it out): `(line,
-    /// which)`. Not a failure (the fourth check of #499, Q1).
+    /// which)`. Not a failure (the fourth check of #499, Q1). Lot 298: an
+    /// interrupted row of an agent before lot 298 (no intent of its own) is
+    /// one too, and so is a row whose first record is in the input without
+    /// its companion (BUG24: a detection's finding without its launch
+    /// record).
     pub notices: Vec<(u64, String)>,
     pub chains: Vec<ChainReport>,
 }
@@ -101,6 +114,12 @@ struct Row {
     entry: String,
     prev: String,
     rotate: Option<String>,
+    /// Lot 298 (BUG24): the records of the row the input holds (bit `i`:
+    /// record `i`), and how many the row maps to.
+    seen: u8,
+    of: usize,
+    /// The line of the input that held the row's first record seen.
+    line: u64,
 }
 
 /// The record of a line: the JSONL file's as it is, a syslog message's
@@ -170,7 +189,7 @@ fn mapped_alike(
     rotate: Option<&str>,
     seal: &nn_evidence::row_verify::RowSeal,
     pk: &VerifyingKey,
-) -> Result<Mapped, String> {
+) -> Result<(Mapped, RecordAt), String> {
     use nn_export::ocsf::{Context, Mapper, Row};
     use nn_proto::ipc::ExportChain;
     let Some(c) = ExportChain::from_name(chain) else {
@@ -222,8 +241,12 @@ fn mapped_alike(
                 "the intent row it carries is not its action's intent",
             ));
         };
+        // an outcome, or (lot 298, BUG19) an interrupted row without an
+        // intent of its own, mapped with the one the worker kept
+        let answer = o.get("row").and_then(|x| x.as_str());
         if c != ExportChain::Actions
-            || o.get("row").and_then(|x| x.as_str()) != Some("outcome")
+            || !(answer == Some("outcome")
+                || (answer == Some("interrupted") && o.get("intent").is_none()))
             || i.get("row").and_then(|x| x.as_str()) != Some("intent")
             || i.get("run").is_none()
             || i.get("run") != o.get("run")
@@ -270,27 +293,51 @@ fn mapped_alike(
             },
         );
     }
-    if mapper.map(&ctx, &row).get(n) != Some(v) {
+    let records = mapper.map(&ctx, &row);
+    if records.get(n) != Some(v) {
         return Err(REWRITTEN.to_string());
     }
+    let at = RecordAt {
+        index: n,
+        of: records.len(),
+    };
     // an outcome without its intent: genuine, its intent's facts not in it
     // (a worker that had not seen the intent — or a relay that took them
-    // out: the record cannot tell; the fourth check of #499, Q1)
+    // out: the record cannot tell; the fourth check of #499, Q1). Lot 298
+    // (BUG19): an interrupted row without an intent of its own (an agent
+    // before lot 298) is one too.
     if c == ExportChain::Actions && nn.get("intent_raw").is_none() {
         let o = serde_json::from_str::<serde_json::Value>(raw).ok();
-        if let Some(o) = o.filter(|o| o.get("row").and_then(|x| x.as_str()) == Some("outcome")) {
-            return Ok(Mapped::NoIntent {
-                run: o
-                    .get("run")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-                action: o.get("action").and_then(|x| x.as_u64()).unwrap_or(0),
-                correlation: text(&["metadata", "correlation_uid"]).unwrap_or_default(),
-            });
+        if let Some(o) = o.filter(|o| match o.get("row").and_then(|x| x.as_str()) {
+            Some("outcome") => true,
+            Some("interrupted") => o.get("intent").is_none(),
+            _ => false,
+        }) {
+            return Ok((
+                Mapped::NoIntent {
+                    run: o
+                        .get("run")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    action: o.get("action").and_then(|x| x.as_u64()).unwrap_or(0),
+                    correlation: text(&["metadata", "correlation_uid"]).unwrap_or_default(),
+                },
+                at,
+            ));
         }
     }
-    Ok(Mapped::Alike)
+    Ok((Mapped::Alike, at))
+}
+
+/// Lot 298 (external bug hunt, BUG24): which record of its row a record is
+/// (`index`: 0 the row's first, 1 its companion `…/1`), of how many the row
+/// maps to (`of`: 2 for a detection of the exec sensor — its Detection
+/// Finding, then its Process Activity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordAt {
+    index: usize,
+    of: usize,
 }
 
 /// A record that is its row's mapping: whole, or an action's outcome
@@ -341,6 +388,10 @@ fn place_words(
 /// or what it carries, are not its row's.
 const REWRITTEN_TAG: &str = "(a record rewritten)";
 
+/// Lot 298 (BUG24): what a NOTICE of a row without its companion record
+/// says, after the row's place.
+const COMPANION_TAG: &str = "companion record not in the input";
+
 /// Why a record whose row verifies is TAMPERED: its fields are not its
 /// row's mapping.
 const REWRITTEN: &str = "its OCSF fields are not its row's mapping (a record rewritten)";
@@ -350,20 +401,48 @@ fn rewritten(why: &str) -> String {
 }
 
 /// Verify every record of `input` with the agent's key.
-pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report> {
+///
+/// Lot 298 (external bug hunt, BUG23): the input is read line by line as
+/// bytes; a line that is not UTF-8 is a line that is no record (MALFORMED),
+/// never the end of the check (`BufRead::lines` made it an I/O error: exit 1
+/// and no report for any record). Only a read error ends it.
+pub fn verify(mut input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report> {
     let mut rep = Report::default();
     let mut rows: BTreeMap<String, BTreeMap<(u64, u64), Row>> = BTreeMap::new();
     let mut records: BTreeMap<String, u64> = BTreeMap::new();
     let mut dups: BTreeMap<String, u64> = BTreeMap::new();
     let mut uids: BTreeSet<String> = BTreeSet::new();
-    for (i, line) in input.lines().enumerate() {
-        let line = line?;
-        let n = i as u64 + 1;
+    let mut buf = Vec::new();
+    let mut n = 0u64;
+    loop {
+        buf.clear();
+        if input.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        n += 1;
+        // the line without its newline (a "\r" before it is trimmed with
+        // the record's spaces, `record_of`)
+        let bytes = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        let line = match std::str::from_utf8(bytes) {
+            Ok(l) => l,
+            Err(e) => {
+                rep.lines += 1;
+                rep.malformed.push((
+                    n,
+                    format!(
+                        "not UTF-8 (an invalid byte at {} of {} bytes): no record",
+                        e.valid_up_to(),
+                        bytes.len()
+                    ),
+                ));
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
         rep.lines += 1;
-        let text = record_of(&line);
+        let text = record_of(line);
         let v: serde_json::Value = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(e) => {
@@ -408,33 +487,42 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
         }
         // the OCSF fields are the agent's mapping of the row, or the
         // record was rewritten (the review of #499, D1: they are not signed)
-        match mapped_alike(&v, &chain, file, l, raw, rotate.as_deref(), &seal, pk) {
-            Ok(Mapped::Alike) => {}
-            Ok(Mapped::NoIntent {
-                run,
-                action,
-                correlation,
-            }) => rep.notices.push((
-                n,
-                format!(
-                    "{chain} {file}/{l}: intent not attached: action {action} of run {run} — \
+        let at = match mapped_alike(&v, &chain, file, l, raw, rotate.as_deref(), &seal, pk) {
+            Ok((Mapped::Alike, at)) => at,
+            Ok((
+                Mapped::NoIntent {
+                    run,
+                    action,
+                    correlation,
+                },
+                at,
+            )) => {
+                rep.notices.push((
+                    n,
+                    format!(
+                        "{chain} {file}/{l}: intent not attached: action {action} of run {run} — \
                      its class, target, reasons and severity are not in the record; its intent \
                      is the actions chain's `intent` row of that run and action (the records' \
                      metadata.correlation_uid {correlation})"
-                ),
-            )),
+                    ),
+                ));
+                at
+            }
             Err(why) => {
                 rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
                 continue;
             }
-        }
+        };
+        // a record of a row this crate's mapping does not give (record 8 or
+        // more) cannot be: `mapped_alike` compared it with one it gives
+        let bit = 1u8 << at.index.min(7);
         let duplicate = v
             .get("metadata")
             .and_then(|m| m.get("uid"))
             .and_then(|u| u.as_str())
             .is_some_and(|uid| !uids.insert(uid.to_string()));
         let held = rows.entry(chain.clone()).or_default();
-        if let Some(before) = held.get(&(file, l)) {
+        if let Some(before) = held.get_mut(&(file, l)) {
             if before.entry != seal.entry_hash {
                 rep.tampered.push((
                     n,
@@ -442,6 +530,7 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
                 ));
                 continue;
             }
+            before.seen |= bit;
             if duplicate {
                 *dups.entry(chain.clone()).or_default() += 1;
             }
@@ -453,6 +542,9 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
                 entry: seal.entry_hash,
                 prev: seal.prev_hash,
                 rotate,
+                seen: bit,
+                of: at.of,
+                line: n,
             },
         );
     }
@@ -468,6 +560,31 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
         };
         let mut prev: Option<((u64, u64), &Row)> = None;
         for (&at, r) in &rs {
+            // Lot 298 (external bug hunt, BUG24): a row whose first record
+            // (a detection's Detection Finding) is not in the input while its
+            // companion is — a relay took the finding out, and the capture
+            // said OK. The companion without the row's first record is
+            // BROKEN; the first without its companion is said (NOTICE): the
+            // finding is whole, its launch record missing.
+            if r.of > 1 && r.seen & 1 == 0 {
+                c.breaks.push(Break {
+                    after: at,
+                    at,
+                    why: "the row's first record (its Detection Finding) is not in the input, its \
+                          companion record is"
+                        .to_string(),
+                });
+            } else if r.of > 1 && r.seen & 2 == 0 {
+                rep.notices.push((
+                    r.line,
+                    format!(
+                        "{chain} {}/{}: {COMPANION_TAG}: the row's Detection Finding is in the \
+                         input, its companion record (`…/1`, the Process Activity of the launch) \
+                         is not",
+                        at.0, at.1
+                    ),
+                ));
+            }
             if let Some((p, pr)) = prev {
                 let why = if at.0 == p.0 && at.1 == p.1 + 1 {
                     (r.prev != pr.entry)
@@ -567,18 +684,34 @@ pub fn report_lines(r: &Report) -> Vec<String> {
     }
 
     out.push(match r.exit_code() {
-        0 => format!(
-            "OK: every record's row is signed by the agent's key, every chain follows from its \
-             first row seen{}",
-            if r.notices.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; {} action outcome(s) without their intent attached (NOTICE lines)",
-                    r.notices.len()
-                )
+        0 => {
+            let companions = r
+                .notices
+                .iter()
+                .filter(|(_, why)| why.contains(COMPANION_TAG))
+                .count();
+            let intents = r.notices.len() - companions;
+            let mut said = Vec::new();
+            if intents > 0 {
+                said.push(format!(
+                    "{intents} action outcome(s) without their intent attached"
+                ));
             }
-        ),
+            if companions > 0 {
+                said.push(format!(
+                    "{companions} row(s) without their companion record"
+                ));
+            }
+            format!(
+                "OK: every record's row is signed by the agent's key, every chain follows from \
+                 its first row seen{}",
+                if said.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {} (NOTICE lines)", said.join(", "))
+                }
+            )
+        }
         13 => {
             // which it is: the second review of #499 (R2) found a rewritten
             // record said "not signed" when its row was
@@ -1410,6 +1543,243 @@ mod tests {
         j["unmapped"]["northnarrow"]["intent_row"]["line"] = 99.into();
         j["unmapped"]["northnarrow"]["intent_row"]["file"] = 42.into();
         assert_eq!(code(j.to_string()), 0);
+    }
+
+    // ── lot 298: the external bug hunt's export verify (BUG23, 24, 19) ──
+
+    /// BUG23: a line that is not UTF-8 is a malformed line, not the end of
+    /// the verify.
+    #[test]
+    fn non_utf8_line_is_malformed_not_an_error() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let input: &[u8] = b"garbage \xff\xfe bytes\n{\"x\":1}\n";
+        let r = verify(input, &k.verifying_key())
+            .expect("a line that is not UTF-8 is no record, not an I/O error");
+        assert_eq!(r.lines, 2);
+        assert_eq!(
+            r.malformed.iter().map(|m| m.0).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            r.malformed[0].1.starts_with("not UTF-8"),
+            "{:?}",
+            r.malformed
+        );
+        assert_eq!(r.exit_code(), 2);
+    }
+
+    /// BUG23: a line that is not UTF-8 among records leaves the others
+    /// verified, their chain linked across it; "\r\n" ends are read as
+    /// before.
+    #[test]
+    fn a_non_utf8_line_among_records_leaves_the_others_verified() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let rows = chain_of(&k, 3);
+        let rec = |i: usize| record("detections", 1, i as u64 + 1, &rows[i], "");
+        let mut input = Vec::new();
+        input.extend_from_slice(rec(0).as_bytes());
+        input.extend_from_slice(b"\r\n\xc3\x28 not a record\n");
+        input.extend_from_slice(rec(1).as_bytes());
+        input.extend_from_slice(b"\n");
+        input.extend_from_slice(rec(2).as_bytes());
+        let r = verify(input.as_slice(), &k.verifying_key()).unwrap();
+        assert_eq!((r.lines, r.records), (4, 3));
+        assert_eq!(r.malformed.iter().map(|m| m.0).collect::<Vec<_>>(), vec![2]);
+        assert!(r.tampered.is_empty(), "{:?}", r.tampered);
+        assert_eq!((r.chains[0].rows, r.chains[0].linked), (3, 2));
+        assert!(r.chains[0].breaks.is_empty());
+        assert_eq!(r.exit_code(), 2, "a line that is no record");
+    }
+
+    /// The two records of a detection of the exec sensor (its Detection
+    /// Finding, then the launch's Process Activity `…/1`), as the worker
+    /// writes them.
+    fn exec_detection(k: &SigningKey) -> Vec<serde_json::Value> {
+        let zero = "0".repeat(64);
+        let body = format!(
+            "{{\"id\":\"d-1\",\"ts\":\"2026-11-03T00:00:00.000000Z\",\"sensor\":\"Exec\",\
+             \"rule_id\":\"NN-L-EXEC-001\",\"severity\":\"High\",\
+             \"principal\":{{\"pid\":4242,\"ppid\":1,\"uid\":0,\"comm\":\"nc\"}},\
+             \"fmt_ver\":3,\"prev_hash\":\"{zero}\""
+        );
+        let raw = sealed(k, "detections", "data", &zero, &body);
+        let (prev, entry) = nn_evidence::row_verify::links(raw.as_bytes()).unwrap();
+        let ctx = nn_export::ocsf::Context {
+            agent_id: "0123456789abcdef0123456789abcdef".into(),
+            hostname: "host-1".into(),
+            version: "0.0.1".into(),
+        };
+        let r = nn_export::ocsf::Row {
+            chain: nn_proto::ipc::ExportChain::from_name("detections").unwrap(),
+            file: 1,
+            line: 1,
+            end: 100,
+            raw: raw.as_bytes(),
+            rotate: None,
+            verified: true,
+            prev_hash: Some(prev),
+            entry_hash: Some(entry),
+        };
+        let recs = nn_export::ocsf::Mapper::new().map(&ctx, &r);
+        assert_eq!(recs.len(), 2, "precondition: an Exec row maps to 2 records");
+        recs
+    }
+
+    /// BUG24: a capture holding a row's companion record (`…/1`, the exec
+    /// sensor's Process Activity) without the row's Detection Finding is
+    /// not "OK".
+    #[test]
+    fn companion_without_its_finding_is_not_ok() {
+        let k = SigningKey::from_bytes(&[7u8; 32]);
+        let recs = exec_detection(&k);
+        // both records: OK (the baseline)
+        let both = format!("{}\n{}\n", recs[0], recs[1]);
+        let rep = verify(both.as_bytes(), &k.verifying_key()).unwrap();
+        assert_eq!(rep.exit_code(), 0, "{:?}", report_lines(&rep));
+        assert!(rep.notices.is_empty(), "{:?}", rep.notices);
+        // a relay takes the Detection Finding out, keeps the companion
+        let only_companion = format!("{}\n", recs[1]);
+        let rep = verify(only_companion.as_bytes(), &k.verifying_key()).unwrap();
+        assert!(rep.tampered.is_empty(), "{:?}", rep.tampered);
+        assert_ne!(
+            rep.exit_code(),
+            0,
+            "the row's first record is missing and the verify says OK: {:?}",
+            report_lines(&rep)
+        );
+        assert_eq!(rep.exit_code(), 11, "BROKEN");
+        let said = report_lines(&rep);
+        assert!(
+            said.iter().any(|l| l.starts_with("ALERT BROKEN detections: after 1/1 at 1/1: the row's first record (its Detection Finding) is not in the input")),
+            "{said:?}"
+        );
+        // the companion delivered twice, the finding still missing: BROKEN
+        let twice = format!("{}\n{}\n", recs[1], recs[1]);
+        assert_eq!(
+            verify(twice.as_bytes(), &k.verifying_key())
+                .unwrap()
+                .exit_code(),
+            11
+        );
+        // in either order, both: OK
+        let reordered = format!("{}\n{}\n", recs[1], recs[0]);
+        assert_eq!(
+            verify(reordered.as_bytes(), &k.verifying_key())
+                .unwrap()
+                .exit_code(),
+            0
+        );
+    }
+
+    /// BUG24: the finding without its companion: the alert is whole, its
+    /// launch record missing — said (NOTICE), the exit 0.
+    #[test]
+    fn a_finding_without_its_companion_is_a_notice() {
+        let k = SigningKey::from_bytes(&[7u8; 32]);
+        let recs = exec_detection(&k);
+        let rep = verify(format!("{}\n", recs[0]).as_bytes(), &k.verifying_key()).unwrap();
+        let said = report_lines(&rep);
+        assert_eq!(rep.exit_code(), 0, "{said:?}");
+        assert_eq!(rep.notices.len(), 1, "{said:?}");
+        assert!(
+            said.iter().any(|l| l
+                .starts_with("NOTICE line 1: detections 1/1: companion record not in the input")),
+            "{said:?}"
+        );
+        assert!(
+            said.last()
+                .unwrap()
+                .ends_with("; 1 row(s) without their companion record (NOTICE lines)"),
+            "{said:?}"
+        );
+    }
+
+    /// BUG19: an interrupted row as an agent before lot 298 wrote it (no
+    /// intent of its own): mapped by the worker that kept its intent, its
+    /// record carries the intent's signed row and verifies on its own;
+    /// mapped without it, it is said as an outcome without its intent; a
+    /// row that carries its intent takes no attached one.
+    #[test]
+    fn an_interrupted_row_verifies_with_the_intent_it_carries() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let pk = k.verifying_key();
+        let (rows, _) = intent_and_outcome(&k);
+        let h1 = hash(&rows[0]);
+        let body = format!(
+            r#"{{"row":"interrupted","run":"r1","action":7,"ts":"2026-10-31T23:59:30.000000Z","outcome":{{"result":"unknown","outcome":"KillProcessTree pid 4242 (NN-L-CANARY-001): not known","reason":"the agent stopped between the action's intent and its outcome","elapsed_us":0}},"noted_by":"r2","fmt_ver":3,"prev_hash":"{h1}""#
+        );
+        let interrupted = sealed(&k, "actions", "data", &h1, &body);
+        let ctx = nn_export::ocsf::Context {
+            agent_id: "0123456789abcdef0123456789abcdef".into(),
+            hostname: "host-1".into(),
+            version: "0.0.1".into(),
+        };
+        fn row(line: u64, raw: &str) -> nn_export::ocsf::Row<'_> {
+            let (prev, entry) = nn_evidence::row_verify::links(raw.as_bytes()).unwrap();
+            nn_export::ocsf::Row {
+                chain: nn_proto::ipc::ExportChain::Actions,
+                file: 1,
+                line,
+                end: 100 * line,
+                raw: raw.as_bytes(),
+                rotate: None,
+                verified: true,
+                prev_hash: Some(prev),
+                entry_hash: Some(entry),
+            }
+        }
+        let mut worker = nn_export::ocsf::Mapper::new();
+        worker.map(&ctx, &row(1, &rows[0]));
+        let rec = worker.map(&ctx, &row(2, &interrupted)).remove(0);
+        assert_eq!(rec["class_uid"], 7003, "the worker had seen the intent");
+        assert!(rec["unmapped"]["northnarrow"]["intent_raw"].is_string());
+        let r = verify(rec.to_string().as_bytes(), &pk).unwrap();
+        assert_eq!(r.exit_code(), 0, "{:?}", report_lines(&r));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        // a relay that takes the attached intent and its facts out: the row's
+        // mapping without its intent — said
+        let alone = nn_export::ocsf::Mapper::new()
+            .map(&ctx, &row(2, &interrupted))
+            .remove(0);
+        assert_eq!(alone["class_uid"], 7001);
+        let r = verify(alone.to_string().as_bytes(), &pk).unwrap();
+        assert_eq!(
+            (r.exit_code(), r.notices.len()),
+            (0, 1),
+            "{:?}",
+            report_lines(&r)
+        );
+        assert!(r.notices[0]
+            .1
+            .contains("intent not attached: action 7 of run r1"));
+        // an intent's row attached to a row that carries its own intent: not
+        // the worker's mapping
+        let own = format!(
+            r#"{{"row":"interrupted","run":"r1","action":7,"ts":"2026-10-31T23:59:30.000000Z","intent":{{"source":"rule","response":"KillProcessTree","pid":4242,"start_ns":1,"severity":"critical","why":["NN-L-CANARY-001"],"queued_us":1}},"outcome":{{"result":"unknown","outcome":"not known","elapsed_us":0}},"fmt_ver":3,"prev_hash":"{h1}""#
+        );
+        let own = sealed(&k, "actions", "data", &h1, &own);
+        let mut forged = nn_export::ocsf::Mapper::new()
+            .map(&ctx, &row(2, &own))
+            .remove(0);
+        let r = verify(forged.to_string().as_bytes(), &pk).unwrap();
+        assert_eq!(
+            (r.exit_code(), r.notices.len()),
+            (0, 0),
+            "{:?}",
+            report_lines(&r)
+        );
+        forged["unmapped"]["northnarrow"]["intent_raw"] = rows[0].clone().into();
+        forged["unmapped"]["northnarrow"]["intent_row"] =
+            rec["unmapped"]["northnarrow"]["intent_row"].clone();
+        let r = verify(forged.to_string().as_bytes(), &pk).unwrap();
+        assert_eq!(r.exit_code(), 13, "{:?}", report_lines(&r));
+        assert!(
+            r.tampered[0]
+                .1
+                .contains("the intent row it carries is not its action's intent"),
+            "{:?}",
+            r.tampered
+        );
     }
 
     #[test]

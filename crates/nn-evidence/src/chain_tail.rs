@@ -7,7 +7,18 @@
 //! of every answer. [`read_chain_tail`] returns the newest rows first: it
 //! reads the active file, then the sealed archives newest-first, only while
 //! the budget is not full and, with `since`, only while no row older than
-//! `since` has been met.
+//! `since` has been met before the rows at or after it.
+//!
+//! Lot 298 (external bug hunt, BUG04/06/07): the answer is always the
+//! newest rows, contiguous — a row is never returned when a newer matching
+//! one was left out for the budget (a row longer than the whole frame, which
+//! no answer can carry, is skipped with `truncated`) — and `truncated` says
+//! whenever older matching rows may exist: past the budget, past a file
+//! that is there and cannot be read (BUG07), and when a row older than
+//! `since` follows a row at or after it (the clock stepped back, BUG06):
+//! such a row no longer stops the descent into the archives. A row stamped
+//! before `since` at the very head of a file still stops it (it cannot be
+//! told from rows in order).
 //!
 //! Bounds (the read runs on the admin socket's task):
 //! - memory: the rows kept never exceed `soft_cap` bytes, and a line longer
@@ -98,8 +109,18 @@ fn read_chain_tail_bounded<H: ChainHost>(
             truncated = true;
             break;
         }
-        let Some(file) = open_regular::<H>(path) else {
-            continue;
+        let file = match open_regular::<H>(path) {
+            Ok(Some(f)) => f,
+            // A missing file holds no rows (a log not written yet, an
+            // archive evicted meanwhile).
+            Ok(None) => continue,
+            // Lot 298 (BUG07): a file that is there and cannot be read (or
+            // is no regular file) leaves its rows out, and those of the
+            // older files are past a gap: the answer says so and stops.
+            Err(()) => {
+                truncated = true;
+                break;
+            }
         };
         let budget = FileBudget {
             room_bytes,
@@ -119,7 +140,10 @@ fn read_chain_tail_bounded<H: ChainHost>(
             used += row.len() + 1;
             rows.push(row);
         }
-        if scan.omitted || (scan.head_skipped && !scan.saw_older) {
+        // Lot 298 (BUG06): a row older than `since` after a row at or after
+        // it (the clock stepped back) breaks the order the stop at `since`
+        // relies on: older files may still hold matching rows.
+        if scan.omitted || (scan.head_skipped && !scan.saw_older) || scan.out_of_order {
             truncated = true;
         }
         if scan.omitted || scan.head_skipped || scan.saw_older {
@@ -142,22 +166,24 @@ fn read_chain_tail_bounded<H: ChainHost>(
 }
 
 /// Open `path` for reading without following a final symlink and without
-/// blocking; `None` unless it is a regular file. A missing file is not an
-/// error (a log not written yet, an archive evicted meanwhile).
-fn open_regular<H: ChainHost>(path: &Path) -> Option<File> {
+/// blocking. `Ok(None)`: the file is missing, which is not an error (a log
+/// not written yet, an archive evicted meanwhile). `Err(())`: it is there
+/// but could not be opened, or is not a regular file — its rows are unread
+/// (lot 298, BUG07: this was `None` too, and the answer had a silent gap).
+fn open_regular<H: ChainHost>(path: &Path) -> Result<Option<File>, ()> {
     let file = match H::open_read_nofollow(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             warn!(error = %e, path = %path.display(), "chain tail: file not opened");
-            return None;
+            return Err(());
         }
     };
     match file.metadata() {
-        Ok(m) if m.is_file() => Some(file),
+        Ok(m) if m.is_file() => Ok(Some(file)),
         _ => {
-            warn!(path = %path.display(), "chain tail: not a regular file, skipped");
-            None
+            warn!(path = %path.display(), "chain tail: not a regular file, its rows unread");
+            Err(())
         }
     }
 }
@@ -175,8 +201,12 @@ struct FileScan {
     omitted: bool,
     /// The file's head, before the scanned window, was not read.
     head_skipped: bool,
-    /// A row older than `since` was met.
+    /// A row older than `since` was met before any row at or after it (in
+    /// the file's order): the rows of the older files are older still.
     saw_older: bool,
+    /// Lot 298 (BUG06): a row older than `since` was met after a row at or
+    /// after it — the rows are not in time order (the clock stepped back).
+    out_of_order: bool,
     scanned: u64,
 }
 
@@ -192,17 +222,26 @@ fn scan_file(
     let start = len - window;
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::with_capacity(64 * 1024, file.take(window));
-    let max_line = query.soft_cap.min(budget.room_bytes.max(1));
+    // Lot 298 (BUG04): a line is cut only past the frame (`soft_cap`), not
+    // past the room this file has left: a row longer than the room is read
+    // whole and the budget loop below drops it with every older one, so the
+    // answer stays the newest rows, contiguous. Cut at the room, such a row
+    // was "oversized" and skipped while an older, shorter one was kept.
+    // Memory stays bounded by `soft_cap` (one line) plus the room.
+    let max_line = query.soft_cap;
 
     let mut out = FileScan {
         rows: VecDeque::new(),
         omitted: false,
         head_skipped: start > 0,
         saw_older: false,
+        out_of_order: false,
         scanned: window,
     };
     let mut kept_bytes = 0usize;
     let mut buf = Vec::new();
+    // A row at or after `since` was met in this file.
+    let mut seen_newer = false;
     if start > 0 {
         // The window starts inside a line: drop that partial line.
         let _ = next_line(&mut reader, &mut buf, 0)?;
@@ -226,9 +265,17 @@ fn scan_file(
         if let Some(since) = query.since {
             if let Some(ts) = ts_field(line) {
                 if ts < since {
-                    out.saw_older = true;
+                    // Lot 298 (BUG06): after a row at or after `since`, an
+                    // older one is out of order (the clock stepped back): it
+                    // says nothing of the older files, which are read on.
+                    if seen_newer {
+                        out.out_of_order = true;
+                    } else {
+                        out.saw_older = true;
+                    }
                     continue;
                 }
+                seen_newer = true;
             }
         }
         if kind == LineKind::Oversized {
@@ -525,5 +572,141 @@ mod tests {
         assert!(!crate::chainlog::archives_newest_first(&active).is_empty());
         let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), (0..12).rev().collect::<Vec<_>>());
+    }
+
+    // ── lot 298: the external bug hunt's tail reader (BUG04, 06, 07) ──
+
+    /// BUG04: an archive read with less room than a row: the rows that do
+    /// not fit the room were skipped as "oversized" while an older, shorter
+    /// one was kept — the answer was not the newest rows.
+    #[test]
+    fn archive_never_returns_a_row_older_than_an_omitted_one() {
+        fn line(n: u64, len: usize) -> String {
+            let head = format!("{{\"ts\":\"2026-10-15T10:00:{n:02}.000000Z\",\"n\":{n},\"pad\":\"");
+            format!("{head}{}\"}}", "x".repeat(len - head.len() - 2))
+        }
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        std::fs::write(
+            dir.path().join("log.jsonl.000001"),
+            format!("{}\n{}\n{}\n", line(0, 59), line(1, 199), line(2, 199)),
+        )
+        .unwrap();
+        let body: String = (3..12).map(|n| line(n, 99) + "\n").collect();
+        assert_eq!(body.len(), 900);
+        std::fs::write(&active, body).unwrap();
+        let t = read_chain_tail::<PortableHost>(&active, &all(1000));
+        let ns = numbers(&t);
+        assert!(t.truncated);
+        assert_eq!(&ns[..9], &[11, 10, 9, 8, 7, 6, 5, 4, 3]);
+        assert!(
+            !ns.contains(&0) || (ns.contains(&1) && ns.contains(&2)),
+            "row 0 returned, the newer rows 1 and 2 left out: {ns:?}"
+        );
+        // with the room for row 2 (and not for 1), row 2 is the oldest
+        // returned: the answer is the newest rows, contiguous
+        let t = read_chain_tail::<PortableHost>(&active, &all(1100));
+        assert_eq!(numbers(&t), vec![11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+        assert!(t.truncated);
+    }
+
+    /// BUG06: one row stamped before `since` (the clock stepped back) after
+    /// rows at or after it stopped the descent into the archives, and the
+    /// answer did not say rows were left out.
+    #[test]
+    fn one_backdated_row_does_not_hide_archive_rows() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");
+        std::fs::write(
+            dir.path().join("log.jsonl.000001"),
+            [
+                line("2026-11-10T08:00:01.000000Z", 1),
+                line("2026-11-10T08:00:02.000000Z", 2),
+                line("2026-11-10T08:00:03.000000Z", 3),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            &active,
+            [
+                line("2026-11-10T08:00:04.000000Z", 4),
+                line("2025-01-01T00:00:00.000000Z", 99),
+                line("2026-11-10T08:00:05.000000Z", 5),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let q = TailQuery {
+            since: Some("2026-11-10T08:00:00"),
+            ..all(1 << 20)
+        };
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert!(
+            t.truncated || numbers(&t) == vec![5, 4, 3, 2, 1],
+            "rows at or after since left out, not truncated: {:?} truncated={}",
+            numbers(&t),
+            t.truncated
+        );
+        // the archive's rows are read, and the out-of-order row is said:
+        // the order `since` stops on does not hold any more
+        assert_eq!(numbers(&t), vec![5, 4, 3, 2, 1]);
+        assert!(t.truncated, "a row out of order sets truncated");
+    }
+
+    /// Rows in time order: a row older than `since` at the head of a file
+    /// still stops the descent, and nothing is said truncated.
+    #[test]
+    fn rows_in_order_before_since_still_stop_the_descent_untruncated() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        write_rows(&dir.path().join("log.jsonl.000001"), 0..5);
+        write_rows(&dir.path().join("log.jsonl.000002"), 5..10);
+        write_rows(&active, 10..12);
+        let q = TailQuery {
+            since: Some("2026-10-15T10:00:07"),
+            ..all(1 << 20)
+        };
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert_eq!(numbers(&t), vec![11, 10, 9, 8, 7]);
+        assert!(!t.truncated);
+    }
+
+    /// BUG07: an archive that is there and cannot be read (here a directory
+    /// at its name) left its rows out: the answer must say so, and it
+    /// returns no row older than them.
+    #[test]
+    fn unreadable_archive_in_the_middle_sets_truncated() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        write_rows(&dir.path().join("log.jsonl.000001"), 0..3);
+        std::fs::create_dir(dir.path().join("log.jsonl.000002")).unwrap();
+        write_rows(&active, 6..8);
+        let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
+        assert!(
+            t.truncated,
+            "archive 000002's rows missing, truncated=false: {:?}",
+            numbers(&t)
+        );
+        assert_eq!(numbers(&t), vec![7, 6], "no row past the gap");
+    }
+
+    /// A missing archive (evicted meanwhile) is still not an error: the
+    /// read goes on, silent (by design).
+    #[test]
+    fn missing_archive_is_still_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        write_rows(&active, 6..8);
+        let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
+        assert_eq!(numbers(&t), vec![7, 6]);
+        assert!(!t.truncated);
+        // the active file itself not a regular file: its rows unread, said
+        let other = dir.path().join("dir.jsonl");
+        std::fs::create_dir(&other).unwrap();
+        let t = read_chain_tail::<PortableHost>(&other, &all(1 << 20));
+        assert_eq!(t.count, 0);
+        assert!(t.truncated);
     }
 }

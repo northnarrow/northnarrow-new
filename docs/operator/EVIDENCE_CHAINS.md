@@ -50,6 +50,23 @@ and check with `journalctl --namespace=northnarrow --verify
 not stop root from removing the files, which is what the forwarded copy is
 for.
 
+### The read verbs' answers (`fim report`, `net flows`, `net listeners`, `canary list`)
+
+They read a log's active file, then its archives newest first, unverified
+(`chain verify` is the check), within the frame's budget; `truncated: true`
+says older matching rows may exist that are not in the answer. Lot 298
+(external bug hunt BUG04, BUG06, BUG07): the answer is the newest rows,
+contiguous — a row is never returned when a newer one was left out for the
+budget; an archive that is there and cannot be read (not a regular file,
+its open refused) ends the answer with `truncated` (a missing one is
+skipped silently, as an archive evicted meanwhile); with `--since`, a row
+stamped before it that follows rows at or after it (the clock stepped back)
+no longer stops the read before the archives: they are read on, and the
+answer says `truncated` (the order the stop relies on does not hold). A
+row stamped before `--since` at the very head of a file still stops it: it
+cannot be told from rows in order. A row longer than the whole frame is
+skipped with `truncated`, as before.
+
 ### The actions chain (R12c, lab PR 270)
 
 `/var/lib/northnarrow/detections/actions.jsonl` (`--actions-file`; its
@@ -69,7 +86,10 @@ The two share `run` (the agent run, 16 hex digits, named in the start's
 journal: `actions journal: this run's id`) and `action` (its number in the
 run). An `interrupted` row, written by a later start, answers an intent of
 an earlier run that has no outcome — the agent stopped, crashed or was
-killed between the two: whether that action took effect is not known; the
+killed between the two: whether that action took effect is not known; it
+carries the intent it answers (`intent`, as the intent row said it; lot
+298 — an older agent's has none, and the export maps it from the intent it
+kept, `EXPORT.md` §6); the
 same start signs a `response_interrupted` audit row naming them and
 `nn-admin status --key` counts them (`intents of an earlier run without an
 outcome`). R12c-3: a `stalled` row names an action still running past the stall
@@ -133,6 +153,13 @@ aborted or stopped at the first bad line):
 - **A sealed archive without its terminator** (`archive N (…) has no
   terminator: it is empty or was cut before its last line`): that rotating
   log is `BROKEN`; the next chains are verified and reported as usual.
+- **A line after a file's terminator** (`file F: entry N: a line after the
+  file's terminator (…)`; lot 298, external bug hunt BUG29): a sealed file
+  ends at its terminator, and the writer appends nothing after it. Genuine
+  lines replayed there from the next file (which roots at that terminator)
+  used to verify and be counted twice; a second terminator, or a line
+  after the terminator of an active file whose rotation was interrupted,
+  is the same finding. That rotating log is `BROKEN`.
 - **Archives past seq 999,999** are named with seven or more digits
   (`detections.jsonl.1000000`) and are listed, rotated out and verified
   like the others. Any other spelling of a number (`.00099`, `.0123456`)
@@ -178,7 +205,10 @@ What `nn-admin chain verify` / `audit verify` print for it (exit 8):
   not what the agent wrote: a key added, reordered or re-spelled)` — a rotating
   log, its archives or manifest (N counted from 0, empty lines included).
 - `entry N: a numbered row not in its canonical form (…)` — the audit chain or a
-  canary chain (N counted from 0 over the rows).
+  canary chain (N counted from 0 over the rows). A `\r` before a row's
+  newline is a byte the agent did not write: the canary chains' rows are
+  split on the newline alone (lot 298, BUG09: `\r\n` passed), so a numbered
+  row ending in `\r` is refused here and an old-format one is counted.
 - `file F: entry N: a line in the old format (v1/v2, untagged pre-image) after v3
   lines` — the agent writes v3 only; an old-format line after the first v3 line
   of a log (or of its manifest) was put there.
@@ -244,7 +274,9 @@ after this version has written is not supported.
 4. **Find the window.** These files can only be changed with the
    anti-tamper hooks out of the way: look in the audit chain, just before
    the finding, for a `trusted_installer_grant`, an `agent_boot` whose
-   `previous_run` says `abrupt`, other `integrity_drift` entries, and for
+   `previous_run` says `abrupt` (a start refused by a gate is not a run: it
+   neither ends the run before it nor makes the next one say `abrupt`; lot
+   298, BUG16), other `integrity_drift` entries, and for
    the time the rows went missing (the anchored head's `seq` and the
    `chain.head` journal lines say what was there).
 5. **Treat it as an incident.** Missing evidence means someone with root

@@ -412,3 +412,90 @@ fn the_configuration_is_off_without_a_signed_text_on_with_one() {
     );
     let _ = RowPos { file: 0, line: 0 };
 }
+
+/// Lot 298 (external bug hunt, BUG19): the interrupted row the journal
+/// writes, mapped by a worker that never saw its intent (restarted since
+/// the intent: `Mapper::new()`, the common case), is its intent's class
+/// (EXPORT.md: "action `interrupted` | its intent's class | status Error")
+/// — it came out as 7001/Unknown, "action ?" — and verifies as a receiver
+/// checks it.
+#[test]
+fn interrupted_row_as_journal_writes_it_is_its_intents_class() {
+    use crate::response::journal::{ActionJournal, ActionRow};
+    use nn_evidence::action_payload::ActionIntent;
+    let dir = tempfile::tempdir().unwrap();
+    let active = dir.path().join("actions.jsonl");
+    let open = || {
+        ActionJournal::open_log(
+            &active,
+            key(dir.path()),
+            RotationConfig {
+                size_cap_bytes: u64::MAX,
+                max_archives: 8,
+                file_mode: 0o600,
+            },
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap()
+    };
+    // run 1: an intent, and the agent "dies" before its outcome
+    let first = ActionJournal::late();
+    let rec = first.bind(open(), &active);
+    first.start_run(&rec);
+    let mut intent = ActionIntent::named("rule", "KillProcessTree", 4242);
+    intent.why = vec!["R001_ExecFromTmp".into()];
+    std::mem::forget(first.intent(intent));
+    // run 2: its start answers it with an interrupted row
+    let second = ActionJournal::late();
+    let rec = second.bind(open(), &active);
+    second.start_run(&rec);
+    let body = std::fs::read_to_string(&active).unwrap();
+    let (line, raw) = body
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("\"row\":\"interrupted\""))
+        .expect("the interrupted row");
+    let parsed: crate::response::journal::ActionRecord = serde_json::from_str(raw).unwrap();
+    assert_eq!(parsed.row, ActionRow::Interrupted);
+    let (prev, entry) = nn_evidence::row_verify::links(raw.as_bytes()).unwrap();
+    let ctx = nn_export::ocsf::Context {
+        agent_id: "0123456789abcdef0123456789abcdef".into(),
+        hostname: "host-1".into(),
+        version: "0.0.1".into(),
+    };
+    let row = nn_export::ocsf::Row {
+        chain: ExportChain::Actions,
+        file: 1,
+        line: line as u64 + 1,
+        end: 0,
+        raw: raw.as_bytes(),
+        rotate: None,
+        verified: true,
+        prev_hash: Some(prev),
+        entry_hash: Some(entry),
+    };
+    let recs = nn_export::ocsf::Mapper::new().map(&ctx, &row);
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(
+        (r["class_uid"].as_u64(), r["activity_id"].as_u64()),
+        (Some(7003), Some(2)),
+        "the intent's class (Process Remediation, Evict): {r}"
+    );
+    assert_eq!(r["process"]["pid"], 4242);
+    assert_eq!(r["status_id"], 6, "Error: interrupted");
+    assert_eq!(r["message"], "rule KillProcessTree pid 4242");
+    let errs = nn_export::schema::check_record(r);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    // the receiver's check: the row the agent's, the record its mapping,
+    // nothing to say
+    let pk = key(dir.path()).verifying_key();
+    let report = nn_admin::export::verify(r.to_string().as_bytes(), &pk).unwrap();
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "{:?}",
+        nn_admin::export::report_lines(&report)
+    );
+    assert!(report.notices.is_empty(), "{:?}", report.notices);
+}

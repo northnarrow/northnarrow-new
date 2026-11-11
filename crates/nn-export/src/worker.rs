@@ -304,7 +304,11 @@ fn file_rows(
         let m = map_row(&mut f.mapper, ctx, pk, r.chain, row);
         records += m.lines.len() as u32;
         unverified += u32::from(!m.verified);
-        lines.extend(m.lines);
+        // Lot 298 (external bug hunt, BUG24): a row's records as one unit
+        // of the sink (joined by their newline), so that a rotation of the
+        // files never falls between them — `nn-admin export verify` says a
+        // detection's companion record without its finding is BROKEN.
+        lines.push(m.lines.join(&b'\n'));
         last = Some(row.pos());
     }
     let result = match f.sink.as_mut() {
@@ -400,6 +404,54 @@ mod tests {
         assert_eq!(o.fault, Some(SinkFault::NotSetUp));
         assert_eq!(o.state, SinkState::Failed);
         assert_eq!(o.acked, None);
+    }
+
+    /// Lot 298 (BUG24): a row's two records (an exec detection's finding
+    /// and its launch) stay in one file: the sink rotates before the row,
+    /// never between them.
+    #[test]
+    fn a_row_s_records_stay_in_one_file() {
+        let fx = crate::ocsf::tests::fixtures();
+        let req = rows(ExportSink::File, vec![row(1, &fx[1].1), row(2, &fx[0].1)]);
+        // the lines' sizes, from a sink that does not rotate
+        let d = tempfile::tempdir().unwrap();
+        let mut w = ExportWorker::new(d.path());
+        w.setup(&setup(true, false, false), &mut |_| false);
+        assert_eq!(w.rows(&req).records, 3);
+        let text = std::fs::read_to_string(d.path().join(crate::jsonl::ACTIVE)).unwrap();
+        let lens: Vec<u64> = text.lines().map(|l| l.len() as u64 + 1).collect();
+        assert_eq!(lens.len(), 3);
+        // a file that holds the first row and the finding, not the launch
+        let d = tempfile::tempdir().unwrap();
+        let mut w = ExportWorker::new(d.path());
+        let mut s = setup(true, false, false);
+        s.file = Some(FileSetup {
+            max_bytes: lens[0] + lens[1] + 1,
+            max_files: 3,
+        });
+        w.setup(&s, &mut |_| false);
+        let o = w.rows(&req);
+        assert_eq!((o.records, o.state), (3, SinkState::Up));
+        let read = |name: &str| std::fs::read_to_string(d.path().join(name)).unwrap();
+        let older = read(&format!("{}.1", crate::jsonl::ACTIVE));
+        let active = read(crate::jsonl::ACTIVE);
+        assert_eq!(older.lines().count(), 1, "the first row alone: {older}");
+        let uids: Vec<String> = active
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["metadata"]["uid"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            uids.len(),
+            2,
+            "the exec row's finding and its launch together"
+        );
+        assert_eq!(format!("{}/1", uids[0]), uids[1]);
+        assert_eq!(format!("{older}{active}"), text, "the same lines, in order");
     }
 
     /// The file sink: each row's records as lines, the row unverified
