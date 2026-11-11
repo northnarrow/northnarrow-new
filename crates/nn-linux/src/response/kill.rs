@@ -989,13 +989,16 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         use std::process::{Command, Stdio};
         let dir = tempfile::tempdir().unwrap();
+        // the kid: a shell run through the link, looping on `sleep 1` (a
+        // shell does not dispatch on `argv[0]`, as uutils' multicall
+        // coreutils — Ubuntu 26.04, the CI's image — does)
         let link = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
-        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        // bash's `exec -a`: argv[0] stays `sleep` (a multicall coreutils —
-        // uutils on Ubuntu 26.04, the CI's image — dispatches on it), the
-        // kernel takes `comm` from the file's name
-        let mut sh = Command::new("bash")
-            .args(["-c", "(exec -a sleep \"$0\" 30) & echo $!; wait"])
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        let mut sh = Command::new("sh")
+            .args([
+                "-c",
+                "\"$0\" -c 'while :; do sleep 1; done' & echo $!; wait",
+            ])
             .arg(&link)
             .stdout(Stdio::piped())
             .spawn()

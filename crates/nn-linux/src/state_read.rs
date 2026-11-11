@@ -32,18 +32,20 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
     /// The `comm` the kernel gives a process that executes a file named so.
     pub const NON_UTF8_COMM: &[u8] = b"\xff\xfe";
 
-    /// A `sleep` run through a symlink named [`NON_UTF8_COMM`]: the kernel
-    /// sets its `comm` to the name of the file it executed, so its
-    /// `/proc/<pid>/stat` and `status` are not UTF-8 from its first
-    /// instruction — what an unprivileged process gets for itself. Killed
-    /// and reaped on drop; the symlink's directory removed.
+    /// A shell (`/bin/sh`) run through a symlink named [`NON_UTF8_COMM`]:
+    /// the kernel sets its `comm` to the name of the file it executed, so
+    /// its `/proc/<pid>/stat` and `status` are not UTF-8 from its first
+    /// instruction — what an unprivileged process gets for itself. It loops
+    /// on `sleep 1` (one process of that name, alive throughout: a shell
+    /// does not dispatch on `argv[0]`, as a multicall coreutils — uutils on
+    /// Ubuntu 26.04, the CI's image — does). Killed and reaped on drop; the
+    /// symlink's directory removed.
     pub struct NonUtf8Comm {
         pub child: Child,
         dir: PathBuf,
@@ -74,17 +76,13 @@ pub mod testing {
         ));
         std::fs::create_dir_all(&dir).expect("n6 dir");
         let link = dir.join(std::ffi::OsStr::from_bytes(NON_UTF8_COMM));
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("sleep(1)");
-        std::os::unix::fs::symlink(sleep, &link).expect("n6 symlink");
-        // argv[0] stays `sleep`: a multicall coreutils (uutils, Ubuntu
-        // 26.04 — the CI's image) dispatches on it, and would not run as
-        // `\xff\xfe`; the kernel takes `comm` from the file's name
+        std::os::unix::fs::symlink("/bin/sh", &link).expect("n6 symlink");
         let child = Command::new(&link)
-            .arg0("sleep")
-            .arg(secs.to_string())
+            .arg("-c")
+            .arg(format!(
+                "i=0; while [ $i -lt {secs} ]; do sleep 1; i=$((i + 1)); done"
+            ))
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
