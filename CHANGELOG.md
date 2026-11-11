@@ -44,6 +44,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `xtask/tests/state_reads.rs` keeps it so: no `/proc` entry of a process
   is read as strict text in the security crates, and a read whose failure
   becomes a default is listed with its reason.
+  - After the independent review: the byte parser reads a mount whose
+    source is `-` (`fusermount3 -o fsname=-`) or empty — it had dropped it,
+    a regression; a FUSE mount is classed by its type and keyed by its
+    device (its daemon names the root's inode); roots are read without
+    following a link and only while they show their line's device; lines
+    not in the kernel's shape and roots the kernel's map refuses are
+    signed degradations; a degradation withdrawn before its flush is signed
+    all the same; drop-ins and environment files are read bounded, regular
+    files only; the kill's capture reads `stat` once more before its pidfd
+    fallback; the ratchet is semantic (the tolerant readers, `if let Ok`,
+    `unwrap_or*`, `match` arms, paths from consts and fields, each site
+    named).
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

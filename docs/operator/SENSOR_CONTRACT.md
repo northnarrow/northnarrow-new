@@ -104,7 +104,12 @@ credential-read rules' owner check, made on the placed path, could not run
 (lab, Ubuntu 24.04: NN-L-FIM-011 on another account's `~/.aws/credentials`
 was recorded with no response, killed once the mount was gone). A table that
 cannot be read at all keeps the roots last read, with a degradation
-(`mount_table`) while it fails.
+(`mount_table`) while it fails. The review of #538: a FUSE mount places its
+files by its device alone (its daemon names its root's inode, and root may
+not `stat` it), any other root is read without following a link and only
+while it shows its line's device; a mount point that is not UTF-8 leaves its
+files unplaced (`mnt[…]`) instead of under a path no file has; a line not in
+the kernel's shape is a degradation (`mount_table_rows`) while it lasts.
 
 R14b: a `dns_query` event's name is decoded by the agent's parse worker
 (`WORKERS.md`), not by the agent's core. While the worker is down or

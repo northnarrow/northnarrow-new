@@ -9187,6 +9187,15 @@ number in parentheses is a lab PR.
     (`6.12.115`): lot 311a's kill cases still killed. Not run end to end:
     the unprivileged FUSE mount itself (no FUSE file system on our
     guests), N8, and BUG-108's kernel half.
+  - The independent review of #538: the byte parser had dropped a mount
+    whose source is `-` or empty (`fsname=-`: a user's FUSE mount left the
+    guarded roots and the sensors' table — a regression of this lot,
+    fixed); N8's key `(dev, 1)` relied on the root's inode, which a FUSE
+    daemon names at will: FUSE mounts are classed by type and keyed by
+    device now — N8 is closed on the user side, its kernel half (the magic
+    in the exec hooks) is lot 318's; the lost lines, the refused roots and
+    a degradation withdrawn before its flush are signed; the ratchet became
+    semantic. @LABREV@
   - Level unchanged: the exec quarantine and policy stay EXPERIMENTAL (C12,
     C13), and BUG-108's kernel half (the walk to a subvolume's root) is
     lot 9's.
