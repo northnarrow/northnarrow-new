@@ -9195,10 +9195,12 @@ number in parentheses is a lab PR.
       (`AlreadyGone` instead of `Failed{EMFILE}`).
     - Every run's `unreported` was 0 (13 runs that print it): no run met
       a process stopped without an entry; that path is proven on the host
-      (the fake kernel's map) only. Which window left one process stopped
-      on `main` before #537 (3 runs of 8) is not attributed by these
-      measurements: neither this lot's new fields nor `main` with #537
-      (0 of 5) show it.
+      (the fake kernel's map) only. `main` before #537 left one process
+      stopped in 4 of 16 runs (a diagnostic round on 7.0, 1 of 8, printed
+      the agent's log lines on the leftover pid: none — no capture failure
+      was logged for it, so its report was never read: BUG-118's case);
+      `main` with #537 passed 5 of 5. The lab shows the property (nothing
+      left stopped in 16 of 16 runs of the fix), not the sweep at work.
     - Every guest left powered off with no agent installed, no process in
       state T, no test cgroup, no leftover file.
   - Not done: the recovery of what a previous agent left stopped when the
