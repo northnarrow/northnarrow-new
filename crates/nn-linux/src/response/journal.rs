@@ -561,7 +561,14 @@ impl ActionJournal {
     /// R12c-2: whether the chain still holds the head (`file`, `bytes`,
     /// `hash`) its [`Self::head`] named earlier — `false`: its tail was cut
     /// or rewritten since (`None`: not bound, or the file not readable).
+    ///
+    /// Lot 314 (the third bug hunt, BUG-107): a head named right after a
+    /// rotation, (N, 0, H), names the terminator that closed archive N-1
+    /// (`chainlog::head_line`): that archive's last line is read. It was
+    /// held without a read, so a cut of that archive's tail went unseen
+    /// for as long as the new file stayed empty (a quiet host's heartbeats).
     pub fn holds(&self, file: u64, bytes: u64, hash: &str) -> Option<bool> {
+        let (file, end) = crate::chainlog::head_line(file, bytes, hash);
         // (the file, and whether the chain must still have it: the active
         // file, or an archive within those it keeps — review of #478, X2)
         let (path, kept) = match &*self.inner.writer.lock() {
@@ -579,7 +586,11 @@ impl ActionJournal {
             }
             _ => return None,
         };
-        match crate::chainlog::holds_line_ending_at(&path, bytes, hash) {
+        let held = match end {
+            Some(end) => crate::chainlog::holds_line_ending_at(&path, end, hash),
+            None => crate::chainlog::holds_last_line(&path, hash),
+        };
+        match held {
             Ok(held) => Some(held),
             // a file the chain keeps, gone: removed — the head not held
             Err(_) if kept && std::fs::symlink_metadata(&path).is_err() => Some(false),

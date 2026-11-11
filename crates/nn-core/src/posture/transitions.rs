@@ -100,6 +100,42 @@ fn touch_last_trigger(state: PostureState, now: Instant) -> PostureState {
     }
 }
 
+/// Lot 314 (the third bug hunt, BUG-84): the state an administrator's
+/// order to `target` leaves (`force-posture`, and the debug hatch). Another
+/// kind: that kind, fresh — its decay timers from `now`, a forced COMBAT
+/// locked (external audit POS-001: the administrator ordered it). The kind
+/// it is in: the state as it is, its decay timers untouched — except an
+/// unlocked COMBAT, which the order locks (an explicit lock, which the
+/// machine records as a transition of its own). The state was rewritten
+/// whole: a force to the current ALERTED or ENGAGED re-armed its decay (one
+/// hour, a day), and an unlocked COMBAT was locked without a trace.
+pub fn forced(state: &PostureState, target: PostureKind, now: Instant) -> PostureState {
+    if state.kind() == target {
+        return match state {
+            PostureState::Combat { since, .. } => PostureState::Combat {
+                since: *since,
+                locked: true,
+            },
+            other => other.clone(),
+        };
+    }
+    match target {
+        PostureKind::Observing => PostureState::Observing,
+        PostureKind::Alerted => PostureState::Alerted {
+            since: now,
+            last_trigger: now,
+        },
+        PostureKind::Engaged => PostureState::Engaged {
+            since: now,
+            last_trigger: now,
+        },
+        PostureKind::Combat => PostureState::Combat {
+            since: now,
+            locked: true,
+        },
+    }
+}
+
 /// Apply decay if the appropriate window has elapsed.
 ///
 /// Returns `Some(new_state)` if a transition fired, `None`

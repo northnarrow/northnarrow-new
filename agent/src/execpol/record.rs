@@ -3,7 +3,6 @@
 //! variable, the environment trick, the mapping), through the per-rule
 //! budget like every rule's. Pure functions; the [`SinkRecorder`] writes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,7 @@ use super::{
     RULE_PRELOAD, RULE_PRELOAD_NAME,
 };
 use crate::decision::attack::{mitre_of, AttackRef, Tactic};
+use crate::decision::bounded::RepeatWindow;
 use crate::detection_payload::ExecPolEvidence;
 use crate::detection_store::DetectionSink;
 
@@ -451,18 +451,66 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
     out
 }
 
+/// Lot 314 (BUG-125): the record-only findings [`Repeats`] remembers; past
+/// it the one admitted least recently is forgotten (it may be recorded once
+/// more, within the per-rule budget). An unprivileged user makes a new
+/// finding with every distinct value (`HISTFILE=/a/<n>`): the table had no
+/// cap, and its sweep ran at every admit once it held 4096.
+pub const REPEATS_CAP: usize = 4096;
+
+/// Lot 314 (BUG-92): what makes two record-only findings the same — every
+/// field the record shows of the finding, its severity and its caller's
+/// tier among them; not the process (its pid, its time). The key was the
+/// rule, the uid, the file, the shown values and the decision: a Critical
+/// CVE-2023-4911 `GLIBC_TUNABLES` whose first 96 characters and length were
+/// a Medium one's was held back as a repeat of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RepeatKey {
+    rule: String,
+    severity: Severity,
+    uid: u32,
+    path: String,
+    kind: String,
+    decision: String,
+    tier: String,
+    tier_signals: Vec<String>,
+    classes: Vec<String>,
+    environment: Vec<String>,
+    values: Vec<String>,
+    at_secure: bool,
+}
+
+impl RepeatKey {
+    fn of(rec: &ExecPolRecord) -> Self {
+        let e = &rec.evidence;
+        RepeatKey {
+            rule: rec.verdict.rule_id.clone(),
+            severity: rec.verdict.severity,
+            uid: crate::detection_payload::Principal::from_event(&rec.event).uid,
+            path: rec.verdict.event_filename.clone(),
+            kind: e.kind.clone(),
+            decision: e.decision.clone(),
+            tier: e.tier.clone(),
+            tier_signals: e.tier_signals.clone(),
+            classes: e.classes.clone(),
+            environment: e.environment.clone(),
+            values: e.values.clone(),
+            at_secure: e.at_secure,
+        }
+    }
+}
+
 /// Holds back repeats of the same record-only finding (one shell's
-/// `HISTFILE=/dev/null` is in every exec it makes) for a while.
+/// `HISTFILE=/dev/null` is in every exec it makes) for a while. Lot 314: a
+/// [`RepeatWindow`] keyed by [`RepeatKey`], capped at [`REPEATS_CAP`].
 pub struct Repeats {
-    seen: HashMap<String, Instant>,
-    every: Duration,
+    seen: RepeatWindow<RepeatKey>,
 }
 
 impl Repeats {
     pub fn new(every: Duration) -> Self {
         Repeats {
-            seen: HashMap::new(),
-            every,
+            seen: RepeatWindow::new(every, REPEATS_CAP),
         }
     }
 
@@ -472,25 +520,7 @@ impl Repeats {
         if rec.evidence.decision == "deny" {
             return true;
         }
-        let key = format!(
-            "{}|{}|{}|{}|{}",
-            rec.verdict.rule_id,
-            crate::detection_payload::Principal::from_event(&rec.event).uid,
-            rec.verdict.event_filename,
-            rec.evidence.values.join(","),
-            rec.evidence.decision
-        );
-        if self.seen.len() > 4096 {
-            let every = self.every;
-            self.seen.retain(|_, t| now.duration_since(*t) < every);
-        }
-        match self.seen.get(&key) {
-            Some(t) if now.duration_since(*t) < self.every => false,
-            _ => {
-                self.seen.insert(key, now);
-                true
-            }
-        }
+        self.seen.admit(RepeatKey::of(rec), now)
     }
 }
 
