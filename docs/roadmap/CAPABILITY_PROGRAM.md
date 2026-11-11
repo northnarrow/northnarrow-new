@@ -9177,7 +9177,23 @@ number in parentheses is a lab PR.
     event's file is `st_nlink`, its path told by a cached `lstat` against
     `fstat` (a hard link left keeps the opened name: a mini-hunt variant);
     `ExecPolRaw::at_secure`; the watchdog's start read before and after.
-  - Measured on our guests: @LAB315@
+  - Measured on our guests: Ubuntu 24.04 (`6.8.0-147-generic`, ext4, the
+    guard on `/srv/nn-cow-test`, `deploy/lab/cow/cow-check.sh`). N2 on
+    `main`: the attack (an untrusted `python3` of the lab user) rewrote and
+    deleted `x.txt`, the owner's `cp -p` of a file dated 2025 got its inode
+    number at the first try, and `remediate ransomware --pid` recreated
+    `x.txt` and moved the owner's file into the journal's evidence, its mtime
+    2025-01-01 — the next expiry's to delete. With this lot (the new `reuse`
+    mode): the same reuse at the first try, `x.txt` recreated, the owner's
+    file in place and unchanged, no evidence. The mass write of `run` (51
+    files rewritten and renamed `.locked`): 50 copies, 50 recreated byte for
+    byte and their 50 renamed copies moved into the evidence, the 20 MiB
+    file over the copy cap as designed. The privileged e2e
+    `cow_privileged_e2e` (the guard on a tmpfs, root): 3 of 3, the new
+    `two_writers_of_one_tree_are_its_attack` included; with the guard's
+    write-opens built without their lineage (mutant M35) it fails. Not run
+    on a guest: BUG-102's worker (a real io_uring worker on the host's
+    kernel, 6.18, in a unit test), BUG-109, BUG-101 (record only), BUG-113.
   - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
     by default (C19, C13); BUG-101's kernel half (the deny skipped for every
     set-id target) is lot 318's.
