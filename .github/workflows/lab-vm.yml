@@ -214,8 +214,8 @@ jobs:
             printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
           APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-          sudo apt-get "${APT_OPTS[@]}" update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends \
+          sudo apt-get update "${APT_OPTS[@]}" -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install "${APT_OPTS[@]}" -y -qq --no-install-recommends \
             qemu-system-x86 qemu-utils seabios ipxe-qemu cloud-image-utils \
             gnupg gpgv openssh-client rsync curl iproute2 >/dev/null
           qemu-system-x86_64 --version | head -1
