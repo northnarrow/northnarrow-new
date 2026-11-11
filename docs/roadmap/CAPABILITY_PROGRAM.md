@@ -8754,6 +8754,13 @@ number in parentheses is a lab PR.
     `head -c 5194304; exit 0`, `trap '' PIPE; head …; exit 0`), 5 runs out
     of 5 — the bug without uutils; with the fix each is an `Err` naming the
     bound; the heartbeat module's 15 tests 40 runs out of 40.
+  - Measured on our Ubuntu 26.04 guest (uutils `head` 0.10.0, the CI's
+    conditions; lease k304): `main`'s heartbeat tests failed 4 runs out of
+    5 (`a_source_past_the_bound_is_a_failed_fetch`, `Ok` instead of `Err`);
+    with the fix 35 runs out of 35 green. The guest's whole unprivileged
+    `cargo test --workspace`: nn-admin green, 34 failures all in `xtask
+    --test install_scripts` (the guest's `target/tmp` left owned by root
+    by an earlier privileged run), none of this change's.
   - Mutations (a catch is a named test failing): 11 on the new code, 11
     caught; `origin/main`'s logic under the new tests caught by 4 named
     tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
