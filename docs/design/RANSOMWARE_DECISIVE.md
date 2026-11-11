@@ -90,15 +90,23 @@ by a package: a binary in `/opt` or `/usr/local` no package lists vouches for
 nothing it starts (lot 292, BUG-49; before, the ancestors were judged by tree
 alone). Lot 310 (BUG-49, the decision of 11/11/2026): nor does an interpreter
 running an inline program (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node
---eval`) or its standard input (`sh -s`) — that program is the caller's, and a
-webshell's `sh -c 'openssl enc …'` made the packaged `openssl` a trusted
-writer (the triage's LOTL case). A packaged tool such a shell starts is
-judged; a package transaction stays trusted. What this costs: a cron job, a
+--eval`) or its standard input (`sh -s`; `bash < file` and `curl … | sh`, a
+shell naming nothing whose standard input the exec pump finds a file, a pipe
+or a socket) — that program is the caller's, and a webshell's `sh -c
+'openssl enc …'` made the packaged `openssl` a trusted writer (the triage's
+LOTL case). Nor does a user's service manager (`systemd --user`, the systemd
+file at a pid other than 1; the independent review of #539):
+`systemd-run --user /usr/bin/openssl enc …` was a lineage of installed
+programs end to end. Its actor is the process it started, never the
+manager. A packaged tool such a shell or manager starts is judged; a package
+transaction and PID 1's units stay trusted. What this costs: a cron job, a
 unit's `ExecStart=/bin/sh -c …`, an administrator's non-interactive `ssh host
-'cmd'` (sshd runs `bash -c`) start their tools through an inline shell, and
-those tools' bursts now count — NN-L-IMP-001's kill stays held by default,
-its Critical record and the posture's `RansomwareEncryption` remain. Never
-by `comm`, never by a name list.
+'cmd'` (sshd runs `bash -c`), a make recipe, a desktop session's services
+and terminal (its user's manager starts the terminal emulator) start their
+tools through an inline shell or a user's manager, and those tools' bursts
+now count — NN-L-IMP-001's kill stays held by default, its Critical record
+and the posture's `RansomwareEncryption` remain (the lab's measure: the PR
+of lot 310). Never by `comm`, never by a name list.
 
 What an interpreter runs is read from its argv with that interpreter's own
 option table (lot 292, BUG-44 and BUG-42: `python3 -O x.py` runs `x.py`,

@@ -680,8 +680,14 @@ mod tests {
     fn an_unlinked_interpreter_is_still_one_and_empty_arguments_count() {
         use std::path::PathBuf;
         let p = |s: &str| PathBuf::from(s);
-        assert_eq!(executed_path(p("/usr/bin/python3.12 (deleted)"), true), p("/usr/bin/python3.12"));
-        assert_eq!(executed_path(p("/opt/x (deleted)"), false), p("/opt/x (deleted)"));
+        assert_eq!(
+            executed_path(p("/usr/bin/python3.12 (deleted)"), true),
+            p("/usr/bin/python3.12")
+        );
+        assert_eq!(
+            executed_path(p("/opt/x (deleted)"), false),
+            p("/opt/x (deleted)")
+        );
         assert_eq!(executed_path(p("/usr/bin/dnf"), false), p("/usr/bin/dnf"));
         assert_eq!(
             argv_of(b"python3\0-W\0\0/tmp/evil.py\0/usr/bin/dnf\0"),
@@ -696,7 +702,10 @@ mod tests {
         // its exec (the parallel harness): `ETXTBSY` for a moment
         let mut child = (0..200)
             .find_map(|_| {
-                match std::process::Command::new(&copy).args(["-c", "sleep 5; :"]).spawn() {
+                match std::process::Command::new(&copy)
+                    .args(["-c", "sleep 5; :"])
+                    .spawn()
+                {
                     Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         None

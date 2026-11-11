@@ -178,7 +178,10 @@ mod tests {
         assert_eq!(super::kernel_dev(0x802), 0x80_0002);
         assert_eq!(super::kernel_dev(64769), 265_289_729);
         // major 8, minor 257: new_encode_dev = 0x01 | 8 << 8 | 0x100 << 12
-        assert_eq!(super::kernel_dev(0x1 | (8 << 8) | (0x100 << 12)), (8 << 20) | 257);
+        assert_eq!(
+            super::kernel_dev(0x1 | (8 << 8) | (0x100 << 12)),
+            (8 << 20) | 257
+        );
         assert_eq!(super::kernel_dev(0), 0);
         // an anonymous device (overlay, tmpfs: major 0)
         assert_eq!(super::kernel_dev(0x2d), 0x2d);

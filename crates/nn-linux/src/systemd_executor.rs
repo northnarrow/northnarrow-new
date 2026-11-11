@@ -119,8 +119,8 @@ fn held_by_managers(root: &Path, proc_root: &Path) -> Vec<(u64, u64)> {
         };
         for fd in fds.flatten() {
             let held = fd.path();
-            let is_executor = link_target(&held, root)
-                .is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()));
+            let is_executor =
+                link_target(&held, root).is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()));
             if let Some(id) = file_id(&held).filter(|_| is_executor) {
                 out.push(id);
             }
@@ -205,7 +205,11 @@ mod tests {
         };
         make("1", "/usr/lib/systemd/systemd", &held);
         make("4242", "/usr/bin/bash", &held);
-        make("4343", "/usr/lib/systemd/systemd", &elsewhere.join("systemd-executor"));
+        make(
+            "4343",
+            "/usr/lib/systemd/systemd",
+            &elsewhere.join("systemd-executor"),
+        );
         assert_eq!(held_by_managers(r, proc_root.path()), vec![held_id]);
         let images = ExecutorImages::default();
         refresh_under(&images, r, proc_root.path());

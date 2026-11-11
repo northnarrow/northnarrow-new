@@ -250,10 +250,55 @@ const PERL_MARKER: &str = "#!perl\nopen(my $f, '>>', $ENV{NN_DIFF_OUT}); print $
 const PERL_CODE: &str = "open(my $f, '>>', $ENV{NN_DIFF_OUT}); print $f \"C\\n\";";
 const PERL_STDIN: &str = "open(my $f, '>>', $ENV{NN_DIFF_OUT}); print $f \"STDIN\\n\";\n";
 const PERL_VOCAB: &[&str] = &[
-    "S1", "S2", "S3", "S1", "S2", "CODE", "-w", "-W", "-X", "-e", "-E", "-l", "-l0", "-n", "-p",
-    "-a", "-s", "-x", "-i", "-i.bak", "-I", "-Itmp", "-Mstrict", "-mstrict", "-M", "-c", "-T",
-    "-t", "-u", "-U", "-0", "-00", "-0777", "-CSD", "-F:", "-lane", "-le", "--", "-", "-v",
-    "-i -e", "-i.bak -e", "-F: -e", "-C -e", "-l -n", "-w -x", "-i -I", "-D", "-n -e",
+    "S1",
+    "S2",
+    "S3",
+    "S1",
+    "S2",
+    "CODE",
+    "-w",
+    "-W",
+    "-X",
+    "-e",
+    "-E",
+    "-l",
+    "-l0",
+    "-n",
+    "-p",
+    "-a",
+    "-s",
+    "-x",
+    "-i",
+    "-i.bak",
+    "-I",
+    "-Itmp",
+    "-Mstrict",
+    "-mstrict",
+    "-M",
+    "-c",
+    "-T",
+    "-t",
+    "-u",
+    "-U",
+    "-0",
+    "-00",
+    "-0777",
+    "-CSD",
+    "-F:",
+    "-lane",
+    "-le",
+    "--",
+    "-",
+    "-v",
+    "-i -e",
+    "-i.bak -e",
+    "-F: -e",
+    "-C -e",
+    "-l -n",
+    "-w -x",
+    "-i -I",
+    "-D",
+    "-n -e",
 ];
 const PERL_FIXED: &[&[&str]] = &[
     &["-e", "CODE", "S1"],
@@ -272,11 +317,9 @@ const PERL_FIXED: &[&[&str]] = &[
     &["-c", "S1"],
 ];
 
-const NODE_MARKER: &str =
-    "require('fs').appendFileSync(process.env.NN_DIFF_OUT, 'NAME\\n');\n";
+const NODE_MARKER: &str = "require('fs').appendFileSync(process.env.NN_DIFF_OUT, 'NAME\\n');\n";
 const NODE_CODE: &str = "require('fs').appendFileSync(process.env.NN_DIFF_OUT, 'C\\n')";
-const NODE_STDIN: &str =
-    "require('fs').appendFileSync(process.env.NN_DIFF_OUT, 'STDIN\\n');\n";
+const NODE_STDIN: &str = "require('fs').appendFileSync(process.env.NN_DIFF_OUT, 'STDIN\\n');\n";
 const NODE_VOCAB: &[&str] = &[
     "S1",
     "S2",
@@ -525,7 +568,14 @@ fn run(i: &Interp, dir: &Path, tokens: &[&str]) -> (Vec<String>, Vec<String>) {
 }
 
 /// Whether what ran agrees with the reading; `None`: not judged (Unknown).
-fn agrees(i: &Interp, exe: &Path, argv: &[String], runs: &Runs, ran: &[String], dir: &Path) -> Option<bool> {
+fn agrees(
+    i: &Interp,
+    exe: &Path,
+    argv: &[String],
+    runs: &Runs,
+    ran: &[String],
+    dir: &Path,
+) -> Option<bool> {
     let marker = |p: &Path| {
         p.strip_prefix(dir)
             .ok()

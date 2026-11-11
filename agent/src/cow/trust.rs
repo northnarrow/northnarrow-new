@@ -675,6 +675,29 @@ mod tests {
         }
     }
 
+    /// Lot 310, the review of #539 (finding 7): an editor a user's service
+    /// manager started (`systemd-run --user vim x`: a lineage of installed
+    /// programs end to end) is started by a foreign program; one of PID 1's
+    /// units is not.
+    #[test]
+    fn a_user_s_service_manager_does_not_vouch_for_an_editor() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert_eq!(
+            judge(Some(&l), &writers(), false, &distro),
+            Trust::Untrusted(Untrusted::ForeignAncestor {
+                writer: "/usr/bin/vim.basic".into(),
+                ancestor: "/usr/lib/systemd/systemd".into(),
+            }),
+        );
+        let l = [(300, id("/usr/bin/vim.basic", None)), (1, systemd())];
+        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+    }
+
     /// BUG-49: an editor started by a binary no package installed, in
     /// `/opt` or `/usr/local`, is started by a foreign program; with no
     /// package database to ask, a root-owned tree stands in, as before.

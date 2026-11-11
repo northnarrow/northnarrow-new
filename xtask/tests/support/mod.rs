@@ -748,10 +748,9 @@ pub fn test_only_file(root: &Path, rel: &str) -> bool {
         lines.windows(2).any(|w| {
             w[0].starts_with("#[cfg(test)]")
                 && (w[1] == format!("mod {stem};") || w[1] == format!("pub(crate) mod {stem};"))
-        }) || lines.iter().any(|l| {
-            l.starts_with("#[cfg(test)]")
-                && (l.ends_with(&format!("mod {stem};")))
-        })
+        }) || lines
+            .iter()
+            .any(|l| l.starts_with("#[cfg(test)]") && (l.ends_with(&format!("mod {stem};"))))
     })
 }
 

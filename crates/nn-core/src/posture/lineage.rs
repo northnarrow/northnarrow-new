@@ -1256,11 +1256,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// from is root's only ([`PostureHost::dir_is_root_only`]); at the
     /// start's scan, off the decision path.
     fn seed_image(&self, pid: u32) -> Option<(u64, u64)> {
-        let link = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let dir = self.inner.proc_root.join(pid.to_string());
+        let link = dir.join("exe");
         let text = H::read_link(&link).ok()?;
         let text = text.to_string_lossy();
         let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
-        if !H::dir_is_root_only(path.parent()?) {
+        // in the process's own view of the files (a container's directory,
+        // not the host's of the same name), as the exec pump reads it
+        let view = dir.join("root").join(path.strip_prefix("/").ok()?);
+        if !H::dir_is_root_only(view.parent()?) {
             return None;
         }
         let (dev, ino) = H::file_id(&link)?;

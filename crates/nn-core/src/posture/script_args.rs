@@ -195,6 +195,12 @@ enum Opt {
     /// Ruby's `-v`: the version printed, then the script run — with none,
     /// nothing runs ([`Runs::Unknown`]).
     NoRunAlone,
+    /// Python's `-i`: after the program, the interpreter reads its standard
+    /// input and runs it (a terminal's user, or a file, a pipe: `python3 -i
+    /// /usr/bin/x < code`) — a script named is not all that runs
+    /// ([`Runs::Unknown`]); with nothing named it is the interactive
+    /// interpreter, as without it (the differential test of #539's review).
+    Inspect,
     /// The rest of its argument, possibly empty (`perl -x`, `ruby -i.bak`).
     Rest,
     /// Lot 310 (the review of #539, finding 1): perl's `-i`, `-F`, `-C`:
@@ -345,7 +351,8 @@ impl Table {
 /// `python3 --help` (3.8–3.14), and 2.7's -3, -t, -R, -U, -Q.
 const PYTHON: Table = Table {
     short: &[
-        ("bBdEiIOPqsSuvxRtU3", Opt::Flag),
+        ("bBdEIOPqsSuvxRtU3", Opt::Flag),
+        ("i", Opt::Inspect),
         ("hV?", Opt::NoRun),
         ("WXQ", Opt::Arg),
         ("c", Opt::Code),
@@ -622,44 +629,153 @@ const NODE: Table = Table {
 
 /// bash 5.2's `set -o` names.
 const BASH_SET_O: &[&str] = &[
-    "allexport", "braceexpand", "emacs", "errexit", "errtrace", "functrace", "hashall",
-    "histexpand", "history", "ignoreeof", "interactive-comments", "keyword", "monitor",
-    "noclobber", "noexec", "noglob", "nolog", "notify", "nounset", "onecmd", "physical",
-    "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+    "allexport",
+    "braceexpand",
+    "emacs",
+    "errexit",
+    "errtrace",
+    "functrace",
+    "hashall",
+    "histexpand",
+    "history",
+    "ignoreeof",
+    "interactive-comments",
+    "keyword",
+    "monitor",
+    "noclobber",
+    "noexec",
+    "noglob",
+    "nolog",
+    "notify",
+    "nounset",
+    "onecmd",
+    "physical",
+    "pipefail",
+    "posix",
+    "privileged",
+    "verbose",
+    "vi",
+    "xtrace",
 ];
 
 /// bash 5.2's `shopt` names (`-O`).
 const BASH_SHOPT: &[&str] = &[
-    "assoc_expand_once", "autocd", "cdable_vars", "cdspell", "checkhash", "checkjobs",
-    "checkwinsize", "cmdhist", "compat31", "compat32", "compat40", "compat41", "compat42",
-    "compat43", "compat44", "complete_fullquote", "direxpand", "dirspell", "dotglob",
-    "execfail", "expand_aliases", "extdebug", "extglob", "extquote", "failglob",
-    "force_fignore", "globasciiranges", "globskipdots", "globstar", "gnu_errfmt",
-    "histappend", "histreedit", "histverify", "hostcomplete", "huponexit",
-    "inherit_errexit", "interactive_comments", "lastpipe", "lithist", "localvar_inherit",
-    "localvar_unset", "login_shell", "mailwarn", "no_empty_cmd_completion", "nocaseglob",
-    "nocasematch", "noexpand_translation", "nullglob", "patsub_replacement", "progcomp",
-    "progcomp_alias", "promptvars", "restricted_shell", "shift_verbose", "sourcepath",
-    "varredir_close", "xpg_echo",
+    "assoc_expand_once",
+    "autocd",
+    "cdable_vars",
+    "cdspell",
+    "checkhash",
+    "checkjobs",
+    "checkwinsize",
+    "cmdhist",
+    "compat31",
+    "compat32",
+    "compat40",
+    "compat41",
+    "compat42",
+    "compat43",
+    "compat44",
+    "complete_fullquote",
+    "direxpand",
+    "dirspell",
+    "dotglob",
+    "execfail",
+    "expand_aliases",
+    "extdebug",
+    "extglob",
+    "extquote",
+    "failglob",
+    "force_fignore",
+    "globasciiranges",
+    "globskipdots",
+    "globstar",
+    "gnu_errfmt",
+    "histappend",
+    "histreedit",
+    "histverify",
+    "hostcomplete",
+    "huponexit",
+    "inherit_errexit",
+    "interactive_comments",
+    "lastpipe",
+    "lithist",
+    "localvar_inherit",
+    "localvar_unset",
+    "login_shell",
+    "mailwarn",
+    "no_empty_cmd_completion",
+    "nocaseglob",
+    "nocasematch",
+    "noexpand_translation",
+    "nullglob",
+    "patsub_replacement",
+    "progcomp",
+    "progcomp_alias",
+    "promptvars",
+    "restricted_shell",
+    "shift_verbose",
+    "sourcepath",
+    "varredir_close",
+    "xpg_echo",
 ];
 
 /// dash's `set -o` names (0.5.12; `pipefail` came later: not known).
 const DASH_SET_O: &[&str] = &[
-    "errexit", "noglob", "ignoreeof", "interactive", "monitor", "noexec", "stdin", "xtrace",
-    "verbose", "vi", "emacs", "noclobber", "allexport", "notify", "nounset", "privileged",
+    "errexit",
+    "noglob",
+    "ignoreeof",
+    "interactive",
+    "monitor",
+    "noexec",
+    "stdin",
+    "xtrace",
+    "verbose",
+    "vi",
+    "emacs",
+    "noclobber",
+    "allexport",
+    "notify",
+    "nounset",
+    "privileged",
     "nolog",
 ];
 
 /// busybox ash's `set -o` names (1.36).
 const ASH_SET_O: &[&str] = &[
-    "errexit", "noglob", "ignoreeof", "interactive", "monitor", "noexec", "stdin", "xtrace",
-    "verbose", "vi", "emacs", "noclobber", "allexport", "notify", "nounset", "pipefail",
+    "errexit",
+    "noglob",
+    "ignoreeof",
+    "interactive",
+    "monitor",
+    "noexec",
+    "stdin",
+    "xtrace",
+    "verbose",
+    "vi",
+    "emacs",
+    "noclobber",
+    "allexport",
+    "notify",
+    "nounset",
+    "pipefail",
 ];
 
 /// The `-o` names zsh, mksh and ksh93 all read (each has more: not known).
 const OTHER_SET_O: &[&str] = &[
-    "errexit", "noglob", "ignoreeof", "monitor", "noexec", "xtrace", "verbose", "vi",
-    "emacs", "noclobber", "allexport", "notify", "nounset", "pipefail",
+    "errexit",
+    "noglob",
+    "ignoreeof",
+    "monitor",
+    "noexec",
+    "xtrace",
+    "verbose",
+    "vi",
+    "emacs",
+    "noclobber",
+    "allexport",
+    "notify",
+    "nounset",
+    "pipefail",
 ];
 
 /// bash's `shell.c` (5.2): the `set` flags, `-i`, `-l`, `-r`, `-s`, `-c`,
@@ -881,6 +997,8 @@ struct Seen {
     no_run: bool,
     /// Ruby's `-v`: nothing runs unless a program is named.
     no_run_alone: bool,
+    /// Python's `-i`: the standard input runs after the program.
+    inspect: bool,
 }
 
 impl Seen {
@@ -898,6 +1016,11 @@ impl Seen {
                 Runs::Unknown(s) => Runs::Unknown(s).into(),
                 Runs::Inline | Runs::Code => Runs::Unknown(None).into(),
             };
+        }
+        if self.inspect {
+            if let Runs::Script(s) = r.runs {
+                return Runs::Unknown(Some(s)).into();
+            }
         }
         if self.loads {
             return match r.runs {
@@ -1036,6 +1159,7 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 Opt::Flag => {}
                 Opt::NoRun => seen.no_run = true,
                 Opt::NoRunAlone => seen.no_run_alone = true,
+                Opt::Inspect => seen.inspect = true,
                 Opt::Next => next.push(c),
                 Opt::Stdin => return Runs::Code.into(),
                 // the rest of the cluster is options too, then its operands
@@ -1441,10 +1565,7 @@ mod tests {
             Runs::Script("/tmp/s".into())
         );
         assert_eq!(
-            runs_of(
-                Path::new("/usr/bin/bash"),
-                &argv(&["bash", "-ovi", "vi"])
-            ),
+            runs_of(Path::new("/usr/bin/bash"), &argv(&["bash", "-ovi", "vi"])),
             Runs::Inline
         );
         assert_eq!(
@@ -1709,6 +1830,37 @@ mod tests {
                 &argv(&["node", "--title", "x", "/usr/bin/aws"])
             ),
             Runs::Script("/usr/bin/aws".into())
+        );
+    }
+
+    /// The review of #539's differential test: `python3 -i S` runs `S`,
+    /// then its standard input (`python3 -i /usr/bin/x < code`: the
+    /// caller's code under an installed script's name) — not known; `-i`
+    /// with an inline program or nothing named reads as without it.
+    #[test]
+    fn review_python_inspect_runs_its_standard_input_after_the_script() {
+        let py = Path::new("/usr/bin/python3");
+        for a in [
+            &["python3", "-i", "/usr/bin/x"][..],
+            &["python3", "-iO", "/usr/bin/x"],
+            &["python3", "-Oi", "/usr/bin/x"],
+            &["python3", "-i", "-m", "json.tool"],
+        ] {
+            assert!(
+                matches!(runs_of(py, &argv(a)), Runs::Unknown(Some(_))),
+                "{a:?}: {:?}",
+                runs_of(py, &argv(a))
+            );
+        }
+        assert_eq!(runs_of(py, &argv(&["python3", "-i"])), Runs::Inline);
+        assert_eq!(
+            runs_of(py, &argv(&["python3", "-i", "-c", "x"])),
+            Runs::Code
+        );
+        assert_eq!(
+            runs_of(py, &argv(&["python3", "-I", "/usr/bin/x"])),
+            Runs::Script("/usr/bin/x".into()),
+            "-I (isolated) is no -i"
         );
     }
 

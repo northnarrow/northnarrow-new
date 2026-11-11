@@ -281,7 +281,10 @@ pub(crate) fn spawn_executor_refresh(images: nn_core::decision::rules::ExecutorI
             .ok()
             .flatten();
             if let Some(n) = changed {
-                info!(identities = n, "R004: systemd-executor's identities changed (an upgrade, a re-exec)");
+                info!(
+                    identities = n,
+                    "R004: systemd-executor's identities changed (an upgrade, a re-exec)"
+                );
             }
         }
     });

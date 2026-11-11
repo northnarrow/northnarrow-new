@@ -291,21 +291,31 @@ mod tests {
         fs::copy("/bin/sleep", &copy).unwrap();
         let spawn = |exe: &Path| {
             (0..200)
-                .find_map(|_| match std::process::Command::new(exe).arg("30").spawn() {
-                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        None
-                    }
-                    other => Some(other.unwrap()),
-                })
+                .find_map(
+                    |_| match std::process::Command::new(exe).arg("30").spawn() {
+                        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            None
+                        }
+                        other => Some(other.unwrap()),
+                    },
+                )
                 .expect("sleep runs")
         };
         let system = std::fs::canonicalize("/bin/sleep").unwrap();
         let mut sys = spawn(&system);
         let mut own = spawn(&copy);
         let root = Path::new(LinuxHost::PROC_ROOT);
-        exec_done(&root.join(sys.id().to_string()).join("exe"), LinuxHost::file_id(&system), EXEC_DONE_WITHIN);
-        exec_done(&root.join(own.id().to_string()).join("exe"), LinuxHost::file_id(&copy), EXEC_DONE_WITHIN);
+        exec_done(
+            &root.join(sys.id().to_string()).join("exe"),
+            LinuxHost::file_id(&system),
+            EXEC_DONE_WITHIN,
+        );
+        exec_done(
+            &root.join(own.id().to_string()).join("exe"),
+            LinuxHost::file_id(&copy),
+            EXEC_DONE_WITHIN,
+        );
         let t = AuthSessionTracker::<LinuxHost>::new(root);
         assert!(t.seed_from_proc() > 0);
         let m = fs::metadata(&system).unwrap();

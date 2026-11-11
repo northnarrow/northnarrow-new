@@ -122,7 +122,8 @@ writer is **trusted** (not copied) when:
   11/11/2026): nor does a shell running an inline program (`sh -c`) or its
   standard input — the ransomware signal's own test
   (`impact::trust::is_foreign`), which this guard's twin of it gave way to;
-  an editor `sh -c` starts is copied for.
+  an editor `sh -c` starts is copied for — nor a user's service manager
+  (`systemd --user`: `impact::trust::is_user_manager`, the review of #539).
 
 What an interpreter runs is read with its own option table (lot 292, BUG-44
 and BUG-42; lot 310's one reader: `posture/script_args.rs`): `python3 -O x.py

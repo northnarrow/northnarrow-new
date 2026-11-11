@@ -19,7 +19,8 @@
 //! - every string literal naming a `/proc` or `/dev` link (`/fd`,
 //!   `thread-self`, `map_files`, `/task/`, `/exe`, `/cwd`, `/root`,
 //!   `/dev/std…`) without a `{` (a path the agent builds with `format!` to
-//!   read its own process is no match);
+//!   read its own process is no match) and without a space (prose, a
+//!   message);
 //! - every `"proc"` segment literal (a slice pattern on a path's segments);
 //! - a prefix or substring test of `"/proc` or `"/dev/fd`.
 
@@ -34,7 +35,14 @@ const READER: &str = "crates/nn-core/src/posture/proc_link.rs";
 
 /// The names only a `/proc` or `/dev` link holds.
 const LINK_NAMES: &[&str] = &[
-    "/fd", "thread-self", "map_files", "/task/", "/exe", "/cwd", "/root", "/dev/std",
+    "/fd",
+    "thread-self",
+    "map_files",
+    "/task/",
+    "/exe",
+    "/cwd",
+    "/root",
+    "/dev/std",
 ];
 
 /// A literal naming a link of `/proc` or `/dev`, or a path segment `proc`.
@@ -43,6 +51,7 @@ fn is_link_literal(s: &str) -> bool {
         return true;
     }
     !s.contains('{')
+        && !s.contains(char::is_whitespace)
         && (s.starts_with("/proc") || s.starts_with("/dev") || s.contains("thread-self"))
         && LINK_NAMES.iter().any(|n| s.contains(n))
 }
@@ -88,8 +97,77 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "agent/src/boot/attach.rs",
+        3,
+        "the agent's own image (`/proc/self/exe`): read, no match",
+    ),
+    (
+        "crates/nn-linux/src/boot/checks.rs",
         2,
         "the agent's own image (`/proc/self/exe`): read, no match",
+    ),
+    (
+        "crates/nn-linux/src/own_dropins.rs",
+        1,
+        "the agent's own image (`/proc/self/exe`): read, no match",
+    ),
+    (
+        "crates/nn-linux/src/worker/mod.rs",
+        1,
+        "the agent's own image (`/proc/self/exe`) its worker is started from: read, no match",
+    ),
+    (
+        "crates/nn-linux/src/anchored.rs",
+        1,
+        "the agent's own descriptor's path built (`/proc/self/fd/` and a descriptor it \
+         opened), and known again when the agent's own code passes it back: no caller's path",
+    ),
+    (
+        "crates/nn-linux/src/response/caps_preflight.rs",
+        1,
+        "the agent's own thread's status read (`/proc/thread-self/status`): no match",
+    ),
+    (
+        "crates/nn-linux/src/canary/path_policy.rs",
+        2,
+        "PID 1's root (`/proc/1/root`), the host's view the agent reads its own paths through, \
+         tested for and joined: no caller's path",
+    ),
+    (
+        "crates/nn-linux/src/response/mod.rs",
+        2,
+        "PID 1's root (`/proc/1/root`), the host's view the agent acts through, tested for and \
+         joined: no caller's path",
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        2,
+        "PID 1's root (`/proc/1/root`), the host's view the agent checks its own files through: \
+         no caller's path",
+    ),
+    (
+        "crates/nn-linux/src/impact/entropy.rs",
+        1,
+        "PID 1's root (`/proc/1/root/`), the host's view the sampler reads files through, tested \
+         for: no caller's path",
+    ),
+    (
+        "agent/src/cow/journal.rs",
+        1,
+        "PID 1's root (`/proc/1/root/`), the host's view the copy guard writes through, tested \
+         for: no caller's path",
+    ),
+    (
+        "common/src/wire/execpol.rs",
+        3,
+        "the loader variables' staging prefixes the eBPF program compares in the kernel \
+         (`/proc/`, `/dev/fd/`: a string prefix of an `LD_PRELOAD` entry, which the `mmap_file` \
+         hook then judges on the file mapped), and their test (gated on `std`)",
+    ),
+    (
+        "agent-ebpf/src/execpol.rs",
+        1,
+        "the same staging prefix as eight bytes in the eBPF program (`/dev/fd/`): the kernel \
+         cannot call the reader; the `mmap_file` hook judges the file",
     ),
 ];
 
@@ -179,7 +257,10 @@ fn the_ratchet_fails_on_planted_violations() {
             "fn a(p: &str) -> bool { p.strip_prefix(\"/proc/\").is_some() || \
              p.starts_with(\"/dev/fd/\") }",
         ),
-        ("contains", "fn a(p: &str) -> bool { p.contains(\"/proc/thread-self/fd/\") }"),
+        (
+            "contains",
+            "fn a(p: &str) -> bool { p.contains(\"/proc/thread-self/fd/\") }",
+        ),
         (
             "konst",
             "const FD: &str = \"/proc/self/fd/\";\nfn a(p: &str) -> bool { p.starts_with(FD) }",
@@ -191,7 +272,10 @@ fn the_ratchet_fails_on_planted_violations() {
     ];
     for (name, body) in planted {
         code.insert(
-            format!("crates/nn-core/src/decision/rules/{}.rs", format_args!("twin_{name}")),
+            format!(
+                "crates/nn-core/src/decision/rules/{}.rs",
+                format_args!("twin_{name}")
+            ),
             body.to_string(),
         );
     }
@@ -205,6 +289,9 @@ fn the_ratchet_fails_on_planted_violations() {
     let v = violations(&code);
     assert_eq!(v.len(), planted.len(), "{v:#?}");
     for (name, _) in planted {
-        assert!(v.iter().any(|x| x.contains(&format!("twin_{name}.rs"))), "{name}");
+        assert!(
+            v.iter().any(|x| x.contains(&format!("twin_{name}.rs"))),
+            "{name}"
+        );
     }
 }

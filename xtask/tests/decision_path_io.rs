@@ -265,7 +265,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        22,
+        24,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
          (`seed_from_proc`) and its sweep (`sweep` and its orphans' adoption, \
@@ -278,7 +278,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
          lot 275 (the final check of #495, C1): `runs_host_file`, the device and inode of a \
          response's receiver's `/proc/<pid>/exe` and of the host's file at its path (one \
          `fstat` each), read by the DNS response pump only, for a receiver whose executable \
-         and uid are already a resolver's, not in a judgement",
+         and uid are already a resolver's, not in a judgement; lot 310 (the review of #539): \
+         the start's scan reads each running process's image (`seed_image`: \
+         `/proc/<pid>/exe`'s link and identity, its directory in the process's root), once, \
+         off the decision path",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

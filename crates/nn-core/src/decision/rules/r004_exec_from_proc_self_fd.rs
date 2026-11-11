@@ -755,7 +755,10 @@ mod tests {
         // lot 310: by the image the pump read (a linked executor)
         let r = R004ExecFromProcSelfFd::new(lineage);
         assert!(r.evaluate(&with_proc_exe(ev.clone(), 0)).is_none());
-        assert!(r.evaluate(&ev).is_some(), "no image: argv[0] exempts nothing");
+        assert!(
+            r.evaluate(&ev).is_some(),
+            "no image: argv[0] exempts nothing"
+        );
     }
 
     /// External audit PROC-001 (NN-AUD-001): a parent that only NAMES
@@ -937,14 +940,25 @@ mod tests {
     /// orphan's parent is pid 1): the caller chooses both.
     #[test]
     fn executor_argv0_exempts_nothing_in_tracepoint_mode() {
-        for a0 in ["/usr/lib/systemd/systemd-executor", "/lib/systemd/systemd-executor"] {
+        for a0 in [
+            "/usr/lib/systemd/systemd-executor",
+            "/lib/systemd/systemd-executor",
+        ] {
             for f in ["/proc/self/fd/9", "/proc/thread-self/fd/9", "/dev/fd/9"] {
                 let ev = spawn_exec(f, 1, "systemd", &[a0, "--deserialize", "3"]);
-                assert!(R004ExecFromProcSelfFd::default().evaluate(&ev).is_some(), "{a0} {f}");
+                assert!(
+                    R004ExecFromProcSelfFd::default().evaluate(&ev).is_some(),
+                    "{a0} {f}"
+                );
             }
         }
         // an unlinked image the pump read: fileless, whatever argv[0] says
-        let ev = spawn_exec("/proc/self/fd/9", 1, "systemd", &["/usr/lib/systemd/systemd-executor"]);
+        let ev = spawn_exec(
+            "/proc/self/fd/9",
+            1,
+            "systemd",
+            &["/usr/lib/systemd/systemd-executor"],
+        );
         assert!(R004ExecFromProcSelfFd::default()
             .evaluate(&with_proc_exe(ev, common::wire::exe::exe_flags::DELETED))
             .is_some());
@@ -1246,7 +1260,10 @@ mod lot310 {
                 exe.flags = flags;
             }
             lineage.ingest_spawn_event(&dropper);
-            assert_eq!(lineage.exec_image(7100, crate::posture::lineage::AsOf::Now), None);
+            assert_eq!(
+                lineage.exec_image(7100, crate::posture::lineage::AsOf::Now),
+                None
+            );
             let r = R004::new(lineage);
             let mut child = exec(1000, 7100, "/proc/7100/fd/4", "/tmp/.x", DELETED);
             if let Event::ProcessSpawn { exe, .. } = &mut child {
@@ -1279,7 +1296,13 @@ mod lot310 {
             executor: images,
         });
         let launch = |pid: u32, ts: u64| {
-            let mut e = exec(0, 1, "/proc/self/fd/9", "/usr/lib/systemd/systemd-executor", DELETED);
+            let mut e = exec(
+                0,
+                1,
+                "/proc/self/fd/9",
+                "/usr/lib/systemd/systemd-executor",
+                DELETED,
+            );
             if let Event::ProcessSpawn {
                 pid: p,
                 exe,

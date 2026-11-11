@@ -233,7 +233,13 @@ mod tests {
             assert!(reopens_a_descriptor(p), "{p}");
             assert!(through_proc_link(p), "{p}");
         }
-        assert_eq!(proc_link("/proc/self/root/usr/bin/ls"), Some(ProcLink::View));
-        assert_eq!(proc_link("/proc/self/root/proc/self/exe"), Some(ProcLink::Exe));
+        assert_eq!(
+            proc_link("/proc/self/root/usr/bin/ls"),
+            Some(ProcLink::View)
+        );
+        assert_eq!(
+            proc_link("/proc/self/root/proc/self/exe"),
+            Some(ProcLink::Exe)
+        );
     }
 }

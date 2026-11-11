@@ -212,13 +212,9 @@ pub fn judge(
     // BUG-49: the writer and the copies of itself that forked it are judged
     // below ([`packaged`]); every ancestor above them must vouch for it.
     let own = topmost_same(hops, 0);
-    if let Some(i) = hops
-        .iter()
-        .enumerate()
-        .position(|(n, (pid, id))| {
-            is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
-        })
-    {
+    if let Some(i) = hops.iter().enumerate().position(|(n, (pid, id))| {
+        is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(*pid, id)))
+    }) {
         // lot 310: a user's service manager is not what to kill (its whole
         // session's services with it): the unit's process it started is.
         // Its own parent runs the same file (PID 1's systemd), so the hop
@@ -679,7 +675,11 @@ mod tests {
         ];
         assert!(matches!(
             judge(502, Some(&l), false, &distro),
-            Judged::Untrusted { actor: 500, key: 502, .. }
+            Judged::Untrusted {
+                actor: 500,
+                key: 502,
+                ..
+            }
         ));
         // `/lib/systemd/systemd` (a split `/usr`) is the same manager
         let l = [
