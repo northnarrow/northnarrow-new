@@ -942,3 +942,16 @@ switch or the legacy ceiling still holding it (`held`: the switch's text or
 `legacy_ceiling`, with `held_action`) and the exemption that covered the
 actor (`exempt`). A held kill reads `Log` with its reasoning ending in
 `[held back: …]`; an enforced one names the policy.
+
+**A kill's outcome (lot 311).** Each response's outcome is signed after it
+ran: `Killed`, `AlreadyGone`, `Refused` (a guard spared it) or `Failed` with
+an errno. A process is captured by a pidfd and its start before it is
+signalled, so a PID reused by another process is never hit. Its name does
+not matter: `/proc/<pid>/stat` is read as bytes, so a process that named
+itself with bytes that are not UTF-8 (which any process may do) is killed
+like any other — before lot 311 its kill was signed `Failed` (errno 5) and
+it ran on. A running process whose `/proc` entry cannot be read at all (the
+agent out of memory or descriptors) is still signalled through its pidfd,
+its start unread, and the agent logs `the process's start could not be read
+— captured by its pidfd alone`. A `Failed` outcome now means the process
+could not be reached: no pidfd could be opened on it, or the signal failed.

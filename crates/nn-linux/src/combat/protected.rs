@@ -270,7 +270,8 @@ impl SystemProtectedProcs {
     /// The real uid of `pid` (`Uid:` in `/proc/<pid>/status`).
     fn real_uid(&self, pid: u32) -> Option<u32> {
         let status =
-            fs::read_to_string(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("status"))
+                .ok()?;
         status
             .lines()
             .find_map(|l| l.strip_prefix("Uid:"))?
@@ -284,7 +285,8 @@ impl SystemProtectedProcs {
     /// own on a v1 host.
     fn cgroup_path(&self, pid: u32) -> Option<String> {
         let cgroup =
-            fs::read_to_string(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("cgroup"))
+                .ok()?;
         super::offender::cgroup_path(&cgroup).map(str::to_string)
     }
 
@@ -498,6 +500,41 @@ mod tests {
                 "uid {uid} in {cgroup}"
             );
         }
+    }
+
+    /// Lot 311: the SSH service whose `status` shows a `comm` that is not
+    /// UTF-8 is still told by its real uid. On main its `status` was
+    /// unreadable as text: the uid unknown, the service not spared.
+    #[test]
+    fn sshd_whose_comm_is_not_utf8_is_still_the_ssh_service() {
+        let tmp = TempDir::new().unwrap();
+        link_exe(tmp.path(), 806, SSHD_EXE);
+        proc_identity(tmp.path(), 806, 0, "/system.slice/ssh.service");
+        fs::write(
+            tmp.path().join("806").join("status"),
+            b"Name:\t\xff\xfe\nUid:\t0\t0\t0\t0\n",
+        )
+        .unwrap();
+        let g = guard(tmp.path(), 10, ExemptPids::with_agent(10));
+        assert_eq!(g.protected_reason(806), Some(ProtectedReason::SshService));
+    }
+
+    /// Lot 311: root's sshd in a cgroup named with bytes that are not UTF-8
+    /// (outside the SSH unit) is not the service. On main the `cgroup`
+    /// read failed and it read as a host without systemd, where exe and
+    /// uid 0 decide: spared.
+    #[test]
+    fn sshd_in_a_cgroup_whose_name_is_not_utf8_is_not_the_ssh_service() {
+        let tmp = TempDir::new().unwrap();
+        link_exe(tmp.path(), 807, SSHD_EXE);
+        proc_identity(tmp.path(), 807, 0, "/");
+        fs::write(
+            tmp.path().join("807").join("cgroup"),
+            b"0::/user.slice/user-1000.slice/user@1000.service/app.slice/\xff.scope\n",
+        )
+        .unwrap();
+        let g = guard(tmp.path(), 10, ExemptPids::with_agent(10));
+        assert_eq!(g.protected_reason(807), None);
     }
 
     #[test]
