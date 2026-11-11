@@ -9188,10 +9188,17 @@ number in parentheses is a lab PR.
       resumed, none left).
     - Ubuntu 26.04 (7.0.0-43): `main` 4c864565 5 runs, 1 failed (974 held,
       one left in T); the fix 5 of 5 passed (944–1,039 held, 1,419–1,664
-      resumed, none left); @ATTRIB@
-    - Every run's `unreported` was 0 (8 runs that print it): no run met a
-      process stopped without an entry; that path is proven on the host
-      (the fake kernel's map) only.
+      resumed, none left); `main` 0420bbe7 (with lot 311a's #537) 5 of 5
+      passed; the fix again 5 of 5 (865–1,058 held, `unreported` and
+      `recaptured` 0). The privileged `a_tree_kill_whose_root_was_not_captured_reports_its_error`
+      passed there, and failed with mutant M26 applied on the guest
+      (`AlreadyGone` instead of `Failed{EMFILE}`).
+    - Every run's `unreported` was 0 (13 runs that print it): no run met
+      a process stopped without an entry; that path is proven on the host
+      (the fake kernel's map) only. Which window left one process stopped
+      on `main` before #537 (3 runs of 8) is not attributed by these
+      measurements: neither this lot's new fields nor `main` with #537
+      (0 of 5) show it.
     - Every guest left powered off with no agent installed, no process in
       state T, no test cgroup, no leftover file.
   - Not done: the recovery of what a previous agent left stopped when the
