@@ -94,6 +94,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- `nn-admin heartbeat watch` fails a fetch whose `--from-cmd` command
+  writes more than 4 MiB to stdout whatever the command's exit status (lot
+  304; `docs/operator/HEARTBEAT.md`). The failure rested on the command
+  dying of the pipe closed at the bound: one that exits 0 on that error
+  (uutils' `head`, the default on Ubuntu 26.04, and the CI's runners since
+  they moved to it) or ignores it gave its first 4 MiB as a whole answer —
+  the newest beats cut off. The first byte past the bound now ends the
+  fetch and stops the command; exactly 4 MiB is still a whole answer.
 - systemd's own BPF programs are no longer signed as foreign at every start
   (lot 304; `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 304"). On
   Debian 13 and Ubuntu 26.04 (systemd 257+) systemd-networkd's

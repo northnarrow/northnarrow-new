@@ -8730,6 +8730,40 @@ number in parentheses is a lab PR.
     nothing after its close).
   - Level unchanged (C23 2, provisional): the re-assessment is not this
     lot's.
+- **Lot 304 (A) — the heartbeat verifier's 4 MiB bound holds whatever the
+  source command's exit status (the CI's `test` job unblocked).**
+  - What was open: lot 299's `run_reading` closed the source command's
+    stdout at `FETCH_MAX_BYTES` and returned what it had read as the
+    answer whenever the command exited 0 — the "never an answer cut short"
+    rested on the command dying of the closed pipe. One that exits 0 on
+    `EPIPE` (uutils' `head`, the default of Ubuntu 26.04, the image of the
+    CI's `ubuntu-latest` runners since 11/11: run 42978372590, `Image:
+    ubuntu-26.04`), that ignores it, or that had its last bytes in the pipe
+    before it was closed gave the first 4 MiB as a whole answer — the newest
+    beats cut off. `heartbeat::tests::a_source_past_the_bound_is_a_failed_fetch`
+    failed on those runners almost every time (#529, #530, #531).
+  - What changed: the stdout pipe keeps reading at exactly the bound and
+    marks the answer cut when a byte past it comes (`Pipe::cut`: from the
+    bytes read alone, never from the exit); a cut fetch is a failed fetch
+    whatever the exit status, its reason the bound, and the command is
+    killed at once instead of waited for. Exactly 4 MiB stays a whole
+    answer.
+  - Measured on the host (Ubuntu 24.04, GNU `head` 9.4): `origin/main`'s
+    `run_with_timeout` returned `Ok` with 4,194,304 bytes for each of the
+    three sources that exit 0 after the bound (`head -c 4194305; exit 0`,
+    `head -c 5194304; exit 0`, `trap '' PIPE; head …; exit 0`), 5 runs out
+    of 5 — the bug without uutils; with the fix each is an `Err` naming the
+    bound; the heartbeat module's 15 tests 40 runs out of 40.
+  - Measured on our Ubuntu 26.04 guest (uutils `head` 0.10.0, the CI's
+    conditions; lease k304): `main`'s heartbeat tests failed 4 runs out of
+    5 (`a_source_past_the_bound_is_a_failed_fetch`, `Ok` instead of `Err`);
+    with the fix 35 runs out of 35 green. The guest's whole unprivileged
+    `cargo test --workspace`: nn-admin green, 34 failures all in `xtask
+    --test install_scripts` (the guest's `target/tmp` left owned by root
+    by an earlier privileged run), none of this change's.
+  - Mutations (a catch is a named test failing): 11 on the new code, 11
+    caught; `origin/main`'s logic under the new tests caught by 4 named
+    tests (`a_source_past_the_bound_is_a_failed_fetch` among them).
 - **Lot 304 (B) — systemd's own BPF programs told by their loader: no
   NN-L-AT-001 High at the start on Debian 13 and Ubuntu 26.04.**
   - What was open: at every start on a systemd 257+ host the agent signed
@@ -8785,10 +8819,13 @@ number in parentheses is a lab PR.
       program to cgroup, ignoring: Operation not permitted"): the residual,
       in `ANTITAMPER_TRUST_MODEL.md`. Agents uninstalled, the monitor
       restored, the guests clean and off.
-    - Found, not this lot's (Ubuntu 26.04 only): the user manager
-      (`systemd --user`, uid 1000) at the first login loads a `tracepoint`
-      program, and networkd at a restart a `kprobe` one (feature probes):
-      both refused outside a window, `bpf_prog_type` High.
+    - Residual, measured (Ubuntu 26.04 only; a later lot of the
+      coordinator's takes it): two feature probes of systemd 259 are refused
+      outside a window and signed `bpf_prog_type` High — the user manager
+      (`systemd --user`, uid 1000) loading a `tracepoint` program at the
+      first login after boot, and systemd-networkd loading a `kprobe`
+      program at a restart. Neither is the start's record; Debian 13
+      (systemd 257) showed neither.
   - Mutations (a catch is a named test failing; every run's baseline green):
     70 on the new code, 70 caught — the table's lookup, the records'
     encodings, each condition of the judgement (the executable, the start,
