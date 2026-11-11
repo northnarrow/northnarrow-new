@@ -859,15 +859,16 @@ impl CombatActuator<LinuxHost> for HostActuator {
             "ladder": "neutralize",
             "offenders": offenders.iter().map(|r| r.pid()).collect::<Vec<_>>(),
         }));
-        let binaries: Vec<(u32, Option<String>)> = offenders
+        // Lot 312 (BUG-90): a binary deleted while it ran is opened too, and
+        // the quarantine finds no name of it left (`deleted` here: unlinked).
+        let binaries: Vec<(u32, Option<(String, bool)>)> = offenders
             .iter()
             .map(|r| {
                 let exe = self
                     .live(r)
                     .then(|| self.host.running(r.pid()))
                     .flatten()
-                    .filter(|p| !p.deleted)
-                    .map(|p| p.exe);
+                    .map(|p| (p.exe, p.deleted));
                 (r.pid(), exe)
             })
             .collect();
@@ -887,12 +888,15 @@ impl CombatActuator<LinuxHost> for HostActuator {
         for (slot, (pid, binary)) in outcomes.iter_mut().zip(binaries) {
             slot.quarantine = match binary {
                 None => NO_BINARY.to_string(),
-                Some(exe) => match done.iter().find(|(e, _)| *e == exe) {
+                Some((exe, deleted)) => match done.iter().find(|(e, _)| *e == exe) {
                     Some((_, first)) => format!("same binary as pid {first}"),
                     None => {
                         done.push((exe.clone(), pid));
                         let primary = if self.detect_only {
                             ExecutionOutcome::WouldExecute { pid }
+                        } else if deleted {
+                            // `quarantine::quarantine_handle`: no name left.
+                            ExecutionOutcome::AlreadyGone { pid }
                         } else if crate::response::quarantine::is_quarantine_denied(Path::new(&exe))
                         {
                             // `quarantine::quarantine_handle`: kill-only.

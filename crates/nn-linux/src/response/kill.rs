@@ -44,6 +44,49 @@ const FREEZE_WAIT: Duration = Duration::from_millis(100);
 /// members still running after it may take to die once signalled again.
 const KILL_WAIT: Duration = Duration::from_millis(500);
 
+/// What the guard of a tree kill spares (lot 312, external bug hunt 1.4,
+/// BUG-122). Decided by the coordinator for the lot:
+///
+/// - a host-critical process (the SSH service) is spared ALONE: the
+///   offender's processes below it are killed — an sshd that forked the
+///   offender's shell does not shield the shell;
+/// - a protected process (the agent, its watchdog, init; a pid of the
+///   executor's protected set) is spared with its whole tree: its children
+///   are its own (the agent's workers and scanner).
+///
+/// The outcomes say each spared pid, with the reason, next to each killed
+/// one. A refused root used to refuse only itself — the walk under it went
+/// on and killed its children: the agent's own tree, had a verdict named
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spare {
+    /// Why, for the outcome (`Refused { reason }`).
+    pub reason: &'static str,
+    /// It and its whole tree (`true`), or itself only.
+    pub tree: bool,
+}
+
+impl Spare {
+    /// A host-critical process: itself only.
+    pub const fn process(reason: &'static str) -> Self {
+        Self {
+            reason,
+            tree: false,
+        }
+    }
+
+    /// A protected process: it and every process below it.
+    pub const fn tree(reason: &'static str) -> Self {
+        Self { reason, tree: true }
+    }
+}
+
+/// The reason of a descendant spared as part of a protected tree.
+pub const IN_A_PROTECTED_TREE: &str = "in the tree of a protected process";
+
+/// The protected set's spare: the pid and its tree.
+const PROTECTED: Spare = Spare::tree("PID is protected");
+
 /// Kill exactly one PID (the process it names now). Verifies the target
 /// is gone post-kill.
 /// R12c (lab PR 270): only for an action whose intent is signed (`intent`).
@@ -122,12 +165,12 @@ pub fn kill_process_tree(
 /// the watchdog, auth-session lineage) was only applied to the attributed
 /// offenders, never to the `/proc` descendants this walk reaps — a
 /// guarded sshd or watchdog *child* of an offender was killed. `guard`
-/// returns the reason a pid must be spared; spared pids are reported as
-/// `Refused` so the caller's audit sees them.
+/// says what a pid's sparing covers ([`Spare`]); spared pids are reported
+/// as `Refused` so the caller's audit sees them.
 pub fn kill_process_tree_guarded(
     root_pid: u32,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
     intent: &Intent,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     if root_pid <= 1 {
@@ -154,7 +197,7 @@ fn refuse_root(root_pid: u32) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
 pub fn kill_tree(
     root: &ProcRef,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
     scope: Option<&Path>,
     _intent: &Intent,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
@@ -166,8 +209,12 @@ pub fn kill_tree(
     if root_pid <= 1 {
         return refuse_root(root_pid);
     }
-    let root_spared =
-        guard(root_pid).or(protected.contains(&root_pid).then_some("PID is protected"));
+    let root_spared = spare_of(root_pid, protected, guard);
+    // Lot 312 (BUG-122): a protected root keeps its whole tree — nothing
+    // is killed, every process of it is said spared.
+    if let Some(spare) = root_spared.filter(|s| s.tree) {
+        return spared_tree(root, spare);
+    }
     if let (Some(dir), None) = (scope, root_spared) {
         if root.is_live() {
             match kill_tree_in_cgroup(root, protected, guard, dir) {
@@ -184,6 +231,68 @@ pub fn kill_tree(
     kill_tree_by_pid(root, protected, guard)
 }
 
+/// What sparing `pid` covers: the guard's answer, or the protected set's
+/// (the pid and its tree).
+fn spare_of(
+    pid: u32,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
+) -> Option<Spare> {
+    guard(pid).or(protected.contains(&pid).then_some(PROTECTED))
+}
+
+/// Lot 312 (BUG-122): what sparing a descendant covers — the pid itself,
+/// or every pid below it ([`Spare::tree`]): one under a spared tree
+/// (`trees`, filled in the walk's order, parents first) is spared with it.
+fn spare_in_walk(
+    pid: u32,
+    parent: u32,
+    trees: &mut HashSet<u32>,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
+) -> Option<Spare> {
+    let spare = if trees.contains(&parent) {
+        Some(Spare::tree(IN_A_PROTECTED_TREE))
+    } else {
+        spare_of(pid, protected, guard)
+    };
+    if spare.is_some_and(|s| s.tree) {
+        trees.insert(pid);
+    }
+    spare
+}
+
+/// Lot 312 (BUG-122): the root is protected — it and every process below
+/// it are spared, and said so one by one; nothing is signalled.
+fn spared_tree(root: &ProcRef, spare: Spare) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    let root_pid = root.pid();
+    let primary = ExecutionOutcome::Refused {
+        pid: root_pid,
+        reason: spare.reason,
+    };
+    let mut outcomes = Vec::new();
+    match collect_descendants(root_pid) {
+        Ok((found, cut)) if root.still_named_by_pid() => {
+            outcomes.extend(
+                found
+                    .into_iter()
+                    .map(|(pid, _, _)| ExecutionOutcome::Refused {
+                        pid,
+                        reason: IN_A_PROTECTED_TREE,
+                    }),
+            );
+            if cut {
+                outcomes.push(ExecutionOutcome::TreeTruncated {
+                    pid: root_pid,
+                    limit: MAX_DESCENDANTS,
+                });
+            }
+        }
+        _ => {}
+    }
+    (primary, outcomes)
+}
+
 /// The tree killed process by process from a `/proc` snapshot taken
 /// before any kill: the parent first (it stops a fork bomb), then each
 /// descendant by the identity it had in the snapshot — a PID that names
@@ -191,7 +300,7 @@ pub fn kill_tree(
 fn kill_tree_by_pid(
     root: &ProcRef,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     kill_tree_by_pid_with(root, protected, guard, read_stat)
 }
@@ -201,7 +310,7 @@ fn kill_tree_by_pid(
 fn kill_tree_by_pid_with(
     root: &ProcRef,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
     read: fn(u32) -> std::io::Result<ProcStat>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     let root_pid = root.pid();
@@ -220,38 +329,43 @@ fn kill_tree_by_pid_with(
         _ => (Vec::new(), false, None),
     };
 
-    let primary = match guard(root_pid) {
-        Some(reason) => ExecutionOutcome::Refused {
+    // A host-critical root is spared alone (BUG-122): its descendants are
+    // the offender's, killed below.
+    let primary = match spare_of(root_pid, protected, guard) {
+        Some(spare) => ExecutionOutcome::Refused {
             pid: root_pid,
-            reason,
+            reason: spare.reason,
         },
         None => kill_one(root, protected),
     };
 
+    let mut trees = HashSet::new();
     let mut outcomes = Vec::with_capacity(descendants.len() + 1);
-    for (child_pid, start) in descendants {
-        outcomes.push(match guard(child_pid) {
-            Some(reason) => ExecutionOutcome::Refused {
-                pid: child_pid,
-                reason,
-            },
-            None => {
-                let child = ProcRef::open_checked_with(child_pid, None, read);
-                if child.holds_start(start) {
-                    kill_one(&child, protected)
-                } else if let Some(errno) = child.capture_errno() {
-                    // not captured (the agent out of descriptors): it may
-                    // still run
-                    ExecutionOutcome::Failed {
-                        pid: child_pid,
-                        errno,
+    for (child_pid, start, parent) in descendants {
+        outcomes.push(
+            match spare_in_walk(child_pid, parent, &mut trees, protected, guard) {
+                Some(spare) => ExecutionOutcome::Refused {
+                    pid: child_pid,
+                    reason: spare.reason,
+                },
+                None => {
+                    let child = ProcRef::open_checked_with(child_pid, None, read);
+                    if child.holds_start(start) {
+                        kill_one(&child, protected)
+                    } else if let Some(errno) = child.capture_errno() {
+                        // not captured (the agent out of descriptors): it may
+                        // still run
+                        ExecutionOutcome::Failed {
+                            pid: child_pid,
+                            errno,
+                        }
+                    } else {
+                        // exited since the snapshot (its PID free, or reused)
+                        ExecutionOutcome::AlreadyGone { pid: child_pid }
                     }
-                } else {
-                    // exited since the snapshot (its PID free, or reused)
-                    ExecutionOutcome::AlreadyGone { pid: child_pid }
                 }
-            }
-        });
+            },
+        );
     }
     if let Some(errno) = walk_error {
         tracing::warn!(
@@ -287,7 +401,7 @@ fn kill_tree_by_pid_with(
 fn kill_tree_in_cgroup(
     root: &ProcRef,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
     dir: &Path,
 ) -> std::io::Result<(ExecutionOutcome, Vec<ExecutionOutcome>)> {
     kill_tree_in_cgroup_with(root, protected, guard, dir, read_stat)
@@ -298,7 +412,7 @@ fn kill_tree_in_cgroup(
 fn kill_tree_in_cgroup_with(
     root: &ProcRef,
     protected: &HashSet<u32>,
-    guard: &dyn Fn(u32) -> Option<&'static str>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
     dir: &Path,
     read: fn(u32) -> std::io::Result<ProcStat>,
 ) -> std::io::Result<(ExecutionOutcome, Vec<ExecutionOutcome>)> {
@@ -340,6 +454,9 @@ fn kill_tree_in_cgroup_with(
     // captured, or not moved (then killed on their own).
     let mut others: Vec<ExecutionOutcome> = Vec::new();
     let mut seen: HashSet<(u32, u64)> = HashSet::new();
+    // Lot 312 (BUG-122): the pids whose whole tree is spared, kept across
+    // the walks (a child forked later is spared with its parent).
+    let mut trees: HashSet<u32> = HashSet::new();
     let mut truncated = false;
     let mut walk_error: Option<i32> = None;
     // Move every descendant still outside the cgroup; a child forked by a
@@ -361,14 +478,15 @@ fn kill_tree_in_cgroup_with(
         walk_error = None;
         truncated |= cut;
         let mut new = 0;
-        for (pid, start) in descendants {
+        for (pid, start, parent) in descendants {
             if !seen.insert((pid, start)) {
                 continue;
             }
-            if let Some(reason) =
-                guard(pid).or(protected.contains(&pid).then_some("PID is protected"))
-            {
-                others.push(ExecutionOutcome::Refused { pid, reason });
+            if let Some(spare) = spare_in_walk(pid, parent, &mut trees, protected, guard) {
+                others.push(ExecutionOutcome::Refused {
+                    pid,
+                    reason: spare.reason,
+                });
                 continue;
             }
             if rel.as_deref().is_some_and(|r| pid_in_cgroup(pid, r)) {
@@ -609,9 +727,13 @@ fn cgroup_rel(dir: &Path) -> Option<String> {
     Some(format!("/{}", rel.display()))
 }
 
+/// Whether `/proc/<pid>/cgroup` places `pid` in the cgroup `rel` itself
+/// (lot 312: by components from the root, the shared helper's rule).
 fn pid_in_cgroup(pid: u32, rel: &str) -> bool {
-    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
-        .is_ok_and(|c| c.lines().any(|l| l.strip_prefix("0::") == Some(rel)))
+    crate::state_read::read_state(format!("/proc/{pid}/cgroup")).is_ok_and(|c| {
+        nn_core::response::cgroup::unified_path(&c)
+            .is_some_and(|p| nn_core::response::cgroup::cgroup_at(p, rel))
+    })
 }
 
 /// Wait until `cgroup.events` holds the line `want`, at most `timeout`.
@@ -631,18 +753,22 @@ fn wait_cgroup_event(dir: &Path, want: &str, timeout: Duration) -> bool {
 }
 
 /// Depth-first walk through the parent→children map built from `/proc`.
-/// Returns descendant `(pid, start ticks)`, capped at [`MAX_DESCENDANTS`],
-/// and whether the cap cut the walk short (external audit CMB-002).
-fn collect_descendants(root_pid: u32) -> std::io::Result<(Vec<(u32, u64)>, bool)> {
+/// Returns descendant `(pid, start ticks, parent pid)` — a parent before
+/// its children — capped at [`MAX_DESCENDANTS`], and whether the cap cut
+/// the walk short (external audit CMB-002).
+fn collect_descendants(root_pid: u32) -> std::io::Result<(Vec<Descendant>, bool)> {
     collect_descendants_capped(root_pid, MAX_DESCENDANTS)
 }
+
+/// A descendant a walk found: `(pid, start ticks, parent pid)`.
+type Descendant = (u32, u64, u32);
 
 fn collect_descendants_capped(
     root_pid: u32,
     cap: usize,
-) -> std::io::Result<(Vec<(u32, u64)>, bool)> {
+) -> std::io::Result<(Vec<Descendant>, bool)> {
     let map = build_ppid_map()?;
-    let mut out: Vec<(u32, u64)> = Vec::new();
+    let mut out: Vec<Descendant> = Vec::new();
     let mut frontier: Vec<u32> = vec![root_pid];
 
     while let Some(parent) = frontier.pop() {
@@ -657,7 +783,7 @@ fn collect_descendants_capped(
                 if out.len() >= cap {
                     return Ok((out, true));
                 }
-                out.push((child, start));
+                out.push((child, start, parent));
                 frontier.push(child);
             }
         }
@@ -1072,7 +1198,7 @@ mod tests {
         let (primary, rest) = kill_process_tree_guarded(
             sh.id(),
             &protected_with(&[]),
-            &|pid| (pid == spared).then_some("host-critical (test guard)"),
+            &|pid| (pid == spared).then_some(Spare::process("host-critical (test guard)")),
             &super::super::journal::test_intent(),
         );
         assert!(
@@ -1509,6 +1635,249 @@ mod tests {
             map.get(&1).map(|v| !v.is_empty()).unwrap_or(false),
             "expected init to have at least one direct child, got {:?}",
             map.get(&1)
+        );
+    }
+}
+
+/// Lot 312 (external bug hunt 1.4, BUG-122): a spared root, its
+/// descendants still killed. The coordinator's decision: a protected
+/// process (the agent, the watchdog, init, the protected set) keeps its
+/// whole tree; a host-critical one (the SSH service) is spared alone.
+#[cfg(test)]
+mod bug122 {
+    use super::*;
+
+    /// A shell of the test's own with two `sleep` children (only this
+    /// shell's subtree is ever walked: never the test process's). The root
+    /// then becomes a `sleep` itself (`exec`): it lives on when its
+    /// children are killed.
+    fn shell_with_two_sleepers() -> (std::process::Child, Vec<u32>) {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut sh = Command::new("sh")
+            .args([
+                "-c",
+                "sleep 30 & echo $!; sleep 30 & echo $!; exec sleep 30",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut out = std::io::BufReader::new(sh.stdout.take().unwrap());
+        let mut kids = Vec::new();
+        for _ in 0..2 {
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            kids.push(line.trim().parse::<u32>().unwrap());
+        }
+        (sh, kids)
+    }
+
+    fn reap(mut sh: std::process::Child, kids: &[u32]) {
+        for k in kids {
+            // SAFETY: plain kill(2) on processes this test started.
+            unsafe { libc::kill(*k as i32, libc::SIGKILL) };
+        }
+        let _ = sh.kill();
+        let _ = sh.wait();
+    }
+
+    fn refused_in_tree(rest: &[ExecutionOutcome], kids: &[u32]) -> bool {
+        kids.iter().all(|k| {
+            rest.contains(&ExecutionOutcome::Refused {
+                pid: *k,
+                reason: IN_A_PROTECTED_TREE,
+            })
+        })
+    }
+
+    /// The root in the protected set (the agent's own PID when no tree
+    /// guard is installed): nothing of its tree is killed, and every
+    /// process of it is said spared.
+    #[test]
+    fn bug122_a_protected_root_keeps_its_children() {
+        let (sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let refs: Vec<ProcRef> = kids.iter().map(|k| ProcRef::open(*k)).collect();
+        let (primary, rest) = kill_process_tree(
+            root,
+            &HashSet::from([1, 2, root]),
+            &super::super::journal::test_intent(),
+        );
+        let alive: Vec<bool> = refs.iter().map(|r| r.is_live()).collect();
+        reap(sh, &kids);
+        assert!(
+            matches!(primary, ExecutionOutcome::Refused { pid, reason: "PID is protected" } if pid == root),
+            "premise: {primary:?}"
+        );
+        assert!(
+            alive.iter().all(|a| *a),
+            "BUG-122: root {root} refused (protected) but children alive {alive:?}, outcomes {rest:?}"
+        );
+        assert!(
+            refused_in_tree(&rest, &kids),
+            "each one said spared: {rest:?}"
+        );
+        assert_eq!(rest.len(), kids.len(), "{rest:?}");
+    }
+
+    /// The same with the guard naming the root protected (the watchdog):
+    /// its tree is spared.
+    #[test]
+    fn bug122_a_guard_protected_root_keeps_its_children() {
+        let (sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let refs: Vec<ProcRef> = kids.iter().map(|k| ProcRef::open(*k)).collect();
+        let (primary, rest) = kill_process_tree_guarded(
+            root,
+            &HashSet::from([1, 2]),
+            &|pid| (pid == root).then_some(Spare::tree("northnarrow-watchdog")),
+            &super::super::journal::test_intent(),
+        );
+        let alive: Vec<bool> = refs.iter().map(|r| r.is_live()).collect();
+        reap(sh, &kids);
+        assert!(
+            matches!(primary, ExecutionOutcome::Refused { pid, reason: "northnarrow-watchdog" } if pid == root),
+            "premise: {primary:?}"
+        );
+        assert!(alive.iter().all(|a| *a), "{alive:?} {rest:?}");
+        assert!(refused_in_tree(&rest, &kids), "{rest:?}");
+    }
+
+    /// A host-critical root (the SSH service) is spared alone: the
+    /// offender's processes below it are killed, each said killed, the root
+    /// said spared.
+    #[test]
+    fn bug122_a_host_critical_root_is_spared_alone() {
+        let (sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let (primary, rest) = kill_process_tree_guarded(
+            root,
+            &HashSet::from([1, 2]),
+            &|pid| (pid == root).then_some(Spare::process("ssh-service(sshd)")),
+            &super::super::journal::test_intent(),
+        );
+        let root_alive = ProcRef::open(root).is_live();
+        reap(sh, &kids);
+        assert!(
+            matches!(primary, ExecutionOutcome::Refused { pid, reason: "ssh-service(sshd)" } if pid == root),
+            "{primary:?}"
+        );
+        assert!(root_alive, "the SSH service itself is not killed");
+        for k in &kids {
+            assert!(
+                rest.iter().any(|o| matches!(o, ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } if pid == k)),
+                "the offender's process {k} below it is killed: {rest:?}"
+            );
+        }
+    }
+
+    /// A protected DESCENDANT keeps its own tree, a host-critical one does
+    /// not; the other offender processes are killed. Shell `m` (the middle
+    /// one) runs a sleeper `g`; the root runs `m` and a sibling sleeper
+    /// `s`.
+    #[test]
+    fn bug122_a_protected_descendant_keeps_its_tree() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        for tree in [true, false] {
+            let mut sh = Command::new("sh")
+                .args([
+                    "-c",
+                    "sh -c 'sleep 30 & echo g $!; wait' & echo m $!; sleep 30 & echo s $!; wait",
+                ])
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            let mut out = std::io::BufReader::new(sh.stdout.take().unwrap());
+            let mut pid_of = std::collections::HashMap::new();
+            for _ in 0..3 {
+                let mut line = String::new();
+                out.read_line(&mut line).unwrap();
+                let (k, v) = line.trim().split_once(' ').unwrap();
+                pid_of.insert(k.to_string(), v.parse::<u32>().unwrap());
+            }
+            let (m, g, s) = (pid_of["m"], pid_of["g"], pid_of["s"]);
+            let spare = if tree {
+                Spare::tree("northnarrow-agent(self)")
+            } else {
+                Spare::process("ssh-service(sshd)")
+            };
+            let (primary, rest) = kill_process_tree_guarded(
+                sh.id(),
+                &HashSet::from([1, 2]),
+                &|pid| (pid == m).then_some(spare),
+                &super::super::journal::test_intent(),
+            );
+            let (m_alive, g_alive, s_alive) = (
+                ProcRef::open(m).is_live(),
+                ProcRef::open(g).is_live(),
+                ProcRef::open(s).is_live(),
+            );
+            for p in [m, g, s] {
+                // SAFETY: plain kill(2) on processes this test started.
+                unsafe { libc::kill(p as i32, libc::SIGKILL) };
+            }
+            let _ = sh.wait();
+            assert!(
+                matches!(primary, ExecutionOutcome::Killed { .. }),
+                "{primary:?}"
+            );
+            assert!(
+                rest.contains(&ExecutionOutcome::Refused {
+                    pid: m,
+                    reason: spare.reason
+                }),
+                "tree {tree}: the spared process is said spared: {rest:?}"
+            );
+            // (alone, it exits by itself once its only child is killed)
+            assert!(m_alive || !tree, "tree {tree}: the spared process lives");
+            assert!(
+                !s_alive,
+                "tree {tree}: the sibling offender is killed: {rest:?}"
+            );
+            assert_eq!(g_alive, tree, "tree {tree}: its child {rest:?}");
+            let g_said = rest.iter().find(|o| matches!(o, ExecutionOutcome::Refused { pid, .. } | ExecutionOutcome::Killed { pid } if *pid == g));
+            if tree {
+                assert_eq!(
+                    g_said,
+                    Some(&ExecutionOutcome::Refused {
+                        pid: g,
+                        reason: IN_A_PROTECTED_TREE
+                    })
+                );
+            } else {
+                assert_eq!(g_said, Some(&ExecutionOutcome::Killed { pid: g }));
+            }
+        }
+    }
+
+    /// The walk's rule on its own, parents first: under a tree-spared pid
+    /// everything is spared, under a process-spared one nothing is.
+    #[test]
+    fn bug122_the_walk_spares_whole_trees_only_below_protected_pids() {
+        // 10 → 11 (tree) → 12 → 13; 10 → 14 (process) → 15; 10 → 16
+        let walk = [(11, 10), (12, 11), (13, 12), (14, 10), (15, 14), (16, 10)];
+        let guard = |pid: u32| match pid {
+            11 => Some(Spare::tree("watchdog")),
+            14 => Some(Spare::process("sshd")),
+            _ => None,
+        };
+        let protected = HashSet::from([16]);
+        let mut trees = HashSet::new();
+        let got: Vec<Option<Spare>> = walk
+            .iter()
+            .map(|&(pid, parent)| spare_in_walk(pid, parent, &mut trees, &protected, &guard))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(Spare::tree("watchdog")),
+                Some(Spare::tree(IN_A_PROTECTED_TREE)),
+                Some(Spare::tree(IN_A_PROTECTED_TREE)),
+                Some(Spare::process("sshd")),
+                None,
+                Some(PROTECTED),
+            ]
         );
     }
 }

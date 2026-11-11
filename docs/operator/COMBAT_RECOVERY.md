@@ -308,6 +308,67 @@ Rows written before the upgrade keep their bytes and their `null`s and
 still verify (`nn-admin audit verify`); a reader takes a missing `cause` or
 `offender_details` as unknown.
 
+### 3.5 What a response reports: what the host holds, read back (lot 312)
+
+A response's signed row says what the host holds after the action, read
+back, never what the agent wrote. Where the read-back does not show the
+effect asked for, the row is a failure with the reason (`not in effect:
+…`; the detection record's `response` says `(not in effect: …)`), never a
+success:
+
+- **Quarantine.** Whether an offender's binary is gone is decided on the
+  file the agent holds open (no name left anywhere: `st_nlink` 0, as for a
+  memfd or a binary unlinked while it ran), never on the ` (deleted)` the
+  kernel appends to `/proc/<pid>/exe`: a payload named `x (deleted)` is
+  quarantined like any other. When the name the process ran was removed
+  while another hard link keeps the file (`ln a .b; rm a`), or the file has
+  a second hard link, the content is vaulted and the file itself is
+  emptied through the agent's descriptor (no name of it runs the binary
+  any more; `response restore` gives the content back), read back empty.
+  A root-owned file linked under a name the agent cannot see is left as
+  it is (its other name may be a system binary): the row says `not in
+  effect: still on disk under a name the agent cannot see …`. A binary
+  NEUTRALIZE could not open is said so (`NOT quarantined: its binary could
+  not be opened (…)`); `binary not quarantined: the process exited before
+  NEUTRALIZE could open it` replaces the earlier "no binary on disk".
+- **Soft egress block (BlockOutbound).** The agent's scope is
+  `/<slice>/blocked.scope` from the cgroup root, compared by components: a
+  cgroup a user names `northnarrow.slice/blocked.scope` in the subtree
+  systemd delegates to it (`user@<uid>.service`) is not it, and a process
+  there is moved into the agent's scope like any other. After the move
+  `/proc/<pid>/cgroup` is read again; the drop rule is loaded again when
+  the scope is a different cgroup (another id) than the one it was loaded
+  for. The drop matches sockets by the cgroup they were created in: a
+  socket the process opened before the move is not dropped by it (lot
+  312's note in [the capability
+  program](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md));
+  NEUTRALIZE's kill and ISOLATE are what end such a connection.
+- **Throttle.** A limit counts only where it reads back as the value asked
+  for (`io.weight` 10, `cpu.max` 10 %, `memory.high` 100 MiB): a default
+  read back is no limit, and the row is partial. A second throttle of a
+  process already in the scope keeps the cgroup it really came from.
+- **Release** (`nn-admin response release`, COMBAT's stand-down) answers
+  `released` only once `/proc/<pid>/cgroup` shows the process back in the
+  cgroup it came from; a record whose origin is the agent's own scope (an
+  earlier agent's) is not released into it (`the recorded origin is the
+  scope itself`).
+- **The host-critical guard** spares the SSH service only in the system
+  manager's own SSH unit: `/system.slice/[<sub>.slice/]ssh.service` (or
+  `sshd.service`, `sshd@…`), one unit, the last component. A
+  `ssh.service` nested in a container's scope or in a service's own
+  subtree is not it. A cgroup with no unit at all spares a root sshd only
+  on a host whose PID 1 is not systemd. On a cgroup v1 host where cgroup2
+  is mounted too, systemd's own hierarchy places a process, never the
+  unified root.
+- **A tree kill's spared processes.** A protected process (the agent, its
+  watchdog, init) is spared with its whole tree; a host-critical one (the
+  SSH service) alone — the offender's processes below an sshd are killed.
+  Each spared pid is in the outcome with its reason (`in the tree of a
+  protected process` for the ones below a protected pid), next to each
+  killed one.
+- **NEUTRALIZE with every offender host-critical** says so, not "no
+  offending process attributed".
+
 ---
 
 ## 4. Recovering from an agent crash mid-COMBAT

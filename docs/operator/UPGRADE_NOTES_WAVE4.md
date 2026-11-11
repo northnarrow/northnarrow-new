@@ -1148,3 +1148,28 @@ configure; use the `nn-admin` of this release where the export is checked.
   monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
   to keep it; that load, seen by the agent, is signed Low.
 
+
+## 26. What a response reports, read back (lot 312)
+
+- **A new failure text in the signed rows**: `not in effect: <reason>`
+  (the action ran, its effect read back did not take); the detection
+  record's `response` reads `BlockOutbound (not in effect: …)`. A SIEM rule
+  keyed on the bare action name as success is unaffected: these rows are
+  `failure` (`COMBAT_RECOVERY.md` §3.5).
+- **The quarantine empties a binary it cannot remove.** A binary whose name
+  was removed while another hard link keeps it, or with a second hard
+  link, is vaulted and then emptied in place (0 bytes; `nn-admin response
+  restore` gives it back). A root-owned one is left as it is, the row
+  `not in effect`. NEUTRALIZE's text for an offender gone before its
+  binary was opened is now "binary not quarantined: the process exited
+  before NEUTRALIZE could open it".
+- **The SSH service is spared only in the system manager's own SSH unit**
+  (`/system.slice/[<sub>.slice/]ssh.service`, one unit). A root sshd in a
+  container's nested `ssh.service`, or — on a systemd host — in a cgroup
+  with no unit, is no longer spared.
+- **A tree kill keeps a protected process's whole tree** (the agent, its
+  watchdog, init) and spares the SSH service alone: an offender's process
+  below an sshd is killed. Each spared pid is in the outcome.
+- **A release says `released` only once the process is back** in the
+  cgroup it came from (`response release`: exit 9 with the reason
+  otherwise).

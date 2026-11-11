@@ -341,11 +341,27 @@ pub fn btime(fd: RawFd, name: Option<&str>) -> Option<i64> {
     Some(sx.stx_btime.tv_sec * 1_000_000_000 + sx.stx_btime.tv_nsec as i64)
 }
 
-/// The path of an event descriptor (`/proc/self/fd/<fd>`).
-pub fn fd_path(fd: RawFd) -> Option<String> {
+/// The path of an event descriptor (`/proc/self/fd/<fd>`, `st` its
+/// `fstat`), while that path still names the file. Lot 312 (external bug
+/// hunt 1.4, a BUG-90 variant): the kernel's ` (deleted)` suffix decided
+/// it, and a file still on disk whose name ends so — a ransomware renames
+/// `report.odt` to `report.odt (deleted)`, then rewrites it — was written
+/// without a copy (`skipped_unresolved_path`). Now: `None` once the inode
+/// has no name (`st_nlink == 0`), or when the name shown leads to another
+/// inode (the name removed while a hard link keeps it); otherwise the
+/// name, whatever it ends with.
+pub fn fd_path(fd: RawFd, st: &libc::stat) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if st.st_nlink == 0 {
+        return None;
+    }
     let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
     let s = p.to_str()?.to_string();
-    (s.starts_with('/') && !s.ends_with(" (deleted)")).then_some(s)
+    if !s.starts_with('/') {
+        return None;
+    }
+    let m = crate::response::on_host_path(&p, |q| std::fs::symlink_metadata(q)).ok()?;
+    (m.dev() == st.st_dev && m.ino() == st.st_ino).then_some(s)
 }
 
 #[cfg(test)]
@@ -589,5 +605,42 @@ mod tests {
         }
         // read(2) is no open: unknown, never read-only
         assert!(classify_syscall_line(&text).may_write(), "{text}");
+    }
+
+    /// Lot 312 (BUG-90 variant in the copy-on-first-write guard): a file on
+    /// disk named `… (deleted)` has its path; a file with no name left, or
+    /// whose name was removed while a hard link keeps it, has none.
+    #[test]
+    fn bug90_variant_a_file_named_deleted_keeps_its_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let named = tmp.path().join("report.odt (deleted)");
+        std::fs::write(&named, b"data").unwrap();
+        let f = std::fs::File::open(&named).unwrap();
+        let st = fstat(f.as_raw_fd()).unwrap();
+        assert_eq!(
+            fd_path(f.as_raw_fd(), &st).as_deref(),
+            Some(named.to_str().unwrap()),
+            "BUG-90 variant: a file still on disk"
+        );
+        // its name removed, another hard link keeps it: no path to restore to
+        // — not even with a decoy at the very name the kernel shows
+        let keep = tmp.path().join(".keep");
+        std::fs::hard_link(&named, &keep).unwrap();
+        std::fs::remove_file(&named).unwrap();
+        let st = fstat(f.as_raw_fd()).unwrap();
+        assert_eq!(fd_path(f.as_raw_fd(), &st), None);
+        let shown = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
+        std::fs::write(&shown, b"decoy").unwrap();
+        assert_eq!(
+            fd_path(f.as_raw_fd(), &st),
+            None,
+            "the decoy is not the file"
+        );
+        std::fs::remove_file(&shown).unwrap();
+        // no name left at all
+        std::fs::remove_file(&keep).unwrap();
+        let st = fstat(f.as_raw_fd()).unwrap();
+        assert_eq!(st.st_nlink, 0);
+        assert_eq!(fd_path(f.as_raw_fd(), &st), None);
     }
 }

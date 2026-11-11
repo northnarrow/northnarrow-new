@@ -1806,7 +1806,10 @@ fn neutralize_outcome(
         report.offenders.len()
     );
     if let NeutralizeOutcome::Uncontainable { reason } = report.outcome() {
-        if not > 0 || report.offenders.is_empty() {
+        // Lot 312 (external bug hunt 1.4, BUG-120): an empty report with
+        // offenders spared is the all-host-critical NEUTRALIZE (nothing
+        // handed to the actuator), not "no offending process attributed".
+        if not > 0 || (report.offenders.is_empty() && spared.is_empty()) {
             summary.push_str(&format!(" ({reason})"));
         }
     }
@@ -1857,4 +1860,46 @@ fn is_loopback(family: u8, addr: &[u8]) -> bool {
     let n = addr.len().min(16);
     b[..n].copy_from_slice(&addr[..n]);
     canonical_ip(family, &b).is_loopback()
+}
+
+/// Lot 312 (external bug hunt 1.4, BUG-120): the all-host-critical
+/// short-circuit hands `neutralize_outcome` an empty report on purpose
+/// (nothing given to the actuator); the signed summary said "no offending
+/// process attributed" next to the offender it spared.
+#[cfg(test)]
+mod bug120 {
+    use super::*;
+
+    #[test]
+    fn bug120_all_spared_outcome_does_not_say_no_offender_was_attributed() {
+        let o = neutralize_outcome(
+            Some(TriggerType::ConfirmedIntrusion),
+            &NeutralizeReport::default(),
+            &[(4242, ProtectedReason::SshService)],
+        );
+        assert!(!o.success);
+        assert!(
+            o.summary.contains("ssh-service(sshd) (pid 4242)"),
+            "{}",
+            o.summary
+        );
+        assert!(
+            !o.summary.contains("no offending process attributed"),
+            "the signed NEUTRALIZE outcome says no process was attributed, while pid 4242 \
+             was attributed and spared: {}",
+            o.summary
+        );
+    }
+
+    /// Guard: an empty report with nobody spared still says why.
+    #[test]
+    fn bug120_guard_nothing_attributed_is_still_said() {
+        let o = neutralize_outcome(None, &NeutralizeReport::default(), &[]);
+        assert!(!o.success);
+        assert!(
+            o.summary.contains("no offending process attributed"),
+            "{}",
+            o.summary
+        );
+    }
 }

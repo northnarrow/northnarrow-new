@@ -618,7 +618,7 @@ impl Runtime {
         if info.trust.is_trusted() {
             return self.allow_fast(fd, read_at, &s.allowed_trusted);
         }
-        let Some(path) = fd_path(fd.as_raw_fd()) else {
+        let Some(path) = fd_path(fd.as_raw_fd(), &st) else {
             return self.allow_fast(fd, read_at, &s.skipped_unresolved_path);
         };
         let cfg = &self.store.cfg;

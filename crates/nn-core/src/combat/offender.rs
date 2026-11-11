@@ -31,16 +31,26 @@ pub struct ProcFacts {
     pub cgroup: Option<String>,
 }
 
-/// The cgroup path a `/proc/<pid>/cgroup` text places the process in: the
-/// unified hierarchy (`0::/…`), or systemd's own (`name=systemd`) on a v1
-/// host.
+/// The cgroup path a `/proc/<pid>/cgroup` text places the process in: on a
+/// unified host (only `0::` lines) the unified hierarchy's; where v1
+/// hierarchies are mounted (a legacy or hybrid host), systemd's own
+/// (`name=systemd`).
+///
+/// Lot 312 (external bug hunt 1.4, BUG-121): the unified line came first
+/// whatever the host. On a v1 host where cgroup2 was mounted once, every
+/// process shows `0::/` — the root, which places none — and that was read
+/// as its cgroup: the guard then found no unit for any process. There the
+/// answer is systemd's line, and without one it is unknown (`None`): never
+/// the root, unless the host has no v1 hierarchy at all.
 pub fn cgroup_path(text: &str) -> Option<&str> {
+    let unified = text.lines().find_map(|l| l.strip_prefix("0::"));
+    let v1 = text.lines().any(|l| !l.is_empty() && !l.starts_with("0::"));
+    if !v1 {
+        return unified;
+    }
     text.lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .or_else(|| {
-            text.lines()
-                .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
-        })
+        .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
+        .or(unified.filter(|p| *p != "/"))
 }
 
 /// `s` within [`MAX_PATH_SHOWN`] bytes: as it is, or its end after `…`.
@@ -159,5 +169,57 @@ mod tests {
         let entry = id(Via::Entry).to_json();
         assert_eq!(entry["via"], "entry");
         assert!(entry.get("parent").is_none());
+    }
+}
+
+/// Lot 312 (external bug hunt 1.4, BUG-121): on a cgroup v1 host where
+/// cgroup2 was mounted once, every process shows `0::/` (the unified root,
+/// which places none); systemd's own line places it.
+#[cfg(test)]
+mod bug121 {
+    use super::*;
+
+    #[test]
+    fn bug121_a_v1_host_with_cgroup2_mounted_is_placed_by_systemd() {
+        let text = "12:pids:/system.slice/ssh.service\n\
+                    1:name=systemd:/system.slice/ssh.service\n\
+                    0::/\n";
+        assert_eq!(cgroup_path(text), Some("/system.slice/ssh.service"));
+    }
+
+    #[test]
+    fn bug121_a_v1_session_scope_is_not_lost_to_the_unified_root() {
+        let text = "0::/\n1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n";
+        assert_eq!(
+            cgroup_path(text),
+            Some("/user.slice/user-1000.slice/session-3.scope")
+        );
+    }
+
+    /// Without systemd's line, a v1 host's unified root is unknown, never
+    /// `/`; a unified line below the root there still places the process.
+    #[test]
+    fn bug121_a_v1_host_without_systemds_line_is_unknown_not_the_root() {
+        assert_eq!(cgroup_path("4:memory:/x\n0::/\n"), None);
+        assert_eq!(cgroup_path("4:memory:/x\n"), None);
+        assert_eq!(
+            cgroup_path("4:memory:/x\n0::/app.slice/a.service\n"),
+            Some("/app.slice/a.service")
+        );
+    }
+
+    /// Guards: a unified host, and a hybrid host (both lines agree).
+    #[test]
+    fn bug121_guards() {
+        assert_eq!(cgroup_path("0::/\n"), Some("/"));
+        assert_eq!(
+            cgroup_path("0::/system.slice/a.service\n"),
+            Some("/system.slice/a.service")
+        );
+        assert_eq!(
+            cgroup_path("1:name=systemd:/system.slice/a.service\n0::/system.slice/a.service\n"),
+            Some("/system.slice/a.service")
+        );
+        assert_eq!(cgroup_path(""), None);
     }
 }

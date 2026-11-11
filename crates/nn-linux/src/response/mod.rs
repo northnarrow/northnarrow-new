@@ -18,6 +18,9 @@ pub use nn_core::response::config;
 pub mod containment;
 pub mod executor;
 pub mod file_caps;
+// Lot 312: whether an executable is gone, from the inode the agent holds
+// (`st_nlink`), never from the kernel's ` (deleted)` suffix.
+pub mod inode;
 // R12c (lab PR 270): no action without a signed record — the actions
 // chain's writer and the ticket an action needs.
 pub mod journal;
@@ -76,7 +79,10 @@ pub enum ExecutionOutcome {
     /// drop rule against that cgroup is now in effect.
     Blocked { pid: u32 },
     /// `Quarantine`: the target's executable was encrypted into the
-    /// vault and the original file was unlinked.
+    /// vault and the original file was unlinked. Lot 312 (BUG-90): where
+    /// another hard link, a name the agent cannot see, still held the
+    /// inode, it was also emptied through the agent's descriptor — read
+    /// back empty — so no name of it runs the binary any more.
     Quarantined {
         original_path: String,
         vault_id: String,
@@ -97,6 +103,12 @@ pub enum ExecutionOutcome {
     /// External audit CMB-002, `KillProcessTree`: the `/proc` walk under
     /// `pid` stopped at `limit` descendants; any beyond were not reached.
     TreeTruncated { pid: u32, limit: usize },
+    /// Lot 312 (external bug hunt 1.4, family F5): the action ran, and
+    /// reading its effect back showed it did not take — the process is not
+    /// in the agent's scope after the move, the binary is still on disk
+    /// under another name. `reason` says what was found. Never a success:
+    /// an action reports what the host holds afterwards, not what it wrote.
+    NotInEffect { pid: u32, reason: &'static str },
 }
 
 /// Aggregate report for one verdict execution.
@@ -197,6 +209,9 @@ pub fn journal_outcome(
             R::Partial,
             Some(format!("the tree walk stopped at {limit} descendants")),
         ),
+        ExecutionOutcome::NotInEffect { reason, .. } => {
+            (R::Failure, Some(format!("not in effect: {reason}")))
+        }
     };
     let mut text = format!("{:?}", report.primary);
     if !report.additional.is_empty() {

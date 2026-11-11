@@ -311,7 +311,7 @@ fn host_critical_guard_applies_to_every_pid_scoped_action() {
     cfg.dry_run = false;
     let exec = Executor::with_config(cfg);
     exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
-        (pid == GUARDED || pid == live).then_some("ssh-service(sshd)")
+        (pid == GUARDED || pid == live).then_some(super::kill::Spare::process("ssh-service(sshd)"))
     }));
     for (action, pid) in [
         (ResponseAction::KillProcess, live),

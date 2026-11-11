@@ -188,18 +188,17 @@ pub struct ExeHandle {
 }
 
 impl ExeHandle {
-    /// The executable `pid` runs. `Ok(None)` once the process has exited,
-    /// or when its binary was deleted while it ran (the kernel's
-    /// ` (deleted)` suffix): nothing on disk to quarantine.
+    /// The executable `pid` runs, opened through `/proc/<pid>/exe` — the
+    /// kernel's link to the inode, whatever became of its names.
+    /// `Ok(None)` once the process has exited (or for a kernel thread,
+    /// which runs none). Lot 312 (external bug hunt 1.4, BUG-90): a binary
+    /// whose name was removed while it ran is still opened, and whether it
+    /// is gone is the inode's to say ([`Self::unlinked`]). The kernel's
+    /// ` (deleted)` suffix decided it here: a payload on disk named
+    /// `x (deleted)` was "nothing on disk to quarantine", and NEUTRALIZE
+    /// left it runnable.
     pub fn of_pid(pid: u32) -> std::io::Result<Option<Self>> {
-        let link = format!("/proc/{pid}/exe");
-        match fs::read_link(&link) {
-            Ok(p) if p.to_string_lossy().ends_with(" (deleted)") => return Ok(None),
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        match fs::File::open(&link) {
+        match fs::File::open(format!("/proc/{pid}/exe")) {
             Ok(f) => Self::from_file(f).map(Some),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -227,12 +226,52 @@ impl ExeHandle {
         })
     }
 
-    /// Where the inode is now, from the agent's own descriptor
-    /// (`/proc/self/fd/N`): a rename or a swapped directory moves it, a
-    /// string read earlier does not. `None` once it was unlinked.
+    /// Lot 312 (BUG-90): the inode has no name left anywhere — `st_nlink`
+    /// of the held descriptor ([`super::inode::exe_unlinked`]), never the
+    /// name `/proc` shows for it.
+    pub fn unlinked(&self) -> std::io::Result<bool> {
+        super::inode::exe_unlinked(&self.file)
+    }
+
+    /// The name `/proc/self/fd/N` shows for the held inode, as the kernel
+    /// shows it (a ` (deleted)` suffix kept): what the logs and the vault's
+    /// record name when no name can be verified ([`Self::current_path`]).
+    fn shown_path(&self) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()
+    }
+
+    /// Where the inode is now, verified: the name the agent's own
+    /// descriptor shows (`/proc/self/fd/N`) while that name still leads to
+    /// this inode — looked up through the host's view without following a
+    /// last link, `(dev, ino)` compared. A rename or a swapped directory
+    /// moves it, a string read earlier does not. `None` once the inode has
+    /// no name, or when the name shown leads elsewhere: lot 312 (BUG-90),
+    /// the name the process ran was removed while another hard link keeps
+    /// the inode — the kernel then shows that name with ` (deleted)` after
+    /// it, a suffix a file on disk may also carry in its own name.
     pub fn current_path(&self) -> Option<PathBuf> {
-        let p = fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()?;
-        (!p.to_string_lossy().ends_with(" (deleted)")).then_some(p)
+        if self.unlinked().unwrap_or(true) {
+            return None;
+        }
+        let p = self.shown_path()?;
+        let m = super::on_host_path(&p, |q| fs::symlink_metadata(q)).ok()?;
+        self.is_inode(m.dev(), m.ino()).then_some(p)
+    }
+
+    /// [`Self::current_path`], tried up to [`VERIFY_TRIES`] times: a
+    /// directory of the path exchanged with a link in a loop (CMB-001)
+    /// fails a try, not all of them. `None` when no name led to the inode
+    /// on any try — its name removed while another hard link keeps it.
+    fn verified_name(&self) -> Option<PathBuf> {
+        for _ in 0..VERIFY_TRIES {
+            if self.unlinked().unwrap_or(true) {
+                return None;
+            }
+            if let Some(p) = self.current_path() {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// The same inode as this handle's.
@@ -295,10 +334,24 @@ pub fn quarantine_handle(
     _intent: &super::journal::Intent,
 ) -> ExecutionOutcome {
     let target_pid = pid;
-    let original_str = match handle.current_path() {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => return ExecutionOutcome::AlreadyGone { pid: target_pid },
-    };
+    // Lot 312 (BUG-90): gone only once the inode has no name left — a name
+    // the agent cannot see (another hard link) keeps the binary runnable.
+    match handle.unlinked() {
+        Ok(true) => return ExecutionOutcome::AlreadyGone { pid: target_pid },
+        Ok(false) => {}
+        Err(e) => {
+            warn!(pid = target_pid, error = %e, "quarantine: fstat of the held binary failed");
+            return ExecutionOutcome::Failed {
+                pid: target_pid,
+                errno: e.raw_os_error().unwrap_or(0),
+            };
+        }
+    }
+    let original_str = handle
+        .verified_name()
+        .or_else(|| handle.shown_path())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     // External audit CMB-020: detect-only touches nothing and says so —
     // `Quarantined` with the vault id "dry-run" was a file never moved.
@@ -335,6 +388,18 @@ pub fn quarantine_handle(
             ExecutionOutcome::Refused {
                 pid: target_pid,
                 reason: "the binary's path changed under the quarantine — vaulted, not removed",
+            }
+        }
+        Err(QuarantineError::LinkedElsewhere(reason)) => {
+            warn!(
+                pid = target_pid,
+                path = %nn_model::log_escape::Escaped(&original_str),
+                reason,
+                "quarantine: the binary is still on disk under a name the agent cannot see"
+            );
+            ExecutionOutcome::NotInEffect {
+                pid: target_pid,
+                reason,
             }
         }
         Err(QuarantineError::ProtectedPath) => {
@@ -567,6 +632,11 @@ enum QuarantineError {
     ProtectedPath,
     /// The file was unlinked before the quarantine reached it.
     Gone,
+    /// Lot 312 (BUG-90): every name the agent could verify is removed (or
+    /// none was left to verify), and the inode is still linked under a
+    /// name it cannot see (another hard link) — and could not be emptied.
+    /// The content is vaulted; the binary stays runnable under that name.
+    LinkedElsewhere(&'static str),
     /// External audit CMB-001: the path no longer names the inode the
     /// process ran; the content is vaulted, nothing is removed.
     PathSwapped,
@@ -595,7 +665,18 @@ fn quarantine_file_after_check(
     cfg: &ExecutorConfig,
     after_check: impl FnOnce(),
 ) -> Result<String, QuarantineError> {
-    let original_buf = handle.current_path().ok_or(QuarantineError::Gone)?;
+    // Lot 312 (BUG-90): gone only when no name is left; otherwise judged
+    // on its verified name or, when none can be verified (the name the
+    // process ran was removed, another hard link keeps the inode), on the
+    // name the kernel shows — the denylist's prefixes still match it.
+    if handle.unlinked()? {
+        return Err(QuarantineError::Gone);
+    }
+    let named = handle.verified_name();
+    let original_buf = named
+        .clone()
+        .or_else(|| handle.shown_path())
+        .unwrap_or_default();
     let original = original_buf.as_path();
     if is_denied_by(cfg, original) {
         return Err(QuarantineError::ProtectedPath);
@@ -677,9 +758,80 @@ fn quarantine_file_after_check(
     // Update index.json atomically (tmp + fsync + rename).
     update_index(&cfg.quarantine_dir, &vault_id, &original_str, size)?;
 
-    remove_held(handle, cfg)?;
+    if named.is_some() && remove_held(handle, cfg)? == Removal::MadeUnusable {
+        // the name could not be removed: the file it names is mode 000
+        return Ok(vault_id);
+    }
+    // Lot 312 (F5): read back. Every name the agent could verify is gone;
+    // one it cannot see may still hold the inode (another hard link).
+    if !handle.unlinked()? {
+        disable_held(handle, SYSTEM_OWNER)?;
+    }
     Ok(vault_id)
 }
+
+/// What [`remove_verified`] did to the name it verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// The name is gone.
+    Unlinked,
+    /// The unlink failed (`EBUSY` on an mmapped binary); the file it names
+    /// is mode 000.
+    MadeUnusable,
+    /// No name of the inode was left to verify (removed meanwhile).
+    NoNameLeft,
+}
+
+/// Lot 312: the owner whose files [`disable_held`] leaves as they are.
+const SYSTEM_OWNER: u32 = 0;
+
+/// Lot 312 (external bug hunt 1.4, BUG-90): the binary `handle` holds is
+/// vaulted and still linked under a name the agent cannot see (a hard link
+/// made before its name was removed: `ln a .b; rm a`). Its name unknown,
+/// the denylist cannot vouch for it, so a file of `system_owner` (root: a
+/// system binary may be the other name) is left as it is, said. Any other
+/// is emptied through the agent's own descriptor — the inode itself,
+/// wherever its names are (reopened for writing through
+/// `/proc/self/fd/N`: `CAP_DAC_OVERRIDE`, which the unit grants; a
+/// `fchmod` needs the owner or `CAP_FOWNER`, which it does not, and the
+/// owner could undo it) — and read back empty. The content is in the
+/// vault, so the quarantine's restore gives it back.
+fn disable_held(handle: &ExeHandle, system_owner: u32) -> Result<(), QuarantineError> {
+    let m = handle.file.metadata()?;
+    if m.uid() == system_owner {
+        return Err(QuarantineError::LinkedElsewhere(
+            "still on disk under a name the agent cannot see (another hard link); a file of \
+             root's, possibly a system one, is left as it is — vaulted, not removed",
+        ));
+    }
+    let emptied = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", handle.file.as_raw_fd()));
+    if let Err(e) = &emptied {
+        warn!(error = %e, "quarantine: emptying the binary held under another name failed");
+    }
+    drop(emptied);
+    // Then no execute bit for anyone, where the agent may (its own file,
+    // or a build with CAP_FOWNER): best effort, the read-back decides.
+    let _ = handle
+        .file
+        .set_permissions(fs::Permissions::from_mode(0o000));
+    // F5: what the inode holds now, not what was written.
+    if handle.file.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    Err(QuarantineError::LinkedElsewhere(
+        "still on disk under a name the agent cannot see (another hard link), and it could \
+         not be emptied — vaulted, not removed",
+    ))
+}
+
+/// Lot 312: tries of [`ExeHandle::verified_name`] before the inode is taken
+/// for one whose names the agent cannot see. A swap racing it fails about
+/// one try in two (the lab's CMB-001 loop): 2^-64 that all of them do.
+const VERIFY_TRIES: usize = 64;
 
 /// Tries of the verified removal. A swap racing it fails the `(dev, ino)`
 /// comparison of that try only; the next one starts again from where the
@@ -688,14 +840,15 @@ fn quarantine_file_after_check(
 const REMOVE_TRIES: usize = 8;
 
 /// Remove the binary `handle` holds by its current name, re-read from the
-/// descriptor for each try ([`ExeHandle::current_path`]) and judged by the
+/// descriptor for each try ([`ExeHandle::verified_name`]) and judged by the
 /// denylist each time. [`QuarantineError::PathSwapped`] once the tries are
-/// spent, or once the name the agent knew is gone while the inode lives on
-/// (another name may hold it): vaulted, not removed.
-fn remove_held(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<(), QuarantineError> {
+/// spent: vaulted, not removed. Lot 312: once no name of it is left to
+/// verify ([`Removal::NoNameLeft`]), the caller reads the inode back — it
+/// is gone, or another hard link holds it.
+fn remove_held(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<Removal, QuarantineError> {
     for _ in 0..REMOVE_TRIES {
-        let Some(path) = handle.current_path() else {
-            break;
+        let Some(path) = handle.verified_name() else {
+            return Ok(Removal::NoNameLeft);
         };
         if is_denied_by(cfg, &path) {
             return Err(QuarantineError::ProtectedPath);
@@ -718,7 +871,7 @@ fn remove_held(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<(), Quarantin
 /// path leads to. If the unlink fails (EBUSY on an mmapped binary), the
 /// verified file is made unusable (`fchmod 000`); if that fails too the
 /// binary is still there, which is a failure, never a quarantine.
-fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineError> {
+fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<Removal, QuarantineError> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(QuarantineError::PathSwapped);
     };
@@ -754,8 +907,9 @@ fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineErro
         let e = std::io::Error::last_os_error();
         warn!(error = %e, path = %nn_model::log_escape::Escaped(path.display()), "remove original failed; chmod 000");
         target.set_permissions(fs::Permissions::from_mode(0o000))?;
+        return Ok(Removal::MadeUnusable);
     }
-    Ok(())
+    Ok(Removal::Unlinked)
 }
 
 /// External audit CMB-017: what happened to a quarantine index that did
@@ -1909,5 +2063,360 @@ mod tests {
                 FIXTURE_META
             );
         }
+    }
+}
+
+/// Lot 312 (external bug hunt 1.4, BUG-90): a file ON DISK whose name ends
+/// in ` (deleted)` was taken for the kernel's suffix of an unlinked dentry,
+/// and a name removed while a hard link keeps the inode for a binary gone.
+#[cfg(test)]
+mod bug90 {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn cfg_for(tmp: &TempDir) -> ExecutorConfig {
+        let mut c = ExecutorConfig::for_test(tmp.path());
+        c.dry_run = false;
+        c
+    }
+
+    fn restored(cfg: &ExecutorConfig, tmp: &TempDir, out: &ExecutionOutcome) -> Vec<u8> {
+        let ExecutionOutcome::Quarantined { vault_id, .. } = out else {
+            panic!("not quarantined: {out:?}");
+        };
+        let to = tmp.path().join(format!("restored-{vault_id}"));
+        restore(vault_id, &to, cfg).unwrap();
+        fs::read(&to).unwrap()
+    }
+
+    /// Promise (`current_path`): `None` only once no name leads to the inode.
+    #[test]
+    fn bug90_current_path_of_a_file_on_disk_named_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("evil (deleted)");
+        fs::write(&f, b"malware").unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        assert_eq!(fs::metadata(&f).unwrap().nlink(), 1, "premise: on disk");
+        assert_eq!(
+            h.current_path(),
+            Some(f.clone()),
+            "BUG-90: current_path() of a file still on disk under that name"
+        );
+        assert!(!h.unlinked().unwrap());
+    }
+
+    /// The entry point the NEUTRALIZE and the exec quarantine use.
+    #[test]
+    fn bug90_quarantine_handle_of_a_file_on_disk_named_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("evil (deleted)");
+        fs::write(&f, b"malware").unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        let still = f.exists();
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }) && !still,
+            "BUG-90: outcome {out:?}, file still on disk: {still}"
+        );
+        assert_eq!(restored(&cfg, &tmp, &out), b"malware");
+    }
+
+    /// `of_pid` (Executor's Quarantine, the ladder's `binary_of`): a real
+    /// process running a copy of `sleep` named `evil (deleted)`.
+    #[test]
+    fn bug90_of_pid_of_a_running_binary_named_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("evil (deleted)");
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .expect("a sleep binary");
+        fs::copy(sleep, &f).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        // ETXTBSY: another test thread's fork may hold the copy's write fd
+        let mut child = None;
+        for _ in 0..50 {
+            match std::process::Command::new(&f).arg("30").spawn() {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(e) => panic!("spawn: {e}"),
+            }
+        }
+        let mut child = child.expect("spawned");
+        let mut link = PathBuf::new();
+        for _ in 0..100 {
+            link = fs::read_link(format!("/proc/{}/exe", child.id())).unwrap_or_default();
+            if link == f {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let h = ExeHandle::of_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(link, f, "premise: /proc/<pid>/exe is the name, no suffix");
+        let h = h
+            .expect("of_pid")
+            .expect("BUG-90: a binary on disk (nlink 1)");
+        assert_eq!(h.current_path(), Some(f));
+    }
+
+    /// Guard (must stay): an inode really unlinked is gone — and a memfd.
+    #[test]
+    fn bug90_guard_an_unlinked_file_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        fs::write(&f, b"malware").unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        assert_eq!(h.current_path(), None);
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(out, ExecutionOutcome::AlreadyGone { .. }),
+            "{out:?}"
+        );
+        use std::os::fd::FromRawFd;
+        // SAFETY: memfd_create with a NUL-terminated name; the fd is owned
+        // by the File below.
+        let fd = unsafe { libc::memfd_create(c"nn-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: a fresh fd owned by nobody else.
+        let memfd = unsafe { fs::File::from_raw_fd(fd) };
+        (&memfd).write_all(b"malware").unwrap();
+        let h = ExeHandle::from_open_file(memfd).unwrap();
+        let out = quarantine_handle(&h, 4243, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(out, ExecutionOutcome::AlreadyGone { .. }),
+            "{out:?}"
+        );
+    }
+
+    /// Variant (the triage's): the name the process ran removed, the inode
+    /// kept under a hard link. The kernel shows ` (deleted)`, yet the
+    /// binary is on disk (nlink 1): `AlreadyGone` ("nothing on disk") was
+    /// wrong. Now it is vaulted and the inode, which the agent holds,
+    /// emptied: no name of it runs the binary any more.
+    #[test]
+    fn bug90_variant_an_inode_still_linked_elsewhere_is_not_already_gone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let nlink = h.file.metadata().unwrap().nlink();
+        assert_eq!(nlink, 1, "premise");
+        assert_eq!(h.current_path(), None, "premise: no name the agent can see");
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            !matches!(out, ExecutionOutcome::AlreadyGone { .. }),
+            "BUG-90 variant: the inode is still on disk as .keep (nlink {nlink}), outcome {out:?}"
+        );
+        assert!(
+            matches!(&out, ExecutionOutcome::Quarantined { original_path, .. }
+                if original_path.ends_with("payload (deleted)")),
+            "{out:?}"
+        );
+        assert_eq!(
+            fs::metadata(&keep).unwrap().len(),
+            0,
+            "the other name runs nothing"
+        );
+        assert_eq!(
+            restored(&cfg, &tmp, &out),
+            b"malware",
+            "the content is vaulted"
+        );
+    }
+
+    /// Variant (mini-hunt): the binary's own name still there AND a second
+    /// hard link. The name was removed and the outcome said `Quarantined`
+    /// while the other link kept the binary, runnable. Read back, the inode
+    /// is emptied too.
+    #[test]
+    fn bug90_variant_a_second_hard_link_does_not_keep_the_binary() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(&out, ExecutionOutcome::Quarantined { original_path, .. }
+                if Path::new(original_path) == f),
+            "{out:?}"
+        );
+        assert!(!f.exists(), "the name the process ran is removed");
+        assert_eq!(
+            fs::metadata(&keep).unwrap().len(),
+            0,
+            "the second link runs nothing"
+        );
+        assert_eq!(restored(&cfg, &tmp, &out), b"malware");
+    }
+
+    /// A binary with no name left is gone in detect-only too (nothing a
+    /// quarantine would do), and the removal of a binary whose verified
+    /// name went meanwhile says so instead of "the path changed".
+    #[test]
+    fn bug90_no_name_left_is_gone_and_said_so() {
+        let tmp = TempDir::new().unwrap();
+        let dry = ExecutorConfig::for_test(tmp.path());
+        assert!(dry.dry_run, "premise: for_test is detect-only");
+        let f = tmp.path().join("payload");
+        fs::write(&f, b"malware").unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        let keep = tmp.path().join(".keep");
+        fs::hard_link(&f, &keep).unwrap();
+        fs::remove_file(&f).unwrap();
+        // the name the agent knew went; another link holds the inode
+        assert_eq!(remove_held(&h, &dry).unwrap(), Removal::NoNameLeft);
+        assert_eq!(fs::metadata(&keep).unwrap().len(), 7, "nothing removed");
+        fs::remove_file(&keep).unwrap();
+        let out = quarantine_handle(&h, 4242, &dry, &super::super::journal::test_intent());
+        assert_eq!(out, ExecutionOutcome::AlreadyGone { pid: 4242 });
+    }
+
+    /// Variant: the name the process ran removed, a hard link keeping the
+    /// inode, and a DECOY created at the very name the kernel shows (`…
+    /// (deleted)`). The shown name leads to another inode: it is not the
+    /// binary's (never removed for it), and the binary is still handled.
+    #[test]
+    fn bug90_variant_a_decoy_at_the_shown_name_is_not_the_binary() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let decoy = tmp.path().join("payload (deleted)");
+        fs::write(&decoy, b"decoy").unwrap();
+        assert_eq!(h.current_path(), None, "the shown name leads to the decoy");
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }),
+            "{out:?}"
+        );
+        assert_eq!(
+            fs::read(&decoy).unwrap(),
+            b"decoy",
+            "the decoy is untouched"
+        );
+        assert_eq!(fs::metadata(&keep).unwrap().len(), 0);
+        assert_eq!(restored(&cfg, &tmp, &out), b"malware");
+    }
+
+    /// A hidden link the agent cannot empty (here read-only to its owner,
+    /// as a read-only mount or a binary still run by another process is to
+    /// the agent) is no quarantine: not in effect, said, never `Quarantined`.
+    #[test]
+    fn bug90_a_hidden_link_that_cannot_be_emptied_is_not_in_effect() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert_eq!(
+            out,
+            ExecutionOutcome::NotInEffect {
+                pid: 4242,
+                reason:
+                    "still on disk under a name the agent cannot see (another hard link), and it \
+                         could not be emptied — vaulted, not removed",
+            }
+        );
+        assert_eq!(
+            fs::metadata(&keep).unwrap().len(),
+            7,
+            "still on disk, whole"
+        );
+    }
+
+    /// A file of the system's owner linked under a name the agent cannot
+    /// see is left as it is (the other name may be a system binary), and
+    /// the outcome says so: never `Quarantined`, never `AlreadyGone`.
+    #[test]
+    fn bug90_a_system_owners_file_linked_elsewhere_is_left_and_said() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        // the test's own uid stands for root here
+        let me = fs::metadata(&keep).unwrap().uid();
+        let r = disable_held(&h, me);
+        assert!(
+            matches!(r, Err(QuarantineError::LinkedElsewhere(why)) if why.contains("left as it is")),
+            "{r:?}"
+        );
+        assert_eq!(fs::read(&keep).unwrap(), b"malware");
+        assert_eq!(fs::metadata(&keep).unwrap().mode() & 0o777, 0o755);
+        // and the outcome the executor signs for it
+        let mapped = match r {
+            Err(QuarantineError::LinkedElsewhere(reason)) => {
+                ExecutionOutcome::NotInEffect { pid: 1, reason }
+            }
+            other => panic!("{other:?}"),
+        };
+        let (result, _, reason) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::Quarantine,
+            primary: mapped,
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Failure);
+        assert!(reason.unwrap().starts_with("not in effect: still on disk"));
+    }
+
+    /// The name the kernel shows is still judged by the denylist when no
+    /// name can be verified: a hidden link of a file under a protected
+    /// directory (here the vault, one of the agent's own) is not touched.
+    #[test]
+    fn bug90_a_hidden_link_under_a_protected_directory_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = cfg_for(&tmp);
+        let own = tmp.path().join("own");
+        fs::create_dir_all(&own).unwrap();
+        cfg.own_files.dirs.push(own.clone());
+        let f = own.join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(
+                out,
+                ExecutionOutcome::Refused {
+                    reason: "path is under a protected system prefix",
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(fs::read(&keep).unwrap(), b"malware");
     }
 }

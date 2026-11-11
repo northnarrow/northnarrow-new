@@ -182,6 +182,9 @@ pub mod combat;
 /// The response's policy (R08c, lab PR 252): the executor's configuration
 /// (was the agent's `response::config`).
 pub mod response {
+    // Lot 312: where a cgroup path is, by its components from the root —
+    // never by a suffix or a substring (the agent's scopes, the units).
+    pub mod cgroup;
     // The detect-only gate, the quarantine's cap, the cgroup and nftables
     // names the actions use.
     pub mod config;

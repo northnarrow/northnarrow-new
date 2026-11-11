@@ -22,8 +22,10 @@ use super::{
 const PID_PROTECTION_FLOOR: u32 = 100;
 
 /// Per-pid guard consulted by KillProcessTree for every pid in the walk
-/// (audit `combat-avail-2`). Returns the reason a pid must be spared.
-pub type TreeGuard = Arc<dyn Fn(u32) -> Option<&'static str> + Send + Sync>;
+/// (audit `combat-avail-2`). Returns what sparing a pid covers, with the
+/// reason (lot 312, BUG-122: [`kill::Spare`] — a host-critical process
+/// alone, a protected one with its tree).
+pub type TreeGuard = Arc<dyn Fn(u32) -> Option<kill::Spare> + Send + Sync>;
 
 /// Reusable executor. Cheap to clone (Arc-wraps the read-only state),
 /// so tasks can grab their own copy and run kill syscalls on a
@@ -424,9 +426,11 @@ impl Executor {
         // BlockOutbound or Throttle verdict, could take down sshd or the
         // watchdog.
         let guard = self.tree_guard.read().clone();
-        let spared = move |pid: u32| -> Option<&'static str> {
+        let spared = move |pid: u32| -> Option<kill::Spare> {
             if pid < PID_PROTECTION_FLOOR {
-                return Some("PID below protection floor (kernel thread / core service)");
+                return Some(kill::Spare::process(
+                    "PID below protection floor (kernel thread / core service)",
+                ));
             }
             guard.as_ref().and_then(|g| g(pid))
         };
@@ -456,12 +460,12 @@ impl Executor {
             // watchdog), and a refusal would read as an offender that
             // could not be contained.
             ExecutionOutcome::AlreadyGone { pid: target_pid }
-        } else if let Some(reason) =
+        } else if let Some(spare) =
             spared(target_pid).filter(|_| acts_on_process && target_pid != 0)
         {
             ExecutionOutcome::Refused {
                 pid: target_pid,
-                reason,
+                reason: spare.reason,
             }
         } else {
             match action {

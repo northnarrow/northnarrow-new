@@ -9148,3 +9148,96 @@ number in parentheses is a lab PR.
     be read are moved and killed); with its mutant the new one fails.
   - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
     proved beyond it.
+
+- **Lot 312 — a response reports what the host holds, read back, not what
+  the agent wrote (C17, C23, C19; external bug hunt, edition 1.4: BUG-90,
+  91, 114, 117, 120, 121, 122, 123 and the triage's N5).**
+  - What was open: NEUTRALIZE killed a payload an unprivileged user named
+    `x (deleted)` and left it on disk, runnable, the signed row saying "no
+    binary on disk" (the quarantine read the kernel's ` (deleted)` suffix
+    as "unlinked"); the same with `ln a .b; rm a` after the exec. A user
+    with the subtree systemd delegates to it (`user@<uid>.service`) made a
+    cgroup named `northnarrow.slice/blocked.scope`: the soft egress block
+    took it for the agent's scope (`ends_with`), answered `Blocked`, moved
+    nothing, and the drop rule — which names the scope from the root —
+    filtered nothing. The guard took a container's nested `ssh.service`
+    for the host's (the deepest unit), and a cgroup with no unit for a host
+    without systemd; a v1 host's `0::/` for every process's cgroup; a second
+    throttle recorded the scope as the origin and the release answered
+    `Released` with the process still throttled; a skipped `io.weight` read
+    back its default as a limit; a refused tree-kill root still had its
+    children killed; an all-host-critical NEUTRALIZE was worded "no
+    offending process attributed".
+  - What changed: two helpers. `nn_core::response::cgroup` (where a cgroup
+    path is, by its components from the root: `cgroup_at`,
+    `cgroup_at_or_under`, `unified_path`; property tests over every path of
+    an alphabet to depth 4 and a seeded generator) and
+    `nn_linux::response::inode::exe_unlinked` (`st_nlink` of the held
+    descriptor; a property test over every sequence of up to four link,
+    unlink, rename and namesake steps). A ratchet,
+    `xtask/tests/response_truth.rs`: no ` (deleted)`, `ends_with`, string
+    `contains`, hand-cut last component or `"0::"` in the response and
+    COMBAT code but the helper, each rule shown failing on main's shape.
+    And F5: the block, the throttle and their release read
+    `/proc/<pid>/cgroup` back; the drop rule is loaded again for a scope
+    that is another cgroup (by id); the throttle's limits count only as the
+    values asked for; a new outcome, `NotInEffect { reason }`, signed as a
+    failure (`not in effect: …`). The quarantine vaults and empties an
+    inode still linked under a name the agent cannot see (the unit has no
+    `CAP_FOWNER`, so a `fchmod` of a user's file fails; the emptying goes
+    through `/proc/self/fd` with `CAP_DAC_OVERRIDE`), leaves a root-owned
+    one as it is and says so. BUG-122 as the coordinator decided: a
+    protected process (the agent, its watchdog, init) keeps its whole tree,
+    a host-critical one (the SSH service) is spared alone.
+  - Measured on our own guests (leases k312), the agent installed from the
+    lot's tree, a real COMBAT each time (root's append-open of
+    `/etc/northnarrow/admin.pub` refused by the anti-tamper hook):
+    - Ubuntu 24.04 (6.8.0-147, systemd 255) at ebcc24fb and Debian 13
+      (6.12.115, systemd 257) at 13727c22, the same results: a copy of
+      `python3` named `/srv/nn312/x (deleted)`, owned by the lab user and
+      run as the offender, was killed, vaulted (`response_quarantine`, the
+      sha256 of `python3`) and removed; the same binary as `a`, linked as
+      `.b` and `a` removed before the tripwire (the kernel showing
+      `a (deleted)`, `nlink` 1), was vaulted and `.b` emptied (0 bytes:
+      running it runs nothing); its mode stayed 755, as the unit's
+      capability set predicts. Both rows `quarantined`.
+    - The same two guests: as the lab user, `northnarrow.slice/
+      blocked.scope` made in `user@1000.service`; a root offender moved
+      itself there, opened one UDP socket before anything, then tripped the
+      hook. `response_contain` names the namesake as the origin; the
+      process's `/proc/<pid>/cgroup` read `0::/northnarrow.slice/
+      blocked.scope` 0.25 s later; from then on a send on a new socket was
+      refused (`EPERM`, the drop rule), until NEUTRALIZE killed it at the
+      INVESTIGATE deadline (32 s on 24.04).
+    - Not closed, found by the lot's mini-hunt and measured there: the
+      socket the offender opened before the move kept sending through the
+      whole INVESTIGATE window, the block signed `success`. `socket cgroupv2`
+      matches a socket's cgroup at its creation, which a move does not
+      change: the soft block covers what the process opens after it. An
+      established channel ends with NEUTRALIZE's kill or ISOLATE; the
+      operator doc says so (`COMBAT_RECOVERY.md` §3.5). Cutting it needs a
+      decision (`SOCK_DESTROY` of the process's sockets, or a per-process
+      egress program).
+    - Privileged nn-linux tests on Debian 13 (the agent installed):
+      `bug117_throttled_twice_then_released_returns_to_its_unit` and
+      `a_released_process_returns_to_its_unit` passed;
+      `bug91_a_delegated_users_namesake_is_moved_and_filtered` (a unit
+      delegated to `nobody`, which makes the namesake and moves itself
+      there as that user) passed once its victim ran from a script file
+      (systemd turns `$$` of a command line into `$`: its first two runs
+      never reached the block). With main's suffix test put back in the
+      guest's copy, the same test fails: `Blocked`, the process still in
+      `/system.slice/nn-namesake-1161.service/northnarrow-test312.slice/
+      blocked.scope`.
+  - Mutation round on the new code: 41 targeted mutations, each a named
+    test run alone after it. First round: 34 caught, 7 survivors (the
+    verified name's `(dev, ino)`, the emptying's read-back, the early
+    `AlreadyGone`, the removal's "no name left", `memory.high`'s value,
+    PID 1's `init.scope`, the SSH service's `Spare`) and 2 in the
+    copy-on-first-write guard; each got a named test, and the rerun caught
+    all but one, argued equivalent: `fd_path`'s `st_nlink == 0` check,
+    whose answer the `(dev, ino)` check gives anyway (no name leads to an
+    inode with no name).
+  - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
+    the cases above, on two kernels; the soft block's established-socket
+    hole stays open (above).

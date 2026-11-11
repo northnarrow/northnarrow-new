@@ -66,7 +66,7 @@ fn simulate_copy(file: &std::fs::File, journal: &std::fs::File, n: u64) -> std::
     let _ = fanotify::tgid_of(me);
     let _ = trust::proc_start_ticks(Path::new("/proc"), me as u32);
     let _ = std::fs::read_link("/proc/self/exe");
-    let _ = fanotify::fd_path(file.as_raw_fd());
+    let _ = fanotify::fd_path(file.as_raw_fd(), &st);
     let _ = fanotify::btime(file.as_raw_fd(), None);
     let dir = journal;
     let name = std::ffi::CString::new(format!("{n:016x}")).unwrap_or_default();
