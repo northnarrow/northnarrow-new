@@ -104,13 +104,17 @@ impl Drop for BurstDir {
 
 /// `n` copies of `/usr/bin/true`, each with bytes of its own appended (a
 /// content the guard has never seen), each named `true` in a directory of
-/// its own (a multi-call coreutils picks its utility from the name).
+/// its own (a multi-call coreutils picks its utility from the name),
+/// writable by every user: the kernel classes a file by the directory it
+/// is in.
 fn burst_binaries(dir: &Path, n: usize) -> Vec<PathBuf> {
     let base = std::fs::read("/usr/bin/true").expect("read /usr/bin/true");
     let mut out = Vec::new();
     for i in 0..n {
         let d = dir.join(format!("b{i:02}"));
         std::fs::create_dir(&d).unwrap();
+        // the guard's class is the file's own directory's
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
         let exe = d.join("true");
         let mut body = base.clone();
         body.extend_from_slice(format!("\nnn-execq-stop {} {i}\n", std::process::id()).as_bytes());
