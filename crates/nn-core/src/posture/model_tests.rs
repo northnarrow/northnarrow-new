@@ -209,8 +209,8 @@ fn run(rng: &mut Rng, proc: &tempfile::TempDir, steps: usize) -> Result<(), Stri
         }
         let after = m.current();
         let added = m.transition_log().len() - rows;
-        let changed = before.kind() != after.kind()
-            || before.is_combat_locked() != after.is_combat_locked();
+        let changed =
+            before.kind() != after.kind() || before.is_combat_locked() != after.is_combat_locked();
         // one row per change of kind or lock, none otherwise
         if added != usize::from(changed) {
             return Err(format!(

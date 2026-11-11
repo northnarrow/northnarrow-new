@@ -291,6 +291,12 @@ enum Item {
     /// A signed unlock (`OperationCode::Unlock`, lab PR 217) by the
     /// administrator's key.
     Unlock {},
+    /// Lot 314: a signed force-posture (`OperationCode::ForcePosture`) to
+    /// `to` by the administrator's key (it holds `unlock`: a force out of
+    /// COMBAT releases).
+    Force {
+        to: nn_model::posture_types::PostureKind,
+    },
     /// A signed trusted-installer grant of `window_secs`.
     InstallerGrant { window_secs: u32 },
     /// The host changes without an event the agent reads.
@@ -1205,7 +1211,7 @@ impl Replay {
         std::fs::write(
             &admin_pub,
             format!(
-                "{} unlock,trusted-installer\n",
+                "{} unlock,trusted-installer,force-posture\n",
                 hex::encode(admin.verifying_key().to_bytes())
             ),
         )
@@ -1570,6 +1576,37 @@ impl Replay {
         self.push(line);
     }
 
+    /// Lot 314: `dispatch_force_posture` (`force_posture`): verify, then the
+    /// posture's force, naming the signer — out of COMBAT with the `unlock`
+    /// role the replay's administrator holds.
+    fn force(&mut self, index: usize, to: nn_model::posture_types::PostureKind) {
+        use nn_proto::admin_signed_payload::{OperationCode, Role, SignedPayload};
+        let (token, signer) = self.signed(
+            |nonce, ts| SignedPayload::new_force_posture(nonce, ts, AGENT_ID, to),
+            Role::ForcePosture,
+            OperationCode::ForcePosture,
+        );
+        let outcome =
+            match self
+                .posture
+                .admin_force_state_signed_by(token, to, true, vec![signer.clone()])
+            {
+                Ok(out) => json!({
+                    "applied": true,
+                    "from": out.from.as_str(),
+                    "to": out.state.kind().as_str(),
+                    "release": out.release,
+                }),
+                Err(e) => json!({"applied": false, "error": e.to_string()}),
+            };
+        let mut line = json!({
+            "item": index,
+            "force": {"signer": signer, "role": "force-posture", "to": to.as_str(), "outcome": outcome},
+        });
+        self.collect(&mut line, None);
+        self.push(line);
+    }
+
     /// `dispatch_trusted_installer_grant`: verify, then arm the window.
     fn grant(&mut self, index: usize, window_secs: u32) {
         use nn_proto::admin_signed_payload::{OperationCode, Role, SignedPayload};
@@ -1606,6 +1643,7 @@ impl Replay {
                     self.push(line);
                 }
                 Item::Unlock {} => self.unlock(i),
+                Item::Force { to } => self.force(i, *to),
                 Item::InstallerGrant { window_secs } => self.grant(i, *window_secs),
                 Item::Host(c) => {
                     self.host.change(c);

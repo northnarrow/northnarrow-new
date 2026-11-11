@@ -803,10 +803,18 @@ mod bughunt3 {
         let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
         assert_eq!(benign.len(), exploit.len());
         assert!(benign.len() > 96 && benign.len() < 127);
-        let medium = records_of(&tunables_at_su(&benign), &su_event(1000, "/usr/bin/su"), "p")
-            .remove(0);
-        let critical =
-            records_of(&tunables_at_su(&exploit), &su_event(1000, "/usr/bin/su"), "p").remove(0);
+        let medium = records_of(
+            &tunables_at_su(&benign),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
+        let critical = records_of(
+            &tunables_at_su(&exploit),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
         assert_eq!(medium.verdict.rule_id, RULE_ENV);
         assert_eq!(medium.verdict.severity, Severity::Medium);
         assert_eq!(critical.verdict.severity, Severity::Critical);
@@ -829,8 +837,12 @@ mod bughunt3 {
     fn bug92_guard_a_true_repeat_is_held_back() {
         let prefix = "glibc.malloc.arena_max=1:".repeat(4);
         let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
-        let critical =
-            records_of(&tunables_at_su(&exploit), &su_event(1000, "/usr/bin/su"), "p").remove(0);
+        let critical = records_of(
+            &tunables_at_su(&exploit),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
         let mut rep = Repeats::new(Duration::from_secs(600));
         let t0 = Instant::now();
         assert!(rep.admit(&critical, t0));
@@ -907,7 +919,11 @@ mod bughunt3 {
                     r.kind = kind::EXEC;
                     r.pid = 7000;
                     r.uid = uid;
-                    r.tier = if session { tier::SESSION } else { tier::SERVICE };
+                    r.tier = if session {
+                        tier::SESSION
+                    } else {
+                        tier::SERVICE
+                    };
                     r.env_flags = env_flags::HISTSIZE_ZERO | env_flags::HISTFILE;
                     r.env_action = action::RECORD;
                     let v = rng.pick(&hist);

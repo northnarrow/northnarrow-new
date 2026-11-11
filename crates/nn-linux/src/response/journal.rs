@@ -1690,7 +1690,10 @@ mod tests {
             );
             pid += 1;
             while owed(&j) {
-                assert!(Instant::now() < deadline, "the rotation thread never rotated");
+                assert!(
+                    Instant::now() < deadline,
+                    "the rotation thread never rotated"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let h = j.head().unwrap();
@@ -1707,8 +1710,16 @@ mod tests {
             "premise: the head names the terminator of archive {}: {last}",
             file - 1
         );
-        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0, "premise: active empty");
-        assert_eq!(j.holds(file, bytes, &hash), Some(true), "guard: intact, held");
+        assert_eq!(
+            std::fs::metadata(&active).unwrap().len(),
+            0,
+            "premise: active empty"
+        );
+        assert_eq!(
+            j.holds(file, bytes, &hash),
+            Some(true),
+            "guard: intact, held"
+        );
         // the archive's tail cut: its terminator and the last action's rows
         let kept = lines[..lines.len() - 3].join("\n") + "\n";
         std::fs::write(&archive, kept).unwrap();
@@ -1717,6 +1728,15 @@ mod tests {
             Some(false),
             "BUG-107: head ({file}, {bytes}) named after the rotation, archive {} tail cut",
             file - 1
+        );
+        // lot 314: the archive removed — a file the chain keeps: not held
+        std::fs::remove_file(&archive).unwrap();
+        assert_eq!(j.holds(file, bytes, &hash), Some(false), "archive removed");
+        // and a head of nothing written (the genesis) holds without a read
+        assert_eq!(
+            j.holds(1, 0, nn_evidence::audit::GENESIS_PREV_HASH),
+            Some(true),
+            "the genesis"
         );
     }
 }

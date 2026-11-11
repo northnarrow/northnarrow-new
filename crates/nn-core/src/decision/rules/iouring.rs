@@ -478,7 +478,9 @@ mod model {
             let _ = std::fs::remove_file(stat(proc, pid));
         }
         let tracker = crate::posture::lineage::AuthSessionTracker::<H>::new(proc);
-        let al = Arc::new(CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()).with_identity(tracker));
+        let al = Arc::new(
+            CommAllowlist::<H>::from_iter_owned(Vec::<String>::new()).with_identity(tracker),
+        );
         let rule = NnLIou002IoUringFileAndNetwork::new(al);
         // pid -> (start, classes) of the process running now
         let mut live: BTreeMap<u32, (u64, u32)> = BTreeMap::new();
@@ -539,7 +541,9 @@ mod model {
                             !fired_pids.contains(&pid)
                         };
                     if fired && !verdicts.insert((pid, start)) {
-                        return Err(format!("step {step}: a second verdict for ({pid}, {start})"));
+                        return Err(format!(
+                            "step {step}: a second verdict for ({pid}, {start})"
+                        ));
                     }
                     if fired != want {
                         return Err(format!(

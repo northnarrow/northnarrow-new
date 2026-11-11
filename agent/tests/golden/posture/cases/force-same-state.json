@@ -1,0 +1,16 @@
+{
+  "about": "Lot 314 (the third bug hunt, BUG-84 a): a force-posture toward the state the posture is in changes nothing — its decay timers included. A signed force to ALERTED; 59 minutes later a second one, to the same ALERTED: no transition, the timers as they were; ALERTED decays to OBSERVING an hour after the first. A force to ENGAGED; 23 h 59 later a second one: ENGAGED decays to ALERTED 24 hours after the first. On main the second force re-armed the decay each time (one hour more of ALERTED, a day more of ENGAGED).",
+  "path": ["ALERTED", "OBSERVING", "ENGAGED", "ALERTED", "OBSERVING"],
+  "start_ns": 60000000000,
+  "procs": [],
+  "items": [
+    {"force": {"to": "Alerted"}},
+    {"wait": {"secs": 3540}},
+    {"force": {"to": "Alerted"}},
+    {"wait": {"secs": 180}},
+    {"force": {"to": "Engaged"}},
+    {"wait": {"secs": 86340}},
+    {"force": {"to": "Engaged"}},
+    {"wait": {"secs": 3900}}
+  ]
+}

@@ -145,7 +145,10 @@ fn the_posture_s_state_is_written_only_by_commit() {
     let open = commit.find('{').unwrap();
     let body = &commit[open..open + support::matching_brace(&commit[open..])];
     assert!(body.contains("*state = next;"), "commit writes the state");
-    assert!(body.contains("self.log_transition("), "commit writes the row");
+    assert!(
+        body.contains("self.log_transition("),
+        "commit writes the row"
+    );
 }
 
 #[test]
@@ -153,7 +156,10 @@ fn a_state_write_outside_commit_is_found() {
     let planted = "impl M {\n    fn commit(&self, state: &mut S, next: S) {\n        *state = next;\n        self.log_transition(a, b);\n    }\n    fn force(&self) {\n        let mut guard = self.inner.state.write();\n        *guard = next;\n    }\n    fn tick(&self) {\n        self.log_transition(a, b);\n    }\n    fn log_transition(&self) {\n        let mut log = self.inner.transitions.write();\n    }\n}\n";
     assert_eq!(
         state_writes_outside_commit(planted),
-        vec!["8: `*guard =`".to_string(), "11: `log_transition(`".to_string()]
+        vec![
+            "8: `*guard =`".to_string(),
+            "11: `log_transition(`".to_string()
+        ]
     );
 }
 
@@ -195,7 +201,9 @@ fn every_table_of_last_seen_times_has_a_cap() {
     }
     for (rel, _, _) in KNOWN {
         if !found.contains_key(*rel) {
-            bad.push(format!("{rel}: listed in KNOWN, no longer has one: lower the table"));
+            bad.push(format!(
+                "{rel}: listed in KNOWN, no longer has one: lower the table"
+            ));
         }
     }
     assert!(
@@ -205,7 +213,11 @@ fn every_table_of_last_seen_times_has_a_cap() {
     );
     // the helpers are where the memories are
     let helpers = std::fs::read_to_string(root.join(HELPERS)).unwrap();
-    for t in ["pub struct BoundedMap", "pub struct RepeatWindow", "pub struct OncePerProcess"] {
+    for t in [
+        "pub struct BoundedMap",
+        "pub struct RepeatWindow",
+        "pub struct OncePerProcess",
+    ] {
         assert!(helpers.contains(t), "{HELPERS}: {t}");
     }
 }

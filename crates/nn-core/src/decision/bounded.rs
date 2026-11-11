@@ -392,11 +392,18 @@ mod tests {
         m.insert(4, 40);
         assert_eq!(m.len(), 3);
         assert_eq!(m.get(&2), None, "the least recent went");
-        assert_eq!((m.get(&1), m.get(&3), m.get(&4)), (Some(&10), Some(&30), Some(&40)));
+        assert_eq!(
+            (m.get(&1), m.get(&3), m.get(&4)),
+            (Some(&10), Some(&30), Some(&40))
+        );
         assert_eq!(m.evicted(), 1);
         m.insert(3, 31); // a rewrite is no new entry
         assert_eq!((m.len(), m.get(&3), m.evicted()), (3, Some(&31), 1));
-        assert_eq!(BoundedMap::<u32, ()>::new(0).cap(), 1, "a cap is at least one");
+        assert_eq!(
+            BoundedMap::<u32, ()>::new(0).cap(),
+            1,
+            "a cap is at least one"
+        );
     }
 
     #[test]
@@ -407,11 +414,17 @@ mod tests {
         assert!(w.admit("a".to_string(), t0));
         assert!(!w.admit("a".to_string(), t0 + 9 * s), "within the window");
         assert!(w.admit("a".to_string(), t0 + 10 * s), "a window later");
-        assert!(!w.admit("a".to_string(), t0 + 15 * s), "anchored on the admission");
+        assert!(
+            !w.admit("a".to_string(), t0 + 15 * s),
+            "anchored on the admission"
+        );
         assert!(w.admit("b".to_string(), t0 + 15 * s));
         assert!(w.admit("c".to_string(), t0 + 15 * s));
         assert_eq!(w.len(), 2, "capped");
-        assert!(w.admit("a".to_string(), t0 + 16 * s), "evicted: admitted again");
+        assert!(
+            w.admit("a".to_string(), t0 + 16 * s),
+            "evicted: admitted again"
+        );
         // a clock that went back is within the window (never a second admission)
         assert!(!w.admit("a".to_string(), t0));
     }
@@ -426,9 +439,21 @@ mod tests {
         assert!(!o.first(10, Some(900)));
         assert!(o.first(11, None), "a process that had exited when read");
         assert!(!o.first(11, None));
-        assert!(o.first(11, Some(70)), "a live process after one that had exited");
+        assert!(
+            o.first(11, Some(70)),
+            "a live process after one that had exited"
+        );
         assert!(o.first(12, Some(1)));
         assert_eq!(o.len(), 2, "capped");
         assert!(o.first(10, Some(900)), "evicted: a first time again");
+        // a process still sending records is the most recent: the one gone
+        // quiet is evicted first
+        let mut o = OncePerProcess::new(2);
+        assert!(o.first(1, Some(1)));
+        assert!(o.first(2, Some(2)));
+        assert!(!o.first(1, Some(1)), "pid 1 again: the most recent now");
+        assert!(o.first(3, Some(3)));
+        assert!(!o.first(1, Some(1)), "pid 1 kept, pid 2 evicted");
+        assert!(o.first(2, Some(2)));
     }
 }

@@ -5687,6 +5687,41 @@ mod tests {
         assert_eq!(plain_ts(&serde_json::json!({})), None);
     }
 
+    // ── lot 314: the third bug hunt (BUG-107) ──
+
+    /// BUG-107: a head names the line it names. (N, 0, H) right after a
+    /// rotation is the last line of archive N-1; a head of nothing written
+    /// (the genesis) is read as it is; no line ends at byte 0, so only the
+    /// genesis holds there; an empty file holds no last line.
+    #[test]
+    fn a_head_at_byte_0_names_the_previous_archive_s_last_line() {
+        assert_eq!(head_line(3, 0, "hhhh"), (2, None));
+        assert_eq!(head_line(3, 120, "hhhh"), (3, Some(120)));
+        assert_eq!(head_line(3, 0, GENESIS_PREV_HASH), (3, Some(0)));
+        assert_eq!(head_line(1, 0, GENESIS_PREV_HASH), (1, Some(0)));
+        assert_eq!(head_line(1, 0, "hhhh"), (1, Some(0)));
+        assert_eq!(head_line(0, 0, "hhhh"), (0, Some(0)));
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("c.jsonl");
+        assert!(
+            holds_line_ending_at(&p, 0, GENESIS_PREV_HASH).unwrap(),
+            "no read"
+        );
+        fs::write(&p, "").unwrap();
+        assert!(!holds_line_ending_at(&p, 0, "hhhh").unwrap());
+        assert!(!holds_last_line(&p, "hhhh").unwrap(), "an empty file");
+        let a = r#"{"entry_hash":"aaaa"}"#;
+        let t = r#"{"rotate":{},"entry_hash":"tttt"}"#;
+        fs::write(&p, format!("{a}\n{t}\n")).unwrap();
+        assert!(holds_last_line(&p, "tttt").unwrap());
+        assert!(!holds_last_line(&p, "aaaa").unwrap(), "not the last line");
+        fs::write(&p, format!("{a}\n")).unwrap();
+        assert!(!holds_last_line(&p, "tttt").unwrap(), "its tail cut");
+        fs::write(&p, format!("{a}\n{t}\n{a}\n")).unwrap();
+        assert!(!holds_last_line(&p, "tttt").unwrap(), "a line after it");
+        assert!(holds_last_line(&dir.path().join("none"), "tttt").is_err());
+    }
+
     // ── lot 298: the external bug hunt's verifier and readers (BUG11, 28, 29) ──
 
     /// BUG11: a genuine line longer than the 64 KiB read-back window was

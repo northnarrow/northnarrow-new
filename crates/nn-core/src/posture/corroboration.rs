@@ -957,7 +957,11 @@ mod tests {
         assert_eq!(l.len(), LEDGER_CAP);
         assert_eq!(l.last_signal(), Some(newest));
         l.clear();
-        assert_eq!(l.last_signal(), None, "an administrator's release forgets it");
+        assert_eq!(
+            l.last_signal(),
+            None,
+            "an administrator's release forgets it"
+        );
     }
 
     /// External audit POS-008: pending changes of two writers stay apart

@@ -433,9 +433,6 @@ mod bug94 {
         clock.advance(17 * MIN);
         assert!(m.tick_decay().is_none());
         clock.advance(14 * MIN);
-        assert_eq!(
-            m.tick_decay().map(|s| s.kind()),
-            Some(PostureKind::Engaged)
-        );
+        assert_eq!(m.tick_decay().map(|s| s.kind()), Some(PostureKind::Engaged));
     }
 }
