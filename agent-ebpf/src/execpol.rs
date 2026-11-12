@@ -355,12 +355,17 @@ pub(crate) unsafe fn on_pass(
         return crate::execq::note_pass(s, inode, task, pass, classes);
     }
     // Lot 322: the new environment, read now into the task's own entry
-    // (`ef` its findings, `ekey` the entry to remove once judged).
-    let (ef, ekey) = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {
+    // (`ef` its findings, `stashed` whether the task's entry holds them:
+    // removed once judged). Plain integers, no `Option<TaskKey>`: its
+    // `None` left a stack slot unwritten that the move read, which 5.15's
+    // verifier refuses ("invalid read from stack").
+    let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {
         exec_env(task as *const u8, wk)
     } else {
-        (0, None)
+        0
     };
+    let ef = er as u32;
+    let stashed = er & ENV_STASHED != 0;
     if classes == 0 && ef == 0 {
         if q {
             return crate::execq::note_pass(s, inode, task, pass, 0);
@@ -418,9 +423,10 @@ pub(crate) unsafe fn on_pass(
     let mut mode_bits = 0u32;
     // The values the record quotes, from the entry (the judgment rests on
     // `ef`, a copy the scan returned).
-    let env = match &ekey {
-        Some(k) => EXECPOL_ENV.get_ptr(k),
-        None => None,
+    let env = if stashed {
+        EXECPOL_ENV.get_ptr(wk)
+    } else {
+        None
     };
     if ef != 0 {
         let tb = 1u64 << t;
@@ -482,8 +488,8 @@ pub(crate) unsafe fn on_pass(
         }
         report_exec(s, inode, t_ptr, t | sig, classes, act, env_act, ef, env, mode_bits);
     }
-    if let Some(k) = &ekey {
-        let _ = EXECPOL_ENV.remove(k);
+    if stashed {
+        let _ = EXECPOL_ENV.remove(wk);
     }
     if (act | env_act) & action::DENY != 0 {
         if pass == 0 {
@@ -603,33 +609,36 @@ pub(crate) fn walk_lost() -> i32 {
     }
 }
 
+/// [`exec_env`]'s bit (above the 32 of [`env_flags`]): the task's entry
+/// holds the findings (the caller removes it once judged).
+const ENV_STASHED: u64 = 1 << 32;
+
 /// The new environment of the exec in progress, read into the task's own
 /// [`EXECPOL_ENV`] entry: its findings ([`env_flags`], 0 for none: the
-/// entry is then gone) and the entry's key, which the caller removes once
-/// judged. Not read whole: [`env_flags::UNREADABLE`] (the caller counts it
+/// entry is then gone) and [`ENV_STASHED`] when the entry holds them. Not read whole: [`env_flags::UNREADABLE`] (the caller counts it
 /// and records it) — a call [`exec_envp_reg`] does not know, a kernel
 /// without the `pt_regs` offsets, an entry that could not be made, an
 /// array or a string the scan could not read.
 #[inline(always)]
-unsafe fn exec_env(task: *const u8, key: &TaskKey) -> (u32, Option<TaskKey>) {
+unsafe fn exec_env(task: *const u8, key: &TaskKey) -> u64 {
     let raw = exec_envp(task);
     if raw == ENVP_UNREAD {
-        return (env_flags::UNREADABLE, None);
+        return u64::from(env_flags::UNREADABLE);
     }
     if raw == 0 {
-        return (0, None);
+        return 0;
     }
     let compat = raw >> 63;
     let envp = raw & !ENVP_COMPAT;
     let r = nn_env_scan(envp, u64::from(key.tid), key.start_ns, compat);
     if r & SCAN_LOST != 0 {
-        return (env_flags::UNREADABLE, None);
+        return u64::from(env_flags::UNREADABLE);
     }
     let ef = r as u32;
     if ef == 0 {
-        return (0, None);
+        return 0;
     }
-    (ef, Some(*key))
+    u64::from(ef) | ENV_STASHED
 }
 
 /// `envp` of the exec in progress, from the registers it entered the

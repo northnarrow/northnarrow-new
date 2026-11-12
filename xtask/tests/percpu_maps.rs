@@ -434,13 +434,15 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     in_order(
         p,
         &[
-            "let (ef, ekey) = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {",
+            "let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {",
             "exec_env(task as *const u8, wk)",
+            "let stashed = er & ENV_STASHED != 0;",
             "if classes == 0 && ef == 0 {",
             "if ef != 0 {",
             "if ef & env_flags::DENYABLE != 0 {",
             "report_exec(",
-            "let _ = EXECPOL_ENV.remove(k);",
+            "if stashed {",
+            "let _ = EXECPOL_ENV.remove(wk);",
         ],
     )
     .unwrap();
@@ -486,11 +488,12 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         body(&pol, "exec_env"),
         &[
             "if raw == ENVP_UNREAD {",
-            "return (env_flags::UNREADABLE, None);",
+            "return u64::from(env_flags::UNREADABLE);",
             "let compat = raw >> 63;",
             "nn_env_scan(envp, u64::from(key.tid), key.start_ns, compat)",
             "if r & SCAN_LOST != 0 {",
-            "return (env_flags::UNREADABLE, None);",
+            "return u64::from(env_flags::UNREADABLE);",
+            "u64::from(ef) | ENV_STASHED",
         ],
     )
     .unwrap();
