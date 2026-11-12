@@ -1018,8 +1018,12 @@ fn quarantine_file_with(
     // its link count — a second hard link it made itself (`ln x .x2`) no
     // longer keeps its payload runnable; the restore in place brings every
     // name back. Root's and other users' inodes keep F1's rule.
-    let own = owns && owner != 0;
-    let (detail, effect) = neutralize_in_place(handle, &identity, named.is_some(), own);
+    let (detail, effect) = neutralize_in_place(
+        handle,
+        &identity,
+        named.is_some(),
+        empties_its_own(handle.offender_uid, owner),
+    );
     record_in_place(cfg, &vault_id, effect == InPlaceEffect::Emptied, handle)?;
     Ok(Done::InPlace {
         vault_id,
@@ -1027,6 +1031,14 @@ fn quarantine_file_with(
         detail,
         effect,
     })
+}
+
+/// Re-check 2 of #543 (R2): whether the quarantine empties the inode
+/// whatever its link count — the file is the offender's own (`owner` the
+/// filesystem uid it acted as), and that is not root (a root offender's
+/// own root-owned store keeps F1's rule: never emptied).
+fn empties_its_own(offender_uid: Option<u32>, owner: u32) -> bool {
+    offender_uid == Some(owner) && owner != 0
 }
 
 /// The system's list of login shells.
@@ -1095,14 +1107,6 @@ fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         };
         return Err(std::io::Error::other(format!("{kind}, not a regular file")));
     }
-    let too_big = |n: u64| {
-        std::io::Error::other(format!(
-            "{n} bytes or more, over the {MAX_SHELLS_BYTES} read"
-        ))
-    };
-    if meta.len() > MAX_SHELLS_BYTES {
-        return Err(too_big(meta.len()));
-    }
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -1110,7 +1114,9 @@ fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut bytes = Vec::new();
     f.take(MAX_SHELLS_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_SHELLS_BYTES {
-        return Err(too_big(bytes.len() as u64));
+        return Err(std::io::Error::other(format!(
+            "over the {MAX_SHELLS_BYTES} bytes read"
+        )));
     }
     Ok(String::from_utf8_lossy(&bytes)
         .lines()
@@ -3118,6 +3124,22 @@ mod bug90 {
         }
     }
 
+    /// Re-check 2 of #543 (R2): only a non-root offender's own file is
+    /// emptied whatever its links; root's, another user's, an unknown
+    /// offender's keep F1's rule.
+    #[test]
+    fn r2_only_a_non_root_offenders_own_file_is_emptied_under_every_name() {
+        assert!(empties_its_own(Some(1000), 1000));
+        for (offender, owner) in [
+            (Some(0), 0),
+            (Some(0), 1000),
+            (Some(1000), 1001),
+            (None, 1000),
+        ] {
+            assert!(!empties_its_own(offender, owner), "{offender:?} on {owner}");
+        }
+    }
+
     /// Re-check 2 of #543 (R2): the one-command evasion — the offender's
     /// own payload given a second name it made itself (`ln x .x2`) — no
     /// longer keeps it runnable: both names emptied, the row a success; the
@@ -3708,7 +3730,7 @@ mod bug90 {
         for (list, says) in [
             (fifo.clone(), "a FIFO, not a regular file"),
             (zero, "a character device, not a regular file"),
-            (big, "bytes or more, over the"),
+            (big, "over the 1048576 bytes read"),
         ] {
             let l = list.clone();
             let got = within_5s(move || listed_shells(&l).map_err(|e| e.to_string()), &fifo);
