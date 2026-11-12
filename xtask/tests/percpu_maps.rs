@@ -435,7 +435,7 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         p,
         &[
             "let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {",
-            "exec_env(task as *const u8, wk)",
+            "nn_exec_env(task, u64::from(wk.tid), wk.start_ns)",
             "let stashed = er & ENV_STASHED != 0;",
             "if classes == 0 && ef == 0 {",
             "if ef != 0 {",

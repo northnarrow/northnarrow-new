@@ -360,7 +360,7 @@ pub(crate) unsafe fn on_pass(
     // `None` left a stack slot unwritten that the move read, which 5.15's
     // verifier refuses ("invalid read from stack").
     let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {
-        exec_env(task as *const u8, wk)
+        nn_exec_env(task, u64::from(wk.tid), wk.start_ns)
     } else {
         0
     };
@@ -612,6 +612,16 @@ pub(crate) fn walk_lost() -> i32 {
 /// [`exec_env`]'s bit (above the 32 of [`env_flags`]): the task's entry
 /// holds the findings (the caller removes it once judged).
 const ENV_STASHED: u64 = 1 << 32;
+
+/// [`exec_env`] as a global function (integer arguments): verified on its
+/// own, apart from `exec_check_lsm`. Inlined there, 5.15's verifier
+/// refused the program: on the unknown-call path the compiler spilled a
+/// register that path never set ("R4 !read_ok").
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_exec_env(task: u64, tid: u64, start: u64) -> u64 {
+    unsafe { exec_env(task as *const u8, &crate::task_scratch::key(tid, start)) }
+}
 
 /// The new environment of the exec in progress, read into the task's own
 /// [`EXECPOL_ENV`] entry: its findings ([`env_flags`], 0 for none: the
