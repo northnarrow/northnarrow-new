@@ -440,8 +440,17 @@ pub const SOURCES: [SourceContract; 16] = [
                      operation of a protected file or directory, or a refused open of a \
                      protected cgroup file: every attempt recorded, no dedup by caller, 50 a \
                      second per CPU in a budget of their own (a loop of them never takes the \
-                     refused signals' and ptraces' room; every one is refused)",
+                     refused signals' and ptraces' room; every one is refused); lot 318: the \
+                     decisive ones only, and one held back is a loss at once",
                 counter: "denial_rate",
+            },
+            KernelBudget {
+                allows: "(lot 318, the review of #545) the refusals signed at each attempt that \
+                     are not decisive — a refused read of the agent's key, a handle on its BPF \
+                     objects, a refused program type or root cgroup/sysctl attach, a loader \
+                     opt-out's record: 50 a second per CPU in a budget of their own (they never \
+                     take a decisive refusal's room; every one is refused); not a loss",
+                counter: "minor_denial_rate",
             },
         ],
         overhead: FS_PROTECT_OVERHEAD,

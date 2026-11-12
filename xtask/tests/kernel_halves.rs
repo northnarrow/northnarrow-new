@@ -55,6 +55,50 @@ fn callers(code: &str, needle: &str) -> Vec<String> {
     out
 }
 
+/// Lot 318 (the review of #545, F5): every use of the shared denial ring
+/// in `code` (file `rel`): `the map` for its `#[map]` definition, else the
+/// function it is in — whatever the method (`reserve`, `output`, a
+/// reference taken to it): a writer that would bypass the budgets by
+/// another call than `reserve` is caught too.
+fn ring_users(rel: &str, code: &str) -> Vec<String> {
+    let mut out: Vec<String> = code
+        .match_indices("FS_PROTECT_EVENTS")
+        .map(|(at, _)| {
+            let line_start = code[..at].rfind('\n').map_or(0, |p| p + 1);
+            if code[line_start..at].contains("static ") {
+                return format!("{rel}: the map");
+            }
+            let start = code[..at].rfind("fn ").unwrap_or(0);
+            let end = code[start..].find('(').map_or(code.len(), |p| start + p);
+            format!("{rel}: {}", &code[start..end])
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Lot 318 (the review of #545, F5): the ring's users are found whatever
+/// the call — a planted `output` writer and a reference passed on are
+/// caught, as `reserve` is.
+#[test]
+fn a_planted_writer_of_the_denial_ring_is_caught_whatever_the_call() {
+    let planted = "fn emit_denial_kind(operation: u8) {\n    let _ = crate::inode_protect::FS_PROTECT_EVENTS.output(&rec, 0);\n}\nfn sneaky() {\n    write_to(&FS_PROTECT_EVENTS);\n}\n";
+    assert_eq!(
+        ring_users("agent-ebpf/src/bpf_defense.rs", planted),
+        [
+            "agent-ebpf/src/bpf_defense.rs: fn emit_denial_kind",
+            "agent-ebpf/src/bpf_defense.rs: fn sneaky",
+        ]
+    );
+    let map =
+        "#[map]\npub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);\n";
+    assert_eq!(
+        ring_users("agent-ebpf/src/inode_protect.rs", map),
+        ["agent-ebpf/src/inode_protect.rs: the map"]
+    );
+}
+
 /// External bug hunt BUG37 (the residue lot 293 left, triage "parziale"):
 /// every write of the shared denial ring goes behind a budget. The BPF
 /// guard's refusals (`bpf_handle`, `bpf_map`, `bpf_link`, `bpf_prog_type`,
@@ -69,22 +113,21 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     let root = repo_root();
     let mut files = Vec::new();
     support::rs_files(&root.join("agent-ebpf/src"), &mut files);
-    let mut writers = Vec::new();
+    let mut users = Vec::new();
     for f in &files {
         let c = strip_comments(&fs::read_to_string(f).unwrap());
-        for fun in callers(&c, "FS_PROTECT_EVENTS.reserve") {
-            let rel = f.strip_prefix(&root).unwrap().display().to_string();
-            writers.push(format!("{rel}: {fun}"));
-        }
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
+        users.extend(ring_users(&rel, &c));
     }
-    writers.sort();
+    users.sort();
     assert_eq!(
-        writers,
+        users,
         [
             "agent-ebpf/src/inode_protect.rs: fn emit_denial",
             "agent-ebpf/src/inode_protect.rs: fn emit_sysctl_record",
+            "agent-ebpf/src/inode_protect.rs: the map",
         ],
-        "the denial ring written outside the two budgeted writers"
+        "the denial ring used outside the map and the two budgeted writers"
     );
     let i = code("agent-ebpf/src/inode_protect.rs");
     // the unbudgeted writer is the module's own: the compiler keeps every
@@ -117,11 +160,53 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
             "if caller_is_self_test() {",
             "emit_denial(operation, key);",
             "return;",
+            // lot 318 (the review of #545, F1): the non-decisive refusals
+            // spend a budget of their own, before the decisive budget
+            "if northnarrow_common::wire::is_minor_denial(operation) {",
+            "if minor_budget() {",
+            "emit_denial(operation, key);",
+            "return;",
             "if attempt_budget() {",
             "emit_denial(operation, key);",
         ],
     )
     .unwrap();
+    assert!(i.contains(
+        "static MINOR_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1, 0);"
+    ));
+    in_order(
+        body(&i, "minor_budget"),
+        &[
+            "MINOR_DENIAL_RATE.get_ptr_mut(0)",
+            "if (*rate)[1] >= MINOR_DENIAL_PER_SEC {",
+            "ring_slot::MINOR_DENIAL_RATE",
+            "return false;",
+            "(*rate)[1] += 1;",
+        ],
+    )
+    .unwrap();
+    assert!(!body(&i, "minor_budget").contains("ATTEMPT_DENIAL_RATE"));
+    assert!(!body(&i, "attempt_budget").contains("MINOR_DENIAL_RATE"));
+    let w = code("common/src/wire/mod.rs");
+    in_order(
+        body(&w, "is_minor_denial"),
+        &[
+            "FS_OP_READ",
+            "| FS_OP_BPF_HANDLE",
+            "| FS_OP_BPF_PROG_TYPE",
+            "| FS_OP_BPF_PROG_OPT_OUT",
+            "| FS_OP_SYSCTL_ROOT_ATTACH",
+        ],
+    )
+    .unwrap();
+    // their drops are no security loss (F7); a decisive drop is one at once
+    let r = code("crates/nn-linux/src/sensors/ring_drops.rs");
+    assert!(r.contains(
+        "pub const DECISIVE_DENIAL_BUDGETS: [u32; 2] = [ring_slot::DENIAL_RATE, ring_slot::TASK_DENIAL_RATE];"
+    ));
+    let sec = &r[r.find("pub const SECURITY_RINGS").unwrap()..];
+    let sec = &sec[..sec.find("];").unwrap()];
+    assert!(!sec.contains("MINOR_DENIAL_RATE"), "{sec}");
 }
 
 /// External bug hunt BUG101 (the kernel half; the record's is lot 315's):
@@ -191,6 +276,8 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
             "} else if flags & exe_flags::TASK_ROOT != 0 {",
             "let g = nn_guarded_root(dentry as u64);",
             "if g & GUARDED_ROOT_FOUND != 0 {",
+            // a guarded point's own identity gives its path class only
+            "if v & root_kind::GUARDED != 0 {",
             "c |= class::GUARDED_MOUNT;",
             "if v & root_kind::HOME != 0 {",
             "c |= class::HOME;",
@@ -421,12 +508,63 @@ fn a_fuse_file_is_guarded_whatever_its_root_says() {
         ],
     )
     .unwrap();
-    // the user-space half's constant, where it is defined (lot 311b)
-    let k = fs::read_to_string(repo_root().join("agent/src/execq/kernel.rs")).unwrap();
-    if k.contains("pub const FUSE_BY_DEVICE") {
+    // the user-space half's constant (lot 311b), and its key: the device
+    // alone, never a stat of the root (the review of #545, F3)
+    let k = code("agent/src/execq/kernel.rs");
+    assert!(
+        k.contains("pub const FUSE_BY_DEVICE: u64 = 0;"),
+        "the agent keys a FUSE mount with another inode than the kernel's"
+    );
+    in_order(
+        body(&k, "guarded_roots"),
+        &[
+            "let key = if nn_linux::mountinfo::is_fuse(&m.fstype) {",
+            "dev: m.kernel_dev(),",
+            "ino: FUSE_BY_DEVICE,",
+        ],
+    )
+    .unwrap();
+}
+
+/// The review of #545, F2 (BUG108 on openSUSE's and ostree's layouts): the
+/// guarded points themselves are published by their identity — `stat()`,
+/// the link followed, a btrfs subvolume's device — beside the guarded
+/// mounts' roots, by both controllers; their kind carries no `GUARDED`
+/// bit, and the kernel adds `guarded_mount` for a mount's root only.
+#[test]
+fn the_guarded_points_are_published_by_identity() {
+    let k = code("agent/src/execq/kernel.rs");
+    assert!(k.contains(
+        "pub const GUARDED_POINTS: [&str; 5] = [\"/tmp\", \"/var/tmp\", \"/home\", \"/root\", \"/dev/shm\"];"
+    ));
+    in_order(
+        body(&k, "point_roots<'a>"),
+        &[
+            "let kind = root_kind_of(point) & !root_kind::GUARDED;",
+            "let Ok(st) = std::fs::metadata(path) else {",
+            "if !st.is_dir() {",
+            "dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),",
+            "ino: st.ino(),",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&k, "published_roots"),
+        &[
+            "let mut out = guarded_roots(table);",
+            "point_roots(GUARDED_POINTS",
+        ],
+    )
+    .unwrap();
+    for ctl in [
+        "agent/src/execq/controller.rs",
+        "agent/src/execpol/controller.rs",
+    ] {
+        let c = code(ctl);
+        assert!(c.contains("published_roots("), "{ctl}");
         assert!(
-            k.contains("pub const FUSE_BY_DEVICE: u64 = 0;"),
-            "the agent keys a FUSE mount with another inode than the kernel's"
+            !c.contains("guarded_roots("),
+            "{ctl} publishes the mounts alone"
         );
     }
 }

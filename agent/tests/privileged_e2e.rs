@@ -2108,6 +2108,136 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
     }
 }
 
+/// Lot 318 (the review of #545, F1): a loop of refused handles on one of
+/// the agent's maps — non-decisive refusals, the kind an administrator's
+/// `bpftool map list` makes — on one CPU, and in the middle of it, on that
+/// CPU, a refused unlink of the agent's signing key: decisive. The two
+/// shared one per-CPU budget, and 50 handles in a second held back the
+/// unlink's record, the posture's decisive trigger with it (it stayed at
+/// ENGAGED). Now the non-decisive refusals spend a budget of their own
+/// (`minor_denial_rate`): the unlink is refused, its record arrives, the
+/// posture reaches COMBAT by `AntiTamperDenial`, and the loop's records past
+/// their budget are counted.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("minor", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+    let key = AgentState::named(fx.dir.path(), "minor").signing_key();
+    assert!(key.exists(), "fixture: the agent's key {}", key.display());
+
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("minor", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let map_id = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
+        .into_iter()
+        .find_map(|(kind, id)| (kind == 1).then_some(id))
+        .expect("OWN_BPF_IDS lists none of the agent's maps");
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // The loop on CPU 0, 3 s: far past the 50 records a second its budget
+    // has there.
+    let mut until: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut until) };
+    until.tv_sec += 3;
+    let flooder = fork_handle_flooder(0, map_id, until);
+    assert!(flooder > 0, "fork failed");
+    std::thread::sleep(Duration::from_millis(1000));
+    // On the same CPU, the decisive refusal: the agent's key unlinked.
+    let mut rm = Command::new("taskset")
+        .args(["-c", "0", "rm", "-f"])
+        .arg(&key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn taskset rm");
+    let rm_pid = rm.id();
+    let st = rm.wait().expect("wait rm");
+    let mut status = 0;
+    // SAFETY: our own child.
+    assert_eq!(unsafe { libc::waitpid(flooder, &mut status, 0) }, flooder);
+    match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+        Some(0) => {}
+        Some(1) => panic!("a handle on the agent's map {map_id} was granted in enforce mode"),
+        other => panic!("the flooder could not drop to nobody with CAP_BPF: {other:?}"),
+    }
+    assert!(
+        !st.success() && key.exists(),
+        "the unlink of the agent's key was not refused ({st:?}; the key {} exists: {})",
+        key.display(),
+        key.exists()
+    );
+
+    // its record arrived (taskset execs rm in place: the pid is rm's) …
+    let pid = format!("pid={rm_pid} ");
+    let line = wait_for_log_line(
+        &log,
+        &["ANTI-TAMPER DENIAL", &pid, "op=unlink"],
+        Duration::from_secs(15),
+    );
+    assert!(
+        line.is_some(),
+        "the refused unlink (pid {rm_pid}) left no record behind the handle loop on its CPU\n{}",
+        log_tail(&log)
+    );
+    // … and the posture took it as what it is: decisive
+    assert!(
+        wait_for_log_line(
+            &log,
+            &["POSTURE TRANSITION", "AntiTamperDenial"],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "no COMBAT by AntiTamperDenial after the refused unlink\n{}",
+        log_tail(&log)
+    );
+    // the loop's records past their own budget were counted (the sampler's
+    // round, every 10 s), and none of the decisive budget's
+    std::thread::sleep(Duration::from_secs(12));
+    let text = read_agent_log(&log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        drops.iter().any(|l| l.contains("minor_denial_rate")),
+        "the handle loop was not held back by its own budget: {drops:#?}"
+    );
+    assert!(
+        !drops
+            .iter()
+            .any(|l| l.contains("fs_protect") || l.contains("\"denial_rate\"")),
+        "a decisive record or the ring lost: {drops:#?}"
+    );
+
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
 // ── Lot 293 — external bug hunt BUG14: a signal through a file's owner ─
 
 /// The ways a root process arms a file's owner on a protected process: the

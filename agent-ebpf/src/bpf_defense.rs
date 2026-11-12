@@ -1062,11 +1062,15 @@ fn emit_denial(operation: u8, object_id: u32) {
 /// per-attempt budget, through `crate::inode_protect::emit_attempt` — the
 /// same record, the same ring. It wrote the ring itself, with no budget: a
 /// root loop of `BPF_MAP_GET_FD_BY_ID` on one of the agent's maps filled
-/// the 64 KiB `fs_protect` ring, and the record of a refused `kill` or
+/// the `fs_protect` ring (64 KiB in the object, 256 KiB as the agent loads
+/// it: `FS_PROTECT_RING_BYTES`), and the record of a refused `kill` or
 /// ptrace was lost with it. A refusal over the budget is counted in
 /// `RING_DROPS` (`ring_slot::DENIAL_RATE`: signed, telemetry loss past the
 /// threshold); the deny never depends on the record. The deny self-test's
-/// refusals stay outside the budget, as every other attempt's.
+/// refusals stay outside the budget, as every other attempt's. Lot 318
+/// (the review of #545, F1): the guard's non-decisive kinds (a handle, a
+/// refused program type, a root attach, an opt-out's record) spend a budget
+/// of their own (`minor_denial_rate`), never the decisive refusals'.
 #[inline(always)]
 fn emit_denial_kind(operation: u8, kind: u8, object_id: u32) {
     crate::inode_protect::emit_attempt(

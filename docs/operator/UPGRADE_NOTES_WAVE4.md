@@ -1187,7 +1187,7 @@ configure; use the `nn-admin` of this release where the export is checked.
   reported a skew, before.
 - Nothing to configure; the files' formats are unchanged.
 
-## 27. The kernel halves of the third bug hunt (lot 318)
+## 28. The kernel halves of the third bug hunt (lot 318)
 
 - **A set-id target no longer escapes the exec policy's environment deny**
   (BUG101; [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)). With `--exec-policy enforce`,

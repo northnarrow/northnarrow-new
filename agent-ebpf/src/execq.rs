@@ -262,7 +262,12 @@ pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags
     }
     if g & GUARDED_ROOT_FOUND != 0 {
         let v = g as u32;
-        c |= class::GUARDED_MOUNT;
+        // a guarded mount's root; a guarded point's own identity (lot 318,
+        // the review of #545, F2: `/var/tmp` in openSUSE's `@/var`, `/home`
+        // under ostree's `/var` bind) gives its path class only
+        if v & root_kind::GUARDED != 0 {
+            c |= class::GUARDED_MOUNT;
+        }
         if v & root_kind::TMP != 0 {
             c |= class::TMP;
         }

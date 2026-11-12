@@ -333,12 +333,63 @@ pub(crate) fn attempt_budget() -> bool {
     true
 }
 
+/// Lot 318 (the review of #545, F1 and F7): the budget of the refusals
+/// signed at each attempt that are not decisive
+/// (`northnarrow_common::wire::is_minor_denial`: a refused read of the
+/// agent's key, a handle on its BPF objects, a refused program type or
+/// root `cgroup/sysctl` attach), per CPU: `[window start (ns), records in
+/// the window]`. They shared [`ATTEMPT_DENIAL_RATE`] with the decisive
+/// ones, and 50 refused read handles on one of the agent's maps (an
+/// administrator's `bpftool map list` makes 150) held back, that second on
+/// that CPU, the record of a refused unlink of a protected file — the
+/// posture's decisive trigger, lost with it. One held back is counted in
+/// `RING_DROPS` (`ring_slot::MINOR_DENIAL_RATE`, signed, not a security
+/// loss: no `TelemetryLoss` for a `bpftool` listing).
+#[map]
+static MINOR_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1, 0);
+
+const MINOR_DENIAL_PER_SEC: u64 = 50;
+
+/// Lot 318: whether this CPU's budget of the non-decisive refusals
+/// ([`MINOR_DENIAL_RATE`]) has room for one more record, taking it; a
+/// record over it is counted (`ring_slot::MINOR_DENIAL_RATE`) and must not
+/// be written.
+#[inline(always)]
+fn minor_budget() -> bool {
+    let Some(rate) = MINOR_DENIAL_RATE.get_ptr_mut(0) else {
+        return false;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    unsafe {
+        // SAFETY: this CPU's slot, owned by the program while it runs.
+        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
+            (*rate)[0] = now;
+            (*rate)[1] = 0;
+        }
+        if (*rate)[1] >= MINOR_DENIAL_PER_SEC {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::MINOR_DENIAL_RATE);
+            return false;
+        }
+        (*rate)[1] += 1;
+    }
+    true
+}
+
 /// Lot 293: [`emit_denial`] behind the attempt budget ([`attempt_budget`]).
+/// Lot 318 (the review of #545, F1): a non-decisive refusal
+/// (`northnarrow_common::wire::is_minor_denial`) behind its own budget
+/// ([`minor_budget`]), so the decisive ones keep theirs whole.
 #[inline(always)]
 pub(crate) fn emit_attempt(operation: u8, key: InodeKey) {
     // Lot 302: the deny self-test's refusal, outside the budget
     if caller_is_self_test() {
         emit_denial(operation, key);
+        return;
+    }
+    if northnarrow_common::wire::is_minor_denial(operation) {
+        if minor_budget() {
+            emit_denial(operation, key);
+        }
         return;
     }
     if attempt_budget() {
@@ -478,7 +529,7 @@ pub(crate) fn emit_sysctl_record(
 /// Lot 318 (external bug hunt BUG37): private to this module — every
 /// other refusal reaches the ring through a budget ([`emit_attempt`],
 /// [`emit_limited`], [`emit_task_denial`]; the BPF guard's through
-/// `emit_attempt`). `xtask/tests/self_defense.rs` keeps the ring's writers
+/// `emit_attempt`). `xtask/tests/kernel_halves.rs` keeps the ring's writers
 /// to this function and [`emit_sysctl_record`].
 #[inline(always)]
 fn emit_denial(operation: u8, key: InodeKey) {

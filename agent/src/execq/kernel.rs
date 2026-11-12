@@ -2,7 +2,6 @@
 //! written once and frozen, and the maps and ring the controller owns.
 
 use std::os::fd::{AsFd, AsRawFd};
-#[cfg(test)]
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::{anyhow, Context, Result};

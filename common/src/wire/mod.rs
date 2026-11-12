@@ -1255,6 +1255,28 @@ pub const fn sigio_signal(sig: i32) -> i32 {
 /// Lot 280b: the last denial code (the tests' loops).
 pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 
+/// Lot 318 (the review of #545, F1 and F7): the refusals signed at each
+/// attempt that are not decisive — the posture's `SensitiveFileAccess` (a
+/// refused read of the agent's key: a backup of `/etc` meets it) and
+/// `DefenseImpairment` (a handle on the agent's BPF objects, a refused
+/// program type, a root `cgroup/sysctl` attach: an administrator's
+/// `bpftool prog list` meets them), and a loader opt-out's record. The
+/// kernel counts them against a per-CPU budget of their own, never the
+/// decisive refusals' (an unlink, a rename, a write-open of a protected
+/// file, a write handle on or a detach of the agent's BPF objects): a flood
+/// of these never takes a decisive record's room. Their held-back count is
+/// its own `RING_DROPS` slot (`minor_denial_rate`), not a security loss.
+pub const fn is_minor_denial(operation: u8) -> bool {
+    matches!(
+        operation,
+        FS_OP_READ
+            | FS_OP_BPF_HANDLE
+            | FS_OP_BPF_PROG_TYPE
+            | FS_OP_BPF_PROG_OPT_OUT
+            | FS_OP_SYSCTL_ROOT_ATTACH
+    )
+}
+
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
 /// each registered inode, so the WRITE-open deny can cover a secret/integrity

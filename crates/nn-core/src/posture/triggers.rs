@@ -2929,6 +2929,60 @@ mod tests {
         );
     }
 
+    /// Lot 318 (the review of #545, F1): the kernel counts the refusals it
+    /// calls non-decisive (`common::wire::is_minor_denial`) against a
+    /// budget of their own, so a flood of them never takes a decisive
+    /// refusal's room. That holds only while every one of them is
+    /// non-decisive here too: none of them raises `AntiTamperDenial`, and
+    /// the decisive file and BPF refusals that share `emit_attempt` with
+    /// them are not in the set.
+    #[test]
+    fn the_kernel_s_minor_denials_are_never_decisive_here() {
+        const S: u64 = 1_000_000_000;
+        let det = detector_with_empty_proc();
+        let refusal = |op: nn_model::FsProtectOperation| Event::FsProtectDenial {
+            pid: 420,
+            uid: 0,
+            comm: "x".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: op,
+            timestamp_ns: 4 * S,
+        };
+        let mut minor = 0;
+        for byte in 1..=common::wire::FS_OP_LAST {
+            if !common::wire::is_minor_denial(byte) {
+                continue;
+            }
+            minor += 1;
+            let op = nn_model::FsProtectOperation::from_wire(byte);
+            let hits = det.detect(&refusal(op), &[]);
+            assert!(
+                !hits.contains(&TriggerType::AntiTamperDenial),
+                "{op:?} is a minor denial in the kernel and decisive here: {hits:?}"
+            );
+        }
+        assert_eq!(minor, 5);
+        use common::wire as w;
+        for decisive in [
+            w::FS_OP_UNLINK,
+            w::FS_OP_RMDIR,
+            w::FS_OP_RENAME,
+            w::FS_OP_SETATTR,
+            w::FS_OP_WRITE,
+            w::FS_OP_CREATE,
+            w::FS_OP_LINK,
+            w::FS_OP_SYMLINK,
+            w::FS_OP_MKDIR,
+            w::FS_OP_MKNOD,
+            w::FS_OP_XATTR,
+            w::FS_OP_BPF_MAP,
+            w::FS_OP_BPF_LINK,
+        ] {
+            assert!(!w::is_minor_denial(decisive), "{decisive}");
+        }
+    }
+
     /// The review of #500 (B2, its probe): any root process makes itself a
     /// package transaction's — `apt-get -o APT::Update::Pre-Invoke::=/tmp/x
     /// update` runs `/tmp/x` under root's apt-get, through `sh -c`. Its
