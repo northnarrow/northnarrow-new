@@ -31,10 +31,10 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
 /// Lot 311 (the review of #538, F9): a configuration file a judge reads (a
 /// drop-in, an `EnvironmentFile=`) — a regular file only, opened without
 /// blocking, at most `antitamper_bpf`'s 1 MiB, its bytes made text
-/// ([`antitamper_bpf::host_dropins::read_lossy`]): a FIFO no longer stalls
+/// ([`antitamper_bpf::config_read::read_lossy`]): a FIFO no longer stalls
 /// the judge, nor `/dev/zero` exhausts it.
 pub fn read_config(path: &Path) -> io::Result<String> {
-    antitamper_bpf::host_dropins::read_lossy(path)
+    antitamper_bpf::config_read::read_lossy(path)
 }
 
 /// Lot 311 (the review of #538): a condition a part of the agent finds and

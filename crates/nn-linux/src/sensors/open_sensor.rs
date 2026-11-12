@@ -1921,6 +1921,8 @@ mod tests {
     /// keeps the roots last read.
     #[test]
     fn a_non_utf8_mount_does_not_empty_the_table() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let t = tempfile::tempdir().unwrap();
         let (a, info) = (t.path().join("a"), t.path().join("mi"));
         std::fs::create_dir(&a).unwrap();
@@ -1953,6 +1955,8 @@ mod tests {
     /// nothing; a line not in the kernel's shape is a degradation.
     #[test]
     fn fuse_mounts_are_placed_by_device_and_odd_points_stay_unplaced() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let t = tempfile::tempdir().unwrap();
         let info = t.path().join("mi");
         std::fs::write(
@@ -1989,6 +1993,8 @@ mod tests {
     #[test]
     #[ignore = "lab: a FUSE mount named by NN_LOT311_FUSE_MP"]
     fn a_real_fuse_mount_places_its_files_by_device() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let Some(mp) = std::env::var_os("NN_LOT311_FUSE_MP") else {
             return;
         };
@@ -2081,6 +2087,8 @@ mod tests {
     /// one.
     #[test]
     fn a_regular_file_never_polls_a_mount_change() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let t = tempfile::tempdir().unwrap();
         let info = t.path().join("mi");
         std::fs::write(&info, "").unwrap();

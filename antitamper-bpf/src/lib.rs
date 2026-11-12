@@ -73,6 +73,9 @@ pub mod sd_notify;
 pub mod cgroup_floors;
 pub mod cgroup_guard;
 
+/// Lot 311: a configuration file the host names, read bounded, as bytes,
+/// a regular file only.
+pub mod config_read;
 /// Lot 273c/273d: the host's drop-ins judged by their value for our units
 /// (the agent's integrity round, its reloads, the watchdog's).
 pub mod host_dropins;
