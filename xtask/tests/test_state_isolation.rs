@@ -136,6 +136,10 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "purges the pin root before its agent starts",
     ),
     (
+        "agent/tests/execq_stop_privileged_e2e.rs",
+        "purges the pin root before each of its agents starts (lot 317: three in one run)",
+    ),
+    (
         "agent/tests/response_privileged_e2e.rs",
         "purges the pin root before its agent starts; reads the metadata of the host's \
          rule-policy.local and its .sig before and after each test, to fail one that changed \

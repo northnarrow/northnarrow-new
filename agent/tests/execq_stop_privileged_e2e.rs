@@ -260,6 +260,23 @@ fn the_map_alone_names_what_the_stop_resumes() {
     );
 }
 
+/// The production pin root, wiped before each agent of this file starts:
+/// the three cases start one agent each in one run, and an agent refuses a
+/// start whose protected directories differ from those its predecessor's
+/// pins recorded (lab: the first run on a fresh guest). As the canary and
+/// FIM suites do.
+const BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
+
+fn wipe_pin_tree() {
+    let pin = Path::new(BPFFS_PIN_ROOT);
+    if let Ok(entries) = std::fs::read_dir(pin) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(pin);
+}
+
 /// A burst, a signed stop in its middle, the checks; `env`: the agent's
 /// extra variables. Returns how many processes the stop resumed without an
 /// entry (`unreported`).
@@ -274,6 +291,7 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
         "bpf is not in the kernel's LSM list ({lsm:?}): the exec quarantine needs it"
     );
 
+    wipe_pin_tree();
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let installed_agent = InstalledAgent::install();
