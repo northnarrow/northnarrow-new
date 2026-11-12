@@ -71,12 +71,17 @@ fn violations(rel: &str, code: &str) -> Vec<Violation> {
         if !helper && compact.contains("(deleted)") {
             hit("1: the kernel's ` (deleted)` mark outside inode.rs");
         }
-        if !helper && compact.contains(".ends_with(") {
+        if !helper && (compact.contains(".ends_with(") || compact.contains("::ends_with(")) {
             hit("2: `ends_with` on a path or a name");
         }
+        // `contains` and `find` of a string: a substring judged
         let mut rest = compact.as_str();
-        while let Some(at) = rest.find(".contains(") {
-            let arg = &rest[at + ".contains(".len()..];
+        while let Some((at, len)) = [".contains(", ".find("]
+            .iter()
+            .filter_map(|t| rest.find(t).map(|i| (i, t.len())))
+            .min()
+        {
+            let arg = &rest[at + len..];
             let arg = &arg[..arg.find(')').map_or(arg.len(), |e| e + 1)];
             if arg.starts_with('"')
                 || arg.starts_with("&\"")
@@ -99,7 +104,7 @@ fn violations(rel: &str, code: &str) -> Vec<Violation> {
                 .iter()
                 .any(|p| arg.starts_with(p))
             {
-                hit("3: `contains` of a string");
+                hit("3: `contains` or `find` of a string");
             }
             rest = &rest[at + 1..];
         }
@@ -218,6 +223,10 @@ fn each_rule_fails_on_the_shape_it_forbids() {
         ("            || p.rsplitn(3, '/').nth(1) == Some(\"blocked.scope\")", "4"),
         ("    let path = text.lines().find_map(|l| l.strip_prefix( \"0::\" ));", "5"),
         ("        if exe.to_string_lossy().ends_with (\" (deleted)\") {", "1"),
+        // re-check of #543: the spellings that still passed
+        ("            str::ends_with(p, want.as_str())", "2"),
+        ("            || p.find(sub.as_str()).is_some()", "3"),
+        ("            || p.find(\"/blocked.scope/\").is_some()", "3"),
     ];
     for (line, rule) in planted {
         let v = violations(rel, line);
@@ -235,6 +244,8 @@ fn each_rule_fails_on_the_shape_it_forbids() {
         "    component.rsplit_once('.').map(|(_, t)| t)",
         "    if trimmed.contains(char::is_whitespace) || trimmed.contains('\\0') {",
         "    stat.rsplit_once(')')?",
+        "    .find(|p| p.exists())",
+        "    .find_map(|l| l.strip_prefix(\"Uid:\"))?",
     ] {
         assert_eq!(violations(rel, ok), Vec::new(), "{ok}");
     }

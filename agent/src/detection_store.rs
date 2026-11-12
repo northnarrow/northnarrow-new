@@ -306,8 +306,17 @@ pub fn describe_response(report: &ExecutionReport) -> String {
         ExecutionOutcome::TreeTruncated { .. } => Some("partial: walk truncated".to_string()),
         // Lot 312: the action ran, its effect read back did not take.
         ExecutionOutcome::NotInEffect { reason, .. } => Some(format!("not in effect: {reason}")),
-        ExecutionOutcome::QuarantinedInPlace { complete: true, .. } => None,
-        ExecutionOutcome::QuarantinedInPlace { detail, .. } => Some(format!("partial: {detail}")),
+        ExecutionOutcome::QuarantinedInPlace {
+            effect: crate::response::quarantine::InPlaceEffect::Emptied,
+            ..
+        } => None,
+        ExecutionOutcome::QuarantinedInPlace {
+            effect: crate::response::quarantine::InPlaceEffect::MadeUnusable,
+            detail,
+            ..
+        } => Some(format!("partial: {detail}")),
+        ExecutionOutcome::QuarantinedInPlace { detail, .. } => Some(format!("failed: {detail}")),
+        ExecutionOutcome::QuarantineRefused { detail, .. } => Some(format!("refused: {detail}")),
         ExecutionOutcome::BlockedNewOnly { sockets, .. } => Some(format!(
             "partial: {}",
             crate::response::blocked_new_only(*sockets)

@@ -100,8 +100,16 @@ pub enum ExecutionOutcome {
         /// A verified name of it, when one was.
         original_path: Option<String>,
         detail: String,
-        complete: bool,
+        /// What holds: emptied (a success), mode 000 with the content kept
+        /// (partial), nothing changed — the content only vaulted (a
+        /// failure).
+        effect: quarantine::InPlaceEffect,
     },
+    /// Re-check of #543 (N1, N2): the quarantine did not touch the file —
+    /// one the offender could not change itself (another user's for a
+    /// non-root offender; root's reached through a name that could not be
+    /// verified). `detail` names the owner. A failure.
+    QuarantineRefused { pid: u32, detail: String },
     /// Lot 312 (review F2): `BlockOutbound` moved the process into the
     /// blocked scope and new sockets are dropped; `sockets` inet sockets
     /// it held before the move are not (the drop matches a socket's cgroup
@@ -234,15 +242,12 @@ pub fn journal_outcome(
         ExecutionOutcome::NotInEffect { reason, .. } => {
             (R::Failure, Some(format!("not in effect: {reason}")))
         }
-        ExecutionOutcome::QuarantinedInPlace {
-            detail, complete, ..
-        } => {
-            if *complete {
-                (R::Success, Some(detail.clone()))
-            } else {
-                (R::Partial, Some(detail.clone()))
-            }
-        }
+        ExecutionOutcome::QuarantinedInPlace { detail, effect, .. } => match effect {
+            quarantine::InPlaceEffect::Emptied => (R::Success, Some(detail.clone())),
+            quarantine::InPlaceEffect::MadeUnusable => (R::Partial, Some(detail.clone())),
+            quarantine::InPlaceEffect::Unchanged => (R::Failure, Some(detail.clone())),
+        },
+        ExecutionOutcome::QuarantineRefused { detail, .. } => (R::Failure, Some(detail.clone())),
         ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
             (R::Partial, Some(blocked_new_only(*sockets)))
         }

@@ -190,6 +190,10 @@ pub struct ExeHandle {
     /// only one whose content a quarantine destroys. `None` when unknown:
     /// never destroyed.
     offender_uid: Option<u32>,
+    /// Tests: no name of the inode verifies (as through another mount
+    /// namespace's bind mount).
+    #[cfg(test)]
+    unverifiable: bool,
 }
 
 impl ExeHandle {
@@ -242,7 +246,16 @@ impl ExeHandle {
             ino: m.ino(),
             file,
             offender_uid: None,
+            #[cfg(test)]
+            unverifiable: false,
         })
+    }
+
+    /// Tests: a handle no name of which verifies.
+    #[cfg(test)]
+    fn unverifiable(mut self) -> Self {
+        self.unverifiable = true;
+        self
     }
 
     /// Lot 312 (BUG-90): the inode has no name left anywhere — `st_nlink`
@@ -269,6 +282,10 @@ impl ExeHandle {
     /// the inode — the kernel then shows that name with ` (deleted)` after
     /// it, a suffix a file on disk may also carry in its own name.
     pub fn current_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if self.unverifiable {
+            return None;
+        }
         if self.unlinked().unwrap_or(true) {
             return None;
         }
@@ -425,7 +442,7 @@ pub fn quarantine_handle(
             vault_id,
             name,
             detail,
-            complete,
+            effect,
         }) => {
             warn!(
                 pid = target_pid,
@@ -438,7 +455,7 @@ pub fn quarantine_handle(
                 vault_id,
                 original_path: name.map(|p| p.to_string_lossy().into_owned()),
                 detail,
-                complete,
+                effect,
             }
         }
         Err(QuarantineError::Gone) => ExecutionOutcome::AlreadyGone { pid: target_pid },
@@ -448,12 +465,31 @@ pub fn quarantine_handle(
             pid: target_pid,
             reason: "the binary's path changed under the quarantine — nothing done",
         },
+        Err(QuarantineError::ProtectedFile) => {
+            warn!(
+                pid = target_pid,
+                path = %nn_model::log_escape::Escaped(&original_str),
+                "the binary is a protected system file (the dynamic loader, a shell, init, sshd \
+                 or the agent's own), whatever its name; refusing to quarantine (kill-only)"
+            );
+            ExecutionOutcome::Refused {
+                pid: target_pid,
+                reason: "a protected system file (by identity: the loader, a shell, init, sshd, \
+                         the agent's own)",
+            }
+        }
+        Err(QuarantineError::Refused(detail)) => {
+            warn!(pid = target_pid, detail = %detail, "quarantine refused: the file is not changed");
+            ExecutionOutcome::QuarantineRefused {
+                pid: target_pid,
+                detail,
+            }
+        }
         Err(QuarantineError::ProtectedPath) => {
             warn!(
                 pid = target_pid,
                 path = %nn_model::log_escape::Escaped(&original_str),
-                "binary lives under a protected system prefix, or is one of the agent's own \
-                 files; refusing to quarantine (kill-only)"
+                "binary lives under a protected system prefix; refusing to quarantine (kill-only)"
             );
             ExecutionOutcome::Refused {
                 pid: target_pid,
@@ -804,9 +840,15 @@ fn write_restored(plaintext: &[u8], out_path: &Path, cfg: &ExecutorConfig) -> st
 
 #[derive(Debug)]
 enum QuarantineError {
-    /// Path is under [`QUARANTINE_DENY_PREFIXES`], or the inode is one of
-    /// the agent's own files; nothing was touched.
+    /// Path is under [`QUARANTINE_DENY_PREFIXES`]; nothing was touched.
     ProtectedPath,
+    /// Re-check of #543 (N1): the inode is a protected system file by
+    /// identity ([`protected_identities`]); nothing was touched.
+    ProtectedFile,
+    /// Re-check of #543 (N1, N2): a file the offender could not change
+    /// itself — not its own (and no root offender on a verified name), or
+    /// root's without a verified name. Nothing was touched; the reason.
+    Refused(String),
     /// The file was unlinked before the quarantine reached it.
     Gone,
     /// External audit CMB-001: the path no longer names the inode the
@@ -835,12 +877,12 @@ enum Done {
     /// Vaulted, and the inode itself neutralized where it is
     /// ([`neutralize_in_place`]): its other names, a name the agent could
     /// not verify, or a removal that failed keep it. `detail` says what
-    /// was done; `complete` when its content is gone (emptied).
+    /// was done, `effect` what holds.
     InPlace {
         vault_id: String,
         name: Option<PathBuf>,
         detail: String,
-        complete: bool,
+        effect: InPlaceEffect,
     },
 }
 
@@ -880,17 +922,53 @@ fn quarantine_file_with(
     if handle.unlinked()? {
         return Err(QuarantineError::Gone);
     }
+    // Re-check of #543 (N1): the identity of the system's own files wins
+    // over any name — the dynamic loader, the shells, init, sshd, the
+    // agent's own binaries are never touched, whatever name (another mount
+    // namespace's bind of /usr/bin) leads to them.
+    if is_protected_identity(cfg, handle) {
+        return Err(QuarantineError::ProtectedFile);
+    }
     let named = handle.verified_name();
-    // Lot 312 (review F5): the denylist judges a VERIFIED name. With none,
-    // the name the kernel shows is not a location (another mount
-    // namespace's, a name swapped meanwhile) and decides nothing; the held
-    // inode's identity does — never one of the agent's own files.
-    match &named {
-        Some(p) if is_denied_by(cfg, p) => return Err(QuarantineError::ProtectedPath),
-        None if is_own_inode(cfg, handle) => return Err(QuarantineError::ProtectedPath),
-        _ => {}
+    // Review F5: the denylist judges a VERIFIED name; the name the kernel
+    // shows when none verifies is not a location and decides nothing.
+    if named.as_deref().is_some_and(|p| is_denied_by(cfg, p)) {
+        return Err(QuarantineError::ProtectedPath);
     }
     let meta = handle.file.metadata()?;
+    // Re-check of #543 (N1, N2): what the offender could do to this file
+    // itself, the quarantine may do. A file it owns, under any name; a
+    // root offender, a file of anyone's under a VERIFIED name (as before
+    // the lot: the payload a user dropped and root ran). Never a
+    // root-owned file without a verified name (a mount namespace's view of
+    // the host's binaries), never another user's for a non-root offender.
+    let owner = meta.uid();
+    let owns = handle.offender_uid == Some(owner);
+    let root_on_a_name = handle.offender_uid == Some(0) && named.is_some();
+    if named.is_none() && owner == 0 {
+        return Err(QuarantineError::Refused(format!(
+            "a root-owned file (uid 0, {} link(s)) reached through a name that could not be \
+             verified is never changed — not quarantined",
+            meta.nlink()
+        )));
+    }
+    if !(owns || root_on_a_name) {
+        return Err(QuarantineError::Refused(match handle.offender_uid {
+            Some(uid) => format!(
+                "the offender (uid {uid}) does not own this file (owner uid {owner}{}): its \
+                 quarantine never changes another user's file — not quarantined",
+                if named.is_none() {
+                    ", no name of it verified"
+                } else {
+                    ""
+                }
+            ),
+            None => format!(
+                "the offender's uid is unknown (owner uid {owner}): the file is not changed — not \
+                 quarantined"
+            ),
+        }));
+    }
     let size = meta.len();
     if size > cfg.quarantine_max_bytes {
         return Err(QuarantineError::TooLarge {
@@ -906,11 +984,9 @@ fn quarantine_file_with(
     let vault_id = vault_content(cfg, &content, named.as_deref(), &identity, false)?;
 
     // Lot 312 (review F1): a name is removed — the content left to the
-    // vault — only when it is the inode's only name and the file is the
-    // offender's own: never another user's file, never a shared one (a
+    // vault — only when it is the inode's only name: never a shared one (a
     // package store's, an environment's hard link).
-    let only_name = meta.nlink() == 1;
-    if let (Some(name), true, true) = (&named, only_name, identity.offenders) {
+    if let (Some(name), 1) = (&named, meta.nlink()) {
         match remove_held_with(handle, cfg, before_unlink) {
             Ok(Removal::Unlinked) | Ok(Removal::NoNameLeft) => {}
             Err(QuarantineError::ProtectedPath) => return Err(QuarantineError::ProtectedPath),
@@ -927,15 +1003,97 @@ fn quarantine_file_with(
             });
         }
     }
-    let (detail, complete) = neutralize_in_place(handle, &identity, named.is_some());
-    record_in_place(cfg, &vault_id, complete, handle)?;
+    let (detail, effect) = neutralize_in_place(handle, &identity, named.is_some());
+    record_in_place(cfg, &vault_id, effect == InPlaceEffect::Emptied, handle)?;
     Ok(Done::InPlace {
         vault_id,
         name: named,
         detail,
-        complete,
+        effect,
     })
 }
+
+/// Re-check of #543 (N1): the files whose identity — `(dev, ino)`, not a
+/// name — the quarantine never touches: the dynamic loaders, the shells
+/// (`/etc/shells` and the usual ones), init and systemd, the SSH daemon,
+/// and the agent's own files and binaries.
+fn protected_identities(cfg: &ExecutorConfig) -> HashSet<(u64, u64)> {
+    let mut paths: Vec<PathBuf> = PROTECTED_FILES.iter().map(PathBuf::from).collect();
+    if let Ok(text) = fs::read_to_string("/etc/shells") {
+        paths.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with('/'))
+                .map(PathBuf::from),
+        );
+    }
+    for dir in LOADER_DIRS {
+        if let Ok(entries) = fs::read_dir(dir) {
+            paths.extend(entries.flatten().filter_map(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                (n.starts_with("ld-linux") || n.starts_with("ld-musl") || n == "ld.so")
+                    .then(|| e.path())
+            }));
+        }
+    }
+    paths.extend(cfg.own_files.files.iter().cloned());
+    for dir in &cfg.own_files.install_dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            paths.extend(entries.flatten().filter_map(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                (n.starts_with("northnarrow-") || n.starts_with("nn-admin")).then(|| e.path())
+            }));
+        }
+    }
+    paths
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect()
+}
+
+/// Re-check of #543 (N1): the held inode is one of [`protected_identities`].
+fn is_protected_identity(cfg: &ExecutorConfig, handle: &ExeHandle) -> bool {
+    protected_identities(cfg).contains(&handle.key())
+}
+
+/// The system files [`protected_identities`] names besides the shells of
+/// `/etc/shells` and the loaders found in [`LOADER_DIRS`].
+const PROTECTED_FILES: &[&str] = &[
+    "/bin/sh",
+    "/bin/bash",
+    "/bin/dash",
+    "/bin/zsh",
+    "/bin/busybox",
+    "/usr/bin/sh",
+    "/usr/bin/bash",
+    "/usr/bin/dash",
+    "/usr/bin/zsh",
+    "/usr/bin/busybox",
+    "/sbin/init",
+    "/usr/sbin/init",
+    "/lib/systemd/systemd",
+    "/usr/lib/systemd/systemd",
+    "/usr/sbin/sshd",
+    "/usr/libexec/openssh/sshd",
+    "/usr/local/bin/northnarrow-agent",
+    "/usr/local/bin/northnarrow-watchdog",
+    "/usr/local/bin/nn-admin",
+];
+
+/// Where the dynamic loaders live (`ld-linux*`, `ld-musl*`, `ld.so`).
+const LOADER_DIRS: &[&str] = &[
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+];
 
 /// The held inode's content, bounded as the size check (external audit
 /// CMB-024: a file that grew since is refused, not read whole).
@@ -966,8 +1124,6 @@ struct Identity {
     /// Birth time (ns) where the filesystem keeps it: an inode number
     /// freed and reused is another file.
     btime_ns: Option<i64>,
-    /// The file is the offender's own (its owner is the offender's uid).
-    offenders: bool,
 }
 
 impl Identity {
@@ -979,7 +1135,6 @@ impl Identity {
             uid: m.uid(),
             nlink: m.nlink(),
             btime_ns: btime_of(handle.file.as_raw_fd()),
-            offenders: handle.offender_uid == Some(m.uid()),
         }
     }
 
@@ -1011,17 +1166,6 @@ fn btime_of(fd: i32) -> Option<i64> {
     };
     (rc == 0 && sx.stx_mask & libc::STATX_BTIME != 0)
         .then(|| sx.stx_btime.tv_sec * 1_000_000_000 + i64::from(sx.stx_btime.tv_nsec))
-}
-
-/// Lot 312 (review F5): the held inode is one of the agent's own files
-/// (`cfg.own_files`), by `(dev, ino)` — what decides when no name of it
-/// can be verified.
-fn is_own_inode(cfg: &ExecutorConfig, handle: &ExeHandle) -> bool {
-    cfg.own_files
-        .files
-        .iter()
-        .filter_map(|p| fs::metadata(p).ok())
-        .any(|m| handle.is_inode(m.dev(), m.ino()))
 }
 
 /// Seal `content` into a new vault entry: its `.bin`, its `.meta` (the
@@ -1123,23 +1267,35 @@ fn vault_nameless(handle: &ExeHandle, cfg: &ExecutorConfig) -> Option<String> {
     }
 }
 
-/// Lot 312 (review F1, F4, F5): neutralize the held inode where it is —
-/// `named`: a name of it was verified. Its content is destroyed (the file
-/// emptied through the agent's own descriptor, `/proc/self/fd/N` reopened
-/// for writing: `CAP_DAC_OVERRIDE`) only when the file is the offender's
-/// own and has no other name. A shared inode (a package store's, an
-/// environment's hard links) or another user's keeps its content: it is
-/// made unusable (mode 000 on the held descriptor), and the detail names
-/// its owner and its link count — a `fchmod` of a file the agent does not
-/// own fails in the unit (no `CAP_FOWNER`), said so too. Read back either
-/// way. Returns (what holds, the content gone).
-fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (String, bool) {
+/// What an in-place neutralization left on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InPlaceEffect {
+    /// The content is gone (the file emptied): a success.
+    Emptied,
+    /// Mode 000, the content kept: partial.
+    MadeUnusable,
+    /// Nothing changed on disk — the content is only vaulted: a failure.
+    Unchanged,
+}
+
+/// Lot 312 (review F1, F4, F5; re-check N1, N2): neutralize the held inode
+/// where it is — `named`: a name of it was verified. The caller has
+/// checked the offender could change the file itself. Its content is
+/// destroyed (the file emptied through the agent's own descriptor,
+/// `/proc/self/fd/N` reopened for writing: `CAP_DAC_OVERRIDE`) only when it
+/// has no other name. A shared inode (a package store's, an environment's
+/// hard links) keeps its content: it is made unusable (mode 000 on the held
+/// descriptor), and the detail names its owner and its link count — a
+/// `fchmod` of a file the agent does not own fails in the unit (no
+/// `CAP_FOWNER`): then nothing changed, and that is said. Read back either
+/// way.
+fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (String, InPlaceEffect) {
     let name = if named {
         "its name verified"
     } else {
         "no name of it verified"
     };
-    if id.offenders && id.nlink == 1 {
+    if id.nlink == 1 {
         let emptied = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -1155,19 +1311,16 @@ fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (Strin
         if handle.file.metadata().is_ok_and(|m| m.len() == 0) {
             return (
                 format!(
-                    "emptied in place (the offender's own file, uid {}, its only link; {name}): \
-                     no name of it runs the binary; a restore puts content and mode back into \
-                     that file",
+                    "emptied in place (owner uid {}, its only link; {name}): no name of it runs \
+                     the binary; a restore puts content and mode back into that file",
                     id.uid
                 ),
-                true,
+                InPlaceEffect::Emptied,
             );
         }
     }
     let why = if id.nlink > 1 {
         format!("shared: {} links", id.nlink)
-    } else if !id.offenders {
-        format!("owner uid {}, not the offender's", id.uid)
     } else {
         "it could not be emptied".to_string()
     };
@@ -1178,21 +1331,21 @@ fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (Strin
     if now == Some(0) {
         (
             format!(
-                "made unusable in place, content kept ({why}; owner uid {}, {} link(s); {name}): \
-                 mode {:o} -> 000 under every name; a restore puts the mode back",
-                id.uid, id.nlink, id.mode
+                "made unusable in place, content kept ({why}; owner uid {}; {name}): mode {:o} -> \
+                 000 under every name; a restore puts the mode back",
+                id.uid, id.mode
             ),
-            false,
+            InPlaceEffect::MadeUnusable,
         )
     } else {
         let err = chmod.err().map(|e| e.to_string()).unwrap_or_default();
         (
             format!(
-                "NOT made unusable ({why}; owner uid {}, {} link(s); {name}): the mode change was \
-                 refused ({err}) — still runnable under its other name(s)",
-                id.uid, id.nlink
+                "vaulted only, the file NOT changed ({why}; owner uid {}; {name}): the mode change \
+                 was refused ({err}) — still runnable",
+                id.uid
             ),
-            false,
+            InPlaceEffect::Unchanged,
         )
     }
 }
@@ -1607,9 +1760,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = cfg_for(&tmp);
         // A real system binary: the denylist must fire BEFORE any
-        // metadata/read/unlink, so the file is untouched afterwards.
-        let target = Path::new("/bin/sh");
-        let before = fs::metadata(target).expect("/bin/sh exists on a Linux test host");
+        // metadata/read/unlink, so the file is untouched afterwards. (Lot
+        // 312: not a shell — `/bin/sh` is refused by identity even before
+        // the denylist, `n1_the_loader_and_the_shells_are_refused_by_identity`.)
+        let target = ["/usr/bin/env", "/bin/ls", "/usr/bin/ls"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .expect("a system binary on a Linux test host");
+        let before = fs::metadata(target).expect("exists");
         match quarantine_file(&ExeHandle::open(target).unwrap(), &cfg) {
             Err(QuarantineError::ProtectedPath) => {}
             Ok(_) => panic!("expected ProtectedPath, got Ok"),
@@ -1733,7 +1892,7 @@ mod tests {
                 // where it is, and comes back there
                 Ok(Done::InPlace {
                     vault_id,
-                    complete: true,
+                    effect: InPlaceEffect::Emptied,
                     ..
                 }) => {
                     assert_eq!(fs::metadata(&real).unwrap().len(), 0, "round {round}");
@@ -2674,7 +2833,7 @@ mod bug90 {
         let ExecutionOutcome::QuarantinedInPlace {
             vault_id,
             original_path: None,
-            complete: true,
+            effect: InPlaceEffect::Emptied,
             detail,
         } = &out
         else {
@@ -2734,7 +2893,7 @@ mod bug90 {
         let ExecutionOutcome::QuarantinedInPlace {
             vault_id,
             original_path,
-            complete: false,
+            effect: InPlaceEffect::MadeUnusable,
             detail,
         } = &out
         else {
@@ -2792,33 +2951,32 @@ mod bug90 {
             .unwrap()
             .with_offender_uid(Some(owner.wrapping_add(1)));
         let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
-        let ExecutionOutcome::QuarantinedInPlace {
-            complete: false,
-            detail,
-            ..
-        } = &out
-        else {
+        // re-check of #543 (N1): refused before anything — not even a mode
+        let ExecutionOutcome::QuarantineRefused { detail, .. } = &out else {
             panic!("{out:?}");
         };
         assert!(
-            detail.contains(&format!("owner uid {owner}, not the offender's")),
+            detail.contains(&format!("does not own this file (owner uid {owner}")),
             "{detail}"
         );
         assert!(f.exists(), "its name is not removed");
-        assert_eq!(fs::metadata(&f).unwrap().len(), 11, "its content kept");
-        // an unknown offender: never destroyed either
+        let m = fs::metadata(&f).unwrap();
+        assert_eq!((m.len(), m.mode() & 0o7777), (11, 0o755), "nothing changed");
+        assert!(list_vault(&cfg).is_empty(), "nothing vaulted either");
+        let (result, _, _) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::Quarantine,
+            primary: out.clone(),
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Failure);
+        // an unknown offender: refused too
         let g = tmp.path().join("tool2");
         fs::write(&g, b"x").unwrap();
         let h = ExeHandle::open(&g).unwrap().with_offender_uid(None);
         let out = quarantine_handle(&h, 4243, &cfg, &super::super::journal::test_intent());
         assert!(
-            matches!(
-                out,
-                ExecutionOutcome::QuarantinedInPlace {
-                    complete: false,
-                    ..
-                }
-            ),
+            matches!(&out, ExecutionOutcome::QuarantineRefused { detail, .. } if detail.contains("uid is unknown")),
             "{out:?}"
         );
         assert!(g.exists());
@@ -2846,7 +3004,10 @@ mod bug90 {
         assert!(
             matches!(
                 out,
-                ExecutionOutcome::QuarantinedInPlace { complete: true, .. }
+                ExecutionOutcome::QuarantinedInPlace {
+                    effect: InPlaceEffect::Emptied,
+                    ..
+                }
             ),
             "not refused by the shown name: {out:?}"
         );
@@ -2862,10 +3023,7 @@ mod bug90 {
         assert!(
             matches!(
                 out,
-                ExecutionOutcome::Refused {
-                    reason: "path is under a protected system prefix",
-                    ..
-                }
+                ExecutionOutcome::Refused { reason, .. } if reason.starts_with("a protected system file (by identity")
             ),
             "{out:?}"
         );
@@ -2893,7 +3051,10 @@ mod bug90 {
         assert!(
             matches!(
                 out,
-                ExecutionOutcome::QuarantinedInPlace { complete: true, .. }
+                ExecutionOutcome::QuarantinedInPlace {
+                    effect: InPlaceEffect::Emptied,
+                    ..
+                }
             ),
             "{out:?}"
         );
@@ -2922,7 +3083,7 @@ mod bug90 {
         fs::remove_file(&f).unwrap();
         let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
         let ExecutionOutcome::QuarantinedInPlace {
-            complete: false,
+            effect: InPlaceEffect::MadeUnusable,
             detail,
             ..
         } = &out
@@ -2975,7 +3136,11 @@ mod bug90 {
         };
         let done = super::quarantine_file_with(&h, &cfg, || {}, &swap).unwrap();
         assert!(swapped.get(), "premise: the swap ran before the unlink");
-        let Done::InPlace { complete: true, .. } = &done else {
+        let Done::InPlace {
+            effect: InPlaceEffect::Emptied,
+            ..
+        } = &done
+        else {
             panic!("{done:?}");
         };
         assert_eq!(
@@ -3165,5 +3330,245 @@ mod bug90 {
             .unwrap()
             .starts_with("emptied in place"));
         assert!(r[1]["extra"]["original_path"].is_null(), "no name invented");
+    }
+
+    fn not_root() -> bool {
+        // SAFETY: geteuid(2) takes no argument and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        if root {
+            eprintln!("SKIP: this test reads system files and must not run as root");
+        }
+        !root
+    }
+
+    /// Re-check of #543 (N1): a root-owned file reached through a name that
+    /// does not verify (a mount namespace's bind of the host's `/usr/bin`)
+    /// is never changed, whoever the offender is — refused before any
+    /// mode change, nothing vaulted, the row a failure.
+    #[test]
+    fn n1_a_root_owned_file_without_a_verified_name_is_never_changed() {
+        if !not_root() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let sys = ["/usr/bin/sleep", "/bin/sleep", "/usr/bin/true"]
+            .into_iter()
+            .find(|p| fs::metadata(p).is_ok_and(|m| m.uid() == 0))
+            .expect("a root-owned system binary");
+        let before = fs::metadata(sys).unwrap().mode();
+        for offender in [Some(1000), Some(0), None] {
+            let h = ExeHandle::open(Path::new(sys))
+                .unwrap()
+                .unverifiable()
+                .with_offender_uid(offender);
+            let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+            let ok = match &out {
+                ExecutionOutcome::QuarantineRefused { detail, .. } => {
+                    detail.starts_with("a root-owned file (uid 0")
+                }
+                // a shell or the loader: refused by identity first
+                ExecutionOutcome::Refused { reason, .. } => reason.contains("by identity"),
+                _ => false,
+            };
+            assert!(ok, "offender {offender:?}: {out:?}");
+        }
+        assert_eq!(
+            fs::metadata(sys).unwrap().mode(),
+            before,
+            "never a mode change"
+        );
+        assert!(list_vault(&cfg).is_empty());
+    }
+
+    /// Re-check of #543 (N1): the system's own files are refused by
+    /// IDENTITY, whatever name leads to them — the dynamic loader, the
+    /// shells — the check winning over any name, verified or not.
+    #[test]
+    fn n1_the_loader_and_the_shells_are_refused_by_identity() {
+        if !not_root() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let ids = protected_identities(&cfg);
+        let loader = LOADER_DIRS
+            .iter()
+            .filter_map(|d| fs::read_dir(d).ok())
+            .flat_map(|e| e.flatten())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("ld-linux"))
+            })
+            .expect("a dynamic loader on this host");
+        let mut checked = 0;
+        for p in [
+            loader.as_path(),
+            Path::new("/bin/sh"),
+            Path::new("/usr/bin/bash"),
+        ] {
+            let Ok(m) = fs::metadata(p) else { continue };
+            assert!(
+                ids.contains(&(m.dev(), m.ino())),
+                "{} not protected",
+                p.display()
+            );
+            for h in [
+                ExeHandle::open(p).unwrap().unverifiable(),
+                ExeHandle::open(p).unwrap().with_offender_uid(Some(0)),
+            ] {
+                let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+                assert!(
+                    matches!(&out, ExecutionOutcome::Refused { reason, .. } if reason.contains("by identity")),
+                    "{}: {out:?}",
+                    p.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 2, "{checked}");
+    }
+
+    /// Re-check of #543 (N1), the reviewer's case: an unprivileged user
+    /// namespace binds the host's `/usr/bin` and runs its `sleep` (and its
+    /// shell) from there. The agent sees a name of the namespace that does
+    /// not verify: refused before any mode change. Needs `unshare -Urm`
+    /// (unprivileged user namespaces); said and skipped where denied.
+    #[test]
+    fn n1_a_host_binary_through_a_user_namespace_bind_is_refused() {
+        if !not_root() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let bin = tmp.path().join("ns/bin");
+        fs::create_dir_all(&bin).unwrap();
+        for prog in ["sleep", "bash"] {
+            let host = Path::new("/usr/bin").join(prog);
+            let Ok(before) = fs::metadata(&host).map(|m| m.mode()) else {
+                continue;
+            };
+            let script = if prog == "sleep" {
+                format!(
+                    "mount --bind /usr/bin {b} && exec {b}/sleep 30",
+                    b = bin.display()
+                )
+            } else {
+                format!(
+                    "mount --bind /usr/bin {b} && exec {b}/bash -c 'sleep 30; true'",
+                    b = bin.display()
+                )
+            };
+            let Ok(mut child) = std::process::Command::new("unshare")
+                .args(["-Urm", "sh", "-c", &script])
+                .spawn()
+            else {
+                eprintln!("SKIP: no unshare");
+                return;
+            };
+            let pid = child.id();
+            let mut link = PathBuf::new();
+            for _ in 0..200 {
+                link = fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+                if link.file_name().is_some_and(|n| n == prog) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if link.file_name().is_none_or(|n| n != prog) {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("SKIP: unprivileged user namespaces denied here ({link:?})");
+                return;
+            }
+            let out = quarantine_process_binary(
+                pid,
+                &HashSet::new(),
+                &cfg,
+                &super::super::journal::test_intent(),
+            );
+            let after = fs::metadata(&host).unwrap().mode();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                matches!(&out, ExecutionOutcome::QuarantineRefused { .. })
+                    || matches!(&out, ExecutionOutcome::Refused { reason, .. } if reason.contains("by identity")),
+                "{prog} through {link:?}: {out:?}"
+            );
+            assert_eq!(after, before, "{prog}: never a mode change");
+        }
+    }
+
+    /// Re-check of #543 (N2): a root offender running another user's
+    /// payload (dropped by `www-data`, run by root) by a VERIFIED name — the
+    /// name is removed as before the lot, the content in the vault.
+    #[test]
+    fn n2_a_root_offender_quarantines_another_users_payload_by_its_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        fs::write(&f, b"dropped by www-data").unwrap();
+        let h = ExeHandle::open(&f).unwrap().with_offender_uid(Some(0));
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        assert!(
+            matches!(&out, ExecutionOutcome::Quarantined { original_path, .. } if Path::new(original_path) == f),
+            "{out:?}"
+        );
+        assert!(!f.exists());
+        assert_eq!(restored(&cfg, &tmp, &out), b"dropped by www-data");
+        // without a verified name, root has no more than the owner's say
+        let g = tmp.path().join("payload2");
+        let keep = tmp.path().join(".keep2");
+        fs::write(&g, b"x").unwrap();
+        fs::hard_link(&g, &keep).unwrap();
+        // SAFETY: geteuid(2) takes no argument and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 {
+            let h = ExeHandle::open(&g).unwrap().with_offender_uid(Some(0));
+            fs::remove_file(&g).unwrap();
+            let out = quarantine_handle(&h, 4243, &cfg, &super::super::journal::test_intent());
+            assert!(
+                matches!(&out, ExecutionOutcome::QuarantineRefused { .. }),
+                "{out:?}"
+            );
+            assert_eq!(fs::read(&keep).unwrap(), b"x");
+        }
+    }
+
+    /// Re-check of #543 (N2): a quarantine whose only effect was the vault —
+    /// the file could not be changed (another owner's mode, a write
+    /// refused) — is `Unchanged`, signed a FAILURE, never partial.
+    #[test]
+    fn n2_a_quarantine_that_only_vaulted_is_a_failure() {
+        if !not_root() {
+            return;
+        }
+        let sys = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|p| fs::metadata(p).is_ok_and(|m| m.uid() == 0))
+            .expect("a root-owned file");
+        let h = ExeHandle::open(Path::new(sys)).unwrap();
+        let m = fs::metadata(sys).unwrap();
+        let before = m.mode();
+        let (detail, effect) = neutralize_in_place(&h, &Identity::of(&h, &m), true);
+        assert_eq!(effect, InPlaceEffect::Unchanged, "{detail}");
+        assert!(
+            detail.starts_with("vaulted only, the file NOT changed"),
+            "{detail}"
+        );
+        assert_eq!(fs::metadata(sys).unwrap().mode(), before);
+        let (result, _, _) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::Quarantine,
+            primary: ExecutionOutcome::QuarantinedInPlace {
+                vault_id: "v".into(),
+                original_path: None,
+                detail,
+                effect,
+            },
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Failure);
     }
 }

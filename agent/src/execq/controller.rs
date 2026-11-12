@@ -1155,14 +1155,15 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             X::QuarantinedInPlace {
                 vault_id,
                 detail,
-                complete,
+                effect,
                 ..
             } => {
-                if complete {
+                if effect == crate::response::quarantine::InPlaceEffect::Emptied {
                     COUNTERS.quarantined.fetch_add(1, Ordering::Relaxed);
                 }
                 format!("quarantined in place (vault {vault_id}): {detail}")
             }
+            X::QuarantineRefused { detail, .. } => format!("not quarantined ({detail})"),
             X::AlreadyGone { .. } => {
                 "not quarantined (no file on disk: a memfd or unlinked)".into()
             }

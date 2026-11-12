@@ -160,12 +160,17 @@ impl Executor {
                 vault_id,
                 original_path,
                 detail,
-                complete,
+                effect,
             } => (
                 original_path.clone(),
                 vault_id,
                 Some(detail.clone()),
-                if *complete { "success" } else { "partial" },
+                match effect {
+                    quarantine::InPlaceEffect::Emptied => "success",
+                    quarantine::InPlaceEffect::MadeUnusable => "partial",
+                    // re-check of #543 (N2): only vaulted is a failure
+                    quarantine::InPlaceEffect::Unchanged => "failure",
+                },
             ),
             _ => {
                 if notes.is_empty() {

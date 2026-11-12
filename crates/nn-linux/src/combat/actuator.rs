@@ -165,10 +165,14 @@ impl SystemActuator {
             // lot 312 (review F1): its inode neutralized in place
             ExecutionOutcome::QuarantinedInPlace {
                 detail,
-                complete: true,
+                effect: crate::response::quarantine::InPlaceEffect::Emptied,
                 ..
             } => format!("quarantined: {detail}"),
-            ExecutionOutcome::QuarantinedInPlace { detail, .. } => {
+            ExecutionOutcome::QuarantinedInPlace {
+                detail,
+                effect: crate::response::quarantine::InPlaceEffect::MadeUnusable,
+                ..
+            } => {
                 warn!(
                     target: "combat.actuator",
                     pid,
@@ -855,20 +859,31 @@ mod tests {
         );
         assert_eq!(SystemActuator::no_binary_text(7, Ok(())), NO_BINARY);
         // lot 312 (review F1): an inode neutralized in place says what holds
-        let in_place = |complete| ExecutionOutcome::QuarantinedInPlace {
+        use crate::response::quarantine::InPlaceEffect as E;
+        let in_place = |effect| ExecutionOutcome::QuarantinedInPlace {
             vault_id: "v".into(),
             original_path: None,
             detail: "D".into(),
-            complete,
+            effect,
         };
         assert_eq!(
-            SystemActuator::quarantine_text(7, &in_place(true)),
+            SystemActuator::quarantine_text(7, &in_place(E::Emptied)),
             "quarantined: D"
         );
         assert_eq!(
-            SystemActuator::quarantine_text(7, &in_place(false)),
+            SystemActuator::quarantine_text(7, &in_place(E::MadeUnusable)),
             "partially quarantined: D (re-exec prevention degraded)"
         );
+        assert!(SystemActuator::quarantine_text(7, &in_place(E::Unchanged))
+            .starts_with("NOT quarantined:"));
+        assert!(SystemActuator::quarantine_text(
+            7,
+            &ExecutionOutcome::QuarantineRefused {
+                pid: 7,
+                detail: "owner uid 0".into()
+            }
+        )
+        .starts_with("NOT quarantined:"));
         assert!(!NO_BINARY.contains("no binary on disk"));
     }
 }
