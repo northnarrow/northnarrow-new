@@ -1014,7 +1014,12 @@ fn quarantine_file_with(
             });
         }
     }
-    let (detail, effect) = neutralize_in_place(handle, &identity, named.is_some());
+    // Re-check 2 (R2): a non-root offender's own file is emptied whatever
+    // its link count — a second hard link it made itself (`ln x .x2`) no
+    // longer keeps its payload runnable; the restore in place brings every
+    // name back. Root's and other users' inodes keep F1's rule.
+    let own = owns && owner != 0;
+    let (detail, effect) = neutralize_in_place(handle, &identity, named.is_some(), own);
     record_in_place(cfg, &vault_id, effect == InPlaceEffect::Emptied, handle)?;
     Ok(Done::InPlace {
         vault_id,
@@ -1043,16 +1048,70 @@ fn shells_path() -> PathBuf {
     PathBuf::from(SHELLS)
 }
 
+/// The most of `/etc/shells` read: lot 311's bound on a configuration
+/// file (`antitamper_bpf::config_read`).
+const MAX_SHELLS_BYTES: u64 = antitamper_bpf::config_read::MAX_CONFIG_BYTES;
+
 /// Re-check of #543 (N1): the shells a `/etc/shells` lists, its bytes made
 /// text. A host with none lists none (the usual shells of
 /// [`PROTECTED_FILES`] stay protected); one that exists and cannot be read
 /// is an error, never an empty list.
+///
+/// Re-check 2 (R1): read as lot 311's `config_read` reads a configuration
+/// file — the path opened `O_PATH` first (no FIFO waited on, no device
+/// opened), a regular file only, reopened through that descriptor (the
+/// same inode) `O_NONBLOCK` (no wait on a lease's break), at most
+/// [`MAX_SHELLS_BYTES`]. A FIFO, `/dev/zero` through a link, a file over
+/// the bound: an error at once — the quarantine is refused and NEUTRALIZE
+/// goes on; `fs::read` waited on the FIFO's writer and read `/dev/zero`
+/// without end.
 fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::Read as _;
+    use std::os::unix::fs::FileTypeExt as _;
+    let at = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(at) => at,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let meta = at.metadata()?;
+    let t = meta.file_type();
+    if !t.is_file() {
+        let kind = if t.is_fifo() {
+            "a FIFO"
+        } else if t.is_char_device() {
+            "a character device"
+        } else if t.is_block_device() {
+            "a block device"
+        } else if t.is_socket() {
+            "a socket"
+        } else if t.is_dir() {
+            "a directory"
+        } else {
+            "not a file"
+        };
+        return Err(std::io::Error::other(format!("{kind}, not a regular file")));
+    }
+    let too_big = |n: u64| {
+        std::io::Error::other(format!(
+            "{n} bytes or more, over the {MAX_SHELLS_BYTES} read"
+        ))
+    };
+    if meta.len() > MAX_SHELLS_BYTES {
+        return Err(too_big(meta.len()));
+    }
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", at.as_raw_fd()))?;
+    let mut bytes = Vec::new();
+    f.take(MAX_SHELLS_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SHELLS_BYTES {
+        return Err(too_big(bytes.len() as u64));
+    }
     Ok(String::from_utf8_lossy(&bytes)
         .lines()
         .map(str::trim)
@@ -1319,24 +1378,32 @@ pub enum InPlaceEffect {
     Unchanged,
 }
 
-/// Lot 312 (review F1, F4, F5; re-check N1, N2): neutralize the held inode
-/// where it is — `named`: a name of it was verified. The caller has
+/// Lot 312 (review F1, F4, F5; re-check N1, N2; re-check 2, R2):
+/// neutralize the held inode where it is — `named`: a name of it was
+/// verified; `own`: the file is the non-root offender's own. The caller has
 /// checked the offender could change the file itself. Its content is
 /// destroyed (the file emptied through the agent's own descriptor,
-/// `/proc/self/fd/N` reopened for writing: `CAP_DAC_OVERRIDE`) only when it
-/// has no other name. A shared inode (a package store's, an environment's
-/// hard links) keeps its content: it is made unusable (mode 000 on the held
-/// descriptor), and the detail names its owner and its link count — a
-/// `fchmod` of a file the agent does not own fails in the unit (no
-/// `CAP_FOWNER`): then nothing changed, and that is said. Read back either
-/// way.
-fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (String, InPlaceEffect) {
+/// `/proc/self/fd/N` reopened for writing: `CAP_DAC_OVERRIDE`, then mode
+/// 000 tried) when it has no other name, or when it is the offender's own
+/// (R2: every name of it emptied — its own store too; the restore in place
+/// puts content and mode back under every name). Another shared inode (a
+/// package store root or another user owns) keeps its content: it is made
+/// unusable (mode 000 on the held descriptor), and the detail names its
+/// owner and its link count — a `fchmod` of a file the agent does not own
+/// fails in the unit (no `CAP_FOWNER`): then nothing changed, and that is
+/// said. Read back either way.
+fn neutralize_in_place(
+    handle: &ExeHandle,
+    id: &Identity,
+    named: bool,
+    own: bool,
+) -> (String, InPlaceEffect) {
     let name = if named {
         "its name verified"
     } else {
         "no name of it verified"
     };
-    if id.nlink == 1 {
+    if id.nlink == 1 || own {
         let emptied = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -1350,10 +1417,18 @@ fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (Strin
             .file
             .set_permissions(fs::Permissions::from_mode(0o000));
         if handle.file.metadata().is_ok_and(|m| m.len() == 0) {
+            let links = if id.nlink == 1 {
+                "its only link".to_string()
+            } else {
+                format!(
+                    "the offender's own file, {} links, every one emptied",
+                    id.nlink
+                )
+            };
             return (
                 format!(
-                    "emptied in place (owner uid {}, its only link; {name}): no name of it runs \
-                     the binary; a restore puts content and mode back into that file",
+                    "emptied in place (owner uid {}, {links}; {name}): no name of it runs the \
+                     binary; a restore puts content and mode back into that file",
                     id.uid
                 ),
                 InPlaceEffect::Emptied,
@@ -2914,15 +2989,9 @@ mod bug90 {
         );
     }
 
-    /// Review F1: a SHARED inode — a package store's, as conda, pnpm or uv
-    /// hard-link one binary into many environments — is never emptied:
-    /// the store and the other environments keep their content. It is made
-    /// unusable (mode 000) in place, the row partial with the owner and the
-    /// link count; the restore puts the mode back on every name.
-    #[test]
-    fn bug90_review_f1_a_shared_store_inode_is_made_unusable_not_emptied() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = cfg_for(&tmp);
+    /// A conda-, pnpm- or uv-style store: one binary hard-linked into two
+    /// environments, three names in all, under the test's directory.
+    fn store(tmp: &TempDir) -> [PathBuf; 3] {
         let store = tmp.path().join("pkgs/python-3.11/bin");
         let env = tmp.path().join("envs/ds/bin");
         let env2 = tmp.path().join("envs/other/bin");
@@ -2934,7 +3003,24 @@ mod bug90 {
         fs::set_permissions(&c, fs::Permissions::from_mode(0o755)).unwrap();
         fs::hard_link(&c, env.join("python3.11")).unwrap();
         fs::hard_link(&c, env2.join("python3.11")).unwrap();
-        let h = ExeHandle::open(&env.join("python3.11")).unwrap();
+        [env.join("python3.11"), c, env2.join("python3.11")]
+    }
+
+    /// Review F1: a SHARED inode the offender does not own — a store a
+    /// user keeps, run by a root offender — is never emptied: the store and
+    /// the other environments keep their content. It is made unusable
+    /// (mode 000) in place, the row partial with the owner and the link
+    /// count; the restore puts the mode back on every name. (Re-check 2,
+    /// R2: the offender's OWN store is emptied —
+    /// `r2_an_offenders_own_store_is_emptied_and_restored_whole`.)
+    #[test]
+    fn bug90_review_f1_a_shared_store_inode_is_made_unusable_not_emptied() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let names = store(&tmp);
+        let h = ExeHandle::open(&names[0])
+            .unwrap()
+            .with_offender_uid(Some(0));
         let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
         let ExecutionOutcome::QuarantinedInPlace {
             vault_id,
@@ -2945,15 +3031,12 @@ mod bug90 {
         else {
             panic!("{out:?}");
         };
-        assert_eq!(
-            original_path.as_deref(),
-            Some(env.join("python3.11").to_str().unwrap())
-        );
+        assert_eq!(original_path.as_deref(), Some(names[0].to_str().unwrap()));
         assert!(
             detail.contains("shared: 3 links") && detail.contains("mode 755 -> 000"),
             "{detail}"
         );
-        for p in [&c, &env.join("python3.11"), &env2.join("python3.11")] {
+        for p in &names {
             let m = fs::metadata(p).unwrap();
             assert_eq!(m.len(), 18, "{} keeps its content", p.display());
             assert_eq!(m.mode() & 0o7777, 0, "{} unusable", p.display());
@@ -2968,8 +3051,8 @@ mod bug90 {
         assert!(reason.unwrap().contains("owner uid"));
         // the restore: every name runs again, no name created
         let back = restore_entry(vault_id, None, &cfg).unwrap();
-        assert_eq!(back, env.join("python3.11"));
-        for p in [&c, &env.join("python3.11"), &env2.join("python3.11")] {
+        assert_eq!(back, names[0]);
+        for p in &names {
             assert_eq!(
                 fs::metadata(p).unwrap().mode() & 0o7777,
                 0o755,
@@ -2977,6 +3060,105 @@ mod bug90 {
                 p.display()
             );
             assert_eq!(fs::read(p).unwrap(), b"python-interpreter");
+        }
+    }
+
+    /// Re-check 2 of #543 (R2): the non-root offender's OWN store — every
+    /// name of it the offender's — is emptied in place under every name
+    /// (success, the link count said), and the restore in place puts
+    /// content and mode back under every name: nothing of the user's lost.
+    #[test]
+    fn r2_an_offenders_own_store_is_emptied_and_restored_whole() {
+        if !not_root() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let names = store(&tmp);
+        let h = ExeHandle::open(&names[0]).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        let ExecutionOutcome::QuarantinedInPlace {
+            vault_id,
+            effect: InPlaceEffect::Emptied,
+            detail,
+            ..
+        } = &out
+        else {
+            panic!("{out:?}");
+        };
+        assert!(
+            detail.starts_with("emptied in place")
+                && detail.contains("the offender's own file, 3 links, every one emptied"),
+            "{detail}"
+        );
+        for p in &names {
+            assert_eq!(
+                fs::metadata(p).unwrap().len(),
+                0,
+                "{} runs nothing",
+                p.display()
+            );
+        }
+        let (result, _, _) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::Quarantine,
+            primary: out.clone(),
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Success);
+        restore_entry(vault_id, None, &cfg).unwrap();
+        for p in &names {
+            assert_eq!(
+                fs::read(p).unwrap(),
+                b"python-interpreter",
+                "{}",
+                p.display()
+            );
+            assert_eq!(fs::metadata(p).unwrap().mode() & 0o7777, 0o755);
+        }
+    }
+
+    /// Re-check 2 of #543 (R2): the one-command evasion — the offender's
+    /// own payload given a second name it made itself (`ln x .x2`) — no
+    /// longer keeps it runnable: both names emptied, the row a success; the
+    /// restore brings both back, content and mode.
+    #[test]
+    fn r2_a_second_hard_link_to_its_own_payload_no_longer_escapes() {
+        if !not_root() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let x = tmp.path().join("x");
+        let x2 = tmp.path().join(".x2");
+        fs::write(&x, b"payload").unwrap();
+        fs::set_permissions(&x, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::hard_link(&x, &x2).unwrap();
+        let h = ExeHandle::open(&x).unwrap();
+        let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
+        let ExecutionOutcome::QuarantinedInPlace {
+            vault_id,
+            original_path,
+            effect: InPlaceEffect::Emptied,
+            detail,
+        } = &out
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(original_path.as_deref(), Some(x.to_str().unwrap()));
+        assert!(detail.contains("2 links, every one emptied"), "{detail}");
+        for p in [&x, &x2] {
+            assert_eq!(
+                fs::metadata(p).unwrap().len(),
+                0,
+                "{} runs nothing",
+                p.display()
+            );
+        }
+        restore_entry(vault_id, None, &cfg).unwrap();
+        for p in [&x, &x2] {
+            assert_eq!(fs::read(p).unwrap(), b"payload", "{}", p.display());
+            assert_eq!(fs::metadata(p).unwrap().mode() & 0o7777, 0o700);
         }
     }
 
@@ -3347,12 +3529,14 @@ mod bug90 {
                 .filter(|r| r["op"] == "response_quarantine")
                 .collect()
         };
-        // shared: content kept
+        // shared, and not the offender's own (a root offender on a user's
+        // file; re-check 2, R2: the offender's own would be emptied):
+        // content kept
         let a = tmp.path().join("a");
         fs::write(&a, b"shared").unwrap();
         fs::hard_link(&a, tmp.path().join("a2")).unwrap();
         exec.quarantine_handle(
-            &ExeHandle::open(&a).unwrap(),
+            &ExeHandle::open(&a).unwrap().with_offender_uid(Some(0)),
             4242,
             &super::super::journal::test_intent(),
         );
@@ -3480,6 +3664,92 @@ mod bug90 {
         // premise: the refusal was the list's
         assert!(quarantine_file(&h, &cfg).is_ok());
         assert!(!payload.exists());
+    }
+
+    /// Re-check 2 of #543 (R1): `f` run on a thread of its own, its answer
+    /// within five seconds — or the test fails (`fifo` opened for writing
+    /// first, so a reader waiting on it lets the thread end).
+    fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static, fifo: &Path) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo);
+                panic!("still blocked after 5 s");
+            }
+        }
+    }
+
+    /// Re-check 2 of #543 (R1): a shell list that is a FIFO, `/dev/zero`
+    /// through a link, or a file over the bound is an error at once —
+    /// never a wait on a writer, never a read without end; a list of
+    /// exactly the bound is read.
+    #[test]
+    fn r1_a_shell_list_that_could_stall_is_an_error_at_once() {
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path; mkfifo(3) reads it only.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "premise");
+        let zero = tmp.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        let big = tmp.path().join("big");
+        fs::write(&big, vec![b'#'; MAX_SHELLS_BYTES as usize + 1]).unwrap();
+        let exact = tmp.path().join("exact");
+        let mut bytes = b"/bin/sh\n".to_vec();
+        bytes.resize(MAX_SHELLS_BYTES as usize, b'#');
+        fs::write(&exact, &bytes).unwrap();
+        for (list, says) in [
+            (fifo.clone(), "a FIFO, not a regular file"),
+            (zero, "a character device, not a regular file"),
+            (big, "bytes or more, over the"),
+        ] {
+            let l = list.clone();
+            let got = within_5s(move || listed_shells(&l).map_err(|e| e.to_string()), &fifo);
+            match got {
+                Err(why) => assert!(why.contains(says), "{}: {why}", list.display()),
+                Ok(v) => panic!("{}: {v:?}", list.display()),
+            }
+        }
+        assert_eq!(listed_shells(&exact).unwrap(), [PathBuf::from("/bin/sh")]);
+    }
+
+    /// Re-check 2 of #543 (R1): with the shell list a FIFO, the quarantine
+    /// — inside NEUTRALIZE — answers at once: refused, nothing changed or
+    /// vaulted, so the ladder goes on (on the branch before, it waited for
+    /// a writer that never came).
+    #[test]
+    fn r1_a_fifo_shell_list_refuses_the_quarantine_at_once() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let fifo = tmp.path().join("shells");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path; mkfifo(3) reads it only.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "premise");
+        let payload = tmp.path().join("payload.bin");
+        fs::write(&payload, b"the offender's own payload").unwrap();
+        let (f, c2) = (fifo.clone(), cfg.clone());
+        let p = payload.clone();
+        let out = within_5s(
+            move || {
+                SHELLS_AT.with(|s| *s.borrow_mut() = Some(f));
+                let h = ExeHandle::open(&p).unwrap();
+                quarantine_handle(&h, 4242, &c2, &super::super::journal::test_intent())
+            },
+            &fifo,
+        );
+        let ExecutionOutcome::QuarantineRefused { detail, .. } = &out else {
+            panic!("{out:?}");
+        };
+        assert!(detail.contains("a FIFO, not a regular file"), "{detail}");
+        assert_eq!(fs::read(&payload).unwrap(), b"the offender's own payload");
+        assert!(list_vault(&cfg).is_empty(), "nothing vaulted");
     }
 
     /// Re-check of #543 (N1): a shell the list names — here only there, by
@@ -3675,7 +3945,7 @@ mod bug90 {
         let h = ExeHandle::open(Path::new(sys)).unwrap();
         let m = fs::metadata(sys).unwrap();
         let before = m.mode();
-        let (detail, effect) = neutralize_in_place(&h, &Identity::of(&h, &m), true);
+        let (detail, effect) = neutralize_in_place(&h, &Identity::of(&h, &m), true, false);
         // the messages leave the detail out: it names the owner's uid
         assert_eq!(
             effect,
