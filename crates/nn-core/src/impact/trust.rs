@@ -186,6 +186,28 @@ pub fn is_user_manager(hops: &[(u32, ExecIdentity)], n: usize) -> bool {
         && hops.get(n + 1).is_none_or(|(parent, _)| *parent == 1)
 }
 
+/// Lot 310, the review of #539 (finding 7, the coordinator's refinement once
+/// the lab measured a new Critical record): hop `n` of `hops` is a shell (or
+/// interpreter) a package installed running an inline program that PID 1
+/// started — a unit's `ExecStart=/bin/sh -c '…'` from a unit file only root
+/// writes, or root's `systemd-run`: it inherits PID 1's vouching. A user's
+/// manager (`systemd --user`), cron (its jobs carry no owner in this
+/// judgement: a user's crontab and the system's alike) and sshd's `bash -c`
+/// do not.
+pub fn started_by_pid1(
+    hops: &[(u32, ExecIdentity)],
+    n: usize,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> bool {
+    let Some((_, id)) = hops.get(n) else {
+        return false;
+    };
+    id.runs == Runs::Code
+        && is_interpreter(&id.exe)
+        && owned_file(&id.exe, owned)
+        && hops.get(n + 1).is_some_and(|(parent, _)| *parent == 1)
+}
+
 /// Why a hop that is not trusted is not: what it runs is not known, it runs
 /// the caller's inline program (lot 310), or no package installed it.
 fn not_installed(id: &ExecIdentity) -> &'static str {
@@ -221,7 +243,9 @@ pub fn judge(
     // below ([`packaged`]); every ancestor above them must vouch for it.
     let own = topmost_same(hops, 0);
     if let Some(i) = hops.iter().enumerate().position(|(n, (_, id))| {
-        is_foreign(id) || (n > own && (!vouches(id, owned) || is_user_manager(hops, n)))
+        let by_pid1 = n > own && started_by_pid1(hops, n, owned);
+        (is_foreign(id) && !by_pid1)
+            || (n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, n)))
     }) {
         // lot 310: a user's service manager is not what to kill (its whole
         // session's services with it): the unit's process it started is.
@@ -734,6 +758,77 @@ mod tests {
             judge(500, Some(&l), false, &distro),
             Judged::Trusted(_)
         ));
+    }
+
+    /// Lot 310, the review of #539 (the refinement the lab's measure called
+    /// for): a unit's `ExecStart=/bin/sh -c 'tar …'` — the inline shell PID 1
+    /// started — vouches as PID 1 does; the same shell under a user's
+    /// manager, under cron or sshd, or a shell no package installed, does
+    /// not; the shell as the writer is judged.
+    #[test]
+    fn an_inline_shell_pid_1_started_inherits_its_vouching() {
+        let sh = || {
+            ExecIdentity::of_exec(
+                "/usr/bin/dash",
+                &["sh".to_string(), "-c".into(), "tar czf x y".into()],
+            )
+        };
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [(400, id("/usr/bin/tar", None)), (300, sh()), (1, systemd())];
+        assert_eq!(
+            judge(400, Some(&l), false, &distro),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
+        );
+        assert!(started_by_pid1(&l, 1, &distro));
+        // the shell's own writes: judged
+        assert!(matches!(
+            judge(300, Some(&l[1..]), false, &distro),
+            Judged::Untrusted { actor: 300, .. }
+        ));
+        for l in [
+            // a user's manager
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (1200, systemd()),
+                (1, systemd()),
+            ],
+            // cron (a user's crontab or the system's: no owner here)
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (250, id("/usr/sbin/cron", None)),
+                (200, id("/usr/sbin/cron", None)),
+                (1, systemd()),
+            ],
+            // sshd's bash -c
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (250, id("/usr/sbin/sshd", None)),
+                (1, systemd()),
+            ],
+            // a shell no package installed
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (
+                    300,
+                    ExecIdentity::of_exec(
+                        "/opt/x/sh",
+                        &["sh".to_string(), "-c".into(), "x".into()],
+                    ),
+                ),
+                (1, systemd()),
+            ],
+        ] {
+            assert!(
+                matches!(
+                    judge(400, Some(&l), false, &distro),
+                    Judged::Untrusted { actor: 300, .. }
+                ),
+                "{l:?}"
+            );
+        }
     }
 
     /// Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running

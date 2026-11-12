@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
-use crate::impact::trust::{is_user_manager, topmost_same, vouches, ProgramOwners};
+use crate::impact::trust::{
+    is_user_manager, started_by_pid1, topmost_same, vouches, ProgramOwners,
+};
 use crate::posture::lineage::{
     in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
 };
@@ -185,7 +187,9 @@ pub fn judge(
         .enumerate()
         .skip(1)
         .find(|(n, (_, id))| {
-            is_foreign(id) || (*n > own && (!vouches(id, owned) || is_user_manager(hops, *n)))
+            let by_pid1 = *n > own && started_by_pid1(hops, *n, owned);
+            (is_foreign(id) && !by_pid1)
+                || (*n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, *n)))
         })
         .map(|(_, hop)| hop)
     {
@@ -696,6 +700,27 @@ mod tests {
         );
         let l = [(300, id("/usr/bin/vim.basic", None)), (1, systemd())];
         assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+        // a unit's `sh -c` PID 1 started inherits its vouching; the same
+        // shell under the user's manager does not
+        let sh = || {
+            ExecIdentity::of_exec(
+                "/usr/bin/dash",
+                &["sh".to_string(), "-c".into(), "vim x".into()],
+            )
+        };
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (250, sh()),
+            (1, systemd()),
+        ];
+        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (250, sh()),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
     }
 
     /// BUG-49: an editor started by a binary no package installed, in
