@@ -93,6 +93,13 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// opened (the final check of #495, C1).
     fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)>;
 
+    /// Lot 310: the directory `path` names (followed) is root's and
+    /// writable by no one else — no user can unlink a file in it. `false`
+    /// when it cannot be read; the portable hosts know no owners.
+    fn dir_is_root_only<P: AsRef<Path>>(_path: P) -> bool {
+        false
+    }
+
     /// The time the host has spent suspended so far, ns: the boot clock
     /// less the monotonic clock (`CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`).
     fn suspended_ns() -> u64;

@@ -692,3 +692,184 @@ pub fn matching_brace(s: &str) -> usize {
     }
     s.len()
 }
+
+// ── lot 310 (the review of #539): every product crate's sources, and the
+// string literals of a text ──
+
+/// The product's source trees: `<dir>/src` of every top-level package and
+/// of every `crates/*` one — not xtask (the build's tooling) nor fuzz.
+pub fn product_trees(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |rel: String| {
+        if root.join(&rel).is_dir() {
+            out.push(rel);
+        }
+    };
+    if let Ok(top) = std::fs::read_dir(root) {
+        for e in top.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if matches!(name.as_str(), "xtask" | "fuzz" | "target") || name.starts_with('.') {
+                continue;
+            }
+            add(format!("{name}/src"));
+        }
+    }
+    if let Ok(crates) = std::fs::read_dir(root.join("crates")) {
+        for e in crates.flatten() {
+            add(format!("crates/{}/src", e.file_name().to_string_lossy()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A file only tests build: named `tests.rs` or `*_tests.rs` **and**
+/// declared under `#[cfg(test)]` by its parent module (a production file of
+/// that name is scanned).
+pub fn test_only_file(root: &Path, rel: &str) -> bool {
+    if !is_test_file(rel) {
+        return false;
+    }
+    let path = root.join(rel);
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return false;
+    };
+    let stem = stem.to_string_lossy();
+    let parent_name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut parents = vec![dir.join("mod.rs"), dir.join("lib.rs"), dir.join("main.rs")];
+    if let (Some(up), Some(n)) = (dir.parent(), parent_name) {
+        parents.push(up.join(format!("{n}.rs")));
+    }
+    parents.iter().any(|p| {
+        let Ok(text) = std::fs::read_to_string(p) else {
+            return false;
+        };
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        lines.windows(2).any(|w| {
+            w[0].starts_with("#[cfg(test)]")
+                && (w[1] == format!("mod {stem};") || w[1] == format!("pub(crate) mod {stem};"))
+        }) || lines
+            .iter()
+            .any(|l| l.starts_with("#[cfg(test)]") && (l.ends_with(&format!("mod {stem};"))))
+    })
+}
+
+/// The production code of every product tree ([`product_trees`]), comments
+/// and test items blanked, by repository-relative path.
+pub fn product_code(root: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for t in product_trees(root) {
+        let mut files = Vec::new();
+        rs_files(&root.join(&t), &mut files);
+        for f in files {
+            let rel = f
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if test_only_file(root, &rel) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            out.insert(rel, production(&strip_comments(&text)));
+        }
+    }
+    out
+}
+
+/// Lot 310 (re-check 3): the strings `concat!` builds in `text` — its
+/// literal arguments joined (`concat!("/pr", "oc/")` is `/proc/`): a ratchet
+/// that reads literals reads these too.
+pub fn concat_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("concat!(") {
+        let start = from + at + "concat!(".len();
+        let mut depth = 1usize;
+        let mut end = start;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start {
+            out.push(string_literals(&text[start..end]).concat());
+        }
+        from = start;
+    }
+    out
+}
+
+/// The contents of `text`'s string literals (`"…"`, escapes kept as
+/// written; raw strings `r"…"`, `r#"…"#`), in order. Char literals are
+/// skipped.
+pub fn string_literals(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                // a char literal ('x', '\n', '\'') or a lifetime
+                if i + 2 < b.len() && b[i + 1] == b'\\' {
+                    i += 1;
+                    while i < b.len() && b[i] != b'\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i + 2 < b.len() && b[i + 2] == b'\'' {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            b'r' if i + 1 < b.len()
+                && (b[i + 1] == b'"' || b[i + 1] == b'#')
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+            {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < b.len() && b[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j >= b.len() || b[j] != b'"' {
+                    i += 1;
+                    continue;
+                }
+                let start = j + 1;
+                let close: Vec<u8> = std::iter::once(b'"')
+                    .chain(std::iter::repeat_n(b'#', hashes))
+                    .collect();
+                let mut k = start;
+                while k + close.len() <= b.len() && b[k..k + close.len()] != close[..] {
+                    k += 1;
+                }
+                out.push(String::from_utf8_lossy(&b[start..k.min(b.len())]).into_owned());
+                i = k + close.len();
+            }
+            b'"' => {
+                let start = i + 1;
+                let mut k = start;
+                while k < b.len() && b[k] != b'"' {
+                    if b[k] == b'\\' {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                out.push(String::from_utf8_lossy(&b[start..k.min(b.len())]).into_owned());
+                i = k + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}

@@ -273,8 +273,10 @@ async fn run(
         key: &signing_key,
     };
     // R14a: how this core starts its workers, which R004 knows (read before
-    // the image goes to the workers' start)
-    let own_launch = workers::own_launch(&image);
+    // the image goes to the workers' start); lot 310: and systemd's
+    // executor, by its identities
+    let launches = workers::known_launches(workers::own_launch(&image));
+    tasks::spawn_executor_refresh(launches.executor.clone());
     // Lot 276: the export's signed configuration — off without it; on, its
     // worker starts with the others
     let export_loaded = northnarrow_agent::export::load(&overlay_gate);
@@ -365,7 +367,7 @@ async fn run(
         &audit_log,
         &dns_cache,
         &lineage,
-        own_launch,
+        launches,
     );
     // Lot 273c (the review of #490): the reloads the agent asks systemd for
     // (a refused set-property's copy, a window's opening, a quarantined

@@ -146,14 +146,25 @@ writer is **trusted** (not copied) when:
   and its own forked copies is a program a package installed — the host's
   package database, asked as the ransomware signal asks it
   (`impact::trust::vouches`; with no database, a root-owned system tree
-  stands in) — or an interpreter a package installed running no named script
-  (an interactive shell, `sh -c`). Lot 292 (BUG-49): a binary in `/opt` or
+  stands in) — or an interpreter a package installed running no program at
+  all (an interactive shell). Lot 292 (BUG-49): a binary in `/opt` or
   `/usr/local` that no package installed vouches for nothing; before, the
-  ancestors were judged by tree alone.
+  ancestors were judged by tree alone. Lot 310 (BUG-49, the decision of
+  11/11/2026): nor does a shell running an inline program (`sh -c`) or its
+  standard input — the ransomware signal's own test
+  (`impact::trust::is_foreign`), which this guard's twin of it gave way to;
+  an editor `sh -c` starts is copied for — nor a user's service manager
+  (`systemd --user`: `impact::trust::is_user_manager`, the review of #539),
+  for any unit (the desktop's editors are copied for: lot 326 will tell a
+  packaged unit by the kernel's record); an
+  installed shell PID 1 forked (a unit's `ExecStart=/bin/sh -c …`; the
+  kernel's record at `sched_process_fork`, never the parent at exec time)
+  vouches as PID 1 does (`impact::trust::started_by_pid1`).
 
 What an interpreter runs is read with its own option table (lot 292, BUG-44
-and BUG-42: `posture/script_args.rs`): `python3 -O x.py /usr/bin/vim` runs
-`x.py` and is no editor, `bash -e x.sh` runs `x.sh` and vouches for nothing;
+and BUG-42; lot 310's one reader: `posture/script_args.rs`): `python3 -O x.py
+/usr/bin/vim` runs `x.py` and is no editor, `bash -e x.sh` and `bash
+-noprofile x.sh` run `x.sh` and vouch for nothing;
 an option the table does not hold leaves what it runs not known — no trusted
 writer, and no ancestor that vouches.
 

@@ -437,6 +437,8 @@ pub mod own_dropins;
 pub mod sysctl_cgroup;
 /// Lot 273d: the global sysctls that abort or starve the agent.
 pub mod sysctl_guard;
+/// Lot 310: the identities of systemd's packaged executor, for R004.
+pub mod systemd_executor;
 pub mod systemd_reload;
 /// Lot 273d: the client lives in `antitamper_bpf::systemd_bus`, shared
 /// with the watchdog.

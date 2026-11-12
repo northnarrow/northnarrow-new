@@ -49,7 +49,7 @@ pub(crate) fn load(
     audit_log: &AuditHandle,
     dns_cache: &Arc<DnsCache>,
     lineage: &AuthSessionTracker,
-    own_launch: Option<nn_core::decision::rules::OwnWorkerLaunch>,
+    launches: nn_core::decision::rules::KnownLaunches,
 ) -> Policy {
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
@@ -424,8 +424,9 @@ pub(crate) fn load(
         net_rule_config,
         Arc::clone(&ransom_tracker),
         Arc::clone(&defense_detector),
-        // R14a: R004 knows the core's own worker launch
-        own_launch,
+        // R14a: R004 knows the core's own worker launch; lot 310: and
+        // systemd's executor, by its identities
+        launches,
     )
     .with_policy(rule_policy.clone());
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904

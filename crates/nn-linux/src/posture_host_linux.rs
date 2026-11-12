@@ -73,6 +73,11 @@ impl PostureHost for LinuxHost {
         Some((meta.dev(), meta.ino()))
     }
 
+    fn dir_is_root_only<P: AsRef<Path>>(path: P) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+    }
+
     fn suspended_ns() -> u64 {
         let now = |clock| {
             let mut ts = libc::timespec {
@@ -265,6 +270,71 @@ mod tests {
     /// image (a loaded host, the parallel harness): far longer than it ever
     /// does, bounded so a wrong `exe` still fails the test.
     const EXEC_DONE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Lot 310 (the review of #539, finding 5): the start's scan keeps the
+    /// image of a process older than the agent, by its identity (the device
+    /// in the kernel's form), when its directory is root's only — a system
+    /// `sleep` — and not a copy in a user's directory; a directory test
+    /// that is root's only.
+    #[test]
+    fn the_start_s_scan_keeps_an_image_no_user_could_unlink() {
+        use nn_core::posture::lineage::{AsOf, AuthSessionTracker};
+        use std::os::unix::fs::MetadataExt;
+        assert!(LinuxHost::dir_is_root_only("/usr/bin"));
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!LinuxHost::dir_is_root_only(tmp.path()));
+        let copy = tmp.path().join("sleep");
+        fs::copy("/bin/sleep", &copy).unwrap();
+        let spawn = |exe: &Path| {
+            (0..200)
+                .find_map(
+                    |_| match std::process::Command::new(exe).arg("30").spawn() {
+                        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            None
+                        }
+                        other => Some(other.unwrap()),
+                    },
+                )
+                .expect("sleep runs")
+        };
+        let system = std::fs::canonicalize("/bin/sleep").unwrap();
+        let mut sys = spawn(&system);
+        let mut own = spawn(&copy);
+        let root = Path::new(LinuxHost::PROC_ROOT);
+        exec_done(
+            &root.join(sys.id().to_string()).join("exe"),
+            LinuxHost::file_id(&system),
+            EXEC_DONE_WITHIN,
+        );
+        exec_done(
+            &root.join(own.id().to_string()).join("exe"),
+            LinuxHost::file_id(&copy),
+            EXEC_DONE_WITHIN,
+        );
+        let t = AuthSessionTracker::<LinuxHost>::new(root);
+        assert!(t.seed_from_proc() > 0);
+        let m = fs::metadata(&system).unwrap();
+        let want = (common::wire::exe::kernel_dev(m.dev()), m.ino());
+        let (sys_image, own_image) = (
+            t.exec_image(sys.id(), AsOf::Now),
+            t.exec_image(own.id(), AsOf::Now),
+        );
+        sys.kill().unwrap();
+        own.kill().unwrap();
+        let _ = (sys.wait(), own.wait());
+        // the re-check of #539 (N6): only in PID 1's mount namespace — which
+        // a user's test cannot read (`/proc/1/ns/mnt`): not known, so none
+        let init_ns = fs::read_link("/proc/1/ns/mnt").ok();
+        let in_init = init_ns.is_some()
+            && init_ns == fs::read_link(format!("/proc/{}/ns/mnt", std::process::id())).ok();
+        assert_eq!(
+            sys_image,
+            in_init.then_some(want),
+            "init namespace: {in_init}"
+        );
+        assert_eq!(own_image, None);
+    }
 
     /// Lot 288: [`exec_done`] waits for the exec only — a link that never
     /// opens the file wanted is returned as it is, after the bound.

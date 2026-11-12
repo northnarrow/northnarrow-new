@@ -47,6 +47,32 @@ pub mod exe_flags {
     pub const DEEP: u32 = 1 << 5;
     /// No root within `EXE_WALK_DEPTH` levels: the path is unknown.
     pub const UNRESOLVED: u32 = 1 << 6;
+
+    // Lot 310 (the review of #539): what the agent's exec pump adds in
+    // userland, never the kernel programs (bits 16 and up).
+
+    /// The identity (`dev`, `ino`, [`DELETED`], [`MEMFD`]) was read by the
+    /// exec pump from `/proc/<pid>/exe` (tracepoint mode: no LSM identity).
+    pub const PROC_EXE: u32 = 1 << 16;
+    /// The executed file's directory is root's and writable by no one else:
+    /// no user could have unlinked the image.
+    pub const ROOT_DIR: u32 = 1 << 17;
+    /// An interpreter whose environment loads the caller's code before the
+    /// program it names (`PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`,
+    /// `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV`, `ENV`).
+    pub const ENV_LOADS: u32 = 1 << 18;
+    /// An interpreter naming no program whose standard input is no
+    /// terminal (`bash < file`, `curl … | sh`): its program is its input.
+    pub const STDIN_PROGRAM: u32 = 1 << 19;
+}
+
+/// Lot 310: a device number as `stat(2)` reports it, in the kernel's
+/// internal form (`MKDEV`: `major << 20 | minor`) the LSM programs read
+/// from `s_dev` — glibc's `major()`/`minor()` decoding.
+pub const fn kernel_dev(st_dev: u64) -> u64 {
+    let major = ((st_dev >> 8) & 0xfff) | ((st_dev >> 32) & !0xfff);
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & !0xff);
+    (major << 20) | minor
 }
 
 /// Lot 322: the key of a task's own entry in the exec guards' per-task
@@ -161,6 +187,23 @@ pub fn relative_path(raw: &ExeIdentityRaw) -> String {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+
+    /// Lot 310: stat's encoding back to the kernel's: `/dev/sda2` (8:2) is
+    /// `0x802` in `st_dev`, `0x800002` in `s_dev`; a device-mapper root
+    /// (253:1) `64769` and `265289729`; a minor past 255 too.
+    #[test]
+    fn kernel_dev_is_mkdev_of_stat_s_encoding() {
+        assert_eq!(super::kernel_dev(0x802), 0x80_0002);
+        assert_eq!(super::kernel_dev(64769), 265_289_729);
+        // major 8, minor 257: new_encode_dev = 0x01 | 8 << 8 | 0x100 << 12
+        assert_eq!(
+            super::kernel_dev(0x1 | (8 << 8) | (0x100 << 12)),
+            (8 << 20) | 257
+        );
+        assert_eq!(super::kernel_dev(0), 0);
+        // an anonymous device (overlay, tmpfs: major 0)
+        assert_eq!(super::kernel_dev(0x2d), 0x2d);
+    }
     use super::*;
 
     /// Lot 322: the per-task key is 16 bytes with no implicit padding (it

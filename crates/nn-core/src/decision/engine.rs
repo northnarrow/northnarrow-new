@@ -141,7 +141,8 @@ impl<H: DecisionHost> RuleEngine<H> {
         ransom: Arc<crate::impact::RansomTracker<H>>,
         defense: Arc<crate::impair::DefenseDetector<H>>,
         // R14a: how the agent starts its own workers.
-        own_launch: Option<super::rules::OwnWorkerLaunch>,
+        // lot 310: and systemd's executor, by its identities
+        launches: super::rules::KnownLaunches,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -159,7 +160,7 @@ impl<H: DecisionHost> RuleEngine<H> {
             net_config,
             ransom,
             defense,
-            own_launch,
+            launches,
         ) {
             e.add_rule(r);
         }

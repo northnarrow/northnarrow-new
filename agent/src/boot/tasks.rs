@@ -263,6 +263,33 @@ pub(crate) fn spawn_shutdown_exe_refresh() {
     });
 }
 
+/// Lot 310 (BUG-103): the packaged `systemd-executor`'s identities read
+/// again every 10 s — its files at the install paths and the copies the
+/// managers hold open — in place of the ones before (the review of #539,
+/// finding 3: an identity no one holds any more is gone).
+pub(crate) fn spawn_executor_refresh(images: nn_core::decision::rules::ExecutorImages) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.tick().await; // seeded at the start
+        loop {
+            tick.tick().await;
+            let images = images.clone();
+            let changed = tokio::task::spawn_blocking(move || {
+                nn_linux::systemd_executor::refresh(&images).then(|| images.len())
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(n) = changed {
+                info!(
+                    identities = n,
+                    "R004: systemd-executor's identities changed (an upgrade, a re-exec)"
+                );
+            }
+        }
+    });
+}
+
 /// The signed audit log, as the watchdog refresh gets it once it is open.
 pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 

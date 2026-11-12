@@ -80,14 +80,35 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
-        observes: "A fileless exec: with the exec sensor's identity, a memfd, or an unlinked \
-                   file reached through a descriptor; without it (tracepoint mode), an exec \
-                   path of the form `/proc/self/fd/N`, `/proc/<pid>/fd/N`, `/dev/fd/N` or \
-                   `/memfd:`.",
-        false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is \
-                          exempt on what the kernel executed and on a systemd parent. Another \
-                          program that re-executes itself from a memfd (older runc versions \
-                          do, to protect their binary) is killed: nothing else is exempt.",
+        observes: "A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file \
+                   opened then deleted), whatever path reached it (lot 310: \
+                   `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`, a \
+                   relative path, a symlink, `/proc/<pid>/exe` alike), judged on the executed \
+                   file's identity: the exec sensor's in LSM mode; in tracepoint mode the \
+                   exec pump's read of `/proc/<pid>/exe` while the process lives, else its \
+                   path, read by the posture's one reader of a `/proc` link \
+                   (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, \
+                   `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`.",
+        false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is a \
+                          linked file, not fileless; after a systemd upgrade PID 1 launches \
+                          from the old, unlinked executor until its re-exec, exempt by that \
+                          file's identity: a copy the host's PID 1 holds by that identity \
+                          alone (an inode no user can reach); the packaged file at its \
+                          install path or a copy a genuine user manager holds (its image the \
+                          packaged manager's, in PID 1's mount namespace) for the first exec \
+                          of a process PID 1 or such a manager forked (the kernel's record \
+                          at sched_process_fork, never the parent at exec time) — re-read \
+                          every 10 s and replaced, never by its name or `argv[0]`. A \
+                          process re-executing the very image its parent runs \
+                          (`/proc/self/exe` after an upgrade unlinked it: Chromium's \
+                          children, Docker's `reexec`) is not fileless when that image was \
+                          executed from a directory only root can write, in PID 1's mount \
+                          namespace (parents running at the agent's start included); a \
+                          user's dropped binary that unlinks and re-executes itself is \
+                          killed. Another program that re-executes itself from a memfd \
+                          (older runc versions do, to protect their binary), or that execs a \
+                          file at the instant an upgrade unlinks it, is killed: nothing else \
+                          is exempt.",
         how_to_test: "`python3 -c 'import os; fd = os.memfd_create(\"x\"); \
                       os.write(fd, open(\"/bin/true\", \"rb\").read()); \
                       os.execv(\"/proc/self/fd/%d\" % fd, [\"x\"])'`.",
@@ -95,6 +116,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd",
             "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
              fires_on_a_memfd_whatever_path_reached_it",
+            "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
+             bug88_other_spellings_the_report_fix_still_misses",
+            "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
+             a_dropped_binary_that_unlinks_and_reexecutes_itself_is_killed",
+            "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
+             the_executor_is_a_child_s_first_exec",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              process_memfd_fileless_exec_trips_r004",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd",

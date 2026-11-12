@@ -464,7 +464,7 @@ fn production_engine(lineage: crate::posture::lineage::AuthSessionTracker<H>) ->
             lineage,
             None,
         )),
-        None,
+        Default::default(),
     )
 }
 

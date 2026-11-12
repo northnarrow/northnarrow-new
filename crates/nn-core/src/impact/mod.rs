@@ -330,6 +330,10 @@ impl<H: DecisionHost> RansomTracker<H> {
         // R-F: the lineage as of the burst's own time
         let as_of = crate::posture::lineage::AsOf::judged(ts);
         let lineage = self.lineage.lineage_identities(pid, as_of);
+        // lot 310: the kernel's fork parents
+        let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
+            trust::hop_facts(&self.lineage, pid, as_of, hops)
+        });
         let package_tx = self.lineage.in_package_transaction(pid, as_of);
         let owned = |p: &std::path::Path| self.owners.owned(p);
         let mut a = Assessment {
@@ -344,7 +348,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             rename_burst: false,
             why: String::new(),
         };
-        match trust::judge(pid, lineage.as_deref(), package_tx, &owned) {
+        match trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned) {
             Judged::Trusted(t) => {
                 self.counters.trusted.fetch_add(1, Ordering::Relaxed);
                 a.trusted = Some(t.describe());

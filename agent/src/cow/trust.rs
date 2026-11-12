@@ -17,8 +17,11 @@
 //!   ([`crate::impact::trust::vouches`], lot 292, BUG-49): a program a
 //!   package installed (the host's package database, as the ransomware
 //!   signal asks it; without one, a root-owned system tree stands in), or an
-//!   interpreter a package installed running no named script (an
-//!   interactive shell, `sh -c`). An editor started by a script from a home
+//!   interpreter a package installed running no program at all (an
+//!   interactive shell). Lot 310 (BUG-49): one running an inline program
+//!   (`sh -c`) or its standard input vouches for nothing — the ransomware
+//!   signal's one test ([`crate::impact::trust::is_foreign`]), the twin this
+//!   file kept until then. An editor started by a script from a home
 //!   directory, by a binary from `/tmp`, `/opt` or `/usr/local` that no
 //!   package installed, by an interpreter whose options could not be read
 //!   (lot 292, BUG-44) or by a deleted executable is not trusted: what
@@ -36,9 +39,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
-use crate::impact::trust::{topmost_same, vouches, ProgramOwners};
+use crate::impact::trust::{
+    is_user_manager, started_by_pid1, topmost_same, vouches, HopFacts, ProgramOwners,
+};
 use crate::posture::lineage::{
-    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity, Runs,
+    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
 };
 
 /// Editors and the version-control client: programs a person runs to
@@ -146,16 +151,11 @@ pub fn program_of(id: &ExecIdentity) -> String {
     id.program()
 }
 
-/// A hop that vouches for nothing below it: neither a program root
-/// installed nor an installed interpreter running no named script. Lot
-/// 292 (BUG-44): an interpreter whose options could not be read is one.
-pub fn is_foreign(id: &ExecIdentity) -> bool {
-    if id.is_installed_program() {
-        return false;
-    }
-    let exe = id.exe.to_string_lossy();
-    !(id.runs == Runs::Inline && is_interpreter(&id.exe) && in_system_tree(&exe))
-}
+/// A hop that vouches for nothing below it: the ransomware signal's test
+/// ([`crate::impact::trust::is_foreign`]; lot 310: this file's twin of it
+/// is gone). Lot 292 (BUG-44): an interpreter whose options could not be
+/// read is one; lot 310 (BUG-49): so is one running an inline program.
+pub use crate::impact::trust::is_foreign;
 
 /// The pure decision. `lineage`: the writer's identity at index 0, then its
 /// ancestors nearest first (`None`: unknown). `writers`: the trusted-writer
@@ -164,6 +164,18 @@ pub fn is_foreign(id: &ExecIdentity) -> bool {
 /// database to ask).
 pub fn judge(
     lineage: Option<&[(u32, ExecIdentity)]>,
+    writers: &[&str],
+    package_tx: bool,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> Trust {
+    judge_with(lineage, &[], writers, package_tx, owned)
+}
+
+/// [`judge`] with each hop's facts (lot 310: the kernel's fork parents —
+/// `crate::impact::trust::HopFacts`; a hop without any knows nothing).
+pub fn judge_with(
+    lineage: Option<&[(u32, ExecIdentity)]>,
+    facts: &[HopFacts],
     writers: &[&str],
     package_tx: bool,
     owned: &dyn Fn(&Path) -> Option<bool>,
@@ -188,7 +200,11 @@ pub fn judge(
         .iter()
         .enumerate()
         .skip(1)
-        .find(|(n, (_, id))| is_foreign(id) || (*n > own && !vouches(id, owned)))
+        .find(|(n, (_, id))| {
+            let by_pid1 = *n > own && started_by_pid1(hops, facts, *n, owned);
+            (is_foreign(id) && !by_pid1)
+                || (*n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, *n)))
+        })
         .map(|(_, hop)| hop)
     {
         return Trust::Untrusted(Untrusted::ForeignAncestor {
@@ -283,8 +299,13 @@ impl TrustFilter {
         let lineage = self.tracker.lineage_identities(tgid, AsOf::Now);
         let writers: Vec<&str> = self.writers.iter().map(String::as_str).collect();
         let owned = |p: &Path| self.owners.owned(p);
-        let trust = judge(
+        // lot 310: the kernel's fork parents
+        let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
+            crate::impact::trust::hop_facts(&self.tracker, tgid, AsOf::Now, hops)
+        });
+        let trust = judge_with(
             lineage.as_deref(),
+            &facts,
             &writers,
             self.tracker.in_package_transaction(tgid, AsOf::Now),
             &owned,
@@ -346,6 +367,7 @@ pub fn parse_stat_start(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::posture::lineage::Runs;
 
     fn id(exe: &str, script: Option<&str>) -> ExecIdentity {
         ExecIdentity {
@@ -378,7 +400,9 @@ mod tests {
             judge(Some(&l), &writers(), false, &distro),
             Trust::Trusted(Trusted::Writer("/usr/bin/vim.basic".into()))
         );
-        // through sudo and `sh -c`
+        // through sudo and a shell running no program (`sudo -s`); lot 310:
+        // `sh -c` vouches for nothing
+        // (`an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor`)
         let l = [
             (300, id("/usr/bin/git", None)),
             (250, id("/usr/bin/dash", None)),
@@ -609,16 +633,183 @@ mod tests {
                 "{argv:?}"
             );
         }
-        // `sh -c` and an interactive shell still vouch
+        // an interactive shell still vouches (lot 310: `sh -ec 'vim x'` no
+        // longer does, the decision of 11/11/2026 on BUG-49:
+        // `an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor`)
         let l = [
             (300, id("/usr/bin/vim.basic", None)),
             (
                 250,
-                ExecIdentity::of_exec("/usr/bin/dash", &args(&["sh", "-ec", "vim x"])),
+                ExecIdentity::of_exec("/usr/bin/bash", &args(&["-bash"])),
             ),
-            (200, id("/usr/bin/bash", None)),
+            (200, id("/usr/sbin/sshd", None)),
         ];
         assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+    }
+
+    /// Lot 310, the twin of the ransomware signal's tests: an editor
+    /// started by an inline shell (BUG-49, the decision of 11/11/2026), or
+    /// by a bash whose one-hyphen long option was read as letters (BUG-97:
+    /// `-noprofile`'s two `o` took two arguments and the identity became
+    /// `/usr/bin/aws`, an installed program that vouched), or by `zsh -ovi`
+    /// (BUG-100) or `node --eval=` (BUG-99), is started by a foreign
+    /// program: its writes are copied.
+    #[test]
+    fn an_inline_shell_or_a_misread_bash_does_not_vouch_for_an_editor() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (exe, argv, ancestor) in [
+            (
+                "/usr/bin/dash",
+                &["sh", "-ec", "vim x"][..],
+                "/usr/bin/dash",
+            ),
+            ("/usr/bin/bash", &["bash", "-s"], "/usr/bin/bash"),
+            (
+                "/usr/bin/bash",
+                &["bash", "-noprofile", "/tmp/steal.sh", "x", "/usr/bin/aws"],
+                "/tmp/steal.sh",
+            ),
+            (
+                "/usr/bin/bash",
+                &["bash", "-rcfile", "/etc/x", "/tmp/steal.sh"],
+                "/tmp/steal.sh",
+            ),
+            (
+                "/usr/bin/zsh",
+                &["zsh", "-ovi", "/tmp/steal.zsh", "/usr/bin/aws"],
+                "/tmp/steal.zsh",
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--eval=x()", "/usr/bin/aws"],
+                "/usr/bin/node",
+            ),
+            (
+                "/usr/bin/node",
+                &["node", "--run", "build", "/usr/bin/aws"],
+                "/usr/bin/node",
+            ),
+        ] {
+            let l = [
+                (300, id("/usr/bin/vim.basic", None)),
+                (250, ExecIdentity::of_exec(exe, &args(argv))),
+                (200, id("/usr/sbin/sshd", None)),
+            ];
+            assert_eq!(
+                judge(Some(&l), &writers(), false, &distro),
+                Trust::Untrusted(Untrusted::ForeignAncestor {
+                    writer: "/usr/bin/vim.basic".into(),
+                    ancestor: ancestor.into(),
+                }),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// Lot 310, the review of #539 (finding 7): an editor a user's service
+    /// manager started (`systemd-run --user vim x`: a lineage of installed
+    /// programs end to end) is started by a foreign program; one of PID 1's
+    /// units is not.
+    #[test]
+    fn a_user_s_service_manager_does_not_vouch_for_an_editor() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert_eq!(
+            judge(Some(&l), &writers(), false, &distro),
+            Trust::Untrusted(Untrusted::ForeignAncestor {
+                writer: "/usr/bin/vim.basic".into(),
+                ancestor: "/usr/lib/systemd/systemd".into(),
+            }),
+        );
+        let l = [(300, id("/usr/bin/vim.basic", None)), (1, systemd())];
+        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+        // a unit's `sh -c` PID 1 started inherits its vouching; the same
+        // shell under the user's manager does not
+        let sh = || {
+            ExecIdentity::of_exec(
+                "/usr/bin/dash",
+                &["sh".to_string(), "-c".into(), "vim x".into()],
+            )
+        };
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (250, sh()),
+            (1, systemd()),
+        ];
+        // PID 1 FORKED it (the kernel's record; the re-check of #539, N2)
+        let by_pid1 = [
+            crate::impact::trust::HopFacts::default(),
+            crate::impact::trust::HopFacts { fork_parent: 1 },
+        ];
+        assert!(judge_with(Some(&l), &by_pid1, &writers(), false, &distro).is_trusted());
+        // a shell PID 1 reaped before its exec, another forked: not
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
+        let l = [
+            (300, id("/usr/bin/vim.basic", None)),
+            (250, sh()),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
+    }
+
+    /// The re-check 4 of #539 (HIGH), the guard's twin: an editor under 33
+    /// nested `timeout`s below a webshell's `sh -c` — or 34 below a user's
+    /// manager — is no trusted writer (its lineage is cut before PID 1: not
+    /// known); at exactly the walk's cap, under PID 1, it is.
+    #[test]
+    fn an_editor_under_more_wrappers_than_the_walk_reads_is_not_trusted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        let n = std::cell::Cell::new(0u64);
+        let exec = |pid: u32, ppid: u32, exe: &str, argv: &[&str]| {
+            n.set(n.get() + 1);
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            t.ingest_exec(pid, ppid, exe, &argv, n.get(), n.get(), 1000);
+        };
+        let wrapped = |top: u32, first: u32, wrappers: u32| {
+            for k in 0..wrappers {
+                let ppid = if k == 0 { top } else { first + k - 1 };
+                exec(first + k, ppid, "/usr/bin/timeout", &["timeout", "1d"]);
+            }
+            let pid = first + wrappers;
+            exec(pid, pid - 1, "/usr/bin/vim.basic", &["vim", "x"]);
+            pid
+        };
+        let trusted = |pid: u32| {
+            judge(
+                t.lineage_identities(pid, AsOf::Now).as_deref(),
+                &writers(),
+                false,
+                &distro,
+            )
+            .is_trusted()
+        };
+        exec(10, 1, "/usr/sbin/php-fpm8.3", &["php-fpm"]);
+        exec(11, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(11, 12, 33);
+        assert!(!trusted(pid), "33 wrappers hide the `sh -c`");
+        let f = TrustFilter::new(&[], t.clone());
+        assert!(
+            !f.evaluate(pid, 0).trust.is_trusted(),
+            "the filter's own walk"
+        );
+        exec(
+            1200,
+            1,
+            "/usr/lib/systemd/systemd",
+            &["/usr/lib/systemd/systemd", "--user"],
+        );
+        let pid = wrapped(1200, 1201, 34);
+        assert!(!trusted(pid), "34 wrappers hide the user's manager");
+        let pid = wrapped(1, 2001, 32);
+        assert!(trusted(pid), "at the cap, under PID 1: whole");
+        let pid = wrapped(1, 3001, 33);
+        assert!(!trusted(pid), "one past the cap");
     }
 
     /// BUG-49: an editor started by a binary no package installed, in

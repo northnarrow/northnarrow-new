@@ -1334,7 +1334,11 @@ impl From<&ProcessSpawnRaw> for Event {
             // read failure OR an older BPF that doesn't set this
             // field) decodes to `false` → R011 fail-secure path.
             parent_is_kthread: raw.parent_is_kthread != 0,
-            exe: ExeIdentity::from_raw(&raw.exe),
+            exe: ExeIdentity {
+                // lot 310: who forked the process, for its first exec
+                fork_parent: raw.fork_ppid,
+                ..ExeIdentity::from_raw(&raw.exe)
+            },
             argv_truncated: raw.trunc_flags & crate::wire::spawn_trunc::ARGV != 0,
             filename_truncated: raw.trunc_flags & crate::wire::spawn_trunc::FILENAME != 0,
             stdio: StdioSockets {
@@ -1471,6 +1475,17 @@ pub struct ExeIdentity {
     /// a mount point; `(0, 0)` once `path` is the task's view or absolute.
     #[serde(skip)]
     pub root: (u64, u64),
+    /// Lot 310 (the re-check of #539, N2): the thread-group id of the
+    /// process that forked this one, when this exec is the first since that
+    /// fork (`ProcessSpawnRaw::fork_ppid`, recorded at `sched_process_fork`;
+    /// never the parent at exec time); 0 when not known. `1` is the host's
+    /// PID 1.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fork_parent: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl ExeIdentity {
@@ -1489,6 +1504,7 @@ impl ExeIdentity {
             flags: raw.flags,
             pass: raw.pass,
             root,
+            fork_parent: 0,
         }
     }
 

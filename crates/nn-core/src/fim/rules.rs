@@ -2765,6 +2765,10 @@ impl<H: PostureHost> Rule for OwnClient<H> {
                     format!("{} {}", id.exe.display(), script)
                 }
                 crate::posture::lineage::Runs::Inline => id.exe.display().to_string(),
+                // lot 310: an inline program, a task, standard input
+                crate::posture::lineage::Runs::Code => {
+                    format!("{} (an inline program)", id.exe.display())
+                }
                 crate::posture::lineage::Runs::Unknown(_) => id.program(),
             },
         );
@@ -6413,5 +6417,88 @@ mod tests {
             Some((ResponseAction::KillProcessTree, Severity::Critical)),
             "{v:?}"
         );
+    }
+
+    // ── Lot 310 (external bug hunt, edition 1.4): the downstream effect
+    // of BUG-97, BUG-99, BUG-100, N3 on NN-L-FIM-011 (High, KillProcess) ──
+    mod bug97_downstream {
+        use super::*;
+
+        /// A process that names `/usr/bin/aws` only through an argv the
+        /// option table misread is no `aws` client: its read of the AWS
+        /// credentials is NN-L-FIM-011's (High, KillProcess). Before lot
+        /// 310 the rule was silent: `OwnClient` took it for the client.
+        #[test]
+        fn bug97_downstream_fim011_acts_on_a_spoofed_aws_identity() {
+            let (_tmp, lineage) = exec_fixture(&[
+                (
+                    300,
+                    "/usr/bin/bash",
+                    &["bash", "-noprofile", "/tmp/steal.sh", "x", "/usr/bin/aws"],
+                ),
+                (
+                    301,
+                    "/usr/bin/node",
+                    &["node", "--eval=steal()", "/usr/bin/aws"],
+                ),
+                (
+                    302,
+                    "/usr/bin/zsh",
+                    &["zsh", "-ovi", "/tmp/steal.zsh", "/usr/bin/aws"],
+                ),
+                (
+                    303,
+                    "/usr/bin/node",
+                    &["node", "--run", "x", "/usr/bin/aws"],
+                ),
+                (
+                    304,
+                    "/usr/bin/bash",
+                    &["bash", "-rcfile", "/etc/x", "/tmp/steal.sh", "/usr/bin/aws"],
+                ),
+                (
+                    305,
+                    "/bin/busybox",
+                    &["sh", "/tmp/steal.sh", "/usr/bin/aws"],
+                ),
+            ]);
+            let rules = rules_by_id(&lineage);
+            let rule = rules.get("NN-L-FIM-011_AwsCredsRead").unwrap();
+            let mut silent = Vec::new();
+            for (pid, bug) in [
+                (300, "BUG-97"),
+                (301, "BUG-99"),
+                (302, "BUG-100"),
+                (303, "N3"),
+                (304, "BUG-97 -rcfile"),
+                (305, "busybox sh"),
+            ] {
+                if rule
+                    .evaluate(&read_by("/root/.aws/credentials", pid, "aws"))
+                    .is_none()
+                {
+                    silent.push(bug);
+                }
+            }
+            assert!(
+                silent.is_empty(),
+                "NN-L-FIM-011 silent on ~/.aws/credentials read by a spoofed `aws`: {silent:?}"
+            );
+        }
+
+        /// Guard: the real client still passes (`own_clients_are_told_by_their_exec`).
+        #[test]
+        fn bug97_downstream_guard_real_client_passes() {
+            let (_tmp, lineage) = exec_fixture(&[(
+                310,
+                "/usr/bin/python3.12",
+                &["/usr/bin/python3", "/usr/bin/aws", "s3"],
+            )]);
+            let rules = rules_by_id(&lineage);
+            let rule = rules.get("NN-L-FIM-011_AwsCredsRead").unwrap();
+            assert!(rule
+                .evaluate(&read_by("/root/.aws/credentials", 310, "aws"))
+                .is_none());
+        }
     }
 }

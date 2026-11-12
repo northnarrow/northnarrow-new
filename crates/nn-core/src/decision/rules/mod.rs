@@ -121,7 +121,9 @@ pub(crate) fn is_service_uid(uid: u32) -> bool {
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;
-pub use r004_exec_from_proc_self_fd::{OwnWorkerLaunch, R004ExecFromProcSelfFd};
+pub use r004_exec_from_proc_self_fd::{
+    ExecutorImages, KnownLaunches, OwnWorkerLaunch, R004ExecFromProcSelfFd,
+};
 pub use r005_netcat_exec::R005NetcatExec;
 pub use r006_reverse_shell_tooling::R006ReverseShellTooling;
 pub use r007_crypto_miner::R007CryptoMiner;
@@ -172,7 +174,7 @@ pub fn default_rules<H: DecisionHost>() -> Vec<Box<dyn Rule>> {
     rules.extend(spawn_rules(
         Arc::clone(&process_allowlist),
         None,
-        None,
+        KnownLaunches::default(),
         None,
     ));
     rules.extend(module_load_rules::<H>());
@@ -247,8 +249,9 @@ pub fn default_rules_with_net<H: DecisionHost>(
     // posture shares.
     ransom: Arc<crate::impact::RansomTracker<H>>,
     defense: Arc<crate::impair::DefenseDetector<H>>,
-    // R14a: how the agent starts its own workers (R004 knows the launch).
-    own_launch: Option<OwnWorkerLaunch>,
+    // R14a: how the agent starts its own workers (R004 knows the launch);
+    // lot 310: and systemd's executor, by its identities.
+    launches: KnownLaunches,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -271,7 +274,7 @@ pub fn default_rules_with_net<H: DecisionHost>(
     rules.extend(spawn_rules(
         Arc::clone(&process_allowlist),
         Some(lineage.clone()),
-        own_launch,
+        launches,
         Some(Arc::clone(&installer_override)),
     ));
     rules.extend(module_load_rules::<H>());
@@ -448,7 +451,7 @@ pub(crate) fn judge_actor<H: PostureHost>(
 fn spawn_rules<H: DecisionHost>(
     allowlist: Arc<CommAllowlist<H>>,
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
-    own_launch: Option<OwnWorkerLaunch>,
+    launches: KnownLaunches,
     installer: Option<Arc<<H as PostureAgent>::InstallerWindow>>,
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
@@ -460,8 +463,9 @@ fn spawn_rules<H: DecisionHost>(
         ),
         None => Default::default(),
     };
-    // R14a: the agent's own worker launch is not a fileless exec
-    let r004 = r004.with_own_launch(own_launch);
+    // R14a: the agent's own worker launch is not a fileless exec; lot 310:
+    // nor systemd's executor left unlinked by an upgrade
+    let r004 = r004.with_launches(launches);
     let al = || Arc::clone(&allowlist);
     vec![
         // Kills (and R009's exceptions).

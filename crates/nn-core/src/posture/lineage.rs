@@ -431,6 +431,15 @@ struct Entry {
     /// event's, from the kernel's credentials; 0 for the plain ingest
     /// calls of tests and tools).
     uid: u32,
+    /// Lot 310: the executed file's `(st_dev, st_ino)` as the exec sensor's
+    /// LSM identity gave it (`None`: tracepoint mode, a process older than
+    /// the agent, the plain ingest calls). A fork runs its parent's.
+    image: Option<(u64, u64)>,
+    /// Lot 310 (the re-check of #539, N2): the process that forked this
+    /// one, when this exec was the first since that fork (the exec record's
+    /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
+    /// known — read from `/proc`, a later exec, an older eBPF object.
+    fork_parent: u32,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -453,6 +462,29 @@ impl ExecIdentity {
         let path = PathBuf::from(exe);
         let runs = runs_of(&path, argv);
         Self { exe: path, runs }
+    }
+
+    /// Lot 310 (the review of #539): the identity of an exec event's own
+    /// process ([`Self::of_exec`]) with what the agent's exec pump read of
+    /// its process at the exec: an environment that loads the caller's
+    /// code before a named script (`PYTHONPATH`, `NODE_OPTIONS`, …: what it
+    /// runs is then not known, the script kept for a record), a standard
+    /// input that is no terminal for an interpreter naming no program
+    /// (`bash < file`: the caller's code, [`Runs::Code`]). `None` for any
+    /// other event.
+    pub fn of_spawn(event: &Event) -> Option<Self> {
+        let Event::ProcessSpawn {
+            filename,
+            argv,
+            exe,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut id = Self::of_exec(exe.path_or(filename), argv);
+        id.runs = with_pump_facts(id.runs, &id.exe, argv, exe.flags);
+        Some(id)
     }
 
     /// Lot 292: the identity of a process known by its executable only (no
@@ -489,11 +521,20 @@ impl ExecIdentity {
         if !in_system_tree(&self.exe.to_string_lossy()) {
             return false;
         }
-        if !is_interpreter(&self.exe) {
+        if !self.interprets() {
             return true;
         }
         self.script()
             .is_some_and(|s| s.starts_with('/') && in_system_tree(s))
+    }
+
+    /// Lot 310: the identity runs a program its argv names or carries — an
+    /// interpreter ([`is_interpreter`]), or a binary of many programs
+    /// running one of its shells (busybox as `sh`: [`Runs`] other than
+    /// [`Runs::Inline`]). busybox's other programs (`busybox wget`) are the
+    /// installed binary they are.
+    pub fn interprets(&self) -> bool {
+        is_interpreter(&self.exe) || self.runs != Runs::Inline
     }
 
     /// A rule's built-in client: the executed file itself is one of
@@ -545,8 +586,9 @@ impl ExecIdentity {
             }
             // A module run with `-m` resolves through the working directory
             // and PYTHONPATH, both the caller's: only a client's own runtime
-            // tree (above) vouches for it.
-            Runs::Script(_) | Runs::Unknown(_) => false,
+            // tree (above) vouches for it. Lot 310: nor is an inline program
+            // a client by the interpreter's name.
+            Runs::Script(_) | Runs::Code | Runs::Unknown(_) => false,
         }
     }
 }
@@ -782,6 +824,10 @@ struct InnerState {
     uid_count: HashMap<u32, usize>,
     by_uid: HashMap<u32, VecDeque<u32>>,
     by_uid_len: usize,
+    /// Lot 310: the processes the start's scan found running an image
+    /// unlinked since (not entered): pid → (its start, the image's
+    /// identity), at most [`TRACKER_CAP`]; a later exec of the pid drops it.
+    seeded_images: HashMap<u32, (u64, (u64, u64))>,
 }
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
@@ -960,6 +1006,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     uid_count: HashMap::new(),
                     by_uid: HashMap::new(),
                     by_uid_len: 0,
+                    seeded_images: HashMap::new(),
                 }),
                 proc_root,
                 live,
@@ -1028,7 +1075,17 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// recorded. Tests and tools: the process is recorded as executed by
     /// root; the agent feeds [`Self::ingest_exec`], with the event's uid.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, Runs::Inline, spawn_ns, (0, None), 0);
+        self.ingest_inner(
+            pid,
+            ppid,
+            exe,
+            false,
+            Runs::Inline,
+            spawn_ns,
+            (0, None),
+            0,
+            (None, 0),
+        );
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -1071,15 +1128,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         else {
             return false;
         };
-        self.ingest_exec(
+        use common::wire::exe::exe_flags::{KNOWN, PROC_EXE, ROOT_DIR};
+        // lot 310: the file's identity (the LSM program's, or the exec
+        // pump's from `/proc` in tracepoint mode), kept only when no user
+        // could have unlinked the image (its directory root's only: the
+        // review of #539, finding 5)
+        let image = (exe.flags & (KNOWN | PROC_EXE) != 0
+            && exe.has(ROOT_DIR)
+            && (exe.dev, exe.ino) != (0, 0))
+            .then_some((exe.dev, exe.ino));
+        let path = exe.path_or(filename);
+        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let runs = with_pump_facts(
+            runs_of(Path::new(path), argv),
+            Path::new(path),
+            argv,
+            exe.flags,
+        );
+        // the kernel's record (the re-check 4 of #539: carried through a
+        // verified systemd-executor in the kernel, at the exec)
+        let fork_parent = exe.fork_parent;
+        self.ingest_inner(
             *pid,
             *ppid,
-            exe.path_or(filename),
-            argv,
+            path,
+            argv_npm_cli,
+            runs,
             *timestamp_ns,
-            *start_ns,
+            (*start_ns, None),
             *uid,
+            (image, fork_parent),
         );
+        let _ = filename;
         true
     }
 
@@ -1109,6 +1189,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
+            (None, 0),
         );
     }
 
@@ -1142,7 +1223,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             if pid == 0 || self.holds(pid) {
                 continue;
             }
+            // lot 310 (the review of #539, finding 5): the image a process
+            // older than the agent runs, by its identity, when no user could
+            // have unlinked it — kept even for an image unlinked since (an
+            // upgraded browser re-executing itself), which is not entered
+            let image = self.seed_image(pid);
             let Some((ppid, exe, uid)) = self.lookup_proc(pid) else {
+                if let (Some(image), Some(ticks)) = (image, self.proc_start_ticks(pid)) {
+                    let start_ns = ticks.saturating_mul(tick).saturating_sub(suspended).max(1);
+                    let mut s = self.inner.state.write();
+                    if s.seeded_images.len() < TRACKER_CAP {
+                        s.seeded_images.insert(pid, (start_ns, image));
+                    }
+                }
                 continue;
             };
             let Some(ticks) = self.proc_start_ticks(pid) else {
@@ -1164,10 +1257,44 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
+                (image, 0),
             );
             seeded += 1;
         }
         seeded
+    }
+
+    /// Lot 310: the identity of the image `pid` runs (`/proc/<pid>/exe`,
+    /// the device in the kernel's form), when the directory it was executed
+    /// from is root's only ([`PostureHost::dir_is_root_only`]); at the
+    /// start's scan, off the decision path.
+    fn seed_image(&self, pid: u32) -> Option<(u64, u64)> {
+        let view = self.image_dir_view(pid)?;
+        if !H::dir_is_root_only(&view) {
+            return None;
+        }
+        let link = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let (dev, ino) = H::file_id(&link)?;
+        Some((common::wire::exe::kernel_dev(dev), ino))
+    }
+
+    /// The directory `pid`'s image was executed from, in the process's own
+    /// view of the files (`/proc/<pid>/root/…`, as the exec pump reads it),
+    /// when the process runs in PID 1's mount namespace (the re-check of
+    /// #539, N6: a user's namespace binds a root directory over its own);
+    /// `None` otherwise, or when either namespace cannot be read.
+    fn image_dir_view(&self, pid: u32) -> Option<PathBuf> {
+        let dir = self.inner.proc_root.join(pid.to_string());
+        let text = H::read_link(dir.join("exe")).ok()?;
+        let text = text.to_string_lossy();
+        let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
+        let ns = |d: &Path| H::read_link(d.join("ns/mnt")).ok();
+        let init = ns(&self.inner.proc_root.join("1"))?;
+        if ns(&dir)? != init {
+            return None;
+        }
+        let view = dir.join("root").join(path.strip_prefix("/").ok()?);
+        view.parent().map(Path::to_path_buf)
     }
 
     /// The spawn cache holds an exec of `pid`.
@@ -1187,6 +1314,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
+        (image, fork_parent): (Option<(u64, u64)>, u32),
     ) {
         if pid == 0 {
             return;
@@ -1200,6 +1328,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs,
             start_ticks,
             uid,
+            image,
+            fork_parent,
         };
         let mut s = self.inner.state.write();
         // Lab PR 267 (R12a): an exec the cache already holds (its time and
@@ -1234,6 +1364,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // review of #475: an exec of the pid — a process that runs (its
         // old entry, if the sweep had found it gone, is history now)
         s.exited.remove(&pid);
+        // lot 310: the start's record of an unlinked image is that process's
+        s.seeded_images.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;
         // any other spawn reusing the pid invalidates a stale copy there.
         if is_system_daemon_binary(&entry.exe) {
@@ -1482,6 +1614,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
+                    (e.image, e.fork_parent),
                 );
                 if orphan {
                     orphans += 1;
@@ -1569,6 +1702,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs: first.runs.clone(),
             start_ticks: Some(ticks),
             uid,
+            image: first.image,
+            // no exec of its own: no fork parent recorded for one
+            fork_parent: 0,
         })
     }
 
@@ -1685,6 +1821,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             runs: parent.runs,
             start_ticks: Some(ticks),
             uid,
+            image: parent.image,
+            fork_parent: 0,
         })
     }
 
@@ -2391,9 +2529,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// The walk of [`Self::lineage_match`], by hop: the first hop
     /// `is_match` accepts — `pid`'s own, or an ancestor's that ran its exe
     /// before the process below it was forked. `Some(None)` when the walk
-    /// ends without one, `None` when a hop cannot be read. As of `as_of`
-    /// (review #471 A1, R-F): each hop the exec its pid had run by then
-    /// ([`Self::hop`]).
+    /// ends without one (at PID 1, or cut: [`Self::lineage_walk_to`]),
+    /// `None` when a hop cannot be read. As of `as_of` (review #471 A1,
+    /// R-F): each hop the exec its pid had run by then ([`Self::hop`]).
+    ///
+    /// For the walks that look for a hop that GRANTS something (a package
+    /// manager, an authentication binary, a client, a grantee): a walk cut
+    /// before PID 1 finds nothing above the cut, and grants nothing for it.
+    /// A walk whose every hop must vouch reads [`Self::lineage_walk_to`].
     fn lineage_walk(
         &self,
         pid: u32,
@@ -2401,28 +2544,57 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         is_match: impl Fn(&Hop) -> bool,
         max_up: usize,
     ) -> Option<Option<Hop>> {
+        Some(match self.lineage_walk_to(pid, as_of, is_match, max_up)? {
+            WalkEnd::Found(hop) => Some(hop),
+            WalkEnd::Root | WalkEnd::Cut => None,
+        })
+    }
+
+    /// [`Self::lineage_walk`], saying how it ended. The re-check 4 of #539
+    /// (HIGH): it reached PID 1 or 0 ([`WalkEnd::Root`]) — the lineage is
+    /// whole — or it stopped before: the depth cap ([`LINEAGE_DEPTH_CAP`],
+    /// or `max_up`), a hop that started after the one below it (a later
+    /// process that took an exited parent's pid), a process its own parent
+    /// ([`WalkEnd::Cut`]: what is above the cut is not known). `pid` + the
+    /// cap's 32 ancestors whose last one's parent is PID 1 is whole: no
+    /// hop is read past the cap to know it. `None` when a hop cannot be
+    /// read.
+    fn lineage_walk_to(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+        is_match: impl Fn(&Hop) -> bool,
+        max_up: usize,
+    ) -> Option<WalkEnd> {
         if pid == 0 || pid == 1 {
-            return Some(None);
+            return Some(WalkEnd::Root);
         }
         let mut below = self.hop(pid, as_of)?;
         if is_match(&below) {
-            return Some(Some(below));
+            return Some(WalkEnd::Found(below));
         }
         for _ in 0..max_up.min(LINEAGE_DEPTH_CAP) {
             let ppid = below.ppid;
-            if ppid == 0 || ppid == 1 || ppid == below.pid {
-                return Some(None);
+            if ppid == 0 || ppid == 1 {
+                return Some(WalkEnd::Root);
+            }
+            if ppid == below.pid {
+                return Some(WalkEnd::Cut);
             }
             let up = self.hop(ppid, as_of)?;
             if !self.started_no_later(&up, &below) {
-                return Some(None);
+                return Some(WalkEnd::Cut);
             }
             if is_match(&up) && self.ran_before(&up, &below, as_of) {
-                return Some(Some(up));
+                return Some(WalkEnd::Found(up));
             }
             below = up;
         }
-        Some(None)
+        Some(if below.ppid == 0 || below.ppid == 1 {
+            WalkEnd::Root
+        } else {
+            WalkEnd::Cut
+        })
     }
 
     /// External audit PROC-008: the nearest process in the lineage of
@@ -2481,17 +2653,46 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
     /// and for each ancestor on the walk of [`Self::actor_in_lineage`]
-    /// (ordered, POS-003: it ends at PID 1, at a hop that started after the
-    /// one below it, or at [`LINEAGE_DEPTH_CAP`]), nearest first, `pid`'s
-    /// own identity at index 0. `None` when a hop can be read neither from
-    /// the spawn cache nor from `/proc`: the lineage is not known.
+    /// (ordered, POS-003), nearest first, `pid`'s own identity at index 0,
+    /// up to PID 1. `None` when the lineage is not known: a hop can be read
+    /// neither from the spawn cache nor from `/proc`, or (the re-check 4 of
+    /// #539, HIGH) the walk stopped before PID 1 — at [`LINEAGE_DEPTH_CAP`]
+    /// (33 nested `timeout`s, each a packaged program that forks the next,
+    /// hid a webshell's `sh -c` above them), at a hop that started after the
+    /// one below it, at a process its own parent ([`WalkEnd::Cut`]). Every
+    /// hop of this lineage must vouch for the writer: one never read never
+    /// does. [`Self::lineage_identities_seen`] keeps the hops below a cut.
     ///
     /// Reads only the spawn cache and `/proc` — never a file elsewhere, so
     /// the guard's fanotify reader may call it (an open on a marked
     /// filesystem from that thread would wait on itself).
     pub fn lineage_identities(&self, pid: u32, as_of: AsOf) -> Option<Vec<(u32, ExecIdentity)>> {
+        match self.walk_identities(pid, as_of)? {
+            (hops, WalkEnd::Root) => Some(hops),
+            _ => None,
+        }
+    }
+
+    /// [`Self::lineage_identities`], with the hops read below a cut too:
+    /// for a reader that LOOKS for a hop (a staged image among them), never
+    /// for one that trusts the lineage whole. `None` when a hop cannot be
+    /// read.
+    pub fn lineage_identities_seen(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+    ) -> Option<Vec<(u32, ExecIdentity)>> {
+        self.walk_identities(pid, as_of).map(|(hops, _)| hops)
+    }
+
+    /// The hops of [`Self::lineage_identities`]' walk and how it ended.
+    fn walk_identities(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+    ) -> Option<(Vec<(u32, ExecIdentity)>, WalkEnd)> {
         let hops = std::cell::RefCell::new(Vec::new());
-        self.lineage_walk(
+        let end = self.lineage_walk_to(
             pid,
             as_of,
             |hop| {
@@ -2500,7 +2701,36 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             },
             LINEAGE_DEPTH_CAP,
         )?;
-        Some(hops.into_inner())
+        Some((hops.into_inner(), end))
+    }
+
+    /// Lot 310 (the re-check of #539, N2): for each hop of
+    /// [`Self::lineage_identities`]'s walk (the same order), the process
+    /// that forked it, when its exec was the first since that fork — the
+    /// kernel's record at `sched_process_fork`, never the parent at exec
+    /// time; 0 when not known.
+    pub fn lineage_fork_parents(&self, pid: u32, as_of: AsOf) -> Vec<u32> {
+        let parents = std::cell::RefCell::new(Vec::new());
+        let _ = self.lineage_walk(
+            pid,
+            as_of,
+            |hop| {
+                parents.borrow_mut().push(hop.fork_parent);
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        );
+        parents.into_inner()
+    }
+
+    /// Lot 310 (the re-check of #539, N2): the process that forked `pid`,
+    /// when the exec the cache holds as of `as_of` was its first since that
+    /// fork; `None` when not known.
+    pub fn fork_parent(&self, pid: u32, as_of: AsOf) -> Option<u32> {
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => Some(e.fork_parent).filter(|p| *p != 0),
+            _ => None,
+        }
     }
 
     /// Lot 282: what the kernel executed for `pid`'s parent, when it forked
@@ -2555,12 +2785,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     fn proc_runs(&self, pid: u32, exe: &Path) -> Runs {
         let cmdline =
             H::read(self.inner.proc_root.join(pid.to_string()).join("cmdline")).unwrap_or_default();
-        let argv: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        runs_of(exe, &argv)
+        runs_of(exe, &argv_of_cmdline(&cmdline))
     }
 
     /// One hop of the walk as of `as_of` (review #471 A1, R-F): the spawn
@@ -2591,6 +2816,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     spawn_ns: e.spawn_ns,
                     start_ns: e.start_ns,
                     uid: Some(e.uid),
+                    fork_parent: e.fork_parent,
                 });
             }
         }
@@ -2610,6 +2836,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: 0,
             start_ns: 0,
             uid,
+            fork_parent: 0,
         })
     }
 
@@ -2908,6 +3135,29 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(ExecIdentity { exe, runs })
     }
 
+    /// Lot 310: the identity (`(st_dev, st_ino)`) of the file `pid` executed,
+    /// as the exec sensor's LSM program gave it — from the spawn cache only
+    /// (no `/proc`: it is read on the decision path), as of `as_of`
+    /// ([`Self::exec_identity`]'s cache lookup); `None` when the cache does
+    /// not hold the exec, or holds no identity for it (tracepoint mode, a
+    /// process older than the agent).
+    pub fn exec_image(&self, pid: u32, as_of: AsOf) -> Option<(u64, u64)> {
+        if pid == 0 {
+            return None;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.image,
+            CachedAt::LaterOnly => None,
+            // lot 310: a process older than the agent whose image was
+            // unlinked before the start's scan (not entered)
+            CachedAt::Absent => {
+                let s = self.inner.state.read();
+                let (start, image) = s.seeded_images.get(&pid).copied()?;
+                as_of.time().is_none_or(|t| t >= start).then_some(image)
+            }
+        }
+    }
+
     /// External audit NETR-008: the image `pid` runs, for a network row
     /// filled at connect time: the spawn cache, else `/proc/<pid>/exe` as
     /// the kernel reports it. Unlike [`Self::exec_identity`] a deleted
@@ -3049,6 +3299,18 @@ impl<H: PostureHost> Default for AuthSessionTracker<H> {
     }
 }
 
+/// How a lineage walk ended ([`AuthSessionTracker::lineage_walk_to`]).
+#[derive(Debug)]
+enum WalkEnd {
+    /// The hop the walk looked for.
+    Found(Hop),
+    /// PID 1 or 0: the lineage is whole.
+    Root,
+    /// Stopped before PID 1 (the depth cap, a later process at a parent's
+    /// pid, a process its own parent): what is above is not known.
+    Cut,
+}
+
 /// One hop of a lineage walk.
 #[derive(Debug)]
 struct Hop {
@@ -3065,6 +3327,10 @@ struct Hop {
     /// Lab PR 175: the real uid it executed `exe` as (cached), or runs as
     /// (`/proc`); `None` when `/proc` shows none.
     uid: Option<u32>,
+    /// Lot 310 (the re-check of #539, N2): cached only, the process that
+    /// forked it when its exec was the first since ([`Entry::fork_parent`]);
+    /// 0 not known.
+    fork_parent: u32,
 }
 
 fn is_auth_binary(exe: &Path) -> bool {
@@ -3096,12 +3362,37 @@ fn is_node_exe(exe: &Path) -> bool {
     NODE_EXES.iter().any(|p| s == *p)
 }
 
+/// Lot 310 (the review of #539, findings 2 and 7): what an exec pump's
+/// facts (`common::wire::exe::exe_flags`) change in what an interpreter
+/// runs: an environment that loads the caller's code before a named
+/// script leaves the script named but not all that runs
+/// ([`Runs::Unknown`]); an interpreter naming no program whose standard
+/// input is no terminal runs its input ([`Runs::Code`]).
+pub fn with_pump_facts(runs: Runs, exe: &Path, argv: &[String], flags: u32) -> Runs {
+    use common::wire::exe::exe_flags::{ENV_LOADS, STDIN_PROGRAM};
+    // the re-check of #539 (N9): busybox running one of its shells reads
+    // a program as any shell does
+    let reads = || super::script_args::reads_a_program(exe, argv);
+    match runs {
+        Runs::Script(s) if flags & ENV_LOADS != 0 => Runs::Unknown(Some(s)),
+        Runs::Inline if flags & (ENV_LOADS | STDIN_PROGRAM) != 0 && reads() => Runs::Code,
+        r => r,
+    }
+}
+
+pub use super::script_args::argv_of_cmdline;
+
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
 /// what they run is named by their arguments, not by their exe. Lot 292:
 /// each family reads them with its own option table
 /// ([`crate::posture::script_args`]).
+///
+/// Lot 310 (the review of #539, finding 11): busybox is no interpreter by
+/// its executable — a binary of many programs, most of them no
+/// interpreter (`wget`, `httpd`, `ntpd`); its shells are told by what an
+/// identity runs ([`ExecIdentity::interprets`]).
 pub fn is_interpreter(exe: &Path) -> bool {
-    family_of(exe).is_some()
+    family_of(exe).is_some_and(|f| f != super::script_args::Family::Busybox)
 }
 
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
@@ -4489,6 +4780,221 @@ mod tests {
         assert!(t.holds(602) && !t.holds(603));
     }
 
+    /// Lot 310: the lineage keeps the executed file's identity the LSM
+    /// program gave (none in tracepoint mode without the exec pump's
+    /// `/proc/<pid>/exe`), when its directory is root's only, and a fork the
+    /// sweep enters,
+    /// or an orphan of a gone process's image, runs that image's identity.
+    #[test]
+    fn a_fork_and_an_orphan_carry_the_identity_of_the_image_they_run() {
+        let exec =
+            |pid: u32, ppid: u32, exe: &str, ns: u64, id: Option<(u64, u64)>| Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: ns,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: ns,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.map_or(0, |i| i.0),
+                    ino: id.map_or(0, |i| i.1),
+                    flags: id.map_or(0, |_| {
+                        common::wire::exe::exe_flags::KNOWN | common::wire::exe::exe_flags::ROOT_DIR
+                    }),
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+        // a fork: dpkg's subshell, never executed
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        assert!(t.ingest_spawn_event(&exec(600, 1, "/usr/bin/dpkg", 10 * S, Some((8, 600)))));
+        assert!(t.ingest_spawn_event(&exec(610, 1, "/usr/bin/apt", 10 * S, None)));
+        assert_eq!(t.exec_image(600, AsOf::Now), Some((8, 600)));
+        assert_eq!(t.exec_image(610, AsOf::Now), None, "tracepoint: none");
+        assert_eq!(t.exec_image(611, AsOf::Now), None, "not held");
+        // the review of #539 (finding 5): an image in a directory a user
+        // can write (no `ROOT_DIR`) could be unlinked and replaced by its
+        // owner — its identity is not kept
+        let mut user_s = exec(612, 1, "/home/u/bin/tool", 10 * S, Some((8, 612)));
+        if let Event::ProcessSpawn { exe, .. } = &mut user_s {
+            exe.flags &= !common::wire::exe::exe_flags::ROOT_DIR;
+        }
+        assert!(t.ingest_spawn_event(&user_s));
+        assert_eq!(t.exec_image(612, AsOf::Now), None, "a user's directory");
+        write_exe(proc.path(), 600, "/usr/bin/dpkg");
+        write_status(proc.path(), 600, 1);
+        write_started(proc.path(), "600", 1, 1_000);
+        write_exe(proc.path(), 602, "/usr/bin/dpkg");
+        write_status(proc.path(), 602, 600);
+        write_started(proc.path(), "602", 600, 1_200);
+        assert_eq!(t.sweep().forks, 1);
+        assert_eq!(t.exec_image(602, AsOf::Now), Some((8, 600)));
+        // an orphan: clamd executed by pid 1, forked 501, exited
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 1, "/usr/lib/systemd/systemd");
+        write_status(proc.path(), 1, 0);
+        write_started(proc.path(), "1", 0, 1);
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        assert_eq!(t.seed_from_proc(), 1);
+        assert!(t.ingest_spawn_event(&exec(500, 1, "/usr/sbin/clamd", 10 * S, Some((8, 500)))));
+        write_exe(proc.path(), 501, "/usr/sbin/clamd");
+        write_status_uid(proc.path(), 501, 1, 0);
+        write_started(proc.path(), "501", 1, 1_005);
+        assert_eq!(t.sweep().orphans, 1);
+        assert_eq!(
+            t.exec_image(501, AsOf::Judged(H::monotonic_ns())),
+            Some((8, 500))
+        );
+    }
+
+    /// The re-check 4 of #539: on systemd ≥ 254 a manager's fork executes
+    /// `systemd-executor`, then the unit's program; the KERNEL carries the
+    /// fork record through a verified executor to that program
+    /// (`common::fork_record`, decided at the exec: no race with a reader
+    /// of `/proc`). The lineage keeps each exec's fork parent as the kernel
+    /// recorded it, and invents none: an exec the kernel gave 0 (an
+    /// unverified file's next exec, a later exec, another process at the
+    /// pid) has none, whatever the exec before it ran.
+    #[test]
+    fn each_exec_keeps_the_fork_parent_the_kernel_recorded() {
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let started = |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32, start: u64| {
+            Event::ProcessSpawn {
+                pid,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: ns,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.0,
+                    ino: id.1,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: forker,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        };
+        let exec = |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32| {
+            started(pid, exe, ns, id, forker, 5 * S)
+        };
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let executor = "/usr/lib/systemd/systemd-executor";
+        // the unit: PID 1's fork, the executor, then `sh -c` (the kernel
+        // carried the record), then `tar` (the record used: 0)
+        assert!(t.ingest_spawn_event(&exec(700, executor, 6 * S, (8, 100), 1)));
+        assert_eq!(t.fork_parent(700, AsOf::Now), Some(1), "the executor's");
+        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/dash", 7 * S, (8, 200), 1)));
+        assert_eq!(
+            t.fork_parent(700, AsOf::Now),
+            Some(1),
+            "the unit's program, as the kernel carried it"
+        );
+        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/tar", 8 * S, (8, 300), 0)));
+        assert_eq!(t.fork_parent(700, AsOf::Now), None, "the exec after");
+        // the kernel gave the program after the executor nothing (not a
+        // verified executor, tracepoint mode): the lineage adds none
+        assert!(t.ingest_spawn_event(&exec(710, executor, 6 * S, (8, 999), 1)));
+        assert!(t.ingest_spawn_event(&exec(710, "/usr/bin/dash", 7 * S, (8, 200), 0)));
+        assert_eq!(t.fork_parent(710, AsOf::Now), None);
+        // another process at the pid: its own record
+        assert!(t.ingest_spawn_event(&exec(730, executor, 6 * S, (8, 100), 1)));
+        assert!(t.ingest_spawn_event(&started(730, "/usr/bin/dash", 9 * S, (8, 200), 4242, 8 * S)));
+        assert_eq!(t.fork_parent(730, AsOf::Now), Some(4242), "another start");
+        assert!(t.ingest_spawn_event(&started(740, executor, 6 * S, (8, 100), 1, 0)));
+        assert!(t.ingest_spawn_event(&started(740, "/usr/bin/dash", 7 * S, (8, 200), 0, 0)));
+        assert_eq!(t.fork_parent(740, AsOf::Now), None, "no start known");
+    }
+
+    /// The re-check of #539 (N6): the start's scan reads an image's
+    /// directory only for a process in PID 1's mount namespace, in the
+    /// process's own root; another namespace, or one not readable: none.
+    #[test]
+    fn the_start_s_scan_reads_a_directory_in_pid_1_s_namespace_only() {
+        let proc = TempDir::new().unwrap();
+        let link = |pid: &str, name: &str, to: &str| {
+            let p = proc.path().join(pid).join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            symlink(to, p).unwrap();
+        };
+        link("1", "ns/mnt", "mnt:[4026531841]");
+        link("80", "exe", "/usr/bin/tool (deleted)");
+        link("80", "ns/mnt", "mnt:[4026531841]");
+        link("81", "exe", "/usr/bin/tool");
+        link("81", "ns/mnt", "mnt:[4026532999]");
+        link("82", "exe", "/usr/bin/tool");
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(
+            t.image_dir_view(80),
+            Some(proc.path().join("80/root/usr/bin")),
+            "PID 1's namespace, the unlinked image's directory"
+        );
+        assert_eq!(t.image_dir_view(81), None, "a namespace of its own");
+        assert_eq!(t.image_dir_view(82), None, "its namespace not readable");
+        std::fs::remove_file(proc.path().join("1/ns/mnt")).unwrap();
+        assert_eq!(t.image_dir_view(80), None, "PID 1's not readable");
+    }
+
+    /// The re-check of #539 (N7): the `/proc` fallback reads an empty
+    /// argument as one, as `ring_drops` does (one reader of a cmdline).
+    #[test]
+    fn a_cmdline_s_empty_argument_counts() {
+        let a = argv_of_cmdline(b"python3\0-W\0\0/tmp/x.py\0/usr/bin/aws\0");
+        assert_eq!(a, ["python3", "-W", "", "/tmp/x.py", "/usr/bin/aws"]);
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/python3"), &a),
+            Runs::Script("/tmp/x.py".into())
+        );
+        assert!(argv_of_cmdline(b"").is_empty());
+        assert_eq!(argv_of_cmdline(b"sh\0"), ["sh"]);
+        let proc = TempDir::new().unwrap();
+        std::fs::create_dir_all(proc.path().join("77")).unwrap();
+        std::fs::write(
+            proc.path().join("77/cmdline"),
+            b"python3\0-W\0\0/tmp/x.py\0/usr/bin/aws\0",
+        )
+        .unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(
+            t.proc_runs(77, Path::new("/usr/bin/python3")),
+            Runs::Script("/tmp/x.py".into())
+        );
+    }
+
+    /// Lot 310: an interpreter running an inline program is no client by
+    /// the interpreter's name (its program is the caller's); a binary, and
+    /// an interpreter running nothing, are named by their executable.
+    #[test]
+    fn an_inline_program_is_no_client_by_the_interpreter_s_name() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let py = ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3", "-c", "x"]));
+        assert_eq!(py.runs, Runs::Code);
+        assert!(!py.is_client(&["python3"]));
+        assert!(ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3"])).is_client(&["python3"]));
+        assert!(ExecIdentity::of_exec("/usr/bin/aws", &a(&["aws", "s3"])).is_client(&["aws"]));
+    }
+
     /// Review of #475: a session older than the agent (sshd and its shell,
     /// entered by the start's scan) still makes its processes auth-mediated
     /// after 2,100 other execs — an exec'd command and a forked subshell;
@@ -4885,6 +5391,74 @@ mod tests {
         assert_eq!(t.evicted_live(), 4);
         assert!(t.holds(700) && t.holds(701), "the person's session kept");
         assert!(!t.holds(2_000) && t.holds(2_009));
+    }
+
+    /// The re-check 4 of #539 (HIGH): a lineage the walk does not follow
+    /// to PID 1 is not known — `pid` and 32 ancestors under PID 1 are
+    /// whole, one more is cut; a hop that started after the one below it (a
+    /// later process at an exited parent's pid) and a process its own
+    /// parent cut it too. What was read below the cut stays readable for a
+    /// reader that looks for a hop.
+    #[test]
+    fn a_lineage_cut_before_pid_1_is_not_known() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let chain = |first: u32, ancestors: u32, start: u64| {
+            for k in 0..=ancestors {
+                let pid = first + k;
+                let ppid = if k == 0 { 1 } else { pid - 1 };
+                t.ingest_exec(
+                    pid,
+                    ppid,
+                    "/usr/bin/timeout",
+                    &[],
+                    start + u64::from(k) * S,
+                    start + u64::from(k) * S,
+                    0,
+                );
+            }
+            first + ancestors
+        };
+        let whole = chain(100, 32, 10 * S);
+        assert_eq!(
+            t.lineage_identities(whole, AsOf::Now).map(|h| h.len()),
+            Some(33),
+            "the writer and 32 ancestors, the last one PID 1's"
+        );
+        let cut = chain(200, 33, 10 * S);
+        assert!(
+            t.lineage_identities(cut, AsOf::Now).is_none(),
+            "one past the cap"
+        );
+        assert_eq!(
+            t.lineage_identities_seen(cut, AsOf::Now).map(|h| h.len()),
+            Some(33),
+            "the hops read below the cut"
+        );
+        // a parent that started after its child: a later process at the pid
+        t.ingest_exec(300, 1, "/usr/bin/bash", &[], 50 * S, 50 * S, 0);
+        t.ingest_exec(301, 300, "/usr/bin/tar", &[], 40 * S, 40 * S, 0);
+        assert!(
+            t.lineage_identities(301, AsOf::Now).is_none(),
+            "a later parent"
+        );
+        assert_eq!(
+            t.lineage_identities_seen(301, AsOf::Now).map(|h| h.len()),
+            Some(1)
+        );
+        // a process its own parent
+        t.ingest_exec(400, 400, "/usr/bin/tar", &[], 60 * S, 60 * S, 0);
+        assert!(
+            t.lineage_identities(400, AsOf::Now).is_none(),
+            "its own parent"
+        );
+        // a short one under PID 1: whole
+        t.ingest_exec(500, 1, "/usr/bin/bash", &[], 70 * S, 70 * S, 0);
+        t.ingest_exec(501, 500, "/usr/bin/tar", &[], 71 * S, 71 * S, 0);
+        assert_eq!(
+            t.lineage_identities(501, AsOf::Now).map(|h| h.len()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -6000,7 +6574,8 @@ mod tests {
             t.exec_identity(200, AsOf::Now),
             Some(ExecIdentity {
                 exe: "/usr/bin/perl".into(),
-                runs: Runs::Inline,
+                // lot 310: an inline program (it was `Runs::Inline`)
+                runs: Runs::Code,
             })
         );
         assert_eq!(t.exec_identity(300, AsOf::Now), None, "unknown pid");
@@ -6372,6 +6947,8 @@ mod tests {
         }
         assert!(wrong.is_empty(), "errexit scripts not named: {wrong:?}");
         // controls: an inline program, or standard input, stays unnamed
+        // (lot 310: as `Runs::Code`, split from `Runs::Inline`, which keeps
+        // a shell running no program)
         for a in [
             &["sh", "-c", "echo"][..],
             &["bash", "-ec", "echo"],
@@ -6381,10 +6958,10 @@ mod tests {
             // arguments are its positional parameters — `/usr/bin/legit`
             // is not what runs
             &["sh", "-s", "/usr/bin/legit"],
-            &["bash"],
         ] {
-            assert_eq!(id("/usr/bin/bash", a).runs, Runs::Inline, "{a:?}");
+            assert_eq!(id("/usr/bin/bash", a).runs, Runs::Code, "{a:?}");
         }
+        assert_eq!(id("/usr/bin/bash", &["bash"]).runs, Runs::Inline);
         // a script `-e` names is installed only from a system tree
         assert!(id(
             "/bin/sh",
@@ -6438,6 +7015,12 @@ mod tests {
     fn family_option_arguments_are_paired_per_interpreter() {
         let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a)).runs;
         let script = |s: &str| Runs::Script(s.into());
+        // lot 310 (the review of #539, finding 2): an option that loads the
+        // caller's code before the script (`node -r`, `--require`, `perl
+        // -I`, `-M`, `-d:`, `ruby -r`, `-I`) leaves the script named but not
+        // all that runs: not known (it was `Script`; the arity this test is
+        // about is unchanged — the script read is the same)
+        let loaded = |s: &str| Runs::Unknown(Some(s.into()));
         let mut wrong = Vec::new();
         for (exe, a, want) in [
             (
@@ -6448,12 +7031,12 @@ mod tests {
             (
                 "/usr/bin/node",
                 &["node", "-r", "/usr/lib/x.js", "/tmp/e.js"][..],
-                script("/tmp/e.js"),
+                loaded("/tmp/e.js"),
             ),
             (
                 "/usr/bin/node",
                 &["node", "--require", "/usr/lib/x.js", "/tmp/e.js"][..],
-                script("/tmp/e.js"),
+                loaded("/tmp/e.js"),
             ),
             // lot 292: the rest of each family's table
             (
@@ -6481,20 +7064,23 @@ mod tests {
                 &["python3", "--check-hash-based-pycs", "never", "/tmp/e.py"][..],
                 script("/tmp/e.py"),
             ),
+            // lot 310, the review of #539's differential test: `-` is the
+            // standard input's program, the caller's (it read as a script
+            // named `-`)
             (
                 "/usr/bin/python3.12",
                 &["python3", "-", "/usr/bin/aws"][..],
-                script("-"),
+                Runs::Code,
             ),
             (
                 "/usr/bin/perl",
                 &["perl", "-I", "/usr/share/perl5", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
                 &["perl", "-Mstrict", "-wT", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
@@ -6515,7 +7101,7 @@ mod tests {
             (
                 "/usr/bin/perl",
                 &["perl", "-d:NYTProf", "/tmp/e.pl"][..],
-                script("/tmp/e.pl"),
+                loaded("/tmp/e.pl"),
             ),
             (
                 "/usr/bin/perl",
@@ -6525,12 +7111,12 @@ mod tests {
             (
                 "/usr/bin/ruby3.2",
                 &["ruby", "-r", "json", "/tmp/e.rb", "/usr/bin/x"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/ruby3.2",
                 &["ruby", "-I", "/usr/lib/ruby/x", "-rjson", "/tmp/e.rb"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/ruby3.2",
@@ -6566,7 +7152,7 @@ mod tests {
             (
                 "/usr/bin/ruby",
                 &["ruby", "-W:no-deprecated", "-rjson", "/tmp/e.rb"][..],
-                script("/tmp/e.rb"),
+                loaded("/tmp/e.rb"),
             ),
             (
                 "/usr/bin/perl",
@@ -6589,39 +7175,35 @@ mod tests {
                 ][..],
                 script("/tmp/e.rb"),
             ),
-            // inline programs
+            // inline programs (lot 310: `Runs::Code`, split from `Runs::Inline`)
             (
                 "/usr/bin/perl",
                 &["perl", "-lane", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/perl",
                 &["perl", "-le", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
-            ("/usr/bin/perl", &["perl", "-de", "0"][..], Runs::Inline),
+            ("/usr/bin/perl", &["perl", "-de", "0"][..], Runs::Code),
             (
                 "/usr/bin/perl",
                 &["perl", "-CSD", "-E", "say 1"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/ruby",
                 &["ruby", "-ne", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
             (
                 "/usr/bin/node",
                 &["node", "-pe", "/usr/bin/aws"][..],
-                Runs::Inline,
+                Runs::Code,
             ),
-            ("/usr/bin/node", &["node", "--eval", "1"][..], Runs::Inline),
-            (
-                "/usr/bin/python3",
-                &["python3", "-Ic", "1"][..],
-                Runs::Inline,
-            ),
+            ("/usr/bin/node", &["node", "--eval", "1"][..], Runs::Code),
+            ("/usr/bin/python3", &["python3", "-Ic", "1"][..], Runs::Code),
         ] {
             let got = id(exe, a);
             if got != want {
@@ -6747,6 +7329,8 @@ mod tests {
             runs: Runs::Inline,
             start_ticks,
             uid: 0,
+            image: None,
+            fork_parent: 0,
         };
         let exact = e(4_003_217_000, None);
         let seeded = e(4_000_000_000, Some(400));

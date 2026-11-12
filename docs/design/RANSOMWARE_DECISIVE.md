@@ -84,15 +84,46 @@ construction; a host with neither database falls back to a root-owned system
 tree) — **and every hop of its lineage vouches for it**: every ancestor up to
 PID 1 above the writer and its own forked copies is a program a package
 installed (its executable, and for an interpreter the script it runs, by the
-same database) or an interpreter a package installed running no named script
-(an interactive shell, `sh -c`). Lying in a root-owned tree is not being
-installed by a package: a binary in `/opt` or `/usr/local` no package lists
-vouches for nothing it starts (lot 292, BUG-49; before, the ancestors were
-judged by tree alone). Never by `comm`, never by a name list.
+same database) or an interpreter a package installed running no program at
+all (an interactive shell). Lying in a root-owned tree is not being installed
+by a package: a binary in `/opt` or `/usr/local` no package lists vouches for
+nothing it starts (lot 292, BUG-49; before, the ancestors were judged by tree
+alone). Lot 310 (BUG-49, the decision of 11/11/2026): nor does an interpreter
+running an inline program (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node
+--eval`) or its standard input (`sh -s`; `bash < file` and `curl … | sh`, a
+shell naming nothing whose standard input the exec pump finds a file, a pipe
+or a socket) — that program is the caller's, and a webshell's `sh -c
+'openssl enc …'` made the packaged `openssl` a trusted writer (the triage's
+LOTL case). Nor does a user's service manager (`systemd --user`), for any
+unit: `systemd-run --user /usr/bin/openssl enc …` was a lineage of
+installed programs end to end, and a user moves its own processes between
+the cgroups of its delegated subtree (a unit read from a cgroup proves
+nothing; lot 326 will record it in the kernel at the unit's main exec). Its
+actor is the process it started, never the manager. An installed shell PID 1 forked (a
+unit's `ExecStart=/bin/sh -c …`, root's `systemd-run`) inherits PID 1's
+vouching (`impact::trust::started_by_pid1`), its own writes still judged.
+"Forked" is the kernel's record at `sched_process_fork`, for the first exec
+after the fork (`HopFacts::fork_parent`; the re-check of #539, N2): a
+webshell's double-forked orphan, reaped by PID 1 before its `sh -c`, was
+forked by the webshell and vouches for nothing (on systemd ≥ 254 the
+record is carried through the executor's exec, by its verified identity, to
+the unit's program). What this costs: a cron job
+(a user's crontab or the system's: a job carries no owner in this
+judgement), an administrator's non-interactive `ssh host 'cmd'` (sshd runs
+`bash -c`), a make recipe start their tools through an inline shell, and
+those tools' bursts now count — NN-L-IMP-001's kill stays held by default,
+its Critical record and the posture's `RansomwareEncryption` remain (the
+lab, on Ubuntu 24.04: a user's crontab `sh -c 'rsync -a --inplace …'` of
+random data drew one NN-L-IMP-001; the PR of lot 310); a desktop session's
+commands are judged (its user's manager starts the terminal emulator): a
+cost accepted while the alpha observes. Never by `comm`, never by a name
+list.
 
 What an interpreter runs is read from its argv with that interpreter's own
 option table (lot 292, BUG-44 and BUG-42: `python3 -O x.py` runs `x.py`,
-`node -r m x.js` runs `x.js`, `sh -e x.sh` runs `x.sh`). An option the table
+`node -r m x.js` runs `x.js`, `sh -e x.sh` runs `x.sh`), by one reader for
+every family (lot 310, BUG-97, BUG-99, BUG-100: `bash -noprofile x.sh`,
+`node --eval=…`, `zsh -ovi x.zsh`). An option the table
 does not hold, or one whose argument is missing, leaves what it runs **not
 known**: such a writer is no packaged program, and such an ancestor vouches
 for nothing (`crates/nn-core/src/posture/script_args.rs`).
