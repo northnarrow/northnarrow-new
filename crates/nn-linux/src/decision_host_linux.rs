@@ -39,6 +39,10 @@ impl DecisionHost for LinuxHost {
         crate::runtime::off_the_runtime(f)
     }
 
+    fn packaged_user_unit(pid: u32) -> bool {
+        crate::user_units::packaged_user_unit(pid)
+    }
+
     /// `trusted_bin::resolve("rpm")`, then `rpm -qf --quiet <path>` with its
     /// output discarded. R14c: on the errands thread
     /// ([`crate::caps::errands`]) — the rules run on the decision thread,

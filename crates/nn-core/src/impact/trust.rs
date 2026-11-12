@@ -202,6 +202,26 @@ pub struct HopFacts {
     pub packaged_user_unit: bool,
 }
 
+/// Lot 310 (the re-check of #539; lot 310b): the [`HopFacts`] of `hops`
+/// (the lineage of `pid` as of `as_of`): the lineage's fork parents, and
+/// for the hop a user's manager started (the hop below one),
+/// `packaged_user_unit(its pid)` — asked of no other hop.
+pub fn hop_facts<H: crate::posture::host::PostureHost>(
+    lineage: &crate::posture::lineage::AuthSessionTracker<H>,
+    pid: u32,
+    as_of: crate::posture::lineage::AsOf,
+    hops: &[(u32, ExecIdentity)],
+    packaged_user_unit: &dyn Fn(u32) -> bool,
+) -> Vec<HopFacts> {
+    let forks = lineage.lineage_fork_parents(pid, as_of);
+    (0..hops.len())
+        .map(|n| HopFacts {
+            fork_parent: forks.get(n).copied().unwrap_or(0),
+            packaged_user_unit: is_user_manager(hops, n + 1) && packaged_user_unit(hops[n].0),
+        })
+        .collect()
+}
+
 /// Lot 310, the review of #539 (finding 7, the coordinator's refinement once
 /// the lab measured a new Critical record): hop `n` of `hops` is a shell (or
 /// interpreter) a package installed running an inline program that PID 1
@@ -238,7 +258,8 @@ pub fn manager_vouches_for_its_unit(
     facts: &[HopFacts],
     n: usize,
 ) -> bool {
-    let (Some((manager, _)), Some(child)) = (hops.get(n), n.checked_sub(1).and_then(|c| facts.get(c)))
+    let (Some((manager, _)), Some(child)) =
+        (hops.get(n), n.checked_sub(1).and_then(|c| facts.get(c)))
     else {
         return false;
     };
@@ -915,6 +936,76 @@ mod tests {
                 "{l:?}"
             );
         }
+    }
+
+    /// Lot 310b (folded into lot 310): the desktop's cascade. A user's
+    /// manager vouches for the process it FORKED for a packaged user unit
+    /// (the kernel's record, and the unit's file root's and a package's):
+    /// the GNOME terminal's server, then the interactive shell in it, then
+    /// the user's `tar` — trusted, as before the decision. The same chain
+    /// with a transient `systemd-run --user` unit or the user's own unit
+    /// (not packaged), or a server the manager did not fork for its first
+    /// exec (not known: a session older than the agent), is judged; the
+    /// actor is the process the manager started.
+    #[test]
+    fn a_user_s_manager_vouches_for_its_packaged_units_only() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let bash_i = ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string()]);
+        let l = [
+            (500, id("/usr/bin/tar", None)),
+            (450, bash_i),
+            (400, id("/usr/libexec/gnome-terminal-server", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        let facts = |forker: u32, packaged: bool| {
+            vec![
+                HopFacts::default(),
+                HopFacts {
+                    fork_parent: 400,
+                    ..HopFacts::default()
+                },
+                HopFacts {
+                    fork_parent: forker,
+                    packaged_user_unit: packaged,
+                },
+            ]
+        };
+        let owned = |p: &Path| {
+            Some(
+                p.starts_with("/usr/bin")
+                    || p.starts_with("/usr/lib")
+                    || p.starts_with("/usr/libexec"),
+            )
+        };
+        assert_eq!(
+            judge_with(500, Some(&l), &facts(1200, true), false, &owned),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
+        );
+        assert!(manager_vouches_for_its_unit(&l, &facts(1200, true), 3));
+        for (forker, packaged) in [(1200, false), (0, true), (450, true)] {
+            assert!(
+                matches!(
+                    judge_with(500, Some(&l), &facts(forker, packaged), false, &owned),
+                    Judged::Untrusted { actor: 400, .. }
+                ),
+                "forked by {forker}, packaged {packaged}"
+            );
+        }
+        // `systemd-run --user /usr/bin/openssl enc …`: a transient unit
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        let f = [HopFacts {
+            fork_parent: 1200,
+            packaged_user_unit: false,
+        }];
+        assert!(matches!(
+            judge_with(500, Some(&l), &f, false, &owned),
+            Judged::Untrusted { actor: 500, .. }
+        ));
     }
 
     /// Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running

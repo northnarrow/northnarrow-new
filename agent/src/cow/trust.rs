@@ -40,7 +40,8 @@ use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
 use crate::impact::trust::{
-    is_user_manager, started_by_pid1, topmost_same, vouches, ProgramOwners,
+    is_user_manager, manager_vouches_for_its_unit, started_by_pid1, topmost_same, vouches,
+    HopFacts, ProgramOwners,
 };
 use crate::posture::lineage::{
     in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
@@ -166,6 +167,19 @@ pub fn judge(
     package_tx: bool,
     owned: &dyn Fn(&Path) -> Option<bool>,
 ) -> Trust {
+    judge_with(lineage, &[], writers, package_tx, owned)
+}
+
+/// [`judge`] with each hop's facts (lot 310: the kernel's fork parents, the
+/// packaged user units — `crate::impact::trust::HopFacts`; a hop without
+/// any knows nothing).
+pub fn judge_with(
+    lineage: Option<&[(u32, ExecIdentity)]>,
+    facts: &[HopFacts],
+    writers: &[&str],
+    package_tx: bool,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> Trust {
     if package_tx {
         return Trust::Trusted(Trusted::PackageTransaction);
     }
@@ -187,9 +201,12 @@ pub fn judge(
         .enumerate()
         .skip(1)
         .find(|(n, (_, id))| {
-            let by_pid1 = *n > own && started_by_pid1(hops, *n, owned);
+            let by_pid1 = *n > own && started_by_pid1(hops, facts, *n, owned);
             (is_foreign(id) && !by_pid1)
-                || (*n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, *n)))
+                || (*n > own
+                    && ((!vouches(id, owned) && !by_pid1)
+                        || (is_user_manager(hops, *n)
+                            && !manager_vouches_for_its_unit(hops, facts, *n))))
         })
         .map(|(_, hop)| hop)
     {
@@ -285,8 +302,15 @@ impl TrustFilter {
         let lineage = self.tracker.lineage_identities(tgid, AsOf::Now);
         let writers: Vec<&str> = self.writers.iter().map(String::as_str).collect();
         let owned = |p: &Path| self.owners.owned(p);
-        let trust = judge(
+        // lot 310: the kernel's fork parents, the packaged user units
+        let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
+            crate::impact::trust::hop_facts(&self.tracker, tgid, AsOf::Now, hops, &|p| {
+                nn_linux::user_units::packaged_user_unit(p)
+            })
+        });
+        let trust = judge_with(
             lineage.as_deref(),
+            &facts,
             &writers,
             self.tracker.in_package_transaction(tgid, AsOf::Now),
             &owned,

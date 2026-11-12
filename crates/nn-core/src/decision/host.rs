@@ -102,6 +102,14 @@ pub trait DecisionHost: PostureAgent + ContentHost {
     /// elsewhere). `f` may borrow from the caller.
     fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T;
 
+    /// Lot 310b: `pid` is a packaged user unit's own process — its cgroup a
+    /// `.service` of a user's manager whose unit file is root's and a
+    /// package's, with no unit or drop-in of the user's
+    /// (`nn_linux::user_units`). `false` on a host that cannot tell.
+    fn packaged_user_unit(_pid: u32) -> bool {
+        false
+    }
+
     /// `rpm -qf --quiet <path>` with the system directories' `rpm`
     /// (external audit ATP-014): `Err` with the reason when there is no
     /// trusted `rpm` to run, `Ok(None)` when it could not be run, else
