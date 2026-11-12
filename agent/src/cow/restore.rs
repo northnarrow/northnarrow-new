@@ -643,6 +643,13 @@ mod lot315 {
         ];
         let ids: Vec<u64> = pick(all.iter(), &tree()).iter().map(|e| e.id).collect();
         assert_eq!(ids, [1]);
+        // the unknown one later: it joins the one known file too
+        let all = [
+            entry(1, "/srv/a", Some(100), 101, 1000),
+            entry(2, "/srv/a", None, 102, 2000),
+        ];
+        let ids: Vec<u64> = pick(all.iter(), &tree()).iter().map(|e| e.id).collect();
+        assert_eq!(ids, [1]);
     }
 
     fn write_by(pid: u32, lineage: Vec<ProcId>) -> PostWrite {
