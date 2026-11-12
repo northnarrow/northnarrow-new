@@ -211,7 +211,14 @@ fn is_user_writable(path: &str) -> bool {
 /// as "carve-out disabled"). Called once at engine construction, not on
 /// the event hot path.
 fn resolve_uid_by_name(name: &str) -> Option<u32> {
-    let body = std::fs::read_to_string("/etc/passwd").ok()?;
+    // lot 311 (F4): read as bytes — one account whose GECOS is not UTF-8
+    // (a Latin-1 full name) hid every account of the file
+    resolve_uid_by_name_in(std::path::Path::new("/etc/passwd"), name)
+}
+
+/// [`resolve_uid_by_name`] in the file at `path` (tests: a fixture).
+fn resolve_uid_by_name_in(path: &std::path::Path, name: &str) -> Option<u32> {
+    let body = crate::posture::host::state_text(std::fs::read(path).ok()?);
     parse_passwd_uid(&body, name)
 }
 
@@ -3648,6 +3655,20 @@ mod tests {
     }
 
     /// The /etc/passwd parser behind the syslog-uid resolution.
+    /// Lot 311 (F4): an account whose GECOS is not UTF-8 does not hide the
+    /// `syslog` user (on main the file read as nothing: the carve-out off).
+    #[test]
+    fn a_latin1_account_does_not_hide_the_syslog_user() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("passwd");
+        std::fs::write(
+            &p,
+            b"u:x:1000:1000:J\xe9r\xf4me:/home/u:/bin/bash\nsyslog:x:104:110::/var/log:/usr/sbin/nologin\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_uid_by_name_in(&p, "syslog"), Some(104));
+    }
+
     #[test]
     fn parse_passwd_uid_extracts_uid_field() {
         let body = "root:x:0:0:root:/root:/bin/bash\n\

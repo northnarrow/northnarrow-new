@@ -316,7 +316,7 @@ impl Launcher for ImageLauncher {
     }
     fn verify(&self, pid: u32, declared: &SandboxLevel) -> Result<(), String> {
         verify_proc(
-            &std::fs::read_to_string(format!("/proc/{pid}/status"))
+            &crate::state_read::read_state(format!("/proc/{pid}/status"))
                 .map_err(|e| format!("/proc/{pid}/status unreadable: {e}"))?,
             declared,
         )
@@ -1436,7 +1436,7 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
     if pid == 0 {
         return None;
     }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = crate::state_read::read_state(format!("/proc/{pid}/stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
     let f: Vec<&str> = rest.split_whitespace().collect();
     // after the name: state is field 3, utime 14 and stime 15

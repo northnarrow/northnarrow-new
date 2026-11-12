@@ -70,6 +70,10 @@ impl Degradation {
 
 struct Registry {
     entries: Vec<Degradation>,
+    /// Lot 311 (the review of #538, F5): entries withdrawn before they were
+    /// signed (no audit log yet, or its append failed) — signed at the next
+    /// flush, never lost.
+    withdrawn_unsigned: Vec<Degradation>,
     /// Reported past [`MAX_KEPT`].
     overflow: u64,
     sink: Option<Arc<Mutex<AuditLog>>>,
@@ -83,6 +87,7 @@ struct Registry {
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     entries: Vec::new(),
+    withdrawn_unsigned: Vec::new(),
     overflow: 0,
     sink: None,
     boot_over: false,
@@ -324,9 +329,18 @@ fn flush_reports() -> usize {
             d.signed = true;
             pending.push(d.clone());
         }
-        (sink, pending)
+        let withdrawn = std::mem::take(&mut r.withdrawn_unsigned);
+        (sink, (pending, withdrawn))
     };
+    let (pending, withdrawn) = pending;
     let mut written = 0;
+    for d in withdrawn {
+        if sign(&sink, &d.source, &d.detail, d.at_boot) {
+            written += 1;
+        } else {
+            REGISTRY.lock().withdrawn_unsigned.push(d);
+        }
+    }
     for d in pending {
         if sign(&sink, &d.source, &d.detail, d.at_boot) {
             written += 1;
@@ -361,12 +375,36 @@ pub fn spawn_flusher() {
 /// condition's own end is signed by its finder (a drift cleared, a reload
 /// confirmed). A degradation that holds stays visible as long as it holds.
 /// Returns how many left.
+/// Lot 311 (the review of #538, F5): one withdrawn before the flush
+/// signed it is signed now (with the audit log at hand; else at its
+/// open): a condition that ends within the flush period still leaves its
+/// record in the chain.
 pub fn withdraw(source: &str, keep: &[String]) -> usize {
-    let mut r = REGISTRY.lock();
-    let before = r.entries.len();
-    r.entries
-        .retain(|d| d.source != source || keep.contains(&d.detail));
-    before - r.entries.len()
+    let (sink, unsigned, left) = {
+        let mut r = REGISTRY.lock();
+        let before = r.entries.len();
+        let mut unsigned = Vec::new();
+        r.entries.retain(|d| {
+            let stays = d.source != source || keep.contains(&d.detail);
+            if !stays && !d.signed {
+                unsigned.push(d.clone());
+            }
+            stays
+        });
+        let left = before - r.entries.len();
+        if r.sink.is_none() {
+            r.withdrawn_unsigned.append(&mut unsigned);
+        }
+        (r.sink.clone(), unsigned, left)
+    };
+    if let Some(sink) = sink {
+        for d in unsigned {
+            if !sign(&sink, &d.source, &d.detail, d.at_boot) {
+                REGISTRY.lock().withdrawn_unsigned.push(d);
+            }
+        }
+    }
+    left
 }
 
 /// Lot 319: [`withdraw`] by a predicate on the detail — the degradations of
@@ -416,6 +454,7 @@ pub fn entries() -> Vec<Degradation> {
 pub(crate) fn reset_for_tests() {
     let mut r = REGISTRY.lock();
     r.entries.clear();
+    r.withdrawn_unsigned.clear();
     r.overflow = 0;
     r.sink = None;
     r.boot_over = false;
@@ -504,6 +543,35 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].get("source").is_none(), "{:?}", rows[0]);
         assert_eq!(snapshot(), ["fim watches no path"]);
+        reset_for_tests();
+    }
+
+    /// Lot 311 (the review of #538, F5): a degradation withdrawn before the
+    /// flush signed it is signed all the same — at once with the audit log
+    /// at hand, at its open otherwise — and only once.
+    #[test]
+    fn a_degradation_withdrawn_before_its_flush_is_still_signed() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(report("execq_roots", "the mount table could not be read"));
+        assert_eq!(withdraw("execq_roots", &[]), 1);
+        assert!(snapshot().is_empty(), "withdrawn from the status");
+        let log = open_log(dir.path());
+        assert_eq!(attach_audit_log(Some(Arc::clone(&log))), 1);
+        let rows = degraded_rows(dir.path());
+        assert_eq!(rows.len(), 1, "signed at the log's open");
+        assert_eq!(rows[0]["source"], "execq_roots");
+        mark_boot_over();
+        assert!(report("mount_table", "one line not in the kernel's shape"));
+        assert_eq!(withdraw("mount_table", &[]), 1);
+        assert_eq!(
+            degraded_rows(dir.path()).len(),
+            2,
+            "signed at its withdrawal"
+        );
+        assert_eq!(flush(), 0, "once");
+        assert_eq!(degraded_rows(dir.path()).len(), 2);
         reset_for_tests();
     }
 

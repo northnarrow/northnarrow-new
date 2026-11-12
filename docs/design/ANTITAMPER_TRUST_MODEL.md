@@ -1091,9 +1091,16 @@ for granted.
   here), an exec line, an `NN_` / `LD_` / `RUST_` / `MALLOC_` / `GLIBC_`
   variable, another slice or user, another root, a mount over our paths —
   and signs each such directive as `unit_dropin_harmful` while it is
-  there. Our units' values are held meanwhile by the deny hooks (PID 1's
-  write of a value other than the registered one is refused) and put back
-  to their floors at every registration. Any other drop-in there is the
+  there. Lot 311 (the re-check of #538, G1): a drop-in or an
+  `EnvironmentFile=` the judge cannot read is harmful as such — a FIFO
+  (systemd reads an environment file from its writer, so a variable the
+  judge never sees reaches our units), a socket, a device, a directory, a
+  file the judge is refused (the watchdog has no `CAP_DAC_OVERRIDE`) —
+  never an empty file; it is opened `O_PATH` first (no device opened, no
+  FIFO waited on, no terminal taken) and read, bounded, only when regular;
+  `/dev/null` (a mask) reads empty. Our units' values are held meanwhile
+  by the deny hooks (PID 1's write of a value other than the registered
+  one is refused) and put back to their floors at every registration. Any other drop-in there is the
   `unit_dropin` alert, as before (now `slice.d` and `system.slice.d` too).
   A drop-in the host had before the install is judged the same and never
   touched; moving one would take a signed overlay listing what may be

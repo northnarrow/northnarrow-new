@@ -28,6 +28,179 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
     std::fs::read(path).map(nn_core::posture::host::state_text)
 }
 
+pub use antitamper_bpf::config_read::Config;
+
+/// Lot 311 (the review of #538, F9, G1): a configuration file a judge reads
+/// (a drop-in, an `EnvironmentFile=`) — a regular file only, at most
+/// `antitamper_bpf`'s 1 MiB, its bytes made text
+/// ([`antitamper_bpf::config_read::read_config`]): a FIFO no longer stalls
+/// the judge, nor `/dev/zero` exhausts it, and what the judge cannot read
+/// is [`Config::Unjudgeable`] — harmful, never an empty file.
+pub fn read_config(path: &Path) -> Config {
+    antitamper_bpf::config_read::read_config(path)
+}
+
+/// Lot 311 (the review of #538): a condition a part of the agent finds and
+/// sees end — a table it cannot read, lines of it it cannot parse, roots the
+/// kernel's map refuses. While it holds it is a degradation of `source`
+/// (listed by `nn-admin status`, counted against the trust level, signed in
+/// the audit chain): reported once, again only when what it says changes;
+/// withdrawn when it ends — and signed before that (`degradation::withdraw`
+/// signs what the flush has not yet), so a condition shorter than the
+/// flush period still leaves its record in the chain.
+///
+/// The review of #538 (G2): a condition made [`Condition::with_hold`]
+/// stands at least that long once reported — one that comes and goes
+/// faster (a count a user moves) is one record per hold, not one per look.
+#[derive(Debug)]
+pub struct Condition {
+    source: &'static str,
+    holding: Option<String>,
+    hold: std::time::Duration,
+    since: Option<std::time::Instant>,
+    reports: u32,
+}
+
+impl Condition {
+    pub const fn new(source: &'static str) -> Self {
+        Self::with_hold(source, std::time::Duration::ZERO)
+    }
+
+    /// One that stands at least `hold` once reported.
+    pub const fn with_hold(source: &'static str, hold: std::time::Duration) -> Self {
+        Condition {
+            source,
+            holding: None,
+            hold,
+            since: None,
+            reports: 0,
+        }
+    }
+
+    /// It holds, as `detail` says.
+    pub fn holds(&mut self, detail: String) {
+        self.holds_at(detail, std::time::Instant::now());
+    }
+
+    /// It holds at `now`, as `detail` says.
+    pub fn holds_at(&mut self, detail: String, now: std::time::Instant) {
+        if self.holding.as_deref() == Some(detail.as_str()) {
+            return;
+        }
+        if self.holding.is_some() {
+            crate::boot::degradation::withdraw(self.source, &[]);
+        }
+        tracing::warn!(source = self.source, detail = %detail, "degraded");
+        crate::boot::degradation::report(self.source, &detail);
+        self.holding = Some(detail);
+        self.since = Some(now);
+        self.reports = self.reports.saturating_add(1);
+    }
+
+    /// It ended: withdrawn (its signed record stays in the chain).
+    pub fn ended(&mut self) {
+        self.ended_at(std::time::Instant::now());
+    }
+
+    /// It ended at `now`: withdrawn — once it has stood its hold.
+    pub fn ended_at(&mut self, now: std::time::Instant) {
+        if self.holding.is_none()
+            || self
+                .since
+                .is_some_and(|t| now.saturating_duration_since(t) < self.hold)
+        {
+            return;
+        }
+        self.holding = None;
+        tracing::info!(source = self.source, "no longer degraded");
+        crate::boot::degradation::withdraw(self.source, &[]);
+    }
+
+    /// It holds now.
+    pub fn holding(&self) -> bool {
+        self.holding.is_some()
+    }
+
+    /// How many times it was reported.
+    pub fn reports(&self) -> u32 {
+        self.reports
+    }
+}
+
+/// Lot 311 (F4): the rule of a reader that publishes what it read of the
+/// kernel's state (the guarded roots, the slices): when a read fails, what
+/// it last published stays in force — never an empty set in its place —
+/// and the failure is a [`Condition`] of `source` while the reads fail.
+/// The caller publishes on a good read only; this keeps the account.
+#[derive(Debug)]
+pub struct LastGood {
+    what: &'static str,
+    unread: Condition,
+}
+
+impl LastGood {
+    /// A reader of `what` (the file, in words) for the part `source`.
+    pub const fn new(source: &'static str, what: &'static str) -> Self {
+        LastGood {
+            what,
+            unread: Condition::new(source),
+        }
+    }
+
+    /// The degradation's text.
+    pub fn detail(&self) -> String {
+        format!(
+            "{} could not be read: what was last read of it stays in force",
+            self.what
+        )
+    }
+
+    /// A read failed: logged and reported (once while the reads fail).
+    pub fn failed(&mut self, e: &io::Error) {
+        if !self.unread.holding() {
+            tracing::warn!(
+                what = self.what,
+                error = %e,
+                "kernel state unreadable — the last good reading stays in force"
+            );
+        }
+        let detail = self.detail();
+        self.unread.holds(detail);
+    }
+
+    /// A read succeeded: the degradation is withdrawn.
+    pub fn ok(&mut self) {
+        self.unread.ended();
+    }
+
+    /// The reads fail now.
+    pub fn failing(&self) -> bool {
+        self.unread.holding()
+    }
+}
+
+/// Lot 311 (the review of #538, F2): the lines of a mount table that are
+/// not in the kernel's shape are a [`Condition`] (`rows`) while there are
+/// any — never dropped in silence: their mounts are not judged by the
+/// caller (`what`, in words).
+pub fn mount_rows(rows: &mut Condition, table: &crate::mountinfo::MountTable, what: &str) {
+    match table.malformed.first() {
+        None => rows.ended(),
+        Some(first) => rows.holds(format!(
+            "{} line(s) of the mount table are not in the kernel's shape ({}, line {}{}): \
+             {what} does not judge their mounts",
+            table.malformed.len(),
+            first.why,
+            first.line,
+            first
+                .mount_point
+                .as_ref()
+                .map(|p| format!(", mount point {}", p.to_string_lossy()))
+                .unwrap_or_default()
+        )),
+    }
+}
+
 /// Test doors: a process whose `comm` is not UTF-8.
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing {
@@ -63,6 +236,33 @@ pub mod testing {
             let _ = self.child.wait();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// A fixture process table's `<root>/<pid>/stat`, `status` and `comm`
+    /// for a process whose `comm` is [`NON_UTF8_COMM`], as the kernel writes
+    /// them: parent `ppid`, real uid `uid`, start `ticks` (field 22).
+    pub fn write_non_utf8_proc(root: &std::path::Path, pid: u32, ppid: u32, uid: u32, ticks: u64) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let mut stat = format!("{pid} (").into_bytes();
+        stat.extend_from_slice(NON_UTF8_COMM);
+        stat.extend_from_slice(
+            format!(") S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n")
+                .as_bytes(),
+        );
+        std::fs::write(dir.join("stat"), stat).expect("fixture stat");
+        let mut status = b"Name:\t".to_vec();
+        status.extend_from_slice(NON_UTF8_COMM);
+        status.extend_from_slice(
+            format!(
+                "\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nThreads:\t1\n"
+            )
+            .as_bytes(),
+        );
+        std::fs::write(dir.join("status"), status).expect("fixture status");
+        let mut comm = NON_UTF8_COMM.to_vec();
+        comm.push(b'\n');
+        std::fs::write(dir.join("comm"), comm).expect("fixture comm");
     }
 
     /// Start one, sleeping `secs`, and wait until the kernel shows its
@@ -122,5 +322,109 @@ mod tests {
         let text = read_state(&status).unwrap();
         assert!(text.lines().any(|l| l.starts_with("PPid:")), "{text}");
         assert!(read_state("/proc/nonexistent-n6").is_err());
+    }
+
+    /// Lot 311 (F4): a failed read is one degradation of its source while
+    /// the reads fail, withdrawn by the next good one.
+    #[test]
+    fn a_failed_read_is_one_degradation_until_a_good_one() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let mut r = LastGood::new("lot311_test_reader", "the test table");
+        let has = || {
+            crate::boot::degradation::entries()
+                .iter()
+                .filter(|d| d.source == "lot311_test_reader")
+                .count()
+        };
+        r.ok();
+        assert_eq!(has(), 0);
+        let e = io::Error::from_raw_os_error(libc::EMFILE);
+        r.failed(&e);
+        r.failed(&e);
+        assert!(r.failing());
+        assert_eq!(has(), 1);
+        assert!(crate::boot::degradation::entries()
+            .iter()
+            .any(|d| d.source == "lot311_test_reader" && d.detail == r.detail()));
+        r.ok();
+        assert!(!r.failing());
+        assert_eq!(has(), 0);
+    }
+
+    /// Lot 311 (the review of #538, F2): lines of a mount table that are
+    /// not in the kernel's shape are a degradation while there are any —
+    /// never dropped in silence — and it ends with them.
+    #[test]
+    fn unparsed_mount_lines_are_a_degradation_while_they_last() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let mut rows = Condition::new("lot311_test_rows");
+        let mine = || {
+            crate::boot::degradation::entries()
+                .into_iter()
+                .filter(|d| d.source == "lot311_test_rows")
+                .map(|d| d.detail)
+                .collect::<Vec<_>>()
+        };
+        let good = crate::mountinfo::parse(b"30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n");
+        mount_rows(&mut rows, &good, "the test");
+        assert!(mine().is_empty());
+        let odd = crate::mountinfo::parse(
+            b"30 1 0:5 / /tmp rw - tmpfs tmpfs rw\n57 1 0:44 / /home/u/mnt rw fuse.x x rw\n",
+        );
+        mount_rows(&mut rows, &odd, "the test");
+        let d = mine();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].contains("1 line(s)") && d[0].contains("/home/u/mnt"),
+            "{d:?}"
+        );
+        mount_rows(&mut rows, &odd, "the test");
+        assert_eq!(mine().len(), 1, "reported once");
+        mount_rows(&mut rows, &good, "the test");
+        assert!(mine().is_empty(), "withdrawn");
+        assert!(!rows.holding());
+    }
+
+    /// The review of #538 (G2): a condition with a hold is one report while
+    /// it comes and goes within the hold — however often — and is withdrawn
+    /// only once it has stood the hold and ended.
+    #[test]
+    fn a_held_condition_is_one_report_however_often_it_comes_and_goes() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let hold = std::time::Duration::from_secs(300);
+        let mut c = Condition::with_hold("lot311_test_held", hold);
+        let t0 = std::time::Instant::now();
+        let listed = || {
+            crate::boot::degradation::entries()
+                .into_iter()
+                .filter(|d| d.source == "lot311_test_held")
+                .count()
+        };
+        for i in 0..30u64 {
+            let at = t0 + std::time::Duration::from_secs(10 * i);
+            if i % 2 == 0 {
+                c.holds_at("refused".into(), at);
+            } else {
+                c.ended_at(at);
+            }
+            assert!(c.holding(), "within the hold: still standing ({i})");
+        }
+        assert_eq!(c.reports(), 1, "one report for thirty looks");
+        assert_eq!(listed(), 1);
+        c.ended_at(t0 + hold);
+        assert!(!c.holding(), "stood its hold and ended: withdrawn");
+        assert_eq!(listed(), 0);
+        c.holds_at(
+            "refused".into(),
+            t0 + hold + std::time::Duration::from_secs(10),
+        );
+        assert_eq!(c.reports(), 2, "a new hold, a new report");
+        c.ended_at(t0 + 2 * hold + std::time::Duration::from_secs(10));
+        assert!(!c.holding());
+        // without a hold, it ends at once
+        let mut plain = Condition::new("lot311_test_held");
+        plain.holds_at("x".into(), t0);
+        plain.ended_at(t0);
+        assert!(!plain.holding());
     }
 }

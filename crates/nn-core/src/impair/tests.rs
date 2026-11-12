@@ -665,6 +665,32 @@ fn a_forking_daemons_own_pid_is_registered_after_its_exec() {
     assert!(h.det.rescans.lock().0.len() <= FORK_RESCANS_MAX);
 }
 
+/// Lot 311 (N6): a defender whose `stat` shows a `comm` that is not UTF-8
+/// is registered with its start — on main its start was unread (`None`),
+/// and a later process holding the pid with an unreadable `stat` too
+/// passed for it.
+#[test]
+fn a_defender_whose_comm_is_not_utf8_is_registered_with_its_start() {
+    let h = host();
+    let d = h._proc.path().join("4956");
+    std::fs::create_dir(&d).unwrap();
+    crate::posture::host::testing::symlink("/usr/sbin/auditd", d.join("exe")).unwrap();
+    std::fs::write(
+        d.join("stat"),
+        b"4956 (\xff\xfe) S 1 4956 4956 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 888 0 0\n",
+    )
+    .unwrap();
+    h.det.scan_proc();
+    assert_eq!(
+        h.det
+            .defenders
+            .lock()
+            .get(&4956)
+            .map(|(t, s)| (t.as_str(), *s)),
+        Some(("auditd", Some(888)))
+    );
+}
+
 #[test]
 fn config_changes_are_findings_and_paths_are_watched() {
     let h = host();

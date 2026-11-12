@@ -46,6 +46,67 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **N9**: the io_uring sensor's per-process state goes with the
     process's last thread (`sched_process_exit`): a process that reused a
     pid inherited the classes of the one before it.
+- A read of the kernel's state never fails on its encoding, and a failed
+  read never empties a protection (lot 311b, the third bug hunt's family
+  F4: BUG-98, its exec policy sibling, BUG-105, BUG-95, BUG-108's userland
+  half, N6's other readers, N8, the partials BUG03 and BUG69;
+  `docs/design/EXEC_POLICY.md` §2, `docs/operator/SENSOR_CONTRACT.md` §3).
+  A process names itself (`comm`), a user names its cgroups and its FUSE
+  mounts: a strict text read refused each file whole. Now:
+  - the lineage reads `/proc` as bytes (the posture hosts' one reader,
+    `read_state`): a process that named itself `\xff\xfe` was skipped by
+    the start's scan, marked gone by the sweep while it ran (and dropped
+    once the map was full), its forks never entered, its admin session's
+    terminal unread; the ancestry tree took it for dead, the watchdog's and
+    a defender's start went unread;
+  - the exec quarantine's and the exec policy's mount table is read as
+    bytes: one unprivileged FUSE mount named with a byte that is not UTF-8
+    emptied `EXECQ_ROOTS` and unpublished the slices (every caller
+    `UNKNOWN`, a service's deny an audit); a table that cannot be read
+    keeps what was published, with a signed degradation; a btrfs
+    subvolume at a guarded point (`/home` on Fedora) and a user's FUSE
+    mount root cannot `stat` are published;
+  - the sensors' mount table likewise (the mini-hunt): while such a mount
+    stood, no opened file had its path and NN-L-FIM-011's kill of a read of
+    another account's `~/.aws/credentials` became a record (lab, Ubuntu
+    24.04);
+  - a Latin-1 comment no longer hides a drop-in, or an `EnvironmentFile=`,
+    from the drop-in judges (the host's and our units'), a package's
+    `.list` or `.md5sums` from the package trust, an account from the
+    resolvers' and the carve-outs' `/etc/passwd` reads, a resolver from
+    `resolv.conf` (a resolver file there but unreadable keeps the set);
+  - a quarantine index that is not UTF-8 is kept aside and rebuilt like any
+    index that does not parse (every quarantine failed after it); the
+    watchdog and `nn-admin verify-keys` read `admin.pub` as the agent does
+    (a Latin-1 comment refused every signed shutdown marker);
+    `nn-admin fim status` ends its count at a read error instead of
+    spinning on it.
+  `xtask/tests/state_reads.rs` keeps it so: no `/proc` entry of a process
+  is read as strict text in the security crates, and a read whose failure
+  becomes a default is listed with its reason.
+  - After the independent review: the byte parser reads a mount whose
+    source is `-` (`fusermount3 -o fsname=-`) or empty — it had dropped it,
+    a regression; a FUSE mount is classed by its type and keyed by its
+    device (its daemon names the root's inode); roots are read without
+    following a link and only while they show their line's device; lines
+    not in the kernel's shape and roots the kernel's map refuses are
+    signed degradations; a degradation withdrawn before its flush is signed
+    all the same; drop-ins and environment files are read bounded, regular
+    files only; the kill's capture reads `stat` once more before its pidfd
+    fallback; the ratchet is semantic (the tolerant readers, `if let Ok`,
+    `unwrap_or*`, `match` arms, paths from consts and fields, each site
+    named).
+  - After the re-check: a drop-in or an `EnvironmentFile=` the judge
+    cannot read — a FIFO (systemd reads it from its writer), a socket, a
+    device, a directory, a refused file — is harmful (a signed
+    `unit_dropin_harmful`, a reload withheld), never an empty file; the
+    path is opened `O_PATH` first (no device opened, no FIFO waited on),
+    `/dev/null` (a mask) reads empty. The guarded roots are ranked, the
+    FUSE ones last, so a user's FUSE mounts never keep a system root out
+    of the kernel's map; only a system root refused is a degradation, held
+    5 minutes. The ratchet also catches `is_ok_and`, `map_or`, a
+    `Type::default()` arm, a read defaulted in a later statement, and a
+    second site under a known key.
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

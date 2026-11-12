@@ -30,6 +30,10 @@ struct KState {
     unstopped: Vec<u32>,
     left: Vec<(u32, ExecqStopped)>,
     counters: [u64; counter::SLOTS as usize],
+    /// Lot 311 (BUG-98): the roots last written.
+    roots: Option<Vec<(ExecqKey, u32)>>,
+    /// Lot 311 (F3): the roots map's size (`None`: unbounded).
+    roots_cap: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -54,7 +58,14 @@ impl KernelIo for FakeKernel {
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
         self.0.lock().left.clone()
     }
-    fn set_roots(&mut self, _roots: &[(ExecqKey, u32)]) {}
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused {
+        let mut k = self.0.lock();
+        // lot 311 (F3, G2): a map of `cap` entries keeps the ranked list's
+        // head
+        let cap = k.roots_cap.unwrap_or(usize::MAX);
+        k.roots = Some(roots.iter().take(cap).copied().collect());
+        kernel::RootsRefused::of_tail(roots, cap)
+    }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         self.0.lock().counters
     }
@@ -867,4 +878,162 @@ fn observe_mode_says_a_script_would_be_refused() {
     );
     assert!(state(h.pid).is_some_and(|s| s != 'Z'), "observe killed it");
     assert_eq!(w.k.0.lock().known.len(), 1, "one record per content");
+}
+
+// ── lot 311 (bug hunt 1.4): BUG-98 ───────────────────────────────────
+
+/// BUG-98: a mount table the controller cannot read as UTF-8 (a FUSE mount
+/// point with a 0xff byte, which the kernel writes as it is) does not
+/// remove the guarded roots of the other lines; and (F4) a table that
+/// cannot be read at all leaves the roots last published, signed.
+#[test]
+fn a_non_utf8_mount_point_does_not_remove_the_guarded_roots() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let mi = w.dir.path().join("mountinfo");
+    let good_line = crate::execq::kernel::tmp_mount_line(30);
+    let good: &[u8] = good_line.as_bytes();
+    std::fs::write(&mi, good).unwrap();
+    w.ctl.roots_source = mi.clone();
+    let tmp = std::fs::metadata("/tmp").unwrap();
+    let t0 = Instant::now();
+    w.ctl.step(t0);
+    let first = w.k.0.lock().roots.clone().unwrap();
+    assert!(
+        first.iter().any(|(k, _)| k.ino == tmp.ino()),
+        "fixture: /tmp published, {first:?}"
+    );
+    // a user's FUSE mount at /home/u/<0xff> appears
+    let mut odd = good.to_vec();
+    odd.extend_from_slice(b"57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n");
+    std::fs::write(&mi, &odd).unwrap();
+    w.ctl.step(t0 + ROOTS_EVERY + Duration::from_millis(1));
+    let now = w.k.0.lock().roots.clone().unwrap();
+    assert!(
+        now.iter().any(|(k, _)| k.ino == tmp.ino()),
+        "EXECQ_ROOTS emptied by one non-UTF-8 line of mountinfo: {now:?}"
+    );
+    // the table gone: nothing written, a degradation while it fails (the
+    // controller's own account: the registry is shared by the tests)
+    std::fs::remove_file(&mi).unwrap();
+    w.k.0.lock().roots = None;
+    w.ctl.step(t0 + 2 * ROOTS_EVERY + Duration::from_millis(2));
+    assert_eq!(w.k.0.lock().roots, None, "the roots last published stay");
+    assert!(w.ctl.roots_read.failing());
+    std::fs::write(&mi, good).unwrap();
+    w.ctl.step(t0 + 3 * ROOTS_EVERY + Duration::from_millis(3));
+    assert!(w.k.0.lock().roots.is_some());
+    assert!(!w.ctl.roots_read.failing());
+}
+
+/// Lot 311 (the review of #538, F2, F3): a user's FUSE mount whose source
+/// is `-` (`fusermount3 -o fsname=-`) is still a guarded root (by its
+/// device); a line not in the kernel's shape is a degradation, never a
+/// silent drop; roots the kernel's map refuses (its 64 entries) are one too.
+#[test]
+fn a_dash_source_line_is_a_root_and_losses_are_signed() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let mi = w.dir.path().join("mountinfo");
+    std::fs::write(
+        &mi,
+        format!(
+            "{}57 1 0:44 / /home/u/mnt rw,nosuid,nodev - fuse.x - rw,user_id=1000\n",
+            crate::execq::kernel::tmp_mount_line(30)
+        ),
+    )
+    .unwrap();
+    w.ctl.roots_source = mi.clone();
+    let t0 = Instant::now();
+    w.ctl.step(t0);
+    let roots = w.k.0.lock().roots.clone().unwrap();
+    assert!(
+        roots.iter().any(|(k, _)| *k
+            == ExecqKey {
+                dev: 44,
+                ino: kernel::FUSE_BY_DEVICE
+            }),
+        "the fsname=- mount is a guarded root: {roots:?}"
+    );
+    assert!(!w.ctl.roots_rows.holding() && !w.ctl.roots_full.holding());
+    // a line not in the kernel's shape: a degradation
+    std::fs::write(
+        &mi,
+        format!(
+            "{}57 1 0:44 / /home/u/mnt rw fuse.x x rw\n",
+            crate::execq::kernel::tmp_mount_line(30)
+        ),
+    )
+    .unwrap();
+    w.ctl.step(t0 + ROOTS_EVERY + Duration::from_millis(1));
+    assert!(w.ctl.roots_rows.holding(), "a dropped line is signed");
+    // the kernel's map full: the refused roots are a degradation
+    w.k.0.lock().roots_cap = Some(0);
+    let full_at = t0 + 2 * ROOTS_EVERY + Duration::from_millis(2);
+    w.ctl.step(full_at);
+    assert!(w.ctl.roots_full.holding());
+    // the review of #538 (G2): it stands its hold, then ends
+    w.k.0.lock().roots_cap = None;
+    w.ctl.step(t0 + 3 * ROOTS_EVERY + Duration::from_millis(3));
+    assert!(w.ctl.roots_full.holding(), "within its hold");
+    w.ctl
+        .step(full_at + crate::execpol::controller::ROOTS_FULL_HOLD + ROOTS_EVERY);
+    assert!(!w.ctl.roots_full.holding());
+    assert_eq!(w.ctl.roots_full.reports(), 1);
+}
+
+/// Lot 311 (the review of #538, G2): seventy FUSE mounts of a user's,
+/// mounted before a system root, never keep it out of the kernel's map
+/// (64 entries): the roots are ranked, the FUSE ones last. Their own
+/// refusal — however its count moves — signs nothing (the exec hooks class
+/// a FUSE file by its magic, lot 318); a system root refused is one record
+/// per hold, however often it comes and goes.
+#[test]
+fn seventy_fuse_mounts_never_keep_a_system_root_out_and_sign_nothing() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    w.k.0.lock().roots_cap = Some(64);
+    let mi = w.dir.path().join("mountinfo");
+    let table = |n: u32| {
+        let mut t = String::new();
+        for i in 0..n {
+            t.push_str(&format!(
+                "{} 1 0:{} / /home/u/m{i} rw,nosuid,nodev - fuse.x - rw,user_id=1000\n",
+                100 + i,
+                200 + i
+            ));
+        }
+        t + &crate::execq::kernel::tmp_mount_line(30)
+    };
+    w.ctl.roots_source = mi.clone();
+    let tmp = std::fs::metadata("/tmp").unwrap();
+    // the root's key: the kernel's dev_t (major << 20 | minor), the inode
+    let tmp_key = ExecqKey {
+        dev: (u64::from(libc::major(tmp.dev())) << 20) | u64::from(libc::minor(tmp.dev())),
+        ino: tmp.ino(),
+    };
+    let t0 = Instant::now();
+    for (round, n) in [70u32, 66, 75, 64, 90, 70].into_iter().enumerate() {
+        std::fs::write(&mi, table(n)).unwrap();
+        w.ctl
+            .step(t0 + (round as u32) * (ROOTS_EVERY + Duration::from_millis(1)));
+        let roots = w.k.0.lock().roots.clone().unwrap();
+        assert_eq!(roots.len(), 64.min(n as usize + 1), "round {round}");
+        assert!(
+            roots.iter().any(|(k, _)| *k == tmp_key),
+            "the system root /tmp, mounted after {n} FUSE mounts, is published"
+        );
+    }
+    assert!(!w.ctl.roots_full.holding());
+    assert_eq!(
+        w.ctl.roots_full.reports(),
+        0,
+        "a FUSE refusal signs nothing"
+    );
+    // a system root refused: one record, however often it comes and goes
+    let t1 = t0 + 10 * ROOTS_EVERY;
+    for i in 0..12u32 {
+        w.k.0.lock().roots_cap = Some(if i % 2 == 0 { 0 } else { 64 });
+        w.ctl
+            .step(t1 + i * (ROOTS_EVERY + Duration::from_millis(1)));
+        assert!(w.ctl.roots_full.holding(), "{i}");
+    }
+    assert_eq!(w.ctl.roots_full.reports(), 1, "bounded: one per hold");
 }

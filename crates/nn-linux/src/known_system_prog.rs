@@ -239,7 +239,7 @@ fn held_link(pdir: &Path, id: u32, link: KnownLink) -> Option<u32> {
 
 /// The start of the process at `pdir`, boot-clock ns.
 fn start_ns(pdir: &Path, clk_tck: u64) -> Option<u64> {
-    start_ns_by(pdir, clk_tck, &|p| std::fs::read_to_string(p).ok())
+    start_ns_by(pdir, clk_tck, &|p| crate::state_read::read_state(p).ok())
 }
 
 /// [`start_ns`], its `stat` read by `read`.
@@ -250,7 +250,7 @@ fn start_ns_by(pdir: &Path, clk_tck: u64, read: &dyn Fn(&Path) -> Option<String>
 
 /// The real uid of the process at `pdir` (`status`' `Uid:` line).
 fn real_uid(pdir: &Path) -> Option<u32> {
-    let status = std::fs::read_to_string(pdir.join("status")).ok()?;
+    let status = crate::state_read::read_state(pdir.join("status")).ok()?;
     status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
@@ -264,8 +264,9 @@ fn real_uid(pdir: &Path) -> Option<u32> {
 /// kind `link`, read as one process throughout (its start the same before
 /// and after; one that cannot be read is left out).
 pub fn holders(proc: &Path, id: u32, link: KnownLink, clk_tck: u64) -> Vec<Holder> {
+    // lot 311 (N6): a holder's `stat` read as bytes — its `comm` is its own
     holders_by(proc, id, link, clk_tck, &|p| {
-        std::fs::read_to_string(p).ok()
+        crate::state_read::read_state(p).ok()
     })
 }
 
@@ -295,7 +296,7 @@ fn holders_by(
         let (Ok(exe), Some(uid)) = (std::fs::metadata(pdir.join("exe")), real_uid(&pdir)) else {
             continue;
         };
-        let comm = std::fs::read_to_string(pdir.join("comm"))
+        let comm = crate::state_read::read_state(pdir.join("comm"))
             .map(|c| c.trim_end().to_string())
             .unwrap_or_default();
         if start_ns_by(&pdir, clk_tck, read_stat) != Some(start) {
@@ -934,5 +935,16 @@ mod tests {
                 None
             )
             .is_err());
+    }
+
+    /// Lot 311 (N6): a loader whose `comm` is not UTF-8 has its real uid
+    /// and start read; on main neither was.
+    #[test]
+    fn a_loader_whose_comm_is_not_utf8_has_its_uid_and_start() {
+        let t = tempfile::tempdir().unwrap();
+        crate::state_read::testing::write_non_utf8_proc(t.path(), 4303, 1, 0, 100);
+        let pdir = t.path().join("4303");
+        assert_eq!(real_uid(&pdir), Some(0));
+        assert!(start_ns(&pdir, 100).is_some());
     }
 }

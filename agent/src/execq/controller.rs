@@ -51,7 +51,8 @@ pub trait KernelIo {
     fn remember(&mut self, key: ExecqKey, v: ExecqKnown);
     fn unstop(&mut self, pid: u32);
     fn stopped(&self) -> Vec<(u32, ExecqStopped)>;
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]);
+    /// What the kernel's map refused of the (ranked) roots.
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused;
     fn counters(&self) -> [u64; counter::SLOTS as usize];
 }
 
@@ -88,7 +89,7 @@ impl KernelIo for kernel::Kernel {
             .map(|(k, v)| (k, v.0))
             .collect()
     }
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) {
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused {
         kernel::Kernel::set_roots(self, roots)
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
@@ -239,6 +240,13 @@ pub struct Controller<K: KernelIo, B: Backend> {
     last_beat: Option<Instant>,
     last_roots: Option<Instant>,
     roots_source: std::path::PathBuf,
+    /// Lot 311 (bug hunt 1.4, BUG-98): a mount table that cannot be read
+    /// leaves the roots last published in force, signed.
+    roots_read: nn_linux::state_read::LastGood,
+    /// Lot 311 (the review of #538): lines of the table not in the
+    /// kernel's shape, and roots the kernel's map refused, signed.
+    roots_rows: nn_linux::state_read::Condition,
+    roots_full: crate::execpol::controller::RootsFull,
     /// Since when the scanner holds requests without a word.
     busy_since: Option<Instant>,
     /// The last signed degradation of the scanner (its cause, when) and
@@ -290,6 +298,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             last_beat: None,
             last_roots: None,
             roots_source: "/proc/self/mountinfo".into(),
+            roots_read: nn_linux::state_read::LastGood::new("execq_roots", "the mount table"),
+            roots_rows: nn_linux::state_read::Condition::new("execq_roots_rows"),
+            roots_full: crate::execpol::controller::RootsFull::new("execq_roots_full"),
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
@@ -352,8 +363,23 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             .last_roots
             .is_none_or(|t| now.duration_since(t) >= ROOTS_EVERY)
         {
-            let text = std::fs::read_to_string(&self.roots_source).unwrap_or_default();
-            self.k.set_roots(&kernel::guarded_roots(&text));
+            // lot 311 (BUG-98): the table read as bytes (a FUSE mount of a
+            // user's, named with bytes that are not UTF-8, emptied it); one
+            // that cannot be read at all keeps the roots last published
+            match nn_linux::mountinfo::read(&self.roots_source) {
+                Ok(table) => {
+                    let roots = kernel::published_roots(&table);
+                    let refused = self.k.set_roots(&roots);
+                    self.roots_full.published(refused, roots.len(), now);
+                    nn_linux::state_read::mount_rows(
+                        &mut self.roots_rows,
+                        &table,
+                        "the exec quarantine",
+                    );
+                    self.roots_read.ok();
+                }
+                Err(e) => self.roots_read.failed(&e),
+            }
             self.last_roots = Some(now);
         }
         for ev in self.b.tick(now) {

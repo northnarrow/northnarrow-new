@@ -125,7 +125,13 @@ impl ProcRef {
         // The pidfd pins the identity; `/proc/<pid>` read now describes
         // the same process as long as it has not exited — checked after
         // the read, since the PID cannot be reused before it is reaped.
-        let stat = read(pid);
+        // lot 311 (the review of #538, F8): an entry unreadable for a
+        // reason of the host's is read once more before the capture falls
+        // back on the pidfd alone
+        let stat = match read(pid) {
+            Err(e) if !is_gone(&e) => read(pid),
+            r => r,
+        };
         let fits = |ticks: u64| start_ns.is_none_or(|ns| started_at(ticks, ns));
         if pidfd_exited(&fd) {
             // Exited. A zombie still describes itself in `/proc` (its PID
@@ -149,9 +155,15 @@ impl ProcRef {
                 // reason of the host's (out of memory or descriptors). It is
                 // still the process the pidfd holds: captured by it, its
                 // start unknown, signalled through it — never left
-                // untouched. The PID cannot change hands while it runs; that
-                // it named another process between the event and the
-                // `pidfd_open` would take a wrap of `pid_max` in that span.
+                // untouched. The PID cannot change hands while it runs. The
+                // trade-off (CMB-004; pinned by
+                // `an_unreadable_stat_skips_the_start_check`): the event's
+                // start is not checked here, so a process that took the PID
+                // between the event and the `pidfd_open` would be signalled
+                // — which takes a full wrap of `pid_max` in a span that
+                // holds the event's queueing and, for a tree, the root's
+                // kill and its wait (seconds at most), and this read failing
+                // twice besides, which no unprivileged process provokes.
                 tracing::warn!(
                     pid,
                     error = %e,
@@ -697,6 +709,44 @@ mod tests {
             Err(std::io::Error::from_raw_os_error(libc::EMFILE))
         });
         assert!(!r.has_fd() && r.capture_errno().is_none());
+    }
+
+    /// Lot 311 (the review of #538, F8): the recorded trade-off of the
+    /// pidfd-only capture (CMB-004). With its `stat` unreadable twice, a
+    /// running process is captured without its start being checked against
+    /// the event's: a process that had taken the event's PID would be
+    /// signalled. With its `stat` readable, the start check holds and a
+    /// process of another start is not captured. And a read that fails
+    /// once is tried again before the fallback.
+    #[test]
+    fn an_unreadable_stat_skips_the_start_check() {
+        let mut child = sleeper();
+        let pid = child.id();
+        let start = proc_start_ns(pid).unwrap();
+        let other = start + 3_600 * 1_000_000_000;
+        let blind = ProcRef::open_checked_with(pid, Some(other), |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert!(
+            blind.has_fd() && blind.start_ticks().is_none(),
+            "the trade-off: captured with another start, its stat unread"
+        );
+        let seeing = ProcRef::open_checked_with(pid, Some(other), read_stat);
+        assert!(!seeing.has_fd(), "a readable stat keeps the start check");
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let flaky = ProcRef::open_checked_with(pid, Some(start), |p| {
+            if CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+            } else {
+                read_stat(p)
+            }
+        });
+        assert!(
+            flaky.has_fd() && flaky.start_ticks().is_some(),
+            "read again once: the start is read and checked"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Lot 311: the reasons a `stat` read fails — the process gone, or the
