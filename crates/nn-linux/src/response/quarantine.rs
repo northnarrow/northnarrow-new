@@ -306,7 +306,12 @@ impl ExeHandle {
 /// The filesystem uid `pid` acts as (`Uid:`'s fourth field of
 /// `/proc/<pid>/status`, read as bytes).
 fn fsuid_of(pid: u32) -> Option<u32> {
-    let status = crate::state_read::read_state(format!("/proc/{pid}/status")).ok()?;
+    fsuid_in(&crate::state_read::read_state(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The filesystem uid a `/proc/<pid>/status` text names (`Uid:` real,
+/// effective, saved, filesystem): the one file access is judged with.
+fn fsuid_in(status: &str) -> Option<u32> {
     status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
@@ -2994,5 +2999,91 @@ mod bug90 {
         let out = quarantine_handle(&h, 4242, &dry, &super::super::journal::test_intent());
         assert_eq!(out, ExecutionOutcome::AlreadyGone { pid: 4242 });
         assert!(list_vault(&dry).is_empty(), "detect-only vaults nothing");
+    }
+
+    /// The offender's uid is the one file access is judged with (`Uid:`'s
+    /// fourth field): a set-uid run's real uid is not the owner it writes
+    /// as.
+    #[test]
+    fn review_f1_the_offenders_uid_is_its_filesystem_uid() {
+        assert_eq!(fsuid_in("Name:\tx\nUid:\t1000\t0\t0\t0\nGid:\t1\t1\t1\t1\n"), Some(0));
+        assert_eq!(fsuid_in("Uid:\t1000\t1000\t1000\t1001\n"), Some(1001));
+        assert_eq!(fsuid_in("Uid:\t1000\n"), None);
+        // SAFETY: getuid(2) takes no argument and cannot fail.
+        let me = unsafe { libc::getuid() };
+        assert_eq!(fsuid_of(std::process::id()), Some(me));
+    }
+
+    /// Where the filesystem records no birth time, the inode number alone
+    /// tells the taken file from another at the name given.
+    #[test]
+    fn review_f1_without_a_birth_time_the_inode_number_decides() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let f = tmp.path().join("payload");
+        let keep = tmp.path().join(".keep");
+        fs::write(&f, b"malware").unwrap();
+        fs::hard_link(&f, &keep).unwrap();
+        let h = ExeHandle::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let ExecutionOutcome::QuarantinedInPlace { vault_id, .. } =
+            quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent())
+        else {
+            panic!();
+        };
+        let meta_path = cfg.quarantine_dir.join("vault").join(format!("{vault_id}.meta"));
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta["inode"]["btime_ns"] = serde_json::Value::Null;
+        fs::write(&meta_path, meta.to_string()).unwrap();
+        let other = tmp.path().join("other");
+        fs::write(&other, b"").unwrap();
+        let e = restore_entry(&vault_id, Some(other.to_str().unwrap()), &cfg).unwrap_err();
+        assert!(e.to_string().contains("is not the file"), "{e}");
+        assert_eq!(fs::read(&other).unwrap(), b"");
+        restore_entry(&vault_id, Some(keep.to_str().unwrap()), &cfg).unwrap();
+        assert_eq!(fs::read(&keep).unwrap(), b"malware");
+    }
+
+    /// The executor's signed row of an in-place quarantine: `partial` with
+    /// what was done when the content is kept, `success` when it is gone.
+    #[test]
+    fn review_f1_the_signed_row_of_an_in_place_quarantine() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&tmp.path().join("agent.sig"))
+            .unwrap();
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::audit::AuditLog::open(&tmp.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+        ));
+        let exec = super::super::Executor::with_config(cfg.clone());
+        exec.set_audit_log(log);
+        let rows = || -> Vec<serde_json::Value> {
+            fs::read_to_string(tmp.path().join("audit.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|r| r["op"] == "response_quarantine")
+                .collect()
+        };
+        // shared: content kept
+        let a = tmp.path().join("a");
+        fs::write(&a, b"shared").unwrap();
+        fs::hard_link(&a, tmp.path().join("a2")).unwrap();
+        exec.quarantine_handle(&ExeHandle::open(&a).unwrap(), 4242, &super::super::journal::test_intent());
+        // hidden link of its own: emptied
+        let b = tmp.path().join("b");
+        fs::write(&b, b"own").unwrap();
+        fs::hard_link(&b, tmp.path().join(".b")).unwrap();
+        let hb = ExeHandle::open(&b).unwrap();
+        fs::remove_file(&b).unwrap();
+        exec.quarantine_handle(&hb, 4243, &super::super::journal::test_intent());
+        let r = rows();
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(r[0]["result"], "partial");
+        assert!(r[0]["extra"]["in_place"].as_str().unwrap().contains("shared: 2 links"));
+        assert_eq!(r[1]["result"], "success");
+        assert!(r[1]["extra"]["in_place"].as_str().unwrap().starts_with("emptied in place"));
+        assert!(r[1]["extra"]["original_path"].is_null(), "no name invented");
     }
 }

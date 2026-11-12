@@ -810,6 +810,18 @@ mod tests {
             "{t}"
         );
         assert_eq!(SystemActuator::no_binary_text(7, Ok(())), NO_BINARY);
+        // lot 312 (review F1): an inode neutralized in place says what holds
+        let in_place = |complete| ExecutionOutcome::QuarantinedInPlace {
+            vault_id: "v".into(),
+            original_path: None,
+            detail: "D".into(),
+            complete,
+        };
+        assert_eq!(SystemActuator::quarantine_text(7, &in_place(true)), "quarantined: D");
+        assert_eq!(
+            SystemActuator::quarantine_text(7, &in_place(false)),
+            "partially quarantined: D (re-exec prevention degraded)"
+        );
         assert!(!NO_BINARY.contains("no binary on disk"));
     }
 }

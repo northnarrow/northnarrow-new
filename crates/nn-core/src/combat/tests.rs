@@ -1359,6 +1359,11 @@ fn a_partial_soft_block_shortens_investigate_and_is_released() {
             && r[0].1.contains("100 FAILED (PARTIAL: 2 inet socket(s) opened before the move)"),
         "{r:?}"
     );
+    assert!(
+        !rec.log().iter().any(|e| e == "soft_clear:100"),
+        "kept blocked until the stand-down: {:?}",
+        rec.log()
+    );
     l.stand_down(t0 + Duration::from_secs(1));
     assert!(rec.log().iter().any(|e| e == "soft_clear:100"), "{:?}", rec.log());
     // and the window is the short one
