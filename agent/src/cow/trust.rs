@@ -745,7 +745,17 @@ mod tests {
             (250, sh()),
             (1, systemd()),
         ];
-        assert!(judge(Some(&l), &writers(), false, &distro).is_trusted());
+        // PID 1 FORKED it (the kernel's record; the re-check of #539, N2)
+        let by_pid1 = [
+            crate::impact::trust::HopFacts::default(),
+            crate::impact::trust::HopFacts {
+                fork_parent: 1,
+                ..Default::default()
+            },
+        ];
+        assert!(judge_with(Some(&l), &by_pid1, &writers(), false, &distro).is_trusted());
+        // a shell PID 1 reaped before its exec, another forked: not
+        assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
         let l = [
             (300, id("/usr/bin/vim.basic", None)),
             (250, sh()),

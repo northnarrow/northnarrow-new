@@ -311,8 +311,13 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// record of who FORKED the process, for its first exec since
     /// (`fork_parent`): PID 1, or a manager by its image — never the
     /// parent at exec time, which an orphan's reaper is.
-    fn is_upgraded_executor(&self, exe: &nn_model::ExeIdentity) -> bool {
-        self.executor.contains((exe.dev, exe.ino)) && self.forked_by_a_manager(exe.fork_parent)
+    fn is_upgraded_executor(
+        &self,
+        exe: &nn_model::ExeIdentity,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> bool {
+        self.executor.contains((exe.dev, exe.ino))
+            && self.forked_by_a_manager(exe.fork_parent, as_of)
     }
 
     /// LSM mode, lot 310: the process re-executes the very image its
@@ -338,11 +343,11 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// host's PID 1, or a `systemd --user` manager told by the image the
     /// lineage holds for it — the packaged manager's identity
     /// ([`ExecutorImages::is_manager`]), never its name or its `comm`.
-    fn forked_by_a_manager(&self, fork_parent: u32) -> bool {
+    fn forked_by_a_manager(&self, fork_parent: u32, as_of: crate::posture::lineage::AsOf) -> bool {
         fork_parent == 1
             || (fork_parent != 0
                 && self.lineage.as_ref().is_some_and(|l| {
-                    l.exec_image(fork_parent, crate::posture::lineage::AsOf::Now)
+                    l.exec_image(fork_parent, as_of)
                         .is_some_and(|id| self.executor.is_manager(id))
                 }))
     }
@@ -400,7 +405,7 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             // (review 61).
             let fileless = exe.has(MEMFD)
                 || (exe.has(DELETED)
-                    && !self.is_upgraded_executor(exe)
+                    && !self.is_upgraded_executor(exe, as_of)
                     && !self.reexecs_its_parent_image(*ppid, exe, as_of));
             if !fileless {
                 return None;

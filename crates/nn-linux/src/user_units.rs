@@ -98,7 +98,7 @@ fn user_unit_of(cgroup: &str) -> Option<(u32, String)> {
             .and_then(|r| r.strip_suffix(".service"))
             .and_then(|u| u.parse::<u32>().ok())
     })?;
-    let unit = parts.last()?;
+    let unit = parts.next_back()?;
     (unit.ends_with(".service") && !unit.contains("..")).then(|| (uid, unit.to_string()))
 }
 
