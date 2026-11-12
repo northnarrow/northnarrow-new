@@ -470,7 +470,7 @@ pub fn fd_path(fd: RawFd) -> Option<String> {
     if st.st_nlink == 0 {
         return None;
     }
-    let Some(opened_by) = s.strip_suffix(" (deleted)") else {
+    let Some(opened_by) = crate::response::inode::name_before_removal(&s) else {
         return Some(s);
     };
     let me = FileId::new(st.st_dev, st.st_ino, btime(fd, None));

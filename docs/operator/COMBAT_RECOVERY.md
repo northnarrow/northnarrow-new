@@ -329,6 +329,104 @@ Rows written before the upgrade keep their bytes and their `null`s and
 still verify (`nn-admin audit verify`); a reader takes a missing `cause` or
 `offender_details` as unknown.
 
+### 3.5 What a response reports: what the host holds, read back (lot 312)
+
+A response's signed row says what the host holds after the action, read
+back — for the quarantine, the soft egress block, the throttle and their
+release. Where the read-back does not show the effect asked for, the row
+is a failure with the reason (`not in effect: …`; the detection record's
+`response` says `(not in effect: …)`), or partial with what holds, never a
+success. Not read back yet: the nft ruleset once applied in an episode
+(re-applied when the scope is another cgroup, not re-read), and
+`StripFileCapability` (its removal by path).
+
+- **Quarantine.** Whether an offender's binary is gone is decided on the
+  file the agent holds open (no name left anywhere: `st_nlink` 0, as for a
+  memfd or a binary unlinked while it ran — vaulted then as evidence, up
+  to 16 MiB), never on the ` (deleted)` the kernel appends to
+  `/proc/<pid>/exe`: a payload named `x (deleted)` is quarantined like any
+  other. The quarantine does to the file only what the offender could have
+  done itself:
+  - never the system's own files, recognized by identity (device and
+    inode), whatever name leads to them: the dynamic loaders, the shells,
+    init and systemd, sshd, the agent's own binaries (`refused: a
+    protected system file`); a verified name under the protected prefixes
+    is refused too, as before. An `/etc/shells` that exists and cannot be
+    read leaves the shells unknown: every quarantine is then refused
+    (`/etc/shells could not be read …`), the offender's own file too, and
+    nothing is changed. It is read as the agent reads a configuration
+    file: a regular file only, at most 1 MiB — a FIFO, a device or a
+    larger file there is refused at once, and NEUTRALIZE goes on;
+  - a non-root offender, only a file it owns; a root offender, any file
+    under a VERIFIED name (the payload a user dropped and root ran); never
+    a root-owned file reached through a name the agent cannot verify (a
+    mount namespace's bind of the host's binaries). Otherwise: `refused`,
+    the owner named, nothing touched;
+  - a name is removed — the content left to the vault — when it is the
+    file's only name. Otherwise the file is neutralized where it is, its
+    names kept: emptied when it has no other link (its name not verified,
+    or not removed), or when it is a non-root offender's own file whatever
+    its links (a second hard link the offender made, `ln x .x2`, or its own
+    environment store: every name emptied, the detail saying how many),
+    read back empty (`success`); a shared file root or another user owns (a
+    package store's binary hard-linked into environments, as conda, pnpm or
+    uv do) is never emptied — made mode 000 under every name where the agent may
+    change its mode, its content kept, the row `partial` with the owner and
+    the link count; where the mode cannot be changed (the unit has no
+    `CAP_FOWNER`) nothing changed but the vault, and the row is a
+    `failure`.
+  `nn-admin response restore` of an entry neutralized in place puts the
+  content and the mode back into that same file (checked by device, inode
+  and birth time), so every name of it comes back; it creates no name.
+  Without a verified name, give `--to` any current name of the file. A
+  binary NEUTRALIZE could not open is said so (`NOT quarantined: its
+  binary could not be opened (…)`); `binary not quarantined: the process
+  exited before NEUTRALIZE could open it` replaces the earlier "no binary
+  on disk".
+- **Soft egress block (BlockOutbound).** The agent's scope is
+  `/<slice>/blocked.scope` from the cgroup root, compared by components: a
+  cgroup a user names `northnarrow.slice/blocked.scope` in the subtree
+  systemd delegates to it (`user@<uid>.service`) is not it, and a process
+  there is moved into the agent's scope like any other. After the move
+  `/proc/<pid>/cgroup` is read again; the drop rule is loaded again when
+  the scope is a different cgroup (another id) than the one it was loaded
+  for. The drop matches sockets by the cgroup they were created in: the
+  inet sockets the process held before the move, and sockets passed to it
+  later from outside the scope (`SCM_RIGHTS`), keep sending. A process
+  holding any is blocked in part — the row is `partial`, "new connections
+  blocked; N inet socket(s) opened before the move are not …" — and the
+  ladder shortens its INVESTIGATE window as for a failed block;
+  NEUTRALIZE's kill and ISOLATE are what end such a connection.
+- **Throttle.** A limit counts only where it reads back as the value asked
+  for (`io.weight` 10, `cpu.max` 10 %, `memory.high` 100 MiB): a default
+  read back is no limit, and the row is partial. A second throttle of a
+  process already in the scope keeps the cgroup it really came from.
+- **Release** (`nn-admin response release`, COMBAT's stand-down) answers
+  `released` only once `/proc/<pid>/cgroup` shows the process back in the
+  cgroup it came from; a record whose origin is the agent's own scope (an
+  earlier agent's) is not released into it (`the recorded origin is the
+  scope itself`).
+- **The host-critical guard** spares the SSH service only in the system
+  manager's own SSH unit: `/system.slice/[<sub>.slice/]ssh.service` (or
+  `sshd.service`, `sshd@…`), one unit, the last component. A
+  `ssh.service` nested in a container's scope or in a service's own
+  subtree is not it. A cgroup with no unit at all spares a root sshd only
+  on a host whose PID 1 is not systemd. On a cgroup v1 host where cgroup2
+  is mounted too, systemd's own hierarchy places a process, never the
+  unified root.
+- **A tree kill's spared processes.** A host-critical process the ladder
+  attributes (the SSH service) is refused, its tree untouched. A protected
+  process (the agent, its watchdog, init) is spared with its whole tree; a
+  host-critical one found below an offender is spared alone. Below a
+  spared host-critical root only the offending lineage can be killed —
+  the chain from the root down to the attributed offender, and the
+  offender's own subtree — never the root's other processes (the other
+  sessions under an sshd listener). Each spared pid is in the outcome
+  with its reason (`in the tree of a protected process` for the ones
+  below a protected pid), next to each killed one.
+- **NEUTRALIZE with every offender host-critical** says so, not "no
+  offending process attributed".
+
 ---
 
 ## 4. Recovering from an agent crash mid-COMBAT

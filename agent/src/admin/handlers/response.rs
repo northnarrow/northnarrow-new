@@ -244,17 +244,29 @@ fn response_restore(
     ) {
         Ok(path) => {
             let path = path.to_string_lossy().into_owned();
+            // lot 312 (review F1): an entry neutralized in place came back
+            // into the same file, its mode its own, every name of it
+            let in_place = crate::response::quarantine::is_in_place(&extra.vault_id, &state.config);
             warn!(
                 target: "admin.response_restore",
                 signer_fp = %v.signer_fp(),
                 vault_id = %extra.vault_id,
                 path = %nn_model::log_escape::Escaped(&path),
-                "quarantined file restored by an administrator (mode 0600)"
+                in_place,
+                "quarantined file restored by an administrator"
             );
+            let message = if in_place {
+                format!(
+                    "restored in place: {path} and every other name of that file hold its \
+                     content and mode again; the vault keeps the entry"
+                )
+            } else {
+                format!("restored to {path} (mode 0600); the vault keeps the entry")
+            };
             ResponseRestoreResponse {
                 result: AdminResult::Success,
                 restored: true,
-                message: format!("restored to {path} (mode 0600); the vault keeps the entry"),
+                message,
                 path,
             }
         }

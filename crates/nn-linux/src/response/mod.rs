@@ -18,6 +18,9 @@ pub use nn_core::response::config;
 pub mod containment;
 pub mod executor;
 pub mod file_caps;
+// Lot 312: whether an executable is gone, from the inode the agent holds
+// (`st_nlink`), never from the kernel's ` (deleted)` suffix.
+pub mod inode;
 // R12c (lab PR 270): no action without a signed record — the actions
 // chain's writer and the ticket an action needs.
 pub mod journal;
@@ -76,11 +79,44 @@ pub enum ExecutionOutcome {
     /// drop rule against that cgroup is now in effect.
     Blocked { pid: u32 },
     /// `Quarantine`: the target's executable was encrypted into the
-    /// vault and the original file was unlinked.
+    /// vault and the original file was unlinked. Lot 312 (BUG-90): where
+    /// another hard link, a name the agent cannot see, still held the
+    /// inode, it was also emptied through the agent's descriptor — read
+    /// back empty — so no name of it runs the binary any more.
     Quarantined {
         original_path: String,
         vault_id: String,
     },
+    /// Lot 312 (review F1, F4, F5): the target's executable was encrypted
+    /// into the vault, and its inode — kept by other names (a shared store,
+    /// a hard link), owned by another user, its name not verified, or its
+    /// removal failed — neutralized where it is: emptied when it is the
+    /// offender's own file with no other name (`complete`), else made mode
+    /// 000 with its content kept, or not changed (`detail` says which, with
+    /// the owner and the link count). A restore puts content and mode back
+    /// into that inode; it creates no name.
+    QuarantinedInPlace {
+        vault_id: String,
+        /// A verified name of it, when one was.
+        original_path: Option<String>,
+        detail: String,
+        /// What holds: emptied (a success), mode 000 with the content kept
+        /// (partial), nothing changed — the content only vaulted (a
+        /// failure).
+        effect: quarantine::InPlaceEffect,
+    },
+    /// Re-check of #543 (N1, N2): the quarantine did not touch the file —
+    /// one the offender could not change itself (another user's for a
+    /// non-root offender; root's reached through a name that could not be
+    /// verified). `detail` names the owner. A failure.
+    QuarantineRefused { pid: u32, detail: String },
+    /// Lot 312 (review F2): `BlockOutbound` moved the process into the
+    /// blocked scope and new sockets are dropped; `sockets` inet sockets
+    /// it held before the move are not (the drop matches a socket's cgroup
+    /// at its creation), nor sockets passed to it later from outside the
+    /// scope (`SCM_RIGHTS`). They may run until NEUTRALIZE's kill or
+    /// ISOLATE. Partial, never a success.
+    BlockedNewOnly { pid: u32, sockets: usize },
     /// `ThrottleProcess`: the PID was placed in
     /// `northnarrow.slice/throttled.scope`. External audit CMB-013: each
     /// limit as read back from the scope after it was written — `None`
@@ -97,6 +133,12 @@ pub enum ExecutionOutcome {
     /// External audit CMB-002, `KillProcessTree`: the `/proc` walk under
     /// `pid` stopped at `limit` descendants; any beyond were not reached.
     TreeTruncated { pid: u32, limit: usize },
+    /// Lot 312 (external bug hunt 1.4, family F5): the action ran, and
+    /// reading its effect back showed it did not take — the process is not
+    /// in the agent's scope after the move, the binary is still on disk
+    /// under another name. `reason` says what was found. Never a success:
+    /// an action reports what the host holds afterwards, not what it wrote.
+    NotInEffect { pid: u32, reason: &'static str },
 }
 
 /// Aggregate report for one verdict execution.
@@ -197,6 +239,18 @@ pub fn journal_outcome(
             R::Partial,
             Some(format!("the tree walk stopped at {limit} descendants")),
         ),
+        ExecutionOutcome::NotInEffect { reason, .. } => {
+            (R::Failure, Some(format!("not in effect: {reason}")))
+        }
+        ExecutionOutcome::QuarantinedInPlace { detail, effect, .. } => match effect {
+            quarantine::InPlaceEffect::Emptied => (R::Success, Some(detail.clone())),
+            quarantine::InPlaceEffect::MadeUnusable => (R::Partial, Some(detail.clone())),
+            quarantine::InPlaceEffect::Unchanged => (R::Failure, Some(detail.clone())),
+        },
+        ExecutionOutcome::QuarantineRefused { detail, .. } => (R::Failure, Some(detail.clone())),
+        ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+            (R::Partial, Some(blocked_new_only(*sockets)))
+        }
     };
     let mut text = format!("{:?}", report.primary);
     if !report.additional.is_empty() {
@@ -222,6 +276,15 @@ pub fn journal_outcome(
         }
     }
     (result, text, reason)
+}
+
+/// Lot 312 (review F2): what a [`ExecutionOutcome::BlockedNewOnly`] row says.
+pub fn blocked_new_only(sockets: usize) -> String {
+    format!(
+        "new connections blocked; {sockets} inet socket(s) opened before the move are not (the \
+         drop matches a socket's cgroup at its creation), nor sockets passed in later from \
+         outside the scope (SCM_RIGHTS): they may run until NEUTRALIZE's kill or ISOLATE"
+    )
 }
 
 /// Reviews 86 and 87: the host's view of `path`, for a response that

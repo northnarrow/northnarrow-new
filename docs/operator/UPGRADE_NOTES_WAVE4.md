@@ -1306,3 +1306,47 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `sched/sched_process_exit` (N9): a process's aggregation state goes with
   its last thread. Where it does not attach, the start signs the
   `io_uring_sensor` degradation.
+
+## 29. What a response reports, read back (lot 312)
+
+- **A new failure text in the signed rows**: `not in effect: <reason>`
+  (the action ran, its effect read back did not take); the detection
+  record's `response` reads `BlockOutbound (not in effect: …)`. A SIEM rule
+  keyed on the bare action name as success is unaffected: these rows are
+  `failure` (`COMBAT_RECOVERY.md` §3.5).
+- **The quarantine does to a file only what the offender could have done
+  itself.** Never the system's own files, by identity (the dynamic
+  loaders, the shells, init, sshd, the agent's binaries), whatever name
+  leads to them (an `/etc/shells` that cannot be read — a FIFO, a device,
+  over 1 MiB — refuses every quarantine at once); a non-root offender only
+  a file it owns; a root offender
+  any file under a verified name; never a root-owned file reached through
+  a name that cannot be verified. Otherwise `refused`, the owner named. A
+  name is removed only when it is the file's only name; a non-root
+  offender's own file is emptied under every name whatever its links (a
+  second hard link no longer keeps it runnable); a shared file root or
+  another user owns (a package store's hard links) is made mode 000 where
+  the agent may, its
+  content kept (`partial`), or, where its mode cannot change, only vaulted
+  (`failure`); the offender's own file under an unverified name is emptied
+  in place. `nn-admin response restore` of those puts content and mode
+  back into the same file — every name of it — and creates no name
+  (without a verified name: `--to` any current name of the file).
+  NEUTRALIZE's text for an offender gone before its binary was opened is
+  now "binary not quarantined: the process exited before NEUTRALIZE could
+  open it".
+- **A soft block of a process holding sockets is partial**: "new
+  connections blocked; N inet socket(s) opened before the move are not",
+  and the INVESTIGATE window is the short one.
+- **The SSH service is spared only in the system manager's own SSH unit**
+  (`/system.slice/[<sub>.slice/]ssh.service`, one unit). A root sshd in a
+  container's nested `ssh.service`, or — on a systemd host — in a cgroup
+  with no unit, is no longer spared.
+- **A tree kill keeps a protected process's whole tree** (the agent, its
+  watchdog, init) and spares a host-critical descendant (an sshd) alone;
+  below a spared host-critical root only the offending lineage (the chain
+  to the offender and its subtree) can be killed, never the root's other
+  sessions. Each spared pid is in the outcome.
+- **A release says `released` only once the process is back** in the
+  cgroup it came from (`response release`: exit 9 with the reason
+  otherwise).

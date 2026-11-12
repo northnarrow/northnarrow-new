@@ -16,6 +16,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use nn_core::response::cgroup::{cgroup_at, cgroup_at_or_under};
 use tracing::{info, warn};
 
 use super::{
@@ -95,6 +96,10 @@ pub fn throttle_pid(
         };
     }
     // External audit CMB-010: where it came from, recorded for the release.
+    // Lot 312 (external bug hunt 1.4, BUG-117): a process already in the
+    // scope (a second throttle) came from where the first record says —
+    // `containment::record` keeps that one; the scope is never its origin.
+    let scope = super::containment::scope_of(cfg, "throttled");
     let origin = super::containment::origin_of(pid);
     let start_ticks = super::block_outbound::proc_start_ticks(pid);
     if let Err(e) = write_pid(&dir.join("cgroup.procs"), pid) {
@@ -103,7 +108,19 @@ pub fn throttle_pid(
         }
         return io_failed(pid, "move_pid_to_throttled", &e);
     }
-    if let Some(origin) = origin {
+    // Lot 312 (F5): read back — the process in the agent's throttle scope,
+    // by components from the root, or the outcome says it is not.
+    if !super::containment::origin_of(pid).is_some_and(|c| cgroup_at(&c, &scope)) {
+        warn!(
+            pid,
+            "throttle: moved, but /proc/<pid>/cgroup does not place it in the scope"
+        );
+        return ExecutionOutcome::NotInEffect {
+            pid,
+            reason: "moved, but /proc/<pid>/cgroup does not place it in the agent's throttle scope",
+        };
+    }
+    if let Some(origin) = origin.filter(|o| !cgroup_at_or_under(o, &scope)) {
         if let Err(e) = super::containment::record(
             cfg,
             super::containment::Contained {
@@ -155,17 +172,18 @@ pub fn release_pid(
     start_ticks: Option<u64>,
     cfg: &ExecutorConfig,
 ) -> std::io::Result<super::containment::Release> {
-    let scope_rel = format!("/{}/throttled.scope", cfg.cgroup_slice);
+    // Lot 312 (BUG-117 and its sibling): the agent's scope from the root,
+    // by components — `ends_with` took a namesake for it.
+    let scope = super::containment::scope_of(cfg, "throttled");
     super::containment::release_to_origin(
         pid,
         start_ticks,
         "throttled",
         cfg,
         &super::containment::Probe {
-            in_scope: &|p| {
-                super::containment::origin_of(p).is_some_and(|c| c.ends_with(&scope_rel))
-            },
+            in_scope: &|p| super::containment::origin_of(p).is_some_and(|c| cgroup_at(&c, &scope)),
             start_of: &super::block_outbound::proc_start_ticks,
+            cgroup_of: &super::containment::origin_of,
         },
     )
 }
@@ -192,7 +210,11 @@ fn ensure_throttled_cgroup(dir: &Path, cfg: &ExecutorConfig) -> std::io::Result<
 }
 
 /// Write each limit, then read it back: what the outcome reports is what
-/// the scope holds (external audit CMB-013).
+/// the scope holds (external audit CMB-013). Lot 312 (external bug hunt
+/// 1.4, BUG-123): a limit counts only when it reads back as the value
+/// asked for — a skipped `io.weight` reads `default 100`, which is no
+/// limit, and was reported as one. A value equal to the one asked for, left
+/// by an earlier throttle, is in force and counts.
 fn write_throttle_limits(dir: &Path) -> std::io::Result<Applied> {
     write_if_present(&dir.join("cpu.max"), CPU_MAX.as_bytes())?;
     write_if_present(&dir.join("io.weight"), IO_WEIGHT.to_string().as_bytes())?;
@@ -200,12 +222,27 @@ fn write_throttle_limits(dir: &Path) -> std::io::Result<Applied> {
         &dir.join("memory.high"),
         MEMORY_HIGH_BYTES.to_string().as_bytes(),
     )?;
+    Ok(read_back(dir))
+}
+
+/// The limits the scope `dir` holds, each only where it is the value the
+/// throttle asks for (lot 312, BUG-123).
+fn read_back(dir: &Path) -> Applied {
     let read = |knob: &str| fs::read_to_string(dir.join(knob)).ok();
-    Ok(Applied {
-        cpu_max_pct: read("cpu.max").as_deref().and_then(parse_cpu_max_pct),
-        io_weight: read("io.weight").as_deref().and_then(parse_io_weight),
-        memory_high_bytes: read("memory.high").as_deref().and_then(parse_memory_high),
-    })
+    Applied {
+        cpu_max_pct: read("cpu.max")
+            .as_deref()
+            .and_then(parse_cpu_max_pct)
+            .filter(|v| *v == CPU_MAX_PCT),
+        io_weight: read("io.weight")
+            .as_deref()
+            .and_then(parse_io_weight)
+            .filter(|v| *v == IO_WEIGHT),
+        memory_high_bytes: read("memory.high")
+            .as_deref()
+            .and_then(parse_memory_high)
+            .filter(|v| *v == MEMORY_HIGH_BYTES),
+    }
 }
 
 /// `cpu.max` reads `"<quota> <period>"` (or `"max <period>"`: no limit).
@@ -397,5 +434,161 @@ mod tests {
                 reason: "PID is protected"
             }
         ));
+    }
+
+    /// Lot 312 (external bug hunt 1.4, BUG-123): a knob that does not read
+    /// back the value asked for is no limit — a skipped `io.weight` reads
+    /// the default (`default 100`), another throttle's or an operator's
+    /// value is not this one. Each such knob is `None`, so the outcome is
+    /// partial (or failed), never a full `Throttled`.
+    #[test]
+    fn bug123_a_limit_counts_only_as_the_value_asked_for() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        let put = |k: &str, v: &str| std::fs::write(d.join(k), v).unwrap();
+        put("cpu.max", "10000 100000\n");
+        put("io.weight", "default 100\n");
+        put("memory.high", "104857600\n");
+        let a = read_back(d);
+        assert_eq!(
+            a.io_weight, None,
+            "BUG-123: the default weight is no limit: {a:?}"
+        );
+        assert_eq!(a.cpu_max_pct, Some(CPU_MAX_PCT));
+        assert_eq!(a.memory_high_bytes, Some(MEMORY_HIGH_BYTES));
+        put("memory.high", "209715200\n");
+        assert_eq!(
+            read_back(d).memory_high_bytes,
+            None,
+            "another limit is not this one"
+        );
+        put("cpu.max", "20000 100000\n");
+        put("memory.high", "max\n");
+        put("io.weight", "default 10\n8:0 100\n");
+        let a = read_back(d);
+        assert_eq!(
+            a,
+            Applied {
+                cpu_max_pct: None,
+                io_weight: Some(IO_WEIGHT),
+                memory_high_bytes: None,
+            }
+        );
+        // the signed row of a throttle whose weight did not take
+        let (result, _, reason) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::ThrottleProcess,
+            primary: ExecutionOutcome::Throttled {
+                pid: 1,
+                cpu_max_pct: Some(CPU_MAX_PCT),
+                io_weight: None,
+                memory_high_bytes: Some(MEMORY_HIGH_BYTES),
+            },
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Partial);
+        assert!(reason.is_some());
+    }
+
+    /// Lot 312 (F5): a move the cgroupfs took but that does not place the
+    /// process in the throttle scope (a plain directory stands for the
+    /// cgroup root here) is not `Throttled`: not in effect, and no origin
+    /// recorded.
+    #[test]
+    fn a_move_that_did_not_take_is_not_throttled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(tmp.path())
+        };
+        let dir = cfg.throttled_cgroup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for k in ["cgroup.procs", "cpu.max", "io.weight", "memory.high"] {
+            std::fs::write(dir.join(k), b"").unwrap();
+        }
+        let me = std::process::id();
+        let out = throttle_pid(
+            me,
+            &HashSet::new(),
+            &cfg,
+            &super::super::journal::test_intent(),
+        );
+        assert_eq!(
+            out,
+            ExecutionOutcome::NotInEffect {
+                pid: me,
+                reason:
+                    "moved, but /proc/<pid>/cgroup does not place it in the agent's throttle scope"
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(),
+            me.to_string()
+        );
+        assert!(super::super::containment::find(&cfg, me, "throttled").is_none());
+    }
+
+    /// Lot 312 (external bug hunt 1.4, BUG-117; privileged: root, systemd,
+    /// cgroup v2 with the cpu, io and memory controllers): a unit's process
+    /// throttled twice and released goes back to its unit. The second
+    /// throttle recorded the scope as its origin, and the release answered
+    /// `Released` with the process still throttled.
+    #[test]
+    #[ignore = "privileged: root, systemd, cgroup v2"]
+    fn bug117_throttled_twice_then_released_returns_to_its_unit() {
+        use std::process::Command;
+        let unit = format!("nn-throttle-victim-{}", std::process::id());
+        let ok = Command::new("systemd-run")
+            .args(["--unit", &unit, "--quiet", "sleep", "300"])
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let out = Command::new("systemctl")
+            .args(["show", "-p", "MainPID", "--value", &unit])
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            cgroup_root: "/sys/fs/cgroup".into(),
+            cgroup_slice: "northnarrow-test312.slice".into(),
+            ..ExecutorConfig::for_test(tmp.path())
+        };
+        let origin = super::super::containment::origin_of(pid).unwrap();
+        let intent = super::super::journal::test_intent();
+        let first = throttle_pid(pid, &HashSet::new(), &cfg, &intent);
+        let second = throttle_pid(pid, &HashSet::new(), &cfg, &intent);
+        let in_scope = super::super::containment::origin_of(pid);
+        let released = release_pid(
+            pid,
+            super::super::block_outbound::proc_start_ticks(pid),
+            &cfg,
+        );
+        let now = super::super::containment::origin_of(pid);
+        let _ = Command::new("systemctl").args(["stop", &unit]).status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::fs::remove_dir(cfg.throttled_cgroup_dir());
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test312.slice");
+        for o in [&first, &second] {
+            assert!(
+                matches!(o, ExecutionOutcome::Throttled { .. }),
+                "{first:?} / {second:?}"
+            );
+        }
+        assert_eq!(
+            in_scope.as_deref(),
+            Some("/northnarrow-test312.slice/throttled.scope")
+        );
+        assert_eq!(
+            released.unwrap(),
+            super::super::containment::Release::Released
+        );
+        assert_eq!(
+            now,
+            Some(origin),
+            "BUG-117: back in its unit, not in the scope"
+        );
     }
 }

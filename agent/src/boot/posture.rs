@@ -481,7 +481,9 @@ pub(crate) fn ladder(
         );
         executor.set_tree_guard(Arc::new(move |pid: u32| {
             use northnarrow_agent::combat::ProtectedProcs;
-            guard.protected_reason(pid).map(|r| r.as_str())
+            guard
+                .protected_reason(pid)
+                .map(northnarrow_agent::combat::protected::spare_of)
         }));
     }
     // Lab PR 181 (debug-trigger builds only): the same guard answers the
