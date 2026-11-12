@@ -190,22 +190,43 @@ pub fn root_kind_of(mp: &str) -> u32 {
     k
 }
 
-/// The roots of the guarded mounts in a `mountinfo` text: mounts of a
-/// filesystem's own root (field 4 is `/`; a bind mount of a directory is
-/// not the root the kernel's walk ends on) at a guarded mount point, with
-/// the point's kind ([`root_kind_of`]).
+/// The roots of the guarded mounts in a `mountinfo` text, with the
+/// point's kind ([`root_kind_of`]): the kernel classes a file by the
+/// identity of its ancestors (lot 318, external bug hunt BUG108:
+/// `nn_guarded_root`), so a root is published by `stat()` of its mount
+/// point, wherever the dentry walk ends:
+///
+/// - a mount of a filesystem's own root (field 4 is `/`) at a guarded
+///   mount point;
+/// - a mount of a directory of a filesystem none of whose mounts is its
+///   root (a btrfs subvolume: `/home` on Fedora and openSUSE, field 4
+///   `/home`), at a guarded mount point;
+/// - a directory of a filesystem mounted at its root elsewhere, bound at a
+///   guarded point itself or at a home ([`bind_home_point`]: `/data/home`
+///   bound at `/home`). A bind deeper in a user's tree is chroot or
+///   sandbox plumbing — `/usr` bound into `~/jail/usr` — and publishing
+///   it would class every file of `/usr` as the user's: left out.
 pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
+    let rows: Vec<Vec<&str>> = mountinfo
+        .lines()
+        .map(|line| line.split(' ').collect::<Vec<&str>>())
+        .collect();
+    // the devices (field 3) some mount shows from their root
+    let rooted: Vec<&str> = rows
+        .iter()
+        .filter(|f| f.get(3) == Some(&"/"))
+        .filter_map(|f| f.get(2).copied())
+        .collect();
     let mut out = Vec::new();
-    for line in mountinfo.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        let (Some(root), Some(mp)) = (f.get(3), f.get(4)) else {
+    for f in &rows {
+        let (Some(dev), Some(root), Some(mp)) = (f.get(2), f.get(3), f.get(4)) else {
             continue;
         };
-        if *root != "/" {
-            continue;
-        }
         let mp = crate::sensors::open_sensor::unescape_octal(mp);
         if !guarded_mount_point(&mp) {
+            continue;
+        }
+        if *root != "/" && rooted.contains(dev) && !bind_home_point(&mp) {
             continue;
         }
         if let Ok(m) = std::fs::metadata(&mp) {
@@ -219,6 +240,20 @@ pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
         }
     }
     out
+}
+
+/// Lot 318 (BUG108): where a bind of a directory is a guarded root — a
+/// guarded point itself (`/home`, `/root`, `/tmp`, `/var/tmp`, `/dev/shm`)
+/// or one home below `/home` or `/run/user` (`/home/<user>`).
+pub fn bind_home_point(mp: &str) -> bool {
+    const POINTS: &[&str] = &["/tmp", "/var/tmp", "/home", "/root", "/dev/shm"];
+    if POINTS.contains(&mp) {
+        return true;
+    }
+    ["/home/", "/run/user/"].iter().any(|p| {
+        mp.strip_prefix(p)
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    })
 }
 
 #[cfg(test)]
@@ -245,11 +280,11 @@ mod tests {
 
     #[test]
     fn only_filesystem_roots_at_guarded_points_are_kept() {
-        // a bind mount of a subdirectory (root field not `/`) and an
-        // unguarded mount are ignored; /tmp itself exists on every host
+        // an unguarded mount is ignored, and a bind mount of a directory
+        // deeper than a home (lot 318); /tmp itself exists on every host
         let text = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
              2 1 0:5 / /tmp rw - tmpfs tmpfs rw\n\
-             3 1 8:1 /srv/data /home rw - ext4 /dev/sda1 rw\n\
+             3 1 8:1 /usr /home/u/jail/usr rw - ext4 /dev/sda1 rw\n\
              4 1 0:6 / /usr rw - tmpfs tmpfs rw\n";
         let roots = guarded_roots(text);
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -257,6 +292,70 @@ mod tests {
         assert_eq!(roots[0].0.ino, m.ino());
         // lab PR 226: the kind of point it is mounted at
         assert_eq!(roots[0].1, root_kind::GUARDED | root_kind::TMP);
+    }
+
+    /// Lot 318 (external bug hunt BUG108): a directory of a filesystem
+    /// mounted at its root elsewhere, bound at a guarded point, is a
+    /// guarded root — the kernel finds it among the ancestors of the files
+    /// under it, whichever path names them (it was left out: the walk ends
+    /// on the filesystem's root, which no guarded mount names). Bound
+    /// deeper in a user's tree it is not (`/usr` in a chroot).
+    #[test]
+    fn a_directory_bound_at_a_guarded_point_is_a_guarded_root() {
+        // /var/tmp exists on every host: the bind's mount point
+        let text = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             2 1 8:1 /srv/data /var/tmp rw - ext4 /dev/sda1 rw\n";
+        let roots = guarded_roots(text);
+        let m = std::fs::metadata("/var/tmp").unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert_eq!(roots[0].0.ino, m.ino());
+        assert_eq!(roots[0].1, root_kind::GUARDED | root_kind::VAR_TMP);
+        for yes in [
+            "/home",
+            "/tmp",
+            "/var/tmp",
+            "/root",
+            "/dev/shm",
+            "/home/u",
+            "/run/user/1000",
+        ] {
+            assert!(bind_home_point(yes), "{yes}");
+        }
+        for no in [
+            "/home/u/jail/usr",
+            "/home/",
+            "/run/user",
+            "/run/user/1000/doc",
+            "/tmp/x",
+            "/usr",
+        ] {
+            assert!(!bind_home_point(no), "{no}");
+        }
+    }
+
+    /// Lot 318 (BUG108): a mount of a directory of a filesystem none of
+    /// whose mounts is its root (a btrfs subvolume) is a guarded root at
+    /// any depth below a guarded point; a directory of a filesystem
+    /// mounted at its root elsewhere, bound at the same depth, is not.
+    #[test]
+    fn a_subvolume_below_a_guarded_point_is_a_guarded_root_and_a_bind_there_is_not() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let mp = dir.path().to_str().unwrap().to_string();
+        assert!(guarded_mount_point(&mp) && !bind_home_point(&mp), "{mp}");
+        let st = std::fs::metadata(&mp).unwrap();
+        let subvol = format!(
+            "1 0 0:35 /root / rw - btrfs /dev/vda3 rw,subvol=/root\n\
+             2 1 0:35 /sv {mp} rw - btrfs /dev/vda3 rw,subvol=/sv\n"
+        );
+        let roots = guarded_roots(&subvol);
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert_eq!(roots[0].0.ino, st.ino());
+        assert_eq!(roots[0].1, root_kind::GUARDED | root_kind::TMP);
+        let bind = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             2 1 8:1 /usr {mp} rw - ext4 /dev/sda1 rw\n"
+        );
+        assert_eq!(guarded_roots(&bind), vec![], "a bind deep below /tmp");
     }
 
     /// Lab PR 226: a file on a filesystem mounted at a guarded point gets

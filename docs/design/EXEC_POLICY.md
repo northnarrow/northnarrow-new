@@ -52,11 +52,16 @@ split out or added in this lot:
 | `tmpfs` | tmpfs, hugetlbfs, ramfs (also `/run`, a container's `/dev/shm`) |
 | `home` | the task's view starts with `/home/` or `/root/`, or a filesystem mounted there |
 | `other_home` | `home`, and the file's owner is neither the caller's real uid nor root (new): code another account controls |
-| `guarded_mount` | a filesystem mounted at a guarded point (`/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`) |
+| `guarded_mount` | a mount at a guarded point (`/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`) is among the file's ancestors, by identity (lot 318: a btrfs subvolume, a bound directory; `docs/design/EXEC_QUARANTINE.md` §2) |
 
 The guarded mount roots (`EXECQ_ROOTS`, from `mountinfo` every 10 s) now say
 which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
-and one on a separate `/home` is `home`. The exec quarantine refreshes them
+and one on a separate `/home` is `home`. Lot 318 (external bug hunt BUG108):
+a file on a btrfs subvolume mounted at `/home`, or in a directory bound
+there, is `home` too, and a file the dentry walk cannot place (more than 64
+levels deep) is `tmp`, `var_tmp` and `home`. A FUSE file outside the task's
+root is `guarded_mount` whatever its daemon says its root is (and `tmp`,
+`var_tmp`, `home` where no published root places it). The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
 ## 3. Lineage tiers
@@ -168,23 +173,34 @@ findings wait in `EXECPOL_ENV` (keyed by `task_struct`) for the exec's pass 0.
 | finding | kernel | record |
 |---|---|---|
 | `LD_PRELOAD` / `LD_AUDIT` entry under `/tmp/`, `/var/tmp/`, `/dev/shm/`, `/proc/` (`/proc/self/fd/N`: a memfd preload), `/dev/fd/` | denied for `service` and `unknown` on a server, for a root caller in `session` (on a desktop: `service`, and a root caller in `session` or `unknown`); recorded for `admin` | `NN-L-EXECENV-001` High (deny) / Medium / Low, T1574.006 |
-| the same at a **set-id target** | never denied | Medium, "the kernel sets AT_SECURE and the loader ignores the entry" |
+| the same at a **set-id target** | lot 318: denied as any other (it was never denied) | as above |
 | `GLIBC_TUNABLES` at a set-id target | recorded | `NN-L-EXECENV-002` Medium; Critical for the shape of CVE-2023-4911 (a tunable whose value holds another assignment, or a value filling the buffer), T1068 |
 | `LD_LIBRARY_PATH` under a staging prefix | recorded for services, unknown callers, root | `NN-L-EXECENV-002` Medium, T1574.006 |
 | `HISTFILE` empty or `/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`, `HISTCONTROL=ignore*` exported, at the exec of a shell | recorded | `NN-L-EXECENV-002` Low, T1070.003 |
 
-**What the kernel already enforces, not duplicated.** For a set-id or
-file-capability target the kernel sets `AT_SECURE`; the loader then ignores
-`LD_PRELOAD` entries with a slash (names without one only from the system
-directories, and only set-id libraries), `LD_LIBRARY_PATH`, and unsafe
-`LD_AUDIT` values. The policy does not deny those (a record says the attempt
-was made). What `AT_SECURE` does not cover is a caller that is **already
-privileged**: a root service, a root cron job, root in a session without a
-terminal — no credential changes, no `AT_SECURE`, the loader honours the
-preload with root's credentials. That is what `deny-root` and the service
-deny are for. File capabilities are not visible to the program (the target
-is judged by its set-id bits): a preload into a capability binary from a
-service is refused, which the loader would have ignored anyway.
+**What the kernel enforces, and why the policy does not count on it.** For
+a set-id or file-capability target whose credentials change the kernel sets
+`AT_SECURE`; the loader then ignores `LD_PRELOAD` entries with a slash (names
+without one only from the system directories, and only set-id libraries),
+`LD_LIBRARY_PATH`, and unsafe `LD_AUDIT` values. What `AT_SECURE` does not
+cover is a caller that is **already privileged**: a root service, a root cron
+job, root in a session without a terminal — no credential changes, no
+`AT_SECURE`, the loader honours the preload with root's credentials. That is
+what `deny-root` and the service deny are for. Lot 318 (external bug hunt
+BUG101): a set-id target is denied as any other. The program read the
+target's set-id bits as "the kernel sets `AT_SECURE`" and let the preload
+through, which the bits do not promise: root running a set-uid-root file
+(`su`, `passwd`, `mount`) changes no credential, and no set-id bit applies
+under `no_new_privs`, on a `nosuid` mount, to a `#!` script (its
+interpreter's bits decide) or for an owner the caller's user namespace does
+not map. `deny-root` was side-stepped with `su`, or with a set-gid copy of
+anything run under `setpriv --no-new-privs`. Telling those cases apart in the
+kernel would take four more facts of it and could still miss one; refusing a
+preload from a staging path at a set-id target whose loader would have
+ignored it costs nothing legitimate. File capabilities were already judged
+the same way: a preload into a capability binary from a service is refused,
+which the loader would have ignored anyway. The set-id bits still decide
+where `GLIBC_TUNABLES` is reported.
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128

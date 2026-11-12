@@ -39,7 +39,7 @@ guarded class (`wire::execq::class`) and its identity is not cached:
 | `dev_shm` | the task's own view starts with `/dev/shm/` (lab PR 226) |
 | `home` | the task's own view starts with `/home/` or `/root/` |
 | `other_home` | `home`, and owned by neither the caller's real uid nor root (lab PR 226) |
-| `guarded_mount` | the walk ended on the root of a filesystem mounted at a guarded point (a separate `/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`): `EXECQ_ROOTS`, refreshed by the agent every 10 s from `mountinfo`. Lab PR 226: the root's value says which point (`root_kind`), and the file gets that point's class too (`tmp`, `var_tmp`, `dev_shm`, `home`) |
+| `guarded_mount` | an ancestor of the file is the root of a mount at a guarded point (a separate `/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`), by its identity: `EXECQ_ROOTS`, the mount points' `stat()` device and inode, refreshed by the agent every 10 s from `mountinfo`. Lab PR 226: the root's value says which point (`root_kind`), and the file gets that point's class too (`tmp`, `var_tmp`, `dev_shm`, `home`). Lot 318 (external bug hunt BUG108): it was the root the walk ended on, the superblock's — never the root of a btrfs subvolume mounted at `/home`, nor of a directory bound there |
 
 Lab PR 226: with the exec policy on (`--exec-policy audit|enforce`,
 `docs/design/EXEC_POLICY.md`) the guard holds only the execs a quarantine
@@ -47,7 +47,47 @@ cell of the policy names (the file's class × the caller's lineage tier);
 without it, every candidate of its classes, as here.
 
 The path classes read the walk's top components, so a container's or a
-chroot's `/tmp` is guarded in its own view. Package-managed binaries live
+chroot's `/tmp` is guarded in its own view; a guarded mount is found by
+identity in any view (lot 318).
+
+**Roots** (`EXECQ_ROOTS`, 1024 entries since lot 318; it had 64, which a
+user's FUSE mounts under their home filled). The agent publishes, from its
+mount table: a mount of a filesystem's own root at a guarded point; a mount
+of a directory of a filesystem none of whose mounts is its root (a btrfs
+subvolume: `subvol=/home`); a directory of a filesystem mounted at its root
+elsewhere, bound at a guarded point itself or at a home (`/home/<user>`,
+`/run/user/<uid>`). A bind deeper in a user's tree is chroot or sandbox
+plumbing (`/usr` bound into `~/jail/usr`) and is left out: published, it
+would class every file of `/usr` as the user's. In the kernel
+(`nn_guarded_root`) the file's ancestors are looked up from its directory
+to its filesystem's root, at most 64 levels, the task's root ignored, each
+level's device as `stat()` gives it (a btrfs subvolume's own).
+
+**A FUSE file** (lot 318, the review of #538, F1 and F3: N8's kernel
+half): a file of a user's FUSE filesystem (`fuse`, `fuseblk`: the
+superblock's magic, `FUSE_SUPER_MAGIC`) outside the task's own root is
+`guarded_mount` whatever the roots say. `virtiofs` shares the magic and is
+left out by the superblock's type name (`sb->s_type->name`, the optional
+offsets `SUPER_BLOCK_S_TYPE_OFFSET` and `FILE_SYSTEM_TYPE_NAME_OFFSET`;
+without them a FUSE-magic file is guarded): a VM's or a Kata container's
+shared directory, its root filesystem at times, is classed by its names and
+roots like any other, as the agent's mount table reader does. The agent publishes a FUSE mount by its device alone,
+`(s_dev, FUSE_BY_DEVICE)` with `FUSE_BY_DEVICE = 0` (lot 311b; it never
+`stat`s a FUSE root): found, the mount point's kind applies; not found (the
+map full, a mount newer than the last refresh), the file is `tmp`, `var_tmp`
+and `home` as well. Its daemon answers every GETATTR, the root's included, and the
+kernel takes the inode number it gives: a user's daemon gave the agent's
+`stat()` one number and kept another for its root (seen on 6.18: 1 became
+7), so the key the agent published never matched, and a user's FUSE mount
+past the map's room had no key at all. Inside the task's root (a virtiofs
+root filesystem) the names decide, as for any other file.
+
+**A walk that finds no root** (lot 318, BUG108's variant): a file more than
+64 levels below the task's root and its filesystem's root — a path no
+installed program has, and one any user can make where they write (65
+`mkdir`s by relative paths) — had no path class, so it was neither held nor
+judged by a cell. It is classed `tmp`, `var_tmp` and `home` now (and
+`other_home` by its owner): where a user writes. Package-managed binaries live
 outside every class (`/usr`, `/opt`, `/snap`…): they are never stopped.
 
 **Identity cache** (`EXECQ_KNOWN`, LRU, 16 384 entries, per agent run, not
@@ -366,8 +406,8 @@ Side effects to know:
 
 - Guard off: one array lookup per binfmt pass and per exec.
 - Guard on, exec outside the guarded classes: the classification (a few
-  probe reads, one hash-map lookup when the walk ends on a filesystem root);
-  no stop.
+  probe reads, one hash-map lookup per ancestor of the file up to its
+  filesystem's root — lot 318); no stop.
 - Known identity: one LRU lookup and two probe reads; no stop.
 - First sight: the stop, the ring's wake-up, two opens, the package lookup
   (skipped in the usual locations), the scan, and the rule engine's verdict

@@ -382,10 +382,21 @@ pub(crate) unsafe fn on_pass(
         let ef = (*e).flags;
         let tb = 1u64 << t;
         mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        // The target's set-id bits: what `GLIBC_TUNABLES` is reported at.
         let setid = mode_bits & 0o6000 != 0;
-        // A set-id target runs with `AT_SECURE`: the loader ignores these
-        // entries itself; recorded, not denied (no duplicate of the kernel).
-        if ef & env_flags::DENYABLE != 0 && !setid {
+        // Lot 318 (external bug hunt BUG101): a set-id target is judged as
+        // any other. It was let through on its mode bits ("the kernel sets
+        // `AT_SECURE` and the loader ignores the entry"), which the bits do
+        // not promise: root running a set-uid-root file changes no
+        // credential, and no set-id bit applies under `no_new_privs`, on a
+        // `nosuid` mount, to a `#!` script (its interpreter's bits decide)
+        // or for an owner the caller's user namespace does not map.
+        // `deny-root` was side-stepped with `su`, or with a set-gid copy of
+        // anything run under `setpriv --no-new-privs`. Telling those apart
+        // here would take four more kernel facts and could still miss one;
+        // a preload from a staging path refused at a set-id target whose
+        // loader would have ignored it costs nothing legitimate.
+        if ef & env_flags::DENYABLE != 0 {
             let root = tv & tier_sig::ROOT != 0;
             if conf(conf_slot::ENV_DENY) & tb != 0
                 || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0)

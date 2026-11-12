@@ -89,6 +89,17 @@ pub mod class {
         | OTHER_HOME;
 }
 
+/// Lot 318 (the review of #538): whether a filesystem type's name, its
+/// first 16 bytes as two little-endian words (the bytes after its NUL zero),
+/// is `virtiofs` — which shares `FUSE_SUPER_MAGIC` with `fuse` and
+/// `fuseblk` and is not a user's FUSE mount (a VM's or a Kata container's
+/// shared directory). The exec guards' kernel half reads it from
+/// `sb->s_type->name`; the agent's mount table reader leaves `virtiofs` out
+/// of FUSE by its type field alike.
+pub const fn is_virtiofs_name(w0: u64, w1: u64) -> bool {
+    w0 == u64::from_le_bytes(*b"virtiofs") && w1 & 0xff == 0
+}
+
 /// `EXECQ_ROOTS` value bits (lab PR 226): which guarded point a mounted
 /// filesystem's root is at, so a file on it gets that point's class too.
 pub mod root_kind {
@@ -358,5 +369,37 @@ mod tests {
             ["dev_shm", "var_tmp", "other_home"]
         );
         assert!(class_names(0).is_empty());
+    }
+
+    /// Lot 318 (the review of #538): of the three filesystem types with
+    /// `FUSE_SUPER_MAGIC`, `virtiofs` alone is told apart — by the whole
+    /// name, its NUL included, as the kernel half reads it.
+    #[test]
+    fn virtiofs_is_told_from_a_user_s_fuse_by_its_type_name() {
+        let words = |name: &[u8]| {
+            let mut b = [0u8; 16];
+            b[..name.len()].copy_from_slice(name);
+            (
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..].try_into().unwrap()),
+            )
+        };
+        let (a, b) = words(b"virtiofs");
+        assert!(is_virtiofs_name(a, b));
+        for other in [
+            &b"fuse"[..],
+            b"fuseblk",
+            b"virtiofs2",
+            b"virtio",
+            b"",
+            b"fuse.sshfs",
+        ] {
+            let (a, b) = words(other);
+            assert!(
+                !is_virtiofs_name(a, b),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
     }
 }

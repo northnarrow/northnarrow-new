@@ -9306,3 +9306,66 @@ number in parentheses is a lab PR.
     empty-line setting. In the backlog: the durability of a run-time cut's
     record across a restart (F5's rest), the stall's end signed and a
     transient listing failure (F7), the open's archive reads (F8).
+- **Lot 318 — the kernel halves of the third bug hunt: BUG37's residue,
+  BUG101, BUG108 and N9, and N8's kernel half from the review of #538
+  (C23, C14; no level changes).**
+  - What was open: the triage of edition 1.4 (11/11) left four kernel
+    halves to one lab lot. BUG37 ("parziale" since lot 293): the BPF
+    guard's refusals wrote the shared denial ring with no budget. BUG101:
+    the exec policy's environment deny skipped every set-id target, and
+    root running `su` with a staging preload kept root and the preload.
+    BUG108: a guarded mount was found by the root the dentry walk ended on,
+    which for a btrfs subvolume at `/home` (Fedora, openSUSE) or a bound
+    directory is no published root. N9: the io_uring sensor's per-process
+    state outlived its process. The review of #538 (F1, F3) added N8's
+    kernel half: a user's FUSE daemon picks its root's inode number at
+    every GETATTR, and `EXECQ_ROOTS` filled at 64.
+  - What changed: `emit_denial_kind` → `emit_attempt` (the ring's writers
+    all budgeted, `inode_protect::emit_denial` private); the set-id skip
+    removed (not the triage's formula: `no_new_privs`, a set-id `#!`
+    script, a `nosuid` mount and an unmapped owner kept root's preload
+    under it); `nn_guarded_root` (an ancestor's identity, each level's
+    device as `stat()` gives it) and the userland publication of binds at a
+    guarded point or a home; a walk that finds no root within 64 levels
+    classed `tmp`, `var_tmp`, `home`; a FUSE file (not `virtiofs`, told by
+    `sb->s_type->name`: two optional BTF offsets, slots 127–128, the later
+    slots +2) outside the task's root `guarded_mount` by its magic, its
+    point's kind from the agent's `(s_dev, 0)` key (lot 311b's contract);
+    `EXECQ_ROOTS` 1024; `io_uring_exit` on `sched_process_exit` (the state
+    and the creation budget of a dead thread group).
+  - Host: `xtask/tests/kernel_halves.rs` (6 tests, all failing on `main`),
+    the userland tests of `execq::kernel`, `wire::execq`'s virtiofs name
+    test; 32 mutants of the new code, every one caught by a named test.
+  - Lab, as measured (our guests, lease k318; the final code's rounds):
+    `verifier-check` 108 programs, 0 failing on 5.15.0-202 (102 OK, 6 not
+    counted), 6.12.115 (105, 3) and 7.0.0-43 (103, 5); on each, the e2e
+    `a_bpf_handle_loop_does_not_bury_a_refused_kill` and the guard's
+    `bpf_guard_enforce_refuses_protected_pids_write` pass (as the nightly
+    runs them); a nobody-owned `true` run by a service from a real btrfs
+    subvolume at `/home/nn318sv`, from a directory bound at `/home/nn318b`
+    (by its own path), 70 levels under `/var/tmp`, and from a user's FUSE
+    mount whose daemon refused the agent's `stat()` of its root: each
+    `guarded_mount`/`home` (`tmp`, `var_tmp` for the deep path and the
+    unplaced FUSE root) and recorded "would deny"; N9: a live process's
+    entry present, gone at its last thread's exit (the leader's first
+    too). BUG101 on 5.15 and 6.12: a staging preload refused (EACCES, the
+    marker preload never ran) at `mount` (root, set-uid root), at a
+    set-gid `chage` under `setpriv --no-new-privs`, at a set-gid `#!`
+    script; eight legitimate set-id runs (`passwd -S`, `sudo -n true`,
+    `ping`, `mount --version`, `su --version`, as the lab user and from a
+    service) ran with no deny record on all three kernels.
+  - Found, not this lot's (pre-existing on `main`): on 7.0 the exec
+    environment's check is nearly inert (0 of 11 preloads refused on
+    `main`; this branch's rounds 0 to 2 of 4 at random). The
+    `sys_enter_execve` program runs at every exec, and its findings are
+    lost unless the exec stays on one CPU: pinned with `taskset`, 20 of 20
+    refused, under load too; unpinned, 6 of 20 and 2 of 10. The scan's
+    per-CPU scratch (`EXECPOL_ENV_SCRATCH`) is written and read back
+    across a CPU change — 7.0's faultable syscall tracepoints do not keep
+    the program on one CPU, as 6.12's did. The fix (the scan writing into
+    the task's own `EXECPOL_ENV` entry) is a follow-up. Also seen: on 5.15
+    the record's path of a file on a btrfs subvolume is empty (the walk
+    ends on the top-level subvolume; the class is right).
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds its e2e to the privileged suite the nightly and
+    the PR's KVM jobs run.

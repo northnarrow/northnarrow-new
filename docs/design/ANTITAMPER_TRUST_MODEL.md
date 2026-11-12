@@ -2347,7 +2347,16 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   guard's refusals (`bpf_handle`, `bpf_prog_type`, `bpf_map`, `bpf_link`)
   are not behind it: lot 290 records one per object on purpose (a
   `bpftool prog list` outside a window is a burst of them); their budget is
-  a follow-up with its own measure.
+  a follow-up with its own measure. **Lot 318** (the follow-up, the bug
+  hunt's "parziale" on BUG37): they are behind it now — they wrote the ring
+  themselves, and a root loop of `BPF_MAP_GET_FD_BY_ID` on one of the
+  agent's maps filled it as the `rm` loop had. A `bpftool prog list`
+  outside a window records the first 50 of its refusals on its CPU in the
+  second and counts the rest (`denial_rate`); the refusal of every one
+  holds. The ring's only writers are the budgeted emitters
+  (`xtask/tests/kernel_halves.rs`); the privileged e2e
+  `a_bpf_handle_loop_does_not_bury_a_refused_kill` runs the loop on every
+  CPU with five refused kills in it.
 - **BUG05 (P2):** `BPF_RAW_TRACEPOINT_OPEN` (17) attaches a program — a raw
   tracepoint, and through it `tp_btf`, `fentry`/`fexit` and LSM programs —
   and the `bpf` hook did not look at it: an attach that way left no record

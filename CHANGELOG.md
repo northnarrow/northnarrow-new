@@ -6,6 +6,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 318 (external bug hunt, editions 1.2/1.3/1.4: the kernel halves of
+  BUG37, BUG101, BUG108 and N9).
+  - **BUG37**: the BPF guard's refusals (`bpf_handle`, `bpf_map`,
+    `bpf_link`, `bpf_prog_type`, `bpf_prog_opt_out`, `sysctl_root_attach`)
+    go behind the per-attempt budget of lot 293. They wrote the shared
+    denial ring themselves: a root loop of `BPF_MAP_GET_FD_BY_ID` on one of
+    the agent's maps filled it, and the record of a refused `kill` was lost
+    (counted, not kept). Past the budget they are counted in `RING_DROPS`
+    (`denial_rate`, signed). Every write of the ring is behind a budget now;
+    `xtask/tests/kernel_halves.rs` keeps it so.
+  - **BUG101**: the exec policy's environment deny (an `LD_PRELOAD` /
+    `LD_AUDIT` entry under a staging path) applies at a set-id target too.
+    It was skipped on the target's set-id bits ("the kernel sets
+    `AT_SECURE`"), which do not promise it: root running a set-uid-root
+    file, a set-id file under `no_new_privs` or on a `nosuid` mount, a
+    set-id `#!` script — `deny-root` was side-stepped with `su`.
+    `docs/design/EXEC_POLICY.md` §5.
+  - **BUG108**: the exec quarantine and the exec policy find a guarded
+    mount by the identity of an ancestor of the file — the root of the
+    mount at the guarded point — not by where the dentry walk ends. A
+    `/home` on a btrfs subvolume (Fedora's and openSUSE's layout) or bound
+    from a directory of another filesystem had no class. The agent
+    publishes those roots (a directory bound at a guarded point or at
+    `/home/<user>`; not one bound deeper, as `/usr` into a chroot), and
+    `EXECQ_ROOTS` holds 1024 of them (64 filled up with a user's FUSE
+    mounts). A file whose walk finds no root within 64 levels — a path any
+    user can make — is classed `tmp`, `var_tmp` and `home` (it had no
+    class).
+  - **N8's kernel half** (the review of #538, F1 and F3): a file of a FUSE
+    filesystem outside the task's root is `guarded_mount` by its
+    superblock's magic (not `virtiofs`, told apart by its type's name: two
+    new optional BTF offsets, the later slots moved up by two), whatever the
+    published roots say; the agent's key
+    for a FUSE mount is its device alone, `(s_dev, 0)` (lot 311b), and
+    where none places it the file is `tmp`, `var_tmp` and `home` too. A user's FUSE daemon chooses its root's inode number at every
+    GETATTR: the `(dev, 1)` key never matched once it said otherwise, and
+    the exec from that mount had no class.
+  - **N9**: the io_uring sensor's per-process state goes with the
+    process's last thread (`sched_process_exit`): a process that reused a
+    pid inherited the classes of the one before it.
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

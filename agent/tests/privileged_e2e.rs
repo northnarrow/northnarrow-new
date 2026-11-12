@@ -1863,6 +1863,251 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     }
 }
 
+// ── Lot 318 — external bug hunt BUG37: the BPF guard's refusals ─────────
+
+/// A process of `nobody` with `CAP_SYS_ADMIN` and `CAP_BPF` (the two that
+/// reach `bpf()`'s LSM hook past `unprivileged_bpf_disabled`), pinned to
+/// `cpu`, asking for a handle on map `map_id` until CLOCK_MONOTONIC passes
+/// `until`. Forked from this multi-threaded test: the child makes raw
+/// system calls only (one thread: each `set*id` its own) and `_exit`s.
+/// Exit 0: every request refused; 1: a handle was granted; 2..5: a step of
+/// the drop failed.
+#[cfg(feature = "debug-trigger")]
+fn fork_handle_flooder(cpu: usize, map_id: u32, until: libc::timespec) -> libc::pid_t {
+    /// `struct __user_cap_header_struct` / `__user_cap_data_struct`.
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_BPF: u32 = 39;
+    const NOBODY: libc::c_long = 65534;
+    // SAFETY: the child runs raw system calls on its own stack and ends
+    // with `_exit`; the parent only gets the pid.
+    unsafe {
+        let pid = libc::fork();
+        if pid != 0 {
+            return pid;
+        }
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
+            libc::_exit(2);
+        }
+        if libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) != 0
+            || libc::syscall(libc::SYS_setresgid, NOBODY, NOBODY, NOBODY) != 0
+        {
+            libc::_exit(3);
+        }
+        if libc::syscall(libc::SYS_setresuid, NOBODY, NOBODY, NOBODY) != 0 {
+            libc::_exit(4);
+        }
+        let header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        for cap in [CAP_SYS_ADMIN, CAP_BPF] {
+            let d = &mut data[(cap / 32) as usize];
+            d.effective |= 1 << (cap % 32);
+            d.permitted |= 1 << (cap % 32);
+        }
+        if libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) != 0 {
+            libc::_exit(5);
+        }
+        let mut granted = 0;
+        let mut attr = [0u32; 32];
+        let mut now: libc::timespec = std::mem::zeroed();
+        loop {
+            for _ in 0..256 {
+                attr[0] = map_id;
+                let fd = libc::syscall(
+                    libc::SYS_bpf,
+                    ::common::bpf_cmd::BPF_MAP_GET_FD_BY_ID as libc::c_long,
+                    attr.as_mut_ptr(),
+                    std::mem::size_of_val(&attr) as u32,
+                );
+                if fd >= 0 {
+                    granted = 1;
+                    libc::close(fd as i32);
+                }
+            }
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+            if (now.tv_sec, now.tv_nsec) >= (until.tv_sec, until.tv_nsec) {
+                libc::_exit(granted);
+            }
+        }
+    }
+}
+
+/// External bug hunt BUG37, the residue lot 293 left (lot 318): a loop of
+/// refused handles on one of the agent's maps, on every CPU, must not cost
+/// the record of a refused `kill`. The BPF guard's refusals wrote the
+/// shared denial ring with no budget, and such a loop filled it: the kill
+/// was refused, its record lost (counted as an `fs_protect` drop). Behind
+/// the per-attempt budget now, the loop's records are held back
+/// (`denial_rate`) and the kills' arrive. The loop runs as `nobody` with
+/// the two capabilities (its NN-L-AT-001 budget is its uid's, not root's);
+/// each kill is a process of its own (the task denials' dedup is per
+/// caller).
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("flood", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let agent = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+
+    // One of the agent's maps, read in a window (outside one a read
+    // handle on its maps is refused too).
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("flood", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let map_id = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
+        .into_iter()
+        .find_map(|(kind, id)| (kind == 1).then_some(id))
+        .expect("OWN_BPF_IDS lists none of the agent's maps");
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // The loop: every CPU, 4 s.
+    const FLOOD: Duration = Duration::from_secs(4);
+    let cpus = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .min(8);
+    let mut until: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut until) };
+    until.tv_sec += FLOOD.as_secs() as libc::time_t;
+    let started = Instant::now();
+    let flooders: Vec<libc::pid_t> = (0..cpus)
+        .map(|cpu| fork_handle_flooder(cpu, map_id, until))
+        .collect();
+    assert!(flooders.iter().all(|p| *p > 0), "fork failed: {flooders:?}");
+
+    // In the middle of it, five refused kills, each its own process.
+    let mut killers = Vec::new();
+    for k in 0..5u64 {
+        let at = Duration::from_millis(1000 + 500 * k);
+        if let Some(wait) = at.checked_sub(started.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        let mut kill = Command::new("kill")
+            .args(["-9", &agent.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kill");
+        let id = kill.id();
+        let st = kill.wait().expect("wait kill");
+        assert!(
+            !st.success(),
+            "kill -9 of the agent (pid {agent}) was not refused"
+        );
+        killers.push(id);
+    }
+    for pid in &flooders {
+        let mut status = 0;
+        // SAFETY: our own child.
+        let r = unsafe { libc::waitpid(*pid, &mut status, 0) };
+        assert_eq!(r, *pid, "waitpid {pid}");
+        let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+        match code {
+            Some(0) => {}
+            Some(1) => panic!(
+                "a handle on the agent's map {map_id} was granted to nobody with CAP_BPF in enforce \
+                 mode\n{}",
+                log_tail(&log)
+            ),
+            other => panic!("the flooder {pid} could not drop to nobody with CAP_BPF: {other:?}"),
+        }
+    }
+    let flood_end = Instant::now();
+    let alive = matches!(
+        fx.enforce_run
+            .as_mut()
+            .expect("enforce run")
+            .child
+            .try_wait(),
+        Ok(None)
+    );
+    assert!(alive, "the agent is gone after the refused kills");
+
+    // Every kill's record arrived.
+    for k in &killers {
+        let pid = format!("pid={k} ");
+        assert!(
+            wait_for_log_line(
+                &log,
+                &["ANTI-TAMPER DENIAL", &pid, "op=signal"],
+                Duration::from_secs(15)
+            )
+            .is_some(),
+            "the refused kill of process {k} left no record (killers {killers:?}, map {map_id}, \
+             {cpus} flooders)\n{}",
+            log_tail(&log)
+        );
+    }
+    // The ring-drop sampler's round (every 10 s) after the loop: the loop
+    // was held back by the budget, and the ring never filled.
+    let sampled = flood_end + Duration::from_secs(12);
+    if let Some(wait) = sampled.checked_duration_since(Instant::now()) {
+        std::thread::sleep(wait);
+    }
+    let text = read_agent_log(&log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        !drops.iter().any(|l| l.contains("fs_protect")),
+        "the denial ring filled during the loop: {drops:#?}"
+    );
+    assert!(
+        drops.iter().any(|l| l.contains("denial_rate")),
+        "the loop's refusals were not held back by the attempt budget (no denial_rate drop: did \
+         it run?): {drops:#?}\n{}",
+        log_tail(&log)
+    );
+
+    // The authorised stop, signed; Drop puts the guard back in observe mode.
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
 // ── Lot 293 — external bug hunt BUG14: a signal through a file's owner ─
 
 /// The ways a root process arms a file's owner on a protected process: the

@@ -1187,3 +1187,46 @@ configure; use the `nn-admin` of this release where the export is checked.
   reported a skew, before.
 - Nothing to configure; the files' formats are unchanged.
 
+## 27. The kernel halves of the third bug hunt (lot 318)
+
+- **A set-id target no longer escapes the exec policy's environment deny**
+  (BUG101; [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)). With `--exec-policy enforce`,
+  an `LD_PRELOAD` or `LD_AUDIT` entry under a staging path (`/tmp/`,
+  `/var/tmp/`, `/dev/shm/`, `/proc/`, `/dev/fd/`) at the exec of a set-uid
+  or set-gid file is refused like at any other file, for the tiers whose
+  rule denies (`service`, `unknown`, a root caller under `deny-root`): the
+  record is `NN-L-EXECENV-001` "denied at exec (EACCES)", where it was
+  "recorded: the target is set-id, the kernel sets AT_SECURE". The bits
+  did not promise it (root running `su`, `no_new_privs`, a `nosuid`
+  mount, a set-id `#!` script). A service whose environment carries such a
+  preload has every other exec refused already; nothing to configure.
+- **More files are in the guarded classes** (BUG108). A file on a btrfs
+  subvolume mounted at `/home` (Fedora, openSUSE), or in a directory of
+  another filesystem bound at a guarded point or at `/home/<user>`, is
+  `home` and `guarded_mount` now, whichever path runs it — the exec
+  quarantine holds it and the policy's cells judge it, as for any home. A
+  file more than 64 levels deep, which the walk cannot place, is `tmp`,
+  `var_tmp` and `home`. A directory bound deeper in a user's tree (a
+  chroot's `/usr`) stays out. Every FUSE filesystem (`fuse`,
+  `fuseblk`; not `virtiofs`, a VM's or a Kata container's shared
+  directory, told apart by the superblock's type name) outside the task's
+  root is `guarded_mount`, with the class of the point it is mounted at, or
+  `tmp`, `var_tmp`, `home` where the agent's table does not place it: a
+  service that runs programs from a FUSE mount (sshfs, rclone, s3fs) now has
+  those execs held for a scan (`quarantine` cells) and recorded by the
+  `audit` cells; a session's own home on the desktop profile is still
+  allowed. Two optional BTF offsets are new (`super_block.s_type`,
+  `file_system_type.name`, slots 127–128; the enum, tracepoint and
+  hook-argument slots move up by two): without them a FUSE-magic file is
+  guarded whatever its type. Check `nn-admin status` (`execpol`
+  counters) after the upgrade on such a layout.
+- **The BPF guard's refusals have a budget** (BUG37): 50 a second per CPU,
+  shared with the other refusals signed at every attempt (lot 293). A
+  `bpftool prog list` or `map list` outside a trusted-installer window
+  records its first 50 refusals in the second and counts the rest in the
+  signed `ringbuf_drop` entry (`denial_rate`) — more than 64 in a 10 s
+  sample are a telemetry loss, as for the `rm` loops. Every refusal holds.
+- **The io_uring sensor** attaches one more program, `io_uring_exit` on
+  `sched/sched_process_exit` (N9): a process's aggregation state goes with
+  its last thread. Where it does not attach, the start signs the
+  `io_uring_sensor` degradation.

@@ -474,8 +474,14 @@ pub(crate) fn emit_sysctl_record(
 
 /// Best-effort audit record. Silently drops if the ringbuffer is
 /// full — the deny verdict still fires.
+///
+/// Lot 318 (external bug hunt BUG37): private to this module — every
+/// other refusal reaches the ring through a budget ([`emit_attempt`],
+/// [`emit_limited`], [`emit_task_denial`]; the BPF guard's through
+/// `emit_attempt`). `xtask/tests/self_defense.rs` keeps the ring's writers
+/// to this function and [`emit_sysctl_record`].
 #[inline(always)]
-pub(crate) fn emit_denial(operation: u8, key: InodeKey) {
+fn emit_denial(operation: u8, key: InodeKey) {
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
