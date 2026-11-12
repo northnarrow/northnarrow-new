@@ -1187,6 +1187,44 @@ configure; use the `nn-admin` of this release where the export is checked.
   reported a skew, before.
 - Nothing to configure; the files' formats are unchanged.
 
+## 27. The exec quarantine's stop and a process it cannot capture (lot 317)
+
+Only for hosts that run the exec quarantine (`--exec-quarantine enforce`,
+EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md)).
+
+- **A stop leaves nothing stopped.** The agent's stop now also resumes the
+  processes the kernel stopped after the agent last read its reports; they
+  stayed in state T until the next start of an agent with the guard on (or
+  a `kill -CONT` by hand). The signed `exec_quarantine` entry `stopping`
+  gains `unreported` (those, among `resumed`), `recaptured`, `killed`
+  (kills owed, see below) and `left` (not captured: still stopped; the next
+  start resumes them, or kills those whose kill is owed).
+- **A process the kernel's map cannot name is not stopped** (the review of
+  #541): `EXECQ_STOPPED` holds 4096 processes; past it an exec runs
+  unheld (record: `not held (the map of stopped processes was full …)`,
+  counted in `not_held`, and in the signed fail-open degradation with the
+  full ring and the refused signal) — it used to be stopped with no entry
+  anything would resume.
+- **New responses in the records**: `resume deferred: …` and `kill
+  deferred: …` — the agent could not capture the held process
+  (`pidfd_open` out of descriptors or memory). The process stays held and
+  the decision is carried out once it is captured, with a new signed
+  `exec_quarantine` entry, `deferred` (`pid`, `action`, `result`,
+  `waited_ms`). A kill owed (a block-list hit, also one that arrives late
+  while a resume is owed) is marked in the pinned map: if the agent stops
+  or dies first, the process stays stopped and the next start kills it
+  (`recovered_at_boot`'s `killed`). The binary does not run — unless the
+  next agent runs without the guard (`--exec-quarantine off`, or a guard
+  that cannot start), which leaves it stopped, neither run nor killed. These records used to say `ended while
+  held` or `already ended`, and the process stayed stopped for good. A SIEM
+  rule that reads `already ended` as "the rules' kill landed first" keeps
+  its meaning; one counting `ended while held` sees fewer of them only
+  where they were false.
+- `recovered_at_boot` gains `deferred`: processes a previous agent left
+  stopped that could not be captured at the boot (no longer counted in
+  `gone`), given their decision once they are; and `killed`: the kills a
+  previous agent owed.
+
 ## 28. The kernel halves of the third bug hunt (lot 318)
 
 - **A set-id target no longer escapes the exec policy's environment deny**

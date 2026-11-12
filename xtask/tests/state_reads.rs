@@ -143,7 +143,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "agent/src/cow/trust.rs",
-        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
     ),
     ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),
@@ -752,6 +752,13 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/sensors/pump.rs",
         "read_to_string(DEBUG_RING_DROP)",
         LAB,
+    ),
+    // lot 315 (#542, merged in): the copy-on-write guard's task `stat`, read
+    // as bytes — a task gone is no task
+    (
+        "agent/src/cow/fanotify.rs",
+        "read_state(format!(\"/proc/{tid}/stat\"))",
+        PROC,
     ),
 ];
 
