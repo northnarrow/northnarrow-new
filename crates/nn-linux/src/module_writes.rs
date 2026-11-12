@@ -373,7 +373,10 @@ fn now() -> (i64, u32) {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    (d.as_secs() as i64, d.subsec_nanos())
+    (
+        i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        d.subsec_nanos(),
+    )
 }
 
 /// With the anti-tamper set: the observer attached in the history's
