@@ -14,9 +14,12 @@
 //! 3. Not a regular file at the path: **kept both**.
 //! 4. Content equal to the original (whatever the inode — a file this
 //!    guard recreated, an operator's own restore): **unchanged**.
-//! 5. Another inode at the path (the file was replaced): **kept both**.
-//! 6. Same inode, a write-open of it after the copy by a process outside
-//!    the attack's tree (a trusted editor, or anyone else): **kept both**.
+//! 5. Not surely the same file at the path (another inode, or the inode
+//!    number with another birth time — or none known to compare: lot 315,
+//!    after the review of #542): **kept both**.
+//! 6. Same file, a write-open of it after the copy by a process outside
+//!    the attack's tree (a trusted editor, or anyone else), or by a process
+//!    of the tree that still runs: **kept both**.
 //! 7. Same inode, the copy predates this run of the guard (the agent
 //!    restarted since: a write-open in between was not seen) and the file
 //!    was modified after the copy: **kept both**.
@@ -55,11 +58,16 @@ impl Current {
         FileId::new(self.dev, self.ino, self.btime_ns)
     }
 
-    /// The same file as the copy's: same device and inode, and — where
-    /// both are known — the same birth time (an inode number freed and
-    /// given to a new file is another file).
+    /// Surely the same file as the copy's: same device and inode, and
+    /// both birth times known and equal (an inode number freed and given to
+    /// a new file is another file). Lot 315, after the review of #542
+    /// (F2): a birth time not known on either side is not "the same" —
+    /// rule 5 then keeps both; with `may_be` here, a new file of the
+    /// owner's that inherited the number at the same path (a filesystem
+    /// without birth times, one open: `cp`, `tar -x`) was restored IN
+    /// PLACE over.
     pub fn same_file(&self, f: &super::index::FileState) -> bool {
-        self.id().may_be(&f.id())
+        self.id().surely_is(&f.id())
     }
 }
 
@@ -96,6 +104,8 @@ pub struct Context<'a> {
     pub post_writes: &'a [PostWrite],
     /// Is this write-open the attack's (see [`Selector::in_attack_write`])?
     pub in_attack: &'a dyn Fn(&PostWrite) -> bool,
+    /// Does this process still run (same pid and start)?
+    pub alive: &'a dyn Fn(ProcId) -> bool,
     /// The copy was taken before this run of the guard started.
     pub predates_run: bool,
 }
@@ -117,13 +127,30 @@ pub fn decide(entry: &Entry, cur: &Current, cx: &Context<'_>) -> Plan {
         return Plan::Unchanged;
     }
     if !cur.same_file(&entry.file) {
+        if cur.id().may_be(&entry.file.id()) {
+            return Plan::KeepBoth(
+                "the file at the path has the copy's inode number, but no birth time tells it \
+                 from a new file that inherited the number"
+                    .into(),
+            );
+        }
         return Plan::KeepBoth("the file was replaced by another (a new file at the path)".into());
     }
+    // Lot 315, after the review of #542 (F3): a write-open of the attack's
+    // tree by a process that still runs (its own copy not taken: shared,
+    // refused for room or time) blocks an in-place restore, as on main.
     if let Some(p) = cx
         .post_writes
         .iter()
-        .find(|p| p.at_ms >= entry.taken_at_ms && !(cx.in_attack)(p))
+        .find(|p| p.at_ms >= entry.taken_at_ms && (!(cx.in_attack)(p) || (cx.alive)(p.writer)))
     {
+        if (cx.in_attack)(p) {
+            return Plan::KeepBoth(format!(
+                "changed after the copy by {} (pid {}) of the attack's tree, which still runs — \
+                 contain it first",
+                p.program, p.writer.pid
+            ));
+        }
         return Plan::KeepBoth(format!(
             "changed after the copy by {} writer {} (pid {})",
             if p.trusted { "trusted" } else { "another" },
@@ -209,7 +236,11 @@ impl Selector {
 /// earliest, the content from before the attack's first write. Lot 315
 /// (BUG-110): one per *file* — two files that had the same inode number
 /// one after the other (birth times known and different) are two, and
-/// neither is dropped.
+/// neither is dropped. After the review of #542 (F5): an entry whose birth
+/// time is not known joins the others of its inode number only when they
+/// are at most one file (one known birth time, or none): beside two known
+/// files it stands alone, never grouping them into one (`may_be` alone is
+/// not transitive: such an entry, the earliest, swallowed both).
 pub fn pick<'a>(entries: impl Iterator<Item = &'a Entry>, sel: &Selector) -> Vec<&'a Entry> {
     let mut slots: std::collections::BTreeMap<super::identity::Slot, Vec<&Entry>> =
         Default::default();
@@ -219,9 +250,16 @@ pub fn pick<'a>(entries: impl Iterator<Item = &'a Entry>, sel: &Selector) -> Vec
     let mut v: Vec<&Entry> = Vec::new();
     for mut same_slot in slots.into_values() {
         same_slot.sort_by_key(|e| (e.taken_at_ms, e.id));
+        let known: std::collections::BTreeSet<i64> =
+            same_slot.iter().filter_map(|e| e.file.btime_ns).collect();
+        let one_file = known.len() <= 1;
         let first = v.len();
         for e in same_slot {
-            if !v[first..].iter().any(|p| p.file.id().may_be(&e.file.id())) {
+            let unknown = |x: &Entry| x.file.btime_ns.is_none();
+            let joins = v[first..]
+                .iter()
+                .any(|k| k.file.id() == e.file.id() || (one_file && (unknown(k) || unknown(e))));
+            if !joins {
                 v.push(e);
             }
         }
@@ -292,6 +330,7 @@ mod tests {
             content_is_original: Some(false),
             post_writes: post,
             in_attack,
+            alive: &|_| false,
             predates_run: false,
         }
     }
@@ -383,9 +422,26 @@ mod tests {
             decide(&e, &reborn, &cx(&none, &attacker)),
             Plan::KeepBoth(_)
         ));
-        // a filesystem without birth times: the inode decides
+        // Lot 315, after the review of #542 (F2): a birth time not known on
+        // one side, or on both (a filesystem that records none), cannot
+        // tell a new file that inherited the number — kept both, never an
+        // overwrite (main restored it in place: "the inode decides")
         reborn.btime_ns = None;
-        assert_eq!(decide(&e, &reborn, &cx(&none, &attacker)), Plan::InPlace);
+        match decide(&e, &reborn, &cx(&none, &attacker)) {
+            Plan::KeepBoth(why) => assert!(why.contains("no birth time"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let mut no_btime = e.clone();
+        no_btime.file.btime_ns = None;
+        assert!(matches!(
+            decide(&no_btime, &reborn, &cx(&none, &attacker)),
+            Plan::KeepBoth(_)
+        ));
+        // known and equal on both sides: the attack's writes only, in place
+        assert_eq!(
+            decide(&e, &same(&e, 1), &cx(&none, &attacker)),
+            Plan::InPlace
+        );
     }
 
     #[test]
@@ -554,6 +610,39 @@ mod lot315 {
             let ids: Vec<u64> = pick(all.iter(), &tree()).iter().map(|e| e.id).collect();
             assert_eq!(ids, [1], "{b1:?} {b2:?}");
         }
+    }
+
+    /// BUG-110 after the review of #542 (F5): an entry without a birth
+    /// time, the earliest, does not group two files that are known to be
+    /// two — each keeps its row (on the lot's first head only the unknown
+    /// one was picked); next to one known file it is that file.
+    #[test]
+    fn bug110_an_entry_without_birth_time_never_groups_two_files() {
+        let all = [
+            entry(1, "/srv/u", None, 100, 500),
+            entry(2, "/srv/a", Some(100), 101, 1000),
+            entry(3, "/srv/b", Some(200), 102, 2000),
+        ];
+        let paths: Vec<&str> = pick(all.iter(), &tree())
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/srv/u", "/srv/a", "/srv/b"]);
+        // later instead of earliest: the same
+        let all = [
+            entry(1, "/srv/a", Some(100), 101, 1000),
+            entry(2, "/srv/b", Some(200), 102, 2000),
+            entry(3, "/srv/u", None, 100, 3000),
+        ];
+        assert_eq!(pick(all.iter(), &tree()).len(), 3);
+        // with one known file it is that file: the earliest of the two
+        let all = [
+            entry(1, "/srv/a", None, 100, 500),
+            entry(2, "/srv/a", Some(100), 101, 1000),
+            entry(3, "/srv/a", Some(100), 102, 2000),
+        ];
+        let ids: Vec<u64> = pick(all.iter(), &tree()).iter().map(|e| e.id).collect();
+        assert_eq!(ids, [1]);
     }
 
     fn write_by(pid: u32, lineage: Vec<ProcId>) -> PostWrite {

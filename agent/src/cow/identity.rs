@@ -20,17 +20,23 @@
 //!
 //! - [`FileId::may_be`]: the same device and inode number, and the same
 //!   birth time where both are known. Asked where a wrong "yes" is the
-//!   careful answer: one entry per file in a restore, a writer of the file
-//!   still running skips its restore, a write-open after the copy keeps
-//!   both, the file at the path is the copy's (rule 5 of the restore).
+//!   careful answer: a writer of the file still running skips its restore,
+//!   a write-open after the copy keeps both, a file with the number is
+//!   reported (never moved) when no birth time can be compared.
 //! - `==`: the same identity as recorded (two unknown birth times are
 //!   equal: a filesystem that records none). Asked where a wrong "no" is
 //!   the careful answer: a writer's copy of the file is taken anew rather
 //!   than taken for done, a copy is shared by the same file only, a restore
-//!   refuses a file that changed under it.
+//!   refuses a file that changed under it; and to group a restore's entries
+//!   (one per file: an entry without a birth time joins the others only
+//!   when they are one file — `pick`).
 //! - [`FileId::surely_is`]: both birth times known and equal. Asked before
 //!   an act that loses a file when it is wrong: moving a file out of the
-//!   owner's directory into the journal's evidence.
+//!   owner's directory into the journal's evidence, and writing the
+//!   original over the file at the path (rule 5 of the restore: after the
+//!   review of #542, F2 — with `may_be` there, a new file of the owner's
+//!   that inherited the number at the same path, on a filesystem without
+//!   birth times, was restored in place over).
 //!
 //! `xtask/tests/cow_file_identity.rs` keeps it so: no other file of
 //! `agent/src/cow/` compares an inode number or builds a key of one.

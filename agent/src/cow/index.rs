@@ -557,6 +557,11 @@ impl JournalIndex {
             .unwrap_or_default()
     }
 
+    /// Every write-open kept, of every file.
+    pub fn all_post_writes(&self) -> impl Iterator<Item = &PostWrite> {
+        self.post_writes.values().flatten()
+    }
+
     /// The object ids every entry references (the journal deletes the
     /// object files no entry names).
     pub fn live_objects(&self) -> impl Iterator<Item = &u64> {
@@ -806,6 +811,7 @@ mod tests {
                 content_is_original: Some(false),
                 post_writes: &post,
                 in_attack: &in_attack,
+                alive: &|_| false,
                 predates_run: false,
             },
         );

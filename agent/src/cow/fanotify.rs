@@ -15,8 +15,11 @@
 //! `open`, `openat` and `open_by_handle_at` carry the flags in a register.
 //! `openat2` carries them in user memory (`struct open_how`), which a
 //! second thread could change after the kernel read it: it counts as a
-//! write. So does anything else the file does not explain (an `io_uring`
-//! open, a 32-bit task, a task the kernel reports `running`).
+//! write. So does anything else the file does not explain (an open by an
+//! io_uring thread, a 32-bit task, a task the kernel reports `running`) —
+//! but not an io_uring open the kernel runs in a user thread's own
+//! task_work, which reads as that thread's syscall (see
+//! [`read_open_intent`]).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -344,27 +347,42 @@ pub fn io_thread_in_stat(stat: &str) -> Option<bool> {
 /// by its `comm` (`iou-wrk-<pid>`, which the process may rename): its
 /// opens count as writes, and so does an open by a task whose flags cannot
 /// be read.
+///
+/// Not closed (the review of #542, F1; a declared limit): an io_uring
+/// request the kernel runs in the submitting thread's own task_work (a
+/// linked `IORING_OP_OPENAT` released while the thread sits in a read-only
+/// `openat`) raises the event from that user thread, whose line is its own
+/// syscall — read as a read. Only the open's mode from the kernel (a BPF
+/// LSM `file_open` record) tells it; a follow-up lot.
 pub fn read_open_intent(tid: i32) -> OpenIntent {
-    let stat = read_task_stat(tid);
-    open_intent(stat.as_deref(), || {
-        std::fs::read_to_string(format!("/proc/{tid}/syscall"))
-    })
+    open_intent(
+        || std::fs::read_to_string(format!("/proc/{tid}/syscall")),
+        || read_task_stat(tid),
+    )
 }
 
-/// [`read_open_intent`] from the task's `stat` text (`None`: unreadable)
-/// and its `syscall` line, read only for a task that is not an io_uring
-/// thread.
-fn open_intent(stat: Option<&str>, syscall: impl FnOnce() -> io::Result<String>) -> OpenIntent {
-    match stat.map(io_thread_in_stat) {
-        Some(Some(false)) => {}
-        Some(Some(true)) => {
-            return OpenIntent::Unknown("an io_uring thread: its syscall line is its creator's")
-        }
-        _ => return OpenIntent::Unknown("/proc/<tid>/stat unreadable"),
-    }
-    match syscall() {
+/// [`read_open_intent`] from the task's `syscall` line and, when that line
+/// reads as a read, its `stat` text (`None`: unreadable) — the flags are
+/// read only for the answer they can change (the review of #542, F8: one
+/// `/proc` read per open on the reader that holds every open of the
+/// marked filesystems).
+fn open_intent(
+    syscall: impl FnOnce() -> io::Result<String>,
+    stat: impl FnOnce() -> Option<String>,
+) -> OpenIntent {
+    let intent = match syscall() {
         Ok(text) => classify_syscall_line(&text),
-        Err(_) => OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
+        Err(_) => return OpenIntent::Unknown("/proc/<tid>/syscall unreadable"),
+    };
+    if intent != OpenIntent::ReadOnly {
+        return intent;
+    }
+    match stat().as_deref().map(io_thread_in_stat) {
+        Some(Some(false)) => OpenIntent::ReadOnly,
+        Some(Some(true)) => {
+            OpenIntent::Unknown("an io_uring thread: its syscall line is its creator's")
+        }
+        _ => OpenIntent::Unknown("/proc/<tid>/stat unreadable"),
     }
 }
 
@@ -837,37 +855,52 @@ mod lot315 {
         );
     }
 
-    /// BUG-102: the flag decides before the line — an io_uring worker
-    /// whose line reads as a user thread's `openat(…, O_RDONLY)` (registers
-    /// and all) is still a write; a task whose flags cannot be read too.
+    /// BUG-102: the flag decides once the line reads as a read — an
+    /// io_uring worker whose line reads as a user thread's
+    /// `openat(…, O_RDONLY)` (registers and all) is still a write; a task
+    /// whose flags cannot be read too. A line that is no read is the answer
+    /// without the flags (they are not read).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bug102_the_flag_decides_before_the_syscall_line() {
         let read_line = || -> io::Result<String> {
             Ok("257 0xffffff9c 0x7ffd1 0x80000 0x0 0x0 0x0 0x7ffd 0x7f12".to_string())
         };
+        let stat = |s: Option<&'static str>| move || s.map(str::to_string);
         let worker =
             "4243 (iou-wrk-4242) S 1 4242 4242 0 -1 2097232 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
         let thread = "4242 (enc) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 777 0 0";
         assert!(matches!(
-            open_intent(Some(worker), read_line),
+            open_intent(read_line, stat(Some(worker))),
             OpenIntent::Unknown(_)
         ));
         assert!(matches!(
-            open_intent(None, read_line),
+            open_intent(read_line, stat(None)),
             OpenIntent::Unknown(_)
         ));
         assert!(matches!(
-            open_intent(Some("4242 (x"), read_line),
+            open_intent(read_line, stat(Some("4242 (x"))),
             OpenIntent::Unknown(_)
         ));
-        assert_eq!(open_intent(Some(thread), read_line), OpenIntent::ReadOnly);
+        assert_eq!(
+            open_intent(read_line, stat(Some(thread))),
+            OpenIntent::ReadOnly
+        );
         assert!(matches!(
-            open_intent(Some(thread), || Err(io::Error::from_raw_os_error(
-                libc::EPERM
-            ))),
+            open_intent(
+                || Err(io::Error::from_raw_os_error(libc::EPERM)),
+                stat(Some(thread))
+            ),
             OpenIntent::Unknown(_)
         ));
+        // a write line is a write, the flags unread
+        let write_line = || -> io::Result<String> {
+            Ok("257 0xffffff9c 0x7ffd1 0x241 0x1b6 0x0 0x0 0x7ffd 0x7f12".to_string())
+        };
+        assert_eq!(
+            open_intent(write_line, || panic!("the flags read for a write")),
+            OpenIntent::Write
+        );
     }
 
     /// BUG-102: the flags of a task whose `comm` is not UTF-8 (its own

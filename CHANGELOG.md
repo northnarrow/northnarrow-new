@@ -12,8 +12,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the triage's N2; `docs/design/COPY_ON_FIRST_WRITE.md` §2.1, §2.3-2.5, §3,
   `docs/design/EXEC_POLICY.md` §2):
   - a file is its device, inode number and birth time in the whole guard
-    (`agent/src/cow/identity.rs`, and a ratchet,
-    `xtask/tests/cow_file_identity.rs`). N2, data loss: the restore took the
+    (`agent/src/cow/identity.rs`, and a ratchet over each file's token
+    stream, `xtask/tests/cow_file_identity.rs`); where a wrong "same" would
+    overwrite or move a file, only a birth time known on both sides makes
+    it the same (after the review of #542: rule 5 too — on a filesystem
+    without birth times a restore keeps both, never in place). N2, data loss: the restore took the
     owner's new file that inherited the inode number of a file the attack
     deleted for "the attack's renamed copy" and moved it into the journal's
     evidence, which the expiry deleted (at once when the file kept an old
@@ -26,12 +29,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - a restore of a process tree weighs every copy of the tree and the
     lineage of each write-open (BUG-93: a second writer of the tree was
     "another writer", the file kept both and the automatic restore said
-    Success; a writer of the tree still running did not stop it); `--since`
+    Success; a writer of the tree still running did not stop it); a
+    process of the tree still running keeps both, and `--pid` without a
+    start refuses a pid the write-opens' lineages show recycled; `--since`
     alone is unchanged (the report's fix would overwrite a later edit);
-  - an io_uring worker's open is a write (BUG-102: its `syscall` line is
-    its creator's — a creator in `openat(…, O_RDONLY)` made the worker's
-    `O_WRONLY|O_TRUNC` opens reads, written without a copy): known by
-    `PF_IO_WORKER` in `/proc/<tid>/stat`, never by its `comm`;
+  - an open by an io-wq worker or an `SQPOLL` thread is a write (BUG-102,
+    in part: its `syscall` line is its creator's — a creator in
+    `openat(…, O_RDONLY)` made the worker's `O_WRONLY|O_TRUNC` opens reads,
+    written without a copy): known by `PF_IO_WORKER` in `/proc/<tid>/stat`,
+    never by its `comm`. Not closed: an io_uring open the kernel runs in
+    the submitting thread's own task_work still reads as that thread's
+    syscall (a declared limit; the open's mode from the BPF LSM is a
+    follow-up lot);
   - a live file named `x (deleted)` has a path (BUG-109: written without a
     copy, `skipped_unresolved_path`): liveness is `st_nlink`, the path is
     told from the kernel's mark by a cached `lstat` against `fstat`; a file

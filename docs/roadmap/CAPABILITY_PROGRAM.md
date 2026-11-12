@@ -9222,7 +9222,12 @@ number in parentheses is a lab PR.
     the file only by a birth time known on both sides; the evidence ages from
     its move; a restore with roots weighs every copy of the tree and each
     write-open's lineage (`--since` alone unchanged); `PF_IO_WORKER` from
-    `/proc/<tid>/stat` and cleared registers make a write; liveness of an
+    `/proc/<tid>/stat` and cleared registers make a write (BUG-102 in part:
+    an io_uring open run in the submitting thread's task_work is a declared
+    limit, its fix a follow-up lot); after the review of #542, rule 5 and
+    the evidence move only on a birth time known on both sides, a running
+    tree writer keeps both, `pick` transitive, `--pid` ambiguity over the
+    write-opens; liveness of an
     event's file is `st_nlink`, its path told by a cached `lstat` against
     `fstat` (a hard link left keeps the opened name: a mini-hunt variant);
     `ExecPolRaw::at_secure`; the watchdog's start read before and after.

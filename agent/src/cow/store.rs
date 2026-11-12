@@ -522,7 +522,7 @@ impl Store {
         let mut report = RestoreReport::default();
         let (entries, weighed): (Vec<Entry>, Vec<Entry>) = {
             let ix = self.index.lock();
-            if let Some(why) = ambiguous(ix.entries(), sel) {
+            if let Some(why) = ambiguous(ix.entries(), ix.all_post_writes(), sel) {
                 report.refusal = Some(why);
                 return report;
             }
@@ -688,6 +688,7 @@ impl Store {
                 content_is_original,
                 post_writes: &post,
                 in_attack: &in_attack,
+                alive: &alive,
                 predates_run: e.taken_at_ms < self.run_started_ms,
             },
         );
@@ -730,7 +731,8 @@ impl Store {
             // The attack's renamed copy of this file, in the same directory.
             match find_file(dir.as_raw_fd(), &e.file.id()) {
                 Found::Surely(found) => {
-                    let others = post.iter().any(|p| !in_attack(p));
+                    // a writer outside the attack, or one of it still running
+                    let others = post.iter().any(|p| !in_attack(p) || alive(p.writer));
                     if others {
                         detail.push_str(&format!(
                             "; its renamed copy {found} was written by others: left"
@@ -756,8 +758,16 @@ impl Store {
 }
 
 /// `--pid` without a start names a pid: refuse when the journal holds
-/// several processes of that pid.
-fn ambiguous<'a>(entries: impl Iterator<Item = &'a Entry>, sel: &Selector) -> Option<String> {
+/// several processes of that pid. Lot 315, after the review of #542 (F4):
+/// the write-opens' lineages count too — a write-open is the attack's when
+/// a root is in its lineage, and a pid of the attack recycled by a process
+/// of the owner's (whose editor then wrote the file) must not be taken for
+/// the attack's root.
+fn ambiguous<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    post_writes: impl Iterator<Item = &'a PostWrite>,
+    sel: &Selector,
+) -> Option<String> {
     let pids: Vec<u32> = sel
         .roots
         .iter()
@@ -769,8 +779,17 @@ fn ambiguous<'a>(entries: impl Iterator<Item = &'a Entry>, sel: &Selector) -> Op
     }
     let mut starts: std::collections::BTreeMap<u32, std::collections::BTreeSet<u64>> =
         Default::default();
-    for e in entries.filter(|e| sel.since_ms.is_none_or(|s| e.taken_at_ms >= s)) {
-        for h in e.lineage.iter().chain(std::iter::once(&e.writer)) {
+    let since = |at: u64| sel.since_ms.is_none_or(|s| at >= s);
+    let chains = entries
+        .filter(|e| since(e.taken_at_ms))
+        .map(|e| (&e.lineage, e.writer))
+        .chain(
+            post_writes
+                .filter(|p| since(p.at_ms))
+                .map(|p| (&p.lineage, p.writer)),
+        );
+    for (lineage, writer) in chains {
+        for h in lineage.iter().chain(std::iter::once(&writer)) {
             if pids.contains(&h.pid) && h.start != 0 {
                 starts.entry(h.pid).or_default().insert(h.start);
             }
@@ -1925,7 +1944,8 @@ mod tests {
             let l = lab();
             std::fs::write(l.scope.join("d.txt"), b"the owner's new file").unwrap();
             if x_had_ds_number(&l, true).is_none() {
-                return; // no birth times here: see the next test
+                eprintln!("SKIPPED: this filesystem records no birth times");
+                return;
             }
             let rep = l.store.restore(&sel(), false, &by());
             assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
@@ -1959,7 +1979,8 @@ mod tests {
                 .set_modified(year_ago)
                 .unwrap();
             if x_had_ds_number(&l, true).is_none() {
-                return; // no birth times here
+                eprintln!("SKIPPED: this filesystem records no birth times");
+                return;
             }
             let rep = l.store.restore(&sel(), false, &by());
             l.store.expire(now_ms());
@@ -2047,6 +2068,142 @@ mod tests {
             assert_eq!(std::fs::read(l.scope.join("w.txt")).unwrap(), b"w original");
         }
 
+        /// N2 at the same path (the review of #542, F2): the attack wrote
+        /// `x.txt` (its copy taken) and deleted it; the owner put a new
+        /// `x.txt` in its place in one open (`cp`, `tar -x`: no write-open
+        /// recorded), and it inherited the number. With no birth time to
+        /// compare (a filesystem without them, or an entry without one) the
+        /// restore keeps both — on the lot's first head it restored in
+        /// place over the owner's file ("rewritten by the attack only").
+        #[test]
+        fn n2_same_path_a_reused_number_without_birth_time_keeps_both() {
+            let l = lab();
+            std::fs::write(l.scope.join("old-x.txt"), b"x original").unwrap();
+            std::fs::write(l.scope.join("x.txt"), b"the owner's new x").unwrap();
+            let m = std::fs::metadata(l.scope.join("x.txt")).unwrap();
+            let file = FileState {
+                path: l.scope.join("x.txt").display().to_string(),
+                dev: m.dev(),
+                ino: m.ino(),
+                size: 10,
+                mtime_ns: 1,
+                ctime_ns: 1,
+                mode: m.mode(),
+                uid: m.uid(),
+                gid: m.gid(),
+                btime_ns: None,
+            };
+            let e = take(
+                &l,
+                "old-x.txt",
+                Some(file),
+                ATTACKER,
+                vec![ATTACKER],
+                now_ms(),
+            );
+            std::fs::remove_file(l.scope.join("old-x.txt")).unwrap();
+            let rep = l.store.restore(&sel(), false, &by());
+            assert_eq!(rep.rows.len(), 1, "{:?}", rep.rows);
+            assert_eq!(rep.rows[0].action, "kept_both", "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("x.txt")).unwrap(),
+                b"the owner's new x",
+                "the owner's file was overwritten in place"
+            );
+            let beside = l.scope.join(format!("x.txt.nn-restored-{}", e.id));
+            assert_eq!(std::fs::read(beside).unwrap(), b"x original");
+        }
+
+        /// BUG-93, after the review of #542 (F3): a process of the tree that
+        /// still runs and wrote the file after the copy (only its
+        /// write-open recorded: its own copy refused) blocks the in-place
+        /// restore — kept both, as on main.
+        #[test]
+        fn bug93_a_running_tree_writer_without_a_copy_keeps_both() {
+            let me = std::process::id();
+            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let running = ProcId { pid: me, start };
+            let l = lab();
+            std::fs::write(l.scope.join("deck.odp"), b"original").unwrap();
+            let t1 = now_ms();
+            let e1 = take(&l, "deck.odp", None, C1, vec![C1, ROOT], t1);
+            std::fs::write(l.scope.join("deck.odp"), b"half encrypted").unwrap();
+            l.store
+                .record_post_write(post(e1.file.id(), running, vec![running, ROOT], t1 + 1000));
+            std::fs::write(l.scope.join("deck.odp"), b"fully encrypted").unwrap();
+            let rep = l.store.restore(&tree(), false, &by());
+            assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+            assert!(
+                rep.rows[0].detail.contains("still runs"),
+                "{}",
+                rep.rows[0].detail
+            );
+            assert_eq!(
+                std::fs::read(l.scope.join("deck.odp")).unwrap(),
+                b"fully encrypted",
+                "not written over while a process of the tree runs"
+            );
+        }
+
+        /// `--pid N` without a start (the review of #542, F4): the attack's
+        /// root N is gone and its pid went to a process of the owner's,
+        /// whose editor then wrote the file. The write-opens' lineages
+        /// count for the ambiguity: refused — on the lot's first head the
+        /// owner's edit counted as the attack's and was overwritten.
+        #[test]
+        fn bug93_a_recycled_root_pid_in_a_write_opens_lineage_is_ambiguous() {
+            let l = lab();
+            std::fs::write(l.scope.join("notes.txt"), b"original").unwrap();
+            let t1 = now_ms();
+            let e1 = take(&l, "notes.txt", None, C1, vec![C1, ROOT], t1);
+            std::fs::write(l.scope.join("notes.txt"), b"encrypted").unwrap();
+            let reborn_root = ProcId {
+                pid: ROOT.pid,
+                start: ROOT.start + 1,
+            };
+            let editor = ProcId {
+                pid: 4_000_400,
+                start: 999_999_940,
+            };
+            l.store.record_post_write(PostWrite {
+                file: e1.file.id(),
+                at_ms: t1 + 1000,
+                writer: editor,
+                program: "/usr/bin/vim.basic".into(),
+                trusted: true,
+                lineage: vec![editor, reborn_root],
+            });
+            std::fs::write(l.scope.join("notes.txt"), b"encrypted + the owner's edit").unwrap();
+            let by_pid = Selector {
+                roots: vec![ProcId {
+                    pid: ROOT.pid,
+                    start: 0,
+                }],
+                since_ms: None,
+            };
+            let rep = l.store.restore(&by_pid, false, &by());
+            assert!(
+                rep.refusal
+                    .as_deref()
+                    .is_some_and(|r| r.contains("different processes")),
+                "{:?} {:?}",
+                rep.refusal,
+                rep.rows
+            );
+            assert_eq!(
+                std::fs::read(l.scope.join("notes.txt")).unwrap(),
+                b"encrypted + the owner's edit"
+            );
+            // the root named with its start: the owner's editor is not of
+            // the tree, its edit is kept
+            let rep = l.store.restore(&tree(), false, &by());
+            assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+            assert_eq!(
+                std::fs::read(l.scope.join("notes.txt")).unwrap(),
+                b"encrypted + the owner's edit"
+            );
+        }
+
         /// N2 guard: the attack's renamed copy — the same file, its birth
         /// time known — still goes to the evidence.
         #[test]
@@ -2055,6 +2212,7 @@ mod tests {
             std::fs::write(l.scope.join("y.txt"), b"y original").unwrap();
             let e = take(&l, "y.txt", None, ATTACKER, vec![ATTACKER], now_ms());
             if e.file.btime_ns.is_none() {
+                eprintln!("SKIPPED: this filesystem records no birth times");
                 return;
             }
             std::fs::write(l.scope.join("y.txt"), b"y encrypted").unwrap();

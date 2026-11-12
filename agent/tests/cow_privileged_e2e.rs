@@ -334,6 +334,17 @@ fn two_writers_of_one_tree_are_its_attack() {
             key_fp: "lot315".into(),
         },
     );
-    assert_eq!(rep.restored, 1, "{:?}", rep.rows);
-    assert_eq!(std::fs::read(&file).unwrap(), b"original");
+    if first.file.btime_ns.is_some() {
+        assert_eq!(rep.restored, 1, "{:?}", rep.rows);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+    } else {
+        // a tmpfs without birth times (older kernels): nothing tells the
+        // file from a new one with its number — kept both, never in place
+        // (the review of #542, F2)
+        assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"half encrypted and the rest"
+        );
+    }
 }

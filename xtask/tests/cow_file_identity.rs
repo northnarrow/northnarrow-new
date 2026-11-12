@@ -20,8 +20,13 @@
 //! arguments of a lookup by number) — but `FileId::new(dev, ino, btime)`,
 //! which makes the identity.
 //!
-//! The scan is lexical (comments blanked, test items left out). The rule is
-//! shown failing on planted violations.
+//! The scan is lexical (comments blanked, test items left out) over each
+//! file as one stream of tokens — a tuple or a comparison that rustfmt
+//! splits over lines is seen whole, and a comparison by method (`.eq(`,
+//! `.cmp(` …), an array key `[dev, ino]` and an element that only holds the
+//! number (`ino + 0`) count (the review of #542, F6, which bypassed a
+//! per-line scan with each). The rule is shown failing on planted
+//! violations.
 
 mod support;
 
@@ -32,24 +37,38 @@ use support::{production, repo_root, rs_files, strip_comments};
 /// The one file of the guard that compares inode numbers.
 const HELPER: &str = "agent/src/cow/identity.rs";
 
-/// Identifier tokens of `line`, with the punctuation between them.
-fn tokens(line: &str) -> Vec<String> {
+/// The tokens of `code` with their line: identifiers and numbers, the
+/// two-character operators `==`, `!=`, `::`, `=>`, `->`, `&&`, `||`, and
+/// single punctuation. The file is one stream: a statement or a tuple that
+/// rustfmt splits over lines is scanned whole (the review of #542, F6).
+fn tokens(code: &str) -> Vec<(String, usize)> {
+    let b: Vec<char> = code.chars().collect();
     let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in line.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            cur.push(c);
-            continue;
+    let mut line = 1usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == '\n' {
+            line += 1;
+            i += 1;
+        } else if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '_') {
+                i += 1;
+            }
+            out.push((b[start..i].iter().collect(), line));
+        } else {
+            let two: String = b[i..(i + 2).min(b.len())].iter().collect();
+            if ["==", "!=", "::", "=>", "->", "&&", "||"].contains(&two.as_str()) {
+                out.push((two, line));
+                i += 2;
+            } else {
+                out.push((c.to_string(), line));
+                i += 1;
+            }
         }
-        if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        if !c.is_whitespace() {
-            out.push(c.to_string());
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
     }
     out
 }
@@ -62,54 +81,75 @@ fn is_dev(t: &str) -> bool {
     t == "dev" || t == "st_dev"
 }
 
-/// The violations of one file's production code: `(line, text)`.
+/// A comparison by method: `.eq(`, `.ne(`, `.cmp(`, `.partial_cmp(`, …
+fn compares_by_method(t: &[(String, usize)], k: usize) -> bool {
+    k + 2 < t.len()
+        && t[k].0 == "."
+        && ["eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge"].contains(&t[k + 1].0.as_str())
+        && t[k + 2].0 == "("
+}
+
+/// The violations of one file's production code: `(line, what)`.
 fn violations(code: &str) -> Vec<(usize, String)> {
+    let t = tokens(&production(&strip_comments(code)));
     let mut out = Vec::new();
-    for (i, line) in production(&strip_comments(code)).lines().enumerate() {
-        let toks = tokens(line);
-        let compares = line.contains("==") || line.contains("!=");
-        let mut bad = compares && toks.iter().any(|t| is_ino(t));
-        // a parenthesised pair: `( … dev , … ino )`
-        for (k, t) in toks.iter().enumerate() {
-            if t != "(" {
-                continue;
-            }
-            let mut depth = 0i32;
-            let mut elems: Vec<Vec<&str>> = vec![Vec::new()];
-            for u in &toks[k + 1..] {
-                match u.as_str() {
-                    "(" | "[" | "{" => depth += 1,
-                    ")" | "]" | "}" if depth > 0 => depth -= 1,
-                    ")" | "]" | "}" => break,
-                    "," if depth == 0 => {
-                        elems.push(Vec::new());
-                        continue;
-                    }
-                    _ => {}
-                }
-                elems.last_mut().unwrap().push(u.as_str());
-            }
-            // the last identifier of an element, past a call's `(` `)`
-            // (`x.ino()` ends in `ino`)
-            fn ends_in(e: &[&str], f: fn(&str) -> bool) -> bool {
-                e.iter()
-                    .rev()
-                    .find(|x| **x != ")" && **x != "(")
-                    .is_some_and(|x| f(x))
-            }
-            let constructor = k >= 4 && toks[k - 4..k].join("") == "FileId::new";
-            if !constructor
-                && elems
-                    .windows(2)
-                    .any(|w| ends_in(&w[0], is_dev) && ends_in(&w[1], is_ino))
-            {
-                bad = true;
-            }
+    // 1. a comparison in a piece (between `;`, `{`, `}`, `,`) that holds an
+    //    inode number token
+    let mut start = 0;
+    for k in 0..=t.len() {
+        let end = k == t.len() || [";", "{", "}", ","].contains(&t[k].0.as_str());
+        if !end {
+            continue;
         }
-        if bad {
-            out.push((i + 1, line.trim().to_string()));
+        let piece = &t[start..k];
+        let ino = piece.iter().find(|(x, _)| is_ino(x));
+        let cmp = piece.iter().any(|(x, _)| x == "==" || x == "!=")
+            || (0..piece.len()).any(|j| compares_by_method(piece, j));
+        if let (Some((_, line)), true) = (ino, cmp) {
+            out.push((*line, "an inode number compared".to_string()));
+        }
+        start = k + 1;
+    }
+    // 2. `dev` then `ino` in a parenthesised or bracketed list (a key, a
+    //    tuple compared, a pattern, a lookup by number) — but the
+    //    constructor `FileId::new(dev, ino, btime)`
+    for (k, (open, line)) in t.iter().enumerate() {
+        let close = match open.as_str() {
+            "(" => ")",
+            "[" => "]",
+            _ => continue,
+        };
+        let constructor =
+            k >= 3 && t[k - 3].0 == "FileId" && t[k - 2].0 == "::" && t[k - 1].0 == "new";
+        if constructor {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut elems: Vec<Vec<&str>> = vec![Vec::new()];
+        for (u, _) in &t[k + 1..] {
+            match u.as_str() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" if depth > 0 => depth -= 1,
+                x if x == close && depth == 0 => break,
+                ")" | "]" | "}" => break,
+                "," if depth == 0 => {
+                    elems.push(Vec::new());
+                    continue;
+                }
+                _ => {}
+            }
+            elems.last_mut().unwrap().push(u.as_str());
+        }
+        let has = |e: &Vec<&str>, f: fn(&str) -> bool| e.iter().any(|x| f(x));
+        if elems
+            .windows(2)
+            .any(|w| has(&w[0], is_dev) && has(&w[1], is_ino))
+        {
+            out.push((*line, "a (dev, ino) list".to_string()));
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -167,6 +207,14 @@ fn the_rule_fails_on_planted_violations() {
         "fn f() { if a.ino != b.ino { } }",
         "fn f() { let key = (job.file.dev, job.file.ino, job.writer); }",
         "fn f() { ix.has_entry_for(dev, ino, writer); }",
+        // the review of #542 (F6): what a per-line scan missed
+        "fn f() {\n    let k = (\n        a.st_dev,\n        a.st_ino,\n    );\n}",
+        "fn f() {\n    if (\n        a.dev,\n        a.ino,\n    ) == key\n    {\n    }\n}",
+        "fn f() { let k = (b.st_dev, b.st_ino + 0); }",
+        "fn f() { if a.st_ino.eq(&b.st_ino) { } }",
+        "fn f() { if a.ino.cmp(&b.ino).is_eq() { } }",
+        "fn f() { let k = [a.st_dev, a.st_ino]; }",
+        "fn f() {\n    let same = a.st_ino\n        == b.st_ino;\n}",
     ] {
         assert!(!violations(planted).is_empty(), "not seen: {planted}");
     }
@@ -176,6 +224,8 @@ fn the_rule_fails_on_planted_violations() {
         "fn f() { if a.file.id().may_be(&b.file.id()) { } }",
         "fn f() { let s = FileState { dev: id.dev, ino: id.ino, size: 1 }; }",
         "fn f() { if m.dev() == dev { } }",
+        "fn f() {\n    let c = Current {\n        regular: st.st_mode & libc::S_IFMT == libc::S_IFREG,\n        dev: st.st_dev,\n        ino: st.st_ino,\n    };\n}",
+        "fn f() { let id = FileId::new(\n    st.st_dev,\n    st.st_ino,\n    None,\n); }",
         // test items are not production code
         "#[cfg(test)]\nmod tests { fn t() { assert!(a.ino == 2); } }",
     ] {
