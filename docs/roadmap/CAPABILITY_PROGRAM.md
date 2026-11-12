@@ -9200,13 +9200,40 @@ number in parentheses is a lab PR.
       the agent's log lines on the leftover pid: none — no capture failure
       was logged for it, so its report was never read: BUG-118's case);
       `main` with #537 passed 5 of 5. The lab shows the property (nothing
-      left stopped in 16 of 16 runs of the fix), not the sweep at work.
+      left stopped in 16 of 16 runs of the fix), not the sweep at work;
+      the review's round below forces the window.
     - Every guest left powered off with no agent installed, no process in
       state T, no test cgroup, no leftover file.
   - Not done: the recovery of what a previous agent left stopped when the
     next agent's guard is off or cannot start (documented limit, §2 of the
     design; a follow-up); the systemd watch's relayed signals still waiting
     at the decision loop's stop are not judged (mini-hunt, a follow-up).
+  - The independent review of #541 (MERGE AFTER FIXES), fixed in new
+    commits: a late block-list verdict on a process whose resume was owed
+    was "kill failed" and the owed resume then ran the binary (F1: the kill
+    is owed in its place, and no owed resume is paid to a process a verdict
+    asks to kill); a kill owed at the stop was resumed by the next start
+    (F2: the kill is marked in the pinned map, `stop_ns` = `u64::MAX`, and
+    the next start kills it); a stop the map could not take (4096) left a
+    process nothing resumes (F3: the kernel writes the map before `SIGSTOP`
+    and stops nothing it cannot name, `MAP_FULL`, signed fail-open; F7: the
+    stop reads the ring a last time); the ratchet passed `!= Liveness::Live`
+    (F4); the stop keyed processes by pid alone (F5: pid and start); no
+    e2e showed the stop's sweep at work (F6); nits (F8). The reviewer's
+    three probes are named tests now; 12 more tests; the second mutation
+    round 20 mutants, 20 caught by a named test.
+  - Lab, measured (ubuntu2604, 7.0.0-43, the review's fixes at 3ce97ad3):
+    the e2e's three cases — the plain stop, the window held open 600 ms by
+    a `debug-trigger` hook with the ring read a last time, and the same
+    with that read skipped so the map alone names them — passed in runs 2
+    and 3: 1,007–1,074 held at the stop in the plain case; 404 processes
+    resumed without an entry in each window case (the ring's capacity:
+    the kernel stopped no more once it was full), none left in state T,
+    the cgroup not frozen; the eBPF object with the new order passed the
+    7.0 verifier. In run 1, on the fresh guest, the plain case passed and
+    the two others were refused their start (a second agent in one run
+    against the first's pins): the e2e now purges the pin root before
+    each agent, as the canary and FIM suites do.
   - Level unchanged.
 - **Lot 314 — the state machines of the third external bug hunt, tested as
   such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,
