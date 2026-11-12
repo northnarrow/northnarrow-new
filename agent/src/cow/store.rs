@@ -2145,6 +2145,38 @@ mod tests {
             );
         }
 
+        /// The review of #542 (F3), the evidence step: a process of the
+        /// tree that still runs and wrote the file after the copy keeps the
+        /// renamed copy where it is (it may be writing it): left, as on
+        /// main.
+        #[test]
+        fn bug93_a_running_tree_writer_keeps_the_renamed_copy_in_place() {
+            let me = std::process::id();
+            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let running = ProcId { pid: me, start };
+            let l = lab();
+            std::fs::write(l.scope.join("plan.ods"), b"original").unwrap();
+            let t1 = now_ms();
+            let e1 = take(&l, "plan.ods", None, C1, vec![C1, ROOT], t1);
+            if e1.file.btime_ns.is_none() {
+                eprintln!("SKIPPED: this filesystem records no birth times");
+                return;
+            }
+            std::fs::write(l.scope.join("plan.ods"), b"encrypted").unwrap();
+            l.store
+                .record_post_write(post(e1.file.id(), running, vec![running, ROOT], t1 + 1000));
+            std::fs::rename(l.scope.join("plan.ods"), l.scope.join("plan.ods.locked")).unwrap();
+            let rep = l.store.restore(&tree(), false, &by());
+            assert_eq!(rep.recreated, 1, "{:?}", rep.rows);
+            assert_eq!(rep.rows[0].evidence, None, "{:?}", rep.rows);
+            assert!(
+                rep.rows[0].detail.contains("written by others: left"),
+                "{}",
+                rep.rows[0].detail
+            );
+            assert!(l.scope.join("plan.ods.locked").exists());
+        }
+
         /// `--pid N` without a start (the review of #542, F4): the attack's
         /// root N is gone and its pid went to a process of the owner's,
         /// whose editor then wrote the file. The write-opens' lineages
