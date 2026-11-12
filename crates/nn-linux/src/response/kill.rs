@@ -302,13 +302,79 @@ fn kill_tree_by_pid(
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<Spare>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
-    kill_tree_by_pid_with(root, protected, guard, read_stat)
+    kill_tree_by_pid_toward(root, None, protected, guard, read_stat)
+}
+
+/// Lot 312 (review of #543, F6; the coordinator's decision for BUG-122):
+/// the offending lineage below a host-critical root (the SSH listener),
+/// killed — the chain from the root down to the attributed offender
+/// `offender`, and the offender's own subtree. The root is spared; every
+/// other process below it (the other sessions) is never touched, nor
+/// named. On the chain a host-critical process is killed (it is the
+/// offender's session); in the offender's subtree the guard spares a
+/// host-critical one alone and a protected one with its tree, as in any
+/// tree kill. An offender not below the root: nothing is killed.
+pub fn kill_lineage(
+    root_pid: u32,
+    offender: u32,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
+    _intent: &Intent,
+) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    if root_pid <= 1 {
+        return refuse_root(root_pid);
+    }
+    let root = ProcRef::open(root_pid);
+    match spare_of(root_pid, protected, guard) {
+        Some(spare) if spare.tree => spared_tree(&root, spare),
+        _ => kill_tree_by_pid_toward(&root, Some(offender), protected, guard, read_stat),
+    }
+}
+
+/// Lot 312 (review F6): the processes a spared host-critical root's kill
+/// may reach — the chain down to `toward` (the root excluded, the offender
+/// excluded) and the offender's own subtree (the offender included). With
+/// no offender, or one not below the root: none.
+fn lineage_of(descendants: &[Descendant], toward: Option<u32>) -> (HashSet<u32>, HashSet<u32>) {
+    let (mut chain, mut subtree) = (HashSet::new(), HashSet::new());
+    let Some(offender) = toward else {
+        return (chain, subtree);
+    };
+    let parent: HashMap<u32, u32> = descendants.iter().map(|&(p, _, pp)| (p, pp)).collect();
+    if !parent.contains_key(&offender) {
+        return (chain, subtree);
+    }
+    let mut up = parent[&offender];
+    while let Some(&pp) = parent.get(&up) {
+        chain.insert(up);
+        up = pp;
+    }
+    subtree.insert(offender);
+    for &(p, _, pp) in descendants {
+        if subtree.contains(&pp) {
+            subtree.insert(p);
+        }
+    }
+    (chain, subtree)
 }
 
 /// [`kill_tree_by_pid`], the descendants' `stat` read by `read` (tests: a
 /// read that fails).
+#[cfg(test)]
 fn kill_tree_by_pid_with(
     root: &ProcRef,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<Spare>,
+    read: fn(u32) -> std::io::Result<ProcStat>,
+) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    kill_tree_by_pid_toward(root, None, protected, guard, read)
+}
+
+/// [`kill_tree_by_pid`] — `toward` the attributed offender below a spared
+/// host-critical root ([`kill_lineage`]).
+fn kill_tree_by_pid_toward(
+    root: &ProcRef,
+    toward: Option<u32>,
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<Spare>,
     read: fn(u32) -> std::io::Result<ProcStat>,
@@ -329,21 +395,36 @@ fn kill_tree_by_pid_with(
         _ => (Vec::new(), false, None),
     };
 
-    // A host-critical root is spared alone (BUG-122): its descendants are
-    // the offender's, killed below.
-    let primary = match spare_of(root_pid, protected, guard) {
+    // A host-critical root is spared (BUG-122); review F6: below it only
+    // the offending lineage is reached — the chain to the attributed
+    // offender and its subtree — never the root's other processes.
+    let root_spare = spare_of(root_pid, protected, guard);
+    let primary = match root_spare {
         Some(spare) => ExecutionOutcome::Refused {
             pid: root_pid,
             reason: spare.reason,
         },
         None => kill_one(root, protected),
     };
+    let lineage = root_spare.map(|_| lineage_of(&descendants, toward));
 
     let mut trees = HashSet::new();
     let mut outcomes = Vec::with_capacity(descendants.len() + 1);
     for (child_pid, start, parent) in descendants {
+        let spare = match &lineage {
+            Some((chain, subtree)) if !chain.contains(&child_pid) && !subtree.contains(&child_pid) => {
+                continue;
+            }
+            // on the chain: the offender's session, killed unless protected
+            Some((chain, _)) if chain.contains(&child_pid) => {
+                spare_in_walk(child_pid, parent, &mut trees, protected, &|p| {
+                    guard(p).filter(|s| s.tree)
+                })
+            }
+            _ => spare_in_walk(child_pid, parent, &mut trees, protected, guard),
+        };
         outcomes.push(
-            match spare_in_walk(child_pid, parent, &mut trees, protected, guard) {
+            match spare {
                 Some(spare) => ExecutionOutcome::Refused {
                     pid: child_pid,
                     reason: spare.reason,
@@ -1743,11 +1824,11 @@ mod bug122 {
         assert!(refused_in_tree(&rest, &kids), "{rest:?}");
     }
 
-    /// A host-critical root (the SSH service) is spared alone: the
-    /// offender's processes below it are killed, each said killed, the root
-    /// said spared.
+    /// A host-critical root (the SSH listener) is refused itself, and with
+    /// no attributed offender below it nothing of its tree is touched
+    /// (review of #543, F6: its other sessions are never killed).
     #[test]
-    fn bug122_a_host_critical_root_is_spared_alone() {
+    fn bug122_a_host_critical_root_is_spared_and_nothing_below_it_killed() {
         let (sh, kids) = shell_with_two_sleepers();
         let root = sh.id();
         let (primary, rest) = kill_process_tree_guarded(
@@ -1756,19 +1837,92 @@ mod bug122 {
             &|pid| (pid == root).then_some(Spare::process("ssh-service(sshd)")),
             &super::super::journal::test_intent(),
         );
+        let alive: Vec<bool> = kids.iter().map(|k| ProcRef::open(*k).is_live()).collect();
         let root_alive = ProcRef::open(root).is_live();
         reap(sh, &kids);
         assert!(
             matches!(primary, ExecutionOutcome::Refused { pid, reason: "ssh-service(sshd)" } if pid == root),
             "{primary:?}"
         );
-        assert!(root_alive, "the SSH service itself is not killed");
-        for k in &kids {
-            assert!(
-                rest.iter().any(|o| matches!(o, ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } if pid == k)),
-                "the offender's process {k} below it is killed: {rest:?}"
-            );
+        assert!(root_alive && alive.iter().all(|a| *a), "{alive:?}");
+        assert!(rest.is_empty(), "nothing below it named: {rest:?}");
+    }
+
+    /// Review of #543 (F6), sshd-shaped: a listener, two sessions, the
+    /// offender (with a child) under one of them. Only that lineage dies —
+    /// the session the offender runs in, the offender, its child; the
+    /// listener and the other session (and its shell) are untouched and
+    /// not even named; the record says who was spared and who was killed.
+    #[test]
+    fn review_f6_only_the_offending_lineage_under_an_sshd_listener_dies() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        let put = |n: &str, body: String| std::fs::write(d.join(n), body).unwrap();
+        let dir = d.display();
+        put("l.sh", format!("sh {dir}/sa.sh & echo a $!; sh {dir}/sb.sh & echo b $!; exec sleep 30\n"));
+        put("sa.sh", format!("sh {dir}/o.sh & echo o $!; exec sleep 30\n"));
+        put("o.sh", "sleep 30 & echo c $!; exec sleep 30\n".to_string());
+        put("sb.sh", "sleep 30 & echo x $!; exec sleep 30\n".to_string());
+        let mut l = Command::new("sh")
+            .arg(d.join("l.sh"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(l.stdout.take().unwrap());
+        let mut pid = std::collections::HashMap::new();
+        for _ in 0..5 {
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            let (k, v) = line.trim().split_once(' ').unwrap();
+            pid.insert(k.to_string(), v.parse::<u32>().unwrap());
         }
+        let (root, a, b, o, c, x) = (l.id(), pid["a"], pid["b"], pid["o"], pid["c"], pid["x"]);
+        // let every process exec its sleep (its children were forked first)
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let sshd = [root, a, b];
+        let (primary, rest) = kill_lineage(
+            root,
+            o,
+            &HashSet::from([1, 2]),
+            &|p| sshd.contains(&p).then_some(Spare::process("ssh-service(sshd)")),
+            &super::super::journal::test_intent(),
+        );
+        let live = |p: u32| ProcRef::open(p).is_live();
+        let state: Vec<(u32, bool)> = [root, a, b, o, c, x].iter().map(|&p| (p, live(p))).collect();
+        for p in [root, a, b, o, c, x] {
+            // SAFETY: plain kill(2) on processes this test started.
+            unsafe { libc::kill(p as i32, libc::SIGKILL) };
+        }
+        let _ = l.wait();
+        assert!(
+            matches!(primary, ExecutionOutcome::Refused { pid, .. } if pid == root),
+            "{primary:?}"
+        );
+        assert_eq!(
+            state,
+            vec![(root, true), (a, false), (b, true), (o, false), (c, false), (x, true)],
+            "only the offending lineage dies: {rest:?}"
+        );
+        let named: HashSet<u32> = rest
+            .iter()
+            .filter_map(|o| match o {
+                ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, HashSet::from([a, o, c]), "{rest:?}");
+        assert_eq!(rest.len(), 3, "the other session is not named: {rest:?}");
+        // an offender not below the root: nothing is killed
+        let (_, rest) = kill_lineage(
+            std::process::id(),
+            u32::MAX,
+            &HashSet::from([1, 2]),
+            &|p| (p == std::process::id()).then_some(Spare::process("test")),
+            &super::super::journal::test_intent(),
+        );
+        assert!(rest.is_empty(), "{rest:?}");
     }
 
     /// A protected DESCENDANT keeps its own tree, a host-critical one does
