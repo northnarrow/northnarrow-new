@@ -904,15 +904,6 @@ pub struct StatusResponse {
     pub execpol_map_denied_total: Option<u64>,
     #[serde(default)]
     pub execpol_map_recorded_total: Option<u64>,
-    /// Lot 322: exec environments not read whole (a string or the array
-    /// unreadable at the exec's first pass, an unknown call); each one is
-    /// also recorded (`NN-L-EXECENV-002`), none refused.
-    #[serde(default)]
-    pub execpol_env_unread_total: Option<u64>,
-    /// Lot 322: exec-guard runs whose per-task buffer could not be made
-    /// (the map full): judged fail-closed.
-    #[serde(default)]
-    pub execpol_lost_total: Option<u64>,
     /// Lab PR 226: scripts the exec quarantine refused at exec (enforce
     /// mode: the interpreter would re-read the file after the scan).
     #[serde(default)]
@@ -946,6 +937,19 @@ pub struct StatusResponse {
     /// byte); `None` from an agent older than the field.
     #[serde(default)]
     pub export: Option<ExportStatus>,
+    /// Lot 322: exec environments not read whole (a string or the array
+    /// unreadable at the exec's first pass, an unknown call); each one is
+    /// also recorded (`NN-L-EXECENV-002`), none refused. With the next
+    /// field, appended after `export` (postcard is positional: an older
+    /// `nn-admin` reads every byte before them); telemetry (`None` in the
+    /// unsigned reply, one byte); `None` from an agent older than the
+    /// field.
+    #[serde(default)]
+    pub execpol_env_unread_total: Option<u64>,
+    /// Lot 322: exec-guard runs whose per-task buffer could not be made
+    /// (the map full): judged fail-closed.
+    #[serde(default)]
+    pub execpol_lost_total: Option<u64>,
 }
 
 /// Lot 276: the export's state ([`StatusResponse::export`];
@@ -2949,13 +2953,14 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the four appended fields' tags: R12a's bus, R12b's decision
-        // delay, R12c's response dispatch (lab PR 270), lot 276's export
-        assert!(a.ends_with(&[0, 0, 0, 0]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 4]) && b.len() > a.len());
+        // the six appended fields' tags: R12a's bus, R12b's decision
+        // delay, R12c's response dispatch (lab PR 270), lot 276's export,
+        // lot 322's two exec-guard counters
+        assert!(a.ends_with(&[0, 0, 0, 0, 0, 0]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 6]) && b.len() > a.len());
         assert!(
-            b.ends_with(&[0, 0, 0]),
-            "R12b's, R12c's and lot 276's fields, absent"
+            b.ends_with(&[0, 0, 0, 0, 0]),
+            "R12b's, R12c's, lot 276's and lot 322's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
@@ -2982,9 +2987,9 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last three: the decision's delay, the dispatch, lot 276's
-        // export — all absent)
-        assert!(c.starts_with(&b[..b.len() - 3]) && c.len() > b.len());
+        // (b's last five: the decision's delay, the dispatch, lot 276's
+        // export, lot 322's two counters — all absent)
+        assert!(c.starts_with(&b[..b.len() - 5]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3044,8 +3049,9 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        // (c's last two: the dispatch and lot 276's export, absent)
-        assert!(d.starts_with(&c[..c.len() - 2]) && d.len() > c.len());
+        // (c's last four: the dispatch, lot 276's export and lot 322's two
+        // counters, absent)
+        assert!(d.starts_with(&c[..c.len() - 4]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3593,8 +3599,9 @@ mod tests {
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
         // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
-        // `response_dispatch`, lot 276's `export`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1;
+        // `response_dispatch`, lot 276's `export`, lot 322's
+        // `execpol_env_unread_total` and `execpol_lost_total`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3606,6 +3613,28 @@ mod tests {
 
     /// External audit CMB-016: the three response verbs and their replies
     /// survive a wire round-trip, signed extras included.
+    /// Lot 322: the exec guards' two counters are the status's last
+    /// fields. Postcard is positional: a reply with them is the reply
+    /// without them, its fields before them unchanged, plus their bytes,
+    /// so an older `nn-admin` reads every field it knows (a field placed
+    /// before `execq_script_refused_total` shifted every later one).
+    #[test]
+    fn the_exec_guards_counters_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.execpol_env_recorded_total = Some(2);
+        status.execq_script_refused_total = Some(3);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.execpol_env_unread_total = Some(300);
+        status.execpol_lost_total = Some(5);
+        let with = postcard::to_allocvec(&status).unwrap();
+        let before = without.len() - 2;
+        assert_eq!(&with[..before], &without[..before]);
+        assert_eq!(&without[before..], &[0, 0]);
+        // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
+        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5]);
+        roundtrip(AdminMessage::StatusResponse(status));
+    }
+
     #[test]
     fn roundtrip_response_verbs() {
         use crate::wire::admin_signed_payload::SignedPayload;
@@ -4401,10 +4430,13 @@ mod tests {
         // tag of `response_dispatch`, appended last.
         // Lot 276: one byte longer (0x4e -> 0x4f) — the absent tag of
         // `export`, appended last; every byte before it is R12c's pin.
+        // Lot 322: two bytes longer (0x4f -> 0x51) — the absent tags of
+        // `execpol_env_unread_total` and `execpol_lost_total`, appended
+        // last; every byte before them is lot 276's pin.
         const STATUS_RESPONSE: &str = concat!(
-            "0000004f050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000051050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "000000",
+            "0000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

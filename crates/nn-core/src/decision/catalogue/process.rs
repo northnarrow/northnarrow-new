@@ -664,7 +664,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id \
                    target (Critical in the shape of CVE-2023-4911), a library path into \
                    staging for a service or root, shell history disabled; an environment \
-                   the kernel could not read whole at exec (High: its loader variables \
+                   the exec sensor could not read whole (High: its loader variables \
                    were not judged).",
         false_positives: "History disabled by a user's own shell configuration (Low, repeats \
                           held back).",
