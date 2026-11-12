@@ -139,13 +139,7 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
         }
     }
     // The task's root, where the walk stops.
-    let mut task_root: *const u8 = core::ptr::null();
-    if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
-        if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
-            let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
-            task_root = peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-        }
-    }
+    let task_root = task_root_of(task);
     let pass: u8 = if interp == filename { 0 } else { 1 };
     (*s).dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
     (*s).ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
@@ -189,6 +183,23 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     // quarantine's candidate (lab PR 223), stopped by `sched_process_exec`
     // once the exec succeeded. Two array reads when both are off.
     crate::execpol::on_pass(s, inode, dentry, task as u64, pass)
+}
+
+/// The dentry of `task`'s root (`task->fs->root.dentry`): where the walk
+/// and (lot 318, the re-check of #545, R3) the identity search stop. Null
+/// without the two optional offsets: neither stops then.
+#[inline(always)]
+pub(crate) unsafe fn task_root_of(task: *const u8) -> *const u8 {
+    if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
+        if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
+            let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
+            if fs.is_null() {
+                return core::ptr::null();
+            }
+            return peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+        }
+    }
+    core::ptr::null()
 }
 
 /// The dentry walk of [`exec_check_lsm`]: writes the path slots, the

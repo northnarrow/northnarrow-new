@@ -78,6 +78,11 @@ pub const FS_PROTECT_RING: &str = "FS_PROTECT_EVENTS";
 /// (`EbpfLoader::map_max_entries`); the eBPF object is unchanged.
 pub const FS_PROTECT_RING_BYTES: u32 = 256 * 1024;
 
+/// Lot 318 (external bug hunt N9): the io_uring sensor's exit program
+/// (`agent-ebpf/src/io_uring.rs`), on `sched/sched_process_exit`: a
+/// process's aggregation state goes with its last thread.
+pub const IO_URING_EXIT_PROGRAM: &str = "io_uring_exit";
+
 /// Tappa 10 N9 — shared state the multiplexer threads into the
 /// TcpConnect + DnsQuery pumps so each kernel observation feeds
 /// the userland flow tracker / DNS cache before the corresponding
@@ -459,6 +464,27 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                         submit_event = name,
                         "io_uring sensor attached (create + submit tracepoints)"
                     );
+                    // Lot 318 (external bug hunt N9): the per-process state
+                    // goes with the process's last thread; without it a pid
+                    // reused by another process inherits its classes.
+                    if let Err(e) = attach_tracepoint(
+                        &mut ebpf,
+                        IO_URING_EXIT_PROGRAM,
+                        "sched",
+                        "sched_process_exit",
+                    ) {
+                        warn!(
+                            error = format!("{e:#}"),
+                            "io_uring exit tracepoint not attached — a pid reused by another \
+                             process inherits the io_uring classes of the process before it"
+                        );
+                        crate::boot::degradation::report(
+                            "io_uring_sensor",
+                            "the io_uring sensor's per-process state is not cleared at the \
+                             process's exit: a pid reused by another process inherits the \
+                             classes of the process before it",
+                        );
+                    }
                     attach_points.note(
                         "io_uring",
                         &format!("tracepoint:io_uring/io_uring_create+{name}"),

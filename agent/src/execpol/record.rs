@@ -661,7 +661,9 @@ mod tests {
     }
 
     /// MS-32: `LD_PRELOAD` from `/tmp` into a service, refused; the same at
-    /// a set-id target is recorded (the loader ignores it).
+    /// a set-id target the kernel only recorded (a tier whose rule does not
+    /// deny: since lot 318 a denying tier refuses it there too) says the
+    /// loader ignores it.
     #[test]
     fn the_preload_record() {
         let mut raw = raw_exec(0, 0, tier::SERVICE | tier_sig::SYSTEM_SLICE);

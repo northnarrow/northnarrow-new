@@ -52,11 +52,29 @@ split out or added in this lot:
 | `tmpfs` | tmpfs, hugetlbfs, ramfs (also `/run`, a container's `/dev/shm`) |
 | `home` | the task's view starts with `/home/` or `/root/`, or a filesystem mounted there |
 | `other_home` | `home`, and the file's owner is neither the caller's real uid nor root (new): code another account controls |
-| `guarded_mount` | a filesystem mounted at a guarded point (`/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`) |
+| `guarded_mount` | a mount at a guarded point (`/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`) is among the file's ancestors, by identity (lot 318: a btrfs subvolume, a bound directory; `docs/design/EXEC_QUARANTINE.md` §2) |
 
 The guarded mount roots (`EXECQ_ROOTS`, from `mountinfo` every 10 s) now say
 which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
-and one on a separate `/home` is `home`. The exec quarantine refreshes them
+and one on a separate `/home` is `home`. Lot 318 (external bug hunt BUG108):
+a file on a btrfs subvolume mounted at `/home`, or in a directory bound
+there, is `home` too, and a file the dentry walk cannot place (more than 64
+levels deep) is `tmp`, `var_tmp` and `home`. The guarded points themselves
+are published by identity as well (the review of #545, F2): `/var/tmp` in
+openSUSE's `@/var` subvolume, `/home` and `/var/tmp` under an ostree
+deployment's `/var` bind are no mount, and their files had no class; a
+point gives its class only (`var_tmp`, `home`), `guarded_mount` stays a
+mount's. A FUSE file outside the task's
+root is `guarded_mount` whatever its daemon says its root is (and `tmp`,
+`var_tmp`, `home` where no published root places it). A filesystem a user
+mounts in their own user namespace (an overlay at `/tmp/m` after `unshare
+-rm`), or a chroot into a FUSE directory, gives no class (not only in a
+container; follow-up lot 323, `docs/design/EXEC_QUARANTINE.md` §2). The
+identity search stops at the task's root (the re-check of #545, R3): a
+container whose root is a directory in a home (LXC's dir backend, rootless
+podman's vfs or btrfs storage) is classed in its own view, as before lot
+318, not `home` and `other_home` by the host's `/home` above it; the
+container policy is lot 323's. The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
 Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
@@ -89,7 +107,7 @@ line of the table that is not in the kernel's shape is a degradation
 (`execq_roots_rows`, `execpol_mounts_rows`) while it lasts — a source `-`
 (`fsname=-`) or an empty one is a mount, read as such. The roots are
 ranked, the FUSE ones last (a user mounts up to `mount_max`, 1000): when
-the kernel's map (64 entries) is full, a FUSE root it holds gives way to a
+the kernel's map (1024 entries since lot 318, 64 before) is full, a FUSE root it holds gives way to a
 system root mounted after it (another user's `/run/user/<uid>`, an
 automounted `/home`). A root other than a FUSE one that the map still
 refuses is a degradation (`execq_roots_full`, `execpol_roots_full`), its
@@ -209,23 +227,48 @@ findings wait in `EXECPOL_ENV` (keyed by `task_struct`) for the exec's pass 0.
 | finding | kernel | record |
 |---|---|---|
 | `LD_PRELOAD` / `LD_AUDIT` entry under `/tmp/`, `/var/tmp/`, `/dev/shm/`, `/proc/` (`/proc/self/fd/N`: a memfd preload), `/dev/fd/` | denied for `service` and `unknown` on a server, for a root caller in `session` (on a desktop: `service`, and a root caller in `session` or `unknown`); recorded for `admin` | `NN-L-EXECENV-001` High (deny) / Medium / Low, T1574.006 |
-| the same at a **set-id target** | never denied on this head; lot 318 drops the set-id skip (denied as any other) | Medium: "the kernel sets AT_SECURE and the loader ignores the entry" when the exec changes the credentials; else "the exec ran; the target is set-id, but the exec changes no credential, so the loader honours the entry" (lot 315) |
+| the same at a **set-id target** | lot 318: denied as any other, for the same tiers (it was never denied) | denied: as above; recorded (a tier whose rule does not deny): Medium, "the kernel sets AT_SECURE and the loader ignores the entry" when the exec changes the credentials, else "the exec ran; the target is set-id, but the exec changes no credential, so the loader honours the entry" (lot 315) |
 | `GLIBC_TUNABLES` at a set-id target | recorded | `NN-L-EXECENV-002` Medium; Critical for the shape of CVE-2023-4911 (a tunable whose value holds another assignment, or a value filling the buffer), T1068 |
 | `LD_LIBRARY_PATH` under a staging prefix | recorded for services, unknown callers, root | `NN-L-EXECENV-002` Medium, T1574.006 |
 | `HISTFILE` empty or `/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`, `HISTCONTROL=ignore*` exported, at the exec of a shell | recorded | `NN-L-EXECENV-002` Low, T1070.003 |
 
-**What the kernel already enforces, not duplicated.** For a set-id or
-file-capability target the kernel sets `AT_SECURE`; the loader then ignores
-`LD_PRELOAD` entries with a slash (names without one only from the system
-directories, and only set-id libraries), `LD_LIBRARY_PATH`, and unsafe
-`LD_AUDIT` values. The policy does not deny those (a record says the attempt
-was made). What `AT_SECURE` does not cover is a caller that is **already
-privileged**: a root service, a root cron job, root in a session without a
-terminal — no credential changes, no `AT_SECURE`, the loader honours the
-preload with root's credentials. That is what `deny-root` and the service
-deny are for. File capabilities are not visible to the program (the target
-is judged by its set-id bits): a preload into a capability binary from a
-service is refused, which the loader would have ignored anyway.
+**What the kernel enforces, and why the policy does not count on it.** For
+a set-id or file-capability target whose credentials change the kernel sets
+`AT_SECURE`; the loader then ignores `LD_PRELOAD` entries with a slash (names
+without one only from the system directories, and only set-id libraries),
+`LD_LIBRARY_PATH`, and unsafe `LD_AUDIT` values. What `AT_SECURE` does not
+cover is a caller that is **already privileged**: a root service, a root cron
+job, root in a session without a terminal — no credential changes, no
+`AT_SECURE`, the loader honours the preload with root's credentials. That is
+what `deny-root` and the service deny are for. Lot 318 (external bug hunt
+BUG101): a set-id target is denied as any other. The program read the
+target's set-id bits as "the kernel sets `AT_SECURE`" and let the preload
+through, which the bits do not promise: root running a set-uid-root file
+(`su`, `passwd`, `mount`) changes no credential, and no set-id bit applies
+under `no_new_privs`, on a `nosuid` mount, to a `#!` script (its
+interpreter's bits decide) or for an owner the caller's user namespace does
+not map. `deny-root` was side-stepped with `su`, or with a set-gid copy of
+anything run under `setpriv --no-new-privs`. Telling those cases apart in the
+kernel would take four more facts of it and could still miss one; refusing a
+preload from a staging path at a set-id target whose loader would have
+ignored it costs nothing legitimate. File capabilities were already judged
+the same way: a preload into a capability binary from a service is refused,
+which the loader would have ignored anyway. The set-id bits still decide
+where `GLIBC_TUNABLES` is reported.
+
+**On 7.0 the environment check is unreliable** (Ubuntu 26.04's 7.0.0-43;
+pre-existing, not lot 318's; follow-up lot 322). The scan runs in the
+`sys_enter_execve` / `sys_enter_execveat` tracepoint programs, and on that
+kernel a syscall tracepoint's BPF program runs for the execs of one CPU
+only (lot 322's lab: attached as aya and libbpf attach it, it fired for
+CPU 0's execs and for no other CPU's). An exec on another CPU reaches pass 0
+with no finding: on `main`, 0 of 11 staging preloads were refused; on this
+branch, pinned to CPU 0 with `taskset` 20 of 20, unpinned 6 of 20, from a
+service 2 of 10. On 5.15, 6.8 and 6.12 the lab's cases are all refused.
+Until lot 322 moves the scan into the exec's own hook, the deny of this
+section (and its set-id case) holds on 7.0 only for the execs the scan
+sees; the policy's cells by class and tier are judged in the exec's LSM
+hook and are unaffected.
 
 Lot 315 (external bug hunt 1.4, BUG-101, the record's half): a set-id
 target is no `AT_SECURE` by its bits alone. The kernel sets it when the

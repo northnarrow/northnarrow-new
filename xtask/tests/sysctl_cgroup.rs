@@ -156,8 +156,11 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
         &[
             "if limited {",
             "TASK_DENIAL_SEEN.get_ptr_mut(&seen)",
-            "TASK_DENIAL_RATE.get_ptr_mut(0)",
-            "if (*rate)[1] >= TASK_DENIAL_PER_SEC {",
+            // lot 318 (the re-check of #545, R2): a sysctl's refusal or
+            // opt-out is no decisive record — the per-CPU budget of the
+            // non-decisive ones (`limited_budget`, pinned in
+            // `kernel_halves.rs`), not the task denials'
+            "if !limited_budget(operation, now) {",
             "FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0)",
             "(*raw_ptr).attacker_pid = tgid;",
             "(*raw_ptr).operation = operation;",
@@ -166,6 +169,18 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
         ],
     )
     .unwrap();
+    // a sysctl's records are non-decisive ones (`nn-core` pins the list
+    // against the posture both ways)
+    let w = code("common/src/wire/mod.rs");
+    let minor = &w[w.find("pub const fn is_minor_denial").unwrap()..];
+    let minor = &minor[..minor.find("\n}\n").unwrap()];
+    for op in [
+        "| FS_OP_SYSCTL\n",
+        "| FS_OP_SYSCTL_VALUE\n",
+        "| FS_OP_SYSCTL_OPT_OUT\n",
+    ] {
+        assert!(minor.contains(op), "{op:?} not minor:\n{minor}");
+    }
     assert!(code("agent-ebpf/src/main.rs").contains("mod sysctl_guard;"));
 }
 

@@ -280,7 +280,10 @@ pub const SECURITY_RINGS: [u32; 11] = [
     // Lot 293 (external bug hunt BUG37): the refusals signed at every
     // attempt (a protected file's unlink, rename, write-open…) held back
     // over their own per-CPU budget — a loop of them is refused and seen,
-    // its records past the budget a loss the operator must see.
+    // its records past the budget a loss the operator must see. Lot 318
+    // (the review of #545, F1 and F7): the decisive ones only; the
+    // non-decisive (`minor_denial_rate`: an administrator's `bpftool map
+    // list` past 50 handles on a CPU) are counted and signed, not a loss.
     ring_slot::DENIAL_RATE,
     // Lab PR 223: an exec quarantine candidate the ring could not hold
     // ran unstopped and unscanned.
@@ -297,14 +300,33 @@ pub const SECURITY_RINGS: [u32; 11] = [
 /// 1 261 and 4 597 drops on a `daemon-reload` and an install burst).
 pub const TELEMETRY_LOSS_THRESHOLD: u64 = 64;
 
-/// `(ring, dropped this sample)` for the security rings above the threshold.
+/// Lot 318 (the review of #545, F1): the budgets of the decisive refusals —
+/// the ones signed at each attempt ([`ring_slot::DENIAL_RATE`]) and the task
+/// denials ([`ring_slot::TASK_DENIAL_RATE`]). One held back is a loss at
+/// once, not past [`TELEMETRY_LOSS_THRESHOLD`]: their budget is theirs alone
+/// (the non-decisive records spend `minor_denial_rate`: the re-check of
+/// #545, R1 and R2, moved there the kprobes and lockdown switches, the
+/// renices, the sysctl writes and opt-outs, the exempt-cgroup moves and the
+/// code-injection records, which had shared these two), so a drop there
+/// means more decisive refusals in a second on one CPU than the budget
+/// records — every one of them an attack on the agent.
+pub const DECISIVE_DENIAL_BUDGETS: [u32; 2] = [ring_slot::DENIAL_RATE, ring_slot::TASK_DENIAL_RATE];
+
+/// `(ring, dropped this sample)` for the security rings above their
+/// threshold: [`TELEMETRY_LOSS_THRESHOLD`], none for
+/// [`DECISIVE_DENIAL_BUDGETS`].
 fn security_losses(prev: &[u64], cur: &[u64]) -> Vec<(&'static str, u64)> {
     SECURITY_RINGS
         .iter()
-        .map(|&slot| slot as usize)
-        .filter_map(|i| {
+        .map(|&slot| (slot, slot as usize))
+        .filter_map(|(slot, i)| {
             let d = cur[i].saturating_sub(prev[i]);
-            (d > TELEMETRY_LOSS_THRESHOLD).then_some((RING_DROP_NAMES[i], d))
+            let threshold = if DECISIVE_DENIAL_BUDGETS.contains(&slot) {
+                0
+            } else {
+                TELEMETRY_LOSS_THRESHOLD
+            };
+            (d > threshold).then_some((RING_DROP_NAMES[i], d))
         })
         .collect()
 }
@@ -657,6 +679,34 @@ mod tests {
         let mut cur = prev.clone();
         cur[ring_slot::DENIAL_RATE as usize] = 200;
         assert_eq!(security_losses(&prev, &cur), vec![("denial_rate", 200)]);
+    }
+
+    /// Lot 318 (the review of #545, F1): one decisive refusal held back is a
+    /// loss — the decisive budgets are theirs alone, a drop there is an
+    /// attack's burst; and (F7) the non-decisive refusals held back are
+    /// never one: an administrator's `bpftool map list` (about 150 refused
+    /// handles on one CPU, 100 past the budget) or a monitoring agent that
+    /// lists the BPF objects every second raises no `TelemetryLoss`.
+    #[test]
+    fn a_decisive_drop_is_a_loss_and_a_bpftool_listing_is_not() {
+        let slots = RING_DROP_SLOTS as usize;
+        let prev = vec![0u64; slots];
+        let mut cur = prev.clone();
+        cur[ring_slot::DENIAL_RATE as usize] = 1;
+        assert_eq!(security_losses(&prev, &cur), vec![("denial_rate", 1)]);
+        let mut cur = prev.clone();
+        cur[ring_slot::TASK_DENIAL_RATE as usize] = 1;
+        assert_eq!(security_losses(&prev, &cur), vec![("task_denial_rate", 1)]);
+        let mut cur = prev.clone();
+        for n in [100, 1_500, 1_000_000] {
+            cur[ring_slot::MINOR_DENIAL_RATE as usize] = n;
+            assert!(security_losses(&prev, &cur).is_empty(), "{n}");
+        }
+        assert!(!SECURITY_RINGS.contains(&ring_slot::MINOR_DENIAL_RATE));
+        // another security ring keeps its threshold
+        let mut cur = prev.clone();
+        cur[ring_slot::FS_PROTECT as usize] = TELEMETRY_LOSS_THRESHOLD;
+        assert!(security_losses(&prev, &cur).is_empty());
     }
 
     fn fake_proc(root: &std::path::Path, pid: u32, euid: u32, exe: &str, cmdline: &[&str]) {

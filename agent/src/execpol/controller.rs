@@ -169,7 +169,7 @@ impl<K: KernelIo> Controller<K> {
         }
         self.k.set_images(&images);
         if let (true, Some(table)) = (self.s.own_roots, &table) {
-            let roots = crate::execq::kernel::guarded_roots(table);
+            let roots = crate::execq::kernel::published_roots(table);
             let refused = self.k.set_roots(&roots);
             self.roots_full.published(refused, roots.len(), now);
         }
@@ -228,7 +228,7 @@ impl<K: KernelIo> Controller<K> {
 pub(crate) const ROOTS_FULL_HOLD: Duration = Duration::from_secs(300);
 
 /// Lot 311 (the review of #538, F3, G2): what the kernel's map
-/// (`EXECQ_ROOTS`, 64 entries) refused of the ranked roots
+/// (`EXECQ_ROOTS`, 1024 entries since lot 318) refused of the ranked roots
 /// ([`crate::execq::kernel::publish_ranked`]: the FUSE ones give way
 /// first). A root other than a FUSE one left out is a degradation (a
 /// mount without its class), held [`ROOTS_FULL_HOLD`] at least, its text
@@ -258,7 +258,7 @@ impl RootsFull {
                 warn!(
                     refused = refused.fuse,
                     of,
-                    "guarded roots: FUSE mounts past the kernel's map (64 entries) left out — \
+                    "guarded roots: FUSE mounts past the kernel's map (1024 entries) left out — \
                      their files are classed by the file system's magic"
                 );
             } else {
@@ -277,7 +277,7 @@ impl RootsFull {
             }
             self.lost.holds_at(
                 "guarded mount roots (not FUSE ones) not published: the kernel's map \
-                 (EXECQ_ROOTS, 64 entries) refused them — exec from those mounts has no mount \
+                 (EXECQ_ROOTS, 1024 entries) refused them — exec from those mounts has no mount \
                  class"
                     .into(),
                 now,

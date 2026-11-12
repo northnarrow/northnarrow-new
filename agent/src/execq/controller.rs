@@ -447,7 +447,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             // that cannot be read at all keeps the roots last published
             match nn_linux::mountinfo::read(&self.roots_source) {
                 Ok(table) => {
-                    let roots = kernel::guarded_roots(&table);
+                    let roots = kernel::published_roots(&table);
                     let refused = self.k.set_roots(&roots);
                     self.roots_full.published(refused, roots.len(), now);
                     nn_linux::state_read::mount_rows(

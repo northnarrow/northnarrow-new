@@ -89,8 +89,9 @@ pub enum MapCell {
 }
 
 /// The loader-variable rule of a tier: what an `LD_PRELOAD` / `LD_AUDIT`
-/// entry under a staging prefix gets at exec (a set-id target excepted:
-/// `AT_SECURE` already makes the loader ignore it).
+/// entry under a staging prefix gets at exec — at a set-id target too (lot
+/// 318, external bug hunt BUG101: its bits do not promise `AT_SECURE`;
+/// `docs/design/EXEC_POLICY.md` §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvRule {
     /// Not reported.
