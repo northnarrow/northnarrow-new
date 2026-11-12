@@ -9625,7 +9625,21 @@ number in parentheses is a lab PR.
     3841 left no record", 3,947,268 `fs_protect` drops); `main`'s tree
     gives the four BUG108/N8 cases no class, runs the four BUG101 preloads
     ("recorded: the target is set-id"), and keeps the N9 entries after the
-    exit.
+    exit. After the review (round r6, `e05b96e6`, `main` merged): on
+    7.0.0-43, 6.12.115 and 5.15.0-202 `verifier-check` 0 failing and three
+    e2e of three — BUG37's, the guard's, and F1's
+    `a_bpf_handle_loop_does_not_hide_a_decisive_refusal` (a handle flood
+    on CPU 0, then a `mkdir` in `/etc/northnarrow` there: refused, its
+    record and the posture's transition arrive; its first version unlinked
+    the fixture agent's key in a tempdir, which no agent protects, and
+    failed on that premise on 6.12 and 7.0); F2's case 108c (a directory
+    under `/home`, a point that is no mount, bound at `/srv/nn318h` and run
+    by that path: `home`, `other_home`, not `guarded_mount`) on all three;
+    the benign set-id runs with a staging preload ran with no deny record
+    (12 of 12 each); and on 5.15 the re-check's R3 reproduced — a service
+    chrooted into a directory in a home (`RootDirectory=`, the image's
+    `true` owned by a subuid) recorded "would deny" with `home` and
+    `other_home`. The re-check's head: in the PR's body (round r7).
   - Found, not this lot's (pre-existing on `main`): on 7.0 the exec
     environment's check is nearly inert (0 of 11 preloads refused on
     `main`; this branch's rounds 0 to 2 of 4 at random; pinned with
