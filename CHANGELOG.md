@@ -17,10 +17,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   identity (the dynamic loaders, the shells, init, sshd, the agent's
   binaries) whatever name leads to them — a user namespace's bind of
   `/usr/bin` no longer reaches them, and an `/etc/shells` that cannot be
-  read refuses the quarantine; a non-root offender only its own
+  read (a FIFO, a device, over 1 MiB: refused at once, NEUTRALIZE goes on)
+  refuses the quarantine; a non-root offender only its own
   files, a root offender any file under a verified name, never a
   root-owned file without one. A name is removed only when it is the
-  file's only name; a shared file (a package store's hard links) is never
+  file's only name; a non-root offender's own file is emptied under every
+  name (a second hard link it made no longer keeps it runnable); a shared
+  file root or another user owns (a package store's hard links) is never
   emptied — made mode 000 where the agent may (partial), else only vaulted
   (a failure) — and a restore puts content and mode back into the same
   file, every name of it. A user with a delegated cgroup subtree (`user@<uid>.service`) made a

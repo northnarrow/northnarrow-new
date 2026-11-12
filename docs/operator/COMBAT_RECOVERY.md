@@ -354,7 +354,9 @@ success. Not read back yet: the nft ruleset once applied in an episode
     is refused too, as before. An `/etc/shells` that exists and cannot be
     read leaves the shells unknown: every quarantine is then refused
     (`/etc/shells could not be read …`), the offender's own file too, and
-    nothing is changed;
+    nothing is changed. It is read as the agent reads a configuration
+    file: a regular file only, at most 1 MiB — a FIFO, a device or a
+    larger file there is refused at once, and NEUTRALIZE goes on;
   - a non-root offender, only a file it owns; a root offender, any file
     under a VERIFIED name (the payload a user dropped and root ran); never
     a root-owned file reached through a name the agent cannot verify (a
@@ -363,9 +365,12 @@ success. Not read back yet: the nft ruleset once applied in an episode
   - a name is removed — the content left to the vault — when it is the
     file's only name. Otherwise the file is neutralized where it is, its
     names kept: emptied when it has no other link (its name not verified,
-    or not removed), read back empty (`success`); a shared file (a package
-    store's binary hard-linked into environments, as conda, pnpm or uv do)
-    is never emptied — made mode 000 under every name where the agent may
+    or not removed), or when it is a non-root offender's own file whatever
+    its links (a second hard link the offender made, `ln x .x2`, or its own
+    environment store: every name emptied, the detail saying how many),
+    read back empty (`success`); a shared file root or another user owns (a
+    package store's binary hard-linked into environments, as conda, pnpm or
+    uv do) is never emptied — made mode 000 under every name where the agent may
     change its mode, its content kept, the row `partial` with the owner and
     the link count; where the mode cannot be changed (the unit has no
     `CAP_FOWNER`) nothing changed but the vault, and the row is a
