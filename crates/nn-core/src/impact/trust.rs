@@ -186,38 +186,28 @@ pub fn is_user_manager(hops: &[(u32, ExecIdentity)], n: usize) -> bool {
         && hops.get(n + 1).is_none_or(|(parent, _)| *parent == 1)
 }
 
-/// Lot 310 (the re-check of #539, N2; lot 310b): what the kernel and the
-/// host say of one hop of a lineage beyond its identity.
+/// Lot 310 (the re-check of #539, N2): what the kernel says of one hop of a
+/// lineage beyond its identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HopFacts {
     /// The process that FORKED it, when its exec was the first since that
     /// fork (the kernel's record at `sched_process_fork`, never the parent
-    /// at exec time); 0 when not known.
+    /// at exec time; carried through systemd's executor), 0 when not known.
     pub fork_parent: u32,
-    /// Its cgroup is a user unit whose unit file is root's and a package's
-    /// (`/usr/lib/systemd/user`, `/etc/systemd/user`), with no unit or
-    /// drop-in of the user's (`~/.config/systemd/user`, a transient
-    /// `systemd-run --user` unit) — the host's `DecisionHost::
-    /// packaged_user_unit`.
-    pub packaged_user_unit: bool,
 }
 
-/// Lot 310 (the re-check of #539; lot 310b): the [`HopFacts`] of `hops`
-/// (the lineage of `pid` as of `as_of`): the lineage's fork parents, and
-/// for the hop a user's manager started (the hop below one),
-/// `packaged_user_unit(its pid)` — asked of no other hop.
+/// Lot 310 (the re-check of #539): the [`HopFacts`] of `hops` (the lineage
+/// of `pid` as of `as_of`): the lineage's fork parents.
 pub fn hop_facts<H: crate::posture::host::PostureHost>(
     lineage: &crate::posture::lineage::AuthSessionTracker<H>,
     pid: u32,
     as_of: crate::posture::lineage::AsOf,
     hops: &[(u32, ExecIdentity)],
-    packaged_user_unit: &dyn Fn(u32) -> bool,
 ) -> Vec<HopFacts> {
     let forks = lineage.lineage_fork_parents(pid, as_of);
     (0..hops.len())
         .map(|n| HopFacts {
             fork_parent: forks.get(n).copied().unwrap_or(0),
-            packaged_user_unit: is_user_manager(hops, n + 1) && packaged_user_unit(hops[n].0),
         })
         .collect()
 }
@@ -245,25 +235,6 @@ pub fn started_by_pid1(
         && is_interpreter(&id.exe)
         && owned_file(&id.exe, owned)
         && facts.get(n).is_some_and(|f| f.fork_parent == 1)
-}
-
-/// Lot 310b (decided 12/11/2026): the user's manager at hop `n` vouches for
-/// the process it started (hop `n - 1`) when that process is the unit's
-/// own — the manager FORKED it, for its first exec — and the unit's file is
-/// root's and a package's ([`HopFacts::packaged_user_unit`]): the desktop's
-/// terminal emulator, its session's services. Never a transient
-/// `systemd-run --user` unit, never a unit or drop-in of the user's.
-pub fn manager_vouches_for_its_unit(
-    hops: &[(u32, ExecIdentity)],
-    facts: &[HopFacts],
-    n: usize,
-) -> bool {
-    let (Some((manager, _)), Some(child)) =
-        (hops.get(n), n.checked_sub(1).and_then(|c| facts.get(c)))
-    else {
-        return false;
-    };
-    child.fork_parent == *manager && child.packaged_user_unit
 }
 
 /// Why a hop that is not trusted is not: what it runs is not known, it runs
@@ -318,9 +289,7 @@ pub fn judge_with(
     if let Some(i) = hops.iter().enumerate().position(|(n, (_, id))| {
         let by_pid1 = n > own && started_by_pid1(hops, facts, n, owned);
         (is_foreign(id) && !by_pid1)
-            || (n > own
-                && ((!vouches(id, owned) && !by_pid1)
-                    || (is_user_manager(hops, n) && !manager_vouches_for_its_unit(hops, facts, n))))
+            || (n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, n)))
     }) {
         // lot 310: a user's service manager is not what to kill (its whole
         // session's services with it): the unit's process it started is.
@@ -444,13 +413,6 @@ impl<H: DecisionHost> ProgramOwners<H> {
     /// give the security-tool detector the same fixture).
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Lot 310b: `pid` is a packaged user unit's own process — the host's
-    /// answer (`DecisionHost::packaged_user_unit`), beside the package
-    /// database's.
-    pub fn packaged_user_unit(&self, pid: u32) -> bool {
-        H::packaged_user_unit(pid)
     }
 
     /// `Some(true)` when a package installed `path`, `Some(false)` when
@@ -945,17 +907,16 @@ mod tests {
         }
     }
 
-    /// Lot 310b (folded into lot 310): the desktop's cascade. A user's
-    /// manager vouches for the process it FORKED for a packaged user unit
-    /// (the kernel's record, and the unit's file root's and a package's):
-    /// the GNOME terminal's server, then the interactive shell in it, then
-    /// the user's `tar` — trusted, as before the decision. The same chain
-    /// with a transient `systemd-run --user` unit or the user's own unit
-    /// (not packaged), or a server the manager did not fork for its first
-    /// exec (not known: a session older than the agent), is judged; the
-    /// actor is the process the manager started.
+    /// Re-check 3 (decision 4): a user's manager vouches for nothing, a
+    /// packaged unit's process included — a user moves its own processes
+    /// between the cgroups of its delegated subtree, so a unit read from a
+    /// cgroup is no proof. The desktop's chain (the GNOME terminal's server
+    /// the manager forked, the interactive shell in it, the user's `tar`)
+    /// is judged; the actor is the process the manager started. The cost is
+    /// accepted for now (records, kills held: the alpha observes); lot 326
+    /// records the unit's cgroup in the kernel at its main exec.
     #[test]
-    fn a_user_s_manager_vouches_for_its_packaged_units_only() {
+    fn a_user_s_manager_vouches_for_nothing_not_even_a_packaged_unit() {
         let systemd = || id("/usr/lib/systemd/systemd", None);
         let bash_i = ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string()]);
         let l = [
@@ -965,19 +926,11 @@ mod tests {
             (1200, systemd()),
             (1, systemd()),
         ];
-        let facts = |forker: u32, packaged: bool| {
-            vec![
-                HopFacts::default(),
-                HopFacts {
-                    fork_parent: 400,
-                    ..HopFacts::default()
-                },
-                HopFacts {
-                    fork_parent: forker,
-                    packaged_user_unit: packaged,
-                },
-            ]
-        };
+        let facts = [
+            HopFacts::default(),
+            HopFacts { fork_parent: 400 },
+            HopFacts { fork_parent: 1200 },
+        ];
         let owned = |p: &Path| {
             Some(
                 p.starts_with("/usr/bin")
@@ -985,33 +938,9 @@ mod tests {
                     || p.starts_with("/usr/libexec"),
             )
         };
-        assert_eq!(
-            judge_with(500, Some(&l), &facts(1200, true), false, &owned),
-            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
-        );
-        assert!(manager_vouches_for_its_unit(&l, &facts(1200, true), 3));
-        for (forker, packaged) in [(1200, false), (0, true), (450, true)] {
-            assert!(
-                matches!(
-                    judge_with(500, Some(&l), &facts(forker, packaged), false, &owned),
-                    Judged::Untrusted { actor: 400, .. }
-                ),
-                "forked by {forker}, packaged {packaged}"
-            );
-        }
-        // `systemd-run --user /usr/bin/openssl enc …`: a transient unit
-        let l = [
-            (500, id("/usr/bin/openssl", None)),
-            (1200, systemd()),
-            (1, systemd()),
-        ];
-        let f = [HopFacts {
-            fork_parent: 1200,
-            packaged_user_unit: false,
-        }];
         assert!(matches!(
-            judge_with(500, Some(&l), &f, false, &owned),
-            Judged::Untrusted { actor: 500, .. }
+            judge_with(500, Some(&l), &facts, false, &owned),
+            Judged::Untrusted { actor: 400, .. }
         ));
     }
 

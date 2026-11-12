@@ -1364,29 +1364,32 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   nothing whose standard input is a file, a pipe or a socket) no longer
   vouches for the packaged tools it starts: the ransomware signal judges
   them (NN-L-IMP-001/-002; the kill held by default) and the copy guard
-  copies an editor it starts. A user's service manager (`systemd --user`)
-  vouches only for a process it FORKED for a packaged user unit — the unit's
-  file root's and a package's (`/usr/lib/systemd/user`, `/etc/systemd/user`)
-  with no unit or drop-in of the user's: the desktop's terminal emulator,
-  the session's services, and the interactive shells in them —, never for a
-  transient `systemd-run --user` unit (`systemd-run --user /usr/bin/openssl
-  enc …` was a lineage of installed programs end to end) or a unit in
-  `~/.config/systemd/user`; the record names the process it started, never
-  the manager. A package transaction and PID 1's units are trusted as
-  before, a unit's `ExecStart=/bin/sh -c …` included: an installed shell
+  copies an editor it starts. Nor does a user's service manager
+  (`systemd --user`: `systemd-run --user /usr/bin/openssl enc …` was a
+  lineage of installed programs end to end), for any unit — a user moves
+  its own processes between the cgroups of its delegated subtree, so a unit
+  read from a cgroup proves nothing (lot 326 will record the unit's cgroup
+  in the kernel at its main exec). On a desktop the user's manager starts
+  the terminal emulator: the commands typed in it are judged (records, the
+  kills held by default; the copy guard copies their editors) — a cost
+  accepted for now. The record names the process the manager started,
+  never the manager. A package transaction and PID 1's units are trusted
+  as before, a unit's `ExecStart=/bin/sh -c …` included: an installed shell
   PID 1 FORKED inherits PID 1's vouching. "Forked" is the kernel's record
-  at `sched_process_fork` (the exec record's `fork_ppid`, for the first
-  exec after the fork), never the parent at exec time: a webshell's
-  double-forked orphan, which PID 1 reaps before its `sh -c`, was forked by
-  the webshell. A process forked before the agent started has no record:
-  a desktop session older than the agent is judged until its next login.
-  Expect more ransomware assessments of the tools a cron job (a user's
-  crontab or the system's: a job carries no owner in this judgement) or a
-  non-interactive `ssh host 'cmd'` runs; the lab measured one on Ubuntu
-  24.04 — a user's crontab `sh -c 'rsync -a --inplace …'` of random data
-  drew NN-L-IMP-001 (Critical, its kill held). A record names the shell
-  ("which runs an inline program") or the manager ("a user's service
-  manager").
+  at `sched_process_fork` (the exec record's `fork_ppid`; processes only,
+  not threads), for the first exec after the fork — carried through
+  systemd's executor, by its verified identity, to the unit's program —
+  never the parent at exec time: a webshell's double-forked orphan, which
+  PID 1 reaps before its `sh -c`, was forked by the webshell. A process
+  forked before the agent started has no record (judged); a record the
+  map evicted under a flood of forks is counted (`fork_record_lost` in the
+  ring-drop counters). Expect more ransomware assessments of the tools a
+  cron job (a user's crontab or the system's: a job carries no owner in
+  this judgement) or a non-interactive `ssh host 'cmd'` runs; the lab
+  measured one on Ubuntu 24.04 — a user's crontab `sh -c 'rsync -a
+  --inplace …'` of random data drew NN-L-IMP-001 (Critical, its kill
+  held). A record names the shell ("which runs an inline program") or the
+  manager ("a user's service manager").
 - **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
   file is a fileless exec whatever path reached it:
   `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
@@ -1399,12 +1402,15 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `/proc/<pid>/root/…` chains followed), when it is gone. Not fileless:
   - the agent's own worker;
   - systemd's executor left unlinked by an upgrade, by its identity
-    (`(dev, ino)`) — the packaged file at its install path (root's, listed by
-    the package database), a copy the host's PID 1 holds, or one a genuine
-    user manager holds (its image the packaged manager's, in PID 1's mount
-    namespace), re-read every 10 s and replaced: "R004: systemd-executor's
-    identities changed" in the journal — for the first exec of a process
-    PID 1 or such a manager FORKED (the kernel's record); no longer by a
+    (`(dev, ino)`), re-read every 10 s and replaced ("R004: systemd-
+    executor's identities changed" in the journal): a copy the host's PID 1
+    holds by that identity alone — no user can reach it, and a flood of
+    forks evicting the kernel's records must not stop a unit's launch after
+    an upgrade —; the packaged file at its install path (root's, listed by
+    the package database) or a copy a genuine user manager holds (its image
+    the packaged manager's, in PID 1's mount namespace) for the first exec
+    of a process PID 1 or such a manager FORKED (the kernel's record); no
+    longer by a
     file *named* `systemd-executor` (BUG-103), by `argv[0]` and a parent
     PID 1 in tracepoint mode, nor by a "manager" a user's namespace runs;
   - a process re-executing the very image its parent runs
@@ -1421,5 +1427,5 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   (microseconds). An identity a manager released stays exempt until the
   next re-read (10 s); the kernel's identity carries no inode generation.
   Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
-  refused: a signed degradation) no launch through an unlinked executor
-  is exempt and no unit's shell vouches.
+  refused: a signed degradation) no unit's shell vouches and only PID 1's
+  executor copies are exempt.

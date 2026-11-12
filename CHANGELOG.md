@@ -27,21 +27,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   standard input (`bash < file`) no longer vouches for the packaged tools it
   starts (ransomware signal, copy guard) — save the installed shell PID 1
   FORKED (a unit's `ExecStart=/bin/sh -c …`), which vouches as PID 1 does;
-  a user's service manager vouches only for the processes it forked for
-  packaged user units (the desktop's terminal), never `systemd-run --user`.
-  "Forked" is the kernel's record (a new eBPF program at
-  `sched_process_fork`, the exec record's `fork_ppid`), never the parent at
-  exec time: a double-forked orphan PID 1 reaped does not pass. A cron
+  a user's service manager vouches for nothing (`systemd-run --user`; the
+  desktop's terminal too, for now: lot 326). "Forked" is the kernel's
+  record (a new eBPF program at `sched_process_fork`, processes only, the
+  exec record's `fork_ppid`, carried through systemd's executor), never the
+  parent at exec time: a double-forked orphan PID 1 reaped does not pass. A cron
   job's `sh -c` is judged (the lab: a user's crontab `rsync --inplace` of
   random data drew NN-L-IMP-001, its kill held). R004 kills a memfd or unlinked file whatever path
   reached it (`/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`,
   `/dev/stdin`, a relative path, a symlink: unprivileged evasions of a kill
   that holds in every posture) — in LSM mode by the exec sensor's identity,
   in tracepoint mode by the exec pump's read of `/proc/<pid>/exe`; systemd's
-  unlinked executor is exempt by an identity the packaged file, PID 1 or a
-  genuine user manager holds now (re-read every 10 s, replaced; a "manager"
-  a user's mount namespace runs adds nothing), for the first exec of a
-  process systemd forked, no longer by its name or `argv[0]`
+  unlinked executor is exempt by an identity PID 1 holds now (no user
+  reaches it), or the packaged file's or a genuine user manager's for the
+  first exec of a process systemd forked (re-read every 10 s, replaced; a
+  "manager" a user's mount namespace runs adds nothing), no longer by its
+  name or `argv[0]`
   (`/opt/app/systemd-executor` was), and a process re-executing its
   parent's own image is not fileless when that image came from a directory
   only root can write, in PID 1's mount namespace. Two ratchets

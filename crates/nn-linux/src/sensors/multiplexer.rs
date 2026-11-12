@@ -1187,12 +1187,34 @@ fn attach_fork_parent(ebpf: &mut Ebpf) {
             .map_err(|e| format!("verifier rejected {PROGRAM}: {e:#}"))?;
         p.attach()
             .map_err(|e| format!("attaching {PROGRAM}: {e:#}"))?;
+        // re-check 3 (decision 2): from now on, an exec of a process that
+        // started later and finds no record lost it (counted:
+        // `fork_record_lost`)
+        let map = ebpf
+            .map_mut("FORK_PARENT_SINCE")
+            .ok_or_else(|| "map FORK_PARENT_SINCE missing from the eBPF object".to_string())?;
+        let mut since: aya::maps::Array<_, u64> =
+            aya::maps::Array::try_from(map).map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
+        since
+            .set(0, monotonic_ns(), 0)
+            .map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
         Ok(())
     })();
     if let Err(e) = attached {
         error!(error = %e, "fork-parent record not attached: {FORK_PARENT_DEGRADED}");
         crate::boot::degradation::report("fork_parent", FORK_PARENT_DEGRADED);
     }
+}
+
+/// `CLOCK_MONOTONIC` now, ns: the clock of a task's `start_time`.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
 }
 
 /// The process-spawn sensor: `sched_process_exec`, or — when the kernel's

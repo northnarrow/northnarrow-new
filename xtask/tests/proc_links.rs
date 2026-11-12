@@ -28,7 +28,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use support::{product_code, repo_root, string_literals};
+use support::{concat_literals, product_code, repo_root, string_literals};
 
 /// The one reader.
 const READER: &str = "crates/nn-core/src/posture/proc_link.rs";
@@ -67,8 +67,10 @@ const TESTS: &[&str] = &[
 ];
 
 fn count(text: &str) -> usize {
+    // re-check 3: what `concat!` builds counts as a literal
     let literals = string_literals(text)
         .iter()
+        .chain(concat_literals(text).iter())
         .filter(|l| is_link_literal(l))
         .count();
     let tests: usize = TESTS.iter().map(|t| text.matches(t).count()).sum();
@@ -174,6 +176,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
 fn which(text: &str) -> String {
     let lits: Vec<String> = string_literals(text)
         .into_iter()
+        .chain(concat_literals(text))
         .filter(|l| is_link_literal(l))
         .collect();
     let tests: Vec<&&str> = TESTS.iter().filter(|t| text.contains(**t)).collect();
@@ -268,6 +271,19 @@ fn the_ratchet_fails_on_planted_violations() {
         (
             "slice",
             "fn a(s: &[&str]) -> bool { matches!(s, [\"\", \"proc\", _, \"fd\", _]) }",
+        ),
+        // re-check 3: the prefix built by `concat!`
+        (
+            "concat_proc",
+            "const P: &str = concat!(\"/pr\", \"oc/self/fd/\");\nfn a(p: &str) -> bool { p.starts_with(P) }",
+        ),
+        (
+            "concat_dev",
+            "fn a(p: &str) -> bool { p.starts_with(concat!(\"/dev/\", \"fd/\")) }",
+        ),
+        (
+            "concat_thread",
+            "fn a(p: &str) -> bool { p.contains(concat!(\"/proc/\", \"thread\", \"-self/\")) }",
         ),
     ];
     for (name, body) in planted {

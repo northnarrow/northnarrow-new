@@ -330,11 +330,9 @@ impl<H: DecisionHost> RansomTracker<H> {
         // R-F: the lineage as of the burst's own time
         let as_of = crate::posture::lineage::AsOf::judged(ts);
         let lineage = self.lineage.lineage_identities(pid, as_of);
-        // lot 310: the kernel's fork parents, the packaged user units
+        // lot 310: the kernel's fork parents
         let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
-            trust::hop_facts(&self.lineage, pid, as_of, hops, &|p| {
-                H::packaged_user_unit(p)
-            })
+            trust::hop_facts(&self.lineage, pid, as_of, hops)
         });
         let package_tx = self.lineage.in_package_transaction(pid, as_of);
         let owned = |p: &std::path::Path| self.owners.owned(p);

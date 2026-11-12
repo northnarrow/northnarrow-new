@@ -460,9 +460,6 @@ pub mod trusted_bin;
 // restored (lab PR 220; R09c, lab PR 257; was the agent's
 // `upgrade_rollback`).
 pub mod upgrade_rollback;
-/// Lot 310b: a process that is a packaged user unit's own (what a user's
-/// service manager vouches for).
-pub mod user_units;
 
 // Lab builds only (`--verifier-check`): every program of the embedded eBPF
 // object through the kernel's verifier (R09c, lab PR 257; was the agent's

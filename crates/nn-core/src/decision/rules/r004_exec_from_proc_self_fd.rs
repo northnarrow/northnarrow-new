@@ -159,6 +159,10 @@ struct ExecutorSets {
     /// manager (the packaged binary, PID 1's image): a user's manager forks
     /// the executor's launches too, and is told by its image.
     managers: Vec<(u64, u64)>,
+    /// Lot 310 (re-check 3, decision 1): the executors the host's PID 1
+    /// holds open — an inode no user can reach (`/proc/1/fd` is root's):
+    /// an exec of one is exempt by its identity alone.
+    pid1_held: Vec<(u64, u64)>,
 }
 
 /// `ids` sorted, deduplicated, without `(0, 0)`, at most `cap`.
@@ -215,6 +219,21 @@ impl ExecutorImages {
         let changed = s.managers != ids;
         s.managers = ids;
         changed
+    }
+
+    /// Lot 310 (re-check 3, decision 1): the executors PID 1 holds now, in
+    /// place of the ones before; `true` when the set changed.
+    pub fn replace_pid1_held(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let changed = s.pid1_held != ids;
+        s.pid1_held = ids;
+        changed
+    }
+
+    /// `id` is an executor the host's PID 1 holds open (never `(0, 0)`).
+    pub fn held_by_pid1(&self, id: (u64, u64)) -> bool {
+        self.0.read().pid1_held.contains(&id)
     }
 
     /// How many executor identities there are.
@@ -316,8 +335,13 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         exe: &nn_model::ExeIdentity,
         as_of: crate::posture::lineage::AsOf,
     ) -> bool {
-        self.executor.contains((exe.dev, exe.ino))
-            && self.forked_by_a_manager(exe.fork_parent, as_of)
+        let id = (exe.dev, exe.ino);
+        // re-check 3 (decision 1): a copy the host's PID 1 holds is an inode
+        // no user can reach — by its identity alone, no fork record needed
+        // (a flood of forks evicting the records must not make R004 kill a
+        // unit's launch after a systemd upgrade)
+        self.executor.held_by_pid1(id)
+            || (self.executor.contains(id) && self.forked_by_a_manager(exe.fork_parent, as_of))
     }
 
     /// LSM mode, lot 310: the process re-executes the very image its
@@ -1410,6 +1434,53 @@ mod lot310 {
             (exe.dev, exe.ino) = (0, 0);
         }
         assert!(kills(r.evaluate(&child)));
+    }
+
+    /// Re-check 3 (decision 1): a unit's launch through the deleted executor
+    /// PID 1 holds is exempt with no fork record (a flood evicted it, the
+    /// fork predates the agent): no user can reach that inode. Another
+    /// identity of the set — a user's manager's copy, the packaged file —
+    /// still needs the fork record.
+    #[test]
+    fn a_pid_1_held_executor_needs_no_fork_record() {
+        let images = ExecutorImages::default();
+        images.record((2049, 1001));
+        images.record((2049, 1002));
+        images.replace_pid1_held(vec![(2049, 1001)]);
+        let r = R004::default().with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images,
+        });
+        let launch = |id: (u64, u64), forker: u32| {
+            let mut e = exec(
+                0,
+                1,
+                "/proc/self/fd/9",
+                "/usr/lib/systemd/systemd-executor",
+                DELETED,
+            );
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                (exe.dev, exe.ino) = id;
+                exe.fork_parent = forker;
+            }
+            e
+        };
+        assert!(
+            r.evaluate(&launch((2049, 1001), 0)).is_none(),
+            "no fork record"
+        );
+        assert!(
+            r.evaluate(&launch((2049, 1001), 4444)).is_none(),
+            "any forker"
+        );
+        assert!(
+            kills(r.evaluate(&launch((2049, 1002), 0))),
+            "not PID 1's: a record needed"
+        );
+        assert!(
+            r.evaluate(&launch((2049, 1002), 1)).is_none(),
+            "PID 1 forked it"
+        );
     }
 
     /// The executor's identities: at most [`ExecutorImages::CAP`], the

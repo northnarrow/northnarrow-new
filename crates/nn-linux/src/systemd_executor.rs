@@ -109,6 +109,9 @@ fn packaged(paths: &[&str], root: &Path, owner: u32, owned: Owned) -> Vec<(u64, 
 pub struct Live {
     pub executors: Vec<(u64, u64)>,
     pub managers: Vec<(u64, u64)>,
+    /// The executors the host's PID 1 holds (also in `executors`): exempt
+    /// by identity alone (re-check 3, decision 1).
+    pub pid1_held: Vec<(u64, u64)>,
 }
 
 /// The executor's identities now, from the three sources (the module's
@@ -123,11 +126,13 @@ pub fn live_under(root: &Path, proc_root: &Path, owner: u32, owned: Owned) -> Li
     if let Some(id) = trusted_file_id(&init.join("exe"), owner) {
         managers.push(id);
     }
-    executors.extend(held_executors(&init, root, owner));
+    let pid1_held = held_executors(&init, root, owner);
+    executors.extend(pid1_held.iter().copied());
     executors.extend(held_by_user_managers(root, proc_root, owner, &managers));
     Live {
         executors,
         managers,
+        pid1_held,
     }
 }
 
@@ -154,7 +159,8 @@ pub fn refresh_under(
 fn apply(images: &ExecutorImages, live: Live) -> bool {
     let executors = images.replace(live.executors);
     let managers = images.replace_managers(live.managers);
-    executors || managers
+    let pid1 = images.replace_pid1_held(live.pid1_held);
+    executors || managers || pid1
 }
 
 /// [`refresh_under`] the host's root and `/proc`, every 10 s.
@@ -336,6 +342,7 @@ mod tests {
         let l = live(me());
         assert!(l.executors.contains(&held_id) && l.executors.contains(&file_id(&exe).unwrap()));
         assert!(l.managers.contains(&file_id(&manager).unwrap()));
+        assert_eq!(l.pid1_held, vec![held_id], "PID 1's own copy, apart");
         // released by PID 1: only a genuine user manager keeps it counted
         std::fs::remove_file(proc_root.path().join("1/fd/9")).unwrap();
         assert!(!live(me()).executors.contains(&held_id), "released: gone");
@@ -352,7 +359,12 @@ mod tests {
         );
         // a genuine user manager
         make("2001", &manager, INIT_NS, Some(&held));
-        assert!(live(me()).executors.contains(&held_id), "a user's manager");
+        let l = live(me());
+        assert!(l.executors.contains(&held_id), "a user's manager");
+        assert!(
+            l.pid1_held.is_empty(),
+            "not PID 1's: no exemption by identity alone"
+        );
         // files a user owns (the production owner is root): nothing counts
         let l = live(me().wrapping_add(1));
         assert!(l.executors.is_empty() && l.managers.is_empty(), "{l:?}");

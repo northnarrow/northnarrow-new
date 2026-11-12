@@ -16,9 +16,10 @@
 use aya_ebpf::{
     helpers::bpf_probe_read_kernel,
     macros::{btf_tracepoint, map},
-    maps::LruHashMap,
+    maps::{Array, LruHashMap},
     programs::BtfTracePointContext,
 };
+use northnarrow_common::ring_drops::ring_slot;
 
 use crate::btf_offsets::{TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
 
@@ -34,10 +35,20 @@ pub struct ForkParent {
 }
 
 /// `task_struct` address → [`ForkParent`]. LRU: a fork always gets its
-/// record; a task that never executes (a worker) is evicted in time. A
-/// unit's fork is followed by its exec within milliseconds.
+/// record; a process that never executes (a worker) is evicted in time. A
+/// unit's fork is followed by its exec within milliseconds. Processes only
+/// (re-check 3, decision 2: a thread is no fork of a process — a flood of
+/// `pthread_create` no longer evicts the records), 65,536 of them: room
+/// for the forks between a unit's fork and its exec many times over.
 #[map]
-static FORK_PARENTS: LruHashMap<u64, ForkParent> = LruHashMap::with_max_entries(16384, 0);
+static FORK_PARENTS: LruHashMap<u64, ForkParent> = LruHashMap::with_max_entries(65536, 0);
+
+/// When the agent attached the record (`CLOCK_MONOTONIC` ns, the tasks'
+/// start-time clock), written once by userland: an exec of a process that
+/// started after it and finds no record lost it to the LRU
+/// (`ring_slot::FORK_RECORD_LOST`, counted and signed).
+#[map]
+static FORK_PARENT_SINCE: Array<u64> = Array::with_max_entries(1, 0);
 
 /// `sched_process_fork(struct task_struct *parent, struct task_struct
 /// *child)`: the child's forker (`parent` is the task that called
@@ -54,6 +65,16 @@ pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
     }) else {
         return 0;
     };
+    // a thread (`CLONE_THREAD`: the forker's own thread group) is no
+    // process's fork
+    let Ok(child_tgid) = (unsafe {
+        bpf_probe_read_kernel::<u32>(child.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const _)
+    }) else {
+        return 0;
+    };
+    if child_tgid == parent_tgid {
+        return 0;
+    }
     let Ok(start) = (unsafe {
         bpf_probe_read_kernel::<u64>(child.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _)
     }) else {
@@ -76,8 +97,21 @@ pub fn take(task: *const u8, start: u64) -> u32 {
     let found = match unsafe { FORK_PARENTS.get(&key) } {
         Some(r) if r.start == start => r.parent_tgid,
         Some(_) => 0,
-        None => return 0,
+        None => {
+            lost(start);
+            return 0;
+        }
     };
     let _ = FORK_PARENTS.remove(&key);
     found
+}
+
+/// A process the record should hold (started after it was attached) that
+/// it does not: counted (`FORK_RECORD_LOST`).
+#[inline(always)]
+fn lost(start: u64) {
+    let since = FORK_PARENT_SINCE.get(0).copied().unwrap_or(0);
+    if since != 0 && start > since {
+        crate::drops::bump(ring_slot::FORK_RECORD_LOST);
+    }
 }

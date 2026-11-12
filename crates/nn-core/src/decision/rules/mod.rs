@@ -456,6 +456,11 @@ fn spawn_rules<H: DecisionHost>(
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let r011_lineage = lineage.clone();
+    // lot 310 (the re-check of #539, R3-1): the lineage carries a fork
+    // parent through systemd's executor, told by these identities
+    if let Some(l) = &lineage {
+        l.set_executor_images(launches.executor.clone());
+    }
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),

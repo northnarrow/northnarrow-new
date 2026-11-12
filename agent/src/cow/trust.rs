@@ -40,8 +40,7 @@ use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
 use crate::impact::trust::{
-    is_user_manager, manager_vouches_for_its_unit, started_by_pid1, topmost_same, vouches,
-    HopFacts, ProgramOwners,
+    is_user_manager, started_by_pid1, topmost_same, vouches, HopFacts, ProgramOwners,
 };
 use crate::posture::lineage::{
     in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
@@ -170,9 +169,8 @@ pub fn judge(
     judge_with(lineage, &[], writers, package_tx, owned)
 }
 
-/// [`judge`] with each hop's facts (lot 310: the kernel's fork parents, the
-/// packaged user units — `crate::impact::trust::HopFacts`; a hop without
-/// any knows nothing).
+/// [`judge`] with each hop's facts (lot 310: the kernel's fork parents —
+/// `crate::impact::trust::HopFacts`; a hop without any knows nothing).
 pub fn judge_with(
     lineage: Option<&[(u32, ExecIdentity)]>,
     facts: &[HopFacts],
@@ -203,10 +201,7 @@ pub fn judge_with(
         .find(|(n, (_, id))| {
             let by_pid1 = *n > own && started_by_pid1(hops, facts, *n, owned);
             (is_foreign(id) && !by_pid1)
-                || (*n > own
-                    && ((!vouches(id, owned) && !by_pid1)
-                        || (is_user_manager(hops, *n)
-                            && !manager_vouches_for_its_unit(hops, facts, *n))))
+                || (*n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, *n)))
         })
         .map(|(_, hop)| hop)
     {
@@ -302,11 +297,9 @@ impl TrustFilter {
         let lineage = self.tracker.lineage_identities(tgid, AsOf::Now);
         let writers: Vec<&str> = self.writers.iter().map(String::as_str).collect();
         let owned = |p: &Path| self.owners.owned(p);
-        // lot 310: the kernel's fork parents, the packaged user units
+        // lot 310: the kernel's fork parents
         let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
-            crate::impact::trust::hop_facts(&self.tracker, tgid, AsOf::Now, hops, &|p| {
-                self.owners.packaged_user_unit(p)
-            })
+            crate::impact::trust::hop_facts(&self.tracker, tgid, AsOf::Now, hops)
         });
         let trust = judge_with(
             lineage.as_deref(),
@@ -748,10 +741,7 @@ mod tests {
         // PID 1 FORKED it (the kernel's record; the re-check of #539, N2)
         let by_pid1 = [
             crate::impact::trust::HopFacts::default(),
-            crate::impact::trust::HopFacts {
-                fork_parent: 1,
-                ..Default::default()
-            },
+            crate::impact::trust::HopFacts { fork_parent: 1 },
         ];
         assert!(judge_with(Some(&l), &by_pid1, &writers(), false, &distro).is_trusted());
         // a shell PID 1 reaped before its exec, another forked: not

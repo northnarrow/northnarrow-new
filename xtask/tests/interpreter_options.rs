@@ -34,7 +34,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use support::{product_code, repo_root, string_literals};
+use support::{concat_literals, product_code, repo_root, string_literals};
 
 /// The one reader.
 const READER: &str = "crates/nn-core/src/posture/script_args.rs";
@@ -153,6 +153,7 @@ fn count(text: &str) -> usize {
 fn sites(text: &str) -> Vec<String> {
     let mut out: Vec<String> = string_literals(text)
         .into_iter()
+        .chain(concat_literals(text))
         .filter(|l| is_option_literal(l))
         .map(|l| format!("literal {l:?}"))
         .collect();

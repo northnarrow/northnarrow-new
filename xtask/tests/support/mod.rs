@@ -777,6 +777,37 @@ pub fn product_code(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// Lot 310 (re-check 3): the strings `concat!` builds in `text` — its
+/// literal arguments joined (`concat!("/pr", "oc/")` is `/proc/`): a ratchet
+/// that reads literals reads these too.
+pub fn concat_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("concat!(") {
+        let start = from + at + "concat!(".len();
+        let mut depth = 1usize;
+        let mut end = start;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start {
+            out.push(string_literals(&text[start..end]).concat());
+        }
+        from = start;
+    }
+    out
+}
+
 /// The contents of `text`'s string literals (`"…"`, escapes kept as
 /// written; raw strings `r"…"`, `r#"…"#`), in order. Char literals are
 /// skipped.

@@ -968,6 +968,11 @@ struct Inner {
     /// Lab PR 175: the host's `/` for `/etc/passwd`, `/etc/subuid` and the
     /// owners of container storage directories; a fixture tree in tests.
     host_root: PathBuf,
+    /// Lot 310 (the re-check of #539, R3-1): systemd's executor by its
+    /// verified identities (R004's, set at the rules' build): an exec after
+    /// one of them carries its fork parent ([`AuthSessionTracker::
+    /// set_executor_images`]).
+    executor: std::sync::OnceLock<crate::decision::rules::ExecutorImages>,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -1011,6 +1016,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 proc_root,
                 live,
                 observer_start: std::sync::OnceLock::new(),
+                executor: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 suspended_ns: None,
                 bounds: Bounds {
@@ -1145,6 +1151,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             argv,
             exe.flags,
         );
+        let fork_parent = match exe.fork_parent {
+            0 => self.carried_fork_parent(*pid, *start_ns),
+            p => p,
+        };
         self.ingest_inner(
             *pid,
             *ppid,
@@ -1154,7 +1164,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *timestamp_ns,
             (*start_ns, None),
             *uid,
-            (image, exe.fork_parent),
+            (image, fork_parent),
         );
         let _ = filename;
         true
@@ -2636,6 +2646,33 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             LINEAGE_DEPTH_CAP,
         )?;
         Some(hops.into_inner())
+    }
+
+    /// Lot 310 (the re-check of #539, R3-1): systemd's executor by its
+    /// verified identities, once (the rules' build: R004's set, refreshed
+    /// in place).
+    pub fn set_executor_images(&self, images: crate::decision::rules::ExecutorImages) {
+        let _ = self.inner.executor.set(images);
+    }
+
+    /// Lot 310 (the re-check of #539, R3-1): on systemd ≥ 254 the first
+    /// exec after a manager's fork is `systemd-executor`, which takes the
+    /// kernel's fork record; the unit's own program is the next exec. When
+    /// the exec the cache holds for `pid` (the same process: `start_ns`) is
+    /// the executor by a VERIFIED identity, with its fork parent, that fork
+    /// parent goes on to this exec — once: the exec after it holds no
+    /// executor image. 0 otherwise.
+    fn carried_fork_parent(&self, pid: u32, start_ns: u64) -> u32 {
+        let Some(executor) = self.inner.executor.get() else {
+            return 0;
+        };
+        let s = self.inner.state.read();
+        s.map
+            .get(&pid)
+            .or_else(|| s.daemons.get(&pid))
+            .filter(|e| start_ns != 0 && e.start_ns == start_ns && e.fork_parent != 0)
+            .filter(|e| e.image.is_some_and(|id| executor.contains(id)))
+            .map_or(0, |e| e.fork_parent)
     }
 
     /// Lot 310 (the re-check of #539, N2): for each hop of
@@ -4777,6 +4814,77 @@ mod tests {
             t.exec_image(501, AsOf::Judged(H::monotonic_ns())),
             Some((8, 500))
         );
+    }
+
+    /// Re-check 3 (R3-1, decision 3): on systemd ≥ 254 a manager's fork
+    /// executes `systemd-executor` first (it takes the kernel's fork
+    /// record), then the unit's program. When that first exec is the
+    /// executor by a VERIFIED identity, its fork parent goes on to the
+    /// next exec of the same process — once; an exec of an unverified file,
+    /// a later exec, another process: none.
+    #[test]
+    fn the_executor_carries_its_fork_parent_to_the_unit_s_program() {
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let exec =
+            |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32| Event::ProcessSpawn {
+                pid,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: ns,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: 5 * S,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.0,
+                    ino: id.1,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: forker,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let images = crate::decision::rules::ExecutorImages::default();
+        images.record((8, 100));
+        t.set_executor_images(images);
+        let executor = "/usr/lib/systemd/systemd-executor";
+        // the unit: PID 1's fork, the executor, then `sh -c`, then `tar`
+        assert!(t.ingest_spawn_event(&exec(700, executor, 6 * S, (8, 100), 1)));
+        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/dash", 7 * S, (8, 200), 0)));
+        assert_eq!(
+            t.fork_parent(700, AsOf::Now),
+            Some(1),
+            "carried to the unit's program"
+        );
+        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/tar", 8 * S, (8, 300), 0)));
+        assert_eq!(
+            t.fork_parent(700, AsOf::Now),
+            None,
+            "once: not to the exec after"
+        );
+        // a file that is no verified executor carries nothing
+        assert!(t.ingest_spawn_event(&exec(
+            710,
+            "/usr/lib/systemd/systemd-executor",
+            6 * S,
+            (8, 999),
+            1
+        )));
+        assert!(t.ingest_spawn_event(&exec(710, "/usr/bin/dash", 7 * S, (8, 200), 0)));
+        assert_eq!(t.fork_parent(710, AsOf::Now), None);
+        // the kernel's own record wins
+        assert!(t.ingest_spawn_event(&exec(720, executor, 6 * S, (8, 100), 1)));
+        assert!(t.ingest_spawn_event(&exec(720, "/usr/bin/dash", 7 * S, (8, 200), 4242)));
+        assert_eq!(t.fork_parent(720, AsOf::Now), Some(4242));
     }
 
     /// The re-check of #539 (N6): the start's scan reads an image's
