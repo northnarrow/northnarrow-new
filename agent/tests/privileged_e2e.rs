@@ -2111,16 +2111,21 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
 /// Lot 318 (the review of #545, F1): a loop of refused handles on one of
 /// the agent's maps — non-decisive refusals, the kind an administrator's
 /// `bpftool map list` makes — on one CPU, and in the middle of it, on that
-/// CPU, a refused unlink of the agent's signing key: decisive. The two
-/// shared one per-CPU budget, and 50 handles in a second held back the
-/// unlink's record, the posture's decisive trigger with it (it stayed at
-/// ENGAGED). Now the non-decisive refusals spend a budget of their own
-/// (`minor_denial_rate`): the unlink is refused, its record arrives, the
-/// posture reaches COMBAT by `AntiTamperDenial`, and the loop's records past
-/// their budget are counted.
+/// CPU, a refused new entry in `/etc/northnarrow` (a protected directory of
+/// every agent, `PROTECTED_DIR_FLAGS`): decisive, signed at each attempt as
+/// a protected file's unlink is. The two shared one per-CPU budget, and 50
+/// handles in a second held back the refusal's record, the posture's
+/// decisive trigger with it (it stayed at ENGAGED). Now the non-decisive
+/// refusals spend a budget of their own (`minor_denial_rate`): the `mkdir`
+/// is refused, its record arrives, the posture reaches COMBAT by
+/// `AntiTamperDenial`, and the loop's records past their budget are
+/// counted. (A first version unlinked the fixture agent's signing key in
+/// its tempdir: no agent protects that path, and the unlink went through —
+/// 7.0 lab, round r5.)
 #[cfg(feature = "debug-trigger")]
 #[test]
-fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
+fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
+    use std::os::unix::process::CommandExt;
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -2138,12 +2143,19 @@ fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
         reg.contains("mode=\"enforce\""),
         "the guard did not start in enforce mode: {reg}"
     );
-    let key = AgentState::named(fx.dir.path(), "minor").signing_key();
-    assert!(key.exists(), "fixture: the agent's key {}", key.display());
+    let etc = Path::new("/etc/northnarrow");
+    assert!(
+        etc.is_dir(),
+        "the agent's protected directory {}",
+        etc.display()
+    );
+    let target = etc.join(".nn-e2e-318-minor");
 
     const WINDOW_SECS: u32 = 5;
     fx.grant_window("minor", WINDOW_SECS)
         .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    // a leftover of an earlier failed run, removed inside the window
+    let _ = std::fs::remove_dir(&target);
     let map_id = common::raw_bpf::own_ids()
         .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
         .into_iter()
@@ -2160,17 +2172,26 @@ fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
     let flooder = fork_handle_flooder(0, map_id, until);
     assert!(flooder > 0, "fork failed");
     std::thread::sleep(Duration::from_millis(1000));
-    // On the same CPU, the decisive refusal: the agent's key unlinked.
-    let mut rm = Command::new("taskset")
-        .args(["-c", "0", "rm", "-f"])
-        .arg(&key)
+    // On the same CPU, the decisive refusal: a new entry in the agent's
+    // protected directory (python3 prints the errno itself: uutils' mkdir
+    // says "Permission denied" for EPERM too). Its own process group: the
+    // ladder a refusal raises acts on the actor, never the harness.
+    let actor = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             try:\n    os.mkdir(sys.argv[1])\n    print('ok')\n\
+             except OSError as e:\n    print('errno=' + errno.errorcode.get(e.errno, str(e.errno)))",
+        )
+        .arg(&target)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
-        .expect("spawn taskset rm");
-    let rm_pid = rm.id();
-    let st = rm.wait().expect("wait rm");
+        .expect("spawn taskset python3");
+    let actor_pid = actor.id();
+    let out = actor.wait_with_output().expect("wait for the actor");
     let mut status = 0;
     // SAFETY: our own child.
     assert_eq!(unsafe { libc::waitpid(flooder, &mut status, 0) }, flooder);
@@ -2179,23 +2200,30 @@ fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
         Some(1) => panic!("a handle on the agent's map {map_id} was granted in enforce mode"),
         other => panic!("the flooder could not drop to nobody with CAP_BPF: {other:?}"),
     }
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let made = target.exists();
+    if made {
+        // not refused: put the directory back as it was (the test fails)
+        let _ = std::fs::remove_dir(&target);
+    }
     assert!(
-        !st.success() && key.exists(),
-        "the unlink of the agent's key was not refused ({st:?}; the key {} exists: {})",
-        key.display(),
-        key.exists()
+        said == "errno=EPERM" && !made,
+        "the new entry {} was not refused: {said:?} {}",
+        target.display(),
+        String::from_utf8_lossy(&out.stderr)
     );
 
-    // its record arrived (taskset execs rm in place: the pid is rm's) …
-    let pid = format!("pid={rm_pid} ");
+    // its record arrived (taskset execs python3 in place: the pid is the
+    // actor's) …
+    let pid = format!("pid={actor_pid} ");
     let line = wait_for_log_line(
         &log,
-        &["ANTI-TAMPER DENIAL", &pid, "op=unlink"],
+        &["ANTI-TAMPER DENIAL", &pid, "op=mkdir"],
         Duration::from_secs(15),
     );
     assert!(
         line.is_some(),
-        "the refused unlink (pid {rm_pid}) left no record behind the handle loop on its CPU\n{}",
+        "the refused mkdir (pid {actor_pid}) left no record behind the handle loop on its CPU\n{}",
         log_tail(&log)
     );
     // … and the posture took it as what it is: decisive
@@ -2206,7 +2234,7 @@ fn a_bpf_handle_loop_does_not_hide_a_refused_unlink() {
             Duration::from_secs(15)
         )
         .is_some(),
-        "no COMBAT by AntiTamperDenial after the refused unlink\n{}",
+        "no COMBAT by AntiTamperDenial after the refused mkdir\n{}",
         log_tail(&log)
     );
     // the loop's records past their own budget were counted (the sampler's

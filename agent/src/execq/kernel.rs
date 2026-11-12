@@ -586,11 +586,15 @@ mod tests {
         // ostree: home -> var/home
         std::fs::create_dir_all(r.join("var/home")).unwrap();
         std::os::unix::fs::symlink("var/home", r.join("home")).unwrap();
+        // a point that is not a directory (a file where `/tmp` should be)
+        // is no root: nothing under it
+        std::fs::write(r.join("afile"), b"x").unwrap();
         let points = [
             (r.join("var/tmp"), "/var/tmp"),
             (r.join("home"), "/home"),
             (r.join("absent"), "/root"),
             (r.join("var"), "/run/user/1000"),
+            (r.join("afile"), "/tmp"),
         ];
         let got = point_roots(points.iter().map(|(p, n)| (p.as_path(), *n)));
         assert_eq!(
@@ -616,6 +620,16 @@ mod tests {
             ino: FUSE_BY_DEVICE,
         };
         assert!(at(&vt).unwrap() < at(&fuse).unwrap(), "{published:?}");
+        // one entry per key: the map keeps the last insert, and a point's
+        // entry after its mount's would take the mount's GUARDED bit away
+        let mut keys: Vec<(u64, u64)> = published.iter().map(|(k, _)| (k.dev, k.ino)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            published.len(),
+            "a key published twice: {published:?}"
+        );
         assert_eq!(
             published
                 .iter()
