@@ -59,9 +59,17 @@ which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
 and one on a separate `/home` is `home`. Lot 318 (external bug hunt BUG108):
 a file on a btrfs subvolume mounted at `/home`, or in a directory bound
 there, is `home` too, and a file the dentry walk cannot place (more than 64
-levels deep) is `tmp`, `var_tmp` and `home`. A FUSE file outside the task's
+levels deep) is `tmp`, `var_tmp` and `home`. The guarded points themselves
+are published by identity as well (the review of #545, F2): `/var/tmp` in
+openSUSE's `@/var` subvolume, `/home` and `/var/tmp` under an ostree
+deployment's `/var` bind are no mount, and their files had no class; a
+point gives its class only (`var_tmp`, `home`), `guarded_mount` stays a
+mount's. A FUSE file outside the task's
 root is `guarded_mount` whatever its daemon says its root is (and `tmp`,
-`var_tmp`, `home` where no published root places it). The exec quarantine refreshes them
+`var_tmp`, `home` where no published root places it). A filesystem a user
+mounts in their own user namespace (an overlay at `/tmp/m` after `unshare
+-rm`), or a chroot into a FUSE directory, gives no class (not only in a
+container; follow-up lot 323, `docs/design/EXEC_QUARANTINE.md` §2). The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
 Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
@@ -242,6 +250,20 @@ ignored it costs nothing legitimate. File capabilities were already judged
 the same way: a preload into a capability binary from a service is refused,
 which the loader would have ignored anyway. The set-id bits still decide
 where `GLIBC_TUNABLES` is reported.
+
+**On 7.0 the environment check is unreliable** (Ubuntu 26.04's 7.0.0-43;
+pre-existing, not lot 318's; follow-up lot 322). The scan runs in the
+`sys_enter_execve` / `sys_enter_execveat` tracepoint programs, and on that
+kernel a syscall tracepoint's BPF program runs for the execs of one CPU
+only (lot 322's lab: attached as aya and libbpf attach it, it fired for
+CPU 0's execs and for no other CPU's). An exec on another CPU reaches pass 0
+with no finding: on `main`, 0 of 11 staging preloads were refused; on this
+branch, pinned to CPU 0 with `taskset` 20 of 20, unpinned 6 of 20, from a
+service 2 of 10. On 5.15, 6.8 and 6.12 the lab's cases are all refused.
+Until lot 322 moves the scan into the exec's own hook, the deny of this
+section (and its set-id case) holds on 7.0 only for the execs the scan
+sees; the policy's cells by class and tier are judged in the exec's LSM
+hook and are unaffected.
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128

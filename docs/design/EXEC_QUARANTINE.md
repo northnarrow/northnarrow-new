@@ -58,7 +58,15 @@ subvolume: `subvol=/home`); a directory of a filesystem mounted at its root
 elsewhere, bound at a guarded point itself or at a home (`/home/<user>`,
 `/run/user/<uid>`). A bind deeper in a user's tree is chroot or sandbox
 plumbing (`/usr` bound into `~/jail/usr`) and is left out: published, it
-would class every file of `/usr` as the user's. In the kernel
+would class every file of `/usr` as the user's. And (the review of #545,
+F2) the guarded points' own identities, `stat()` of `/tmp`, `/var/tmp`,
+`/home`, `/root` and `/dev/shm` (a link followed, a btrfs subvolume's own
+device), with the point's class and without `guarded_mount`, ranked with the
+mounts before the FUSE roots: openSUSE's `/var/tmp` is a directory of its
+`@/var` subvolume, an ostree deployment's `/home` a link to `var/home` and
+its `/var/tmp` a directory of the `/var` bind — no mount at those points, so
+the mounts alone left their files without a class. A point that is a
+mount's root keeps the mount's entry. In the kernel
 (`nn_guarded_root`) the file's ancestors are looked up from its directory
 to its filesystem's root, at most 64 levels, the task's root ignored, each
 level's device as `stat()` gives it (a btrfs subvolume's own).
@@ -79,8 +87,25 @@ and `home` as well. Its daemon answers every GETATTR, the root's included, and t
 kernel takes the inode number it gives: a user's daemon gave the agent's
 `stat()` one number and kept another for its root (seen on 6.18: 1 became
 7), so the key the agent published never matched, and a user's FUSE mount
-past the map's room had no key at all. Inside the task's root (a virtiofs
-root filesystem) the names decide, as for any other file.
+past the map's room had no key at all. Inside the task's root the FUSE rule
+does not apply and the names decide, as for any other file: that is a
+container's root on `fuse-overlayfs`, and also a chroot into a directory of
+a user's FUSE mount (`virtiofs` is left out by its type name wherever it
+is, not by this exemption).
+
+**Not covered** (the review of #545, F4 and F6; follow-up lot 323): a
+filesystem a user mounts in their own user namespace, which no published
+root places, gives a file no class. An overlay mounted with `unshare -rm` at
+`/tmp/m` (no container, no chroot: Debian, Fedora, RHEL let an unprivileged
+user do it; Ubuntu 24.04 and later do not by default) ends the walk on the
+overlay's root, its names say nothing and its identity is not published, so
+`/tmp/m/payload` is neither held nor judged where `/tmp/payload` is; a
+chroot into a FUSE directory, likewise. A chroot at least 62 levels below a
+published guarded mount gets no class either: the walk stops at the task's
+root (no `UNRESOLVED`), and the identity search runs out of its 64 levels
+before the mount's root. Lot 323 classes a superblock mounted in a user
+namespace (`s_user_ns` not the initial one) like an unplaced FUSE file, and
+a search that runs out like a walk that finds no root.
 
 **A walk that finds no root** (lot 318, BUG108's variant): a file more than
 64 levels below the task's root and its filesystem's root — a path no

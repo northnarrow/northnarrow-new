@@ -9397,12 +9397,36 @@ number in parentheses is a lab PR.
     point's kind from the agent's `(s_dev, 0)` key (lot 311b's contract);
     `EXECQ_ROOTS` 1024; `io_uring_exit` on `sched_process_exit` (the state
     and the creation budget of a dead thread group).
-  - Host: `xtask/tests/kernel_halves.rs` (6 tests, all failing on `main`),
-    the userland tests of `execq::kernel`, `wire::execq`'s virtiofs name
-    test; 32 mutants of the new code, every one caught by a named test.
-  - Lab, as measured (our guests, lease k318; the final code's rounds):
-    `verifier-check` 108 programs, 0 failing on 5.15.0-202 (102 OK, 6 not
-    counted), 6.12.115 (105, 3) and 7.0.0-43 (103, 5); on each, the e2e
+  - The review of #545 (merge after fixes), in the same PR: #538's
+    `guarded_roots` taken whole, the bind rule on top (F3); the guarded
+    points published by their own identity, a point's class without
+    `guarded_mount` (F2: openSUSE's `/var/tmp` in `@/var`, ostree's `/home`
+    and `/var/tmp` under the `/var` bind); the refusals that decide nothing
+    (`is_minor_denial`: a refused read of the key, a BPF handle, a program
+    type, a root sysctl attach, an opt-out) on a per-CPU budget of their own
+    (`minor_denial_rate`, no telemetry loss), a decisive one held back a
+    telemetry loss at once (F1, F7); every use of the denial ring outside
+    its two budgeted writers caught by the ratchet (F5). Not this lot's,
+    recorded: a filesystem a user mounts in their own user namespace (an
+    overlay after `unshare -rm`, no container needed), a chroot into a FUSE
+    directory and one 62 levels below a guarded mount give no class
+    (F4, F6: lot 323); a new image keeps the io_uring state of the one it
+    replaced (`execve`, same tgid: a possible IOU-002 false positive).
+  - Host: `xtask/tests/kernel_halves.rs` (8 tests; 7 fail on `main`, the
+    eighth plants a writer for the ratchet's reader), the userland tests of
+    `execq::kernel` (the openSUSE and ostree layouts), `ring_drops`'s
+    decisive and minor drops, `nn-core`'s "no minor denial is decisive",
+    `wire::execq`'s virtiofs name test; 50 mutants of the new code (32
+    before the review, 18 of its fixes), every one caught by a named test —
+    two of the review's (the points' dedup, the points' directory check)
+    survived until the points test pinned one entry per key and a
+    non-directory point. The eBPF mutants are caught by
+    the text ratchets: the score says the text is pinned; the behaviour is
+    the lab's and the e2e's.
+  - Lab, as measured (our guests, lease k318). The code before the review
+    (rounds r4): `verifier-check` 108 programs, 0 failing on 5.15.0-202
+    (102 OK, 6 not counted), 6.8.0-147 (106, 2), 6.12.115 (105, 3) and
+    7.0.0-43 (103, 5); on each, the e2e
     `a_bpf_handle_loop_does_not_bury_a_refused_kill` and the guard's
     `bpf_guard_enforce_refuses_protected_pids_write` pass (as the nightly
     runs them); a nobody-owned `true` run by a service from a real btrfs
@@ -9412,24 +9436,25 @@ number in parentheses is a lab PR.
     `guarded_mount`/`home` (`tmp`, `var_tmp` for the deep path and the
     unplaced FUSE root) and recorded "would deny"; N9: a live process's
     entry present, gone at its last thread's exit (the leader's first
-    too). BUG101 on 5.15 and 6.12: a staging preload refused (EACCES, the
-    marker preload never ran) at `mount` (root, set-uid root), at a
+    too). BUG101 on 5.15, 6.8 and 6.12: a staging preload refused (EACCES,
+    the marker preload never ran) at `mount` (root, set-uid root), at a
     set-gid `chage` under `setpriv --no-new-privs`, at a set-gid `#!`
-    script; eight legitimate set-id runs (`passwd -S`, `sudo -n true`,
-    `ping`, `mount --version`, `su --version`, as the lab user and from a
-    service) ran with no deny record on all three kernels.
+    script. Before (Ubuntu 24.04, 6.8.0-147): the e2e with BUG37's fix
+    reverted fails on the bug's own symptom ("the refused kill of process
+    3841 left no record", 3,947,268 `fs_protect` drops); `main`'s tree
+    gives the four BUG108/N8 cases no class, runs the four BUG101 preloads
+    ("recorded: the target is set-id"), and keeps the N9 entries after the
+    exit.
   - Found, not this lot's (pre-existing on `main`): on 7.0 the exec
     environment's check is nearly inert (0 of 11 preloads refused on
-    `main`; this branch's rounds 0 to 2 of 4 at random). The
-    `sys_enter_execve` program runs at every exec, and its findings are
-    lost unless the exec stays on one CPU: pinned with `taskset`, 20 of 20
-    refused, under load too; unpinned, 6 of 20 and 2 of 10. The scan's
-    per-CPU scratch (`EXECPOL_ENV_SCRATCH`) is written and read back
-    across a CPU change — 7.0's faultable syscall tracepoints do not keep
-    the program on one CPU, as 6.12's did. The fix (the scan writing into
-    the task's own `EXECPOL_ENV` entry) is a follow-up. Also seen: on 5.15
-    the record's path of a file on a btrfs subvolume is empty (the walk
-    ends on the top-level subvolume; the class is right).
+    `main`; this branch's rounds 0 to 2 of 4 at random; pinned with
+    `taskset` to CPU 0, 20 of 20; unpinned, 6 of 20 and 2 of 10). This
+    lot's guess (a per-CPU scratch read back on another CPU) was wrong:
+    lot 322's lab shows the `sys_enter_execve` program running for CPU 0's
+    execs only on that kernel, and moves the scan into the exec's own
+    hook. Also seen: on 5.15 the record's path of a file on a btrfs
+    subvolume is empty (the walk ends on the top-level subvolume; the class
+    is right).
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds its e2e to the privileged suite the nightly and
     the PR's KVM jobs run.

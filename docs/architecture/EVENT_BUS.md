@@ -815,7 +815,7 @@ stage of an event's path (plan §3.4):
 | Stage | Counted by | Since |
 |---|---|---|
 | 1 kernel ring | `RING_DROPS`, a ring or map full | Tappa 10.8 |
-| 2 kernel budget | `RING_DROPS` `dns_rate`, `listen_rate`, `io_uring_rate`, `task_denial_rate` | reviews 78, EBPF-013/017 |
+| 2 kernel budget | `RING_DROPS` `dns_rate`, `listen_rate`, `io_uring_rate`, `task_denial_rate`, `denial_rate` (lot 293), `minor_denial_rate` (lot 318) | reviews 78, EBPF-013/017 |
 | 3 decode | `RejectThrottle` | SNS-008 |
 | 4 bus queue | the bus, per queue | R12a |
 | 5 decision delay | the decisions over their class's budget, from the record's kernel time | R12b |

@@ -10,19 +10,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   BUG37, BUG101, BUG108 and N9).
   - **BUG37**: the BPF guard's refusals (`bpf_handle`, `bpf_map`,
     `bpf_link`, `bpf_prog_type`, `bpf_prog_opt_out`, `sysctl_root_attach`)
-    go behind the per-attempt budget of lot 293. They wrote the shared
-    denial ring themselves: a root loop of `BPF_MAP_GET_FD_BY_ID` on one of
-    the agent's maps filled it, and the record of a refused `kill` was lost
-    (counted, not kept). Past the budget they are counted in `RING_DROPS`
-    (`denial_rate`, signed). Every write of the ring is behind a budget now;
-    `xtask/tests/kernel_halves.rs` keeps it so.
+    go behind a budget. They wrote the shared denial ring themselves: a
+    root loop of `BPF_MAP_GET_FD_BY_ID` on one of the agent's maps filled
+    it, and the record of a refused `kill` was lost (counted, not kept).
+    Every write of the ring is behind a budget now;
+    `xtask/tests/kernel_halves.rs` keeps it so, whatever the call (the
+    review of #545, F5: `output` and any other use of the ring outside its
+    two budgeted writers fail it).
+  - **The decisive refusals keep their room** (the review of #545, F1 and
+    F7). The refusals signed at each attempt that decide nothing — a
+    refused read of the agent's key, a handle on its BPF objects, a refused
+    program type or root `cgroup/sysctl` attach, a loader opt-out's record
+    (`common::wire::is_minor_denial`) — spend a per-CPU budget of their own
+    (50 a second, `RING_DROPS` slot `minor_denial_rate`), never lot 293's
+    (sharing it, 50 refused handles in a second on a CPU kept out the record
+    of a refused unlink of a protected file there, the posture's decisive
+    trigger). A
+    decisive refusal held back (`denial_rate`, `task_denial_rate`) is a
+    `TelemetryLoss` at once (it was past 64 in a 10 s sample); the
+    non-decisive ones held back never are: an administrator's `bpftool map
+    list` (about 150 refused handles) is counted and signed, no loss. The
+    privileged e2e `a_bpf_handle_loop_does_not_hide_a_decisive_refusal`
+    floods the guard on one CPU and refuses a new entry in
+    `/etc/northnarrow` there: its record and the posture's transition
+    arrive.
   - **BUG101**: the exec policy's environment deny (an `LD_PRELOAD` /
     `LD_AUDIT` entry under a staging path) applies at a set-id target too.
     It was skipped on the target's set-id bits ("the kernel sets
     `AT_SECURE`"), which do not promise it: root running a set-uid-root
     file, a set-id file under `no_new_privs` or on a `nosuid` mount, a
     set-id `#!` script — `deny-root` was side-stepped with `su`.
-    `docs/design/EXEC_POLICY.md` §5.
+    `docs/design/EXEC_POLICY.md` §5. **On 7.0 the environment check is
+    unreliable** (Ubuntu 26.04's 7.0.0-43, pre-existing: on `main` 0 of 11
+    staging preloads refused): the scan's syscall tracepoint program sees
+    the execs of one CPU only there; follow-up lot 322 moves it into the
+    exec's own hook.
   - **BUG108**: the exec quarantine and the exec policy find a guarded
     mount by the identity of an ancestor of the file — the root of the
     mount at the guarded point — not by where the dentry walk ends. A
@@ -33,7 +55,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `EXECQ_ROOTS` holds 1024 of them (64 filled up with a user's FUSE
     mounts). A file whose walk finds no root within 64 levels — a path any
     user can make — is classed `tmp`, `var_tmp` and `home` (it had no
-    class).
+    class). The guarded points themselves are published by identity too
+    (the review of #545, F2): openSUSE's `/var/tmp` (a directory of its
+    `@/var` subvolume), an ostree deployment's `/home` and `/var/tmp` (under
+    its `/var` bind) had no class, no mount being at those points; a point
+    gives its class (`var_tmp`, `home`), not `guarded_mount`. Not covered
+    (follow-up lot 323): a filesystem a user mounts in their own user
+    namespace — an overlay at `/tmp/m` after `unshare -rm`, no container and
+    no chroot needed — or a chroot into a FUSE directory gives no class, nor
+    does a chroot 62 levels or more below a guarded mount.
   - **N8's kernel half** (the review of #538, F1 and F3): a file of a FUSE
     filesystem outside the task's root is `guarded_mount` by its
     superblock's magic (not `virtiofs`, told apart by its type's name: two

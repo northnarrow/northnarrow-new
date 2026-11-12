@@ -2363,7 +2363,21 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   holds. The ring's only writers are the budgeted emitters
   (`xtask/tests/kernel_halves.rs`); the privileged e2e
   `a_bpf_handle_loop_does_not_bury_a_refused_kill` runs the loop on every
-  CPU with five refused kills in it.
+  CPU with five refused kills in it. **The review of #545 (F1, F7)**: one
+  budget for both let 50 refused handles hold back, that second on that
+  CPU, the record of a refused unlink — the posture's decisive trigger —
+  and a `bpftool map list` (about 150 refused handles) was a telemetry
+  loss. The refusals that decide nothing (`common::wire::is_minor_denial`:
+  a refused read of the key, `bpf_handle`, `bpf_prog_type`,
+  `bpf_prog_opt_out`, `sysctl_root_attach`) spend a per-CPU budget of
+  their own (`MINOR_DENIAL_RATE`, 50 a second; `RING_DROPS`
+  `minor_denial_rate`, signed, not a security ring); the decisive ones
+  (`bpf_map`, `bpf_link` and the file refusals) keep lot 293's to
+  themselves, and one of them held back (`denial_rate`, or a task denial's
+  `task_denial_rate`) is a telemetry loss at once. The privileged e2e
+  `a_bpf_handle_loop_does_not_hide_a_decisive_refusal` floods the handles on
+  one CPU and refuses a `mkdir` in `/etc/northnarrow` on it: the record, the
+  posture's transition, no `denial_rate` drop.
 - **BUG05 (P2):** `BPF_RAW_TRACEPOINT_OPEN` (17) attaches a program — a raw
   tracepoint, and through it `tp_btf`, `fentry`/`fexit` and LSM programs —
   and the `bpf` hook did not look at it: an attach that way left no record
