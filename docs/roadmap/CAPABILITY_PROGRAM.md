@@ -9653,3 +9653,60 @@ number in parentheses is a lab PR.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds its e2e to the privileged suite the nightly and
     the PR's KVM jobs run.
+- **Lot 322 — the exec environment's check on every CPU; the exec guards'
+  buffers per task (C23, C14; no level changes).**
+  - What was open: lot 318's lab found the exec environment's check
+    (`EXECPOL_ENV`, a staging `LD_PRELOAD` refused at exec) nearly inert on
+    Ubuntu 26.04's 7.0, `main` included (0 of 11 refused), and supposed a
+    per-CPU scratch read back on another CPU.
+  - The cause, as measured (the kernel alone, `bpftrace`, no agent,
+    ubuntu2604 `7.0.0-43`, 4 vCPU, preemption `full (lazy)`): a program on
+    a syscall tracepoint, attached as aya and libbpf attach it (one perf
+    event, CPU 0), ran only for the calls made on CPU 0 — an exec loop
+    pinned to CPU 1, 2 or 3 never fired `sys_enter_execve` (77, 86, 90
+    execs), `sched_process_exec` and `security_bprm_check` fired on every
+    CPU. Lot 318's hypothesis does not hold (upstream v7.0 runs that
+    program with preemption off).
+  - Done: the exec sensor's `bprm_check_security` program reads `envp` from
+    the exec's registers at the first pass (`bpf_task_pt_regs`, `dx` for
+    `execve`, `r10` for `execveat`; optional `PT_REGS_R10_OFFSET`, slot 129)
+    into the task's own `EXECPOL_ENV` entry (thread id and start time),
+    judges and removes it in the same run; the two tracepoint programs and
+    their tracefs slots are gone. The audit of the 24 per-CPU maps: the
+    exec sensor's walk, the mapping check's walk, the quarantine's candidate
+    and the BPF guard's `OBJ_GET` path became per-task entries
+    (`task_scratch.rs`; an LSM program is preemptible on a `full`/`lazy`
+    kernel); the mapping check's cached report walks again (it carried the
+    CPU's last walk); the FIM sensor's four walk buffers left for a
+    follow-up (hot path, measured first); the rest classified (counters,
+    rate state — #545's `MINOR_DENIAL_RATE` among them —, preemption off,
+    single reader) in
+    `xtask/tests/percpu_maps.rs`.
+  - Host: `percpu_maps.rs` (3 tests, all failing on the base), wire and
+    `btf_offsets` unit tests; 25 mutants, each caught by a named test.
+  - Lab, as measured (our guests, lease k322): the "before" round on 7.0.0-43 (the base `c9c101bc`, the agent
+    installed, `NN_EXEC_POLICY=enforce`, 20 execs of `true` with a staging
+    preload each): an ssh root shell 4 of 20 refused unpinned, 3 of 20 with
+    every CPU busy, 20 of 20 pinned to CPU 0, 0 of 20 pinned to CPU 2 and to
+    CPU 3; `fexecve` 20 of 20 on CPU 0, 5 of 20 unpinned; the preload string
+    in an untouched file mapping 0 of 20 even on CPU 0; a service 7 of 20
+    (root) and 5 of 20 (`nobody`); `execpol_env_execve` ran 376 times for
+    1,206 runs of `exec_check_lsm`; the new e2e failed (about 52 of 72 execs
+    not refused). The final code (`b19515fe`) on 7.0.0-43, 6.12.115 and
+    5.15.0-202: every one of the 11 cases 20 of 20 refused (EACCES, the
+    marker preload never ran; 220 environment denials each), the e2e
+    `a_staging_preload_is_refused_at_every_exec_on_every_cpu` and the
+    guard's `bpf_guard_enforce_refuses_protected_pids_write` pass;
+    `verifier-check` 106 programs, 0 failing on 5.15 (100 OK, 6 not
+    counted), 6.8.0-147 (104, 2), 6.12 (103, 3) and 7.0 (101, 5);
+    `exec_check_lsm` 9,565 insns on 5.15 and 6.8, 9,901 on 6.12, 9,905 on
+    7.0 (lot 318: 8,658 / 9,034 / 9,036; processed 418,908 on 7.0, 436,028
+    on 6.12).
+  - Mini-hunt: the exec sensor's tracepoint mode and the file-open
+    fallback (`sys_enter_openat`) are blind on CPUs other than 0 on that
+    kernel (degraded starts only; not fixed, follow-up); an `LD_PRELOAD`
+    string in an untouched file mapping evaded the old tracepoint read
+    (fixed by the same change); a 32-bit exec's environment is still not
+    read (counted); the check has no live self-test (proposed).
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds its e2e to the privileged suites.

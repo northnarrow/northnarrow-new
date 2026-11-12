@@ -6,6 +6,53 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 322: the exec environment's check works on every CPU, and the exec
+  guards' buffers are the running task's own.
+  - **The check was almost inert on Ubuntu 26.04 (kernel 7.0).** It refused
+    0 of 11 staging preloads there (lot 318's lab), on `main` too. Its two
+    programs sat on the `sys_enter_execve` / `sys_enter_execveat`
+    tracepoints. On that kernel a program on a syscall tracepoint, attached
+    as aya and libbpf attach it (one perf event, on CPU 0), ran only for the
+    calls made on CPU 0. The lab measured it with the kernel alone
+    (`bpftrace`, no agent): with the exec loop pinned to CPU 1, 2 or 3 the
+    tracepoint never fired; `sched_process_exec` and the LSM hook fired on
+    every CPU. Lot 318's hypothesis, a per-CPU buffer read back on another
+    CPU, did not hold.
+  - **The fix.** The exec sensor's own `bprm_check_security` program reads
+    the new environment at the exec's first pass, from `envp` as the exec's
+    registers hold it (`execve`'s `dx`, `execveat`'s `r10`; a new optional
+    BTF offset, `PT_REGS_R10_OFFSET`, slot 129). The caller's memory is
+    still its own there, and the kernel has just copied the same strings
+    from it. The findings go into the task's own `EXECPOL_ENV` entry, keyed
+    by thread id and start time so that a reused id inherits nothing. The
+    entry is judged and removed in the same run. No state passes from one
+    program to another, and the two tracepoint programs are gone, along
+    with their tracefs slots.
+  - **Mini-hunt (fixed by the same change).** The old read could not fault
+    a page in. An `LD_PRELOAD` string in a file mapping that was never
+    touched read as nothing, while the kernel's copy faulted it in and the
+    loader honoured it. The strings are read after the kernel's copy now.
+  - **The audit of every per-CPU map.** LSM programs run with migration
+    disabled but preemption enabled: on a `full` or `lazy` preemption
+    kernel (Ubuntu 26.04's default), another task's run on the same CPU can
+    rewrite a per-CPU buffer kept across a helper call. These are now the
+    running task's own LRU entries (`agent-ebpf/src/task_scratch.rs`):
+    - the exec sensor's path walk, which the exec policy's classes are read
+      from;
+    - the mapping check's walk;
+    - the exec quarantine's candidate, built in place;
+    - the BPF guard's `OBJ_GET` path.
+
+    The mapping check also re-walks a file before a report from its cache.
+    It copied whatever walk the CPU had made last, another file's path.
+    `xtask/tests/percpu_maps.rs` classifies every remaining per-CPU map:
+    counters, rate state, programs that run with preemption off, single
+    readers. The FIM sensor's four walk buffers on the file-open path are
+    left for a follow-up (observations, not refusals; a hash insert per open
+    is measured first).
+  - Privileged e2e `response_privileged_e2e::a_staging_preload_is_refused_at_every_exec_on_every_cpu`:
+    24 execs with a staging `LD_PRELOAD` each as root, as `nobody` and from
+    a service, from unpinned threads with every CPU busy. All are refused.
 - Lot 318 (external bug hunt, editions 1.2/1.3/1.4: the kernel halves of
   BUG37, BUG101, BUG108 and N9).
   - **BUG37**: the BPF guard's refusals (`bpf_handle`, `bpf_map`,

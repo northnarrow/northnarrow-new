@@ -73,7 +73,7 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
     macros::{lsm, map, raw_tracepoint},
-    maps::{Array, HashMap, LruHashMap, RingBuf, PerCpuArray},
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::{LsmContext, RawTracePointContext},
 };
 use northnarrow_common::bpf_cmd::{
@@ -85,6 +85,7 @@ use northnarrow_common::bpf_prog_class::{denied_by_default, type_bit};
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
+use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_HANDLE,
     FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
@@ -121,12 +122,15 @@ pub const PIN_NAME_LEN: usize = 32;
 const PATH_BUF_LEN: usize = 256;
 
 
-/// Per-CPU scratch for the `OBJ_GET` pathname. A 256-byte stack array
-/// lowers to a `memset` subprogram, which the 5.15 verifier rejects (see
-/// `zero.rs`); map memory needs no zeroing — only the first `n` bytes the
-/// helper wrote are ever read.
+/// The `OBJ_GET` pathname's buffer: the calling task's own entry, made and
+/// removed by [`nn_obj_get_own_link`]. A 256-byte stack array lowers to a
+/// `memset` subprogram, which the 5.15 verifier rejects (see `zero.rs`).
+/// Lot 322: it was a per-CPU buffer, read twice around helper calls by a
+/// program that runs preemptible (`crate::task_scratch`): another task's
+/// `OBJ_GET` on the same CPU could rewrite the name between the reads.
 #[map]
-static OBJ_GET_PATH_SCRATCH: PerCpuArray<[u8; PATH_BUF_LEN]> = PerCpuArray::with_max_entries(1, 0);
+static OBJ_GET_PATH_SCRATCH: LruHashMap<TaskKey, [u8; PATH_BUF_LEN]> =
+    LruHashMap::with_max_entries(1024, 0);
 
 /// Final path components of the agent's own LINK pins, hashed
 /// (`northnarrow_common::wire::pin_name_hash`; value = [`OWN_KIND_LINK`]),
@@ -465,9 +469,18 @@ const PIN_UNDER_DIRS: u64 = 3;
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
-    match unsafe { obj_get_names_own_link(user_ptr) } {
-        Ok(v) => v,
-        Err(()) => PIN_UNREADABLE,
+    unsafe {
+        let key = crate::task_scratch::key_of(bpf_get_current_task() as *const u8);
+        let buf = match crate::task_scratch::make(&OBJ_GET_PATH_SCRATCH, &key) {
+            Some(b) => b,
+            None => return PIN_UNREADABLE,
+        };
+        let r = match obj_get_names_own_link(user_ptr, buf) {
+            Ok(v) => v,
+            Err(()) => PIN_UNREADABLE,
+        };
+        let _ = OBJ_GET_PATH_SCRATCH.remove(&key);
+        r
     }
 }
 
@@ -487,14 +500,10 @@ pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
 /// "R4 min value is negative" on 5.15), no 256-byte scan (minutes of
 /// verification), no stack array (memset subprogram).
 #[inline(always)]
-unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<u64, ()> {
+unsafe fn obj_get_names_own_link(user_ptr: u64, buf: *mut [u8; PATH_BUF_LEN]) -> Result<u64, ()> {
     if user_ptr == 0 {
         return Ok(0);
     }
-    let buf: *mut [u8; PATH_BUF_LEN] = match OBJ_GET_PATH_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p,
-        None => return Err(()),
-    };
     // pass 1: length only. A path that does not fit the buffer (truncated
     // read: PATH_BUF_LEN - 1 bytes, the NUL takes the last slot) is not
     // matched: scanning PATH_MAX in chunks blew the 5.15 state budget

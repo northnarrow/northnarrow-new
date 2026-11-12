@@ -9,13 +9,15 @@
 //! frozen policy ([`conf_slot`]) gives, per tier, the classes to deny, to
 //! record as "would deny", and to hand to the exec quarantine; a deny is
 //! `-EACCES` from `bprm_check_security`, before the exec's point of no
-//! return. The environment is read at `sys_enter_execve{,at}` ([`EnvStashRaw`],
-//! a bounded prefix) and judged at the exec's first pass. The `mmap_file`
+//! return. The environment is read at the exec's first pass from the exec's
+//! own syscall registers ([`EnvStashRaw`], a bounded prefix, in the task's
+//! own [`TaskKey`] entry; lot 322) and judged there. The `mmap_file`
 //! LSM hook applies the same classes to executable mappings of files.
 //!
 //! Every struct is `#[repr(C)]` with explicit padding; strict append-only.
 
 use super::exe::ExeIdentityRaw;
+pub use super::exe::TaskKey;
 use super::TASK_COMM_LEN;
 
 /// Lineage tiers of the exec'ing task (`ExecPolRaw::tier`, low byte).
@@ -116,7 +118,8 @@ pub mod mode {
 
 /// `EXECPOL_CONF[FLAGS]`.
 pub mod flags {
-    /// The `sys_enter_execve{,at}` programs read the new environment.
+    /// The exec's first pass reads the new environment (lot 322: from the
+    /// exec's own registers; it was two `sys_enter_execve{,at}` programs).
     pub const ENV_SCAN: u64 = 1 << 0;
     /// The `mmap_file` program judges executable mappings.
     pub const MAP: u64 = 1 << 1;
@@ -225,9 +228,9 @@ pub const ENV_HIST_LEN: usize = 16;
 /// classifies the file the loader actually maps).
 pub const STAGING_PREFIXES: [&str; 5] = ["/tmp/", "/var/tmp/", "/dev/shm/", "/proc/", "/dev/fd/"];
 
-/// The new environment's loader findings, read at `sys_enter_execve{,at}`
-/// and judged at the exec's first pass (`EXECPOL_ENV`, keyed by
-/// `task_struct`). 416 bytes, no implicit padding.
+/// The new environment's loader findings, read and judged at the exec's
+/// first pass (`EXECPOL_ENV`, the exec'ing task's own [`TaskKey`]
+/// entry; lot 322). 416 bytes, no implicit padding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -303,6 +306,10 @@ pub mod counter {
     pub const RING_FULL: u32 = 9;
     /// Environments with more than `ENV_SCAN_MAX` variables.
     pub const ENV_TRUNCATED: u32 = 10;
+    /// Lot 322: environments not read — the task's own stash could not be
+    /// made, or the exec was not a native `execve` / `execveat` (a 32-bit
+    /// or x32 call: [`exec_envp_reg`]).
+    pub const ENV_UNREAD: u32 = 11;
     /// Slots in the map.
     pub const SLOTS: u32 = 12;
 }
@@ -494,6 +501,34 @@ pub fn entry_is_staging(entry: &[u8]) -> bool {
         .any(|p| entry.len() >= p.len() && &entry[..p.len()] == p.as_bytes())
 }
 
+/// x86-64 `execve(2)` and `execveat(2)`, `orig_ax` at `bprm_check_security`.
+pub const NR_EXECVE: u64 = 59;
+pub const NR_EXECVEAT: u64 = 322;
+
+/// The register of the exec's `pt_regs` that holds `envp`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EnvpReg {
+    /// `execve(filename, argv, envp)`: the third argument.
+    Dx,
+    /// `execveat(dirfd, filename, argv, envp, flags)`: the fourth.
+    R10,
+}
+
+/// Lot 322: where the exec's new environment is, from the syscall number
+/// the exec entered with. `bprm_check_security` is reached from these two
+/// native calls (and `kernel_execve`, whose task has no user registers:
+/// the caller does not ask). A 32-bit (`int 0x80`: `orig_ax` 11 or 358)
+/// or x32 call (bit 30) passes 32-bit pointers: not read (`None`, counted
+/// as [`counter::ENV_UNREAD`]).
+#[inline(always)]
+pub const fn exec_envp_reg(orig_ax: u64) -> Option<EnvpReg> {
+    match orig_ax {
+        NR_EXECVE => Some(EnvpReg::Dx),
+        NR_EXECVEAT => Some(EnvpReg::R10),
+        _ => None,
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -564,6 +599,19 @@ mod tests {
             "",
         ] {
             assert!(!entry_is_staging(no.as_bytes()), "{no}");
+        }
+    }
+
+    /// Lot 322: `envp` is `execve`'s third argument and `execveat`'s
+    /// fourth; a 32-bit, x32 or unknown call is not read.
+    #[test]
+    fn the_new_environment_is_found_in_the_exec_s_own_registers() {
+        assert_eq!(exec_envp_reg(59), Some(EnvpReg::Dx));
+        assert_eq!(exec_envp_reg(322), Some(EnvpReg::R10));
+        // ia32 execve / execveat, x32 execve / execveat, kernel_execve's
+        // zeroed registers, a negative (no call)
+        for other in [11, 358, 0x4000_0000 | 520, 0x4000_0000 | 545, 0, u64::MAX] {
+            assert_eq!(exec_envp_reg(other), None, "{other:#x}");
         }
     }
 

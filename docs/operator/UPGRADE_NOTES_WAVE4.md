@@ -1306,3 +1306,37 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `sched/sched_process_exit` (N9): a process's aggregation state goes with
   its last thread. Where it does not attach, the start signs the
   `io_uring_sensor` degradation.
+
+## 28. The exec environment's check on every CPU (lot 322)
+
+- **On Ubuntu 26.04 (kernel 7.0) the check now refuses.** This is the
+  check of [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md):
+  an `LD_PRELOAD` or `LD_AUDIT` entry under a staging path, with
+  `--exec-policy enforce`. On that kernel it refused almost nothing. Its two
+  programs on the `sys_enter_execve{,at}` tracepoints ran only for the execs
+  made on CPU 0 (0 of 11 refused in the lab). The exec sensor's own
+  `bprm_check_security` program now reads the environment from the exec's
+  registers. Expect `NN-L-EXECENV-001` "denied at exec (EACCES)" records,
+  and refused execs, where there were none: a service, a cron job or a root
+  session that runs programs with a preload from `/tmp/`, `/var/tmp/`,
+  `/dev/shm/`, `/proc/` or `/dev/fd/`. On the other kernels nothing changes
+  but the way the environment is read. Nothing to configure.
+- **Programs and offsets.** The programs `execpol_env_execve` and
+  `execpol_env_execveat` are gone, and so are their two tracefs fields. One
+  optional BTF offset is new, `pt_regs.r10` (slot 129). The enum,
+  tracepoint and hook-argument slots move by one: 144 slots in all. Where
+  the `pt_regs` offsets do not resolve (another architecture than x86-64),
+  the environment is not judged: the start signs the `exec_policy`
+  degradation "the exec's registers cannot be read on this kernel". A
+  32-bit or x32 exec's environment is not read either, which was already
+  the case; it is counted in `EXECPOL_COUNTERS` slot 11 (`ENV_UNREAD`).
+- **The exec guards' buffers are per task.** The following moved from
+  per-CPU buffers to LRU hashes of 1024 entries keyed by the running task:
+  - the exec sensor's walk;
+  - the mapping check's walk;
+  - the environment;
+  - the BPF guard's `OBJ_GET` path.
+
+  The exec quarantine's candidate is built in its own entry. A mapping
+  report from the check's cache now carries the file's own path; it had the
+  path of whatever that CPU had walked last.
