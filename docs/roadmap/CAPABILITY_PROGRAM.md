@@ -9694,6 +9694,21 @@ number in parentheses is a lab PR.
     (refused). Lot 315's copy-on-write `fd_path` replaces the lot's F3
     version, its ` (deleted)` stripped by the lot's helper. Six targeted
     mutations of these reads, all caught (one after a test was added).
+  - Re-check 2 of #543: R1 (blocking) — `/etc/shells` was read with
+    `fs::read`, so a FIFO there stalled the quarantine and NEUTRALIZE with
+    it; now read as lot 311 reads a configuration file (`O_PATH` first, a
+    regular file only, at most 1 MiB), anything else refused at once. R2
+    (decided) — a non-root offender's own payload with a second hard link
+    it made (`ln x .x2`) was only vaulted; the offender's own inode is now
+    emptied under every name, and the restore in place brings every name
+    back; root's and other users' inodes keep F1's rule. Eleven targeted
+    mutations, all caught. Measured on our Ubuntu 24.04 guest (lease k312,
+    6.8.0-149) at 8d38d6b4 and 6b271ac7: with `/etc/shells` a FIFO,
+    NEUTRALIZE signed about 2 s after the tripwire, the quarantine refused
+    at once, the ladder concluded; the lab user's payload with `.x2` run by
+    an offender acting as that user emptied under both names (`success`,
+    mode left 755: no `CAP_FOWNER`), and `nn-admin response restore` put
+    the content (sha256 of `python3`) and mode back under both.
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
