@@ -211,11 +211,13 @@ pub const SOURCES: [SourceContract; 16] = [
              310) the fork-parent record not attached is signed degraded (fork_parent) and \
              every exec's fork parent is not known: no unit shell vouches",
         kernel_budgets: &[KernelBudget {
-            allows: "(lot 310, re-check 3 of #539) the fork-parent record holds 65,536 \
-                 processes' forks (LRU, threads not recorded); an exec of a process started \
-                 after it was attached whose record was evicted carries no fork parent \
-                 (fail-closed: no unit shell vouches; R004 exempts PID 1's executor copies \
-                 by identity alone) and is counted; not a security ring",
+            allows: "(lot 310, re-checks 3 and 4 of #539) the fork-parent record holds 65,536 \
+                 processes' forks (LRU, threads not recorded, each removed at its process's \
+                 exit); an exec of a process started after it was attached whose record was \
+                 evicted carries no fork parent (fail-closed: no unit shell vouches; R004 \
+                 exempts PID 1's executor copies by identity alone) and is counted — a later \
+                 exec of the same process finds its record used and is not; not a security \
+                 ring",
             counter: "fork_record_lost",
         }],
         overhead: &[],

@@ -968,11 +968,6 @@ struct Inner {
     /// Lab PR 175: the host's `/` for `/etc/passwd`, `/etc/subuid` and the
     /// owners of container storage directories; a fixture tree in tests.
     host_root: PathBuf,
-    /// Lot 310 (the re-check of #539, R3-1): systemd's executor by its
-    /// verified identities (R004's, set at the rules' build): an exec after
-    /// one of them carries its fork parent ([`AuthSessionTracker::
-    /// set_executor_images`]).
-    executor: std::sync::OnceLock<crate::decision::rules::ExecutorImages>,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -1016,7 +1011,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 proc_root,
                 live,
                 observer_start: std::sync::OnceLock::new(),
-                executor: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 suspended_ns: None,
                 bounds: Bounds {
@@ -1151,10 +1145,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             argv,
             exe.flags,
         );
-        let fork_parent = match exe.fork_parent {
-            0 => self.carried_fork_parent(*pid, *start_ns),
-            p => p,
-        };
+        // the kernel's record (the re-check 4 of #539: carried through a
+        // verified systemd-executor in the kernel, at the exec)
+        let fork_parent = exe.fork_parent;
         self.ingest_inner(
             *pid,
             *ppid,
@@ -2536,9 +2529,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// The walk of [`Self::lineage_match`], by hop: the first hop
     /// `is_match` accepts — `pid`'s own, or an ancestor's that ran its exe
     /// before the process below it was forked. `Some(None)` when the walk
-    /// ends without one, `None` when a hop cannot be read. As of `as_of`
-    /// (review #471 A1, R-F): each hop the exec its pid had run by then
-    /// ([`Self::hop`]).
+    /// ends without one (at PID 1, or cut: [`Self::lineage_walk_to`]),
+    /// `None` when a hop cannot be read. As of `as_of` (review #471 A1,
+    /// R-F): each hop the exec its pid had run by then ([`Self::hop`]).
+    ///
+    /// For the walks that look for a hop that GRANTS something (a package
+    /// manager, an authentication binary, a client, a grantee): a walk cut
+    /// before PID 1 finds nothing above the cut, and grants nothing for it.
+    /// A walk whose every hop must vouch reads [`Self::lineage_walk_to`].
     fn lineage_walk(
         &self,
         pid: u32,
@@ -2546,28 +2544,57 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         is_match: impl Fn(&Hop) -> bool,
         max_up: usize,
     ) -> Option<Option<Hop>> {
+        Some(match self.lineage_walk_to(pid, as_of, is_match, max_up)? {
+            WalkEnd::Found(hop) => Some(hop),
+            WalkEnd::Root | WalkEnd::Cut => None,
+        })
+    }
+
+    /// [`Self::lineage_walk`], saying how it ended. The re-check 4 of #539
+    /// (HIGH): it reached PID 1 or 0 ([`WalkEnd::Root`]) — the lineage is
+    /// whole — or it stopped before: the depth cap ([`LINEAGE_DEPTH_CAP`],
+    /// or `max_up`), a hop that started after the one below it (a later
+    /// process that took an exited parent's pid), a process its own parent
+    /// ([`WalkEnd::Cut`]: what is above the cut is not known). `pid` + the
+    /// cap's 32 ancestors whose last one's parent is PID 1 is whole: no
+    /// hop is read past the cap to know it. `None` when a hop cannot be
+    /// read.
+    fn lineage_walk_to(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+        is_match: impl Fn(&Hop) -> bool,
+        max_up: usize,
+    ) -> Option<WalkEnd> {
         if pid == 0 || pid == 1 {
-            return Some(None);
+            return Some(WalkEnd::Root);
         }
         let mut below = self.hop(pid, as_of)?;
         if is_match(&below) {
-            return Some(Some(below));
+            return Some(WalkEnd::Found(below));
         }
         for _ in 0..max_up.min(LINEAGE_DEPTH_CAP) {
             let ppid = below.ppid;
-            if ppid == 0 || ppid == 1 || ppid == below.pid {
-                return Some(None);
+            if ppid == 0 || ppid == 1 {
+                return Some(WalkEnd::Root);
+            }
+            if ppid == below.pid {
+                return Some(WalkEnd::Cut);
             }
             let up = self.hop(ppid, as_of)?;
             if !self.started_no_later(&up, &below) {
-                return Some(None);
+                return Some(WalkEnd::Cut);
             }
             if is_match(&up) && self.ran_before(&up, &below, as_of) {
-                return Some(Some(up));
+                return Some(WalkEnd::Found(up));
             }
             below = up;
         }
-        Some(None)
+        Some(if below.ppid == 0 || below.ppid == 1 {
+            WalkEnd::Root
+        } else {
+            WalkEnd::Cut
+        })
     }
 
     /// External audit PROC-008: the nearest process in the lineage of
@@ -2626,17 +2653,46 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
     /// and for each ancestor on the walk of [`Self::actor_in_lineage`]
-    /// (ordered, POS-003: it ends at PID 1, at a hop that started after the
-    /// one below it, or at [`LINEAGE_DEPTH_CAP`]), nearest first, `pid`'s
-    /// own identity at index 0. `None` when a hop can be read neither from
-    /// the spawn cache nor from `/proc`: the lineage is not known.
+    /// (ordered, POS-003), nearest first, `pid`'s own identity at index 0,
+    /// up to PID 1. `None` when the lineage is not known: a hop can be read
+    /// neither from the spawn cache nor from `/proc`, or (the re-check 4 of
+    /// #539, HIGH) the walk stopped before PID 1 — at [`LINEAGE_DEPTH_CAP`]
+    /// (33 nested `timeout`s, each a packaged program that forks the next,
+    /// hid a webshell's `sh -c` above them), at a hop that started after the
+    /// one below it, at a process its own parent ([`WalkEnd::Cut`]). Every
+    /// hop of this lineage must vouch for the writer: one never read never
+    /// does. [`Self::lineage_identities_seen`] keeps the hops below a cut.
     ///
     /// Reads only the spawn cache and `/proc` — never a file elsewhere, so
     /// the guard's fanotify reader may call it (an open on a marked
     /// filesystem from that thread would wait on itself).
     pub fn lineage_identities(&self, pid: u32, as_of: AsOf) -> Option<Vec<(u32, ExecIdentity)>> {
+        match self.walk_identities(pid, as_of)? {
+            (hops, WalkEnd::Root) => Some(hops),
+            _ => None,
+        }
+    }
+
+    /// [`Self::lineage_identities`], with the hops read below a cut too:
+    /// for a reader that LOOKS for a hop (a staged image among them), never
+    /// for one that trusts the lineage whole. `None` when a hop cannot be
+    /// read.
+    pub fn lineage_identities_seen(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+    ) -> Option<Vec<(u32, ExecIdentity)>> {
+        self.walk_identities(pid, as_of).map(|(hops, _)| hops)
+    }
+
+    /// The hops of [`Self::lineage_identities`]' walk and how it ended.
+    fn walk_identities(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+    ) -> Option<(Vec<(u32, ExecIdentity)>, WalkEnd)> {
         let hops = std::cell::RefCell::new(Vec::new());
-        self.lineage_walk(
+        let end = self.lineage_walk_to(
             pid,
             as_of,
             |hop| {
@@ -2645,34 +2701,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             },
             LINEAGE_DEPTH_CAP,
         )?;
-        Some(hops.into_inner())
-    }
-
-    /// Lot 310 (the re-check of #539, R3-1): systemd's executor by its
-    /// verified identities, once (the rules' build: R004's set, refreshed
-    /// in place).
-    pub fn set_executor_images(&self, images: crate::decision::rules::ExecutorImages) {
-        let _ = self.inner.executor.set(images);
-    }
-
-    /// Lot 310 (the re-check of #539, R3-1): on systemd ≥ 254 the first
-    /// exec after a manager's fork is `systemd-executor`, which takes the
-    /// kernel's fork record; the unit's own program is the next exec. When
-    /// the exec the cache holds for `pid` (the same process: `start_ns`) is
-    /// the executor by a VERIFIED identity, with its fork parent, that fork
-    /// parent goes on to this exec — once: the exec after it holds no
-    /// executor image. 0 otherwise.
-    fn carried_fork_parent(&self, pid: u32, start_ns: u64) -> u32 {
-        let Some(executor) = self.inner.executor.get() else {
-            return 0;
-        };
-        let s = self.inner.state.read();
-        s.map
-            .get(&pid)
-            .or_else(|| s.daemons.get(&pid))
-            .filter(|e| start_ns != 0 && e.start_ns == start_ns && e.fork_parent != 0)
-            .filter(|e| e.image.is_some_and(|id| executor.contains(id)))
-            .map_or(0, |e| e.fork_parent)
+        Some((hops.into_inner(), end))
     }
 
     /// Lot 310 (the re-check of #539, N2): for each hop of
@@ -3268,6 +3297,18 @@ impl<H: PostureHost> Default for AuthSessionTracker<H> {
     fn default() -> Self {
         Self::with_proc()
     }
+}
+
+/// How a lineage walk ended ([`AuthSessionTracker::lineage_walk_to`]).
+#[derive(Debug)]
+enum WalkEnd {
+    /// The hop the walk looked for.
+    Found(Hop),
+    /// PID 1 or 0: the lineage is whole.
+    Root,
+    /// Stopped before PID 1 (the depth cap, a later process at a parent's
+    /// pid, a process its own parent): what is above is not known.
+    Cut,
 }
 
 /// One hop of a lineage walk.
@@ -4816,15 +4857,16 @@ mod tests {
         );
     }
 
-    /// Re-check 3 (R3-1, decision 3): on systemd ≥ 254 a manager's fork
-    /// executes `systemd-executor` first (it takes the kernel's fork
-    /// record), then the unit's program. When that first exec is the
-    /// executor by a VERIFIED identity, its fork parent goes on to the
-    /// next exec of the same process — once; an exec of an unverified file,
-    /// a later exec, another process (the pid reused: another start, or no
-    /// start known): none.
+    /// The re-check 4 of #539: on systemd ≥ 254 a manager's fork executes
+    /// `systemd-executor`, then the unit's program; the KERNEL carries the
+    /// fork record through a verified executor to that program
+    /// (`common::fork_record`, decided at the exec: no race with a reader
+    /// of `/proc`). The lineage keeps each exec's fork parent as the kernel
+    /// recorded it, and invents none: an exec the kernel gave 0 (an
+    /// unverified file's next exec, a later exec, another process at the
+    /// pid) has none, whatever the exec before it ran.
     #[test]
-    fn the_executor_carries_its_fork_parent_to_the_unit_s_program() {
+    fn each_exec_keeps_the_fork_parent_the_kernel_recorded() {
         use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
         let started = |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32, start: u64| {
             Event::ProcessSpawn {
@@ -4858,43 +4900,28 @@ mod tests {
         };
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(proc.path());
-        let images = crate::decision::rules::ExecutorImages::default();
-        images.record((8, 100));
-        t.set_executor_images(images);
         let executor = "/usr/lib/systemd/systemd-executor";
-        // the unit: PID 1's fork, the executor, then `sh -c`, then `tar`
+        // the unit: PID 1's fork, the executor, then `sh -c` (the kernel
+        // carried the record), then `tar` (the record used: 0)
         assert!(t.ingest_spawn_event(&exec(700, executor, 6 * S, (8, 100), 1)));
-        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/dash", 7 * S, (8, 200), 0)));
+        assert_eq!(t.fork_parent(700, AsOf::Now), Some(1), "the executor's");
+        assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/dash", 7 * S, (8, 200), 1)));
         assert_eq!(
             t.fork_parent(700, AsOf::Now),
             Some(1),
-            "carried to the unit's program"
+            "the unit's program, as the kernel carried it"
         );
         assert!(t.ingest_spawn_event(&exec(700, "/usr/bin/tar", 8 * S, (8, 300), 0)));
-        assert_eq!(
-            t.fork_parent(700, AsOf::Now),
-            None,
-            "once: not to the exec after"
-        );
-        // a file that is no verified executor carries nothing
-        assert!(t.ingest_spawn_event(&exec(
-            710,
-            "/usr/lib/systemd/systemd-executor",
-            6 * S,
-            (8, 999),
-            1
-        )));
+        assert_eq!(t.fork_parent(700, AsOf::Now), None, "the exec after");
+        // the kernel gave the program after the executor nothing (not a
+        // verified executor, tracepoint mode): the lineage adds none
+        assert!(t.ingest_spawn_event(&exec(710, executor, 6 * S, (8, 999), 1)));
         assert!(t.ingest_spawn_event(&exec(710, "/usr/bin/dash", 7 * S, (8, 200), 0)));
         assert_eq!(t.fork_parent(710, AsOf::Now), None);
-        // the kernel's own record wins
-        assert!(t.ingest_spawn_event(&exec(720, executor, 6 * S, (8, 100), 1)));
-        assert!(t.ingest_spawn_event(&exec(720, "/usr/bin/dash", 7 * S, (8, 200), 4242)));
-        assert_eq!(t.fork_parent(720, AsOf::Now), Some(4242));
-        // the pid reused: another process (another start) carries nothing
+        // another process at the pid: its own record
         assert!(t.ingest_spawn_event(&exec(730, executor, 6 * S, (8, 100), 1)));
-        assert!(t.ingest_spawn_event(&started(730, "/usr/bin/dash", 9 * S, (8, 200), 0, 8 * S)));
-        assert_eq!(t.fork_parent(730, AsOf::Now), None, "another start");
-        // no start known: never the same process by assumption
+        assert!(t.ingest_spawn_event(&started(730, "/usr/bin/dash", 9 * S, (8, 200), 4242, 8 * S)));
+        assert_eq!(t.fork_parent(730, AsOf::Now), Some(4242), "another start");
         assert!(t.ingest_spawn_event(&started(740, executor, 6 * S, (8, 100), 1, 0)));
         assert!(t.ingest_spawn_event(&started(740, "/usr/bin/dash", 7 * S, (8, 200), 0, 0)));
         assert_eq!(t.fork_parent(740, AsOf::Now), None, "no start known");
@@ -5364,6 +5391,74 @@ mod tests {
         assert_eq!(t.evicted_live(), 4);
         assert!(t.holds(700) && t.holds(701), "the person's session kept");
         assert!(!t.holds(2_000) && t.holds(2_009));
+    }
+
+    /// The re-check 4 of #539 (HIGH): a lineage the walk does not follow
+    /// to PID 1 is not known — `pid` and 32 ancestors under PID 1 are
+    /// whole, one more is cut; a hop that started after the one below it (a
+    /// later process at an exited parent's pid) and a process its own
+    /// parent cut it too. What was read below the cut stays readable for a
+    /// reader that looks for a hop.
+    #[test]
+    fn a_lineage_cut_before_pid_1_is_not_known() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let chain = |first: u32, ancestors: u32, start: u64| {
+            for k in 0..=ancestors {
+                let pid = first + k;
+                let ppid = if k == 0 { 1 } else { pid - 1 };
+                t.ingest_exec(
+                    pid,
+                    ppid,
+                    "/usr/bin/timeout",
+                    &[],
+                    start + u64::from(k) * S,
+                    start + u64::from(k) * S,
+                    0,
+                );
+            }
+            first + ancestors
+        };
+        let whole = chain(100, 32, 10 * S);
+        assert_eq!(
+            t.lineage_identities(whole, AsOf::Now).map(|h| h.len()),
+            Some(33),
+            "the writer and 32 ancestors, the last one PID 1's"
+        );
+        let cut = chain(200, 33, 10 * S);
+        assert!(
+            t.lineage_identities(cut, AsOf::Now).is_none(),
+            "one past the cap"
+        );
+        assert_eq!(
+            t.lineage_identities_seen(cut, AsOf::Now).map(|h| h.len()),
+            Some(33),
+            "the hops read below the cut"
+        );
+        // a parent that started after its child: a later process at the pid
+        t.ingest_exec(300, 1, "/usr/bin/bash", &[], 50 * S, 50 * S, 0);
+        t.ingest_exec(301, 300, "/usr/bin/tar", &[], 40 * S, 40 * S, 0);
+        assert!(
+            t.lineage_identities(301, AsOf::Now).is_none(),
+            "a later parent"
+        );
+        assert_eq!(
+            t.lineage_identities_seen(301, AsOf::Now).map(|h| h.len()),
+            Some(1)
+        );
+        // a process its own parent
+        t.ingest_exec(400, 400, "/usr/bin/tar", &[], 60 * S, 60 * S, 0);
+        assert!(
+            t.lineage_identities(400, AsOf::Now).is_none(),
+            "its own parent"
+        );
+        // a short one under PID 1: whole
+        t.ingest_exec(500, 1, "/usr/bin/bash", &[], 70 * S, 70 * S, 0);
+        t.ingest_exec(501, 500, "/usr/bin/tar", &[], 71 * S, 71 * S, 0);
+        assert_eq!(
+            t.lineage_identities(501, AsOf::Now).map(|h| h.len()),
+            Some(2)
+        );
     }
 
     #[test]

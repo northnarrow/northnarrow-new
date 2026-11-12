@@ -757,6 +757,61 @@ mod tests {
         assert!(!judge(Some(&l), &writers(), false, &distro).is_trusted());
     }
 
+    /// The re-check 4 of #539 (HIGH), the guard's twin: an editor under 33
+    /// nested `timeout`s below a webshell's `sh -c` — or 34 below a user's
+    /// manager — is no trusted writer (its lineage is cut before PID 1: not
+    /// known); at exactly the walk's cap, under PID 1, it is.
+    #[test]
+    fn an_editor_under_more_wrappers_than_the_walk_reads_is_not_trusted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        let n = std::cell::Cell::new(0u64);
+        let exec = |pid: u32, ppid: u32, exe: &str, argv: &[&str]| {
+            n.set(n.get() + 1);
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            t.ingest_exec(pid, ppid, exe, &argv, n.get(), n.get(), 1000);
+        };
+        let wrapped = |top: u32, first: u32, wrappers: u32| {
+            for k in 0..wrappers {
+                let ppid = if k == 0 { top } else { first + k - 1 };
+                exec(first + k, ppid, "/usr/bin/timeout", &["timeout", "1d"]);
+            }
+            let pid = first + wrappers;
+            exec(pid, pid - 1, "/usr/bin/vim.basic", &["vim", "x"]);
+            pid
+        };
+        let trusted = |pid: u32| {
+            judge(
+                t.lineage_identities(pid, AsOf::Now).as_deref(),
+                &writers(),
+                false,
+                &distro,
+            )
+            .is_trusted()
+        };
+        exec(10, 1, "/usr/sbin/php-fpm8.3", &["php-fpm"]);
+        exec(11, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(11, 12, 33);
+        assert!(!trusted(pid), "33 wrappers hide the `sh -c`");
+        let f = TrustFilter::new(&[], t.clone());
+        assert!(
+            !f.evaluate(pid, 0).trust.is_trusted(),
+            "the filter's own walk"
+        );
+        exec(
+            1200,
+            1,
+            "/usr/lib/systemd/systemd",
+            &["/usr/lib/systemd/systemd", "--user"],
+        );
+        let pid = wrapped(1200, 1201, 34);
+        assert!(!trusted(pid), "34 wrappers hide the user's manager");
+        let pid = wrapped(1, 2001, 32);
+        assert!(trusted(pid), "at the cap, under PID 1: whole");
+        let pid = wrapped(1, 3001, 33);
+        assert!(!trusted(pid), "one past the cap");
+    }
+
     /// BUG-49: an editor started by a binary no package installed, in
     /// `/opt` or `/usr/local`, is started by a foreign program; with no
     /// package database to ask, a root-owned tree stands in, as before.

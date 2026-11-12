@@ -553,6 +553,9 @@ planned = false
 # Lot 285: the kernel's module-load verdicts, the trust map's entry, the
 # write history's step (the eBPF programs and the agent)
 "module_judge" = "northnarrow-common"
+# Lot 310 (the re-check 4 of #539): what an exec does with its process's
+# fork record — the exec program's decision, tested in the crate
+"fork_record" = "northnarrow-common"
 # Lot 290: the BPF program types refused to a foreign loader, their names,
 # the cross-view's iterator records (the eBPF programs and the agent)
 "bpf_prog_class" = "northnarrow-common"

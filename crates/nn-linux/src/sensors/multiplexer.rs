@@ -1165,9 +1165,8 @@ pub const STDIO_PROBE_DEGRADED: &str = "R020 (shell or interpreter with its stan
 /// Lot 310 (the re-check of #539, N2): what is lost without the fork-parent
 /// record.
 pub const FORK_PARENT_DEGRADED: &str = "the exec records carry no fork parent: no unit's inline \
-     shell inherits PID 1's vouching, no user unit is vouched for by its manager, and R004 \
-     exempts no launch through systemd's unlinked executor (sched_process_fork's BTF \
-     tracepoint refused)";
+     shell inherits PID 1's vouching, and R004 exempts a launch through systemd's unlinked \
+     executor only by a copy PID 1 holds (sched_process_fork's BTF tracepoint refused)";
 
 /// Lot 310 (the re-check of #539, N2): the fork-parent record
 /// (`fork_parent_record`, BTF tracepoint `sched_process_fork`), which the
@@ -1198,11 +1197,31 @@ fn attach_fork_parent(ebpf: &mut Ebpf) {
         since
             .set(0, monotonic_ns(), 0)
             .map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
+        // the re-check 4 of #539: the verified executor's identities, which
+        // the agent writes at each read (`systemd_executor::refresh`)
+        let ids = ebpf
+            .take_map("EXECUTOR_IDS")
+            .ok_or_else(|| "map EXECUTOR_IDS missing from the eBPF object".to_string())?;
+        crate::systemd_executor::install_kernel_map(
+            aya::maps::HashMap::try_from(ids).map_err(|e| format!("EXECUTOR_IDS: {e}"))?,
+        );
         Ok(())
     })();
     if let Err(e) = attached {
         error!(error = %e, "fork-parent record not attached: {FORK_PARENT_DEGRADED}");
         crate::boot::degradation::report("fork_parent", FORK_PARENT_DEGRADED);
+        return;
+    }
+    // a process's record goes at its exit: a flood of `fork` + `_exit`
+    // fills no map, and a missing record is a real loss
+    if let Err(e) =
+        attach_tracepoint_any(ebpf, "fork_parent_forget", "sched", &["sched_process_exit"])
+    {
+        warn!(
+            error = %e,
+            "fork-parent record: exits not seen — an exited process's record stays until the map \
+             evicts it (fork_record_lost may count a record a flood evicted)"
+        );
     }
 }
 

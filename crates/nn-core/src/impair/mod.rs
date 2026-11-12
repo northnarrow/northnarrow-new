@@ -1100,9 +1100,10 @@ impl<H: DecisionHost> DefenseDetector<H> {
     }
 
     /// The nearest hop of `pid`'s lineage that runs from a staging
-    /// directory, or a deleted or memory-only executable.
+    /// directory, or a deleted or memory-only executable — among the hops
+    /// read, below a cut too (it looks for one: the re-check 4 of #539).
     fn suspicious(&self, pid: u32, as_of: AsOf) -> Option<(u32, String)> {
-        let hops = self.lineage.lineage_identities(pid, as_of)?;
+        let hops = self.lineage.lineage_identities_seen(pid, as_of)?;
         hops.into_iter().find_map(|(p, id)| {
             let exe = id.exe.to_string_lossy().into_owned();
             // lot 292: what an argv whose options could not be read may run

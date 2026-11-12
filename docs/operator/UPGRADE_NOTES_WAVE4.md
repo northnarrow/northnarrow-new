@@ -1420,19 +1420,38 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   as before, a unit's `ExecStart=/bin/sh -c …` included: an installed shell
   PID 1 FORKED inherits PID 1's vouching. "Forked" is the kernel's record
   at `sched_process_fork` (the exec record's `fork_ppid`; processes only,
-  not threads), for the first exec after the fork — carried through
-  systemd's executor, by its verified identity, to the unit's program —
-  never the parent at exec time: a webshell's double-forked orphan, which
-  PID 1 reaps before its `sh -c`, was forked by the webshell. A process
-  forked before the agent started has no record (judged); a record the
-  map evicted under a flood of forks is counted (`fork_record_lost` in the
-  ring-drop counters). Expect more ransomware assessments of the tools a
+  not threads), for the first exec after the fork — carried in the kernel
+  through systemd's executor, by its verified identity (the packaged
+  file's, PID 1's copies: the eBPF map `EXECUTOR_IDS` the agent writes at
+  each 10 s read), to the unit's program — never the parent at exec time:
+  a webshell's double-forked orphan, which PID 1 reaps before its `sh -c`,
+  was forked by the webshell. A process forked before the agent started
+  has no record (judged); a record the map evicted under a flood of forks
+  is counted (`fork_record_lost` in the ring-drop counters; a record goes
+  at its process's exit, and a later exec of a process is no loss). One
+  more program attaches: `fork_parent_forget` on
+  `sched/sched_process_exit` (not attached: a warning; exited processes'
+  records then wait for the map to evict them). Expect more ransomware assessments of the tools a
   cron job (a user's crontab or the system's: a job carries no owner in
   this judgement) or a non-interactive `ssh host 'cmd'` runs; the lab
   measured one on Ubuntu 24.04 — a user's crontab `sh -c 'rsync -a
   --inplace …'` of random data drew NN-L-IMP-001 (Critical, its kill
   held). A record names the shell ("which runs an inline program") or the
   manager ("a user's service manager").
+- **A lineage the walk does not follow to PID 1 is not known, and vouches
+  for nothing** (the re-check 4 of #539). The walk reads a writer and at
+  most 32 ancestors; 33 nested `timeout`s (each a packaged program that
+  forks the next) put a webshell's `sh -c`, or a user's manager, above the
+  cut, and every hop read vouched. Now a walk that stops before PID 1 — the
+  cap, a parent that started after its child (a later process at an exited
+  parent's pid), a process its own parent — is a lineage not known: the
+  ransomware judge and the copy guard judge the writer ("its lineage could
+  not be read"), as for a hop that cannot be read. A deeper legitimate tree
+  is judged too (the kill held by default). The searches for a hop that
+  grants something (a package manager, an authentication binary, a client)
+  find nothing above the cut, as before; the defense-impairment rules
+  (NN-L-EVA-*) still look for a staged or deleted program among the hops
+  below it.
 - **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
   file is a fileless exec whatever path reached it:
   `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a

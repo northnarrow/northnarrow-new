@@ -39,6 +39,13 @@
 //! The manager's identities ([`ExecutorImages::replace_managers`]) go to
 //! R004 too: a user manager forks the executor's launches, and is told by
 //! its image.
+//!
+//! The re-check 4 of #539: the kernel tells the executor's exec too —
+//! [`carriers`] (the packaged file's identities and PID 1's copies, never a
+//! user manager's) go to the eBPF map `EXECUTOR_IDS` at each read
+//! ([`install_kernel_map`]): an exec of one leaves the process's fork
+//! record to its next exec, the unit's own program
+//! (`northnarrow_common::fork_record`).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -112,6 +119,85 @@ pub struct Live {
     /// The executors the host's PID 1 holds (also in `executors`): exempt
     /// by identity alone (re-check 3, decision 1).
     pub pid1_held: Vec<(u64, u64)>,
+    /// The packaged executor's files at the install paths (also in
+    /// `executors`).
+    pub packaged: Vec<(u64, u64)>,
+}
+
+/// The re-check 4 of #539: the identities whose exec leaves its fork
+/// record to the next exec, in the kernel (`EXECUTOR_IDS`) — the packaged
+/// file's and PID 1's copies; a user manager's copies are not among them
+/// (its units are judged: decision 4). Sorted, deduplicated, without
+/// `(0, 0)`, at most `EXECUTOR_IDS_MAX`.
+pub fn carriers(live: &Live) -> Vec<(u64, u64)> {
+    let mut ids: Vec<(u64, u64)> = live
+        .packaged
+        .iter()
+        .chain(&live.pid1_held)
+        .copied()
+        .filter(|id| *id != (0, 0))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(common::fork_record::EXECUTOR_IDS_MAX as usize);
+    ids
+}
+
+/// The eBPF map `EXECUTOR_IDS`, once the fork record is attached.
+type KernelIds =
+    aya::maps::HashMap<aya::maps::MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32>;
+
+/// The kernel's copy of [`carriers`], and the last carriers read (written
+/// to the map when it is installed after the start's read).
+struct Kernel {
+    map: Option<KernelIds>,
+    ids: Vec<(u64, u64)>,
+}
+
+static KERNEL: parking_lot::Mutex<Kernel> = parking_lot::Mutex::new(Kernel {
+    map: None,
+    ids: Vec::new(),
+});
+
+/// The fork record's executor map (`EXECUTOR_IDS`), given by the sensors
+/// once the record is attached: the carriers read so far go in now, each
+/// later read's at that read.
+pub fn install_kernel_map(map: KernelIds) {
+    let mut guard = KERNEL.lock();
+    let k = &mut *guard;
+    k.map = Some(map);
+    publish(&mut k.map, &k.ids);
+}
+
+/// `ids` in place of the kernel map's: the ones gone removed first (an
+/// inode freed may be a user's next file's), then the new ones.
+fn publish(map: &mut Option<KernelIds>, ids: &[(u64, u64)]) {
+    let Some(map) = map.as_mut() else {
+        return;
+    };
+    let old: Vec<_> = map.keys().filter_map(Result::ok).collect();
+    for k in old {
+        if !ids.contains(&(k.0.dev, k.0.ino)) {
+            let _ = map.remove(&k);
+        }
+    }
+    for (dev, ino) in ids {
+        let key = crate::anti_tamper::filesystem::AyaInodeKey(common::wire::InodeKey {
+            dev: *dev,
+            ino: *ino,
+        });
+        if let Err(e) = map.insert(key, 1, 0) {
+            tracing::warn!(error = %e, dev, ino, "EXECUTOR_IDS: an executor identity not written to the kernel");
+        }
+    }
+}
+
+/// [`carriers`] of `live` to the kernel (kept for a map installed later).
+fn carry(live: &Live) {
+    let mut guard = KERNEL.lock();
+    let k = &mut *guard;
+    k.ids = carriers(live);
+    publish(&mut k.map, &k.ids);
 }
 
 /// The executor's identities now, from the three sources (the module's
@@ -119,7 +205,8 @@ pub struct Live {
 /// and `proc_root` (`/proc`); `owner` the files' owner (0), `owned` the
 /// package database.
 pub fn live_under(root: &Path, proc_root: &Path, owner: u32, owned: Owned) -> Live {
-    let mut executors = packaged(EXECUTOR_PATHS, root, owner, owned);
+    let packaged_executors = packaged(EXECUTOR_PATHS, root, owner, owned);
+    let mut executors = packaged_executors.clone();
     let mut managers = packaged(MANAGER_PATHS, root, owner, owned);
     let init = proc_root.join("1");
     // PID 1's image: the manager every user manager runs until a re-exec
@@ -133,6 +220,7 @@ pub fn live_under(root: &Path, proc_root: &Path, owner: u32, owned: Owned) -> Li
         executors,
         managers,
         pid1_held,
+        packaged: packaged_executors,
     }
 }
 
@@ -163,14 +251,17 @@ fn apply(images: &ExecutorImages, live: Live) -> bool {
     executors || managers || pid1
 }
 
-/// [`refresh_under`] the host's root and `/proc`, every 10 s.
+/// [`refresh_under`] the host's root and `/proc`, every 10 s; the
+/// [`carriers`] to the kernel.
 pub fn refresh(images: &ExecutorImages) -> bool {
-    apply(images, live())
+    let live = live();
+    carry(&live);
+    apply(images, live)
 }
 
 /// At the start: [`refresh`]; how many identities the executor has now.
 pub fn seed(images: &ExecutorImages) -> usize {
-    apply(images, live());
+    refresh(images);
     images.len()
 }
 
@@ -343,6 +434,12 @@ mod tests {
         assert!(l.executors.contains(&held_id) && l.executors.contains(&file_id(&exe).unwrap()));
         assert!(l.managers.contains(&file_id(&manager).unwrap()));
         assert_eq!(l.pid1_held, vec![held_id], "PID 1's own copy, apart");
+        // the re-check 4 of #539: the kernel's carriers — the packaged
+        // file's and PID 1's copy
+        let mut both = vec![held_id, file_id(&exe).unwrap()];
+        both.sort_unstable();
+        assert_eq!(l.packaged, vec![file_id(&exe).unwrap()]);
+        assert_eq!(carriers(&l), both);
         // released by PID 1: only a genuine user manager keeps it counted
         std::fs::remove_file(proc_root.path().join("1/fd/9")).unwrap();
         assert!(!live(me()).executors.contains(&held_id), "released: gone");
@@ -364,6 +461,11 @@ mod tests {
         assert!(
             l.pid1_held.is_empty(),
             "not PID 1's: no exemption by identity alone"
+        );
+        assert_eq!(
+            carriers(&l),
+            vec![file_id(&exe).unwrap()],
+            "a user manager's copy carries no fork record in the kernel"
         );
         // files a user owns (the production owner is root): nothing counts
         let l = live(me().wrapping_add(1));

@@ -217,8 +217,15 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
             unsafe { (*raw_ptr).start_ns = start };
             // Lot 310 (the re-check of #539, N2): the process that forked
             // this one, for its first exec since the fork (never the parent
-            // at exec time: an orphan's is its reaper)
-            let forker = crate::fork_parent::take(task, start);
+            // at exec time: an orphan's is its reaper). The re-check 4: the
+            // file executed, as the LSM exec hook found it (pass 0), tells
+            // a verified systemd-executor, whose exec leaves the record to
+            // the unit's program; none in tracepoint mode.
+            let (dev, ino) = match crate::exec_lsm::EXEC_HANDOFF.get_ptr(&(task as u64)) {
+                Some(v) => unsafe { ((*v).dev, (*v).ino) },
+                None => (0, 0),
+            };
+            let forker = crate::fork_parent::take(task, start, dev, ino);
             unsafe { (*raw_ptr).fork_ppid = forker };
         }
         // Parent: task->real_parent, then tgid (userspace ppid) +

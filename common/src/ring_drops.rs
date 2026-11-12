@@ -98,7 +98,10 @@ pub mod ring_slot {
     /// found no record — the LRU map evicted it under a flood of forks. Its
     /// fork parent is "not known": the decisions that need it fail closed
     /// (no unit shell vouches); R004 exempts PID 1's executor copies by
-    /// identity alone. Counted and signed, not a security ring.
+    /// identity alone. Counted and signed, not a security ring. The
+    /// re-check 4 of #539: a later exec of the same process finds its
+    /// record used, not missing, and is not counted; a record goes at its
+    /// process's exit (`common::fork_record`).
     pub const FORK_RECORD_LOST: u32 = 30;
 }
 

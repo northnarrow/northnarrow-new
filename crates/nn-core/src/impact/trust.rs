@@ -250,8 +250,9 @@ fn not_installed(id: &ExecIdentity) -> &'static str {
 /// The pure decision. `lineage`: the writer's identity at index 0, then
 /// its ancestors nearest first (`None`: unknown). `pid`: the writer.
 /// `package_tx`: the writer belongs to a root package transaction. No
-/// [`HopFacts`]: no hop is known to be PID 1's or a packaged user unit's
-/// ([`judge_with`]).
+/// [`HopFacts`]: no hop is known to be PID 1's ([`judge_with`]). A lineage
+/// cut before PID 1 is `None` (the re-check 4 of #539: what is above the
+/// cut never vouches).
 pub fn judge(
     pid: u32,
     lineage: Option<&[(u32, ExecIdentity)]>,
@@ -262,8 +263,7 @@ pub fn judge(
 }
 
 /// [`judge`] with each hop's [`HopFacts`] (`facts[n]` for `lineage[n]`; a
-/// hop without any knows nothing): the kernel's fork parents and the
-/// host's packaged user units.
+/// hop without any knows nothing): the kernel's fork parents.
 pub fn judge_with(
     pid: u32,
     lineage: Option<&[(u32, ExecIdentity)]>,
@@ -716,6 +716,80 @@ mod tests {
             wrong.push(format!("/usr/local/bin/enc.sh: {got:?}"));
         }
         assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// The re-check 4 of #539 (HIGH): the walk reads `pid` and at most
+    /// 32 ancestors. 33 nested `timeout`s — each a packaged program that
+    /// forks the next — put a webshell's `sh -c` (or a user's manager) above
+    /// the cut, and every hop read vouched: Trusted. A lineage cut before
+    /// PID 1 is not known and vouches for nothing; one that reaches PID 1
+    /// at exactly the cap is whole, judged by what it holds.
+    #[test]
+    fn a_lineage_deeper_than_the_walk_vouches_for_nothing() {
+        use crate::posture::lineage::{AsOf, AuthSessionTracker};
+        const S: u64 = 1_000_000_000;
+        let proc = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::<H>::new(proc.path());
+        let n = std::cell::Cell::new(0u64);
+        let exec = |pid: u32, ppid: u32, exe: &str, argv: &[&str]| {
+            n.set(n.get() + 1);
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            t.ingest_exec(pid, ppid, exe, &argv, n.get() * S, n.get() * S, 0);
+        };
+        // `wrappers` nested `timeout`s from `first` up, the first one's
+        // parent `top`; then `openssl` below the last: its pid
+        let wrapped = |top: u32, first: u32, wrappers: u32| {
+            for k in 0..wrappers {
+                let ppid = if k == 0 { top } else { first + k - 1 };
+                exec(first + k, ppid, "/usr/bin/timeout", &["timeout", "1d"]);
+            }
+            let pid = first + wrappers;
+            exec(pid, pid - 1, "/usr/bin/openssl", &["openssl", "enc"]);
+            pid
+        };
+        let judged = |pid: u32| {
+            judge(
+                pid,
+                t.lineage_identities(pid, AsOf::Now).as_deref(),
+                false,
+                &distro,
+            )
+        };
+        let unknown = |got: &Judged, pid: u32| {
+            matches!(got, Judged::Untrusted { actor, key, program, .. }
+                if (*actor, *key) == (pid, pid) && program == LINEAGE_UNKNOWN)
+        };
+        // a webshell: php-fpm (PID 1's), `sh -c`, 33 × `timeout`, openssl
+        exec(10, 1, "/usr/sbin/php-fpm8.3", &["php-fpm"]);
+        exec(11, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(11, 12, 33);
+        assert!(unknown(&judged(pid), pid), "33 wrappers hide the `sh -c`");
+        // one wrapper: the `sh -c` is read, and judged
+        exec(50, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(50, 51, 1);
+        assert!(matches!(judged(pid), Judged::Untrusted { actor: 50, .. }));
+        // `systemd-run --user`: the user's manager, 34 × `timeout`, openssl
+        exec(
+            1200,
+            1,
+            "/usr/lib/systemd/systemd",
+            &["/usr/lib/systemd/systemd", "--user"],
+        );
+        let pid = wrapped(1200, 1201, 34);
+        assert!(
+            unknown(&judged(pid), pid),
+            "34 wrappers hide the user's manager"
+        );
+        // exactly at the cap: openssl + 32 ancestors, the last one PID 1's
+        // (a unit's `timeout`): whole, every hop packaged
+        let pid = wrapped(1, 2001, 32);
+        assert_eq!(
+            judged(pid),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into()))
+        );
+        // one more: cut, whatever is above
+        let pid = wrapped(1, 3001, 33);
+        assert!(unknown(&judged(pid), pid), "one past the cap");
     }
 
     /// Lot 310, the review of #539 (finding 7): a user's service manager
