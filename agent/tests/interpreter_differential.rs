@@ -546,6 +546,9 @@ fn run(i: &Interp, dir: &Path, tokens: &[&str]) -> (Vec<String>, Vec<String>) {
         .stdin(Stdio::from(std::fs::File::open(&stdin).unwrap()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // a group of its own: a pipeline's `tee` the shell left behind
+        // (killed at the deadline) must not write into the next argv's run
+        .process_group(0)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -560,6 +563,9 @@ fn run(i: &Interp, dir: &Path, tokens: &[&str]) -> (Vec<String>, Vec<String>) {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    // SAFETY: a signal to the group the child led (its pid); none is left
+    // to run on
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let mut text = String::new();
     if let Ok(mut f) = std::fs::File::open(&out) {
         f.read_to_string(&mut text).unwrap();

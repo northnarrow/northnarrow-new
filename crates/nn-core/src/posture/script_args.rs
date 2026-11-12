@@ -195,7 +195,8 @@ enum Opt {
     /// Ruby's `-v`: the version printed, then the script run — with none,
     /// nothing runs ([`Runs::Unknown`]).
     NoRunAlone,
-    /// Python's `-i`: after the program, the interpreter reads its standard
+    /// Python's `-i` (and ruby's `-s`, whose script arguments set its
+    /// globals): after the program, the interpreter reads its standard
     /// input and runs it (a terminal's user, or a file, a pipe: `python3 -i
     /// /usr/bin/x < code`) — a script named is not all that runs
     /// ([`Runs::Unknown`]); with nothing named it is the interactive
@@ -309,10 +310,20 @@ struct Table {
     /// The values a long option takes, when it has a list (python's
     /// `--check-hash-based-pycs`): another one it refuses, and nothing runs.
     long_names: &'static [(&'static str, &'static [&'static str])],
-    /// perl and ruby: after `-e CODE` the switches go on (`perl -e A -e B
-    /// -n`, `-e A -c`), up to the program's arguments; any other family
-    /// ends its options with the program.
+    /// perl, ruby and node: after `-e CODE` the options go on (`perl -e A
+    /// -e B -n`, `-e A -c`, `node -p A --version`), up to the program's
+    /// arguments; any other family ends its options with the program.
     code_continues: bool,
+    /// node and ruby: an option's value in the next argument never starts
+    /// with `-` (node: "--title requires an argument"; ruby takes it and
+    /// fails on it) — such an argv runs nothing.
+    arg_not_dash: bool,
+    /// The options whose value is a word — never a path, never empty
+    /// (ruby's `-E` encoding): another value the interpreter refuses.
+    word_values: &'static str,
+    /// A `+c` cluster runs its program as `-c` does (bash, dash, busybox's
+    /// ash); for the ksh family and zsh it is no option to rely on.
+    plus_code: bool,
     /// What a lone `-` means.
     dash: Dash,
 }
@@ -389,6 +400,9 @@ const PYTHON: Table = Table {
     names: &[],
     long_names: &[("check-hash-based-pycs", &["default", "always", "never"])],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: false,
     dash: Dash::Stdin,
 };
 
@@ -417,6 +431,9 @@ const PERL: Table = Table {
     names: &[],
     long_names: &[],
     code_continues: true,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: false,
     dash: Dash::Stdin,
 };
 
@@ -424,11 +441,16 @@ const PERL: Table = Table {
 /// if one is given.
 const RUBY: Table = Table {
     short: &[
-        ("apndywslSU", Opt::Flag),
+        ("apndywlSU", Opt::Flag),
+        // `-s`: the script's arguments set its globals (one it refuses
+        // stops it): the script named is not all that decides what runs
+        ("s", Opt::Inspect),
         ("v", Opt::NoRunAlone),
         ("hc", Opt::NoRun),
-        ("rI", Opt::Loads),
-        ("CXE", Opt::Arg),
+        // `-C dir`, `-X dir`: the script named is read from another
+        // directory
+        ("rICX", Opt::Loads),
+        ("E", Opt::Arg),
         ("ixF", Opt::Rest),
         ("0T", Opt::Digits),
         ("K", Opt::OneChar),
@@ -472,6 +494,9 @@ const RUBY: Table = Table {
     names: &[],
     long_names: &[],
     code_continues: true,
+    arg_not_dash: true,
+    word_values: "E",
+    plus_code: false,
     dash: Dash::Stdin,
 };
 
@@ -647,7 +672,10 @@ const NODE: Table = Table {
     space_continues: false,
     names: &[],
     long_names: &[],
-    code_continues: false,
+    code_continues: true,
+    arg_not_dash: true,
+    word_values: "",
+    plus_code: false,
     dash: Dash::Stdin,
 };
 
@@ -841,6 +869,9 @@ const BASH: Table = Table {
     names: &[('o', BASH_SET_O), ('O', BASH_SHOPT)],
     long_names: &[],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: true,
     dash: Dash::EndOfOptions,
 };
 
@@ -865,13 +896,23 @@ const DASH: Table = Table {
     names: &[('o', DASH_SET_O)],
     long_names: &[],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: true,
     dash: Dash::EndOfOptions,
 };
 
 /// busybox's ash and hush (`ash.c`, `options`): dash's letters, `+c` read
 /// as `-c`, and one long option, `--login`.
 const BUSYBOX_ASH: Table = Table {
-    short: DASH.short,
+    // busybox 1.36's ash: no `-p`, no `-V` (it refuses them)
+    short: &[
+        ("abeflimuvxCEI", Opt::Flag),
+        ("n", Opt::NoRun),
+        ("o", Opt::Next),
+        ("c", Opt::ShellCode),
+        ("s", Opt::Stdin),
+    ],
     long: &[("login", Long::Flag)],
     long_prefixes: &[],
     words: false,
@@ -881,6 +922,9 @@ const BUSYBOX_ASH: Table = Table {
     names: &[('o', ASH_SET_O)],
     long_names: &[],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: true,
     dash: Dash::EndOfOptions,
 };
 
@@ -904,6 +948,9 @@ const OTHER_SHELL: Table = Table {
     names: &[('o', OTHER_SET_O)],
     long_names: &[],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: false,
     dash: Dash::Unknown,
 };
 
@@ -929,6 +976,9 @@ const MONO: Table = Table {
     names: &[],
     long_names: &[],
     code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: false,
     dash: Dash::Stdin,
 };
 
@@ -1152,6 +1202,9 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                             let Some(v) = argv.get(i) else {
                                 return unknown();
                             };
+                            if table.arg_not_dash && v.starts_with('-') {
+                                return unknown();
+                            }
                             i += 1;
                             v.as_str()
                         }
@@ -1163,16 +1216,25 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     continue;
                 }
                 Some(Long::Code) => {
-                    let code = match value {
-                        Some(_) => Some((i - 1, a.len() - value.map_or(0, str::len))),
+                    let at = match value {
+                        Some(v) => (i - 1, a.len() - v.len()),
                         // the interpreter refuses an option with no program
                         None if argv.get(i).is_none() => return unknown(),
-                        None => Some((i, 0)),
+                        None if table.arg_not_dash && argv[i].starts_with('-') => return unknown(),
+                        None => {
+                            i += 1;
+                            (i - 1, 0)
+                        }
                     };
-                    return Reading {
-                        runs: Runs::Code,
-                        code,
-                    };
+                    if !table.code_continues {
+                        return Reading {
+                            runs: Runs::Code,
+                            code: Some(at),
+                        };
+                    }
+                    // node: the options go on after the program
+                    code.get_or_insert(at);
+                    continue;
                 }
                 None => return unknown(),
             }
@@ -1187,6 +1249,8 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
             },
         };
         words = false;
+        // a `+` cluster (a shell's)
+        let plus = a.starts_with('+');
         // the letters of this cluster that take the next arguments
         let mut next: Vec<char> = Vec::new();
         let mut pos = 0;
@@ -1217,6 +1281,10 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 Opt::NoRunAlone => seen.no_run_alone = true,
                 Opt::Inspect => seen.inspect = true,
                 Opt::Next => next.push(c),
+                // `+c`, `+s`: as `-c`, `-s` for bash, dash and ash; not
+                // an option to rely on in the ksh family and zsh (mksh runs
+                // `+c CODE`'s `CODE` as a script)
+                Opt::ShellCode | Opt::Stdin if plus && !table.plus_code => return unknown(),
                 Opt::Stdin => stdin = true,
                 // the rest of the cluster is options too, then its operands
                 Opt::ShellCode => shell_code = true,
@@ -1260,11 +1328,19 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                         let Some(v) = argv.get(i) else {
                             return unknown();
                         };
+                        if table.arg_not_dash && v.starts_with('-') {
+                            return unknown();
+                        }
                         i += 1;
                         v.as_str()
                     } else {
                         rest
                     };
+                    if table.word_values.contains(c)
+                        && (value.is_empty() || value.starts_with('-') || value.contains('/'))
+                    {
+                        return unknown();
+                    }
                     if opt == Opt::Module {
                         // a module's name, never a path (python refuses
                         // one: nothing runs)
@@ -1980,7 +2056,50 @@ mod tests {
         ] {
             assert_eq!(runs_of(exe, &argv(a)), Runs::Code, "{a:?}");
         }
+        // the guest's run (node 18, ruby 3.2, busybox 1.36, mksh R59c):
+        // node refuses a value starting with `-` and reads options after
+        // its program; ruby's `-E` takes an encoding, `-C` moves the
+        // script's directory, `-s` lets the script's arguments set its
+        // globals; busybox's ash has no `-p`, no `-V`; mksh's `+c` runs no
+        // command string
+        let (node, bb, mksh) = (
+            Path::new("/usr/bin/node"),
+            Path::new("/bin/busybox"),
+            Path::new("/usr/bin/mksh"),
+        );
+        unknown(node, &["node", "--title", "--trace-warnings", "/tmp/s"]);
+        unknown(node, &["node", "-r", "-x", "/tmp/s"]);
+        unknown(node, &["node", "-p", "A", "--version"]);
+        unknown(node, &["node", "--print", "A", "--require"]);
+        unknown(ruby, &["ruby", "-E", "-W", "/tmp/s"]);
+        unknown(ruby, &["ruby", "-E", "/tmp/x", "/tmp/s"]);
+        unknown(ruby, &["ruby", "-C", "/tmp", "/tmp/s"]);
+        unknown(ruby, &["ruby", "-s", "/tmp/s", "-0"]);
+        unknown(bb, &["sh", "-p", "/tmp/s"]);
+        unknown(bb, &["sh", "-V", "/tmp/s"]);
+        unknown(mksh, &["mksh", "+c", "CODE"]);
+        assert_eq!(
+            runs_of(node, &argv(&["node", "--title", "t", "/tmp/s"])),
+            Runs::Script("/tmp/s".into())
+        );
+        assert_eq!(
+            runs_of(ruby, &argv(&["ruby", "-E", "UTF-8", "/tmp/s"])),
+            Runs::Script("/tmp/s".into())
+        );
+        for (exe, a) in [
+            (bash, &["bash", "+c", "CODE"][..]),
+            (dash, &["sh", "+c", "CODE"]),
+            (bb, &["sh", "+c", "CODE"]),
+        ] {
+            assert_eq!(runs_of(exe, &argv(a)), Runs::Code, "{a:?}");
+        }
         for (exe, a, prog) in [
+            (
+                node,
+                &["node", "-e", "A", "--no-warnings", "/tmp/s"][..],
+                "A",
+            ),
+            (node, &["node", "--eval", "A", "--no-warnings"], "A"),
             (perl, &["perl", "-e", "A", "-e", "B", "/tmp/s"][..], "A"),
             (perl, &["perl", "-e", "A", "-n", "/tmp/s"], "A"),
             (perl, &["perl", "-e", "A", "-"], "A"),

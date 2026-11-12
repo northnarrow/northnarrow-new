@@ -9193,5 +9193,31 @@ number in parentheses is a lab PR.
     0.5.12, Python 3.12.3, perl 5.38.2); 44 mutations of the new code, 42
     caught by named tests, 2 equivalent (removed from the code); the full
     gates in the PR.
+  - The independent review of #539 (11 findings, the coordinator's
+    decisions), fixed in the commits after the first: perl's switches after
+    a space (`'-i -e'`); code loaded before the program — node `-r`,
+    `--import`, perl `-M`/`-I`/`-d`, ruby `-r`/`-I`, python's `-i`, and the
+    environment's loading variables, read by the exec pump
+    (`nn_linux::sensors::exec_facts`) — is not the installed program; an
+    option that runs nothing, or that the interpreter refuses (no program,
+    a refused value), is not known; `-` is the standard input's program;
+    dash and busybox's ash read with their own tables, the names `-o`
+    takes checked; busybox applets keep "installed program". R004: the
+    executor's identities re-read every 10 s and replaced, for a child's
+    first exec; tracepoint mode on the exec pump's `/proc/<pid>/exe`, no
+    `argv[0]` exemption; the parent's image only from a root-only
+    directory, the processes running at the agent's start seeded; `..`
+    folded outside a link, `/proc/<x>/root/` chains followed. BUG-49: `bash
+    < file` (the pump's `STDIN_PROGRAM`) is code, a user's service manager
+    (`systemd --user`, PID 1's child) vouches for nothing. `ring_drops`
+    keeps an unlinked interpreter's identity and empty arguments. Both
+    ratchets scan every product crate (seven planted twins fail). The
+    differential test has a program on standard input and a strict oracle:
+    0 mismatches on the host (bash 5.2.21, dash 0.5.12, perl 5.38.2,
+    Python 3.12.3; ~6,070 argvs, 3,183 judged) after the reader's fixes it
+    found; TBD-DIFF-GUEST. 40 mutants of the new code, 40 caught by named
+    tests (4 after their tests were strengthened); gates on dfb0d0e3: 98
+    suites, 4,560 passed, 0 failed.
+  - The review's lab: TBD-LAB-NOTE
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
