@@ -9242,6 +9242,40 @@ number in parentheses is a lab PR.
     r2's BUG-49 script stopped at its `ssh` case (it read the script's
     standard input) and left its lab key line and directories, removed
     first thing in r3.
+  - The re-check of #539 (12/11, the coordinator's decisions A–D, lot 310b
+    folded in): the executor's identities from three sources only (the
+    packaged file, PID 1's copies, a user manager whose image is the
+    packaged manager's in PID 1's mount namespace: a "manager" a user's
+    namespace runs adds nothing); "launched by systemd" is the kernel's
+    record of the FORKER (`fork_parent_record`, BTF `sched_process_fork`,
+    the exec record's `fork_ppid`), for R004's executor and BUG-49's PID 1
+    rule alike — a webshell's double-forked orphan no longer passes; a
+    user's manager vouches only for what it forked for a packaged user unit
+    (`nn_linux::user_units`: the desktop's terminal; never `systemd-run
+    --user`); the environment past 1 MiB fails closed; `PYTHONSTARTUP`,
+    `ENV` only for an interpreter naming nothing, `NODE_OPTIONS` only with a
+    loading option (node's table); node `--test-reporter`, python `-X
+    pycache_prefix`, `PYTHONPYCACHEPREFIX`; `ROOT_DIR` only in PID 1's mount
+    namespace; one cmdline reader; busybox's shell reads its stdin; the
+    ratchet catches seven evasive twins (main's `ring_drops` copied as it
+    was among them). 20 mutants of the round's code, all caught by named
+    tests (3 after their tests were strengthened; with the review round's
+    51, 71). Lab: Ubuntu 24.04
+    (6.8.0-149): BUG-88's eight spellings and the `/opt` name killed;
+    `systemd-run` through the unlinked executor ran (the fork record:
+    PID 1); FIM-011 killed the six misread readers; the fake manager's held
+    file, executed by an orphan through a descriptor: R004 kill; the
+    double-forked `sh -c` doing `rsync --inplace` of random data:
+    NN-L-IMP-001 (judged), the same as PID 1's unit: no record (trusted); a
+    legitimate `aws` with `PYTHONSTARTUP` or `NODE_OPTIONS=--max-old-space-
+    size`: not killed, with `PYTHONPATH`: killed. Ubuntu 26.04 (7.0.0-43):
+    the same for BUG-88, the executor, FIM-011 and `aws`; the fake manager
+    could not be set up there (sudo-rs), and the double fork's case and its
+    control drew no record at all (the shapes not reached: not conclusive
+    on 7.0). An incident: r4's 26.04 build filled the guest's disk (its
+    build cache freed); r4's 24.04 uninstall stopped after its plan (the
+    guest powered off with the agent installed: booted again and
+    uninstalled, nothing left).
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;

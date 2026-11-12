@@ -4788,7 +4788,7 @@ mod tests {
         let link = |pid: &str, name: &str, to: &str| {
             let p = proc.path().join(pid).join(name);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(to, p).unwrap();
+            symlink(to, p).unwrap();
         };
         link("1", "ns/mnt", "mnt:[4026531841]");
         link("80", "exe", "/usr/bin/tool (deleted)");
