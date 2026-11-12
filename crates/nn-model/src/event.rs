@@ -1781,8 +1781,9 @@ impl From<&FsProtectDenialRaw> for Event {
     }
 }
 
-/// Severity assigned to a verdict.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Severity assigned to a verdict. (Lot 314: `Hash`, a key of the exec
+/// policy's repeat table.)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Severity {
     Low,
     Medium,

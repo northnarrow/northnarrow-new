@@ -201,6 +201,59 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The evidence chains' residues of the third external bug hunt (lot 319;
+  edition 1.4's partials 06, 28, 31, 10, 12, and lot 296's backlog;
+  `docs/operator/EVIDENCE_CHAINS.md`, `EXPORT.md` §3 and §8, upgrade notes
+  §26). The flat chains — the canary registry and access log, the FIM
+  baseline, the listener log — write as the audit log does since lot 296:
+  after a write the disk stopped part-way or a failed fsync, the next row
+  reads the tail again, cuts the fragment and signs the cut
+  (`chain_tail_repaired`); the next row used to be glued to it (the
+  registry's and the access log's chains broken there, the listener log no
+  longer opened at the next start). A stalled retention (an archive past the
+  budget that cannot be removed) is a degradation in `nn-admin status`,
+  signed, and leaves it when a pass runs again; it was an ERROR at each
+  rotation. Every foreign entry at an archive name is attested once: those
+  below a rotation a crash interrupted (BUG28), those a rotation jumped
+  over, those planted while the log was closed above the last rotation its
+  manifest records (the verifier reports the others). The read verbs read on
+  past a backdated row at a file's head when the next file's last row is at
+  or after `--since` (BUG06), and a `--since` past any row's time keeps no
+  row (it kept every one). The JSONL export closes a line a dead worker
+  left before its first record — an empty line when the file had ended
+  whole (BUG31). The heartbeat verifier's `--max-skew-secs` holds past
+  2^63 (BUG12), as `detections --since/--until` do. The compatibility logs
+  of the combat teardown and of the watchdog's holds, and the copy-on-write
+  journal while it runs, close a line left unfinished before the next.
+- State machines of the third external bug hunt (lot 314; editions 1.2/1.3/1.4
+  of the external bug hunt; `docs/operator/COMBAT_RECOVERY.md`):
+  - an unlocked COMBAT decays 30 minutes after the **last** escalation
+    signal, kept apart from the corroboration ledger (BUG-94): any event
+    with a hit pruned the ledger to its 15-minute window, and a scan by any
+    user 15 minutes after the last signal made COMBAT decay — and the ladder
+    stand down — up to 15 minutes early;
+  - `force-posture` toward the current state changes nothing (BUG-84): an
+    ALERTED or ENGAGED posture keeps its decay deadline (it was re-armed: an
+    hour, a day more); an unlocked COMBAT forced to COMBAT is locked
+    explicitly — a transition row naming the lock and the admin action (it
+    was locked with no trace). The posture's state is written in one place,
+    which records every change of its kind or of COMBAT's lock (a lock a
+    later signal acquires is a row too; ratchet
+    `xtask/tests/state_machines.rs`);
+  - NN-L-IOU-002 fires once per process, keyed by pid and start, its memory
+    capped (BUG-83): it fired again on most of the records the io_uring
+    sensor sends after the first (a High alert a second per process);
+  - the exec policy's repeat table keys a finding by everything its record
+    shows — the severity and the caller's tier among it — and is capped at
+    4096 (BUG-92, BUG-125): a Critical CVE-2023-4911 `GLIBC_TUNABLES` was
+    held back as a repeat of a Medium one with the same first 96 characters,
+    and a user grew the table without bound with distinct `HISTFILE`s;
+  - the heartbeat's check of the actions chain's head reads, for a head named
+    right after a rotation (N, 0, H), the last line of archive N-1 (BUG-107):
+    it was held without a read, so a cut of that archive's tail went unseen
+    for as long as the new file stayed empty;
+  - the targets of the `daemon-reload` rate limit are capped (the ratchet's
+    find, lot 314).
 - The DNS response sensor attaches on kernels whose `udp_recvmsg` and
   `udpv6_recvmsg` take four parameters (7.1, and Ubuntu 26.04's 7.0, which
   carries the change; lot 303; `docs/operator/KERNEL_COMPATIBILITY.md`): it

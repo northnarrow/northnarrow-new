@@ -16,9 +16,12 @@
 //! whenever older matching rows may exist: past the budget, past a file
 //! that is there and cannot be read (BUG07), and when a row older than
 //! `since` follows a row at or after it (the clock stepped back, BUG06):
-//! such a row no longer stops the descent into the archives. A row stamped
-//! before `since` at the very head of a file still stops it (it cannot be
-//! told from rows in order).
+//! such a row no longer stops the descent into the archives. Lot 319
+//! (external bug hunt, third edition: BUG06's partial): a row stamped
+//! before `since` at the very head of a file stops it only when the next,
+//! older file's last row is before `since` too — rows in order. That row
+//! read at or after `since` says the clock stepped back: the read goes on,
+//! `truncated`.
 //!
 //! Bounds (the read runs on the admin socket's task):
 //! - memory: the rows kept never exceed `soft_cap` bytes, and a line longer
@@ -101,7 +104,7 @@ fn read_chain_tail_bounded<H: ChainHost>(
     let mut used = 0usize;
     let mut scanned = 0u64;
     let mut truncated = false;
-    for path in &files {
+    for (i, path) in files.iter().enumerate() {
         let room_bytes = query.soft_cap.saturating_sub(used);
         let room_rows = query.max_rows.saturating_sub(rows.len());
         if room_bytes == 0 || room_rows == 0 || scanned >= total {
@@ -146,10 +149,29 @@ fn read_chain_tail_bounded<H: ChainHost>(
         if scan.omitted || (scan.head_skipped && !scan.saw_older) || scan.out_of_order {
             truncated = true;
         }
-        if scan.omitted || scan.head_skipped || scan.saw_older {
+        if scan.omitted || scan.head_skipped {
             // Everything in older files is older still: either over the
-            // budget, past a gap, or before `since`.
+            // budget or past a gap.
             break;
+        }
+        if scan.saw_older {
+            // Lot 319 (BUG06's partial): a row before `since` at the head of
+            // this file says the older files are older still only if the
+            // rows are in order. The next file's last row tells: at or after
+            // `since`, the clock stepped back — read on, `truncated`.
+            let newer = match (query.since, files.get(i + 1)) {
+                (Some(since), Some(next)) => {
+                    let (ts, read) = last_row_ts::<H>(next);
+                    scanned += read;
+                    ts.is_some_and(|ts| ts.as_str() >= since)
+                }
+                _ => false,
+            };
+            if !newer {
+                // Rows in order: everything older is before `since`.
+                break;
+            }
+            truncated = true;
         }
     }
 
@@ -186,6 +208,50 @@ fn open_regular<H: ChainHost>(path: &Path) -> Result<Option<File>, ()> {
             Err(())
         }
     }
+}
+
+/// Bytes read from the end of a file for its last row
+/// ([`last_row_ts`]): a sealed archive ends in its terminator, a row
+/// before it.
+const LAST_ROW_WINDOW: u64 = 64 * 1024;
+
+/// Lot 319 (BUG06's partial): the `ts` of the last row of the file at
+/// `path` — its last complete line that is a row (not a terminator, not
+/// blank) within the last [`LAST_ROW_WINDOW`] bytes — and the bytes read.
+/// `None`: the file cannot be read, holds no such row there, or its last
+/// row has no `ts`.
+fn last_row_ts<H: ChainHost>(path: &Path) -> (Option<String>, u64) {
+    let Ok(Some(mut file)) = open_regular::<H>(path) else {
+        return (None, 0);
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return (None, 0);
+    };
+    let window = len.min(LAST_ROW_WINDOW);
+    let mut buf = Vec::with_capacity(window as usize);
+    if file.seek(SeekFrom::Start(len - window)).is_err()
+        || file.take(window).read_to_end(&mut buf).is_err()
+    {
+        return (None, window);
+    }
+    // The bytes after the last newline are no complete line; the first
+    // line of a window inside the file is cut, unless it starts the file.
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
+        return (None, window);
+    };
+    let mut lines: Vec<&[u8]> = buf[..end].split(|&b| b == b'\n').collect();
+    if len > window && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let ts = lines
+        .into_iter()
+        .rev()
+        .filter_map(|l| std::str::from_utf8(l).ok())
+        .map(|l| l.trim_end_matches('\r'))
+        .find(|l| !l.trim().is_empty() && !crate::chainlog::is_terminator_line(l))
+        .and_then(ts_field)
+        .map(str::to_string);
+    (ts, window)
 }
 
 struct FileBudget {
@@ -653,6 +719,153 @@ mod tests {
         // the order `since` stops on does not hold any more
         assert_eq!(numbers(&t), vec![5, 4, 3, 2, 1]);
         assert!(t.truncated, "a row out of order sets truncated");
+    }
+
+    /// Lot 319 (external bug hunt, BUG06 partial): a row stamped before
+    /// `since` at the very HEAD of the active file (the clock stepped back
+    /// before its first row) stopped the descent, and the answer did not say
+    /// rows were left out — while the newest archive ends with rows at or
+    /// after `since`. Its last row is read: newer than `since`, the order
+    /// does not hold, and the archives are read on, `truncated` set.
+    #[test]
+    fn a_backdated_head_with_a_newer_archive_reads_on() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");
+        std::fs::write(
+            dir.path().join("log.jsonl.000001"),
+            [
+                line("2026-11-10T07:59:00.000000Z", 0),
+                line("2026-11-10T08:00:01.000000Z", 1),
+                line("2026-11-10T08:00:02.000000Z", 2),
+                "{\"rotate\":{\"fmt_ver\":3},\"ts\":\"2026-11-10T08:00:02Z\"}\n".to_string(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            &active,
+            [
+                line("2025-01-01T00:00:00.000000Z", 99),
+                line("2026-11-10T08:00:03.000000Z", 3),
+                line("2026-11-10T08:00:04.000000Z", 4),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let q = TailQuery {
+            since: Some("2026-11-10T08:00:00"),
+            ..all(1 << 20)
+        };
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert!(
+            t.truncated || numbers(&t) == vec![4, 3, 2, 1],
+            "rows at or after since left out, not truncated: {:?} truncated={}",
+            numbers(&t),
+            t.truncated
+        );
+        assert_eq!(numbers(&t), vec![4, 3, 2, 1], "the archive's rows read on");
+        assert!(t.truncated, "the order since stops on does not hold");
+        // the archive itself stops at its own older row (0), the archive
+        // before it older still: not read
+        std::fs::write(
+            dir.path().join("log.jsonl.000000"),
+            line("2026-11-10T07:00:00.000000Z", 50),
+        )
+        .unwrap();
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert_eq!((numbers(&t), t.truncated), (vec![4, 3, 2, 1], true));
+        // the archive's last row stamped `since` itself: at or after it
+        std::fs::write(
+            dir.path().join("log.jsonl.000001"),
+            [
+                line("2026-11-10T07:59:00.000000Z", 0),
+                line("2026-11-10T08:00:00", 5),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert_eq!((numbers(&t), t.truncated), (vec![4, 3, 5], true));
+    }
+
+    /// Lot 319: the last row read from the next file counts against the
+    /// read's scan bound — one read scans at most `total` bytes, the peek
+    /// included: past it the descent stops with `truncated`.
+    #[test]
+    fn the_peek_counts_against_the_scan_bound() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");
+        let archive = [
+            line("2026-11-10T08:00:01.000000Z", 1),
+            line("2026-11-10T08:00:02.000000Z", 2),
+        ]
+        .concat();
+        std::fs::write(dir.path().join("log.jsonl.000001"), &archive).unwrap();
+        let body = [
+            line("2025-01-01T00:00:00.000000Z", 99),
+            line("2026-11-10T08:00:03.000000Z", 3),
+        ]
+        .concat();
+        std::fs::write(&active, &body).unwrap();
+        let q = TailQuery {
+            since: Some("2026-11-10T08:00:00"),
+            ..all(1 << 20)
+        };
+        // room for the active file and the peek: the archive is read
+        let total = (body.len() + 2 * archive.len()) as u64;
+        let t = read_chain_tail_bounded::<PortableHost>(&active, &q, u64::MAX, total);
+        assert_eq!((numbers(&t), t.truncated), (vec![3, 2, 1], true));
+        // room for the active file and less than the peek: not read further
+        let total = (body.len() + archive.len() - 1) as u64;
+        let t = read_chain_tail_bounded::<PortableHost>(&active, &q, u64::MAX, total);
+        assert_eq!((numbers(&t), t.truncated), (vec![3], true));
+    }
+
+    /// Lot 319: the head row before `since` with an archive that is older
+    /// still (its last row before `since`) — rows in order — stops the
+    /// descent untruncated, as before; so does an archive whose tail holds
+    /// no row (a terminator only) or no time.
+    #[test]
+    fn a_head_before_since_with_an_older_archive_still_stops() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");
+        std::fs::write(
+            dir.path().join("log.jsonl.000001"),
+            [
+                line("2026-11-10T07:00:00.000000Z", 0),
+                line("2026-11-10T07:30:00.000000Z", 1),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            &active,
+            [
+                line("2026-11-10T07:59:00.000000Z", 2),
+                line("2026-11-10T08:00:03.000000Z", 3),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let q = TailQuery {
+            since: Some("2026-11-10T08:00:00"),
+            ..all(1 << 20)
+        };
+        let t = read_chain_tail::<PortableHost>(&active, &q);
+        assert_eq!((numbers(&t), t.truncated), (vec![3], false));
+        // an archive whose tail is a terminator alone, or a row without a
+        // time: nothing says the order broke
+        for tail in [
+            "{\"rotate\":{\"fmt_ver\":3},\"ts\":\"2026-11-10T09:00:00Z\"}\n",
+            "{\"n\":7}\n",
+        ] {
+            std::fs::write(dir.path().join("log.jsonl.000001"), tail).unwrap();
+            let t = read_chain_tail::<PortableHost>(&active, &q);
+            assert_eq!((numbers(&t), t.truncated), (vec![3], false), "{tail}");
+        }
     }
 
     /// Rows in time order: a row older than `since` at the head of a file

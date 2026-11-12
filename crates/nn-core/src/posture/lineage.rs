@@ -2777,6 +2777,16 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         )
     }
 
+    /// Lot 314 (BUG-83): `starttime` of `/proc/<pid>/stat` (clock ticks
+    /// since boot): with the pid, one process's identity for as long as it
+    /// runs. `None` when `/proc` does not show the process.
+    pub fn start_ticks(&self, pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        self.proc_start_ticks(pid)
+    }
+
     /// `pid` started before the agent did.
     fn predates_observer(&self, pid: u32) -> bool {
         let observer = *self

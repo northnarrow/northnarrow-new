@@ -3,7 +3,6 @@
 //! variable, the environment trick, the mapping), through the per-rule
 //! budget like every rule's. Pure functions; the [`SinkRecorder`] writes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,7 @@ use super::{
     RULE_PRELOAD, RULE_PRELOAD_NAME,
 };
 use crate::decision::attack::{mitre_of, AttackRef, Tactic};
+use crate::decision::bounded::RepeatWindow;
 use crate::detection_payload::ExecPolEvidence;
 use crate::detection_store::DetectionSink;
 
@@ -451,18 +451,66 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
     out
 }
 
+/// Lot 314 (BUG-125): the record-only findings [`Repeats`] remembers; past
+/// it the one admitted least recently is forgotten (it may be recorded once
+/// more, within the per-rule budget). An unprivileged user makes a new
+/// finding with every distinct value (`HISTFILE=/a/<n>`): the table had no
+/// cap, and its sweep ran at every admit once it held 4096.
+pub const REPEATS_CAP: usize = 4096;
+
+/// Lot 314 (BUG-92): what makes two record-only findings the same — every
+/// field the record shows of the finding, its severity and its caller's
+/// tier among them; not the process (its pid, its time). The key was the
+/// rule, the uid, the file, the shown values and the decision: a Critical
+/// CVE-2023-4911 `GLIBC_TUNABLES` whose first 96 characters and length were
+/// a Medium one's was held back as a repeat of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RepeatKey {
+    rule: String,
+    severity: Severity,
+    uid: u32,
+    path: String,
+    kind: String,
+    decision: String,
+    tier: String,
+    tier_signals: Vec<String>,
+    classes: Vec<String>,
+    environment: Vec<String>,
+    values: Vec<String>,
+    at_secure: bool,
+}
+
+impl RepeatKey {
+    fn of(rec: &ExecPolRecord) -> Self {
+        let e = &rec.evidence;
+        RepeatKey {
+            rule: rec.verdict.rule_id.clone(),
+            severity: rec.verdict.severity,
+            uid: crate::detection_payload::Principal::from_event(&rec.event).uid,
+            path: rec.verdict.event_filename.clone(),
+            kind: e.kind.clone(),
+            decision: e.decision.clone(),
+            tier: e.tier.clone(),
+            tier_signals: e.tier_signals.clone(),
+            classes: e.classes.clone(),
+            environment: e.environment.clone(),
+            values: e.values.clone(),
+            at_secure: e.at_secure,
+        }
+    }
+}
+
 /// Holds back repeats of the same record-only finding (one shell's
-/// `HISTFILE=/dev/null` is in every exec it makes) for a while.
+/// `HISTFILE=/dev/null` is in every exec it makes) for a while. Lot 314: a
+/// [`RepeatWindow`] keyed by [`RepeatKey`], capped at [`REPEATS_CAP`].
 pub struct Repeats {
-    seen: HashMap<String, Instant>,
-    every: Duration,
+    seen: RepeatWindow<RepeatKey>,
 }
 
 impl Repeats {
     pub fn new(every: Duration) -> Self {
         Repeats {
-            seen: HashMap::new(),
-            every,
+            seen: RepeatWindow::new(every, REPEATS_CAP),
         }
     }
 
@@ -472,25 +520,7 @@ impl Repeats {
         if rec.evidence.decision == "deny" {
             return true;
         }
-        let key = format!(
-            "{}|{}|{}|{}|{}",
-            rec.verdict.rule_id,
-            crate::detection_payload::Principal::from_event(&rec.event).uid,
-            rec.verdict.event_filename,
-            rec.evidence.values.join(","),
-            rec.evidence.decision
-        );
-        if self.seen.len() > 4096 {
-            let every = self.every;
-            self.seen.retain(|_, t| now.duration_since(*t) < every);
-        }
-        match self.seen.get(&key) {
-            Some(t) if now.duration_since(*t) < self.every => false,
-            _ => {
-                self.seen.insert(key, now);
-                true
-            }
-        }
+        self.seen.admit(RepeatKey::of(rec), now)
     }
 }
 
@@ -721,5 +751,240 @@ mod tests {
         .remove(0);
         assert!(rep.admit(&d, t0));
         assert!(rep.admit(&d, t0));
+    }
+}
+
+/// Bug hunt 3 (edition 1.4), BUG-92, BUG-125: tests that
+/// assert the promised behaviour (they fail on 0cdfb6b where the defect is)
+/// and guards that must keep passing.
+#[cfg(test)]
+mod bughunt3 {
+    use super::*;
+    use common::wire::execpol::tier_sig;
+
+    fn su_event(uid: u32, path: &str) -> Event {
+        Event::ExecCheck {
+            pid: 5930,
+            ppid: 1,
+            uid,
+            comm: "su".into(),
+            filename: String::new(),
+            timestamp_ns: 7,
+            exe: ExeIdentity {
+                path: path.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The kernel's report of `GLIBC_TUNABLES=<v>` at the exec of the
+    /// set-uid-root `/usr/bin/su` by uid 1000 in a login session.
+    fn tunables_at_su(v: &str) -> ExecPolRaw {
+        let mut r = ExecPolRaw::zeroed();
+        r.kind = kind::EXEC;
+        r.pid = 5930;
+        r.uid = 1000;
+        r.file_uid = 0;
+        r.file_mode = 0o104755;
+        r.tier = tier::SESSION | tier_sig::LOGIN | tier_sig::TTY;
+        r.env_flags = env_flags::GLIBC_TUNABLES;
+        r.env_action = action::RECORD;
+        r.tunables[..v.len()].copy_from_slice(v.as_bytes());
+        r.tunables_len = v.len() as u32;
+        r
+    }
+
+    /// BUG-92: a Critical Looney Tunables record is not a "repeat" of a
+    /// Medium one whose first 96 shown characters and length are the same.
+    #[test]
+    fn bug92_critical_tunables_is_not_a_repeat_of_a_medium() {
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let benign = format!("{prefix}glibc.malloc.tcache_m=1");
+        let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
+        assert_eq!(benign.len(), exploit.len());
+        assert!(benign.len() > 96 && benign.len() < 127);
+        let medium = records_of(
+            &tunables_at_su(&benign),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
+        let critical = records_of(
+            &tunables_at_su(&exploit),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
+        assert_eq!(medium.verdict.rule_id, RULE_ENV);
+        assert_eq!(medium.verdict.severity, Severity::Medium);
+        assert_eq!(critical.verdict.severity, Severity::Critical);
+        assert!(critical.verdict.reasoning.contains("CVE-2023-4911"));
+        // what the repeat key reads is the same in both records
+        assert_eq!(medium.evidence.values, critical.evidence.values);
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        assert!(rep.admit(&medium, t0), "the first record is new");
+        assert!(
+            rep.admit(&critical, t0 + Duration::from_secs(5)),
+            "the Critical CVE-2023-4911 record was held back as a repeat of the Medium one \
+             (key without severity; values cut at 96 characters)"
+        );
+    }
+
+    /// BUG-92 guard: a true repeat (same record, same severity) is still
+    /// held back within the window.
+    #[test]
+    fn bug92_guard_a_true_repeat_is_held_back() {
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let exploit = format!("{prefix}glibc.malloc.mxfast=g=A");
+        let critical = records_of(
+            &tunables_at_su(&exploit),
+            &su_event(1000, "/usr/bin/su"),
+            "p",
+        )
+        .remove(0);
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        assert!(rep.admit(&critical, t0));
+        assert!(!rep.admit(&critical, t0 + Duration::from_secs(5)));
+    }
+
+    /// BUG-125: the repeat table stays bounded however many distinct
+    /// record-only findings an unprivileged user makes in the window
+    /// (`HISTSIZE=0 HISTFILE=/a/N sh -c :`, N always different).
+    #[test]
+    fn bug125_the_repeat_table_is_bounded() {
+        let mut rep = Repeats::new(Duration::from_secs(600));
+        let t0 = Instant::now();
+        for n in 0..20_000u32 {
+            let mut r = ExecPolRaw::zeroed();
+            r.kind = kind::EXEC;
+            r.pid = 7000 + n;
+            r.uid = 1000;
+            r.tier = tier::SESSION;
+            r.env_flags = env_flags::HISTSIZE_ZERO | env_flags::HISTFILE;
+            r.env_action = action::RECORD;
+            let v = format!("/a/{n}");
+            r.hist[..v.len()].copy_from_slice(v.as_bytes());
+            let mut ev = su_event(1000, "/usr/bin/sh");
+            if let Event::ExecCheck { pid, .. } = &mut ev {
+                *pid = r.pid;
+            }
+            let rec = records_of(&r, &ev, "p").remove(0);
+            assert!(rep.admit(&rec, t0 + Duration::from_millis(u64::from(n))));
+        }
+        assert!(
+            rep.seen.len() <= 4097,
+            "the repeat table has no ceiling: {} live keys after 20000 distinct findings in 20 s \
+             (admit's own threshold is 4096)",
+            rep.seen.len()
+        );
+    }
+
+    /// Lot 314 (F3, `nn_core::model_check`): the repeat table as a state
+    /// machine. A seeded generator draws record-only findings — a
+    /// `GLIBC_TUNABLES` benign or of the CVE-2023-4911 shape behind the same
+    /// shown characters, history disabled with a few `HISTFILE`s, by two
+    /// users in two tiers, from two programs — and exec denies, at times a
+    /// few minutes apart. After each: a record is admitted exactly when the
+    /// oracle (its whole record — rule, severity, uid, file, every field of
+    /// the evidence — last admitted at least a window ago, or never) says
+    /// so, a deny always; the table within its cap.
+    #[test]
+    fn the_repeat_table_keeps_its_invariants() {
+        use nn_core::model_check::{check, Rng, SEQUENCES};
+        use std::collections::HashMap;
+        let prefix = "glibc.malloc.arena_max=1:".repeat(4);
+        let tunables = [
+            format!("{prefix}glibc.malloc.tcache_m=1"),
+            format!("{prefix}glibc.malloc.mxfast=g=A"),
+            "glibc.malloc.arena_max=1".to_string(),
+        ];
+        let hist = ["/dev/null", "/a/1", "/a/2"];
+        let window = Duration::from_secs(600);
+        let draw = |rng: &mut Rng| -> (ExecPolRaw, Event) {
+            let uid = *rng.pick(&[1000u32, 1001]);
+            let session = rng.one_in(2);
+            match rng.below(5) {
+                0..=1 => {
+                    let mut r = tunables_at_su(rng.pick::<String>(&tunables));
+                    r.uid = uid;
+                    if !session {
+                        r.tier = tier::SERVICE;
+                    }
+                    (r, su_event(uid, "/usr/bin/su"))
+                }
+                2..=3 => {
+                    let mut r = ExecPolRaw::zeroed();
+                    r.kind = kind::EXEC;
+                    r.pid = 7000;
+                    r.uid = uid;
+                    r.tier = if session {
+                        tier::SESSION
+                    } else {
+                        tier::SERVICE
+                    };
+                    r.env_flags = env_flags::HISTSIZE_ZERO | env_flags::HISTFILE;
+                    r.env_action = action::RECORD;
+                    let v = rng.pick(&hist);
+                    r.hist[..v.len()].copy_from_slice(v.as_bytes());
+                    let path = rng.pick::<&str>(&["/usr/bin/sh", "/usr/bin/bash"]);
+                    (r, su_event(uid, path))
+                }
+                _ => {
+                    let mut r = ExecPolRaw::zeroed();
+                    r.kind = kind::EXEC;
+                    r.pid = 7001;
+                    r.uid = uid;
+                    r.classes = class::MEMFD;
+                    r.action = action::DENY;
+                    r.tier = tier::SERVICE;
+                    r.file_mode = 0o100755;
+                    (r, su_event(uid, "/memfd:x (deleted)"))
+                }
+            }
+        };
+        check("exec policy repeats", 0x3143_0000, SEQUENCES, |rng| {
+            let mut rep = Repeats::new(window);
+            let mut oracle: HashMap<String, Instant> = HashMap::new();
+            let t0 = Instant::now();
+            let mut now = t0;
+            for step in 0..30 {
+                now += Duration::from_secs(rng.below(400));
+                let (raw, event) = draw(rng);
+                for rec in records_of(&raw, &event, "p") {
+                    let uid = match &rec.event {
+                        Event::ExecCheck { uid, .. } => *uid,
+                        _ => u32::MAX,
+                    };
+                    let key = format!(
+                        "{}|{:?}|{uid}|{}|{:?}",
+                        rec.verdict.rule_id,
+                        rec.verdict.severity,
+                        rec.verdict.event_filename,
+                        rec.evidence
+                    );
+                    let deny = rec.evidence.decision == "deny";
+                    let want = deny
+                        || oracle
+                            .get(&key)
+                            .is_none_or(|t| now.duration_since(*t) >= window);
+                    let got = rep.admit(&rec, now);
+                    if got != want {
+                        return Err(format!(
+                            "step {step}: {} {:?} admitted {got}, the oracle says {want}",
+                            rec.verdict.rule_id, rec.verdict.severity
+                        ));
+                    }
+                    if got && !deny {
+                        oracle.insert(key, now);
+                    }
+                }
+                if rep.seen.len() > rep.seen.cap() {
+                    return Err(format!("step {step}: the table past its cap"));
+                }
+            }
+            Ok(())
+        });
     }
 }

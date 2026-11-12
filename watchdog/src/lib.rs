@@ -2039,15 +2039,31 @@ fn file_name_of(path: &str) -> &str {
 }
 
 /// Append `line` to `path` (created 0600; never through a symlink).
+///
+/// Lot 319 (the mini-hunt of BUG31's partial): the start of a line a
+/// watchdog that died left is closed first — the new record is never glued
+/// to it.
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file: record not written",
+            path.display()
+        )));
+    }
+    let mut last = [0u8; 1];
+    if meta.len() > 0 && f.read_exact_at(&mut last, meta.len() - 1).is_ok() && last[0] != b'\n' {
+        f.write_all(b"\n")?;
+    }
     f.write_all(line.as_bytes())?;
     f.sync_all()
 }
@@ -3897,6 +3913,64 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Lot 319 (the mini-hunt of BUG31's partial): a watchdog that died in
+    /// the middle of a hold record left the start of its line; the next
+    /// record is a line of its own (glued to it, the agent read neither, and
+    /// signed no hold), and a link or a FIFO at the path takes nothing.
+    #[test]
+    fn a_hold_record_is_never_glued_to_a_line_left_unfinished() {
+        use nn_proto::watchdog_hold::HoldRecord;
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("holds.jsonl");
+        let rec = HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 4242,
+            reason: "agent respawn failed".into(),
+            detail: "no agent after the start job".into(),
+            unit_state: None,
+        };
+        record_hold(&path, &rec).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"at\":18000")
+            .unwrap();
+        record_hold(&path, &rec).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "{body}");
+        assert_eq!(lines[1], "{\"at\":18000");
+        for l in [lines[0], lines[2]] {
+            assert_eq!(serde_json::from_str::<HoldRecord>(l).unwrap(), rec);
+        }
+        // not a regular file: refused before a byte is written, nothing
+        // waits (a reader holds the FIFO open: what reached it stays there)
+        let fifo = dir.path().join("fifo.jsonl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let mut reader = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap()
+        };
+        assert!(record_hold(&fifo, &rec).is_err());
+        let mut got = [0u8; 64];
+        match std::io::Read::read(&mut reader, &mut got) {
+            Ok(n) => assert_eq!(n, 0, "the record reached the FIFO"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(record_hold(&link, &rec).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
     }
 
     #[test]

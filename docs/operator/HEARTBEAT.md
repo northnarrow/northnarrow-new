@@ -73,7 +73,9 @@ ordered by their numbers and links; a beat stamped before the one seen
 than `--max-skew-secs` is `DEGRADED` ("the agent's clock went back",
 "… is N s ahead"), never `REPLAY` or `TAMPERED`; freshness is the
 verifier's own clock, and a late beat within a run is measured on the
-agent's `uptime_ms`.
+agent's `uptime_ms`. Every bound holds at any value (lot 295 for the
+silence and stall bounds; lot 319 for `--max-skew-secs`: a value of 2^63
+or more read as -1, and a beat stamped this very second was `DEGRADED`).
 
 A state file that is there and cannot be read or decoded stops the
 verifier (exit 3): it never re-anchors silently, which would take a

@@ -230,6 +230,16 @@ impl<H: PostureHost> CommAllowlist<H> {
         self
     }
 
+    /// Lot 314 (BUG-83): the start of process `pid` — `starttime` of its
+    /// `stat`, in clock ticks since boot — as the identity source's process
+    /// table shows it now: with the pid, what tells one process from the
+    /// next the kernel gives the pid to. `None` without an identity source
+    /// (tests, the boot-time rule set) or when the table shows no `pid`
+    /// (it has exited).
+    pub fn process_start(&self, pid: u32) -> Option<u64> {
+        self.identity.as_ref()?.start_ticks(pid)
+    }
+
     /// [`Self::judge`] for an exec event's own process, whose identity the
     /// event carries ([`crate::posture::lineage::ExecIdentity::of_exec`]):
     /// no lookup, so never [`Judgement::Unverified`]. `comm` only says
