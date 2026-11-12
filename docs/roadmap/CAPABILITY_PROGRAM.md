@@ -9197,3 +9197,112 @@ number in parentheses is a lab PR.
   - Measured on the host only (no lab: no unit, install, eBPF or self-test
     changed; the agent's boot wiring is untouched): the gates in the PR.
   - Level unchanged.
+- **Lot 319 — the evidence chains' residues: the third bug hunt's lot 10
+  (C21, C23; the partials 06, 28, 31, 10, 12 of edition 1.4, P3, and lot
+  296's backlog "the flat chains need the poisoned-writer scheme"; no level
+  changes).**
+  - What was open (our triage of 11/11/2026, its fix guidance followed): a
+    backdated row at the very head of a file still stopped the read verbs'
+    descent into the archives, untruncated (06); a rotation a crash
+    interrupted between its seal and its rename was finished at the next
+    open without the `ForeignArchive` rows of the slots its probe had
+    skipped (28); the JSONL export glued its first record to the start of a
+    line a dead worker left (31); a regular archive that cannot be removed
+    stopped every retention pass, an ERROR at each rotation and nothing in
+    the status (10); `--max-skew-secs` of 2^63 or more turned the heartbeat
+    verifier's skew bound negative (12). And the flat chains — the canary
+    registry and access log, the FIM baseline, the listener log — wrote with
+    `write_all` and went on after an error: a short write's fragment glued
+    to the next row, a failed fsync's row forked.
+  - What changed (`EVIDENCE_CHAINS.md` "The read verbs' answers" and "What
+    the agent did about it", `EXPORT.md` §3 and §8, `HEARTBEAT.md`, upgrade
+    notes §26): the read reads the next file's last row before it stops at
+    a backdated head, and reads on, `truncated`, when that row is at or
+    after `--since`; the open that finishes an interrupted rotation sounds
+    the slots from the last `Rotated` row again (an archive of the log's
+    own, its terminator verified, is never foreign); the JSONL sink opened
+    on a non-empty file closes the line first (an empty line when it ended
+    whole: the worker cannot read its files); a stalled retention is told
+    to the host (`ChainHost::retention_stalled`, a no-op by default) and the
+    agent's host makes it a `chain_retention` degradation, withdrawn at the
+    first pass that runs; the skew bound is compared without the cast. The
+    flat chains append through one writer, `nn_linux::flat_chain::FlatFile`:
+    a failed append or fsync poisons it, the next row cuts the fragment
+    (`repair_torn_tail`, as the open) and re-reads the chain's tail, and the
+    cut is signed in the audit chain by the degradation registry's sink
+    (`attest_repair`: at once with the log free, else at the flush; never
+    waited for). Two ratchets in `xtask/tests`: `flat_chain_writes.rs` (a
+    production file that holds a chain row opens no file to append, but for
+    the chain crate's own writers) and `time_bounds.rs` (no time bound cast
+    `as i64`).
+  - The mini-hunt (variants of each, each with its test failing without the
+    fix): 28 — a rotation's probe jumps past every archive name on disk,
+    and a foreign name it jumped over was never attested; one planted while
+    the log was closed sits below the next seq and no rotation probes it
+    (attested at the open now, above the last `Rotated` row the manifest
+    holds); 06 — the backdated head of an archive (the
+    same rule, per file); 12 — `fim report`/`net flows --since` past year
+    9999 or 2^63 kept every row (`unix_ts as i64`, or `+10000-…` sorting
+    before every row), and `detections --since/--until` likewise (`s as
+    i64`); 31 — the combat teardown's compatibility log, the watchdog's
+    hold records (which the agent signs: a glued record was neither read
+    nor signed) and the copy-on-write journal while it runs (lot 297 closed
+    its torn line at the open only) glued a line to one left unfinished.
+    Looked at and left: the export sink's rotation (a failed unlink is the
+    sink's fault, Down, already visible), the copy-on-write retention
+    (bounded 1–168 h, no cast past `i64`).
+  - The tests: each named test fails on `main` (4c864565) and passes here;
+    the backlog's with the kernel's own short write (`RLIMIT_FSIZE`, in a
+    helper process). Mutation testing on the new code: 52 mutants over two
+    passes, 51 caught by named tests (the six that survived the first pass
+    each got a test: the peek's scan budget, an archive copied into another
+    slot, the same stall told twice, a row cut before its newline, a FIFO at
+    the watchdog's record path), 0 compile-only, 1 argued equivalent — the
+    poisoning of the listener log by a failed group fsync: its rows were
+    written whole and its tail already advanced, so the re-read gives the
+    same tail.
+  - The lab, as measured (our own guest under lease k319, **Ubuntu 24.04**
+    `6.8.0-147-generic`, clean at the start: no agent, no pin, no overlay;
+    9f7cbed6 installed and enabled the operator's way):
+    - a fresh install: every manifest without a `ForeignArchive` row (the
+      open's new scan found none), `nn-admin status` "degradations: none",
+      the trust level L3, `chain verify` OK for the ten chains;
+    - the root filesystem filled to ENOSPC (`fallocate` and `dd` as root,
+      4,092 blocks left) while 60 listens by `nobody` were written to the
+      listener log: one write stopped 400 bytes into its row at a block's
+      end (7,792 bytes of whole rows kept); the next row cut it and the cut
+      was signed (`chain_tail_repaired`, the file, 400 bytes and their
+      SHA-256) once the audit log could take it; the failed row is the only
+      one missing (59 of 60). With the space back and 20 more listens: 89
+      rows, every line a row, every link whole. The audit log itself ended
+      in a 345-byte fragment while idle (lot 296's scheme: repaired and
+      attested at its next row, 23:42:31; `chain verify` read it `BROKEN`
+      just before that, as lot 296's lab did for netflow);
+    - the cold boot after (host power-off, bootcheck OK: the agent active,
+      its pin root and LSM programs): the listener log opened and took 5
+      more rows (94, all chained), `chain verify` OK for all ten chains (7
+      heads anchored), 2 `chain_tail_repaired` rows in the audit chain, no
+      `ForeignArchive` row, no degradation; then uninstalled, the guest
+      clean and off, the lease released. The stalled retention, the foreign
+      slots and the export's open are measured by the tests only (they need
+      a rotated log with an archive made unremovable, or root's planting in
+      the protected state directory).
+  - The independent review of #544 (verdict: merge; no P0–P2), its cheap
+    fixes in this PR: the rotation's probe takes every name in its range
+    for a foreign entry again, as `main` did — a planted file ending in a
+    forged terminator (its hash recomputes, signed with any key) passed the
+    "earlier key" rule and went unattested (test
+    `a_forged_terminator_at_the_next_slot_is_foreign`); an earlier key's
+    terminator counts as the log's own only when the manifest holds no
+    `Rotated` row this key verifies. The `time_bounds` ratchet catches the
+    cast it was written for (`.map(|s| s as i64)` on a time-named receiver),
+    a time-named call (`d.as_secs() as i64`: one site fixed in
+    `module_writes.rs`), `ts`, `…_ns`, `ttl`, `deadline`, `timeout` and
+    parenthesised expressions, over every crate (`common`, `cli`, `scan`
+    too). A repair's cut whose fsync fails is still returned and signed, and
+    the repairs dropped past the bound are counted in a signed row
+    (`chain_repairs`). The docs say what is left: names planted below the
+    last `Rotated` row, a clock step-back across a rotation, the shippers'
+    empty-line setting. In the backlog: the durability of a run-time cut's
+    record across a restart (F5's rest), the stall's end signed and a
+    transient listing failure (F7), the open's archive reads (F8).

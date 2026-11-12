@@ -49,7 +49,7 @@
 //!   consume.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -608,7 +608,9 @@ impl BaselineCache {
 /// so each `append` produces a well-chained next entry. Same
 /// shape as [`nn_evidence::audit::AuditLog`].
 pub struct BaselineDb {
-    path: PathBuf,
+    /// Lot 319: the file's append side, poisoned by a failed write
+    /// ([`crate::flat_chain`]).
+    file: crate::flat_chain::FlatFile,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -636,7 +638,7 @@ impl BaselineDb {
         let (last_hash, skipped_lines) = read_tail_hash(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
-            path: crate::anchored::anchor(path),
+            file: crate::flat_chain::FlatFile::new(path, BASELINE_FILE_MODE),
             key,
             agent_id,
             last_hash,
@@ -658,6 +660,7 @@ impl BaselineDb {
     /// line via `O_APPEND` + fsync, advances the in-memory
     /// tail. On success returns the entry as persisted.
     pub fn append(&mut self, draft: BaselineEntryDraft) -> Result<BaselineEntry> {
+        self.heal()?;
         let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
         self.write_entry(&entry)?;
         Ok(entry)
@@ -676,6 +679,7 @@ impl BaselineDb {
         draft: BaselineEntryDraft,
         cache: &BaselineCache,
     ) -> Result<BaselineEntry> {
+        self.heal()?;
         let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
         let previous = cache.swap_in(entry.clone());
         if let Err(e) = self.write_entry(&entry) {
@@ -691,17 +695,25 @@ impl BaselineDb {
         let mut line =
             serde_json::to_string(entry).map_err(|e| anyhow!("serialising baseline entry: {e}"))?;
         line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(BASELINE_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| format!("opening baseline log {} for append", self.path.display()))?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending baseline entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.file
+            .append(line.as_bytes(), true)
+            .context("appending a baseline entry")?;
         self.last_hash = entry.entry_hash.clone();
+        Ok(())
+    }
+
+    /// Lot 319 (lot 296's scheme): after a failed write, before the next
+    /// entry, the tail is read again — a fragment it left is cut and the cut
+    /// signed, an entry it wrote whole is the tail
+    /// ([`crate::flat_chain::FlatFile::heal`]). Lines the walk could not
+    /// read were counted at the open; they are not counted again here.
+    fn heal(&mut self) -> Result<()> {
+        if let Some((last_hash, _skipped)) = self.file.heal(
+            |l| serde_json::from_slice::<BaselineEntry>(l).is_ok(),
+            read_tail_hash,
+        )? {
+            self.last_hash = last_hash;
+        }
         Ok(())
     }
 
@@ -1565,5 +1577,31 @@ mod tests {
             lines[0]
         );
         assert!(lines[2].contains("\"target\""));
+    }
+
+    /// Lot 319 (lot 296's scheme): an entry written whole whose fsync failed
+    /// is the chain's tail — the next entry chains off it (it chained off
+    /// the entry before: a fork); the cached append too.
+    #[test]
+    fn an_entry_whose_fsync_failed_is_the_tail() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        db.append(sample_draft(1)).unwrap();
+        db.file.fail_next_sync();
+        assert!(db.append(sample_draft(2)).is_err());
+        let cache = BaselineCache::new();
+        db.append_cached(sample_draft(3), &cache).unwrap();
+        db.file.fail_next_sync();
+        assert!(db.append_cached(sample_draft(4), &cache).is_err());
+        db.append(sample_draft(5)).unwrap();
+        let rows: Vec<BaselineEntry> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 5);
+        verify_chain(&rows, &pk).unwrap();
     }
 }

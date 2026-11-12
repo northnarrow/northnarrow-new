@@ -1279,6 +1279,36 @@ fn max_silence_u64_max_fresh_beat_is_not_silent() {
     assert!(r.alerts.is_empty(), "a fresh beat: {r:?}");
 }
 
+/// Lot 319 (BUG12, the partial left by lot 295): the skew bound was still
+/// `cfg.max_skew_secs as i64` — `--max-skew-secs 18446744073709551615`
+/// made it -1, and a beat stamped this very second (no skew at all) read as
+/// the agent's clock running ahead: a false DEGRADED. A bound past what a
+/// skew can be is never reached.
+#[test]
+fn huge_max_skew_does_not_go_negative() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    for bound in [u64::MAX, 1u64 << 63, (1u64 << 63) + 1] {
+        let huge = WatchConfig {
+            max_skew_secs: bound,
+            ..cfg()
+        };
+        let r = check(Ok(&c.lines()), &c.pk, None, at(0), &huge);
+        assert!(r.alerts.is_empty(), "bound {bound}, no skew: {r:?}");
+        // a beat far ahead is within a bound that large too
+        let r = check(Ok(&c.lines()), &c.pk, None, at(-86_400), &huge);
+        assert!(r.alerts.is_empty(), "bound {bound}, a day ahead: {r:?}");
+    }
+    // the bound still holds where it can: 30 s, a beat 40 s ahead
+    let r = check(Ok(&c.lines()), &c.pk, None, at(-40), &cfg());
+    assert!(
+        r.alerts
+            .iter()
+            .any(|a| a.detail().contains("ahead of the verifier")),
+        "{r:?}"
+    );
+}
+
 /// BUG12 (b'): an explicit bound does not depend on the beat's interval —
 /// `unwrap_or(2 * interval + 15)` is evaluated (and overflows) anyway.
 #[test]

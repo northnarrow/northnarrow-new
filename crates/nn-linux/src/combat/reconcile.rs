@@ -53,6 +53,7 @@ pub fn append_line(path: &Path, rules_removed: usize, cap: u64) -> std::io::Resu
     let anchored = crate::anchored::anchor(path);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -72,6 +73,15 @@ pub fn append_line(path: &Path, rules_removed: usize, cap: u64) -> std::io::Resu
     if meta.len() > cap {
         // O_APPEND: the next write lands at the new end, offset 0.
         f.set_len(0)?;
+    } else if meta.len() > 0 {
+        // Lot 319 (the mini-hunt of BUG31's partial): a run that died in the
+        // middle of its line left the start of it — closed first, the new
+        // line never glued to it.
+        let mut last = [0u8; 1];
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut last, meta.len() - 1)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
     }
     writeln!(f, "{line}")
 }
@@ -148,6 +158,30 @@ mod tests {
             mode, 0o640,
             "the agent does not chmod a file it did not create"
         );
+    }
+
+    /// Lot 319 (the mini-hunt of BUG31's partial): the start of a line a
+    /// run that died left is closed before the next line, never glued.
+    #[test]
+    fn a_line_left_unfinished_is_closed_before_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("combat-audit.jsonl");
+        append_line(&p, 1, CAP_BYTES).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"{\"ts\":\"2026")
+            .unwrap();
+        append_line(&p, 2, CAP_BYTES).unwrap();
+        append_line(&p, 3, CAP_BYTES).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines[1], "{\"ts\":\"2026");
+        for l in [lines[0], lines[2], lines[3]] {
+            serde_json::from_str::<serde_json::Value>(l).unwrap();
+        }
     }
 
     #[test]

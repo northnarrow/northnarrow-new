@@ -15,6 +15,11 @@
 //!   caller holds the log, at the log's open for what came before it
 //!   ([`attach_audit_log`]), within [`FLUSH_PERIOD`] otherwise
 //!   ([`spawn_flusher`]). [`SIGNED_WITHIN`] bounds the wait.
+//!
+//! Lot 319: the torn tails the flat chains' writers cut at run time, after
+//! a failed write ([`crate::flat_chain`]), are signed the same way, as
+//! `chain_tail_repaired` rows ([`attest_repair`]): at once when the audit
+//! log is free, else at the next flush.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +28,8 @@ use parking_lot::Mutex;
 use tracing::warn;
 
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::chainlog::TailRepair;
+use std::path::{Path, PathBuf};
 
 /// How often the reports made without the audit log are signed.
 pub const FLUSH_PERIOD: Duration = Duration::from_secs(15);
@@ -67,6 +74,11 @@ struct Registry {
     overflow: u64,
     sink: Option<Arc<Mutex<AuditLog>>>,
     boot_over: bool,
+    /// Lot 319: run-time repairs of the flat chains not signed yet (the
+    /// file as the command line names it, the repair).
+    repairs: Vec<(PathBuf, TailRepair)>,
+    /// Repairs past [`MAX_KEPT`] waiting: not signed (an ERROR each).
+    repairs_dropped: u64,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -74,6 +86,8 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     overflow: 0,
     sink: None,
     boot_over: false,
+    repairs: Vec::new(),
+    repairs_dropped: 0,
 });
 
 /// A degradation found by a part of the agent without the audit log at
@@ -204,8 +218,102 @@ pub fn attach_audit_log(log: Option<Arc<Mutex<AuditLog>>>) -> usize {
     flush()
 }
 
+/// Lot 319 (the review of #544, F5): the source of the signed count of the
+/// flat chains' repairs dropped past [`MAX_KEPT`].
+pub const REPAIRS_DROPPED: &str = "chain_repairs";
+
+/// Lot 319: a torn tail a flat chain's writer cut or closed at run time
+/// (after a failed write, [`crate::flat_chain::FlatFile::heal`]), to be
+/// signed in the audit chain as the open's repairs are (`chain_tail_repaired`,
+/// the cut bytes' length and SHA-256): at once when the audit log is there
+/// and free (never waited for: the writer may hold a lock its holder
+/// waits on), else at the next flush. At most [`MAX_KEPT`] wait; past it a
+/// repair is not signed, and its ERROR says so.
+pub fn attest_repair(file: &Path, repair: TailRepair) {
+    {
+        let mut r = REGISTRY.lock();
+        if r.repairs.len() >= MAX_KEPT {
+            r.repairs_dropped += 1;
+            tracing::error!(
+                file = %file.display(),
+                detail = %repair.describe(),
+                dropped = r.repairs_dropped,
+                "a flat chain's repair is not signed: too many wait for the audit log"
+            );
+            return;
+        }
+        r.repairs.push((file.to_path_buf(), repair));
+    }
+    sign_repairs(false);
+}
+
+/// Sign the repairs waiting, with the audit log's lock when `wait`, else
+/// only if it is free. Returns how many were written.
+fn sign_repairs(wait: bool) -> usize {
+    let Some(sink) = REGISTRY.lock().sink.clone() else {
+        return 0;
+    };
+    let mut log = if wait {
+        sink.lock()
+    } else {
+        match sink.try_lock() {
+            Some(l) => l,
+            None => return 0,
+        }
+    };
+    let (pending, dropped) = {
+        let mut r = REGISTRY.lock();
+        (
+            std::mem::take(&mut r.repairs),
+            std::mem::take(&mut r.repairs_dropped),
+        )
+    };
+    let mut written = 0;
+    let mut failed = Vec::new();
+    for (file, repair) in pending {
+        match log.attest_tail_repair(&file, &repair) {
+            Ok(()) => written += 1,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), file = %file.display(), "attesting a chain repair failed");
+                failed.push((file, repair));
+            }
+        }
+    }
+    // The review of #544 (F5): the repairs dropped past the bound are said in
+    // the next signed row — their count, as a degradation of this run.
+    let dropped_said = dropped == 0
+        || sign_into(
+            &mut log,
+            REPAIRS_DROPPED,
+            &format!(
+                "{dropped} run-time repair(s) of the flat chains not signed: more than {MAX_KEPT} \
+                 waited for the audit log"
+            ),
+            false,
+        );
+    drop(log);
+    if dropped > 0 {
+        if dropped_said {
+            written += 1;
+        } else {
+            REGISTRY.lock().repairs_dropped += dropped;
+        }
+    }
+    if !failed.is_empty() {
+        // Tried again at the next flush, before the ones that came since.
+        let mut r = REGISTRY.lock();
+        failed.append(&mut r.repairs);
+        r.repairs = failed;
+    }
+    written
+}
+
 /// Sign every report not signed yet; returns how many were written.
 pub fn flush() -> usize {
+    sign_repairs(true) + flush_reports()
+}
+
+fn flush_reports() -> usize {
     let (sink, pending) = {
         let mut r = REGISTRY.lock();
         let Some(sink) = r.sink.clone() else {
@@ -261,6 +369,18 @@ pub fn withdraw(source: &str, keep: &[String]) -> usize {
     before - r.entries.len()
 }
 
+/// Lot 319: [`withdraw`] by a predicate on the detail — the degradations of
+/// `source` whose condition `ended` says ended leave the status (one source
+/// shared by several parts: the chain logs' stalled retention, one line
+/// each). Returns how many left.
+pub fn withdraw_where(source: &str, ended: impl Fn(&str) -> bool) -> usize {
+    let mut r = REGISTRY.lock();
+    let before = r.entries.len();
+    r.entries
+        .retain(|d| d.source != source || !ended(&d.detail));
+    before - r.entries.len()
+}
+
 /// The event loop starts: later reports are not boot ones.
 pub fn mark_boot_over() {
     REGISTRY.lock().boot_over = true;
@@ -299,6 +419,8 @@ pub(crate) fn reset_for_tests() {
     r.overflow = 0;
     r.sink = None;
     r.boot_over = false;
+    r.repairs.clear();
+    r.repairs_dropped = 0;
 }
 
 /// The registry is one per process: the tests that read it run one at a
@@ -408,6 +530,90 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.len(), MAX_KEPT + 1);
         assert!(s.last().unwrap().contains("3 more"), "{s:?}");
+        reset_for_tests();
+    }
+
+    fn repair(n: u64) -> TailRepair {
+        TailRepair::Truncated {
+            kept_len: 100,
+            dropped_len: n,
+            dropped_sha256: "ab".repeat(32),
+        }
+    }
+
+    /// The `chain_tail_repaired` rows of the audit log in `dir` for files
+    /// under `under` (the registry is the process's: a test of another
+    /// module may report meanwhile).
+    fn repaired_rows(dir: &std::path::Path, under: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("audit.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["op"] == crate::audit::CHAIN_TAIL_REPAIRED_OP)
+            .map(|v| v["extra"].clone())
+            .filter(|e| e["file"].as_str().is_some_and(|f| f.starts_with(under)))
+            .collect()
+    }
+
+    /// Lot 319: a flat chain's run-time repair is signed at once when the
+    /// audit log is free; while another thread holds it, the repair waits
+    /// — never the writer — and the next flush signs it.
+    #[test]
+    fn a_flat_chain_repair_is_signed_at_once_or_at_the_flush() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        attach_audit_log(Some(Arc::clone(&log)));
+        attest_repair(Path::new("/k319/canaries.jsonl"), repair(40));
+        let rows = repaired_rows(dir.path(), "/k319/");
+        assert_eq!(rows.len(), 1, "signed at once");
+        assert_eq!(rows[0]["file"], "/k319/canaries.jsonl");
+        assert!(rows[0]["detail"].as_str().unwrap().contains("(40 bytes"));
+        // the audit log held by another: the writer does not wait
+        let held = log.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            attest_repair(Path::new("/k319/baseline.jsonl"), repair(7));
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the writer waited for the audit log");
+        drop(held);
+        assert_eq!(repaired_rows(dir.path(), "/k319/").len(), 1, "waiting");
+        flush();
+        let rows = repaired_rows(dir.path(), "/k319/");
+        assert_eq!(rows.len(), 2, "signed at the flush");
+        assert_eq!(rows[1]["file"], "/k319/baseline.jsonl");
+        flush();
+        assert_eq!(repaired_rows(dir.path(), "/k319/").len(), 2, "once");
+        reset_for_tests();
+    }
+
+    /// Lot 319: without an audit log the repairs wait, at most
+    /// [`MAX_KEPT`]; the one past it is not signed (an ERROR), the others
+    /// are once the log is there.
+    #[test]
+    fn flat_chain_repairs_wait_within_a_bound() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        for n in 0..MAX_KEPT as u64 + 1 {
+            attest_repair(Path::new("/k319/canary_access.jsonl"), repair(n + 1));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        attach_audit_log(Some(open_log(dir.path())));
+        assert_eq!(repaired_rows(dir.path(), "/k319/").len(), MAX_KEPT);
+        // the one dropped is said in the next signed row (the review of
+        // #544, F5)
+        let said: Vec<serde_json::Value> = degraded_rows(dir.path())
+            .into_iter()
+            .filter(|r| r["source"] == REPAIRS_DROPPED)
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 run-time repair(s)"));
         reset_for_tests();
     }
 
