@@ -154,8 +154,11 @@ writer is **trusted** (not copied) when:
   standard input — the ransomware signal's own test
   (`impact::trust::is_foreign`), which this guard's twin of it gave way to;
   an editor `sh -c` starts is copied for — nor a user's service manager
-  (`systemd --user`: `impact::trust::is_user_manager`, the review of #539);
-  an installed shell PID 1 started (a unit's `ExecStart=/bin/sh -c …`)
+  (`systemd --user`: `impact::trust::is_user_manager`, the review of #539),
+  save for the process it forked for a packaged user unit
+  (`manager_vouches_for_its_unit`, lot 310b: the desktop's terminal); an
+  installed shell PID 1 forked (a unit's `ExecStart=/bin/sh -c …`; the
+  kernel's record at `sched_process_fork`, never the parent at exec time)
   vouches as PID 1 does (`impact::trust::started_by_pid1`).
 
 What an interpreter runs is read with its own option table (lot 292, BUG-44

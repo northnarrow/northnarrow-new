@@ -2214,6 +2214,32 @@ mod tests {
         }
     }
 
+    /// The re-check of #539 (N5): `NODE_OPTIONS` loads code only with a
+    /// loading option of node's table; memory and diagnostics options do
+    /// not.
+    #[test]
+    fn node_options_load_only_with_a_loading_option() {
+        for v in [
+            "--require /tmp/x.js",
+            "--max-old-space-size=64 --import=data:text/javascript,x",
+            "-r/tmp/x.js",
+            "-r /tmp/x.js",
+            "--test-reporter=/tmp/r.mjs",
+            "\"--experimental-loader\" /tmp/l.mjs",
+        ] {
+            assert!(node_options_load(v), "{v}");
+        }
+        for v in [
+            "--max-old-space-size=4096",
+            "--max-old-space-size 4096 --enable-source-maps",
+            "--no-warnings --trace-warnings",
+            "--stack-size=500",
+            "",
+        ] {
+            assert!(!node_options_load(v), "{v}");
+        }
+    }
+
     /// The review of #539's differential test: `python3 -i S` runs `S`,
     /// then its standard input (`python3 -i /usr/bin/x < code`: the
     /// caller's code under an installed script's name) — not known; `-i`

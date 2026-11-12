@@ -23,22 +23,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `-I`, and the loading variables of the environment, which the exec pump
   reads), and the kernel-resolved names `mono-sgen`, `mksh` and busybox as
   `/bin/sh`; anything outside the table, or an option that runs nothing, is
-  not known, never a script. An inline program (`sh -c`, `python3 -c`),
-  standard input (`bash < file`) or a user's service manager (`systemd
-  --user`) no longer vouches for the packaged tools it starts (ransomware
-  signal, copy guard) — save the installed shell PID 1 starts (a unit's
-  `ExecStart=/bin/sh -c …`), which vouches as PID 1 does; a cron job's
-  `sh -c` is judged (the lab: a user's crontab `rsync --inplace` of random
-  data drew NN-L-IMP-001, its kill held). R004 kills a memfd or unlinked file whatever path
+  not known, never a script. An inline program (`sh -c`, `python3 -c`) or
+  standard input (`bash < file`) no longer vouches for the packaged tools it
+  starts (ransomware signal, copy guard) — save the installed shell PID 1
+  FORKED (a unit's `ExecStart=/bin/sh -c …`), which vouches as PID 1 does;
+  a user's service manager vouches only for the processes it forked for
+  packaged user units (the desktop's terminal), never `systemd-run --user`.
+  "Forked" is the kernel's record (a new eBPF program at
+  `sched_process_fork`, the exec record's `fork_ppid`), never the parent at
+  exec time: a double-forked orphan PID 1 reaped does not pass. A cron
+  job's `sh -c` is judged (the lab: a user's crontab `rsync --inplace` of
+  random data drew NN-L-IMP-001, its kill held). R004 kills a memfd or unlinked file whatever path
   reached it (`/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`,
   `/dev/stdin`, a relative path, a symlink: unprivileged evasions of a kill
   that holds in every posture) — in LSM mode by the exec sensor's identity,
   in tracepoint mode by the exec pump's read of `/proc/<pid>/exe`; systemd's
-  unlinked executor is exempt by an identity a manager holds now (re-read
-  every 10 s, replaced), for a child's first exec, no longer by its name or
-  `argv[0]` (`/opt/app/systemd-executor` was), and a process re-executing
-  its parent's own image is not fileless when that image came from a
-  directory only root can write. Two ratchets
+  unlinked executor is exempt by an identity the packaged file, PID 1 or a
+  genuine user manager holds now (re-read every 10 s, replaced; a "manager"
+  a user's mount namespace runs adds nothing), for the first exec of a
+  process systemd forked, no longer by its name or `argv[0]`
+  (`/opt/app/systemd-executor` was), and a process re-executing its
+  parent's own image is not fileless when that image came from a directory
+  only root can write, in PID 1's mount namespace. Two ratchets
   (`xtask/tests/interpreter_options.rs`, `proc_links.rs`) keep option
   parsing and `/proc` link matching in their one reader, in every product
   crate; an `#[ignore]` differential test runs the tables against the real

@@ -1266,25 +1266,32 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// from is root's only ([`PostureHost::dir_is_root_only`]); at the
     /// start's scan, off the decision path.
     fn seed_image(&self, pid: u32) -> Option<(u64, u64)> {
+        let view = self.image_dir_view(pid)?;
+        if !H::dir_is_root_only(&view) {
+            return None;
+        }
+        let link = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let (dev, ino) = H::file_id(&link)?;
+        Some((common::wire::exe::kernel_dev(dev), ino))
+    }
+
+    /// The directory `pid`'s image was executed from, in the process's own
+    /// view of the files (`/proc/<pid>/root/…`, as the exec pump reads it),
+    /// when the process runs in PID 1's mount namespace (the re-check of
+    /// #539, N6: a user's namespace binds a root directory over its own);
+    /// `None` otherwise, or when either namespace cannot be read.
+    fn image_dir_view(&self, pid: u32) -> Option<PathBuf> {
         let dir = self.inner.proc_root.join(pid.to_string());
-        let link = dir.join("exe");
-        let text = H::read_link(&link).ok()?;
+        let text = H::read_link(dir.join("exe")).ok()?;
         let text = text.to_string_lossy();
         let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
-        // in PID 1's mount namespace only (the re-check of #539, N6: a
-        // user's namespace binds a root directory over its own), in the
-        // process's own view of the files, as the exec pump reads it
         let ns = |d: &Path| H::read_link(d.join("ns/mnt")).ok();
         let init = ns(&self.inner.proc_root.join("1"))?;
         if ns(&dir)? != init {
             return None;
         }
         let view = dir.join("root").join(path.strip_prefix("/").ok()?);
-        if !H::dir_is_root_only(view.parent()?) {
-            return None;
-        }
-        let (dev, ino) = H::file_id(&link)?;
-        Some((common::wire::exe::kernel_dev(dev), ino))
+        view.parent().map(Path::to_path_buf)
     }
 
     /// The spawn cache holds an exec of `pid`.
@@ -4770,6 +4777,35 @@ mod tests {
             t.exec_image(501, AsOf::Judged(H::monotonic_ns())),
             Some((8, 500))
         );
+    }
+
+    /// The re-check of #539 (N6): the start's scan reads an image's
+    /// directory only for a process in PID 1's mount namespace, in the
+    /// process's own root; another namespace, or one not readable: none.
+    #[test]
+    fn the_start_s_scan_reads_a_directory_in_pid_1_s_namespace_only() {
+        let proc = TempDir::new().unwrap();
+        let link = |pid: &str, name: &str, to: &str| {
+            let p = proc.path().join(pid).join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(to, p).unwrap();
+        };
+        link("1", "ns/mnt", "mnt:[4026531841]");
+        link("80", "exe", "/usr/bin/tool (deleted)");
+        link("80", "ns/mnt", "mnt:[4026531841]");
+        link("81", "exe", "/usr/bin/tool");
+        link("81", "ns/mnt", "mnt:[4026532999]");
+        link("82", "exe", "/usr/bin/tool");
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(
+            t.image_dir_view(80),
+            Some(proc.path().join("80/root/usr/bin")),
+            "PID 1's namespace, the unlinked image's directory"
+        );
+        assert_eq!(t.image_dir_view(81), None, "a namespace of its own");
+        assert_eq!(t.image_dir_view(82), None, "its namespace not readable");
+        std::fs::remove_file(proc.path().join("1/ns/mnt")).unwrap();
+        assert_eq!(t.image_dir_view(80), None, "PID 1's not readable");
     }
 
     /// The re-check of #539 (N7): the `/proc` fallback reads an empty

@@ -1332,16 +1332,23 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
 - **Code loaded before the program named is the caller's.** node's `-r`,
   `--require`, `--import`, `--loader`, `--env-file`, perl's `-M`, `-m`,
   `-I`, `-d`, ruby's `-r`, `-I` leave a named script not known, an inline
-  program inline; so does python's `-i` (its standard input runs after the
-  script), and an environment that loads code (`PYTHONPATH`, `PYTHONHOME`,
-  `PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONSTARTUP`, `NODE_OPTIONS`,
-  `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`,
-  `GEM_HOME`, `GEM_PATH`, `BASH_ENV`, `ENV`, `ZDOTDIR`, set and not empty)
-  for an interpreter naming an installed script or nothing, as the exec
-  pump reads it at the exec. A developer's
-  `PERL5LIB` or `PYTHONPATH` therefore takes the client identity from an
-  installed perl or python program it runs (its reads of a client's store
-  are judged as any other process's).
+  program inline; so do python's `-i` (its standard input runs after the
+  script) and `-X pycache_prefix=`, node's `--test-reporter`, and an
+  environment that loads code — `PYTHONPATH`, `PYTHONHOME`,
+  `PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONPYCACHEPREFIX`, `NODE_PATH`,
+  `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `GEM_HOME`,
+  `GEM_PATH`, `BASH_ENV`, `SHELLOPTS`, `ZDOTDIR`, bash's exported functions
+  (`BASH_FUNC_*`), set and not empty; `NODE_OPTIONS` only when it names a
+  loading option (`--require`, `--import`, `--loader`…, read with node's
+  table: `--max-old-space-size` loads nothing); `PYTHONSTARTUP`, `ENV`,
+  `NODE_REPL_EXTERNAL_MODULE` only for an interpreter naming no program
+  (they load nothing into a script: a user's `PYTHONSTARTUP` leaves `aws`
+  its identity) — for an interpreter (or busybox's shell) naming an
+  installed script or nothing, as the exec pump reads it at the exec. An
+  environment larger than the pump reads (1 MiB) is taken to load. A
+  developer's `PERL5LIB` or `PYTHONPATH` therefore takes the client
+  identity from an installed perl or python program it runs (its reads of
+  a client's store are judged as any other process's).
 - **The kernel-resolved names of an interpreter are interpreters**
   (BUG-104): `mono-sgen` and `mono-boehm` (what `/usr/bin/mono` resolves
   to: KeePass 2's store read by its own process is its client again,
@@ -1357,21 +1364,29 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   nothing whose standard input is a file, a pipe or a socket) no longer
   vouches for the packaged tools it starts: the ransomware signal judges
   them (NN-L-IMP-001/-002; the kill held by default) and the copy guard
-  copies an editor it starts. Nor does a user's service manager
-  (`systemd --user`: `systemd-run --user /usr/bin/openssl enc …` was a
-  lineage of installed programs end to end); the record names the process
-  it started, never the manager. An interactive shell on a terminal (`-bash`,
-  `bash -l`, `bash -i`) still vouches; a package transaction and PID 1's
-  units are trusted as before, a unit's `ExecStart=/bin/sh -c …` included
-  (an installed shell PID 1 started inherits PID 1's vouching). Expect more
-  ransomware assessments of the tools a cron job (a user's crontab or the
-  system's: a job carries no owner in this judgement), a non-interactive
-  `ssh host 'cmd'` or a desktop session's services run (on a desktop the
-  user's manager starts the terminal emulator: the commands typed in it are
-  judged); the lab measured one on Ubuntu 24.04 — a user's crontab
-  `sh -c 'rsync -a --inplace …'` of random data drew NN-L-IMP-001 (Critical,
-  its kill held). A record names the shell ("which runs an inline program")
-  or the manager ("a user's service manager").
+  copies an editor it starts. A user's service manager (`systemd --user`)
+  vouches only for a process it FORKED for a packaged user unit — the unit's
+  file root's and a package's (`/usr/lib/systemd/user`, `/etc/systemd/user`)
+  with no unit or drop-in of the user's: the desktop's terminal emulator,
+  the session's services, and the interactive shells in them —, never for a
+  transient `systemd-run --user` unit (`systemd-run --user /usr/bin/openssl
+  enc …` was a lineage of installed programs end to end) or a unit in
+  `~/.config/systemd/user`; the record names the process it started, never
+  the manager. A package transaction and PID 1's units are trusted as
+  before, a unit's `ExecStart=/bin/sh -c …` included: an installed shell
+  PID 1 FORKED inherits PID 1's vouching. "Forked" is the kernel's record
+  at `sched_process_fork` (the exec record's `fork_ppid`, for the first
+  exec after the fork), never the parent at exec time: a webshell's
+  double-forked orphan, which PID 1 reaps before its `sh -c`, was forked by
+  the webshell. A process forked before the agent started has no record:
+  a desktop session older than the agent is judged until its next login.
+  Expect more ransomware assessments of the tools a cron job (a user's
+  crontab or the system's: a job carries no owner in this judgement) or a
+  non-interactive `ssh host 'cmd'` runs; the lab measured one on Ubuntu
+  24.04 — a user's crontab `sh -c 'rsync -a --inplace …'` of random data
+  drew NN-L-IMP-001 (Critical, its kill held). A record names the shell
+  ("which runs an inline program") or the manager ("a user's service
+  manager").
 - **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
   file is a fileless exec whatever path reached it:
   `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
@@ -1384,22 +1399,27 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `/proc/<pid>/root/…` chains followed), when it is gone. Not fileless:
   - the agent's own worker;
   - systemd's executor left unlinked by an upgrade, by its identity
-    (`(dev, ino)`) — one linked at the packaged executor's path or held open
-    by a running systemd manager, re-read every 10 s and replaced: "R004:
-    systemd-executor's identities changed" in the journal — for the first
-    exec of a child of systemd; no longer by a file *named*
-    `systemd-executor` (BUG-103), nor by `argv[0]` and a parent PID 1 in
-    tracepoint mode;
+    (`(dev, ino)`) — the packaged file at its install path (root's, listed by
+    the package database), a copy the host's PID 1 holds, or one a genuine
+    user manager holds (its image the packaged manager's, in PID 1's mount
+    namespace), re-read every 10 s and replaced: "R004: systemd-executor's
+    identities changed" in the journal — for the first exec of a process
+    PID 1 or such a manager FORKED (the kernel's record); no longer by a
+    file *named* `systemd-executor` (BUG-103), by `argv[0]` and a parent
+    PID 1 in tracepoint mode, nor by a "manager" a user's namespace runs;
   - a process re-executing the very image its parent runs
     (`/proc/self/exe` after a package upgrade unlinked it: Chromium's and
     Electron's children, Docker's `reexec`), when that image was executed
-    from a directory only root can write; the parents running at the
-    agent's start are read at its start. A user's dropped binary that
+    from a directory only root can write, by a process in PID 1's mount
+    namespace (a container's process gets no such exemption); the parents
+    running at the agent's start are read at its start. A user's dropped binary that
     unlinks and re-executes itself is killed, as before.
 
   Residual: a program re-executing itself in place (no fork) through
   `/proc/self/exe` after an upgrade is killed; so is an exec that opens a
   binary at the instant an upgrade renames its replacement over it
   (microseconds). An identity a manager released stays exempt until the
-  next re-read (10 s); the kernel's identity carries no inode generation. A
-  child reparented to PID 1 before its first exec counts as systemd's.
+  next re-read (10 s); the kernel's identity carries no inode generation.
+  Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
+  refused: a signed degradation) no launch through an unlinked executor
+  is exempt and no unit's shell vouches.

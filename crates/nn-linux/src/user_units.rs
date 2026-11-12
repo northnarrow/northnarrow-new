@@ -275,5 +275,12 @@ mod tests {
             user_unit_of("0::/user.slice/user-1000.slice/session-2.scope\n"),
             None
         );
+        // a scope of the manager's is no service of its
+        assert_eq!(
+            user_unit_of(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-x-1.scope\n"
+            ),
+            None
+        );
     }
 }

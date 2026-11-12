@@ -94,24 +94,26 @@ running an inline program (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node
 shell naming nothing whose standard input the exec pump finds a file, a pipe
 or a socket) — that program is the caller's, and a webshell's `sh -c
 'openssl enc …'` made the packaged `openssl` a trusted writer (the triage's
-LOTL case). Nor does a user's service manager (`systemd --user`, the systemd
-file at a pid other than 1 that PID 1 started — a container's systemd is
-judged as any hop; the independent review of #539):
-`systemd-run --user /usr/bin/openssl enc …` was a lineage of installed
-programs end to end. Its actor is the process it started, never the
-manager. A packaged tool such a shell or manager starts is judged; a package
-transaction and PID 1's units stay trusted — an installed shell PID 1
-started (a unit's `ExecStart=/bin/sh -c …`, root's `systemd-run`) inherits
-PID 1's vouching (`impact::trust::started_by_pid1`), its own writes still
-judged. What this costs: a cron job (a user's crontab or the system's: a
-job carries no owner in this judgement), an administrator's non-interactive
-`ssh host 'cmd'` (sshd runs `bash -c`), a make recipe, a desktop session's
-services and terminal (its user's manager starts the terminal emulator)
-start their tools through an inline shell or a user's manager, and those
-tools' bursts now count — NN-L-IMP-001's kill stays held by default, its
-Critical record and the posture's `RansomwareEncryption` remain (the lab, on
-Ubuntu 24.04: a user's crontab `sh -c 'rsync -a --inplace …'` of random data
-drew one NN-L-IMP-001; the PR of lot 310). Never by `comm`, never by a name
+LOTL case). A user's service manager (`systemd --user`) vouches only for
+a process it forked for a packaged user unit (its unit file root's and a
+package's, no unit or drop-in of the user's: `nn_linux::user_units`; lot
+310b) — the desktop's terminal emulator and session services —, never for a
+transient `systemd-run --user /usr/bin/openssl enc …`; its actor is the
+process it started, never the manager. An installed shell PID 1 forked (a
+unit's `ExecStart=/bin/sh -c …`, root's `systemd-run`) inherits PID 1's
+vouching (`impact::trust::started_by_pid1`), its own writes still judged.
+"Forked" is the kernel's record at `sched_process_fork`, for the first exec
+after the fork (`HopFacts::fork_parent`; the re-check of #539, N2): a
+webshell's double-forked orphan, reaped by PID 1 before its `sh -c`, was
+forked by the webshell and vouches for nothing. What this costs: a cron job
+(a user's crontab or the system's: a job carries no owner in this
+judgement), an administrator's non-interactive `ssh host 'cmd'` (sshd runs
+`bash -c`), a make recipe start their tools through an inline shell, and
+those tools' bursts now count — NN-L-IMP-001's kill stays held by default,
+its Critical record and the posture's `RansomwareEncryption` remain (the
+lab, on Ubuntu 24.04: a user's crontab `sh -c 'rsync -a --inplace …'` of
+random data drew one NN-L-IMP-001; the PR of lot 310); a desktop session
+older than the agent (no fork record) is judged until its next login. Never by `comm`, never by a name
 list.
 
 What an interpreter runs is read from its argv with that interpreter's own

@@ -92,19 +92,22 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is a \
                           linked file, not fileless; after a systemd upgrade PID 1 launches \
                           from the old, unlinked executor until its re-exec, exempt by that \
-                          file's identity — one linked at the packaged executor's path or \
-                          held open by a running systemd manager, re-read every 10 s and \
-                          replaced (an identity no one holds any more leaves the set) — for \
-                          the first exec of a child of systemd, never by its name or \
-                          `argv[0]`. A process re-executing the very image its parent runs \
+                          file's identity — the packaged file at its install path, a copy \
+                          the host's PID 1 holds, or one a genuine user manager holds (its \
+                          image the packaged manager's, in PID 1's mount namespace), re-read \
+                          every 10 s and replaced — for the first exec of a process PID 1 or \
+                          such a manager forked (the kernel's record at sched_process_fork, \
+                          never the parent at exec time), never by its name or `argv[0]`. A \
+                          process re-executing the very image its parent runs \
                           (`/proc/self/exe` after an upgrade unlinked it: Chromium's \
                           children, Docker's `reexec`) is not fileless when that image was \
-                          executed from a directory only root can write (parents running at \
-                          the agent's start included); a user's dropped binary that unlinks \
-                          and re-executes itself is killed. Another program that re-executes \
-                          itself from a memfd (older runc versions do, to protect their \
-                          binary), or that execs a file at the instant an upgrade unlinks \
-                          it, is killed: nothing else is exempt.",
+                          executed from a directory only root can write, in PID 1's mount \
+                          namespace (parents running at the agent's start included); a \
+                          user's dropped binary that unlinks and re-executes itself is \
+                          killed. Another program that re-executes itself from a memfd \
+                          (older runc versions do, to protect their binary), or that execs a \
+                          file at the instant an upgrade unlinks it, is killed: nothing else \
+                          is exempt.",
         how_to_test: "`python3 -c 'import os; fd = os.memfd_create(\"x\"); \
                       os.write(fd, open(\"/bin/true\", \"rb\").read()); \
                       os.execv(\"/proc/self/fd/%d\" % fd, [\"x\"])'`.",
