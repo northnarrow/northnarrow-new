@@ -9577,13 +9577,26 @@ number in parentheses is a lab PR.
     its two budgeted writers caught by the ratchet (F5). Not this lot's,
     recorded: a filesystem a user mounts in their own user namespace (an
     overlay after `unshare -rm`, no container needed), a chroot into a FUSE
-    directory and one 62 levels below a guarded mount give no class
+    directory and a chroot below a guarded mount give no class
     (F4, F6: lot 323); a new image keeps the io_uring state of the one it
     replaced (`execve`, same tgid: a possible IOU-002 false positive).
+  - The re-check of #545 (merge after small fixes): the kprobes and
+    lockdown switches, non-decisive but refused at the write-open, still
+    spent the decisive attempt budget (R1), and the task denials' budget
+    carried the renices, sysctl writes and exempt-cgroup records with the
+    refused signals (R2): `is_minor_denial` is now exactly the operations
+    the posture does not take as `AntiTamperDenial` (pinned both ways), and
+    a rate-limited record spends the minor budget when it is one
+    (`limited_budget`). The identity search went past the task's root: a
+    container whose root is a directory in a home (LXC's dir backend,
+    rootless podman on vfs or btrfs) made every program of its image
+    `other_home` (R3, a false-positive scope F2 widened); it stops at the
+    task's root, as the walk does — containers and chroots as before lot
+    318, their policy lot 323's. Two stale comments (R4).
   - Host: `xtask/tests/kernel_halves.rs` (8 tests; 7 fail on `main`, the
     eighth plants a writer for the ratchet's reader), the userland tests of
     `execq::kernel` (the openSUSE and ostree layouts), `ring_drops`'s
-    decisive and minor drops, `nn-core`'s "no minor denial is decisive",
+    decisive and minor drops, `nn-core`'s minor-equals-non-decisive test,
     `wire::execq`'s virtiofs name test; 50 mutants of the new code (32
     before the review, 18 of its fixes), every one caught by a named test —
     two of the review's (the points' dedup, the points' directory check)

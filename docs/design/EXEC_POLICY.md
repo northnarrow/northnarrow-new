@@ -69,7 +69,12 @@ root is `guarded_mount` whatever its daemon says its root is (and `tmp`,
 `var_tmp`, `home` where no published root places it). A filesystem a user
 mounts in their own user namespace (an overlay at `/tmp/m` after `unshare
 -rm`), or a chroot into a FUSE directory, gives no class (not only in a
-container; follow-up lot 323, `docs/design/EXEC_QUARANTINE.md` §2). The exec quarantine refreshes them
+container; follow-up lot 323, `docs/design/EXEC_QUARANTINE.md` §2). The
+identity search stops at the task's root (the re-check of #545, R3): a
+container whose root is a directory in a home (LXC's dir backend, rootless
+podman's vfs or btrfs storage) is classed in its own view, as before lot
+318, not `home` and `other_home` by the host's `/home` above it; the
+container policy is lot 323's. The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
 Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
@@ -102,7 +107,7 @@ line of the table that is not in the kernel's shape is a degradation
 (`execq_roots_rows`, `execpol_mounts_rows`) while it lasts — a source `-`
 (`fsname=-`) or an empty one is a mount, read as such. The roots are
 ranked, the FUSE ones last (a user mounts up to `mount_max`, 1000): when
-the kernel's map (64 entries) is full, a FUSE root it holds gives way to a
+the kernel's map (1024 entries since lot 318, 64 before) is full, a FUSE root it holds gives way to a
 system root mounted after it (another user's `/run/user/<uid>`, an
 automounted `/home`). A root other than a FUSE one that the map still
 refuses is a degradation (`execq_roots_full`, `execpol_roots_full`), its

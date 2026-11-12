@@ -1256,11 +1256,15 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `/var` bind) their files are `var_tmp` and `home` now (not
   `guarded_mount`), and a file under `/home` or `/tmp` reached through a
   bind elsewhere (a container's bind of a home directory) has the point's
-  class, as it had with a separate `/home` partition. Not covered yet
-  (lot 323): a filesystem a user mounts in their own user namespace (an
+  class, as it had with a separate `/home` partition. Containers and
+  chroots keep their own view: a container whose root is a plain directory
+  in a home (LXC's dir backend, rootless podman on vfs or btrfs) is not
+  `home` or `other_home` by the host's `/home` above its root (the search
+  stops at the task's root). Not covered yet (lot 323, with the container
+  policy): a filesystem a user mounts in their own user namespace (an
   overlay after `unshare -rm`, no container needed), a chroot into a FUSE
-  directory, and a chroot 62 levels or more below a guarded mount give no
-  class. Every FUSE filesystem (`fuse`,
+  directory, and a chroot or container whose root is below a guarded mount
+  or point give no class. Every FUSE filesystem (`fuse`,
   `fuseblk`; not `virtiofs`, a VM's or a Kata container's shared
   directory, told apart by the superblock's type name) outside the task's
   root is `guarded_mount`, with the class of the point it is mounted at, or
@@ -1277,20 +1281,25 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   unreachable and `--exec-quarantine-on-expiry` applies — with `kill`, an
   AppImage or an sshfs tool run by a service from such a mount is killed;
   keep the default (`resume`) where those run.
-- **The BPF guard's refusals have a budget** (BUG37), and the refusals
-  that decide nothing have their own (the review of #545). A refused read
-  of the agent's key, a handle on its BPF objects, a refused program type
-  or root `cgroup/sysctl` attach and a loader opt-out's record: 50 a second
-  per CPU, the rest counted in the signed `ringbuf_drop` entry
-  (`minor_denial_rate`, a new slot) and never a telemetry loss — a
-  `bpftool prog list` or `map list` outside a trusted-installer window, or
-  a monitoring agent listing the BPF objects every second, records its
-  first 50 refusals in the second and raises no `TelemetryLoss`. The
+- **The BPF guard's refusals have a budget** (BUG37), and the records
+  that decide nothing have their own (the review of #545 and its
+  re-check). A refused read of the agent's key, a handle on its BPF
+  objects, a refused program type or root `cgroup/sysctl` attach, a refused
+  write of the kprobes or lockdown switch, a refused renice (nice,
+  scheduling, I/O priority) or sysctl write, a signal through a file's
+  owner, a loader or sysctl opt-out's record, a move into an exempt cgroup
+  and a code-injection record: 50 a second per CPU, the rest counted in the
+  signed `ringbuf_drop` entry (`minor_denial_rate`, a new slot) and never a
+  telemetry loss — a `bpftool prog list` or `map list` outside a
+  trusted-installer window, a monitoring agent listing the BPF objects
+  every second, a tuning daemon or a burst of opted-out sysctl writes
+  records its first 50 in the second and raises no `TelemetryLoss`. The
   decisive refusals (an unlink, rename or write-open of a protected file, a
-  write handle on or a detach of the agent's BPF objects; and the refused
-  signals and ptraces) keep their 50 a second to themselves, and one of
-  them held back (`denial_rate`, `task_denial_rate`) is a telemetry loss
-  at once, where more than 64 in a 10 s sample were. Every refusal holds.
+  write handle on or a detach of the agent's BPF objects; the refused
+  signals, ptraces, kexecs, cgroup moves and limit changes) keep their 50 a
+  second to themselves, and one of them held back (`denial_rate`,
+  `task_denial_rate`) is a telemetry loss at once, where more than 64 in a
+  10 s sample were. Every refusal holds.
   A reader of the `ringbuf_drop` counters by index sees 30 slots
   (`minor_denial_rate` is the 30th).
 - **The io_uring sensor** attaches one more program, `io_uring_exit` on

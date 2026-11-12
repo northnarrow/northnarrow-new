@@ -48,7 +48,8 @@ without it, every candidate of its classes, as here.
 
 The path classes read the walk's top components, so a container's or a
 chroot's `/tmp` is guarded in its own view; a guarded mount is found by
-identity in any view (lot 318).
+identity within the task's view (lot 318; the re-check of #545, R3: not
+above the task's root).
 
 **Roots** (`EXECQ_ROOTS`, 1024 entries since lot 318; it had 64, which a
 user's FUSE mounts under their home filled). The agent publishes, from its
@@ -68,8 +69,18 @@ its `/var/tmp` a directory of the `/var` bind — no mount at those points, so
 the mounts alone left their files without a class. A point that is a
 mount's root keeps the mount's entry. In the kernel
 (`nn_guarded_root`) the file's ancestors are looked up from its directory
-to its filesystem's root, at most 64 levels, the task's root ignored, each
-level's device as `stat()` gives it (a btrfs subvolume's own).
+to its filesystem's root or the task's own root, whichever comes first, at
+most 64 levels, each level's device as `stat()` gives it (a btrfs
+subvolume's own). The re-check of #545 (R3): the search went past the
+task's root, and a container whose root is a plain directory in a home (an
+unprivileged LXC container's `rootfs` on the dir backend, rootless
+podman's vfs or btrfs storage) took that home's class from above it —
+every program of its image, owned by its root (a host subuid), was
+`home` and `other_home`, held or recorded at every exec of a container
+user. It stops at the task's root now, as the walk does: a container or a
+chroot is classed in its own view, as before lot 318. A task of the host
+has the top of its filesystem for root, and a file of another filesystem
+never meets it.
 
 **A FUSE file** (lot 318, the review of #538, F1 and F3: N8's kernel
 half): a file of a user's FUSE filesystem (`fuse`, `fuseblk`: the
@@ -100,12 +111,16 @@ root places, gives a file no class. An overlay mounted with `unshare -rm` at
 user do it; Ubuntu 24.04 and later do not by default) ends the walk on the
 overlay's root, its names say nothing and its identity is not published, so
 `/tmp/m/payload` is neither held nor judged where `/tmp/payload` is; a
-chroot into a FUSE directory, likewise. A chroot at least 62 levels below a
-published guarded mount gets no class either: the walk stops at the task's
-root (no `UNRESOLVED`), and the identity search runs out of its 64 levels
-before the mount's root. Lot 323 classes a superblock mounted in a user
-namespace (`s_user_ns` not the initial one) like an unplaced FUSE file, and
-a search that runs out like a walk that finds no root.
+chroot into a FUSE directory, likewise. A chroot or a container whose root
+is a directory below a guarded mount or point (a jail in a home, a
+container's `rootfs` in a home) gets no class from it either, at any depth:
+the walk and the identity search both stop at the task's root (R3 above;
+before the re-check a jail 62 levels deep or more already had none). The
+container policy — what a container user's exec from its own image, from a
+home or from a user-namespace mount should be — is lot 323's: it classes a
+superblock mounted in a user namespace (`s_user_ns` not the initial one)
+like an unplaced FUSE file, and decides the chroot and container case with
+it.
 
 **A walk that finds no root** (lot 318, BUG108's variant): a file more than
 64 levels below the task's root and its filesystem's root — a path no

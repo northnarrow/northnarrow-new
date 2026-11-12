@@ -18,22 +18,30 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     review of #545, F5: `output` and any other use of the ring outside its
     two budgeted writers fail it).
   - **The decisive refusals keep their room** (the review of #545, F1 and
-    F7). The refusals signed at each attempt that decide nothing — a
-    refused read of the agent's key, a handle on its BPF objects, a refused
-    program type or root `cgroup/sysctl` attach, a loader opt-out's record
-    (`common::wire::is_minor_denial`) — spend a per-CPU budget of their own
-    (50 a second, `RING_DROPS` slot `minor_denial_rate`), never lot 293's
-    (sharing it, 50 refused handles in a second on a CPU kept out the record
-    of a refused unlink of a protected file there, the posture's decisive
-    trigger). A
-    decisive refusal held back (`denial_rate`, `task_denial_rate`) is a
+    F7, and its re-check, R1 and R2). Every record of the kernel that the
+    posture does not take as `AntiTamperDenial`
+    (`common::wire::is_minor_denial`, pinned both ways by `nn-core`'s
+    `the_kernel_s_minor_denials_are_exactly_the_non_decisive_ones_here`) —
+    a refused read of the agent's key, a handle on its BPF objects, a
+    refused program type or root `cgroup/sysctl` attach, a refused write of
+    the kprobes or lockdown switch, a refused renice, sysctl write or
+    signal through a file's owner, a loader or sysctl opt-out's record, a
+    move into an exempt cgroup, code-injection access — spends a per-CPU
+    budget of its own (50 a second, `RING_DROPS` slot `minor_denial_rate`),
+    never lot 293's attempt budget nor the task denials' (sharing them, 50
+    refused handles, or 50 refused opens of `kprobes/enabled`, in a second
+    on a CPU kept out the record of a refused unlink of a protected file
+    there, and 50 refused renices of the agent the record of a refused
+    `kill -9`: the posture's decisive trigger lost with it). A decisive
+    refusal held back (`denial_rate`, `task_denial_rate`) is a
     `TelemetryLoss` at once (it was past 64 in a 10 s sample); the
     non-decisive ones held back never are: an administrator's `bpftool map
     list` (about 150 refused handles) is counted and signed, no loss. The
-    privileged e2e `a_bpf_handle_loop_does_not_hide_a_decisive_refusal`
-    floods the guard on one CPU and refuses a new entry in
-    `/etc/northnarrow` there: its record and the posture's transition
-    arrive.
+    privileged e2e `a_bpf_handle_loop_does_not_hide_a_decisive_refusal`,
+    `a_switch_refusal_loop_does_not_hide_a_decisive_refusal` and
+    `a_renice_loop_does_not_hide_a_refused_kill` flood one CPU and refuse a
+    new entry in `/etc/northnarrow`, or a `kill -9` of the agent, there:
+    its record and the posture's transition arrive.
   - **BUG101**: the exec policy's environment deny (an `LD_PRELOAD` /
     `LD_AUDIT` entry under a staging path) applies at a set-id target too.
     It was skipped on the target's set-id bits ("the kernel sets
@@ -59,11 +67,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (the review of #545, F2): openSUSE's `/var/tmp` (a directory of its
     `@/var` subvolume), an ostree deployment's `/home` and `/var/tmp` (under
     its `/var` bind) had no class, no mount being at those points; a point
-    gives its class (`var_tmp`, `home`), not `guarded_mount`. Not covered
-    (follow-up lot 323): a filesystem a user mounts in their own user
-    namespace — an overlay at `/tmp/m` after `unshare -rm`, no container and
-    no chroot needed — or a chroot into a FUSE directory gives no class, nor
-    does a chroot 62 levels or more below a guarded mount.
+    gives its class (`var_tmp`, `home`), not `guarded_mount`. The identity
+    search stops at the task's own root (the re-check of #545, R3): a
+    container whose root is a plain directory in a home (an unprivileged
+    LXC container on the dir backend, rootless podman on vfs or btrfs) took
+    that home's class from above its root, and every program of its image
+    was `other_home`; containers and chroots are classed in their own view,
+    as before. Not covered (follow-up lot 323, with the container policy):
+    a filesystem a user mounts in their own user namespace — an overlay at
+    `/tmp/m` after `unshare -rm`, no container and no chroot needed — or a
+    chroot into a FUSE directory gives no class, nor does a chroot or a
+    container whose root is below a guarded mount or point.
   - **N8's kernel half** (the review of #538, F1 and F3): a file of a FUSE
     filesystem outside the task's root is `guarded_mount` by its
     superblock's magic (not `virtiofs`, told apart by its type's name: two
