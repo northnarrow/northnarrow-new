@@ -9303,8 +9303,12 @@ number in parentheses is a lab PR.
     copy-on-first-write guard retries its check and copies anyway; below a
     spared host-critical root only the offending lineage can be killed;
     the ratchet reads past spacing and argument forms and covers the cow,
-    the offender's and the rule policy's cgroup readers. @REVIEW-LAB@
-    @REVIEW-MUT@
+    the offender's and the rule policy's cgroup readers. A second mutation
+    round on these fixes: 29 targeted mutations; 22 caught at once, one
+    compile error rewritten and six survivors given a named test (the
+    restore's inode number where no birth time is kept, the offender's
+    filesystem uid, the partial block held until the stand-down, the
+    in-place row's `partial`, the NEUTRALIZE text); the rerun caught all 29.
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
