@@ -449,7 +449,18 @@ pub(crate) fn cgroup_pids(boot: &[u32], live: &[u32], installed: impl Fn(u32) ->
 pub(crate) fn arm_v1_policy(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<V1Policy> {
     let unified = antitamper_bpf::cgroup_guard::cgroup2_root()
         .is_some_and(|p| p == Path::new(antitamper_bpf::cgroup_guard::CGROUP2_MOUNTS[0]));
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    // lot 311 (bug hunt 1.4, F4): read as bytes — a user's FUSE mount named
+    // with bytes that are not UTF-8 made the table unreadable, and the
+    // policy was judged on an empty one; a table that cannot be read at
+    // all is said so (the policy then sees no v1 hierarchy: the stricter
+    // answer where systemd runs the unified one)
+    let mountinfo = match crate::state_read::read_state("/proc/self/mountinfo") {
+        Ok(text) => text,
+        Err(e) => {
+            crate::state_read::LastGood::new("cgroup_guard", "the mount table").failed(&e);
+            String::new()
+        }
+    };
     let policy = antitamper_bpf::cgroup_guard::v1_policy(unified, &mountinfo);
     let bits = match &policy {
         V1Policy::Refused { .. } => CGROUP_POLICY_V1_REFUSE,

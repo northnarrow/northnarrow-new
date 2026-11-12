@@ -689,7 +689,7 @@ pub fn installer_of_requester(proc_root: &Path, requester: u32) -> Option<(u32, 
 /// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
 /// after the `(comm)` field, which may hold spaces or parentheses.
 fn stat_parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
-    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
 }
@@ -1000,5 +1000,14 @@ mod tests {
         assert_eq!(installer_of_requester(proc.path(), 801), None);
         // PID 1 itself is no requester
         assert_eq!(installer_of_requester(proc.path(), 1), None);
+    }
+
+    /// Lot 311 (N6): an installer's lineage hop whose `comm` is not UTF-8
+    /// is read (parent and start) — on main the read failed.
+    #[test]
+    fn a_hop_whose_comm_is_not_utf8_has_its_parent_and_start() {
+        let t = tempfile::tempdir().unwrap();
+        crate::state_read::testing::write_non_utf8_proc(t.path(), 4301, 77, 0, 555);
+        assert_eq!(stat_parent_and_start(t.path(), 4301), Some((77, 555)));
     }
 }

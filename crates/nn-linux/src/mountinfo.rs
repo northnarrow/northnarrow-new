@@ -114,20 +114,29 @@ pub fn parse(text: &[u8]) -> MountTable {
 fn parse_line(line: &[u8]) -> Result<MountEntry, &'static str> {
     // id parent major:minor root mount_point opts [optional…] - fstype source superopts
     let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
-    if fields.iter().any(|f| f.is_empty()) {
-        return Err("an empty field (two spaces in a row)");
-    }
-    let seps: Vec<usize> = fields
+    // Lot 311 (the review of #538, F2): the separator is the FIRST field
+    // `-` from the seventh on — the optional fields (`shared:N`,
+    // `master:N`, `propagate_from:N`, `unbindable`) are never `-`, but the
+    // source after it may be: `fusermount3 -o fsname=-` makes it `-`, and
+    // an empty `fsname=` makes it empty (the kernel then writes two spaces
+    // in a row). Both are a mount, read as such; refused, they took a
+    // user's mount out of every table that judges it.
+    let Some(sep) = fields
         .iter()
         .enumerate()
-        .filter(|(i, f)| *i >= 6 && **f == b"-")
-        .map(|(i, _)| i)
-        .collect();
-    let [sep] = seps[..] else {
-        return Err("not exactly one `-` separator after the mount options");
+        .position(|(i, f)| i >= 6 && *f == b"-")
+    else {
+        return Err("no `-` separator after the mount options");
     };
     if fields.len() != sep + 4 {
         return Err("not the filesystem type, the source and the super options after `-`");
+    }
+    if fields
+        .iter()
+        .enumerate()
+        .any(|(i, f)| f.is_empty() && i != sep + 2)
+    {
+        return Err("an empty field (two spaces in a row)");
     }
     let id = number(fields[0]).ok_or("the mount id is not a number")?;
     let parent = number(fields[1]).ok_or("the parent id is not a number")?;
@@ -186,6 +195,50 @@ fn unescape_bytes(field: &[u8]) -> Vec<u8> {
 
 fn unescape(field: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(&unescape_bytes(field)))
+}
+
+/// Lot 311 (the review of #538, F1): a FUSE filesystem's type — `fuse`,
+/// `fuseblk`, `fuse.<name>`. Its daemon, the mount's user, answers every
+/// `stat` of it (the root's inode number included: the kernel takes it from
+/// each answer) and may not answer at all: such a mount is told by its type
+/// and its device, never by a root key read from it.
+pub fn is_fuse(fstype: &OsStr) -> bool {
+    let t = fstype.as_bytes();
+    t == b"fuse" || t == b"fuseblk" || t.starts_with(b"fuse.")
+}
+
+impl MountEntry {
+    /// The device in the kernel's encoding (`MKDEV`: major << 20 | minor),
+    /// as the BPF records and the inode keys carry it.
+    pub fn kernel_dev(&self) -> u64 {
+        (u64::from(self.major) << 20) | u64::from(self.minor)
+    }
+
+    /// Lot 311 (the review of #538, F1 and F7): the root this mount shows
+    /// at its mount point — `(kernel dev, inode)` — read without following
+    /// a link (`O_PATH | O_NOFOLLOW | O_DIRECTORY`: a mount point a user
+    /// replaced by a link to another filesystem's root is not read through
+    /// it), and only while it is this mount's device (btrfs excepted: a
+    /// subvolume shows a device of its own). `None` for a FUSE mount
+    /// ([`is_fuse`]: never `stat`ed — its daemon names the root and may
+    /// stall the caller) and for a mount point that does not show it.
+    pub fn root_key(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if is_fuse(&self.fstype) {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&self.mount_point)
+            .ok()?;
+        let st = file.metadata().ok()?;
+        let dev = (u64::from(libc::major(st.dev())) << 20) | u64::from(libc::minor(st.dev()));
+        if dev != self.kernel_dev() && self.fstype.as_bytes() != b"btrfs" {
+            return None;
+        }
+        Some((dev, st.ino()))
+    }
 }
 
 /// Whether `m` is a bind of a directory onto itself (lab PR 265): the mount
@@ -293,6 +346,80 @@ mod tests {
                 t.malformed[0]
             );
         }
+    }
+
+    /// Lot 311 (the review of #538, F2): a source `-` (`fusermount3 -o
+    /// fsname=-`) and an empty source (the kernel writes two spaces) are
+    /// mounts, read as such — refused, a user's mount left every table.
+    #[test]
+    fn a_source_that_is_a_dash_or_empty_is_a_mount() {
+        for (text, source) in [
+            (
+                "57 29 0:44 / /home/u/mnt rw,nosuid,nodev shared:5 - fuse.x - rw,user_id=1000",
+                "-",
+            ),
+            (
+                "58 29 0:45 / /tmp/x rw,nosuid,nodev - tmpfs  rw,size=1024k",
+                "",
+            ),
+            ("59 29 0:46 / /dev/shm/y rw - fuse - rw", "-"),
+        ] {
+            let t = line(text);
+            assert!(t.malformed.is_empty(), "{text}: {:?}", t.malformed);
+            assert_eq!(t.entries.len(), 1, "{text}");
+            assert_eq!(t.entries[0].source, OsStr::new(source), "{text}");
+        }
+        // an empty field anywhere else is still not the kernel's shape
+        let t = line("57 29 0:44  /home/u/mnt rw - fuse.x x rw");
+        assert!(t.entries.is_empty());
+    }
+
+    /// Lot 311 (the review of #538, F1, F7): a FUSE mount is told by its
+    /// type and never `stat`ed; another mount's root is read without
+    /// following a link, and only while it shows the mount's device.
+    #[test]
+    fn a_root_key_is_read_without_a_link_and_never_from_fuse() {
+        use std::os::unix::fs::MetadataExt;
+        for t in ["fuse", "fuseblk", "fuse.sshfs", "fuse.rev538"] {
+            assert!(is_fuse(OsStr::new(t)), "{t}");
+        }
+        for t in ["fusectl", "tmpfs", "ext4", "fuse_"] {
+            assert!(!is_fuse(OsStr::new(t)), "{t}");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let st = std::fs::metadata(d.path()).unwrap();
+        let (maj, min) = (libc::major(st.dev()), libc::minor(st.dev()));
+        let row = |mp: &Path, fstype: &str, minor: u32| {
+            let text = format!(
+                "40 22 {maj}:{minor} / {} rw - {fstype} x rw\n",
+                mp.display()
+            );
+            parse(text.as_bytes()).entries.remove(0)
+        };
+        let key = (u64::from(maj) << 20 | u64::from(min), st.ino());
+        assert_eq!(row(d.path(), "ext4", min).root_key(), Some(key));
+        assert_eq!(
+            row(d.path(), "fuse.x", min).root_key(),
+            None,
+            "FUSE: never stat'ed"
+        );
+        assert_eq!(
+            row(d.path(), "ext4", min + 1).root_key(),
+            None,
+            "another device"
+        );
+        assert_eq!(
+            row(d.path(), "btrfs", min + 1).root_key(),
+            Some(key),
+            "a subvolume"
+        );
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert_eq!(
+            row(&link, "ext4", min).root_key(),
+            None,
+            "a link is not followed"
+        );
     }
 
     #[test]

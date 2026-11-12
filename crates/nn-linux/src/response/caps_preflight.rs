@@ -184,8 +184,8 @@ fn capget_effective() -> std::io::Result<u64> {
 /// `CapEff` of this thread's `/proc/thread-self/status` (the same thread
 /// `capget` asks about); `/proc/self/status` on a kernel before 3.17.
 fn proc_cap_eff() -> Result<u64, String> {
-    let status = std::fs::read_to_string("/proc/thread-self/status")
-        .or_else(|_| std::fs::read_to_string("/proc/self/status"))
+    let status = crate::state_read::read_state("/proc/thread-self/status")
+        .or_else(|_| crate::state_read::read_state("/proc/self/status"))
         .map_err(|e| format!("/proc/thread-self/status: {e}"))?;
     parse_cap_eff(&status).ok_or_else(|| "/proc/thread-self/status: no CapEff to parse".into())
 }

@@ -35,6 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cgroup_floors::{below_floor, floor_on, FloorRole};
+use crate::config_read::{read_config, Config};
 use common::cgroup_limits::limit_kind_of;
 
 /// The unit search path, highest precedence first: where the drop-ins and
@@ -143,7 +144,8 @@ impl HostLimits {
     /// percentage of it is then not judged harmful).
     pub fn read() -> Self {
         let f = crate::cgroup_floors::Host::read();
-        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        // the kernel's files: a value that cannot be read is taken as large
+        let read = |p: &str| read_config(Path::new(p)).text().unwrap_or_default();
         let words = |t: String| {
             t.split([',', ' ', '\n'])
                 .filter(|w| !w.is_empty())
@@ -272,6 +274,14 @@ impl Harm {
     /// One line for the journal and the signed drift.
     pub fn detail(&self) -> String {
         match self.kind {
+            // the review of #538 (G1): a drop-in the judge cannot read
+            Kind::Harmful if self.directive.is_empty() => format!(
+                "{} reaches {}: {}; held for our units by the deny hooks and the floors \
+                 at every registration; the drop-in is the host's (left in place)",
+                self.path.display(),
+                self.reach.who(),
+                self.why
+            ),
             Kind::Harmful => format!(
                 "{} sets {}={} for {}: {}; held for our units by the deny hooks and the floors \
                  at every registration; the drop-in is the host's (left in place)",
@@ -626,18 +636,26 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         }),
         "EnvironmentFile" => {
             let p = v.trim_start_matches('-');
-            let text = std::fs::read_to_string(p).unwrap_or_default();
-            text.lines().find_map(|l| {
-                let var = l
-                    .trim()
-                    .trim_start_matches("export ")
-                    .split('=')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
-                dangerous_env(var)
-                    .then(|| format!("{var} set in our units' environment (from {p})"))
-            })
+            // lot 311 (F4): read as bytes — a byte that is not UTF-8 (a
+            // Latin-1 comment) hid the whole file and its LD_PRELOAD; the
+            // review of #538 (G1): what the judge cannot read — a FIFO
+            // systemd reads from its writer, a socket, a device, a refused
+            // file — is harmful, never an empty file
+            match read_config(Path::new(p)) {
+                Config::Absent => None,
+                Config::Unjudgeable(why) => Some(format!("EnvironmentFile={p}: {why}")),
+                Config::Text(text) => text.lines().find_map(|l| {
+                    let var = l
+                        .trim()
+                        .trim_start_matches("export ")
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    dangerous_env(var)
+                        .then(|| format!("{var} set in our units' environment (from {p})"))
+                }),
+            }
         }
         _ => None,
     }
@@ -844,8 +862,25 @@ pub fn harmful(roots: &[&Path], host: &HostLimits) -> Vec<Harm> {
                 if path.extension().and_then(|x| x.to_str()) != Some("conf") {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
+                // lot 311 (F4): read as bytes — a drop-in with one byte that
+                // is not UTF-8 (a Latin-1 comment) was skipped whole, its
+                // harmful directives unseen; the review of #538 (G1): one
+                // the judge cannot read (a link to a FIFO, a device, a
+                // refused file) is harmful as a whole
+                let text = match read_config(&path) {
+                    Config::Absent => continue,
+                    Config::Text(t) => t,
+                    Config::Unjudgeable(why) => {
+                        out.push(Harm {
+                            path: path.clone(),
+                            directive: String::new(),
+                            value: String::new(),
+                            why,
+                            reach: *reach,
+                            kind: Kind::Harmful,
+                        });
+                        continue;
+                    }
                 };
                 for (key, value) in effective(directives(&text)) {
                     let found = harms(*reach, &key, &value, host)
@@ -1156,6 +1191,162 @@ mod tests {
         assert_eq!(
             directives("[Service]\n# MemoryMax=4K\n; TasksMax=1\nEnvironment=A=1 \\\n  NN_X=1\n"),
             vec![("Environment".to_string(), "A=1  NN_X=1".to_string())]
+        );
+    }
+
+    /// Lot 311 (the mini-hunt of bug hunt 1.4's F4): a drop-in with one byte
+    /// that is not UTF-8 (a Latin-1 comment) is still judged — on main its
+    /// read failed and the whole file was skipped, its harmful directive
+    /// unseen; an `EnvironmentFile=` with such a byte still shows its
+    /// `LD_PRELOAD`.
+    #[test]
+    fn a_latin1_comment_does_not_hide_a_harmful_drop_in() {
+        let root = tempfile::tempdir().unwrap();
+        let svc = root.path().join("service.d");
+        std::fs::create_dir_all(&svc).unwrap();
+        let mem = svc.join("50-mem.conf");
+        std::fs::write(&mem, b"# r\xe9glage\n[Service]\nMemoryMax=4K\n").unwrap();
+        let r = harmful(&[root.path()], &host());
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(
+            (r[0].path.as_path(), r[0].kind),
+            (mem.as_path(), Kind::Harmful)
+        );
+        let env = root.path().join("env");
+        std::fs::write(&env, b"# r\xe9glage\nLD_PRELOAD=/tmp/x.so\n").unwrap();
+        let found = h(
+            Reach::Services,
+            &format!("EnvironmentFile={}", env.display()),
+        );
+        assert!(
+            found.as_deref().is_some_and(|w| w.contains("LD_PRELOAD")),
+            "{found:?}"
+        );
+    }
+
+    /// The review of #538 (G1): the judge of an `EnvironmentFile=` named
+    /// `p` — harmful, and why.
+    fn env_file_harm(p: &Path) -> String {
+        h(
+            Reach::Services,
+            &format!("EnvironmentFile=-{}", p.display()),
+        )
+        .unwrap_or_else(|| panic!("{} judged harmless", p.display()))
+    }
+
+    fn mkfifo(p: &Path) {
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// G1: a FIFO `EnvironmentFile=` — systemd reads it from its writer
+    /// (the reviewer's `systemd-run -p EnvironmentFile=<fifo>`: the service
+    /// got the writer's variable) — is harmful: the judge cannot see the
+    /// `LD_PRELOAD` it would carry. Before: judged an empty file.
+    #[test]
+    fn a_fifo_environment_file_is_harmful() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("env");
+        mkfifo(&fifo);
+        let why = env_file_harm(&fifo);
+        assert!(why.contains("a FIFO, not a regular file"), "{why}");
+        // named through a link, the same
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        assert!(env_file_harm(&link).contains("a FIFO"));
+    }
+
+    /// G1: a socket `EnvironmentFile=` is harmful.
+    #[test]
+    fn a_socket_environment_file_is_harmful() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("env");
+        let _l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        assert!(env_file_harm(&p).contains("a socket"));
+    }
+
+    /// G1: a character device `EnvironmentFile=` is harmful (`/dev/zero`, a
+    /// terminal) — `/dev/null`, which reads nothing for systemd too, is not.
+    #[test]
+    fn a_character_device_environment_file_is_harmful_but_dev_null_is_not() {
+        assert!(env_file_harm(Path::new("/dev/zero")).contains("a character device"));
+        assert!(env_file_harm(Path::new("/dev/tty")).contains("a character device"));
+        assert_eq!(h(Reach::Services, "EnvironmentFile=/dev/null"), None);
+    }
+
+    /// G1: a block device `EnvironmentFile=` is harmful.
+    #[test]
+    fn a_block_device_environment_file_is_harmful() {
+        use std::os::unix::fs::FileTypeExt;
+        let block = std::fs::read_dir("/dev")
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_type().is_ok_and(|t| t.is_block_device()))
+            .map(|e| e.path())
+            .expect("a block device under /dev");
+        assert!(env_file_harm(&block).contains("a block device"));
+    }
+
+    /// G1: a directory where the `EnvironmentFile=` should be is harmful; a
+    /// file that is not there (`-` optional) is not.
+    #[test]
+    fn a_directory_environment_file_is_harmful_and_a_missing_one_is_not() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(env_file_harm(d.path()).contains("a directory"));
+        let none = d.path().join("none");
+        assert_eq!(
+            h(
+                Reach::Services,
+                &format!("EnvironmentFile=-{}", none.display())
+            ),
+            None
+        );
+    }
+
+    /// G1: a drop-in the judge cannot read — a `.conf` linked to a FIFO or
+    /// a device, or a directory so named — is harmful as a whole, and
+    /// withholds a reload; one masked by a link to `/dev/null` (systemd's
+    /// way) is not.
+    #[test]
+    fn a_drop_in_the_judge_cannot_read_is_harmful() {
+        let root = tempfile::tempdir().unwrap();
+        let svc = root.path().join("service.d");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::os::unix::fs::symlink("/dev/null", svc.join("10-timeout-abort.conf")).unwrap();
+        assert!(harmful(&[root.path()], &host()).is_empty(), "a mask");
+        let fifo = root.path().join("fifo");
+        mkfifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, svc.join("20-x.conf")).unwrap();
+        std::fs::create_dir(svc.join("30-y.conf")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", svc.join("40-z.conf")).unwrap();
+        let r = harmful(&[root.path()], &host());
+        let whys: Vec<(&str, &str)> = r
+            .iter()
+            .map(|h| {
+                (
+                    h.path.file_name().unwrap().to_str().unwrap(),
+                    h.why.split(',').next().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            whys,
+            [
+                ("20-x.conf", "a FIFO"),
+                ("30-y.conf", "a directory"),
+                ("40-z.conf", "a character device")
+            ]
+        );
+        assert!(r.iter().all(|h| h.kind == Kind::Harmful));
+        assert!(withholding(&r).is_some(), "a reload is withheld");
+        assert!(
+            r[0].detail().contains(
+                "reaches northnarrow-agent.service and northnarrow-watchdog.service: a FIFO, \
+                 not a regular file"
+            ),
+            "{}",
+            r[0].detail()
         );
     }
 }

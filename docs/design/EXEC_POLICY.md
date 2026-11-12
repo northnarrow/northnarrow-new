@@ -59,6 +59,47 @@ which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
 and one on a separate `/home` is `home`. The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
+Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
+is read as bytes (`nn_linux::mountinfo`). Read as text, one mount whose point
+or source is not UTF-8 — an unprivileged user's FUSE mount (`fusermount3`)
+at `~/\xff` — emptied it: the roots removed, and here the slices unpublished
+(every caller `UNKNOWN`, `NO_SLICES`: a service's deny became an audit). A
+table that cannot be read at all leaves the slices and roots last published
+in force, never zeros or an empty set, with a degradation
+(`execpol_mounts`, `execq_roots`) while it fails, withdrawn at the next good
+read. A btrfs subvolume mounted at a guarded point (`/home` on Fedora and
+openSUSE: `subvol=/home`) is published although its root field is not `/`,
+when no mount of that filesystem is its root (a bind mount of a directory of
+a filesystem mounted elsewhere stays out); the kernel's walk to it is lot 9's
+(the userland half only here).
+
+The independent review of #538 (lot 311b): a FUSE mount — any, wherever it
+is mounted (a user's, through `fusermount3`, in `~/mnt` or in a world-writable
+directory) — is classed by its type (`fuse`, `fuseblk`, `fuse.*`) and keyed
+in `EXECQ_ROOTS` by its device alone, `(dev, 0)`: its daemon (the user) names
+its root's inode and changes it at will (`fuse_change_attributes_common`
+takes the inode number from every answer), and root may not `stat` it (no
+`allow_other`) or be stalled by it. The kernel's half — telling a FUSE file
+by its superblock's magic in the exec hooks and looking `(s_dev, 0)` up — is
+lot 318's. Any other root is read without following a link
+(`O_PATH | O_NOFOLLOW | O_DIRECTORY`) and only while its mount point shows the
+line's device (a btrfs subvolume excepted): a mount point a user swapped for
+a link to another filesystem's root no longer gets that root published. A
+line of the table that is not in the kernel's shape is a degradation
+(`execq_roots_rows`, `execpol_mounts_rows`) while it lasts — a source `-`
+(`fsname=-`) or an empty one is a mount, read as such. The roots are
+ranked, the FUSE ones last (a user mounts up to `mount_max`, 1000): when
+the kernel's map (64 entries) is full, a FUSE root it holds gives way to a
+system root mounted after it (another user's `/run/user/<uid>`, an
+automounted `/home`). A root other than a FUSE one that the map still
+refuses is a degradation (`execq_roots_full`, `execpol_roots_full`), its
+text the same whatever the count and standing 5 minutes at least once
+reported (one signed record per hold, however often the count comes and
+goes); a FUSE root left out is no loss — the exec hooks class a FUSE file
+by its magic (lot 318) — and only logged. A degradation that ends within
+the 15 s before its flush is signed at its withdrawal: every one leaves its
+record in the chain.
+
 ## 3. Lineage tiers
 
 Computed in the kernel at the exec, from signals a process cannot set for

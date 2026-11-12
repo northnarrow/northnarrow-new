@@ -399,7 +399,7 @@ pub fn is_own_thread(tid: i32) -> bool {
 
 /// The thread group (process) of `tid`, from `/proc/<tid>/status`.
 pub fn tgid_of(tid: i32) -> Option<u32> {
-    let text = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    let text = nn_linux::state_read::read_state(format!("/proc/{tid}/status")).ok()?;
     text.lines()
         .find_map(|l| l.strip_prefix("Tgid:"))
         .and_then(|v| v.trim().parse().ok())
@@ -736,6 +736,24 @@ mod tests {
             !listed || tgid == Some(me),
             "tid {child}: listed {listed}, tgid {tgid:?}"
         );
+    }
+
+    /// Lot 311 (N6): the thread group of a writer whose `comm` is not UTF-8
+    /// (a ransomware names itself as it likes) is read from its `status`;
+    /// and the copy-on-write store sees it running, with its start — on
+    /// main neither read worked: the writer had no start, and a restore
+    /// ran while it still wrote ("not alive").
+    #[test]
+    fn a_writer_whose_comm_is_not_utf8_is_known_and_seen_running() {
+        let p = nn_linux::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let pid = p.pid();
+        assert_eq!(tgid_of(pid as i32), Some(pid));
+        let start = super::super::trust::proc_start_ticks(std::path::Path::new("/proc"), pid);
+        assert!(start.is_some(), "its start unread");
+        assert!(super::super::store::alive(super::super::trust::ProcId {
+            pid,
+            start: start.unwrap()
+        }));
     }
 
     /// The blocked-task read works on this host for a thread of our own

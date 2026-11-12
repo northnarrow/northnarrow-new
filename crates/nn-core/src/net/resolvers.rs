@@ -87,12 +87,20 @@ fn stamp(path: &Path) -> Stamp {
 /// Bound on a file read (a resolv.conf is a few hundred bytes).
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 
-fn read_bounded(path: &Path) -> Option<String> {
+/// Lot 311 (bug hunt 1.4, BUG-105): the file's first [`MAX_FILE_BYTES`]
+/// as text, read as bytes — a Latin-1 comment, or a character the bound
+/// cuts in two, dropped the whole file (and its `nameserver` lines) when
+/// the read was a strict `read_to_string`. `Ok(None)`: no such file.
+fn read_bounded(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
-    let mut s = String::new();
-    f.take(MAX_FILE_BYTES).read_to_string(&mut s).ok()?;
-    Some(s)
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    f.take(MAX_FILE_BYTES).read_to_end(&mut bytes)?;
+    Ok(Some(crate::posture::host::state_text(bytes)))
 }
 
 struct State {
@@ -183,8 +191,19 @@ impl HostResolvers {
         }
         let mut set = BTreeSet::new();
         for path in &self.files {
-            if let Some(text) = read_bounded(path) {
-                set.extend(parse_resolv_conf(&text));
+            match read_bounded(path) {
+                Ok(Some(text)) => set.extend(parse_resolv_conf(&text)),
+                Ok(None) => {}
+                Err(e) => {
+                    // lot 311 (F4): a file there but unreadable leaves the
+                    // set last read in force, read again at the next check
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "resolver file unreadable — the resolvers last read stay in force"
+                    );
+                    return;
+                }
             }
         }
         st.set = set;
@@ -276,5 +295,71 @@ mod tests {
         let r = HostResolvers::fixed(["192.0.2.53".parse().unwrap()]);
         assert!(r.contains(&"::ffff:192.0.2.53".parse().unwrap()));
         assert!(!HostResolvers::none().contains(&"192.0.2.53".parse().unwrap()));
+    }
+}
+
+/// Lot 311 (bug hunt 1.4, BUG-105): one byte that is not UTF-8 (a Latin-1
+/// comment, a character cut by the 64 KiB bound) made `read_bounded` drop
+/// the whole file: no `nameserver` line of it was a resolver.
+#[cfg(test)]
+mod bug105 {
+    use super::*;
+
+    #[test]
+    fn a_non_utf8_comment_does_not_hide_the_nameserver() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("resolv.conf");
+        std::fs::write(&a, b"# r\xe9seau local\nnameserver 192.168.1.1\n").unwrap();
+        let r = HostResolvers::from_files(vec![a]);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(
+            r.contains(&ip),
+            "192.168.1.1 is a nameserver line of the file, the set is {:?}",
+            r.snapshot()
+        );
+    }
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_does_not_hide_the_nameserver() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("resolv.conf");
+        let mut text = b"nameserver 192.168.1.1\n#".to_vec();
+        // pad so that "é" (C3 A9) straddles bytes 65535/65536
+        text.resize(MAX_FILE_BYTES as usize - 1, b'x');
+        text.extend_from_slice("é\n".as_bytes());
+        std::fs::write(&a, &text).unwrap();
+        let r = HostResolvers::from_files(vec![a]);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(r.contains(&ip), "the set is {:?}", r.snapshot());
+    }
+
+    /// Guard: the same comment in UTF-8 is ignored and the line read.
+    #[test]
+    fn a_utf8_comment_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("resolv.conf");
+        std::fs::write(&a, "# réseau local\nnameserver 192.168.1.1\n").unwrap();
+        let r = HostResolvers::from_files(vec![a]);
+        assert!(r.contains(&"192.168.1.1".parse().unwrap()));
+    }
+
+    /// Lot 311 (F4): a resolver file there but unreadable (a directory in
+    /// its place: the read fails) leaves the set last read in force — not
+    /// an empty set; a file removed takes its resolvers with it.
+    #[test]
+    fn an_unreadable_file_keeps_the_set_last_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("resolv.conf");
+        std::fs::write(&a, "nameserver 192.0.2.53\n").unwrap();
+        let r = HostResolvers::from_files(vec![a.clone()]);
+        let ip: IpAddr = "192.0.2.53".parse().unwrap();
+        assert!(r.contains(&ip));
+        std::fs::remove_file(&a).unwrap();
+        std::fs::create_dir(&a).unwrap();
+        r.refresh(Instant::now());
+        assert!(r.contains(&ip), "the set is {:?}", r.snapshot());
+        std::fs::remove_dir(&a).unwrap();
+        r.refresh(Instant::now());
+        assert!(!r.contains(&ip), "a removed file's resolvers go");
     }
 }

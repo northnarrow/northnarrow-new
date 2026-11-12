@@ -203,7 +203,7 @@ mod tests {
             .expect("the grandchild's pid on stderr");
         let deadline = Instant::now() + Duration::from_secs(3);
         let gone = || {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            crate::state_read::read_state(format!("/proc/{pid}/stat"))
                 .map(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
                 .unwrap_or(true)
         };

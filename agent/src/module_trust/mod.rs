@@ -337,7 +337,7 @@ impl Controller {
                 None => warn!("module-load judge: rpm not asked — no rpm file vouched for"),
             }
         }
-        let boot_sec = std::fs::read_to_string("/proc/stat")
+        let boot_sec = nn_linux::state_read::read_state("/proc/stat")
             .ok()
             .and_then(|s| scan::boot_time(&s))
             .unwrap_or(i64::MAX);

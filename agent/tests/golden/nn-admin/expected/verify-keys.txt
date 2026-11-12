@@ -135,7 +135,8 @@ exit: 1
 --- stdout
 (empty)
 --- stderr
-| verify-keys: reading admin.pub: stream did not contain valid UTF-8
+| verify-keys: line 1 is not a key (the agent skips it): pub key must be 64 hex chars (got 6)
+| verify-keys: no valid pub keys installed
 
 ### verify-keys.missing
 $ nn-admin verify-keys --path absent.pub
