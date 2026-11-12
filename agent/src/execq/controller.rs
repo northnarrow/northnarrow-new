@@ -373,8 +373,6 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         // thread: the guarded locations a package never uses skip it.
         loop {
             if stopping.load(Ordering::Relaxed) {
-                #[cfg(feature = "debug-trigger")]
-                self.debug_hold_reports_unread();
                 self.stop_all();
                 return;
             }
@@ -385,27 +383,18 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     }
 
     /// Lot 317 (review F6): a `debug-trigger` build's
-    /// `NN_DEBUG_EXECQ_STOP_UNREAD_MS=<ms>` (the lab's privileged e2e, never a
-    /// release): at the stop, the heartbeat kept fresh and the ring left
-    /// unread for that long (at most 1 s, under the kernel's 1.5 s bound),
-    /// so that the kernel stops processes whose report the agent has not
-    /// read — the window of BUG-118, held open. With
-    /// `NN_DEBUG_EXECQ_STOP_NO_LAST_READ=1` the stop's last read of the ring
-    /// is skipped too ([`Self::stop_all`]), so that the map alone names them.
+    /// `NN_DEBUG_EXECQ_PAUSE_READS=<file>` (the lab's privileged e2e, never a
+    /// release): while that file exists the ring is not read — the
+    /// heartbeat beats on, so the kernel stops processes whose report the
+    /// agent does not read: the window of BUG-118, held open from before
+    /// the stop is asked (the stop's own 2 s budget untouched). With
+    /// `NN_DEBUG_EXECQ_STOP_NO_LAST_READ=1` the stop's last read of the
+    /// ring is skipped too ([`Self::stop_all`]), so that the map alone names
+    /// them.
     #[cfg(feature = "debug-trigger")]
-    fn debug_hold_reports_unread(&mut self) {
-        let Some(ms) = std::env::var("NN_DEBUG_EXECQ_STOP_UNREAD_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        else {
-            return;
-        };
-        warn!(
-            ms,
-            "debug-trigger: the exec quarantine's stop holds the ring unread"
-        );
-        self.k.beat(kernel::monotonic_ns());
-        std::thread::sleep(Duration::from_millis(ms.min(1000)));
+    fn debug_reads_paused() -> bool {
+        std::env::var_os("NN_DEBUG_EXECQ_PAUSE_READS")
+            .is_some_and(|f| std::path::Path::new(&f).exists())
     }
 
     /// One pass: heartbeat, scanner, ring, dispatch, decisions. Returns
@@ -460,7 +449,13 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             self.on_scanner(ev, now);
         }
         let mut raws = Vec::new();
-        self.k.drain(&mut raws);
+        #[cfg(feature = "debug-trigger")]
+        let read = !Self::debug_reads_paused();
+        #[cfg(not(feature = "debug-trigger"))]
+        let read = true;
+        if read {
+            self.k.drain(&mut raws);
+        }
         for raw in raws {
             self.on_stop(raw, now);
         }

@@ -9223,17 +9223,32 @@ number in parentheses is a lab PR.
     three probes are named tests now; 12 more tests; the second mutation
     round 20 mutants, 20 caught by a named test.
   - Lab, measured (ubuntu2604, 7.0.0-43, the review's fixes at 3ce97ad3):
-    the e2e's three cases — the plain stop, the window held open 600 ms by
-    a `debug-trigger` hook with the ring read a last time, and the same
-    with that read skipped so the map alone names them — passed in runs 2
-    and 3: 1,007–1,074 held at the stop in the plain case; 404 processes
-    resumed without an entry in each window case (the ring's capacity:
-    the kernel stopped no more once it was full), none left in state T,
-    the cgroup not frozen; the eBPF object with the new order passed the
-    7.0 verifier. In run 1, on the fresh guest, the plain case passed and
-    the two others were refused their start (a second agent in one run
-    against the first's pins): the e2e now purges the pin root before
-    each agent, as the canary and FIM suites do.
+    the plain case and two cases with the window held open (a
+    `debug-trigger` hook that kept the ring unread for 600 ms at the stop;
+    one with the stop's last read of the ring skipped, so that the map
+    alone names them) passed in runs 2 and 3: 1,007–1,074 held at the stop
+    in the plain case; 404 processes resumed without an entry in each
+    window case (the ring's capacity: the kernel stopped no more once it
+    was full), none left in state T, the cgroup not frozen; the eBPF object
+    with the new order passed the 7.0 verifier. In run 1, on the fresh
+    guest, the two window cases were refused their start (a second agent
+    in one run against the first's pins): the e2e purges the pin root
+    before each agent now, as the canary and FIM suites do. The PR's CI on
+    22.04 (5.15) then failed both window cases: the 600 ms hold ate the
+    stop's 2 s budget (`stop_deadline`) and the controller's stop was cut
+    (no `stopping` entry; the processes left in the pinned map for a next
+    start the test never makes). The hook now pauses the ring's reads from
+    a file the test creates 300 ms *before* it asks the stop
+    (`NN_DEBUG_EXECQ_PAUSE_READS`), so the stop runs at its own pace;
+    @LAB3@
+  - The re-check of #541 (MERGE): the stop also kills a held entry whose
+    verdict asks for it, the rules' verdict still awaited (N1, it was
+    resumed undecided); `owe_kill` rewrites a pid's entry only when it
+    names the same start (N2); the ratchet refuses a `match` on `Liveness`
+    with a catch-all arm. Mutation: 6 mutants, 4 caught, 1 equivalent (a
+    redundant clause, removed), 1 survivor: `Kernel::owe_kill`'s guard over
+    the aya map, which the host tests cannot build (its decision,
+    `entry_is_its_own`, is tested).
   - Level unchanged.
 - **Lot 314 — the state machines of the third external bug hunt, tested as
   such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,

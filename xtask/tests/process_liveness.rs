@@ -189,11 +189,11 @@ fn catch_all_matches(src: &str) -> Vec<(usize, String)> {
         }
         if arm_patterns(inner).iter().any(|p| {
             let p = p.split(" if ").next().unwrap_or(p).trim();
-            p == "_"
-                || (!p.is_empty()
-                    && p.bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-                    && p.as_bytes()[0] != b'0')
+            // `_`, or a bare binding (`other`): lower-case, digits, `_`
+            !p.is_empty()
+                && p.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                && !p.as_bytes()[0].is_ascii_digit()
         }) {
             let line = code[..at].matches('\n').count() + 1;
             let end = code[at..].find('\n').map_or(code.len(), |i| at + i);

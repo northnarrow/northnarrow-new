@@ -225,15 +225,16 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
 }
 
 /// Lot 317 (the review of #541, F6): the window of BUG-118 held open — a
-/// `debug-trigger` build's agent keeps its heartbeat fresh and the ring
-/// unread for 600 ms at the stop, so that the kernel stops processes whose
-/// report the agent never reads before it stops. The stop resumes them all
-/// (the signed `unreported`), from the ring's last read.
+/// `debug-trigger` build's agent stops reading the ring 300 ms before the
+/// stop is asked (`NN_DEBUG_EXECQ_PAUSE_READS`, the heartbeat beating on),
+/// so that the kernel stops processes whose report the agent never reads
+/// before it stops. The stop resumes them all (the signed `unreported`),
+/// from the ring's last read.
 #[cfg(feature = "debug-trigger")]
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn a_stop_with_reports_left_unread_resumes_them() {
-    let unreported = burst_and_stop("unread", &[("NN_DEBUG_EXECQ_STOP_UNREAD_MS", "600")]);
+    let unreported = burst_and_stop("unread", &[("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE)]);
     assert!(
         unreported > 0,
         "no process held without an entry: the window was not held open"
@@ -250,7 +251,7 @@ fn the_map_alone_names_what_the_stop_resumes() {
     let unreported = burst_and_stop(
         "map",
         &[
-            ("NN_DEBUG_EXECQ_STOP_UNREAD_MS", "600"),
+            ("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE),
             ("NN_DEBUG_EXECQ_STOP_NO_LAST_READ", "1"),
         ],
     );
@@ -277,9 +278,13 @@ fn wipe_pin_tree() {
     let _ = std::fs::remove_dir(pin);
 }
 
+/// The placeholder of `NN_DEBUG_EXECQ_PAUSE_READS`'s value: the test's
+/// pause file, created 300 ms before the stop is asked.
+const PAUSE: &str = "@pause@";
+
 /// A burst, a signed stop in its middle, the checks; `env`: the agent's
-/// extra variables. Returns how many processes the stop resumed without an
-/// entry (`unreported`).
+/// extra variables (`PAUSE`: the pause file). Returns how many processes
+/// the stop resumed without an entry (`unreported`).
 fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     common::require_root("run the exec quarantine's stop e2e");
     common::require_disposable_host("run the exec quarantine's stop e2e");
@@ -334,8 +339,13 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     let log = dir.join("agent.log");
     let out = std::fs::File::create(&log).unwrap();
     let err = out.try_clone().unwrap();
+    let pause = dir.join("nn-execq-pause-reads");
+    let pause_s = pause.display().to_string();
     let mut agent_env = vec![("NO_COLOR", "1")];
-    agent_env.extend_from_slice(env);
+    for (k, v) in env {
+        agent_env.push((k, if *v == PAUSE { pause_s.as_str() } else { v }));
+    }
+    let pausing = env.iter().any(|(_, v)| *v == PAUSE);
     let child = installed_agent
         .command(&state, Launch::Sudo, &agent_env)
         .arg("--combat-rules")
@@ -399,6 +409,12 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
         .filter(|c| proc_state(c.id()) == Some(b'T'))
         .count();
 
+    // the window held open: the agent stops reading the ring, 300 ms
+    // before the stop is asked (the kernel goes on stopping)
+    if pausing {
+        std::fs::write(&pause, b"").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    }
     // the operator's stop, the burst going on
     let mut c = agent.0.take().unwrap();
     let stopped = common::shutdown_signed(
@@ -470,6 +486,10 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     };
     let (resumed, unreported, left_in_map) = (count("resumed"), count("unreported"), count("left"));
     let recaptured = count("recaptured");
+    // the controller's stop cut by the 2 s the agent's stop gives it (its
+    // processes then stay in the pinned map for the next start)
+    let overran = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default())
+        .contains("exec quarantine controller did not stop within");
     // a process left stopped: what the agent's log says of its pid
     let named: Vec<String> = {
         let text = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
@@ -497,7 +517,8 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
              stopping entries: {} — resumed {resumed}, of which {unreported} without an entry \
              and {recaptured} captured again, {left_in_map} left in the map; after the stop {} of \
              the burst still running, {} not exit 0, {} new process(es) in state T, cgroup frozen \
-             {frozen:?}; the agent's log on them: {named:?}",
+             {frozen:?}; the controller's stop overran its wait: {overran}; the agent's log on them: \
+             {named:?}",
             stopping.len(),
             left.len(),
             failed.len(),
