@@ -4614,6 +4614,8 @@ mod tests {
                 execpol_env_recorded_total: None,
                 execpol_map_denied_total: None,
                 execpol_map_recorded_total: None,
+                execpol_env_unread_total: None,
+                execpol_lost_total: None,
                 execq_script_refused_total: None,
                 event_bus: None,
                 event_bus_decision: None,

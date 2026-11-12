@@ -163,19 +163,32 @@ static OPEN_HAD_DATA: LruHashMap<InodeKey, u64> = LruHashMap::with_max_entries(4
 /// ([`crate::read_repeat`]).
 #[map]
 static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
-/// Names and the child-rule key are built here, never on the stack:
-/// [0..32) a name, [32..64) its parent's name, [64..112) a
-/// `ChildRuleKey` (5.15 rule 4).
-#[map]
-static OPEN_SCRATCH: PerCpuArray<[u8; 128]> = PerCpuArray::with_max_entries(1, 0);
-/// Bulk windows (per CPU), each read in one call: `struct file` at
-/// [0, FILE_WIN) and the opened inode at [FILE_WIN, FILE_WIN + INODE_WIN).
-/// A kernel read costs about 70 ns on the lab; one window replaces four
-/// field reads (design §9.1).
+/// Bulk windows, each read in one call: `struct file` at [0, FILE_WIN) and
+/// the opened inode at [FILE_WIN, FILE_WIN + INODE_WIN). A kernel read
+/// costs about 70 ns on the lab; one window replaces four field reads
+/// (design §9.1).
 const FILE_WIN: usize = 256;
 const INODE_WIN: usize = 128;
+/// The sensor's buffers for one run: the windows, then the names and the
+/// child-rule key, built here, never on the stack ([0..32) a name, [32..64)
+/// its parent's name, [64..112) a `ChildRuleKey`; 5.15 rule 4).
+#[repr(C)]
+pub(crate) struct OpenTask {
+    win: [u8; FILE_WIN + INODE_WIN],
+    names: [u8; 128],
+}
+/// Lot 322 (the review of #546, F3): [`OpenTask`] is the running task's own
+/// entry, keyed by its `task_struct` (`crate::task_scratch`), made by
+/// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`) and
+/// removed before the program returns. They were two per-CPU buffers in
+/// programs that run preemptible: on a `full`/`lazy` kernel another task's
+/// open on the same CPU could rewrite the window or the names between the
+/// read and the use, and a credential file's path went out with an
+/// innocent task's pid — `NN-L-FIM-011`/`014` kill that pid, and the
+/// FIM-010..017 records are posture floors.
 #[map]
-static OPEN_WIN: PerCpuArray<[u8; FILE_WIN + INODE_WIN]> = PerCpuArray::with_max_entries(1, 0);
+static OPEN_TASK: HashMap<u64, OpenTask> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -185,14 +198,22 @@ static OPEN_RENAMES: LruHashMap<u32, RenameWindow> = LruHashMap::with_max_entrie
 /// Lab PR 225: per-tgid unlink windows.
 #[map]
 static OPEN_UNLINKS: LruHashMap<u32, UnlinkWindow> = LruHashMap::with_max_entries(4096, 0);
-/// Lab PR 225: both names of a rename, never on the stack.
+/// Lab PR 225: both names of a rename, never on the stack, and the two
+/// names' extensions ([`name_ext`]), slots [`EXT_NEW`] and [`EXT_OLD`] of
+/// `ext`: `[hash, length]` each, written by [`nn_rename_ext`], read by
+/// [`nn_rename_shape`] and the window.
+#[repr(C)]
+pub(crate) struct RenameTask {
+    names: RenameNames,
+    ext: [u64; 4],
+}
+/// Lot 322 (the review of #546, F3): [`RenameTask`] is the renaming task's
+/// own entry (keyed by its `task_struct`), made and removed in one run of
+/// [`nn_rename_burst`]: per CPU, the burst behind `NN-L-FIM-010` (a
+/// posture floor) could count another task's rename.
 #[map]
-static RENAME_SCRATCH: PerCpuArray<RenameNames> = PerCpuArray::with_max_entries(1, 0);
-/// Lab PR 225: the two names' extensions ([`name_ext`]), slots
-/// [`EXT_NEW`] and [`EXT_OLD`]: `[hash, length]` each, written by
-/// [`nn_rename_ext`], read by [`nn_rename_shape`] and the window.
-#[map]
-static RENAME_EXT: PerCpuArray<[u64; 4]> = PerCpuArray::with_max_entries(1, 0);
+static RENAME_TASK: HashMap<u64, RenameTask> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 const EXT_NEW: usize = 0;
 const EXT_OLD: usize = 2;
 
@@ -418,9 +439,15 @@ pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> 
 
 #[inline(always)]
 unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
-    let scratch = match OPEN_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p as *mut u8,
-        None => return u64::from(u32::MAX) << 32,
+    // The running task's buffers: [`on_open`]'s, or made here for an
+    // unlink or a rename (`forget_task` removes them).
+    let task = bpf_get_current_task();
+    let scratch = match crate::task_scratch::get_or_make(&OPEN_TASK, &task) {
+        Some(p) => (*p).names.as_mut_ptr(),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+            return u64::from(u32::MAX) << 32;
+        }
     };
     let mut bits = 0u32;
     let mut uid = u32::MAX;
@@ -745,18 +772,30 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 
 /// The whole `file_open` work of the sensor variant of the FIM observer
 /// (`fim_watch::fim_file_open_sensor`): the FIM watch and the sensor, from
-/// one read of `struct file` and one of the inode.
+/// one read of `struct file` and one of the inode, in the running task's
+/// own buffers ([`OPEN_TASK`]), removed at the end.
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
-    let w = match OPEN_WIN.get_ptr_mut(0) {
-        Some(p) => p as *mut u8,
-        None => core::ptr::null_mut(),
+    let task = bpf_get_current_task();
+    let t = match crate::task_scratch::make(&OPEN_TASK, &task) {
+        Some(p) => p,
+        None => {
+            // The map full: FIM still sees the open (the plain observer,
+            // field by field, no shared buffer); the sensor's look is
+            // lost, counted.
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+            crate::fim_watch::observe_open_plain(file);
+            return;
+        }
     };
-    let inode = if w.is_null() {
-        core::ptr::null()
-    } else {
-        read_windows(file, w)
-    };
+    on_open_in(file, t);
+    let _ = OPEN_TASK.remove(&task);
+}
+
+#[inline(always)]
+unsafe fn on_open_in(file: *const u8, t: *mut OpenTask) {
+    let w = (*t).win.as_mut_ptr();
+    let inode = read_windows(file, w);
     if inode.is_null() {
         // No windows: FIM still sees the open, field by field as the
         // plain observer reads it; only the sensor skips it.
@@ -799,7 +838,7 @@ pub unsafe fn on_open(file: *const u8) {
     // writing `/dev/console` at shutdown) does not count.
     let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
     let size = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SIZE_OFFSET));
-    observe(&key, watched, watched, mode, flags, dentry, regular, size);
+    observe(&key, watched, watched, mode, flags, dentry, regular, size, (*t).names.as_mut_ptr());
 }
 
 /// The sensor proper. `family_checked`: the caller already knows the
@@ -814,6 +853,7 @@ unsafe fn observe(
     dentry: *const u8,
     regular: bool,
     size: u64,
+    scratch: *mut u8,
 ) {
     let write = mode & FMODE_WRITE != 0;
     if dentry.is_null() {
@@ -835,10 +875,6 @@ unsafe fn observe(
             Ok(i) => i,
             Err(_) => return,
         },
-    };
-    let scratch = match OPEN_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p as *mut u8,
-        None => return,
     };
     let cls = dir_class(&pkey, parent, parent_inode);
     // A file's own rule only where userland put one (DIR_HAS_FILES).
@@ -1147,12 +1183,16 @@ unsafe fn mode_size(inode: *const u8) -> (u16, u64) {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_rename_burst(old_dentry: u64, new_dentry: u64) -> u64 {
-    unsafe { rename_burst(old_dentry as *const u8, new_dentry as *const u8) };
+    unsafe {
+        let task = bpf_get_current_task();
+        rename_burst(old_dentry as *const u8, new_dentry as *const u8, task);
+        let _ = RENAME_TASK.remove(&task);
+    }
     0
 }
 
 #[inline(always)]
-unsafe fn rename_burst(old: *const u8, new: *const u8) {
+unsafe fn rename_burst(old: *const u8, new: *const u8, task: u64) {
     if !armed() || old.is_null() || new.is_null() {
         return;
     }
@@ -1164,12 +1204,16 @@ unsafe fn rename_burst(old: *const u8, new: *const u8) {
     if mode & S_IFMT != S_IFREG {
         return;
     }
-    let sc = match RENAME_SCRATCH.get_ptr_mut(0) {
+    let rt = match crate::task_scratch::make(&RENAME_TASK, &task) {
         Some(p) => p,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+            return;
+        }
     };
-    read_parts(old, &mut (*sc).old);
-    read_parts(new, &mut (*sc).new);
+    let sc = &mut (*rt).names;
+    read_parts(old, &mut sc.old);
+    read_parts(new, &mut sc.new);
     // Each extension scan, then the shape, in a global function of its
     // own, the results in map memory: inlined here together, the scans'
     // dot positions and the head comparisons multiplied the verifier's
@@ -1184,13 +1228,10 @@ unsafe fn rename_burst(old: *const u8, new: *const u8) {
     if crate::fim_watch::caller_is_in_family() {
         return;
     }
-    let (ext, src) = match RENAME_EXT.get_ptr(0) {
-        Some(e) => (
-            core::ptr::read_volatile(&(*e)[EXT_NEW]),
-            core::ptr::read_volatile(&(*e)[EXT_OLD]),
-        ),
-        None => return,
-    };
+    let (ext, src) = (
+        core::ptr::read_volatile(&(*rt).ext[EXT_NEW]),
+        core::ptr::read_volatile(&(*rt).ext[EXT_OLD]),
+    );
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
     let appended = shape == RENAME_APPENDED;
@@ -1219,14 +1260,12 @@ unsafe fn rename_burst(old: *const u8, new: *const u8) {
 #[inline(never)]
 pub extern "C" fn nn_rename_ext(slot: u64) -> u64 {
     unsafe {
-        let sc = match RENAME_SCRATCH.get_ptr(0) {
+        let rt = match RENAME_TASK.get_ptr_mut(&bpf_get_current_task()) {
             Some(p) => p,
             None => return 0,
         };
-        let out = match RENAME_EXT.get_ptr_mut(0) {
-            Some(p) => p,
-            None => return 0,
-        };
+        let sc = &(*rt).names;
+        let out = &mut (*rt).ext;
         if slot == EXT_NEW as u64 {
             let (h, len) = name_ext(&(*sc).new);
             core::ptr::write_volatile(&mut (*out)[EXT_NEW], h);
@@ -1247,14 +1286,12 @@ pub extern "C" fn nn_rename_ext(slot: u64) -> u64 {
 #[inline(never)]
 pub extern "C" fn nn_rename_shape() -> u64 {
     unsafe {
-        let sc = match RENAME_SCRATCH.get_ptr(0) {
+        let rt = match RENAME_TASK.get_ptr(&bpf_get_current_task()) {
             Some(p) => p,
             None => return RENAME_OTHER as u64,
         };
-        let e = match RENAME_EXT.get_ptr(0) {
-            Some(p) => p,
-            None => return RENAME_OTHER as u64,
-        };
+        let sc = &(*rt).names;
+        let e = &(*rt).ext;
         let new_ext = (
             core::ptr::read_volatile(&(*e)[EXT_NEW]),
             core::ptr::read_volatile(&(*e)[EXT_NEW + 1]) as u32,
@@ -1499,4 +1536,14 @@ unsafe fn try_file_cap(ctx: &LsmContext) {
     // does not take (5.15: "R4 is not a scalar").
     let dentry_value = raw_arg(ctx, 0) as *const u8;
     emit(open_reason::FILE_CAP, &key, dentry_value, high, head[0], head[1]);
+}
+
+/// Lot 322 (the review of #546, F3): the walk's buffers an unlink or a
+/// rename made ([`nn_open_walk`] from [`nn_unlink_burst`]), removed at the
+/// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe`.
+#[inline(always)]
+pub(crate) fn forget_task() {
+    // SAFETY: a helper call with no argument.
+    let task = unsafe { bpf_get_current_task() };
+    let _ = OPEN_TASK.remove(&task);
 }

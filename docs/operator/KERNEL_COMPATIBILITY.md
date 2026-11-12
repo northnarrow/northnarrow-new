@@ -642,7 +642,7 @@ agent:
 | Piece | Kernel interface | 5.14 | 5.15 | 6.1 | 6.8 | 6.12 | Without it |
 |---|---|---|---|---|---|---|---|
 | exec policy (the verdict) | LSM `bprm_check_security`: the exec sensor's program returns `-EACCES` | yes | yes | yes | yes | yes | nothing refused (the exec sensor not on LSM) |
-| exec environment | tracepoints `syscalls/sys_enter_execve` and `sys_enter_execveat`, field `envp` (resolved from the tracepoint format) | yes | yes | yes | yes | yes | no environment check |
+| exec environment (lot 322) | the exec's registers at `bprm_check_security`: `bpf_task_pt_regs` (5.15+), BTF `pt_regs.orig_ax`, `dx`, `r10`, `si` (optional slots 109, 108, 129, 107; x86-64) | 5.15+ | yes | yes | yes | yes | no environment check |
 | executable mappings | LSM `mmap_file` `(file, reqprot, prot, flags)`, argument 0 checked at boot (`HOOK_ARG_CHECKS`) | yes | yes | yes | yes | yes | no mapping check |
 | admin tier | BTF `task_struct.signal`, `signal_struct.tty` (optional slots 98, 99) | yes | yes | yes | yes | yes | no `admin` tier |
 | session tier | `task_struct.loginuid` (`CONFIG_AUDIT`) | yes | yes | yes | yes | yes | a login session is `unknown` |
@@ -653,6 +653,52 @@ agent:
 on a kernel is the lab's `nn-lab.sh verifier-check`, recorded in the
 design note. Design:
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md
+
+### Syscall tracepoints on Ubuntu 26.04's 7.0 (lot 322)
+
+On `7.0.0-43-generic` (Ubuntu 26.04, 4 vCPU, preemption `full (lazy)`) a
+BPF program on a **syscall** tracepoint ran only for the calls made on
+CPU 0. Such a program is attached as aya and libbpf attach it: one perf
+event, opened for every process on CPU 0. The lab measured it with the
+kernel alone, using `bpftrace` and no agent:
+
+- with an exec loop pinned to CPU 1, 2 or 3, `syscalls:sys_enter_execve`
+  never fired (0 of 77, 86 and 90 execs);
+- pinned to CPU 0, it fired for every exec;
+- `sched:sched_process_exec` (not a syscall's tracepoint) and the
+  `security_bprm_check` hook fired on every CPU.
+
+Upstream reworked that path in 2026: 57918341dd19 runs the program
+before the perf list check, and 2c2b322acdcc is the stale-head fix. Which
+patch Ubuntu's kernel carries was not identified.
+
+What it meant here:
+
+- **Exec environment check.** It read `envp` on those tracepoints until lot
+  322, so it refused 0 of 11 staging preloads. It now reads it at
+  `bprm_check_security`.
+- **Exec sensor, tracepoint mode** (`sys_enter_execve`, when the LSM program
+  cannot run) and **file-open sensor fallback** (`sys_enter_openat`). On
+  such a kernel they see only the calls made on CPU 0. Both are fallbacks
+  of a degraded start. The telemetry probe's exec and open steps miss on
+  the rounds whose child runs elsewhere, which ends in its alert. They are
+  not fixed by lot 322.
+
+A program on a non-syscall tracepoint, a raw tracepoint (the exploit
+guard's `sys_enter` / `sys_exit`), a BTF tracepoint, a kprobe or an LSM hook
+is not affected.
+
+The same lot moved the exec guards' and the FIM sensor's per-CPU buffers
+to per-task entries (plain hashes, one entry per run in flight). On a
+`full` or `lazy` preemption kernel an LSM program can be preempted, and
+another task's run on that CPU could rewrite the buffer. This is Ubuntu
+26.04's default: `/sys/kernel/debug/sched/preempt` reads `full (lazy)`.
+The default Ubuntu 22.04 and 24.04 kernels preempt voluntarily (no
+preemption inside a program), unless booted with `preempt=full` or a
+low-latency flavour.
+
+The environment check reads the 32-bit (`int $0x80`) and x32 execs as
+well; x32 calls exist only where the kernel has `CONFIG_X86_X32_ABI`.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 

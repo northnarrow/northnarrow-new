@@ -237,6 +237,7 @@ pub fn full_status() -> StatusResponse {
         "execpol_quarantine_total": 0, "execpol_quarantine_inactive_total": 1,
         "execpol_env_denied_total": 0, "execpol_env_recorded_total": 1,
         "execpol_map_denied_total": 0, "execpol_map_recorded_total": 0,
+        "execpol_env_unread_total": 0, "execpol_lost_total": 0,
         "execq_script_refused_total": 0,
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         "event_bus": {

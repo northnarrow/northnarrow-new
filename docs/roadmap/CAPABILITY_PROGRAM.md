@@ -10011,3 +10011,80 @@ number in parentheses is a lab PR.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds its e2e to the privileged suite the nightly and
     the PR's KVM jobs run.
+- **Lot 322 — the exec environment's check on every CPU; the exec guards'
+  and the FIM sensor's buffers per task (C23, C14; no level changes).**
+  - What was open: lot 318's lab found the exec environment's check
+    (`EXECPOL_ENV`, a staging `LD_PRELOAD` refused at exec) nearly inert on
+    Ubuntu 26.04's 7.0, `main` included (0 of 11 refused), and supposed a
+    per-CPU scratch read back on another CPU.
+  - The cause, as measured (the kernel alone, `bpftrace`, no agent,
+    ubuntu2604 `7.0.0-43`, 4 vCPU, preemption `full (lazy)`): a program on
+    a syscall tracepoint, attached as aya and libbpf attach it (one perf
+    event, CPU 0), ran only for the calls made on CPU 0 — an exec loop
+    pinned to CPU 1, 2 or 3 never fired `sys_enter_execve` (77, 86, 90
+    execs), `sched_process_exec` and `security_bprm_check` fired on every
+    CPU. Lot 318's hypothesis does not hold (upstream v7.0 runs that
+    program with preemption off).
+  - Done: the exec sensor's `bprm_check_security` program reads `envp` from
+    the exec's registers at the first pass (`bpf_task_pt_regs`; `dx` for
+    `execve`, `r10` for `execveat`, optional `PT_REGS_R10_OFFSET`, slot
+    129) into the task's own `EXECPOL_ENV` entry (thread id and start
+    time), judged and removed in the same run; the two tracepoint programs
+    and their tracefs slots are gone. The review of #546: 32-bit
+    (`int $0x80`) and x32 execs read too (32-bit pointer arrays; they were
+    a deterministic bypass); a string or an entry the scan cannot read is a
+    finding (counted, `nn-admin status` "environments not read", and one
+    High `NN-L-EXECENV-002` record), never skipped and never refused; the
+    read is a second read of the caller's memory after the kernel's copy
+    (TOCTOU, documented; the kernel's own copy is lot 325's). The audit of
+    the 24 per-CPU maps: the exec sensor's walk, the mapping check's walk,
+    the quarantine's candidate buffer, the BPF guard's `OBJ_GET` path and
+    the FIM sensor's windows, names and a rename's names (they fed
+    FIM-011/014 kills and the FIM-010..017 floors) became per-task entries
+    of plain hashes (never LRU: an eviction could hand an entry in flight
+    to another task), 2048 each, the overflow fail-closed and counted
+    (`nn-admin status` "runs without their buffer"); the mapping check's
+    cached report walks again (it carried the CPU's last walk); the rest
+    classified (counters, rate state — #545's `MINOR_DENIAL_RATE` among
+    them —, preemption off, single reader) in `xtask/tests/percpu_maps.rs`,
+    which also sees qualified and aliased spellings.
+  - Host: `percpu_maps.rs` (4 tests; the first three fail on the base),
+    wire, `btf_offsets` and record unit tests; 25 mutants of the first
+    round and 31 of the review's, each caught by a named test but one
+    equivalent (the walk's names in the task's window region).
+  - Lab, as measured (our guests, lease k322): the "before" round on 7.0.0-43
+    (`main`, the agent installed, `NN_EXEC_POLICY=enforce`, 20 execs of
+    `true` with a staging preload each): an ssh root shell 4 of 20 refused
+    unpinned, 0 to 3 with every CPU busy, 20 of 20 pinned to CPU 0, 0 of 20
+    pinned to CPU 2 and to CPU 3; `fexecve` 20 of 20 on CPU 0, 5 to 6
+    unpinned; the preload string in an untouched file mapping 0 of 20 even
+    on CPU 0; a 32-bit (`int $0x80`) exec 0 of 20; a service 6 to 7 of 20
+    (root) and 5 to 6 (`nobody`); the new e2e failed (about 52 of 72 execs
+    not refused). After, on 7.0.0-43 (the final object `4d8890d9`): every
+    case 20 of 20 refused (EACCES, the marker preload never ran; 240
+    environment denials, 0 unread, 0 lost), x32 `ENOSYS` (off in Ubuntu's
+    kernel); the first round's code (`b19515fe`) the same on 6.12.115 and
+    5.15.0-202; the e2e
+    `a_staging_preload_is_refused_at_every_exec_on_every_cpu` and the
+    guard's `bpf_guard_enforce_refuses_protected_pids_write` pass.
+    `verifier-check` of the final object, 106 programs: 0 failing on 7.0
+    (`exec_check_lsm` 10,484 insns, processed 571,629), 6.12.116 (10,470,
+    processed 595,745) and 5.15 (10,070; 5.15 reports no processed count);
+    6.8 by the PR's KVM job (our 24.04 guest was another lot's). Two
+    intermediate commits were refused (an `Option` return's unwritten
+    stack slot on 5.15, an inlined path's unset register on 5.15 and 7.0),
+    hence the global function. FIM across tasks (`fimx`, a root victim and the lab
+    user's credential reads pinned to one CPU for 40 s): 0 records naming
+    the victim on `main` and after (not reproduced under `lazy`
+    preemption; the per-task buffers remove it by construction).
+    Overhead (bpf_stats, 300,000 opens of one file): `fim_file_open_sensor`
+    320 ns per open on `main` (one run), 497 to 590 ns with the per-task
+    buffers (three runs, one boot each); `exec_check_lsm` 26.2 µs per exec
+    on `main`, 27.3 to 28.3 after.
+  - Mini-hunt: the exec sensor's tracepoint mode and the file-open
+    fallback (`sys_enter_openat`) are blind on CPUs other than 0 on that
+    kernel (degraded starts only; not fixed, follow-up); an `LD_PRELOAD`
+    string in an untouched file mapping evaded the old tracepoint read
+    (fixed by the same change); the check has no live self-test (proposed).
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds its e2e to the privileged suites.

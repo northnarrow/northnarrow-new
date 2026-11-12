@@ -167,6 +167,13 @@ impl Fixture {
     /// admin socket once the agent runs (`nn-admin policy set`, a key with
     /// `config-manage`, nn-admin from a root-owned copy).
     fn setup_with(policy: Option<&str>) -> Self {
+        Self::setup_opts(policy, None)
+    }
+
+    /// Lot 322: with `exec_policy`, the exec policy in enforce mode with
+    /// that table (`--exec-policy-local`, in the test's directory; the
+    /// unsigned overlays are allowed here).
+    fn setup_opts(policy: Option<&str>, exec_policy: Option<&str>) -> Self {
         let host_policy = HostPolicyUnchanged::snapshot();
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -235,8 +242,16 @@ impl Fixture {
         let detections_log = state.detections();
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone agent.log");
-        let mut cmd =
-            installed_agent.command(&state, Launch::Direct, &[common::OWN_DEFAULT_LISTS_ENV]);
+        let mut env = vec![common::OWN_DEFAULT_LISTS_ENV];
+        let exec_policy_local = dir.join("exec-policy.local");
+        if let Some(table) = exec_policy {
+            std::fs::write(&exec_policy_local, table).expect("write the exec policy");
+            env.push(("NN_EXEC_POLICY", "enforce"));
+        }
+        let mut cmd = installed_agent.command(&state, Launch::Direct, &env);
+        if exec_policy.is_some() {
+            cmd.arg("--exec-policy-local").arg(&exec_policy_local);
+        }
         cmd.arg("--combat-rules")
             .arg(&combat)
             .arg("--fim-paths-v1")
@@ -693,4 +708,331 @@ fn processes_of(image: &std::path::Path) -> Vec<u32> {
         }
     }
     pids
+}
+
+// ── Lot 322: a staging preload refused at every exec, on every CPU ────
+
+/// A shared object whose constructor writes the file named by
+/// `NN_E2E_PRELOAD_MARK`: it ran, so the preload was not refused.
+fn compile_marker_preload(dir: &Path) -> PathBuf {
+    let src = dir.join("mark.c");
+    std::fs::write(
+        &src,
+        "#include <fcntl.h>\n#include <stdlib.h>\n#include <unistd.h>\n\
+         __attribute__((constructor)) static void m(void) {\n\
+           const char *p = getenv(\"NN_E2E_PRELOAD_MARK\");\n\
+           if (p) { int fd = open(p, O_WRONLY | O_CREAT, 0666); if (fd >= 0) close(fd); }\n\
+         }\n",
+    )
+    .expect("write mark.c");
+    let lib = dir.join("libmark.so");
+    let st = Command::new("cc")
+        .args(["-shared", "-fPIC", "-O2", "-o"])
+        .arg(&lib)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(st.success(), "cc failed");
+    std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).expect("chmod lib");
+    lib
+}
+
+/// Lot 322 (the review of #546, F1): a 64-bit program that execs
+/// `/usr/bin/true` through the 32-bit entry (`int $0x80`, eax 11) or the
+/// x32 one (`0x40000000 | 520`), with `LD_PRELOAD=<lib>` and the marker in
+/// an `envp` of 32-bit pointers below 4 GiB. Exit 77: refused (`EACCES`);
+/// 38: the call does not exist on this kernel (x32 off); 1: another error.
+fn compile_compat_exec(dir: &Path) -> PathBuf {
+    let src = dir.join("compat_exec.c");
+    std::fs::write(
+        &src,
+        r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 4) return 2;
+  char *low = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+  if (low == MAP_FAILED) return 3;
+  char *p = low + 1024;
+  char *path = p; strcpy(p, "/usr/bin/true"); p += strlen(p) + 1;
+  char *a0 = p; strcpy(p, "true"); p += strlen(p) + 1;
+  char *e0 = p; p += sprintf(p, "LD_PRELOAD=%s", argv[2]) + 1;
+  char *e1 = p; p += sprintf(p, "NN_E2E_PRELOAD_MARK=%s", argv[3]) + 1;
+  uint32_t *av = (uint32_t *)low; av[0] = (uint32_t)(uintptr_t)a0; av[1] = 0;
+  uint32_t *ev = (uint32_t *)(low + 64);
+  ev[0] = (uint32_t)(uintptr_t)e0; ev[1] = (uint32_t)(uintptr_t)e1; ev[2] = 0;
+  long ret;
+  if (!strcmp(argv[1], "ia32")) {
+    __asm__ volatile("int $0x80" : "=a"(ret)
+                     : "a"(11), "b"((uint32_t)(uintptr_t)path),
+                       "c"((uint32_t)(uintptr_t)av), "d"((uint32_t)(uintptr_t)ev)
+                     : "memory");
+  } else {
+    ret = syscall(0x40000000L | 520, path, av, ev);
+    if (ret < 0) ret = -(long)errno;
+  }
+  if (ret == -13) return 77;
+  if (ret == -38) return 38;
+  return 1;
+}
+"#,
+    )
+    .expect("write compat_exec.c");
+    let bin = dir.join("compat_exec");
+    let st = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(st.success(), "cc failed");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    bin
+}
+
+/// Lot 322: the exec environment's check refused 0 of 11 staging preloads
+/// on Ubuntu 26.04's 7.0 — its programs sat on the `sys_enter_execve{,at}`
+/// tracepoints, which ran there only for the execs entered on CPU 0 (20 of
+/// 20 refused pinned to CPU 0, 6 of 20 unpinned, 2 of 10 from a service).
+/// With a table that denies a staging preload in every tier, `N` execs of
+/// `/usr/bin/true` with `LD_PRELOAD` from this test's directory under
+/// `/tmp`, from unpinned threads while every CPU is busy (so the execs land
+/// on every CPU), as root, as `nobody` and from a service (`systemd-run`):
+/// every one is refused at exec (`EACCES`; a service's exec fails) and the
+/// preload's constructor never runs. The same exec without the preload
+/// runs. Fails on a kernel where the check runs on one CPU only.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    const N: usize = 24;
+
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup_opts(None, Some("preload * deny\n"));
+    let armed = common::wait_until(Duration::from_secs(30), || {
+        std::fs::read_to_string(&fx.agent_log).ok().and_then(|l| {
+            l.lines()
+                .find(|l| l.contains("exec policy armed in the kernel") && l.contains("env=true"))
+                .map(str::to_string)
+        })
+    });
+    let armed = armed.unwrap_or_else(|| {
+        panic!(
+            "the exec policy did not arm with the environment check; agent.log tail:\n{}",
+            tail(&fx.agent_log)
+        )
+    });
+    assert!(armed.contains("enforce"), "{armed}");
+
+    let work = tempfile::Builder::new()
+        .prefix("nn-e2e-322-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod the work directory");
+    let lib = compile_marker_preload(work.path());
+    let mark = |who: &str, i: usize| work.path().join(format!("mark.{who}.{i}"));
+
+    // the controls (the review of #546, F8): the same exec without the
+    // preload runs as root, as `nobody` and from a service, so a refusal
+    // below is the preload's
+    let st = Command::new("/usr/bin/true").status().expect("spawn true");
+    assert!(st.success(), "/usr/bin/true without a preload: {st}");
+    let st = Command::new("/usr/bin/true")
+        .uid(65534)
+        .gid(65534)
+        .status()
+        .expect("spawn true as nobody");
+    assert!(
+        st.success(),
+        "/usr/bin/true as nobody without a preload: {st}"
+    );
+    let out = Command::new("systemd-run")
+        .args([
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "-p",
+            "User=root",
+            "/usr/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn systemd-run");
+    assert!(
+        out.status.success(),
+        "a service's /usr/bin/true without a preload: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // every CPU busy for the run: the execs are spread by the scheduler
+    let cpus = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .min(16);
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinners: Vec<_> = (0..cpus)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = std::hint::black_box(x.wrapping_add(1));
+                }
+            })
+        })
+        .collect();
+
+    // as root and as nobody, from unpinned threads
+    // every exec not refused, once, with what showed it
+    let mut ran: std::collections::BTreeMap<(&str, usize), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (who, uid) in [("root", None), ("nobody", Some(65534u32))] {
+        let per = N.div_ceil(cpus);
+        let outcomes: Vec<(usize, Result<(), String>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..cpus)
+                .map(|t| {
+                    let lib = &lib;
+                    let mark = &mark;
+                    sc.spawn(move || {
+                        let mut out = Vec::new();
+                        for k in 0..per {
+                            let i = t * per + k;
+                            if i >= N {
+                                break;
+                            }
+                            let mut c = Command::new("/usr/bin/true");
+                            c.env("LD_PRELOAD", lib)
+                                .env("NN_E2E_PRELOAD_MARK", mark(who, i))
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null());
+                            if let Some(u) = uid {
+                                c.uid(u).gid(u);
+                            }
+                            let r = match c.spawn() {
+                                Err(e) if e.raw_os_error() == Some(13) => Ok(()),
+                                Err(e) => Err(format!("spawn failed otherwise: {e}")),
+                                Ok(mut child) => {
+                                    let st = child.wait();
+                                    Err(format!("the exec ran ({st:?})"))
+                                }
+                            };
+                            out.push((i, r));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .flat_map(|h| h.join().expect("exec thread"))
+                .collect()
+        });
+        assert_eq!(outcomes.len(), N, "{who}");
+        for (i, r) in outcomes {
+            if let Err(e) = r {
+                ran.entry((who, i)).or_default().push(e);
+            }
+            if mark(who, i).exists() {
+                ran.entry((who, i))
+                    .or_default()
+                    .push("the preload ran".into());
+            }
+        }
+    }
+
+    // the review of #546 (F1): through the 32-bit entry and the x32 one,
+    // envp an array of 32-bit pointers (x32 only where the kernel has it)
+    let compat = compile_compat_exec(work.path());
+    let mut x32_absent = 0;
+    for i in 0..N / 3 {
+        for abi in ["ia32", "x32"] {
+            let who = abi;
+            let st = Command::new(&compat)
+                .arg(abi)
+                .arg(&lib)
+                .arg(mark(who, i))
+                .stdin(Stdio::null())
+                .status()
+                .expect("spawn compat_exec");
+            match st.code() {
+                Some(77) => {}
+                Some(38) if abi == "x32" => x32_absent += 1,
+                other => {
+                    ran.entry((who, i))
+                        .or_default()
+                        .push(format!("not refused ({other:?})"));
+                }
+            }
+            if mark(who, i).exists() {
+                ran.entry((who, i))
+                    .or_default()
+                    .push("the preload ran".into());
+            }
+        }
+    }
+    eprintln!(
+        "compat execs: ia32 {} refused; x32 absent on this kernel in {x32_absent} of {}",
+        N / 3,
+        N / 3
+    );
+
+    // from a service: the unit's exec fails, the preload never runs
+    for i in 0..N {
+        let out = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "-p",
+                "User=root",
+                "-E",
+            ])
+            .arg(format!("LD_PRELOAD={}", lib.display()))
+            .arg("-E")
+            .arg(format!(
+                "NN_E2E_PRELOAD_MARK={}",
+                mark("service", i).display()
+            ))
+            .arg("/usr/bin/true")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn systemd-run");
+        if out.status.success() {
+            ran.entry(("service", i))
+                .or_default()
+                .push("the exec ran".into());
+        }
+        if mark("service", i).exists() {
+            ran.entry(("service", i))
+                .or_default()
+                .push("the preload ran".into());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for s in spinners {
+        let _ = s.join();
+    }
+    let of = |who: &str| ran.keys().filter(|(w, _)| *w == who).count();
+    assert!(
+        ran.is_empty(),
+        "{} staging-preload execs were not refused (root {}, nobody {}, service {}, of {N} each; \
+         ia32 {}, x32 {}, of {} each; on {cpus} CPUs): {ran:#?}\nagent.log tail:\n{}",
+        ran.len(),
+        of("root"),
+        of("nobody"),
+        of("service"),
+        of("ia32"),
+        of("x32"),
+        N / 3,
+        tail(&fx.agent_log)
+    );
 }

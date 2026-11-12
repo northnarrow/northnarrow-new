@@ -75,6 +75,24 @@ pub const fn kernel_dev(st_dev: u64) -> u64 {
     (major << 20) | minor
 }
 
+/// Lot 322: the key of a task's own entry in the exec guards' per-task
+/// maps (`EXECPOL_ENV`, the exec sensor's and the mapping check's walks,
+/// the BPF guard's path buffer): its thread id and its start time
+/// (`task_struct.start_time`, ns since boot), so that a thread id the
+/// kernel hands out again never finds an entry it did not make. Each such
+/// entry is made, used and removed in one run of one program: a program
+/// that runs with migration disabled but preemption enabled (LSM, on a
+/// `full` or `lazy` preemption kernel) must not keep a per-CPU buffer
+/// across its run, since another task's run on the same CPU may rewrite it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct TaskKey {
+    pub start_ns: u64,
+    pub tid: u32,
+    pub _pad: u32,
+}
+
 /// The executed file, as one binfmt pass of `bprm_check_security` saw
 /// it. 552 bytes, no implicit padding.
 #[repr(C)]
@@ -187,6 +205,15 @@ mod tests {
         assert_eq!(super::kernel_dev(0x2d), 0x2d);
     }
     use super::*;
+
+    /// Lot 322: the per-task key is 16 bytes with no implicit padding (it
+    /// is hashed whole by the kernel).
+    #[test]
+    fn the_task_key_has_no_hidden_bytes() {
+        assert_eq!(core::mem::size_of::<TaskKey>(), 16);
+        assert_eq!(core::mem::offset_of!(TaskKey, tid), 8);
+        assert_eq!(core::mem::offset_of!(TaskKey, _pad), 12);
+    }
 
     fn raw_with(names: &[&str], flags: u32) -> ExeIdentityRaw {
         // names[0] is the file, the last one the root ("/").

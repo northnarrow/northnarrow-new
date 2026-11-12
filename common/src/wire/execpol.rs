@@ -9,13 +9,15 @@
 //! frozen policy ([`conf_slot`]) gives, per tier, the classes to deny, to
 //! record as "would deny", and to hand to the exec quarantine; a deny is
 //! `-EACCES` from `bprm_check_security`, before the exec's point of no
-//! return. The environment is read at `sys_enter_execve{,at}` ([`EnvStashRaw`],
-//! a bounded prefix) and judged at the exec's first pass. The `mmap_file`
+//! return. The environment is read at the exec's first pass from the exec's
+//! own syscall registers ([`EnvStashRaw`], a bounded prefix, in the task's
+//! own [`TaskKey`] entry; lot 322) and judged there. The `mmap_file`
 //! LSM hook applies the same classes to executable mappings of files.
 //!
 //! Every struct is `#[repr(C)]` with explicit padding; strict append-only.
 
 use super::exe::ExeIdentityRaw;
+pub use super::exe::TaskKey;
 use super::TASK_COMM_LEN;
 
 /// Lineage tiers of the exec'ing task (`ExecPolRaw::tier`, low byte).
@@ -116,7 +118,8 @@ pub mod mode {
 
 /// `EXECPOL_CONF[FLAGS]`.
 pub mod flags {
-    /// The `sys_enter_execve{,at}` programs read the new environment.
+    /// The exec's first pass reads the new environment (lot 322: from the
+    /// exec's own registers; it was two `sys_enter_execve{,at}` programs).
     pub const ENV_SCAN: u64 = 1 << 0;
     /// The `mmap_file` program judges executable mappings.
     pub const MAP: u64 = 1 << 1;
@@ -225,9 +228,9 @@ pub const ENV_HIST_LEN: usize = 16;
 /// classifies the file the loader actually maps).
 pub const STAGING_PREFIXES: [&str; 5] = ["/tmp/", "/var/tmp/", "/dev/shm/", "/proc/", "/dev/fd/"];
 
-/// The new environment's loader findings, read at `sys_enter_execve{,at}`
-/// and judged at the exec's first pass (`EXECPOL_ENV`, keyed by
-/// `task_struct`). 416 bytes, no implicit padding.
+/// The new environment's loader findings, read and judged at the exec's
+/// first pass (`EXECPOL_ENV`, the exec'ing task's own [`TaskKey`]
+/// entry; lot 322). 416 bytes, no implicit padding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -303,8 +306,21 @@ pub mod counter {
     pub const RING_FULL: u32 = 9;
     /// Environments with more than `ENV_SCAN_MAX` variables.
     pub const ENV_TRUNCATED: u32 = 10;
+    /// Lot 322: environments not read whole (`env_flags::UNREADABLE`): the
+    /// array or a string unreadable at the exec's first pass (the caller's
+    /// memory changed after the kernel's copy), an exec entered by a call
+    /// [`exec_envp_reg`] does not know, or the task's stash not made. Each
+    /// one is also recorded (`NN-L-EXECENV-002`, High); none is refused.
+    /// The agent reports the total (`nn-admin status`).
+    pub const ENV_UNREAD: u32 = 11;
+    /// Lot 322 (the review of #546, F4/F5): a run whose per-task buffer could
+    /// not be made (the map full: that many runs in flight) — the exec
+    /// sensor's walk (refused in enforce mode), the mapping check's walk
+    /// (classed `tmp`, `var_tmp`, `home`), the quarantine's candidate. The
+    /// agent reports the total.
+    pub const LOST: u32 = 12;
     /// Slots in the map.
-    pub const SLOTS: u32 = 12;
+    pub const SLOTS: u32 = 13;
 }
 
 /// One policy report (a deny, a "would deny", an environment finding, an
@@ -494,6 +510,73 @@ pub fn entry_is_staging(entry: &[u8]) -> bool {
         .any(|p| entry.len() >= p.len() && &entry[..p.len()] == p.as_bytes())
 }
 
+/// x86-64 `execve(2)` and `execveat(2)`, `orig_ax` at `bprm_check_security`.
+pub const NR_EXECVE: u64 = 59;
+pub const NR_EXECVEAT: u64 = 322;
+/// The same through the 32-bit entry (`int $0x80`, `sysenter`): any
+/// process can make it, a 64-bit one included (the review of #546, F1).
+pub const IA32_NR_EXECVE: u64 = 11;
+pub const IA32_NR_EXECVEAT: u64 = 358;
+/// The same through the x32 ABI (`__X32_SYSCALL_BIT`, where the kernel has
+/// `CONFIG_X86_X32_ABI`).
+pub const X32_SYSCALL_BIT: u64 = 0x4000_0000;
+pub const X32_NR_EXECVE: u64 = X32_SYSCALL_BIT | 520;
+pub const X32_NR_EXECVEAT: u64 = X32_SYSCALL_BIT | 545;
+
+/// The register of the exec's `pt_regs` that holds `envp`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EnvpReg {
+    /// Native and x32 `execve(filename, argv, envp)`, ia32 `execve`
+    /// (`edx`): the third argument.
+    Dx,
+    /// Native and x32 `execveat(dirfd, filename, argv, envp, flags)`: the
+    /// fourth.
+    R10,
+    /// ia32 `execveat` (`ebx, ecx, edx, esi, edi`): the fourth, `esi`.
+    Si,
+}
+
+/// Lot 322: where the exec's new environment is, from the syscall number
+/// the exec entered with, and whether it is a compat one — `envp` then a
+/// 32-bit address (the register's low half: the kernel reads no more) of
+/// an array of 32-bit pointers. `bprm_check_security` is reached from
+/// these six calls (and `kernel_execve`, whose task has no user registers:
+/// the caller does not ask): 11 and 358 are no native exec (`munmap`, none),
+/// 59 and 322 no 32-bit one. `None`: not read (counted and recorded as
+/// [`counter::ENV_UNREAD`]).
+#[inline(always)]
+pub const fn exec_envp_reg(orig_ax: u64) -> Option<(EnvpReg, bool)> {
+    match orig_ax {
+        NR_EXECVE => Some((EnvpReg::Dx, false)),
+        NR_EXECVEAT => Some((EnvpReg::R10, false)),
+        IA32_NR_EXECVE => Some((EnvpReg::Dx, true)),
+        IA32_NR_EXECVEAT => Some((EnvpReg::Si, true)),
+        X32_NR_EXECVE => Some((EnvpReg::Dx, true)),
+        X32_NR_EXECVEAT => Some((EnvpReg::R10, true)),
+        _ => None,
+    }
+}
+
+/// Lot 322: `envp` as the kernel reads it — a compat call's register
+/// truncated to its low 32 bits (a 64-bit caller of `int $0x80` may leave
+/// the high half set: the kernel ignores it, so must the scan).
+#[inline(always)]
+pub const fn envp_value(reg: u64, compat: bool) -> u64 {
+    if compat {
+        reg & 0xffff_ffff
+    } else {
+        reg
+    }
+}
+
+/// Lot 322: the size of one entry of the `envp` array (8, or 4 for a
+/// compat call): `8 - 4 * compat`, an arithmetic form the verifier bounds
+/// to [4, 8] without splitting the scan's loop in two.
+#[inline(always)]
+pub const fn envp_stride(compat: u64) -> u64 {
+    8 - 4 * (compat & 1)
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -565,6 +648,32 @@ mod tests {
         ] {
             assert!(!entry_is_staging(no.as_bytes()), "{no}");
         }
+    }
+
+    /// Lot 322: `envp` is `execve`'s third argument and `execveat`'s
+    /// fourth, native or x32; ia32's `execveat` passes it in `esi`. The
+    /// review of #546 (F1): the 32-bit and x32 entries are read too, as
+    /// 32-bit pointers; an unknown call is not.
+    #[test]
+    fn the_new_environment_is_found_in_the_exec_s_own_registers() {
+        assert_eq!(exec_envp_reg(59), Some((EnvpReg::Dx, false)));
+        assert_eq!(exec_envp_reg(322), Some((EnvpReg::R10, false)));
+        assert_eq!(exec_envp_reg(11), Some((EnvpReg::Dx, true)));
+        assert_eq!(exec_envp_reg(358), Some((EnvpReg::Si, true)));
+        assert_eq!(exec_envp_reg(0x4000_0000 | 520), Some((EnvpReg::Dx, true)));
+        assert_eq!(exec_envp_reg(0x4000_0000 | 545), Some((EnvpReg::R10, true)));
+        // kernel_execve's zeroed registers, a negative (no call), x32's
+        // numbers without the bit (no native call), a native call that
+        // never execs, a native number with the x32 bit
+        for other in [0, u64::MAX, 520, 545, 9, 0x4000_0000 | 59] {
+            assert_eq!(exec_envp_reg(other), None, "{other:#x}");
+        }
+        // the kernel reads a compat envp's low half only, a native one whole
+        assert_eq!(envp_value(0xdead_beef_0040_1000, true), 0x0040_1000);
+        assert_eq!(envp_value(0x7ffd_0040_1000, false), 0x7ffd_0040_1000);
+        assert_eq!(envp_stride(0), 8);
+        assert_eq!(envp_stride(1), 4);
+        assert_eq!(envp_stride(3), 4);
     }
 
     #[test]

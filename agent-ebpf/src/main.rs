@@ -55,6 +55,7 @@ mod socket_connect;
 mod stdio;
 mod sysctl_guard;
 mod task_kill;
+mod task_scratch;
 mod task_limits;
 mod tcp_close;
 mod tcp_connect;

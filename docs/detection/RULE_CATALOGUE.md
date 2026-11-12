@@ -34,7 +34,7 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`NN-L-EXECQ-001_FirstSightQuarantine`](#nn-l-execq-001_firstsightquarantine) | Exec quarantine at first sight | Critical, High, Medium, Low | Quarantine, KillProcess, Log | T1204.002, T1059.004, T1059.006, T1059.007, T1059 |
 | [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium | Log | T1620, T1070.004, T1204.002, T1564.001 |
 | [`NN-L-EXECENV-001_PreloadFromStaging`](#nn-l-execenv-001_preloadfromstaging) | Loader variable naming a staging path at exec | High, Medium, Low | Log | T1574.006 |
-| [`NN-L-EXECENV-002_ExecEnvironmentTrick`](#nn-l-execenv-002_execenvironmenttrick) | Exec environment trick | Critical, Medium, Low | Log | T1068, T1574.006, T1070.003 |
+| [`NN-L-EXECENV-002_ExecEnvironmentTrick`](#nn-l-execenv-002_execenvironmenttrick) | Exec environment trick | Critical, High, Medium, Low | Log | T1068, T1574.006, T1070.003 |
 | [`NN-L-EXECENV-003_ExecMappingFromStaging`](#nn-l-execenv-003_execmappingfromstaging) | Executable mapping of a file from a staging location | High, Medium, Low | Log | T1574.006, T1129, T1620 |
 
 ### R001_ExecFromTmp
@@ -519,19 +519,19 @@ Exec environment trick — category `malware_prevention`.
 
 | | |
 |---|---|
-| Severity | Critical, Medium, Low |
+| Severity | Critical, High, Medium, Low |
 | Response | Log |
 | ATT&CK | T1068 Exploitation for Privilege Escalation (Privilege Escalation); T1574.006 Hijack Execution Flow: Dynamic Linker Hijacking (Stealth); T1070.003 Indicator Removal: Clear Command History (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | no proof |
 
-**Observes.** The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id target (Critical in the shape of CVE-2023-4911), a library path into staging for a service or root, shell history disabled.
+**Observes.** The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id target (Critical in the shape of CVE-2023-4911), a library path into staging for a service or root, shell history disabled; an environment the exec sensor could not read whole (High: its loader variables were not judged).
 
 **Known false positives.** History disabled by a user's own shell configuration (Low, repeats held back).
 
 **How to test.** Run `su` with `GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A` on a lab guest with the exec policy on.
 
-**Tests.** `agent/src/execpol/record.rs::tunables_history_and_library_path`
+**Tests.** `agent/src/execpol/record.rs::tunables_history_and_library_path`, `agent/src/execpol/record.rs::an_environment_not_read_whole_is_one_high_record`
 
 **ATT&CK note.** Per record: T1068 for the set-id exploit's environment, T1574.006 for the library path, T1070.003 for the history.
 
