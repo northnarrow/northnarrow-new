@@ -10,7 +10,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision
   of 11/11/2026 on BUG-49, and the independent review of #539;
-  `docs/operator/UPGRADE_NOTES_WAVE4.md` §26). `bash -noprofile /tmp/x.sh x
+  `docs/operator/UPGRADE_NOTES_WAVE4.md` §28). `bash -noprofile /tmp/x.sh x
   /usr/bin/aws`, `node --eval=… /usr/bin/aws`, `node --run task
   /usr/bin/aws`, `zsh -ovi /tmp/x /usr/bin/aws`, `perl '-i -e' CODE
   /usr/bin/aws`, `node -r pre.js /usr/bin/aws` and `PYTHONPATH=dir python3
@@ -44,6 +44,65 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   crate; an `#[ignore]` differential test runs the tables against the real
   bash, dash, python3, perl, node, ruby, zsh, mksh and busybox, with a
   program on standard input.
+- The copy-on-first-write guard and the exec policy trust the kernel's
+  data, not a name or a number (lot 315, the third bug hunt's lot 6, family
+  F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's record half, BUG-113;
+  the triage's N2; `docs/design/COPY_ON_FIRST_WRITE.md` §2.1, §2.3-2.5, §3,
+  `docs/design/EXEC_POLICY.md` §2):
+  - a file is its device, inode number and birth time in the whole guard
+    (`agent/src/cow/identity.rs`, and a ratchet over each file's token
+    stream, `xtask/tests/cow_file_identity.rs`); where a wrong "same" would
+    overwrite or move a file, only a birth time known on both sides makes
+    it the same (after the review of #542: rule 5 too — on a filesystem
+    without birth times a restore keeps both, never in place). N2, data loss: the restore took the
+    owner's new file that inherited the inode number of a file the attack
+    deleted for "the attack's renamed copy" and moved it into the journal's
+    evidence, which the expiry deleted (at once when the file kept an old
+    mtime: `tar -x`, `rsync -a`, `cp -p`). The renamed copy is that file by
+    its birth time now; one whose birth time cannot be compared is named in
+    the row and left in place. The same identity in `pick` (BUG-110: the
+    second file's entry was dropped without a row), copy on first write (a
+    writer of the deleted file got no copy of the new one), shared copies
+    and the write-opens after a copy; the evidence ages from its move;
+  - a restore of a process tree weighs every copy of the tree and the
+    lineage of each write-open (BUG-93: a second writer of the tree was
+    "another writer", the file kept both and the automatic restore said
+    Success; a writer of the tree still running did not stop it); a
+    process of the tree still running keeps both, and `--pid` without a
+    start refuses a pid the write-opens' lineages show recycled; `--since`
+    alone is unchanged (the report's fix would overwrite a later edit);
+  - an open by an io-wq worker or an `SQPOLL` thread is a write (BUG-102,
+    in part: its `syscall` line is its creator's — a creator in
+    `openat(…, O_RDONLY)` made the worker's `O_WRONLY|O_TRUNC` opens reads,
+    written without a copy): known by `PF_IO_WORKER` in `/proc/<tid>/stat`,
+    never by its `comm`. Not closed: an io_uring open the kernel runs in
+    the submitting thread's own task_work still reads as that thread's
+    syscall (a declared limit; the open's mode from the BPF LSM is a
+    follow-up lot);
+  - a live file named `x (deleted)` has a path (BUG-109: written without a
+    copy, `skipped_unresolved_path`): liveness is `st_nlink`, the path is
+    told from the kernel's mark by a cached `lstat` against `fstat`; a file
+    whose opened name was unlinked while a hard link remains is copied too;
+  - `EXECENV-001` says `AT_SECURE` only when the exec changes the
+    credentials (BUG-101's record half: root running `su` with a preload
+    was "ignored by the loader" — it is honoured); the kernel's half is lot
+    318;
+  - the watchdog's start is read before and after its exe (BUG-113: a PID
+    recycled between the reads was verified with the newcomer's start).
+- A kill reaches a process whatever it names itself (lot 311, the third
+  bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
+  is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,
+  or simply the name of the file it executed, with no privilege — made its
+  `/proc/<pid>/stat` unreadable as text, and the response took that for a
+  process it could not capture: every kill and tree kill of it was signed
+  `Failed` (errno 5) and the process ran on. On Ubuntu 24.04 a `www-data`
+  exec from `/tmp` named `\xff\xfe`, or renaming itself so at its first
+  instruction, drew R001's record and outlived its kill tree. The response
+  reads `/proc` as bytes now (the `(comm)` field is skipped to its last
+  `)`), a running process whose entry cannot be read for another reason is
+  captured by its pidfd alone and still signalled, and a killed cgroup's
+  member whose `stat` cannot be read is no longer counted killed. The COMBAT
+  ladder's reads of a process's `status` and `cgroup` read bytes too.
 - The kernel module judge sees a compressed module's load on 7.0 (lot 303;
   `docs/operator/RULE_POLICY.md` §2.4). 7.0 reads the file of a
   `finit_module(2)` with `MODULE_INIT_COMPRESSED_FILE` — kmod's load of a
@@ -164,6 +223,101 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The exec quarantine's stop resumes every process the kernel holds (lot
+  317, third bug hunt BUG-118; `docs/design/EXEC_QUARANTINE.md` §3). It
+  resumed the processes whose report it had read from the ring: one the
+  kernel stopped after the last read stayed stopped until the next start of
+  an agent with the guard on. The stop clears the heartbeat, waits until
+  every run of the exec program that read it has returned (`membarrier`
+  `MEMBARRIER_CMD_GLOBAL`, `synchronize_rcu()`), then resumes everything in
+  `EXECQ_STOPPED` too (the signed `stopping` entry's `unreported`).
+- A held process the agent cannot capture is not taken for one that ended
+  (lot 317, BUG-124). With `pidfd_open` out of descriptors or memory, the
+  exec quarantine recorded "ended while held" or "already ended", sent no
+  `SIGCONT` or `SIGKILL` and took the pid out of `EXECQ_STOPPED`: the
+  process stayed stopped for good, a block-listed one unkilled. The capture
+  is tried again; while it fails the decision is deferred (`resume
+  deferred` / `kill deferred`), the process stays held and in the map, and
+  the decision is carried out once it is captured (signed `deferred`
+  entry); the rules' verdict is awaited as for any held process; the boot's
+  recovery and the stop leave such a process in the map for the next start.
+  `ProcRef::liveness()` tells running, gone and not captured apart; the
+  stand-down of a soft egress block and the executor's "already gone" use
+  it, and `xtask/tests/process_liveness.rs` keeps every caller on it — the
+  same confusion spelled `liveness() != Liveness::Live` included.
+- The review of #541 (lot 317): a late block-list verdict on a process
+  whose resume is owed is a kill owed, never a resume; a kill owed is
+  marked in the pinned `EXECQ_STOPPED` (`stop_ns` = `u64::MAX`) and the
+  next start kills the process instead of resuming it; the stop reads the
+  ring a last time after its wait, and keys every process by its pid and
+  start (a reused pid neither hides nor releases another); the kernel
+  writes `EXECQ_STOPPED` before it sends `SIGSTOP` and does not stop a
+  process the map cannot name (`MAP_FULL`, counted, signed as fail-open):
+  past 4096 held processes a stop used to leave one no stop, crash or next
+  start resumed.
+- The dispatcher of slow work prepares nothing at the stop (lot 317,
+  BUG-116; `docs/architecture/EVENT_BUS.md` §2d): it prepared its whole
+  queue (up to 256 bursts, with their I/O) inside the stop's budget, and
+  the stop then threw the assessments away and judged the same bursts again
+  with their I/O. What it prepared comes back with its assessment, the rest
+  unprepared, and nothing it is handed is dropped. Its `catch_unwind`, whose
+  fallback lived only in unwinding builds (the release aborts on a panic)
+  and dropped the burst saying it was judged, is gone (BUG-115);
+  `xtask/tests/unwind_fallbacks.rs` lists the four left, each with what its
+  fallback does.
+- The evidence chains' residues of the third external bug hunt (lot 319;
+  edition 1.4's partials 06, 28, 31, 10, 12, and lot 296's backlog;
+  `docs/operator/EVIDENCE_CHAINS.md`, `EXPORT.md` §3 and §8, upgrade notes
+  §26). The flat chains — the canary registry and access log, the FIM
+  baseline, the listener log — write as the audit log does since lot 296:
+  after a write the disk stopped part-way or a failed fsync, the next row
+  reads the tail again, cuts the fragment and signs the cut
+  (`chain_tail_repaired`); the next row used to be glued to it (the
+  registry's and the access log's chains broken there, the listener log no
+  longer opened at the next start). A stalled retention (an archive past the
+  budget that cannot be removed) is a degradation in `nn-admin status`,
+  signed, and leaves it when a pass runs again; it was an ERROR at each
+  rotation. Every foreign entry at an archive name is attested once: those
+  below a rotation a crash interrupted (BUG28), those a rotation jumped
+  over, those planted while the log was closed above the last rotation its
+  manifest records (the verifier reports the others). The read verbs read on
+  past a backdated row at a file's head when the next file's last row is at
+  or after `--since` (BUG06), and a `--since` past any row's time keeps no
+  row (it kept every one). The JSONL export closes a line a dead worker
+  left before its first record — an empty line when the file had ended
+  whole (BUG31). The heartbeat verifier's `--max-skew-secs` holds past
+  2^63 (BUG12), as `detections --since/--until` do. The compatibility logs
+  of the combat teardown and of the watchdog's holds, and the copy-on-write
+  journal while it runs, close a line left unfinished before the next.
+- State machines of the third external bug hunt (lot 314; editions 1.2/1.3/1.4
+  of the external bug hunt; `docs/operator/COMBAT_RECOVERY.md`):
+  - an unlocked COMBAT decays 30 minutes after the **last** escalation
+    signal, kept apart from the corroboration ledger (BUG-94): any event
+    with a hit pruned the ledger to its 15-minute window, and a scan by any
+    user 15 minutes after the last signal made COMBAT decay — and the ladder
+    stand down — up to 15 minutes early;
+  - `force-posture` toward the current state changes nothing (BUG-84): an
+    ALERTED or ENGAGED posture keeps its decay deadline (it was re-armed: an
+    hour, a day more); an unlocked COMBAT forced to COMBAT is locked
+    explicitly — a transition row naming the lock and the admin action (it
+    was locked with no trace). The posture's state is written in one place,
+    which records every change of its kind or of COMBAT's lock (a lock a
+    later signal acquires is a row too; ratchet
+    `xtask/tests/state_machines.rs`);
+  - NN-L-IOU-002 fires once per process, keyed by pid and start, its memory
+    capped (BUG-83): it fired again on most of the records the io_uring
+    sensor sends after the first (a High alert a second per process);
+  - the exec policy's repeat table keys a finding by everything its record
+    shows — the severity and the caller's tier among it — and is capped at
+    4096 (BUG-92, BUG-125): a Critical CVE-2023-4911 `GLIBC_TUNABLES` was
+    held back as a repeat of a Medium one with the same first 96 characters,
+    and a user grew the table without bound with distinct `HISTFILE`s;
+  - the heartbeat's check of the actions chain's head reads, for a head named
+    right after a rotation (N, 0, H), the last line of archive N-1 (BUG-107):
+    it was held without a read, so a cut of that archive's tail went unseen
+    for as long as the new file stayed empty;
+  - the targets of the `daemon-reload` rate limit are capped (the ratchet's
+    find, lot 314).
 - The DNS response sensor attaches on kernels whose `udp_recvmsg` and
   `udpv6_recvmsg` take four parameters (7.1, and Ubuntu 26.04's 7.0, which
   carries the change; lot 303; `docs/operator/KERNEL_COMPATIBILITY.md`): it

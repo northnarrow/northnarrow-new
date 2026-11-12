@@ -168,7 +168,7 @@ findings wait in `EXECPOL_ENV` (keyed by `task_struct`) for the exec's pass 0.
 | finding | kernel | record |
 |---|---|---|
 | `LD_PRELOAD` / `LD_AUDIT` entry under `/tmp/`, `/var/tmp/`, `/dev/shm/`, `/proc/` (`/proc/self/fd/N`: a memfd preload), `/dev/fd/` | denied for `service` and `unknown` on a server, for a root caller in `session` (on a desktop: `service`, and a root caller in `session` or `unknown`); recorded for `admin` | `NN-L-EXECENV-001` High (deny) / Medium / Low, T1574.006 |
-| the same at a **set-id target** | never denied | Medium, "the kernel sets AT_SECURE and the loader ignores the entry" |
+| the same at a **set-id target** | never denied on this head; lot 318 drops the set-id skip (denied as any other) | Medium: "the kernel sets AT_SECURE and the loader ignores the entry" when the exec changes the credentials; else "the exec ran; the target is set-id, but the exec changes no credential, so the loader honours the entry" (lot 315) |
 | `GLIBC_TUNABLES` at a set-id target | recorded | `NN-L-EXECENV-002` Medium; Critical for the shape of CVE-2023-4911 (a tunable whose value holds another assignment, or a value filling the buffer), T1068 |
 | `LD_LIBRARY_PATH` under a staging prefix | recorded for services, unknown callers, root | `NN-L-EXECENV-002` Medium, T1574.006 |
 | `HISTFILE` empty or `/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`, `HISTCONTROL=ignore*` exported, at the exec of a shell | recorded | `NN-L-EXECENV-002` Low, T1070.003 |
@@ -185,6 +185,24 @@ preload with root's credentials. That is what `deny-root` and the service
 deny are for. File capabilities are not visible to the program (the target
 is judged by its set-id bits): a preload into a capability binary from a
 service is refused, which the loader would have ignored anyway.
+
+Lot 315 (external bug hunt 1.4, BUG-101, the record's half): a set-id
+target is no `AT_SECURE` by its bits alone. The kernel sets it when the
+exec changes the credentials — a set-user-ID file owned by another user
+than the caller's real uid, or a set-group-ID file (the record does not
+carry the file's group: a set-group-ID target counts as changing it, as it
+does for every caller outside that group). Root running a set-user-ID-root
+file (`su`, `passwd`, `mount`) changes nothing: the loader honours the
+preload, as root, and the record said it ignored it. The record now says
+the exec ran (`at_secure: false`, Medium). The kernel's half is lot 318's:
+it drops the set-id skip entirely (a set-id target is denied as any other,
+whatever `AT_SECURE`); this record's `at_secure` stays as it is, the
+evidence of whether the loader would have ignored the entry. Residuals of
+the record's wording (no privilege at stake): a set-id bit the kernel does
+not apply (`nosuid` mount, `no_new_privs`, a set-id `#!` script) still reads
+`AT_SECURE`; a file capability sets it and the record says nothing.
+`GLIBC_TUNABLES` at a set-id target stays reported by the bits (an exploit
+attempt is one whatever the caller).
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128

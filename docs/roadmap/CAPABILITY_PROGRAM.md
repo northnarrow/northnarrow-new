@@ -9244,3 +9244,360 @@ number in parentheses is a lab PR.
     first thing in r3.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
+- **Lot 311a — a kill reaches a process whatever it names itself (C17;
+  the third bug hunt's triage, N6; no level changes).**
+  - What was open: a process whose `comm` is not UTF-8 — set with
+    `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`, or by executing a
+    file of that name, no privilege needed — has a `/proc/<pid>/stat` and
+    `status` that `std::fs::read_to_string` refuses. The response's capture
+    (`ProcRef`) read `stat` so and took the refusal for "running, no
+    identity": every kill and tree kill of such a process was signed
+    `Failed` (errno 5) and it ran on; a killed cgroup's member whose `stat`
+    was unreadable was counted killed. The judgement itself held (the exec
+    event is the kernel's).
+  - What changed: the response reads `/proc/<pid>/stat` as bytes
+    (`nn_linux::state_read`, the fields after the last `)`), and the COMBAT
+    ladder's `status` and `cgroup` reads too; a running process whose entry
+    cannot be read for another reason (the agent out of memory or
+    descriptors) is captured by its pidfd alone and signalled, never left
+    untouched; a member of a killed cgroup is dead only when its PID names
+    no process, another process or a zombie. The lineage, the ancestry and
+    the other `/proc` readers are lot 311b's.
+  - Measured on our guests (R001's kill tree of a `www-data` exec from
+    `/tmp`): on `main`, Ubuntu 24.04 (`6.8.0-147-generic`), a payload named
+    `\xff\xfe` and one renaming itself so at its first instruction were
+    recorded and each kill signed `Failed { errno: 5 }`, both ran their
+    8 s; with this lot both are killed (`rc 137`, the tree frozen and
+    killed in a cgroup of its own), the control and a renamed parent's
+    child as before. Ubuntu 26.04 (`7.0.0-43-generic`): the same,
+    the four cases as on 24.04. The kill cgroup's privileged tests on 24.04
+    (root): 4 of 4, the new one included (descendants whose `stat` cannot
+    be read are moved and killed); with its mutant the new one fails.
+  - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
+    proved beyond it.
+- **Lot 317 — the exec quarantine's stop and its partial failures (third
+  bug hunt, edition 1.4: BUG-118, BUG-124, BUG-116, BUG-115; all P3; C13
+  and C17, no level change).**
+  - What was open: the stop resumed only the held processes whose report
+    the controller had read (BUG-118: one the kernel stopped after the last
+    read stayed in state T until the next start of an agent with the guard
+    on); a held process whose capture (`ProcRef`) failed was taken for one
+    that had ended at four sites — no `SIGCONT`, no `SIGKILL`, its pid out
+    of `EXECQ_STOPPED`, the record "ended while held" or "already ended"
+    (BUG-124); the dispatcher of slow work prepared its whole queue at the
+    stop and the stop threw the assessments away (BUG-116), and its
+    `catch_unwind` branch, alive only in unwinding builds, dropped the
+    burst saying it was judged (BUG-115).
+  - What changed: `ProcRef::liveness()` (live, gone, not captured) and a
+    ratchet (`xtask/tests/process_liveness.rs`); the controller captures
+    again and owes a decision it cannot carry out (the process stays held
+    and in the map; a signed `deferred` entry when it is carried out); the
+    stop clears the heartbeat, waits for the exec programs that read it
+    (`membarrier` `MEMBARRIER_CMD_GLOBAL`), then resumes the entries, the
+    owed decisions and the rest of `EXECQ_STOPPED` (`stopping`:
+    `unreported`, `recaptured`, `killed`, `left`); the slow work stops
+    before its next burst, hands back what it prepared with its assessment
+    and drops nothing; `xtask/tests/unwind_fallbacks.rs` lists the four
+    `catch_unwind` left.
+  - Measured on the host: 21 new named tests (the controller 11, the slow
+    work 4, nn-linux 4 of which 1 privileged, the e2e 1, the quiesce 1) and
+    the two ratchets; mutation 28 mutants, 28 caught by a named test (M26,
+    the tree kill's root through the kill cgroup, by the privileged test on
+    the 7.0 guest; M13 and M17 rewritten after a compile error).
+  - Lab, measured (the privileged e2e `execq_stop_privileged_e2e`: enforce
+    mode, a scanner that never says ready, a burst of new binaries from
+    four threads, a signed 2-of-N shutdown 1.5 s in, then every process of
+    the burst must end, no new process in state T, the cgroup not frozen):
+    - Ubuntu 24.04 (6.8.0-147), guest clean at boot (no agent, no overlay,
+      no pin): `main` 4c864565 with the test 3 runs, 2 failed — 1,065 and
+      1,061 execs held at the stop, one process of the burst still in state
+      T 15 s later; the fix 6 of 6 passed (964–997 held, 1,711–1,870
+      resumed, none left).
+    - Ubuntu 26.04 (7.0.0-43): `main` 4c864565 5 runs, 1 failed (974 held,
+      one left in T); the fix 5 of 5 passed (944–1,039 held, 1,419–1,664
+      resumed, none left); `main` 0420bbe7 (with lot 311a's #537) 5 of 5
+      passed; the fix again 5 of 5 (865–1,058 held, `unreported` and
+      `recaptured` 0). The privileged `a_tree_kill_whose_root_was_not_captured_reports_its_error`
+      passed there, and failed with mutant M26 applied on the guest
+      (`AlreadyGone` instead of `Failed{EMFILE}`).
+    - Every run's `unreported` was 0 (13 runs that print it): no run met
+      a process stopped without an entry; that path is proven on the host
+      (the fake kernel's map) only. `main` before #537 left one process
+      stopped in 4 of 16 runs (a diagnostic round on 7.0, 1 of 8, printed
+      the agent's log lines on the leftover pid: none — no capture failure
+      was logged for it, so its report was never read: BUG-118's case);
+      `main` with #537 passed 5 of 5. The lab shows the property (nothing
+      left stopped in 16 of 16 runs of the fix), not the sweep at work;
+      the review's round below forces the window.
+    - Every guest left powered off with no agent installed, no process in
+      state T, no test cgroup, no leftover file.
+  - Not done: the recovery of what a previous agent left stopped when the
+    next agent's guard is off or cannot start (documented limit, §2 of the
+    design; a follow-up); the systemd watch's relayed signals still waiting
+    at the decision loop's stop are not judged (mini-hunt, a follow-up).
+  - The independent review of #541 (MERGE AFTER FIXES), fixed in new
+    commits: a late block-list verdict on a process whose resume was owed
+    was "kill failed" and the owed resume then ran the binary (F1: the kill
+    is owed in its place, and no owed resume is paid to a process a verdict
+    asks to kill); a kill owed at the stop was resumed by the next start
+    (F2: the kill is marked in the pinned map, `stop_ns` = `u64::MAX`, and
+    the next start kills it); a stop the map could not take (4096) left a
+    process nothing resumes (F3: the kernel writes the map before `SIGSTOP`
+    and stops nothing it cannot name, `MAP_FULL`, signed fail-open; F7: the
+    stop reads the ring a last time); the ratchet passed `!= Liveness::Live`
+    (F4); the stop keyed processes by pid alone (F5: pid and start); no
+    e2e showed the stop's sweep at work (F6); nits (F8). The reviewer's
+    three probes are named tests now; 12 more tests; the second mutation
+    round 20 mutants, 20 caught by a named test.
+  - Lab, measured (ubuntu2604, 7.0.0-43, the review's fixes at 3ce97ad3):
+    the plain case and two cases with the window held open (a
+    `debug-trigger` hook that kept the ring unread for 600 ms at the stop;
+    one with the stop's last read of the ring skipped, so that the map
+    alone names them) passed in runs 2 and 3: 1,007–1,074 held at the stop
+    in the plain case; 404 processes resumed without an entry in each
+    window case (the ring's capacity: the kernel stopped no more once it
+    was full), none left in state T, the cgroup not frozen; the eBPF object
+    with the new order passed the 7.0 verifier. In run 1, on the fresh
+    guest, the two window cases were refused their start ("not the
+    directory the previous agent protected" — a second agent in one run on
+    a guest no agent had run on before; the purge of the pin root before
+    each agent, as the canary and FIM suites do, did not change it; not
+    this lot's, and not met in the CI, whose earlier suites run agents
+    first). The PR's CI on
+    22.04 (5.15) then failed both window cases: the 600 ms hold ate the
+    stop's 2 s budget (`stop_deadline`) and the controller's stop was cut
+    (no `stopping` entry; the processes left in the pinned map for a next
+    start the test never makes). The hook now pauses the ring's reads from
+    a file the test creates 300 ms *before* it asks the stop
+    (`NN_DEBUG_EXECQ_PAUSE_READS`), so the stop runs at its own pace. On
+    ubuntu2604 again (ffad8f1c), run 2: the three cases passed — 1,056
+    held in the plain case, 404 processes resumed without an entry in each
+    window case, no stop overran its wait, nothing left in state T; run 1:
+    the plain case passed (and resumed 1 process without an entry, the
+    window met unforced), the two others refused at their start as above.
+    The CI's 24.04 suite on the earlier hook resumed 1 process without an
+    entry in its plain case too.
+  - The re-check of #541 (MERGE): the stop also kills a held entry whose
+    verdict asks for it, the rules' verdict still awaited (N1, it was
+    resumed undecided); `owe_kill` rewrites a pid's entry only when it
+    names the same start (N2); the ratchet refuses a `match` on `Liveness`
+    with a catch-all arm. Mutation: 6 mutants, 4 caught, 1 equivalent (a
+    redundant clause, removed), 1 survivor: `Kernel::owe_kill`'s guard over
+    the aya map, which the host tests cannot build (its decision,
+    `entry_is_its_own`, is tested).
+  - Level unchanged.
+- **Lot 314 — the state machines of the third external bug hunt, tested as
+  such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,
+  family F3 "state, windows and counts"; no level changes).**
+  - What was open: BUG-94 (an unlocked COMBAT's 30-minute quiet read from
+    the corroboration ledger's newest entry, which any event with a hit
+    prunes to 15 minutes: a scan by any user decayed COMBAT, and stood the
+    ladder down, up to 15 minutes early); BUG-84 (a force-posture toward the
+    current state rewrote it before the no-op check: ALERTED and ENGAGED
+    re-armed their decay, an unlocked COMBAT was locked with no transition
+    row); BUG-83 (NN-L-IOU-002's "once per process" had no memory: it fired
+    on most records the sensor sends after the first); BUG-92 and BUG-125
+    (the exec policy's repeat table keyed a finding without its severity or
+    tier, and had no cap); BUG-107 (the heartbeat's check held a head named
+    right after a rotation, (N, 0, H), without reading archive N-1).
+  - What changed, structurally: the posture's state is written in one place
+    (`PostureMachine::commit`), which records every change of its kind or of
+    COMBAT's lock as a transition row; a force toward the current state is
+    `transitions::forced` (the state as it is, an unlocked COMBAT locked
+    explicitly, with a row and the admin action — the decision of 11/11);
+    the last signal's time is kept apart from the ledger's entries; the
+    decision layer's "once" and "repeat" memories are
+    `decision::bounded::{BoundedMap, RepeatWindow, OncePerProcess}`, capped,
+    with the oldest entry evicted (NN-L-IOU-002 keyed by pid and start, the
+    repeat table by everything its record shows); a chain head names its
+    line through `chainlog::head_line`, and no line ends at byte 0. Ratchet
+    `xtask/tests/state_machines.rs`: the posture's state written only by
+    `commit`, and a table of last-seen times (`Map<…, Instant>`) only on the
+    bounded helpers or listed with what bounds it — it found the
+    `daemon-reload` limiter's targets without a cap (now capped at 1024).
+  - Model tests (`nn_core::model_check`: a SplitMix64 generator, no
+    dependency, a failing sequence named by its seed): 10,000 sequences each
+    of the posture machine (events, the clock, ticks, force-posture,
+    unlock), the corroboration ledger, NN-L-IOU-002 (processes that start
+    and exit, records read late) and the repeat table, checked after every
+    step against an oracle — a command toward the current state changes
+    nothing but the explicit COMBAT lock; the quiet counts from the last
+    signal; a "once" rule gives at most one verdict per key; every table
+    keeps its cap. The counterexamples are golden cases: `force-same-state`,
+    `force-locks-heuristic-combat` (a signed force-posture item in the
+    posture golden), `combat-quiet-after-a-prune`, `iou002-once-per-process`.
+  - Not done: the start a NN-L-IOU-002 record is keyed by is read from
+    `/proc` when the record is read, not carried by the record: a record
+    read after its pid went to another process is taken for that one's (the
+    reader runs milliseconds behind; the kernel half, N9 and a start in the
+    record, is lot 318's). The catalogue's text of NN-L-IOU-002 was left as
+    it was (still accurate).
+  - Measured on the host only (no lab: no unit, install, eBPF or self-test
+    changed; the agent's boot wiring is untouched): the gates in the PR.
+  - Level unchanged.
+- **Lot 319 — the evidence chains' residues: the third bug hunt's lot 10
+  (C21, C23; the partials 06, 28, 31, 10, 12 of edition 1.4, P3, and lot
+  296's backlog "the flat chains need the poisoned-writer scheme"; no level
+  changes).**
+  - What was open (our triage of 11/11/2026, its fix guidance followed): a
+    backdated row at the very head of a file still stopped the read verbs'
+    descent into the archives, untruncated (06); a rotation a crash
+    interrupted between its seal and its rename was finished at the next
+    open without the `ForeignArchive` rows of the slots its probe had
+    skipped (28); the JSONL export glued its first record to the start of a
+    line a dead worker left (31); a regular archive that cannot be removed
+    stopped every retention pass, an ERROR at each rotation and nothing in
+    the status (10); `--max-skew-secs` of 2^63 or more turned the heartbeat
+    verifier's skew bound negative (12). And the flat chains — the canary
+    registry and access log, the FIM baseline, the listener log — wrote with
+    `write_all` and went on after an error: a short write's fragment glued
+    to the next row, a failed fsync's row forked.
+  - What changed (`EVIDENCE_CHAINS.md` "The read verbs' answers" and "What
+    the agent did about it", `EXPORT.md` §3 and §8, `HEARTBEAT.md`, upgrade
+    notes §26): the read reads the next file's last row before it stops at
+    a backdated head, and reads on, `truncated`, when that row is at or
+    after `--since`; the open that finishes an interrupted rotation sounds
+    the slots from the last `Rotated` row again (an archive of the log's
+    own, its terminator verified, is never foreign); the JSONL sink opened
+    on a non-empty file closes the line first (an empty line when it ended
+    whole: the worker cannot read its files); a stalled retention is told
+    to the host (`ChainHost::retention_stalled`, a no-op by default) and the
+    agent's host makes it a `chain_retention` degradation, withdrawn at the
+    first pass that runs; the skew bound is compared without the cast. The
+    flat chains append through one writer, `nn_linux::flat_chain::FlatFile`:
+    a failed append or fsync poisons it, the next row cuts the fragment
+    (`repair_torn_tail`, as the open) and re-reads the chain's tail, and the
+    cut is signed in the audit chain by the degradation registry's sink
+    (`attest_repair`: at once with the log free, else at the flush; never
+    waited for). Two ratchets in `xtask/tests`: `flat_chain_writes.rs` (a
+    production file that holds a chain row opens no file to append, but for
+    the chain crate's own writers) and `time_bounds.rs` (no time bound cast
+    `as i64`).
+  - The mini-hunt (variants of each, each with its test failing without the
+    fix): 28 — a rotation's probe jumps past every archive name on disk,
+    and a foreign name it jumped over was never attested; one planted while
+    the log was closed sits below the next seq and no rotation probes it
+    (attested at the open now, above the last `Rotated` row the manifest
+    holds); 06 — the backdated head of an archive (the
+    same rule, per file); 12 — `fim report`/`net flows --since` past year
+    9999 or 2^63 kept every row (`unix_ts as i64`, or `+10000-…` sorting
+    before every row), and `detections --since/--until` likewise (`s as
+    i64`); 31 — the combat teardown's compatibility log, the watchdog's
+    hold records (which the agent signs: a glued record was neither read
+    nor signed) and the copy-on-write journal while it runs (lot 297 closed
+    its torn line at the open only) glued a line to one left unfinished.
+    Looked at and left: the export sink's rotation (a failed unlink is the
+    sink's fault, Down, already visible), the copy-on-write retention
+    (bounded 1–168 h, no cast past `i64`).
+  - The tests: each named test fails on `main` (4c864565) and passes here;
+    the backlog's with the kernel's own short write (`RLIMIT_FSIZE`, in a
+    helper process). Mutation testing on the new code: 52 mutants over two
+    passes, 51 caught by named tests (the six that survived the first pass
+    each got a test: the peek's scan budget, an archive copied into another
+    slot, the same stall told twice, a row cut before its newline, a FIFO at
+    the watchdog's record path), 0 compile-only, 1 argued equivalent — the
+    poisoning of the listener log by a failed group fsync: its rows were
+    written whole and its tail already advanced, so the re-read gives the
+    same tail.
+  - The lab, as measured (our own guest under lease k319, **Ubuntu 24.04**
+    `6.8.0-147-generic`, clean at the start: no agent, no pin, no overlay;
+    9f7cbed6 installed and enabled the operator's way):
+    - a fresh install: every manifest without a `ForeignArchive` row (the
+      open's new scan found none), `nn-admin status` "degradations: none",
+      the trust level L3, `chain verify` OK for the ten chains;
+    - the root filesystem filled to ENOSPC (`fallocate` and `dd` as root,
+      4,092 blocks left) while 60 listens by `nobody` were written to the
+      listener log: one write stopped 400 bytes into its row at a block's
+      end (7,792 bytes of whole rows kept); the next row cut it and the cut
+      was signed (`chain_tail_repaired`, the file, 400 bytes and their
+      SHA-256) once the audit log could take it; the failed row is the only
+      one missing (59 of 60). With the space back and 20 more listens: 89
+      rows, every line a row, every link whole. The audit log itself ended
+      in a 345-byte fragment while idle (lot 296's scheme: repaired and
+      attested at its next row, 23:42:31; `chain verify` read it `BROKEN`
+      just before that, as lot 296's lab did for netflow);
+    - the cold boot after (host power-off, bootcheck OK: the agent active,
+      its pin root and LSM programs): the listener log opened and took 5
+      more rows (94, all chained), `chain verify` OK for all ten chains (7
+      heads anchored), 2 `chain_tail_repaired` rows in the audit chain, no
+      `ForeignArchive` row, no degradation; then uninstalled, the guest
+      clean and off, the lease released. The stalled retention, the foreign
+      slots and the export's open are measured by the tests only (they need
+      a rotated log with an archive made unremovable, or root's planting in
+      the protected state directory).
+  - The independent review of #544 (verdict: merge; no P0–P2), its cheap
+    fixes in this PR: the rotation's probe takes every name in its range
+    for a foreign entry again, as `main` did — a planted file ending in a
+    forged terminator (its hash recomputes, signed with any key) passed the
+    "earlier key" rule and went unattested (test
+    `a_forged_terminator_at_the_next_slot_is_foreign`); an earlier key's
+    terminator counts as the log's own only when the manifest holds no
+    `Rotated` row this key verifies. The `time_bounds` ratchet catches the
+    cast it was written for (`.map(|s| s as i64)` on a time-named receiver),
+    a time-named call (`d.as_secs() as i64`: one site fixed in
+    `module_writes.rs`), `ts`, `…_ns`, `ttl`, `deadline`, `timeout` and
+    parenthesised expressions, over every crate (`common`, `cli`, `scan`
+    too). A repair's cut whose fsync fails is still returned and signed, and
+    the repairs dropped past the bound are counted in a signed row
+    (`chain_repairs`). The docs say what is left: names planted below the
+    last `Rotated` row, a clock step-back across a rotation, the shippers'
+    empty-line setting. In the backlog: the durability of a run-time cut's
+    record across a restart (F5's rest), the stall's end signed and a
+    transient listing failure (F7), the open's archive reads (F8).
+- **Lot 315 — the copy-on-first-write guard and the exec policy trust the
+  kernel's data, not a name or a number (C19, C13, C23; the third bug
+  hunt's lot 6, family F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's
+  record half, BUG-113, the triage's N2, and the lot's mini-hunt; no level
+  changes).**
+  - What was open: N2, data loss — the restore looked for "the attack's
+    renamed copy" of a deleted file by device and inode number alone: a new
+    file of the owner's that had inherited the number (one open: `cp`,
+    `tar`, a download) was moved into the journal's evidence, and the
+    evidence's expiry, by the file's own mtime, deleted it (at once with an
+    old mtime kept). The same number-only identity in four more places
+    (BUG-110's `pick`, copy on first write, shared copies, the write-opens
+    after a copy). BUG-93: a restore of a process tree weighed a file's
+    later writers against the copies it picked, one per file: a second
+    writer of the tree was "another writer". BUG-102: an io_uring worker's
+    open read as its creator's syscall. BUG-109: a file named `x (deleted)`
+    taken for an unlinked one. BUG-101: `AT_SECURE` claimed by the set-id
+    bits alone. BUG-113: the watchdog's start read after its exe only.
+  - What changed: `cow/identity.rs` (`FileId`: device, inode number, birth
+    time; three questions, each wrong only on the side that loses nothing)
+    holds every comparison of the guard, and `xtask/tests/cow_file_identity.rs`
+    refuses any other (it flags the 19 sites of `main`); the renamed copy is
+    the file only by a birth time known on both sides; the evidence ages from
+    its move; a restore with roots weighs every copy of the tree and each
+    write-open's lineage (`--since` alone unchanged); `PF_IO_WORKER` from
+    `/proc/<tid>/stat` and cleared registers make a write (BUG-102 in part:
+    an io_uring open run in the submitting thread's task_work is a declared
+    limit, its fix a follow-up lot); after the review of #542, rule 5 and
+    the evidence move only on a birth time known on both sides, a running
+    tree writer keeps both, `pick` transitive, `--pid` ambiguity over the
+    write-opens; liveness of an
+    event's file is `st_nlink`, its path told by a cached `lstat` against
+    `fstat` (a hard link left keeps the opened name: a mini-hunt variant);
+    `ExecPolRaw::at_secure`; the watchdog's start read before and after.
+  - Measured on our guests: Ubuntu 24.04 (`6.8.0-147-generic`, ext4, the
+    guard on `/srv/nn-cow-test`, `deploy/lab/cow/cow-check.sh`). N2 on
+    `main`: the attack (an untrusted `python3` of the lab user) rewrote and
+    deleted `x.txt`, the owner's `cp -p` of a file dated 2025 got its inode
+    number at the first try, and `remediate ransomware --pid` recreated
+    `x.txt` and moved the owner's file into the journal's evidence, its mtime
+    2025-01-01 — the next expiry's to delete. With this lot (the new `reuse`
+    mode): the same reuse at the first try, `x.txt` recreated, the owner's
+    file in place and unchanged, no evidence. The mass write of `run` (51
+    files rewritten and renamed `.locked`): 50 copies, 50 recreated byte for
+    byte and their 50 renamed copies moved into the evidence, the 20 MiB
+    file over the copy cap as designed. The privileged e2e
+    `cow_privileged_e2e` (the guard on a tmpfs, root): 3 of 3, the new
+    `two_writers_of_one_tree_are_its_attack` included; with the guard's
+    write-opens built without their lineage (mutant M35) it fails. Not run
+    on a guest: BUG-102's worker (a real io_uring worker on the host's
+    kernel, 6.18, in a unit test), BUG-109, BUG-101 (record only), BUG-113;
+    and the fixes after the review of #542 (rule 5 on a known birth time,
+    the running tree writer, `pick`, the `--pid` ambiguity): host tests
+    only, no guest lease free in the round's window.
+  - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
+    by default (C19, C13); BUG-101's kernel half (the deny skipped for every
+    set-id target) is lot 318's.

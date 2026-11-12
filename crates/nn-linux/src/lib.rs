@@ -137,6 +137,10 @@ pub mod canary {
 // the agent's `canary_host_linux`).
 pub mod canary_host_linux;
 
+// Lot 319 (lot 296's backlog): the flat chains' writer after a failed write
+// — the canary registry and access log, the FIM baseline, the listener log.
+pub mod flat_chain;
+
 // Lot 277: the start-in-cgroup tracker's agent half — the exemptions by
 // cgroup or unit hold for processes started in their cgroup only.
 pub mod cgroup_join;
@@ -373,6 +377,10 @@ pub mod worker;
 // Lab PR 265 (review of #468 R1, R3): the one `mountinfo` reader, byte by
 // byte, of the start's mount check and the self-integrity watcher.
 pub mod mountinfo;
+
+// Lot 311 (third bug hunt, F4 and N6): the kernel's state files read as
+// text that never fails on its encoding — a process sets its own `comm`.
+pub mod state_read;
 
 // systemd's readiness notification (`READY=1` on `$NOTIFY_SOCKET`, T7.10),
 // through the datagram `antitamper-bpf` shares with the watchdog (R09c, lab

@@ -30,6 +30,21 @@ use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Lot 311 (third bug hunt, F4 and N6): a kernel state file's bytes as
+/// text, what is not UTF-8 replaced by U+FFFD. A process names itself —
+/// its `comm` (`prctl(PR_SET_NAME)`, the name of the file it executed) is
+/// in its `stat` and `status` byte for byte — and a mount's source or a
+/// cgroup's name is its creator's: a strict decode refused the whole file,
+/// and the reader took the refusal for "no such process". The fields read
+/// from these files are ASCII and come out as the kernel wrote them; a
+/// replaced byte never makes a name an ASCII one another process may hold.
+pub fn state_text(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
 /// The host's reads and clocks the posture uses. A unit type: the posture's
 /// types hold it as a parameter only (hence `Copy`, `Default`, `Debug`).
 pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {

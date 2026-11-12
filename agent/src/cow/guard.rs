@@ -47,9 +47,10 @@ use tracing::{debug, error, info, warn};
 use super::config::MarkKind;
 use super::copy::{snapshot, Snapshot};
 use super::fanotify::{
-    fd_path, fstat, is_own_thread, parse_events, read_open_intent, tgid_of, Group, OpenIntent,
-    RawEvent,
+    btime, fd_path, fstat, is_own_thread, parse_events, read_open_intent, tgid_of, Group,
+    OpenIntent, RawEvent,
 };
+use super::identity::FileId;
 use super::index::{FileState, Method, PostWrite, Refusal, Reservation};
 use super::journal::{host_view, Journal};
 use super::store::{now_ms, Stats, Store};
@@ -121,7 +122,9 @@ pub struct Runtime {
     group: Group,
     trust: TrustFilter,
     pending: Mutex<HashMap<u64, Pending>>,
-    inflight: Mutex<HashSet<(u64, u64, ProcId)>>,
+    /// Copies under way: the file (with its birth time, lot 315) and the
+    /// writer.
+    inflight: Mutex<HashSet<(FileId, ProcId)>>,
     next_id: AtomicU64,
     /// Monotonic milliseconds of the reader's last progress.
     heartbeat: AtomicU64,
@@ -604,17 +607,18 @@ impl Runtime {
         let start = proc_start_ticks(Path::new("/proc"), tgid).unwrap_or(0);
         let writer = ProcId { pid: tgid, start };
         let info = self.trust.evaluate(tgid, start);
-        let (dev, ino) = (st.st_dev, st.st_ino);
-        self.store.record_post_write(
-            dev,
-            ino,
-            PostWrite {
-                at_ms: now_ms(),
-                writer,
-                program: info.program.clone(),
-                trusted: info.trust.is_trusted(),
-            },
-        );
+        // Lot 315 (bug hunt 1.4, F6): the file is its device, inode number
+        // and birth time — a new file that inherited a journaled inode
+        // number is not the old one (see `cow/identity.rs`).
+        let id = FileId::new(st.st_dev, st.st_ino, btime(fd.as_raw_fd(), None));
+        self.store.record_post_write(PostWrite {
+            file: id,
+            at_ms: now_ms(),
+            writer,
+            program: info.program.clone(),
+            trusted: info.trust.is_trusted(),
+            lineage: info.lineage.clone(),
+        });
         if info.trust.is_trusted() {
             return self.allow_fast(fd, read_at, &s.allowed_trusted);
         }
@@ -628,23 +632,22 @@ impl Runtime {
         if cfg.in_journal(Path::new(&path)) || self.store.objects_fds[scope] < 0 {
             return self.allow_fast(fd, read_at, &s.allowed_outside_scope);
         }
-        let key = (dev, ino, writer);
-        if self.inflight.lock().contains(&key)
-            || self.store.index.lock().has_entry_for(dev, ino, writer)
+        let key = (id, writer);
+        if self.inflight.lock().contains(&key) || self.store.index.lock().has_entry_for(&id, writer)
         {
             return self.allow_fast(fd, read_at, &s.allowed_already_copied);
         }
         let file = FileState {
             path,
-            dev,
-            ino,
+            dev: id.dev,
+            ino: id.ino,
             size: st.st_size as u64,
             mtime_ns: st.st_mtime * 1_000_000_000 + st.st_mtime_nsec,
             ctime_ns: st.st_ctime * 1_000_000_000 + st.st_ctime_nsec,
             mode: st.st_mode,
             uid: st.st_uid,
             gid: st.st_gid,
-            btime_ns: super::fanotify::btime(fd.as_raw_fd(), None),
+            btime_ns: id.btime_ns,
         };
         let reusable = self.store.index.lock().reusable_object(&file);
         if let Some(obj) = reusable {
@@ -802,7 +805,7 @@ impl Runtime {
             job.deadline,
         );
         let in_time = self.finish(job.id);
-        let key = (job.file.dev, job.file.ino, job.writer);
+        let key = (job.file.id(), job.writer);
         let abandon = |counter: &AtomicU64| {
             Stats::bump(counter);
             self.store.release(job.reservation);
@@ -886,7 +889,7 @@ impl Runtime {
                     at_ms,
                     method,
                 }) => {
-                    let key = (file.dev, file.ino, writer);
+                    let key = (file.id(), writer);
                     if let Err(e) = self.store.commit(
                         reservation,
                         file,

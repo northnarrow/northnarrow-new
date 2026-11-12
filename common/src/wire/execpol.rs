@@ -393,11 +393,33 @@ impl ExecPolRaw {
         self.tier & tier::MASK
     }
 
-    /// The target is set-user-ID or set-group-ID: the kernel will set
-    /// `AT_SECURE` and the loader ignores `LD_PRELOAD` entries with a
-    /// slash, `LD_LIBRARY_PATH` and unsafe `LD_AUDIT` values.
+    /// The target is set-user-ID or set-group-ID (its mode only: whether
+    /// the exec changes the credentials is [`Self::at_secure`]).
     pub const fn target_setid(&self) -> bool {
         self.file_mode & 0o6000 != 0
+    }
+
+    /// The kernel sets `AT_SECURE` for this exec — the loader then ignores
+    /// `LD_PRELOAD` entries with a slash, `LD_LIBRARY_PATH` and unsafe
+    /// `LD_AUDIT` values — only when the exec changes the credentials:
+    /// the effective uid becomes another than the real one (a set-user-ID
+    /// file owned by another user than the caller's real uid, [`Self::uid`])
+    /// or the effective gid another than the real one (a set-group-ID file:
+    /// the record does not carry the file's group, so a set-group-ID target
+    /// counts as changing it — as it does for every caller outside that
+    /// group).
+    ///
+    /// Lot 315 (external bug hunt 1.4, BUG-101, the record's half): the
+    /// set-id bits alone said `AT_SECURE` for root running a
+    /// set-user-ID-root file (`su`, `passwd`, `mount`), which changes no
+    /// credential: the loader honours the preload, as root, and the record
+    /// said it was ignored. A `file_uid` read as 0 (the kernel's `i_uid`
+    /// offset not resolved) keeps it so for a caller other than root and
+    /// says "not secure" for root — the side that does not claim a
+    /// neutralised preload. The kernel's half (the deny skipped for every
+    /// set-id target) is lot 318's.
+    pub const fn at_secure(&self) -> bool {
+        (self.file_mode & 0o4000 != 0 && self.file_uid != self.uid) || self.file_mode & 0o2000 != 0
     }
 }
 
@@ -554,6 +576,40 @@ mod tests {
         assert!(r.target_setid());
         r.file_mode = 0o102755;
         assert!(r.target_setid());
+        r.tier = tier::SESSION | tier_sig::TTY;
+        assert_eq!(r.tier_value(), tier::SESSION);
+    }
+
+    /// Lot 315 (BUG-101): `AT_SECURE` when the exec changes the
+    /// credentials, not for every set-id file.
+    #[test]
+    fn at_secure_when_the_credentials_change() {
+        let mut r = ExecPolRaw::zeroed();
+        r.file_mode = 0o104755;
+        r.file_uid = 0;
+        r.uid = 0;
+        assert!(r.target_setid());
+        assert!(
+            !r.at_secure(),
+            "root running a set-uid-root file: no change"
+        );
+        r.uid = 1000;
+        assert!(r.at_secure(), "a user running a set-uid-root file");
+        r.file_uid = 1000;
+        assert!(!r.at_secure(), "a user running its own set-uid file");
+        r.uid = 0;
+        assert!(r.at_secure(), "root running a set-uid file of another user");
+        r.file_mode = 0o102755;
+        r.file_uid = 0;
+        assert!(
+            r.at_secure(),
+            "set-gid: the file's group is not in the record"
+        );
+        r.file_mode = 0o106755;
+        assert!(r.at_secure());
+        r.file_mode = 0o100755;
+        r.uid = 1000;
+        assert!(!r.at_secure(), "no set-id bit");
         r.tier = tier::SESSION | tier_sig::TTY;
         assert_eq!(r.tier_value(), tier::SESSION);
     }

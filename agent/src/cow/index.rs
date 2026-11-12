@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use super::identity::{FileId, Slot};
 use super::trust::ProcId;
 
 /// How an object was taken.
@@ -65,6 +66,13 @@ pub struct FileState {
     pub btime_ns: Option<i64>,
 }
 
+impl FileState {
+    /// The file's identity (see [`super::identity`]).
+    pub const fn id(&self) -> FileId {
+        FileId::new(self.dev, self.ino, self.btime_ns)
+    }
+}
+
 /// One journal entry (persisted as a line of `index.jsonl`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -87,11 +95,17 @@ impl Entry {
     /// The entry's writer, or one of its ancestors when it was taken, is
     /// `p` (a start of 0 matches any start of that pid).
     pub fn in_tree_of(&self, p: ProcId) -> bool {
-        self.lineage
-            .iter()
-            .chain(std::iter::once(&self.writer))
-            .any(|h| h.pid == p.pid && (p.start == 0 || h.start == 0 || h.start == p.start))
+        names(&self.lineage, self.writer, p)
     }
+}
+
+/// `writer` or one of `lineage` is `p` (a start of 0 matches any start of
+/// that pid).
+fn names(lineage: &[ProcId], writer: ProcId, p: ProcId) -> bool {
+    lineage
+        .iter()
+        .chain(std::iter::once(&writer))
+        .any(|h| h.pid == p.pid && (p.start == 0 || h.start == 0 || h.start == p.start))
 }
 
 /// One object's bookkeeping.
@@ -109,10 +123,25 @@ pub struct ObjectInfo {
 /// A write-open of a journaled file seen after its copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostWrite {
+    /// The file opened (lot 315: with its birth time — the open of a new
+    /// file that inherited a journaled inode number is not the old one's).
+    pub file: FileId,
     pub at_ms: u64,
     pub writer: ProcId,
     pub program: String,
     pub trusted: bool,
+    /// The writer's lineage when it opened the file, writer first (lot
+    /// 315, BUG-93: a restore of a process tree knows a writer of that
+    /// tree whose own copy was not taken).
+    pub lineage: Vec<ProcId>,
+}
+
+impl PostWrite {
+    /// The writer, or one of its ancestors when it opened the file, is `p`
+    /// (a start of 0 matches any start of that pid).
+    pub fn in_tree_of(&self, p: ProcId) -> bool {
+        names(&self.lineage, self.writer, p)
+    }
 }
 
 /// Room held for a copy in progress.
@@ -148,10 +177,10 @@ const POST_WRITES_PER_INODE: usize = 8;
 #[derive(Debug, Clone, Default)]
 pub struct JournalIndex {
     entries: BTreeMap<u64, Entry>,
-    by_inode: HashMap<(u64, u64), Vec<u64>>,
+    by_inode: HashMap<Slot, Vec<u64>>,
     objects: HashMap<u64, ObjectInfo>,
     scopes: Vec<Usage>,
-    post_writes: HashMap<(u64, u64), Vec<PostWrite>>,
+    post_writes: HashMap<Slot, Vec<PostWrite>>,
     next_entry: u64,
     next_object: u64,
     retention_ms: u64,
@@ -202,32 +231,40 @@ impl JournalIndex {
         self.objects.get(&id)
     }
 
-    /// The inode has an entry (a write-open of it is worth recording).
-    pub fn has_inode(&self, dev: u64, ino: u64) -> bool {
-        self.by_inode.contains_key(&(dev, ino))
-    }
-
-    /// Copy on first write: this writer has an entry for the inode.
-    pub fn has_entry_for(&self, dev: u64, ino: u64, writer: ProcId) -> bool {
-        self.by_inode.get(&(dev, ino)).is_some_and(|ids| {
-            ids.iter()
-                .filter_map(|id| self.entries.get(id))
-                .any(|e| e.writer == writer)
-        })
-    }
-
-    /// The latest object of the inode when the file is unchanged since it
-    /// was taken (same size, mtime and ctime): a new writer shares it.
-    pub fn reusable_object(&self, f: &FileState) -> Option<u64> {
-        let ids = self.by_inode.get(&(f.dev, f.ino))?;
-        let latest = ids
-            .iter()
+    /// The entries filed in `f`'s slot: `f`'s, and those of files that
+    /// had its inode number before it.
+    fn in_slot(&self, f: &FileId) -> impl Iterator<Item = &Entry> {
+        self.by_inode
+            .get(&f.slot())
+            .into_iter()
+            .flatten()
             .filter_map(|id| self.entries.get(id))
+    }
+
+    /// An entry may be `f`'s: a write-open of it is worth recording.
+    pub fn has_slot(&self, f: &FileId) -> bool {
+        self.by_inode.contains_key(&f.slot())
+    }
+
+    /// Copy on first write: this writer has an entry for the file. Lot 315
+    /// (the triage's F6 sites): for this file — a new file that inherited
+    /// the inode number of one the writer had a copy of gets its own copy.
+    pub fn has_entry_for(&self, f: &FileId, writer: ProcId) -> bool {
+        self.in_slot(f)
+            .any(|e| e.writer == writer && e.file.id() == *f)
+    }
+
+    /// The latest object of the file when it is unchanged since it was
+    /// taken (the same file, same size, mtime and ctime): a new writer
+    /// shares it.
+    pub fn reusable_object(&self, f: &FileState) -> Option<u64> {
+        let latest = self
+            .in_slot(&f.id())
+            .filter(|e| e.file.id() == f.id())
             .max_by_key(|e| (e.taken_at_ms, e.id))?;
         (latest.file.size == f.size
             && latest.file.mtime_ns == f.mtime_ns
-            && latest.file.ctime_ns == f.ctime_ns
-            && latest.file.btime_ns == f.btime_ns)
+            && latest.file.ctime_ns == f.ctime_ns)
             .then_some(latest.object)
     }
 
@@ -413,7 +450,7 @@ impl JournalIndex {
             o.refs += 1;
         }
         self.by_inode
-            .entry((e.file.dev, e.file.ino))
+            .entry(e.file.id().slot())
             .or_default()
             .push(e.id);
         self.next_entry = self.next_entry.max(e.id + 1);
@@ -455,7 +492,7 @@ impl JournalIndex {
             .collect();
         for id in ids {
             if let Some(e) = self.entries.remove(&id) {
-                let key = (e.file.dev, e.file.ino);
+                let key = e.file.id().slot();
                 if let Some(v) = self.by_inode.get_mut(&key) {
                     v.retain(|x| *x != id);
                     if v.is_empty() {
@@ -492,24 +529,37 @@ impl JournalIndex {
     /// `post_writes(since that copy)` — and the restore of that copy
     /// rewrote the file in place over the legitimate change. The newer
     /// write-open replaces the older one and becomes the most recent.
-    pub fn record_post_write(&mut self, dev: u64, ino: u64, w: PostWrite) {
-        if !self.by_inode.contains_key(&(dev, ino)) {
+    pub fn record_post_write(&mut self, w: PostWrite) {
+        let slot = w.file.slot();
+        if !self.by_inode.contains_key(&slot) {
             return;
         }
-        let v = self.post_writes.entry((dev, ino)).or_default();
-        v.retain(|p| p.writer != w.writer);
+        let v = self.post_writes.entry(slot).or_default();
+        v.retain(|p| !(p.writer == w.writer && p.file == w.file));
         if v.len() >= POST_WRITES_PER_INODE {
             v.remove(0);
         }
         v.push(w);
     }
 
-    /// The write-opens of the inode seen at or after `since_ms`.
-    pub fn post_writes(&self, dev: u64, ino: u64, since_ms: u64) -> Vec<PostWrite> {
+    /// The write-opens of the file seen at or after `since_ms`. Lot 315:
+    /// of a file that may be `f` — a write-open of a new file that
+    /// inherited the inode number is not one of `f`'s.
+    pub fn post_writes(&self, f: &FileId, since_ms: u64) -> Vec<PostWrite> {
         self.post_writes
-            .get(&(dev, ino))
-            .map(|v| v.iter().filter(|p| p.at_ms >= since_ms).cloned().collect())
+            .get(&f.slot())
+            .map(|v| {
+                v.iter()
+                    .filter(|p| p.at_ms >= since_ms && p.file.may_be(f))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// Every write-open kept, of every file.
+    pub fn all_post_writes(&self) -> impl Iterator<Item = &PostWrite> {
+        self.post_writes.values().flatten()
     }
 
     /// The object ids every entry references (the journal deletes the
@@ -549,6 +599,11 @@ mod tests {
         ProcId { pid, start: 100 }
     }
 
+    /// The identity of [`file`]`(ino, _)`.
+    fn id(ino: u64) -> FileId {
+        FileId::new(8, ino, None)
+    }
+
     fn take(
         ix: &mut JournalIndex,
         ino: u64,
@@ -584,8 +639,8 @@ mod tests {
         // past the floor, the least recently used object goes first
         let (_, evicted) = take(&mut ix, 3, 30, t0 + 20 * MIN).unwrap();
         assert_eq!(evicted.len(), 1);
-        assert!(!ix.has_inode(8, 1), "the oldest object was evicted");
-        assert!(ix.has_inode(8, 2));
+        assert!(!ix.has_slot(&id(1)), "the oldest object was evicted");
+        assert!(ix.has_slot(&id(2)));
         assert_eq!(ix.usage(0).unwrap().used, 70);
         assert_eq!(
             ix.reserve(0, 101, t0).unwrap_err(),
@@ -622,16 +677,16 @@ mod tests {
         // object 2 is now the least recently used
         let (_, evicted) = take(&mut ix, 3, 30, t0 + 20 * MIN).unwrap();
         assert_eq!(ix.entry_count(0), 3);
-        assert!(ix.has_inode(8, 1) && !ix.has_inode(8, 2), "{evicted:?}");
+        assert!(ix.has_slot(&id(1)) && !ix.has_slot(&id(2)), "{evicted:?}");
     }
 
     #[test]
     fn copy_on_first_write_is_per_writer() {
         let mut ix = JournalIndex::new(&[1000], 24 * 60 * MIN, 0);
         take(&mut ix, 1, 10, 1).unwrap();
-        assert!(ix.has_entry_for(8, 1, w(7)));
-        assert!(!ix.has_entry_for(8, 1, w(8)));
-        assert!(!ix.has_entry_for(8, 1, ProcId { pid: 7, start: 101 }));
+        assert!(ix.has_entry_for(&id(1), w(7)));
+        assert!(!ix.has_entry_for(&id(1), w(8)));
+        assert!(!ix.has_entry_for(&id(1), ProcId { pid: 7, start: 101 }));
     }
 
     #[test]
@@ -641,7 +696,7 @@ mod tests {
         take(&mut ix, 2, 10, 50 * MIN).unwrap();
         let gone = ix.expire(70 * MIN);
         assert_eq!(gone.len(), 1);
-        assert!(!ix.has_inode(8, 1) && ix.has_inode(8, 2));
+        assert!(!ix.has_slot(&id(1)) && ix.has_slot(&id(2)));
         assert_eq!(ix.usage(0).unwrap().used, 10);
     }
 
@@ -649,31 +704,27 @@ mod tests {
     fn post_writes_are_kept_per_inode_and_bounded() {
         let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
         take(&mut ix, 1, 10, 5).unwrap();
-        ix.record_post_write(
-            8,
-            99,
-            PostWrite {
-                at_ms: 6,
-                writer: w(1),
+        ix.record_post_write(PostWrite {
+            file: id(99),
+            at_ms: 6,
+            writer: w(1),
+            program: "vim".into(),
+            trusted: true,
+            lineage: vec![],
+        });
+        assert!(ix.post_writes(&id(99), 0).is_empty(), "not journaled");
+        for pid in 0..20 {
+            ix.record_post_write(PostWrite {
+                file: id(1),
+                at_ms: 10 + pid as u64,
+                writer: w(pid),
                 program: "vim".into(),
                 trusted: true,
-            },
-        );
-        assert!(ix.post_writes(8, 99, 0).is_empty(), "not journaled");
-        for pid in 0..20 {
-            ix.record_post_write(
-                8,
-                1,
-                PostWrite {
-                    at_ms: 10 + pid as u64,
-                    writer: w(pid),
-                    program: "vim".into(),
-                    trusted: true,
-                },
-            );
+                lineage: vec![],
+            });
         }
-        assert_eq!(ix.post_writes(8, 1, 0).len(), POST_WRITES_PER_INODE);
-        assert_eq!(ix.post_writes(8, 1, 28).len(), 2);
+        assert_eq!(ix.post_writes(&id(1), 0).len(), POST_WRITES_PER_INODE);
+        assert_eq!(ix.post_writes(&id(1), 28).len(), 2);
     }
 
     #[test]
@@ -724,16 +775,18 @@ mod tests {
             )
         };
         let pw = |at: u64| PostWrite {
+            file: id(7),
             at_ms: at,
             writer: w(50),
             program: "vim".into(),
             trusted: true,
+            lineage: vec![w(50)],
         };
         mk(&mut ix, 10, 100);
-        ix.record_post_write(8, 7, pw(150));
+        ix.record_post_write(pw(150));
         let b = mk(&mut ix, 20, 200);
-        ix.record_post_write(8, 7, pw(250));
-        let post = ix.post_writes(8, 7, 200);
+        ix.record_post_write(pw(250));
+        let post = ix.post_writes(&id(7), 200);
         let sel = Selector {
             roots: vec![w(20)],
             since_ms: None,
@@ -741,7 +794,7 @@ mod tests {
         let picked = pick(ix.entries(), &sel);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].id, b.id);
-        let in_attack = |p: ProcId| sel.in_attack(&picked, p);
+        let in_attack = |p: &PostWrite| sel.in_attack_write(&picked, p);
         let cur = Current {
             exists: true,
             regular: true,
@@ -758,6 +811,7 @@ mod tests {
                 content_is_original: Some(false),
                 post_writes: &post,
                 in_attack: &in_attack,
+                alive: &|_| false,
                 predates_run: false,
             },
         );
@@ -768,7 +822,7 @@ mod tests {
         );
         assert!(matches!(plan, Plan::KeepBoth(_)), "{plan:?}");
         // one slot per writer: its latest write-open only
-        assert_eq!(ix.post_writes(8, 7, 0), vec![pw(250)]);
+        assert_eq!(ix.post_writes(&id(7), 0), vec![pw(250)]);
     }
 
     /// Lot 297 (BUG48): a writer seen again keeps one slot, its latest
@@ -779,17 +833,19 @@ mod tests {
         let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
         take(&mut ix, 1, 10, 5).unwrap();
         let pw = |pid: u32, at: u64| PostWrite {
+            file: id(1),
             at_ms: at,
             writer: w(pid),
             program: "vim".into(),
             trusted: true,
+            lineage: vec![],
         };
         for pid in 0..POST_WRITES_PER_INODE as u32 {
-            ix.record_post_write(8, 1, pw(pid, 10 + u64::from(pid)));
+            ix.record_post_write(pw(pid, 10 + u64::from(pid)));
         }
-        ix.record_post_write(8, 1, pw(0, 30));
+        ix.record_post_write(pw(0, 30));
         let pids = |ix: &JournalIndex| -> Vec<(u32, u64)> {
-            ix.post_writes(8, 1, 0)
+            ix.post_writes(&id(1), 0)
                 .iter()
                 .map(|p| (p.writer.pid, p.at_ms))
                 .collect()
@@ -800,7 +856,7 @@ mod tests {
         want.push((0, 30));
         assert_eq!(pids(&ix), want, "writer 0 once, at 30, the most recent");
         // a new writer evicts the one seen longest ago (1), not writer 0
-        ix.record_post_write(8, 1, pw(100, 40));
+        ix.record_post_write(pw(100, 40));
         want.remove(0);
         want.push((100, 40));
         assert_eq!(pids(&ix), want);
@@ -815,5 +871,67 @@ mod tests {
         assert!(e.in_tree_of(ProcId { pid: 1, start: 100 }));
         assert!(!e.in_tree_of(ProcId { pid: 7, start: 5 }));
         assert!(!e.in_tree_of(ProcId { pid: 8, start: 100 }));
+    }
+
+    /// Lot 315 (the triage's F6 sites, index.rs:211-217 and 495-513 on
+    /// main): a new file that inherited a journaled inode number (another
+    /// birth time) is another file — its writer gets a copy of it, its
+    /// write-opens are not the old file's, and it shares no copy.
+    #[test]
+    fn a_reused_inode_number_is_another_file_in_the_index() {
+        let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
+        let born = |b: Option<i64>| FileState {
+            btime_ns: b,
+            ..file(7, 10)
+        };
+        let (r, _) = ix.reserve(0, 10, 5).unwrap();
+        let old = ix.commit(
+            r,
+            born(Some(100)),
+            "ab".into(),
+            w(7),
+            "/x".into(),
+            vec![w(7)],
+            5,
+            Method::Copy,
+        );
+        let reborn = FileId::new(8, 7, Some(200));
+        // copy on first write: the writer's copy of the old file is not
+        // one of the new file
+        assert!(ix.has_entry_for(&old.file.id(), w(7)));
+        assert!(
+            !ix.has_entry_for(&reborn, w(7)),
+            "the writer of a deleted file opens the new file with its number: no copy taken"
+        );
+        // a birth time not known on one side: a new copy too
+        assert!(!ix.has_entry_for(&FileId::new(8, 7, None), w(7)));
+        // shared copies: of the same file only
+        assert_eq!(ix.reusable_object(&born(Some(100))), Some(old.object));
+        assert_eq!(ix.reusable_object(&born(Some(200))), None);
+        assert_eq!(ix.reusable_object(&born(None)), None);
+        // write-opens of the new file are not the old one's
+        let open_of = |file: FileId, pid: u32| PostWrite {
+            file,
+            at_ms: 10,
+            writer: w(pid),
+            program: "vim".into(),
+            trusted: true,
+            lineage: vec![],
+        };
+        assert!(ix.has_slot(&reborn), "recorded: the slot holds a copy");
+        ix.record_post_write(open_of(reborn, 50));
+        assert!(
+            ix.post_writes(&old.file.id(), 0).is_empty(),
+            "the new file's write-open counted against the old file's copy"
+        );
+        assert_eq!(ix.post_writes(&reborn, 0).len(), 1);
+        // one not known on either side may be the file: counted (the
+        // careful side: a restore keeps both)
+        ix.record_post_write(open_of(FileId::new(8, 7, None), 51));
+        assert_eq!(ix.post_writes(&old.file.id(), 0).len(), 1);
+        // the same writer on two files of the slot: two write-opens kept
+        ix.record_post_write(open_of(old.file.id(), 50));
+        assert_eq!(ix.post_writes(&reborn, 0).len(), 2);
+        assert_eq!(ix.post_writes(&old.file.id(), 0).len(), 2);
     }
 }

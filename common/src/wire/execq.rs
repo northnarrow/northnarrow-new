@@ -127,6 +127,11 @@ pub mod stop_flags {
     /// path once it runs, so a scan made while it is held cannot vouch for
     /// what it reads (the file can be rewritten or replaced in between).
     pub const SCRIPT_REFUSED: u32 = 1 << 6;
+    /// Lot 317 (third bug hunt, review F3): not stopped — `EXECQ_STOPPED`
+    /// could not name the process (the map full). The kernel stops only a
+    /// process the map names, so that the agent's stop, its crash's next
+    /// start and the boot's recovery can always resume it.
+    pub const MAP_FULL: u32 = 1 << 7;
 }
 
 /// `EXECQ_COUNTERS` slots (per-CPU `u64`, summed by the agent).
@@ -147,8 +152,10 @@ pub mod counter {
     pub const CAND_DROPPED: u32 = 6;
     /// Lab PR 226: scripts refused at exec (enforce mode).
     pub const SCRIPT_REFUSED: u32 = 7;
+    /// Lot 317: candidates not stopped — `EXECQ_STOPPED` was full.
+    pub const MAP_FULL: u32 = 8;
     /// Slots in the map.
-    pub const SLOTS: u32 = 8;
+    pub const SLOTS: u32 = 9;
 }
 
 /// Key of `EXECQ_KNOWN` and `EXECQ_ROOTS`: an inode as the exec sensor
@@ -288,7 +295,8 @@ impl ExecqStopRaw {
             & (stop_flags::OBSERVE
                 | stop_flags::SIGNAL_FAILED
                 | stop_flags::HEARTBEAT_STALE
-                | stop_flags::SCRIPT_REFUSED)
+                | stop_flags::SCRIPT_REFUSED
+                | stop_flags::MAP_FULL)
             == 0
             && self.stop_rc == 0
     }

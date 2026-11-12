@@ -110,6 +110,7 @@ NN-L-CHAIN-002's alert stays held on the same flow (both listed).
 | `imp001-in-place` | lab MS-22: an unpackaged program rewrites 20 files, ciphertext left; rsync rewrites 20 files | NN-L-IMP-001 decisive, kill held; a packaged writer trusted |
 | `imp001-copy-delete` | lab MS-23: 20 new files, 20 originals deleted beside their encrypted copies | NN-L-IMP-001 decisive by copies, kill held |
 | `imp002-rename-burst` | 20 renames appending one new extension, plain content | NN-L-IMP-002, one shape |
+| `iou002-once-per-process` | lot 314 (BUG-83): an implant's io_uring records (open, connect, read, send, then periodic ones) and a server's (accept, read, then periodic) | NN-L-IOU-002 once each, on the record completing the pair; none on the later records |
 | `eva001-service-stopped` | auditd stopped by a package transaction, by a root shell, by a lineage holding a `/tmp` program | NN-L-EVA-001 sanctioned (Low), unsanctioned (High), the staged program's kill held; R009's kill of the root exec from `/tmp` (not held) |
 | `eva-switched-off-killed-config` | `auditctl -e 0` twice, auditd sent SIGTERM, its configuration modified | NN-L-EVA-002 (the repeat coalesced), NN-L-EVA-003, NN-L-EVA-004 |
 | `net026-scan-fanout` | 520 addresses on port 445 in 6 s | NN-L-NET-026's record of the process and of its parent's children, then its kill held |
@@ -238,6 +239,10 @@ posture and the ladder:
    verifies it, then `admin_release_combat_with_token`;
 4. `{"installer_grant": {"window_secs": N}}`: a signed trusted-installer
    grant, verified the same way, then the window armed for its signer;
+   `{"force": {"to": "Combat"}}` (lot 314): a signed force-posture
+   (`OperationCode::ForcePosture`) to the kind named, verified the same way,
+   then `admin_force_state_signed_by` with the signer named (the
+   administrator holds `unlock`: a force out of COMBAT releases);
 5. `{"host": {...}}`: the host changes without an event the agent reads —
    processes exit (`exit`, their children go to init), start (`spawn`: a
    fork with no exec read, or another process taking a freed pid), enter an
@@ -254,7 +259,7 @@ every 5 s, on the events' clock, in that order when they fall together.
 | the actuator | the replay's `CombatActuator` on that table, with the steps and words of `SystemActuator`: a capture is a pid and a start (a process that exited, or whose pid another process holds now — a stale pidfd — reaches nothing); a soft egress block takes unless `nft` is missing; NEUTRALIZE looks up each binary before the kill, kills each offender's tree through a cgroup of its own (the root moved in and frozen, every descendant found by the `/proc` walk moved in, a guarded one refused, the cgroup killed, each member checked by its identity: one in an uninterruptible wait is still running and reported failed) and quarantines each binary once (a system path refused, kill-only); the outcomes go through `SystemActuator::kill_outcome`, `quarantine_text` and `soft_block_of` |
 | the isolation | the case's `isolation` (what each engage finds per family, then both isolated) and `release` (what each release reads back, then both clear) |
 | the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log; lab PR 249: the log opened with a fixed key, the replay's wall clock (`nn_evidence::clock::Clock`) and the replayed agent's pid (`AuditStamps`), so every row is the same bytes in every replay |
-| the administrator | a fixed Ed25519 key (`unlock,trusted-installer`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
+| the administrator | a fixed Ed25519 key (`unlock,trusted-installer,force-posture`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
 | the agent | pid 4,200,000, exempt from the posture as `boot` exempts its own, and the `client_pid` of the rows it signs |
 | the switches | lab PR 249: the machine's own — the ransomware directive of a per-rule policy handle of its own (`PostureMachine::with_rule_policy`; the case's `rule_policy` lines, parsed as `rule-policy.local` is, or the built-in defaults), the mass-write mode at the default (tracepoint) |
 
@@ -280,7 +285,8 @@ each with `seq`, `at_ms` (the events' clock) and:
 
 - `event`: the event's kind and process; `wait_secs`; `unlock` (the
   signer's fingerprint, the outcome as the admin socket words it);
-  `installer_grant` (signer, window, its end); `host: "changed"`;
+  `installer_grant` (signer, window, its end); `force` (signer, the kind
+  ordered, the outcome: the state left and entered); `host: "changed"`;
 - `posture`: the transitions of the posture's log, each with `from`, `to`,
   `trigger` (the firing one; `null` for decay and release), `reason` and
   `unix_ts_secs`, and for an event's transition its `evidence`: the triggers
@@ -323,6 +329,9 @@ each with `seq`, `at_ms` (the events' clock) and:
 | `decay-to-observing` | `nmap` twice, then `nc`, then quiet | ALERTED re-armed by the same tier, decays to OBSERVING an hour after the last; ENGAGED decays to ALERTED after 24 h, then to OBSERVING |
 | `mass-write-arm-alone-engaged` | lot 282: a service's unpackaged worker rewrites 20 distinct existing files, 20 more a window later, creates 20 files and destroys 20 originals, its cgroup crosses the cgroup window | every shape of the mass-write arm is ConfirmedIntrusion, file-system evidence; with the ransomware tracker's RansomwareEncryption (file-system too) nothing of another kind vouches: ENGAGED, the ladder never engaged; files created alone raise nothing |
 | `container-first-pull-benign` | lot 282: a host's first `sudo podman run` (layers extracted, its database reopened, its CNI plugin flushing its own NAT chain), dockerd flushing its own isolation chain, then rootless podman's extraction | no trigger at all: files created alone are no mass write, a runtime flushing its own chain (its packaged plugin, dockerd) is no switch-off (on main: DefenseImpairment + the overwrite crossing → COMBAT locked, podman killed). Lot 310 (BUG-49): the administrator's command reaches podman through `bash -c` (a non-interactive ssh command), an inline shell that vouches for nothing — podman's writes are judged by the ransomware signal (they were "trusted"), and with no shape of ransomware no line shows an assessment |
+| `force-same-state` | lot 314 (BUG-84): signed force-posture to ALERTED, again 59 minutes later; to ENGAGED, again 23 h 59 later | a force toward the current state is no transition and keeps the decay timers: ALERTED decays an hour after the first force, ENGAGED a day after the first |
+| `force-locks-heuristic-combat` | lot 314 (BUG-84): the corroborated ransomware's unlocked COMBAT, then a signed force-posture to COMBAT; quiet; the signed unlock | the force is one transition COMBAT → COMBAT naming the lock (no second ladder entry); locked, no decay after the quiet window; the unlock leaves to ALERTED |
+| `combat-quiet-after-a-prune` | lot 314 (BUG-94): the corroborated ransomware's unlocked COMBAT; `nc` again 20 minutes later; `nmap` 16 minutes after that | the scan (ALERTED tier) prunes the ledger, the quiet still counts from the second `nc`: COMBAT decays 30 minutes after it (3660 s), not at the tick after the scan |
 | `package-refusal-alerted` | lot 282: `sudo apt-get purge` → dpkg → postrm → deb-systemd-helper refused an rmdir; a session tool rewrites 20 files; `sudo rmdir` refused | the transaction's refusal is PackageTamperRefusal (ALERTED, not in the ledger); the rewrite stays ENGAGED (nothing vouches); the non-transaction refusal is AntiTamperDenial: COMBAT locked, NEUTRALIZE at the deadline |
 
 Each case names the levels its posture moves to, in order (`path`), the

@@ -52,6 +52,8 @@ pub mod transitions;
 pub mod triggers;
 
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
@@ -685,7 +687,18 @@ impl<H: DecisionHost> PostureMachine<H> {
         drop(ledger);
 
         let after = current.kind();
-        *guard = current.clone();
+        // Lot 314: a lock acquired on an unlocked COMBAT is a transition row
+        // of its own (it was a WARN only).
+        self.commit(&mut guard, current.clone(), firing, |c| {
+            if c.kind_changed() {
+                describe_triggers(&hits)
+            } else {
+                format!(
+                    "COMBAT locked: {} — evidence an unprivileged user cannot produce",
+                    describe_triggers(&hits)
+                )
+            }
+        });
         drop(guard);
         if lock_acquired {
             tracing::warn!(
@@ -705,7 +718,6 @@ impl<H: DecisionHost> PostureMachine<H> {
                 %scope,
                 "posture signal scope"
             );
-            self.log_transition(before, after, firing, describe_triggers(&hits));
             // Combat-entry edge — fire the hook exactly once per upward
             // crossing: `entry` exists only when this round crossed into
             // COMBAT from below, so a re-trigger while already in Combat
@@ -740,10 +752,11 @@ impl<H: DecisionHost> PostureMachine<H> {
         let before = guard.kind();
         let next = transitions::apply_to_level(&guard, trigger.target_level(), now);
         let after = next.kind();
-        *guard = next.clone();
+        self.commit(&mut guard, next.clone(), Some(trigger), |_| {
+            format!("{trigger}: {reason}")
+        });
         drop(guard);
         if after != before {
-            self.log_transition(before, after, Some(trigger), format!("{trigger}: {reason}"));
             Some(next)
         } else {
             None
@@ -769,8 +782,10 @@ impl<H: DecisionHost> PostureMachine<H> {
             locked: false,
         } = *guard
         {
-            let newest = self.inner.corroboration.lock().newest();
-            let quiet_since = newest.map_or(since, |n| n.max(since));
+            // Lot 314 (BUG-94): from the last signal recorded, kept apart
+            // from the ledger's entries (a prune dropped the newest one).
+            let last_signal = self.inner.corroboration.lock().last_signal();
+            let quiet_since = last_signal.map_or(since, |n| n.max(since));
             if now.saturating_duration_since(quiet_since) < transitions::COMBAT_QUIET_WINDOW {
                 return None;
             }
@@ -778,14 +793,10 @@ impl<H: DecisionHost> PostureMachine<H> {
                 since: now,
                 last_trigger: now,
             };
-            *guard = next.clone();
+            self.commit(&mut guard, next.clone(), None, |_| {
+                "unlocked COMBAT (heuristic evidence only) quiet: decay COMBAT -> ENGAGED".into()
+            });
             drop(guard);
-            self.log_transition(
-                PostureKind::Combat,
-                PostureKind::Engaged,
-                None,
-                "unlocked COMBAT (heuristic evidence only) quiet: decay COMBAT -> ENGAGED".into(),
-            );
             if let Some(hook) = self.inner.combat_decay_hook.get() {
                 hook();
             }
@@ -794,14 +805,10 @@ impl<H: DecisionHost> PostureMachine<H> {
         let before = guard.kind();
         let next = transitions::apply_decay(&guard, now)?;
         let after = next.kind();
-        *guard = next.clone();
+        self.commit(&mut guard, next.clone(), None, |_| {
+            format!("decay {} -> {}", before, after)
+        });
         drop(guard);
-        self.log_transition(
-            before,
-            after,
-            None,
-            format!("decay {} -> {}", before, after),
-        );
         Some(next)
     }
 
@@ -835,15 +842,9 @@ impl<H: DecisionHost> PostureMachine<H> {
             since: now,
             last_trigger: now,
         };
-        *guard = next.clone();
+        self.commit(&mut guard, next.clone(), None, |_| "admin override".into());
         drop(guard);
         self.clear_corroboration_on_release();
-        self.log_transition(
-            PostureKind::Combat,
-            PostureKind::Engaged,
-            None,
-            "admin override".into(),
-        );
         Ok(next)
     }
 
@@ -938,16 +939,12 @@ impl<H: DecisionHost> PostureMachine<H> {
             since: now,
             last_trigger: now,
         };
-        *guard = next.clone();
+        self.commit(&mut guard, next.clone(), None, |_| {
+            "admin token release (isolation released, read back)".into()
+        });
         drop(guard);
         *self.inner.last_admin_action.lock() = Some(now);
         self.clear_corroboration_on_release();
-        self.log_transition(
-            PostureKind::Combat,
-            PostureKind::Alerted,
-            None,
-            "admin token release (isolation released, read back)".into(),
-        );
         Ok(ReleaseOutcome {
             left_combat: true,
             state: next,
@@ -997,12 +994,17 @@ impl<H: DecisionHost> PostureMachine<H> {
     /// - COMBAT → non-COMBAT fires `combat_release_hook` (iptables
     ///   release — identical to an unlock).
     /// - Same-direction (before == target) is a no-op: no log, no
-    ///   hooks, token drops out of scope.
+    ///   hooks, token drops out of scope — the state as it is, its decay
+    ///   timers untouched (lot 314, BUG-84: they were re-armed). Except an
+    ///   unlocked COMBAT, which the order locks (POS-001: COMBAT is locked
+    ///   by an administrator's order, `COMBAT_RECOVERY.md`): a transition
+    ///   row COMBAT → COMBAT naming the lock, and `last_admin_action`; no
+    ///   hook (the ladder is engaged already, and reads the lock).
     /// - Lateral non-COMBAT transitions (e.g. Alerted → Engaged)
     ///   log the transition but fire no hook.
     ///
     /// Records the machine's now in `last_admin_action` on any
-    /// actual transition — surfaced via
+    /// actual transition (and on the lock above) — surfaced via
     /// [`Self::last_admin_action_secs_ago`] for `nn-admin status`.
     ///
     /// Returns a [`ForceOutcome`]: the state before the call and the
@@ -1092,31 +1094,26 @@ impl<H: DecisionHost> PostureMachine<H> {
                 ));
             }
         }
-        let next = match target {
-            PostureKind::Observing => PostureState::Observing,
-            PostureKind::Alerted => PostureState::Alerted {
-                since: now,
-                last_trigger: now,
-            },
-            PostureKind::Engaged => PostureState::Engaged {
-                since: now,
-                last_trigger: now,
-            },
-            PostureKind::Combat => PostureState::Combat {
-                since: now,
-                locked: true,
-            },
-        };
-        *guard = next.clone();
+        // Lot 314 (BUG-84): toward the kind it is in, the state stays as it
+        // is (its decay timers too), except an unlocked COMBAT, which the
+        // order locks — a transition row and an admin action of its own.
+        let next = transitions::forced(&guard, target, now);
+        let change = self.commit(&mut guard, next.clone(), None, |c| {
+            if c.kind_changed() {
+                "admin token force-posture".into()
+            } else {
+                "admin token force-posture: COMBAT locked by the administrator's order".into()
+            }
+        });
         drop(guard);
 
-        if before == target {
-            // No-op transition — no log, no hook. The capability
-            // check (the type-system gate on minting) has already
-            // done its work by the time we got here; the `token`
-            // binding falls out of scope on return. UnlockToken
-            // has no Drop impl so an explicit `drop()` would be a
-            // no-op (clippy::drop_non_drop).
+        if !change.any() {
+            // Nothing changed — no log, no hook, no admin action. The
+            // capability check (the type-system gate on minting) has
+            // already done its work by the time we got here; the `token`
+            // binding falls out of scope on return. UnlockToken has no
+            // Drop impl so an explicit `drop()` would be a no-op
+            // (clippy::drop_non_drop).
             let _ = token;
             return Ok(ForceOutcome {
                 from: before,
@@ -1126,7 +1123,6 @@ impl<H: DecisionHost> PostureMachine<H> {
         }
 
         *self.inner.last_admin_action.lock() = Some(now);
-        self.log_transition(before, target, None, "admin token force-posture".into());
 
         // Side-effects per §12.2.
         if before != PostureKind::Combat && target == PostureKind::Combat {
@@ -1147,7 +1143,8 @@ impl<H: DecisionHost> PostureMachine<H> {
             let _ = token;
         } else {
             // Lateral non-COMBAT transition (e.g., Alerted →
-            // Engaged). No hook fires.
+            // Engaged), or COMBAT locked by the order (lot 314). No hook
+            // fires: the ladder reads the lock when it needs it.
             let _ = token;
         }
 
@@ -1168,35 +1165,15 @@ impl<H: DecisionHost> PostureMachine<H> {
         let now = self.now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
-        let next = match target {
-            PostureKind::Observing => PostureState::Observing,
-            PostureKind::Alerted => PostureState::Alerted {
-                since: now,
-                last_trigger: now,
-            },
-            PostureKind::Engaged => PostureState::Engaged {
-                since: now,
-                last_trigger: now,
-            },
-            PostureKind::Combat => PostureState::Combat {
-                since: now,
-                locked: true,
-            },
-        };
-        *guard = next;
+        // Lot 314 (BUG-84's sibling): the production force's rule.
+        let next = transitions::forced(&guard, target, now);
+        self.commit(&mut guard, next, None, |_| {
+            "debug-trigger force_state_for_test".into()
+        });
         drop(guard);
-        let after = target;
-        if before != after {
-            self.log_transition(
-                before,
-                after,
-                None,
-                "debug-trigger force_state_for_test".into(),
-            );
-            if before != PostureKind::Combat && after == PostureKind::Combat {
-                if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
-                    hook(&CombatEntry::forced(CombatCause::DebugForce));
-                }
+        if before != PostureKind::Combat && target == PostureKind::Combat {
+            if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
+                hook(&CombatEntry::forced(CombatCause::DebugForce));
             }
         }
     }
@@ -1204,6 +1181,33 @@ impl<H: DecisionHost> PostureMachine<H> {
     /// Snapshot of the most recent transitions (oldest first, capped).
     pub fn transition_log(&self) -> Vec<PostureTransition> {
         self.inner.transitions.read().clone()
+    }
+
+    /// Lot 314 (the third bug hunt, BUG-84; ratchet
+    /// `xtask/tests/state_machines.rs`): the one write of the posture's
+    /// state, under its write lock (`state`). Every change of its kind or of
+    /// COMBAT's lock is a row of the transition log, written here with
+    /// `reason` (told what changed) and `trigger`; a write that changes
+    /// neither (a same-tier signal re-arming a decay timer) is none. A force
+    /// to the current COMBAT locked it, and a later signal could lock an
+    /// unlocked one, with no row.
+    fn commit(
+        &self,
+        state: &mut PostureState,
+        next: PostureState,
+        trigger: Option<TriggerType>,
+        reason: impl FnOnce(&Change) -> String,
+    ) -> Change {
+        let change = Change {
+            from: state.kind(),
+            to: next.kind(),
+            lock: (state.is_combat_locked(), next.is_combat_locked()),
+        };
+        *state = next;
+        if change.any() {
+            self.log_transition(change.from, change.to, trigger, reason(&change));
+        }
+        change
     }
 
     fn log_transition(
@@ -1268,6 +1272,28 @@ impl<H: DecisionHost> Default for PostureMachine<H> {
     }
 }
 
+/// Lot 314: what one write of the posture's state changed
+/// ([`PostureMachine::commit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Change {
+    from: PostureKind,
+    to: PostureKind,
+    /// COMBAT's lock before and after.
+    lock: (bool, bool),
+}
+
+impl Change {
+    /// The kind changed.
+    fn kind_changed(&self) -> bool {
+        self.from != self.to
+    }
+
+    /// The kind or COMBAT's lock changed: a transition row.
+    fn any(&self) -> bool {
+        self.kind_changed() || self.lock.0 != self.lock.1
+    }
+}
+
 /// What [`PostureMachine::admin_force_state_with_token`] did. External
 /// audit ASK-015: the state the agent was in before the force is what the
 /// journal line and the audit row record as `from`; the in-memory
@@ -1276,8 +1302,9 @@ impl<H: DecisionHost> Default for PostureMachine<H> {
 pub struct ForceOutcome {
     /// The state before the call, read under the transition's write lock.
     pub from: PostureKind,
-    /// The state after it (the target; unchanged when `from` was already
-    /// the target).
+    /// The state after it (the target). When `from` was already the target
+    /// (lot 314, BUG-84): the state as it was, its decay timers untouched —
+    /// or, from an unlocked COMBAT, COMBAT locked by the order.
     pub state: PostureState,
     /// Lab PR 217: what the release hook released, when the force left
     /// COMBAT (`None` otherwise, or without a hook).

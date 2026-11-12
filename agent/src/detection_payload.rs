@@ -383,8 +383,10 @@ pub struct ExecPolEvidence {
     pub environment: Vec<String>,
     /// The captured values (`LD_PRELOAD=/tmp/x.so`), journal-escaped.
     pub values: Vec<String>,
-    /// The target is set-id: the kernel sets `AT_SECURE` and the loader
-    /// ignores these variables itself.
+    /// The exec changes the credentials (a set-id target run by another
+    /// user than its owner, or set-group-ID): the kernel sets `AT_SECURE`
+    /// and the loader ignores these variables itself. Lot 315 (BUG-101): not
+    /// the set-id bits alone — root running a set-uid-root file is `false`.
     pub at_secure: bool,
     /// Where the policy came from (`server profile (built in)`,
     /// `/etc/northnarrow/exec-policy.local (signed)`).

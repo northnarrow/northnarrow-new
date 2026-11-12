@@ -658,8 +658,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging \
-                   path: refused (enforce) or recorded; a set-id target is recorded (the \
-                   kernel sets AT_SECURE and the loader ignores it).",
+                   path: refused (enforce) or recorded; a set-id target is recorded (when \
+                   the exec changes the credentials the kernel sets AT_SECURE and the \
+                   loader ignores it; root running a set-uid-root file changes none, and \
+                   the record says the loader honours it).",
         false_positives: "A developer's own preload from a build tree in a session (Low).",
         how_to_test: "`nn-lab.sh malsim-exec-check`: MS-32, LD_PRELOAD of a no-op library \
                       from /tmp into a service.",

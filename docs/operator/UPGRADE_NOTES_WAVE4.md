@@ -1148,8 +1148,85 @@ configure; use the `nn-admin` of this release where the export is checked.
   monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
   to keep it; that load, seen by the agent, is signed Low.
 
+## 26. The evidence chains' residues of the third bug hunt (lot 319)
 
-## 26. What an interpreter runs, and a fileless exec, read in one place (lot 310)
+- **The flat chains after a failed write**: the canary registry
+  (`canaries.jsonl`), the canary access log, the FIM baseline and the
+  listener log (`netflow_listeners.jsonl`) read their tail again before
+  the next row after a write the disk stopped part-way or a failed fsync.
+  The fragment is cut and the cut signed in the audit chain
+  (`chain_tail_repaired`, the file, the length and SHA-256 of what was cut;
+  at once, or within the next flush of 15 s when the audit log is busy). An
+  install that already holds a glued line keeps it (`nn-admin chain verify`
+  names it); nothing to do.
+- **A stalled retention is a degradation**: `nn-admin status` lists
+  `chain_retention: <log>: the retention stopped at archive N: it cannot be
+  removed (…)` while an archive past the budget cannot be removed, and the
+  trust level counts it; a `subsystem_degraded` row (source
+  `chain_retention`) is signed once. Make the archive removable again
+  (`chattr -i`, or move it aside to keep it): the next rotation's pass runs
+  and the line leaves the status. A SIEM keyed on the trust level sees the
+  degradation where it saw an ERROR alone.
+- **Foreign entries at archive names**: one `ForeignArchive` row each in
+  the log's manifest — new for those a rotation jumped over, those below a
+  rotation a crash interrupted, and those planted while the agent was
+  stopped above the last rotation the manifest records (at the next
+  start). Each is still refused by `nn-admin chain verify`; the row says
+  the agent saw it.
+- **The JSONL export**: each start of the export on a non-empty
+  `export.jsonl` writes a newline before its first record — one empty line
+  when the file had ended whole. `nn-admin export verify` skips empty
+  lines; configure your shipper to skip them (Fluent Bit's `tail` input:
+  `Skip_Empty_Lines On`; its default is off, and with a JSON parser the
+  empty line is an event that is no record). A reader that counts lines
+  counts one more per start.
+- **`--since` and `--until`**: a value past any row's time (beyond year
+  9999, or 2^63 seconds and more) keeps no row for `fim report` and `net
+  flows`, and is the farthest time for `detections`; `nn-admin heartbeat
+  verify --max-skew-secs` holds at any value. They all kept every row, or
+  reported a skew, before.
+- Nothing to configure; the files' formats are unchanged.
+
+## 27. The exec quarantine's stop and a process it cannot capture (lot 317)
+
+Only for hosts that run the exec quarantine (`--exec-quarantine enforce`,
+EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md)).
+
+- **A stop leaves nothing stopped.** The agent's stop now also resumes the
+  processes the kernel stopped after the agent last read its reports; they
+  stayed in state T until the next start of an agent with the guard on (or
+  a `kill -CONT` by hand). The signed `exec_quarantine` entry `stopping`
+  gains `unreported` (those, among `resumed`), `recaptured`, `killed`
+  (kills owed, see below) and `left` (not captured: still stopped; the next
+  start resumes them, or kills those whose kill is owed).
+- **A process the kernel's map cannot name is not stopped** (the review of
+  #541): `EXECQ_STOPPED` holds 4096 processes; past it an exec runs
+  unheld (record: `not held (the map of stopped processes was full …)`,
+  counted in `not_held`, and in the signed fail-open degradation with the
+  full ring and the refused signal) — it used to be stopped with no entry
+  anything would resume.
+- **New responses in the records**: `resume deferred: …` and `kill
+  deferred: …` — the agent could not capture the held process
+  (`pidfd_open` out of descriptors or memory). The process stays held and
+  the decision is carried out once it is captured, with a new signed
+  `exec_quarantine` entry, `deferred` (`pid`, `action`, `result`,
+  `waited_ms`). A kill owed (a block-list hit, also one that arrives late
+  while a resume is owed) is marked in the pinned map: if the agent stops
+  or dies first, the process stays stopped and the next start kills it
+  (`recovered_at_boot`'s `killed`). The binary does not run — unless the
+  next agent runs without the guard (`--exec-quarantine off`, or a guard
+  that cannot start), which leaves it stopped, neither run nor killed. These records used to say `ended while
+  held` or `already ended`, and the process stayed stopped for good. A SIEM
+  rule that reads `already ended` as "the rules' kill landed first" keeps
+  its meaning; one counting `ended while held` sees fewer of them only
+  where they were false.
+- `recovered_at_boot` gains `deferred`: processes a previous agent left
+  stopped that could not be captured at the boot (no longer counted in
+  `gone`), given their decision once they are; and `killed`: the kills a
+  previous agent owed.
+
+
+## 28. What an interpreter runs, and a fileless exec, read in one place (lot 310)
 
 - **One reader of an interpreter's options**
   (`crates/nn-core/src/posture/script_args.rs`, the external bug hunt's

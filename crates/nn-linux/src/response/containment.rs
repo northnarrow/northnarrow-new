@@ -47,7 +47,7 @@ static LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// The cgroup v2 path `/proc/<pid>/cgroup` shows for `pid`.
 pub fn origin_of(pid: u32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
         .ok()?
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(|p| p.trim_end().to_string()))

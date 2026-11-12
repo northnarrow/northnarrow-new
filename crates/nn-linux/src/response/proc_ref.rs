@@ -25,6 +25,8 @@ use std::time::Duration;
 pub struct ProcRef {
     pid: u32,
     /// `starttime` from `/proc/<pid>/stat` (clock ticks since boot).
+    /// `None` with a pidfd held: a running process whose entry could not
+    /// be read (lot 311) — still signalled through the pidfd.
     start_ticks: Option<u64>,
     /// The start its event reported (`CLOCK_MONOTONIC` ns), when known.
     start_ns: Option<u64>,
@@ -39,6 +41,30 @@ pub struct ProcRef {
     /// out of descriptors or memory): a signal fails with this errno
     /// instead of reporting the process gone.
     errno: Option<i32>,
+}
+
+/// What a [`ProcRef`] says about its process now ([`ProcRef::liveness`]).
+///
+/// Lot 317 (third bug hunt, BUG-124): `!is_live()` was read as "the
+/// process ended" where the capture had failed — `pidfd_open` out of
+/// descriptors or memory, a failure of the agent's, not of the process.
+/// The exec quarantine took a held process it could not capture for one
+/// that had ended: no `SIGCONT`, no `SIGKILL`, its pid taken out of the
+/// kernel's stopped map, a record saying "ended while held". The three
+/// answers are told apart here, and a caller that matches on them handles
+/// the third (`xtask/tests/process_liveness.rs` holds the callers to it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// Captured, and running (stopped included): a signal through its
+    /// pidfd reaches it.
+    Live,
+    /// It has exited (a zombie included), or no process — or another one
+    /// — held its PID when it was captured: a signal reaches no one, and
+    /// none is owed.
+    Gone,
+    /// The capture failed (the errno): the process may still run, and a
+    /// signal fails with this error. Not an exit.
+    Uncaptured(i32),
 }
 
 impl ProcRef {
@@ -84,6 +110,16 @@ impl ProcRef {
     }
 
     fn open_checked(pid: u32, start_ns: Option<u64>) -> ProcRef {
+        Self::open_checked_with(pid, start_ns, read_stat)
+    }
+
+    /// [`Self::open_checked`], its `stat` read by `read` (tests: a read
+    /// that fails).
+    pub(crate) fn open_checked_with(
+        pid: u32,
+        start_ns: Option<u64>,
+        read: fn(u32) -> std::io::Result<ProcStat>,
+    ) -> ProcRef {
         let gone = ProcRef {
             start_ns,
             ..ProcRef::unopened(pid)
@@ -113,13 +149,14 @@ impl ProcRef {
         // The pidfd pins the identity; `/proc/<pid>` read now describes
         // the same process as long as it has not exited — checked after
         // the read, since the PID cannot be reused before it is reaped.
-        let stat = proc_stat(pid);
+        let stat = read(pid);
         let fits = |ticks: u64| start_ns.is_none_or(|ns| started_at(ticks, ns));
         if pidfd_exited(&fd) {
             // Exited. A zombie still describes itself in `/proc` (its PID
             // is held until it is reaped): its start is kept, the identity
             // the events of the children it left name.
             let start_ticks = stat
+                .ok()
                 .filter(|s| s.zombie)
                 .map(|s| s.start_ticks)
                 .filter(|t| fits(*t));
@@ -128,9 +165,27 @@ impl ProcRef {
                 ..gone
             };
         }
-        let Some(stat) = stat else {
-            // running, but its `/proc` entry unreadable: no identity
-            return uncaptured(libc::EIO);
+        let stat = match stat {
+            Ok(stat) => stat,
+            Err(e) => {
+                // Lot 311 (N6): running, its `/proc` entry unreadable — not
+                // for its name any more (`stat` is read as bytes), for a
+                // reason of the host's (out of memory or descriptors). It is
+                // still the process the pidfd holds: captured by it, its
+                // start unknown, signalled through it — never left
+                // untouched. The PID cannot change hands while it runs; that
+                // it named another process between the event and the
+                // `pidfd_open` would take a wrap of `pid_max` in that span.
+                tracing::warn!(
+                    pid,
+                    error = %e,
+                    "the process's start could not be read — captured by its pidfd alone"
+                );
+                return ProcRef {
+                    fd: Some(fd),
+                    ..gone
+                };
+            }
         };
         if !fits(stat.start_ticks) {
             tracing::warn!(
@@ -167,6 +222,18 @@ impl ProcRef {
         }
     }
 
+    /// Lot 317: a capture of `pid` (started at `start_ns`) that failed with
+    /// `errno` — what `pidfd_open` out of descriptors gives (tests: the
+    /// agent's descriptor limit is the whole test process's).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn uncaptured_for_test(pid: u32, start_ns: u64, errno: i32) -> ProcRef {
+        ProcRef {
+            start_ns: (start_ns != 0).then_some(start_ns),
+            errno: Some(errno),
+            ..ProcRef::unopened(pid)
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -193,6 +260,17 @@ impl ProcRef {
         self.start_ticks
     }
 
+    /// This reference is the process `/proc` showed started at `ticks` (a
+    /// walk's snapshot): its start read the same — or, lot 311, not read
+    /// while the pidfd holds the running process (its PID then cannot have
+    /// changed hands since the snapshot without a wrap of `pid_max`).
+    pub fn holds_start(&self, ticks: u64) -> bool {
+        match self.start_ticks {
+            Some(t) => t == ticks,
+            None => self.fd.is_some(),
+        }
+    }
+
     /// The start its event reported (`CLOCK_MONOTONIC` ns), when known
     /// (lab PR 245: the COMBAT ladder's rows name it).
     pub fn start_ns(&self) -> Option<u64> {
@@ -209,6 +287,19 @@ impl ProcRef {
     /// still run.
     pub fn capture_errno(&self) -> Option<i32> {
         self.errno
+    }
+
+    /// Lot 317 (BUG-124): what this reference says about its process now —
+    /// running, gone, or not captured ([`Liveness`]). `is_live() == false`
+    /// is either of the last two; only [`Liveness::Gone`] is an exit.
+    pub fn liveness(&self) -> Liveness {
+        if self.is_live() {
+            Liveness::Live
+        } else if let Some(errno) = self.errno {
+            Liveness::Uncaptured(errno)
+        } else {
+            Liveness::Gone
+        }
     }
 
     /// An event about this PID — with the process start it reported
@@ -237,9 +328,13 @@ impl ProcRef {
     /// `/proc/<pid>` still describes this process: it runs, and the PID's
     /// start time is the captured one. A PID written to a cgroup file
     /// right after this is this process (the PID cannot change hands
-    /// while it runs).
+    /// while it runs). Lot 311: one captured by its pidfd alone (its start
+    /// unread) is named by its PID while it runs.
     pub fn still_named_by_pid(&self) -> bool {
-        self.is_live() && proc_start_ticks(self.pid) == self.start_ticks
+        self.is_live()
+            && self
+                .start_ticks
+                .is_none_or(|t| proc_start_ticks(self.pid) == Some(t))
     }
 
     /// Send `sig` to this process. `ESRCH` when it has exited (or the PID
@@ -279,7 +374,7 @@ impl ProcRef {
     }
 }
 
-/// What [`proc_stat`] reads from `/proc/<pid>/stat`.
+/// What [`read_stat`] reads from `/proc/<pid>/stat`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProcStat {
     pub start_ticks: u64,
@@ -287,14 +382,29 @@ pub(crate) struct ProcStat {
     pub zombie: bool,
 }
 
-/// The state and start of process `pid`.
-pub(crate) fn proc_stat(pid: u32) -> Option<ProcStat> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
-    Some(ProcStat {
-        start_ticks: stat_start_ticks(&stat)?,
+/// The state and start of process `pid`. Lot 311 (N6): `/proc/<pid>/stat`
+/// read as bytes ([`crate::state_read::read_state`]) — its `(comm)` field
+/// is whatever the process named itself, not UTF-8 if it likes, and a
+/// strict read failed on it: every kill of such a process reported failed
+/// and left it running. The fields are read after the last `)`. An error
+/// of kind `NotFound` (or `ESRCH`): no such process; any other: the entry
+/// could not be read.
+pub(crate) fn read_stat(pid: u32) -> std::io::Result<ProcStat> {
+    let stat = crate::state_read::read_state(format!("/proc/{pid}/stat"))?;
+    let malformed = || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed stat");
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .ok_or_else(malformed)?;
+    Ok(ProcStat {
+        start_ticks: stat_start_ticks(&stat).ok_or_else(malformed)?,
         zombie: matches!(state, "Z" | "X" | "x"),
     })
+}
+
+/// The read of `/proc/<pid>/...` failed because the process is gone.
+pub(crate) fn is_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// `pidfd_open(2)`.
@@ -340,10 +450,10 @@ pub fn pidfd_exited(pidfd: &OwnedFd) -> bool {
 }
 
 /// `starttime`, field 22 of `/proc/<pid>/stat`, counted after the `(comm)`
-/// field, which may itself hold spaces or parentheses.
+/// field, which may itself hold spaces or parentheses — or bytes that are
+/// not UTF-8 (lot 311, N6: [`read_stat`]).
 pub fn proc_start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat_start_ticks(&stat)
+    read_stat(pid).ok().map(|s| s.start_ticks)
 }
 
 pub(crate) fn stat_start_ticks(stat: &str) -> Option<u64> {
@@ -508,7 +618,7 @@ mod tests {
         // SAFETY: plain kill(2) on our own child, not reaped yet.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !proc_stat(pid).is_some_and(|s| s.zombie) {
+        while !read_stat(pid).is_ok_and(|s| s.zombie) {
             assert!(std::time::Instant::now() < deadline, "no zombie");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -586,6 +696,92 @@ mod tests {
         assert!(!r.is_live() && !r.matches_event(0));
         assert_eq!(r.capture_errno(), Some(libc::EMFILE));
         assert!(ProcRef::unopened(4242).capture_errno().is_none());
+    }
+
+    /// Lot 317 (BUG-124): the three answers about a process — running,
+    /// gone, not captured — are told apart; a failed capture is never an
+    /// exit, whatever `is_live` says.
+    #[test]
+    fn a_failed_capture_is_neither_live_nor_gone() {
+        let mut child = sleeper();
+        let live = ProcRef::open(child.id());
+        assert_eq!(live.liveness(), Liveness::Live);
+        let failed = ProcRef::uncaptured_for_test(child.id(), 0, libc::EMFILE);
+        assert!(!failed.is_live(), "the premise: is_live() alone says no");
+        assert_eq!(failed.liveness(), Liveness::Uncaptured(libc::EMFILE));
+        assert_eq!(
+            failed.signal(libc::SIGCONT).unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(live.liveness(), Liveness::Gone, "exited");
+        assert_eq!(
+            ProcRef::open(999_999_999).liveness(),
+            Liveness::Gone,
+            "no such process"
+        );
+        assert_eq!(ProcRef::for_test(4242, Some(1)).liveness(), Liveness::Gone);
+    }
+
+    /// Lot 311 (N6): a process whose `comm` is not UTF-8 — any process
+    /// names itself — is captured with its start, signalled and seen to
+    /// die. On main its `stat` was unreadable as text: the capture failed
+    /// (`EIO`), every kill of it reported failed and left it running.
+    #[test]
+    fn a_process_whose_comm_is_not_utf8_is_captured_and_killed() {
+        let p = crate::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let r = ProcRef::open(p.pid());
+        assert_eq!(r.capture_errno(), None, "not captured");
+        assert!(r.is_live() && r.start_ticks().is_some());
+        assert_eq!(proc_start_ticks(p.pid()), r.start_ticks());
+        assert!(r.still_named_by_pid());
+        assert!(read_stat(p.pid()).is_ok_and(|s| !s.zombie));
+        r.signal(libc::SIGKILL).unwrap();
+        assert!(r.wait_exit(Duration::from_secs(2)));
+    }
+
+    /// Lot 311: a running process whose `/proc` entry cannot be read for
+    /// a reason of the host's (here: out of descriptors) is captured by its
+    /// pidfd, its start unknown, and the kill reaches it — never "not acted
+    /// on". On main the capture failed (`EIO`) and the process ran on.
+    #[test]
+    fn a_running_process_whose_stat_cannot_be_read_is_still_signalled() {
+        let mut child = sleeper();
+        let r = ProcRef::open_checked_with(child.id(), None, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert_eq!(r.capture_errno(), None);
+        assert!(r.is_live() && r.start_ticks().is_none());
+        assert!(
+            r.holds_start(12_345),
+            "a snapshot's start: held by the pidfd"
+        );
+        assert!(r.still_named_by_pid(), "running: its PID names it");
+        assert!(ProcRef::for_test(child.id(), Some(7)).holds_start(7));
+        assert!(!ProcRef::for_test(child.id(), Some(7)).holds_start(8));
+        assert!(
+            !ProcRef::for_test(child.id(), None).holds_start(7),
+            "no pidfd"
+        );
+        r.signal(libc::SIGKILL).unwrap();
+        assert!(r.wait_exit(Duration::from_secs(2)));
+        child.wait().unwrap();
+        // gone by the time it is captured: nothing held, nothing signalled
+        let r = ProcRef::open_checked_with(child.id(), None, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert!(!r.has_fd() && r.capture_errno().is_none());
+    }
+
+    /// Lot 311: the reasons a `stat` read fails — the process gone, or the
+    /// entry unreadable — are told apart.
+    #[test]
+    fn a_gone_process_is_told_from_an_unreadable_entry() {
+        assert!(is_gone(&read_stat(999_999_999).unwrap_err()));
+        assert!(is_gone(&std::io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(!is_gone(&std::io::Error::from_raw_os_error(libc::EMFILE)));
+        assert!(!is_gone(&std::io::Error::from_raw_os_error(libc::EIO)));
     }
 
     #[test]

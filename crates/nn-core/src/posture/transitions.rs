@@ -100,6 +100,42 @@ fn touch_last_trigger(state: PostureState, now: Instant) -> PostureState {
     }
 }
 
+/// Lot 314 (the third bug hunt, BUG-84): the state an administrator's
+/// order to `target` leaves (`force-posture`, and the debug hatch). Another
+/// kind: that kind, fresh — its decay timers from `now`, a forced COMBAT
+/// locked (external audit POS-001: the administrator ordered it). The kind
+/// it is in: the state as it is, its decay timers untouched — except an
+/// unlocked COMBAT, which the order locks (an explicit lock, which the
+/// machine records as a transition of its own). The state was rewritten
+/// whole: a force to the current ALERTED or ENGAGED re-armed its decay (one
+/// hour, a day), and an unlocked COMBAT was locked without a trace.
+pub fn forced(state: &PostureState, target: PostureKind, now: Instant) -> PostureState {
+    if state.kind() == target {
+        return match state {
+            PostureState::Combat { since, .. } => PostureState::Combat {
+                since: *since,
+                locked: true,
+            },
+            other => other.clone(),
+        };
+    }
+    match target {
+        PostureKind::Observing => PostureState::Observing,
+        PostureKind::Alerted => PostureState::Alerted {
+            since: now,
+            last_trigger: now,
+        },
+        PostureKind::Engaged => PostureState::Engaged {
+            since: now,
+            last_trigger: now,
+        },
+        PostureKind::Combat => PostureState::Combat {
+            since: now,
+            locked: true,
+        },
+    }
+}
+
 /// Apply decay if the appropriate window has elapsed.
 ///
 /// Returns `Some(new_state)` if a transition fired, `None`
@@ -176,6 +212,49 @@ mod tests {
         let s2 = apply_trigger(&s, TriggerType::Reconnaissance, now());
         assert_eq!(s2.kind(), PostureKind::Combat);
         assert!(s2.is_combat_locked());
+    }
+
+    /// Lot 314 (BUG-84): a force toward the kind the posture is in leaves
+    /// it as it is — its timers too — except an unlocked COMBAT, locked with
+    /// its entry time kept; toward another kind, that kind from `now`.
+    #[test]
+    fn a_force_toward_the_current_kind_keeps_the_state() {
+        let t = now();
+        let later = t + Duration::from_secs(3540);
+        let alerted = PostureState::Alerted {
+            since: t,
+            last_trigger: t,
+        };
+        match forced(&alerted, PostureKind::Alerted, later) {
+            PostureState::Alerted {
+                since,
+                last_trigger,
+            } => assert_eq!((since, last_trigger), (t, t)),
+            other => panic!("{other:?}"),
+        }
+        let unlocked = PostureState::Combat {
+            since: t,
+            locked: false,
+        };
+        match forced(&unlocked, PostureKind::Combat, later) {
+            PostureState::Combat { since, locked } => assert_eq!((since, locked), (t, true)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            forced(&PostureState::Observing, PostureKind::Observing, later),
+            PostureState::Observing
+        ));
+        match forced(&alerted, PostureKind::Engaged, later) {
+            PostureState::Engaged {
+                since,
+                last_trigger,
+            } => assert_eq!((since, last_trigger), (later, later)),
+            other => panic!("{other:?}"),
+        }
+        match forced(&PostureState::Observing, PostureKind::Combat, later) {
+            PostureState::Combat { since, locked } => assert_eq!((since, locked), (later, true)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

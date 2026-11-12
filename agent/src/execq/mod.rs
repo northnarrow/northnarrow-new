@@ -506,7 +506,13 @@ pub fn shutdown(handle: Option<Handle>) {
         if h.thread.is_finished() {
             let _ = h.thread.join();
         } else {
-            warn!("exec quarantine controller did not stop within 2 s");
+            // lot 317 (review F8): the stop's budget is 2 s in all
+            // (stop_deadline: the unit's 5 s less the kernel's release)
+            warn!(
+                "exec quarantine controller did not stop within 2 s — the processes it holds stay \
+                 stopped, in the pinned map: the next start resumes them (or kills those whose \
+                 kill is owed)"
+            );
         }
     }
     ACTIVE.store(false, Ordering::Relaxed);

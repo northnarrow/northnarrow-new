@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::journal::Intent;
-use super::proc_ref::{proc_stat, ProcRef};
+use super::proc_ref::{is_gone, read_stat, ProcRef, ProcStat};
 use super::ExecutionOutcome;
 
 /// How long a SIGKILLed process may take to exit before the kill is
@@ -169,7 +169,9 @@ pub fn kill_tree(
     let root_spared =
         guard(root_pid).or(protected.contains(&root_pid).then_some("PID is protected"));
     if let (Some(dir), None) = (scope, root_spared) {
-        if root.is_live() {
+        // lot 317: a root not captured goes process by process, whose
+        // outcome carries the capture's error
+        if root.liveness() == super::proc_ref::Liveness::Live {
             match kill_tree_in_cgroup(root, protected, guard, dir) {
                 Ok(done) => return done,
                 Err(e) => tracing::warn!(
@@ -192,6 +194,17 @@ fn kill_tree_by_pid(
     root: &ProcRef,
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<&'static str>,
+) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    kill_tree_by_pid_with(root, protected, guard, read_stat)
+}
+
+/// [`kill_tree_by_pid`], the descendants' `stat` read by `read` (tests: a
+/// read that fails).
+fn kill_tree_by_pid_with(
+    root: &ProcRef,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<&'static str>,
+    read: fn(u32) -> std::io::Result<ProcStat>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     let root_pid = root.pid();
     // External audit CMB-004: the children of the PID are the root's only
@@ -225,8 +238,8 @@ fn kill_tree_by_pid(
                 reason,
             },
             None => {
-                let child = ProcRef::open(child_pid);
-                if child.start_ticks() == Some(start) {
+                let child = ProcRef::open_checked_with(child_pid, None, read);
+                if child.holds_start(start) {
                     kill_one(&child, protected)
                 } else if let Some(errno) = child.capture_errno() {
                     // not captured (the agent out of descriptors): it may
@@ -278,6 +291,18 @@ fn kill_tree_in_cgroup(
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<&'static str>,
     dir: &Path,
+) -> std::io::Result<(ExecutionOutcome, Vec<ExecutionOutcome>)> {
+    kill_tree_in_cgroup_with(root, protected, guard, dir, read_stat)
+}
+
+/// [`kill_tree_in_cgroup`], the descendants' and members' `stat` read by
+/// `read` (tests: a read that fails).
+fn kill_tree_in_cgroup_with(
+    root: &ProcRef,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<&'static str>,
+    dir: &Path,
+    read: fn(u32) -> std::io::Result<ProcStat>,
 ) -> std::io::Result<(ExecutionOutcome, Vec<ExecutionOutcome>)> {
     use std::io::{Error, ErrorKind};
     let root_pid = root.pid();
@@ -353,12 +378,12 @@ fn kill_tree_in_cgroup(
                 members.push((pid, start));
                 continue;
             }
-            let child = ProcRef::open(pid);
+            let child = ProcRef::open_checked_with(pid, None, read);
             if let Some(errno) = child.capture_errno() {
                 others.push(ExecutionOutcome::Failed { pid, errno });
                 continue;
             }
-            if child.start_ticks() != Some(start) || !child.still_named_by_pid() {
+            if !child.holds_start(start) || !child.still_named_by_pid() {
                 continue; // exited since the walk
             }
             match super::block_outbound::write_pid(&procs, pid) {
@@ -414,7 +439,7 @@ fn kill_tree_in_cgroup(
     } else {
         kill_one(root, protected)
     };
-    let mut outcomes = check_members(&members);
+    let mut outcomes = check_members_with(&members, read);
     outcomes.extend(others);
     if let Some(errno) = walk_error {
         tracing::warn!(
@@ -471,19 +496,37 @@ fn has_no_children_in(proc: &Path, pid: u32) -> Option<bool> {
     Some(true)
 }
 
+/// A member of a killed cgroup, by what its `stat` reads now: dead when
+/// the PID names no process, or another (another start), or a zombie.
+/// Lot 311: a `stat` that cannot be read is not a death — the member is
+/// captured and signalled (on main it was reported killed, and one whose
+/// name was not UTF-8 never had its `stat` read).
+fn member_is_dead(stat: std::io::Result<ProcStat>, start: u64) -> bool {
+    match stat {
+        Ok(s) => s.start_ticks != start || s.zombie,
+        Err(e) => is_gone(&e),
+    }
+}
+
 /// After the cgroup's kill, each member by its identity. One still
 /// running — moved out before the kill, or stuck in an uninterruptible
 /// wait — is signalled on its own; they are waited for together.
-fn check_members(members: &[(u32, u64)]) -> Vec<ExecutionOutcome> {
+/// Each member's `stat` is read by `read` (`read_stat`; tests: a read that
+/// fails).
+fn check_members_with(
+    members: &[(u32, u64)],
+    read: fn(u32) -> std::io::Result<ProcStat>,
+) -> Vec<ExecutionOutcome> {
     let mut outcomes = Vec::with_capacity(members.len());
     let mut running: Vec<ProcRef> = Vec::new();
     for &(pid, start) in members {
-        if !proc_stat(pid).is_some_and(|s| s.start_ticks == start && !s.zombie) {
+        if member_is_dead(read(pid), start) {
             outcomes.push(ExecutionOutcome::Killed { pid });
             continue;
         }
-        let r = ProcRef::open(pid);
-        if r.start_ticks() != Some(start) {
+        let r = ProcRef::open_checked_with(pid, None, read);
+        // lot 311: running, its start unread — the pidfd holds it
+        if !r.holds_start(start) {
             outcomes.push(match r.capture_errno() {
                 Some(errno) => ExecutionOutcome::Failed { pid, errno },
                 None => ExecutionOutcome::Killed { pid },
@@ -569,7 +612,7 @@ fn cgroup_rel(dir: &Path) -> Option<String> {
 }
 
 fn pid_in_cgroup(pid: u32, rel: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
         .is_ok_and(|c| c.lines().any(|l| l.strip_prefix("0::") == Some(rel)))
 }
 
@@ -769,6 +812,261 @@ mod tests {
         let _ = sh.wait();
     }
 
+    /// Lot 311 (N6): the kill of a process whose `comm` is not UTF-8 —
+    /// its own choice, no privilege needed — runs and reports it killed.
+    /// On main the capture could not read its `stat` as text: `Failed
+    /// { errno: EIO }`, and the process ran on.
+    #[test]
+    fn a_process_whose_comm_is_not_utf8_is_killed() {
+        let mut p = crate::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let pid = p.pid();
+        let out = kill_process(
+            pid,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
+        assert!(
+            matches!(out, ExecutionOutcome::Killed { pid: k } if k == pid),
+            "{out:?}"
+        );
+        let status = p.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    /// Lot 311: after a cgroup's kill, a member whose `stat` cannot be read
+    /// is not counted dead (on main: "Killed", and it ran on); one whose
+    /// PID is free, another process's, or a zombie is.
+    #[test]
+    fn an_unreadable_member_is_not_counted_dead() {
+        use std::io::Error;
+        let alive = ProcStat {
+            start_ticks: 7,
+            zombie: false,
+        };
+        assert!(!member_is_dead(Ok(alive), 7));
+        assert!(member_is_dead(Ok(alive), 8), "another process's");
+        assert!(member_is_dead(
+            Ok(ProcStat {
+                zombie: true,
+                ..alive
+            }),
+            7
+        ));
+        assert!(member_is_dead(
+            Err(Error::from_raw_os_error(libc::ENOENT)),
+            7
+        ));
+        assert!(member_is_dead(
+            Err(Error::from_raw_os_error(libc::ESRCH)),
+            7
+        ));
+        assert!(!member_is_dead(
+            Err(Error::from_raw_os_error(libc::EMFILE)),
+            7
+        ));
+        assert!(!member_is_dead(Err(Error::from_raw_os_error(libc::EIO)), 7));
+    }
+
+    /// Lot 311: a member of the killed cgroup still running with a `comm`
+    /// that is not UTF-8 is signalled and reported killed (not alive).
+    #[test]
+    fn a_running_member_whose_comm_is_not_utf8_is_signalled() {
+        let mut p = crate::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let pid = p.pid();
+        let start = crate::response::proc_ref::proc_start_ticks(pid).expect("its start");
+        let out = check_members_with(&[(pid, start)], read_stat);
+        assert!(
+            matches!(out.as_slice(), [ExecutionOutcome::Killed { pid: k }] if *k == pid),
+            "{out:?}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match p.child.try_wait().unwrap() {
+                Some(status) => break status,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                None => panic!("reported killed, still running"),
+            }
+        };
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    /// A `stat` read that fails as the agent out of descriptors would.
+    fn unreadable(_pid: u32) -> std::io::Result<ProcStat> {
+        Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+    }
+
+    /// Wait for `child` to end, at most 2 s: its exit status.
+    fn ended(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => return Some(status),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                None => return None,
+            }
+        }
+    }
+
+    /// Lot 311: a member of a killed cgroup that still runs, its `stat`
+    /// unreadable (the agent out of descriptors), is signalled through its
+    /// pidfd and reported killed — on main it was reported killed and
+    /// never signalled.
+    #[test]
+    fn a_running_member_whose_stat_cannot_be_read_is_signalled() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::response::proc_ref::proc_start_ticks(pid).unwrap();
+        let out = check_members_with(&[(pid, start)], unreadable);
+        assert!(
+            matches!(out.as_slice(), [ExecutionOutcome::Killed { pid: k }] if *k == pid),
+            "{out:?}"
+        );
+        let status = ended(&mut child);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let status = status.expect("reported killed, still running");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    /// Lot 311: a descendant whose `stat` cannot be read when the tree is
+    /// killed process by process (the agent out of descriptors) is still
+    /// killed — not "already gone" and left running.
+    #[test]
+    fn a_descendant_whose_stat_cannot_be_read_is_killed_with_its_tree() {
+        let (mut sh, kids) = shell_with_two_sleepers();
+        let root = ProcRef::open(sh.id());
+        let (primary, rest) =
+            kill_tree_by_pid_with(&root, &protected_with(&[]), &|_| None, unreadable);
+        assert!(
+            matches!(primary, ExecutionOutcome::Killed { .. }),
+            "{primary:?}"
+        );
+        let _ = sh.wait();
+        let mut alive = Vec::new();
+        for kid in &kids {
+            let r = ProcRef::open(*kid);
+            if r.is_live() {
+                let _ = r.signal(libc::SIGKILL);
+                alive.push(*kid);
+            }
+        }
+        assert!(
+            alive.is_empty(),
+            "left running: {alive:?}; outcomes {rest:?}"
+        );
+        for kid in &kids {
+            assert!(
+                rest.iter()
+                    .any(|o| matches!(o, ExecutionOutcome::Killed { pid } if pid == kid)),
+                "{rest:?}"
+            );
+        }
+    }
+
+    /// Lot 311 (N6): a descendant whose `comm` is not UTF-8 is killed with
+    /// its tree. On main the tree's walk found it (the walk reads `stat`
+    /// as bytes) but its capture did not: `Failed { errno: EIO }`, and it
+    /// ran on under init.
+    #[test]
+    fn a_descendant_whose_comm_is_not_utf8_is_killed_with_its_tree() {
+        use std::io::BufRead;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        // the kid: a shell run through the link, looping on `sleep 1` (a
+        // shell does not dispatch on `argv[0]`, as uutils' multicall
+        // coreutils — Ubuntu 26.04, the CI's image — does)
+        let link = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        let mut sh = Command::new("sh")
+            .args([
+                "-c",
+                "\"$0\" -c 'while :; do sleep 1; done' & echo $!; wait",
+            ])
+            .arg(&link)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        std::io::BufReader::new(sh.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let kid: u32 = line.trim().parse().unwrap();
+        // the precondition: the kid runs the link (its `comm` the link's
+        // name) as a child of the shell — waited for, at most 10 s
+        let stat = format!("/proc/{kid}/stat");
+        let ready = |s: &[u8]| {
+            let parent = s.iter().rposition(|b| *b == b')').and_then(|i| {
+                String::from_utf8_lossy(&s[i + 1..])
+                    .split_whitespace()
+                    .nth(1)
+                    .map(str::to_string)
+            });
+            s.windows(3).any(|w| w == b"(\xff\xfe") && parent == Some(sh.id().to_string())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            seen = std::fs::read(&stat).unwrap_or_default();
+            if ready(&seen) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready(&seen),
+            "precondition: the kid {kid} of sh {} is not running the link: {:?}",
+            sh.id(),
+            String::from_utf8_lossy(&seen)
+        );
+        // what the walk sees, for the failure's message
+        let walk = collect_descendants(sh.id());
+        let seen_by_procfs = procfs::process::Process::new(kid as i32)
+            .and_then(|p| p.stat())
+            .map(|st| (st.ppid, st.comm));
+        let named = ProcRef::open(sh.id()).still_named_by_pid();
+        let (primary, rest) = kill_process_tree(
+            sh.id(),
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
+        assert!(
+            matches!(primary, ExecutionOutcome::Killed { .. }),
+            "{primary:?}"
+        );
+        assert!(
+            rest.iter()
+                .any(|o| matches!(o, ExecutionOutcome::Killed { pid } if *pid == kid)),
+            "the descendant {kid} must be killed: {rest:?}; before the kill the walk from {} \
+             found {walk:?}, procfs read the kid as {seen_by_procfs:?}, the root named: {named}",
+            sh.id()
+        );
+        let _ = sh.wait();
+        let gone = ProcRef::open(kid);
+        if gone.is_live() {
+            let _ = gone.signal(libc::SIGKILL);
+            panic!("the descendant {kid} still runs");
+        }
+    }
+
     #[test]
     fn kill_tree_guard_spares_descendants() {
         let (mut sh, kids) = shell_with_two_sleepers();
@@ -955,6 +1253,100 @@ mod tests {
         }
     }
 
+    /// Lot 311 (privileged: root, cgroup v2 with cgroup.kill): descendants
+    /// whose `stat` cannot be read (the agent out of descriptors) are
+    /// moved into the kill cgroup by their pidfd and killed with it — on
+    /// main they were skipped as "exited since the walk" and ran on.
+    #[test]
+    #[ignore = "privileged: root, cgroup v2 with cgroup.kill"]
+    fn a_tree_kill_moves_descendants_whose_stat_cannot_be_read() {
+        let (sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let scope = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/northnarrow-test.slice/blocked.scope/neutralize-u{}",
+            std::process::id()
+        ));
+        let result = kill_tree_in_cgroup_with(
+            &ProcRef::open(root),
+            &HashSet::new(),
+            &|_| None,
+            &scope,
+            unreadable,
+        );
+        let mut status = 0;
+        // SAFETY: waitpid(2) on this test's own child.
+        unsafe { libc::waitpid(root as i32, &mut status, 0) };
+        drop(sh);
+        let mut alive = Vec::new();
+        for kid in &kids {
+            let r = ProcRef::open(*kid);
+            if r.is_live() {
+                let _ = r.signal(libc::SIGKILL);
+                alive.push(*kid);
+            }
+        }
+        let _ = std::fs::remove_dir(&scope);
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice/blocked.scope");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice");
+        let (primary, rest) = result.expect("the kill cgroup could not be used");
+        assert!(
+            alive.is_empty(),
+            "left running: {alive:?}; outcomes {rest:?}"
+        );
+        assert!(
+            matches!(primary, ExecutionOutcome::Killed { .. }),
+            "{primary:?}"
+        );
+        for kid in &kids {
+            assert!(
+                rest.iter()
+                    .any(|o| matches!(o, ExecutionOutcome::Killed { pid } if pid == kid)),
+                "child {kid}: {rest:?}"
+            );
+        }
+    }
+
+    /// Lot 317 (BUG-124's family; privileged: root, cgroup v2 with
+    /// `cgroup.kill`): a tree kill whose root the agent could not capture
+    /// goes process by process, and reports the capture's error — through
+    /// the kill cgroup it would read as "already gone" (the root's PID is
+    /// checked by its capture there), the process running on.
+    #[test]
+    #[ignore = "privileged: root, cgroup v2 with cgroup.kill"]
+    fn a_tree_kill_whose_root_was_not_captured_reports_its_error() {
+        let (mut sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let scope = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/northnarrow-test.slice/blocked.scope/neutralize-u{}",
+            std::process::id()
+        ));
+        let (primary, _rest) = kill_tree(
+            &ProcRef::uncaptured_for_test(root, 0, libc::EMFILE),
+            &HashSet::new(),
+            &|_| None,
+            Some(&scope),
+            &super::super::journal::test_intent(),
+        );
+        let alive = ProcRef::open(root).liveness();
+        let _ = sh.kill();
+        let _ = sh.wait();
+        for kid in &kids {
+            // SAFETY: plain kill(2) on the test's own sleepers.
+            unsafe { libc::kill(*kid as i32, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir(&scope);
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice/blocked.scope");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice");
+        assert_eq!(
+            primary,
+            ExecutionOutcome::Failed {
+                pid: root,
+                errno: libc::EMFILE
+            }
+        );
+        assert_eq!(alive, super::super::proc_ref::Liveness::Live, "reached");
+    }
+
     /// External audit CMB-019 (privileged: root, cgroup v2, kernel 5.14+):
     /// a tree whose processes keep forking is killed whole through its
     /// kill cgroup — no process carrying the test's marker survives.
@@ -1046,7 +1438,7 @@ mod tests {
         let pid = child.id();
         let start = crate::response::proc_ref::proc_start_ticks(pid).unwrap();
         // with a member that has gone: both killed
-        let outcomes = check_members(&[(pid, start), (999_999_999, 1)]);
+        let outcomes = check_members_with(&[(pid, start), (999_999_999, 1)], read_stat);
         assert_eq!(outcomes.len(), 2, "{outcomes:?}");
         for p in [pid, 999_999_999] {
             assert!(
@@ -1067,7 +1459,7 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let outcomes = check_members(&[(other.id(), 1)]);
+        let outcomes = check_members_with(&[(other.id(), 1)], read_stat);
         assert!(matches!(outcomes[..], [ExecutionOutcome::Killed { .. }]));
         assert!(
             ProcRef::open(other.id()).is_live(),
