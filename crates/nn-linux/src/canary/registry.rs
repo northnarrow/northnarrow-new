@@ -86,9 +86,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -434,7 +434,9 @@ pub struct UnrecordedTrip {
 /// Same shape as [`AuditLog`](nn_evidence::audit::AuditLog) +
 /// the agent's `fim::baseline::BaselineDb`.
 pub struct Registry {
-    path: PathBuf,
+    /// Lot 319: the file's append side, poisoned by a failed write
+    /// ([`crate::flat_chain`]).
+    file: crate::flat_chain::FlatFile,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -475,7 +477,7 @@ impl Registry {
         let read = read_chain(path, &key.verifying_key())?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
-            path: crate::anchored::anchor(path),
+            file: crate::flat_chain::FlatFile::new(path, REGISTRY_FILE_MODE),
             key,
             agent_id,
             last_hash: read.last_hash,
@@ -528,7 +530,9 @@ impl Registry {
     /// next start records the trip.
     #[cfg(feature = "debug-trigger")]
     pub fn debug_stop_before_trip_mark(&self) {
-        if std::fs::remove_file(self.path.with_file_name(DEBUG_STOP_BEFORE_TRIP_MARK)).is_ok() {
+        if std::fs::remove_file(self.file.path().with_file_name(DEBUG_STOP_BEFORE_TRIP_MARK))
+            .is_ok()
+        {
             tracing::warn!(
                 "debug-trigger: the agent stops between the access row and the trip mark, on \
                  request (lab test of lab PR 260)"
@@ -764,6 +768,7 @@ impl Registry {
         actor_fp: &str,
         decoy_state: Option<DecoyState>,
     ) -> Result<CanaryToken> {
+        self.heal()?;
         let entry = build_signed_entry(
             action,
             state,
@@ -792,22 +797,35 @@ impl Registry {
             serde_json::to_string(entry).map_err(|e| anyhow!("serialising canary entry: {e}"))?;
         line.push('\n');
         crate::canary::chain_lines::check_row_len(&line)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(REGISTRY_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| {
-                format!(
-                    "opening canary registry log {} for append",
-                    self.path.display()
-                )
-            })?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending canary entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.file
+            .append(line.as_bytes(), true)
+            .context("appending a canary registry entry")?;
         self.rows += 1;
+        Ok(())
+    }
+
+    /// Lot 319 (lot 296's scheme): after a failed write, before the next
+    /// row, the tail is read again — a fragment it left is cut and the cut
+    /// signed, a row it wrote whole is the tail
+    /// ([`crate::flat_chain::FlatFile::heal`]). The tail and the row count
+    /// are the file's; the live set stays this run's (a row written whole
+    /// after its error was reported: its canary is in the live set from the
+    /// next start; a trip marked before its row failed stays marked — DEC-011).
+    fn heal(&mut self) -> Result<()> {
+        let pk = self.key.verifying_key();
+        if let Some(read) = self.file.heal(
+            |l| serde_json::from_slice::<CanaryToken>(l).is_ok(),
+            |p| read_chain(p, &pk),
+        )? {
+            if read.last_hash != self.last_hash {
+                tracing::warn!(
+                    "canary registry: the row of a failed write reached the file whole; it is \
+                     the chain's tail"
+                );
+            }
+            self.last_hash = read.last_hash;
+            self.rows = read.seq.rows();
+        }
         Ok(())
     }
 }
@@ -2567,5 +2585,30 @@ mod tests {
             hex::encode(compute_entry_hash(&stripped).unwrap()),
             row.entry_hash
         );
+    }
+
+    /// Lot 319 (lot 296's scheme): a row written whole whose fsync failed is
+    /// the chain's tail — the next row chains off it and takes the next
+    /// number (it chained off the row before: a fork, a number twice). The
+    /// live set stays this run's: the deploy reported failed is not in it.
+    #[test]
+    fn a_row_whose_fsync_failed_is_the_tail() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        let (key, pk) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        reg.deploy(sample_draft(1)).unwrap();
+        reg.file.fail_next_sync();
+        assert!(reg.deploy(sample_draft(2)).is_err());
+        let third = reg.deploy(sample_draft(3)).unwrap();
+        assert_eq!(third.seq, Some(2));
+        assert_eq!(reg.len(), 2, "the failed deploy is not live this run");
+        let rows: Vec<CanaryToken> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        verify_chain(&rows, &pk).unwrap();
     }
 }

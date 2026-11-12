@@ -82,8 +82,8 @@ fn detections(
     // result (the CLI restricts these to valid values; this is the
     // defensive server-side path).
     let mut filter = DetectionFilter {
-        since_unix: extra.since_unix_ts.map(|s| s as i64),
-        until_unix: extra.until_unix_ts.map(|s| s as i64),
+        since_unix: extra.since_unix_ts.map(unix_bound),
+        until_unix: extra.until_unix_ts.map(unix_bound),
         subject_substr: extra.path.clone().filter(|s| !s.is_empty()),
         ..Default::default()
     };
@@ -311,5 +311,27 @@ fn detection_set_status(
         id: extra.id,
         new_status: new_status.as_str().to_string(),
         persist_failed: false,
+    }
+}
+
+/// A request's time bound (UNIX seconds) as the filter's. Lot 319 (the
+/// mini-hunt of BUG12's partial): `s as i64` made a bound of 2^63 or more
+/// negative — `since` kept every detection instead of none, `until` none
+/// instead of every one. Past `i64::MAX` the bound is the farthest time.
+fn unix_bound(s: u64) -> i64 {
+    i64::try_from(s).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_huge_time_bound_stays_the_farthest_time() {
+        assert_eq!(unix_bound(0), 0);
+        assert_eq!(unix_bound(1_762_900_000), 1_762_900_000);
+        for huge in [i64::MAX as u64, 1u64 << 63, u64::MAX] {
+            assert_eq!(unix_bound(huge), i64::MAX, "{huge}");
+        }
     }
 }

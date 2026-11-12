@@ -98,7 +98,31 @@ impl ChainHost for LinuxHost {
     fn anchor(path: &Path) -> PathBuf {
         crate::anchored::anchor(path)
     }
+
+    /// Lot 319 (external bug hunt BUG10's partial): a stalled retention is
+    /// a degradation of the agent ([`RETENTION_DEGRADATION`], one line per
+    /// log, named by its file): in `nn-admin status` and the trust level,
+    /// signed in the audit chain; it leaves them when a pass runs again (or
+    /// stops at another archive: that line takes its place).
+    fn retention_stalled(active: &Path, why: Option<&str>) {
+        let name = active.file_name().map_or_else(
+            || active.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let prefix = format!("{name}: ");
+        let line = why.map(|w| format!("{prefix}{w}"));
+        crate::boot::degradation::withdraw_where(RETENTION_DEGRADATION, |d| {
+            d.starts_with(&prefix) && Some(d) != line.as_deref()
+        });
+        if let Some(line) = &line {
+            crate::boot::degradation::report(RETENTION_DEGRADATION, line);
+        }
+    }
 }
+
+/// Lot 319: the degradation's source of a rotating chain whose retention
+/// stalled ([`LinuxHost::retention_stalled`]).
+pub const RETENTION_DEGRADATION: &str = "chain_retention";
 
 /// What is Linux about the chains, on the agent's host: modes, symlinks,
 /// FIFOs. R04a (lab PR 241): from the tests of `chainlog`, `audit`,
@@ -656,6 +680,204 @@ mod tests {
         );
     }
 
+    // ── Lot 319 (lot 296's backlog): the flat chains of the agent's host —
+    //    the canary registry and access log, the FIM baseline, the listener
+    //    log — after the kernel's own short write ──
+
+    const FLAT_SHORT_WRITE_DIR: &str = "NN_LINUX_FLAT_SHORT_WRITE_DIR";
+
+    /// The flat chains [`flat_short_write_writer`] writes, by file name.
+    const FLAT_CHAINS: [&str; 4] = [
+        "canary_access.jsonl",
+        "canaries.jsonl",
+        "baseline.jsonl",
+        "netflow_listeners.jsonl",
+    ];
+
+    /// `append` cut short by the file size limit, 40 bytes into its row:
+    /// it fails, and the start of its row is in the file.
+    fn cut_short<T>(path: &Path, append: impl FnOnce() -> anyhow::Result<T>) {
+        let len = fs::metadata(path).unwrap().len();
+        let r = with_file_size_limit(len + 40, append);
+        assert!(r.is_err(), "premise: {} took the whole row", path.display());
+        assert_eq!(
+            fs::metadata(path).unwrap().len(),
+            len + 40,
+            "premise: a short write in {}",
+            path.display()
+        );
+    }
+
+    /// The writer of [`a_short_write_glues_no_row_in_the_flat_chains`], in a
+    /// process of its own (the file size limit is the process's). A no-op
+    /// without its variable.
+    #[test]
+    #[ignore = "a helper: run by a_short_write_glues_no_row_in_the_flat_chains"]
+    fn flat_short_write_writer() {
+        use crate::canary::{access_log, registry};
+        let Some(dir) = std::env::var_os(FLAT_SHORT_WRITE_DIR) else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        // the audit chain the agent signs its repairs in
+        let audit = std::sync::Arc::new(parking_lot::Mutex::new(
+            AuditLog::open(&dir.join("audit.log"), key(dir), [0u8; 16]).unwrap(),
+        ));
+        crate::boot::degradation::attach_audit_log(Some(audit));
+        let access = |n: u32| access_log::CanaryAccessDraft {
+            canary_id: format!("canary_id_{n}"),
+            canary_name: format!("decoy_{n}"),
+            canary_type: nn_model::CanaryTypeTag::File,
+            access_kind: nn_model::CanaryAccessKind::FileOpen,
+            accessor_pid: 1000 + n,
+            accessor_uid: 0,
+            accessor_comm: format!("attacker_{n}"),
+            accessor_exe: None,
+            first_trip: n == 1,
+        };
+        let p = dir.join(FLAT_CHAINS[0]);
+        let mut db = access_log::CanaryAccessDb::open(&p, key(dir), [0u8; 16]).unwrap();
+        db.append(access(1)).unwrap();
+        cut_short(&p, || db.append(access(2)));
+        db.append(access(3)).unwrap();
+        let canary = |n: u32| registry::CanaryTokenDraft {
+            name: format!("test_canary_{n}"),
+            canary_type: nn_proto::admin_signed_payload::CanaryTypeWire::File,
+            deployment: nn_proto::admin_signed_payload::CanaryDeploymentWire::File {
+                path: format!("/tmp/decoy_{n}.txt"),
+                template: None,
+            },
+            deployed_by_fp: format!("{n:08x}"),
+            content: None,
+        };
+        let p = dir.join(FLAT_CHAINS[1]);
+        let mut reg = registry::Registry::open(&p, key(dir), [0u8; 16]).unwrap();
+        reg.deploy(canary(1)).unwrap();
+        cut_short(&p, || reg.deploy(canary(2)));
+        reg.deploy(canary(3)).unwrap();
+        let entry = |n: u32| crate::fim::baseline::BaselineEntryDraft {
+            path: format!("/etc/test_{n}"),
+            sha256: hex::encode([n as u8; 32]),
+            mode: "0o644".to_string(),
+            uid: 0,
+            gid: 0,
+            size_bytes: 1024,
+            is_symlink: false,
+            target: None,
+        };
+        let p = dir.join(FLAT_CHAINS[2]);
+        let mut base = crate::fim::baseline::BaselineDb::open(&p, key(dir), [0u8; 16]).unwrap();
+        base.append(entry(1)).unwrap();
+        cut_short(&p, || base.append(entry(2)));
+        base.append(entry(3)).unwrap();
+        let listener = |n: u64| nn_model::telemetry::NetListenerEvent {
+            timestamp_ns: n,
+            family: 2,
+            bind_addr: "0.0.0.0".parse().unwrap(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 42,
+            uid: 0,
+            comm: "nc".to_string(),
+            exe: None,
+        };
+        let p = dir.join(FLAT_CHAINS[3]);
+        let mut net = crate::net::drain::NetListenerDb::open(&p, key(dir), [0u8; 16]).unwrap();
+        net.append(&listener(1)).unwrap();
+        cut_short(&p, || net.append(&listener(2)));
+        net.append(&listener(3)).unwrap();
+        crate::boot::degradation::flush();
+    }
+
+    /// The rows of the flat chain at `path`, each line one: a line that is
+    /// not a row (a fragment with a row glued to it) fails.
+    fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str(l).unwrap_or_else(|e| {
+                    panic!("{}: a line that is no row ({e}): {l}", path.display())
+                })
+            })
+            .collect()
+    }
+
+    /// Lot 296's poisoned-writer scheme on the flat chains: a write stopped
+    /// part-way (a full disk: the kernel's own short write, by the file size
+    /// limit) left the start of its row, and the next row was glued to it —
+    /// one line no row (the registry and the access log skipped it at the
+    /// next start and their chains broke; the listener log no longer opened,
+    /// so the next start wrote no listener). The next row now reads the tail
+    /// first: the fragment is cut, the cut signed in the audit chain
+    /// (`chain_tail_repaired`), and each chain verifies whole.
+    #[test]
+    fn a_short_write_glues_no_row_in_the_flat_chains() {
+        use crate::canary::{access_log, registry};
+        let dir = TempDir::new().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "chain_host_linux::tests::flat_short_write_writer",
+                "--test-threads=1",
+            ])
+            .env(FLAT_SHORT_WRITE_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the writer: {st}");
+        let pk = key(dir.path()).verifying_key();
+        let d = |i: usize| dir.path().join(FLAT_CHAINS[i]);
+        let rows: Vec<access_log::CanaryAccessEntry> = flat_rows(&d(0));
+        assert_eq!(rows.len(), 2);
+        access_log::verify_chain(&rows, &pk).unwrap();
+        let rows: Vec<registry::CanaryToken> = flat_rows(&d(1));
+        assert_eq!(rows.len(), 2);
+        registry::verify_chain(&rows, &pk).unwrap();
+        let rows: Vec<crate::fim::baseline::BaselineEntry> = flat_rows(&d(2));
+        assert_eq!(rows.len(), 2);
+        crate::fim::baseline::verify_chain(&rows, &pk).unwrap();
+        let rows: Vec<crate::net::drain::NetListenerEntry> = flat_rows(&d(3));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].prev_hash, rows[0].entry_hash,
+            "the listener rows chain"
+        );
+        // each opens again with nothing to repair or skip
+        let mut a = access_log::CanaryAccessDb::open(&d(0), key(dir.path()), [0u8; 16]).unwrap();
+        assert_eq!(a.take_open_findings(), (None, 0));
+        assert!(a.take_chain_findings().is_empty());
+        let mut r = registry::Registry::open(&d(1), key(dir.path()), [0u8; 16]).unwrap();
+        assert_eq!(r.take_open_findings(), (None, 0));
+        assert!(r.take_chain_findings().is_empty());
+        assert_eq!(r.len(), 2, "two canaries deployed");
+        let mut b =
+            crate::fim::baseline::BaselineDb::open(&d(2), key(dir.path()), [0u8; 16]).unwrap();
+        assert_eq!(b.take_open_findings(), (None, 0));
+        let mut n = crate::net::drain::NetListenerDb::open(&d(3), key(dir.path()), [0u8; 16])
+            .expect("the listener log opens again");
+        assert!(n.take_tail_repair().is_none());
+        // each cut signed once in the audit chain, naming its file
+        let audit: Vec<serde_json::Value> = fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["op"] == crate::audit::CHAIN_TAIL_REPAIRED_OP)
+            .collect();
+        let mut files: Vec<String> = audit
+            .iter()
+            .map(|v| v["extra"]["file"].as_str().unwrap().to_string())
+            .collect();
+        files.sort();
+        let mut want: Vec<String> = (0..4).map(|i| d(i).display().to_string()).collect();
+        want.sort();
+        assert_eq!(files, want, "{audit:?}");
+        assert!(audit
+            .iter()
+            .all(|v| v["extra"]["detail"].as_str().unwrap().contains("(40 bytes")));
+    }
+
     // ── Lot 296 (external bug hunt BUG27): a real failed fsync ──
 
     thread_local! {
@@ -762,5 +984,205 @@ mod tests {
             r.as_ref().is_ok_and(|r| r.total_records == 3),
             "the chain forked after a failed fsync: {r:?}"
         );
+    }
+
+    // ── Lot 319 (external bug hunt BUG10, the partial left by lot 296): a
+    //    stalled retention in the agent's status ──
+
+    /// An archive that cannot be removed (`chattr +i`, a read-only
+    /// filesystem), as a protection: while `on`, its release of the archive
+    /// named `name` swaps it for a directory that is not empty (the removal
+    /// then fails), and the next dance swaps the archive back — a regular
+    /// archive again at every pass.
+    struct Stuck {
+        name: &'static str,
+        aside: PathBuf,
+        on: std::sync::atomic::AtomicBool,
+    }
+
+    impl Stuck {
+        fn swapped(&self, dir: &Path) -> PathBuf {
+            dir.join(self.name)
+        }
+    }
+
+    impl crate::chainlog::ProtectionManager for Stuck {
+        fn with_mutable_dir(
+            &self,
+            f: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let held = self.swapped(self.aside.parent().unwrap());
+            if held.is_dir() {
+                fs::remove_dir_all(&held)?;
+                fs::rename(&self.aside, &held)?;
+            }
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn release(&self, path: &Path) -> anyhow::Result<()> {
+            if self.on.load(std::sync::atomic::Ordering::SeqCst)
+                && path.file_name().is_some_and(|n| n == self.name)
+            {
+                fs::rename(path, &self.aside)?;
+                fs::create_dir(path)?;
+                fs::write(path.join("x"), b"x")?;
+            }
+            Ok(())
+        }
+    }
+
+    fn retention_lines() -> Vec<String> {
+        crate::boot::degradation::entries()
+            .into_iter()
+            .filter(|d| d.source == "chain_retention")
+            .map(|d| d.detail)
+            .collect()
+    }
+
+    /// BUG10: an archive past the retention that cannot be removed stops
+    /// every eviction pass (by design: removing the newer ones past it would
+    /// leave a gap in the chain) — and that stayed an `error!` at each
+    /// rotation, while the disk use grew. On the agent's host it is a
+    /// degradation: in `nn-admin status` (and the trust level), signed in
+    /// the audit chain, once; it leaves the status when a pass runs again.
+    #[test]
+    fn retention_stalled_is_a_visible_degradation() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("netflow.jsonl");
+        let cfg = |archives| RotationConfig {
+            size_cap_bytes: 300,
+            max_archives: archives,
+            file_mode: 0o600,
+        };
+        let mut log = RotatingChainLog::<P>::open(
+            &active,
+            key(dir.path()),
+            cfg(50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        let mut i = 0u64;
+        let mut rotate_to = |log: &mut RotatingChainLog<P>, seq: u64| {
+            while !archive_path_for(&active, seq).exists() {
+                log.append(p(i % 60)).unwrap();
+                i += 1;
+                assert!(i < 2000);
+            }
+        };
+        rotate_to(&mut log, 3);
+        drop(log);
+        // archive 2 cannot be removed; the retention falls to one archive
+        let stuck = std::sync::Arc::new(Stuck {
+            name: "netflow.jsonl.000002",
+            aside: dir.path().join("aside"),
+            on: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut log =
+            RotatingChainLog::<P>::open(&active, key(dir.path()), cfg(1), stuck.clone()).unwrap();
+        rotate_to(&mut log, 4);
+        assert!(
+            archive_path_for(&active, 3).is_file() && !archive_path_for(&active, 1).exists(),
+            "premise: the pass removed 1 and stopped at archive 2"
+        );
+        let lines = retention_lines();
+        assert_eq!(lines.len(), 1, "one degradation: {lines:?}");
+        assert!(
+            lines[0].contains("netflow.jsonl") && lines[0].contains("archive 2"),
+            "it names the log and the archive: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("/proc/self/fd"),
+            "the log's name, not its anchor: {lines:?}"
+        );
+        // signed in the audit chain when the log is there (the flush)
+        let audit = dir.path().join("audit.log");
+        let audit_log = std::sync::Arc::new(parking_lot::Mutex::new(
+            AuditLog::open(&audit, key(dir.path()), [0u8; 16]).unwrap(),
+        ));
+        crate::boot::degradation::attach_audit_log(Some(audit_log));
+        let signed = || {
+            fs::read_to_string(&audit)
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains("subsystem_degraded") && l.contains("archive 2"))
+                .count()
+        };
+        assert_eq!(signed(), 1, "signed once");
+        // the next pass stops at 2 again: still one line, signed once
+        rotate_to(&mut log, 5);
+        assert!(archive_path_for(&active, 3).is_file(), "stopped again");
+        assert_eq!(retention_lines(), lines);
+        crate::boot::degradation::flush();
+        assert_eq!(signed(), 1);
+        // the archive can be removed again: the stall ends, the line leaves
+        stuck.on.store(false, std::sync::atomic::Ordering::SeqCst);
+        rotate_to(&mut log, 6);
+        assert!(!archive_path_for(&active, 2).exists(), "removed");
+        assert!(
+            retention_lines().is_empty(),
+            "a pass that ran withdraws it: {:?}",
+            retention_lines()
+        );
+        crate::boot::degradation::reset_for_tests();
+    }
+
+    /// Lot 319: one line per log — the end of one log's stall leaves the
+    /// other's; a stall at another archive replaces the log's line.
+    #[test]
+    fn each_log_s_stall_is_its_own_line() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        let a = Path::new("/proc/self/fd/9/netflow.jsonl");
+        let b = Path::new("/proc/self/fd/9/fim_drift.jsonl");
+        LinuxHost::retention_stalled(a, Some("the retention stopped at archive 2"));
+        LinuxHost::retention_stalled(b, Some("the retention stopped at archive 7"));
+        assert_eq!(retention_lines().len(), 2);
+        LinuxHost::retention_stalled(a, Some("the retention stopped at archive 3"));
+        let mut lines = retention_lines();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                "fim_drift.jsonl: the retention stopped at archive 7",
+                "netflow.jsonl: the retention stopped at archive 3"
+            ]
+        );
+        LinuxHost::retention_stalled(a, None);
+        assert_eq!(
+            retention_lines(),
+            ["fim_drift.jsonl: the retention stopped at archive 7"]
+        );
+        crate::boot::degradation::reset_for_tests();
+    }
+
+    /// Lot 319: the same stall told again (a writer of the log opened again
+    /// in the process) keeps its line — it is not withdrawn and signed a
+    /// second time.
+    #[test]
+    fn the_same_stall_told_again_is_signed_once() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        let dir = TempDir::new().unwrap();
+        let audit = dir.path().join("audit.log");
+        crate::boot::degradation::attach_audit_log(Some(std::sync::Arc::new(
+            parking_lot::Mutex::new(AuditLog::open(&audit, key(dir.path()), [0u8; 16]).unwrap()),
+        )));
+        let a = Path::new("/proc/self/fd/9/k319-netflow.jsonl");
+        for _ in 0..2 {
+            LinuxHost::retention_stalled(a, Some("the retention stopped at archive 4"));
+            crate::boot::degradation::flush();
+        }
+        let signed = fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("subsystem_degraded") && l.contains("k319-netflow.jsonl"))
+            .count();
+        assert_eq!(signed, 1);
+        assert_eq!(retention_lines().len(), 1);
+        crate::boot::degradation::reset_for_tests();
     }
 }
