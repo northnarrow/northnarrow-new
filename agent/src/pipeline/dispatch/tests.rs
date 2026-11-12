@@ -987,7 +987,7 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
     cfg.dry_run = false;
     let executor = Executor::with_config(cfg);
     executor.set_tree_guard(std::sync::Arc::new(move |p: u32| {
-        (p == pid).then_some("ssh-service(sshd)")
+        (p == pid).then_some(crate::response::kill::Spare::process("ssh-service(sshd)"))
     }));
     let (d, journal, sink) = dispatcher_on(executor, 64);
     let hold = d.shared.hold.lock();

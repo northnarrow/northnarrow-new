@@ -76,6 +76,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     a service, from unpinned threads with every CPU busy, and 8 through the
     32-bit and x32 entries, after positive controls for each caller. All are
     refused.
+- A response reports what the host holds after it, read back, not what
+  the agent wrote (lot 312; external bug hunt, edition 1.4: BUG-90, 91,
+  114, 117, 120–123, and the independent review of #543;
+  `docs/operator/COMBAT_RECOVERY.md` §3.5). A payload an unprivileged user
+  named `x (deleted)` was killed by NEUTRALIZE and left on disk, runnable,
+  recorded as "no binary on disk": whether a binary is gone is now the
+  held inode's `st_nlink`. The quarantine does to a file only what the
+  offender could have done itself: never the system's own files, judged by
+  identity (the dynamic loaders, the shells, init, sshd, the agent's
+  binaries) whatever name leads to them — a user namespace's bind of
+  `/usr/bin` no longer reaches them, and an `/etc/shells` that cannot be
+  read (a FIFO, a device, over 1 MiB: refused at once, NEUTRALIZE goes on)
+  refuses the quarantine; a non-root offender only its own
+  files, a root offender any file under a verified name, never a
+  root-owned file without one. A name is removed only when it is the
+  file's only name; a non-root offender's own file is emptied under every
+  name (a second hard link it made no longer keeps it runnable); a shared
+  file root or another user owns (a package store's hard links) is never
+  emptied — made mode 000 where the agent may (partial), else only vaulted
+  (a failure) — and a restore puts content and mode back into the same
+  file, every name of it. A user with a delegated cgroup subtree (`user@<uid>.service`) made a
+  cgroup named as the agent's blocked scope and the soft egress block
+  answered `Blocked`, moved nothing and filtered nothing: the agent's
+  scopes and the SSH unit are now compared by components from the cgroup
+  root (one helper, `nn_core::response::cgroup`; a ratchet,
+  `xtask/tests/response_truth.rs`), the block, the throttle and their
+  release read `/proc/<pid>/cgroup` back, the drop rule is loaded again
+  for a scope made again, and a process holding sockets from before the
+  move is blocked in part (said, INVESTIGATE shortened). A container's
+  nested `ssh.service` no longer spares its root sshd, nor does a cgroup
+  with no unit on a systemd host; a throttle's limit counts only as the
+  value asked for; a second throttle keeps the real origin; a protected
+  tree-kill root keeps its tree, and below a spared host-critical root
+  only the offending lineage can be killed; the copy-on-first-write guard
+  copies a file named `… (deleted)`, and one a rename races, too.
 - Lot 318 (external bug hunt, editions 1.2/1.3/1.4: the kernel halves of
   BUG37, BUG101, BUG108 and N9).
   - **BUG37**: the BPF guard's refusals (`bpf_handle`, `bpf_map`,

@@ -311,7 +311,7 @@ fn host_critical_guard_applies_to_every_pid_scoped_action() {
     cfg.dry_run = false;
     let exec = Executor::with_config(cfg);
     exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
-        (pid == GUARDED || pid == live).then_some("ssh-service(sshd)")
+        (pid == GUARDED || pid == live).then_some(super::kill::Spare::process("ssh-service(sshd)"))
     }));
     for (action, pid) in [
         (ResponseAction::KillProcess, live),
@@ -438,6 +438,46 @@ fn a_thread_lowers_its_own_priority_only() {
     assert_eq!(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }, before);
 }
 
+/// Lot 312 (review of #543, F2): the signed containment row of a block
+/// that leaves the sockets opened before the move is `partial`, with the
+/// count and what escapes; a full block's is `success`.
+#[test]
+fn a_partial_block_is_signed_partial() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let key =
+        crate::audit::AgentSigningKey::load_or_bootstrap(&tmp.path().join("agent.sig")).unwrap();
+    let log = std::sync::Arc::new(parking_lot::Mutex::new(
+        crate::audit::AuditLog::open(&tmp.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+    ));
+    let exec = Executor::with_config(cfg);
+    exec.set_audit_log(log);
+    exec.record_contain(
+        42,
+        "blocked",
+        &ExecutionOutcome::BlockedNewOnly {
+            pid: 42,
+            sockets: 2,
+        },
+    );
+    exec.record_contain(43, "blocked", &ExecutionOutcome::Blocked { pid: 43 });
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(tmp.path().join("audit.log"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["op"] == "response_contain")
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["result"], "partial");
+    assert_eq!(rows[0]["extra"]["sockets_before_the_move"], 2);
+    assert!(rows[0]["extra"]["why"]
+        .as_str()
+        .unwrap()
+        .starts_with("new connections blocked; 2 inet socket(s)"));
+    assert_eq!(rows[1]["result"], "success");
+}
+
 /// Lot 317 (BUG-124's family): a kill whose target the agent could not
 /// capture (`pidfd_open` out of descriptors) is a failure with the
 /// capture's error — never "already gone" — and the process it names
@@ -473,4 +513,41 @@ fn a_kill_of_a_target_not_captured_fails_with_the_capture_s_error() {
     );
     let _ = sleeper.kill();
     let _ = sleeper.wait();
+}
+
+/// Re-check of #543 (N2): the signed row of a quarantine whose only effect
+/// was the vault is a `failure`; mode 000 with the content kept is
+/// `partial`; an emptied file is `success`.
+#[test]
+fn an_in_place_quarantine_is_signed_by_what_it_left() {
+    use super::quarantine::InPlaceEffect as E;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let key =
+        crate::audit::AgentSigningKey::load_or_bootstrap(&tmp.path().join("agent.sig")).unwrap();
+    let log = std::sync::Arc::new(parking_lot::Mutex::new(
+        crate::audit::AuditLog::open(&tmp.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+    ));
+    let exec = Executor::with_config(cfg);
+    exec.set_audit_log(log);
+    for effect in [E::Unchanged, E::MadeUnusable, E::Emptied] {
+        exec.record_quarantine(
+            42,
+            &ExecutionOutcome::QuarantinedInPlace {
+                vault_id: "00000000000000000000000000000000".into(),
+                original_path: None,
+                detail: format!("{effect:?}"),
+                effect,
+            },
+        );
+    }
+    let results: Vec<String> = std::fs::read_to_string(tmp.path().join("audit.log"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["op"] == "response_quarantine")
+        .map(|r| r["result"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(results, ["failure", "partial", "success"]);
 }

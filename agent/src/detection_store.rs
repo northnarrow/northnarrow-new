@@ -304,6 +304,23 @@ pub fn describe_response(report: &ExecutionReport) -> String {
         ExecutionOutcome::Failed { errno, .. } => Some(format!("failed: {}", errno_text(*errno))),
         // Never a primary outcome today; reported, not hidden, if it becomes one.
         ExecutionOutcome::TreeTruncated { .. } => Some("partial: walk truncated".to_string()),
+        // Lot 312: the action ran, its effect read back did not take.
+        ExecutionOutcome::NotInEffect { reason, .. } => Some(format!("not in effect: {reason}")),
+        ExecutionOutcome::QuarantinedInPlace {
+            effect: crate::response::quarantine::InPlaceEffect::Emptied,
+            ..
+        } => None,
+        ExecutionOutcome::QuarantinedInPlace {
+            effect: crate::response::quarantine::InPlaceEffect::MadeUnusable,
+            detail,
+            ..
+        } => Some(format!("partial: {detail}")),
+        ExecutionOutcome::QuarantinedInPlace { detail, .. } => Some(format!("failed: {detail}")),
+        ExecutionOutcome::QuarantineRefused { detail, .. } => Some(format!("refused: {detail}")),
+        ExecutionOutcome::BlockedNewOnly { sockets, .. } => Some(format!(
+            "partial: {}",
+            crate::response::blocked_new_only(*sockets)
+        )),
     };
     let outcome = match (root, partial_outcome(&report.additional)) {
         (Some(root), Some(partial)) => Some(format!("{root}; {partial}")),
@@ -2671,6 +2688,18 @@ mod tests {
                 ),
                 "FullNetworkIsolation (refused: host-wide isolation is the COMBAT ladder's)",
             ),
+            // lot 312: the action ran, its effect read back did not take
+            (
+                report(
+                    BlockOutbound,
+                    ExecutionOutcome::NotInEffect {
+                        pid: 7,
+                        reason: "moved, but /proc/<pid>/cgroup does not place it in the agent's blocked scope",
+                    },
+                    vec![],
+                ),
+                "BlockOutbound (not in effect: moved, but /proc/<pid>/cgroup does not place it in the agent's blocked scope)",
+            ),
         ];
         for (r, want) in cases {
             assert_eq!(describe_response(&r), want, "{r:?}");
@@ -2821,7 +2850,7 @@ mod tests {
 
         let guarded = Executor::with_config(cfg.clone());
         guarded.set_tree_guard(std::sync::Arc::new(move |p: u32| {
-            (p == pid).then_some("ssh-service(sshd)")
+            (p == pid).then_some(crate::response::kill::Spare::process("ssh-service(sshd)"))
         }));
         let r = guarded.execute(
             ResponseAction::KillProcess,

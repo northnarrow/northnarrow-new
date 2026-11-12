@@ -115,6 +115,12 @@ const CGROUP: &str = "our own units' cgroup files, written and read back by the 
 const MOUNT: &str = "the copy-on-write guard's start: with no mount table readable a mount scope \
                      is refused as no mount point, and the guard's start reports the refusal";
 
+/// Why a response's read-back may default (lot 312, #543): it fails toward
+/// the stricter side.
+const READBACK: &str = "a response's read-back of what it did (lot 312): a read that fails is \
+                        answered on the stricter side — a cgroup that cannot be read back is no \
+                        block in effect, a failure with its reason";
+
 /// Rule 2's sites, each by its read as written (spaces dropped): `(file,
 /// read, why)` — none reads a file a process or a user names into an empty
 /// answer that a protection then publishes. The readers that keep the last
@@ -758,6 +764,19 @@ const KNOWN: &[(&str, &str, &str)] = &[
     (
         "agent/src/cow/fanotify.rs",
         "read_state(format!(\"/proc/{tid}/stat\"))",
+        PROC,
+    ),
+    // lot 312 (#543): the block's read-back and the quarantine's offender
+    (
+        "crates/nn-linux/src/response/block_outbound.rs",
+        "read_state(format!(\"/proc/{pid}/cgroup\"))",
+        READBACK,
+    ),
+    // the filesystem uid the offender acts as: unknown, the quarantine
+    // judges no owner its own and refuses
+    (
+        "crates/nn-linux/src/response/quarantine.rs",
+        "read_state(format!(\"/proc/{pid}/status\"))",
         PROC,
     ),
 ];

@@ -134,6 +134,12 @@ pub enum SoftBlock {
     NotNeeded(&'static str),
     /// The block did not take effect.
     Failed(String),
+    /// Lot 312 (review F2): the process is in the blocked scope and its
+    /// new sockets are dropped, but sockets it opened before the move (or
+    /// is passed later from outside the scope) are not: contained in part.
+    /// Released at the stand-down like a block; the INVESTIGATE window is
+    /// shortened like a failure.
+    Partial(String),
 }
 
 /// The operations [`super::CombatLadder`] performs on the system, on the
