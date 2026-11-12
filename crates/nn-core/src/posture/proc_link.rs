@@ -229,6 +229,9 @@ mod tests {
             "/proc/net/../fd/3",
             "/dev/fd/../fd/3",
             "/proc/self/cwd/../fd/3",
+            // a `..` outside a link folds: the link is what is left
+            "/tmp/../proc/self/fd/3",
+            "/home/u/../../dev/fd/3",
         ] {
             assert!(reopens_a_descriptor(p), "{p}");
             assert!(through_proc_link(p), "{p}");

@@ -2045,10 +2045,19 @@ mod tests {
             let got = runs_of(Path::new(exe), &argv(a));
             assert!(matches!(got, Runs::Unknown(_)), "{a:?}: {got:?}");
         }
-        // ruby's -v prints the version and runs the script given
+        // ruby's -v prints the version and runs the script given; with
+        // none, nothing (it reads no standard input)
         assert_eq!(
             runs_of(Path::new("/usr/bin/ruby"), &argv(&["ruby", "-v", "/tmp/s"])),
             Runs::Script("/tmp/s".into())
+        );
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/ruby"), &argv(&["ruby", "-v"])),
+            Runs::Unknown(None)
+        );
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/ruby"), &argv(&["ruby", "-wv"])),
+            Runs::Unknown(None)
         );
     }
 

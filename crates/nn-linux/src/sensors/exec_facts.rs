@@ -305,6 +305,47 @@ mod tests {
         assert_eq!(flags(&e).0, exe_flags::KNOWN | exe_flags::ENV_LOADS);
     }
 
+    /// Tracepoint mode on a real process: an image unlinked after its exec
+    /// is `DELETED` (its link count 0), with its identity.
+    #[test]
+    fn an_unlinked_image_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = tmp.path().join("payload");
+        std::fs::copy("/bin/sleep", &copy).unwrap();
+        // another test's fork may hold the copy's write descriptor until its
+        // exec (the parallel harness): `ETXTBSY` for a moment
+        let mut child = (0..200)
+            .find_map(
+                |_| match std::process::Command::new(&copy).arg("5").spawn() {
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                    other => Some(other.unwrap()),
+                },
+            )
+            .expect("the copy runs");
+        for _ in 0..500 {
+            if std::fs::read_link(format!("/proc/{}/exe", child.id())).is_ok_and(|l| l == copy) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let id = std::fs::metadata(&copy).unwrap();
+        let id = (kernel_dev(id.dev()), id.ino());
+        std::fs::remove_file(&copy).unwrap();
+        let mut e = spawn(child.id(), Default::default(), "/proc/self/fd/3", &["x"]);
+        read_under(Path::new("/proc"), &mut e);
+        let _ = child.kill();
+        let _ = child.wait();
+        let (f, dev, ino) = flags(&e);
+        assert!(
+            f & exe_flags::DELETED != 0 && f & exe_flags::PROC_EXE != 0,
+            "{f:#x}"
+        );
+        assert_eq!((dev, ino), id);
+    }
+
     /// `ROOT_DIR` is read in the process's own view of the files: a
     /// container's `/usr/bin` is its root's (`/proc/<pid>/root`), not the
     /// host's directory of the same name.

@@ -1370,5 +1370,11 @@ mod lot310 {
         assert!(images.record((1, 999)));
         assert!(!images.contains((1, 1)), "the oldest went out");
         assert!(images.contains((1, 2)) && images.contains((1, 999)));
+        // a refresh's replacement: `(0, 0)` is never one either
+        let images = ExecutorImages::default();
+        assert!(images.replace(vec![(0, 0), (1, 2), (1, 2)]));
+        assert!(!images.contains((0, 0)));
+        assert_eq!(images.len(), 1);
+        assert!(!images.replace(vec![(1, 2), (0, 0)]), "the same set");
     }
 }
