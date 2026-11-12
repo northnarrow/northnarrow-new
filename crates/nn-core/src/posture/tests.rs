@@ -252,3 +252,218 @@ fn loopback_burst_after_another_class_stays_engaged() {
     assert!(!t.locked);
     assert_eq!(heard[0].offender.map(|p| p.pid), Some(42));
 }
+
+// ── Bug hunt 3 (edition 1.4) triage, group A: BUG-84, BUG-94 ────────────
+
+/// BUG-84: a force-posture to the state the machine is already in is
+/// promised a no-op (`admin_force_state_with_token`'s doc: "Same-direction
+/// (before == target) is a no-op"; `ForceOutcome::state`: "unchanged when
+/// `from` was already the target"). On main the state is rewritten before
+/// the `before == target` check: the decay timers restart and an unlocked
+/// COMBAT becomes locked, with no transition logged.
+mod bug84 {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::posture::clock::{Clock, TestClock};
+    use crate::posture::state::PostureState;
+    use crate::posture::ForceOutcome;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    fn clock() -> Arc<TestClock> {
+        Arc::new(TestClock::at(
+            UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+        ))
+    }
+
+    fn force(m: &PostureMachine, to: PostureKind) -> ForceOutcome {
+        m.admin_force_state_with_token((), to, true)
+            .expect("force-posture")
+    }
+
+    fn timers(s: &PostureState) -> Option<(std::time::Instant, std::time::Instant)> {
+        match s {
+            PostureState::Alerted {
+                since,
+                last_trigger,
+            }
+            | PostureState::Engaged {
+                since,
+                last_trigger,
+            } => Some((*since, *last_trigger)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bug84_same_state_force_alerted_keeps_the_decay_deadline() {
+        let clock = clock();
+        let m = PostureMachine::new().with_clock(clock.clone());
+        let t0 = clock.now();
+        assert_eq!(force(&m, PostureKind::Alerted).from, PostureKind::Observing);
+        let log0 = m.transition_log().len();
+        clock.advance(59 * MIN);
+        let out = force(&m, PostureKind::Alerted);
+        assert_eq!(out.from, PostureKind::Alerted);
+        assert_eq!(m.transition_log().len(), log0, "no transition logged");
+        assert_eq!(
+            (timers(&out.state), timers(&m.current())),
+            (Some((t0, t0)), Some((t0, t0))),
+            "BUG-84: a force to the current ALERTED rewrote since/last_trigger (t0 = {t0:?})"
+        );
+        clock.advance(2 * MIN);
+        assert_eq!(
+            m.tick_decay().map(|s| s.kind()),
+            Some(PostureKind::Observing),
+            "BUG-84: ALERTED must decay one hour after its last trigger (t0+60min), the no-op \
+             force at t0+59min re-armed it"
+        );
+    }
+
+    #[test]
+    fn bug84_same_state_force_engaged_keeps_the_decay_deadline() {
+        let clock = clock();
+        let m = PostureMachine::new().with_clock(clock.clone());
+        force(&m, PostureKind::Engaged);
+        clock.advance(24 * 60 * MIN - MIN);
+        force(&m, PostureKind::Engaged);
+        clock.advance(2 * MIN);
+        assert_eq!(
+            m.tick_decay().map(|s| s.kind()),
+            Some(PostureKind::Alerted),
+            "BUG-84: ENGAGED must decay 24 h after its last trigger; the no-op force at \
+             t0+23h59 re-armed it"
+        );
+    }
+
+    /// Case (b): an unlocked (heuristic) COMBAT forced to COMBAT. Whatever
+    /// the owner decides (keep it a no-op, as the doc says, or lock it as
+    /// an administrator's order — POS-001), the lock must not change
+    /// silently: either it stays unlocked, or the change is logged.
+    #[test]
+    fn bug84_same_state_force_combat_never_locks_silently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (m, _heard) = service_machine(&tmp);
+        let clock = clock();
+        let m = m.with_clock(clock.clone());
+        m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+        let recent: Vec<Event> = (0..20u64)
+            .map(|i| tcp_v4(42, [203, 0, 113, 9], 443, i + 1))
+            .collect();
+        m.observe(&tcp_v4(42, [203, 0, 113, 9], 443, 100), &recent);
+        assert_eq!(m.current_kind(), PostureKind::Combat);
+        assert!(!m.is_combat_locked(), "precondition: a heuristic COMBAT");
+        let log0 = m.transition_log().len();
+        clock.advance(5 * MIN);
+        let out = force(&m, PostureKind::Combat);
+        assert_eq!(out.from, PostureKind::Combat);
+        assert!(
+            !m.is_combat_locked() || m.transition_log().len() > log0,
+            "BUG-84: force-posture combat on an unlocked COMBAT locked it (ISOLATE now allowed, \
+             no quiet-window decay) with nothing in the transition log: {:?}",
+            m.current()
+        );
+    }
+}
+
+/// BUG-94: an unlocked COMBAT decays once no escalation signal has been
+/// recorded for `COMBAT_QUIET_WINDOW` (30 min, `tick_decay_at`'s doc). The
+/// quiet is read from the corroboration ledger's newest entry, and
+/// `observe()` prunes the ledger to `CORROBORATION_WINDOW` (15 min) at every
+/// event with a hit: an unrelated ALERTED-tier event between 15 and 30 min
+/// after the last signal erases it, and the quiet is counted from COMBAT's
+/// entry instead.
+mod bug94 {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::posture::clock::TestClock;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    /// pid 42 of `app.service`: an unlocked COMBAT at t0 (an offensive
+    /// tool's exec, then a burst of connects to a public address).
+    fn unlocked_combat(tmp: &tempfile::TempDir) -> (PostureMachine, Arc<TestClock>) {
+        let (m, _heard) = service_machine(tmp);
+        let clock = Arc::new(TestClock::at(
+            UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+        ));
+        let m = m.with_clock(clock.clone());
+        m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+        let recent: Vec<Event> = (0..20u64)
+            .map(|i| tcp_v4(42, [203, 0, 113, 9], 443, i + 1))
+            .collect();
+        m.observe(&tcp_v4(42, [203, 0, 113, 9], 443, 100), &recent);
+        assert_eq!(m.current_kind(), PostureKind::Combat);
+        assert!(!m.is_combat_locked());
+        (m, clock)
+    }
+
+    #[test]
+    fn bug94_quiet_window_counts_from_the_last_signal_despite_a_prune() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (m, clock) = unlocked_combat(&tmp);
+        // t0+20: a new escalation signal (the offensive tool again)
+        clock.advance(20 * MIN);
+        m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 200), &[]);
+        assert_eq!(m.current_kind(), PostureKind::Combat);
+        // t0+36: an unrelated ALERTED-tier event (nmap: Reconnaissance)
+        clock.advance(16 * MIN);
+        m.observe(&spawn(42, 1, "nmap", "/usr/bin/nmap", 300), &[]);
+        // t0+37: the agent's 60 s tick
+        clock.advance(MIN);
+        let out = m.tick_decay();
+        assert!(
+            out.is_none(),
+            "BUG-94: the unlocked COMBAT decayed to {:?} 17 min after the last escalation \
+             signal (promised quiet window: 30 min, until t0+50)",
+            out.map(|s| s.kind())
+        );
+    }
+
+    /// Guard: the same scenario without the unrelated event keeps COMBAT
+    /// until 30 min after the last signal (passes on main).
+    #[test]
+    fn bug94_control_without_the_prune_combat_holds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (m, clock) = unlocked_combat(&tmp);
+        clock.advance(20 * MIN);
+        m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 200), &[]);
+        clock.advance(17 * MIN);
+        assert!(m.tick_decay().is_none());
+        clock.advance(14 * MIN);
+        assert_eq!(m.tick_decay().map(|s| s.kind()), Some(PostureKind::Engaged));
+    }
+}
+
+/// Lot 314, the mini-hunt's variant of BUG-84: a lock a later signal
+/// acquires on an unlocked COMBAT (a kernel denial: decisive, it locks) is a
+/// transition row of its own, COMBAT → COMBAT, naming it — it was a WARN of
+/// the journal only, and the transition log said nothing of it.
+#[test]
+fn a_lock_a_later_signal_acquires_is_a_transition_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (m, heard) = service_machine(&tmp);
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+    let recent: Vec<Event> = (0..20u64)
+        .map(|i| tcp_v4(42, [203, 0, 113, 9], 443, i + 1))
+        .collect();
+    m.observe(&tcp_v4(42, [203, 0, 113, 9], 443, 100), &recent);
+    assert!(!m.is_combat_locked(), "precondition: a heuristic COMBAT");
+    let rows = m.transition_log().len();
+    assert!(
+        m.observe(&fs_protect_denial(42, 200), &[]).is_none(),
+        "no change of kind"
+    );
+    assert!(m.is_combat_locked());
+    let log = m.transition_log();
+    assert_eq!(log.len(), rows + 1, "one row: {log:?}");
+    let row = log.last().unwrap();
+    assert_eq!(
+        (row.from, row.to),
+        (PostureKind::Combat, PostureKind::Combat)
+    );
+    assert!(row.reason.starts_with("COMBAT locked: "), "{}", row.reason);
+    assert_eq!(heard.lock().len(), 1, "the ladder is not engaged again");
+}

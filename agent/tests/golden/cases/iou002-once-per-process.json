@@ -1,0 +1,16 @@
+{
+  "about": "Lot 314 (the third bug hunt, BUG-83): NN-L-IOU-002 fires once per process. The sensor sends the cumulative bitmap of a process's io_uring opcode classes with every new class and again at most once a second, with the opcode of that moment. An implant opens a file, connects (the record completing the file+network pair: the verdict), reads, sends, and goes on (periodic records); a server accepts, reads (the verdict), then reads and writes. One verdict each; on main every later record whose last opcode was a file or network one fired again (5 and 3 verdicts).",
+  "fires": ["NN-L-IOU-002_IoUringFileAndNetwork"],
+  "items": [
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 1, "count": 32, "last_opcode": 18, "sq_thread": false, "timestamp_ns": 4000000000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 5, "count": 32, "last_opcode": 16, "sq_thread": false, "timestamp_ns": 4000100000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 7, "count": 32, "last_opcode": 22, "sq_thread": false, "timestamp_ns": 4000200000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 15, "count": 32, "last_opcode": 26, "sq_thread": false, "timestamp_ns": 4000300000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 15, "count": 32, "last_opcode": 22, "sq_thread": false, "timestamp_ns": 4001300000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314001, "uid": 1000, "comm": "evil", "classes": 15, "count": 32, "last_opcode": 26, "sq_thread": false, "timestamp_ns": 4002300000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314002, "uid": 1000, "comm": "srv", "classes": 4, "count": 32, "last_opcode": 13, "sq_thread": false, "timestamp_ns": 4003000000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314002, "uid": 1000, "comm": "srv", "classes": 6, "count": 32, "last_opcode": 22, "sq_thread": false, "timestamp_ns": 4003100000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314002, "uid": 1000, "comm": "srv", "classes": 6, "count": 32, "last_opcode": 23, "sq_thread": false, "timestamp_ns": 4004100000000}}},
+    {"event": {"IoUring": {"created": false, "pid": 5314002, "uid": 1000, "comm": "srv", "classes": 6, "count": 32, "last_opcode": 22, "sq_thread": false, "timestamp_ns": 4005100000000}}}
+  ]
+}
