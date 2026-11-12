@@ -9417,3 +9417,60 @@ number in parentheses is a lab PR.
     empty-line setting. In the backlog: the durability of a run-time cut's
     record across a restart (F5's rest), the stall's end signed and a
     transient listing failure (F7), the open's archive reads (F8).
+- **Lot 315 — the copy-on-first-write guard and the exec policy trust the
+  kernel's data, not a name or a number (C19, C13, C23; the third bug
+  hunt's lot 6, family F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's
+  record half, BUG-113, the triage's N2, and the lot's mini-hunt; no level
+  changes).**
+  - What was open: N2, data loss — the restore looked for "the attack's
+    renamed copy" of a deleted file by device and inode number alone: a new
+    file of the owner's that had inherited the number (one open: `cp`,
+    `tar`, a download) was moved into the journal's evidence, and the
+    evidence's expiry, by the file's own mtime, deleted it (at once with an
+    old mtime kept). The same number-only identity in four more places
+    (BUG-110's `pick`, copy on first write, shared copies, the write-opens
+    after a copy). BUG-93: a restore of a process tree weighed a file's
+    later writers against the copies it picked, one per file: a second
+    writer of the tree was "another writer". BUG-102: an io_uring worker's
+    open read as its creator's syscall. BUG-109: a file named `x (deleted)`
+    taken for an unlinked one. BUG-101: `AT_SECURE` claimed by the set-id
+    bits alone. BUG-113: the watchdog's start read after its exe only.
+  - What changed: `cow/identity.rs` (`FileId`: device, inode number, birth
+    time; three questions, each wrong only on the side that loses nothing)
+    holds every comparison of the guard, and `xtask/tests/cow_file_identity.rs`
+    refuses any other (it flags the 19 sites of `main`); the renamed copy is
+    the file only by a birth time known on both sides; the evidence ages from
+    its move; a restore with roots weighs every copy of the tree and each
+    write-open's lineage (`--since` alone unchanged); `PF_IO_WORKER` from
+    `/proc/<tid>/stat` and cleared registers make a write (BUG-102 in part:
+    an io_uring open run in the submitting thread's task_work is a declared
+    limit, its fix a follow-up lot); after the review of #542, rule 5 and
+    the evidence move only on a birth time known on both sides, a running
+    tree writer keeps both, `pick` transitive, `--pid` ambiguity over the
+    write-opens; liveness of an
+    event's file is `st_nlink`, its path told by a cached `lstat` against
+    `fstat` (a hard link left keeps the opened name: a mini-hunt variant);
+    `ExecPolRaw::at_secure`; the watchdog's start read before and after.
+  - Measured on our guests: Ubuntu 24.04 (`6.8.0-147-generic`, ext4, the
+    guard on `/srv/nn-cow-test`, `deploy/lab/cow/cow-check.sh`). N2 on
+    `main`: the attack (an untrusted `python3` of the lab user) rewrote and
+    deleted `x.txt`, the owner's `cp -p` of a file dated 2025 got its inode
+    number at the first try, and `remediate ransomware --pid` recreated
+    `x.txt` and moved the owner's file into the journal's evidence, its mtime
+    2025-01-01 — the next expiry's to delete. With this lot (the new `reuse`
+    mode): the same reuse at the first try, `x.txt` recreated, the owner's
+    file in place and unchanged, no evidence. The mass write of `run` (51
+    files rewritten and renamed `.locked`): 50 copies, 50 recreated byte for
+    byte and their 50 renamed copies moved into the evidence, the 20 MiB
+    file over the copy cap as designed. The privileged e2e
+    `cow_privileged_e2e` (the guard on a tmpfs, root): 3 of 3, the new
+    `two_writers_of_one_tree_are_its_attack` included; with the guard's
+    write-opens built without their lineage (mutant M35) it fails. Not run
+    on a guest: BUG-102's worker (a real io_uring worker on the host's
+    kernel, 6.18, in a unit test), BUG-109, BUG-101 (record only), BUG-113;
+    and the fixes after the review of #542 (rule 5 on a known birth time,
+    the running tree writer, `pick`, the `--pid` ambiguity): host tests
+    only, no guest lease free in the round's window.
+  - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
+    by default (C19, C13); BUG-101's kernel half (the deny skipped for every
+    set-id target) is lot 318's.

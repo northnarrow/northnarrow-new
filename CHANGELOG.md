@@ -6,6 +6,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- The copy-on-first-write guard and the exec policy trust the kernel's
+  data, not a name or a number (lot 315, the third bug hunt's lot 6, family
+  F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's record half, BUG-113;
+  the triage's N2; `docs/design/COPY_ON_FIRST_WRITE.md` §2.1, §2.3-2.5, §3,
+  `docs/design/EXEC_POLICY.md` §2):
+  - a file is its device, inode number and birth time in the whole guard
+    (`agent/src/cow/identity.rs`, and a ratchet over each file's token
+    stream, `xtask/tests/cow_file_identity.rs`); where a wrong "same" would
+    overwrite or move a file, only a birth time known on both sides makes
+    it the same (after the review of #542: rule 5 too — on a filesystem
+    without birth times a restore keeps both, never in place). N2, data loss: the restore took the
+    owner's new file that inherited the inode number of a file the attack
+    deleted for "the attack's renamed copy" and moved it into the journal's
+    evidence, which the expiry deleted (at once when the file kept an old
+    mtime: `tar -x`, `rsync -a`, `cp -p`). The renamed copy is that file by
+    its birth time now; one whose birth time cannot be compared is named in
+    the row and left in place. The same identity in `pick` (BUG-110: the
+    second file's entry was dropped without a row), copy on first write (a
+    writer of the deleted file got no copy of the new one), shared copies
+    and the write-opens after a copy; the evidence ages from its move;
+  - a restore of a process tree weighs every copy of the tree and the
+    lineage of each write-open (BUG-93: a second writer of the tree was
+    "another writer", the file kept both and the automatic restore said
+    Success; a writer of the tree still running did not stop it); a
+    process of the tree still running keeps both, and `--pid` without a
+    start refuses a pid the write-opens' lineages show recycled; `--since`
+    alone is unchanged (the report's fix would overwrite a later edit);
+  - an open by an io-wq worker or an `SQPOLL` thread is a write (BUG-102,
+    in part: its `syscall` line is its creator's — a creator in
+    `openat(…, O_RDONLY)` made the worker's `O_WRONLY|O_TRUNC` opens reads,
+    written without a copy): known by `PF_IO_WORKER` in `/proc/<tid>/stat`,
+    never by its `comm`. Not closed: an io_uring open the kernel runs in
+    the submitting thread's own task_work still reads as that thread's
+    syscall (a declared limit; the open's mode from the BPF LSM is a
+    follow-up lot);
+  - a live file named `x (deleted)` has a path (BUG-109: written without a
+    copy, `skipped_unresolved_path`): liveness is `st_nlink`, the path is
+    told from the kernel's mark by a cached `lstat` against `fstat`; a file
+    whose opened name was unlinked while a hard link remains is copied too;
+  - `EXECENV-001` says `AT_SECURE` only when the exec changes the
+    credentials (BUG-101's record half: root running `su` with a preload
+    was "ignored by the loader" — it is honoured); the kernel's half is lot
+    318;
+  - the watchdog's start is read before and after its exe (BUG-113: a PID
+    recycled between the reads was verified with the newcomer's start).
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

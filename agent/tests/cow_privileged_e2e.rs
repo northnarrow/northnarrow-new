@@ -243,3 +243,108 @@ fn a_torn_index_line_keeps_the_guards_copies() {
         "the copies taken after the restart are there at the start after"
     );
 }
+
+/// Lot 315 (external bug hunt 1.4, BUG-93, through the real guard): two
+/// processes of one tree (two `sh` children of this test) write-open the
+/// same file one after the other. The second one's write-open is recorded
+/// with its lineage (this process in it) and with the file's identity, and
+/// a restore of the tree (`--pid` this process) puts the original back in
+/// place — on `main` the second writer was "another writer": kept both.
+#[test]
+#[ignore = "requires root (fanotify, a tmpfs mount); lab: nn-lab.sh test-one cow_privileged_e2e"]
+fn two_writers_of_one_tree_are_its_attack() {
+    use northnarrow_agent::cow::restore::Selector;
+    use northnarrow_agent::cow::store::RestoreBy;
+    use northnarrow_agent::cow::trust::ProcId;
+    let dir = tempfile::Builder::new()
+        .prefix("nn-cow-tree")
+        .tempdir()
+        .unwrap();
+    let scope = dir.path().join("scope");
+    std::fs::create_dir(&scope).unwrap();
+    let mounted = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=64m", "nn-cow-test"])
+        .arg(&scope)
+        .status()
+        .unwrap();
+    assert!(mounted.success(), "mount a tmpfs at the scope (root?)");
+    let _mount = Mount(scope.clone());
+    let file = scope.join("report.odt");
+    std::fs::write(&file, b"original").unwrap();
+    let cfg = CowConfig::parse(&format!(
+        "enabled = true\nscope = {} mark=mount\n",
+        scope.display()
+    ))
+    .unwrap();
+    let (store, problems) = Store::open(cfg, None);
+    assert!(problems.is_empty(), "{problems:?}");
+    // the host's /proc: the writers' lineage is read as the agent reads it
+    let guard = Runtime::start(Arc::clone(&store), AuthSessionTracker::new("/proc"))
+        .expect("the guard starts");
+    // each writer's copy committed before the next one opens the file (a
+    // write-open is recorded for a file the index holds)
+    let scripts = [
+        "printf 'half encrypted' > \"$0\"",
+        "printf ' and the rest' >> \"$0\"",
+    ];
+    for (i, script) in scripts.iter().enumerate() {
+        let ok = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while store.index.lock().entry_count(0) < i + 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "copy {} not committed within 20 s",
+                i + 1
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    guard.stop();
+    drop(guard);
+    let me = ProcId {
+        pid: std::process::id(),
+        start: 0,
+    };
+    let first = store
+        .index
+        .lock()
+        .entries()
+        .min_by_key(|e| e.id)
+        .unwrap()
+        .clone();
+    let post = store.index.lock().post_writes(&first.file.id(), 0);
+    assert!(
+        post.iter()
+            .any(|p| p.in_tree_of(me) && p.file.may_be(&first.file.id())),
+        "the second writer's write-open, with its lineage: {post:?}"
+    );
+    let rep = store.restore(
+        &Selector {
+            roots: vec![me],
+            since_ms: None,
+        },
+        false,
+        &RestoreBy::Admin {
+            key_fp: "lot315".into(),
+        },
+    );
+    if first.file.btime_ns.is_some() {
+        assert_eq!(rep.restored, 1, "{:?}", rep.rows);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+    } else {
+        // a tmpfs without birth times (older kernels): nothing tells the
+        // file from a new one with its number — kept both, never in place
+        // (the review of #542, F2)
+        assert_eq!(rep.kept_both, 1, "{:?}", rep.rows);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"half encrypted and the rest"
+        );
+    }
+}

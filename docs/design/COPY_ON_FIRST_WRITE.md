@@ -92,11 +92,42 @@ reader has decided, with no deadline of its own but the 3 s stall (§3).
   `open_by_handle_at`: the flags register (`O_RDONLY` without `O_TRUNC` is a
   read; anything else a write). `creat`: a write. `openat2` (flags in user
   memory, a race away from a lie) and anything the table does not know (an
-  `io_uring` open, a 32-bit task, a task the kernel reports `running`):
-  counted as a write. Reading it needs `CAP_SYS_PTRACE` over the task (the
+  `io_uring` open made by an io_uring thread, a 32-bit task, a task the
+  kernel reports `running`): counted as a write — but see the limit below:
+  an `io_uring` open the kernel runs in a user thread's own context is not
+  told apart. Reading it needs `CAP_SYS_PTRACE` over the task (the
   unit has it); with Yama's `ptrace_scope=3` it fails and every open of an
   untrusted writer is copied — slower, not a hole. `status --key` says
   which (`open flags from`).
+  Lot 315 (external bug hunt 1.4, BUG-102): an io_uring worker (io-wq, or
+  an `SQPOLL` thread) opens files for its process (`IORING_OP_OPENAT`), and
+  its `syscall` file does not show that open: it shows its creator's
+  registers at the worker's birth, user stack and program counter cleared.
+  A process that made its worker while it sat in `openat(fifo, O_RDONLY)`
+  had every later open of that worker read as a read — answered at once,
+  no copy, the file truncated and rewritten unprotected. The worker is
+  known by the kernel's flag on the task (`PF_IO_WORKER` in field 9 of
+  `/proc/<tid>/stat`, read whatever bytes the task's `comm` holds), never
+  by its `comm` (`iou-wrk-<pid>`, which the process can rename): its opens
+  count as writes, and so do an open by a task whose `stat` cannot be read
+  and a `syscall` line whose user stack or program counter is 0 (the flags
+  are read only when the line says read).
+
+  **Declared limit (the review of #542, F1; not closed by lot 315).** An
+  io_uring request can also run in the submitting thread's *own* context,
+  from its task_work: `IORING_OP_READ` of an empty pipe linked
+  (`IOSQE_IO_LINK`) to `IORING_OP_OPENAT(victim, O_RDWR)`, the thread then
+  blocked in `openat(fifo, O_RDONLY)`, another thread writing one byte to
+  the pipe — the linked open is issued inline in the blocked thread, on its
+  way out of the interrupted `openat` (`task_work_run`). That thread is a
+  user thread (no `PF_IO_WORKER`), and its `syscall` line is its own
+  `openat(…, O_RDONLY)` with real registers: the open reads as a read and is
+  answered without a copy — reproduced up to the permission event on the
+  host kernel (6.18) by the review, without root. The `syscall` line cannot
+  say which open raised the event. The fix is the open's own mode from the
+  kernel: a BPF LSM `file_open` program (it runs before
+  `fsnotify_open_perm`) recording the task's `FMODE_WRITE` for the guard —
+  a follow-up lot of its own.
 
 ### 2.2 Who is copied for (the trust filter, `cow/trust.rs`)
 
@@ -136,6 +167,37 @@ cached by path until dpkg's status changes, and it is asked only for a
 trusted writer's ancestors.
 
 ### 2.3 Copy on *first* write
+
+A **file** is its device, its inode number and its birth time where the
+filesystem records it (`statx` `STATX_BTIME`; `cow/identity.rs`). Recorded
+on ext4 (256-byte inodes, the default), XFS v5, btrfs (`otime`), tmpfs
+(6.18 checked; older kernels: not assumed); not on v9fs, ext4 with 128-byte
+inodes (an old ext3 converted) or XFS v4; NFS and FUSE depend on the server.
+Overlayfs keeps the device and inode number of a file across its copy-up
+but gives it a new birth time: the copy taken at the first write-open (the
+permission event comes before the copy-up) records the lower file's, the
+file then has the upper's — nothing is lost, but such a file is never
+restored in place (kept both) and its renamed copy is not found (left where
+it is). Lot 315
+(external bug hunt 1.4, family F6; the triage's N2 and BUG-110): an inode
+number freed by a delete goes to the next file created (ext4 hands out the
+lowest free number of its group), and the guard compared the device and the
+number alone in five places — a new file of the owner's that inherited the
+number of a file the attack deleted was the attack's renamed copy for the
+restore (moved into the evidence, then deleted by its expiry: data loss),
+one entry with the old file's in a restore (dropped without a row), already
+copied for a writer that had copied the old one (no copy), and its
+write-opens counted as the old one's. Each comparison now asks one of three
+questions, each wrong only on the side that loses nothing: *may be the same
+file* (birth times equal where both are known: a writer still running, a
+write-open after the copy), *the same identity as recorded* (two unknown
+birth times equal: a copy taken for done, shared, a file that changed under
+the restore), *surely the same file* (both birth times known and equal:
+before moving a file into the evidence, and before restoring one in place —
+rule 5, after the review of #542). A restore's entries are grouped by the
+second, an entry without a birth time joining them only when they are one
+file (F5 of that review). `xtask/tests/cow_file_identity.rs` refuses any other comparison
+of an inode number in `agent/src/cow/`.
 
 One copy per file and writer process. A second writer of a file unchanged
 since the last copy (same size, mtime, ctime, birth time) shares that copy
@@ -189,7 +251,11 @@ was answered.
   them out. When the room cannot be made the copy is refused (`budget_full`,
   signed). No copy either under `min_free_percent` (5 %) free.
 - **Retention** 24 h (`retention_hours`) from an object's last use (its copy
-  or a later share); the evidence files by their own mtime.
+  or a later share); the evidence files from their move into `evidence/`
+  (the later of their mtime and ctime — the rename sets the ctime). Lot 315
+  (a variant of the triage's N2): by their own mtime, a file that kept an
+  old one (`tar -x`, `rsync -a`, `cp -p`) was deleted at the first expiry
+  after its move.
 - **Anti-tamper**: the three directories take the flags of the agent's own
   directories in `PROTECTED_INODES` (MUTATE | NOCREATE — no unlink, rename,
   chmod, chattr or xattr of them and no new entry in them from outside the
@@ -209,23 +275,51 @@ names several processes in the journal is refused — narrow it with
 `--since`), and/or copies taken since a time; with both, an entry must meet
 both. `--since` alone selects every writer's copies taken since then — for
 each file the earliest copy at or after that time, which is the content
-before the attack only if the attack began after it. One entry per file: the
-earliest selected, the content before the tree's first write. A file whose
-writer still runs is skipped. Then, per file:
+before the attack only if the attack began after it. One entry per file (a
+file by its birth time too, §2.3 — lot 315, BUG-110: two files that had the
+same inode number one after the other are two): the earliest selected, the
+content before the tree's first write.
+
+**The attack** a restore undoes, against which a file's later writers are
+weighed (rule 6, the evidence move of rule 2, a writer still running): with
+`--pid` (and the automatic restore, whose roots are the processes killed),
+the roots, every writer of a copy the selector matches — not only of the copy
+picked for the file — and every writer whose lineage, when it opened the
+file, held a root (a writer of the tree whose own copy was not taken: shared,
+refused for room or time). Lot 315 (BUG-93): two processes of the tree that
+each copied a file had the second one judged "another writer" (kept both,
+the encrypted file left in place, the automatic restore reported Success),
+and a second writer still running did not stop the restore. With `--since`
+alone a lineage names no attack and the attack is the writers of the copies
+picked: a later edit by a program of the owner's that has its own copy is
+never taken for the attack's (the report's fix, every matching copy for
+`--since` too, would have overwritten it). A file a writer of the attack
+still runs on is skipped. Then, per file:
 
 1. copy missing or SHA-256 mismatch → **refused** (`journal_corrupt`);
 2. nothing at the path (renamed `.locked`, deleted) → **recreated** (mode,
-   owner, mtime of the original); the attack's renamed copy of that inode, in
+   owner, mtime of the original); the attack's renamed copy of that file, in
    the same directory, is moved to `evidence/` unless someone else wrote it
    (names that are not UTF-8 are passed over in that search — lot 297,
    BUG63: one ended it; a renamed copy whose own name is not UTF-8 stays
-   where it is);
+   where it is). The renamed copy is that file by its birth time, known on
+   both sides (lot 315, the triage's N2: by the inode number alone, the
+   owner's new file that inherited it was moved, and expired). A file with
+   the inode number whose birth time cannot be compared (a filesystem that
+   records none) is named in the row's detail and left where it is;
 3. not a regular file now → **kept both**;
 4. content already the original (whatever the inode) → **unchanged**;
-5. another file at the path (other inode, or the inode number reused — the
-   birth time differs) → **kept both**;
-6. a write-open of the inode after the copy by a process outside the attack
-   (a trusted editor or anyone else; the guard records them) → **kept both**;
+5. not surely the copy's file at the path (another inode, the inode number
+   reused — the birth time differs —, or no birth time to compare on either
+   side) → **kept both**. Lot 315, after the review of #542 (F2): with the
+   number alone, a new file of the owner's put at the same path in one open
+   (`cp`, `tar -x`: no write-open recorded) that inherited the number was
+   restored in place over, on a filesystem without birth times. There, a
+   restore now always keeps both;
+6. a write-open of the file after the copy by a process outside the attack
+   (a trusted editor or anyone else; the guard records them), or by a
+   process of the attack's tree that still runs (its own copy not taken) →
+   **kept both**;
 7. the copy predates this run of the guard (the agent restarted: write-opens
    in between were not seen) and the file was modified since → **kept both**;
 8. otherwise → **restored in place** (same inode, links, xattrs; content and
@@ -234,7 +328,8 @@ writer still runs is skipped. Then, per file:
 "Kept both" writes the original beside the file (`<name>.nn-restored-<entry>`,
 new, never over anything) and reports both: a restore does not overwrite a
 file someone else changed after the attack **as far as the guard saw it**.
-The write-opens of rule 6 are kept in memory (the last 8 writers per inode,
+The write-opens of rule 6 are kept in memory (the last 8 writers per inode
+number, each with the opened file's birth time and the writer's lineage,
 each writer's latest write-open — lot 297, BUG48: its first one was kept, so
 its edit after a later copy was missed and the restore of that copy
 overwrote it) and lost at a restart, after which only the mtime is compared (rule
@@ -306,6 +401,14 @@ refused at restore, never written back.
   `unlink`/`rename` permission event does not exist in fanotify; that needs
   a pre-delete hook (BPF LSM `inode_unlink`/`inode_rename` keeping a link),
   a follow-up. So does `truncate(2)` by path (no open).
+- **An io_uring open run in a user thread's task_work** (§2.1, the
+  declared limit of lot 315): read as that thread's own syscall — a
+  read-only `openat` makes it a read, answered without a copy. A follow-up
+  lot takes the open's mode from the BPF LSM `file_open` hook.
+- **No birth time** (§2.3: v9fs, ext4 with 128-byte inodes, XFS v4, some
+  NFS/FUSE) or **overlayfs**: a restore never writes a file in place there
+  (kept both, the original beside it), and an attack's renamed copy is left
+  where it is.
 - **What the guard does not see**: a directory created after the last
   rescan (60 s), past the mark cap, on another filesystem below the scope
   (`mark=dirs` stays on the scope's filesystem), opens through another mount
@@ -317,7 +420,17 @@ refused at restore, never written back.
   log, or at a stop before the next summary, they can be lost. Some skips
   are counted but not signed (a path that cannot be resolved, a file larger
   than the budget, a source that changed during its copy, a copy the
-  backstop answered). Reasons: `event_budget` (a copy past its budget: slow
+  backstop answered). A path is not resolved only when the file has no
+  link left (`st_nlink` 0: nothing reaches it once its writer closes it).
+  Lot 315 (BUG-109): the name's ending was the test — a file the writer
+  renamed `x (deleted)` was taken for an unlinked one and written without a
+  copy. Whether the kernel's ` (deleted)` mark or the file's own name ends
+  the path is told by a lookup of it compared with the descriptor (`lstat`
+  against `fstat`, from the kernel's caches only: a user's FUSE mount over
+  one of the path's directories cannot hold the reader); a file whose
+  opened name was unlinked while another link remains (`ln f g`, then `f`
+  opened for writing and unlinked while the open waits) keeps that name as
+  its path, and is copied. Reasons: `event_budget` (a copy past its budget: slow
   disk, large file), `budget_full`,
   `low_space`, `queue_full` (more than 256 copies waiting), `queue_overflow`
   (the kernel's fanotify queue, 16384 events: the opens beyond pass
@@ -330,7 +443,9 @@ event budget + 25 ms after the reader read it (the backstop's grace and
 poll); any other open, until the reader has decided. The reader thread
 touches `/proc` and the event's
 descriptor only — never a file on a marked filesystem, whose open would wait
-on the reader itself; the agent's other threads' opens reach it as events of
+on the reader itself (the one path it looks up, an event's name that ends in
+` (deleted)`, is an `O_PATH` lookup from the kernel's caches: no open event,
+never a wait on a filesystem — §3, the unresolved paths); the agent's other threads' opens reach it as events of
 its own process and are allowed first thing. If the reader makes no
 progress for 3 s the backstop closes the group: the kernel allows every
 pending and queued open and generates no more events (`reader_stalled`, the

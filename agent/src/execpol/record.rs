@@ -240,7 +240,7 @@ fn evidence(raw: &ExecPolRaw, decision: &str, policy: &str) -> ExecPolEvidence {
             .map(str::to_string)
             .collect(),
         values: values(raw),
-        at_secure: raw.target_setid(),
+        at_secure: raw.at_secure(),
         policy: policy.to_string(),
     }
 }
@@ -362,6 +362,10 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
         return out;
     }
     let setid = raw.target_setid();
+    // Lot 315 (BUG-101): whether the loader ignores the entry is whether
+    // the exec changes the credentials, not the mode's set-id bits alone
+    // (root running a set-uid-root file: the preload is honoured).
+    let at_secure = raw.at_secure();
     // The loader variable into a staging path.
     if ef & env_flags::DENYABLE != 0 {
         let (sev, resp) = if ea & action::DENY != 0 {
@@ -371,11 +375,18 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
                 Severity::Medium,
                 "would deny (audit): the exec ran".to_string(),
             )
-        } else if setid {
+        } else if at_secure {
             (
                 Severity::Medium,
                 "recorded: the target is set-id, the kernel sets AT_SECURE and the loader \
                  ignores the entry"
+                    .to_string(),
+            )
+        } else if setid {
+            (
+                Severity::Medium,
+                "recorded: the exec ran; the target is set-id, but the exec changes no \
+                 credential, so the loader honours the entry"
                     .to_string(),
             )
         } else if t == tier::SERVICE || t == tier::UNKNOWN {
@@ -986,5 +997,100 @@ mod bughunt3 {
             }
             Ok(())
         });
+    }
+}
+
+/// Lot 315 (external bug hunt 1.4, BUG-101, the record's half).
+#[cfg(test)]
+mod lot315 {
+    use super::*;
+    use common::wire::execpol::tier_sig;
+
+    fn su_event(uid: u32, path: &str) -> Event {
+        Event::ExecCheck {
+            pid: 5930,
+            ppid: 1,
+            uid,
+            comm: "su".into(),
+            filename: String::new(),
+            timestamp_ns: 7,
+            exe: ExeIdentity {
+                path: path.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn preload_at(uid: u32, file_uid: u32, mode: u32, t: u32) -> ExecPolRaw {
+        let mut r = ExecPolRaw::zeroed();
+        r.kind = kind::EXEC;
+        r.pid = 4242;
+        r.uid = uid;
+        r.file_uid = file_uid;
+        r.file_mode = mode;
+        r.tier = t;
+        r.env_flags = env_flags::LD_PRELOAD | env_flags::PRELOAD_STAGING;
+        // what the kernel reports for a set-id target: the deny is skipped
+        // (agent-ebpf/src/execpol.rs, lot 318's half), recorded only
+        r.env_action = action::RECORD;
+        let v = "/tmp/x.so";
+        r.preload[..v.len()].copy_from_slice(v.as_bytes());
+        r
+    }
+
+    /// BUG-101: root running a set-uid-root binary changes no credential:
+    /// no AT_SECURE, the loader honours the preload. The record must not
+    /// say the loader ignored it (on main it did) — and stays Medium.
+    #[test]
+    fn bug101_root_running_setuid_root_is_not_at_secure() {
+        for t in [
+            tier::SERVICE | tier_sig::ROOT | tier_sig::SYSTEM_SLICE,
+            tier::SESSION | tier_sig::ROOT | tier_sig::LOGIN | tier_sig::TTY,
+        ] {
+            let raw = preload_at(0, 0, 0o104755, t);
+            let recs = records_of(&raw, &su_event(0, "/usr/bin/su"), "p");
+            assert_eq!(recs.len(), 1, "{recs:?}");
+            let r = &recs[0];
+            assert_eq!(r.verdict.rule_id, RULE_PRELOAD);
+            assert!(
+                !r.evidence.at_secure,
+                "at_secure = true for uid 0 running a set-uid-root file (no credential change)"
+            );
+            assert!(
+                !r.response.contains("AT_SECURE") && !r.response.contains("ignores"),
+                "false response: {}",
+                r.response
+            );
+            assert!(r.response.contains("honours"), "{}", r.response);
+            assert_eq!(r.verdict.severity, Severity::Medium, "{t:#x}");
+        }
+    }
+
+    /// BUG-101 guard: an unprivileged caller of a set-uid-root binary does
+    /// change credentials: AT_SECURE applies and the record says so.
+    #[test]
+    fn bug101_guard_user_running_setuid_root_stays_at_secure() {
+        let raw = preload_at(33, 0, 0o104755, tier::SERVICE | tier_sig::SYSTEM_SLICE);
+        let r = records_of(&raw, &su_event(33, "/usr/bin/su"), "p").remove(0);
+        assert!(r.evidence.at_secure);
+        assert!(r.response.contains("AT_SECURE"), "{}", r.response);
+        assert_eq!(r.verdict.severity, Severity::Medium);
+    }
+
+    /// BUG-101: Looney Tunables (`GLIBC_TUNABLES` at a set-id target) is
+    /// still reported for root running a set-uid-root file — the set-id
+    /// bits decide that record, not the credential change.
+    #[test]
+    fn bug101_guard_tunables_at_a_setid_target_stay_reported_for_root() {
+        let mut raw = preload_at(0, 0, 0o104755, tier::SESSION | tier_sig::ROOT);
+        raw.env_flags = env_flags::GLIBC_TUNABLES;
+        let v = "glibc.malloc.mxfast=glibc.malloc.mxfast=A";
+        raw.tunables[..v.len()].copy_from_slice(v.as_bytes());
+        raw.tunables_len = v.len() as u32;
+        let recs = records_of(&raw, &su_event(0, "/usr/bin/su"), "p");
+        assert!(
+            recs.iter().any(|r| r.verdict.rule_id == RULE_ENV),
+            "{recs:?}"
+        );
     }
 }
