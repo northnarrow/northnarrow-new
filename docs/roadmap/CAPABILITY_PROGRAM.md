@@ -9247,7 +9247,10 @@ number in parentheses is a lab PR.
     `two_writers_of_one_tree_are_its_attack` included; with the guard's
     write-opens built without their lineage (mutant M35) it fails. Not run
     on a guest: BUG-102's worker (a real io_uring worker on the host's
-    kernel, 6.18, in a unit test), BUG-109, BUG-101 (record only), BUG-113.
+    kernel, 6.18, in a unit test), BUG-109, BUG-101 (record only), BUG-113;
+    and the fixes after the review of #542 (rule 5 on a known birth time,
+    the running tree writer, `pick`, the `--pid` ambiguity): host tests
+    only, no guest lease free in the round's window.
   - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
     by default (C19, C13); BUG-101's kernel half (the deny skipped for every
     set-id target) is lot 318's.
