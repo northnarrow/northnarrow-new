@@ -353,7 +353,11 @@ const PACKAGE_MANAGER_EXES: &[&str] = &[
 ];
 
 /// Package managers that are interpreter scripts (`/proc/<pid>/exe` is the
-/// interpreter): matched by `argv[1]`, root processes only.
+/// interpreter): matched by the script the interpreter runs, root processes
+/// only. Lot 310: read by the interpreters' one reader (`python3 -E
+/// /usr/bin/dnf` runs dnf; `cat /usr/bin/dnf` and `python3 -c …
+/// /usr/bin/dnf` run none) — it was the cmdline's second word, whatever the
+/// executable.
 const PACKAGE_MANAGER_SCRIPTS: &[&str] = &[
     "/usr/bin/dnf",
     "/usr/bin/dnf-3",
@@ -388,22 +392,48 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
         if !root {
             return false;
         }
-        let exe = std::fs::read_link(base.join("exe")).unwrap_or_default();
+        let exe = image_path(&base);
         if PACKAGE_MANAGER_EXES
             .iter()
             .any(|p| exe == std::path::Path::new(p))
         {
             return true;
         }
-        std::fs::read(base.join("cmdline"))
-            .ok()
-            .and_then(|c| {
-                c.split(|b| *b == 0)
-                    .nth(1)
-                    .map(|a| PACKAGE_MANAGER_SCRIPTS.iter().any(|p| a == p.as_bytes()))
-            })
-            .unwrap_or(false)
+        let Ok(cmdline) = std::fs::read(base.join("cmdline")) else {
+            return false;
+        };
+        nn_core::posture::lineage::ExecIdentity::of_exec(&exe.to_string_lossy(), &argv_of(&cmdline))
+            .script()
+            .is_some_and(|s| PACKAGE_MANAGER_SCRIPTS.contains(&s))
     })
+}
+
+/// Lot 310 (the review of #539, finding 8): the image a process runs, as
+/// the path it was executed by: the kernel's ` (deleted)` dropped when the
+/// image is indeed unlinked (its link count 0, by its identity: a file
+/// named `x (deleted)` keeps its name) — an upgrade of python inside the
+/// transaction unlinks dnf's interpreter, which is still python.
+fn image_path(proc_pid: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::fs::read_link(proc_pid.join("exe")).unwrap_or_default();
+    let unlinked = std::fs::metadata(proc_pid.join("exe")).is_ok_and(|m| m.nlink() == 0);
+    executed_path(exe, unlinked)
+}
+
+/// The path an image was executed by, from its `exe` link's text and
+/// whether the image is unlinked ([`image_path`]).
+fn executed_path(link: std::path::PathBuf, unlinked: bool) -> std::path::PathBuf {
+    match link.to_string_lossy().strip_suffix(" (deleted)") {
+        Some(path) if unlinked => std::path::PathBuf::from(path),
+        _ => link,
+    }
+}
+
+/// A `cmdline`'s arguments: its NUL-separated words, the final NUL
+/// dropped and no other (lot 310, finding 8: an empty argument is one —
+/// `python3 -W '' /tmp/x.py /usr/bin/dnf` runs `/tmp/x.py`).
+fn argv_of(cmdline: &[u8]) -> Vec<String> {
+    nn_core::posture::lineage::argv_of_cmdline(cmdline)
 }
 
 /// External audit SNS-009: security rings lost events — raise
@@ -687,6 +717,61 @@ mod tests {
         std::fs::write(d.join("cmdline"), c).unwrap();
     }
 
+    /// Lot 310 (the review of #539, finding 8): an interpreter unlinked by
+    /// an upgrade is still the interpreter its path names; a file merely
+    /// named `x (deleted)` keeps its name; an empty argument is one.
+    #[test]
+    fn an_unlinked_interpreter_is_still_one_and_empty_arguments_count() {
+        use std::path::PathBuf;
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            executed_path(p("/usr/bin/python3.12 (deleted)"), true),
+            p("/usr/bin/python3.12")
+        );
+        assert_eq!(
+            executed_path(p("/opt/x (deleted)"), false),
+            p("/opt/x (deleted)")
+        );
+        assert_eq!(executed_path(p("/usr/bin/dnf"), false), p("/usr/bin/dnf"));
+        assert_eq!(
+            argv_of(b"python3\0-W\0\0/tmp/evil.py\0/usr/bin/dnf\0"),
+            ["python3", "-W", "", "/tmp/evil.py", "/usr/bin/dnf"]
+        );
+        assert!(argv_of(b"").is_empty());
+        // a running process whose image was unlinked: its link count tells it
+        let tmp = tempfile::TempDir::new().unwrap();
+        let copy = tmp.path().join("python3.12");
+        std::fs::copy("/bin/sh", &copy).unwrap();
+        // another test's fork may hold the copy's write descriptor until
+        // its exec (the parallel harness): `ETXTBSY` for a moment
+        let mut child = (0..200)
+            .find_map(|_| {
+                match std::process::Command::new(&copy)
+                    .args(["-c", "sleep 5; :"])
+                    .spawn()
+                {
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                    other => Some(other.unwrap()),
+                }
+            })
+            .expect("the copy runs");
+        // its exec done: its image is the copy
+        for _ in 0..500 {
+            if std::fs::read_link(format!("/proc/{}/exe", child.id())).is_ok_and(|l| l == copy) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&copy).unwrap();
+        let got = image_path(&PathBuf::from(format!("/proc/{}", child.id())));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(got, copy);
+    }
+
     /// External audit SNS-009: a root package manager opens the exemption;
     /// the same binary run by a user does not.
     #[test]
@@ -698,12 +783,38 @@ mod tests {
         std::fs::create_dir(root.join("self")).unwrap();
         assert!(!package_transaction_running(root));
 
+        // lot 310: what the interpreter runs, by its table — not the
+        // cmdline's second word of any executable, nor an inline program's
+        fake_proc(root, 103, 0, "/usr/bin/cat", &["cat", "/usr/bin/dnf"]);
+        // lot 310 (finding 8): an empty argument shifts nothing
+        fake_proc(
+            root,
+            106,
+            0,
+            "/usr/bin/python3.12",
+            &["python3", "-W", "", "/tmp/evil.py", "/usr/bin/dnf"],
+        );
+        fake_proc(
+            root,
+            105,
+            0,
+            "/usr/bin/python3.12",
+            &["python3", "-Z", "/usr/bin/dnf"],
+        );
+        fake_proc(
+            root,
+            104,
+            0,
+            "/usr/bin/python3.12",
+            &["python3", "-c", "x", "/usr/bin/dnf"],
+        );
+        assert!(!package_transaction_running(root));
         fake_proc(
             root,
             102,
             0,
             "/usr/bin/python3.12",
-            &["/usr/bin/python3", "/usr/bin/unattended-upgrade"],
+            &["/usr/bin/python3", "-E", "/usr/bin/unattended-upgrade"],
         );
         assert!(package_transaction_running(root));
 

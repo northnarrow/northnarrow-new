@@ -345,6 +345,14 @@ const STATICS: &[Kept] = &[
         "the inodes this boot registered in the pinned PROTECTED_INODES",
     ),
     kept(
+        "crates/nn-linux/src/systemd_executor.rs",
+        "KERNEL",
+        Kernel,
+        "lot 310 (the re-check 4 of #539): the fork record's executor map (EXECUTOR_IDS) of the \
+         one eBPF object and the verified executor identities last read (the packaged file's, \
+         PID 1's copies), written to it at the start and at each 10 s read",
+    ),
+    kept(
         "antitamper-bpf/src/cgroup_floors.rs",
         "PENDING",
         Log,

@@ -6,6 +6,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- An interpreter's options are read by one reader, and a fileless exec is
+  judged on the executed file (lot 310; the external bug hunt's edition 1.4:
+  BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision
+  of 11/11/2026 on BUG-49, and the independent review of #539;
+  `docs/operator/UPGRADE_NOTES_WAVE4.md` §31). `bash -noprofile /tmp/x.sh x
+  /usr/bin/aws`, `node --eval=… /usr/bin/aws`, `node --run task
+  /usr/bin/aws`, `zsh -ovi /tmp/x /usr/bin/aws`, `perl '-i -e' CODE
+  /usr/bin/aws`, `node -r pre.js /usr/bin/aws` and `PYTHONPATH=dir python3
+  /usr/bin/aws` were taken for the `aws` client: their read of
+  `~/.aws/credentials` drew no NN-L-FIM-011 kill, and they vouched for what
+  they started. One reader (`posture/script_args.rs`, a table per family)
+  reads bash's one-hyphen long options, dash's and busybox's own, perl's
+  switches after a space, `--name=value`, zsh's attached `-o` and the names
+  `-o` takes, node's `--run`, code loaded before the program (`-r`, `-M`,
+  `-I`, and the loading variables of the environment, which the exec pump
+  reads), and the kernel-resolved names `mono-sgen`, `mksh` and busybox as
+  `/bin/sh`; anything outside the table, or an option that runs nothing, is
+  not known, never a script. An inline program (`sh -c`, `python3 -c`) or
+  standard input (`bash < file`) no longer vouches for the packaged tools it
+  starts (ransomware signal, copy guard) — save the installed shell PID 1
+  FORKED (a unit's `ExecStart=/bin/sh -c …`), which vouches as PID 1 does;
+  a user's service manager vouches for nothing (`systemd-run --user`; the
+  desktop's terminal too, for now: lot 326). "Forked" is the kernel's
+  record (a new eBPF program at `sched_process_fork`, processes only, the
+  exec record's `fork_ppid`, carried through systemd's executor), never the
+  parent at exec time: a double-forked orphan PID 1 reaped does not pass. A cron
+  job's `sh -c` is judged (the lab: a user's crontab `rsync --inplace` of
+  random data drew NN-L-IMP-001, its kill held). R004 kills a memfd or unlinked file whatever path
+  reached it (`/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`,
+  `/dev/stdin`, a relative path, a symlink: unprivileged evasions of a kill
+  that holds in every posture) — in LSM mode by the exec sensor's identity,
+  in tracepoint mode by the exec pump's read of `/proc/<pid>/exe`; systemd's
+  unlinked executor is exempt by an identity PID 1 holds now (no user
+  reaches it), or the packaged file's or a genuine user manager's for the
+  first exec of a process systemd forked (re-read every 10 s, replaced; a
+  "manager" a user's mount namespace runs adds nothing), no longer by its
+  name or `argv[0]`
+  (`/opt/app/systemd-executor` was), and a process re-executing its
+  parent's own image is not fileless when that image came from a directory
+  only root can write, in PID 1's mount namespace. Two ratchets
+  (`xtask/tests/interpreter_options.rs`, `proc_links.rs`) keep option
+  parsing and `/proc` link matching in their one reader, in every product
+  crate; an `#[ignore]` differential test runs the tables against the real
+  bash, dash, python3, perl, node, ruby, zsh, mksh and busybox, with a
+  program on standard input.
 - Lot 322: the exec environment's check works on every CPU; the exec
   guards' and the FIM sensor's buffers are the running task's own.
   - **The check was almost inert on Ubuntu 26.04 (kernel 7.0).** It refused

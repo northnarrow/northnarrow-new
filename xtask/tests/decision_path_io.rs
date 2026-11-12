@@ -232,11 +232,8 @@ const KNOWN: &[(&str, usize, &str)] = &[
          (`ModuleOwners::refresh`, R12b); the decision reads its answer, and asks itself \
          only for a file no pump asked about (the replay, the tests)",
     ),
-    (
-        "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs",
-        1,
-        "R004 matches a `/proc/self/fd` path in the exec's string, no read",
-    ),
+    // lot 310: R004 matches no `/proc` path itself any more (the posture's
+    // one reader of a `/proc` link, `posture/proc_link.rs`, does: no read)
     (
         "crates/nn-core/src/impact/mod.rs",
         4,
@@ -270,7 +267,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        22,
+        25,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
          (`seed_from_proc`) and its sweep (`sweep` and its orphans' adoption, \
@@ -283,7 +280,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
          lot 275 (the final check of #495, C1): `runs_host_file`, the device and inode of a \
          response's receiver's `/proc/<pid>/exe` and of the host's file at its path (one \
          `fstat` each), read by the DNS response pump only, for a receiver whose executable \
-         and uid are already a resolver's, not in a judgement",
+         and uid are already a resolver's, not in a judgement; lot 310 (the review of #539): \
+         the start's scan reads each running process's image (`seed_image`: \
+         `/proc/<pid>/exe`'s link and identity, its directory in the process's root, its \
+         and PID 1's mount namespaces: the re-check of #539, N6), once, off the decision path",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

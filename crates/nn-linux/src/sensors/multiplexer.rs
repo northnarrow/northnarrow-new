@@ -30,7 +30,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{ring_buf::RingBuf, MapData},
-    programs::{FExit, KProbe, TracePoint},
+    programs::{BtfTracePoint, FExit, KProbe, TracePoint},
     Btf, Ebpf, EbpfLoader,
 };
 use bytemuck::Pod;
@@ -413,6 +413,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         crate::sensors::flow_sock::install(&mut ebpf);
 
         let attach_points = crate::boot::manifest::AttachPoints::new();
+        attach_fork_parent(&mut ebpf);
         attach_exec_tracepoint(&mut ebpf, &attach_points)?;
         attach_tracepoint(
             &mut ebpf,
@@ -1161,6 +1162,80 @@ pub const STDIO_PROBE_DEGRADED: &str = "R020 (shell or interpreter with its stan
      network socket) cannot fire: this kernel's verifier refused the standard-stream probes of \
      sched_process_exec, which runs without them (exec records say \"not read\")";
 
+/// Lot 310 (the re-check of #539, N2): what is lost without the fork-parent
+/// record.
+pub const FORK_PARENT_DEGRADED: &str = "the exec records carry no fork parent: no unit's inline \
+     shell inherits PID 1's vouching, and R004 exempts a launch through systemd's unlinked \
+     executor only by a copy PID 1 holds (sched_process_fork's BTF tracepoint refused)";
+
+/// Lot 310 (the re-check of #539, N2): the fork-parent record
+/// (`fork_parent_record`, BTF tracepoint `sched_process_fork`), which the
+/// exec record reads (`fork_ppid`): who forked a process, for its first
+/// exec. Not attached, every exec's fork parent is "not known" — the
+/// decisions that need it fail closed; a signed degradation, not fatal.
+fn attach_fork_parent(ebpf: &mut Ebpf) {
+    const PROGRAM: &str = "fork_parent_record";
+    let attached = (|| -> Result<(), String> {
+        let btf = Btf::from_sys_fs().map_err(|e| format!("BTF: {e}"))?;
+        let p: &mut BtfTracePoint = ebpf
+            .program_mut(PROGRAM)
+            .ok_or_else(|| format!("program {PROGRAM} missing from the eBPF object"))?
+            .try_into()
+            .map_err(|e| format!("{PROGRAM} is not a BTF tracepoint: {e}"))?;
+        p.load("sched_process_fork", &btf)
+            .map_err(|e| format!("verifier rejected {PROGRAM}: {e:#}"))?;
+        p.attach()
+            .map_err(|e| format!("attaching {PROGRAM}: {e:#}"))?;
+        // re-check 3 (decision 2): from now on, an exec of a process that
+        // started later and finds no record lost it (counted:
+        // `fork_record_lost`)
+        let map = ebpf
+            .map_mut("FORK_PARENT_SINCE")
+            .ok_or_else(|| "map FORK_PARENT_SINCE missing from the eBPF object".to_string())?;
+        let mut since: aya::maps::Array<_, u64> =
+            aya::maps::Array::try_from(map).map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
+        since
+            .set(0, monotonic_ns(), 0)
+            .map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
+        // the re-check 4 of #539: the verified executor's identities, which
+        // the agent writes at each read (`systemd_executor::refresh`)
+        let ids = ebpf
+            .take_map("EXECUTOR_IDS")
+            .ok_or_else(|| "map EXECUTOR_IDS missing from the eBPF object".to_string())?;
+        crate::systemd_executor::install_kernel_map(
+            aya::maps::HashMap::try_from(ids).map_err(|e| format!("EXECUTOR_IDS: {e}"))?,
+        );
+        Ok(())
+    })();
+    if let Err(e) = attached {
+        error!(error = %e, "fork-parent record not attached: {FORK_PARENT_DEGRADED}");
+        crate::boot::degradation::report("fork_parent", FORK_PARENT_DEGRADED);
+        return;
+    }
+    // a process's record goes at its exit: a flood of `fork` + `_exit`
+    // fills no map, and a missing record is a real loss
+    if let Err(e) =
+        attach_tracepoint_any(ebpf, "fork_parent_forget", "sched", &["sched_process_exit"])
+    {
+        warn!(
+            error = %e,
+            "fork-parent record: exits not seen — an exited process's record stays until the map \
+             evicts it (fork_record_lost may count a record a flood evicted)"
+        );
+    }
+}
+
+/// `CLOCK_MONOTONIC` now, ns: the clock of a task's `start_time`.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+}
+
 /// The process-spawn sensor: `sched_process_exec`, or — when the kernel's
 /// verifier refuses it — `sched_process_exec_nostdio`, the same program
 /// without R020's standard-stream probes (lab PR 224, `crate::stdio` in the
@@ -1347,7 +1422,10 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
 /// pump's order, before any exec its process forks.
 fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
     crate::sensors::kmod_exec::read_and_keep(&e);
-    let (e, carried) = resolved(raw, e);
+    let (mut e, carried) = resolved(raw, e);
+    // lot 310 (the review of #539): the image, its directory, an
+    // interpreter's environment and standard input, read while it runs
+    crate::sensors::exec_facts::read(&mut e);
     crate::sensors::kmod_exec::note_exec(&e);
     (e, carried)
 }

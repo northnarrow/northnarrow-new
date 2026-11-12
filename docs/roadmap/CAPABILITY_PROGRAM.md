@@ -9117,6 +9117,227 @@ number in parentheses is a lab PR.
     five guests and an AlmaLinux 9 guest for each lot's key piece; C14 the
     V2 campaign's matrix rows and #119; C23 #120, the guide of #121, the
     deny proof in a privileged e2e; then a third party's validation.
+- **Lot 310 — script and descriptor identity, one reader each (C06, C14,
+  C19; the third bug hunt's lot 1: BUG-97 P0, BUG-88 P0, BUG-99 P1,
+  BUG-100, BUG-103, BUG-104, N3; the decision of 11/11/2026 on BUG-49).**
+  - What was open: `bash -noprofile /tmp/x.sh x /usr/bin/aws` (bash's long
+    options with one hyphen read as letters), `node --eval=… /usr/bin/aws`
+    (`--name=value` skipped the table), `node --run task /usr/bin/aws`,
+    `zsh -ovi /tmp/x /usr/bin/aws` were the `aws` client — NN-L-FIM-011's
+    kill silent, and they vouched for what they started; `mono-sgen` and
+    busybox as `/bin/sh` were no interpreter; R004 knew three spellings of a
+    descriptor, so an unlinked file run by an unprivileged user through
+    `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
+    relative path or a symlink was not killed (in every posture), and any
+    file named `systemd-executor` in a root-owned tree (`/opt/app`) was
+    exempt; `sh -c` vouched for the packaged tools it ran (the triage's
+    LOTL ransomware).
+  - What changed: one getopt-style reader over a table per family
+    (`posture/script_args.rs`; anything outside it is not known, never a
+    script; `Runs::Code` for an inline program or standard input, which
+    vouches for nothing); one reader of a path through a `/proc` link
+    (`posture/proc_link.rs`); R004 in LSM mode on the executed file's flags
+    whatever the path, systemd's unlinked executor exempt by its identity
+    (recorded by the agent) and a systemd parent, a re-exec of the parent's
+    own image not fileless (the lineage keeps each exec's `(dev, ino)`); two
+    ratchets (`xtask/tests/interpreter_options.rs`, `proc_links.rs`); the
+    differential `#[ignore]` test against the real interpreters (move 3,
+    first stage). Found in the lab and fixed: the exec sensor's device is
+    the kernel's form (`MKDEV`), and R14a's worker image was compared in
+    `stat(2)`'s; the posture's ingest of an exec dropped its identity.
+  - The lab, as measured (our own guests under lease k310; the agent
+    uninstalled, the guests clean and off at the end):
+    - **Ubuntu 26.04** (`7.0.0-43-generic`, systemd 259; r1 at 7d4e03d1,
+      r2 at 9c73ff37). An unprivileged user's `O_TMPFILE` in its home,
+      executed through `/proc/self/fd/N`, `/proc/thread-self/fd/N`,
+      `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, `/dev/fd/N`, a relative
+      `fd/N` from `/proc/self`, a symlink in the home and `/proc//self/fd/N`:
+      R004 KillProcessTree for each, rc 137; an unlinked file named
+      `systemd-executor` under `/opt` (the user's): killed. Round r1 found
+      two faults, fixed before r2: a re-exec of the parent's own unlinked
+      image (bash copied to the home, removed, `/proc/self/exe` run from a
+      fork) was killed — the posture ingested execs without their
+      identity; and `systemd-run` through PID 1's unlinked executor (the
+      file replaced by an identical copy) drew R004's KillProcessTree (the
+      unit had finished) — the executor's identity was recorded in
+      `stat(2)`'s device form (`64769`) where the exec sensor reports the
+      kernel's (`MKDEV`). In r2 the re-exec ran (rc 0, no record), and
+      `systemd-run` through the unlinked executor ran with no record, both
+      with the identity recorded at the agent's start (1 identity) and after
+      an agent restart before PID 1's re-exec (2: the install path and PID
+      1's open copy); `daemon-reexec` after. NN-L-FIM-011 KillProcess (rc
+      137) on a canary `/root/.aws/credentials` (fake values, in place
+      before the agent's start) read by `bash -noprofile <reader> x
+      /usr/bin/aws`, `bash -rcfile /etc/hostname <reader> /usr/bin/aws` and
+      `node --eval=… /usr/bin/aws` (node 22.22, installed for the probe and
+      purged); a plain `cat`: recorded, as on main.
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255; r1 at 5345b5bb):
+      the same probe, the same outcomes (the eight spellings and the
+      `/opt` name killed; the parent's image re-executed ran; `systemd-run`
+      through the unlinked executor ran, at the start and after an agent
+      restart; FIM-011 killed the three misread readers, node 18.19). The
+      benign corpus: `dev` (24 steps, rc 0) — one kill, the `www-data`
+      control's R001 (rc 137), as designed and as in lots 283b and 292; the
+      records R001 High (go test, `go run`, the AppImage runs, the lab
+      user's control) and one NN-L-IMP-001 in `go test` (held), as before;
+      no R004, no new record. `ci` (15 steps, rc 0, transient units, docker
+      build and run) — no kill; R001 High for go test and `go run`, the
+      known NN-L-AT-001 ×24 of `deb-systemd-helper`'s `rmdir` of the
+      agent's drop-in directories during the cleanup's purge; no R004, no
+      NN-L-IMP record. The executor's file on both shared guests is now an
+      identical copy (`cp -p` then `mv`: same content and mode, another
+      inode).
+  - Host: named tests for each bug (the triage's versions fail on main
+    0cdfb6b; the differential test with main's reader finds BUG-97's 14
+    bash argvs, 0 on this branch over ~6,000 argvs of bash 5.2.21, dash
+    0.5.12, Python 3.12.3, perl 5.38.2); 44 mutations of the new code, 42
+    caught by named tests, 2 equivalent (removed from the code); the full
+    gates in the PR.
+  - The independent review of #539 (11 findings, the coordinator's
+    decisions), fixed in the commits after the first: perl's switches after
+    a space (`'-i -e'`); code loaded before the program — node `-r`,
+    `--import`, perl `-M`/`-I`/`-d`, ruby `-r`/`-I`, python's `-i`, and the
+    environment's loading variables, read by the exec pump
+    (`nn_linux::sensors::exec_facts`) — is not the installed program; an
+    option that runs nothing, or that the interpreter refuses (no program,
+    a refused value), is not known; `-` is the standard input's program;
+    dash and busybox's ash read with their own tables, the names `-o`
+    takes checked; busybox applets keep "installed program". R004: the
+    executor's identities re-read every 10 s and replaced, for a child's
+    first exec; tracepoint mode on the exec pump's `/proc/<pid>/exe`, no
+    `argv[0]` exemption; the parent's image only from a root-only
+    directory, the processes running at the agent's start seeded; `..`
+    folded outside a link, `/proc/<x>/root/` chains followed. BUG-49: `bash
+    < file` (the pump's `STDIN_PROGRAM`) is code, a user's service manager
+    (`systemd --user`, PID 1's child) vouches for nothing. `ring_drops`
+    keeps an unlinked interpreter's identity and empty arguments. Both
+    ratchets scan every product crate (seven planted twins fail). The
+    differential test has a program on standard input and a strict oracle:
+    0 mismatches on the host (bash 5.2.21, dash 0.5.12, perl 5.38.2,
+    Python 3.12.3; ~6,070 argvs, 3,183 judged) after the reader's fixes it
+    found; in the guest (node 18.19, ruby 3.2.3, zsh 5.9, mksh R59c,
+    busybox 1.36 installed for the run and purged) 0 reader mismatches over
+    13,667 argvs after the fixes it found (node's `-` values and options
+    after its program, ruby's `-E`/`-C`/`-s`, busybox's table, `+c`). 51
+    mutants of the new code, 51 caught by named tests (5 after their tests
+    were strengthened); gates on 23c8e3e7: 98 suites, 4,561 passed, 0
+    failed.
+  - The review's lab (our guests, lease k310, clean and off at the end):
+    Ubuntu 24.04 r2 (dfb0d0e3) and r3 (ab726b7c), Ubuntu 26.04 r3: the
+    eight spellings of BUG-88 and the `/opt` executor name killed;
+    `systemd-run` through PID 1's unlinked executor ran (identities 1 → 2
+    at the 10 s re-read; 2 after an agent restart); NN-L-FIM-011 killed
+    six misread readers (`bash -noprofile`, `-rcfile`, `node --eval=`,
+    `perl '-i -e'`, `PYTHONPATH` with a `sitecustomize.py`, `node -r`); a
+    re-exec of the parent's unlinked image ran from a directory only root
+    writes and was killed from the user's home. Corpus on 24.04: `dev` and
+    `ci` as in r1; `db` as the 6/11 run plus NN-L-CHAIN-008 ×2 (Log) on
+    `unattended-upgrade --dry-run`'s `http` (a rule that reads none of
+    this identity). BUG-49's cases: a user's crontab `sh -c 'rsync
+    --inplace …'` of random data drew NN-L-IMP-001 (Critical, Log: the kill
+    held); a system cron job, a unit's `sh -c`, `ssh host 'cmd'`: no
+    record (their controls drew none either: a bound, not a proof). The
+    coordinator's refinement followed: an installed shell PID 1 started
+    vouches as PID 1 does; cron's stays judged (no owner in the judgement).
+    r2's BUG-49 script stopped at its `ssh` case (it read the script's
+    standard input) and left its lab key line and directories, removed
+    first thing in r3.
+  - The re-check of #539 (12/11, the coordinator's decisions A–D, lot 310b
+    folded in): the executor's identities from three sources only (the
+    packaged file, PID 1's copies, a user manager whose image is the
+    packaged manager's in PID 1's mount namespace: a "manager" a user's
+    namespace runs adds nothing); "launched by systemd" is the kernel's
+    record of the FORKER (`fork_parent_record`, BTF `sched_process_fork`,
+    the exec record's `fork_ppid`), for R004's executor and BUG-49's PID 1
+    rule alike — a webshell's double-forked orphan no longer passes; a
+    user's manager vouched only for what it forked for a packaged user unit
+    (`nn_linux::user_units`: the desktop's terminal; never `systemd-run
+    --user` — withdrawn in re-check 3, below); the environment past 1 MiB fails closed; `PYTHONSTARTUP`,
+    `ENV` only for an interpreter naming nothing, `NODE_OPTIONS` only with a
+    loading option (node's table); node `--test-reporter`, python `-X
+    pycache_prefix`, `PYTHONPYCACHEPREFIX`; `ROOT_DIR` only in PID 1's mount
+    namespace; one cmdline reader; busybox's shell reads its stdin; the
+    ratchet catches seven evasive twins (main's `ring_drops` copied as it
+    was among them). 20 mutants of the round's code, all caught by named
+    tests (3 after their tests were strengthened; with the review round's
+    51, 71). Lab: Ubuntu 24.04
+    (6.8.0-149): BUG-88's eight spellings and the `/opt` name killed;
+    `systemd-run` through the unlinked executor ran (the fork record:
+    PID 1); FIM-011 killed the six misread readers; the fake manager's held
+    file, executed by an orphan through a descriptor: R004 kill; the
+    double-forked `sh -c` doing `rsync --inplace` of random data:
+    NN-L-IMP-001 (judged), the same as PID 1's unit: no record (trusted); a
+    legitimate `aws` with `PYTHONSTARTUP` or `NODE_OPTIONS=--max-old-space-
+    size`: not killed, with `PYTHONPATH`: killed. Ubuntu 26.04 (7.0.0-43):
+    the same for BUG-88, the executor, FIM-011 and `aws`; the fake manager
+    could not be set up there (sudo-rs), and the double fork's case and its
+    control drew no record at all (the shapes not reached: not conclusive
+    on 7.0). An incident: r4's 26.04 build filled the guest's disk (its
+    build cache freed); r4's 24.04 uninstall stopped after its plan (the
+    guest powered off with the agent installed: booted again and
+    uninstalled, nothing left).
+  - Re-check 3 of #539 (12/11, the coordinator's decisions 1–5): R004
+    exempts the exec of a deleted file that is PID 1's held executor by
+    its identity alone (no fork record needed: an upgrade's units start
+    even when the record was evicted); `fork_parent_record` skips a
+    thread's clone (`CLONE_THREAD`), its LRU map holds 65,536 records and
+    a lost record is counted (`fork_record_lost`, a ring-drop slot, in the
+    exec source's contract); on systemd ≥ 254 the executor's verified exec
+    carries its fork parent to the same process's next exec, once; the
+    user's manager vouches for nothing (the desktop's terminal is judged:
+    the cost accepted in observe-only alpha; lot 326 records the unit's
+    cgroup at its main exec); the ratchets read `concat!` of literals (the
+    syntax lints are lot 327). Gates on fc641f2d (eBPF changed): 108
+    suites, 4,824 passed, 0 failed, 32 ignored, clippy ×4, `golden` ×5
+    (63 files the same bytes), MSRV, the fuzz replay (14 targets),
+    portable-core (5). Mutations: 4 of the round's code, one (the carry
+    without its start check) survived and has its test — 75 with the
+    earlier rounds'. Lab, Ubuntu 24.04 (6.8.0-149, systemd 255): the
+    double-forked `sh -c` NN-L-IMP-001 (judged); the unit's `sh -c` drew
+    no record but neither did its control (not conclusive); the executor
+    replaced (PID 1 holding its unlinked copy) under a flood of 20,000
+    threads and a fork loop: 3 of 3 units ran, no R004, the lost records
+    counted (58) in the agent's journal; uninstalled, nothing left. 26.04
+    not rerun this round.
+  - Re-check 4 of #539 (12/11, decisions 1, 2 and 4 held; one HIGH, two
+    smaller): (HIGH) the lineage walk reads a writer and 32 ancestors, and
+    a walk that stopped there was taken for the whole lineage — 33 nested
+    `timeout`s (packaged, each forking the next) hid a webshell's `sh -c`
+    or a user's manager, and every hop read vouched; a walk that ends
+    before PID 1 (the cap, a parent that started after its child, a
+    process its own parent) is now a lineage not known, which never
+    vouches (the ransomware judge, the copy guard); the walks that look
+    for a hop that grants find nothing above a cut, the impairment
+    rules' staged-ancestor search reads the hops below it. The executor's
+    carry moved into the kernel: the exec program reads the LSM identity
+    of the file executed and, for a verified executor (`EXECUTOR_IDS`: the
+    packaged file's and PID 1's copies, written by the agent), leaves the
+    fork record to the next exec — the userland carry raced the pump's
+    `/proc` read. A record is marked used at a first exec and removed at
+    its process's exit (`sched_process_exit`): `fork_record_lost` counts
+    evictions only (re-check 3's 58 were mostly second execs). Mutations:
+    14 of the round's code, 13 caught at once, the impairment search's
+    survivor has its test — 89 with the earlier rounds'. The merge of lot
+    322 (#546) between. Gates on 21aaa2af (eBPF changed): 110 suites,
+    4,913 passed, 0 failed, 34 ignored, clippy ×4, `golden` ×5 (63 files
+    the same bytes), MSRV, the fuzz replay (14), portable-core (5).
+    `verifier-check`, every program of that object: 5.15.0-202 102 OK and
+    7.0.0-43 103 OK (the same object), 6.8.0-149 106 OK, 0 failing on
+    each. Lab, Ubuntu 24.04 (6.8.0-149, systemd 255), told by the agent's
+    own counters (shapes counted against trusted bursts) with `cp` as the
+    writer: a unit's `ExecStart=/bin/sh -c` through the executor vouched 5
+    of 5; an unpackaged script's unit, the double-forked `sh -c` and
+    `systemd-run --user sh -c` judged (NN-L-IMP-001 each); the unit's
+    `sh -c` with 2 nested `timeout`s vouched, with 33 judged,
+    `systemd-run --user` with 34 judged; `fork_record_lost` 0 → 0 over 500
+    second execs and 20 units; the executor replaced (PID 1 launching from
+    its unlinked copy): vouched, and after PID 1's re-exec. With `rsync` as
+    the writer (r9) the unit's `sh -c` vouched once in five: rsync's
+    receiver is a fork that never executes, read from `/proc` only, and
+    once it has exited its lineage is not known (a residual older than
+    this lot). Uninstalled each round, nothing left.
+  - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
+    their level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
   - What was open: a process whose `comm` is not UTF-8 — set with

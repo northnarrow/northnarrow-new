@@ -17,9 +17,14 @@
 //!   package database ([`ProgramOwners`]) — **and** every hop of its lineage
 //!   vouches for it ([`vouches`], lot 292, BUG-49): every ancestor up to
 //!   PID 1 above the writer and its forked copies is a program a package
-//!   installed, or an interpreter a package installed running no named
-//!   script (an interactive shell, `sh -c`), and none is foreign
-//!   ([`is_foreign`]). `rsync`, `tar`, `git`, `cp`, a compiler, a
+//!   installed, or an interpreter a package installed running no program
+//!   at all (an interactive shell), and none is foreign ([`is_foreign`]).
+//!   Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running
+//!   an inline program (`sh -c`, `python3 -c`, `perl -e`) or its standard
+//!   input (`sh -s`) vouches for nothing ([`Runs::Code`]): that program is
+//!   the caller's, and a webshell's `sh -c 'openssl enc …'` made the
+//!   packaged `openssl` a trusted writer. A package transaction stays
+//!   trusted as before (its own test, above). `rsync`, `tar`, `git`, `cp`, a compiler, a
 //!   package-installed backup agent or database, started by a person or a
 //!   unit, are trusted this way; the same programs started by a script from
 //!   a home directory or `/tmp`, by a binary in `/opt` or `/usr/local` no
@@ -106,9 +111,11 @@ pub fn program_of(id: &ExecIdentity) -> String {
 }
 
 /// A hop that vouches for nothing below it: neither a program root
-/// installed nor an installed interpreter running no named script (the
-/// test of lab PR 222's `cow::trust::is_foreign`). Lot 292 (BUG-44): an
-/// interpreter whose options could not be read ([`Runs::Unknown`]) is one.
+/// installed nor an installed interpreter running no program at all (the
+/// test of lab PR 222's copy on first write, which calls this one). Lot 292
+/// (BUG-44): an interpreter whose options could not be read
+/// ([`Runs::Unknown`]) is one; lot 310 (BUG-49): so is one running an
+/// inline program or its standard input ([`Runs::Code`]).
 pub fn is_foreign(id: &ExecIdentity) -> bool {
     if id.is_installed_program() {
         return false;
@@ -139,7 +146,7 @@ fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
     if !owned_file(&id.exe, owned) {
         return false;
     }
-    if !is_interpreter(&id.exe) {
+    if !id.interprets() {
         return true;
     }
     match id.script() {
@@ -150,31 +157,117 @@ fn packaged(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
 
 /// Lot 292 (BUG-49): an ancestor vouches for what it starts when a package
 /// installed its program ([`packaged`]), or when it is an interpreter a
-/// package installed running no named script (an interactive shell, `sh
-/// -c`). Lying in a root-owned tree (`/opt/x`, `/usr/local/bin/x`) is not
-/// being installed by a package, and an interpreter whose options could
-/// not be read vouches for nothing.
+/// package installed running no program at all (an interactive shell).
+/// Lying in a root-owned tree (`/opt/x`, `/usr/local/bin/x`) is not being
+/// installed by a package, an interpreter whose options could not be read
+/// vouches for nothing, and (lot 310) nor does one running an inline
+/// program (`sh -c`) or its standard input ([`Runs::Code`]).
 pub fn vouches(id: &ExecIdentity, owned: &dyn Fn(&Path) -> Option<bool>) -> bool {
     packaged(id, owned)
         || (id.runs == Runs::Inline && is_interpreter(&id.exe) && owned_file(&id.exe, owned))
 }
 
-/// Why a hop that is not trusted is not: what it runs is not known, or no
-/// package installed it.
+/// Lot 310 (the review of #539, finding 7): hop `n` of `hops` is a
+/// `systemd --user` manager — the manager's program at a pid other than 1,
+/// started by PID 1 (or of a parent not known) — which vouches for nothing
+/// it starts: the user chooses what it runs (`systemd-run --user
+/// /usr/bin/openssl enc …` was a lineage of installed programs end to end,
+/// no inline program in it). PID 1 runs units from root's unit files and an
+/// administrator's `systemd-run`, and still vouches; so does a container's
+/// systemd (its parent a container runtime, judged as every hop is).
+pub fn is_user_manager(hops: &[(u32, ExecIdentity)], n: usize) -> bool {
+    const MANAGERS: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
+    let Some((pid, id)) = hops.get(n) else {
+        return false;
+    };
+    *pid != 1
+        && id.runs == Runs::Inline
+        && MANAGERS.iter().any(|m| id.exe == Path::new(m))
+        && hops.get(n + 1).is_none_or(|(parent, _)| *parent == 1)
+}
+
+/// Lot 310 (the re-check of #539, N2): what the kernel says of one hop of a
+/// lineage beyond its identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HopFacts {
+    /// The process that FORKED it, when its exec was the first since that
+    /// fork (the kernel's record at `sched_process_fork`, never the parent
+    /// at exec time; carried through systemd's executor), 0 when not known.
+    pub fork_parent: u32,
+}
+
+/// Lot 310 (the re-check of #539): the [`HopFacts`] of `hops` (the lineage
+/// of `pid` as of `as_of`): the lineage's fork parents.
+pub fn hop_facts<H: crate::posture::host::PostureHost>(
+    lineage: &crate::posture::lineage::AuthSessionTracker<H>,
+    pid: u32,
+    as_of: crate::posture::lineage::AsOf,
+    hops: &[(u32, ExecIdentity)],
+) -> Vec<HopFacts> {
+    let forks = lineage.lineage_fork_parents(pid, as_of);
+    (0..hops.len())
+        .map(|n| HopFacts {
+            fork_parent: forks.get(n).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Lot 310, the review of #539 (finding 7, the coordinator's refinement once
+/// the lab measured a new Critical record): hop `n` of `hops` is a shell (or
+/// interpreter) a package installed running an inline program that PID 1
+/// started — a unit's `ExecStart=/bin/sh -c '…'` from a unit file only root
+/// writes, or root's `systemd-run`: it inherits PID 1's vouching. The
+/// re-check of #539 (N2): "PID 1 started it" is the kernel's record of who
+/// FORKED it, for its first exec ([`HopFacts::fork_parent`]) — a webshell's
+/// double-forked orphan, which PID 1 reaps before its `sh -c`, was forked
+/// by the webshell. A user's manager, cron (its jobs carry no owner in this
+/// judgement) and sshd's `bash -c` do not.
+pub fn started_by_pid1(
+    hops: &[(u32, ExecIdentity)],
+    facts: &[HopFacts],
+    n: usize,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> bool {
+    let Some((_, id)) = hops.get(n) else {
+        return false;
+    };
+    id.runs == Runs::Code
+        && is_interpreter(&id.exe)
+        && owned_file(&id.exe, owned)
+        && facts.get(n).is_some_and(|f| f.fork_parent == 1)
+}
+
+/// Why a hop that is not trusted is not: what it runs is not known, it runs
+/// the caller's inline program (lot 310), or no package installed it.
 fn not_installed(id: &ExecIdentity) -> &'static str {
-    if matches!(id.runs, Runs::Unknown(_)) {
-        "its arguments do not tell what it runs"
-    } else {
-        "no package installed it"
+    match id.runs {
+        Runs::Unknown(_) => "its arguments do not tell what it runs",
+        Runs::Code => "it runs an inline program",
+        _ => "no package installed it",
     }
 }
 
 /// The pure decision. `lineage`: the writer's identity at index 0, then
 /// its ancestors nearest first (`None`: unknown). `pid`: the writer.
-/// `package_tx`: the writer belongs to a root package transaction.
+/// `package_tx`: the writer belongs to a root package transaction. No
+/// [`HopFacts`]: no hop is known to be PID 1's ([`judge_with`]). A lineage
+/// cut before PID 1 is `None` (the re-check 4 of #539: what is above the
+/// cut never vouches).
 pub fn judge(
     pid: u32,
     lineage: Option<&[(u32, ExecIdentity)]>,
+    package_tx: bool,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> Judged {
+    judge_with(pid, lineage, &[], package_tx, owned)
+}
+
+/// [`judge`] with each hop's [`HopFacts`] (`facts[n]` for `lineage[n]`; a
+/// hop without any knows nothing): the kernel's fork parents.
+pub fn judge_with(
+    pid: u32,
+    lineage: Option<&[(u32, ExecIdentity)]>,
+    facts: &[HopFacts],
     package_tx: bool,
     owned: &dyn Fn(&Path) -> Option<bool>,
 ) -> Judged {
@@ -193,23 +286,45 @@ pub fn judge(
     // BUG-49: the writer and the copies of itself that forked it are judged
     // below ([`packaged`]); every ancestor above them must vouch for it.
     let own = topmost_same(hops, 0);
-    if let Some(i) = hops
-        .iter()
-        .enumerate()
-        .position(|(n, (_, id))| is_foreign(id) || (n > own && !vouches(id, owned)))
-    {
-        let (actor, id) = &hops[topmost_same(hops, i)];
+    if let Some(i) = hops.iter().enumerate().position(|(n, (_, id))| {
+        let by_pid1 = n > own && started_by_pid1(hops, facts, n, owned);
+        (is_foreign(id) && !by_pid1)
+            || (n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, n)))
+    }) {
+        // lot 310: a user's service manager is not what to kill (its whole
+        // session's services with it): the unit's process it started is.
+        // Its own parent runs the same file (PID 1's systemd), so the hop
+        // is taken as is, never climbed to the copies above it.
+        let manager = i > 0 && is_user_manager(hops, i);
+        let (actor, id) = if manager {
+            (hops[i - 1].0, &hops[i].1)
+        } else {
+            let (a, id) = &hops[topmost_same(hops, i)];
+            (*a, id)
+        };
         // A foreign writer's shapes add up with its forked workers'; a
         // packaged tool's under a foreign program count for that tool's
         // process alone: two tools a user's script runs one after the
         // other (`tar x` deleting, `rsync --inplace` rewriting) are not one
         // burst. The kill reaches the foreign program either way.
-        let key = if i == 0 { *actor } else { hops[0].0 };
+        let key = if i == 0 { actor } else { hops[0].0 };
         let why = if i == 0 {
             not_installed(id).to_string()
         } else if matches!(id.runs, Runs::Unknown(_)) {
             format!(
                 "{} was started by {}, whose arguments do not tell what it runs",
+                program_of(writer),
+                program_of(id)
+            )
+        } else if manager {
+            format!(
+                "{} was started by a user's service manager ({}), which runs what the user asks",
+                program_of(writer),
+                program_of(id)
+            )
+        } else if id.runs == Runs::Code {
+            format!(
+                "{} was started by {}, which runs an inline program",
                 program_of(writer),
                 program_of(id)
             )
@@ -221,7 +336,7 @@ pub fn judge(
             )
         };
         return Judged::Untrusted {
-            actor: *actor,
+            actor,
             key,
             program: program_of(id),
             why,
@@ -235,7 +350,7 @@ pub fn judge(
         actor: *actor,
         key: *actor,
         program: program_of(writer),
-        why: if is_interpreter(&writer.exe) {
+        why: if writer.interprets() {
             "an interpreter running an inline program or an unpackaged script".to_string()
         } else {
             not_installed(writer).to_string()
@@ -603,19 +718,384 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
-    /// BUG-49, what keeps vouching: an interactive shell or `sh -c` a
-    /// package installed, a packaged daemon, a packaged script; and with no
-    /// package database to ask, a root-owned tree, as before. An interpreter
-    /// no package installed vouches for nothing, even running no script.
+    /// The re-check 4 of #539 (HIGH): the walk reads `pid` and at most
+    /// 32 ancestors. 33 nested `timeout`s — each a packaged program that
+    /// forks the next — put a webshell's `sh -c` (or a user's manager) above
+    /// the cut, and every hop read vouched: Trusted. A lineage cut before
+    /// PID 1 is not known and vouches for nothing; one that reaches PID 1
+    /// at exactly the cap is whole, judged by what it holds.
+    #[test]
+    fn a_lineage_deeper_than_the_walk_vouches_for_nothing() {
+        use crate::posture::lineage::{AsOf, AuthSessionTracker};
+        const S: u64 = 1_000_000_000;
+        let proc = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::<H>::new(proc.path());
+        let n = std::cell::Cell::new(0u64);
+        let exec = |pid: u32, ppid: u32, exe: &str, argv: &[&str]| {
+            n.set(n.get() + 1);
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            t.ingest_exec(pid, ppid, exe, &argv, n.get() * S, n.get() * S, 0);
+        };
+        // `wrappers` nested `timeout`s from `first` up, the first one's
+        // parent `top`; then `openssl` below the last: its pid
+        let wrapped = |top: u32, first: u32, wrappers: u32| {
+            for k in 0..wrappers {
+                let ppid = if k == 0 { top } else { first + k - 1 };
+                exec(first + k, ppid, "/usr/bin/timeout", &["timeout", "1d"]);
+            }
+            let pid = first + wrappers;
+            exec(pid, pid - 1, "/usr/bin/openssl", &["openssl", "enc"]);
+            pid
+        };
+        let judged = |pid: u32| {
+            judge(
+                pid,
+                t.lineage_identities(pid, AsOf::Now).as_deref(),
+                false,
+                &distro,
+            )
+        };
+        let unknown = |got: &Judged, pid: u32| {
+            matches!(got, Judged::Untrusted { actor, key, program, .. }
+                if (*actor, *key) == (pid, pid) && program == LINEAGE_UNKNOWN)
+        };
+        // a webshell: php-fpm (PID 1's), `sh -c`, 33 × `timeout`, openssl
+        exec(10, 1, "/usr/sbin/php-fpm8.3", &["php-fpm"]);
+        exec(11, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(11, 12, 33);
+        assert!(unknown(&judged(pid), pid), "33 wrappers hide the `sh -c`");
+        // one wrapper: the `sh -c` is read, and judged
+        exec(50, 10, "/usr/bin/dash", &["sh", "-c", "timeout 1d …"]);
+        let pid = wrapped(50, 51, 1);
+        assert!(matches!(judged(pid), Judged::Untrusted { actor: 50, .. }));
+        // `systemd-run --user`: the user's manager, 34 × `timeout`, openssl
+        exec(
+            1200,
+            1,
+            "/usr/lib/systemd/systemd",
+            &["/usr/lib/systemd/systemd", "--user"],
+        );
+        let pid = wrapped(1200, 1201, 34);
+        assert!(
+            unknown(&judged(pid), pid),
+            "34 wrappers hide the user's manager"
+        );
+        // exactly at the cap: openssl + 32 ancestors, the last one PID 1's
+        // (a unit's `timeout`): whole, every hop packaged
+        let pid = wrapped(1, 2001, 32);
+        assert_eq!(
+            judged(pid),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into()))
+        );
+        // one more: cut, whatever is above
+        let pid = wrapped(1, 3001, 33);
+        assert!(unknown(&judged(pid), pid), "one past the cap");
+    }
+
+    /// Lot 310, the review of #539 (finding 7): a user's service manager
+    /// (`systemd --user`, the systemd file at a pid other than 1) runs what
+    /// the user asks — `systemd-run --user /usr/bin/openssl enc …` was a
+    /// lineage of installed programs end to end. It vouches for nothing; the
+    /// process it started is the actor (never the manager, never PID 1 above
+    /// it, which runs the same file), and PID 1's units still vouch.
+    #[test]
+    fn a_user_s_service_manager_vouches_for_nothing() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        match judge(500, Some(&l), false, &distro) {
+            Judged::Untrusted {
+                actor,
+                key,
+                program,
+                why,
+            } => {
+                assert_eq!((actor, key), (500, 500));
+                assert_eq!(program, "/usr/lib/systemd/systemd");
+                // the verdict's text stays out of the failure message (CodeQL
+                // rust/cleartext-logging reads a trust verdict as sensitive)
+                assert!(
+                    why.contains("a user's service manager"),
+                    "the reason names the user's manager"
+                );
+            }
+            Judged::Trusted(_) => panic!("trusted: the user's manager vouched"),
+        }
+        // its forked workers: the topmost copy of the program it started
+        let l = [
+            (502, id("/usr/bin/openssl", None)),
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        assert!(matches!(
+            judge(502, Some(&l), false, &distro),
+            Judged::Untrusted {
+                actor: 500,
+                key: 502,
+                ..
+            }
+        ));
+        // `/lib/systemd/systemd` (a split `/usr`) is the same manager
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, id("/lib/systemd/systemd", None)),
+            (1, id("/lib/systemd/systemd", None)),
+        ];
+        assert!(matches!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Untrusted { actor: 500, .. }
+        ));
+        // PID 1's unit
+        let l = [(500, id("/usr/bin/openssl", None)), (1, systemd())];
+        assert_eq!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/openssl".into()))
+        );
+        let under_pid1 = |id: ExecIdentity| [(1200, id), (1, systemd())];
+        assert!(is_user_manager(&under_pid1(systemd()), 0));
+        assert!(!is_user_manager(&under_pid1(systemd()), 1), "PID 1");
+        assert!(!is_user_manager(&under_pid1(id("/usr/bin/bash", None)), 0));
+        assert!(!is_user_manager(
+            &under_pid1(id("/usr/lib/systemd/systemd", Some("/tmp/x"))),
+            0
+        ));
+        assert!(
+            is_user_manager(&[(1200, systemd())], 0),
+            "a parent not known"
+        );
+        assert!(is_user_manager(
+            &under_pid1(id("/lib/systemd/systemd", None)),
+            0
+        ));
+        // a container's systemd: its parent a container runtime, which is
+        // judged as every hop is (here installed: the lineage vouches)
+        let l = [
+            (500, id("/usr/bin/openssl", None)),
+            (1200, systemd()),
+            (1100, id("/usr/bin/conmon", None)),
+            (1, systemd()),
+        ];
+        assert!(!is_user_manager(&l, 1));
+        assert!(matches!(
+            judge(500, Some(&l), false, &distro),
+            Judged::Trusted(_)
+        ));
+    }
+
+    /// Lot 310, the review of #539 (the refinement the lab's measure called
+    /// for): a unit's `ExecStart=/bin/sh -c 'tar …'` — the inline shell PID 1
+    /// started — vouches as PID 1 does; the same shell under a user's
+    /// manager, under cron or sshd, or a shell no package installed, does
+    /// not; the shell as the writer is judged.
+    #[test]
+    fn an_inline_shell_pid_1_started_inherits_its_vouching() {
+        let sh = || {
+            ExecIdentity::of_exec(
+                "/usr/bin/dash",
+                &["sh".to_string(), "-c".into(), "tar czf x y".into()],
+            )
+        };
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let l = [(400, id("/usr/bin/tar", None)), (300, sh()), (1, systemd())];
+        // the re-check of #539 (N2): PID 1 FORKED the shell, the kernel's
+        // record of its first exec
+        let forked = |by: u32| [HopFacts::default(), HopFacts { fork_parent: by }];
+        assert_eq!(
+            judge_with(400, Some(&l), &forked(1), false, &distro),
+            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
+        );
+        assert!(started_by_pid1(&l, &forked(1), 1, &distro));
+        // the reviewer's double fork: the webshell's `sh -c '(sleep 1; exec
+        // sh -c "openssl enc …") & exit'` — PID 1 reaps the orphan before
+        // its exec, but the webshell forked it; and a fork not known
+        for by in [250, 0] {
+            assert!(
+                matches!(
+                    judge_with(400, Some(&l), &forked(by), false, &distro),
+                    Judged::Untrusted { actor: 300, .. }
+                ),
+                "forked by {by}"
+            );
+        }
+        assert!(matches!(
+            judge(400, Some(&l), false, &distro),
+            Judged::Untrusted { actor: 300, .. }
+        ));
+        // the shell's own writes: judged
+        assert!(matches!(
+            judge_with(300, Some(&l[1..]), &forked(1)[1..], false, &distro),
+            Judged::Untrusted { actor: 300, .. }
+        ));
+        for l in [
+            // a user's manager
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (1200, systemd()),
+                (1, systemd()),
+            ],
+            // cron (a user's crontab or the system's: no owner here)
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (250, id("/usr/sbin/cron", None)),
+                (200, id("/usr/sbin/cron", None)),
+                (1, systemd()),
+            ],
+            // sshd's bash -c
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (300, sh()),
+                (250, id("/usr/sbin/sshd", None)),
+                (1, systemd()),
+            ],
+            // a shell no package installed
+            vec![
+                (400, id("/usr/bin/tar", None)),
+                (
+                    300,
+                    ExecIdentity::of_exec(
+                        "/opt/x/sh",
+                        &["sh".to_string(), "-c".into(), "x".into()],
+                    ),
+                ),
+                (1, systemd()),
+            ],
+        ] {
+            assert!(
+                matches!(
+                    // the shell forked by its parent there (cron's child,
+                    // sshd, a user's manager, PID 1 for the unpackaged one)
+                    judge_with(400, Some(&l), &forked(l[2].0), false, &distro),
+                    Judged::Untrusted { actor: 300, .. }
+                ),
+                "{l:?}"
+            );
+        }
+    }
+
+    /// Re-check 3 (decision 4): a user's manager vouches for nothing, a
+    /// packaged unit's process included — a user moves its own processes
+    /// between the cgroups of its delegated subtree, so a unit read from a
+    /// cgroup is no proof. The desktop's chain (the GNOME terminal's server
+    /// the manager forked, the interactive shell in it, the user's `tar`)
+    /// is judged; the actor is the process the manager started. The cost is
+    /// accepted for now (records, kills held: the alpha observes); lot 326
+    /// records the unit's cgroup in the kernel at its main exec.
+    #[test]
+    fn a_user_s_manager_vouches_for_nothing_not_even_a_packaged_unit() {
+        let systemd = || id("/usr/lib/systemd/systemd", None);
+        let bash_i = ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string()]);
+        let l = [
+            (500, id("/usr/bin/tar", None)),
+            (450, bash_i),
+            (400, id("/usr/libexec/gnome-terminal-server", None)),
+            (1200, systemd()),
+            (1, systemd()),
+        ];
+        let facts = [
+            HopFacts::default(),
+            HopFacts { fork_parent: 400 },
+            HopFacts { fork_parent: 1200 },
+        ];
+        let owned = |p: &Path| {
+            Some(
+                p.starts_with("/usr/bin")
+                    || p.starts_with("/usr/lib")
+                    || p.starts_with("/usr/libexec"),
+            )
+        };
+        assert!(matches!(
+            judge_with(500, Some(&l), &facts, false, &owned),
+            Judged::Untrusted { actor: 400, .. }
+        ));
+    }
+
+    /// Lot 310 (BUG-49, the decision of 11/11/2026): an interpreter running
+    /// an inline program or its standard input vouches for nothing — the
+    /// LOTL ransomware of the triage, a webshell's `sh -c 'openssl enc …'`,
+    /// is judged, and the kill reaches the inline shell. A package
+    /// transaction stays trusted, as before.
+    #[test]
+    fn an_inline_program_vouches_for_nothing() {
+        let inline = |exe: &str, a: &[&str]| {
+            ExecIdentity::of_exec(exe, &a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        for (shell, program) in [
+            (
+                inline("/usr/bin/dash", &["sh", "-c", "openssl enc -in x"]),
+                "/usr/bin/dash",
+            ),
+            (
+                inline("/usr/bin/bash", &["bash", "-ec", "gpg -c x"]),
+                "/usr/bin/bash",
+            ),
+            (inline("/usr/bin/bash", &["bash", "-s"]), "/usr/bin/bash"),
+            (
+                inline("/usr/bin/python3.12", &["python3", "-c", "import os"]),
+                "/usr/bin/python3.12",
+            ),
+            (
+                inline("/usr/bin/perl", &["perl", "-e", "system 1"]),
+                "/usr/bin/perl",
+            ),
+            (
+                inline("/usr/bin/node", &["node", "--eval=x"]),
+                "/usr/bin/node",
+            ),
+            (inline("/bin/busybox", &["sh", "-c", "x"]), "/bin/busybox"),
+        ] {
+            assert!(is_foreign(&shell), "{shell:?}");
+            assert!(!vouches(&shell, &distro), "{shell:?}");
+            let l = [
+                (400, id("/usr/bin/openssl", None)),
+                (300, shell.clone()),
+                (250, id("/usr/sbin/php-fpm8.2", None)),
+                (1, id("/usr/lib/systemd/systemd", None)),
+            ];
+            // (the messages name what was expected, not the verdict: CodeQL's
+            // cleartext-logging query reads a `Trusted` value as sensitive)
+            let got = judge(400, Some(&l), false, &distro);
+            assert!(
+                matches!(
+                    &got,
+                    Judged::Untrusted { actor: 300, key: 400, program: p, why }
+                        if p == program && why.ends_with("which runs an inline program")
+                ),
+                "{shell:?}: expected judged, actor 300 (the inline shell), key 400"
+            );
+            // the inline shell itself as the writer
+            assert!(matches!(
+                judge(300, Some(&l[1..]), false, &distro),
+                Judged::Untrusted { actor: 300, .. }
+            ));
+            // a package transaction is trusted, as before
+            assert_eq!(
+                judge(400, Some(&l), true, &distro),
+                Judged::Trusted(Trusted::PackageTransaction)
+            );
+        }
+    }
+
+    /// BUG-49, what keeps vouching: an interactive shell a package
+    /// installed, a packaged daemon, a packaged script; and with no package
+    /// database to ask, a root-owned tree, as before. An interpreter no
+    /// package installed vouches for nothing, even running no script. Lot
+    /// 310: `bash -c x` left this list (the decision of 11/11/2026, below:
+    /// [`an_inline_program_vouches_for_nothing`]); a login shell (`-bash`,
+    /// `bash -l`, `bash -i`) stays in it.
     #[test]
     fn an_installed_shell_and_packaged_programs_still_vouch() {
         for shell in [
             id("/usr/bin/bash", None),
             id("/usr/bin/dash", None),
-            ExecIdentity::of_exec(
-                "/usr/bin/bash",
-                &["bash".to_string(), "-c".into(), "x".into()],
-            ),
+            ExecIdentity::of_exec("/usr/bin/bash", &["-bash".to_string()]),
+            ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string(), "-l".into()]),
+            ExecIdentity::of_exec("/usr/bin/bash", &["bash".to_string(), "-i".into()]),
         ] {
             let l = [
                 (400, id("/usr/bin/openssl", None)),
@@ -632,7 +1112,7 @@ mod tests {
         let l = [
             (400, id("/usr/bin/tar", None)),
             (300, id("/usr/bin/python3", Some("/usr/lib/borg/backup.py"))),
-            (200, id("/usr/lib/systemd/systemd", None)),
+            (1, id("/usr/lib/systemd/systemd", None)),
         ];
         assert!(matches!(
             judge(400, Some(&l), false, &distro),

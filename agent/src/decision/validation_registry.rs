@@ -174,8 +174,8 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
             crate::posture::lineage::AuthSessionTracker::default(),
             None,
         )),
-        // R14a: no worker launch to know here
-        None,
+        // R14a: no worker launch to know here (lot 310: nor an executor)
+        Default::default(),
     );
     let mut ids = BTreeMap::new();
     for r in &engine {

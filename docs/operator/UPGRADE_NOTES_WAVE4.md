@@ -1403,3 +1403,147 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   count ("runs without their buffer", `lost` in `--json`). A mapping
   report from the check's cache now carries the file's own path; it had the
   path of whatever that CPU had walked last.
+
+## 31. What an interpreter runs, and a fileless exec, read in one place (lot 310)
+
+- **One reader of an interpreter's options**
+  (`crates/nn-core/src/posture/script_args.rs`, the external bug hunt's
+  edition 1.4: BUG-97, BUG-99, BUG-100, N3; the independent review of #539).
+  bash's long options written with one hyphen before its first cluster
+  (`bash -noprofile x.sh`, `-norc`, `-rcfile F`, `-login`) are read as bash
+  reads them, and dash and busybox's `sh` with their own options (`-posix`
+  is `-p -o six` to dash, an error to busybox); node's `--eval=…`,
+  `--print=…` and `--run <task>` as inline code; zsh's and ksh's `-ovi` as
+  `-o vi`, and the name `-o` and `-O` take is checked (a name the shell does
+  not know makes it refuse the argv); perl reads on after a space inside one
+  argument (`'-i -e'`: an in-place edit, then the program). Each of them
+  used to move the identity onto an argument the caller chose: `bash
+  -noprofile /tmp/x.sh x /usr/bin/aws` was taken for the `aws` client and
+  its read of `~/.aws/credentials` drew no NN-L-FIM-011. An option the
+  reader's table does not hold, `--name=value` included, leaves what the
+  interpreter runs not known ("(options not understood)"): no client, no
+  installed program, no trusted writer — report the option, it joins the
+  table. So does an option that runs nothing (`--help`, `--version`, `-c`
+  syntax checks).
+- **Code loaded before the program named is the caller's.** node's `-r`,
+  `--require`, `--import`, `--loader`, `--env-file`, perl's `-M`, `-m`,
+  `-I`, `-d`, ruby's `-r`, `-I` leave a named script not known, an inline
+  program inline; so do python's `-i` (its standard input runs after the
+  script) and `-X pycache_prefix=`, node's `--test-reporter`, and an
+  environment that loads code — `PYTHONPATH`, `PYTHONHOME`,
+  `PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONPYCACHEPREFIX`, `NODE_PATH`,
+  `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `GEM_HOME`,
+  `GEM_PATH`, `BASH_ENV`, `SHELLOPTS`, `ZDOTDIR`, bash's exported functions
+  (`BASH_FUNC_*`), set and not empty; `NODE_OPTIONS` only when it names a
+  loading option (`--require`, `--import`, `--loader`…, read with node's
+  table: `--max-old-space-size` loads nothing); `PYTHONSTARTUP`, `ENV`,
+  `NODE_REPL_EXTERNAL_MODULE` only for an interpreter naming no program
+  (they load nothing into a script: a user's `PYTHONSTARTUP` leaves `aws`
+  its identity) — for an interpreter (or busybox's shell) naming an
+  installed script or nothing, as the exec pump reads it at the exec. An
+  environment larger than the pump reads (1 MiB) is taken to load. A
+  developer's `PERL5LIB` or `PYTHONPATH` therefore takes the client
+  identity from an installed perl or python program it runs (its reads of
+  a client's store are judged as any other process's).
+- **The kernel-resolved names of an interpreter are interpreters**
+  (BUG-104): `mono-sgen` and `mono-boehm` (what `/usr/bin/mono` resolves
+  to: KeePass 2's store read by its own process is its client again,
+  NN-L-FIM-016 no longer kills it), `mksh`, `lksh`, `pdksh`, `oksh`, and
+  busybox, which runs the program `argv[0]` names (`busybox sh`, `busybox
+  busybox sh`, an `argv[0]` starting `busybox`): as `/bin/sh` (Alpine, its
+  containers) a script it runs is that script; another applet is the
+  installed `/bin/busybox`, as before.
+- **An inline program vouches for nothing** (BUG-49, the decision of
+  11/11/2026). A shell or interpreter running a program its arguments carry
+  (`sh -c`, `bash -c`, `python3 -c`, `perl -e`, `node --eval`) or its
+  standard input (`sh -s`, `bash < file`, `curl … | sh`: a shell naming
+  nothing whose standard input is a file, a pipe or a socket) no longer
+  vouches for the packaged tools it starts: the ransomware signal judges
+  them (NN-L-IMP-001/-002; the kill held by default) and the copy guard
+  copies an editor it starts. Nor does a user's service manager
+  (`systemd --user`: `systemd-run --user /usr/bin/openssl enc …` was a
+  lineage of installed programs end to end), for any unit — a user moves
+  its own processes between the cgroups of its delegated subtree, so a unit
+  read from a cgroup proves nothing (lot 326 will record the unit's cgroup
+  in the kernel at its main exec). On a desktop the user's manager starts
+  the terminal emulator: the commands typed in it are judged (records, the
+  kills held by default; the copy guard copies their editors) — a cost
+  accepted for now. The record names the process the manager started,
+  never the manager. A package transaction and PID 1's units are trusted
+  as before, a unit's `ExecStart=/bin/sh -c …` included: an installed shell
+  PID 1 FORKED inherits PID 1's vouching. "Forked" is the kernel's record
+  at `sched_process_fork` (the exec record's `fork_ppid`; processes only,
+  not threads), for the first exec after the fork — carried in the kernel
+  through systemd's executor, by its verified identity (the packaged
+  file's, PID 1's copies: the eBPF map `EXECUTOR_IDS` the agent writes at
+  each 10 s read), to the unit's program — never the parent at exec time:
+  a webshell's double-forked orphan, which PID 1 reaps before its `sh -c`,
+  was forked by the webshell. A process forked before the agent started
+  has no record (judged); a record the map evicted under a flood of forks
+  is counted (`fork_record_lost` in the ring-drop counters; a record goes
+  at its process's exit, and a later exec of a process is no loss). One
+  more program attaches: `fork_parent_forget` on
+  `sched/sched_process_exit` (not attached: a warning; exited processes'
+  records then wait for the map to evict them). Expect more ransomware assessments of the tools a
+  cron job (a user's crontab or the system's: a job carries no owner in
+  this judgement) or a non-interactive `ssh host 'cmd'` runs; the lab
+  measured one on Ubuntu 24.04 — a user's crontab `sh -c 'rsync -a
+  --inplace …'` of random data drew NN-L-IMP-001 (Critical, its kill
+  held). A record names the shell ("which runs an inline program") or the
+  manager ("a user's service manager").
+- **A lineage the walk does not follow to PID 1 is not known, and vouches
+  for nothing** (the re-check 4 of #539). The walk reads a writer and at
+  most 32 ancestors; 33 nested `timeout`s (each a packaged program that
+  forks the next) put a webshell's `sh -c`, or a user's manager, above the
+  cut, and every hop read vouched. Now a walk that stops before PID 1 — the
+  cap, a parent that started after its child (a later process at an exited
+  parent's pid), a process its own parent — is a lineage not known: the
+  ransomware judge and the copy guard judge the writer ("its lineage could
+  not be read"), as for a hop that cannot be read. A deeper legitimate tree
+  is judged too (the kill held by default). The searches for a hop that
+  grants something (a package manager, an authentication binary, a client)
+  find nothing above the cut, as before; the defense-impairment rules
+  (NN-L-EVA-*) still look for a staged or deleted program among the hops
+  below it. As before this lot, a writer that is a fork which never
+  executes (`rsync`'s receiver) is read from `/proc` only: once it has
+  exited, its bursts judged after that have a lineage not known — a
+  unit's `rsync` may be judged where a unit's `cp` is vouched.
+- **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
+  file is a fileless exec whatever path reached it:
+  `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a
+  relative `fd/N`, a symlink to a descriptor, `/proc/<pid>/exe` and
+  `map_files/` ran an unlinked file without the kill before. In LSM mode
+  (the default) the exec sensor's identity says so; in tracepoint mode the
+  exec pump reads `/proc/<pid>/exe` (the same identity) while the process
+  lives, and the path, read by the posture's one reader of a `/proc` link
+  (`crates/nn-core/src/posture/proc_link.rs`: `..` folded outside a link,
+  `/proc/<pid>/root/…` chains followed), when it is gone. Not fileless:
+  - the agent's own worker;
+  - systemd's executor left unlinked by an upgrade, by its identity
+    (`(dev, ino)`), re-read every 10 s and replaced ("R004: systemd-
+    executor's identities changed" in the journal): a copy the host's PID 1
+    holds by that identity alone — no user can reach it, and a flood of
+    forks evicting the kernel's records must not stop a unit's launch after
+    an upgrade —; the packaged file at its install path (root's, listed by
+    the package database) or a copy a genuine user manager holds (its image
+    the packaged manager's, in PID 1's mount namespace) for the first exec
+    of a process PID 1 or such a manager FORKED (the kernel's record); no
+    longer by a
+    file *named* `systemd-executor` (BUG-103), by `argv[0]` and a parent
+    PID 1 in tracepoint mode, nor by a "manager" a user's namespace runs;
+  - a process re-executing the very image its parent runs
+    (`/proc/self/exe` after a package upgrade unlinked it: Chromium's and
+    Electron's children, Docker's `reexec`), when that image was executed
+    from a directory only root can write, by a process in PID 1's mount
+    namespace (a container's process gets no such exemption); the parents
+    running at the agent's start are read at its start. A user's dropped binary that
+    unlinks and re-executes itself is killed, as before.
+
+  Residual: a program re-executing itself in place (no fork) through
+  `/proc/self/exe` after an upgrade is killed; so is an exec that opens a
+  binary at the instant an upgrade renames its replacement over it
+  (microseconds). An identity a manager released stays exempt until the
+  next re-read (10 s); the kernel's identity carries no inode generation.
+  Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
+  refused: a signed degradation) no unit's shell vouches and only PID 1's
+  executor copies are exempt.

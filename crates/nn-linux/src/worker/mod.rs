@@ -118,6 +118,20 @@ impl SelfImage {
     pub fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
     }
+
+    /// Lot 310: the binary's identity as the exec sensor reports an
+    /// executed file — the device in the kernel's form (`MKDEV`, the
+    /// superblock's `s_dev`), not `stat(2)`'s encoding ([`Self::identity`]).
+    /// R004 compares it with a worker launch's (R14a); in stat's encoding
+    /// it matched no device with a major number (`/dev/sda2`, a
+    /// device-mapper root), and the launch from an unlinked image was taken
+    /// for a fileless exec.
+    pub fn exec_identity(&self) -> (u64, u64) {
+        (
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(self.dev),
+            self.ino,
+        )
+    }
 }
 
 /// The account a worker runs as.
@@ -183,6 +197,16 @@ mod tests {
         let md = std::fs::metadata("/proc/self/exe").unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(img.identity(), (md.dev(), md.ino()));
+        // lot 310: the exec sensor's form
+        assert_eq!(
+            img.exec_identity(),
+            (
+                crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(md.dev()),
+                md.ino()
+            )
+        );
+        let (major, minor) = (libc::major(md.dev()) as u64, libc::minor(md.dev()) as u64);
+        assert_eq!(img.exec_identity().0, (major << 20) | minor);
         // close-on-exec
         // SAFETY: F_GETFD on our descriptor.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };

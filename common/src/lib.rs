@@ -51,6 +51,9 @@ pub mod epg;
 /// Per-hook fail-open counter slots of the deny hooks, shared by the eBPF
 /// programs and the agent (lab PR 215). NOT `std`-gated.
 pub mod fail_open;
+/// Lot 310 (the re-check 4 of #539): what an exec does with its process's
+/// fork record — the eBPF exec program's decision, tested here.
+pub mod fork_record;
 /// Lot 280b: the kernel's taint flags, the ones that say foreign code
 /// entered it, and how much a new one weighs. NOT `std`-gated (the
 /// letters and meanings are).

@@ -32,10 +32,32 @@ pub(crate) fn own_launch(
     Some(nn_core::decision::rules::OwnWorkerLaunch {
         agent_pid: std::process::id(),
         exec_path: image.exec_path(),
-        image: image.identity(),
+        // lot 310: as the exec sensor reports an executed file (the
+        // kernel's device form)
+        image: image.exec_identity(),
         uid: account.uid,
         export_uid: WorkerAccount::lookup(EXPORT_USER).ok().map(|a| a.uid),
     })
+}
+
+/// Lot 310 (BUG-103): systemd's executor by its identities, for R004 — the
+/// files at its install paths and the ones systemd's managers hold open,
+/// read now; the install paths again every minute
+/// ([`super::tasks::spawn_executor_refresh`]), so an image an upgrade
+/// unlinks was recorded while it was linked.
+pub(crate) fn known_launches(
+    own_worker: Option<nn_core::decision::rules::OwnWorkerLaunch>,
+) -> nn_core::decision::rules::KnownLaunches {
+    let executor = nn_core::decision::rules::ExecutorImages::default();
+    let n = nn_linux::systemd_executor::seed(&executor);
+    info!(
+        identities = n,
+        "R004: systemd-executor known by its identity (install paths, managers' open copies)"
+    );
+    nn_core::decision::rules::KnownLaunches {
+        own_worker,
+        executor,
+    }
 }
 
 /// Start the supervisor. `image`: what `main` opened at boot; `export_on`:

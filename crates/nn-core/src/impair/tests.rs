@@ -835,6 +835,51 @@ fn sanctioned_and_suspicious_lineages() {
     );
 }
 
+/// The re-check 4 of #539: a lineage cut before PID 1 (here a parent that
+/// started after its child: a later process at an exited parent's pid) is
+/// not known to the judges that trust it whole; the search for a staged
+/// program still reads the hops below the cut.
+#[test]
+fn a_staged_script_below_a_cut_lineage_is_still_found() {
+    let h = host();
+    // the process at 899 started after 900 (and executed before the judged
+    // exec at 100 s): not 900's parent
+    h.lineage.ingest_exec(
+        899,
+        1,
+        "/usr/bin/bash",
+        &["bash".into()],
+        99 * S + S / 2,
+        99 * S + S / 2,
+        0,
+    );
+    h.lineage.ingest_exec(
+        900,
+        899,
+        "/usr/bin/bash",
+        &["bash".into(), "/tmp/.x/init.sh".into()],
+        99 * S,
+        99 * S,
+        0,
+    );
+    let f = h
+        .run(
+            901,
+            900,
+            "/usr/bin/systemctl",
+            &["systemctl", "stop", "aegis"],
+        )
+        .unwrap();
+    assert!(
+        h.lineage.lineage_identities(901, AsOf::Now).is_none(),
+        "cut"
+    );
+    assert_eq!(
+        f.suspicious,
+        Some((900, "/usr/bin/bash /tmp/.x/init.sh".to_string()))
+    );
+}
+
 #[test]
 fn loading_applies_the_shipped_copy() {
     let t = TempDir::new().unwrap();

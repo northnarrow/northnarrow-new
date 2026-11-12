@@ -28,6 +28,39 @@
 //! manager by its own exec identity. In tracepoint mode, with no exec
 //! identity, `argv[0]` must be an install path exactly and only PID 1
 //! counts as the parent.
+//!
+//! # Lot 310 (external bug hunt, edition 1.4: BUG-88, BUG-103)
+//!
+//! LSM mode (the default) decides on the executed file's own flags: a
+//! memfd, or an unlinked file (`i_nlink == 0`: `O_TMPFILE`, opened then
+//! deleted) is fileless **whatever path reached it**. It used to ask the
+//! caller's string to be `/proc/self/fd/N` too, and `/proc/thread-self/fd/N`,
+//! `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a relative `fd/3` from a
+//! `/proc/self` working directory, a symlink in a home directory, `/proc/<pid>/exe`
+//! and `map_files/` each ran an unlinked file without the kill. Three
+//! launches of an unlinked image are not fileless, each told by the
+//! kernel's identity of the file, never by its name:
+//!
+//! - the agent's own worker ([`OwnWorkerLaunch`], R14a);
+//! - systemd's executor left unlinked by an upgrade: its `(dev, ino)` is
+//!   one the packaged executor has on this host now ([`ExecutorImages`]:
+//!   the packaged file at its install path, the copies PID 1 and genuine
+//!   user managers hold — re-read every 10 s), for the first exec of a
+//!   process systemd FORKED (the kernel's record, `fork_parent`; the
+//!   re-check of #539, N1 and N2). BUG-103: it was a
+//!   file *named* `systemd-executor` in any root-owned tree — `/opt/app/`,
+//!   which an application's user often owns, included — with any parent;
+//! - a process re-executing the very image its parent runs (`(dev, ino)`
+//!   from the lineage's record of the parent's exec): Chromium's children
+//!   and Docker's `reexec` run `/proc/self/exe`, which after a package
+//!   upgrade is the unlinked old image. No new code runs: the parent ran
+//!   that file, and was judged, when it was linked.
+//!
+//! Tracepoint mode has no identity: the caller's path is read by the
+//! posture's one reader of a `/proc` link
+//! ([`crate::posture::proc_link::reopens_a_descriptor`]: every per-thread
+//! and `/dev` name of a descriptor, folded); a symlink or a relative path
+//! there is a residual of that mode.
 
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
@@ -56,7 +89,9 @@ pub struct OwnWorkerLaunch {
     pub agent_pid: u32,
     /// `/proc/self/fd/<n>`.
     pub exec_path: String,
-    /// `(st_dev, st_ino)` of the core's image.
+    /// `(dev, ino)` of the core's image, as the exec sensor reports an
+    /// executed file (lot 310: the device in the kernel's form, `MKDEV` —
+    /// it was `stat(2)`'s, which matched no device with a major number).
     pub image: (u64, u64),
     /// The `northnarrow-worker` account's uid.
     pub uid: u32,
@@ -74,7 +109,7 @@ impl OwnWorkerLaunch {
         argv: &[String],
         exe: &nn_model::ExeIdentity,
     ) -> bool {
-        use common::wire::exe::exe_flags::KNOWN;
+        use common::wire::exe::exe_flags::{KNOWN, PROC_EXE};
         let kind = match argv {
             [a0, w, kind, f, three]
                 if a0 == "northnarrow-agent"
@@ -99,18 +134,152 @@ impl OwnWorkerLaunch {
             && uid != 0
             && filename == self.exec_path
             && argv_ok
-            && (!exe.has(KNOWN) || (exe.dev, exe.ino) == self.image)
+            && (exe.flags & (KNOWN | PROC_EXE) == 0 || (exe.dev, exe.ino) == self.image)
     }
 }
 
+/// Lot 310 (BUG-103): the identities `(dev, ino)` the packaged
+/// `systemd-executor` has had on this host, as the exec sensor reports an
+/// executed file (the device in the kernel's form, `MKDEV`, not `stat(2)`'s
+/// encoding) — the files at its install paths
+/// as the agent saw them, and the ones systemd's managers held open when it
+/// started (`nn_linux::systemd_executor`). PID 1 keeps launching units from
+/// the image it opened until its re-exec, so an upgrade leaves it running
+/// an unlinked one; the agent's records keep the ones before (at most
+/// [`ExecutorImages::CAP`], the oldest out first). Shared: the agent's
+/// refresh records, R004 reads.
+#[derive(Clone, Debug, Default)]
+pub struct ExecutorImages(std::sync::Arc<parking_lot::RwLock<ExecutorSets>>);
+
+/// [`ExecutorImages`]' two sets.
+#[derive(Debug, Default)]
+struct ExecutorSets {
+    executors: Vec<(u64, u64)>,
+    /// Lot 310 (the re-check of #539, N1): the identities of systemd's
+    /// manager (the packaged binary, PID 1's image): a user's manager forks
+    /// the executor's launches too, and is told by its image.
+    managers: Vec<(u64, u64)>,
+    /// Lot 310 (re-check 3, decision 1): the executors the host's PID 1
+    /// holds open — an inode no user can reach (`/proc/1/fd` is root's):
+    /// an exec of one is exempt by its identity alone.
+    pid1_held: Vec<(u64, u64)>,
+}
+
+/// `ids` sorted, deduplicated, without `(0, 0)`, at most `cap`.
+fn normalised(mut ids: Vec<(u64, u64)>, cap: usize) -> Vec<(u64, u64)> {
+    ids.retain(|id| *id != (0, 0));
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(cap);
+    ids
+}
+
+impl ExecutorImages {
+    /// The identities kept: more than a host's upgrades between two
+    /// re-execs of its managers.
+    pub const CAP: usize = 16;
+
+    /// Record `id`; `true` when it is new. `(0, 0)` is no identity.
+    pub fn record(&self, id: (u64, u64)) -> bool {
+        if id == (0, 0) {
+            return false;
+        }
+        let mut s = self.0.write();
+        if s.executors.contains(&id) {
+            return false;
+        }
+        if s.executors.len() == Self::CAP {
+            s.executors.remove(0);
+        }
+        s.executors.push(id);
+        true
+    }
+
+    /// Lot 310 (the review of #539, finding 3): the identities the executor
+    /// has now, in place of every one before — an executor no manager holds
+    /// and no install path links any more is freed, and its inode number
+    /// may be a user's file's next (`(0, 0)` dropped, at most
+    /// [`Self::CAP`]). `true` when the set changed.
+    pub fn replace(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let mut before = s.executors.clone();
+        before.sort_unstable();
+        let changed = before != ids;
+        s.executors = ids;
+        changed
+    }
+
+    /// Lot 310 (the re-check of #539, N1): the manager's identities now
+    /// (the packaged `systemd`, PID 1's image), in place of the ones
+    /// before; `true` when the set changed.
+    pub fn replace_managers(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let changed = s.managers != ids;
+        s.managers = ids;
+        changed
+    }
+
+    /// Lot 310 (re-check 3, decision 1): the executors PID 1 holds now, in
+    /// place of the ones before; `true` when the set changed.
+    pub fn replace_pid1_held(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let changed = s.pid1_held != ids;
+        s.pid1_held = ids;
+        changed
+    }
+
+    /// `id` is an executor the host's PID 1 holds open (never `(0, 0)`).
+    pub fn held_by_pid1(&self, id: (u64, u64)) -> bool {
+        self.0.read().pid1_held.contains(&id)
+    }
+
+    /// How many executor identities there are.
+    pub fn len(&self) -> usize {
+        self.0.read().executors.len()
+    }
+
+    /// No executor identity.
+    pub fn is_empty(&self) -> bool {
+        self.0.read().executors.is_empty()
+    }
+
+    /// `id` is one the packaged executor had (never `(0, 0)`, which
+    /// [`Self::record`] refuses).
+    pub fn contains(&self, id: (u64, u64)) -> bool {
+        self.0.read().executors.contains(&id)
+    }
+
+    /// `id` is the manager's image (never `(0, 0)`).
+    pub fn is_manager(&self, id: (u64, u64)) -> bool {
+        self.0.read().managers.contains(&id)
+    }
+}
+
+/// What R004 knows of the launches that run an unlinked image without
+/// being fileless (lot 310): the agent's own worker's (R14a) and systemd's
+/// executor's.
+#[derive(Clone, Debug, Default)]
+pub struct KnownLaunches {
+    /// R14a: the agent's own worker launch (`None`: no worker).
+    pub own_worker: Option<OwnWorkerLaunch>,
+    /// Lot 310: systemd's executor, by its identities.
+    pub executor: ExecutorImages,
+}
+
 /// R004 rule. `lineage` resolves a `systemd --user` parent by what the
-/// kernel executed for it (external audit PROC-001); without it (unit
-/// tests) only PID 1 counts as systemd.
+/// kernel executed for it (external audit PROC-001), and (lot 310) the
+/// image a parent runs; without it (unit tests) only PID 1 counts as
+/// systemd and no parent's image is known.
 #[derive(Default)]
 pub struct R004ExecFromProcSelfFd<H: PostureHost> {
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
     /// R14a: the agent's own worker launch (`None`: no worker).
     own: Option<OwnWorkerLaunch>,
+    /// Lot 310: systemd's executor, by its identities (empty: none known).
+    executor: ExecutorImages,
 }
 
 impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
@@ -118,6 +287,7 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         Self {
             lineage: Some(lineage),
             own: None,
+            executor: ExecutorImages::default(),
         }
     }
 
@@ -127,92 +297,83 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         self
     }
 
-    /// True if the path looks like `/proc/self/fd/<n>` or
-    /// `/proc/<pid>/fd/<n>`. Both forms are the canonical way to exec
-    /// from a memfd or anonymous fd, which is a strong fileless-exec
-    /// signal.
+    /// Lot 310: this rule knowing the launches of an unlinked image that
+    /// are not fileless ([`KnownLaunches`]).
+    pub fn with_launches(mut self, launches: KnownLaunches) -> Self {
+        self.own = launches.own_worker;
+        self.executor = launches.executor;
+        self
+    }
+
+    /// Tracepoint mode: the caller's path reopens a descriptor — the
+    /// canonical way to exec from a memfd or an anonymous fd, a strong
+    /// fileless-exec signal. Lot 310 (BUG-88): read by the posture's one
+    /// reader of a `/proc` link ([`crate::posture::proc_link`]), which
+    /// knows the per-thread and `/dev` names (`/proc/thread-self/fd/N`,
+    /// `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`) and folds `//` and `.`;
+    /// it was a twin here that knew `/proc/self/fd/N`, `/proc/<pid>/fd/N`
+    /// and `/dev/fd/N` only. `/dev/fd/N` is what glibc's fexecve(3) passes
+    /// (lab guest, Ubuntu 24.04 / glibc 2.39), `/memfd:` what
+    /// execveat(AT_EMPTY_PATH) reports.
     fn is_proc_fd_path(path: &str) -> bool {
-        // `/dev/fd` is a symlink to `/proc/self/fd` and is what glibc's
-        // fexecve(3) actually passes to execve on a memfd (lab guest,
-        // Ubuntu 24.04 / glibc 2.39: the exec surfaced as
-        // `filename: "/dev/fd/4", comm: "memfd:nnx_memfd"` and R004
-        // stayed silent). `/memfd:` is what execveat(AT_EMPTY_PATH)
-        // reports. Both are the same fileless-exec signal.
-        if let Some(after) = path.strip_prefix("/dev/fd/") {
-            return !after.is_empty();
-        }
-        if path.starts_with("/memfd:") {
-            return true;
-        }
-        let rest = match path.strip_prefix("/proc/") {
-            Some(r) => r,
-            None => return false,
-        };
-        // /proc/self/fd/N
-        if let Some(after_self) = rest.strip_prefix("self/fd/") {
-            return !after_self.is_empty();
-        }
-        // /proc/<pid>/fd/N — first segment must be all-digits.
-        let mut parts = rest.splitn(3, '/');
-        let pid = parts.next().unwrap_or("");
-        let fd_lit = parts.next().unwrap_or("");
-        let after = parts.next().unwrap_or("");
-        if !pid.is_empty()
-            && pid.bytes().all(|b| b.is_ascii_digit())
-            && fd_lit == "fd"
-            && !after.is_empty()
-        {
-            return true;
-        }
-        false
+        path.starts_with("/memfd:") || crate::posture::proc_link::reopens_a_descriptor(path)
     }
 
-    /// Tracepoint mode (no exec identity): `argv[0]` must be one of the
-    /// executor's install paths exactly. External audit PROC-001
-    /// (NN-AUD-001): it used to be any string ending in
-    /// `/systemd-executor`, and the caller chooses `argv[0]`.
-    fn argv0_is_the_executor(argv: &[String]) -> bool {
-        const EXECUTOR_PATHS: &[&str] = &[
-            "/usr/lib/systemd/systemd-executor",
-            "/lib/systemd/systemd-executor",
-        ];
-        argv.first()
-            .is_some_and(|a| EXECUTOR_PATHS.contains(&a.as_str()))
-    }
-
-    /// LSM mode: the unlinked file reached through an fd is systemd's own
-    /// executor — PID 1 holds it open across a systemd upgrade and keeps
-    /// launching units from it until the next re-exec — a file named
-    /// `systemd-executor` in a root-owned system tree.
-    fn is_upgraded_executor(exe: &nn_model::ExeIdentity) -> bool {
-        let path = exe.path_or("");
-        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
-        path.rsplit('/').next() == Some("systemd-executor")
-            && crate::posture::lineage::in_system_tree(path)
-    }
-
-    /// External audit PROC-001: systemd launched it — PID 1 (the system
-    /// manager), or a `systemd --user` manager told by what the kernel
-    /// executed for the parent, never by its `comm`, which the parent sets
-    /// for itself with `prctl(PR_SET_NAME)`.
-    fn parented_by_systemd(&self, ppid: u32, as_of: crate::posture::lineage::AsOf) -> bool {
-        ppid == 1
-            || self.lineage.as_ref().is_some_and(|l| {
-                l.exec_identity(ppid, as_of).is_some_and(|id| {
-                    id.runs == crate::posture::lineage::Runs::Inline && id.is_client(&["systemd"])
-                })
-            })
-    }
-
-    /// Tracepoint mode: a `/proc/self/fd` exec that is the legitimate
-    /// launch of a systemd unit (both signals).
-    fn is_systemd_executor_launch(
+    /// The unlinked file is systemd's own executor — PID 1 holds it open
+    /// across a systemd upgrade and keeps launching units from it until the
+    /// next re-exec. Lot 310 (BUG-103): by its identity, one the packaged
+    /// executor has on this host now ([`ExecutorImages`]: linked at its
+    /// install path, or held by PID 1 or a genuine user manager), launched
+    /// by systemd. It was any file *named* `systemd-executor` in a
+    /// root-owned tree (`/opt/app/systemd-executor`), whatever its parent.
+    /// The re-check of #539 (N2): "launched by systemd" is the kernel's
+    /// record of who FORKED the process, for its first exec since
+    /// (`fork_parent`): PID 1, or a manager by its image — never the
+    /// parent at exec time, which an orphan's reaper is.
+    fn is_upgraded_executor(
         &self,
-        ppid: u32,
-        argv: &[String],
+        exe: &nn_model::ExeIdentity,
         as_of: crate::posture::lineage::AsOf,
     ) -> bool {
-        Self::argv0_is_the_executor(argv) && self.parented_by_systemd(ppid, as_of)
+        let id = (exe.dev, exe.ino);
+        // re-check 3 (decision 1): a copy the host's PID 1 holds is an inode
+        // no user can reach — by its identity alone, no fork record needed
+        // (a flood of forks evicting the records must not make R004 kill a
+        // unit's launch after a systemd upgrade)
+        self.executor.held_by_pid1(id)
+            || (self.executor.contains(id) && self.forked_by_a_manager(exe.fork_parent, as_of))
+    }
+
+    /// LSM mode, lot 310: the process re-executes the very image its
+    /// parent runs (the lineage's record of the parent's exec, its
+    /// `(dev, ino)`): `/proc/self/exe` after a package upgrade unlinked it
+    /// (Chromium's children, Docker's `reexec`). No new code runs.
+    fn reexecs_its_parent_image(
+        &self,
+        ppid: u32,
+        exe: &nn_model::ExeIdentity,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> bool {
+        (exe.dev, exe.ino) != (0, 0)
+            && self
+                .lineage
+                .as_ref()
+                .and_then(|l| l.exec_image(ppid, as_of))
+                == Some((exe.dev, exe.ino))
+    }
+
+    /// The re-check of #539 (N2): `fork_parent` (the kernel's record of
+    /// who forked the process, for its first exec; 0 not known) is the
+    /// host's PID 1, or a `systemd --user` manager told by the image the
+    /// lineage holds for it — the packaged manager's identity
+    /// ([`ExecutorImages::is_manager`]), never its name or its `comm`.
+    fn forked_by_a_manager(&self, fork_parent: u32, as_of: crate::posture::lineage::AsOf) -> bool {
+        fork_parent == 1
+            || (fork_parent != 0
+                && self.lineage.as_ref().is_some_and(|l| {
+                    l.exec_image(fork_parent, as_of)
+                        .is_some_and(|id| self.executor.is_manager(id))
+                }))
     }
 }
 
@@ -243,7 +404,7 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
         else {
             return None;
         };
-        use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
+        use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD, PROC_EXE};
         // R14a: the core starting its own worker from its boot descriptor
         if self
             .own
@@ -252,33 +413,34 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
         {
             return None;
         }
-        let via_fd = Self::is_proc_fd_path(filename);
-        if exe.has(KNOWN) {
+        let as_of = crate::posture::lineage::AsOf::of_event(event);
+        // lot 310 (the review of #539, finding 4): in tracepoint mode the
+        // exec pump reads the image from `/proc/<pid>/exe` (`PROC_EXE`) —
+        // the same facts, read while the process runs
+        if exe.flags & (KNOWN | PROC_EXE) != 0 {
             // External audit PROC-001 (NN-AUD-001): with the exec sensor's
             // identity, what the kernel executed decides, not the caller's
             // path, argv[0] or parent name. Fileless code is a memfd, or an
-            // unlinked file (O_TMPFILE) reached through an fd. A real file
-            // reached through an fd is not fileless: systemd-executor's
-            // fexecve of every unit is one, and the other rules judge any
-            // such file on its canonical path (review 61).
-            let fileless =
-                exe.has(MEMFD) || (via_fd && exe.has(DELETED) && !Self::is_upgraded_executor(exe));
+            // unlinked file (O_TMPFILE) — lot 310 (BUG-88): whatever path
+            // reached it, the caller's string no longer asked to be
+            // `/proc/self/fd/N`. A real file reached through an fd is not
+            // fileless: systemd-executor's fexecve of every unit is one, and
+            // the other rules judge any such file on its canonical path
+            // (review 61).
+            let fileless = exe.has(MEMFD)
+                || (exe.has(DELETED)
+                    && !self.is_upgraded_executor(exe, as_of)
+                    && !self.reexecs_its_parent_image(*ppid, exe, as_of));
             if !fileless {
                 return None;
             }
-        } else {
-            // Tracepoint mode: the path heuristic. Tappa 10.6.5: systemd's
-            // fexecve(/proc/self/fd/N) of systemd-executor launches every
-            // unit; it is exempt, on argv[0] exactly and a systemd parent.
-            if !via_fd
-                || self.is_systemd_executor_launch(
-                    *ppid,
-                    argv,
-                    crate::posture::lineage::AsOf::of_event(event),
-                )
-            {
-                return None;
-            }
+        } else if !Self::is_proc_fd_path(filename) {
+            // Tracepoint mode, the process gone before the pump read its
+            // image: the path heuristic. Lot 310 (finding 4): no exemption
+            // by `argv[0]` and a parent of pid 1 any more — the caller
+            // chooses `argv[0]`, and an orphan's parent is pid 1; systemd's
+            // launch of a unit is judged by its image above (a linked file)
+            return None;
         }
         Some(build_verdict(
             self,
@@ -334,9 +496,14 @@ mod tests {
             .evaluate(&event)
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
-        // a deleted file alone is no memfd (an upgraded binary re-exec'd)
+        // Lot 310 (BUG-88): an unlinked file is fileless whatever path
+        // reached it (this assertion said "a deleted file alone is no
+        // memfd", which left the per-thread names of a descriptor, a
+        // relative path and a symlink to it without the kill). An upgraded
+        // binary re-exec'd is told by its identity instead: the image its
+        // parent runs (`a_parents_own_image_reexecuted_is_not_fileless`).
         let event = spawn_exe("x", "/usr/bin/x", "/usr/bin/x", exe_flags::DELETED);
-        assert!(R004ExecFromProcSelfFd::default().evaluate(&event).is_none());
+        assert!(R004ExecFromProcSelfFd::default().evaluate(&event).is_some());
     }
 
     /// R14a: the core's own worker launch is not fileless — in LSM mode
@@ -572,16 +739,38 @@ mod tests {
         assert!(R004ExecFromProcSelfFd::default()
             .evaluate(&spawn("x", "/proc/self/fd/"))
             .is_none());
-        // Non-numeric pid does not count.
+        // Lot 310: the posture's one reader of a `/proc` link reads any
+        // second segment (`self`, `thread-self`, a pid): this assertion
+        // said a non-numeric one does not count. No `/proc` entry has
+        // such a name, so `/proc/abc/fd/3` is never executed, and the
+        // per-thread names (`thread-self`) are what it missed (BUG-88).
         assert!(R004ExecFromProcSelfFd::default()
             .evaluate(&spawn("x", "/proc/abc/fd/3"))
-            .is_none());
+            .is_some());
+        assert!(R004ExecFromProcSelfFd::default()
+            .evaluate(&spawn("x", "/proc/thread-self/fd/3"))
+            .is_some());
     }
 
     // ── Tappa 10.6.5 — systemd-executor exemption ──────────────────────
 
+    /// The tracepoint-mode event as the exec pump completes it (lot 310):
+    /// the image read from `/proc/<pid>/exe` (`PROC_EXE`), `flags` its facts.
+    fn with_proc_exe(mut e: Event, flags: u32) -> Event {
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.flags = flags | common::wire::exe::exe_flags::PROC_EXE;
+            (exe.dev, exe.ino) = (2049, 4321);
+        }
+        e
+    }
+
     /// `systemd-run sleep 10` and every other system unit: systemd
-    /// (ppid 1) fexecve's systemd-executor → must be EXEMPT.
+    /// (ppid 1) fexecve's systemd-executor → must be EXEMPT. Lot 310 (the
+    /// review of #539, finding 4): by the image the exec pump read — the
+    /// linked executor is no fileless exec — no longer by `argv[0]` and a
+    /// parent of pid 1 (this test's event had no image); without an image
+    /// (the process gone before the read), an exec through a descriptor
+    /// fires, whatever `argv[0]` says.
     #[test]
     fn exempts_systemd_executor_system_unit() {
         let ev = spawn_exec(
@@ -591,9 +780,12 @@ mod tests {
             &["/usr/lib/systemd/systemd-executor", "--deserialize", "68"],
         );
         assert!(
-            R004ExecFromProcSelfFd::default().evaluate(&ev).is_none(),
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&with_proc_exe(ev.clone(), 0))
+                .is_none(),
             "legitimate systemd-executor launch must not fire R004"
         );
+        assert!(R004ExecFromProcSelfFd::default().evaluate(&ev).is_some());
     }
 
     /// `--user` manager launch: the parent is a `systemd --user` manager,
@@ -609,7 +801,13 @@ mod tests {
             "systemd",
             &["/lib/systemd/systemd-executor", "--deserialize", "12"],
         );
-        assert!(R004ExecFromProcSelfFd::new(lineage).evaluate(&ev).is_none());
+        // lot 310: by the image the pump read (a linked executor)
+        let r = R004ExecFromProcSelfFd::new(lineage);
+        assert!(r.evaluate(&with_proc_exe(ev.clone(), 0)).is_none());
+        assert!(
+            r.evaluate(&ev).is_some(),
+            "no image: argv[0] exempts nothing"
+        );
     }
 
     /// External audit PROC-001 (NN-AUD-001): a parent that only NAMES
@@ -666,13 +864,41 @@ mod tests {
             TASK_ROOT,
         );
         assert!(r.evaluate(&unit).is_none());
-        // the same after a systemd upgrade: PID 1 holds the old, unlinked one
-        let upgraded = ev(
-            "/proc/self/fd/9",
-            "/usr/lib/systemd/systemd-executor (deleted)",
-            DELETED,
-        );
-        assert!(r.evaluate(&upgraded).is_none());
+        // the same after a systemd upgrade: PID 1 holds the old, unlinked
+        // one. Lot 310 (BUG-103): exempt only as the identity the packaged
+        // executor had (recorded by the agent) and launched by systemd —
+        // this assertion exempted it on its name from a bash parent
+        let images = ExecutorImages::default();
+        assert!(images.record((2049, 1001)));
+        let r_known = R004ExecFromProcSelfFd::default().with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images,
+        });
+        // the re-check of #539 (N2): by who FORKED it (the kernel's record,
+        // `fork_parent`), not by its parent at exec time
+        let upgraded = |forker: u32, id: (u64, u64)| {
+            let mut e = ev(
+                "/proc/self/fd/9",
+                "/usr/lib/systemd/systemd-executor",
+                DELETED,
+            );
+            if let Event::ProcessSpawn {
+                ppid: p, exe: x, ..
+            } = &mut e
+            {
+                *p = 1;
+                x.fork_parent = forker;
+                (x.dev, x.ino) = id;
+            }
+            e
+        };
+        assert!(r_known.evaluate(&upgraded(1, (2049, 1001))).is_none());
+        // forked by a bash (an orphan PID 1 reaped before its exec), the
+        // fork not known (a later exec), another identity, none recorded
+        assert!(r_known.evaluate(&upgraded(7777, (2049, 1001))).is_some());
+        assert!(r_known.evaluate(&upgraded(0, (2049, 1001))).is_some());
+        assert!(r_known.evaluate(&upgraded(1, (2049, 1002))).is_some());
+        assert!(r.evaluate(&upgraded(1, (2049, 1001))).is_some());
         // fileless: a memfd (whatever argv[0] and parent claim), or an
         // unlinked file reached through an fd (O_TMPFILE)
         assert!(r
@@ -762,20 +988,520 @@ mod tests {
         );
     }
 
+    /// Lot 310 (the review of #539, finding 4): `argv[0]` exempts nothing
+    /// in tracepoint mode — not an install path of the executor (this test
+    /// checked the matcher that held it), not with a parent of pid 1 (an
+    /// orphan's parent is pid 1): the caller chooses both.
     #[test]
-    fn executor_argv0_matcher_is_exact() {
-        let argv = |a: &str| vec![a.to_string()];
-        assert!(R004ExecFromProcSelfFd::argv0_is_the_executor(&argv(
-            "/usr/lib/systemd/systemd-executor"
-        )));
-        assert!(R004ExecFromProcSelfFd::argv0_is_the_executor(&argv(
-            "/lib/systemd/systemd-executor"
-        )));
-        assert!(!R004ExecFromProcSelfFd::argv0_is_the_executor(&argv(
-            "/tmp/x/systemd-executor"
-        )));
-        assert!(!R004ExecFromProcSelfFd::argv0_is_the_executor(&argv(
-            "/usr/bin/ls"
-        )));
+    fn executor_argv0_exempts_nothing_in_tracepoint_mode() {
+        for a0 in [
+            "/usr/lib/systemd/systemd-executor",
+            "/lib/systemd/systemd-executor",
+        ] {
+            for f in ["/proc/self/fd/9", "/proc/thread-self/fd/9", "/dev/fd/9"] {
+                let ev = spawn_exec(f, 1, "systemd", &[a0, "--deserialize", "3"]);
+                assert!(
+                    R004ExecFromProcSelfFd::default().evaluate(&ev).is_some(),
+                    "{a0} {f}"
+                );
+            }
+        }
+        // an unlinked image the pump read: fileless, whatever argv[0] says
+        let ev = spawn_exec(
+            "/proc/self/fd/9",
+            1,
+            "systemd",
+            &["/usr/lib/systemd/systemd-executor"],
+        );
+        assert!(R004ExecFromProcSelfFd::default()
+            .evaluate(&with_proc_exe(ev, common::wire::exe::exe_flags::DELETED))
+            .is_some());
+    }
+}
+
+/// Lot 310 (external bug hunt, edition 1.4): BUG-88 and BUG-103.
+#[cfg(test)]
+mod lot310 {
+    use super::*;
+    use crate::posture::host::testing::TestHost as H;
+    use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD, ROOT_DIR};
+    type R004 = R004ExecFromProcSelfFd<H>;
+
+    fn exec(uid: u32, ppid: u32, filename: &str, exe_path: &str, flags: u32) -> Event {
+        Event::ProcessSpawn {
+            pid: 4242,
+            ppid,
+            uid,
+            gid: uid,
+            comm: "x".to_string(),
+            filename: filename.to_string(),
+            timestamp_ns: 42,
+            argv: vec!["anything".to_string()],
+            parent_comm: "bash".to_string(),
+            parent_start_ns: 0,
+            start_ns: 0,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: exe_path.to_string(),
+                dev: if exe_path.is_empty() { 0 } else { 2049 },
+                ino: if exe_path.is_empty() { 0 } else { 777 },
+                flags: if flags == 0 && exe_path.is_empty() {
+                    0
+                } else {
+                    flags | KNOWN
+                },
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        }
+    }
+
+    fn kills(v: Option<Verdict>) -> bool {
+        v.is_some_and(|v| v.action == ResponseAction::KillProcessTree)
+    }
+
+    /// The per-thread names of the same descriptor, and the `/dev`
+    /// symlinks to fds 0..2 (the report's forms).
+    const PER_THREAD: &[&str] = &[
+        "/proc/thread-self/fd/3",
+        "/proc/self/task/4242/fd/3",
+        "/proc/4242/task/4242/fd/3",
+        "/dev/stdin",
+    ];
+
+    /// BUG-88, LSM mode (the default): an unlinked file (O_TMPFILE, or
+    /// opened then deleted) reached through descriptor 3 fires with
+    /// `/proc/self/fd/3`; the per-thread names must fire alike.
+    #[test]
+    fn bug88_lsm_unlinked_file_via_per_thread_fd_is_fileless() {
+        let r = R004::default();
+        assert!(kills(r.evaluate(&exec(
+            1000,
+            7777,
+            "/proc/self/fd/3",
+            "/home/u/#1234",
+            DELETED
+        ))));
+        let missed: Vec<&str> = PER_THREAD
+            .iter()
+            .copied()
+            .filter(|f| !kills(r.evaluate(&exec(1000, 7777, f, "/home/u/#1234", DELETED))))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "LSM, unlinked file through an fd: no R004 kill for {missed:?}"
+        );
+    }
+
+    /// BUG-88, tracepoint mode (no exec identity): a memfd fexecve'd
+    /// through the per-thread name of its descriptor.
+    #[test]
+    fn bug88_tracepoint_per_thread_fd_is_fileless() {
+        let r = R004::default();
+        let missed: Vec<&str> = PER_THREAD
+            .iter()
+            .copied()
+            .chain([
+                "/proc//self/fd/3",
+                "/proc/self/./fd/3",
+                "/proc/self/task/../fd/3",
+            ])
+            .filter(|f| !kills(r.evaluate(&exec(1000, 7777, f, "", 0))))
+            .collect();
+        assert!(missed.is_empty(), "tracepoint: no R004 kill for {missed:?}");
+        // the image and a view are no descriptor: an exec of
+        // `/proc/self/exe` (Chromium's children) is not fileless here
+        for f in ["/proc/self/exe", "/proc/self/root/usr/bin/ls", "/dev/null"] {
+            assert!(r.evaluate(&exec(1000, 7777, f, "", 0)).is_none(), "{f}");
+        }
+    }
+
+    /// Beyond the report's fix: the caller's string has unbounded
+    /// spellings of the same descriptor — relative to a `/proc/self`
+    /// cwd, a doubled slash, a `.` segment, a symlink to it in a home —
+    /// and the other proc links that reopen an unlinked image (`exe`,
+    /// `map_files/`). In LSM mode the file's own flag decides: the six of
+    /// the triage, and an O_TMPFILE in `$HOME` (its dentry's path as the
+    /// LSM walk gives it).
+    #[test]
+    fn bug88_other_spellings_the_report_fix_still_misses() {
+        let r = R004::default();
+        let missed: Vec<&str> = [
+            "fd/3",
+            "/proc//self/fd/3",
+            "/proc/self/./fd/3",
+            "/home/u/link-to-proc-self-fd-3",
+            // other proc links that reopen an unlinked image
+            "/proc/4242/exe",
+            "/proc/self/map_files/7f0000000000-7f0000001000",
+        ]
+        .into_iter()
+        .filter(|f| !kills(r.evaluate(&exec(1000, 7777, f, "/home/u/#1234", DELETED))))
+        .collect();
+        assert!(
+            missed.is_empty(),
+            "LSM, unlinked file through an fd: no R004 kill for {missed:?}"
+        );
+        // O_TMPFILE in the home directory, through `/dev/fd/N` (glibc's
+        // fexecve) and the per-thread name: the dentry is `#<ino>`
+        for f in ["/dev/fd/5", "/proc/thread-self/fd/5"] {
+            assert!(
+                kills(r.evaluate(&exec(1000, 7777, f, "/home/u/#5242934", DELETED))),
+                "{f}"
+            );
+        }
+    }
+
+    /// Guard: a memfd fires in LSM mode whatever path reached it.
+    #[test]
+    fn bug88_guard_lsm_memfd_fires_whatever_the_path() {
+        let r = R004::default();
+        for f in PER_THREAD.iter().copied().chain(["fd/3", "/home/u/l"]) {
+            assert!(
+                kills(r.evaluate(&exec(1000, 7777, f, "/memfd:x", MEMFD))),
+                "{f}"
+            );
+        }
+    }
+
+    /// BUG-103: the exemption for systemd's executor left unlinked by an
+    /// upgrade was bought by the file name alone in any `in_system_tree`
+    /// tree (`/opt/` included, where an application user often owns its
+    /// subtree; any parent, any uid). It is the identity the packaged
+    /// executor had on this host, launched by systemd.
+    #[test]
+    fn bug103_unlinked_systemd_executor_under_opt_is_fileless() {
+        let images = ExecutorImages::default();
+        images.record((2049, 1001));
+        let r = R004::default().with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images,
+        });
+        // control: the same exec, another file name, fires
+        assert!(kills(r.evaluate(&exec(
+            1001,
+            7777,
+            "/proc/self/fd/3",
+            "/opt/app/payload",
+            DELETED
+        ))));
+        // control: the real executor unlinked by an upgrade (its identity,
+        // PID 1 its parent) stays exempt
+        let mut real = exec(
+            0,
+            1,
+            "/proc/self/fd/9",
+            "/usr/lib/systemd/systemd-executor",
+            DELETED,
+        );
+        if let Event::ProcessSpawn { exe, .. } = &mut real {
+            (exe.dev, exe.ino) = (2049, 1001);
+            exe.fork_parent = 1;
+        }
+        assert!(r.evaluate(&real).is_none());
+        let missed: Vec<&str> = [
+            "/opt/app/systemd-executor",
+            "/usr/local/lib/x/systemd-executor",
+            // the install path itself, another identity
+            "/usr/lib/systemd/systemd-executor",
+        ]
+        .into_iter()
+        .filter(|p| !kills(r.evaluate(&exec(1001, 7777, "/proc/self/fd/3", p, DELETED))))
+        .collect();
+        assert!(
+            missed.is_empty(),
+            "an unlinked file named systemd-executor that is not the executor: no R004 kill for {missed:?}"
+        );
+        // as PID 1's child, too: an identity is not a name
+        assert!(kills(r.evaluate(&exec(
+            0,
+            1,
+            "/proc/self/fd/9",
+            "/opt/app/systemd-executor",
+            DELETED
+        ))));
+    }
+
+    /// Lot 310: a process that re-executes the very image its parent runs
+    /// (the lineage's `(dev, ino)` of the parent's exec) runs no new code —
+    /// `/proc/self/exe` after an upgrade unlinked it (Chromium's children,
+    /// Docker's `reexec`). Another image, or a parent the lineage holds no
+    /// identity for, fires.
+    #[test]
+    fn a_parents_own_image_reexecuted_is_not_fileless() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        // lot 310 (the review of #539, finding 5): the exec pump found the
+        // parent's directory root's only (`ROOT_DIR`)
+        let parent = |pid: u32, id: (u64, u64)| Event::ProcessSpawn {
+            pid,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            comm: "chrome".into(),
+            filename: "/opt/google/chrome/chrome".into(),
+            timestamp_ns: 10,
+            argv: vec!["chrome".into()],
+            parent_comm: "systemd".into(),
+            parent_start_ns: 0,
+            start_ns: 10,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: "/opt/google/chrome/chrome".into(),
+                dev: id.0,
+                ino: id.1,
+                flags: KNOWN | common::wire::exe::exe_flags::ROOT_DIR,
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        lineage.ingest_spawn_event(&parent(7777, (2049, 777)));
+        lineage.ingest_spawn_event(&parent(8888, (2049, 999)));
+        let r = R004::new(lineage);
+        // the child runs the parent's image, unlinked since
+        assert!(r
+            .evaluate(&exec(
+                1000,
+                7777,
+                "/proc/self/exe",
+                "/opt/google/chrome/chrome",
+                DELETED
+            ))
+            .is_none());
+        // another image than its parent's
+        assert!(kills(r.evaluate(&exec(
+            1000,
+            8888,
+            "/proc/self/exe",
+            "/opt/google/chrome/chrome",
+            DELETED
+        ))));
+        // a parent the lineage does not hold
+        assert!(kills(r.evaluate(&exec(
+            1000,
+            9999,
+            "/proc/self/exe",
+            "/opt/google/chrome/chrome",
+            DELETED
+        ))));
+        // a memfd is never its parent's image
+        assert!(kills(r.evaluate(&exec(
+            1000,
+            7777,
+            "/proc/self/fd/3",
+            "/memfd:x",
+            MEMFD
+        ))));
+    }
+
+    /// The review of #539 (finding 5): a program a user dropped, which
+    /// unlinks itself and re-executes its image through a descriptor, is
+    /// fileless — as on main: its directory is the user's (no `ROOT_DIR`),
+    /// so its image is no exemption. The same in tracepoint mode, by the
+    /// image the pump read.
+    #[test]
+    fn a_dropped_binary_that_unlinks_and_reexecutes_itself_is_killed() {
+        use common::wire::exe::exe_flags::{PROC_EXE, ROOT_DIR};
+        for flags in [KNOWN, PROC_EXE] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+            let mut dropper = exec(1000, 1, "/tmp/.x", "/tmp/.x", 0);
+            if let Event::ProcessSpawn { pid, exe, .. } = &mut dropper {
+                *pid = 7100;
+                exe.flags = flags;
+            }
+            lineage.ingest_spawn_event(&dropper);
+            assert_eq!(
+                lineage.exec_image(7100, crate::posture::lineage::AsOf::Now),
+                None
+            );
+            let r = R004::new(lineage);
+            let mut child = exec(1000, 7100, "/proc/7100/fd/4", "/tmp/.x", DELETED);
+            if let Event::ProcessSpawn { exe, .. } = &mut child {
+                exe.flags = flags | DELETED;
+            }
+            assert!(kills(r.evaluate(&child)), "{flags:#x}");
+            // the same parent from a directory only root writes: exempt
+            let tmp = tempfile::TempDir::new().unwrap();
+            let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+            if let Event::ProcessSpawn { exe, .. } = &mut dropper {
+                exe.flags = flags | ROOT_DIR;
+            }
+            lineage.ingest_spawn_event(&dropper);
+            assert!(R004::new(lineage).evaluate(&child).is_none(), "{flags:#x}");
+        }
+    }
+
+    /// The review of #539 (finding 3) and its re-check (N1, N2): the
+    /// executor is what a manager runs first in a child it FORKED — the
+    /// kernel's record of the forker (`fork_parent`), never the parent at
+    /// exec time. PID 1's fork: exempt; a later exec (no record), an
+    /// orphan a shell forked and PID 1 reaped before its exec: killed. A
+    /// user's manager by its image: the packaged manager's identity
+    /// exempts; a "manager" a user's namespace runs (`/usr/lib/systemd/
+    /// systemd` bound over another file: its image is that file's), or one
+    /// whose image the lineage does not hold, does not.
+    #[test]
+    fn the_executor_is_a_child_s_first_exec() {
+        let images = ExecutorImages::default();
+        images.record((2049, 1001));
+        images.replace_managers(vec![(2049, 900)]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let r = R004::new(lineage.clone()).with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images,
+        });
+        let launch = |pid: u32, ppid: u32, forker: u32| {
+            let mut e = exec(
+                0,
+                ppid,
+                "/proc/self/fd/9",
+                "/usr/lib/systemd/systemd-executor",
+                DELETED,
+            );
+            if let Event::ProcessSpawn { pid: p, exe, .. } = &mut e {
+                *p = pid;
+                (exe.dev, exe.ino) = (2049, 1001);
+                exe.fork_parent = forker;
+            }
+            e
+        };
+        assert!(r.evaluate(&launch(5100, 1, 1)).is_none(), "PID 1's fork");
+        assert!(kills(r.evaluate(&launch(5200, 1, 0))), "not the first exec");
+        assert!(kills(r.evaluate(&launch(5300, 1, 4444))), "an orphan");
+        // a user's manager, by its image
+        let manager = |pid: u32, id: (u64, u64)| {
+            let mut m = exec(
+                1000,
+                1,
+                "/usr/lib/systemd/systemd",
+                "/usr/lib/systemd/systemd",
+                ROOT_DIR,
+            );
+            if let Event::ProcessSpawn { pid: p, exe, .. } = &mut m {
+                *p = pid;
+                (exe.dev, exe.ino) = id;
+            }
+            assert!(lineage.ingest_spawn_event(&m));
+        };
+        manager(2001, (2049, 900));
+        assert!(
+            r.evaluate(&launch(5400, 2001, 2001)).is_none(),
+            "a user's manager"
+        );
+        // the reviewer's probe: `unshare -Urm`, `/bin/sleep` bound over
+        // `/usr/lib/systemd/systemd` — the path is systemd's, the image
+        // sleep's
+        manager(2002, (2049, 777));
+        assert!(
+            kills(r.evaluate(&launch(5500, 2002, 2002))),
+            "a fake manager"
+        );
+        assert!(kills(r.evaluate(&launch(5600, 2003, 2003))), "not held");
+    }
+    /// No identity is no image: a parent the LSM program gave `(0, 0)` (in
+    /// a root's directory) is held with no image — lot 310, the review of
+    /// #539: the lineage keeps none rather than `(0, 0)` — and does not
+    /// exempt a child whose file has none either.
+    #[test]
+    fn no_identity_is_no_parents_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let mut parent = exec(
+            1000,
+            1,
+            "/usr/bin/x",
+            "/usr/bin/x",
+            common::wire::exe::exe_flags::ROOT_DIR,
+        );
+        if let Event::ProcessSpawn { pid, exe, .. } = &mut parent {
+            *pid = 7000;
+            (exe.dev, exe.ino) = (0, 0);
+        }
+        assert!(lineage.ingest_spawn_event(&parent));
+        assert_eq!(
+            lineage.exec_image(7000, crate::posture::lineage::AsOf::Now),
+            None
+        );
+        let r = R004::new(lineage);
+        let mut child = exec(1000, 7000, "/proc/self/exe", "/usr/bin/x", DELETED);
+        if let Event::ProcessSpawn { exe, .. } = &mut child {
+            (exe.dev, exe.ino) = (0, 0);
+        }
+        assert!(kills(r.evaluate(&child)));
+    }
+
+    /// Re-check 3 (decision 1): a unit's launch through the deleted executor
+    /// PID 1 holds is exempt with no fork record (a flood evicted it, the
+    /// fork predates the agent): no user can reach that inode. Another
+    /// identity of the set — a user's manager's copy, the packaged file —
+    /// still needs the fork record.
+    #[test]
+    fn a_pid_1_held_executor_needs_no_fork_record() {
+        let images = ExecutorImages::default();
+        images.record((2049, 1001));
+        images.record((2049, 1002));
+        images.replace_pid1_held(vec![(2049, 1001)]);
+        let r = R004::default().with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images,
+        });
+        let launch = |id: (u64, u64), forker: u32| {
+            let mut e = exec(
+                0,
+                1,
+                "/proc/self/fd/9",
+                "/usr/lib/systemd/systemd-executor",
+                DELETED,
+            );
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                (exe.dev, exe.ino) = id;
+                exe.fork_parent = forker;
+            }
+            e
+        };
+        assert!(
+            r.evaluate(&launch((2049, 1001), 0)).is_none(),
+            "no fork record"
+        );
+        assert!(
+            r.evaluate(&launch((2049, 1001), 4444)).is_none(),
+            "any forker"
+        );
+        assert!(
+            kills(r.evaluate(&launch((2049, 1002), 0))),
+            "not PID 1's: a record needed"
+        );
+        assert!(
+            r.evaluate(&launch((2049, 1002), 1)).is_none(),
+            "PID 1 forked it"
+        );
+    }
+
+    /// The executor's identities: at most [`ExecutorImages::CAP`], the
+    /// oldest out first; `(0, 0)` is never one.
+    #[test]
+    fn the_executor_s_identities_are_bounded_and_never_zero() {
+        let images = ExecutorImages::default();
+        assert!(!images.record((0, 0)));
+        assert!(!images.contains((0, 0)));
+        for i in 0..ExecutorImages::CAP as u64 {
+            assert!(images.record((1, i + 1)));
+        }
+        assert!(!images.record((1, 1)), "known");
+        assert!(images.record((1, 999)));
+        assert!(!images.contains((1, 1)), "the oldest went out");
+        assert!(images.contains((1, 2)) && images.contains((1, 999)));
+        // a refresh's replacement: `(0, 0)` is never one either
+        let images = ExecutorImages::default();
+        assert!(images.replace(vec![(0, 0), (1, 2), (1, 2)]));
+        assert!(!images.contains((0, 0)));
+        assert_eq!(images.len(), 1);
+        assert!(!images.replace(vec![(1, 2), (0, 0)]), "the same set");
     }
 }

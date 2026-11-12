@@ -23,6 +23,8 @@ pub mod ebpf_object;
 pub mod epg;
 pub mod exe_identity;
 pub mod exec;
+/// Lot 310: what the exec pump reads of an exec's process while it runs.
+pub mod exec_facts;
 pub mod flow_sock;
 /// Lot 279: the exec pump's reading of a module tool's exec (R011).
 pub mod kmod_exec;

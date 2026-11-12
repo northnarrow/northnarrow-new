@@ -1,0 +1,452 @@
+{
+ "about": "Lot 310 (external bug hunt, edition 1.4: BUG-97, BUG-99, BUG-100, BUG-104's sibling, N3; the mini-hunt's variants): a user's process reads ~/.aws/credentials under the name `aws` while it runs a script of /tmp or an inline program, and names /usr/bin/aws only as an argument its interpreter's options consume \u2014 bash's long options with one hyphen (-noprofile, -rcfile F, -norc -login), node's --eval=, --print=, --run, zsh's and mksh's -o with its name attached, busybox as sh \u2014 each NN-L-FIM-011 (High, KillProcess). Control: the real client (python3 running /usr/bin/aws) reads its store, nothing. On main each misread argv was taken for the aws client and the rule was silent.",
+ "fires": [
+  "NN-L-FIM-011_AwsCredsRead"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3699000000000,
+     "argv": [
+      "-bash"
+     ],
+     "parent_comm": "sshd",
+     "start_ns": 3698999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 500
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200011,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3700000000000,
+     "argv": [
+      "bash",
+      "-noprofile",
+      "/tmp/steal.sh",
+      "x",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3699999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600011
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200012,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3701000000000,
+     "argv": [
+      "bash",
+      "-rcfile",
+      "/etc/x",
+      "/tmp/steal.sh",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3700999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600012
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200013,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3702000000000,
+     "argv": [
+      "bash",
+      "-norc",
+      "-login",
+      "/tmp/steal.sh",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3701999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600013
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200014,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "node",
+     "filename": "/usr/bin/node",
+     "timestamp_ns": 3703000000000,
+     "argv": [
+      "node",
+      "--eval=steal()",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3702999000000,
+     "exe": {
+      "path": "/usr/bin/node",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600014
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200015,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "node",
+     "filename": "/usr/bin/node",
+     "timestamp_ns": 3704000000000,
+     "argv": [
+      "node",
+      "--print=steal()",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3703999000000,
+     "exe": {
+      "path": "/usr/bin/node",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600015
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200016,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "node",
+     "filename": "/usr/bin/node",
+     "timestamp_ns": 3705000000000,
+     "argv": [
+      "node",
+      "--run",
+      "x",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3704999000000,
+     "exe": {
+      "path": "/usr/bin/node",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600016
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200017,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "zsh",
+     "filename": "/usr/bin/zsh",
+     "timestamp_ns": 3706000000000,
+     "argv": [
+      "zsh",
+      "-ovi",
+      "/tmp/steal.zsh",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3705999000000,
+     "exe": {
+      "path": "/usr/bin/zsh",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600017
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200018,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "mksh",
+     "filename": "/usr/bin/mksh",
+     "timestamp_ns": 3707000000000,
+     "argv": [
+      "mksh",
+      "-onoclobber",
+      "/tmp/steal.sh",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3706999000000,
+     "exe": {
+      "path": "/usr/bin/mksh",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600018
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200019,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3708000000000,
+     "argv": [
+      "sh",
+      "/tmp/steal.sh",
+      "/usr/bin/aws"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3707999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600019
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200021,
+     "ppid": 6200001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "python3.12",
+     "filename": "/usr/bin/python3.12",
+     "timestamp_ns": 3709000000000,
+     "argv": [
+      "/usr/bin/python3",
+      "/usr/bin/aws",
+      "s3",
+      "ls"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3708999000000,
+     "exe": {
+      "path": "/usr/bin/python3.12",
+      "flags": 1,
+      "dev": 2049,
+      "ino": 600021
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3750000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/bash",
+     "modifier_pid": 6200011,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3751000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/bash",
+     "modifier_pid": 6200012,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3752000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/bash",
+     "modifier_pid": 6200013,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3753000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/node",
+     "modifier_pid": 6200014,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3754000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/node",
+     "modifier_pid": 6200015,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3755000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/node",
+     "modifier_pid": 6200016,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3756000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/zsh",
+     "modifier_pid": 6200017,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3757000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/mksh",
+     "modifier_pid": 6200018,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3758000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/bin/busybox",
+     "modifier_pid": 6200019,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3759000000000,
+     "path": "/home/u/.aws/credentials",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/python3.12",
+     "modifier_pid": 6200021,
+     "modifier_uid": 1000,
+     "modifier_comm": "aws"
+    }
+   }
+  }
+ ]
+}
