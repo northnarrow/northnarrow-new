@@ -14,10 +14,12 @@
 //! The rule: in the production code of the agent and the crates it is
 //! built from (`agent/src`, `crates/*/src`, `watchdog/src`,
 //! `antitamper-bpf/src`, `scan/src`; test files and `#[cfg(test)]` items
-//! aside) `catch_unwind` is called only at the sites [`REVIEWED`] lists,
-//! each with what its fallback does — never a claim that the work was done,
-//! never the only place a piece of work goes. And the release profile
-//! still aborts, the premise of all of it.
+//! aside) a panic fallback — `catch_unwind`, and (the review of #541, F8)
+//! a thread's `join()` whose `Err` is read, a task's `is_panic()`,
+//! `std::thread::panicking()` in a guard — sits only at the sites
+//! [`REVIEWED`] lists, each with what its fallback does: never a claim that
+//! the work was done, never the only place a piece of work goes. And the
+//! release profile still aborts, the premise of all of it.
 
 mod support;
 
@@ -25,31 +27,78 @@ use std::fs;
 
 use support::{is_test_file, production, repo_root, rs_files, strip_comments};
 
-/// The `catch_unwind` calls of production code: (file, the function it
-/// sits in, what its fallback does).
-const REVIEWED: &[(&str, &str, &str)] = &[
+/// The panic fallbacks of production code: (file, the function it sits
+/// in, the kind — `catch_unwind`, `join` (a thread's `join()` whose `Err`
+/// is read), `is_panic` (a task's), `panicking` (`std::thread::panicking()`
+/// in a guard's `Drop`) —, what its fallback does).
+const REVIEWED: &[(&str, &str, &str, &str)] = &[
     (
         "agent/src/cow/guard.rs",
         "fn spawn_threads",
+        "catch_unwind",
         "the fanotify reader ended: the group is closed (no open waits on a guard without a \
          reader), the state says stopped, a signed degradation",
     ),
     (
         "agent/src/pipeline/dispatch.rs",
         "fn run_one",
+        "catch_unwind",
         "an action that panicked: its outcome is Failed and its intent abandoned — never \
          reported done",
     ),
     (
+        "agent/src/pipeline/dispatch.rs",
+        "fn stop_by",
+        "join",
+        "a response thread that panicked is logged at the stop; what it held was answered \
+         not-run, signed",
+    ),
+    (
+        "agent/src/pipeline/dispatch.rs",
+        "fn drop",
+        "panicking",
+        "a worker that panicked marks the dispatcher not running (the responses no longer \
+         queue for it) and says so: nothing is claimed run",
+    ),
+    (
         "crates/nn-linux/src/caps/errands.rs",
         "fn start",
+        "catch_unwind",
         "a job that panicked loses its own answer (the caller reads `None`); the thread serves \
          the next",
     ),
     (
         "crates/nn-core/src/supervised.rs",
         "fn run<T>",
+        "catch_unwind",
         "a job that panicked: counted lost and reported (\"that job's work is lost\")",
+    ),
+    (
+        "agent/src/pipeline/slow.rs",
+        "fn stop",
+        "join",
+        "the dispatcher of slow work panicked: logged at the stop; what it was handed comes \
+         back unprepared and is judged (lot 317: also at the decision's next turn, \
+         `take_ready`)",
+    ),
+    (
+        "agent/src/run_loop.rs",
+        "fn run",
+        "join",
+        "the decision thread's panic is raised again (`resume_unwind`): nothing is claimed",
+    ),
+    (
+        "crates/nn-linux/src/sensors/bus.rs",
+        "fn spawn_loss_recorder",
+        "is_panic",
+        "the loss recorder's panic is raised again (`resume_unwind`); a cancel is the stop",
+    ),
+    (
+        "agent/src/config/overlay_floor.rs",
+        "fn check_all",
+        "join",
+        "a verifying thread that panicked fails each of its rows (\"verification failed\"): \
+         nothing is passed unverified",
     ),
 ];
 
@@ -82,12 +131,38 @@ fn covered() -> Vec<(String, String)> {
     out
 }
 
-/// Each `catch_unwind` of `src`'s production code: (line, the nearest
-/// `fn` above it).
-fn calls(src: &str) -> Vec<(usize, String)> {
+/// Each panic fallback of `src`'s production code: (line, the nearest
+/// `fn` above it, its kind).
+fn calls(src: &str) -> Vec<(usize, String, &'static str)> {
     let code = production(&strip_comments(src));
-    let mut out = Vec::new();
+    let mut at_kinds: Vec<(usize, &'static str)> = Vec::new();
     for (at, _) in code.match_indices("catch_unwind") {
+        at_kinds.push((at, "catch_unwind"));
+    }
+    for (at, _) in code.match_indices(".is_panic()") {
+        at_kinds.push((at, "is_panic"));
+    }
+    for (at, _) in code.match_indices("panicking()") {
+        at_kinds.push((at, "panicking"));
+    }
+    for (at, _) in code.match_indices(".join()") {
+        // a thread's join whose result is read for its panic
+        let after = code[at + ".join()".len()..].trim_start();
+        let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+        let before = &code[line_start..at];
+        if after.starts_with(".is_err()")
+            || after.starts_with(".is_ok()")
+            || after.starts_with(".unwrap_or")
+            || before.contains("match ")
+            || before.contains("if let Err")
+            || before.contains("if let Ok")
+        {
+            at_kinds.push((at, "join"));
+        }
+    }
+    at_kinds.sort();
+    let mut out = Vec::new();
+    for (at, kind) in at_kinds {
         let line = code[..at].matches('\n').count() + 1;
         let func = code[..at]
             .lines()
@@ -99,23 +174,23 @@ fn calls(src: &str) -> Vec<(usize, String)> {
                 Some(head[..head.find('(').unwrap_or(head.len())].to_string())
             })
             .unwrap_or_default();
-        out.push((line, func));
+        out.push((line, func, kind));
     }
     out
 }
 
 fn check(rel: &str, src: &str, used: &mut [usize]) -> Vec<String> {
     let mut bad = Vec::new();
-    for (line, func) in calls(src) {
+    for (line, func, kind) in calls(src) {
         match REVIEWED
             .iter()
-            .position(|(f, fun, _)| *f == rel && *fun == func)
+            .position(|(f, fun, k, _)| *f == rel && *fun == func && *k == kind)
         {
             Some(i) => used[i] += 1,
             None => bad.push(format!(
-                "{rel}:{line}: catch_unwind in `{func}` — the release build aborts on a panic, so \
-                 its fallback lives only in unwinding builds: make sure it claims nothing done and \
-                 drops nothing, then list it in REVIEWED with what it does"
+                "{rel}:{line}: a panic fallback ({kind}) in `{func}` — the release build aborts \
+                 on a panic, so it lives only in unwinding builds: make sure it claims nothing \
+                 done and drops nothing, then list it in REVIEWED with what it does"
             )),
         }
     }
@@ -130,16 +205,17 @@ fn catch_unwind_only_at_the_reviewed_sites() {
         bad.extend(check(&rel, &src, &mut used));
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
-    for (i, (file, func, _)) in REVIEWED.iter().enumerate() {
+    for (i, (file, func, kind, _)) in REVIEWED.iter().enumerate() {
         assert_eq!(
             used[i], 1,
-            "REVIEWED {file} `{func}`: {} catch_unwind, not one (moved or gone: update the list)",
+            "REVIEWED {file} `{func}` ({kind}): found {} time(s), not once (moved or gone: \
+             update the list)",
             used[i]
         );
     }
-    // BUG-115's site stays without one
+    // BUG-115's site stays without a catch
     let slow = fs::read_to_string(repo_root().join("agent/src/pipeline/slow.rs")).unwrap();
-    assert!(calls(&slow).is_empty());
+    assert!(calls(&slow).iter().all(|(_, _, k)| *k != "catch_unwind"));
 }
 
 /// The premise: the release profile aborts on a panic.
@@ -173,4 +249,21 @@ fn a_planted_catch_unwind_fails_the_rule() {
     let reviewed = "fn run<T>(s: &S<T>) {\n    let _ = std::panic::catch_unwind(|| ());\n}\n";
     assert!(check("crates/nn-core/src/supervised.rs", reviewed, &mut used).is_empty());
     assert!(!check("planted/supervised.rs", reviewed, &mut used).is_empty());
+    // review F8: the same family through a join, a task's panic, a guard
+    for planted in [
+        "fn stop(t: T) {\n    if t.join().is_err() { log(); }\n}\n",
+        "fn stop(t: T) -> V {\n    t.join().unwrap_or_else(|_| V::default())\n}\n",
+        "fn stop(t: T) {\n    match t.join() { Ok(v) => v, Err(_) => () }\n}\n",
+        "async fn f(h: H) {\n    if let Err(e) = h.await { if e.is_panic() { quiet(); } }\n}\n",
+        "fn drop(&mut self) {\n    if std::thread::panicking() { self.off(); }\n}\n",
+    ] {
+        assert_eq!(
+            check("planted/join.rs", planted, &mut used).len(),
+            1,
+            "{planted}"
+        );
+    }
+    // a join that re-raises the panic is no fallback
+    let raised = "fn f(t: T) { t.join().unwrap(); let _ = parts.join(\",\"); }\n";
+    assert!(check("planted/join.rs", raised, &mut used).is_empty());
 }

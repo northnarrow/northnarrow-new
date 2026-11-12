@@ -221,6 +221,49 @@ impl Drop for Burst {
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
+    burst_and_stop("plain", &[]);
+}
+
+/// Lot 317 (the review of #541, F6): the window of BUG-118 held open — a
+/// `debug-trigger` build's agent keeps its heartbeat fresh and the ring
+/// unread for 600 ms at the stop, so that the kernel stops processes whose
+/// report the agent never reads before it stops. The stop resumes them all
+/// (the signed `unreported`), from the ring's last read.
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
+fn a_stop_with_reports_left_unread_resumes_them() {
+    let unreported = burst_and_stop("unread", &[("NN_DEBUG_EXECQ_STOP_UNREAD_MS", "600")]);
+    assert!(
+        unreported > 0,
+        "no process held without an entry: the window was not held open"
+    );
+}
+
+/// Lot 317 (review F6): the same, the stop's last read of the ring skipped
+/// — the pinned map alone names the processes the agent never read about,
+/// and the stop resumes them from it.
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
+fn the_map_alone_names_what_the_stop_resumes() {
+    let unreported = burst_and_stop(
+        "map",
+        &[
+            ("NN_DEBUG_EXECQ_STOP_UNREAD_MS", "600"),
+            ("NN_DEBUG_EXECQ_STOP_NO_LAST_READ", "1"),
+        ],
+    );
+    assert!(
+        unreported > 0,
+        "no process held without an entry: the window was not held open"
+    );
+}
+
+/// A burst, a signed stop in its middle, the checks; `env`: the agent's
+/// extra variables. Returns how many processes the stop resumed without an
+/// entry (`unreported`).
+fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     common::require_root("run the exec quarantine's stop e2e");
     common::require_disposable_host("run the exec quarantine's stop e2e");
     common::refuse_if_northnarrow_running("run the exec quarantine's stop e2e");
@@ -273,8 +316,10 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
     let log = dir.join("agent.log");
     let out = std::fs::File::create(&log).unwrap();
     let err = out.try_clone().unwrap();
+    let mut agent_env = vec![("NO_COLOR", "1")];
+    agent_env.extend_from_slice(env);
     let child = installed_agent
-        .command(&state, Launch::Sudo, &[("NO_COLOR", "1")])
+        .command(&state, Launch::Sudo, &agent_env)
         .arg("--combat-rules")
         .arg(&rules)
         .args(["--exec-quarantine", "enforce"])
@@ -430,7 +475,7 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr().lock(),
-            "execq stop e2e: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
+            "execq stop e2e [{case}]: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
              stopping entries: {} — resumed {resumed}, of which {unreported} without an entry \
              and {recaptured} captured again, {left_in_map} left in the map; after the stop {} of \
              the burst still running, {} not exit 0, {} new process(es) in state T, cgroup frozen \
@@ -471,4 +516,5 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
     drop(nn_admin);
     drop(installed_agent);
     drop(burst_dir);
+    unreported
 }

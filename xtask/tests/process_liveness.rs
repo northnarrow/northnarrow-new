@@ -20,6 +20,14 @@
 //! failed capture. Every other caller asks `liveness()`. An entry whose
 //! site is gone fails too, and the rule is shown failing on a planted
 //! violation. The scan is lexical (comments blanked, strings kept).
+//!
+//! The review of #541 (F4): the same confusion, spelled with the new type —
+//! `liveness() != Liveness::Live`, `!matches!(…, Liveness::Live)`, `if let
+//! Liveness::Live = …` with an `else` — passed the rule. So `Liveness::Live`
+//! is named only as the pattern of a `match` arm (`Liveness::Live =>`, with a
+//! guard, in an or-pattern or a tuple), never in a comparison, `matches!` or
+//! `if let`; no `Liveness` variant is compared with `!=` (two answers read as
+//! one); the sites [`REVIEWED`] lists aside.
 
 mod support;
 
@@ -45,6 +53,14 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "r.has_fd() && !r.is_live()",
         "`close_exited`: a capture that holds its descriptor was captured — not running is \
          exited there; the descriptor is dropped, the identity kept",
+    ),
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "root.liveness() == super::proc_ref::Liveness::Live",
+        "the tree kill's root: only a live root takes the kill cgroup's path; any other goes \
+         process by process, whose outcome carries the capture's error (a root not captured is \
+         `Failed`, never `AlreadyGone`: the privileged test `a_tree_kill_whose_root_was_not_\
+         captured_reports_its_error`)",
     ),
 ];
 
@@ -103,6 +119,52 @@ fn uses(src: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Review F4: the lines of `src` (production code) that name a `Liveness`
+/// variant other than as a `match` arm's pattern (`Liveness::Live`), or
+/// compare one with `!=`: (line number, the line trimmed).
+fn variant_uses(src: &str) -> Vec<(usize, String)> {
+    let code = production(&strip_comments(src));
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("Liveness::") {
+        if at > 0 && ident(b[at - 1]) {
+            continue;
+        }
+        let name_at = at + "Liveness::".len();
+        let name_len = code[name_at..].bytes().take_while(|c| ident(*c)).count();
+        let variant = &code[name_at..name_at + name_len];
+        let start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = code[at..].find('\n').map_or(code.len(), |i| at + i);
+        // the path's own head: `super::proc_ref::Liveness::Live`
+        let head = code[start..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(start, |i| start + i + 1);
+        let pre = code[start..head].trim_end();
+        let rest = code[name_at + name_len..end].trim_start();
+        let line = code[..at].matches('\n').count() + 1;
+        let text = code[start..end].trim().to_string();
+        if pre.ends_with("!=") {
+            out.push((line, text));
+            continue;
+        }
+        if variant != "Live" {
+            continue;
+        }
+        let pattern = !pre.contains("matches!(")
+            && !pre.ends_with("let")
+            && !pre.ends_with("==")
+            && (rest.starts_with("=>")
+                || rest.starts_with("if ")
+                || rest.starts_with('|')
+                || ((rest.starts_with(',') || rest.starts_with(')')) && rest.contains("=>")));
+        if !pattern {
+            out.push((line, text));
+        }
+    }
+    out
+}
+
 /// The rule on one file: what it breaks, and the [`REVIEWED`] entries it
 /// uses (by index).
 fn check(rel: &str, src: &str, used: &mut [usize]) -> Vec<String> {
@@ -110,6 +172,20 @@ fn check(rel: &str, src: &str, used: &mut [usize]) -> Vec<String> {
         return Vec::new();
     }
     let mut bad = Vec::new();
+    for (line, text) in variant_uses(src) {
+        match REVIEWED
+            .iter()
+            .position(|(f, snippet, _)| *f == rel && text.contains(snippet))
+        {
+            Some(i) => used[i] += 1,
+            None => bad.push(format!(
+                "{rel}:{line}: `{text}` — a `Liveness` read as two answers: `Live` against the \
+                 rest takes a process not captured for one that ended. Match on all three (an arm \
+                 for `Uncaptured`), or compare with `Liveness::Gone` (or list the site in \
+                 REVIEWED with why)"
+            )),
+        }
+    }
     for (line, text) in uses(src) {
         match REVIEWED
             .iter()
@@ -203,4 +279,35 @@ fn a_planted_violation_fails_the_rule() {
         !check("planted/combat.rs", reviewed, &mut used).is_empty(),
         "a reviewed spelling in another file"
     );
+}
+
+/// Review F4: the confusion spelled with `Liveness` fails the rule — a
+/// negated `Live`, `matches!`, an `if let` with an `else`, a `Live` compared
+/// with `==`, any `!=`; the arms of a `match` and a comparison with `Gone`
+/// pass.
+#[test]
+fn a_planted_negation_of_liveness_fails_the_rule() {
+    let mut used = vec![0usize; REVIEWED.len()];
+    for planted in [
+        "fn f(p: &ProcRef) -> bool { p.liveness() != Liveness::Live }\n",
+        "fn f(p: &ProcRef) -> bool { !matches!(p.liveness(), Liveness::Live) }\n",
+        "fn f(p: &ProcRef) -> bool { matches!(p.liveness(), Liveness::Live) }\n",
+        "fn f(p: &ProcRef) -> &str { if let Liveness::Live = p.liveness() { \"a\" } else { \"ended\" } }\n",
+        "fn f(p: &ProcRef) -> &str { if p.liveness() == Liveness::Live { \"a\" } else { \"ended\" } }\n",
+        "fn f(p: &ProcRef) -> bool { p.liveness() != Liveness::Gone }\n",
+        "fn f(p: &ProcRef) -> bool { p.liveness() != super::proc_ref::Liveness::Live }\n",
+    ] {
+        let bad = check("planted/liveness.rs", planted, &mut used);
+        assert_eq!(bad.len(), 1, "{planted}: {bad:?}");
+    }
+    let fine = "fn f(p: &ProcRef) -> u8 {\n    match p.liveness() {\n        Liveness::Live if p.ok() => 1,\n        Liveness::Live | Liveness::Gone => 2,\n        Liveness::Uncaptured(_) => 3,\n    }\n}\nfn g(p: &ProcRef, a: A) -> u8 {\n    match (p.liveness(), a) {\n        (Liveness::Live, A::K) => 1,\n        (A::R, Liveness::Live) => 2,\n        _ => 3,\n    }\n}\nfn h(p: &ProcRef) -> bool { p.liveness() == Liveness::Gone }\nfn i(p: &ProcRef) -> bool { matches!(p.liveness(), Liveness::Uncaptured(_)) }\n";
+    assert!(
+        check("planted/liveness.rs", fine, &mut used).is_empty(),
+        "{:?}",
+        check("planted/liveness.rs", fine, &mut used)
+    );
+    let reviewed =
+        "fn k(root: &ProcRef) { if root.liveness() == super::proc_ref::Liveness::Live {} }\n";
+    assert!(check("crates/nn-linux/src/response/kill.rs", reviewed, &mut used).is_empty());
+    assert_eq!(check("planted/kill.rs", reviewed, &mut used).len(), 1);
 }

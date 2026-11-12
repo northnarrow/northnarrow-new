@@ -151,7 +151,39 @@ pub fn quiesce() -> bool {
     rc == 0
 }
 
+/// Lot 317 (review F2): `ExecqStopped::stop_ns` as the agent marks the map's
+/// entry of a held process whose kill it owes (the kernel writes its stop
+/// time there, never this): the next start kills the process instead of
+/// resuming it.
+pub const KILL_OWED: u64 = u64::MAX;
+
 impl Kernel {
+    /// Lot 317 (review F5): the map's entry of process `pid` goes when it is
+    /// the one started at `start_ns` — a later holder of the pid, which the
+    /// kernel holds in its turn, keeps its own.
+    pub fn unstop(&mut self, pid: u32, start_ns: u64) {
+        match self.stopped.get(&pid, 0) {
+            Ok(v) if v.0.start_ns != start_ns => {}
+            _ => {
+                let _ = self.stopped.remove(&pid);
+            }
+        }
+    }
+
+    /// Lot 317 (review F2): mark the map's entry of process `(pid,
+    /// start_ns)` [`KILL_OWED`] (an update of an existing key succeeds on a
+    /// full map). A failure is logged: the process stays stopped, and is
+    /// resumed by the next start instead of killed.
+    pub fn owe_kill(&mut self, pid: u32, start_ns: u64) {
+        let v = AyaStopped(ExecqStopped {
+            start_ns,
+            stop_ns: KILL_OWED,
+        });
+        if let Err(e) = self.stopped.insert(pid, v, 0) {
+            tracing::warn!(pid, error = %e, "exec quarantine: the owed kill could not be marked in the map");
+        }
+    }
+
     /// The heartbeat a stop needs (0: the kernel stops nothing).
     pub fn beat(&mut self, ns: u64) {
         let _ = self.alive.set(0, ns, 0);

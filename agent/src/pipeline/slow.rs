@@ -164,11 +164,14 @@ impl SlowWork {
     /// order, each with its assessment (`None` for an event the tracker has
     /// none for).
     pub(crate) fn take_ready(&self) -> Vec<Prepared> {
-        let mut r = self.shared.ready.lock();
-        if r.is_empty() {
-            return Vec::new();
+        let mut out: Vec<Prepared> = self.shared.ready.lock().drain(..).collect();
+        // lot 317 (review F8): a thread that has ended (a panic, in a build
+        // that unwinds) prepares nothing more — what it was handed comes
+        // back unprepared now, not at the stop
+        if self.thread.lock().as_ref().is_some_and(|t| t.is_finished()) {
+            out.extend(self.shared.inbox.lock().drain(..).map(|(_, e)| (e, None)));
         }
-        r.drain(..).collect()
+        out
     }
 
     /// The decision thread, right before it judges an event handed back
@@ -448,6 +451,31 @@ mod tests {
         assert!(matches!(got[0].0, Event::DefenderSignal { pid: 4242, .. }));
         assert!(got[0].1.is_none());
         assert!(slow.stop().is_empty());
+    }
+
+    /// Lot 317 (review F8): what a dispatcher whose thread has ended had
+    /// been handed comes back unprepared at the decision's next turn — not
+    /// only at the stop.
+    #[test]
+    fn a_dispatcher_whose_thread_ended_hands_back_its_queue() {
+        let (_tmp, tracker) = tracker();
+        let slow = SlowWork::start(tracker, None);
+        let ended = std::thread::spawn(|| {});
+        while !ended.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let running = slow.thread.lock().replace(ended);
+        slow.shared
+            .inbox
+            .lock()
+            .push_back((Instant::now(), burst(7, 1)));
+        let got = slow.take_ready();
+        assert_eq!(got.len(), 1, "the queue of a dead thread is left waiting");
+        assert!(got[0].1.is_none());
+        assert!(slow.shared.inbox.lock().is_empty());
+        slow.shared.stop.store(true, Ordering::Release);
+        slow.shared.wake_thread.notify_all();
+        running.unwrap().join().unwrap();
     }
 
     /// BUG-115: a dispatcher whose thread has ended (a panic, in a build

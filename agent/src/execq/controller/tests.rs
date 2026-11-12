@@ -44,7 +44,9 @@ impl KernelIo for FakeKernel {
         None
     }
     fn drain(&mut self, out: &mut Vec<ExecqStopRaw>) {
-        out.append(&mut self.0.lock().queue);
+        let mut st = self.0.lock();
+        st.log.push("drain");
+        out.append(&mut st.queue);
     }
     fn beat(&mut self, ns: u64) {
         let mut st = self.0.lock();
@@ -56,11 +58,24 @@ impl KernelIo for FakeKernel {
     fn remember(&mut self, key: ExecqKey, v: ExecqKnown) {
         self.0.lock().known.push((key, v));
     }
-    fn unstop(&mut self, pid: u32) {
+    fn unstop(&mut self, pid: u32, start_ns: u64) {
         let mut st = self.0.lock();
         st.unstopped.push(pid);
-        // the map's entry goes, as `EXECQ_STOPPED`'s does
-        st.left.retain(|(p, _)| *p != pid);
+        // the map's entry goes, as `EXECQ_STOPPED`'s does — the one of that
+        // process (lot 317, review F5)
+        st.left
+            .retain(|(p, v)| !(*p == pid && v.start_ns == start_ns));
+    }
+    fn owe_kill(&mut self, pid: u32, start_ns: u64) {
+        let mut st = self.0.lock();
+        let v = ExecqStopped {
+            start_ns,
+            stop_ns: kernel::KILL_OWED,
+        };
+        match st.left.iter_mut().find(|(p, _)| *p == pid) {
+            Some(e) => e.1 = v,
+            None => st.left.push((pid, v)),
+        }
     }
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
         let mut st = self.0.lock();
@@ -941,7 +956,7 @@ fn stopping_resumes_what_the_kernel_holds_without_an_entry() {
 fn the_stop_reads_the_kernels_map_once_no_program_can_add_to_it() {
     let mut w = world(ScanConfig::default(), enforce(), 5000, true);
     w.ctl.stop_all();
-    assert_eq!(w.k.0.lock().log, ["beat 0", "quiesce", "stopped"]);
+    assert_eq!(w.k.0.lock().log, ["beat 0", "quiesce", "drain", "stopped"]);
 }
 
 /// BUG-118: a process both held for a decision and in the kernel's map is
@@ -1261,4 +1276,283 @@ fn the_stop_carries_out_a_kill_it_owes() {
     let a = w.rec.audits.lock();
     assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
     assert_eq!(a[0]["resumed"], serde_json::json!([]), "{}", a[0]);
+}
+
+// ── lot 317, the review of #541 (rev541): F1, F2, F3, F5 ─────────────
+
+/// A process `(pid, start)` the fake kernel holds.
+fn hold_in_map(w: &World, pid: u32, start_ns: u64) {
+    w.k.0.lock().left.push((
+        pid,
+        ExecqStopped {
+            start_ns,
+            stop_ns: 1,
+        },
+    ));
+}
+
+/// Review F1 (the reviewer's probe): a late block-list verdict arrives
+/// while the default policy's resume is still owed (the capture failing):
+/// the process is still held, so the kill is owed in turn — and carried
+/// out once the capture succeeds. The probe found it resumed: the owed
+/// resume ran a process with a block-list verdict.
+#[test]
+fn a_late_block_list_verdict_on_a_process_whose_resume_is_owed_kills_it() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-slow");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "late".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 150, false);
+    w.b.st.lock().hold = true;
+    let broken = w.break_capture();
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.ledger.judged(h.pid, h.start_ns);
+    w.run_until(|w| !w.records().is_empty());
+    assert!(
+        w.records()[0].response.starts_with("resume deferred"),
+        "{}",
+        w.records()[0].response
+    );
+    assert_eq!(state(h.pid), Some('T'), "held: the resume is owed");
+    w.b.st.lock().hold = false;
+    w.run_until(|w| {
+        w.b.answer_held();
+        w.records().len() >= 2
+    });
+    let late = w.records()[1].response.clone();
+    assert!(late.starts_with("kill deferred"), "{late}");
+    assert_eq!(state(h.pid), Some('T'), "still held");
+    assert_eq!(
+        w.k.0.lock().left,
+        [(
+            h.pid,
+            ExecqStopped {
+                start_ns: h.start_ns,
+                stop_ns: kernel::KILL_OWED
+            }
+        )],
+        "the owed kill is marked in the map"
+    );
+    broken.store(false, Ordering::Relaxed);
+    w.ctl.step(Instant::now());
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "a process with a block-list verdict ran: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert_eq!(a[0]["action"], "kill", "{}", a[0]);
+    assert_eq!(a[0]["result"], "killed while held", "{}", a[0]);
+    assert!(w.k.0.lock().left.is_empty());
+}
+
+/// Review F1, its variant: the late kill lands (the capture back by then):
+/// the resume owed is dropped with it — no later signed `deferred` entry
+/// for a process the agent itself killed.
+#[test]
+fn a_late_kill_that_lands_drops_the_resume_owed() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-slow");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "late".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 150, false);
+    w.b.st.lock().hold = true;
+    let broken = w.break_capture();
+    w.push(raw_for(&h, class::TMP));
+    w.ledger.judged(h.pid, h.start_ns);
+    w.run_until(|w| !w.records().is_empty());
+    assert!(w.records()[0].response.starts_with("resume deferred"));
+    // the capture back, the verdict arrives in the same pass (before the
+    // owed resume is paid)
+    broken.store(false, Ordering::Relaxed);
+    w.b.st.lock().hold = false;
+    w.b.answer_held();
+    w.ctl.step(Instant::now());
+    assert!(
+        w.records()
+            .get(1)
+            .is_some_and(|r| r.response.starts_with("killed while held")),
+        "{:?}",
+        w.records()
+            .iter()
+            .map(|r| r.response.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(wait_state(h.pid, |s| s.is_none() || s == Some('Z')));
+    for _ in 0..3 {
+        w.ctl.step(Instant::now());
+    }
+    assert!(
+        w.rec.audits.lock().is_empty(),
+        "a signed entry for a resume owed to a process the agent killed: {:?}",
+        w.rec.audits.lock()
+    );
+}
+
+/// Review F2 (the reviewer's probe): a kill still owed when the agent stops
+/// (the capture failing) is marked in the pinned map, and the next start
+/// kills the process instead of resuming it. The probe found it resumed.
+#[test]
+fn a_kill_owed_at_the_stop_is_carried_out_by_the_next_start() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-bad");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "nn-lab-owed".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 2000, false);
+    let broken = w.break_capture();
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.ledger.judged(h.pid, h.start_ns);
+    w.run_until(|w| !w.records().is_empty());
+    assert!(w.records()[0].response.starts_with("kill deferred"));
+    w.ctl.stop_all();
+    {
+        let a = w.rec.audits.lock();
+        assert_eq!(a[0]["left"], serde_json::json!([h.pid]), "{}", a[0]);
+        assert_eq!(a[0]["resumed"], serde_json::json!([]), "{}", a[0]);
+    }
+    assert_eq!(state(h.pid), Some('T'));
+    assert_eq!(
+        w.k.0.lock().left[0].1.stop_ns,
+        kernel::KILL_OWED,
+        "the owed kill outlives the agent in the pinned map"
+    );
+    // the next start, with descriptors again
+    broken.store(false, Ordering::Relaxed);
+    w.ctl.recover();
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "the next start resumed a process whose kill was owed: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[1]["kind"], "recovered_at_boot");
+    assert_eq!(a[1]["killed"], serde_json::json!([h.pid]), "{}", a[1]);
+    assert_eq!(a[1]["resumed"], serde_json::json!([]), "{}", a[1]);
+}
+
+/// Review F2: the next start that cannot capture a process whose kill is
+/// owed owes the kill in turn — never a resume.
+#[test]
+fn a_kill_owed_by_a_previous_agent_stays_a_kill_while_the_capture_fails() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, false);
+    let broken = w.break_capture();
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.k.0.lock().left.push((
+        h.pid,
+        ExecqStopped {
+            start_ns: h.start_ns,
+            stop_ns: kernel::KILL_OWED,
+        },
+    ));
+    w.ctl.recover();
+    broken.store(false, Ordering::Relaxed);
+    w.ctl.step(Instant::now());
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "{:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[1]["kind"], "deferred");
+    assert_eq!(a[1]["action"], "kill");
+    assert_eq!(a[1]["origin"], "a kill a previous agent owed");
+}
+
+/// Review F5 (the reviewer's probe): an entry whose process has ended
+/// (its pid since taken by a process the kernel holds, its report not read
+/// yet) neither takes the new process's map entry out nor hides it from
+/// the sweep: the stop resumes it.
+#[test]
+fn a_reused_pid_neither_hides_nor_releases_the_process_the_kernel_holds() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    w.b.st.lock().hold = true;
+    let h = held_copy(w.dir.path(), "nn-x");
+    // an entry for an earlier holder of this pid (another start: gone)
+    let mut raw = raw_for(&h, class::HOME);
+    raw.start_ns = h.start_ns - 10_000_000_000;
+    w.push(raw);
+    w.ctl.step(Instant::now());
+    // the kernel holds the pid's new process (its report not read)
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "the held process under a reused pid was left stopped: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["unreported"], serde_json::json!([h.pid]), "{}", a[0]);
+}
+
+/// Review F3, F7: a report still on the ring when the agent stops — its
+/// process stopped after the controller's last pass — is read a last time
+/// and the process resumed, whether or not the map names it.
+#[test]
+fn the_stop_reads_the_ring_a_last_time() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.push(raw_for(&h, class::HOME));
+    // no pass in between: the report is still on the ring, the map empty
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "{:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["unreported"], serde_json::json!([h.pid]), "{}", a[0]);
+}
+
+/// Review F3: an exec the kernel could not name in its map is not held
+/// (the kernel stops only a process the map names): its record says so,
+/// nothing is resumed or unstopped, and the count is a signed fail-open
+/// degradation.
+#[test]
+fn an_exec_the_map_could_not_name_is_not_held_and_is_signed() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let h = held_copy(w.dir.path(), "nn-x");
+    // SAFETY: resuming our own child: the kernel did not stop it.
+    unsafe { libc::kill(h.pid as i32, libc::SIGCONT) };
+    let mut raw = raw_for(&h, class::HOME);
+    raw.flags |= stop_flags::MAP_FULL;
+    assert!(!raw.stopped());
+    w.push(raw);
+    w.ledger.judged(h.pid, h.start_ns);
+    w.run_until(|w| !w.records().is_empty());
+    let r = &w.records()[0];
+    assert!(!r.evidence.held);
+    assert!(
+        r.response
+            .starts_with("not held (the map of stopped processes was full"),
+        "{}",
+        r.response
+    );
+    assert!(w.k.0.lock().unstopped.is_empty());
+    let t0 = Instant::now();
+    w.k.0.lock().counters[counter::MAP_FULL as usize] = 2;
+    w.ctl.step(t0 + HEARTBEAT_EVERY + Duration::from_millis(1));
+    let d = w.rec.degraded.lock();
+    assert!(
+        d.iter()
+            .any(|d| d.contains("the map of stopped processes was full for 2")),
+        "{d:?}"
+    );
 }
