@@ -1504,7 +1504,10 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   grants something (a package manager, an authentication binary, a client)
   find nothing above the cut, as before; the defense-impairment rules
   (NN-L-EVA-*) still look for a staged or deleted program among the hops
-  below it.
+  below it. As before this lot, a writer that is a fork which never
+  executes (`rsync`'s receiver) is read from `/proc` only: once it has
+  exited, its bursts judged after that have a lineage not known — a
+  unit's `rsync` may be judged where a unit's `cp` is vouched.
 - **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
   file is a fileless exec whatever path reached it:
   `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a

@@ -9299,6 +9299,43 @@ number in parentheses is a lab PR.
     threads and a fork loop: 3 of 3 units ran, no R004, the lost records
     counted (58) in the agent's journal; uninstalled, nothing left. 26.04
     not rerun this round.
+  - Re-check 4 of #539 (12/11, decisions 1, 2 and 4 held; one HIGH, two
+    smaller): (HIGH) the lineage walk reads a writer and 32 ancestors, and
+    a walk that stopped there was taken for the whole lineage — 33 nested
+    `timeout`s (packaged, each forking the next) hid a webshell's `sh -c`
+    or a user's manager, and every hop read vouched; a walk that ends
+    before PID 1 (the cap, a parent that started after its child, a
+    process its own parent) is now a lineage not known, which never
+    vouches (the ransomware judge, the copy guard); the walks that look
+    for a hop that grants find nothing above a cut, the impairment
+    rules' staged-ancestor search reads the hops below it. The executor's
+    carry moved into the kernel: the exec program reads the LSM identity
+    of the file executed and, for a verified executor (`EXECUTOR_IDS`: the
+    packaged file's and PID 1's copies, written by the agent), leaves the
+    fork record to the next exec — the userland carry raced the pump's
+    `/proc` read. A record is marked used at a first exec and removed at
+    its process's exit (`sched_process_exit`): `fork_record_lost` counts
+    evictions only (re-check 3's 58 were mostly second execs). Mutations:
+    14 of the round's code, 13 caught at once, the impairment search's
+    survivor has its test — 89 with the earlier rounds'. The merge of lot
+    322 (#546) between. Gates on 21aaa2af (eBPF changed): 110 suites,
+    4,913 passed, 0 failed, 34 ignored, clippy ×4, `golden` ×5 (63 files
+    the same bytes), MSRV, the fuzz replay (14), portable-core (5).
+    `verifier-check`, every program of that object: 5.15.0-202 102 OK and
+    7.0.0-43 103 OK (the same object), 6.8.0-149 106 OK, 0 failing on
+    each. Lab, Ubuntu 24.04 (6.8.0-149, systemd 255), told by the agent's
+    own counters (shapes counted against trusted bursts) with `cp` as the
+    writer: a unit's `ExecStart=/bin/sh -c` through the executor vouched 5
+    of 5; an unpackaged script's unit, the double-forked `sh -c` and
+    `systemd-run --user sh -c` judged (NN-L-IMP-001 each); the unit's
+    `sh -c` with 2 nested `timeout`s vouched, with 33 judged,
+    `systemd-run --user` with 34 judged; `fork_record_lost` 0 → 0 over 500
+    second execs and 20 units; the executor replaced (PID 1 launching from
+    its unlinked copy): vouched, and after PID 1's re-exec. With `rsync` as
+    the writer (r9) the unit's `sh -c` vouched once in five: rsync's
+    receiver is a fork that never executes, read from `/proc` only, and
+    once it has exited its lineage is not known (a residual older than
+    this lot). Uninstalled each round, nothing left.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
