@@ -143,9 +143,12 @@ fn per_cpu_decls(src: &str) -> (Vec<String>, Vec<String>) {
     (maps, aliases)
 }
 
+/// `(file, name)` pairs.
+type Found = Vec<(String, String)>;
+
 /// `(file, map)` of every per-CPU map declared in `agent-ebpf/src`, and
 /// `(file, alias)` of every type alias to a per-CPU map type.
-fn per_cpu_maps() -> (Vec<(String, String)>, Vec<(String, String)>) {
+fn per_cpu_maps() -> (Found, Found) {
     let root = repo_root();
     let mut files = Vec::new();
     support::rs_files(&root.join("agent-ebpf/src"), &mut files);
