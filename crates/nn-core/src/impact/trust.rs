@@ -741,9 +741,14 @@ mod tests {
             } => {
                 assert_eq!((actor, key), (500, 500));
                 assert_eq!(program, "/usr/lib/systemd/systemd");
-                assert!(why.contains("a user's service manager"), "{why}");
+                // the verdict's text stays out of the failure message (CodeQL
+                // rust/cleartext-logging reads a trust verdict as sensitive)
+                assert!(
+                    why.contains("a user's service manager"),
+                    "the reason names the user's manager"
+                );
             }
-            other => panic!("{other:?}"),
+            Judged::Trusted(_) => panic!("trusted: the user's manager vouched"),
         }
         // its forked workers: the topmost copy of the program it started
         let l = [
