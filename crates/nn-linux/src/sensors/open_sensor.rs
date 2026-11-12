@@ -196,8 +196,10 @@ impl RuleInputs {
         let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut carveout = own(MASS_WRITE_CARVEOUT_PREFIXES);
         carveout.extend(extras.carveout.iter().cloned());
-        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-        let login_defs = std::fs::read_to_string("/etc/login.defs").unwrap_or_default();
+        // lot 311 (F4): read as bytes — one account whose GECOS is not
+        // UTF-8 (a Latin-1 full name) hid every home and service account
+        let passwd = crate::state_read::read_state("/etc/passwd").unwrap_or_default();
+        let login_defs = crate::state_read::read_state("/etc/login.defs").unwrap_or_default();
         let (svc_homes, caches) = account_dirs(&passwd, crate::accounts::uid_min(&login_defs));
         let mut svc_data = vec![(PathBuf::from("/var/lib"), None)];
         svc_data.extend(svc_homes.into_iter().map(|(h, uid)| (h, Some(uid))));
@@ -1084,7 +1086,13 @@ pub fn take_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
 /// the record would be a kernel change).
 #[derive(Debug)]
 pub struct MountTable {
-    roots: HashMap<(u64, u64), String>,
+    /// Lot 311 (the review of #538, F6): the mount points as the table
+    /// gives them, bytes kept.
+    roots: HashMap<(u64, u64), PathBuf>,
+    /// Lot 311 (the review of #538, F1): the FUSE mounts, by device alone —
+    /// their daemon names the root's inode (and changes it at will), so a
+    /// record of one is placed by its device.
+    fuse: HashMap<u64, PathBuf>,
     loaded: Option<Instant>,
     /// The `mountinfo` a refresh reads (`/proc/self/mountinfo`; a fixture
     /// in tests).
@@ -1094,16 +1102,24 @@ pub struct MountTable {
     watch: Option<std::fs::File>,
     /// A change was polled and the table not re-read yet.
     changed: bool,
+    /// Lot 311 (F4): a table that cannot be read leaves the roots last
+    /// read in force, signed.
+    read: crate::state_read::LastGood,
+    /// Lot 311 (the review of #538, F2): lines not in the kernel's shape.
+    rows: crate::state_read::Condition,
 }
 
 impl Default for MountTable {
     fn default() -> Self {
         MountTable {
             roots: HashMap::new(),
+            fuse: HashMap::new(),
             loaded: None,
             source: PathBuf::from("/proc/self/mountinfo"),
             watch: None,
             changed: false,
+            read: crate::state_read::LastGood::new("mount_table", "the mount table"),
+            rows: crate::state_read::Condition::new("mount_table_rows"),
         }
     }
 }
@@ -1148,35 +1164,68 @@ impl MountTable {
         t
     }
 
+    /// Lot 311 (the mini-hunt of bug hunt 1.4's BUG-98): the table is read
+    /// as bytes ([`crate::mountinfo`]). Read as strict text, one mount whose
+    /// point or source is not UTF-8 — a user's FUSE mount (`fusermount3`)
+    /// at `~/\xff` — emptied it: no opened file had its path (FIM's rules
+    /// matched none), and an exec's kernel-resolved file was unplaced, its
+    /// rules back on the caller's string. A table that cannot be read at
+    /// all keeps the roots last read (signed), never none.
     pub fn refresh(&mut self) {
-        let text = std::fs::read_to_string(&self.source).unwrap_or_default();
-        let mut roots = HashMap::new();
-        for mp in mount_points(&text) {
-            if let Ok(m) = std::fs::metadata(&mp) {
-                let k = key_of(&m);
-                // The shortest mount point wins (a bind mount of the same
-                // root elsewhere is an alias).
+        let table = match crate::mountinfo::read(&self.source) {
+            Ok(table) => {
+                self.read.ok();
+                table
+            }
+            Err(e) => {
+                self.read.failed(&e);
+                self.loaded = Some(Instant::now());
+                self.changed = false;
+                return;
+            }
+        };
+        crate::state_read::mount_rows(&mut self.rows, &table, "the sensors' path placing");
+        let mut roots: HashMap<(u64, u64), PathBuf> = HashMap::new();
+        let mut fuse: HashMap<u64, PathBuf> = HashMap::new();
+        // The shortest mount point wins (a bind mount of the same root
+        // elsewhere is an alias).
+        let shorter = |cur: &mut PathBuf, mp: &PathBuf| {
+            if mp.as_os_str().len() < cur.as_os_str().len() {
+                *cur = mp.clone();
+            }
+        };
+        for m in &table.entries {
+            let mp = m.mount_point.clone();
+            if crate::mountinfo::is_fuse(&m.fstype) {
+                fuse.entry(m.kernel_dev())
+                    .and_modify(|cur| shorter(cur, &mp))
+                    .or_insert(mp);
+            } else if let Some(key) = m.root_key() {
                 roots
-                    .entry((k.dev, k.ino))
-                    .and_modify(|cur: &mut String| {
-                        if mp.len() < cur.len() {
-                            *cur = mp.clone();
-                        }
-                    })
+                    .entry(key)
+                    .and_modify(|cur| shorter(cur, &mp))
                     .or_insert(mp);
             }
         }
         self.roots = roots;
+        self.fuse = fuse;
         self.loaded = Some(Instant::now());
         self.changed = false;
     }
 
-    /// Whether the mount point `mp` still shows the filesystem root `root`.
-    fn still_shows(mp: &str, root: (u64, u64)) -> bool {
-        std::fs::metadata(mp).is_ok_and(|m| {
-            let k = key_of(&m);
-            (k.dev, k.ino) == root
-        })
+    /// Whether the mount point `mp` still shows the filesystem root `root`
+    /// (read without following a link).
+    fn still_shows(mp: &Path, root: (u64, u64)) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(mp)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| {
+                let k = key_of(&m);
+                (k.dev, k.ino) == root
+            })
     }
 
     /// Absolute path of `rel` (mount-relative, starting with `/`) under
@@ -1189,7 +1238,7 @@ impl MountTable {
         if self.watch.as_ref().is_some_and(mounts_changed) {
             self.changed = true;
         }
-        let hit = self.roots.contains_key(&root);
+        let hit = self.roots.contains_key(&root) || self.fuse.contains_key(&root.0);
         let age = self.loaded.map(|t| t.elapsed());
         let refresh = match age {
             None => true,
@@ -1206,7 +1255,11 @@ impl MountTable {
                 }
             }
         }
-        let mp = self.roots.get(&root)?;
+        let mp = self.roots.get(&root).or_else(|| self.fuse.get(&root.0))?;
+        // lot 311 (the review of #538, F6): a mount point that is not
+        // UTF-8 has no text a file has — the record stays unplaced
+        // (`mnt[…]`), never a path that names nothing
+        let mp = mp.to_str()?;
         Some(if mp == "/" {
             rel.to_string()
         } else {
@@ -1289,7 +1342,7 @@ fn owner_of(path: &str, opened: InodeKey) -> Option<u32> {
 /// that has already exited counts as not capable.
 fn reader_dac_capable(pid: u32) -> bool {
     const DAC_CAPS: u64 = (1 << 1) | (1 << 2); // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+    let Ok(status) = crate::state_read::read_state(format!("/proc/{pid}/status")) else {
         return false;
     };
     let caps = crate::response::caps_preflight::parse_cap_eff(&status).unwrap_or(0);
@@ -1839,16 +1892,136 @@ mod tests {
     /// A `mountinfo` fixture with one mount at `mp`, and the root key a
     /// `stat()` of `mp` gives.
     fn one_mount(info: &Path, mp: &Path) {
-        std::fs::write(
-            info,
-            format!("40 22 0:45 / {} rw - tmpfs tmpfs rw\n", mp.display()),
+        std::fs::write(info, format!("{}\n", mount_line(mp))).unwrap();
+    }
+
+    /// A `mountinfo` line of a mount at `mp` with `mp`'s own device (lot
+    /// 311: a root is read only while its mount point shows the line's
+    /// device).
+    fn mount_line(mp: &Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(mp).unwrap().dev();
+        format!(
+            "40 22 {}:{} / {} rw - tmpfs tmpfs rw",
+            libc::major(dev),
+            libc::minor(dev),
+            mp.display()
         )
-        .unwrap();
     }
 
     fn root_of(p: &Path) -> (u64, u64) {
         let k = key_of(&std::fs::metadata(p).unwrap());
         (k.dev, k.ino)
+    }
+
+    /// Lot 311 (the mini-hunt of BUG-98): a mount whose point (or source)
+    /// is not UTF-8 — a user's FUSE mount at `~/\xff` — does not empty the
+    /// table: the other mounts still place their files (on main no file
+    /// had its path, every one `mnt[…]`); and a table that cannot be read
+    /// keeps the roots last read.
+    #[test]
+    fn a_non_utf8_mount_does_not_empty_the_table() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let t = tempfile::tempdir().unwrap();
+        let (a, info) = (t.path().join("a"), t.path().join("mi"));
+        std::fs::create_dir(&a).unwrap();
+        let mut text = format!("{}\n", mount_line(&a)).into_bytes();
+        text.extend_from_slice(
+            b"57 22 0:46 / /home/u/\xff rw,nosuid - fuse.x \xff rw,user_id=1000\n",
+        );
+        std::fs::write(&info, &text).unwrap();
+        let mut mounts = MountTable::load_from(&info);
+        let root = root_of(&a);
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", a.display()))
+        );
+        std::fs::remove_file(&info).unwrap();
+        mounts.loaded = Instant::now().checked_sub(MOUNT_HIT_TTL);
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", a.display())),
+            "the roots last read stay"
+        );
+        assert!(mounts.read.failing());
+    }
+
+    /// Lot 311 (the review of #538, F1, F2, F6): a FUSE mount — its source
+    /// `-` (`fsname=-`) or not — places its files by its device, whatever
+    /// root inode its daemon answers (and never `stat`ed: root cannot, or
+    /// the daemon stalls it); a mount point that is not UTF-8 leaves its
+    /// files unplaced (`mnt[…]`) rather than under a path that names
+    /// nothing; a line not in the kernel's shape is a degradation.
+    #[test]
+    fn fuse_mounts_are_placed_by_device_and_odd_points_stay_unplaced() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let t = tempfile::tempdir().unwrap();
+        let info = t.path().join("mi");
+        std::fs::write(
+            &info,
+            b"57 22 0:44 / /home/u/mnt rw,nosuid,nodev - fuse.x - rw,user_id=1000\n\
+              58 22 0:45 / /tmp/f rw,nosuid,nodev - fuse  rw,user_id=1000\n\
+              59 22 0:46 / /home/u/\xff rw,nosuid,nodev - fuse.y y rw,user_id=1000\n",
+        )
+        .unwrap();
+        let mut mounts = MountTable::load_from(&info);
+        assert!(!mounts.rows.holding());
+        for ino in [1, 7, 4242] {
+            assert_eq!(
+                mounts.absolute((44, ino), "/f").as_deref(),
+                Some("/home/u/mnt/f"),
+                "root inode {ino}"
+            );
+        }
+        assert_eq!(mounts.absolute((45, 9), "/g").as_deref(), Some("/tmp/f/g"));
+        assert_eq!(mounts.absolute((46, 1), "/h"), None, "not UTF-8: unplaced");
+        let mut odd = std::fs::read(&info).unwrap();
+        odd.extend_from_slice(b"60 22 0:47 / /tmp/z rw tmpfs z rw\n");
+        std::fs::write(&info, &odd).unwrap();
+        mounts.loaded = Instant::now().checked_sub(MOUNT_HIT_TTL);
+        let _ = mounts.absolute((44, 1), "/f");
+        assert!(mounts.rows.holding(), "a dropped line is signed");
+    }
+
+    /// Lot 311 (the lab's check of the review of #538, F1/F2): the FUSE
+    /// mount at `NN_LOT311_FUSE_MP` (a user's, `fsname=-`, its daemon
+    /// answering a root inode of its choice) is read from this process's
+    /// own table — no line dropped — and places its files by its device,
+    /// whatever root inode the record names. A no-op without the variable.
+    #[test]
+    #[ignore = "lab: a FUSE mount named by NN_LOT311_FUSE_MP"]
+    fn a_real_fuse_mount_places_its_files_by_device() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let Some(mp) = std::env::var_os("NN_LOT311_FUSE_MP") else {
+            return;
+        };
+        let table = crate::mountinfo::read(Path::new("/proc/self/mountinfo")).unwrap();
+        let entry = table
+            .entries
+            .iter()
+            .find(|m| m.mount_point.as_os_str() == mp)
+            .unwrap_or_else(|| panic!("{mp:?} is not a mount point: {:?}", table.malformed));
+        println!(
+            "mount {mp:?}: fstype {:?} source {:?} dev {}:{}; lines not read: {}",
+            entry.fstype,
+            entry.source,
+            entry.major,
+            entry.minor,
+            table.malformed.len()
+        );
+        assert!(crate::mountinfo::is_fuse(&entry.fstype));
+        let mut mounts = MountTable::load();
+        assert!(!mounts.rows.holding(), "a line of the table was dropped");
+        for ino in [1, 7, 4242] {
+            assert_eq!(
+                mounts.absolute((entry.kernel_dev(), ino), "/f"),
+                Some(format!("{}/f", Path::new(&mp).display())),
+                "root inode {ino}"
+            );
+        }
     }
 
     /// External audit SNS-004: a hit was never checked again — a
@@ -1914,6 +2087,8 @@ mod tests {
     /// one.
     #[test]
     fn a_regular_file_never_polls_a_mount_change() {
+        // the table's conditions report to the process's one registry
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let t = tempfile::tempdir().unwrap();
         let info = t.path().join("mi");
         std::fs::write(&info, "").unwrap();

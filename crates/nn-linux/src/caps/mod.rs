@@ -503,7 +503,7 @@ pub fn restore_core() {
 /// The thread group leader's permitted set (`/proc/self/status`'s `CapPrm`
 /// is the leader's): the core's.
 fn leader_permitted() -> Option<CapSet> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let status = crate::state_read::read_state("/proc/self/status").ok()?;
     let hex = status
         .lines()
         .find_map(|l| l.strip_prefix("CapPrm:"))?

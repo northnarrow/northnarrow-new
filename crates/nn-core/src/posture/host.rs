@@ -56,8 +56,15 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     const HOST_ROOT: &'static str;
 
     /// `path` read as text: an entry of the process table, an account
-    /// file, the watchdog's pidfile.
-    fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String>;
+    /// file, the watchdog's pidfile. Lot 311 (N6, F4): read as bytes
+    /// ([`Self::read`]) and made text by [`state_text`] — what is not UTF-8
+    /// replaced, never an error: a process names itself, and a strict read
+    /// of its `stat` or `status` blinded every reader of it (the start's
+    /// scan skipped it, the sweep marked it gone while it ran). Provided,
+    /// one conversion for every host; there is no strict text read.
+    fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
+        Self::read(path).map(state_text)
+    }
 
     /// `path` read as bytes (a process's `cmdline`).
     fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>>;
@@ -181,10 +188,6 @@ pub(crate) mod testing {
         const PROC_ROOT: &'static str = "/proc";
 
         const HOST_ROOT: &'static str = "/";
-
-        fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
-            std::fs::read_to_string(path)
-        }
 
         fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
             std::fs::read(path)

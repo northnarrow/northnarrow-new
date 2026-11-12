@@ -251,7 +251,7 @@ fn is_alive<H: PostureHost>(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
 
 /// `starttime`, field 22 of `/proc/<pid>/stat`, counted after `(comm)`.
 fn proc_start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()
@@ -478,6 +478,30 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!is_alive(root, pid, start));
+    }
+
+    /// Lot 311 (N6): a process whose `comm` is not UTF-8 (any process
+    /// names itself so, no privilege needed) is live for the tree, its
+    /// start read. On main its `stat` was unreadable as text: dead, its
+    /// edge the first freed when the tree is full — its descendants' chain
+    /// correlation lost.
+    #[test]
+    fn a_process_whose_comm_is_not_utf8_is_live_for_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("4321")).unwrap();
+        std::fs::write(
+            root.join("4321/stat"),
+            b"4321 (\xff\xfe) S 1 4321 4321 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(proc_start_ticks(root, 4321), Some(5000));
+        let start = 5000 * H::clock_tick_ns();
+        assert!(
+            is_alive(root, 4321, start),
+            "a running process taken for dead"
+        );
+        assert!(!is_alive(root, 4321, start + 3_600 * 1_000_000_000));
     }
 
     /// External audit NETR-009/010 (privileged: writes `ns_last_pid`): a

@@ -9275,6 +9275,70 @@ number in parentheses is a lab PR.
     be read are moved and killed); with its mutant the new one fails.
   - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
     proved beyond it.
+- **Lot 311b — a read of the kernel's state never fails on its encoding,
+  and a failed read never empties a protection (C12, C13, C14, C17, C23;
+  the third bug hunt's family F4: BUG-98 and its exec policy sibling,
+  BUG-105, BUG-95, BUG-108's userland half, N6's other readers, N8, the
+  partials BUG03 and BUG69, and the lot's mini-hunt; no level changes).**
+  - What was open: a strict `read_to_string` of a file a process or a user
+    names refused it whole, and the reader took the refusal for an empty
+    answer. N6 beyond the kill (lot 311a): the lineage's start scan, sweep,
+    forks and admin-session reads, the ancestry tree's liveness, the
+    watchdog's and a defender's start, the exemption facts. BUG-98: one
+    FUSE mount named with a byte that is not UTF-8 (`fusermount3`, setuid,
+    unprivileged) emptied `EXECQ_ROOTS` and, through the exec policy's
+    refresh, unpublished the slices. The mini-hunt found the same in the
+    sensors' mount table (every file-open record unplaced while the mount
+    stood), in the drop-in judges, the package lists, `/etc/passwd` and the
+    watchdog's records.
+  - What changed: one conversion, `nn_core::posture::host::state_text`
+    (bytes, U+FFFD for what is not UTF-8), behind the posture hosts'
+    provided `read_state` (the trait has no strict text read any more) and
+    `nn_linux::state_read::read_state`; the mount tables read by
+    `nn_linux::mountinfo`; `nn_linux::state_read::LastGood`: a periodic
+    reader whose read fails keeps what it last published and reports a
+    degradation (`execq_roots`, `execpol_mounts`, `mount_table`) while it
+    fails, withdrawn at the next good read; the guarded roots include a
+    btrfs subvolume at a guarded point and a FUSE mount root cannot `stat`
+    (keyed from the table). `xtask/tests/state_reads.rs`: no process's
+    `/proc` entry read as strict text in the security crates (none
+    excepted); 28 files listed with the reads whose failure becomes a
+    default and why each is not a protection emptied.
+  - Measured on our guests: Ubuntu 24.04 (`6.8.0-147-generic`), with a
+    mount at `/mnt/\xff` standing for a user's FUSE mount, a `www-data`
+    read of another account's `~/.aws/credentials` drew NN-L-FIM-011 with
+    no response on lot 311a's tree (the sensors' table emptied) and its
+    kill with this lot; a btrfs subvolume (`subvol=sv`, root field `/sv`)
+    mounted at `/var/tmp/nn108` is a guarded root (the lab-only test
+    `a_real_guarded_mount_is_a_guarded_root`). Ubuntu 24.04 and Debian 13
+    (`6.12.115`): lot 311a's kill cases still killed. Not run end to end:
+    the unprivileged FUSE mount itself (no FUSE file system on our
+    guests), N8, and BUG-108's kernel half.
+  - The independent review of #538: the byte parser had dropped a mount
+    whose source is `-` or empty (`fsname=-`: a user's FUSE mount left the
+    guarded roots and the sensors' table — a regression of this lot,
+    fixed); N8's key `(dev, 1)` relied on the root's inode, which a FUSE
+    daemon names at will: FUSE mounts are classed by type and keyed by
+    device now — N8 is closed on the user side, its kernel half (the magic
+    in the exec hooks) is lot 318's; the lost lines, the refused roots and
+    a degradation withdrawn before its flush are signed; the ratchet became
+    semantic. Lab (Ubuntu 26.04, `fusermount3` 3.18.2): a user's FUSE
+    mount at `~/k311mnt`, `fsname=-`, its daemon answering root inode 7,
+    root's `stat` refused (`EACCES`) — its line read (no line dropped),
+    published as `(dev, 0)` with the class `home`, its files placed by the
+    sensors' table by device. Mutation: 20 of 20 caught by a named test.
+  - The re-check of #538 (merge after fixes): G1, opened by the bounded
+    configuration read — a FIFO `EnvironmentFile=` was judged empty while
+    systemd reads it from its writer (C23's `LD_PRELOAD`) — now what the
+    judge cannot read is harmful; G2, the roots ranked (FUSE last) so a
+    user's FUSE mounts never crowd a system root out of the 64-entry map,
+    and only a system root refused is a degradation, held 5 minutes; G3,
+    the ratchet's cheap extensions (helper functions stay a residual).
+    Host tests name each file type, the ranking and the hold; a mutant of
+    each fix is caught by one of them (the PR's body). No level moves.
+  - Level unchanged: the exec quarantine and policy stay EXPERIMENTAL (C12,
+    C13), and BUG-108's kernel half (the walk to a subvolume's root) is
+    lot 9's.
 - **Lot 317 — the exec quarantine's stop and its partial failures (third
   bug hunt, edition 1.4: BUG-118, BUG-124, BUG-116, BUG-115; all P3; C13
   and C17, no level change).**

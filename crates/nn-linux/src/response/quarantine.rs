@@ -806,13 +806,14 @@ pub struct VaultEntry {
 /// `index.json`, or rebuilt from the `.meta` files when the index is
 /// missing or does not parse (read-only: the index is left as it is).
 pub fn list_vault(cfg: &ExecutorConfig) -> Vec<VaultEntry> {
-    let entries: Vec<serde_json::Value> =
-        match fs::read_to_string(cfg.quarantine_dir.join("index.json")) {
-            Ok(s) => {
-                serde_json::from_str(&s).unwrap_or_else(|_| index_from_meta(&cfg.quarantine_dir))
-            }
-            Err(_) => index_from_meta(&cfg.quarantine_dir),
-        };
+    // lot 311 (bug hunt 1.4, BUG-95): bytes, parsed — an index that is
+    // not UTF-8 does not parse, and is rebuilt like any other
+    let entries: Vec<serde_json::Value> = match fs::read(cfg.quarantine_dir.join("index.json")) {
+        Ok(s) => {
+            serde_json::from_slice(&s).unwrap_or_else(|_| index_from_meta(&cfg.quarantine_dir))
+        }
+        Err(_) => index_from_meta(&cfg.quarantine_dir),
+    };
     entries
         .iter()
         .map(|e| VaultEntry {
@@ -830,8 +831,8 @@ fn index_from_meta(quarantine_dir: &Path) -> Vec<serde_json::Value> {
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.path().extension().is_some_and(|x| x == "meta"))
-                .filter_map(|e| fs::read_to_string(e.path()).ok())
-                .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .filter_map(|e| fs::read(e.path()).ok())
+                .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s).ok())
                 .map(|m| {
                     serde_json::json!({
                         "vault_id": m["vault_id"],
@@ -856,8 +857,12 @@ fn update_index(
     let index_path = quarantine_dir.join("index.json");
     let tmp_path = quarantine_dir.join("index.json.tmp");
 
-    let mut entries: Vec<serde_json::Value> = match fs::read_to_string(&index_path) {
-        Ok(s) => match serde_json::from_str(&s) {
+    // lot 311 (bug hunt 1.4, BUG-95): read as bytes and parsed — an index
+    // that is not UTF-8 (a disk's corruption) failed the read itself, and
+    // every quarantine after it, its `.bin` and `.meta` left behind; it is
+    // an index that does not parse, kept aside and rebuilt (CMB-017)
+    let mut entries: Vec<serde_json::Value> = match fs::read(&index_path) {
+        Ok(s) => match serde_json::from_slice(&s) {
             Ok(v) => v,
             Err(e) => {
                 // External audit CMB-017: an index that does not parse was
@@ -1909,5 +1914,74 @@ mod tests {
                 FIXTURE_META
             );
         }
+    }
+}
+
+/// Lot 311 (bug hunt 1.4, BUG-95): an index that is not UTF-8.
+#[cfg(test)]
+mod bug95 {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Promise (CMB-017): an index that does not parse is kept aside,
+    /// rebuilt from the `.meta` files, and the quarantine goes on — one
+    /// that is not UTF-8 too (on main: `Failed { errno: 0 }`, the original
+    /// left on disk, every later quarantine failing the same way).
+    #[test]
+    fn a_non_utf8_index_is_kept_aside_and_rebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = ExecutorConfig::for_test(tmp.path());
+        cfg.dry_run = false;
+        let intent = super::super::journal::test_intent();
+        let a = tmp.path().join("first.bin");
+        fs::write(&a, b"first").unwrap();
+        let first = quarantine_handle(&ExeHandle::open(&a).unwrap(), 4241, &cfg, &intent);
+        assert!(
+            matches!(first, ExecutionOutcome::Quarantined { .. }),
+            "premise: {first:?}"
+        );
+        let index = cfg.quarantine_dir.join("index.json");
+        let mut bytes = fs::read(&index).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] = 0xFF;
+        fs::write(&index, bytes).unwrap();
+        assert_eq!(list_vault(&cfg).len(), 1, "listed from the .meta files");
+        let b = tmp.path().join("payload.bin");
+        fs::write(&b, b"payload").unwrap();
+        let out = quarantine_handle(&ExeHandle::open(&b).unwrap(), 4242, &cfg, &intent);
+        let kept_aside = fs::read_dir(&cfg.quarantine_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("index.json.corrupt-")
+            });
+        let _ = take_index_notes(&cfg.quarantine_dir);
+        let still = b.exists();
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }) && !still && kept_aside,
+            "BUG-95: outcome {out:?}, original still on disk: {still}, index kept aside: {kept_aside}"
+        );
+        assert_eq!(list_vault(&cfg).len(), 2);
+    }
+
+    /// Guard (must stay): a UTF-8 index that does not parse is repaired.
+    #[test]
+    fn a_utf8_corrupt_index_is_repaired() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = ExecutorConfig::for_test(tmp.path());
+        cfg.dry_run = false;
+        let intent = super::super::journal::test_intent();
+        fs::create_dir_all(&cfg.quarantine_dir).unwrap();
+        fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
+        let b = tmp.path().join("payload.bin");
+        fs::write(&b, b"payload").unwrap();
+        let out = quarantine_handle(&ExeHandle::open(&b).unwrap(), 4242, &cfg, &intent);
+        let _ = take_index_notes(&cfg.quarantine_dir);
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }) && !b.exists(),
+            "{out:?}"
+        );
     }
 }

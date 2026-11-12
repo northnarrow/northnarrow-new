@@ -66,7 +66,9 @@ const MARKERS: &[&str] = &[
     "thread::sleep",
     "\"/proc",
     "H::read_link",
-    "H::read_to_string",
+    // lot 311: the posture host's text read is `read_state` (bytes made
+    // text, never a strict decode); nn-linux's own reader has the name too
+    "read_state(",
     "H::read_dir",
     "H::rpm_owns",
     "H::on_host_path",

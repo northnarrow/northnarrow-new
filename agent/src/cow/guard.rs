@@ -138,6 +138,9 @@ pub struct Runtime {
     copy_tx: Mutex<Option<SyncSender<CopyJob>>>,
     work_tx: SyncSender<Work>,
     budget: Duration,
+    /// Lot 311 (the re-check of #538): the mount table's lines not in the
+    /// kernel's shape, as the scope checks find them (one condition).
+    mount_scope_rows: Mutex<nn_linux::state_read::Condition>,
 }
 
 /// Probe: does `/proc/<tid>/syscall` of another task read?
@@ -188,19 +191,43 @@ fn probe_reflink(objects: i32) -> bool {
     ok
 }
 
-/// The scope is a mount point in the host's mount namespace.
-fn is_mount_point(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string("/proc/1/mountinfo")
-        .or_else(|_| std::fs::read_to_string("/proc/self/mountinfo"))
+/// The scope is a mount point in the host's mount namespace. Lot 311 (bug
+/// hunt 1.4, F4): the table read as bytes ([`nn_linux::mountinfo`]) — a
+/// user's FUSE mount named with bytes that are not UTF-8 made it unreadable,
+/// and a mount scope was refused at the start.
+fn is_mount_point(path: &Path, rows: &mut nn_linux::state_read::Condition) -> bool {
+    is_mount_point_in(
+        path,
+        &[
+            Path::new("/proc/1/mountinfo"),
+            Path::new("/proc/self/mountinfo"),
+        ],
+        rows,
+    )
+}
+
+/// [`is_mount_point`] in the first table of `tables` that can be read.
+fn is_mount_point_in(
+    path: &Path,
+    tables: &[&Path],
+    rows: &mut nn_linux::state_read::Condition,
+) -> bool {
+    let Some(table) = tables
+        .iter()
+        .find_map(|t| nn_linux::mountinfo::read(t).ok())
     else {
         return false;
     };
-    let want = path.to_string_lossy();
-    text.lines().any(|l| {
-        l.split_whitespace()
-            .nth(4)
-            .is_some_and(|mp| mp.replace("\\040", " ") == want)
-    })
+    // lot 311 (the review of #538, F2): a line not in the kernel's shape is
+    // signed, and one that still names the scope as its mount point counts;
+    // the re-check: the guard's one condition (one made per call was never
+    // withdrawn), withdrawn by a later table in the kernel's shape
+    nn_linux::state_read::mount_rows(rows, &table, "the copy-on-write guard's scopes");
+    table.entries.iter().any(|m| m.mount_point == path)
+        || table
+            .malformed
+            .iter()
+            .any(|m| m.mount_point.as_deref() == Some(path))
 }
 
 impl Runtime {
@@ -252,6 +279,9 @@ impl Runtime {
             copy_tx: Mutex::new(Some(copy_tx)),
             work_tx,
             budget: Duration::from_millis(cfg.event_budget_ms),
+            mount_scope_rows: Mutex::new(nn_linux::state_read::Condition::new(
+                "cow_mount_scope_rows",
+            )),
             store: Arc::clone(&store),
         });
         let mut marked = 0;
@@ -383,7 +413,7 @@ impl Runtime {
         }
         match s.mark {
             MarkKind::Mount | MarkKind::Filesystem => {
-                if !is_mount_point(&s.path) {
+                if !is_mount_point(&s.path, &mut self.mount_scope_rows.lock()) {
                     return Err(format!(
                         "mark={} needs a mount point; {} is not one (use mark=dirs)",
                         s.mark.as_str(),
@@ -1045,5 +1075,60 @@ impl Runtime {
     pub fn reader_idle_ms(&self) -> u64 {
         self.mono_ms()
             .saturating_sub(self.heartbeat.load(Ordering::Relaxed))
+    }
+}
+
+/// Lot 311 (bug hunt 1.4, F4).
+#[cfg(test)]
+mod lot311 {
+    use super::*;
+
+    /// A mount scope is found in a table that holds a user's FUSE mount
+    /// named with bytes that are not UTF-8 — on main the table was
+    /// unreadable as text and the scope refused at the start. A mount
+    /// point with such bytes is matched by them.
+    #[test]
+    fn a_non_utf8_mount_does_not_hide_a_mount_scope() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("mountinfo");
+        std::fs::write(
+            &t,
+            b"30 1 8:2 / /srv/data rw - ext4 /dev/sdb rw\n\
+              57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n",
+        )
+        .unwrap();
+        let missing = d.path().join("absent");
+        let mut rows = nn_linux::state_read::Condition::new("lot311_test_cow_rows");
+        assert!(is_mount_point_in(
+            Path::new("/srv/data"),
+            &[&missing, &t],
+            &mut rows
+        ));
+        assert!(is_mount_point_in(
+            Path::new(std::ffi::OsStr::from_bytes(b"/home/u/\xff")),
+            &[&t],
+            &mut rows
+        ));
+        assert!(!is_mount_point_in(Path::new("/srv"), &[&t], &mut rows));
+        assert!(!is_mount_point_in(
+            Path::new("/srv/data"),
+            &[&missing],
+            &mut rows
+        ));
+        // the review of #538 (F2): a source `-`, and a line not in the
+        // kernel's shape that still names the scope
+        std::fs::write(
+            &t,
+            b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n32 1 8:3 / /srv/odd rw ext4 x rw\n",
+        )
+        .unwrap();
+        assert!(is_mount_point_in(Path::new("/srv/fuse"), &[&t], &mut rows));
+        assert!(is_mount_point_in(Path::new("/srv/odd"), &[&t], &mut rows));
+        assert!(rows.holding(), "the odd line is signed");
+        // the re-check: a table in the kernel's shape withdraws it
+        std::fs::write(&t, b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n").unwrap();
+        assert!(is_mount_point_in(Path::new("/srv/fuse"), &[&t], &mut rows));
+        assert!(!rows.holding(), "withdrawn");
     }
 }

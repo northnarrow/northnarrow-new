@@ -425,7 +425,10 @@ fn dpkg_lists(info: &Path, key: &str) -> bool {
         if entry.path().extension().is_none_or(|e| e != "list") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+        // lot 311 (bug hunt 1.4, F4, BUG-105's sibling): read as bytes — a
+        // package that ships one file whose name is not UTF-8 had its whole
+        // list skipped, every file of it unowned
+        let Ok(text) = std::fs::read(entry.path()).map(crate::posture::host::state_text) else {
             continue;
         };
         if text.lines().any(|l| without_usr(l) == key) {
@@ -1047,5 +1050,19 @@ mod tests {
             }
             Judged::Trusted(_) => panic!("a tool under an unread ancestor is judged"),
         }
+    }
+
+    /// Lot 311 (F4): a package whose list names one file that is not UTF-8
+    /// still owns its other files (on main the whole list was skipped).
+    #[test]
+    fn a_list_with_a_non_utf8_name_still_owns_its_other_files() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("pkg.list"),
+            b"/usr/share/doc/pkg/caf\xe9.txt\n/usr/bin/pkgtool\n",
+        )
+        .unwrap();
+        assert!(dpkg_lists(d.path(), "/bin/pkgtool"));
+        assert!(!dpkg_lists(d.path(), "/bin/other"));
     }
 }

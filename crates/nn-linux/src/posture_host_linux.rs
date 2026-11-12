@@ -30,10 +30,6 @@ impl PostureHost for LinuxHost {
 
     const HOST_ROOT: &'static str = "/";
 
-    fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
-        fs::read_to_string(path)
-    }
-
     fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
         fs::read(path)
     }
@@ -183,7 +179,7 @@ mod tests {
             LinuxHost::read_link(me.join("exe")).unwrap(),
             std::env::current_exe().unwrap()
         );
-        let stat = LinuxHost::read_to_string(me.join("stat")).unwrap();
+        let stat = LinuxHost::read_state(me.join("stat")).unwrap();
         assert!(
             stat.starts_with(&format!("{} (", std::process::id())),
             "{stat}"

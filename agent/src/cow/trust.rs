@@ -323,7 +323,15 @@ impl TrustFilter {
 /// `starttime`, field 22 of `/proc/<pid>/stat` (after the `(comm)` field,
 /// which may hold spaces or parentheses).
 pub fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    // lot 311 (N6; the re-check of #542): read as bytes — a writer's `comm`
+    // is its own choice; read strictly, a writer named `\xff\xfe` was "not
+    // alive" and the in-place restore ran while it still wrote. The one
+    // conversion, `nn_linux::state_read::read_state`'s own: this module is
+    // in nn-core's layer (`xtask/tests/module_map.rs`), so not through
+    // nn-linux
+    let stat = std::fs::read(proc_root.join(pid.to_string()).join("stat"))
+        .map(nn_core::posture::host::state_text)
+        .ok()?;
     parse_stat_start(&stat)
 }
 
@@ -803,5 +811,24 @@ mod tests {
             })
         );
         assert!(f.evaluate(400, 0).trust.is_trusted());
+    }
+
+    /// Lot 311 (the re-check of #542): a writer whose `comm` is not UTF-8
+    /// (`\xff\xfe`, the name of the file it executed) has its start read
+    /// and is alive for the restore — read strictly, its `stat` was refused
+    /// and the writer "not alive": the in-place restore ran under it. Its
+    /// `stat` in a fixture `/proc` the same, and a gone one is none.
+    #[test]
+    fn a_writer_whose_comm_is_not_utf8_has_its_start_and_is_alive() {
+        let p = nn_linux::state_read::testing::sleeper_with_non_utf8_comm(30);
+        let pid = p.pid();
+        let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
+        assert!(std::str::from_utf8(&comm).is_err(), "the fixture's comm");
+        let start = proc_start_ticks(Path::new("/proc"), pid).expect("its start");
+        assert!(super::super::store::alive(ProcId { pid, start }));
+        let root = tempfile::tempdir().unwrap();
+        nn_linux::state_read::testing::write_non_utf8_proc(root.path(), 4242, 1, 1000, 777);
+        assert_eq!(proc_start_ticks(root.path(), 4242), Some(777));
+        assert_eq!(proc_start_ticks(root.path(), 4243), None, "gone");
     }
 }

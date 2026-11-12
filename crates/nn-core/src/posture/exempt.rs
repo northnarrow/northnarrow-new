@@ -184,7 +184,7 @@ impl<H: PostureHost> ExemptPids<H> {
 /// `starttime`, field 22 of `<proc_root>/<pid>/stat`, counted after the
 /// `(comm)` field, which may itself hold spaces or parentheses.
 fn proc_start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()
@@ -232,7 +232,7 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
     expected_exe: &Path,
     proc_root: &Path,
 ) -> WatchdogResolution {
-    let text = match H::read_to_string(pidfile) {
+    let text = match H::read_state(pidfile) {
         Ok(t) => t,
         Err(_) => return WatchdogResolution::NotPresent,
     };
@@ -410,6 +410,30 @@ mod tests {
         ));
     }
 
+    /// Lot 311 (N6): the watchdog's start is read from a `stat` whose
+    /// `comm` is not UTF-8 (a process names itself) — on main the read
+    /// failed and the verified watchdog was "unverifiable": not spared.
+    #[test]
+    fn a_watchdog_whose_comm_is_not_utf8_is_verified_with_its_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(proc_root.join("2001")).unwrap();
+        fs::write(
+            proc_root.join("2001/stat"),
+            b"2001 (\xff\xfe) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 6000 0 0\n",
+        )
+        .unwrap();
+        symlink(DEFAULT_WATCHDOG_EXE, proc_root.join("2001/exe")).unwrap();
+        let pf = write_pidfile(tmp.path(), "2001");
+        assert_eq!(
+            resolve_with_proc_root(&pf, Path::new(DEFAULT_WATCHDOG_EXE), &proc_root),
+            WatchdogResolution::Verified {
+                pid: 2001,
+                start_ticks: 6_000
+            }
+        );
+    }
+
     fn write_pidfile(dir: &Path, pid: &str) -> PathBuf {
         let p = dir.join("watchdog.pid");
         let mut f = fs::File::create(&p).unwrap();
@@ -564,9 +588,8 @@ mod lot315 {
     impl PostureHost for RaceHost {
         const PROC_ROOT: &'static str = "/proc";
         const HOST_ROOT: &'static str = "/";
-        fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
-            std::fs::read_to_string(path)
-        }
+        // lot 311: the trait's text read is its provided `read_state`
+        // (lossy, over `read`): no strict text read to give
         fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
             std::fs::read(path)
         }
