@@ -753,6 +753,13 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_to_string(DEBUG_RING_DROP)",
         LAB,
     ),
+    // lot 315 (#542, merged in): the copy-on-write guard's task `stat`, read
+    // as bytes — a task gone is no task
+    (
+        "agent/src/cow/fanotify.rs",
+        "read_state(format!(\"/proc/{tid}/stat\"))",
+        PROC,
+    ),
 ];
 
 /// The argument list of the call whose `(` is at `open` in `code`.
