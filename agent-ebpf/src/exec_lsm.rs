@@ -28,7 +28,7 @@ use aya_ebpf::{
         bpf_ktime_get_ns, generated,
     },
     macros::{lsm, map},
-    maps::LruHashMap,
+    maps::{HashMap, LruHashMap},
     programs::LsmContext,
 };
 use northnarrow_common::wire::exe::{
@@ -65,10 +65,10 @@ pub static EXEC_HANDOFF: LruHashMap<u64, ExeIdentityRaw> = LruHashMap::with_max_
 /// program runs preemptible (migration disabled only): on a `full` or
 /// `lazy` preemption kernel another task's exec on the same CPU could
 /// rewrite the walk between the write and the classes judged from it
-/// (`crate::task_scratch`).
+/// (`crate::task_scratch`: a plain hash, never an LRU).
 #[map]
-pub(crate) static EXEC_SCRATCH: LruHashMap<TaskKey, ExeIdentityRaw> =
-    LruHashMap::with_max_entries(1024, 0);
+pub(crate) static EXEC_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 
 /// `u64` at `src`, 0 when unreadable, without a branch on the result
 /// (the helper always writes its destination).
@@ -125,7 +125,9 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     let key = crate::task_scratch::key_of(task);
     let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
         Some(p) => p,
-        None => return 0,
+        // The review of #546 (F4, F5): the map full — counted, and in
+        // enforce mode refused (nothing of the exec can be judged).
+        None => return crate::execpol::walk_lost(),
     };
 
     // The file: identity, filesystem, memfd name, link count.

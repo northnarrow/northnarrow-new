@@ -41,7 +41,8 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::exe::{exe_flags, ExeIdentityRaw};
 use northnarrow_common::wire::execpol::{
-    action, conf_slot, counter, env_flags, exec_envp_reg, flags, image_role, kind, mode,
+    action, conf_slot, counter, env_flags, envp_stride, envp_value, exec_envp_reg, flags,
+    image_role, kind, mode,
     slice_slot, tier, tier_sig, EnvStashRaw, TaskKey, EnvpReg, ExecPolRaw, MapSeen,
     ENV_AUDIT_LEN, ENV_HIST_LEN, ENV_LIBPATH_LEN, ENV_PREFIX_LEN, ENV_PRELOAD_LEN, ENV_SCAN_MAX,
     ENV_TUNABLES_LEN, MAP_REPORT_EVERY_NS,
@@ -53,6 +54,7 @@ use crate::btf_offsets::{
     INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
     INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
     PATH_DENTRY_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_R10_OFFSET,
+    PT_REGS_SI_OFFSET,
     QSTR_NAME_OFFSET, SIGNAL_STRUCT_TTY_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
     TASK_STRUCT_LOGINUID_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
@@ -94,7 +96,8 @@ pub static EXECPOL_IMAGES: HashMap<ExecqKey, u32> = HashMap::with_max_entries(25
 /// 26.04's default), so another task's exec on the same CPU could rewrite
 /// a per-CPU buffer between the scan and the judgment.
 #[map]
-static EXECPOL_ENV: LruHashMap<TaskKey, EnvStashRaw> = LruHashMap::with_max_entries(1024, 0);
+static EXECPOL_ENV: HashMap<TaskKey, EnvStashRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 /// One report per deny, "would deny", environment finding or mapping.
 /// 256 KiB: about 240 reports of 1 056 bytes.
 #[map]
@@ -113,8 +116,8 @@ static EXECMAP_SEEN: LruHashMap<ExecqKey, MapSeen> = LruHashMap::with_max_entrie
 /// this one was preempted, and copied into a report from the cache with
 /// whatever walk the CPU had made last (another file's path).
 #[map]
-pub(crate) static EXECMAP_SCRATCH: LruHashMap<TaskKey, ExeIdentityRaw> =
-    LruHashMap::with_max_entries(1024, 0);
+pub(crate) static EXECMAP_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 
 #[inline(always)]
 fn bump(slot: u32) {
@@ -443,8 +446,18 @@ pub(crate) unsafe fn on_pass(
                 }
             }
         }
+        // The review of #546 (F1, F2): an environment not read whole is
+        // counted and recorded, never refused (32-bit runtimes exec through
+        // the compat calls; a string can go unreadable after the kernel's
+        // copy).
+        if ef & env_flags::UNREADABLE != 0 {
+            bump(counter::ENV_UNREAD);
+        }
         let reportable = ef
-            & (env_flags::DENYABLE | env_flags::LIBPATH_STAGING | env_flags::HISTORY)
+            & (env_flags::DENYABLE
+                | env_flags::LIBPATH_STAGING
+                | env_flags::HISTORY
+                | env_flags::UNREADABLE)
             != 0
             || (setid && ef & env_flags::GLIBC_TUNABLES != 0);
         if conf(conf_slot::ENV_RECORD) & tb != 0 && reportable {
@@ -555,32 +568,49 @@ unsafe fn report_exec(
 // ── the new environment, at the exec's first pass ───────────────────
 
 /// `nn_env_scan`'s result bit (above the 32 of [`env_flags`]): the task's
-/// own entry could not be made or was gone (the LRU's eviction under a
-/// flood of execs in flight): nothing was read.
+/// own entry could not be made (the map full: that many execs in flight):
+/// nothing was read.
 const SCAN_LOST: u64 = 1 << 32;
+
+/// The review of #546 (F5): a per-task buffer of the exec guards could not
+/// be made (the map full) — counted ([`counter::LOST`]).
+#[inline(always)]
+pub(crate) fn count_lost() {
+    bump(counter::LOST);
+}
+
+/// The review of #546 (F4, F5): the exec sensor's walk could not be made
+/// (the per-task map full) — counted, and in enforce mode the exec is
+/// refused: neither its classes nor its environment can be judged.
+#[inline(always)]
+pub(crate) fn walk_lost() -> i32 {
+    bump(counter::LOST);
+    if conf(conf_slot::MODE) == mode::ENFORCE {
+        -EACCES
+    } else {
+        0
+    }
+}
 
 /// The new environment of the exec in progress, read into the task's own
 /// [`EXECPOL_ENV`] entry: its findings ([`env_flags`], 0 for none: the
 /// entry is then gone) and the entry's key, which the caller removes once
-/// judged. Not read, and counted ([`counter::ENV_UNREAD`]): a 32-bit or x32
-/// call, a kernel without the `pt_regs` offsets, an entry that could not
-/// be made.
+/// judged. Not read whole: [`env_flags::UNREADABLE`] (the caller counts it
+/// and records it) — a call [`exec_envp_reg`] does not know, a kernel
+/// without the `pt_regs` offsets, an entry that could not be made, an
+/// array or a string the scan could not read.
 #[inline(always)]
 unsafe fn exec_env(task: *const u8, key: &TaskKey) -> (u32, Option<TaskKey>) {
-    let envp = match exec_envp(task) {
+    let (envp, compat) = match exec_envp(task) {
         Some(p) => p,
-        None => {
-            bump(counter::ENV_UNREAD);
-            return (0, None);
-        }
+        None => return (env_flags::UNREADABLE, None),
     };
     if envp == 0 {
         return (0, None);
     }
-    let r = nn_env_scan(envp, u64::from(key.tid), key.start_ns);
+    let r = nn_env_scan(envp, u64::from(key.tid), key.start_ns, u64::from(compat));
     if r & SCAN_LOST != 0 {
-        bump(counter::ENV_UNREAD);
-        return (0, None);
+        return (env_flags::UNREADABLE, None);
     }
     let ef = r as u32;
     if ef == 0 {
@@ -590,42 +620,49 @@ unsafe fn exec_env(task: *const u8, key: &TaskKey) -> (u32, Option<TaskKey>) {
 }
 
 /// `envp` of the exec in progress, from the registers it entered the
-/// kernel with (`task_pt_regs`): `execve`'s third argument, `execveat`'s
-/// fourth ([`exec_envp_reg`]). The caller's memory is still its own at
-/// `bprm_check_security`, and the kernel has just copied the strings from
-/// it (so they are mapped). `Some(0)`: a task with no user call of its own
-/// (no `mm`: a kernel-started exec; an io-wq worker carries another call's
-/// registers). `None`: not read (the offsets are not resolved: another
-/// architecture; a 32-bit or x32 call).
+/// kernel with (`task_pt_regs`), and whether it is a compat call's (an
+/// array of 32-bit pointers; [`exec_envp_reg`], [`envp_value`]). The
+/// caller's memory is still its own at `bprm_check_security`; the kernel
+/// copied the strings from it earlier in the exec (into the new image's
+/// stack, which is not readable here), so this is a second read of memory
+/// the caller — another thread, a process sharing the page — can change in
+/// between (the review of #546, F2: the kernel's own copy is lot 325's).
+/// `Some((0, _))`: a task with no user call of its own (no `mm`: a
+/// kernel-started exec; an io-wq worker carries another call's registers).
+/// `None`: not read (the offsets are not resolved: another architecture;
+/// an unknown call).
 #[inline(always)]
-unsafe fn exec_envp(task: *const u8) -> Option<u64> {
-    let (Some(ax), Some(dx), Some(r10)) = (
+unsafe fn exec_envp(task: *const u8) -> Option<(u64, bool)> {
+    let (Some(ax), Some(dx), Some(r10), Some(si)) = (
         off_opt!(PT_REGS_ORIG_AX_OFFSET),
         off_opt!(PT_REGS_DX_OFFSET),
         off_opt!(PT_REGS_R10_OFFSET),
+        off_opt!(PT_REGS_SI_OFFSET),
     ) else {
         return None;
     };
-    if ax > 0xff || dx > 0xff || r10 > 0xff {
+    if ax > 0xff || dx > 0xff || r10 > 0xff || si > 0xff {
         return None;
     }
     if peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) == 0 {
-        return Some(0);
+        return Some((0, false));
     }
     let tflags = peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET)));
     if !northnarrow_common::cgroup_limits::regs_are_the_writes(tflags) {
-        return Some(0);
+        return Some((0, false));
     }
     let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
     if regs == 0 {
         return None;
     }
     let nr = peek_u64((regs + ax as u64) as *const u8);
-    match exec_envp_reg(nr) {
-        Some(EnvpReg::Dx) => Some(peek_u64((regs + dx as u64) as *const u8)),
-        Some(EnvpReg::R10) => Some(peek_u64((regs + r10 as u64) as *const u8)),
-        None => None,
-    }
+    let (reg, compat) = exec_envp_reg(nr)?;
+    let off = match reg {
+        EnvpReg::Dx => dx,
+        EnvpReg::R10 => r10,
+        EnvpReg::Si => si,
+    };
+    Some((envp_value(peek_u64((regs + off as u64) as *const u8), compat), compat))
 }
 
 /// "LD_PRELO", "LD_AUDIT", "LD_LIBRA", "GLIBC_TU", "HISTFILE",
@@ -655,17 +692,19 @@ const M7: u64 = 0x00ff_ffff_ffff_ffff;
 /// image) into the task's own entry of [`EXECPOL_ENV`] (`tid`, `start`:
 /// [`TaskKey`]), made here zeroed: at most
 /// [`ENV_SCAN_MAX`] variables, 24 bytes of each compared, the values of the
-/// loader variables captured. Returns the findings ([`env_flags`]; with
-/// none the entry is removed) or [`SCAN_LOST`]. A global function (integer
-/// arguments): the verifier checks its loop once.
+/// loader variables captured. `compat` (1): an array of 32-bit pointers.
+/// Returns the findings ([`env_flags`]; with none the entry is removed) or
+/// [`SCAN_LOST`]. An entry or a string it cannot read sets
+/// [`env_flags::UNREADABLE`] (the review of #546, F2: it was skipped). A
+/// global function (integer arguments): the verifier checks its loop once.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_scan(envp: u64, tid: u64, start: u64) -> u64 {
-    unsafe { env_scan(envp, tid, start) }
+pub extern "C" fn nn_env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
+    unsafe { env_scan(envp, tid, start, compat) }
 }
 
 #[inline(always)]
-unsafe fn env_scan(envp: u64, tid: u64, start: u64) -> u64 {
+unsafe fn env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
     let key = crate::task_scratch::key(tid, start);
     let e = match crate::task_scratch::make(&EXECPOL_ENV, &key) {
         Some(p) => p,
@@ -674,14 +713,16 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64) -> u64 {
     // Findings go to the stash's memory, not to a register: the verifier
     // then sees the same state at the loop head whatever matched, and the
     // 64 iterations stay linear (5.15 rule: no state explosion in loops).
-    // The entry starts zeroed.
+    // The entry starts zeroed. An entry is 8 bytes, or 4 for a compat
+    // call (read into the low half of `ptr`, which starts at 0).
+    let stride = envp_stride(compat);
     let mut i = 0usize;
     while i < ENV_SCAN_MAX {
         let mut ptr = 0u64;
         if generated::bpf_probe_read_user(
             &mut ptr as *mut u64 as *mut c_void,
-            8,
-            (envp + (i as u64) * 8) as *const c_void,
+            stride as u32,
+            (envp + (i as u64) * stride) as *const c_void,
         ) != 0
         {
             (*e).flags |= env_flags::UNREADABLE;
@@ -700,11 +741,14 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64) -> u64 {
             core::ptr::write_volatile(wp.add(z), 0);
             z += 1;
         }
-        let _ = generated::bpf_probe_read_user_str(
+        if generated::bpf_probe_read_user_str(
             wp as *mut c_void,
             ENV_PREFIX_LEN as u32,
             ptr as *const c_void,
-        );
+        ) < 0
+        {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         let w = buf.assume_init();
         scan_one(e, ptr, w[0], w[1], w[2]);
         i += 1;
@@ -715,8 +759,8 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64) -> u64 {
         let mut ptr = 0u64;
         let _ = generated::bpf_probe_read_user(
             &mut ptr as *mut u64 as *mut c_void,
-            8,
-            (envp + (ENV_SCAN_MAX as u64) * 8) as *const c_void,
+            stride as u32,
+            (envp + (ENV_SCAN_MAX as u64) * stride) as *const c_void,
         );
         if ptr != 0 {
             (*e).flags |= env_flags::TRUNCATED;
@@ -749,6 +793,9 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
             ENV_PRELOAD_LEN as u32,
             (ptr + 11) as *const c_void,
         );
+        if len < 0 {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         if len >= ENV_PRELOAD_LEN as i64 {
             (*e).flags |= env_flags::VALUE_CUT;
         }
@@ -759,6 +806,9 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
             ENV_AUDIT_LEN as u32,
             (ptr + 9) as *const c_void,
         );
+        if len < 0 {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         if len >= ENV_AUDIT_LEN as i64 {
             (*e).flags |= env_flags::VALUE_CUT;
         }
@@ -769,6 +819,9 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
             ENV_LIBPATH_LEN as u32,
             (ptr + 16) as *const c_void,
         );
+        if len < 0 {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         if len >= ENV_LIBPATH_LEN as i64 {
             (*e).flags |= env_flags::VALUE_CUT;
         }
@@ -779,14 +832,20 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
             ENV_TUNABLES_LEN as u32,
             (ptr + 15) as *const c_void,
         );
+        if len < 0 {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         (*e).tunables_len = if len > 0 { (len - 1) as u32 } else { 0 };
     } else if w0 == W_HISTFILE && w1 & M1 == u64::from(b'=') {
         (*e).flags |= env_flags::HISTFILE;
-        let _ = generated::bpf_probe_read_user_str(
+        let hl = generated::bpf_probe_read_user_str(
             (*e).hist.as_mut_ptr() as *mut c_void,
             ENV_HIST_LEN as u32,
             (ptr + 9) as *const c_void,
         );
+        if hl < 0 {
+            (*e).flags |= env_flags::UNREADABLE;
+        }
         // "HISTFILE=" then "/dev/null" or nothing.
         let v = (w1 >> 8) | (w2 << 56);
         if v & M1 == 0 || (v == W_DEV_NUL && (w2 >> 8) & 0xffff == 0x6c) {
@@ -956,14 +1015,19 @@ unsafe fn try_execmap(ctx: &LsmContext, task: *const u8, walked: &mut Option<Tas
     let wk = crate::task_scratch::key_of(task);
     if !cached {
         *walked = Some(wk);
-        classes = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns) as u32;
-        let v = MapSeen {
-            ctime_sec: cs,
-            ctime_nsec: cn,
-            classes,
-            reported_ns: 0,
-        };
-        let _ = EXECMAP_SEEN.insert(&key, &v, 0);
+        let r = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns) as u32;
+        classes = r & !MAP_WALK_LOST;
+        // A classification without a walk (fail-closed) is not cached:
+        // the next mapping of the file is walked.
+        if r & MAP_WALK_LOST == 0 {
+            let v = MapSeen {
+                ctime_sec: cs,
+                ctime_nsec: cn,
+                classes,
+                reported_ns: 0,
+            };
+            let _ = EXECMAP_SEEN.insert(&key, &v, 0);
+        }
     }
     if classes == 0 {
         return 0;
@@ -1048,11 +1112,20 @@ pub extern "C" fn nn_map_classify(file: u64, tid: u64, start: u64) -> u64 {
     unsafe { u64::from(map_classify(file as *const u8, tid, start)) }
 }
 
+/// [`nn_map_classify`]'s bit: no walk could be made (the per-task map full):
+/// the classes are the fail-closed `tmp`, `var_tmp`, `home`, not cached.
+const MAP_WALK_LOST: u32 = 1 << 31;
+
 #[inline(always)]
 unsafe fn map_classify(file: *const u8, tid: u64, start: u64) -> u32 {
     let s = match crate::task_scratch::make(&EXECMAP_SCRATCH, &crate::task_scratch::key(tid, start)) {
         Some(p) => p,
-        None => return 0,
+        // The review of #546 (F4, F5): counted, and classed as a file the
+        // walk cannot place (it was class 0: let through, uncounted).
+        None => {
+            bump(counter::LOST);
+            return MAP_WALK_LOST | class::TMP | class::VAR_TMP | class::HOME;
+        }
     };
     let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
     let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;

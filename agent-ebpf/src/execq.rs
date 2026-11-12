@@ -29,7 +29,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
 };
 use northnarrow_common::wire::exe::{
-    exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
+    exe_flags, exe_path_slot, ExeIdentityRaw, TaskKey, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
 };
 use northnarrow_common::wire::execq::{
     class, conf_slot, counter, mode, root_kind, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown,
@@ -74,11 +74,18 @@ pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(EXECQ
 
 /// [`EXECQ_ROOTS`]' capacity.
 pub const EXECQ_ROOTS_CAPACITY: u32 = 1024;
-/// The candidate of each exec in progress, keyed by `task_struct`, built in
-/// place (584 bytes: never on the stack). Lot 322: it was built in a
-/// per-CPU buffer, then copied in, by a program that runs preemptible.
+/// The candidate of each exec in progress, keyed by `task_struct`, from the
+/// exec's pass to its `sched_process_exec`.
 #[map]
 static EXECQ_CAND: LruHashMap<u64, ExecqCandRaw> = LruHashMap::with_max_entries(1024, 0);
+/// Where a candidate is built (584 bytes: never on the stack): the running
+/// task's own entry, made, copied into [`EXECQ_CAND`] and removed in one
+/// run. Lot 322: it was a per-CPU buffer in a program that runs
+/// preemptible; built in place in the LRU it could be evicted under the
+/// writer (the review of #546, F4).
+#[map]
+static EXECQ_CAND_SCRATCH: HashMap<TaskKey, ExecqCandRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 /// Processes stopped and not decided yet (tgid → start, stop time). Pinned:
 /// a restarted agent resumes what its predecessor left stopped.
 #[map]
@@ -520,10 +527,12 @@ pub(crate) unsafe fn note_pass(
         }
         return 0;
     }
-    let cand = match crate::task_scratch::make(&EXECQ_CAND, &task) {
+    let ck = crate::task_scratch::current_key();
+    let cand = match crate::task_scratch::make(&EXECQ_CAND_SCRATCH, &ck) {
         Some(p) => p,
         None => {
             bump(counter::CAND_DROPPED);
+            crate::execpol::count_lost();
             return 0;
         }
     };
@@ -543,6 +552,10 @@ pub(crate) unsafe fn note_pass(
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         s as *const c_void,
     );
+    if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {
+        bump(counter::CAND_DROPPED);
+    }
+    let _ = EXECQ_CAND_SCRATCH.remove(&ck);
     0
 }
 

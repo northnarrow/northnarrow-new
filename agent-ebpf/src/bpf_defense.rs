@@ -129,8 +129,8 @@ const PATH_BUF_LEN: usize = 256;
 /// program that runs preemptible (`crate::task_scratch`): another task's
 /// `OBJ_GET` on the same CPU could rewrite the name between the reads.
 #[map]
-static OBJ_GET_PATH_SCRATCH: LruHashMap<TaskKey, [u8; PATH_BUF_LEN]> =
-    LruHashMap::with_max_entries(1024, 0);
+static OBJ_GET_PATH_SCRATCH: HashMap<TaskKey, [u8; PATH_BUF_LEN]> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 
 /// Final path components of the agent's own LINK pins, hashed
 /// (`northnarrow_common::wire::pin_name_hash`; value = [`OWN_KIND_LINK`]),

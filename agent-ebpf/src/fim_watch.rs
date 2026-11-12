@@ -591,6 +591,8 @@ unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
     // Lab PR 225: every unlink counts toward its process's unlink burst
     // (the deletion of originals after an encrypted copy was written).
     let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 1));
+    // Lot 322: the walk's per-task buffers, if it made them.
+    crate::open_sensor::forget_task();
     0
 }
 
@@ -666,6 +668,8 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
         crate::open_sensor::raw_arg(ctx, 1),
         crate::open_sensor::raw_arg(ctx, 3),
     );
+    // Lot 322: the walk's per-task buffers, if the unlink burst made them.
+    crate::open_sensor::forget_task();
     0
 }
 
