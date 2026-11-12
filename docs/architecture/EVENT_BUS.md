@@ -572,7 +572,8 @@ has no assessment for comes back without one. No `catch_unwind` around the
 preparation (BUG-115): the release build aborts on a panic, so the fallback
 lived only in unwinding builds — where it dropped the event and said it was
 judged; a thread that has ended takes no more bursts (`defer` checks it
-runs). `xtask/tests/unwind_fallbacks.rs` lists the `catch_unwind` calls left
+runs), and what it had been handed comes back unprepared at the decision's
+next turn (`take_ready`), not at the stop. `xtask/tests/unwind_fallbacks.rs` lists the `catch_unwind` calls left
 in production code, each with what its fallback does.
 
 ## 3. The take order

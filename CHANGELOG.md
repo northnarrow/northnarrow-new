@@ -160,7 +160,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   recovery and the stop leave such a process in the map for the next start.
   `ProcRef::liveness()` tells running, gone and not captured apart; the
   stand-down of a soft egress block and the executor's "already gone" use
-  it, and `xtask/tests/process_liveness.rs` keeps every caller on it.
+  it, and `xtask/tests/process_liveness.rs` keeps every caller on it — the
+  same confusion spelled `liveness() != Liveness::Live` included.
+- The review of #541 (lot 317): a late block-list verdict on a process
+  whose resume is owed is a kill owed, never a resume; a kill owed is
+  marked in the pinned `EXECQ_STOPPED` (`stop_ns` = `u64::MAX`) and the
+  next start kills the process instead of resuming it; the stop reads the
+  ring a last time after its wait, and keys every process by its pid and
+  start (a reused pid neither hides nor releases another); the kernel
+  writes `EXECQ_STOPPED` before it sends `SIGSTOP` and does not stop a
+  process the map cannot name (`MAP_FULL`, counted, signed as fail-open):
+  past 4096 held processes a stop used to leave one no stop, crash or next
+  start resumed.
 - The dispatcher of slow work prepares nothing at the stop (lot 317,
   BUG-116; `docs/architecture/EVENT_BUS.md` §2d): it prepared its whole
   queue (up to 256 bursts, with their I/O) inside the stop's budget, and
