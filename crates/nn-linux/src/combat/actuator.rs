@@ -220,6 +220,10 @@ impl SystemActuator {
     pub fn soft_block_of(outcome: ExecutionOutcome) -> SoftBlock {
         match outcome {
             ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
+            // lot 312 (review F2): new sockets dropped, older ones not
+            ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+                SoftBlock::Partial(crate::response::blocked_new_only(sockets))
+            }
             ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
             ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
             ExecutionOutcome::Failed { errno: 0, .. } => {

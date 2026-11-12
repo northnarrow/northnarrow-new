@@ -132,7 +132,7 @@ pub fn block_outbound_for_pid(
     if pid_under_blocked_scope(pid, cfg) {
         debug!(pid, "already in the blocked scope");
         return match in_effect(pid, cfg, scope_id) {
-            Ok(()) => ExecutionOutcome::Blocked { pid },
+            Ok(()) => blocked(pid),
             Err(reason) => not_in_effect(pid, reason),
         };
     }
@@ -167,7 +167,60 @@ pub fn block_outbound_for_pid(
         return not_in_effect(pid, reason);
     }
     info!(pid, cgroup = %cfg.blocked_cgroup_match(), "blocked outbound traffic");
-    ExecutionOutcome::Blocked { pid }
+    blocked(pid)
+}
+
+/// Lot 312 (review F2): `Blocked` only for a process that holds no inet
+/// socket: the drop matches a socket's cgroup at its creation, so a socket
+/// it opened before the move keeps sending — partial, said with the count.
+fn blocked(pid: u32) -> ExecutionOutcome {
+    match inet_sockets_of(Path::new("/proc"), pid) {
+        0 => ExecutionOutcome::Blocked { pid },
+        sockets => {
+            warn!(
+                pid,
+                sockets, "block outbound: new sockets dropped, the ones opened before the move are not"
+            );
+            ExecutionOutcome::BlockedNewOnly { pid, sockets }
+        }
+    }
+}
+
+/// The inet sockets (TCP, UDP, raw, v4 and v6) process `pid` holds: its
+/// descriptors that are sockets, found in its network namespace's tables
+/// (`<proc>/<pid>/net/{tcp,udp,raw,…}`, by inode). Unreadable: none known.
+fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
+    let dir = proc.join(pid.to_string());
+    let Ok(fds) = fs::read_dir(dir.join("fd")) else {
+        return 0;
+    };
+    let held: HashSet<u64> = fds
+        .flatten()
+        .filter_map(|e| fs::read_link(e.path()).ok())
+        .filter_map(|l| {
+            l.to_str()?
+                .strip_prefix("socket:[")?
+                .trim_end_matches(']')
+                .parse()
+                .ok()
+        })
+        .collect();
+    if held.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    for table in ["tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6"] {
+        let Ok(text) = crate::state_read::read_state(dir.join("net").join(table)) else {
+            continue;
+        };
+        n += text
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().nth(9)?.parse::<u64>().ok())
+            .filter(|ino| held.contains(ino))
+            .count();
+    }
+    n
 }
 
 /// Lot 312 (external bug hunt 1.4, F5): the block read back. The process
@@ -920,7 +973,7 @@ mod bug91 {
         let _ = fs::remove_dir(format!("/sys/fs/cgroup/{SLICE}"));
         forget_applied_ruleset();
         match &out {
-            ExecutionOutcome::Blocked { .. } => {
+            ExecutionOutcome::Blocked { .. } | ExecutionOutcome::BlockedNewOnly { .. } => {
                 assert_eq!(
                     after.trim_end(),
                     format!("0::/{SLICE}/blocked.scope"),
@@ -943,5 +996,69 @@ mod bug91 {
                 );
             }
         }
+    }
+}
+
+/// Lot 312 (review F2): a block that leaves sockets opened before the move
+/// is partial, never a success.
+#[cfg(test)]
+mod review_f2 {
+    use super::*;
+
+    /// The inet sockets of a process, from a `/proc` tree of the test's own:
+    /// its descriptors that are sockets, found by inode in the tables.
+    #[test]
+    fn the_sockets_a_process_holds_are_counted_by_inode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("4242");
+        fs::create_dir_all(p.join("fd")).unwrap();
+        fs::create_dir_all(p.join("net")).unwrap();
+        std::os::unix::fs::symlink("socket:[555]", p.join("fd/3")).unwrap();
+        std::os::unix::fs::symlink("socket:[777]", p.join("fd/4")).unwrap();
+        std::os::unix::fs::symlink("socket:[888]", p.join("fd/5")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", p.join("fd/0")).unwrap();
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let row = |ino: u64| format!("   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {ino} 1 0000000000000000 100 0 0 10 0\n");
+        fs::write(p.join("net/tcp"), format!("{header}{}{}", row(555), row(999))).unwrap();
+        fs::write(p.join("net/udp6"), format!("{header}{}", row(777))).unwrap();
+        // 888: a unix socket, in no inet table
+        assert_eq!(inet_sockets_of(tmp.path(), 4242), 2);
+        assert_eq!(inet_sockets_of(tmp.path(), 1), 0, "no such process: none known");
+    }
+
+    /// The test process holding a UDP socket: the block of such a process
+    /// is `BlockedNewOnly`, signed partial with the count and what escapes.
+    #[test]
+    fn a_process_holding_a_socket_is_blocked_new_only() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let me = std::process::id();
+        assert!(inet_sockets_of(Path::new("/proc"), me) >= 1);
+        let out = blocked(me);
+        let ExecutionOutcome::BlockedNewOnly { sockets, .. } = out else {
+            panic!("{out:?}");
+        };
+        assert!(sockets >= 1);
+        drop(sock);
+        let (result, _, reason) = super::super::journal_outcome(&super::super::ExecutionReport {
+            action: nn_model::ResponseAction::BlockOutbound,
+            primary: ExecutionOutcome::BlockedNewOnly { pid: me, sockets: 2 },
+            additional: Vec::new(),
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        assert_eq!(result, super::super::journal::ActionResult::Partial);
+        let reason = reason.unwrap();
+        assert!(
+            reason.starts_with("new connections blocked; 2 inet socket(s) opened before the move")
+                && reason.contains("SCM_RIGHTS"),
+            "{reason}"
+        );
+        // the ladder: partial, released at the stand-down, window shortened
+        assert!(matches!(
+            crate::combat::actuator::SystemActuator::soft_block_of(ExecutionOutcome::BlockedNewOnly {
+                pid: me,
+                sockets: 2
+            }),
+            nn_core::combat::actuator::SoftBlock::Partial(_)
+        ));
     }
 }

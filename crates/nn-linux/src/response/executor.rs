@@ -515,7 +515,11 @@ impl Executor {
                         &self.config,
                         intent,
                     );
-                    if matches!(o, ExecutionOutcome::Blocked { .. }) && !self.config.dry_run {
+                    if matches!(
+                        o,
+                        ExecutionOutcome::Blocked { .. } | ExecutionOutcome::BlockedNewOnly { .. }
+                    ) && !self.config.dry_run
+                    {
                         self.record_contain(target_pid, "blocked");
                     }
                     o

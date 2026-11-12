@@ -1399,6 +1399,21 @@ impl<H: CombatHost> Inner<H> {
         let outcome = self.actuator.soft_egress_block(target);
         let mut s = self.state.lock();
         let ours = s.engaged && s.episode == episode;
+        // Lot 312 (review F2): a partial block is a block for the
+        // stand-down (the process was moved) and a failure for the window.
+        let outcome = match outcome {
+            SoftBlock::Partial(why) => {
+                if ours {
+                    s.blocked.insert(pid, Arc::clone(target));
+                } else {
+                    drop(s);
+                    self.actuator.soft_egress_clear(target);
+                    s = self.state.lock();
+                }
+                SoftBlock::Failed(format!("PARTIAL: {why}"))
+            }
+            other => other,
+        };
         match outcome {
             SoftBlock::Blocked => {
                 if ours {
@@ -1418,6 +1433,7 @@ impl<H: CombatHost> Inner<H> {
                 (None, false)
             }
             SoftBlock::NotNeeded(why) => (Some(format!("{pid} not blocked ({why})")), false),
+            SoftBlock::Partial(_) => unreachable!("mapped to Failed above"),
             SoftBlock::Failed(why) => {
                 // External audit CMB-014: the offender is not contained
                 // while we analyse — the episode's INVESTIGATE is shorter.
