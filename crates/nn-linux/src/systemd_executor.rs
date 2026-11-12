@@ -20,8 +20,25 @@
 //!   an inode cannot be freed. Residual: a release is seen at the next read
 //!   (10 s); the LSM program reports `(dev, ino)` only, no generation.
 //!
-//! The managers are told by their own executable (`/proc/<pid>/exe`), not by
-//! their name.
+//! The re-check of #539 (N1): a user could make a "manager" in a user
+//! namespace of its own (`unshare -Urm`: `/bin/sleep` bound over
+//! `/usr/lib/systemd/systemd`, its own file over the executor's path, held,
+//! then removed) whose links read as systemd's: its file joined the set,
+//! and R004 exempted its exec. The identities come from three sources only
+//! ([`live_under`]), each a file root owns and no one else may write:
+//!
+//! - the packaged executor at its install path, in the agent's own mount
+//!   namespace, listed by the package database where there is one
+//!   (dpkg's lists, `rpm -qf`);
+//! - the copies the host's PID 1 holds (`/proc/1/fd`);
+//! - the copies a `systemd --user` manager holds, when its image is the
+//!   packaged manager's (the binary at its install path, or PID 1's image)
+//!   and it runs in PID 1's mount namespace — never a process told by the
+//!   text of its links.
+//!
+//! The manager's identities ([`ExecutorImages::replace_managers`]) go to
+//! R004 too: a user manager forks the executor's launches, and is told by
+//! its image.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -51,6 +68,18 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
     })
 }
 
+/// [`file_id`] of a file `owner` owns that no one else may write (`0` on
+/// the host; a test's own uid in its tree).
+fn trusted_file_id(path: &Path, owner: u32) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    (m.is_file() && m.uid() == owner && m.mode() & 0o022 == 0).then(|| {
+        (
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+            m.ino(),
+        )
+    })
+}
+
 /// A link's target as a path of the host under `root` (`/`, or a test's
 /// tree), without the ` (deleted)` the kernel adds to an unlinked file:
 /// `/usr/lib/systemd/systemd-executor`.
@@ -62,68 +91,130 @@ fn link_target(path: &Path, root: &Path) -> Option<String> {
     Some(format!("/{}", rel.to_string_lossy()))
 }
 
-/// The executor's identities now: its files at the install paths under
-/// `root` (`/` on the host, a test's tree), and the ones systemd's managers
-/// hold open under `proc_root` (`/proc`).
-pub fn live_under(root: &Path, proc_root: &Path) -> Vec<(u64, u64)> {
-    let mut ids: Vec<(u64, u64)> = EXECUTOR_PATHS
+/// The package database's answer for `path` (`None`: no database to ask).
+type Owned<'a> = &'a dyn Fn(&Path) -> Option<bool>;
+
+/// The packaged files at `paths` under `root`: root's (`owner`'s), written
+/// by no one else, and not disowned by the package database.
+fn packaged(paths: &[&str], root: &Path, owner: u32, owned: Owned) -> Vec<(u64, u64)> {
+    paths
         .iter()
-        .filter_map(|p| file_id(&root.join(p.trim_start_matches('/'))))
-        .collect();
-    ids.extend(held_by_managers(root, proc_root));
-    ids
+        .filter(|p| owned(Path::new(p)) != Some(false))
+        .filter_map(|p| trusted_file_id(&root.join(p.trim_start_matches('/')), owner))
+        .collect()
 }
 
-/// Replace `images` with the executor's identities now ([`live_under`]);
-/// `true` when the set changed.
-pub fn refresh_under(images: &ExecutorImages, root: &Path, proc_root: &Path) -> bool {
-    images.replace(live_under(root, proc_root))
+/// What [`live_under`] reads: the executor's identities, and the manager's.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Live {
+    pub executors: Vec<(u64, u64)>,
+    pub managers: Vec<(u64, u64)>,
+}
+
+/// The executor's identities now, from the three sources (the module's
+/// head), and the manager's: under `root` (`/` on the host, a test's tree)
+/// and `proc_root` (`/proc`); `owner` the files' owner (0), `owned` the
+/// package database.
+pub fn live_under(root: &Path, proc_root: &Path, owner: u32, owned: Owned) -> Live {
+    let mut executors = packaged(EXECUTOR_PATHS, root, owner, owned);
+    let mut managers = packaged(MANAGER_PATHS, root, owner, owned);
+    let init = proc_root.join("1");
+    // PID 1's image: the manager every user manager runs until a re-exec
+    if let Some(id) = trusted_file_id(&init.join("exe"), owner) {
+        managers.push(id);
+    }
+    executors.extend(held_executors(&init, root, owner));
+    executors.extend(held_by_user_managers(root, proc_root, owner, &managers));
+    Live {
+        executors,
+        managers,
+    }
+}
+
+/// The host's executor sources ([`live_under`] of `/` and `/proc`, root's
+/// files, the package database of the host).
+fn live() -> Live {
+    let owners =
+        nn_core::impact::trust::ProgramOwners::<crate::chain_host_linux::LinuxHost>::new("/");
+    live_under(Path::new("/"), Path::new("/proc"), 0, &|p| owners.owned(p))
+}
+
+/// Replace `images` with the identities now ([`live_under`]); `true` when
+/// the set changed.
+pub fn refresh_under(
+    images: &ExecutorImages,
+    root: &Path,
+    proc_root: &Path,
+    owner: u32,
+    owned: Owned,
+) -> bool {
+    apply(images, live_under(root, proc_root, owner, owned))
+}
+
+fn apply(images: &ExecutorImages, live: Live) -> bool {
+    let executors = images.replace(live.executors);
+    let managers = images.replace_managers(live.managers);
+    executors || managers
 }
 
 /// [`refresh_under`] the host's root and `/proc`, every 10 s.
 pub fn refresh(images: &ExecutorImages) -> bool {
-    refresh_under(images, Path::new("/"), Path::new("/proc"))
+    apply(images, live())
 }
 
 /// At the start: [`refresh`]; how many identities the executor has now.
 pub fn seed(images: &ExecutorImages) -> usize {
-    let ids = live_under(Path::new("/"), Path::new("/proc"));
-    images.replace(ids);
+    apply(images, live());
     images.len()
 }
 
-/// The executors systemd's managers hold open (their descriptors whose link
+/// The executors process `pid_dir` holds open (its descriptors whose link
 /// names an install path, ` (deleted)` or not), read through the
-/// descriptor.
-fn held_by_managers(root: &Path, proc_root: &Path) -> Vec<(u64, u64)> {
+/// descriptor: files root owns that no one else may write.
+fn held_executors(pid_dir: &Path, root: &Path, owner: u32) -> Vec<(u64, u64)> {
+    let Ok(fds) = std::fs::read_dir(pid_dir.join("fd")) else {
+        return Vec::new();
+    };
+    fds.flatten()
+        .map(|fd| fd.path())
+        .filter(|held| {
+            link_target(held, root).is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()))
+        })
+        .filter_map(|held| trusted_file_id(&held, owner))
+        .collect()
+}
+
+/// The executors the `systemd --user` managers hold: a process other than
+/// PID 1 whose image is one of `managers` (by identity, never by its
+/// link's text) and that runs in PID 1's mount namespace.
+fn held_by_user_managers(
+    root: &Path,
+    proc_root: &Path,
+    owner: u32,
+    managers: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
+    let ns = |d: &Path| std::fs::read_link(d.join("ns/mnt")).ok();
+    let Some(init_ns) = ns(&proc_root.join("1")) else {
+        return out;
+    };
     let Ok(dir) = std::fs::read_dir(proc_root) else {
         return out;
     };
     for entry in dir.flatten() {
         let name = entry.file_name();
-        if !name
-            .to_str()
-            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        if name == "1"
+            || !name
+                .to_str()
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
         {
             continue;
         }
         let pid_dir = entry.path();
-        let is_manager = link_target(&pid_dir.join("exe"), root)
-            .is_some_and(|exe| MANAGER_PATHS.contains(&exe.as_str()));
-        if !is_manager {
-            continue;
-        }
-        let Ok(fds) = std::fs::read_dir(pid_dir.join("fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let held = fd.path();
-            let is_executor =
-                link_target(&held, root).is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()));
-            if let Some(id) = file_id(&held).filter(|_| is_executor) {
-                out.push(id);
-            }
+        let is_manager = file_id(&pid_dir.join("exe")).is_some_and(|id| managers.contains(&id))
+            && ns(&pid_dir).is_some_and(|n| n == init_ns);
+        if is_manager {
+            out.extend(held_executors(&pid_dir, root, owner));
         }
     }
     out
@@ -132,30 +223,51 @@ fn held_by_managers(root: &Path, proc_root: &Path) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// The test's uid: its tree's files are "root's" here.
+    fn me() -> u32 {
+        // SAFETY: getuid has no preconditions.
+        unsafe { libc::getuid() }
+    }
+
+    /// No package database: every file is one a package may have installed.
+    fn no_db(_: &Path) -> Option<bool> {
+        None
+    }
+
+    fn file(path: &Path, body: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     /// The install paths' files: an upgrade (the new file renamed over the
     /// old) replaces the identity — the old one, held by no manager, is gone
     /// (finding 3: its inode is free); a file named so elsewhere is never
-    /// looked at; the device in the kernel's form.
+    /// looked at; the device in the kernel's form. The re-check of #539
+    /// (N1): a file the package database disowns, one another user owns,
+    /// one others may write, is no executor.
     #[test]
     fn an_upgrade_replaces_the_identity_no_manager_holds() {
         let root = tempfile::tempdir().unwrap();
         let none = root.path().join("no-proc");
         let lib = root.path().join("usr/lib/systemd");
-        std::fs::create_dir_all(&lib).unwrap();
         let exe = lib.join("systemd-executor");
-        std::fs::write(&exe, b"v1").unwrap();
+        file(&exe, b"v1");
         let images = ExecutorImages::default();
-        assert!(refresh_under(&images, root.path(), &none));
-        assert!(!refresh_under(&images, root.path(), &none), "unchanged");
+        assert!(refresh_under(&images, root.path(), &none, me(), &no_db));
+        assert!(
+            !refresh_under(&images, root.path(), &none, me(), &no_db),
+            "unchanged"
+        );
         let old = file_id(&exe).unwrap();
         assert!(images.contains(old));
         // dpkg: the new file renamed over the old one
         let new_file = lib.join("systemd-executor.dpkg-new");
-        std::fs::write(&new_file, b"v2").unwrap();
+        file(&new_file, b"v2");
         std::fs::rename(&new_file, &exe).unwrap();
-        assert!(refresh_under(&images, root.path(), &none));
+        assert!(refresh_under(&images, root.path(), &none, me(), &no_db));
         assert!(!images.contains(old), "held by no one: gone");
         assert!(images.contains(file_id(&exe).unwrap()));
         assert_eq!(images.len(), 1);
@@ -167,65 +279,88 @@ mod tests {
             assert!(!images.contains((md.dev(), md.ino())), "stat's encoding");
         }
         // a file named so elsewhere is never looked at
-        let opt = root.path().join("opt/app");
-        std::fs::create_dir_all(&opt).unwrap();
-        std::fs::write(opt.join("systemd-executor"), b"x").unwrap();
-        refresh_under(&images, root.path(), &none);
-        assert!(!images.contains(file_id(&opt.join("systemd-executor")).unwrap()));
+        let opt = root.path().join("opt/app/systemd-executor");
+        file(&opt, b"x");
+        refresh_under(&images, root.path(), &none, me(), &no_db);
+        assert!(!images.contains(file_id(&opt).unwrap()));
+        // disowned by the package database, another owner, others may write
+        let disowned = |_: &Path| Some(false);
+        refresh_under(&images, root.path(), &none, me(), &disowned);
+        assert!(images.is_empty(), "no package installed it");
+        refresh_under(&images, root.path(), &none, me().wrapping_add(1), &no_db);
+        assert!(images.is_empty(), "another owner");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o757)).unwrap();
+        refresh_under(&images, root.path(), &none, me(), &no_db);
+        assert!(images.is_empty(), "writable by others");
     }
 
     /// A manager's held executor is read through its descriptor (whose `stat`
     /// is the open file's, unlinked or not: the kernel's magic link; here a
-    /// link to a file of that name): kept while held, gone once released; a
-    /// process that is not systemd's manager is not looked at, whatever it
-    /// holds, nor a manager's descriptor of another file.
+    /// link to a file of that name): PID 1's, kept while held, gone once
+    /// released. The re-check of #539 (N1), the reviewer's probe: a user
+    /// manager counts when its image is the packaged manager's and it runs
+    /// in PID 1's mount namespace — a "manager" in a namespace of its own,
+    /// or whose image is another file (`/bin/sleep` bound over
+    /// `/usr/lib/systemd/systemd`: the path says systemd, the identity
+    /// says sleep), adds nothing, whatever its descriptors' links say.
     #[test]
-    fn a_held_executor_is_kept_while_held_and_dropped_once_released() {
+    fn a_held_executor_counts_from_pid_1_and_genuine_managers_only() {
+        const INIT_NS: &str = "mnt:[4026531841]";
         let root = tempfile::tempdir().unwrap();
         let proc_root = tempfile::tempdir().unwrap();
         let r = root.path();
-        let lib = r.join("usr/lib/systemd");
-        std::fs::create_dir_all(&lib).unwrap();
-        let exe = lib.join("systemd-executor");
-        std::fs::write(&exe, b"new").unwrap();
-        // the old image PID 1 holds, unlinked: the kernel shows its link as
-        // the install path `(deleted)`
-        let held = lib.join("systemd-executor (deleted)");
-        std::fs::write(&held, b"old").unwrap();
+        let manager = r.join("usr/lib/systemd/systemd");
+        file(&manager, b"systemd");
+        let sleep = r.join("usr/bin/sleep");
+        file(&sleep, b"sleep");
+        let exe = r.join("usr/lib/systemd/systemd-executor");
+        file(&exe, b"new");
+        // the old image a manager holds, unlinked: the kernel shows its
+        // link as the install path `(deleted)`
+        let held = r.join("usr/lib/systemd/systemd-executor (deleted)");
+        file(&held, b"old");
         let held_id = file_id(&held).unwrap();
-        let elsewhere = r.join("opt/app");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::write(elsewhere.join("systemd-executor"), b"x").unwrap();
-        let fake_id = file_id(&elsewhere.join("systemd-executor")).unwrap();
-        let make = |pid: &str, exe: &str, fd_target: &Path| {
+        let make = |pid: &str, image: &Path, ns: &str, fd: Option<&Path>| {
             let d = proc_root.path().join(pid);
             std::fs::create_dir_all(d.join("fd")).unwrap();
-            symlink(r.join(exe.trim_start_matches('/')), d.join("exe")).unwrap();
-            symlink(fd_target, d.join("fd/9")).unwrap();
+            std::fs::create_dir_all(d.join("ns")).unwrap();
+            symlink(image, d.join("exe")).unwrap();
+            symlink(ns, d.join("ns/mnt")).unwrap();
+            if let Some(f) = fd {
+                symlink(f, d.join("fd/9")).unwrap();
+            }
         };
-        make("1", "/usr/lib/systemd/systemd", &held);
-        make("4242", "/usr/bin/bash", &held);
-        make(
-            "4343",
-            "/usr/lib/systemd/systemd",
-            &elsewhere.join("systemd-executor"),
-        );
-        assert_eq!(held_by_managers(r, proc_root.path()), vec![held_id]);
-        let images = ExecutorImages::default();
-        refresh_under(&images, r, proc_root.path());
-        assert!(images.contains(held_id) && images.contains(file_id(&exe).unwrap()));
-        assert!(!images.contains(fake_id));
-        // a process that is not systemd's manager, alone holding it
-        let others = tempfile::tempdir().unwrap();
-        let d = others.path().join("4242");
-        std::fs::create_dir_all(d.join("fd")).unwrap();
-        symlink(r.join("usr/bin/bash"), d.join("exe")).unwrap();
-        symlink(&held, d.join("fd/9")).unwrap();
-        assert!(held_by_managers(r, others.path()).is_empty());
-        // PID 1 re-executed: it holds the old executor no more
+        let live = |owner: u32| live_under(r, proc_root.path(), owner, &no_db);
+        // PID 1 holds it
+        make("1", &manager, INIT_NS, Some(&held));
+        let l = live(me());
+        assert!(l.executors.contains(&held_id) && l.executors.contains(&file_id(&exe).unwrap()));
+        assert!(l.managers.contains(&file_id(&manager).unwrap()));
+        // released by PID 1: only a genuine user manager keeps it counted
         std::fs::remove_file(proc_root.path().join("1/fd/9")).unwrap();
-        assert!(refresh_under(&images, r, proc_root.path()));
-        assert!(!images.contains(held_id), "released: gone");
-        assert_eq!(images.len(), 1);
+        assert!(!live(me()).executors.contains(&held_id), "released: gone");
+        // the reviewer's fake manager: sleep's image, a namespace of its own
+        make("3001", &sleep, "mnt:[4026532999]", Some(&held));
+        // the packaged image, but another namespace; sleep's image in PID 1's
+        make("3002", &manager, "mnt:[4026532999]", Some(&held));
+        make("3003", &sleep, INIT_NS, Some(&held));
+        // not a manager at all
+        make("4242", &r.join("usr/bin/bash"), INIT_NS, Some(&held));
+        assert!(
+            !live(me()).executors.contains(&held_id),
+            "no genuine manager holds it"
+        );
+        // a genuine user manager
+        make("2001", &manager, INIT_NS, Some(&held));
+        assert!(live(me()).executors.contains(&held_id), "a user's manager");
+        // files a user owns (the production owner is root): nothing counts
+        let l = live(me().wrapping_add(1));
+        assert!(l.executors.is_empty() && l.managers.is_empty(), "{l:?}");
+        // the refresh sets both
+        let images = ExecutorImages::default();
+        assert!(refresh_under(&images, r, proc_root.path(), me(), &no_db));
+        assert!(images.contains(held_id));
+        assert!(images.is_manager(file_id(&manager).unwrap()));
+        assert!(!images.is_manager(file_id(&sleep).unwrap()));
     }
 }

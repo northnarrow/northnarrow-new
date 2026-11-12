@@ -435,6 +435,11 @@ struct Entry {
     /// LSM identity gave it (`None`: tracepoint mode, a process older than
     /// the agent, the plain ingest calls). A fork runs its parent's.
     image: Option<(u64, u64)>,
+    /// Lot 310 (the re-check of #539, N2): the process that forked this
+    /// one, when this exec was the first since that fork (the exec record's
+    /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
+    /// known — read from `/proc`, a later exec, an older eBPF object.
+    fork_parent: u32,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -478,7 +483,7 @@ impl ExecIdentity {
             return None;
         };
         let mut id = Self::of_exec(exe.path_or(filename), argv);
-        id.runs = with_pump_facts(id.runs, &id.exe, exe.flags);
+        id.runs = with_pump_facts(id.runs, &id.exe, argv, exe.flags);
         Some(id)
     }
 
@@ -1079,7 +1084,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (0, None),
             0,
-            None,
+            (None, 0),
         );
     }
 
@@ -1134,7 +1139,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .then_some((exe.dev, exe.ino));
         let path = exe.path_or(filename);
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
-        let runs = with_pump_facts(runs_of(Path::new(path), argv), Path::new(path), exe.flags);
+        let runs = with_pump_facts(
+            runs_of(Path::new(path), argv),
+            Path::new(path),
+            argv,
+            exe.flags,
+        );
         self.ingest_inner(
             *pid,
             *ppid,
@@ -1144,7 +1154,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *timestamp_ns,
             (*start_ns, None),
             *uid,
-            image,
+            (image, exe.fork_parent),
         );
         let _ = filename;
         true
@@ -1176,7 +1186,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
-            None,
+            (None, 0),
         );
     }
 
@@ -1244,7 +1254,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
-                image,
+                (image, 0),
             );
             seeded += 1;
         }
@@ -1261,25 +1271,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let text = H::read_link(&link).ok()?;
         let text = text.to_string_lossy();
         let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
-        // in the process's own view of the files (a container's directory,
-        // not the host's of the same name), as the exec pump reads it
+        // in PID 1's mount namespace only (the re-check of #539, N6: a
+        // user's namespace binds a root directory over its own), in the
+        // process's own view of the files, as the exec pump reads it
+        let ns = |d: &Path| H::read_link(d.join("ns/mnt")).ok();
+        let init = ns(&self.inner.proc_root.join("1"))?;
+        if ns(&dir)? != init {
+            return None;
+        }
         let view = dir.join("root").join(path.strip_prefix("/").ok()?);
         if !H::dir_is_root_only(view.parent()?) {
             return None;
         }
         let (dev, ino) = H::file_id(&link)?;
         Some((common::wire::exe::kernel_dev(dev), ino))
-    }
-
-    /// Lot 310 (the review of #539, finding 3): the cache holds an exec of
-    /// `pid` by the process that started at `start_ns` before `before_ns`
-    /// — its exec at `before_ns` is not the first since its fork.
-    pub fn execed_before(&self, pid: u32, start_ns: u64, before_ns: u64) -> bool {
-        let s = self.inner.state.read();
-        let cur = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
-        let past = s.history.get(&pid).into_iter().flatten();
-        past.chain(cur)
-            .any(|e| e.start_ns == start_ns && e.spawn_ns != 0 && e.spawn_ns < before_ns)
     }
 
     /// The spawn cache holds an exec of `pid`.
@@ -1299,7 +1304,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
-        image: Option<(u64, u64)>,
+        (image, fork_parent): (Option<(u64, u64)>, u32),
     ) {
         if pid == 0 {
             return;
@@ -1314,6 +1319,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks,
             uid,
             image,
+            fork_parent,
         };
         let mut s = self.inner.state.write();
         // Lab PR 267 (R12a): an exec the cache already holds (its time and
@@ -1598,7 +1604,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
-                    e.image,
+                    (e.image, e.fork_parent),
                 );
                 if orphan {
                     orphans += 1;
@@ -1687,6 +1693,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks: Some(ticks),
             uid,
             image: first.image,
+            // no exec of its own: no fork parent recorded for one
+            fork_parent: 0,
         })
     }
 
@@ -1804,6 +1812,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks: Some(ticks),
             uid,
             image: parent.image,
+            fork_parent: 0,
         })
     }
 
@@ -2622,6 +2631,35 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(hops.into_inner())
     }
 
+    /// Lot 310 (the re-check of #539, N2): for each hop of
+    /// [`Self::lineage_identities`]'s walk (the same order), the process
+    /// that forked it, when its exec was the first since that fork — the
+    /// kernel's record at `sched_process_fork`, never the parent at exec
+    /// time; 0 when not known.
+    pub fn lineage_fork_parents(&self, pid: u32, as_of: AsOf) -> Vec<u32> {
+        let parents = std::cell::RefCell::new(Vec::new());
+        let _ = self.lineage_walk(
+            pid,
+            as_of,
+            |hop| {
+                parents.borrow_mut().push(hop.fork_parent);
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        );
+        parents.into_inner()
+    }
+
+    /// Lot 310 (the re-check of #539, N2): the process that forked `pid`,
+    /// when the exec the cache holds as of `as_of` was its first since that
+    /// fork; `None` when not known.
+    pub fn fork_parent(&self, pid: u32, as_of: AsOf) -> Option<u32> {
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => Some(e.fork_parent).filter(|p| *p != 0),
+            _ => None,
+        }
+    }
+
     /// Lot 282: what the kernel executed for `pid`'s parent, when it forked
     /// `pid` (the ordered walk of one hop: external audit POS-003). `None`
     /// when either cannot be placed. Unlike [`Self::lineage_identities`],
@@ -2674,12 +2712,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     fn proc_runs(&self, pid: u32, exe: &Path) -> Runs {
         let cmdline =
             H::read(self.inner.proc_root.join(pid.to_string()).join("cmdline")).unwrap_or_default();
-        let argv: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        runs_of(exe, &argv)
+        runs_of(exe, &argv_of_cmdline(&cmdline))
     }
 
     /// One hop of the walk as of `as_of` (review #471 A1, R-F): the spawn
@@ -2710,6 +2743,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     spawn_ns: e.spawn_ns,
                     start_ns: e.start_ns,
                     uid: Some(e.uid),
+                    fork_parent: e.fork_parent,
                 });
             }
         }
@@ -2729,6 +2763,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: 0,
             start_ns: 0,
             uid,
+            fork_parent: 0,
         })
     }
 
@@ -3207,6 +3242,10 @@ struct Hop {
     /// Lab PR 175: the real uid it executed `exe` as (cached), or runs as
     /// (`/proc`); `None` when `/proc` shows none.
     uid: Option<u32>,
+    /// Lot 310 (the re-check of #539, N2): cached only, the process that
+    /// forked it when its exec was the first since ([`Entry::fork_parent`]);
+    /// 0 not known.
+    fork_parent: u32,
 }
 
 fn is_auth_binary(exe: &Path) -> bool {
@@ -3244,14 +3283,30 @@ fn is_node_exe(exe: &Path) -> bool {
 /// script leaves the script named but not all that runs
 /// ([`Runs::Unknown`]); an interpreter naming no program whose standard
 /// input is no terminal runs its input ([`Runs::Code`]).
-pub fn with_pump_facts(runs: Runs, exe: &Path, flags: u32) -> Runs {
+pub fn with_pump_facts(runs: Runs, exe: &Path, argv: &[String], flags: u32) -> Runs {
     use common::wire::exe::exe_flags::{ENV_LOADS, STDIN_PROGRAM};
+    // the re-check of #539 (N9): busybox running one of its shells reads
+    // a program as any shell does
+    let reads = || super::script_args::reads_a_program(exe, argv);
     match runs {
         Runs::Script(s) if flags & ENV_LOADS != 0 => Runs::Unknown(Some(s)),
-        Runs::Inline if flags & ENV_LOADS != 0 && is_interpreter(exe) => Runs::Code,
-        Runs::Inline if flags & STDIN_PROGRAM != 0 && is_interpreter(exe) => Runs::Code,
+        Runs::Inline if flags & (ENV_LOADS | STDIN_PROGRAM) != 0 && reads() => Runs::Code,
         r => r,
     }
+}
+
+/// A `/proc/<pid>/cmdline`'s arguments: its NUL-separated words, the
+/// final NUL dropped and no other (lot 310: an empty argument is one —
+/// `python3 -W '' /tmp/x.py /usr/bin/aws` runs `/tmp/x.py`; the review of
+/// #539 found the empty words dropped in `ring_drops`, its re-check here).
+pub fn argv_of_cmdline(cmdline: &[u8]) -> Vec<String> {
+    let body = cmdline.strip_suffix(&[0]).unwrap_or(cmdline);
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
 }
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
@@ -4726,6 +4781,32 @@ mod tests {
         assert_eq!(
             t.exec_image(501, AsOf::Judged(H::monotonic_ns())),
             Some((8, 500))
+        );
+    }
+
+    /// The re-check of #539 (N7): the `/proc` fallback reads an empty
+    /// argument as one, as `ring_drops` does (one reader of a cmdline).
+    #[test]
+    fn a_cmdline_s_empty_argument_counts() {
+        let a = argv_of_cmdline(b"python3\0-W\0\0/tmp/x.py\0/usr/bin/aws\0");
+        assert_eq!(a, ["python3", "-W", "", "/tmp/x.py", "/usr/bin/aws"]);
+        assert_eq!(
+            runs_of(Path::new("/usr/bin/python3"), &a),
+            Runs::Script("/tmp/x.py".into())
+        );
+        assert!(argv_of_cmdline(b"").is_empty());
+        assert_eq!(argv_of_cmdline(b"sh\0"), ["sh"]);
+        let proc = TempDir::new().unwrap();
+        std::fs::create_dir_all(proc.path().join("77")).unwrap();
+        std::fs::write(
+            proc.path().join("77/cmdline"),
+            b"python3\0-W\0\0/tmp/x.py\0/usr/bin/aws\0",
+        )
+        .unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(
+            t.proc_runs(77, Path::new("/usr/bin/python3")),
+            Runs::Script("/tmp/x.py".into())
         );
     }
 
@@ -7009,6 +7090,7 @@ mod tests {
             start_ticks,
             uid: 0,
             image: None,
+            fork_parent: 0,
         };
         let exact = e(4_003_217_000, None);
         let seeded = e(4_000_000_000, Some(400));

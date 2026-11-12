@@ -126,11 +126,14 @@ pub struct ProcessSpawnRaw {
     /// `FILENAME_LEN`). The first byte of the former `_pad`: an older
     /// eBPF object leaves it 0 ("not known to be cut").
     pub trunc_flags: u8,
-    /// Explicit pad → no implicit `bytemuck::Pod` padding (size 840,
-    /// align 8). Shrunk from 6 → 5 bytes when `parent_is_kthread`
-    /// was added (cluster 15.3) and to 4 for `trunc_flags` (EBPF-021);
-    /// total size unchanged.
-    pub _pad: [u8; 4],
+    /// Lot 310 (the re-check of #539, N2): the thread-group id of the
+    /// process that FORKED this one — recorded at `sched_process_fork`
+    /// (`FORK_PARENTS`), never the parent at exec time (an orphan's is its
+    /// reaper) — when this exec is the first since that fork; 0 when not
+    /// known (a fork older than the agent, the map's eviction, a later
+    /// exec, an older eBPF object). The former 4-byte `_pad` (size and
+    /// offsets unchanged).
+    pub fork_ppid: u32,
     // ── Tappa 10.9 step 2 APPENDED (never reorder the above) ──
     /// The file the caller named, as the LSM `bprm_check_security`
     /// program found it (pass 0, handed over through `EXEC_HANDOFF`):
@@ -226,7 +229,7 @@ impl ProcessSpawnRaw {
             argv_len: 0,
             parent_is_kthread: 0,
             trunc_flags: 0,
-            _pad: [0u8; 4],
+            fork_ppid: 0,
             exe: exe::ExeIdentityRaw::zeroed(),
             start_ns: 0,
             stdio: StdioRaw::zeroed(),
@@ -2043,7 +2046,8 @@ mod tests {
             834
         );
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, trunc_flags), 835);
-        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, _pad), 836);
+        // lot 310: `fork_ppid`, the former 4-byte `_pad`
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, fork_ppid), 836);
     }
 
     #[test]
@@ -2093,7 +2097,7 @@ mod tests {
             argv_len: 7,
             parent_is_kthread: 0,
             trunc_flags: spawn_trunc::ARGV,
-            _pad: [0u8; 4],
+            fork_ppid: 0,
             exe: exe::ExeIdentityRaw::zeroed(),
             stdio: StdioRaw {
                 flags: stdio_flags::READ | stdio_flags::FD0_INET | stdio_flags::OUTBOUND,

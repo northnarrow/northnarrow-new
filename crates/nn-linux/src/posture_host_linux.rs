@@ -323,7 +323,16 @@ mod tests {
         sys.kill().unwrap();
         own.kill().unwrap();
         let _ = (sys.wait(), own.wait());
-        assert_eq!(sys_image, Some(want));
+        // the re-check of #539 (N6): only in PID 1's mount namespace — which
+        // a user's test cannot read (`/proc/1/ns/mnt`): not known, so none
+        let init_ns = fs::read_link("/proc/1/ns/mnt").ok();
+        let in_init = init_ns.is_some()
+            && init_ns == fs::read_link(format!("/proc/{}/ns/mnt", std::process::id())).ok();
+        assert_eq!(
+            sys_image,
+            in_init.then_some(want),
+            "init namespace: {in_init}"
+        );
         assert_eq!(own_image, None);
     }
 

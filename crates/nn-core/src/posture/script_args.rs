@@ -324,6 +324,10 @@ struct Table {
     /// A `+c` cluster runs its program as `-c` does (bash, dash, busybox's
     /// ash); for the ksh family and zsh it is no option to rely on.
     plus_code: bool,
+    /// The values of an option that load code (python's `-X
+    /// pycache_prefix=DIR`: bytecode read from the caller's directory; `-X
+    /// presite=MOD`): by prefix (the re-check of #539, N4).
+    loading_values: &'static [(char, &'static [&'static str])],
     /// What a lone `-` means.
     dash: Dash,
 }
@@ -403,6 +407,7 @@ const PYTHON: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: false,
+    loading_values: &[('X', &["pycache_prefix", "presite"])],
     dash: Dash::Stdin,
 };
 
@@ -434,6 +439,7 @@ const PERL: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: false,
+    loading_values: &[],
     dash: Dash::Stdin,
 };
 
@@ -497,6 +503,7 @@ const RUBY: Table = Table {
     arg_not_dash: true,
     word_values: "E",
     plus_code: false,
+    loading_values: &[],
     dash: Dash::Stdin,
 };
 
@@ -574,7 +581,9 @@ const NODE: Table = Table {
         ("trace-event-file-pattern", Long::Arg),
         ("test-name-pattern", Long::Arg),
         ("test-skip-pattern", Long::Arg),
-        ("test-reporter", Long::Arg),
+        // the reporter is a module node loads into the process (the re-check
+        // of #539, N4: `--test --test-reporter=/tmp/r.mjs /usr/bin/aws`)
+        ("test-reporter", Long::Loads),
         ("test-reporter-destination", Long::Arg),
         ("test-concurrency", Long::Arg),
         ("test-shard", Long::Arg),
@@ -676,6 +685,7 @@ const NODE: Table = Table {
     arg_not_dash: true,
     word_values: "",
     plus_code: false,
+    loading_values: &[],
     dash: Dash::Stdin,
 };
 
@@ -872,6 +882,7 @@ const BASH: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: true,
+    loading_values: &[],
     dash: Dash::EndOfOptions,
 };
 
@@ -899,6 +910,7 @@ const DASH: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: true,
+    loading_values: &[],
     dash: Dash::EndOfOptions,
 };
 
@@ -925,6 +937,7 @@ const BUSYBOX_ASH: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: true,
+    loading_values: &[],
     dash: Dash::EndOfOptions,
 };
 
@@ -951,6 +964,7 @@ const OTHER_SHELL: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: false,
+    loading_values: &[],
     dash: Dash::Unknown,
 };
 
@@ -979,6 +993,7 @@ const MONO: Table = Table {
     arg_not_dash: false,
     word_values: "",
     plus_code: false,
+    loading_values: &[],
     dash: Dash::Stdin,
 };
 
@@ -1018,8 +1033,42 @@ impl From<Runs> for Reading {
     }
 }
 
-fn reading(exe: &Path, argv: &[String]) -> Reading {
+/// busybox's `main`: the program `argv[0]` names (a login shell's `-`
+/// dropped); a name starting with `busybox` is busybox itself
+/// (`is_prefixed_with`), and the next argument names the program — one
+/// starting with `-` is busybox's own option (`--list`, `--help`). The
+/// index of the argument naming one of its shells, `None` for another
+/// program.
+fn busybox_shell_at(argv: &[String]) -> Option<usize> {
     let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
+    let first = argv.first()?;
+    let mut at = 0;
+    let mut program = base(first.strip_prefix('-').unwrap_or(first));
+    while program.starts_with("busybox") {
+        match argv.get(at + 1) {
+            Some(a) if !a.starts_with('-') => {
+                at += 1;
+                program = base(a);
+            }
+            _ => return None,
+        }
+    }
+    BUSYBOX_SHELLS.contains(&program.as_str()).then_some(at)
+}
+
+/// Lot 310 (the re-check of #539, N9): `exe` run as `argv` reads a program
+/// its caller gives — any interpreter, or busybox running one of its
+/// shells (`sh`, `busybox sh`): its standard input or its environment can
+/// carry the caller's code. busybox's other programs read none.
+pub fn reads_a_program(exe: &Path, argv: &[String]) -> bool {
+    match family_of(exe) {
+        None => false,
+        Some(Family::Busybox) => busybox_shell_at(argv).is_some(),
+        Some(_) => true,
+    }
+}
+
+fn reading(exe: &Path, argv: &[String]) -> Reading {
     let table = match family_of(exe) {
         None => return Runs::Inline.into(),
         Some(Family::Python) => &PYTHON,
@@ -1045,29 +1094,10 @@ fn reading(exe: &Path, argv: &[String]) -> Reading {
             }
         }
         Some(Family::Busybox) => {
-            // busybox's `main`: the program `argv[0]` names (a login
-            // shell's `-` dropped); a name starting with `busybox` is
-            // busybox itself (`is_prefixed_with`), and the next argument
-            // names the program — one starting with `-` is busybox's own
-            // option (`--list`, `--help`)
-            let Some(first) = argv.first() else {
-                return Runs::Inline.into();
+            return match busybox_shell_at(argv) {
+                Some(at) => read(&BUSYBOX_ASH, argv, at + 1),
+                None => Runs::Inline.into(),
             };
-            let mut at = 0;
-            let mut program = base(first.strip_prefix('-').unwrap_or(first));
-            while program.starts_with("busybox") {
-                match argv.get(at + 1) {
-                    Some(a) if !a.starts_with('-') => {
-                        at += 1;
-                        program = base(a);
-                    }
-                    _ => return Runs::Inline.into(),
-                }
-            }
-            if !BUSYBOX_SHELLS.contains(&program.as_str()) {
-                return Runs::Inline.into();
-            }
-            return read(&BUSYBOX_ASH, argv, at + 1);
         }
     };
     read(table, argv, 1)
@@ -1352,7 +1382,11 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     if !table.names_ok(c, value) {
                         return unknown();
                     }
-                    seen.loads |= opt == Opt::Loads;
+                    seen.loads |= opt == Opt::Loads
+                        || table
+                            .loading_values
+                            .iter()
+                            .any(|(o, v)| *o == c && v.iter().any(|p| value.starts_with(p)));
                     break;
                 }
                 // Perl's `-0x1F`: the `x` then reads as `-x`, which takes
@@ -2069,6 +2103,36 @@ mod tests {
         );
         unknown(node, &["node", "--title", "--trace-warnings", "/tmp/s"]);
         unknown(node, &["node", "-r", "-x", "/tmp/s"]);
+        // the re-check (N4): a test reporter and a bytecode cache are code
+        // loaded beside the program named
+        unknown(
+            node,
+            &[
+                "node",
+                "--test",
+                "--test-reporter=/tmp/r.mjs",
+                "/usr/bin/aws",
+            ],
+        );
+        unknown(
+            node,
+            &[
+                "node",
+                "--test",
+                "--test-reporter",
+                "/tmp/r.mjs",
+                "/usr/bin/aws",
+            ],
+        );
+        unknown(
+            py,
+            &["python3", "-X", "pycache_prefix=/tmp/c", "/usr/bin/aws"],
+        );
+        unknown(py, &["python3", "-Xpresite=m", "/usr/bin/aws"]);
+        assert_eq!(
+            runs_of(py, &argv(&["python3", "-X", "dev", "/usr/bin/aws"])),
+            Runs::Script("/usr/bin/aws".into())
+        );
         unknown(node, &["node", "-C", "-x", "/tmp/s"]);
         unknown(node, &["node", "-p", "A", "--version"]);
         unknown(node, &["node", "--print", "A", "--require"]);

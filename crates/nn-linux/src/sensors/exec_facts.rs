@@ -12,14 +12,17 @@
 //! - `ROOT_DIR`: the directory the image was executed from is root's and
 //!   writable by no one else — no user could have unlinked it (R004's
 //!   re-exec of a parent's own image). Read through `/proc/<pid>/exe`'s
-//!   link, in the process's own view of the files (`/proc/<pid>/root`: a
-//!   container's directory, not the host's of the same name), and only
-//!   when that image is still the exec's own.
+//!   link, in the process's own view of the files (`/proc/<pid>/root`),
+//!   only when that image is still the exec's own and the process runs in
+//!   PID 1's mount namespace (the re-check of #539, N6: a user's namespace
+//!   binds a root directory over its own; a container's process gets none).
 //! - `ENV_LOADS`: an interpreter naming a script of a root-owned system tree
 //!   (a client's or an installed program's identity), or naming nothing,
 //!   whose environment loads the caller's code beside it (`PYTHONPATH`,
-//!   `NODE_OPTIONS`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`,
-//!   `BASH_ENV`, `ENV` and their kin, [`LOADING_VARS`]).
+//!   `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV` and their kin,
+//!   [`LOADING_VARS`]; `NODE_OPTIONS` naming a loading option; `ENV`,
+//!   `PYTHONSTARTUP` only for one naming nothing), or whose environment is
+//!   larger than the pump reads (fail closed).
 //! - `STDIN_PROGRAM`: an interpreter naming no program whose standard input
 //!   is a file, a pipe or a socket (`bash < file`, `curl … | sh`): it runs
 //!   its input.
@@ -35,21 +38,22 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use common::wire::exe::{exe_flags, kernel_dev};
-use nn_core::posture::lineage::{in_system_tree, is_interpreter, ExecIdentity, Runs};
+use nn_core::posture::lineage::{in_system_tree, ExecIdentity, Runs};
+use nn_core::posture::script_args::reads_a_program;
 use nn_model::Event;
 
-/// The environment variables that load code into an interpreter beside the
+/// The environment variables that load code into an interpreter beside any
 /// program it names: the review's list, and their kin (python's own
-/// library or user site moved, its standard input run after the script or
-/// a startup file before the prompt; perl's older library variable; node's
-/// and ruby's module paths; zsh's startup files moved).
+/// library, user site or bytecode cache moved, its standard input run after
+/// the script; perl's older library variable; node's and ruby's module
+/// paths; bash's exported functions and trace options, zsh's startup files
+/// moved). `NODE_OPTIONS` is read apart ([`node_options_load`]).
 const LOADING_VARS: &[&str] = &[
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONUSERBASE",
     "PYTHONINSPECT",
-    "PYTHONSTARTUP",
-    "NODE_OPTIONS",
+    "PYTHONPYCACHEPREFIX",
     "NODE_PATH",
     "PERL5OPT",
     "PERL5LIB",
@@ -59,11 +63,35 @@ const LOADING_VARS: &[&str] = &[
     "GEM_HOME",
     "GEM_PATH",
     "BASH_ENV",
-    "ENV",
+    "SHELLOPTS",
     "ZDOTDIR",
 ];
 
-/// The most of an environment read.
+/// The prefixes of variables that load code the same way (bash's exported
+/// functions, `BASH_FUNC_name%%`).
+const LOADING_PREFIXES: &[&str] = &["BASH_FUNC_"];
+
+/// The variables that load code only into an interpreter naming no program
+/// (interactive): python's startup file, a POSIX shell's `ENV`, node's REPL
+/// module. For a script they load nothing (the re-check of #539, N5: a
+/// user's `PYTHONSTARTUP` must not take the `aws` client's identity away).
+const INTERACTIVE_VARS: &[&str] = &["PYTHONSTARTUP", "ENV", "NODE_REPL_EXTERNAL_MODULE"];
+
+/// The options of `NODE_OPTIONS` that load code ([`node_options_load`]):
+/// the node reader's loading options; `--max-old-space-size` and its like
+/// load nothing.
+const NODE_LOADING_OPTIONS: &[&str] = &[
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--test-reporter",
+];
+
+/// The most of an environment read: a larger one is not read on, and its
+/// identity is not known (the re-check of #539, N3: a `PYTHONPATH` past the
+/// first MiB loaded its `sitecustomize` unseen).
 const MAX_ENVIRON: u64 = 1 << 20;
 
 /// The exec pump's step: `event`'s process read under `/proc`.
@@ -106,9 +134,13 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
             exe.flags |= exe_flags::MEMFD;
         }
     }
+    // the re-check of #539 (N6): a process in another mount namespace
+    // shows the files it chose (a user's bind mount over its own
+    // directory): no `ROOT_DIR` for it
+    let init_mounts = same_mount_namespace(proc_root, &dir);
     if let Some(path) = link
         .as_deref()
-        .filter(|_| own)
+        .filter(|_| own && init_mounts)
         .map(|l| executed_path(l, meta.nlink() == 0))
     {
         let view = dir
@@ -123,8 +155,9 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     let id = ExecIdentity::of_exec(&path, argv);
     let names_a_system_script =
         matches!(&id.runs, Runs::Script(s) if s.starts_with('/') && in_system_tree(s));
-    let names_nothing = id.runs == Runs::Inline && is_interpreter(Path::new(&path));
-    if (names_a_system_script || names_nothing) && environ_loads(&dir) {
+    // an interpreter, or busybox running one of its shells (N9)
+    let names_nothing = id.runs == Runs::Inline && reads_a_program(Path::new(&path), argv);
+    if (names_a_system_script || names_nothing) && environ_loads(&dir, names_nothing) {
         exe.flags |= exe_flags::ENV_LOADS;
     }
     if names_nothing && stdin_is_a_program(&dir) {
@@ -147,24 +180,67 @@ fn dir_is_root_only(dir: &Path) -> bool {
     std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
 }
 
-/// The process's environment sets one of [`LOADING_VARS`] to a value that
-/// is not empty. An environment that cannot be read whole says nothing.
-fn environ_loads(dir: &Path) -> bool {
+/// The process's environment loads code into it: one of [`LOADING_VARS`]
+/// (or [`LOADING_PREFIXES`]) set to a value that is not empty, one of
+/// [`INTERACTIVE_VARS`] for an interpreter naming no program
+/// (`interactive`), or `NODE_OPTIONS` naming a loading option. An
+/// environment larger than [`MAX_ENVIRON`] loads, as far as the pump can
+/// tell (fail closed); one that cannot be read says nothing (the process
+/// is gone: its identity is the argv's).
+fn environ_loads(dir: &Path, interactive: bool) -> bool {
     use std::io::Read;
     let Ok(f) = std::fs::File::open(dir.join("environ")) else {
         return false;
     };
     let mut env = Vec::new();
-    if f.take(MAX_ENVIRON).read_to_end(&mut env).is_err() {
+    if f.take(MAX_ENVIRON + 1).read_to_end(&mut env).is_err() {
         return false;
     }
+    if env.len() as u64 > MAX_ENVIRON {
+        return true;
+    }
+    let value = |var: &[u8], name: &str| -> Option<Vec<u8>> {
+        var.strip_prefix(name.as_bytes())
+            .and_then(|r| r.strip_prefix(b"="))
+            .filter(|v| !v.is_empty())
+            .map(<[u8]>::to_vec)
+    };
     env.split(|b| *b == 0).any(|var| {
-        LOADING_VARS.iter().any(|name| {
-            var.strip_prefix(name.as_bytes())
-                .and_then(|r| r.strip_prefix(b"="))
-                .is_some_and(|v| !v.is_empty())
-        })
+        LOADING_VARS.iter().any(|name| value(var, name).is_some())
+            || LOADING_PREFIXES
+                .iter()
+                .any(|p| var.starts_with(p.as_bytes()))
+            || (interactive
+                && INTERACTIVE_VARS
+                    .iter()
+                    .any(|name| value(var, name).is_some()))
+            || value(var, "NODE_OPTIONS").is_some_and(|v| node_options_load(&v))
     })
+}
+
+/// `NODE_OPTIONS` names an option that loads code ([`NODE_LOADING_OPTIONS`],
+/// spelled alone, with `=value`, or `-rvalue`). Node splits the variable on
+/// whitespace (a quoted value with a space is one word to node: a loading
+/// option inside quotes is still a word here that starts with it — read
+/// as loading).
+fn node_options_load(value: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(value);
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .filter(|w| !w.is_empty())
+        .any(|w| {
+            let name = w.split_once('=').map_or(w, |(n, _)| n);
+            NODE_LOADING_OPTIONS.contains(&name) || (w.starts_with("-r") && !w.starts_with("--"))
+        })
+}
+
+/// The process runs in PID 1's mount namespace (`/proc/<pid>/ns/mnt` the
+/// same as `/proc/1/ns/mnt`). Not readable: not known, so no.
+fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
+    let ns = |d: &Path| std::fs::read_link(d.join("ns/mnt")).ok();
+    match (ns(dir), ns(&proc_root.join("1"))) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The process's standard input is a file, a pipe or a socket: not a
@@ -215,11 +291,24 @@ mod tests {
 
     /// A fixture process: its `exe` a link to `image`, its environment and
     /// standard input as given.
+    const INIT_NS: &str = "mnt:[4026531841]";
+
+    /// `pid`'s mount namespace in the fixture (its `ns/mnt` link's text).
+    fn mount_ns(root: &Path, pid: u32, ns: &str) {
+        let d = root.join(pid.to_string()).join("ns");
+        std::fs::create_dir_all(&d).unwrap();
+        let _ = std::fs::remove_file(d.join("mnt"));
+        symlink(ns, d.join("mnt")).unwrap();
+    }
+
     fn proc_with(root: &Path, pid: u32, image: &Path, environ: &[&str], stdin: Option<&Path>) {
         let d = root.join(pid.to_string());
         std::fs::create_dir_all(d.join("fd")).unwrap();
         symlink(image, d.join("exe")).unwrap();
         symlink("/", d.join("root")).unwrap();
+        // PID 1's mount namespace, and the process in it
+        mount_ns(root, 1, INIT_NS);
+        mount_ns(root, pid, INIT_NS);
         let mut env = environ.join("\0").into_bytes();
         env.push(0);
         std::fs::write(d.join("environ"), env).unwrap();
@@ -365,6 +454,9 @@ mod tests {
         // container's path
         symlink("/usr/bin/env", d.join("exe")).unwrap();
         symlink(container.path(), d.join("root")).unwrap();
+        // (PID 1's mount namespace: what is read is the root's view)
+        mount_ns(proc.path(), 1, INIT_NS);
+        mount_ns(proc.path(), 50, INIT_NS);
         std::fs::write(d.join("environ"), b"\0").unwrap();
         let mut e = spawn(50, Default::default(), "/usr/bin/env", &["env"]);
         read_under(proc.path(), &mut e);
@@ -465,5 +557,139 @@ mod tests {
         let mut e = spawn(40, Default::default(), "/usr/bin/bash", &["bash"]);
         read_under(proc.path(), &mut e);
         assert_eq!(ExecIdentity::of_spawn(&e).unwrap().runs, Runs::Code);
+    }
+
+    /// The re-check of #539 (N6): a process in a mount namespace other than
+    /// PID 1's gets no `ROOT_DIR` — a user's namespace binds a root-owned
+    /// directory over the one its unlinked binary came from.
+    #[test]
+    fn another_mount_namespace_has_no_root_dir() {
+        let proc = tempfile::tempdir().unwrap();
+        proc_with(proc.path(), 60, Path::new("/usr/bin/env"), &[], None);
+        let mut e = spawn(60, Default::default(), "/usr/bin/env", &["env"]);
+        read_under(proc.path(), &mut e);
+        assert!(flags(&e).0 & exe_flags::ROOT_DIR != 0, "PID 1's namespace");
+        mount_ns(proc.path(), 60, "mnt:[4026532999]");
+        let mut e = spawn(60, Default::default(), "/usr/bin/env", &["env"]);
+        read_under(proc.path(), &mut e);
+        assert_eq!(
+            flags(&e).0 & exe_flags::ROOT_DIR,
+            0,
+            "a namespace of its own"
+        );
+        // PID 1's namespace not readable: not known, so none
+        std::fs::remove_file(proc.path().join("1/ns/mnt")).unwrap();
+        mount_ns(proc.path(), 60, INIT_NS);
+        let mut e = spawn(60, Default::default(), "/usr/bin/env", &["env"]);
+        read_under(proc.path(), &mut e);
+        assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "not known");
+    }
+
+    /// The re-check of #539 (N3, N4, N5, N9): an environment past the read
+    /// limit loads (fail closed); python's bytecode cache moved and bash's
+    /// exported functions load; `PYTHONSTARTUP` and `ENV` load only into an
+    /// interpreter naming nothing — a legitimate `aws` with a user's
+    /// startup file keeps its identity; `NODE_OPTIONS` loads only with a
+    /// loading option (`--max-old-space-size` does not); busybox's shell
+    /// reads its standard input as any shell.
+    #[test]
+    fn the_environment_s_false_positives_and_its_size() {
+        let proc = tempfile::tempdir().unwrap();
+        let read = |pid: u32, exe: &str, env: &[&str], stdin: Option<&Path>, argv: &[&str]| {
+            proc_with(proc.path(), pid, Path::new("/usr/bin/env"), env, stdin);
+            let mut e = spawn(pid, Default::default(), exe, argv);
+            read_under(proc.path(), &mut e);
+            flags(&e).0
+        };
+        let loads = |f: u32| f & exe_flags::ENV_LOADS != 0;
+        let py = "/usr/bin/python3";
+        let aws = &["python3", "/usr/bin/aws"][..];
+        // the legitimate client: no mark
+        assert!(!loads(read(
+            70,
+            py,
+            &["PYTHONSTARTUP=/home/u/.pythonrc"],
+            None,
+            aws
+        )));
+        assert!(!loads(read(
+            71,
+            "/usr/bin/node",
+            &["NODE_OPTIONS=--max-old-space-size=4096"],
+            None,
+            &["node", "/usr/bin/x"]
+        )));
+        assert!(!loads(read(
+            72,
+            "/usr/bin/dash",
+            &["ENV=/home/u/.shrc"],
+            None,
+            &["sh", "/usr/bin/x"]
+        )));
+        // interactive: the startup files load
+        assert!(loads(read(
+            73,
+            py,
+            &["PYTHONSTARTUP=/tmp/s.py"],
+            None,
+            &["python3"]
+        )));
+        assert!(loads(read(
+            74,
+            "/usr/bin/dash",
+            &["ENV=/tmp/s"],
+            None,
+            &["sh"]
+        )));
+        // the loading options of NODE_OPTIONS, every spelling
+        for (k, v) in [
+            "NODE_OPTIONS=--require /tmp/x.js",
+            "NODE_OPTIONS=--max-old-space-size=64 --import=data:text/javascript,x",
+            "NODE_OPTIONS=-r/tmp/x.js",
+            "NODE_OPTIONS=--test-reporter=/tmp/r.mjs",
+            "NODE_OPTIONS=\"--experimental-loader\" /tmp/l.mjs",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                loads(read(
+                    90 + k as u32,
+                    "/usr/bin/node",
+                    &[v],
+                    None,
+                    &["node", "/usr/bin/x"]
+                )),
+                "{v}"
+            );
+        }
+        // python's bytecode cache, bash's exported functions
+        assert!(loads(read(
+            76,
+            py,
+            &["PYTHONPYCACHEPREFIX=/tmp/c"],
+            None,
+            aws
+        )));
+        assert!(loads(read(
+            77,
+            "/usr/bin/bash",
+            &["BASH_FUNC_aws%%=() { id; }"],
+            None,
+            &["bash", "/usr/bin/x"]
+        )));
+        // past the read limit: loads, whatever it holds
+        let big = format!("X={}", "a".repeat(MAX_ENVIRON as usize));
+        assert!(loads(read(78, py, &[&big], None, aws)));
+        let fits = format!("X={}", "a".repeat(1000));
+        assert!(!loads(read(79, py, &[&fits], None, aws)));
+        // busybox's shell reading a pipe, and its environment
+        let bb = "/bin/busybox";
+        let f = read(80, bb, &[], Some(Path::new("pipe:[9]")), &["sh"]);
+        assert!(f & exe_flags::STDIN_PROGRAM != 0);
+        assert!(loads(read(81, bb, &["ENV=/tmp/s"], None, &["sh"])));
+        // another applet reads no program
+        let f = read(82, bb, &[], Some(Path::new("pipe:[9]")), &["wget", "x"]);
+        assert_eq!(f & (exe_flags::STDIN_PROGRAM | exe_flags::ENV_LOADS), 0);
     }
 }

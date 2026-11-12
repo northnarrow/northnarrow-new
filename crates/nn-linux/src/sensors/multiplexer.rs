@@ -30,7 +30,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{ring_buf::RingBuf, MapData},
-    programs::{FExit, KProbe, TracePoint},
+    programs::{BtfTracePoint, FExit, KProbe, TracePoint},
     Btf, Ebpf, EbpfLoader,
 };
 use bytemuck::Pod;
@@ -413,6 +413,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         crate::sensors::flow_sock::install(&mut ebpf);
 
         let attach_points = crate::boot::manifest::AttachPoints::new();
+        attach_fork_parent(&mut ebpf);
         attach_exec_tracepoint(&mut ebpf, &attach_points)?;
         attach_tracepoint(
             &mut ebpf,
@@ -1160,6 +1161,39 @@ fn attach_tracepoint_any(
 pub const STDIO_PROBE_DEGRADED: &str = "R020 (shell or interpreter with its standard streams on a \
      network socket) cannot fire: this kernel's verifier refused the standard-stream probes of \
      sched_process_exec, which runs without them (exec records say \"not read\")";
+
+/// Lot 310 (the re-check of #539, N2): what is lost without the fork-parent
+/// record.
+pub const FORK_PARENT_DEGRADED: &str = "the exec records carry no fork parent: no unit's inline \
+     shell inherits PID 1's vouching, no user unit is vouched for by its manager, and R004 \
+     exempts no launch through systemd's unlinked executor (sched_process_fork's BTF \
+     tracepoint refused)";
+
+/// Lot 310 (the re-check of #539, N2): the fork-parent record
+/// (`fork_parent_record`, BTF tracepoint `sched_process_fork`), which the
+/// exec record reads (`fork_ppid`): who forked a process, for its first
+/// exec. Not attached, every exec's fork parent is "not known" — the
+/// decisions that need it fail closed; a signed degradation, not fatal.
+fn attach_fork_parent(ebpf: &mut Ebpf) {
+    const PROGRAM: &str = "fork_parent_record";
+    let attached = (|| -> Result<(), String> {
+        let btf = Btf::from_sys_fs().map_err(|e| format!("BTF: {e}"))?;
+        let p: &mut BtfTracePoint = ebpf
+            .program_mut(PROGRAM)
+            .ok_or_else(|| format!("program {PROGRAM} missing from the eBPF object"))?
+            .try_into()
+            .map_err(|e| format!("{PROGRAM} is not a BTF tracepoint: {e}"))?;
+        p.load("sched_process_fork", &btf)
+            .map_err(|e| format!("verifier rejected {PROGRAM}: {e:#}"))?;
+        p.attach()
+            .map_err(|e| format!("attaching {PROGRAM}: {e:#}"))?;
+        Ok(())
+    })();
+    if let Err(e) = attached {
+        error!(error = %e, "fork-parent record not attached: {FORK_PARENT_DEGRADED}");
+        crate::boot::degradation::report("fork_parent", FORK_PARENT_DEGRADED);
+    }
+}
 
 /// The process-spawn sensor: `sched_process_exec`, or — when the kernel's
 /// verifier refuses it — `sched_process_exec_nostdio`, the same program

@@ -433,13 +433,7 @@ fn executed_path(link: std::path::PathBuf, unlinked: bool) -> std::path::PathBuf
 /// dropped and no other (lot 310, finding 8: an empty argument is one —
 /// `python3 -W '' /tmp/x.py /usr/bin/dnf` runs `/tmp/x.py`).
 fn argv_of(cmdline: &[u8]) -> Vec<String> {
-    let body = cmdline.strip_suffix(&[0]).unwrap_or(cmdline);
-    if body.is_empty() {
-        return Vec::new();
-    }
-    body.split(|b| *b == 0)
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect()
+    nn_core::posture::lineage::argv_of_cmdline(cmdline)
 }
 
 /// External audit SNS-009: security rings lost events — raise

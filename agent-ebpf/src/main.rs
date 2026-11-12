@@ -39,6 +39,7 @@ mod execq;
 mod fail_open;
 mod file_open;
 mod fim_watch;
+mod fork_parent;
 mod inbound;
 mod inet_csk_listen;
 mod inode_dev;
@@ -214,6 +215,11 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
             bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _)
         } {
             unsafe { (*raw_ptr).start_ns = start };
+            // Lot 310 (the re-check of #539, N2): the process that forked
+            // this one, for its first exec since the fork (never the parent
+            // at exec time: an orphan's is its reaper)
+            let forker = crate::fork_parent::take(task, start);
+            unsafe { (*raw_ptr).fork_ppid = forker };
         }
         // Parent: task->real_parent, then tgid (userspace ppid) +
         // the start of its thread-group leader (PID-reuse key) + comm.

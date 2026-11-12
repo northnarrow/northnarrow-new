@@ -43,9 +43,11 @@
 //!
 //! - the agent's own worker ([`OwnWorkerLaunch`], R14a);
 //! - systemd's executor left unlinked by an upgrade: its `(dev, ino)` is
-//!   one the packaged executor had on this host ([`ExecutorImages`], which
-//!   the agent records at its start and every minute), launched by systemd
-//!   ([`R004ExecFromProcSelfFd::parented_by_systemd`]). BUG-103: it was a
+//!   one the packaged executor has on this host now ([`ExecutorImages`]:
+//!   the packaged file at its install path, the copies PID 1 and genuine
+//!   user managers hold — re-read every 10 s), for the first exec of a
+//!   process systemd FORKED (the kernel's record, `fork_parent`; the
+//!   re-check of #539, N1 and N2). BUG-103: it was a
 //!   file *named* `systemd-executor` in any root-owned tree — `/opt/app/`,
 //!   which an application's user often owns, included — with any parent;
 //! - a process re-executing the very image its parent runs (`(dev, ino)`
@@ -147,7 +149,26 @@ impl OwnWorkerLaunch {
 /// [`ExecutorImages::CAP`], the oldest out first). Shared: the agent's
 /// refresh records, R004 reads.
 #[derive(Clone, Debug, Default)]
-pub struct ExecutorImages(std::sync::Arc<parking_lot::RwLock<Vec<(u64, u64)>>>);
+pub struct ExecutorImages(std::sync::Arc<parking_lot::RwLock<ExecutorSets>>);
+
+/// [`ExecutorImages`]' two sets.
+#[derive(Debug, Default)]
+struct ExecutorSets {
+    executors: Vec<(u64, u64)>,
+    /// Lot 310 (the re-check of #539, N1): the identities of systemd's
+    /// manager (the packaged binary, PID 1's image): a user's manager forks
+    /// the executor's launches too, and is told by its image.
+    managers: Vec<(u64, u64)>,
+}
+
+/// `ids` sorted, deduplicated, without `(0, 0)`, at most `cap`.
+fn normalised(mut ids: Vec<(u64, u64)>, cap: usize) -> Vec<(u64, u64)> {
+    ids.retain(|id| *id != (0, 0));
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(cap);
+    ids
+}
 
 impl ExecutorImages {
     /// The identities kept: more than a host's upgrades between two
@@ -159,14 +180,14 @@ impl ExecutorImages {
         if id == (0, 0) {
             return false;
         }
-        let mut ids = self.0.write();
-        if ids.contains(&id) {
+        let mut s = self.0.write();
+        if s.executors.contains(&id) {
             return false;
         }
-        if ids.len() == Self::CAP {
-            ids.remove(0);
+        if s.executors.len() == Self::CAP {
+            s.executors.remove(0);
         }
-        ids.push(id);
+        s.executors.push(id);
         true
     }
 
@@ -175,33 +196,46 @@ impl ExecutorImages {
     /// and no install path links any more is freed, and its inode number
     /// may be a user's file's next (`(0, 0)` dropped, at most
     /// [`Self::CAP`]). `true` when the set changed.
-    pub fn replace(&self, mut ids: Vec<(u64, u64)>) -> bool {
-        ids.retain(|id| *id != (0, 0));
-        ids.sort_unstable();
-        ids.dedup();
-        ids.truncate(Self::CAP);
-        let mut cur = self.0.write();
-        let mut before = cur.clone();
+    pub fn replace(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let mut before = s.executors.clone();
         before.sort_unstable();
         let changed = before != ids;
-        *cur = ids;
+        s.executors = ids;
         changed
     }
 
-    /// How many identities there are.
-    pub fn len(&self) -> usize {
-        self.0.read().len()
+    /// Lot 310 (the re-check of #539, N1): the manager's identities now
+    /// (the packaged `systemd`, PID 1's image), in place of the ones
+    /// before; `true` when the set changed.
+    pub fn replace_managers(&self, ids: Vec<(u64, u64)>) -> bool {
+        let ids = normalised(ids, Self::CAP);
+        let mut s = self.0.write();
+        let changed = s.managers != ids;
+        s.managers = ids;
+        changed
     }
 
-    /// No identity.
+    /// How many executor identities there are.
+    pub fn len(&self) -> usize {
+        self.0.read().executors.len()
+    }
+
+    /// No executor identity.
     pub fn is_empty(&self) -> bool {
-        self.0.read().is_empty()
+        self.0.read().executors.is_empty()
     }
 
     /// `id` is one the packaged executor had (never `(0, 0)`, which
     /// [`Self::record`] refuses).
     pub fn contains(&self, id: (u64, u64)) -> bool {
-        self.0.read().contains(&id)
+        self.0.read().executors.contains(&id)
+    }
+
+    /// `id` is the manager's image (never `(0, 0)`).
+    pub fn is_manager(&self, id: (u64, u64)) -> bool {
+        self.0.read().managers.contains(&id)
     }
 }
 
@@ -270,30 +304,15 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// across a systemd upgrade and keeps launching units from it until the
     /// next re-exec. Lot 310 (BUG-103): by its identity, one the packaged
     /// executor has on this host now ([`ExecutorImages`]: linked at its
-    /// install path, or held open by a manager), launched by systemd: its
-    /// parent a manager by the parent's exec identity, and this exec the
-    /// first of the process since its fork (the executor is what a manager
-    /// executes first in a child it forks; the review of #539, finding 3).
-    /// It was any file *named* `systemd-executor` in a root-owned tree
-    /// (`/opt/app/systemd-executor`), whatever its parent.
-    fn is_upgraded_executor(&self, event: &Event, exe: &nn_model::ExeIdentity) -> bool {
-        let Event::ProcessSpawn {
-            pid,
-            ppid,
-            start_ns,
-            timestamp_ns,
-            ..
-        } = event
-        else {
-            return false;
-        };
-        let as_of = crate::posture::lineage::AsOf::of_event(event);
-        self.executor.contains((exe.dev, exe.ino))
-            && self.parented_by_systemd(*ppid, as_of)
-            && !self
-                .lineage
-                .as_ref()
-                .is_some_and(|l| l.execed_before(*pid, *start_ns, *timestamp_ns))
+    /// install path, or held by PID 1 or a genuine user manager), launched
+    /// by systemd. It was any file *named* `systemd-executor` in a
+    /// root-owned tree (`/opt/app/systemd-executor`), whatever its parent.
+    /// The re-check of #539 (N2): "launched by systemd" is the kernel's
+    /// record of who FORKED the process, for its first exec since
+    /// (`fork_parent`): PID 1, or a manager by its image — never the
+    /// parent at exec time, which an orphan's reaper is.
+    fn is_upgraded_executor(&self, exe: &nn_model::ExeIdentity) -> bool {
+        self.executor.contains((exe.dev, exe.ino)) && self.forked_by_a_manager(exe.fork_parent)
     }
 
     /// LSM mode, lot 310: the process re-executes the very image its
@@ -314,17 +333,18 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 == Some((exe.dev, exe.ino))
     }
 
-    /// External audit PROC-001: systemd launched it — PID 1 (the system
-    /// manager), or a `systemd --user` manager told by what the kernel
-    /// executed for the parent, never by its `comm`, which the parent sets
-    /// for itself with `prctl(PR_SET_NAME)`.
-    fn parented_by_systemd(&self, ppid: u32, as_of: crate::posture::lineage::AsOf) -> bool {
-        ppid == 1
-            || self.lineage.as_ref().is_some_and(|l| {
-                l.exec_identity(ppid, as_of).is_some_and(|id| {
-                    id.runs == crate::posture::lineage::Runs::Inline && id.is_client(&["systemd"])
-                })
-            })
+    /// The re-check of #539 (N2): `fork_parent` (the kernel's record of
+    /// who forked the process, for its first exec; 0 not known) is the
+    /// host's PID 1, or a `systemd --user` manager told by the image the
+    /// lineage holds for it — the packaged manager's identity
+    /// ([`ExecutorImages::is_manager`]), never its name or its `comm`.
+    fn forked_by_a_manager(&self, fork_parent: u32) -> bool {
+        fork_parent == 1
+            || (fork_parent != 0
+                && self.lineage.as_ref().is_some_and(|l| {
+                    l.exec_image(fork_parent, crate::posture::lineage::AsOf::Now)
+                        .is_some_and(|id| self.executor.is_manager(id))
+                }))
     }
 }
 
@@ -380,7 +400,7 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             // (review 61).
             let fileless = exe.has(MEMFD)
                 || (exe.has(DELETED)
-                    && !self.is_upgraded_executor(event, exe)
+                    && !self.is_upgraded_executor(exe)
                     && !self.reexecs_its_parent_image(*ppid, exe, as_of));
             if !fileless {
                 return None;
@@ -825,7 +845,9 @@ mod tests {
             own_worker: None,
             executor: images,
         });
-        let upgraded = |ppid: u32, id: (u64, u64)| {
+        // the re-check of #539 (N2): by who FORKED it (the kernel's record,
+        // `fork_parent`), not by its parent at exec time
+        let upgraded = |forker: u32, id: (u64, u64)| {
             let mut e = ev(
                 "/proc/self/fd/9",
                 "/usr/lib/systemd/systemd-executor",
@@ -835,14 +857,17 @@ mod tests {
                 ppid: p, exe: x, ..
             } = &mut e
             {
-                *p = ppid;
+                *p = 1;
+                x.fork_parent = forker;
                 (x.dev, x.ino) = id;
             }
             e
         };
         assert!(r_known.evaluate(&upgraded(1, (2049, 1001))).is_none());
-        // from a bash parent, another identity, or with none recorded
+        // forked by a bash (an orphan PID 1 reaped before its exec), the
+        // fork not known (a later exec), another identity, none recorded
         assert!(r_known.evaluate(&upgraded(7777, (2049, 1001))).is_some());
+        assert!(r_known.evaluate(&upgraded(0, (2049, 1001))).is_some());
         assert!(r_known.evaluate(&upgraded(1, (2049, 1002))).is_some());
         assert!(r.evaluate(&upgraded(1, (2049, 1001))).is_some());
         // fileless: a memfd (whatever argv[0] and parent claim), or an
@@ -970,7 +995,7 @@ mod tests {
 mod lot310 {
     use super::*;
     use crate::posture::host::testing::TestHost as H;
-    use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
+    use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD, ROOT_DIR};
     type R004 = R004ExecFromProcSelfFd<H>;
 
     fn exec(uid: u32, ppid: u32, filename: &str, exe_path: &str, flags: u32) -> Event {
@@ -1144,6 +1169,7 @@ mod lot310 {
         );
         if let Event::ProcessSpawn { exe, .. } = &mut real {
             (exe.dev, exe.ino) = (2049, 1001);
+            exe.fork_parent = 1;
         }
         assert!(r.evaluate(&real).is_none());
         let missed: Vec<&str> = [
@@ -1281,49 +1307,74 @@ mod lot310 {
         }
     }
 
-    /// The review of #539 (finding 3): the executor is what a manager runs
-    /// first in a child it forks — a process that executed something before
-    /// (the lineage holds an earlier exec of the same start) is no executor
-    /// launch, whatever its image and parent.
+    /// The review of #539 (finding 3) and its re-check (N1, N2): the
+    /// executor is what a manager runs first in a child it FORKED — the
+    /// kernel's record of the forker (`fork_parent`), never the parent at
+    /// exec time. PID 1's fork: exempt; a later exec (no record), an
+    /// orphan a shell forked and PID 1 reaped before its exec: killed. A
+    /// user's manager by its image: the packaged manager's identity
+    /// exempts; a "manager" a user's namespace runs (`/usr/lib/systemd/
+    /// systemd` bound over another file: its image is that file's), or one
+    /// whose image the lineage does not hold, does not.
     #[test]
     fn the_executor_is_a_child_s_first_exec() {
         let images = ExecutorImages::default();
         images.record((2049, 1001));
+        images.replace_managers(vec![(2049, 900)]);
         let tmp = tempfile::TempDir::new().unwrap();
         let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
         let r = R004::new(lineage.clone()).with_launches(KnownLaunches {
             own_worker: None,
             executor: images,
         });
-        let launch = |pid: u32, ts: u64| {
+        let launch = |pid: u32, ppid: u32, forker: u32| {
             let mut e = exec(
                 0,
-                1,
+                ppid,
                 "/proc/self/fd/9",
                 "/usr/lib/systemd/systemd-executor",
                 DELETED,
             );
-            if let Event::ProcessSpawn {
-                pid: p,
-                exe,
-                timestamp_ns,
-                start_ns,
-                ..
-            } = &mut e
-            {
+            if let Event::ProcessSpawn { pid: p, exe, .. } = &mut e {
                 *p = pid;
                 (exe.dev, exe.ino) = (2049, 1001);
-                *timestamp_ns = ts;
-                *start_ns = 5;
+                exe.fork_parent = forker;
             }
             e
         };
-        assert!(r.evaluate(&launch(5100, 42)).is_none(), "a first exec");
-        // the process ran something before: an earlier exec, same start
-        lineage.ingest_exec(5200, 1, "/usr/bin/python3", &[], 20, 5, 0);
-        assert!(kills(r.evaluate(&launch(5200, 42))));
+        assert!(r.evaluate(&launch(5100, 1, 1)).is_none(), "PID 1's fork");
+        assert!(kills(r.evaluate(&launch(5200, 1, 0))), "not the first exec");
+        assert!(kills(r.evaluate(&launch(5300, 1, 4444))), "an orphan");
+        // a user's manager, by its image
+        let manager = |pid: u32, id: (u64, u64)| {
+            let mut m = exec(
+                1000,
+                1,
+                "/usr/lib/systemd/systemd",
+                "/usr/lib/systemd/systemd",
+                ROOT_DIR,
+            );
+            if let Event::ProcessSpawn { pid: p, exe, .. } = &mut m {
+                *p = pid;
+                (exe.dev, exe.ino) = id;
+            }
+            assert!(lineage.ingest_spawn_event(&m));
+        };
+        manager(2001, (2049, 900));
+        assert!(
+            r.evaluate(&launch(5400, 2001, 2001)).is_none(),
+            "a user's manager"
+        );
+        // the reviewer's probe: `unshare -Urm`, `/bin/sleep` bound over
+        // `/usr/lib/systemd/systemd` — the path is systemd's, the image
+        // sleep's
+        manager(2002, (2049, 777));
+        assert!(
+            kills(r.evaluate(&launch(5500, 2002, 2002))),
+            "a fake manager"
+        );
+        assert!(kills(r.evaluate(&launch(5600, 2003, 2003))), "not held");
     }
-
     /// No identity is no image: a parent the LSM program gave `(0, 0)` (in
     /// a root's directory) is held with no image — lot 310, the review of
     /// #539: the lineage keeps none rather than `(0, 0)` — and does not

@@ -186,16 +186,35 @@ pub fn is_user_manager(hops: &[(u32, ExecIdentity)], n: usize) -> bool {
         && hops.get(n + 1).is_none_or(|(parent, _)| *parent == 1)
 }
 
+/// Lot 310 (the re-check of #539, N2; lot 310b): what the kernel and the
+/// host say of one hop of a lineage beyond its identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HopFacts {
+    /// The process that FORKED it, when its exec was the first since that
+    /// fork (the kernel's record at `sched_process_fork`, never the parent
+    /// at exec time); 0 when not known.
+    pub fork_parent: u32,
+    /// Its cgroup is a user unit whose unit file is root's and a package's
+    /// (`/usr/lib/systemd/user`, `/etc/systemd/user`), with no unit or
+    /// drop-in of the user's (`~/.config/systemd/user`, a transient
+    /// `systemd-run --user` unit) — the host's `DecisionHost::
+    /// packaged_user_unit`.
+    pub packaged_user_unit: bool,
+}
+
 /// Lot 310, the review of #539 (finding 7, the coordinator's refinement once
 /// the lab measured a new Critical record): hop `n` of `hops` is a shell (or
 /// interpreter) a package installed running an inline program that PID 1
 /// started — a unit's `ExecStart=/bin/sh -c '…'` from a unit file only root
-/// writes, or root's `systemd-run`: it inherits PID 1's vouching. A user's
-/// manager (`systemd --user`), cron (its jobs carry no owner in this
-/// judgement: a user's crontab and the system's alike) and sshd's `bash -c`
-/// do not.
+/// writes, or root's `systemd-run`: it inherits PID 1's vouching. The
+/// re-check of #539 (N2): "PID 1 started it" is the kernel's record of who
+/// FORKED it, for its first exec ([`HopFacts::fork_parent`]) — a webshell's
+/// double-forked orphan, which PID 1 reaps before its `sh -c`, was forked
+/// by the webshell. A user's manager, cron (its jobs carry no owner in this
+/// judgement) and sshd's `bash -c` do not.
 pub fn started_by_pid1(
     hops: &[(u32, ExecIdentity)],
+    facts: &[HopFacts],
     n: usize,
     owned: &dyn Fn(&Path) -> Option<bool>,
 ) -> bool {
@@ -205,7 +224,25 @@ pub fn started_by_pid1(
     id.runs == Runs::Code
         && is_interpreter(&id.exe)
         && owned_file(&id.exe, owned)
-        && hops.get(n + 1).is_some_and(|(parent, _)| *parent == 1)
+        && facts.get(n).is_some_and(|f| f.fork_parent == 1)
+}
+
+/// Lot 310b (decided 12/11/2026): the user's manager at hop `n` vouches for
+/// the process it started (hop `n - 1`) when that process is the unit's
+/// own — the manager FORKED it, for its first exec — and the unit's file is
+/// root's and a package's ([`HopFacts::packaged_user_unit`]): the desktop's
+/// terminal emulator, its session's services. Never a transient
+/// `systemd-run --user` unit, never a unit or drop-in of the user's.
+pub fn manager_vouches_for_its_unit(
+    hops: &[(u32, ExecIdentity)],
+    facts: &[HopFacts],
+    n: usize,
+) -> bool {
+    let (Some((manager, _)), Some(child)) = (hops.get(n), n.checked_sub(1).and_then(|c| facts.get(c)))
+    else {
+        return false;
+    };
+    child.fork_parent == *manager && child.packaged_user_unit
 }
 
 /// Why a hop that is not trusted is not: what it runs is not known, it runs
@@ -220,10 +257,25 @@ fn not_installed(id: &ExecIdentity) -> &'static str {
 
 /// The pure decision. `lineage`: the writer's identity at index 0, then
 /// its ancestors nearest first (`None`: unknown). `pid`: the writer.
-/// `package_tx`: the writer belongs to a root package transaction.
+/// `package_tx`: the writer belongs to a root package transaction. No
+/// [`HopFacts`]: no hop is known to be PID 1's or a packaged user unit's
+/// ([`judge_with`]).
 pub fn judge(
     pid: u32,
     lineage: Option<&[(u32, ExecIdentity)]>,
+    package_tx: bool,
+    owned: &dyn Fn(&Path) -> Option<bool>,
+) -> Judged {
+    judge_with(pid, lineage, &[], package_tx, owned)
+}
+
+/// [`judge`] with each hop's [`HopFacts`] (`facts[n]` for `lineage[n]`; a
+/// hop without any knows nothing): the kernel's fork parents and the
+/// host's packaged user units.
+pub fn judge_with(
+    pid: u32,
+    lineage: Option<&[(u32, ExecIdentity)]>,
+    facts: &[HopFacts],
     package_tx: bool,
     owned: &dyn Fn(&Path) -> Option<bool>,
 ) -> Judged {
@@ -243,9 +295,11 @@ pub fn judge(
     // below ([`packaged`]); every ancestor above them must vouch for it.
     let own = topmost_same(hops, 0);
     if let Some(i) = hops.iter().enumerate().position(|(n, (_, id))| {
-        let by_pid1 = n > own && started_by_pid1(hops, n, owned);
+        let by_pid1 = n > own && started_by_pid1(hops, facts, n, owned);
         (is_foreign(id) && !by_pid1)
-            || (n > own && ((!vouches(id, owned) && !by_pid1) || is_user_manager(hops, n)))
+            || (n > own
+                && ((!vouches(id, owned) && !by_pid1)
+                    || (is_user_manager(hops, n) && !manager_vouches_for_its_unit(hops, facts, n))))
     }) {
         // lot 310: a user's service manager is not what to kill (its whole
         // session's services with it): the unit's process it started is.
@@ -778,14 +832,41 @@ mod tests {
         };
         let systemd = || id("/usr/lib/systemd/systemd", None);
         let l = [(400, id("/usr/bin/tar", None)), (300, sh()), (1, systemd())];
+        // the re-check of #539 (N2): PID 1 FORKED the shell, the kernel's
+        // record of its first exec
+        let forked = |by: u32| {
+            [
+                HopFacts::default(),
+                HopFacts {
+                    fork_parent: by,
+                    ..HopFacts::default()
+                },
+            ]
+        };
         assert_eq!(
-            judge(400, Some(&l), false, &distro),
+            judge_with(400, Some(&l), &forked(1), false, &distro),
             Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
         );
-        assert!(started_by_pid1(&l, 1, &distro));
+        assert!(started_by_pid1(&l, &forked(1), 1, &distro));
+        // the reviewer's double fork: the webshell's `sh -c '(sleep 1; exec
+        // sh -c "openssl enc …") & exit'` — PID 1 reaps the orphan before
+        // its exec, but the webshell forked it; and a fork not known
+        for by in [250, 0] {
+            assert!(
+                matches!(
+                    judge_with(400, Some(&l), &forked(by), false, &distro),
+                    Judged::Untrusted { actor: 300, .. }
+                ),
+                "forked by {by}"
+            );
+        }
+        assert!(matches!(
+            judge(400, Some(&l), false, &distro),
+            Judged::Untrusted { actor: 300, .. }
+        ));
         // the shell's own writes: judged
         assert!(matches!(
-            judge(300, Some(&l[1..]), false, &distro),
+            judge_with(300, Some(&l[1..]), &forked(1)[1..], false, &distro),
             Judged::Untrusted { actor: 300, .. }
         ));
         for l in [
@@ -826,7 +907,9 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    judge(400, Some(&l), false, &distro),
+                    // the shell forked by its parent there (cron's child,
+                    // sshd, a user's manager, PID 1 for the unpackaged one)
+                    judge_with(400, Some(&l), &forked(l[2].0), false, &distro),
                     Judged::Untrusted { actor: 300, .. }
                 ),
                 "{l:?}"
