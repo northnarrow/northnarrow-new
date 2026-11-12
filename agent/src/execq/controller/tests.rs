@@ -58,12 +58,13 @@ impl KernelIo for FakeKernel {
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
         self.0.lock().left.clone()
     }
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused {
         let mut k = self.0.lock();
-        // lot 311 (F3): a map of `cap` entries refuses the rest
+        // lot 311 (F3, G2): a map of `cap` entries keeps the ranked list's
+        // head
         let cap = k.roots_cap.unwrap_or(usize::MAX);
         k.roots = Some(roots.iter().take(cap).copied().collect());
-        roots.len().saturating_sub(cap)
+        kernel::RootsRefused::of_tail(roots, cap)
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         self.0.lock().counters
@@ -966,9 +967,73 @@ fn a_dash_source_line_is_a_root_and_losses_are_signed() {
     assert!(w.ctl.roots_rows.holding(), "a dropped line is signed");
     // the kernel's map full: the refused roots are a degradation
     w.k.0.lock().roots_cap = Some(0);
-    w.ctl.step(t0 + 2 * ROOTS_EVERY + Duration::from_millis(2));
+    let full_at = t0 + 2 * ROOTS_EVERY + Duration::from_millis(2);
+    w.ctl.step(full_at);
     assert!(w.ctl.roots_full.holding());
+    // the review of #538 (G2): it stands its hold, then ends
     w.k.0.lock().roots_cap = None;
     w.ctl.step(t0 + 3 * ROOTS_EVERY + Duration::from_millis(3));
+    assert!(w.ctl.roots_full.holding(), "within its hold");
+    w.ctl
+        .step(full_at + crate::execpol::controller::ROOTS_FULL_HOLD + ROOTS_EVERY);
     assert!(!w.ctl.roots_full.holding());
+    assert_eq!(w.ctl.roots_full.reports(), 1);
+}
+
+/// Lot 311 (the review of #538, G2): seventy FUSE mounts of a user's,
+/// mounted before a system root, never keep it out of the kernel's map
+/// (64 entries): the roots are ranked, the FUSE ones last. Their own
+/// refusal — however its count moves — signs nothing (the exec hooks class
+/// a FUSE file by its magic, lot 318); a system root refused is one record
+/// per hold, however often it comes and goes.
+#[test]
+fn seventy_fuse_mounts_never_keep_a_system_root_out_and_sign_nothing() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    w.k.0.lock().roots_cap = Some(64);
+    let mi = w.dir.path().join("mountinfo");
+    let table = |n: u32| {
+        let mut t = String::new();
+        for i in 0..n {
+            t.push_str(&format!(
+                "{} 1 0:{} / /home/u/m{i} rw,nosuid,nodev - fuse.x - rw,user_id=1000\n",
+                100 + i,
+                200 + i
+            ));
+        }
+        t + &crate::execq::kernel::tmp_mount_line(30)
+    };
+    w.ctl.roots_source = mi.clone();
+    let tmp = std::fs::metadata("/tmp").unwrap();
+    // the root's key: the kernel's dev_t (major << 20 | minor), the inode
+    let tmp_key = ExecqKey {
+        dev: (u64::from(libc::major(tmp.dev())) << 20) | u64::from(libc::minor(tmp.dev())),
+        ino: tmp.ino(),
+    };
+    let t0 = Instant::now();
+    for (round, n) in [70u32, 66, 75, 64, 90, 70].into_iter().enumerate() {
+        std::fs::write(&mi, table(n)).unwrap();
+        w.ctl
+            .step(t0 + (round as u32) * (ROOTS_EVERY + Duration::from_millis(1)));
+        let roots = w.k.0.lock().roots.clone().unwrap();
+        assert_eq!(roots.len(), 64.min(n as usize + 1), "round {round}");
+        assert!(
+            roots.iter().any(|(k, _)| *k == tmp_key),
+            "the system root /tmp, mounted after {n} FUSE mounts, is published"
+        );
+    }
+    assert!(!w.ctl.roots_full.holding());
+    assert_eq!(
+        w.ctl.roots_full.reports(),
+        0,
+        "a FUSE refusal signs nothing"
+    );
+    // a system root refused: one record, however often it comes and goes
+    let t1 = t0 + 10 * ROOTS_EVERY;
+    for i in 0..12u32 {
+        w.k.0.lock().roots_cap = Some(if i % 2 == 0 { 0 } else { 64 });
+        w.ctl
+            .step(t1 + i * (ROOTS_EVERY + Duration::from_millis(1)));
+        assert!(w.ctl.roots_full.holding(), "{i}");
+    }
+    assert_eq!(w.ctl.roots_full.reports(), 1, "bounded: one per hold");
 }

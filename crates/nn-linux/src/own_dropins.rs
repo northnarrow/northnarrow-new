@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::host_dropins::{breaks, directives, effective, harms, HostLimits, Kind, Reach};
+use crate::state_read::Config;
 
 /// Where a quarantined drop-in goes.
 pub const QUARANTINE_DIR: &str = "/var/lib/northnarrow/quarantine/dropins";
@@ -232,12 +233,16 @@ fn own_harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         "EnvironmentFile" => {
             let p = value.trim().trim_start_matches('-');
             // lot 311 (F4): read as bytes — a byte that is not UTF-8 hid
-            // the whole file
-            let text = crate::state_read::read_config(Path::new(p)).unwrap_or_default();
-            env_file_assignments(&text)
-                .into_iter()
-                .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
-                .map(|(n, _)| format!("{n} set in our units' environment (from {p})"))
+            // the whole file; the review of #538 (G1): what the judge
+            // cannot read is harmful, never an empty file
+            match crate::state_read::read_config(Path::new(p)) {
+                Config::Absent => None,
+                Config::Unjudgeable(why) => Some(format!("EnvironmentFile={p}: {why}")),
+                Config::Text(text) => env_file_assignments(&text)
+                    .into_iter()
+                    .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
+                    .map(|(n, _)| format!("{n} set in our units' environment (from {p})")),
+            }
         }
         _ => harms(reach, key, value, host),
     }
@@ -307,8 +312,10 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                     continue;
                 }
                 // lot 311 (F4): read as bytes — a drop-in with one byte that
-                // is not UTF-8 was skipped whole
-                let Ok(text) = crate::state_read::read_config(&from) else {
+                // is not UTF-8 was skipped whole. One that cannot be read
+                // has no setting to list: its judge ([`harmful`]: its
+                // shape, [`own_harms`]) holds it harmful
+                let Some(text) = crate::state_read::read_config(&from).text() else {
                     continue;
                 };
                 for (k, v) in effective(directives(&text)) {
@@ -319,9 +326,14 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                             if !under_env_dir(p) {
                                 continue;
                             }
-                            env_file_assignments(
-                                &crate::state_read::read_config(Path::new(p)).unwrap_or_default(),
-                            )
+                            // one that cannot be read lists no setting:
+                            // its drop-in's judge holds it harmful
+                            // ([`shape_harm`]: not a protected regular
+                            // file; [`own_harms`])
+                            match crate::state_read::read_config(Path::new(p)).text() {
+                                Some(text) => env_file_assignments(&text),
+                                None => continue,
+                            }
                         }
                         _ => continue,
                     };
@@ -472,9 +484,10 @@ pub fn harmful(
                 } else {
                     None
                 };
-                if regular && bytes.is_none() {
-                    continue;
-                }
+                // the review of #538's re-check (G1): a regular drop-in the
+                // judge cannot read is harmful — what systemd reads there
+                // cannot be judged — never skipped
+                let unread = regular && bytes.is_none();
                 let text = bytes
                     .as_ref()
                     .map(|b| String::from_utf8_lossy(b).to_string());
@@ -492,26 +505,34 @@ pub fn harmful(
                     }
                 }
                 let when = pass.when;
-                let why = shape_harm(&meta, &from, text.as_deref(), protect)
-                    .map(|w| format!("{when}, {w}"))
-                    .or_else(|| {
-                        effective(directives(text.as_deref()?))
-                            .into_iter()
-                            .find_map(|(k, v)| {
-                                own_harms(reach, &k, &v, host)
-                                    .map(|w| (k.clone(), v.clone(), w, Kind::Harmful))
-                                    .or_else(|| {
-                                        breaks(&k, &v).map(|w| (k, v, w, Kind::BreaksAgent))
-                                    })
-                            })
-                            .map(|(k, v, w, _)| format!("{when}, sets {k}={v}: {w}"))
-                    });
+                let why = if unread {
+                    Some(format!(
+                        "{when}, it could not be read: what systemd reads there cannot be judged"
+                    ))
+                } else {
+                    shape_harm(&meta, &from, text.as_deref(), protect)
+                        .map(|w| format!("{when}, {w}"))
+                }
+                .or_else(|| {
+                    effective(directives(text.as_deref()?))
+                        .into_iter()
+                        .find_map(|(k, v)| {
+                            own_harms(reach, &k, &v, host)
+                                .map(|w| (k.clone(), v.clone(), w, Kind::Harmful))
+                                .or_else(|| breaks(&k, &v).map(|w| (k, v, w, Kind::BreaksAgent)))
+                        })
+                        .map(|(k, v, w, _)| format!("{when}, sets {k}={v}: {w}"))
+                });
                 let Some(why) = why else {
                     keep_protected(&from, text.as_deref(), protect);
                     continue;
                 };
-                // a symlink is kept as its target's name, never followed
+                // a symlink is kept as its target's name, never followed; a
+                // file that could not be read, as that
                 let keep = bytes.unwrap_or_else(|| {
+                    if unread {
+                        return b"(it could not be read)\n".to_vec();
+                    }
                     format!(
                         "symlink -> {}\n",
                         std::fs::read_link(&from)
@@ -1634,5 +1655,61 @@ mod tests {
             found.as_deref().is_some_and(|w| w.contains("LD_PRELOAD")),
             "{found:?}"
         );
+    }
+
+    /// The review of #538 (G1): an `EnvironmentFile=` of our drop-ins the
+    /// judge cannot read — a FIFO systemd reads from its writer, a device —
+    /// is harmful, never an empty file; `/dev/null` and a missing optional
+    /// one are not.
+    #[test]
+    fn an_own_environment_file_the_judge_cannot_read_is_harmful() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("env");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let judge = |p: &str| own_harms(Reach::Agent, "EnvironmentFile", p, &host());
+        let why = judge(&format!("-{}", fifo.display())).unwrap_or_default();
+        assert!(why.contains("a FIFO, not a regular file"), "{why:?}");
+        let why = judge("/dev/zero").unwrap_or_default();
+        assert!(why.contains("a character device"), "{why:?}");
+        assert_eq!(judge("/dev/null"), None);
+        assert_eq!(
+            judge(&format!("-{}", d.path().join("none").display())),
+            None
+        );
+    }
+
+    /// The review of #538's re-check (G1): a regular drop-in of ours the
+    /// judge cannot read (refused: the judge without `CAP_DAC_OVERRIDE`) is
+    /// harmful, never skipped. As root, the file is read through its mode
+    /// and judged on its content (here: harmless).
+    #[test]
+    fn an_own_drop_in_the_judge_cannot_read_is_harmful() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let shut = ag.join("50-shut.conf");
+        std::fs::write(&shut, b"[Service]\nEnvironment=NN_LOG=info\n").unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let found = preinstall_harmful(
+            &[root.path()],
+            &host(),
+            SystemTime::now() + std::time::Duration::from_secs(60),
+            |_, _| false,
+        );
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // SAFETY: geteuid has no precondition and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(found.is_empty(), "{found:?}");
+        } else {
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                found[0].why.contains("it could not be read"),
+                "{}",
+                found[0].why
+            );
+        }
     }
 }

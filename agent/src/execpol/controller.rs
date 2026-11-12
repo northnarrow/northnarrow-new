@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use super::kernel;
 use super::record::{event_of, records_of, Recorder, Repeats};
 use super::COUNTERS;
+use crate::execq::kernel::RootsRefused;
 
 /// How often the slices, the images and the roots are read again.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(10);
@@ -30,8 +31,8 @@ pub trait KernelIo {
     fn drain(&mut self, out: &mut Vec<ExecPolRaw>);
     fn set_slices(&mut self, system: u64, user: u64, ours: u64);
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]);
-    /// How many roots the kernel's map refused.
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize;
+    /// What the kernel's map refused of the (ranked) roots.
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused;
     fn counters(&self) -> [u64; counter::SLOTS as usize];
 }
 
@@ -56,7 +57,7 @@ impl KernelIo for kernel::Kernel {
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
         kernel::Kernel::set_images(self, entries)
     }
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused {
         kernel::Kernel::set_roots(self, roots)
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
@@ -107,7 +108,7 @@ pub struct Controller<K: KernelIo> {
     /// Lot 311 (the review of #538): lines of the table not in the
     /// kernel's shape, and roots the kernel's map refused, signed.
     mounts_rows: nn_linux::state_read::Condition,
-    roots_full: nn_linux::state_read::Condition,
+    roots_full: RootsFull,
 }
 
 impl<K: KernelIo> Controller<K> {
@@ -122,7 +123,7 @@ impl<K: KernelIo> Controller<K> {
             skipped_logged: false,
             mounts_read: nn_linux::state_read::LastGood::new("execpol_mounts", "the mount table"),
             mounts_rows: nn_linux::state_read::Condition::new("execpol_mounts_rows"),
-            roots_full: nn_linux::state_read::Condition::new("execpol_roots_full"),
+            roots_full: RootsFull::new("execpol_roots_full"),
         }
     }
 
@@ -170,7 +171,7 @@ impl<K: KernelIo> Controller<K> {
         if let (true, Some(table)) = (self.s.own_roots, &table) {
             let roots = crate::execq::kernel::guarded_roots(table);
             let refused = self.k.set_roots(&roots);
-            roots_published(&mut self.roots_full, refused, roots.len());
+            self.roots_full.published(refused, roots.len(), now);
         }
         self.last_refresh = Some(now);
         self.slices
@@ -221,21 +222,79 @@ impl<K: KernelIo> Controller<K> {
     }
 }
 
-/// Lot 311 (the review of #538, F3): roots the kernel's map refused
-/// (`EXECQ_ROOTS` holds 64) are a degradation of `full` while they are —
-/// a mount past the 64th left without its class, never in silence.
-pub(crate) fn roots_published(
-    full: &mut nn_linux::state_read::Condition,
-    refused: usize,
-    of: usize,
-) {
-    if refused == 0 {
-        full.ended();
-    } else {
-        full.holds(format!(
-            "{refused} of {of} guarded mount roots not published: the kernel's map \
-             (EXECQ_ROOTS, 64 entries) refused them — exec from those mounts has no mount class"
-        ));
+/// Lot 311 (the review of #538, G2): the least time a refusal of the
+/// roots' map stands as a degradation once reported — a count that comes
+/// and goes is one signed record per hold, not one per re-read.
+pub(crate) const ROOTS_FULL_HOLD: Duration = Duration::from_secs(300);
+
+/// Lot 311 (the review of #538, F3, G2): what the kernel's map
+/// (`EXECQ_ROOTS`, 64 entries) refused of the ranked roots
+/// ([`crate::execq::kernel::publish_ranked`]: the FUSE ones give way
+/// first). A root other than a FUSE one left out is a degradation (a
+/// mount without its class), held [`ROOTS_FULL_HOLD`] at least, its text
+/// the same whatever the count. A FUSE root left out is no loss — the exec
+/// hooks class a FUSE file by its file system's magic (lot 318) — and no
+/// record: a user mounts as many as `mount_max`, and would sign rows at
+/// will; it is logged when it starts and ends.
+#[derive(Debug)]
+pub(crate) struct RootsFull {
+    lost: nn_linux::state_read::Condition,
+    fuse_left_out: bool,
+}
+
+impl RootsFull {
+    pub(crate) const fn new(source: &'static str) -> Self {
+        RootsFull {
+            lost: nn_linux::state_read::Condition::with_hold(source, ROOTS_FULL_HOLD),
+            fuse_left_out: false,
+        }
+    }
+
+    /// The roots were published at `now`, `of` of them, `refused` left out.
+    pub(crate) fn published(&mut self, refused: RootsRefused, of: usize, now: Instant) {
+        let fuse = refused.fuse > 0;
+        if fuse != self.fuse_left_out {
+            if fuse {
+                warn!(
+                    refused = refused.fuse,
+                    of,
+                    "guarded roots: FUSE mounts past the kernel's map (64 entries) left out — \
+                     their files are classed by the file system's magic"
+                );
+            } else {
+                debug!("guarded roots: every FUSE root published again");
+            }
+            self.fuse_left_out = fuse;
+        }
+        if refused.other == 0 {
+            self.lost.ended_at(now);
+        } else {
+            if !self.lost.holding() {
+                warn!(
+                    refused = refused.other,
+                    of, "guarded roots refused by the kernel's map"
+                );
+            }
+            self.lost.holds_at(
+                "guarded mount roots (not FUSE ones) not published: the kernel's map \
+                 (EXECQ_ROOTS, 64 entries) refused them — exec from those mounts has no mount \
+                 class"
+                    .into(),
+                now,
+            );
+        }
+    }
+
+    /// The degradation stands (tests).
+    #[cfg(test)]
+    pub(crate) fn holding(&self) -> bool {
+        self.lost.holding()
+    }
+
+    /// How many times it was reported (tests).
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> u32 {
+        self.lost.reports()
     }
 }
 
@@ -270,11 +329,12 @@ mod tests {
         fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
             self.images = entries.to_vec();
         }
-        fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
-            // lot 311 (F3): a map of `cap` entries refuses the rest
+        fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused {
+            // lot 311 (F3, G2): a map of `cap` entries keeps the ranked
+            // list's head
             let cap = self.cap.unwrap_or(usize::MAX);
             self.roots = roots.iter().take(cap).copied().collect();
-            roots.len().saturating_sub(cap)
+            RootsRefused::of_tail(roots, cap)
         }
         fn counters(&self) -> [u64; counter::SLOTS as usize] {
             self.counters

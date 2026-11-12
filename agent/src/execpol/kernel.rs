@@ -12,7 +12,7 @@ use aya::Ebpf;
 use common::wire::execpol::{conf_slot, counter, image_role, slice_slot};
 use common::wire::execq::ExecqKey;
 
-use crate::execq::kernel::AyaKey;
+use crate::execq::kernel::{AyaKey, RootsRefused};
 
 /// What the controller holds.
 pub struct Kernel {
@@ -110,21 +110,13 @@ impl Kernel {
     }
 
     /// Replace the guarded mount roots (only when this side owns them);
-    /// how many the kernel's map refused (lot 311, the review of #538, F3).
-    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
+    /// what the kernel's map refused (lot 311, the review of #538, F3, G2:
+    /// ranked, [`crate::execq::kernel::publish_ranked`]).
+    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused {
         let Some(map) = self.roots.as_mut() else {
-            return 0;
+            return RootsRefused::default();
         };
-        let old: Vec<AyaKey> = map.keys().filter_map(|k| k.ok()).collect();
-        for k in old {
-            if !roots.iter().any(|(r, _)| *r == k.0) {
-                let _ = map.remove(&k);
-            }
-        }
-        roots
-            .iter()
-            .filter(|(k, v)| map.insert(AyaKey(*k), *v, 0).is_err())
-            .count()
+        crate::execq::kernel::publish_ranked(map, roots)
     }
 }
 

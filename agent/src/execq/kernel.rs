@@ -142,21 +142,105 @@ impl Kernel {
         out
     }
 
-    /// Replace the guarded mount roots with `roots`; how many the kernel's
-    /// map refused (lot 311, the review of #538, F3: `EXECQ_ROOTS` holds 64
-    /// — the caller signs a refusal instead of losing the root in silence).
-    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
-        let old: Vec<AyaKey> = self.roots.keys().filter_map(|k| k.ok()).collect();
-        for k in old {
-            if !roots.iter().any(|(r, _)| *r == k.0) {
-                let _ = self.roots.remove(&k);
+    /// Replace the guarded mount roots with `roots` (ranked:
+    /// [`guarded_roots`]); what the kernel's map refused (lot 311, the
+    /// review of #538, F3 and G2: [`publish_ranked`]).
+    pub fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused {
+        publish_ranked(&mut self.roots, roots)
+    }
+}
+
+/// Lot 311 (the review of #538, G2): the guarded roots the kernel's map
+/// (`EXECQ_ROOTS`, 64 entries) refused, the FUSE ones apart. A FUSE root
+/// left out is classed by its file system's magic all the same (lot 318:
+/// the exec hooks close a FUSE file whose device is not in the map), so
+/// only `other` is a loss.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootsRefused {
+    pub other: usize,
+    pub fuse: usize,
+}
+
+impl RootsRefused {
+    /// The refusals of `roots` past the first `kept` (a map that keeps the
+    /// ranked list's head).
+    pub fn of_tail(roots: &[(ExecqKey, u32)], kept: usize) -> Self {
+        let mut r = RootsRefused::default();
+        for (k, _) in roots.iter().skip(kept) {
+            if k.ino == FUSE_BY_DEVICE {
+                r.fuse += 1;
+            } else {
+                r.other += 1;
             }
         }
-        roots
-            .iter()
-            .filter(|(k, v)| self.roots.insert(AyaKey(*k), *v, 0).is_err())
-            .count()
+        r
     }
+}
+
+/// A map of guarded roots: the kernel's (`EXECQ_ROOTS`), a test's.
+pub trait RootsMap {
+    /// The keys it holds.
+    fn held(&self) -> Vec<ExecqKey>;
+    /// Removed (it held it).
+    fn remove(&mut self, key: &ExecqKey) -> bool;
+    /// Inserted or updated (`false`: refused — the map is full).
+    fn insert(&mut self, key: ExecqKey, value: u32) -> bool;
+}
+
+impl RootsMap for HashMap<MapData, AyaKey, u32> {
+    fn held(&self) -> Vec<ExecqKey> {
+        self.keys().filter_map(|k| k.ok()).map(|k| k.0).collect()
+    }
+    fn remove(&mut self, key: &ExecqKey) -> bool {
+        HashMap::remove(self, &AyaKey(*key)).is_ok()
+    }
+    fn insert(&mut self, key: ExecqKey, value: u32) -> bool {
+        HashMap::insert(self, AyaKey(key), value, 0).is_ok()
+    }
+}
+
+/// Lot 311 (the review of #538, G2): publish `roots`, ranked (the
+/// non-FUSE roots first: [`guarded_roots`]), into a map of bounded size.
+/// The keys `roots` no longer holds leave first; then each root in rank
+/// order is inserted, and when the map is full the lowest-ranked root it
+/// holds gives way — so the roots a user can multiply (FUSE mounts,
+/// `mount_max` is 1000) never keep out a system root mounted after them
+/// (a `/run/user/<uid>` at another user's login, a `/home` automounted).
+pub fn publish_ranked(map: &mut impl RootsMap, roots: &[(ExecqKey, u32)]) -> RootsRefused {
+    let mut held: std::collections::HashSet<ExecqKey> = std::collections::HashSet::new();
+    for k in map.held() {
+        if roots.iter().any(|(r, _)| *r == k) {
+            held.insert(k);
+        } else {
+            map.remove(&k);
+        }
+    }
+    // the roots at `floor` and past it are not in the map (given way, or
+    // never in): the lowest-ranked one held is found below it
+    let mut floor = roots.len();
+    for (i, (k, v)) in roots.iter().enumerate() {
+        let mut placed = map.insert(*k, *v);
+        while !placed && floor > i + 1 {
+            floor -= 1;
+            let low = roots[floor].0;
+            if held.contains(&low) && map.remove(&low) {
+                held.remove(&low);
+                placed = map.insert(*k, *v);
+            }
+        }
+        if placed {
+            held.insert(*k);
+        }
+    }
+    let mut refused = RootsRefused::default();
+    for (k, _) in roots.iter().filter(|(k, _)| !held.contains(k)) {
+        if k.ino == FUSE_BY_DEVICE {
+            refused.fuse += 1;
+        } else {
+            refused.other += 1;
+        }
+    }
+    refused
 }
 
 /// Mount points whose filesystem the guard watches as a whole: a separate
@@ -215,7 +299,8 @@ pub fn root_kind_of(mp: &str) -> u32 {
 ///   FUSE file by its superblock's magic and looks its device up so.
 ///
 /// A mount point that is not UTF-8 is classed by its text with the bytes
-/// replaced.
+/// replaced. The list is ranked, the FUSE roots last (the review of #538,
+/// G2).
 pub fn guarded_roots(table: &nn_linux::mountinfo::MountTable) -> Vec<(ExecqKey, u32)> {
     let mut out: Vec<(ExecqKey, u32)> = Vec::new();
     for m in &table.entries {
@@ -247,6 +332,11 @@ pub fn guarded_roots(table: &nn_linux::mountinfo::MountTable) -> Vec<(ExecqKey, 
             out.push((key, root_kind_of(&mp)));
         }
     }
+    // the review of #538 (G2): ranked — the roots a user cannot multiply
+    // first, the FUSE ones (a user mounts up to `mount_max`) after them, in
+    // the table's order within each: the kernel's map keeps the head
+    // ([`publish_ranked`])
+    out.sort_by_key(|(k, _)| k.ino == FUSE_BY_DEVICE);
     out
 }
 
@@ -431,6 +521,111 @@ mod tests {
             "{mp:?} ({:?} of {:?}) is not a guarded root",
             entry.root,
             entry.fstype
+        );
+    }
+
+    /// A bounded map of roots, as the kernel's (`EXECQ_ROOTS`).
+    struct Bounded {
+        cap: usize,
+        held: Vec<(ExecqKey, u32)>,
+    }
+
+    impl RootsMap for Bounded {
+        fn held(&self) -> Vec<ExecqKey> {
+            self.held.iter().map(|(k, _)| *k).collect()
+        }
+        fn remove(&mut self, key: &ExecqKey) -> bool {
+            let before = self.held.len();
+            self.held.retain(|(k, _)| k != key);
+            self.held.len() < before
+        }
+        fn insert(&mut self, key: ExecqKey, value: u32) -> bool {
+            if let Some(e) = self.held.iter_mut().find(|(k, _)| *k == key) {
+                e.1 = value;
+                return true;
+            }
+            if self.held.len() >= self.cap {
+                return false;
+            }
+            self.held.push((key, value));
+            true
+        }
+    }
+
+    /// Lot 311 (the review of #538, G2): seventy FUSE mounts of a user's
+    /// fill the kernel's map (64 entries); a system root mounted after them
+    /// — a directory of `/tmp`'s file system here, standing for another
+    /// user's `/run/user/<uid>` at login — still gets in: the roots are
+    /// ranked (the FUSE ones last), and a FUSE root the map holds gives
+    /// way. Before: the map kept the table's first 64, the system root
+    /// refused.
+    #[test]
+    fn seventy_fuse_mounts_never_keep_a_later_system_root_out_of_the_map() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let sys = d.path().join("sys");
+        std::fs::create_dir(&sys).unwrap();
+        let m = std::fs::metadata(&sys).unwrap();
+        let fuse = |n: u32| {
+            (0..n)
+                .map(|i| {
+                    format!(
+                        "{} 1 0:{} / /home/u/m{i} rw,nosuid,nodev - fuse.x - rw,user_id=1000\n",
+                        100 + i,
+                        200 + i
+                    )
+                })
+                .collect::<String>()
+        };
+        let mut map = Bounded {
+            cap: 64,
+            held: Vec::new(),
+        };
+        let first = format!("{}{}", tmp_mount_line(30), fuse(70));
+        let roots = guarded_roots(&nn_linux::mountinfo::parse(first.as_bytes()));
+        assert_eq!(
+            publish_ranked(&mut map, &roots),
+            RootsRefused { other: 0, fuse: 7 }
+        );
+        assert_eq!(map.held.len(), 64);
+        let later = format!(
+            "{first}400 1 {}:{} / {} rw - tmpfs sys rw\n",
+            libc::major(m.dev()),
+            libc::minor(m.dev()),
+            sys.display()
+        );
+        let roots = guarded_roots(&nn_linux::mountinfo::parse(later.as_bytes()));
+        let key = ExecqKey {
+            dev: roots[1].0.dev,
+            ino: m.ino(),
+        };
+        assert_eq!(roots[1].0, key, "ranked before every FUSE root: {roots:?}");
+        assert_eq!(
+            publish_ranked(&mut map, &roots),
+            RootsRefused { other: 0, fuse: 8 }
+        );
+        assert_eq!(map.held.len(), 64);
+        assert!(
+            map.held.iter().any(|(k, _)| *k == key),
+            "the later system root is in"
+        );
+        let tmp = std::fs::metadata("/tmp").unwrap();
+        assert!(map
+            .held
+            .iter()
+            .any(|(k, _)| k.ino == tmp.ino() && k.ino != FUSE_BY_DEVICE));
+        // a map with room for the system roots only: every FUSE root left out
+        map.cap = 2;
+        map.held.clear();
+        assert_eq!(
+            publish_ranked(&mut map, &roots),
+            RootsRefused { other: 0, fuse: 70 }
+        );
+        // and none at all: the system roots are the loss
+        map.cap = 0;
+        map.held.clear();
+        assert_eq!(
+            publish_ranked(&mut map, &roots),
+            RootsRefused { other: 2, fuse: 70 }
         );
     }
 }

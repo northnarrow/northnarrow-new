@@ -51,8 +51,8 @@ pub trait KernelIo {
     fn remember(&mut self, key: ExecqKey, v: ExecqKnown);
     fn unstop(&mut self, pid: u32);
     fn stopped(&self) -> Vec<(u32, ExecqStopped)>;
-    /// How many roots the kernel's map refused.
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize;
+    /// What the kernel's map refused of the (ranked) roots.
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused;
     fn counters(&self) -> [u64; counter::SLOTS as usize];
 }
 
@@ -89,7 +89,7 @@ impl KernelIo for kernel::Kernel {
             .map(|(k, v)| (k, v.0))
             .collect()
     }
-    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> usize {
+    fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused {
         kernel::Kernel::set_roots(self, roots)
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
@@ -246,7 +246,7 @@ pub struct Controller<K: KernelIo, B: Backend> {
     /// Lot 311 (the review of #538): lines of the table not in the
     /// kernel's shape, and roots the kernel's map refused, signed.
     roots_rows: nn_linux::state_read::Condition,
-    roots_full: nn_linux::state_read::Condition,
+    roots_full: crate::execpol::controller::RootsFull,
     /// Since when the scanner holds requests without a word.
     busy_since: Option<Instant>,
     /// The last signed degradation of the scanner (its cause, when) and
@@ -300,7 +300,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             roots_source: "/proc/self/mountinfo".into(),
             roots_read: nn_linux::state_read::LastGood::new("execq_roots", "the mount table"),
             roots_rows: nn_linux::state_read::Condition::new("execq_roots_rows"),
-            roots_full: nn_linux::state_read::Condition::new("execq_roots_full"),
+            roots_full: crate::execpol::controller::RootsFull::new("execq_roots_full"),
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
@@ -370,11 +370,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 Ok(table) => {
                     let roots = kernel::guarded_roots(&table);
                     let refused = self.k.set_roots(&roots);
-                    crate::execpol::controller::roots_published(
-                        &mut self.roots_full,
-                        refused,
-                        roots.len(),
-                    );
+                    self.roots_full.published(refused, roots.len(), now);
                     nn_linux::state_read::mount_rows(
                         &mut self.roots_rows,
                         &table,

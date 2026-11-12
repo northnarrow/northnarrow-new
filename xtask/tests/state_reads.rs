@@ -82,11 +82,22 @@ const LAB: &str = "lab, golden-replay or debug-trigger tooling, or the feasibili
 const OPER: &str = "a file the operator hands nn-admin, or the operator's signed allow list: the \
                     tool reports what it reads; an unreadable allow list is an empty one (never \
                     an open one)";
-/// Why a drop-in judge may default.
-const CONFIG: &str =
-    "a drop-in or an EnvironmentFile= the drop-in judges read (bounded, a regular \
-                      file, its bytes made text): one that cannot be read has nothing to judge, \
-                      and the file is still listed by the directory scan that found it";
+/// Why the listing of our drop-ins' settings may default (the review of
+/// #538's re-check, G1: the judges themselves never do).
+const CONFIG: &str = "a drop-in or an EnvironmentFile= of ours whose NN_ settings are listed \
+                      (bounded, a regular file, its bytes made text): one that cannot be read \
+                      lists no setting, and its judge holds it harmful (shape_harm: not a \
+                      protected regular file; own_harms: unjudgeable) — the judges never \
+                      default";
+/// Why the kill cgroups' events may default.
+const KILLCG: &str = "the kill cgroups the agent creates (neutralize-*): an unreadable \
+                      cgroup.events is no 'populated' at the sweep of a leftover (removed only \
+                      when empty: rmdir refuses a populated cgroup), and a wait that reads \
+                      nothing waits to its deadline";
+/// Why the host-hardening check's bpffs count may default.
+const HARDEN: &str = "the host-hardening check's bpffs count: a mount table that cannot be \
+                      read is reported so by the same check (a warning naming the error), \
+                      never as 'not mounted'";
 /// Why a package list may default.
 const PKG: &str = "a package's file list or sums (dpkg's .list and .md5sums, a file rpm \
                    recorded): unreadable, its files are not owned — no trust is lent, the \
@@ -213,13 +224,8 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "antitamper-bpf/src/host_dropins.rs",
-        "read_lossy(Path::new(p))",
-        CONFIG,
-    ),
-    (
-        "antitamper-bpf/src/host_dropins.rs",
-        "read_lossy(&path)",
-        CONFIG,
+        "read_config(Path::new(p))",
+        KNOB,
     ),
     (
         "antitamper-bpf/src/lib.rs",
@@ -646,6 +652,107 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     ("watchdog/src/lib.rs", "fs::read(\"/proc/stat\")", KNOB),
+    // The review of #538's re-check (G3): one entry per site — the second
+    // sites under a key listed above — and the sites of the forms rule 2
+    // now catches (`is_ok_and`, `map_or`, `Type::default()`, a later
+    // statement).
+    (
+        "agent/src/config/overlay_floor.rs",
+        "fs::read(audit_log)",
+        OWN,
+    ),
+    (
+        "agent/src/pipeline/mod.rs",
+        "read_state(\"/proc/1/comm\")",
+        PROC,
+    ),
+    ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
+    ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/cgroup_join.rs",
+        "read_to_string(STATE_PATH)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/fim/honeypot.rs",
+        "read_to_string(state_dir.join(BOOT_ID_FILE))",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/host_hardening.rs",
+        "mountinfo::read(&root.join(\"proc/self/mountinfo\"))",
+        HARDEN,
+    ),
+    (
+        "crates/nn-linux/src/keys/mod.rs",
+        "read_to_string(&pub_path)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/known_system_prog.rs",
+        "read_state(p)",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/response/block_outbound.rs",
+        "read_state(format!(\"/proc/{pid}/cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/response/block_outbound.rs",
+        "read_state(format!(\"/proc/{pid}/cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "read_to_string(dir.join(\"cgroup.events\"))",
+        KILLCG,
+    ),
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "read_to_string(dir.join(\"cgroup.events\"))",
+        KILLCG,
+    ),
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "read_state(format!(\"/proc/{pid}/cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_state(path)",
+        OWN,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(task.join(tid).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/pump.rs",
+        "read_to_string(DEBUG_RING_DROP)",
+        LAB,
+    ),
 ];
 
 /// The argument list of the call whose `(` is at `open` in `code`.
@@ -656,7 +763,7 @@ fn arguments(code: &str, open: usize) -> &str {
         match c {
             b'(' => depth += 1,
             b')' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return &code[open + 1..i];
                 }
@@ -683,6 +790,59 @@ fn function_start(code: &str, at: usize) -> usize {
 
 /// The statement the call at `at` is in, before it: from the statement's
 /// start (the last `;`, `{` or `}` — never before the function's start).
+/// The review of #538's re-check (G3): a read bound by a `let` whose
+/// statement keeps the `Result` (`let r = mountinfo::read(..);`), and whose
+/// next use in the function turns it into a default
+/// (`let t = r.unwrap_or_default();`, `if let Ok(t) = r`, a `match r` arm).
+/// Only a statement that is the bare call (`let r = read(p);`): one with
+/// `?` or a chain binds the value, not the `Result`.
+fn defaults_later(code: &str, at: usize, name: &str) -> bool {
+    let h = head(code, at).trim_start();
+    let Some(rest) = h.strip_prefix("let ") else {
+        return false;
+    };
+    let rest = rest.trim_start().trim_start_matches("mut ").trim_start();
+    let bound: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if bound.is_empty() || bound == "_" || !rest[bound.len()..].trim_start().starts_with('=') {
+        return false;
+    }
+    let open = at + name.len();
+    let end = open + arguments(code, open).len() + 2;
+    if !code[floor(code, end)..].trim_start().starts_with(';') {
+        return false;
+    }
+    let end = floor(code, end);
+    // the rest of the function: up to the next `fn`
+    let stop = code[end..]
+        .find("fn ")
+        .map_or(code.len(), |j| end + j)
+        .min(floor(code, end + 2000));
+    let after = &code[end..stop];
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(j) = after[from..].find(bound.as_str()) {
+        let k = from + j;
+        from = k + bound.len();
+        let before_ok = after[..k]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident(c) && c != '.');
+        let after_ok = after[k + bound.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident(c));
+        if !(before_ok && after_ok) {
+            continue;
+        }
+        let pos = end + k;
+        return defaults(head(code, pos), tail(code, pos));
+    }
+    false
+}
+
 fn head(code: &str, at: usize) -> &str {
     let from = function_start(code, at);
     let h = &code[from..at];
@@ -895,6 +1055,13 @@ fn defaults(head: &str, tail: &str) -> bool {
         ".unwrap_or(",
         ".unwrap_or_else(",
         "map_while(Result::ok)",
+        // the review of #538's re-check (G3): a failure folded into a
+        // boolean or a value, and the configuration reader's collapse of
+        // what cannot be judged into nothing
+        ".is_ok_and(",
+        ".map_or(",
+        ".map_or_else(",
+        ".text()",
     ]
     .iter()
     .any(|d| chain.contains(d))
@@ -926,7 +1093,8 @@ fn defaults(head: &str, tail: &str) -> bool {
         [
             "Vec::new()",
             "String::new()",
-            "Default::default()",
+            // `Default::default()`, `MountTable::default()` (G3)
+            "::default()",
             "HashMap::new()",
             "BTreeMap::new()",
             "HashSet::new()",
@@ -956,7 +1124,7 @@ fn defaulted_reads(code: &str) -> Vec<(usize, String)> {
     let line = |i: usize| code[..i].matches('\n').count() + 1;
     let mut out = Vec::new();
     for (i, name) in calls(code, READS) {
-        if !defaults(head(code, i), tail(code, i)) {
+        if !defaults(head(code, i), tail(code, i)) && !defaults_later(code, i, name) {
             continue;
         }
         let call = format!("{name}({})", arguments(code, i + name.len()));
@@ -1040,12 +1208,18 @@ fn reads_that_default_on_failure_are_known() {
     let mut used = vec![0usize; KNOWN.len()];
     for (file, text) in &code {
         for (line, key) in defaulted_reads(text) {
-            match KNOWN.iter().position(|(f, k, _)| f == file && *k == key) {
+            // one entry for one site (G3: a second site under a known key
+            // is a site of its own, listed again with its reason)
+            match KNOWN
+                .iter()
+                .enumerate()
+                .position(|(n, (f, k, _))| f == file && *k == key && used[n] == 0)
+            {
                 Some(n) => used[n] += 1,
                 None => problems.push(format!(
                     "{file}:{line}: `{key}` turns a failed read into a default — keep the last \
                      good state (nn_linux::state_read::LastGood, a Condition) or list the site \
-                     in KNOWN with its reason"
+                     in KNOWN with its reason (one entry per site)"
                 )),
             }
         }
@@ -1122,8 +1296,11 @@ fn c() -> io::Result<MountTable> {
 }
 
 /// Rule 2 fails on every default the review of #538 (F4) planted — the
-/// tolerant readers' included — and not on a read whose error is
-/// propagated or that keeps the last good state.
+/// tolerant readers' included — and the re-check's (G3): `is_ok_and`,
+/// `map_or`, `map_or_else`, a `Type::default()` arm, a read bound by a `let`
+/// and defaulted in a later statement, the configuration reader's
+/// `.text()`; and not on a read whose error is propagated or that keeps the
+/// last good state.
 #[test]
 fn rule_two_catches_every_planted_default() {
     let planted = r#"
@@ -1183,6 +1360,40 @@ fn l(p: &Path) -> String {
         }
     }
 }
+fn m(p: &Path) -> bool {
+    std::fs::read_to_string(p).is_ok_and(|t| t.contains("x"))
+}
+fn n(p: &Path) -> usize {
+    std::fs::read_to_string(p).map_or(0, |t| t.len())
+}
+fn o(p: &Path) -> String {
+    std::fs::read_to_string(p).map_or_else(|_| String::new(), |t| t)
+}
+fn q(&self) -> MountTable {
+    match nn_linux::mountinfo::read(&self.roots_source) {
+        Ok(t) => t,
+        Err(_) => MountTable::default(),
+    }
+}
+fn r(&self) -> MountTable {
+    let read = nn_linux::mountinfo::read(&self.roots_source);
+    let table = read.unwrap_or_default();
+    table
+}
+fn s(p: &Path) -> String {
+    let r = std::fs::read_to_string(p);
+    if let Ok(t) = r { t } else { String::new() }
+}
+fn t(p: &Path) -> String {
+    let got = read_state(p);
+    match got {
+        Ok(t) => t,
+        Err(_) => String::new(),
+    }
+}
+fn u(p: &Path) -> String {
+    read_config(p).text().unwrap_or_default()
+}
 "#;
     let lines: Vec<usize> = defaulted_reads(planted)
         .into_iter()
@@ -1190,7 +1401,7 @@ fn l(p: &Path) -> String {
         .collect();
     assert_eq!(
         lines,
-        vec![3, 7, 10, 16, 20, 29, 32, 35, 38, 41, 44, 50],
+        vec![3, 7, 10, 16, 20, 29, 32, 35, 38, 41, 44, 50, 59, 62, 65, 68, 74, 79, 83, 90],
         "{lines:?}"
     );
     let clean = r#"
@@ -1206,6 +1417,17 @@ fn b(p: &Path) -> io::Result<String> {
 }
 fn c(&mut self) {
     match nn_linux::mountinfo::read(&self.source) {
+        Ok(t) => self.publish(&t),
+        Err(e) => self.read.failed(&e),
+    }
+}
+fn d(p: &Path) -> io::Result<u32> {
+    let t = std::fs::read_to_string(p)?;
+    Ok(t.trim().parse().unwrap_or(0))
+}
+fn e(&mut self) {
+    let read = nn_linux::mountinfo::read(&self.source);
+    match read {
         Ok(t) => self.publish(&t),
         Err(e) => self.read.failed(&e),
     }
