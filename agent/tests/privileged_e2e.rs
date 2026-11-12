@@ -2266,6 +2266,237 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
     }
 }
 
+/// The re-check of #545: what a flood of non-decisive records on one CPU
+/// left of a decisive one there — its record arrived, the posture took it
+/// as `AntiTamperDenial`, the flood was held back in `minor_denial_rate`
+/// and nothing in a decisive budget (`budget`) or the ring.
+fn assert_decisive_record_after_flood(
+    fx: &mut GuardFixture,
+    log: &Path,
+    actor: u32,
+    op: &str,
+    budget: &str,
+) {
+    let pid = format!("pid={actor} ");
+    assert!(
+        wait_for_log_line(
+            log,
+            &["ANTI-TAMPER DENIAL", &pid, &format!("op={op}")],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the refused {op} (pid {actor}) left no record behind the flood on its CPU\n{}",
+        log_tail(log)
+    );
+    assert!(
+        wait_for_log_line(
+            log,
+            &["POSTURE TRANSITION", "AntiTamperDenial"],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "no COMBAT by AntiTamperDenial after the refused {op}\n{}",
+        log_tail(log)
+    );
+    // the sampler's round, every 10 s
+    std::thread::sleep(Duration::from_secs(12));
+    let text = read_agent_log(log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        drops.iter().any(|l| l.contains("minor_denial_rate")),
+        "the flood was not held back by its own budget: {drops:#?}"
+    );
+    let decisive = format!("\"{budget}\"");
+    assert!(
+        !drops
+            .iter()
+            .any(|l| l.contains("fs_protect") || l.contains(&decisive)),
+        "a decisive record or the ring lost: {drops:#?}"
+    );
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+/// The re-check of #545 (R1): the kprobes and lockdown switches are
+/// refused at the write-open and signed at each attempt, and they are no
+/// decisive tamper (`DefenseImpairment`: a debugging script meets them) —
+/// yet they spent the decisive attempt budget. 150 refused write-opens of
+/// `kprobes/enabled` (or securityfs' `lockdown`) on CPU 0 held back, that
+/// second, a refused new entry in `/etc/northnarrow` there: no record, no
+/// COMBAT. They spend the non-decisive budget now.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_switch_refusal_loop_does_not_hide_a_decisive_refusal() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let Some(switch) = [
+        "/sys/kernel/debug/kprobes/enabled",
+        "/sys/kernel/security/lockdown",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists()) else {
+        eprintln!("neither kprobes/enabled nor securityfs' lockdown here: nothing to test");
+        return;
+    };
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("switch", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    let etc = Path::new("/etc/northnarrow");
+    assert!(
+        etc.is_dir(),
+        "the agent's protected directory {}",
+        etc.display()
+    );
+    let target = etc.join(".nn-e2e-318-switch");
+    // a leftover of an earlier failed run, removed inside a window
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("switch", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let _ = std::fs::remove_dir(&target);
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // One process on CPU 0: the refused write-opens of the switch, then the
+    // decisive refusal, within the second.
+    let out = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             refused = 0\n\
+             for _ in range(150):\n    \
+                 try:\n        os.close(os.open(sys.argv[1], os.O_WRONLY))\n    \
+                 except OSError as e:\n        refused += e.errno == errno.EPERM\n\
+             try:\n    os.mkdir(sys.argv[2])\n    made = 'ok'\n\
+             except OSError as e:\n    made = 'errno=' + errno.errorcode.get(e.errno, str(e.errno))\n\
+             print(os.getpid(), refused, made, flush=True)",
+        )
+        .arg(switch)
+        .arg(&target)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .output()
+        .expect("run the actor");
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let made = target.exists();
+    if made {
+        let _ = std::fs::remove_dir(&target);
+    }
+    let f: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(
+        f.len(),
+        3,
+        "the actor said {said:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f[1], "150",
+        "the switch {switch} was not refused every time: {said:?}"
+    );
+    assert!(
+        f[2] == "errno=EPERM" && !made,
+        "the new entry {} was not refused: {said:?}",
+        target.display()
+    );
+    let actor: u32 = f[0].parse().expect("the actor's pid");
+    assert_decisive_record_after_flood(&mut fx, &log, actor, "mkdir", "denial_rate");
+}
+
+/// The re-check of #545 (R2): the task denials' budget carried the refused
+/// renices (`DefenseImpairment`: a tuning daemon meets them) with the
+/// refused signals and ptraces, so 80 short-lived processes each refused a
+/// renice of the agent on CPU 0 held back, that second, a refused `kill
+/// -9` of the agent there: no record, no COMBAT. A renice spends the
+/// non-decisive budget now, after the per-caller dedup; the task budget is
+/// the decisive refusals' alone.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_renice_loop_does_not_hide_a_refused_kill() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("renice", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let agent = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+
+    // A parent on CPU 0 (its children inherit it): 80 children, each one
+    // refused renice of the agent (one record each: the dedup is per
+    // caller), then its own `kill -9` of the agent.
+    let out = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             agent = int(sys.argv[1])\n\
+             refused = 0\n\
+             for _ in range(80):\n    \
+                 pid = os.fork()\n    \
+                 if pid == 0:\n        \
+                     try:\n            os.setpriority(os.PRIO_PROCESS, agent, 19)\n            os._exit(0)\n        \
+                     except OSError as e:\n            os._exit(1 if e.errno == errno.EPERM else 2)\n    \
+                 _, st = os.waitpid(pid, 0)\n    \
+                 refused += os.WIFEXITED(st) and os.WEXITSTATUS(st) == 1\n\
+             try:\n    os.kill(agent, 9)\n    killed = 'ok'\n\
+             except OSError as e:\n    killed = 'errno=' + errno.errorcode.get(e.errno, str(e.errno))\n\
+             print(os.getpid(), refused, killed, flush=True)",
+        )
+        .arg(agent.to_string())
+        .stdin(Stdio::null())
+        .process_group(0)
+        .output()
+        .expect("run the actor");
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let f: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(
+        f.len(),
+        3,
+        "the actor said {said:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f[1], "80",
+        "a renice of the agent was not refused: {said:?}"
+    );
+    assert_eq!(
+        f[2], "errno=EPERM",
+        "kill -9 of the agent (pid {agent}) was not refused"
+    );
+    let alive = matches!(
+        fx.enforce_run
+            .as_mut()
+            .expect("enforce run")
+            .child
+            .try_wait(),
+        Ok(None)
+    );
+    assert!(alive, "the agent is gone after the refused kill");
+    let actor: u32 = f[0].parse().expect("the actor's pid");
+    assert_decisive_record_after_flood(&mut fx, &log, actor, "signal", "task_denial_rate");
+}
+
 // ── Lot 293 — external bug hunt BUG14: a signal through a file's owner ─
 
 /// The ways a root process arms a file's owner on a protected process: the

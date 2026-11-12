@@ -222,7 +222,8 @@ impl Kernel {
 }
 
 /// Lot 311 (the review of #538, G2): the guarded roots the kernel's map
-/// (`EXECQ_ROOTS`, 64 entries) refused, the FUSE ones apart. A FUSE root
+/// (`EXECQ_ROOTS`; 1024 entries since lot 318, 64 before) refused, the
+/// FUSE ones apart. A FUSE root
 /// left out is classed by its file system's magic all the same (lot 318:
 /// the exec hooks close a FUSE file whose device is not in the map), so
 /// only `other` is a loss.
@@ -360,9 +361,12 @@ pub fn root_kind_of(mp: &str) -> u32 {
 /// - lot 311 (bug hunt 1.4, BUG-108, the userland half): a mount of a
 ///   directory of a filesystem none of whose mounts is its root — a btrfs
 ///   subvolume (`/home` on Fedora and openSUSE: `subvol=/home`, field 4
-///   `/home`); a bind mount of a directory of a filesystem mounted at its
-///   root elsewhere (`/srv/data` bound at `/home`) is not a root the
-///   kernel's walk ends on, and is left out as before;
+///   `/home`); lot 318 (BUG108's kernel half): a bind mount of a directory
+///   of a filesystem mounted at its root elsewhere is published too when it
+///   is bound at a guarded point or at a home (`/srv/data` bound at
+///   `/home`, [`bind_home_point`]) — the kernel finds it among the
+///   ancestors' identities, whichever path names the file — and left out
+///   when bound deeper in a user's tree (a chroot's `/usr`);
 /// - lot 311 (N8, and the review of #538, F1): every FUSE mount, wherever
 ///   it is mounted — classed by its type, never by its root's inode, which
 ///   its daemon (the user) names and changes at will: keyed by its device
@@ -892,7 +896,9 @@ mod tests {
     }
 
     /// Lot 311 (the review of #538, G2): seventy FUSE mounts of a user's
-    /// fill the kernel's map (64 entries); a system root mounted after them
+    /// fill a map of 64 entries (the kernel's had 64; 1024 since lot 318,
+    /// which a user's FUSE mounts fill the same way); a system root mounted
+    /// after them
     /// — a directory of `/tmp`'s file system here, standing for another
     /// user's `/run/user/<uid>` at login — still gets in: the roots are
     /// ranked (the FUSE ones last), and a FUSE root the map holds gives

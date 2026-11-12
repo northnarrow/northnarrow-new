@@ -37,11 +37,11 @@ use northnarrow_common::wire::execpol::{
 use northnarrow_common::wire::execq::{class, ExecqKey};
 
 use crate::btf_offsets::{
-    DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_PATH_OFFSET, FS_STRUCT_ROOT_OFFSET,
+    DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_PATH_OFFSET,
     INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
     INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
     PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SIGNAL_STRUCT_TTY_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
-    SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FS_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
+    SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
     TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_SIGNAL_OFFSET,
     TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET, TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET,
     TP_SYS_ENTER_EXECVE_ENVP_OFFSET,
@@ -978,14 +978,7 @@ unsafe fn map_classify(file: *const u8) -> u32 {
             fl |= exe_flags::DELETED;
         }
     }
-    let task = bpf_get_current_task() as *const u8;
-    let mut task_root: *const u8 = core::ptr::null();
-    if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
-        if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
-            let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
-            task_root = peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-        }
-    }
+    let task_root = crate::exec_lsm::task_root_of(bpf_get_current_task() as *const u8);
     let key = inode_key(inode);
     (*s).dev = key.dev;
     (*s).ino = key.ino;

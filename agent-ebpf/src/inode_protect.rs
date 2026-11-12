@@ -333,12 +333,14 @@ pub(crate) fn attempt_budget() -> bool {
     true
 }
 
-/// Lot 318 (the review of #545, F1 and F7): the budget of the refusals
-/// signed at each attempt that are not decisive
-/// (`northnarrow_common::wire::is_minor_denial`: a refused read of the
-/// agent's key, a handle on its BPF objects, a refused program type or
-/// root `cgroup/sysctl` attach), per CPU: `[window start (ns), records in
-/// the window]`. They shared [`ATTEMPT_DENIAL_RATE`] with the decisive
+/// Lot 318 (the review of #545, F1 and F7): the budget of the records
+/// that are not decisive (`northnarrow_common::wire::is_minor_denial`: a
+/// refused read of the agent's key, a handle on its BPF objects, a refused
+/// program type or root `cgroup/sysctl` attach; the re-check, R1 and R2: a
+/// refused kprobes or lockdown switch, a refused renice or sysctl write,
+/// the records that refuse nothing), signed at each attempt or rate-limited
+/// per caller ([`limited_budget`]), per CPU: `[window start (ns), records
+/// in the window]`. They shared [`ATTEMPT_DENIAL_RATE`] with the decisive
 /// ones, and 50 refused read handles on one of the agent's maps (an
 /// administrator's `bpftool map list` makes 150) held back, that second on
 /// that CPU, the record of a refused unlink of a protected file — the
@@ -438,8 +440,31 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
             let _ = TASK_DENIAL_SEEN.insert(&seen, &now, 0);
         }
     }
-    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+    if !limited_budget(operation, now) {
         return;
+    }
+    emit_denial(operation, key);
+}
+
+/// Lot 318 (the re-check of #545, R2): the per-CPU budget a rate-limited
+/// record spends — a non-decisive one
+/// (`northnarrow_common::wire::is_minor_denial`: a refused renice, a
+/// refused sysctl write, a sysctl opt-out's write, a move into an exempt
+/// cgroup, code-injection access, a signal through a file's owner) the
+/// non-decisive refusals' ([`minor_budget`]), a decisive one (a refused
+/// signal, ptrace, kexec, cgroup move, limit change, write through a
+/// descriptor) the task denials' ([`TASK_DENIAL_RATE`]) alone. They shared
+/// it, and 50 refused renices of the agent in a second on a CPU held back a
+/// refused `kill -9`'s record there. Whether there is room, taking it; a
+/// record over a budget is counted in its `RING_DROPS` slot and must not be
+/// written.
+#[inline(always)]
+fn limited_budget(operation: u8, now: u64) -> bool {
+    if northnarrow_common::wire::is_minor_denial(operation) {
+        return minor_budget();
+    }
+    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+        return false;
     };
     unsafe {
         // SAFETY: this CPU's slot, owned by the program while it runs.
@@ -449,11 +474,11 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
         }
         if (*rate)[1] >= TASK_DENIAL_PER_SEC {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
-            return;
+            return false;
         }
         (*rate)[1] += 1;
     }
-    emit_denial(operation, key);
+    true
 }
 
 /// Lot 280a: a record of the `cgroup/sysctl` program (`crate::
@@ -486,20 +511,10 @@ pub(crate) fn emit_sysctl_record(
             }
         }
     }
-    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+    // Lot 318 (the re-check of #545, R2): a sysctl's refusal or opt-out
+    // record is not decisive — the non-decisive refusals' budget
+    if !limited_budget(operation, now) {
         return;
-    };
-    unsafe {
-        // SAFETY: this CPU's slot, owned by the program while it runs.
-        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
-            (*rate)[0] = now;
-            (*rate)[1] = 0;
-        }
-        if (*rate)[1] >= TASK_DENIAL_PER_SEC {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
-            return;
-        }
-        (*rate)[1] += 1;
     }
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,

@@ -1255,17 +1255,27 @@ pub const fn sigio_signal(sig: i32) -> i32 {
 /// Lot 280b: the last denial code (the tests' loops).
 pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 
-/// Lot 318 (the review of #545, F1 and F7): the refusals signed at each
-/// attempt that are not decisive — the posture's `SensitiveFileAccess` (a
-/// refused read of the agent's key: a backup of `/etc` meets it) and
-/// `DefenseImpairment` (a handle on the agent's BPF objects, a refused
-/// program type, a root `cgroup/sysctl` attach: an administrator's
-/// `bpftool prog list` meets them), and a loader opt-out's record. The
-/// kernel counts them against a per-CPU budget of their own, never the
-/// decisive refusals' (an unlink, a rename, a write-open of a protected
-/// file, a write handle on or a detach of the agent's BPF objects): a flood
-/// of these never takes a decisive record's room. Their held-back count is
-/// its own `RING_DROPS` slot (`minor_denial_rate`), not a security loss.
+/// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
+/// kernel's records that are not decisive — every operation whose record
+/// the posture does not take as `AntiTamperDenial`: its
+/// `SensitiveFileAccess` (a refused read of the agent's key: a backup of
+/// `/etc` meets it), its `DefenseImpairment` (a handle on the agent's BPF
+/// objects, a refused program type or root `cgroup/sysctl` attach, a
+/// refused write of the kprobes or lockdown switch, a refused scheduling,
+/// nice or I/O priority change, a refused sysctl write, a signal through a
+/// file's owner: an administrator's `bpftool prog list`, a debugging
+/// script, a tuning daemon meet them), and the records that refuse nothing
+/// (a move into an exempt cgroup, a sysctl opt-out's write, a loader
+/// opt-out's load, code-injection access, the kernel-state round's
+/// findings). The kernel counts them against a per-CPU budget of their own
+/// (`MINOR_DENIAL_RATE`), never a decisive budget's — the refusals signed
+/// at each attempt (an unlink, a rename, a write-open of a protected file,
+/// a write handle on or a detach of the agent's BPF objects) nor the task
+/// denials' (a refused signal, ptrace, kexec, cgroup move, limit change):
+/// a flood of these never takes a decisive record's room. Their held-back
+/// count is its own `RING_DROPS` slot (`minor_denial_rate`), not a security
+/// loss. `nn_core`'s posture test pins the equivalence both ways: minor
+/// here exactly when not `AntiTamperDenial` there.
 pub const fn is_minor_denial(operation: u8) -> bool {
     matches!(
         operation,
@@ -1274,6 +1284,26 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_BPF_PROG_TYPE
             | FS_OP_BPF_PROG_OPT_OUT
             | FS_OP_SYSCTL_ROOT_ATTACH
+            // the re-check of #545, R1: refused at the write-open, signed
+            // at each attempt (`cgroup_files::sign`, `Phase::Open`)
+            | FS_OP_KPROBES
+            | FS_OP_LOCKDOWN
+            // R2: the task denials' budget is the decisive ones' alone
+            | FS_OP_SCHED
+            | FS_OP_NICE
+            | FS_OP_IOPRIO
+            | FS_OP_SYSCTL
+            | FS_OP_SYSCTL_VALUE
+            | FS_OP_SYSCTL_OPT_OUT
+            | FS_OP_SIGIO
+            | FS_OP_CGROUP_JOIN
+            | FS_OP_EXEMPT_INJECT
+            // the kernel-state round's findings (no refusal, no budget of
+            // the kernel's: listed for the equivalence)
+            | FS_OP_KERNEL_TAINT
+            | FS_OP_SYSCTL_ROOT_PROG
+            | FS_OP_BPF_UNSEEN
+            | FS_OP_BPF_BASELINE
     )
 }
 

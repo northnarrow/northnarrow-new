@@ -228,7 +228,15 @@ pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags
     // filesystem's root, and neither is the key the agent publishes. In a
     // task's own view (a chroot, a container) it adds to the classes of the
     // names.
-    let g = nn_guarded_root(dentry as u64);
+    // The re-check of #545 (R3): not past the task's own root — a
+    // container's or a chroot's root on a directory of the host (an
+    // unprivileged LXC container's `rootfs`, rootless podman's vfs or btrfs
+    // storage, both in a home) took the host's `home` from above it, and
+    // every program of the container's image (owned by its root, a host
+    // subuid) was `other_home`. As before lot 318 there: the task's view.
+    let task_root =
+        crate::exec_lsm::task_root_of(aya_ebpf::helpers::bpf_get_current_task() as *const u8);
+    let g = nn_guarded_root(dentry as u64, task_root as u64);
     // Lot 318 (the review of #538, F1 and F3: N8's kernel half): a file of
     // a FUSE filesystem outside the task's own root is guarded whatever the
     // roots say. Its daemon answers every GETATTR, the root's included, and
@@ -377,19 +385,23 @@ const GUARDED_ROOT_FOUND: u64 = 1 << 32;
 /// nearest ancestor of `dentry` whose key — `stat()`'s device and inode
 /// number, as the agent publishes a guarded mount's root — is there, with
 /// [`GUARDED_ROOT_FOUND`]; 0 when none is within [`EXE_WALK_DEPTH`] levels.
-/// The task's root does not stop it: a key is an identity, not a name. On
-/// btrfs each level's device is its subvolume's (`SbDev`), so a subvolume's
-/// root (inode 256 under its own device) is found where the walk crosses
-/// it. A global function (integer argument, never inlined): the verifier
-/// checks its loop once (5.15 rule 6).
+/// The search stops at `task_root`, the task's root (the re-check of #545,
+/// R3): what lies above a container's or a chroot's root is not its view —
+/// a container whose root is a directory in a home took that home's class.
+/// For a task of the host the root is the top of its filesystem, and a
+/// file of another filesystem never meets it. On btrfs each level's device
+/// is its subvolume's (`SbDev`), so a subvolume's root (inode 256 under its
+/// own device) is found where the walk crosses it. A global function
+/// (integer arguments, never inlined): the verifier checks its loop once
+/// (5.15 rule 6).
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_guarded_root(dentry: u64) -> u64 {
-    unsafe { guarded_root(dentry as *const u8) }
+pub extern "C" fn nn_guarded_root(dentry: u64, task_root: u64) -> u64 {
+    unsafe { guarded_root(dentry as *const u8, task_root as *const u8) }
 }
 
 #[inline(always)]
-unsafe fn guarded_root(dentry: *const u8) -> u64 {
+unsafe fn guarded_root(dentry: *const u8, task_root: *const u8) -> u64 {
     if dentry.is_null() {
         return 0;
     }
@@ -409,7 +421,7 @@ unsafe fn guarded_root(dentry: *const u8) -> u64 {
         return 0;
     }
     for _ in 0..EXE_WALK_DEPTH {
-        if d.is_null() {
+        if d.is_null() || d == task_root {
             break;
         }
         let inode = peek_u64(d.add(o_inode)) as *const u8;

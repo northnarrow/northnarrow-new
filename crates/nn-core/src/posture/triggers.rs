@@ -2929,15 +2929,20 @@ mod tests {
         );
     }
 
-    /// Lot 318 (the review of #545, F1): the kernel counts the refusals it
-    /// calls non-decisive (`common::wire::is_minor_denial`) against a
-    /// budget of their own, so a flood of them never takes a decisive
-    /// refusal's room. That holds only while every one of them is
-    /// non-decisive here too: none of them raises `AntiTamperDenial`, and
-    /// the decisive file and BPF refusals that share `emit_attempt` with
-    /// them are not in the set.
+    /// Lot 318 (the review of #545, F1, and its re-check, R1 and R2): the
+    /// kernel counts the records it calls non-decisive
+    /// (`common::wire::is_minor_denial`) against a budget of their own, so a
+    /// flood of them never takes a decisive refusal's room. That holds only
+    /// if the two lists are one, both ways: no minor record raises
+    /// `AntiTamperDenial` here, and every record that does not is minor
+    /// there. The first version checked one way only, and the kprobes and
+    /// lockdown switches (`DefenseImpairment`, refused at the write-open and
+    /// signed at each attempt) still spent the decisive budget: 50 refused
+    /// opens of `kprobes/enabled` held back a refused unlink's record on that
+    /// CPU (R1); the renices and sysctl writes shared the task denials'
+    /// budget with the refused signals (R2).
     #[test]
-    fn the_kernel_s_minor_denials_are_never_decisive_here() {
+    fn the_kernel_s_minor_denials_are_exactly_the_non_decisive_ones_here() {
         const S: u64 = 1_000_000_000;
         let det = detector_with_empty_proc();
         let refusal = |op: nn_model::FsProtectOperation| Event::FsProtectDenial {
@@ -2951,18 +2956,24 @@ mod tests {
         };
         let mut minor = 0;
         for byte in 1..=common::wire::FS_OP_LAST {
-            if !common::wire::is_minor_denial(byte) {
-                continue;
-            }
-            minor += 1;
             let op = nn_model::FsProtectOperation::from_wire(byte);
             let hits = det.detect(&refusal(op), &[]);
-            assert!(
-                !hits.contains(&TriggerType::AntiTamperDenial),
-                "{op:?} is a minor denial in the kernel and decisive here: {hits:?}"
-            );
+            let decisive = hits.contains(&TriggerType::AntiTamperDenial);
+            if common::wire::is_minor_denial(byte) {
+                minor += 1;
+                assert!(
+                    !decisive,
+                    "{op:?} is a minor denial in the kernel and decisive here: {hits:?}"
+                );
+            } else {
+                assert!(
+                    decisive,
+                    "{op:?} is not decisive here ({hits:?}) and spends a decisive budget in \
+                     the kernel: add it to common::wire::is_minor_denial"
+                );
+            }
         }
-        assert_eq!(minor, 5);
+        assert_eq!(minor, 20);
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -2978,8 +2989,25 @@ mod tests {
             w::FS_OP_XATTR,
             w::FS_OP_BPF_MAP,
             w::FS_OP_BPF_LINK,
+            w::FS_OP_SIGNAL,
+            w::FS_OP_PTRACE,
+            w::FS_OP_KEXEC,
+            w::FS_OP_RLIMIT,
+            w::FS_OP_OOM_ADJ,
+            w::FS_OP_CGROUP_MOVE,
         ] {
             assert!(!w::is_minor_denial(decisive), "{decisive}");
+        }
+        for minor in [
+            w::FS_OP_KPROBES,
+            w::FS_OP_LOCKDOWN,
+            w::FS_OP_NICE,
+            w::FS_OP_SCHED,
+            w::FS_OP_IOPRIO,
+            w::FS_OP_SYSCTL,
+            w::FS_OP_CGROUP_JOIN,
+        ] {
+            assert!(w::is_minor_denial(minor), "{minor}");
         }
     }
 

@@ -187,6 +187,32 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     .unwrap();
     assert!(!body(&i, "minor_budget").contains("ATTEMPT_DENIAL_RATE"));
     assert!(!body(&i, "attempt_budget").contains("MINOR_DENIAL_RATE"));
+    // the re-check of #545, R2: the rate-limited records (the task denials,
+    // a write through a descriptor, a sysctl's refusal or opt-out) spend
+    // the minor budget when not decisive, the task denials' when decisive
+    in_order(
+        body(&i, "limited_budget"),
+        &[
+            "if northnarrow_common::wire::is_minor_denial(operation) {",
+            "return minor_budget();",
+            "TASK_DENIAL_RATE.get_ptr_mut(0)",
+            "if (*rate)[1] >= TASK_DENIAL_PER_SEC {",
+            "ring_slot::TASK_DENIAL_RATE",
+            "return false;",
+        ],
+    )
+    .unwrap();
+    for writer in ["emit_limited", "emit_sysctl_record"] {
+        let w = body(&i, writer);
+        assert!(
+            w.contains("if !limited_budget(operation, now) {"),
+            "{writer}: {w}"
+        );
+        assert!(
+            !w.contains("TASK_DENIAL_RATE"),
+            "{writer} spends a budget of its own"
+        );
+    }
     let w = code("common/src/wire/mod.rs");
     in_order(
         body(&w, "is_minor_denial"),
@@ -196,6 +222,14 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
             "| FS_OP_BPF_PROG_TYPE",
             "| FS_OP_BPF_PROG_OPT_OUT",
             "| FS_OP_SYSCTL_ROOT_ATTACH",
+            // the re-check, R1: the switches refused at the write-open
+            "| FS_OP_KPROBES",
+            "| FS_OP_LOCKDOWN",
+            // R2: the task denials' budget, the decisive ones' alone
+            "| FS_OP_SCHED",
+            "| FS_OP_NICE",
+            "| FS_OP_IOPRIO",
+            "| FS_OP_SYSCTL",
         ],
     )
     .unwrap();
@@ -261,9 +295,13 @@ fn a_set_id_target_does_not_escape_the_environment_deny() {
 /// ends. On Fedora's and openSUSE's layout (`/home` a btrfs subvolume) the
 /// walk ends on the top-level subvolume, and for a directory bound at
 /// `/home` on its filesystem's root; neither is a key the agent publishes,
-/// and the home had no class. The search ignores the task's root (a key is
-/// an identity, not a name), reads each level's device as `stat()` does
-/// (a btrfs subvolume's own), and runs whatever the walk found.
+/// and the home had no class. The search reads each level's device as
+/// `stat()` does (a btrfs subvolume's own) and runs whatever the walk
+/// found. The re-check of #545 (R3): it stops at the task's own root — it
+/// ignored it, and a container whose root is a directory in a home (an
+/// unprivileged LXC container's `rootfs`, rootless podman's vfs or btrfs
+/// storage) took that home's class above its root: every program of its
+/// image, owned by its root (a host subuid), was `other_home`.
 #[test]
 fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
     let q = code("agent-ebpf/src/execq.rs");
@@ -274,7 +312,7 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
         &[
             "if flags & exe_flags::UNRESOLVED != 0 {",
             "} else if flags & exe_flags::TASK_ROOT != 0 {",
-            "let g = nn_guarded_root(dentry as u64);",
+            "let g = nn_guarded_root(dentry as u64, task_root as u64);",
             "if g & GUARDED_ROOT_FOUND != 0 {",
             // a guarded point's own identity gives its path class only
             "if v & root_kind::GUARDED != 0 {",
@@ -295,7 +333,10 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
         "{c}"
     );
     assert!(q.contains(
-        "#[no_mangle]\n#[inline(never)]\npub extern \"C\" fn nn_guarded_root(dentry: u64) -> u64 {"
+        "#[no_mangle]\n#[inline(never)]\npub extern \"C\" fn nn_guarded_root(dentry: u64, task_root: u64) -> u64 {"
+    ));
+    assert!(c.contains(
+        "let task_root =\n        crate::exec_lsm::task_root_of(aya_ebpf::helpers::bpf_get_current_task() as *const u8);"
     ));
     let g = body(&q, "guarded_root");
     in_order(
@@ -305,6 +346,9 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
             "let devs = crate::inode_dev::SbDev::of(sb,",
             "let mut d = peek_u64(dentry.add(o_parent)) as *const u8;",
             "for _ in 0..EXE_WALK_DEPTH {",
+            // R3: not past the task's root
+            "if d.is_null() || d == task_root {",
+            "break;",
             "dev: u64::from(devs.dev(inode)),",
             "ino: peek_u64(inode.add(o_ino)),",
             "if let Some(v) = EXECQ_ROOTS.get(&key) {",
@@ -315,10 +359,20 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
         ],
     )
     .unwrap();
-    assert!(
-        !g.contains("task_root"),
-        "the task's root stops the search:\n{g}"
-    );
+    // the task's root is the walk's and the search's one reading
+    let l = code("agent-ebpf/src/exec_lsm.rs");
+    in_order(
+        body(&l, "task_root_of"),
+        &[
+            "off_opt!(TASK_STRUCT_FS_OFFSET)",
+            "off_opt!(FS_STRUCT_ROOT_OFFSET)",
+            "+ off!(PATH_DENTRY_OFFSET))) as *const u8;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&l, "try_exec_check_lsm").contains("let task_root = task_root_of(task);"));
+    let p = code("agent-ebpf/src/execpol.rs");
+    assert!(body(&p, "map_classify").contains("crate::exec_lsm::task_root_of("));
     // a btrfs subvolume's device, read as stat() does: the flag, not an
     // offset of 0, says the three offsets resolved (btrfs_inode.root is at
     // byte 0)
@@ -492,7 +546,7 @@ fn a_fuse_file_is_guarded_whatever_its_root_says() {
     in_order(
         c,
         &[
-            "let g = nn_guarded_root(dentry as u64);",
+            "let g = nn_guarded_root(dentry as u64, task_root as u64);",
             "let fuse = if flags & exe_flags::TASK_ROOT == 0 {",
             "fuse_dev(dentry)",
             "if fuse != 0 {",

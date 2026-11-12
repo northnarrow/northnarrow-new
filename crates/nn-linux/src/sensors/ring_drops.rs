@@ -304,7 +304,10 @@ pub const TELEMETRY_LOSS_THRESHOLD: u64 = 64;
 /// the ones signed at each attempt ([`ring_slot::DENIAL_RATE`]) and the task
 /// denials ([`ring_slot::TASK_DENIAL_RATE`]). One held back is a loss at
 /// once, not past [`TELEMETRY_LOSS_THRESHOLD`]: their budget is theirs alone
-/// (the non-decisive refusals spend `minor_denial_rate`), so a drop there
+/// (the non-decisive records spend `minor_denial_rate`: the re-check of
+/// #545, R1 and R2, moved there the kprobes and lockdown switches, the
+/// renices, the sysctl writes and opt-outs, the exempt-cgroup moves and the
+/// code-injection records, which had shared these two), so a drop there
 /// means more decisive refusals in a second on one CPU than the budget
 /// records — every one of them an attack on the agent.
 pub const DECISIVE_DENIAL_BUDGETS: [u32; 2] = [ring_slot::DENIAL_RATE, ring_slot::TASK_DENIAL_RATE];

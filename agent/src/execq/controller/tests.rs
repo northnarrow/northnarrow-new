@@ -978,7 +978,8 @@ fn a_non_utf8_mount_point_does_not_remove_the_guarded_roots() {
 /// Lot 311 (the review of #538, F2, F3): a user's FUSE mount whose source
 /// is `-` (`fusermount3 -o fsname=-`) is still a guarded root (by its
 /// device); a line not in the kernel's shape is a degradation, never a
-/// silent drop; roots the kernel's map refuses (its 64 entries) are one too.
+/// silent drop; roots the kernel's map refuses (the test's holds 64 entries,
+/// the kernel's 1024 since lot 318) are one too.
 #[test]
 fn a_dash_source_line_is_a_root_and_losses_are_signed() {
     let mut w = world(ScanConfig::default(), enforce(), 2000, true);
@@ -1031,8 +1032,9 @@ fn a_dash_source_line_is_a_root_and_losses_are_signed() {
 }
 
 /// Lot 311 (the review of #538, G2): seventy FUSE mounts of a user's,
-/// mounted before a system root, never keep it out of the kernel's map
-/// (64 entries): the roots are ranked, the FUSE ones last. Their own
+/// mounted before a system root, never keep it out of the kernel's map (the
+/// test's holds 64 entries, the kernel's 1024 since lot 318): the roots are
+/// ranked, the FUSE ones last. Their own
 /// refusal — however its count moves — signs nothing (the exec hooks class
 /// a FUSE file by its magic, lot 318); a system root refused is one record
 /// per hold, however often it comes and goes.
