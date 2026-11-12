@@ -1056,6 +1056,44 @@ fn busybox_shell_at(argv: &[String]) -> Option<usize> {
     BUSYBOX_SHELLS.contains(&program.as_str()).then_some(at)
 }
 
+/// A `/proc/<pid>/cmdline`'s arguments: its NUL-separated words, the
+/// final NUL dropped and no other (lot 310: an empty argument is one —
+/// `python3 -W '' /tmp/x.py /usr/bin/aws` runs `/tmp/x.py`; the review of
+/// #539 found the empty words dropped in `ring_drops`, its re-check here).
+pub fn argv_of_cmdline(cmdline: &[u8]) -> Vec<String> {
+    let body = cmdline.strip_suffix(&[0]).unwrap_or(cmdline);
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
+/// Lot 310 (the re-check of #539, N5): `NODE_OPTIONS` names an option
+/// that loads code into node (`-r`, `--require`, `--import`, `--loader`,
+/// `--experimental-loader`, `--test-reporter`: the node table's loading
+/// options, written alone, with `=value` or `-rvalue`) — read with the node
+/// table, so `--max-old-space-size` and its like load nothing. Node splits
+/// the variable on whitespace; quotes are dropped.
+pub fn node_options_load(options: &str) -> bool {
+    options
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .filter(|w| !w.is_empty())
+        .any(|w| match w.strip_prefix("--") {
+            Some(long) => {
+                let name = long.split_once('=').map_or(long, |(n, _)| n);
+                NODE.long(name) == Some(Long::Loads)
+            }
+            None => w.strip_prefix('-').is_some_and(|cluster| {
+                cluster
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(NODE.short(c), Some(Opt::Loads | Opt::LoadsRest)))
+            }),
+        })
+}
+
 /// Lot 310 (the re-check of #539, N9): `exe` run as `argv` reads a program
 /// its caller gives — any interpreter, or busybox running one of its
 /// shells (`sh`, `busybox sh`): its standard input or its environment can

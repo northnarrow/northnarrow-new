@@ -760,6 +760,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(format!(\"/proc/{tid}/stat\"))",
         PROC,
     ),
+    (
+        "crates/nn-linux/src/user_units.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/user_units.rs",
+        "read_to_string(root.join(\"etc/passwd\"))",
+        "lot 310b: the user's home, to find the units and drop-ins of the user's side: a passwd \
+         that cannot be read finds no home, and a user without one is taken to have overrides \
+         (no packaged unit vouched for) — the stricter side",
+    ),
 ];
 
 /// The argument list of the call whose `(` is at `open` in `code`.

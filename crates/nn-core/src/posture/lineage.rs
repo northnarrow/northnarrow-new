@@ -3295,19 +3295,7 @@ pub fn with_pump_facts(runs: Runs, exe: &Path, argv: &[String], flags: u32) -> R
     }
 }
 
-/// A `/proc/<pid>/cmdline`'s arguments: its NUL-separated words, the
-/// final NUL dropped and no other (lot 310: an empty argument is one —
-/// `python3 -W '' /tmp/x.py /usr/bin/aws` runs `/tmp/x.py`; the review of
-/// #539 found the empty words dropped in `ring_drops`, its re-check here).
-pub fn argv_of_cmdline(cmdline: &[u8]) -> Vec<String> {
-    let body = cmdline.strip_suffix(&[0]).unwrap_or(cmdline);
-    if body.is_empty() {
-        return Vec::new();
-    }
-    body.split(|b| *b == 0)
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect()
-}
+pub use super::script_args::argv_of_cmdline;
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
 /// what they run is named by their arguments, not by their exe. Lot 292:

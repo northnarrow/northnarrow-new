@@ -446,6 +446,13 @@ impl<H: DecisionHost> ProgramOwners<H> {
         &self.root
     }
 
+    /// Lot 310b: `pid` is a packaged user unit's own process — the host's
+    /// answer (`DecisionHost::packaged_user_unit`), beside the package
+    /// database's.
+    pub fn packaged_user_unit(&self, pid: u32) -> bool {
+        H::packaged_user_unit(pid)
+    }
+
     /// `Some(true)` when a package installed `path`, `Some(false)` when
     /// none did, `None` when the host has no package database to ask.
     pub fn owned(&self, path: &Path) -> Option<bool> {

@@ -69,7 +69,9 @@ pub fn packaged_user_unit_under(
     owner: u32,
     owned: &dyn Fn(&Path) -> Option<bool>,
 ) -> bool {
-    let Ok(cgroup) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup")) else {
+    // a failed read vouches for nothing (the stricter side)
+    let Ok(cgroup) = crate::state_read::read_state(proc_root.join(pid.to_string()).join("cgroup"))
+    else {
         return false;
     };
     let Some((uid, unit)) = user_unit_of(&cgroup) else {

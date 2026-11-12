@@ -305,7 +305,7 @@ impl TrustFilter {
         // lot 310: the kernel's fork parents, the packaged user units
         let facts = lineage.as_deref().map_or_else(Vec::new, |hops| {
             crate::impact::trust::hop_facts(&self.tracker, tgid, AsOf::Now, hops, &|p| {
-                nn_linux::user_units::packaged_user_unit(p)
+                self.owners.packaged_user_unit(p)
             })
         });
         let trust = judge_with(

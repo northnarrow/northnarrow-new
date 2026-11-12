@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use common::wire::exe::{exe_flags, kernel_dev};
 use nn_core::posture::lineage::{in_system_tree, ExecIdentity, Runs};
-use nn_core::posture::script_args::reads_a_program;
+use nn_core::posture::script_args::{node_options_load, reads_a_program};
 use nn_model::Event;
 
 /// The environment variables that load code into an interpreter beside any
@@ -47,7 +47,8 @@ use nn_model::Event;
 /// library, user site or bytecode cache moved, its standard input run after
 /// the script; perl's older library variable; node's and ruby's module
 /// paths; bash's exported functions and trace options, zsh's startup files
-/// moved). `NODE_OPTIONS` is read apart ([`node_options_load`]).
+/// moved). `NODE_OPTIONS` is read apart, with the node reader's table
+/// (`script_args::node_options_load`).
 const LOADING_VARS: &[&str] = &[
     "PYTHONPATH",
     "PYTHONHOME",
@@ -76,18 +77,6 @@ const LOADING_PREFIXES: &[&str] = &["BASH_FUNC_"];
 /// module. For a script they load nothing (the re-check of #539, N5: a
 /// user's `PYTHONSTARTUP` must not take the `aws` client's identity away).
 const INTERACTIVE_VARS: &[&str] = &["PYTHONSTARTUP", "ENV", "NODE_REPL_EXTERNAL_MODULE"];
-
-/// The options of `NODE_OPTIONS` that load code ([`node_options_load`]):
-/// the node reader's loading options; `--max-old-space-size` and its like
-/// load nothing.
-const NODE_LOADING_OPTIONS: &[&str] = &[
-    "-r",
-    "--require",
-    "--import",
-    "--loader",
-    "--experimental-loader",
-    "--test-reporter",
-];
 
 /// The most of an environment read: a larger one is not read on, and its
 /// identity is not known (the re-check of #539, N3: a `PYTHONPATH` past the
@@ -214,23 +203,9 @@ fn environ_loads(dir: &Path, interactive: bool) -> bool {
                 && INTERACTIVE_VARS
                     .iter()
                     .any(|name| value(var, name).is_some()))
-            || value(var, "NODE_OPTIONS").is_some_and(|v| node_options_load(&v))
+            || value(var, "NODE_OPTIONS")
+                .is_some_and(|v| node_options_load(&String::from_utf8_lossy(&v)))
     })
-}
-
-/// `NODE_OPTIONS` names an option that loads code ([`NODE_LOADING_OPTIONS`],
-/// spelled alone, with `=value`, or `-rvalue`). Node splits the variable on
-/// whitespace (a quoted value with a space is one word to node: a loading
-/// option inside quotes is still a word here that starts with it — read
-/// as loading).
-fn node_options_load(value: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(value);
-    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-        .filter(|w| !w.is_empty())
-        .any(|w| {
-            let name = w.split_once('=').map_or(w, |(n, _)| n);
-            NODE_LOADING_OPTIONS.contains(&name) || (w.starts_with("-r") && !w.starts_with("--"))
-        })
 }
 
 /// The process runs in PID 1's mount namespace (`/proc/<pid>/ns/mnt` the
