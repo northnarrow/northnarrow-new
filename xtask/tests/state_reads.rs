@@ -143,7 +143,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "agent/src/cow/trust.rs",
-        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
     ),
     ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),
@@ -1272,10 +1272,16 @@ fn g(pid: u32) -> io::Result<String> {
     let path = format!("/proc/{pid}/comm");
     std::fs::read_to_string(path)
 }
+// the copy-on-write writer's start as lot 315 (#542) read it: a writer
+// named `\xff\xfe` was "not alive" and the in-place restore ran under it
+fn h(proc_root: &Path, pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    parse_stat_start(&stat)
+}
 "#;
     assert_eq!(
         strict_proc_reads(planted),
-        vec![7, 11, 14, 18, 22, 25, 29, 33]
+        vec![7, 11, 14, 18, 22, 25, 29, 33, 38]
     );
     let clean = r#"
 fn a(pid: u32) -> io::Result<String> {
