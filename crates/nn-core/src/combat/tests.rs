@@ -128,6 +128,9 @@ struct MockActuator {
     neutralize_outcome: NeutralizeOutcome,
     /// PIDs whose soft block does not take effect (external audit CMB-014).
     failing_blocks: Vec<u32>,
+    /// Lot 312 (review F2): PIDs whose soft block is partial (sockets
+    /// opened before it keep sending).
+    partial_blocks: Vec<u32>,
     /// Lab PR 217: what each isolate call reports, in order; once used up,
     /// every family isolated.
     isolate_plan: Mutex<std::collections::VecDeque<IsolateOutcome>>,
@@ -188,6 +191,8 @@ impl CombatActuator<TestHost> for MockActuator {
         self.rec.push(format!("soft_block:{pid}"));
         if self.failing_blocks.contains(&pid) {
             SoftBlock::Failed("no nft".to_string())
+        } else if self.partial_blocks.contains(&pid) {
+            SoftBlock::Partial("2 inet socket(s) opened before the move".to_string())
         } else {
             SoftBlock::Blocked
         }
@@ -244,6 +249,7 @@ fn ladder(neutralize: NeutralizeOutcome, window: Duration) -> (CombatLadder, Rec
         rec: rec.clone(),
         neutralize_outcome: neutralize,
         failing_blocks: Vec::new(),
+        partial_blocks: Vec::new(),
         isolate_plan: Default::default(),
     });
     let evidence = Box::new(MockEvidence { rec: rec.clone() });
@@ -304,6 +310,7 @@ fn ladder_protected(
         rec: rec.clone(),
         neutralize_outcome: neutralize,
         failing_blocks: Vec::new(),
+        partial_blocks: Vec::new(),
         isolate_plan: Default::default(),
     });
     let evidence = Box::new(ReasonEvidence(reasons.clone()));
@@ -1259,6 +1266,7 @@ fn spread_attribution_is_capped_and_escalates() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: Vec::new(),
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(MockEvidence { rec: rec.clone() }),
@@ -1300,6 +1308,7 @@ fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![100],
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(reasons.clone()),
@@ -1322,6 +1331,65 @@ fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
     assert!(r[1].1.contains("shortened"), "{r:?}");
 }
 
+/// Lot 312 (review F2): a partial soft block — new sockets dropped, the
+/// ones opened before the move not — is no success: the INVESTIGATE row
+/// says so and the window is the short one; the process was moved, so the
+/// stand-down releases it like a block.
+#[test]
+fn a_partial_soft_block_shortens_investigate_and_is_released() {
+    let rec = Recorder::new();
+    let reasons = ReasonEvidence(Arc::new(Mutex::new(Vec::new())));
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: Vec::new(),
+            partial_blocks: vec![100],
+            isolate_plan: Default::default(),
+        }),
+        Box::new(reasons.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(&entry(Some(100), None), t0);
+    let r = reasons.0.lock().clone();
+    assert!(
+        r[0].0 == "INVESTIGATE"
+            && r[0]
+                .1
+                .contains("100 FAILED (PARTIAL: 2 inet socket(s) opened before the move)"),
+        "{r:?}"
+    );
+    assert!(
+        !rec.log().iter().any(|e| e == "soft_clear:100"),
+        "kept blocked until the stand-down: {:?}",
+        rec.log()
+    );
+    l.stand_down(t0 + Duration::from_secs(1));
+    assert!(
+        rec.log().iter().any(|e| e == "soft_clear:100"),
+        "{:?}",
+        rec.log()
+    );
+    // and the window is the short one
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: Recorder::new(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: Vec::new(),
+            partial_blocks: vec![100],
+            isolate_plan: Default::default(),
+        }),
+        Box::new(ReasonEvidence(Arc::new(Mutex::new(Vec::new())))),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    l.engage(&entry(Some(100), None), t0);
+    l.tick(t0 + Duration::from_secs(10));
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+}
+
 /// External audit CMB-014: an offender attributed after the INVESTIGATE
 /// record whose block fails is in a signed record of its own, the window
 /// shortened once per episode. Lab PR 245: an offender a later COMBAT
@@ -1334,6 +1402,7 @@ fn a_failed_block_after_the_investigate_record_is_recorded() {
             rec: Recorder::new(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![100, 101],
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(reasons.clone()),
@@ -1369,6 +1438,7 @@ fn a_failed_block_of_a_spread_child_is_recorded_once() {
             rec: Recorder::new(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![102, 103],
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(reasons.clone()),
@@ -1401,6 +1471,7 @@ fn stand_down_releases_only_what_this_episode_blocked() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![8],
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(MockEvidence { rec: rec.clone() }),
@@ -1536,6 +1607,7 @@ fn ladder_with_isolate_plan(
                 reason: "respawns".to_string(),
             },
             failing_blocks: Vec::new(),
+            partial_blocks: Vec::new(),
             isolate_plan: Mutex::new(plan.into()),
         }),
         Box::new(ev.clone()),
@@ -1752,6 +1824,7 @@ fn a_ladder_whose_worker_is_missing_runs_nothing_on_the_caller() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: Vec::new(),
+            partial_blocks: Vec::new(),
             isolate_plan: Default::default(),
         }),
         Box::new(MockEvidence { rec: rec.clone() }),

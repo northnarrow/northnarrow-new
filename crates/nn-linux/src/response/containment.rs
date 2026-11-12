@@ -24,6 +24,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use nn_core::response::cgroup::{cgroup_at, cgroup_at_or_under, scope_path};
+
 use super::config::ExecutorConfig;
 
 /// One contained process.
@@ -47,10 +49,8 @@ static LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// The cgroup v2 path `/proc/<pid>/cgroup` shows for `pid`.
 pub fn origin_of(pid: u32) -> Option<String> {
-    crate::state_read::read_state(format!("/proc/{pid}/cgroup"))
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("0::").map(|p| p.trim_end().to_string()))
+    let text = crate::state_read::read_state(format!("/proc/{pid}/cgroup")).ok()?;
+    nn_core::response::cgroup::unified_path(&text).map(str::to_string)
 }
 
 /// The records (missing file: none). A file that does not parse is kept
@@ -98,9 +98,22 @@ fn store(cfg: &ExecutorConfig, entries: &[Contained]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The path of the agent's scope `scope_name` (`blocked`, `throttled`)
+/// from the root: `/northnarrow.slice/blocked.scope`.
+pub fn scope_of(cfg: &ExecutorConfig, scope_name: &str) -> String {
+    scope_path(&cfg.cgroup_slice, &format!("{scope_name}.scope"))
+}
+
 /// Record a move into `scope` (replacing an earlier record of the same
-/// process and scope).
+/// process and scope). Lot 312 (external bug hunt 1.4, BUG-117): an origin
+/// at or under that scope is the scope itself — a second move of a process
+/// already in it — never where the process came from; the first record
+/// stays (a release replaced it with the scope, answered `Released`, and
+/// left the process where it was).
 pub fn record(cfg: &ExecutorConfig, entry: Contained) -> std::io::Result<()> {
+    if cgroup_at_or_under(&entry.origin, &scope_of(cfg, &entry.scope)) {
+        return Ok(());
+    }
     let _g = LOCK.lock();
     let mut all = load(cfg);
     all.retain(|e| !(e.pid == entry.pid && e.scope == entry.scope));
@@ -143,6 +156,9 @@ pub(crate) struct Probe<'a> {
     pub in_scope: &'a dyn Fn(u32) -> bool,
     /// The start ticks of the process `pid` names now.
     pub start_of: &'a dyn Fn(u32) -> Option<u64>,
+    /// Lot 312 (F5): the cgroup v2 path `/proc/<pid>/cgroup` shows now —
+    /// read back after the release wrote the process.
+    pub cgroup_of: &'a dyn Fn(u32) -> Option<String>,
 }
 
 /// Write `pid` back to the cgroup it came from, if it is still the process
@@ -179,6 +195,12 @@ pub(crate) fn release_to_origin(
         let _ = remove(cfg, pid, scope_name);
         return Ok(Release::Skipped("the pid now names another process"));
     }
+    // Lot 312 (BUG-117): a record whose origin is the scope (written by an
+    // agent before this check) would write the process back into it.
+    if cgroup_at_or_under(&rec.origin, &scope_of(cfg, scope_name)) {
+        warn!(pid, origin = %nn_model::log_escape::Escaped(&rec.origin), "the recorded origin is the scope itself — left contained");
+        return Ok(Release::Skipped("the recorded origin is the scope itself"));
+    }
     let dest = cfg
         .cgroup_root
         .join(rec.origin.trim_start_matches('/'))
@@ -189,6 +211,13 @@ pub(crate) fn release_to_origin(
     }
     match super::block_outbound::write_pid(&dest, pid) {
         Ok(()) => {
+            // Lot 312 (F5): what `/proc` shows now, not what was written.
+            if !(probe.cgroup_of)(pid).is_some_and(|c| cgroup_at(&c, &rec.origin)) {
+                warn!(pid, origin = %nn_model::log_escape::Escaped(&rec.origin), scope = scope_name, "written back, but /proc/<pid>/cgroup does not show the cgroup it came from — still contained");
+                return Ok(Release::Skipped(
+                    "written back, but the process is not in the cgroup it came from",
+                ));
+            }
             let _ = remove(cfg, pid, scope_name);
             info!(pid, origin = %nn_model::log_escape::Escaped(&rec.origin), scope = scope_name, "released back to the cgroup it came from");
             Ok(Release::Released)
@@ -298,6 +327,7 @@ mod tests {
         let probe = Probe {
             in_scope: &|_| true,
             start_of: &|pid| Some(u64::from(pid) * 10),
+            cgroup_of: &|_| Some("/system.slice/nn-victim.service".into()),
         };
         let r = release_to_origin(4242, Some(42420), "blocked", &cfg, &probe).unwrap();
         assert_eq!(r, Release::Released);
@@ -323,6 +353,7 @@ mod tests {
         let probe = Probe {
             in_scope: &|_| true,
             start_of: &|pid| Some(u64::from(pid) * 10),
+            cgroup_of: &|_| None,
         };
         assert_eq!(
             release_to_origin(7, Some(70), "blocked", &cfg, &probe).unwrap(),
@@ -336,6 +367,7 @@ mod tests {
         let other = Probe {
             in_scope: &|_| true,
             start_of: &|_| Some(1),
+            cgroup_of: &|_| None,
         };
         assert_eq!(
             release_to_origin(7, Some(70), "blocked", &cfg, &other).unwrap(),
@@ -344,6 +376,7 @@ mod tests {
         let outside = Probe {
             in_scope: &|_| false,
             start_of: &|pid| Some(u64::from(pid) * 10),
+            cgroup_of: &|_| None,
         };
         assert_eq!(
             release_to_origin(7, Some(70), "blocked", &cfg, &outside).unwrap(),
@@ -385,5 +418,78 @@ mod tests {
         assert!(!cfg.containment_file.exists());
         record(&cfg, entry(5, "/x")).unwrap();
         assert_eq!(load(&cfg), vec![entry(5, "/x")]);
+    }
+
+    /// Lot 312 (external bug hunt 1.4, BUG-117): a second move into the
+    /// same scope does not record the scope as the origin; the release
+    /// returns the process where it really came from.
+    #[test]
+    fn bug117_a_second_move_into_the_scope_keeps_the_first_origin() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg(&tmp);
+        let mut first = entry(9, "/system.slice/nn-victim.service");
+        first.scope = "throttled".into();
+        record(&cfg, first.clone()).unwrap();
+        let mut again = entry(9, "/northnarrow.slice/throttled.scope");
+        again.scope = "throttled".into();
+        record(&cfg, again).unwrap();
+        assert_eq!(find(&cfg, 9, "throttled"), Some(first.clone()));
+        // nor below it, nor a namesake's origin taken for the scope
+        let mut below = entry(9, "/northnarrow.slice/throttled.scope/x");
+        below.scope = "throttled".into();
+        record(&cfg, below).unwrap();
+        assert_eq!(find(&cfg, 9, "throttled"), Some(first));
+        let mut namesake = entry(
+            10,
+            "/user.slice/user@1000.service/northnarrow.slice/throttled.scope",
+        );
+        namesake.scope = "throttled".into();
+        record(&cfg, namesake.clone()).unwrap();
+        assert_eq!(find(&cfg, 10, "throttled"), Some(namesake));
+    }
+
+    /// Lot 312 (BUG-117, F5): a record that names the scope as the origin
+    /// (an earlier agent's) is no release; and a release whose read-back
+    /// does not show the origin says so — never `Released`.
+    #[test]
+    fn bug117_a_release_says_released_only_where_proc_shows_the_origin() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg(&tmp);
+        let unit = cfg.cgroup_root.join("system.slice/nn-victim.service");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("cgroup.procs"), b"").unwrap();
+        let scope = cfg.cgroup_root.join("northnarrow.slice/throttled.scope");
+        fs::create_dir_all(&scope).unwrap();
+        fs::write(scope.join("cgroup.procs"), b"").unwrap();
+        // an old record, written before the check: origin = the scope
+        let mut old = entry(11, "/northnarrow.slice/throttled.scope");
+        old.scope = "throttled".into();
+        {
+            let _g = LOCK.lock();
+            store(&cfg, std::slice::from_ref(&old)).unwrap();
+        }
+        let probe = Probe {
+            in_scope: &|_| true,
+            start_of: &|pid| Some(u64::from(pid) * 10),
+            cgroup_of: &|_| Some("/northnarrow.slice/throttled.scope".into()),
+        };
+        assert_eq!(
+            release_to_origin(11, Some(110), "throttled", &cfg, &probe).unwrap(),
+            Release::Skipped("the recorded origin is the scope itself")
+        );
+        assert_eq!(fs::read_to_string(scope.join("cgroup.procs")).unwrap(), "");
+        // the write went through, the process is not there
+        let mut rec = entry(12, "/system.slice/nn-victim.service");
+        rec.scope = "throttled".into();
+        record(&cfg, rec.clone()).unwrap();
+        assert_eq!(
+            release_to_origin(12, Some(120), "throttled", &cfg, &probe).unwrap(),
+            Release::Skipped("written back, but the process is not in the cgroup it came from")
+        );
+        assert_eq!(
+            find(&cfg, 12, "throttled"),
+            Some(rec),
+            "still contained, still recorded"
+        );
     }
 }

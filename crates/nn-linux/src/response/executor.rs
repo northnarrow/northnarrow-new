@@ -22,8 +22,10 @@ use super::{
 const PID_PROTECTION_FLOOR: u32 = 100;
 
 /// Per-pid guard consulted by KillProcessTree for every pid in the walk
-/// (audit `combat-avail-2`). Returns the reason a pid must be spared.
-pub type TreeGuard = Arc<dyn Fn(u32) -> Option<&'static str> + Send + Sync>;
+/// (audit `combat-avail-2`). Returns what sparing a pid covers, with the
+/// reason (lot 312, BUG-122: [`kill::Spare`] — a host-critical process
+/// alone, a protected one with its tree).
+pub type TreeGuard = Arc<dyn Fn(u32) -> Option<kill::Spare> + Send + Sync>;
 
 /// Reusable executor. Cheap to clone (Arc-wraps the read-only state),
 /// so tasks can grab their own copy and run kill syscalls on a
@@ -112,13 +114,20 @@ impl Executor {
 
     /// External audit CMB-010: a process moved into a containment scope,
     /// with the cgroup it came from, in the signed audit log.
-    fn record_contain(&self, pid: u32, scope: &str) {
+    pub(super) fn record_contain(&self, pid: u32, scope: &str, outcome: &ExecutionOutcome) {
         let origin = super::containment::find(&self.config, pid, scope).map(|c| c.origin);
-        self.audit_entry(
-            "response_contain",
-            serde_json::json!({ "pid": pid, "scope": scope, "origin": origin }),
-            "success",
-        );
+        let mut extra = serde_json::json!({ "pid": pid, "scope": scope, "origin": origin });
+        // Lot 312 (review of #543, F2): a block that leaves the sockets
+        // opened before the move is partial, said with what holds.
+        let result = match outcome {
+            ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+                extra["sockets_before_the_move"] = serde_json::json!(sockets);
+                extra["why"] = serde_json::json!(super::blocked_new_only(*sockets));
+                "partial"
+            }
+            _ => "success",
+        };
+        self.audit_entry("response_contain", extra, result);
     }
 
     /// External audit CMB-010: a release (or a release left undone, with
@@ -138,17 +147,37 @@ impl Executor {
     /// External audit CMB-017: a quarantine (and any repair of this
     /// executor's vault index) in the signed audit log — the vault id, the
     /// path, the content's SHA-256 and size, the process.
-    fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
+    pub(super) fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
         let notes = quarantine::take_index_notes(&self.config.quarantine_dir);
-        let ExecutionOutcome::Quarantined {
-            original_path,
-            vault_id,
-        } = outcome
-        else {
-            if notes.is_empty() {
-                return;
+        // Lot 312 (review F1): an inode neutralized in place is recorded
+        // too, with what was done, `partial` when its content is kept.
+        let (original_path, vault_id, in_place, result) = match outcome {
+            ExecutionOutcome::Quarantined {
+                original_path,
+                vault_id,
+            } => (Some(original_path.clone()), vault_id, None, "success"),
+            ExecutionOutcome::QuarantinedInPlace {
+                vault_id,
+                original_path,
+                detail,
+                effect,
+            } => (
+                original_path.clone(),
+                vault_id,
+                Some(detail.clone()),
+                match effect {
+                    quarantine::InPlaceEffect::Emptied => "success",
+                    quarantine::InPlaceEffect::MadeUnusable => "partial",
+                    // re-check of #543 (N2): only vaulted is a failure
+                    quarantine::InPlaceEffect::Unchanged => "failure",
+                },
+            ),
+            _ => {
+                if notes.is_empty() {
+                    return;
+                }
+                return self.record_index_notes(notes);
             }
-            return self.record_index_notes(notes);
         };
         let Some(log) = self.audit.read().clone() else {
             warn!(vault_id = %vault_id, "quarantine not recorded: the audit log is not open");
@@ -157,16 +186,22 @@ impl Executor {
         let meta = quarantine::vault_meta(vault_id, &self.config).unwrap_or_default();
         let draft = crate::audit::AuditEntryDraft {
             op: "response_quarantine".to_string(),
-            extra: serde_json::json!({
-                "vault_id": vault_id,
-                "original_path": original_path,
-                "sha256": meta["sha256"],
-                "size_bytes": meta["size_bytes"],
-                "pid": pid,
-            }),
+            extra: {
+                let mut x = serde_json::json!({
+                    "vault_id": vault_id,
+                    "original_path": original_path,
+                    "sha256": meta["sha256"],
+                    "size_bytes": meta["size_bytes"],
+                    "pid": pid,
+                });
+                if let Some(detail) = in_place {
+                    x["in_place"] = serde_json::json!(detail);
+                }
+                x
+            },
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
-            result: "success".to_string(),
+            result: result.to_string(),
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
@@ -424,9 +459,11 @@ impl Executor {
         // BlockOutbound or Throttle verdict, could take down sshd or the
         // watchdog.
         let guard = self.tree_guard.read().clone();
-        let spared = move |pid: u32| -> Option<&'static str> {
+        let spared = move |pid: u32| -> Option<kill::Spare> {
             if pid < PID_PROTECTION_FLOOR {
-                return Some("PID below protection floor (kernel thread / core service)");
+                return Some(kill::Spare::process(
+                    "PID below protection floor (kernel thread / core service)",
+                ));
             }
             guard.as_ref().and_then(|g| g(pid))
         };
@@ -455,12 +492,12 @@ impl Executor {
             // watchdog), and a refusal would read as an offender that
             // could not be contained.
             ExecutionOutcome::AlreadyGone { pid: target_pid }
-        } else if let Some(reason) =
+        } else if let Some(spare) =
             spared(target_pid).filter(|_| acts_on_process && target_pid != 0)
         {
             ExecutionOutcome::Refused {
                 pid: target_pid,
-                reason,
+                reason: spare.reason,
             }
         } else {
             match action {
@@ -489,8 +526,12 @@ impl Executor {
                         &self.config,
                         intent,
                     );
-                    if matches!(o, ExecutionOutcome::Blocked { .. }) && !self.config.dry_run {
-                        self.record_contain(target_pid, "blocked");
+                    if matches!(
+                        o,
+                        ExecutionOutcome::Blocked { .. } | ExecutionOutcome::BlockedNewOnly { .. }
+                    ) && !self.config.dry_run
+                    {
+                        self.record_contain(target_pid, "blocked", &o);
                     }
                     o
                 }
@@ -512,7 +553,7 @@ impl Executor {
                     let o =
                         throttle::throttle_pid(target_pid, &self.protected, &self.config, intent);
                     if matches!(o, ExecutionOutcome::Throttled { .. }) && !self.config.dry_run {
-                        self.record_contain(target_pid, "throttled");
+                        self.record_contain(target_pid, "throttled", &o);
                     }
                     o
                 }

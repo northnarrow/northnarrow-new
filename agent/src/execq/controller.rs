@@ -1156,7 +1156,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             .try_clone()
             .and_then(crate::response::quarantine::ExeHandle::from_open_file)
         {
-            Ok(h) => h,
+            // lot 312 (review F1): the exec's uid stands for the offender's
+            Ok(h) => h.with_offender_uid(Some(p.raw.uid)),
             Err(e) => return format!("not quarantined ({e})"),
         };
         use crate::response::ExecutionOutcome as X;
@@ -1177,6 +1178,18 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 COUNTERS.quarantined.fetch_add(1, Ordering::Relaxed);
                 format!("quarantined (vault {vault_id})")
             }
+            X::QuarantinedInPlace {
+                vault_id,
+                detail,
+                effect,
+                ..
+            } => {
+                if effect == crate::response::quarantine::InPlaceEffect::Emptied {
+                    COUNTERS.quarantined.fetch_add(1, Ordering::Relaxed);
+                }
+                format!("quarantined in place (vault {vault_id}): {detail}")
+            }
+            X::QuarantineRefused { detail, .. } => format!("not quarantined ({detail})"),
             X::AlreadyGone { .. } => {
                 "not quarantined (no file on disk: a memfd or unlinked)".into()
             }

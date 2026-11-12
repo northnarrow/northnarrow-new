@@ -162,6 +162,25 @@ impl SystemActuator {
     pub fn quarantine_text(pid: u32, outcome: &ExecutionOutcome) -> String {
         match outcome {
             ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
+            // lot 312 (review F1): its inode neutralized in place
+            ExecutionOutcome::QuarantinedInPlace {
+                detail,
+                effect: crate::response::quarantine::InPlaceEffect::Emptied,
+                ..
+            } => format!("quarantined: {detail}"),
+            ExecutionOutcome::QuarantinedInPlace {
+                detail,
+                effect: crate::response::quarantine::InPlaceEffect::MadeUnusable,
+                ..
+            } => {
+                warn!(
+                    target: "combat.actuator",
+                    pid,
+                    detail = %detail,
+                    "NEUTRALIZE: binary quarantine partial (re-exec prevention degraded)"
+                );
+                format!("partially quarantined: {detail} (re-exec prevention degraded)")
+            }
             ExecutionOutcome::AlreadyGone { .. } => "binary already gone".to_string(),
             ExecutionOutcome::WouldExecute { .. } => {
                 "detect-only: would be quarantined".to_string()
@@ -178,12 +197,37 @@ impl SystemActuator {
         }
     }
 
+    /// Lot 312 (BUG-90): what NEUTRALIZE says of an offender whose binary
+    /// it holds no handle to — the process gone before it was opened
+    /// (`Ok`), or the open failed (`Err`, said: it read "no binary on disk").
+    pub fn no_binary_text(pid: u32, opened: std::io::Result<()>) -> String {
+        match opened {
+            Ok(()) => NO_BINARY.to_string(),
+            Err(e) => {
+                warn!(
+                    target: "combat.actuator",
+                    pid,
+                    error = %e,
+                    "NEUTRALIZE: the offender's binary could not be opened — not quarantined"
+                );
+                format!(
+                    "NOT quarantined: its binary could not be opened ({e}) (re-exec prevention \
+                     degraded)"
+                )
+            }
+        }
+    }
+
     /// External audit CMB-014: what a soft egress block's outcome means for
     /// the ladder (lab PR 243: a function of its own, as
     /// [`Self::kill_outcome`]).
     pub fn soft_block_of(outcome: ExecutionOutcome) -> SoftBlock {
         match outcome {
             ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
+            // lot 312 (review F2): new sockets dropped, older ones not
+            ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+                SoftBlock::Partial(crate::response::blocked_new_only(sockets))
+            }
             ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
             ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
             ExecutionOutcome::Failed { errno: 0, .. } => {
@@ -198,10 +242,14 @@ impl SystemActuator {
     }
 }
 
-/// Review 87: an offender with no binary on disk to quarantine (lab PR
-/// 243: named, for the golden replay's host).
+/// Review 87: an offender whose binary NEUTRALIZE could not take, the
+/// process gone before its binary was opened (lab PR 243: named, for the
+/// golden replay's host). Lot 312 (BUG-90): it said "no binary on disk",
+/// which the binary of an exited process usually is not; one deleted while
+/// it ran is now opened and judged by its inode (`binary already gone` once
+/// no name of it is left).
 pub const NO_BINARY: &str =
-    "no binary on disk to quarantine (exited before NEUTRALIZE, or deleted while running)";
+    "binary not quarantined: the process exited before NEUTRALIZE could open it";
 
 /// What ISOLATE answers in detect-only (lab PR 243: named, as
 /// [`NO_BINARY`]).
@@ -328,10 +376,16 @@ impl CombatActuator<LinuxHost> for SystemActuator {
         // ran whatever becomes of its path before the quarantine.
         // External audit CMB-004: only while the PID still names the
         // attributed process.
-        let binaries: Vec<(u32, Option<ExeHandle>)> = offenders
+        // Lot 312 (BUG-90): a binary that could not be opened is said so —
+        // the error was dropped and read "no binary on disk".
+        let binaries: Vec<(u32, std::io::Result<Option<ExeHandle>>)> = offenders
             .iter()
             .map(|r| {
-                let exe = r.still_named_by_pid().then(|| binary_of(r.pid())).flatten();
+                let exe = if r.still_named_by_pid() {
+                    binary_of(r.pid())
+                } else {
+                    Ok(None)
+                };
                 (r.pid(), exe)
             })
             .collect();
@@ -379,9 +433,13 @@ impl CombatActuator<LinuxHost> for SystemActuator {
         // process is already dead), but it is in the offender's outcome.
         let mut done: Vec<((u64, u64), u32)> = Vec::new();
         for (slot, (pid, binary)) in outcomes.iter_mut().zip(binaries) {
+            let binary = match binary {
+                Ok(Some(handle)) => Ok(handle),
+                other => Err(Self::no_binary_text(pid, other.map(|_| ()))),
+            };
             slot.quarantine = match binary {
-                None => NO_BINARY.to_string(),
-                Some(handle) => match done.iter().find(|(k, _)| *k == handle.key()) {
+                Err(text) => text,
+                Ok(handle) => match done.iter().find(|(k, _)| *k == handle.key()) {
                     Some((_, first)) => format!("same binary as pid {first}"),
                     None => {
                         let intent = self.intent("Quarantine", pid, "NEUTRALIZE");
@@ -477,11 +535,12 @@ pub fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
     ProcFacts { exe, cgroup }
 }
 
-/// Review 87: the file a process runs, opened before it is killed. `None`
-/// once it has exited, or when the binary was deleted while it ran (the
-/// kernel's ` (deleted)` suffix): nothing on disk to quarantine.
-fn binary_of(pid: u32) -> Option<ExeHandle> {
-    ExeHandle::of_pid(pid).ok().flatten()
+/// Review 87: the file a process runs, opened before it is killed.
+/// `Ok(None)` once it has exited. Lot 312 (BUG-90): a binary deleted while
+/// it ran is opened too — the quarantine decides on its inode whether any
+/// name of it is left — and an error is kept, not read as "none".
+fn binary_of(pid: u32) -> std::io::Result<Option<ExeHandle>> {
+    ExeHandle::of_pid(pid)
 }
 
 #[cfg(test)]
@@ -588,7 +647,7 @@ mod tests {
         };
         let exec = Executor::with_config(cfg);
         exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
-            (pid == child).then_some("test-guard")
+            (pid == child).then_some(crate::response::kill::Spare::process("test-guard"))
         }));
         let actuator = SystemActuator::new(exec, None, false, ActionJournal::memory());
         let outcome = actuator
@@ -667,7 +726,7 @@ mod tests {
         };
         let exec = Executor::with_config(cfg);
         exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
-            (pid == spared).then_some("test-guard")
+            (pid == spared).then_some(crate::response::kill::Spare::process("test-guard"))
         }));
         let actuator = SystemActuator::new(exec, None, false, ActionJournal::memory());
         let report = actuator.neutralize(&[
@@ -743,7 +802,13 @@ mod tests {
         let pid = child.id();
         // the exec has replaced the image before NEUTRALIZE reads it
         for _ in 0..100 {
-            if binary_of(pid).and_then(|h| h.current_path()).as_deref() == Some(mal.as_path()) {
+            if binary_of(pid)
+                .ok()
+                .flatten()
+                .and_then(|h| h.current_path())
+                .as_deref()
+                == Some(mal.as_path())
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -780,5 +845,45 @@ mod tests {
             })
             .count();
         assert_eq!(bins, 1);
+    }
+
+    /// Lot 312 (BUG-90): a binary NEUTRALIZE could not open is said so —
+    /// the error was dropped and the row read "no binary on disk".
+    #[test]
+    fn a_binary_that_could_not_be_opened_is_said_so() {
+        let t =
+            SystemActuator::no_binary_text(7, Err(std::io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(
+            t.starts_with("NOT quarantined: its binary could not be opened (Permission denied"),
+            "{t}"
+        );
+        assert_eq!(SystemActuator::no_binary_text(7, Ok(())), NO_BINARY);
+        // lot 312 (review F1): an inode neutralized in place says what holds
+        use crate::response::quarantine::InPlaceEffect as E;
+        let in_place = |effect| ExecutionOutcome::QuarantinedInPlace {
+            vault_id: "v".into(),
+            original_path: None,
+            detail: "D".into(),
+            effect,
+        };
+        assert_eq!(
+            SystemActuator::quarantine_text(7, &in_place(E::Emptied)),
+            "quarantined: D"
+        );
+        assert_eq!(
+            SystemActuator::quarantine_text(7, &in_place(E::MadeUnusable)),
+            "partially quarantined: D (re-exec prevention degraded)"
+        );
+        assert!(SystemActuator::quarantine_text(7, &in_place(E::Unchanged))
+            .starts_with("NOT quarantined:"));
+        assert!(SystemActuator::quarantine_text(
+            7,
+            &ExecutionOutcome::QuarantineRefused {
+                pid: 7,
+                detail: "owner uid 0".into()
+            }
+        )
+        .starts_with("NOT quarantined:"));
+        assert!(!NO_BINARY.contains("no binary on disk"));
     }
 }

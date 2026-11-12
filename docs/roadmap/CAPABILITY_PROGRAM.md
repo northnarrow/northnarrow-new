@@ -9722,6 +9722,180 @@ number in parentheses is a lab PR.
   - Level unchanged: the guard and the exec policy stay EXPERIMENTAL and off
     by default (C19, C13); BUG-101's kernel half (the deny skipped for every
     set-id target) is lot 318's.
+
+- **Lot 312 — a response reports what the host holds, read back, not what
+  the agent wrote (C17, C23, C19; external bug hunt, edition 1.4: BUG-90,
+  91, 114, 117, 120, 121, 122, 123 and the triage's N5).**
+  - What was open: NEUTRALIZE killed a payload an unprivileged user named
+    `x (deleted)` and left it on disk, runnable, the signed row saying "no
+    binary on disk" (the quarantine read the kernel's ` (deleted)` suffix
+    as "unlinked"); the same with `ln a .b; rm a` after the exec. A user
+    with the subtree systemd delegates to it (`user@<uid>.service`) made a
+    cgroup named `northnarrow.slice/blocked.scope`: the soft egress block
+    took it for the agent's scope (`ends_with`), answered `Blocked`, moved
+    nothing, and the drop rule — which names the scope from the root —
+    filtered nothing. The guard took a container's nested `ssh.service`
+    for the host's (the deepest unit), and a cgroup with no unit for a host
+    without systemd; a v1 host's `0::/` for every process's cgroup; a second
+    throttle recorded the scope as the origin and the release answered
+    `Released` with the process still throttled; a skipped `io.weight` read
+    back its default as a limit; a refused tree-kill root still had its
+    children killed; an all-host-critical NEUTRALIZE was worded "no
+    offending process attributed".
+  - What changed: two helpers. `nn_core::response::cgroup` (where a cgroup
+    path is, by its components from the root: `cgroup_at`,
+    `cgroup_at_or_under`, `unified_path`; property tests over every path of
+    an alphabet to depth 4 and a seeded generator) and
+    `nn_linux::response::inode::exe_unlinked` (`st_nlink` of the held
+    descriptor; a property test over every sequence of up to four link,
+    unlink, rename and namesake steps). A ratchet,
+    `xtask/tests/response_truth.rs`: no ` (deleted)`, `ends_with`, string
+    `contains`, hand-cut last component or `"0::"` in the response and
+    COMBAT code but the helper, each rule shown failing on main's shape.
+    And F5: the block, the throttle and their release read
+    `/proc/<pid>/cgroup` back; the drop rule is loaded again for a scope
+    that is another cgroup (by id); the throttle's limits count only as the
+    values asked for; a new outcome, `NotInEffect { reason }`, signed as a
+    failure (`not in effect: …`). The quarantine vaults and empties an
+    inode still linked under a name the agent cannot see (the unit has no
+    `CAP_FOWNER`, so a `fchmod` of a user's file fails; the emptying goes
+    through `/proc/self/fd` with `CAP_DAC_OVERRIDE`), leaves a root-owned
+    one as it is and says so. BUG-122 as the coordinator decided: a
+    protected process (the agent, its watchdog, init) keeps its whole tree,
+    a host-critical one (the SSH service) is spared alone.
+  - Measured on our own guests (leases k312), the agent installed from the
+    lot's tree, a real COMBAT each time (root's append-open of
+    `/etc/northnarrow/admin.pub` refused by the anti-tamper hook):
+    - Ubuntu 24.04 (6.8.0-147, systemd 255) at ebcc24fb and Debian 13
+      (6.12.115, systemd 257) at 13727c22, the same results: a copy of
+      `python3` named `/srv/nn312/x (deleted)`, owned by the lab user and
+      run as the offender, was killed, vaulted (`response_quarantine`, the
+      sha256 of `python3`) and removed; the same binary as `a`, linked as
+      `.b` and `a` removed before the tripwire (the kernel showing
+      `a (deleted)`, `nlink` 1), was vaulted and `.b` emptied (0 bytes:
+      running it runs nothing); its mode stayed 755, as the unit's
+      capability set predicts. Both rows `quarantined`.
+    - The same two guests: as the lab user, `northnarrow.slice/
+      blocked.scope` made in `user@1000.service`; a root offender moved
+      itself there, opened one UDP socket before anything, then tripped the
+      hook. `response_contain` names the namesake as the origin; the
+      process's `/proc/<pid>/cgroup` read `0::/northnarrow.slice/
+      blocked.scope` 0.25 s later; from then on a send on a new socket was
+      refused (`EPERM`, the drop rule), until NEUTRALIZE killed it at the
+      INVESTIGATE deadline (32 s on 24.04).
+    - Not closed, found by the lot's mini-hunt and measured there: the
+      socket the offender opened before the move kept sending through the
+      whole INVESTIGATE window, the block signed `success`. `socket cgroupv2`
+      matches a socket's cgroup at its creation, which a move does not
+      change: the soft block covers what the process opens after it. An
+      established channel ends with NEUTRALIZE's kill or ISOLATE; the
+      operator doc says so (`COMBAT_RECOVERY.md` §3.5). Cutting it needs a
+      decision (`SOCK_DESTROY` of the process's sockets, or a per-process
+      egress program).
+    - Privileged nn-linux tests on Debian 13 (the agent installed):
+      `bug117_throttled_twice_then_released_returns_to_its_unit` and
+      `a_released_process_returns_to_its_unit` passed;
+      `bug91_a_delegated_users_namesake_is_moved_and_filtered` (a unit
+      delegated to `nobody`, which makes the namesake and moves itself
+      there as that user) passed once its victim ran from a script file
+      (systemd turns `$$` of a command line into `$`: its first two runs
+      never reached the block). With main's suffix test put back in the
+      guest's copy, the same test fails: `Blocked`, the process still in
+      `/system.slice/nn-namesake-1161.service/northnarrow-test312.slice/
+      blocked.scope`.
+  - Mutation round on the new code: 41 targeted mutations, each a named
+    test run alone after it. First round: 32 caught, 9 survivors (the
+    verified name's `(dev, ino)`, the emptying's read-back, the early
+    `AlreadyGone`, the removal's "no name left", `memory.high`'s value,
+    PID 1's `init.scope`, the SSH service's `Spare`, and two in the
+    copy-on-first-write guard's `fd_path`); each got a named test, and the
+    rerun caught all but one, argued equivalent: `fd_path`'s
+    `st_nlink == 0` check, whose answer the `(dev, ino)` check gives anyway
+    (no name leads to an inode with no name).
+  - The independent review of #543 (merge after fixes; both P1 confirmed
+    closed) found the emptying of a held inode destructive through hard
+    links — a package store's binary shared by every environment, or
+    another user's file — and the restore unable to bring the other names
+    back. As the coordinator decided: a name is removed only when it is the
+    file's only name and the file is the offender's own; a shared or
+    another user's file is made mode 000 where the agent may, never
+    emptied, the row partial with owner and link count; a restore puts
+    content and mode back into the same inode. Also: a failed removal
+    (`EISDIR` after a swap with a directory) still neutralizes the held
+    inode; an unverified name never meets the prefix denylist (the inode's
+    identity does); a block of a process holding sockets from before the
+    move is partial and shortens INVESTIGATE (destroying them: lot 321); the
+    copy-on-first-write guard retries its check and copies anyway; below a
+    spared host-critical root only the offending lineage can be killed;
+    the ratchet reads past spacing and argument forms and covers the cow,
+    the offender's and the rule policy's cgroup readers. A second mutation
+    round on these fixes: 29 targeted mutations; 22 caught at once, one
+    compile error rewritten and six survivors given a named test (the
+    restore's inode number where no birth time is kept, the offender's
+    filesystem uid, the partial block held until the stand-down, the
+    in-place row's `partial`, the NEUTRALIZE text); the rerun caught all 29.
+    Measured after the fixes on our Ubuntu 24.04 guest (6.8.0-147, lease
+    k312) at 07a64f30, a real COMBAT each time: a root offender's own
+    `x (deleted)` removed (`quarantined`); its own binary kept under a
+    hidden hard link (`ln a .b; rm a`) emptied in place (0 bytes, mode
+    000, `success`); a binary hard-linked three times (a store and two
+    environments) made mode 000 under every name, its content kept
+    (`partial`, "shared: 3 links; owner uid 0"); the BUG-91 namesake moved,
+    new sockets refused, the socket opened before the move still sending,
+    the INVESTIGATE row `FAILED (PARTIAL: new connections blocked; 1 inet
+    socket(s) opened before the move are not …)` and the window shortened;
+    the three privileged tests passed. The round showed the containment row
+    of that partial block still signed `success`: fixed after it (`partial`,
+    with the count).
+  - The re-check of #543 found the F5 change a P1 (N1): with no verified
+    name the prefixes were skipped, so a user namespace's bind of the
+    host's `/usr/bin` let an unprivileged user have the agent set `bash`, or
+    the dynamic loader, to mode 000 for the whole host; and a regression
+    (N2): a root offender's payload dropped by another user stayed, signed
+    `partial` though nothing changed. Now the quarantine does to a file only
+    what the offender could do itself: the system's own files (the loaders,
+    the shells, init, sshd, the agent's binaries) refused by identity
+    whatever the name; a non-root offender only its own files; a root
+    offender any file under a verified name; never a root-owned file
+    without one; a vault-only quarantine signed a failure. Eleven targeted
+    mutations, all caught (one after a test was added). Measured on our
+    Ubuntu 24.04 guest (lease k312) at b30b21a2, a real COMBAT each time:
+    a `www-data` payload named `x (deleted)` run by root removed
+    (`quarantined`); the hidden-link variant, root's or `www-data`'s file,
+    refused and left whole (mode 755, the owner named); `bash` of the host
+    reached through a private bind of `/usr/bin` over `/usr/local/bin`
+    refused by identity, `/usr/bin/bash` still 755, and `python3` through
+    the same bind refused as root's file with no verified name; the store
+    binary with three links mode 000, content kept (`partial`); the three
+    privileged tests passed.
+  - Merged with lot 311b (#538) and lot 315 (#542): the lot's new reads
+    follow 311b's rule — a failed read never empties a protection. The
+    block's cgroup read-back that fails is no block in effect; a socket
+    table that cannot be read (other than one the kernel lacks) counts
+    every socket the process holds (partial); an `/etc/shells` that cannot
+    be read refuses the quarantine instead of leaving its shells
+    unprotected; the offender's filesystem uid unread leaves it no owner
+    (refused). Lot 315's copy-on-write `fd_path` replaces the lot's F3
+    version, its ` (deleted)` stripped by the lot's helper. Six targeted
+    mutations of these reads, all caught (one after a test was added).
+  - Re-check 2 of #543: R1 (blocking) — `/etc/shells` was read with
+    `fs::read`, so a FIFO there stalled the quarantine and NEUTRALIZE with
+    it; now read as lot 311 reads a configuration file (`O_PATH` first, a
+    regular file only, at most 1 MiB), anything else refused at once. R2
+    (decided) — a non-root offender's own payload with a second hard link
+    it made (`ln x .x2`) was only vaulted; the offender's own inode is now
+    emptied under every name, and the restore in place brings every name
+    back; root's and other users' inodes keep F1's rule. Eleven targeted
+    mutations, all caught. Measured on our Ubuntu 24.04 guest (lease k312,
+    6.8.0-149) at 8d38d6b4 and 6b271ac7: with `/etc/shells` a FIFO,
+    NEUTRALIZE signed about 2 s after the tripwire, the quarantine refused
+    at once, the ladder concluded; the lab user's payload with `.x2` run by
+    an offender acting as that user emptied under both names (`success`,
+    mode left 755: no `CAP_FOWNER`), and `nn-admin response restore` put
+    the content (sha256 of `python3`) and mode back under both.
+  - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
+    the cases above, on two kernels; the soft block's established-socket
+    hole stays open (above).
 - **Lot 318 — the kernel halves of the third bug hunt: BUG37's residue,
   BUG101, BUG108 and N9, and N8's kernel half from the review of #538
   (C23, C14; no level changes).**
