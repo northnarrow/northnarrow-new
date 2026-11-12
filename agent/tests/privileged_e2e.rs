@@ -1863,6 +1863,640 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     }
 }
 
+// ── Lot 318 — external bug hunt BUG37: the BPF guard's refusals ─────────
+
+/// A process of `nobody` with `CAP_SYS_ADMIN` and `CAP_BPF` (the two that
+/// reach `bpf()`'s LSM hook past `unprivileged_bpf_disabled`), pinned to
+/// `cpu`, asking for a handle on map `map_id` until CLOCK_MONOTONIC passes
+/// `until`. Forked from this multi-threaded test: the child makes raw
+/// system calls only (one thread: each `set*id` its own) and `_exit`s.
+/// Exit 0: every request refused; 1: a handle was granted; 2..5: a step of
+/// the drop failed.
+#[cfg(feature = "debug-trigger")]
+fn fork_handle_flooder(cpu: usize, map_id: u32, until: libc::timespec) -> libc::pid_t {
+    /// `struct __user_cap_header_struct` / `__user_cap_data_struct`.
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_BPF: u32 = 39;
+    const NOBODY: libc::c_long = 65534;
+    // SAFETY: the child runs raw system calls on its own stack and ends
+    // with `_exit`; the parent only gets the pid.
+    unsafe {
+        let pid = libc::fork();
+        if pid != 0 {
+            return pid;
+        }
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
+            libc::_exit(2);
+        }
+        if libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) != 0
+            || libc::syscall(libc::SYS_setresgid, NOBODY, NOBODY, NOBODY) != 0
+        {
+            libc::_exit(3);
+        }
+        if libc::syscall(libc::SYS_setresuid, NOBODY, NOBODY, NOBODY) != 0 {
+            libc::_exit(4);
+        }
+        let header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        for cap in [CAP_SYS_ADMIN, CAP_BPF] {
+            let d = &mut data[(cap / 32) as usize];
+            d.effective |= 1 << (cap % 32);
+            d.permitted |= 1 << (cap % 32);
+        }
+        if libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) != 0 {
+            libc::_exit(5);
+        }
+        let mut granted = 0;
+        let mut attr = [0u32; 32];
+        let mut now: libc::timespec = std::mem::zeroed();
+        loop {
+            for _ in 0..256 {
+                attr[0] = map_id;
+                let fd = libc::syscall(
+                    libc::SYS_bpf,
+                    ::common::bpf_cmd::BPF_MAP_GET_FD_BY_ID as libc::c_long,
+                    attr.as_mut_ptr(),
+                    std::mem::size_of_val(&attr) as u32,
+                );
+                if fd >= 0 {
+                    granted = 1;
+                    libc::close(fd as i32);
+                }
+            }
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+            if (now.tv_sec, now.tv_nsec) >= (until.tv_sec, until.tv_nsec) {
+                libc::_exit(granted);
+            }
+        }
+    }
+}
+
+/// External bug hunt BUG37, the residue lot 293 left (lot 318): a loop of
+/// refused handles on one of the agent's maps, on every CPU, must not cost
+/// the record of a refused `kill`. The BPF guard's refusals wrote the
+/// shared denial ring with no budget, and such a loop filled it: the kill
+/// was refused, its record lost (counted as an `fs_protect` drop). Behind
+/// the per-attempt budget now, the loop's records are held back
+/// (`denial_rate`) and the kills' arrive. The loop runs as `nobody` with
+/// the two capabilities (its NN-L-AT-001 budget is its uid's, not root's);
+/// each kill is a process of its own (the task denials' dedup is per
+/// caller).
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("flood", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let agent = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+
+    // One of the agent's maps, read in a window (outside one a read
+    // handle on its maps is refused too).
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("flood", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let map_id = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
+        .into_iter()
+        .find_map(|(kind, id)| (kind == 1).then_some(id))
+        .expect("OWN_BPF_IDS lists none of the agent's maps");
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // The loop: every CPU, 4 s.
+    const FLOOD: Duration = Duration::from_secs(4);
+    let cpus = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .min(8);
+    let mut until: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut until) };
+    until.tv_sec += FLOOD.as_secs() as libc::time_t;
+    let started = Instant::now();
+    let flooders: Vec<libc::pid_t> = (0..cpus)
+        .map(|cpu| fork_handle_flooder(cpu, map_id, until))
+        .collect();
+    assert!(flooders.iter().all(|p| *p > 0), "fork failed: {flooders:?}");
+
+    // In the middle of it, five refused kills, each its own process.
+    let mut killers = Vec::new();
+    for k in 0..5u64 {
+        let at = Duration::from_millis(1000 + 500 * k);
+        if let Some(wait) = at.checked_sub(started.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        let mut kill = Command::new("kill")
+            .args(["-9", &agent.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kill");
+        let id = kill.id();
+        let st = kill.wait().expect("wait kill");
+        assert!(
+            !st.success(),
+            "kill -9 of the agent (pid {agent}) was not refused"
+        );
+        killers.push(id);
+    }
+    for pid in &flooders {
+        let mut status = 0;
+        // SAFETY: our own child.
+        let r = unsafe { libc::waitpid(*pid, &mut status, 0) };
+        assert_eq!(r, *pid, "waitpid {pid}");
+        let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+        match code {
+            Some(0) => {}
+            Some(1) => panic!(
+                "a handle on the agent's map {map_id} was granted to nobody with CAP_BPF in enforce \
+                 mode\n{}",
+                log_tail(&log)
+            ),
+            other => panic!("the flooder {pid} could not drop to nobody with CAP_BPF: {other:?}"),
+        }
+    }
+    let flood_end = Instant::now();
+    let alive = matches!(
+        fx.enforce_run
+            .as_mut()
+            .expect("enforce run")
+            .child
+            .try_wait(),
+        Ok(None)
+    );
+    assert!(alive, "the agent is gone after the refused kills");
+
+    // Every kill's record arrived.
+    for k in &killers {
+        let pid = format!("pid={k} ");
+        assert!(
+            wait_for_log_line(
+                &log,
+                &["ANTI-TAMPER DENIAL", &pid, "op=signal"],
+                Duration::from_secs(15)
+            )
+            .is_some(),
+            "the refused kill of process {k} left no record (killers {killers:?}, map {map_id}, \
+             {cpus} flooders)\n{}",
+            log_tail(&log)
+        );
+    }
+    // The ring-drop sampler's round (every 10 s) after the loop: the loop
+    // was held back by the budget, and the ring never filled.
+    let sampled = flood_end + Duration::from_secs(12);
+    if let Some(wait) = sampled.checked_duration_since(Instant::now()) {
+        std::thread::sleep(wait);
+    }
+    let text = read_agent_log(&log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        !drops.iter().any(|l| l.contains("fs_protect")),
+        "the denial ring filled during the loop: {drops:#?}"
+    );
+    assert!(
+        drops.iter().any(|l| l.contains("denial_rate")),
+        "the loop's refusals were not held back by the attempt budget (no denial_rate drop: did \
+         it run?): {drops:#?}\n{}",
+        log_tail(&log)
+    );
+
+    // The authorised stop, signed; Drop puts the guard back in observe mode.
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+/// Lot 318 (the review of #545, F1): a loop of refused handles on one of
+/// the agent's maps — non-decisive refusals, the kind an administrator's
+/// `bpftool map list` makes — on one CPU, and in the middle of it, on that
+/// CPU, a refused new entry in `/etc/northnarrow` (a protected directory of
+/// every agent, `PROTECTED_DIR_FLAGS`): decisive, signed at each attempt as
+/// a protected file's unlink is. The two shared one per-CPU budget, and 50
+/// handles in a second held back the refusal's record, the posture's
+/// decisive trigger with it (it stayed at ENGAGED). Now the non-decisive
+/// refusals spend a budget of their own (`minor_denial_rate`): the `mkdir`
+/// is refused, its record arrives, the posture reaches COMBAT by
+/// `AntiTamperDenial`, and the loop's records past their budget are
+/// counted. (A first version unlinked the fixture agent's signing key in
+/// its tempdir: no agent protects that path, and the unlink went through —
+/// 7.0 lab, round r5.)
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("minor", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+    let etc = Path::new("/etc/northnarrow");
+    assert!(
+        etc.is_dir(),
+        "the agent's protected directory {}",
+        etc.display()
+    );
+    let target = etc.join(".nn-e2e-318-minor");
+
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("minor", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    // a leftover of an earlier failed run, removed inside the window
+    let _ = std::fs::remove_dir(&target);
+    let map_id = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
+        .into_iter()
+        .find_map(|(kind, id)| (kind == 1).then_some(id))
+        .expect("OWN_BPF_IDS lists none of the agent's maps");
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // The loop on CPU 0, 3 s: far past the 50 records a second its budget
+    // has there.
+    let mut until: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut until) };
+    until.tv_sec += 3;
+    let flooder = fork_handle_flooder(0, map_id, until);
+    assert!(flooder > 0, "fork failed");
+    std::thread::sleep(Duration::from_millis(1000));
+    // On the same CPU, the decisive refusal: a new entry in the agent's
+    // protected directory (python3 prints the errno itself: uutils' mkdir
+    // says "Permission denied" for EPERM too). Its own process group: the
+    // ladder a refusal raises acts on the actor, never the harness.
+    let actor = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             try:\n    os.mkdir(sys.argv[1])\n    print('ok')\n\
+             except OSError as e:\n    print('errno=' + errno.errorcode.get(e.errno, str(e.errno)))",
+        )
+        .arg(&target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn taskset python3");
+    let actor_pid = actor.id();
+    let out = actor.wait_with_output().expect("wait for the actor");
+    let mut status = 0;
+    // SAFETY: our own child.
+    assert_eq!(unsafe { libc::waitpid(flooder, &mut status, 0) }, flooder);
+    match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+        Some(0) => {}
+        Some(1) => panic!("a handle on the agent's map {map_id} was granted in enforce mode"),
+        other => panic!("the flooder could not drop to nobody with CAP_BPF: {other:?}"),
+    }
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let made = target.exists();
+    if made {
+        // not refused: put the directory back as it was (the test fails)
+        let _ = std::fs::remove_dir(&target);
+    }
+    assert!(
+        said == "errno=EPERM" && !made,
+        "the new entry {} was not refused: {said:?} {}",
+        target.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // its record arrived (taskset execs python3 in place: the pid is the
+    // actor's) …
+    let pid = format!("pid={actor_pid} ");
+    let line = wait_for_log_line(
+        &log,
+        &["ANTI-TAMPER DENIAL", &pid, "op=mkdir"],
+        Duration::from_secs(15),
+    );
+    assert!(
+        line.is_some(),
+        "the refused mkdir (pid {actor_pid}) left no record behind the handle loop on its CPU\n{}",
+        log_tail(&log)
+    );
+    // … and the posture took it as what it is: decisive
+    assert!(
+        wait_for_log_line(
+            &log,
+            &["POSTURE TRANSITION", "AntiTamperDenial"],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "no COMBAT by AntiTamperDenial after the refused mkdir\n{}",
+        log_tail(&log)
+    );
+    // the loop's records past their own budget were counted (the sampler's
+    // round, every 10 s), and none of the decisive budget's
+    std::thread::sleep(Duration::from_secs(12));
+    let text = read_agent_log(&log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        drops.iter().any(|l| l.contains("minor_denial_rate")),
+        "the handle loop was not held back by its own budget: {drops:#?}"
+    );
+    assert!(
+        !drops
+            .iter()
+            .any(|l| l.contains("fs_protect") || l.contains("\"denial_rate\"")),
+        "a decisive record or the ring lost: {drops:#?}"
+    );
+
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+/// The re-check of #545: what a flood of non-decisive records on one CPU
+/// left of a decisive one there — its record arrived, the posture took it
+/// as `AntiTamperDenial`, the flood was held back in `minor_denial_rate`
+/// and nothing in a decisive budget (`budget`) or the ring.
+fn assert_decisive_record_after_flood(
+    fx: &mut GuardFixture,
+    log: &Path,
+    actor: u32,
+    op: &str,
+    budget: &str,
+) {
+    let pid = format!("pid={actor} ");
+    assert!(
+        wait_for_log_line(
+            log,
+            &["ANTI-TAMPER DENIAL", &pid, &format!("op={op}")],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the refused {op} (pid {actor}) left no record behind the flood on its CPU\n{}",
+        log_tail(log)
+    );
+    assert!(
+        wait_for_log_line(
+            log,
+            &["POSTURE TRANSITION", "AntiTamperDenial"],
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "no COMBAT by AntiTamperDenial after the refused {op}\n{}",
+        log_tail(log)
+    );
+    // the sampler's round, every 10 s
+    std::thread::sleep(Duration::from_secs(12));
+    let text = read_agent_log(log);
+    let drops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ring-buffer events DROPPED"))
+        .collect();
+    assert!(
+        drops.iter().any(|l| l.contains("minor_denial_rate")),
+        "the flood was not held back by its own budget: {drops:#?}"
+    );
+    let decisive = format!("\"{budget}\"");
+    assert!(
+        !drops
+            .iter()
+            .any(|l| l.contains("fs_protect") || l.contains(&decisive)),
+        "a decisive record or the ring lost: {drops:#?}"
+    );
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+/// The re-check of #545 (R1): the kprobes and lockdown switches are
+/// refused at the write-open and signed at each attempt, and they are no
+/// decisive tamper (`DefenseImpairment`: a debugging script meets them) —
+/// yet they spent the decisive attempt budget. 150 refused write-opens of
+/// `kprobes/enabled` (or securityfs' `lockdown`) on CPU 0 held back, that
+/// second, a refused new entry in `/etc/northnarrow` there: no record, no
+/// COMBAT. They spend the non-decisive budget now.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_switch_refusal_loop_does_not_hide_a_decisive_refusal() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let Some(switch) = [
+        "/sys/kernel/debug/kprobes/enabled",
+        "/sys/kernel/security/lockdown",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists()) else {
+        eprintln!("neither kprobes/enabled nor securityfs' lockdown here: nothing to test");
+        return;
+    };
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("switch", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    let etc = Path::new("/etc/northnarrow");
+    assert!(
+        etc.is_dir(),
+        "the agent's protected directory {}",
+        etc.display()
+    );
+    let target = etc.join(".nn-e2e-318-switch");
+    // a leftover of an earlier failed run, removed inside a window
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("switch", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let _ = std::fs::remove_dir(&target);
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+
+    // One process on CPU 0: the refused write-opens of the switch, then the
+    // decisive refusal, within the second.
+    let out = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             refused = 0\n\
+             for _ in range(150):\n    \
+                 try:\n        os.close(os.open(sys.argv[1], os.O_WRONLY))\n    \
+                 except OSError as e:\n        refused += e.errno == errno.EPERM\n\
+             try:\n    os.mkdir(sys.argv[2])\n    made = 'ok'\n\
+             except OSError as e:\n    made = 'errno=' + errno.errorcode.get(e.errno, str(e.errno))\n\
+             print(os.getpid(), refused, made, flush=True)",
+        )
+        .arg(switch)
+        .arg(&target)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .output()
+        .expect("run the actor");
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let made = target.exists();
+    if made {
+        let _ = std::fs::remove_dir(&target);
+    }
+    let f: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(
+        f.len(),
+        3,
+        "the actor said {said:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f[1], "150",
+        "the switch {switch} was not refused every time: {said:?}"
+    );
+    assert!(
+        f[2] == "errno=EPERM" && !made,
+        "the new entry {} was not refused: {said:?}",
+        target.display()
+    );
+    let actor: u32 = f[0].parse().expect("the actor's pid");
+    assert_decisive_record_after_flood(&mut fx, &log, actor, "mkdir", "denial_rate");
+}
+
+/// The re-check of #545 (R2): the task denials' budget carried the refused
+/// renices (`DefenseImpairment`: a tuning daemon meets them) with the
+/// refused signals and ptraces, so 80 short-lived processes each refused a
+/// renice of the agent on CPU 0 held back, that second, a refused `kill
+/// -9` of the agent there: no record, no COMBAT. A renice spends the
+/// non-decisive budget now, after the per-caller dedup; the task budget is
+/// the decisive refusals' alone.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_renice_loop_does_not_hide_a_refused_kill() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("renice", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let agent = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+
+    // A parent on CPU 0 (its children inherit it): 80 children, each one
+    // refused renice of the agent (one record each: the dedup is per
+    // caller), then its own `kill -9` of the agent.
+    let out = Command::new("taskset")
+        .args(["-c", "0", "python3", "-I", "-c"])
+        .arg(
+            "import errno, os, sys\n\
+             agent = int(sys.argv[1])\n\
+             refused = 0\n\
+             for _ in range(80):\n    \
+                 pid = os.fork()\n    \
+                 if pid == 0:\n        \
+                     try:\n            os.setpriority(os.PRIO_PROCESS, agent, 19)\n            os._exit(0)\n        \
+                     except OSError as e:\n            os._exit(1 if e.errno == errno.EPERM else 2)\n    \
+                 _, st = os.waitpid(pid, 0)\n    \
+                 refused += os.WIFEXITED(st) and os.WEXITSTATUS(st) == 1\n\
+             try:\n    os.kill(agent, 9)\n    killed = 'ok'\n\
+             except OSError as e:\n    killed = 'errno=' + errno.errorcode.get(e.errno, str(e.errno))\n\
+             print(os.getpid(), refused, killed, flush=True)",
+        )
+        .arg(agent.to_string())
+        .stdin(Stdio::null())
+        .process_group(0)
+        .output()
+        .expect("run the actor");
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let f: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(
+        f.len(),
+        3,
+        "the actor said {said:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f[1], "80",
+        "a renice of the agent was not refused: {said:?}"
+    );
+    assert_eq!(
+        f[2], "errno=EPERM",
+        "kill -9 of the agent (pid {agent}) was not refused"
+    );
+    let alive = matches!(
+        fx.enforce_run
+            .as_mut()
+            .expect("enforce run")
+            .child
+            .try_wait(),
+        Ok(None)
+    );
+    assert!(alive, "the agent is gone after the refused kill");
+    let actor: u32 = f[0].parse().expect("the actor's pid");
+    assert_decisive_record_after_flood(&mut fx, &log, actor, "signal", "task_denial_rate");
+}
+
 // ── Lot 293 — external bug hunt BUG14: a signal through a file's owner ─
 
 /// The ways a root process arms a file's owner on a protected process: the

@@ -86,7 +86,7 @@ use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
-    BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_HANDLE,
+    BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_HANDLE,
     FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
 
@@ -1057,29 +1057,27 @@ fn emit_denial(operation: u8, object_id: u32) {
 
 /// [`emit_denial`] with the object's kind in `target_dev` (lot 290:
 /// `FS_OP_BPF_HANDLE`).
+///
+/// Lot 318 (external bug hunt BUG37, the residue of lot 293): behind the
+/// per-attempt budget, through `crate::inode_protect::emit_attempt` — the
+/// same record, the same ring. It wrote the ring itself, with no budget: a
+/// root loop of `BPF_MAP_GET_FD_BY_ID` on one of the agent's maps filled
+/// the `fs_protect` ring (64 KiB in the object, 256 KiB as the agent loads
+/// it: `FS_PROTECT_RING_BYTES`), and the record of a refused `kill` or
+/// ptrace was lost with it. A refusal over the budget is counted in
+/// `RING_DROPS` (`ring_slot::DENIAL_RATE`: signed, telemetry loss past the
+/// threshold); the deny never depends on the record. The deny self-test's
+/// refusals stay outside the budget, as every other attempt's. Lot 318
+/// (the review of #545, F1): the guard's non-decisive kinds (a handle, a
+/// refused program type, a root attach, an opt-out's record) spend a budget
+/// of their own (`minor_denial_rate`), never the decisive refusals'.
 #[inline(always)]
 fn emit_denial_kind(operation: u8, kind: u8, object_id: u32) {
-    let mut entry = match crate::inode_protect::FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0)
-    {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(ring_slot::FS_PROTECT);
-            return;
-        }
-    };
-    let raw_ptr: *mut FsProtectDenialRaw = entry.as_mut_ptr();
-    unsafe {
-        crate::zero::zero(raw_ptr);
-        (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
-        let pid_tgid = bpf_get_current_pid_tgid();
-        (*raw_ptr).attacker_pid = (pid_tgid >> 32) as u32;
-        (*raw_ptr).attacker_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-        (*raw_ptr).target_dev = kind as u64;
-        (*raw_ptr).target_ino = object_id as u64;
-        (*raw_ptr).operation = operation;
-        if let Ok(comm) = bpf_get_current_comm() {
-            (*raw_ptr).attacker_comm = comm;
-        }
-    }
-    entry.submit(0);
+    crate::inode_protect::emit_attempt(
+        operation,
+        InodeKey {
+            dev: kind as u64,
+            ino: object_id as u64,
+        },
+    );
 }

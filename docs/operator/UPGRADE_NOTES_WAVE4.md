@@ -1224,3 +1224,85 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   stopped that could not be captured at the boot (no longer counted in
   `gone`), given their decision once they are; and `killed`: the kills a
   previous agent owed.
+
+## 28. The kernel halves of the third bug hunt (lot 318)
+
+- **A set-id target no longer escapes the exec policy's environment deny**
+  (BUG101; [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)). With `--exec-policy enforce`,
+  an `LD_PRELOAD` or `LD_AUDIT` entry under a staging path (`/tmp/`,
+  `/var/tmp/`, `/dev/shm/`, `/proc/`, `/dev/fd/`) at the exec of a set-uid
+  or set-gid file is refused like at any other file, for the tiers whose
+  rule denies (`service`, `unknown`, a root caller under `deny-root`): the
+  record is `NN-L-EXECENV-001` "denied at exec (EACCES)", where it was
+  "recorded: the target is set-id, the kernel sets AT_SECURE". The bits
+  did not promise it (root running `su`, `no_new_privs`, a `nosuid`
+  mount, a set-id `#!` script). A service whose environment carries such a
+  preload has every other exec refused already; nothing to configure.
+  **On 7.0** (Ubuntu 26.04's 7.0.0-43) the environment check is unreliable,
+  before this release too: the scan's syscall tracepoint program sees the
+  execs of one CPU only there, and a preload on another CPU is not refused
+  (lab: 6 of 20 unpinned). Do not count on this deny on 7.0 until lot 322
+  ([the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)).
+- **More files are in the guarded classes** (BUG108). A file on a btrfs
+  subvolume mounted at `/home` (Fedora, openSUSE), or in a directory of
+  another filesystem bound at a guarded point or at `/home/<user>`, is
+  `home` and `guarded_mount` now, whichever path runs it — the exec
+  quarantine holds it and the policy's cells judge it, as for any home. A
+  file more than 64 levels deep, which the walk cannot place, is `tmp`,
+  `var_tmp` and `home`. A directory bound deeper in a user's tree (a
+  chroot's `/usr`) stays out. The guarded points are published by their
+  own identity too: on openSUSE (`/var/tmp` in the `@/var` subvolume) and
+  on ostree systems (Silverblue, CoreOS: `/home` and `/var/tmp` under the
+  `/var` bind) their files are `var_tmp` and `home` now (not
+  `guarded_mount`), and a file under `/home` or `/tmp` reached through a
+  bind elsewhere (a container's bind of a home directory) has the point's
+  class, as it had with a separate `/home` partition. Containers and
+  chroots keep their own view: a container whose root is a plain directory
+  in a home (LXC's dir backend, rootless podman on vfs or btrfs) is not
+  `home` or `other_home` by the host's `/home` above its root (the search
+  stops at the task's root). Not covered yet (lot 323, with the container
+  policy): a filesystem a user mounts in their own user namespace (an
+  overlay after `unshare -rm`, no container needed), a chroot into a FUSE
+  directory, and a chroot or container whose root is below a guarded mount
+  or point give no class. Every FUSE filesystem (`fuse`,
+  `fuseblk`; not `virtiofs`, a VM's or a Kata container's shared
+  directory, told apart by the superblock's type name) outside the task's
+  root is `guarded_mount`, with the class of the point it is mounted at, or
+  `tmp`, `var_tmp`, `home` where the agent's table does not place it: a
+  service that runs programs from a FUSE mount (sshfs, rclone, s3fs) now has
+  those execs held for a scan (`quarantine` cells) and recorded by the
+  `audit` cells; a session's own home on the desktop profile is still
+  allowed. Two optional BTF offsets are new (`super_block.s_type`,
+  `file_system_type.name`, slots 127–128; the enum, tracepoint and
+  hook-argument slots move up by two): without them a FUSE-magic file is
+  guarded whatever its type. Check `nn-admin status` (`execpol`
+  counters) after the upgrade on such a layout. A user's FUSE mount
+  without `allow_other` cannot be read by the agent: the scan's basis is
+  unreachable and `--exec-quarantine-on-expiry` applies — with `kill`, an
+  AppImage or an sshfs tool run by a service from such a mount is killed;
+  keep the default (`resume`) where those run.
+- **The BPF guard's refusals have a budget** (BUG37), and the records
+  that decide nothing have their own (the review of #545 and its
+  re-check). A refused read of the agent's key, a handle on its BPF
+  objects, a refused program type or root `cgroup/sysctl` attach, a refused
+  write of the kprobes or lockdown switch, a refused renice (nice,
+  scheduling, I/O priority) or sysctl write, a signal through a file's
+  owner, a loader or sysctl opt-out's record, a move into an exempt cgroup
+  and a code-injection record: 50 a second per CPU, the rest counted in the
+  signed `ringbuf_drop` entry (`minor_denial_rate`, a new slot) and never a
+  telemetry loss — a `bpftool prog list` or `map list` outside a
+  trusted-installer window, a monitoring agent listing the BPF objects
+  every second, a tuning daemon or a burst of opted-out sysctl writes
+  records its first 50 in the second and raises no `TelemetryLoss`. The
+  decisive refusals (an unlink, rename or write-open of a protected file, a
+  write handle on or a detach of the agent's BPF objects; the refused
+  signals, ptraces, kexecs, cgroup moves and limit changes) keep their 50 a
+  second to themselves, and one of them held back (`denial_rate`,
+  `task_denial_rate`) is a telemetry loss at once, where more than 64 in a
+  10 s sample were. Every refusal holds.
+  A reader of the `ringbuf_drop` counters by index sees 30 slots
+  (`minor_denial_rate` is the 30th).
+- **The io_uring sensor** attaches one more program, `io_uring_exit` on
+  `sched/sched_process_exit` (N9): a process's aggregation state goes with
+  its last thread. Where it does not attach, the start signs the
+  `io_uring_sensor` degradation.

@@ -22,12 +22,22 @@
 //!   connect, network send/recv, filesystem mutation, other) or at most
 //!   once per second with the submission count since the last record.
 //!
+//! * `sched/sched_process_exit` (lot 318, external bug hunt N9) — a thread
+//!   group's [`IOURING_STATE`] entry goes with its last thread: it was
+//!   never removed, and a process that reused the pid inherited the classes
+//!   of the one before it (its first record could carry the network class
+//!   of a dead server and complete NN-L-IOU-002's pair on a process that
+//!   only read files).
+//!
 //! Field offsets come from the `BTF_OFFSETS` map (`off!`), placed by the
 //! tracefs resolver: the layouts differ on every kernel the lab runs
 //! (opcode at 24 on 5.15, 32 on 6.1 and 6.8, 40 on RHEL 9).
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, bpf_probe_read_kernel,
+    },
     macros::{map, tracepoint},
     maps::{LruHashMap, RingBuf},
     programs::TracePointContext,
@@ -39,9 +49,9 @@ use northnarrow_common::wire::{
 
 use crate::budget::{admit, saturate_u32, Budget, Held, Limits};
 use crate::btf_offsets::{
-    TP_IOURING_CREATE_FD_OFFSET, TP_IOURING_CREATE_FLAGS_OFFSET,
-    TP_IOURING_CREATE_SQ_ENTRIES_OFFSET, TP_IOURING_SUBMIT_OPCODE_OFFSET,
-    TP_IOURING_SUBMIT_SQ_THREAD_OFFSET,
+    SIGNAL_STRUCT_LIVE_OFFSET, TASK_STRUCT_SIGNAL_OFFSET, TP_IOURING_CREATE_FD_OFFSET,
+    TP_IOURING_CREATE_FLAGS_OFFSET, TP_IOURING_CREATE_SQ_ENTRIES_OFFSET,
+    TP_IOURING_SUBMIT_OPCODE_OFFSET, TP_IOURING_SUBMIT_SQ_THREAD_OFFSET,
 };
 
 /// Per-pid aggregation state.
@@ -61,6 +71,8 @@ pub struct IoUringState {
 pub static IOURING_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 
 /// pid → aggregation state. LRU: a pid that stops submitting ages out.
+/// Lot 318 (N9): removed when the process's last thread exits
+/// ([`io_uring_exit`]).
 #[map]
 pub static IOURING_STATE: LruHashMap<u32, IoUringState> = LruHashMap::with_max_entries(4096, 0);
 
@@ -175,6 +187,53 @@ fn try_submit(ctx: &TracePointContext) -> Result<(), i64> {
         );
     }
     Ok(())
+}
+
+/// Lot 318 (external bug hunt N9): `sched/sched_process_exit`, attached
+/// with the submit program. The exiting thread's group loses its
+/// [`IOURING_STATE`] entry (and its ring-creation budget,
+/// `IOURING_TASK_BUDGET`) when the group is dead: `signal->live`,
+/// decremented before the tracepoint, is 0 — its last thread, not its
+/// leader, which may exit first while the others keep submitting. Without
+/// the two optional offsets (or a read that fails) the leader's exit stands
+/// for the group's. Two threads exiting together may both see 0: the second
+/// remove finds nothing. The pid cannot be reused before this runs: its
+/// number is freed when the group is reaped, after its last thread's exit.
+#[tracepoint]
+pub fn io_uring_exit(_ctx: TracePointContext) -> u32 {
+    unsafe { try_exit() };
+    0
+}
+
+#[inline(always)]
+unsafe fn try_exit() {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    if IOURING_STATE.get(&tgid).is_none() && IOURING_TASK_BUDGET.get(&tgid).is_none() {
+        return;
+    }
+    if group_dead().unwrap_or(tgid == pid_tgid as u32) {
+        let _ = IOURING_STATE.remove(&tgid);
+        // Lot 318's mini-hunt: the ring creations' budget too — a pid
+        // reused by another process started with what was left of it
+        let _ = IOURING_TASK_BUDGET.remove(&tgid);
+    }
+}
+
+/// Whether the current task's thread group is dead (`signal->live == 0`);
+/// `None` when that cannot be read. Optional offsets, one at a time (5.15
+/// rule 3).
+#[inline(always)]
+unsafe fn group_dead() -> Option<bool> {
+    let o_signal = off_opt!(TASK_STRUCT_SIGNAL_OFFSET)? & 0xffff;
+    let o_live = off_opt!(SIGNAL_STRUCT_LIVE_OFFSET)? & 0xffff;
+    let task = bpf_get_current_task() as *const u8;
+    let signal = bpf_probe_read_kernel::<u64>(task.add(o_signal) as *const u64).ok()?;
+    if signal == 0 {
+        return None;
+    }
+    let live = bpf_probe_read_kernel::<u32>((signal as *const u8).add(o_live) as *const u32).ok()?;
+    Some(live == 0)
 }
 
 #[inline(always)]

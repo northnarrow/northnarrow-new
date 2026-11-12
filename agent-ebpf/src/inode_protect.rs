@@ -333,12 +333,65 @@ pub(crate) fn attempt_budget() -> bool {
     true
 }
 
+/// Lot 318 (the review of #545, F1 and F7): the budget of the records
+/// that are not decisive (`northnarrow_common::wire::is_minor_denial`: a
+/// refused read of the agent's key, a handle on its BPF objects, a refused
+/// program type or root `cgroup/sysctl` attach; the re-check, R1 and R2: a
+/// refused kprobes or lockdown switch, a refused renice or sysctl write,
+/// the records that refuse nothing), signed at each attempt or rate-limited
+/// per caller ([`limited_budget`]), per CPU: `[window start (ns), records
+/// in the window]`. They shared [`ATTEMPT_DENIAL_RATE`] with the decisive
+/// ones, and 50 refused read handles on one of the agent's maps (an
+/// administrator's `bpftool map list` makes 150) held back, that second on
+/// that CPU, the record of a refused unlink of a protected file — the
+/// posture's decisive trigger, lost with it. One held back is counted in
+/// `RING_DROPS` (`ring_slot::MINOR_DENIAL_RATE`, signed, not a security
+/// loss: no `TelemetryLoss` for a `bpftool` listing).
+#[map]
+static MINOR_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1, 0);
+
+const MINOR_DENIAL_PER_SEC: u64 = 50;
+
+/// Lot 318: whether this CPU's budget of the non-decisive refusals
+/// ([`MINOR_DENIAL_RATE`]) has room for one more record, taking it; a
+/// record over it is counted (`ring_slot::MINOR_DENIAL_RATE`) and must not
+/// be written.
+#[inline(always)]
+fn minor_budget() -> bool {
+    let Some(rate) = MINOR_DENIAL_RATE.get_ptr_mut(0) else {
+        return false;
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    unsafe {
+        // SAFETY: this CPU's slot, owned by the program while it runs.
+        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
+            (*rate)[0] = now;
+            (*rate)[1] = 0;
+        }
+        if (*rate)[1] >= MINOR_DENIAL_PER_SEC {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::MINOR_DENIAL_RATE);
+            return false;
+        }
+        (*rate)[1] += 1;
+    }
+    true
+}
+
 /// Lot 293: [`emit_denial`] behind the attempt budget ([`attempt_budget`]).
+/// Lot 318 (the review of #545, F1): a non-decisive refusal
+/// (`northnarrow_common::wire::is_minor_denial`) behind its own budget
+/// ([`minor_budget`]), so the decisive ones keep theirs whole.
 #[inline(always)]
 pub(crate) fn emit_attempt(operation: u8, key: InodeKey) {
     // Lot 302: the deny self-test's refusal, outside the budget
     if caller_is_self_test() {
         emit_denial(operation, key);
+        return;
+    }
+    if northnarrow_common::wire::is_minor_denial(operation) {
+        if minor_budget() {
+            emit_denial(operation, key);
+        }
         return;
     }
     if attempt_budget() {
@@ -387,8 +440,31 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
             let _ = TASK_DENIAL_SEEN.insert(&seen, &now, 0);
         }
     }
-    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+    if !limited_budget(operation, now) {
         return;
+    }
+    emit_denial(operation, key);
+}
+
+/// Lot 318 (the re-check of #545, R2): the per-CPU budget a rate-limited
+/// record spends — a non-decisive one
+/// (`northnarrow_common::wire::is_minor_denial`: a refused renice, a
+/// refused sysctl write, a sysctl opt-out's write, a move into an exempt
+/// cgroup, code-injection access, a signal through a file's owner) the
+/// non-decisive refusals' ([`minor_budget`]), a decisive one (a refused
+/// signal, ptrace, kexec, cgroup move, limit change, write through a
+/// descriptor) the task denials' ([`TASK_DENIAL_RATE`]) alone. They shared
+/// it, and 50 refused renices of the agent in a second on a CPU held back a
+/// refused `kill -9`'s record there. Whether there is room, taking it; a
+/// record over a budget is counted in its `RING_DROPS` slot and must not be
+/// written.
+#[inline(always)]
+fn limited_budget(operation: u8, now: u64) -> bool {
+    if northnarrow_common::wire::is_minor_denial(operation) {
+        return minor_budget();
+    }
+    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+        return false;
     };
     unsafe {
         // SAFETY: this CPU's slot, owned by the program while it runs.
@@ -398,11 +474,11 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
         }
         if (*rate)[1] >= TASK_DENIAL_PER_SEC {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
-            return;
+            return false;
         }
         (*rate)[1] += 1;
     }
-    emit_denial(operation, key);
+    true
 }
 
 /// Lot 280a: a record of the `cgroup/sysctl` program (`crate::
@@ -435,20 +511,10 @@ pub(crate) fn emit_sysctl_record(
             }
         }
     }
-    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+    // Lot 318 (the re-check of #545, R2): a sysctl's refusal or opt-out
+    // record is not decisive — the non-decisive refusals' budget
+    if !limited_budget(operation, now) {
         return;
-    };
-    unsafe {
-        // SAFETY: this CPU's slot, owned by the program while it runs.
-        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
-            (*rate)[0] = now;
-            (*rate)[1] = 0;
-        }
-        if (*rate)[1] >= TASK_DENIAL_PER_SEC {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
-            return;
-        }
-        (*rate)[1] += 1;
     }
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
@@ -474,8 +540,14 @@ pub(crate) fn emit_sysctl_record(
 
 /// Best-effort audit record. Silently drops if the ringbuffer is
 /// full — the deny verdict still fires.
+///
+/// Lot 318 (external bug hunt BUG37): private to this module — every
+/// other refusal reaches the ring through a budget ([`emit_attempt`],
+/// [`emit_limited`], [`emit_task_denial`]; the BPF guard's through
+/// `emit_attempt`). `xtask/tests/kernel_halves.rs` keeps the ring's writers
+/// to this function and [`emit_sysctl_record`].
 #[inline(always)]
-pub(crate) fn emit_denial(operation: u8, key: InodeKey) {
+fn emit_denial(operation: u8, key: InodeKey) {
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
