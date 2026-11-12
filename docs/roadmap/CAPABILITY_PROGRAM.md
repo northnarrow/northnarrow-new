@@ -9250,9 +9250,9 @@ number in parentheses is a lab PR.
     record of the FORKER (`fork_parent_record`, BTF `sched_process_fork`,
     the exec record's `fork_ppid`), for R004's executor and BUG-49's PID 1
     rule alike — a webshell's double-forked orphan no longer passes; a
-    user's manager vouches only for what it forked for a packaged user unit
+    user's manager vouched only for what it forked for a packaged user unit
     (`nn_linux::user_units`: the desktop's terminal; never `systemd-run
-    --user`); the environment past 1 MiB fails closed; `PYTHONSTARTUP`,
+    --user` — withdrawn in re-check 3, below); the environment past 1 MiB fails closed; `PYTHONSTARTUP`,
     `ENV` only for an interpreter naming nothing, `NODE_OPTIONS` only with a
     loading option (node's table); node `--test-reporter`, python `-X
     pycache_prefix`, `PYTHONPYCACHEPREFIX`; `ROOT_DIR` only in PID 1's mount
@@ -9276,6 +9276,29 @@ number in parentheses is a lab PR.
     build cache freed); r4's 24.04 uninstall stopped after its plan (the
     guest powered off with the agent installed: booted again and
     uninstalled, nothing left).
+  - Re-check 3 of #539 (12/11, the coordinator's decisions 1–5): R004
+    exempts the exec of a deleted file that is PID 1's held executor by
+    its identity alone (no fork record needed: an upgrade's units start
+    even when the record was evicted); `fork_parent_record` skips a
+    thread's clone (`CLONE_THREAD`), its LRU map holds 65,536 records and
+    a lost record is counted (`fork_record_lost`, a ring-drop slot, in the
+    exec source's contract); on systemd ≥ 254 the executor's verified exec
+    carries its fork parent to the same process's next exec, once; the
+    user's manager vouches for nothing (the desktop's terminal is judged:
+    the cost accepted in observe-only alpha; lot 326 records the unit's
+    cgroup at its main exec); the ratchets read `concat!` of literals (the
+    syntax lints are lot 327). Gates on fc641f2d (eBPF changed): 108
+    suites, 4,824 passed, 0 failed, 32 ignored, clippy ×4, `golden` ×5
+    (63 files the same bytes), MSRV, the fuzz replay (14 targets),
+    portable-core (5). Mutations: 4 of the round's code, one (the carry
+    without its start check) survived and has its test — 75 with the
+    earlier rounds'. Lab, Ubuntu 24.04 (6.8.0-149, systemd 255): the
+    double-forked `sh -c` NN-L-IMP-001 (judged); the unit's `sh -c` drew
+    no record but neither did its control (not conclusive); the executor
+    replaced (PID 1 holding its unlinked copy) under a flood of 20,000
+    threads and a fork loop: 3 of 3 units ran, no R004, the lost records
+    counted (58) in the agent's journal; uninstalled, nothing left. 26.04
+    not rerun this round.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
