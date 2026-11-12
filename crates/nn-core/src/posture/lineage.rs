@@ -4821,12 +4821,13 @@ mod tests {
     /// record), then the unit's program. When that first exec is the
     /// executor by a VERIFIED identity, its fork parent goes on to the
     /// next exec of the same process — once; an exec of an unverified file,
-    /// a later exec, another process: none.
+    /// a later exec, another process (the pid reused: another start, or no
+    /// start known): none.
     #[test]
     fn the_executor_carries_its_fork_parent_to_the_unit_s_program() {
         use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
-        let exec =
-            |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32| Event::ProcessSpawn {
+        let started = |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32, start: u64| {
+            Event::ProcessSpawn {
                 pid,
                 ppid: 1,
                 uid: 0,
@@ -4837,7 +4838,7 @@ mod tests {
                 argv: vec![exe.into()],
                 parent_comm: String::new(),
                 parent_start_ns: 0,
-                start_ns: 5 * S,
+                start_ns: start,
                 parent_is_kthread: false,
                 exe: nn_model::ExeIdentity {
                     path: exe.into(),
@@ -4850,7 +4851,11 @@ mod tests {
                 argv_truncated: false,
                 filename_truncated: false,
                 stdio: Default::default(),
-            };
+            }
+        };
+        let exec = |pid: u32, exe: &str, ns: u64, id: (u64, u64), forker: u32| {
+            started(pid, exe, ns, id, forker, 5 * S)
+        };
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(proc.path());
         let images = crate::decision::rules::ExecutorImages::default();
@@ -4885,6 +4890,14 @@ mod tests {
         assert!(t.ingest_spawn_event(&exec(720, executor, 6 * S, (8, 100), 1)));
         assert!(t.ingest_spawn_event(&exec(720, "/usr/bin/dash", 7 * S, (8, 200), 4242)));
         assert_eq!(t.fork_parent(720, AsOf::Now), Some(4242));
+        // the pid reused: another process (another start) carries nothing
+        assert!(t.ingest_spawn_event(&exec(730, executor, 6 * S, (8, 100), 1)));
+        assert!(t.ingest_spawn_event(&started(730, "/usr/bin/dash", 9 * S, (8, 200), 0, 8 * S)));
+        assert_eq!(t.fork_parent(730, AsOf::Now), None, "another start");
+        // no start known: never the same process by assumption
+        assert!(t.ingest_spawn_event(&started(740, executor, 6 * S, (8, 100), 1, 0)));
+        assert!(t.ingest_spawn_event(&started(740, "/usr/bin/dash", 7 * S, (8, 200), 0, 0)));
+        assert_eq!(t.fork_parent(740, AsOf::Now), None, "no start known");
     }
 
     /// The re-check of #539 (N6): the start's scan reads an image's
