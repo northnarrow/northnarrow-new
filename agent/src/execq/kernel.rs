@@ -151,6 +151,13 @@ pub fn quiesce() -> bool {
     rc == 0
 }
 
+/// Lot 317 (review F5): whether the unstop of process `start_ns` removes the
+/// map's entry of its pid, which names the process started at `found`
+/// (`None`: no entry, nothing to keep) — only its own.
+pub(crate) fn unstop_removes(found: Option<u64>, start_ns: u64) -> bool {
+    found.is_none_or(|f| f == start_ns)
+}
+
 /// Lot 317 (review F2): `ExecqStopped::stop_ns` as the agent marks the map's
 /// entry of a held process whose kill it owes (the kernel writes its stop
 /// time there, never this): the next start kills the process instead of
@@ -162,11 +169,9 @@ impl Kernel {
     /// the one started at `start_ns` — a later holder of the pid, which the
     /// kernel holds in its turn, keeps its own.
     pub fn unstop(&mut self, pid: u32, start_ns: u64) {
-        match self.stopped.get(&pid, 0) {
-            Ok(v) if v.0.start_ns != start_ns => {}
-            _ => {
-                let _ = self.stopped.remove(&pid);
-            }
+        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
+        if unstop_removes(found, start_ns) {
+            let _ = self.stopped.remove(&pid);
         }
     }
 
@@ -283,6 +288,15 @@ pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 317 (review F5): an unstop removes the entry of its own process,
+    /// never the one a later holder of the pid has.
+    #[test]
+    fn an_unstop_removes_only_its_own_process() {
+        assert!(unstop_removes(Some(7), 7));
+        assert!(!unstop_removes(Some(8), 7), "a later holder of the pid");
+        assert!(unstop_removes(None, 7));
+    }
 
     /// Lot 317 (BUG-118): the stop's wait for the exec programs is the
     /// kernel's grace period (`membarrier` GLOBAL), not the fallback's
