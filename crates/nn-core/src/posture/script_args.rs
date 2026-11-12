@@ -2069,6 +2069,7 @@ mod tests {
         );
         unknown(node, &["node", "--title", "--trace-warnings", "/tmp/s"]);
         unknown(node, &["node", "-r", "-x", "/tmp/s"]);
+        unknown(node, &["node", "-C", "-x", "/tmp/s"]);
         unknown(node, &["node", "-p", "A", "--version"]);
         unknown(node, &["node", "--print", "A", "--require"]);
         unknown(ruby, &["ruby", "-E", "-W", "/tmp/s"]);
