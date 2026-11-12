@@ -64,6 +64,7 @@ counters!(
     skipped_source_changed,
     skipped_failed,
     skipped_unresolved_path,
+    copies_path_unverified,
     late_answered_by_backstop,
     queue_overflows,
     post_writes,

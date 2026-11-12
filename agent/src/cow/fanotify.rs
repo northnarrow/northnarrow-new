@@ -342,27 +342,42 @@ pub fn btime(fd: RawFd, name: Option<&str>) -> Option<i64> {
 }
 
 /// The path of an event descriptor (`/proc/self/fd/<fd>`, `st` its
-/// `fstat`), while that path still names the file. Lot 312 (external bug
-/// hunt 1.4, a BUG-90 variant): the kernel's ` (deleted)` suffix decided
-/// it, and a file still on disk whose name ends so — a ransomware renames
-/// `report.odt` to `report.odt (deleted)`, then rewrites it — was written
-/// without a copy (`skipped_unresolved_path`). Now: `None` once the inode
-/// has no name (`st_nlink == 0`), or when the name shown leads to another
-/// inode (the name removed while a hard link keeps it); otherwise the
-/// name, whatever it ends with.
-pub fn fd_path(fd: RawFd, st: &libc::stat) -> Option<String> {
+/// `fstat`), and whether that path was verified to name the file. Lot 312
+/// (external bug hunt 1.4, a BUG-90 variant): the kernel's ` (deleted)`
+/// suffix decided it, and a file still on disk whose name ends so — a
+/// ransomware renames `report.odt` to `report.odt (deleted)`, then rewrites
+/// it — was written without a copy (`skipped_unresolved_path`). Now: `None`
+/// once the inode has no name (`st_nlink == 0`: nothing to restore to);
+/// otherwise the name, verified by `(dev, ino)` on up to
+/// [`FD_PATH_TRIES`] tries — the review of #543 (F3): a rename racing a
+/// single try failed it one time in eight, and the write went on without
+/// a copy — and, when no try verifies it, the name shown, unverified: the
+/// copy is taken from the descriptor all the same (the content is the
+/// point; the path is what it is restored to).
+pub fn fd_path(fd: RawFd, st: &libc::stat) -> Option<(String, bool)> {
     use std::os::unix::fs::MetadataExt;
     if st.st_nlink == 0 {
         return None;
     }
-    let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
-    let s = p.to_str()?.to_string();
-    if !s.starts_with('/') {
-        return None;
+    let shown = || -> Option<(std::path::PathBuf, String)> {
+        let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+        let s = p.to_str()?.to_string();
+        s.starts_with('/').then_some((p, s))
+    };
+    for _ in 0..FD_PATH_TRIES {
+        let (p, s) = shown()?;
+        let same = crate::response::on_host_path(&p, |q| std::fs::symlink_metadata(q))
+            .is_ok_and(|m| m.dev() == st.st_dev && m.ino() == st.st_ino);
+        if same {
+            return Some((s, true));
+        }
     }
-    let m = crate::response::on_host_path(&p, |q| std::fs::symlink_metadata(q)).ok()?;
-    (m.dev() == st.st_dev && m.ino() == st.st_ino).then_some(s)
+    shown().map(|(_, s)| (s, false))
 }
+
+/// Lot 312 (review of #543, F3): tries of [`fd_path`]'s verification
+/// before the name shown is taken unverified.
+pub const FD_PATH_TRIES: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -608,8 +623,10 @@ mod tests {
     }
 
     /// Lot 312 (BUG-90 variant in the copy-on-first-write guard): a file on
-    /// disk named `… (deleted)` has its path; a file with no name left, or
-    /// whose name was removed while a hard link keeps it, has none.
+    /// disk named `… (deleted)` has its path, verified; a file with no name
+    /// left has none; a name removed while a hard link keeps the file — a
+    /// decoy at the very name shown or not — is the shown name, UNVERIFIED
+    /// (the copy is still taken, from the descriptor).
     #[test]
     fn bug90_variant_a_file_named_deleted_keeps_its_path() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -618,29 +635,78 @@ mod tests {
         let f = std::fs::File::open(&named).unwrap();
         let st = fstat(f.as_raw_fd()).unwrap();
         assert_eq!(
-            fd_path(f.as_raw_fd(), &st).as_deref(),
-            Some(named.to_str().unwrap()),
+            fd_path(f.as_raw_fd(), &st),
+            Some((named.to_str().unwrap().to_string(), true)),
             "BUG-90 variant: a file still on disk"
         );
-        // its name removed, another hard link keeps it: no path to restore to
-        // — not even with a decoy at the very name the kernel shows
+        // its name removed, another hard link keeps it
         let keep = tmp.path().join(".keep");
         std::fs::hard_link(&named, &keep).unwrap();
         std::fs::remove_file(&named).unwrap();
         let st = fstat(f.as_raw_fd()).unwrap();
-        assert_eq!(fd_path(f.as_raw_fd(), &st), None);
         let shown = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
-        std::fs::write(&shown, b"decoy").unwrap();
         assert_eq!(
             fd_path(f.as_raw_fd(), &st),
-            None,
-            "the decoy is not the file"
+            Some((shown.to_str().unwrap().to_string(), false))
         );
+        // a decoy at the very name shown is not the file
+        std::fs::write(&shown, b"decoy").unwrap();
+        assert_eq!(fd_path(f.as_raw_fd(), &st).map(|(_, v)| v), Some(false));
         std::fs::remove_file(&shown).unwrap();
         // no name left at all
         std::fs::remove_file(&keep).unwrap();
         let st = fstat(f.as_raw_fd()).unwrap();
         assert_eq!(st.st_nlink, 0);
         assert_eq!(fd_path(f.as_raw_fd(), &st), None);
+    }
+
+    /// Review of #543 (F3): a rename racing the verification (a thread
+    /// exchanging the file with a dummy, as a ransomware may) never makes
+    /// the guard skip the copy: every call answers a path, verified or
+    /// not; and three tries verify it far more often than one.
+    #[test]
+    fn review_f3_a_rename_race_never_skips_the_copy() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::write(&a, b"victim").unwrap();
+        std::fs::write(&b, b"dummy").unwrap();
+        let f = std::fs::File::open(&a).unwrap();
+        let st = fstat(f.as_raw_fd()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = stop.clone();
+            let ca = std::ffi::CString::new(a.as_os_str().as_bytes()).unwrap();
+            let cb = std::ffi::CString::new(b.as_os_str().as_bytes()).unwrap();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: two NUL-terminated paths; renameat2 reads them.
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            libc::AT_FDCWD,
+                            ca.as_ptr(),
+                            libc::AT_FDCWD,
+                            cb.as_ptr(),
+                            libc::RENAME_EXCHANGE,
+                        )
+                    };
+                }
+            })
+        };
+        let (mut none, mut unverified) = (0, 0);
+        for _ in 0..2000 {
+            match fd_path(f.as_raw_fd(), &st) {
+                None => none += 1,
+                Some((_, false)) => unverified += 1,
+                Some((_, true)) => {}
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(none, 0, "a racing rename never skips the copy");
+        assert!(unverified < 200, "{unverified} of 2000 unverified");
     }
 }

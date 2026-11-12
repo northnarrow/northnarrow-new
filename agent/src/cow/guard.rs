@@ -618,9 +618,14 @@ impl Runtime {
         if info.trust.is_trusted() {
             return self.allow_fast(fd, read_at, &s.allowed_trusted);
         }
-        let Some(path) = fd_path(fd.as_raw_fd(), &st) else {
+        let Some((path, verified)) = fd_path(fd.as_raw_fd(), &st) else {
             return self.allow_fast(fd, read_at, &s.skipped_unresolved_path);
         };
+        // lot 312 (review of #543, F3): a name a racing rename kept from
+        // being verified: the copy is taken from the descriptor all the same
+        if !verified {
+            Stats::bump(&s.copies_path_unverified);
+        }
         let cfg = &self.store.cfg;
         let Some(scope) = cfg.scope_of(Path::new(&path)) else {
             return self.allow_fast(fd, read_at, &s.allowed_outside_scope);

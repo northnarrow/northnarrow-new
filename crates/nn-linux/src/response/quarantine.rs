@@ -1242,6 +1242,7 @@ const REMOVE_TRIES: usize = 8;
 /// spent. Lot 312: once no name of it is left to verify
 /// ([`Removal::NoNameLeft`]), the caller reads the inode back — it is gone,
 /// or another name holds it.
+#[cfg(test)]
 fn remove_held(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<Removal, QuarantineError> {
     remove_held_with(handle, cfg, &|| {})
 }
