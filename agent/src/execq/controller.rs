@@ -31,7 +31,7 @@ use super::policy::{decide, Action, Basis, Gate, Next, Outcome, Policy};
 use super::record::{evidence, ExecqRecord};
 use super::{kernel, SpawnLedger, AUDIT_OP, COUNTERS, HEARTBEAT_EVERY};
 use crate::response::config::ExecutorConfig;
-use crate::response::proc_ref::ProcRef;
+use crate::response::proc_ref::{Liveness, ProcRef};
 
 /// How long an expired decision still waits for its scan verdict (a late
 /// block-list hit kills the process then).
@@ -49,10 +49,19 @@ pub trait KernelIo {
     fn drain(&mut self, out: &mut Vec<ExecqStopRaw>);
     fn beat(&mut self, ns: u64);
     fn remember(&mut self, key: ExecqKey, v: ExecqKnown);
-    fn unstop(&mut self, pid: u32);
+    /// Lot 317 (review F5): the map's entry of process `pid` started at
+    /// `start_ns` goes — not one a later holder of the pid has.
+    fn unstop(&mut self, pid: u32, start_ns: u64);
+    /// Lot 317 (review F2): the map's entry of that process says its kill
+    /// is owed ([`kernel::KILL_OWED`]): the next start kills it.
+    fn owe_kill(&mut self, pid: u32, start_ns: u64);
     fn stopped(&self) -> Vec<(u32, ExecqStopped)>;
     fn set_roots(&mut self, roots: &[(ExecqKey, u32)]);
     fn counters(&self) -> [u64; counter::SLOTS as usize];
+    /// Lot 317 (BUG-118): return once every run of the kernel's programs
+    /// that read the heartbeat before it was cleared has ended — the stop
+    /// it decided is in [`Self::stopped`] by then.
+    fn quiesce(&mut self);
 }
 
 impl KernelIo for kernel::Kernel {
@@ -78,8 +87,11 @@ impl KernelIo for kernel::Kernel {
             .known
             .insert(kernel::AyaKey(key), kernel::AyaKnown(v), 0);
     }
-    fn unstop(&mut self, pid: u32) {
-        let _ = self.stopped.remove(&pid);
+    fn unstop(&mut self, pid: u32, start_ns: u64) {
+        kernel::Kernel::unstop(self, pid, start_ns)
+    }
+    fn owe_kill(&mut self, pid: u32, start_ns: u64) {
+        kernel::Kernel::owe_kill(self, pid, start_ns)
     }
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
         self.stopped
@@ -93,6 +105,11 @@ impl KernelIo for kernel::Kernel {
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         kernel::Kernel::counters(self)
+    }
+    fn quiesce(&mut self) {
+        if !kernel::quiesce() {
+            debug!("exec quarantine stop: membarrier refused — waited a fixed time instead");
+        }
     }
 }
 
@@ -201,6 +218,42 @@ impl Pending {
     }
 }
 
+/// How the controller captures a process the kernel holds: its pid and
+/// the start the kernel reported (production: [`ProcRef::open_started_at`];
+/// tests: a capture that fails as one out of descriptors does).
+pub type Capture = Box<dyn FnMut(u32, u64) -> ProcRef + Send>;
+
+/// Lot 317 (BUG-124): what process `p` holds is now. A reference whose
+/// capture failed — `pidfd_open` out of descriptors or memory, a failure
+/// of the agent's, which passes — is captured again; while that fails the
+/// process may still run, held: [`Liveness::Uncaptured`], never an exit.
+fn recheck(capture: &mut Capture, p: &mut Pending) -> Liveness {
+    if let Liveness::Uncaptured(_) = p.proc_ref.liveness() {
+        p.proc_ref = capture(p.raw.pid, p.raw.start_ns);
+    }
+    p.proc_ref.liveness()
+}
+
+/// Lot 317 (BUG-124): a decision on a process the kernel holds that could
+/// not be carried out — the process could not be captured. Its pid stays
+/// in `EXECQ_STOPPED` (the process stays held) and the decision is retried
+/// at every pass until the process is captured or has ended; an agent that
+/// stops first leaves it there, and the next start resumes it.
+struct Owed {
+    pid: u32,
+    start_ns: u64,
+    /// [`Action::Resume`] or [`Action::Kill`].
+    action: Action,
+    /// The candidate's path (the kill's signed intent names it).
+    path: String,
+    /// Why it is held: the record's decision, or a stop a previous agent
+    /// left.
+    origin: &'static str,
+    since: Instant,
+    /// The last capture's error.
+    errno: i32,
+}
+
 /// Clean digests, bounded (oldest out).
 #[derive(Default)]
 struct KnownSet {
@@ -249,8 +302,13 @@ pub struct Controller<K: KernelIo, B: Backend> {
     /// The kernel's fail-open counts already reported (the events ring
     /// full, the stop signal refused) and when: one signed degradation per
     /// [`DEGRADED_EVERY`] at most, with the counts since the previous one.
-    fail_open_seen: (u64, u64),
+    fail_open_seen: (u64, u64, u64),
     fail_open_at: Option<Instant>,
+    /// Lot 317 (BUG-124): how a held process is captured.
+    capture: Capture,
+    /// Lot 317 (BUG-124): the decisions not carried out yet, their process
+    /// not captured ([`Owed`]).
+    owed: Vec<Owed>,
 }
 
 /// One signed scanner degradation per cause at most this often.
@@ -293,8 +351,10 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
-            fail_open_seen: (0, 0),
+            fail_open_seen: (0, 0, 0),
             fail_open_at: None,
+            capture: Box::new(ProcRef::open_started_at),
+            owed: Vec::new(),
         }
     }
 
@@ -322,6 +382,21 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         }
     }
 
+    /// Lot 317 (review F6): a `debug-trigger` build's
+    /// `NN_DEBUG_EXECQ_PAUSE_READS=<file>` (the lab's privileged e2e, never a
+    /// release): while that file exists the ring is not read — the
+    /// heartbeat beats on, so the kernel stops processes whose report the
+    /// agent does not read: the window of BUG-118, held open from before
+    /// the stop is asked (the stop's own 2 s budget untouched). With
+    /// `NN_DEBUG_EXECQ_STOP_NO_LAST_READ=1` the stop's last read of the
+    /// ring is skipped too ([`Self::stop_all`]), so that the map alone names
+    /// them.
+    #[cfg(feature = "debug-trigger")]
+    fn debug_reads_paused() -> bool {
+        std::env::var_os("NN_DEBUG_EXECQ_PAUSE_READS")
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+    }
+
     /// One pass: heartbeat, scanner, ring, dispatch, decisions. Returns
     /// when the next pass is due at the latest.
     pub fn step(&mut self, now: Instant) -> Instant {
@@ -339,12 +414,16 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 c[counter::OBSERVED as usize]
                     + c[counter::STALE as usize]
                     + c[counter::RING_FULL as usize]
-                    + c[counter::SIGNAL_FAILED as usize],
+                    + c[counter::SIGNAL_FAILED as usize]
+                    + c[counter::MAP_FULL as usize],
                 Ordering::Relaxed,
             );
             self.report_fail_open(
-                c[counter::RING_FULL as usize],
-                c[counter::SIGNAL_FAILED as usize],
+                [
+                    c[counter::RING_FULL as usize],
+                    c[counter::SIGNAL_FAILED as usize],
+                    c[counter::MAP_FULL as usize],
+                ],
                 now,
             );
         }
@@ -370,11 +449,18 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             self.on_scanner(ev, now);
         }
         let mut raws = Vec::new();
-        self.k.drain(&mut raws);
+        #[cfg(feature = "debug-trigger")]
+        let read = !Self::debug_reads_paused();
+        #[cfg(not(feature = "debug-trigger"))]
+        let read = true;
+        if read {
+            self.k.drain(&mut raws);
+        }
         for raw in raws {
             self.on_stop(raw, now);
         }
         self.dispatch(now);
+        self.pay_owed(now);
         self.progress(now)
     }
 
@@ -432,7 +518,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         } else {
             String::new()
         };
-        let proc_ref = ProcRef::open_started_at(raw.pid, raw.start_ns);
+        let proc_ref = (self.capture)(raw.pid, raw.start_ns);
         let (file, target, unreachable) = open_target(&raw, &path, proc_ref.has_fd());
         let mut notes = Vec::new();
         let stamp_ok = file
@@ -452,13 +538,15 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 PkgOutcome::NotOwned | PkgOutcome::Skipped => {}
             }
         }
-        let alive = proc_ref.is_live();
+        // Lot 317 (BUG-124): only a process that ended has no verdict of the
+        // rules to wait for — one not captured may still run, held.
+        let gone = proc_ref.liveness() == Liveness::Gone;
         let gate = Gate {
             since: now,
             budget: self.s.budget,
             stopped: held,
             verdict: basis.is_some(),
-            spawn_judged: !held || !alive || self.ledger.check(raw.pid, raw.start_ns),
+            spawn_judged: !held || gone || self.ledger.check(raw.pid, raw.start_ns),
         };
         debug!(
             pid = raw.pid,
@@ -616,10 +704,13 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// events ring was full (or the stop signal was refused) is fail-open —
     /// never scanned. It was counted only (`not_held`, ring-drop slot
     /// `execq`); it is a signed degradation too, at most one per
-    /// [`DEGRADED_EVERY`], with the counts since the previous one.
-    fn report_fail_open(&mut self, ring_full: u64, signal_failed: u64, now: Instant) {
-        let (ring0, sig0) = self.fail_open_seen;
-        if ring_full <= ring0 && signal_failed <= sig0 {
+    /// [`DEGRADED_EVERY`], with the counts since the previous one. Lot 317
+    /// (review F3): and one the map of stopped processes could not name
+    /// (`MAP_FULL`: the kernel stops only a process the map names).
+    fn report_fail_open(&mut self, counts: [u64; 3], now: Instant) {
+        let [ring_full, signal_failed, map_full] = counts;
+        let (ring0, sig0, map0) = self.fail_open_seen;
+        if ring_full <= ring0 && signal_failed <= sig0 && map_full <= map0 {
             return;
         }
         if self
@@ -630,18 +721,20 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         }
         let ring = ring_full.saturating_sub(ring0);
         let sig = signal_failed.saturating_sub(sig0);
+        let map = map_full.saturating_sub(map0);
         warn!(
             ring_full = ring,
             signal_failed = sig,
+            map_full = map,
             "exec quarantine fail-open: execs ran without being held"
         );
         self.r.degraded(&format!(
             "exec quarantine fail-open: {} exec(s) ran without being held or scanned since the \
              previous record — the events ring was full for {ring} (ring-drop slot execq), the \
-             stop signal was refused for {sig}",
-            ring + sig
+             stop signal was refused for {sig}, the map of stopped processes was full for {map}",
+            ring + sig + map
         ));
-        self.fail_open_seen = (ring_full, signal_failed);
+        self.fail_open_seen = (ring_full, signal_failed, map_full);
         self.fail_open_at = Some(now);
     }
 
@@ -712,7 +805,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 continue;
             }
             if !p.gate.spawn_judged
-                && (self.ledger.check(p.raw.pid, p.raw.start_ns) || !p.proc_ref.is_live())
+                && (self.ledger.check(p.raw.pid, p.raw.start_ns)
+                    || recheck(&mut self.capture, p) == Liveness::Gone)
             {
                 p.gate.spawn_judged = true;
             }
@@ -812,74 +906,217 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// Resume or kill (and quarantine); the record's `response`.
     fn carry_out(&mut self, id: u64, o: &Outcome) -> String {
         let enforce = self.s.policy.enforce;
+        // Lot 317 (BUG-124): a process that could not be captured is
+        // captured again; one that still cannot be is not one that ended.
+        let liveness = match self.entries.get_mut(&id) {
+            Some(p) => recheck(&mut self.capture, p),
+            None => return "none".into(),
+        };
         let Some(p) = self.entries.get(&id) else {
             return "none".into();
         };
         let was_held = p.held();
         let late = p.late_until.is_some();
-        let held = was_held && !late;
-        let alive = p.proc_ref.is_live();
         let pid = p.raw.pid;
+        let start_ns = p.raw.start_ns;
+        // Lot 317 (review F1): a process whose resume is still owed is
+        // still held — the default policy's resume never reached it — so a
+        // late verdict acts on a held process: its kill is owed in turn,
+        // never "failed" while the owed resume would let it run
+        let had_owed = self
+            .owed
+            .iter()
+            .position(|o| o.pid == pid && o.start_ns == start_ns);
+        let held = was_held && (!late || had_owed.is_some());
+        // the capture's error when the decision is owed (the process stays
+        // held, the decision retried)
+        let mut owed = None;
         let mut out = if !enforce && o.refused {
             "observe: would refuse at exec (not held, the script ran)".to_string()
         } else if !enforce {
             format!("observe: would {} (not held)", o.action.as_str())
         } else {
-            match o.action {
-                Action::Resume if late => "running (resumed by the default policy)".to_string(),
-                Action::Resume if !held => {
+            match (o.action, liveness) {
+                (Action::Resume, _) if late => {
+                    "running (resumed by the default policy)".to_string()
+                }
+                (Action::Resume, _) if !held => {
                     format!("not held ({}): ran unstopped", not_held_reason(&p.raw))
                 }
-                Action::Resume if !alive => {
+                (Action::Resume, Liveness::Gone) => {
                     "ended while held (the rule engine's response, or a signal from elsewhere)"
                         .to_string()
                 }
-                Action::Resume => match p.proc_ref.signal(libc::SIGCONT) {
-                    Ok(()) => {
-                        COUNTERS.resumed.fetch_add(1, Ordering::Relaxed);
-                        "resumed".to_string()
-                    }
-                    Err(e) => format!("resume failed: {e}"),
-                },
-                Action::Kill if !alive => "already ended".to_string(),
-                Action::Kill => {
-                    // R12c (lab PR 270): the kill's signed intent first.
+                (Action::Resume, Liveness::Uncaptured(errno)) => {
+                    owed = Some(errno);
+                    format!(
+                        "resume deferred: the process could not be captured ({}); it stays \
+                         held and is resumed as soon as it can be",
+                        std::io::Error::from_raw_os_error(errno)
+                    )
+                }
+                (Action::Resume, Liveness::Live) => resume(&p.proc_ref),
+                (Action::Kill, Liveness::Gone) => "already ended".to_string(),
+                (Action::Kill, Liveness::Uncaptured(errno)) => {
+                    // R12c: the attempt is an action like any other — its
+                    // signed intent, and the failure
                     let intent = self.intent("KillProcess", pid, &p.path);
-                    match p.proc_ref.signal(libc::SIGKILL) {
-                        Ok(()) => {
-                            COUNTERS.killed.fetch_add(1, Ordering::Relaxed);
-                            let text = if held {
-                                "killed while held".to_string()
-                            } else {
-                                "killed".to_string()
-                            };
-                            intent.finish(
-                                crate::response::journal::ActionResult::Success,
-                                text.clone(),
-                                None,
-                            );
-                            text
-                        }
-                        Err(e) => {
-                            intent.finish(
-                                crate::response::journal::ActionResult::Failure,
-                                "kill failed".to_string(),
-                                Some(e.to_string()),
-                            );
-                            format!("kill failed: {e}")
-                        }
+                    let why = std::io::Error::from_raw_os_error(errno);
+                    intent.finish(
+                        crate::response::journal::ActionResult::Failure,
+                        "the process could not be captured".to_string(),
+                        Some(why.to_string()),
+                    );
+                    if held {
+                        owed = Some(errno);
+                        format!(
+                            "kill deferred: the process could not be captured ({why}); it \
+                             stays held and is killed as soon as it can be"
+                        )
+                    } else {
+                        format!("kill failed: the process could not be captured ({why})")
                     }
                 }
+                (Action::Kill, Liveness::Live) => self.kill(&p.proc_ref, pid, &p.path, held).1,
             }
         };
+        let path = p.path.clone();
+        match (owed, had_owed) {
+            // a decision on a process whose decision was owed takes its
+            // place (a late kill replaces the owed resume)
+            (Some(errno), Some(i)) => {
+                let o2 = &mut self.owed[i];
+                o2.action = o.action;
+                o2.path = path;
+                o2.errno = errno;
+            }
+            (Some(errno), None) => self.owed.push(Owed {
+                pid,
+                start_ns,
+                action: o.action,
+                path,
+                origin: "decided",
+                since: Instant::now(),
+                errno,
+            }),
+            // carried out (killed, or ended): nothing owed any more
+            (None, Some(i)) if held => {
+                self.owed.remove(i);
+            }
+            _ => {}
+        }
+        // Lot 317 (review F2): a kill owed is written into the pinned map,
+        // so that the next start kills the process instead of resuming it
+        if owed.is_some() && o.action == Action::Kill {
+            self.k.owe_kill(pid, start_ns);
+        }
         if enforce && o.action == Action::Kill && o.quarantine {
             out.push_str("; ");
             out.push_str(&self.quarantine(id));
         }
-        if was_held && !late {
-            self.k.unstop(pid);
+        // an owed decision keeps the process in the kernel's map: the next
+        // start resumes it — or kills it, its kill owed — if this agent
+        // stops first
+        if held && owed.is_none() {
+            self.k.unstop(pid, start_ns);
         }
         out
+    }
+
+    /// Lot 317 (review F1): the verdict an entry of process `(pid,
+    /// start_ns)` holds asks for its kill (a block-list hit, a suspicious
+    /// verdict the policy kills): an owed resume must not run it.
+    fn verdict_kills(&self, pid: u32, start_ns: u64) -> bool {
+        self.entries.values().any(|p| {
+            p.raw.pid == pid
+                && p.raw.start_ns == start_ns
+                && p.scan.as_ref().is_some_and(|r| {
+                    decide(&self.s.policy, &Basis::Scanned(r.verdict)).action == Action::Kill
+                })
+        })
+    }
+
+    /// The kill of a captured process, with its signed intent (R12c, lab PR
+    /// 270) and outcome: whether the signal was delivered, and the response.
+    fn kill(&self, pr: &ProcRef, pid: u32, path: &str, held: bool) -> (bool, String) {
+        let intent = self.intent("KillProcess", pid, path);
+        match pr.signal(libc::SIGKILL) {
+            Ok(()) => {
+                COUNTERS.killed.fetch_add(1, Ordering::Relaxed);
+                let text = if held {
+                    "killed while held".to_string()
+                } else {
+                    "killed".to_string()
+                };
+                intent.finish(
+                    crate::response::journal::ActionResult::Success,
+                    text.clone(),
+                    None,
+                );
+                (true, text)
+            }
+            Err(e) => {
+                intent.finish(
+                    crate::response::journal::ActionResult::Failure,
+                    "kill failed".to_string(),
+                    Some(e.to_string()),
+                );
+                (false, format!("kill failed: {e}"))
+            }
+        }
+    }
+
+    /// Lot 317 (BUG-124): the decisions owed to held processes that could
+    /// not be captured ([`Owed`]), retried. A process captured now gets its
+    /// decision and leaves the kernel's map; one that has ended leaves the
+    /// map; one still not captured stays held for the next pass. Each one
+    /// carried out is a signed `exec_quarantine` entry (`deferred`).
+    fn pay_owed(&mut self, now: Instant) {
+        if self.owed.is_empty() {
+            return;
+        }
+        for mut o in std::mem::take(&mut self.owed) {
+            // review F1: a resume owed to a process a verdict since asks to
+            // kill is a kill — the binary never runs
+            if o.action == Action::Resume && self.verdict_kills(o.pid, o.start_ns) {
+                o.action = Action::Kill;
+                self.k.owe_kill(o.pid, o.start_ns);
+            }
+            let pr = (self.capture)(o.pid, o.start_ns);
+            let result = match pr.liveness() {
+                Liveness::Uncaptured(errno) => {
+                    o.errno = errno;
+                    self.owed.push(o);
+                    continue;
+                }
+                Liveness::Gone => "ended before it could be captured".to_string(),
+                Liveness::Live => match o.action {
+                    Action::Kill => self.kill(&pr, o.pid, &o.path, true).1,
+                    Action::Resume => resume(&pr),
+                },
+            };
+            self.k.unstop(o.pid, o.start_ns);
+            info!(
+                pid = o.pid,
+                action = o.action.as_str(),
+                result = %result,
+                "exec quarantine: a decision deferred for a process not captured, carried out"
+            );
+            self.r.audit(
+                serde_json::json!({
+                    "kind": "deferred",
+                    "detail": "a decision on a held process that could not be captured, \
+                               carried out once it could be",
+                    "pid": o.pid,
+                    "action": o.action.as_str(),
+                    "origin": o.origin,
+                    "result": result,
+                    "waited_ms": now.saturating_duration_since(o.since).as_millis() as u64,
+                    "op": AUDIT_OP,
+                }),
+                "success",
+            );
+        }
     }
 
     fn quarantine(&mut self, id: u64) -> String {
@@ -1040,68 +1277,301 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
 
     // ── boot and stop ────────────────────────────────────────────────
 
-    /// Resume what an agent that died left stopped.
+    /// Resume what an agent that died left stopped. Lot 317 (BUG-124): a
+    /// process that cannot be captured now is not counted gone — it stays
+    /// in the map, held, and its resume is owed ([`Self::pay_owed`]). Lot
+    /// 317 (review F2): a process whose kill the previous agent owed (its
+    /// map entry marked [`kernel::KILL_OWED`]) is killed, never resumed.
     fn recover(&mut self) {
         let left = self.k.stopped();
         if left.is_empty() {
             return;
         }
         let mut resumed = Vec::new();
+        let mut killed = Vec::new();
         let mut gone = 0u64;
+        let mut deferred = Vec::new();
+        let now = Instant::now();
         for (pid, st) in &left {
-            let pr = ProcRef::open_started_at(*pid, st.start_ns);
-            if pr.is_live() && pr.signal(libc::SIGCONT).is_ok() {
-                resumed.push(*pid);
-            } else {
-                gone += 1;
+            let kill = st.stop_ns == kernel::KILL_OWED;
+            let pr = (self.capture)(*pid, st.start_ns);
+            match pr.liveness() {
+                Liveness::Uncaptured(errno) => {
+                    deferred.push(*pid);
+                    self.owed.push(Owed {
+                        pid: *pid,
+                        start_ns: st.start_ns,
+                        action: if kill { Action::Kill } else { Action::Resume },
+                        path: String::new(),
+                        origin: if kill {
+                            "a kill a previous agent owed"
+                        } else {
+                            "left stopped by a previous agent"
+                        },
+                        since: now,
+                        errno,
+                    });
+                    continue;
+                }
+                Liveness::Live if kill => {
+                    if self.kill(&pr, *pid, LEFT_BY_A_PREVIOUS_AGENT, true).0 {
+                        killed.push(*pid);
+                    } else {
+                        gone += 1;
+                    }
+                }
+                Liveness::Live if pr.signal(libc::SIGCONT).is_ok() => resumed.push(*pid),
+                Liveness::Live | Liveness::Gone => gone += 1,
             }
-            self.k.unstop(*pid);
+            self.k.unstop(*pid, st.start_ns);
         }
         COUNTERS
             .recovered
             .fetch_add(resumed.len() as u64, Ordering::Relaxed);
         warn!(
             resumed = resumed.len(),
-            gone, "exec quarantine: processes left stopped by the previous agent resumed"
+            killed = killed.len(),
+            gone,
+            deferred = deferred.len(),
+            "exec quarantine: processes left stopped by the previous agent resumed"
         );
         self.r.audit(
             serde_json::json!({
                 "kind": "recovered_at_boot",
-                "detail": "held by an agent that exited before deciding; resumed undecided",
+                "detail": "held by an agent that exited before deciding; resumed undecided \
+                           (a kill it owed: killed)",
                 "resumed": resumed,
+                // lot 317 (review F2): the kills the previous agent owed
+                "killed": killed,
                 "gone": gone,
+                // lot 317: not captured yet — still held, carried out once they are
+                "deferred": deferred,
                 "op": AUDIT_OP,
             }),
             "success",
         );
     }
 
-    /// The agent stops: resume every held process, clear the heartbeat.
-    fn stop_all(&mut self) {
-        self.k.beat(0);
-        let mut resumed = Vec::new();
-        let ids: Vec<u64> = self.entries.keys().copied().collect();
-        for id in ids {
-            if let Some(p) = self.entries.remove(&id) {
-                if p.held() && p.late_until.is_none() {
-                    if p.proc_ref.signal(libc::SIGCONT).is_ok() {
-                        resumed.push(p.raw.pid);
-                    }
-                    self.k.unstop(p.raw.pid);
+    /// Resume one process the kernel holds without an entry of this run
+    /// (stopped after the ring's last read, or left by a previous agent):
+    /// its kill if the map says one is owed. `None`: not captured, left in
+    /// the map for the next start.
+    fn release_unreported(&mut self, pid: u32, start_ns: u64, kill: bool) -> Option<Released> {
+        let pr = (self.capture)(pid, start_ns);
+        let r = match pr.liveness() {
+            Liveness::Uncaptured(_) => return None,
+            Liveness::Live if kill => {
+                if self.kill(&pr, pid, LEFT_BY_A_PREVIOUS_AGENT, true).0 {
+                    Released::Killed
+                } else {
+                    Released::Gone
                 }
             }
+            Liveness::Live if pr.signal(libc::SIGCONT).is_ok() => Released::Resumed,
+            Liveness::Live | Liveness::Gone => Released::Gone,
+        };
+        self.k.unstop(pid, start_ns);
+        Some(r)
+    }
+
+    /// The agent stops: every held process resumed, the heartbeat cleared.
+    ///
+    /// Lot 317 (BUG-118): what the kernel holds without an entry too — a
+    /// process stopped after the ring's last read. The heartbeat is cleared
+    /// first, then every program run that read it has ended
+    /// ([`KernelIo::quiesce`]); the ring is read a last time (review F3,
+    /// F7: a report the quiesce could not wait for — `membarrier` returns
+    /// at once on a single CPU); then the entries are resumed, the owed
+    /// decisions carried out (a kill still kills, and a resume a verdict
+    /// since asks to kill is a kill), the reports of the last read and the
+    /// rest of `EXECQ_STOPPED` resumed — each process keyed by its pid and
+    /// start (review F5: a reused pid neither hides nor releases another
+    /// process). A process that cannot be captured (BUG-124) stays in the
+    /// pinned map, held, its kill marked if one is owed: the next start
+    /// resumes it, or kills it.
+    fn stop_all(&mut self) {
+        self.k.beat(0);
+        self.k.quiesce();
+        let mut last = Vec::new();
+        #[cfg(feature = "debug-trigger")]
+        let read_last = std::env::var("NN_DEBUG_EXECQ_STOP_NO_LAST_READ").as_deref() != Ok("1");
+        #[cfg(not(feature = "debug-trigger"))]
+        let read_last = true;
+        if read_last {
+            self.k.drain(&mut last);
         }
-        if !resumed.is_empty() {
+        let mut resumed = Vec::new();
+        let mut killed = Vec::new();
+        let mut left = Vec::new();
+        let mut unreported = Vec::new();
+        let mut recaptured = Vec::new();
+        let mut seen: HashSet<(u32, u64)> = HashSet::new();
+        // review F1: the owed resumes a verdict since asks to kill (read
+        // before the entries go)
+        let kill_verdicts: HashSet<(u32, u64)> = self
+            .owed
+            .iter()
+            .filter(|o| o.action == Action::Resume && self.verdict_kills(o.pid, o.start_ns))
+            .map(|o| (o.pid, o.start_ns))
+            .collect();
+        // the processes held for a decision
+        for (_, mut p) in std::mem::take(&mut self.entries) {
+            if !p.held() || p.late_until.is_some() {
+                continue;
+            }
+            seen.insert((p.raw.pid, p.raw.start_ns));
+            if self
+                .owed
+                .iter()
+                .any(|o| o.pid == p.raw.pid && o.start_ns == p.raw.start_ns)
+            {
+                continue; // its decision is owed: below
+            }
+            // the re-check of #541 (N1): a verdict that asks for the kill —
+            // the scan answered, the rules' verdict on the exec still awaited
+            // — is carried out at the stop, as for an owed resume: never a
+            // resume undecided
+            let kill = p.scan.as_ref().is_some_and(|r| {
+                decide(&self.s.policy, &Basis::Scanned(r.verdict)).action == Action::Kill
+            });
+            let was_uncaptured = matches!(p.proc_ref.liveness(), Liveness::Uncaptured(_));
+            match recheck(&mut self.capture, &mut p) {
+                Liveness::Uncaptured(_) => {
+                    if kill {
+                        self.k.owe_kill(p.raw.pid, p.raw.start_ns);
+                    }
+                    left.push(p.raw.pid);
+                    continue;
+                }
+                Liveness::Live if kill => {
+                    if self.kill(&p.proc_ref, p.raw.pid, &p.path, true).0 {
+                        killed.push(p.raw.pid);
+                    }
+                }
+                Liveness::Live if p.proc_ref.signal(libc::SIGCONT).is_ok() => {
+                    resumed.push(p.raw.pid);
+                    if was_uncaptured {
+                        recaptured.push(p.raw.pid);
+                    }
+                }
+                Liveness::Live | Liveness::Gone => {}
+            }
+            self.k.unstop(p.raw.pid, p.raw.start_ns);
+        }
+        // the decisions owed, carried out on the processes captured now
+        for mut o in std::mem::take(&mut self.owed) {
+            seen.insert((o.pid, o.start_ns));
+            if kill_verdicts.contains(&(o.pid, o.start_ns)) {
+                o.action = Action::Kill;
+            }
+            let pr = (self.capture)(o.pid, o.start_ns);
+            match (pr.liveness(), o.action) {
+                (Liveness::Uncaptured(_), action) => {
+                    // a kill owed is marked in the map since it was owed;
+                    // one a verdict turns into a kill only now is marked here
+                    if action == Action::Kill && kill_verdicts.contains(&(o.pid, o.start_ns)) {
+                        self.k.owe_kill(o.pid, o.start_ns);
+                    }
+                    left.push(o.pid);
+                    continue;
+                }
+                (Liveness::Live, Action::Kill) => {
+                    if self.kill(&pr, o.pid, &o.path, true).0 {
+                        killed.push(o.pid)
+                    }
+                }
+                (Liveness::Live, Action::Resume) => {
+                    if pr.signal(libc::SIGCONT).is_ok() {
+                        resumed.push(o.pid)
+                    }
+                }
+                (Liveness::Gone, _) => {}
+            }
+            self.k.unstop(o.pid, o.start_ns);
+        }
+        // BUG-118: what the kernel holds without an entry — the reports of
+        // the last read, then the map (a kill a previous agent owed, too)
+        let mut unentered: Vec<(u32, u64, bool)> = last
+            .iter()
+            .filter(|r| r.stopped() && r.flags & stop_flags::SCRIPT_REFUSED == 0)
+            .map(|r| (r.pid, r.start_ns, false))
+            .collect();
+        unentered.extend(
+            self.k
+                .stopped()
+                .into_iter()
+                .map(|(pid, st)| (pid, st.start_ns, st.stop_ns == kernel::KILL_OWED)),
+        );
+        for (pid, start_ns, kill) in unentered {
+            if !seen.insert((pid, start_ns)) {
+                continue;
+            }
+            match self.release_unreported(pid, start_ns, kill) {
+                None => {
+                    left.push(pid);
+                }
+                Some(Released::Resumed) => {
+                    resumed.push(pid);
+                    unreported.push(pid);
+                }
+                Some(Released::Killed) => killed.push(pid),
+                Some(Released::Gone) => {}
+            }
+        }
+        if !left.is_empty() {
+            warn!(
+                left = ?left,
+                "exec quarantine: held processes that could not be captured stay stopped — \
+                 the next start resumes them, or kills them when their kill is owed"
+            );
+        }
+        if !resumed.is_empty() || !killed.is_empty() || !left.is_empty() {
             self.r.audit(
                 serde_json::json!({
                     "kind": "stopping",
-                    "detail": "the agent stops: held processes resumed undecided",
+                    "detail": "the agent stops: held processes resumed undecided, the kills \
+                               owed carried out, those not captured left stopped for the next \
+                               start",
                     "resumed": resumed,
+                    // lot 317: kills owed and carried out; processes not
+                    // captured, left in the pinned map for the next start
+                    "killed": killed,
+                    "left": left,
+                    // BUG-118: of the resumed, those whose report the
+                    // agent had not read (held without an entry)
+                    "unreported": unreported,
+                    // BUG-124: of the resumed, those held for a decision
+                    // whose capture had failed until the stop
+                    "recaptured": recaptured,
                     "op": AUDIT_OP,
                 }),
                 "success",
             );
         }
+    }
+}
+
+/// What [`Controller::release_unreported`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Released {
+    Resumed,
+    Killed,
+    Gone,
+}
+
+/// The path a kill's signed intent names for a process the agent holds
+/// without an entry (its report unread, or its kill owed by a previous
+/// agent).
+const LEFT_BY_A_PREVIOUS_AGENT: &str = "(a process held without a report of this run)";
+
+/// `SIGCONT` to a captured held process; the record's response.
+fn resume(pr: &ProcRef) -> String {
+    match pr.signal(libc::SIGCONT) {
+        Ok(()) => {
+            COUNTERS.resumed.fetch_add(1, Ordering::Relaxed);
+            "resumed".to_string()
+        }
+        Err(e) => format!("resume failed: {e}"),
     }
 }
 
@@ -1115,6 +1585,8 @@ fn not_held_reason(raw: &ExecqStopRaw) -> String {
         "observe mode".into()
     } else if raw.flags & stop_flags::SIGNAL_FAILED != 0 {
         format!("bpf_send_signal returned {}", raw.stop_rc)
+    } else if raw.flags & stop_flags::MAP_FULL != 0 {
+        "the map of stopped processes was full: the kernel stops only a process it names".into()
     } else {
         "the kernel did not stop it".into()
     }

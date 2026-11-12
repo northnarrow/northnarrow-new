@@ -479,8 +479,7 @@ impl Executor {
             action,
             ResponseAction::KillProcess | ResponseAction::KillProcessTree
         ) && target_pid != 0
-            && !target.is_live()
-            && target.capture_errno().is_none()
+            && target.liveness() == super::proc_ref::Liveness::Gone
         {
             // External audit CMB-004: a kill target that has exited is gone
             // — decided before the guard, which looks at the PID: by now it

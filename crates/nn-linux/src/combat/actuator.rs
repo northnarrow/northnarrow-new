@@ -304,9 +304,23 @@ impl CombatActuator<LinuxHost> for SystemActuator {
             return;
         }
         let pid = target.pid();
-        if !target.is_live() {
-            info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
-            return;
+        // lot 317 (BUG-124's family): a capture that failed is not an exit
+        // (no block was applied to one: `soft_egress_block` failed on it)
+        match target.liveness() {
+            crate::response::proc_ref::Liveness::Live => {}
+            crate::response::proc_ref::Liveness::Gone => {
+                info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
+                return;
+            }
+            crate::response::proc_ref::Liveness::Uncaptured(errno) => {
+                info!(
+                    target: "combat.actuator",
+                    pid,
+                    error = %std::io::Error::from_raw_os_error(errno),
+                    "soft egress not released: the process could not be captured (no block was applied)"
+                );
+                return;
+            }
         }
         let intent = self.intent("Release", pid, "stand-down: soft egress released");
         let released =
@@ -647,6 +661,36 @@ mod tests {
             }
             other => panic!("a surviving descendant must not count as contained: {other:?}"),
         }
+    }
+
+    /// Lot 317 (BUG-124's family): the stand-down releases the soft egress
+    /// block of a process it captured; one it could not capture (no block
+    /// was applied to it) or one that has exited is not released — no
+    /// `Release` action is attempted, and neither is called an exit when it
+    /// is not one.
+    #[test]
+    fn a_target_not_captured_is_not_released() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(&tmp.path().join("state"))
+        };
+        let journal = ActionJournal::memory();
+        let actuator =
+            SystemActuator::new(Executor::with_config(cfg), None, false, journal.clone());
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        actuator.soft_egress_clear(&ProcRef::uncaptured_for_test(sleeper.id(), 0, libc::EMFILE));
+        actuator.soft_egress_clear(&ProcRef::open(999_999_999));
+        assert!(journal.rows().is_empty(), "{:#?}", journal.rows());
+        // a captured one is: its release is an action
+        actuator.soft_egress_clear(&ProcRef::open(sleeper.id()));
+        assert!(!journal.rows().is_empty());
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
     }
 
     /// Lab PR 217 (capability C17): the first offender cannot be contained
