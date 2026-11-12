@@ -37,6 +37,112 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   tree-kill root keeps its tree, and below a spared host-critical root
   only the offending lineage can be killed; the copy-on-first-write guard
   copies a file named `… (deleted)`, and one a rename races, too.
+- A read of the kernel's state never fails on its encoding, and a failed
+  read never empties a protection (lot 311b, the third bug hunt's family
+  F4: BUG-98, its exec policy sibling, BUG-105, BUG-95, BUG-108's userland
+  half, N6's other readers, N8, the partials BUG03 and BUG69;
+  `docs/design/EXEC_POLICY.md` §2, `docs/operator/SENSOR_CONTRACT.md` §3).
+  A process names itself (`comm`), a user names its cgroups and its FUSE
+  mounts: a strict text read refused each file whole. Now:
+  - the lineage reads `/proc` as bytes (the posture hosts' one reader,
+    `read_state`): a process that named itself `\xff\xfe` was skipped by
+    the start's scan, marked gone by the sweep while it ran (and dropped
+    once the map was full), its forks never entered, its admin session's
+    terminal unread; the ancestry tree took it for dead, the watchdog's and
+    a defender's start went unread;
+  - the exec quarantine's and the exec policy's mount table is read as
+    bytes: one unprivileged FUSE mount named with a byte that is not UTF-8
+    emptied `EXECQ_ROOTS` and unpublished the slices (every caller
+    `UNKNOWN`, a service's deny an audit); a table that cannot be read
+    keeps what was published, with a signed degradation; a btrfs
+    subvolume at a guarded point (`/home` on Fedora) and a user's FUSE
+    mount root cannot `stat` are published;
+  - the sensors' mount table likewise (the mini-hunt): while such a mount
+    stood, no opened file had its path and NN-L-FIM-011's kill of a read of
+    another account's `~/.aws/credentials` became a record (lab, Ubuntu
+    24.04);
+  - a Latin-1 comment no longer hides a drop-in, or an `EnvironmentFile=`,
+    from the drop-in judges (the host's and our units'), a package's
+    `.list` or `.md5sums` from the package trust, an account from the
+    resolvers' and the carve-outs' `/etc/passwd` reads, a resolver from
+    `resolv.conf` (a resolver file there but unreadable keeps the set);
+  - a quarantine index that is not UTF-8 is kept aside and rebuilt like any
+    index that does not parse (every quarantine failed after it); the
+    watchdog and `nn-admin verify-keys` read `admin.pub` as the agent does
+    (a Latin-1 comment refused every signed shutdown marker);
+    `nn-admin fim status` ends its count at a read error instead of
+    spinning on it.
+  `xtask/tests/state_reads.rs` keeps it so: no `/proc` entry of a process
+  is read as strict text in the security crates, and a read whose failure
+  becomes a default is listed with its reason.
+  - After the independent review: the byte parser reads a mount whose
+    source is `-` (`fusermount3 -o fsname=-`) or empty — it had dropped it,
+    a regression; a FUSE mount is classed by its type and keyed by its
+    device (its daemon names the root's inode); roots are read without
+    following a link and only while they show their line's device; lines
+    not in the kernel's shape and roots the kernel's map refuses are
+    signed degradations; a degradation withdrawn before its flush is signed
+    all the same; drop-ins and environment files are read bounded, regular
+    files only; the kill's capture reads `stat` once more before its pidfd
+    fallback; the ratchet is semantic (the tolerant readers, `if let Ok`,
+    `unwrap_or*`, `match` arms, paths from consts and fields, each site
+    named).
+  - After the re-check: a drop-in or an `EnvironmentFile=` the judge
+    cannot read — a FIFO (systemd reads it from its writer), a socket, a
+    device, a directory, a refused file — is harmful (a signed
+    `unit_dropin_harmful`, a reload withheld), never an empty file; the
+    path is opened `O_PATH` first (no device opened, no FIFO waited on),
+    `/dev/null` (a mask) reads empty. The guarded roots are ranked, the
+    FUSE ones last, so a user's FUSE mounts never keep a system root out
+    of the kernel's map; only a system root refused is a degradation, held
+    5 minutes. The ratchet also catches `is_ok_and`, `map_or`, a
+    `Type::default()` arm, a read defaulted in a later statement, and a
+    second site under a known key.
+- The copy-on-first-write guard and the exec policy trust the kernel's
+  data, not a name or a number (lot 315, the third bug hunt's lot 6, family
+  F6: BUG-102, BUG-109, BUG-110, BUG-93, BUG-101's record half, BUG-113;
+  the triage's N2; `docs/design/COPY_ON_FIRST_WRITE.md` §2.1, §2.3-2.5, §3,
+  `docs/design/EXEC_POLICY.md` §2):
+  - a file is its device, inode number and birth time in the whole guard
+    (`agent/src/cow/identity.rs`, and a ratchet over each file's token
+    stream, `xtask/tests/cow_file_identity.rs`); where a wrong "same" would
+    overwrite or move a file, only a birth time known on both sides makes
+    it the same (after the review of #542: rule 5 too — on a filesystem
+    without birth times a restore keeps both, never in place). N2, data loss: the restore took the
+    owner's new file that inherited the inode number of a file the attack
+    deleted for "the attack's renamed copy" and moved it into the journal's
+    evidence, which the expiry deleted (at once when the file kept an old
+    mtime: `tar -x`, `rsync -a`, `cp -p`). The renamed copy is that file by
+    its birth time now; one whose birth time cannot be compared is named in
+    the row and left in place. The same identity in `pick` (BUG-110: the
+    second file's entry was dropped without a row), copy on first write (a
+    writer of the deleted file got no copy of the new one), shared copies
+    and the write-opens after a copy; the evidence ages from its move;
+  - a restore of a process tree weighs every copy of the tree and the
+    lineage of each write-open (BUG-93: a second writer of the tree was
+    "another writer", the file kept both and the automatic restore said
+    Success; a writer of the tree still running did not stop it); a
+    process of the tree still running keeps both, and `--pid` without a
+    start refuses a pid the write-opens' lineages show recycled; `--since`
+    alone is unchanged (the report's fix would overwrite a later edit);
+  - an open by an io-wq worker or an `SQPOLL` thread is a write (BUG-102,
+    in part: its `syscall` line is its creator's — a creator in
+    `openat(…, O_RDONLY)` made the worker's `O_WRONLY|O_TRUNC` opens reads,
+    written without a copy): known by `PF_IO_WORKER` in `/proc/<tid>/stat`,
+    never by its `comm`. Not closed: an io_uring open the kernel runs in
+    the submitting thread's own task_work still reads as that thread's
+    syscall (a declared limit; the open's mode from the BPF LSM is a
+    follow-up lot);
+  - a live file named `x (deleted)` has a path (BUG-109: written without a
+    copy, `skipped_unresolved_path`): liveness is `st_nlink`, the path is
+    told from the kernel's mark by a cached `lstat` against `fstat`; a file
+    whose opened name was unlinked while a hard link remains is copied too;
+  - `EXECENV-001` says `AT_SECURE` only when the exec changes the
+    credentials (BUG-101's record half: root running `su` with a preload
+    was "ignored by the loader" — it is honoured); the kernel's half is lot
+    318;
+  - the watchdog's start is read before and after its exe (BUG-113: a PID
+    recycled between the reads was verified with the newcomer's start).
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

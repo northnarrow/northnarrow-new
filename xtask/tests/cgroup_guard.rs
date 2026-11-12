@@ -793,6 +793,29 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     ] {
         assert!(!hd.contains(call), "host_dropins.rs only reads: {call}");
     }
+    // Lot 311 (the review of #538, F9): the judges' reads of a drop-in or an
+    // environment file go through `config_read`, which opens read-only —
+    // never for writing, creating, truncating or appending — and nothing else
+    let cr = code("antitamper-bpf/src/config_read.rs");
+    let cr = &cr[..cr.find("#[cfg(test)]").expect("its tests")];
+    for call in [
+        "fs::rename",
+        "fs::remove_file",
+        "fs::write",
+        "fs::copy",
+        "create_dir",
+        "File::create",
+        "Reason::",
+        ".write(",
+        ".create(",
+        ".create_new(",
+        ".append(",
+        ".truncate(",
+    ] {
+        assert!(!cr.contains(call), "config_read.rs only reads: {call}");
+    }
+    assert_eq!(cr.matches("OpenOptions::new()").count(), 1);
+    assert!(in_order(cr, &["OpenOptions::new()", ".read(true)", ".open(path)"]).is_ok());
     assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
     // Lot 273d: the watchdog reads systemd's copy before each respawn (a
     // reload unless a harmful host drop-in withholds it), and the agent

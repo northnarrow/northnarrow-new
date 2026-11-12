@@ -32,6 +32,7 @@ pub mod config;
 pub mod copy;
 pub mod fanotify;
 pub mod guard;
+pub mod identity;
 pub mod index;
 pub mod journal;
 pub mod protect;

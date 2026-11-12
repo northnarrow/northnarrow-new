@@ -184,7 +184,7 @@ impl<H: PostureHost> ExemptPids<H> {
 /// `starttime`, field 22 of `<proc_root>/<pid>/stat`, counted after the
 /// `(comm)` field, which may itself hold spaces or parentheses.
 fn proc_start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()
@@ -232,7 +232,7 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
     expected_exe: &Path,
     proc_root: &Path,
 ) -> WatchdogResolution {
-    let text = match H::read_to_string(pidfile) {
+    let text = match H::read_state(pidfile) {
         Ok(t) => t,
         Err(_) => return WatchdogResolution::NotPresent,
     };
@@ -244,6 +244,13 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
             }
         }
     };
+    // External audit POS-009, lot 315 (external bug hunt 1.4, BUG-113): the
+    // start of the process verified, read before AND after its exe. Read
+    // after only, a PID recycled between the two reads was `Verified` with
+    // the newcomer's start — a process whose exe was never checked, exempt
+    // until the next refresh, and registered by its PID. A PID recycled at
+    // any point of the check shows another start on one side.
+    let start_before = proc_start_ticks::<H>(proc_root, pid);
     let exe_link = proc_root.join(pid.to_string()).join("exe");
     let resolved = match H::read_link(&exe_link) {
         Ok(p) => p,
@@ -260,13 +267,18 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
     if resolved != expected_exe {
         return WatchdogResolution::ExeMismatch { pid, resolved };
     }
-    // External audit POS-009: the start of the process just verified. Read
-    // after the exe: a PID recycled in between starts later, and the
-    // exemption then names a start no process has (fails toward not
-    // exempt) until the next refresh.
-    match proc_start_ticks::<H>(proc_root, pid) {
-        Some(start_ticks) => WatchdogResolution::Verified { pid, start_ticks },
-        None => WatchdogResolution::Unverifiable {
+    match (start_before, proc_start_ticks::<H>(proc_root, pid)) {
+        (Some(before), Some(after)) if before == after => WatchdogResolution::Verified {
+            pid,
+            start_ticks: before,
+        },
+        (Some(before), Some(after)) => WatchdogResolution::Unverifiable {
+            pid,
+            reason: format!(
+                "pid {pid} changed hands while it was verified (start {before}, then {after})"
+            ),
+        },
+        _ => WatchdogResolution::Unverifiable {
             pid,
             reason: format!("no start time in {}/{pid}/stat", proc_root.display()),
         },
@@ -398,6 +410,30 @@ mod tests {
         ));
     }
 
+    /// Lot 311 (N6): the watchdog's start is read from a `stat` whose
+    /// `comm` is not UTF-8 (a process names itself) — on main the read
+    /// failed and the verified watchdog was "unverifiable": not spared.
+    #[test]
+    fn a_watchdog_whose_comm_is_not_utf8_is_verified_with_its_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(proc_root.join("2001")).unwrap();
+        fs::write(
+            proc_root.join("2001/stat"),
+            b"2001 (\xff\xfe) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 6000 0 0\n",
+        )
+        .unwrap();
+        symlink(DEFAULT_WATCHDOG_EXE, proc_root.join("2001/exe")).unwrap();
+        let pf = write_pidfile(tmp.path(), "2001");
+        assert_eq!(
+            resolve_with_proc_root(&pf, Path::new(DEFAULT_WATCHDOG_EXE), &proc_root),
+            WatchdogResolution::Verified {
+                pid: 2001,
+                start_ticks: 6_000
+            }
+        );
+    }
+
     fn write_pidfile(dir: &Path, pid: &str) -> PathBuf {
         let p = dir.join("watchdog.pid");
         let mut f = fs::File::create(&p).unwrap();
@@ -493,6 +529,180 @@ mod tests {
         assert_eq!(
             sibling_watchdog_exe(None),
             PathBuf::from(DEFAULT_WATCHDOG_EXE)
+        );
+    }
+}
+
+/// Lot 315 (external bug hunt 1.4, BUG-113): the watchdog's start is read
+/// before and after its exe. The race is injected by a host whose
+/// `read_link` of the exe hands the PID to another process right after the
+/// read (or right before it).
+#[cfg(test)]
+mod lot315 {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io;
+
+    use crate::posture::host::testing::symlink;
+
+    const PID: u32 = 2000;
+    const WATCHDOG_START: u64 = 5_000;
+    const IMPOSTOR_START: u64 = 9_000;
+    const IMPOSTOR_EXE: &str = "/usr/bin/impostor";
+
+    /// When the PID changes hands, relative to the exe read.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Recycle {
+        /// After the read: the exe read was the watchdog's.
+        AfterExe,
+        /// Before the read, to a process that runs the watchdog's binary
+        /// too (started by someone else).
+        BeforeExeSameBinary,
+    }
+
+    thread_local! {
+        /// The fixture `/proc` whose PID is recycled, and when.
+        static RECYCLE: RefCell<Option<(PathBuf, Recycle)>> = const { RefCell::new(None) };
+    }
+
+    fn write_started(proc_root: &Path, pid: u32, ticks: u64) {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (x) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
+    }
+
+    fn hand_over(root: &Path, exe: &str) {
+        let dir = root.join(PID.to_string());
+        write_started(root, PID, IMPOSTOR_START);
+        let _ = std::fs::remove_file(dir.join("exe"));
+        symlink(exe, dir.join("exe")).unwrap();
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct RaceHost;
+
+    impl PostureHost for RaceHost {
+        const PROC_ROOT: &'static str = "/proc";
+        const HOST_ROOT: &'static str = "/";
+        // lot 311: the trait's text read is its provided `read_state`
+        // (lossy, over `read`): no strict text read to give
+        fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+        fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+            let when = RECYCLE.with(|r| r.borrow_mut().take());
+            if let Some((root, Recycle::BeforeExeSameBinary)) = &when {
+                hand_over(root, DEFAULT_WATCHDOG_EXE);
+            }
+            let out = std::fs::read_link(path.as_ref());
+            if let Some((root, Recycle::AfterExe)) = &when {
+                // the watchdog exits; PID is the impostor's from now on
+                hand_over(root, IMPOSTOR_EXE);
+            }
+            out
+        }
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
+            std::fs::read_dir(path)
+        }
+        fn is_dir(path: &Path) -> bool {
+            path.is_dir()
+        }
+        fn exists(path: &Path) -> bool {
+            path.exists()
+        }
+        fn dir_owner<P: AsRef<Path>>(_path: P) -> Option<u32> {
+            None
+        }
+        fn file_id<P: AsRef<Path>>(_path: P) -> Option<(u64, u64)> {
+            None
+        }
+        fn suspended_ns() -> u64 {
+            0
+        }
+        fn clock_tick_ns() -> u64 {
+            10_000_000
+        }
+        fn monotonic_ns() -> u64 {
+            0
+        }
+    }
+
+    /// The watchdog at `PID`, its pidfile; `recycle`: when the PID changes
+    /// hands.
+    fn world(recycle: Option<Recycle>) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proc_root = tmp.path().join("proc");
+        write_started(&proc_root, PID, WATCHDOG_START);
+        symlink(DEFAULT_WATCHDOG_EXE, proc_root.join(format!("{PID}/exe"))).unwrap();
+        let pidfile = tmp.path().join("watchdog.pid");
+        std::fs::write(&pidfile, format!("{PID}\n")).unwrap();
+        if let Some(r) = recycle {
+            RECYCLE.with(|c| *c.borrow_mut() = Some((proc_root.clone(), r)));
+        }
+        (tmp, proc_root, pidfile)
+    }
+
+    fn resolve(proc_root: &Path, pidfile: &Path) -> WatchdogResolution {
+        resolve_with_proc_root::<RaceHost>(pidfile, Path::new(DEFAULT_WATCHDOG_EXE), proc_root)
+    }
+
+    /// BUG-113: the PID recycled right after the exe read is not exempt
+    /// (on main: `Verified` with the impostor's start, exempt).
+    #[test]
+    fn bug113_pid_recycled_after_the_exe_read_is_not_exempt() {
+        let (_tmp, proc_root, pidfile) = world(Some(Recycle::AfterExe));
+        let r = resolve(&proc_root, &pidfile);
+        // applied as agent/src/boot/tasks.rs does
+        let exempt = ExemptPids::<RaceHost>::with_agent_on(1, &proc_root);
+        if let WatchdogResolution::Verified { pid, start_ticks } = &r {
+            exempt.set_watchdog(*pid, *start_ticks);
+        }
+        assert_eq!(
+            std::fs::read_link(proc_root.join(format!("{PID}/exe"))).unwrap(),
+            PathBuf::from(IMPOSTOR_EXE),
+            "scenario not run"
+        );
+        assert!(
+            !exempt.is_exempt(PID),
+            "BUG-113: pid {PID} is now {IMPOSTOR_EXE} (start {IMPOSTOR_START}), never verified, \
+             yet exempt; the refresh returned {r:?}"
+        );
+    }
+
+    /// BUG-113: a PID that changed hands during the check is not verified
+    /// at all — the agent registers a verified watchdog by its PID
+    /// (PROTECTED_PIDS, the watchdog role, its cgroup), whatever start the
+    /// exemption keeps. Recycled after the exe read, or before it to a
+    /// process running the watchdog's binary: the two starts differ.
+    #[test]
+    fn bug113_a_pid_recycled_during_the_check_is_not_verified() {
+        for when in [Recycle::AfterExe, Recycle::BeforeExeSameBinary] {
+            let (_tmp, proc_root, pidfile) = world(Some(when));
+            let r = resolve(&proc_root, &pidfile);
+            match &r {
+                WatchdogResolution::Unverifiable { pid, reason } => {
+                    assert_eq!(*pid, PID);
+                    assert!(reason.contains("changed hands"), "{when:?}: {reason}");
+                }
+                other => panic!("{when:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Guard: no recycling, the watchdog is verified with its start.
+    #[test]
+    fn bug113_guard_without_recycling_the_watchdog_is_exempt() {
+        let (_tmp, proc_root, pidfile) = world(None);
+        assert_eq!(
+            resolve(&proc_root, &pidfile),
+            WatchdogResolution::Verified {
+                pid: PID,
+                start_ticks: WATCHDOG_START
+            }
         );
     }
 }

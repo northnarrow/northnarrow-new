@@ -187,8 +187,21 @@ fn count_and_last_ts_jsonl(path: &Path) -> (u32, String) {
     let mut count = 0u32;
     let mut last_ts = String::new();
     for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
+        // lot 311 (bug hunt 1.4, partial BUG69): a line that is not UTF-8
+        // is consumed and skipped; any other error ends the read — it does
+        // not consume, and `continue` spun a worker on it for ever (a
+        // directory at the path: `EISDIR`; a disk's `EIO`)
+        let line = match line {
+            Ok(line) => line,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "fim-status: jsonl read failed — counted up to the error"
+                );
+                break;
+            }
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -247,5 +260,38 @@ fn fim_report(v: Verified<'_, FimReportRequest>, read_paths: &AdminReadPaths) ->
         entries_jsonl,
         entries_count,
         entries_truncated,
+    }
+}
+
+#[cfg(test)]
+mod lot311 {
+    use super::*;
+
+    /// Lot 311 (bug hunt 1.4, partial BUG69): a read error that consumes
+    /// nothing (a directory at the drift log's path: `EISDIR`) ends the
+    /// count — on main the loop spun on it for ever; a line that is not
+    /// UTF-8 is skipped and the lines after it counted.
+    #[test]
+    fn a_read_error_ends_the_count_and_a_non_utf8_line_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("drift.jsonl");
+        std::fs::create_dir(&d).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = d.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(count_and_last_ts_jsonl(&p));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(got.ok(), Some((0, String::new())), "the count never ended");
+        let f = dir.path().join("rows.jsonl");
+        std::fs::write(
+            &f,
+            b"{\"ts\":\"2026-01-01T00:00:00Z\"}\n{\"x\":\"\xff\"}\n{\"ts\":\"2026-01-02T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            count_and_last_ts_jsonl(&f),
+            (2, "2026-01-02T00:00:00Z".to_string())
+        );
     }
 }

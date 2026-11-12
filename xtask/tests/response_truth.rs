@@ -25,7 +25,8 @@
 //!    `.as_str()`, `.as_ref()`, `.display()` or lossy conversion, a `&*`, a
 //!    `&str` named after a path) — a set's `contains(&pid)` is not one;
 //! 4. no last component cut off a path by hand: `rsplit('/')`,
-//!    `rsplit_once('/')`, any `rsplitn(`, `strip_suffix(`;
+//!    `rsplit_once('/')`, any `rsplitn(`, `strip_suffix(` (but the
+//!    helper's own `name_before_removal`);
 //! 5. a `/proc/<pid>/cgroup` text is read through `unified_path`: no
 //!    `"0::"` spelled here.
 //!
@@ -114,7 +115,7 @@ fn violations(rel: &str, code: &str) -> Vec<Violation> {
             ".rsplitn(",
             ".strip_suffix(",
         ] {
-            if compact.contains(cut) {
+            if !helper && compact.contains(cut) {
                 hit("4: a last component cut off a path by hand");
             }
         }

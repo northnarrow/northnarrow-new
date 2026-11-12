@@ -921,7 +921,7 @@ pub(crate) fn caller_exe(proc: &Path, pid: u32, comm: &str) -> Option<String> {
         return None;
     }
     let dir = proc.join(pid.to_string());
-    let now = std::fs::read_to_string(dir.join("comm")).ok()?;
+    let now = nn_linux::state_read::read_state(dir.join("comm")).ok()?;
     if now.trim_end_matches('\n') != comm {
         return None;
     }
@@ -1018,7 +1018,9 @@ fn seed_last_id(active_path: &Path) -> u64 {
 /// one-time, bounded boot read is not the unbounded whole-file walk that
 /// BUG-026 removed from the chainlog hot path.
 fn last_id_in_file(path: &Path) -> Option<u64> {
-    let body = std::fs::read_to_string(path).ok()?;
+    // lot 311 (F4): read as bytes — one byte that is not UTF-8 hid the
+    // file's last id (the ids then began again)
+    let body = nn_linux::state_read::read_state(path).ok()?;
     body.lines().rev().find_map(|line| {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         value.get("id")?.as_u64()
@@ -2517,6 +2519,23 @@ mod tests {
         assert_eq!(caller_exe(t.path(), 4242, "sh"), None);
         assert_eq!(caller_exe(t.path(), 4243, "bash"), None);
         assert_eq!(caller_exe(t.path(), 0, "bash"), None);
+    }
+
+    /// Lot 311 (N6): a caller whose `comm` is not UTF-8 — the kernel's
+    /// record carries it with its bytes replaced (U+FFFD) — is still named
+    /// by its executable. On main its `comm` file was unreadable as text:
+    /// a denial of a process that named itself so had no executable.
+    #[test]
+    fn a_denials_caller_whose_comm_is_not_utf8_is_named() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("4244");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("comm"), b"\xff\xfe\n").unwrap();
+        std::os::unix::fs::symlink("/tmp/payload", p.join("exe")).unwrap();
+        assert_eq!(
+            caller_exe(t.path(), 4244, "\u{fffd}\u{fffd}").as_deref(),
+            Some("/tmp/payload")
+        );
     }
 
     /// An anti-tamper denial is a Log verdict, but the kernel acted: it

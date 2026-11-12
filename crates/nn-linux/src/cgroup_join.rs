@@ -1989,7 +1989,7 @@ pub fn sync_names(policy: &RulePolicy) {
 /// `<proc_root>/<pid>/stat` (clock ticks since boot), after the command's
 /// closing parenthesis.
 fn start_boot_ns(proc_root: &Path, pid: u32) -> Option<u64> {
-    let s = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let s = crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     start_ticks(&s).map(|t| t.saturating_mul(ns_per_tick()))
 }
 
@@ -2015,7 +2015,7 @@ fn ns_per_tick() -> u64 {
 
 /// `Tgid:` of `<proc_root>/<pid>/status`.
 fn tgid_of(proc_root: &Path, pid: u32) -> Option<u32> {
-    let s = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;
+    let s = crate::state_read::read_state(proc_root.join(pid.to_string()).join("status")).ok()?;
     s.lines()
         .find_map(|l| l.strip_prefix("Tgid:"))
         .and_then(|v| v.trim().parse().ok())
@@ -2806,5 +2806,17 @@ mod tests {
             marks_step(&mut w, Some(unknown), Ok(4), "t9"),
             MarksStep::Lost(l) if l.contains(unknown)
         ));
+    }
+
+    /// Lot 311 (N6): a process whose `comm` is not UTF-8 has its start and
+    /// thread group read for the exemption by cgroup (`started_in_cgroup`)
+    /// — on main both reads failed for a process that named itself so.
+    #[test]
+    fn a_process_whose_comm_is_not_utf8_has_its_start_and_tgid() {
+        use crate::state_read::testing::write_non_utf8_proc;
+        let t = tempfile::tempdir().unwrap();
+        write_non_utf8_proc(t.path(), 4300, 1, 1000, 777);
+        assert_eq!(start_boot_ns(t.path(), 4300), Some(777 * ns_per_tick()));
+        assert_eq!(tgid_of(t.path(), 4300), Some(4300));
     }
 }

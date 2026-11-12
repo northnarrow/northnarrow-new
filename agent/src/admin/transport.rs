@@ -951,7 +951,7 @@ pub(super) fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> 
         return client;
     }
     let pid = cred.pid;
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+    let comm = nn_linux::state_read::read_state(format!("/proc/{pid}/comm"))
         .ok()
         .map(|s| s.trim_end_matches('\n').to_string())
         .filter(|s| !s.is_empty());

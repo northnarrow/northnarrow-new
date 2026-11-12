@@ -746,8 +746,11 @@ pub fn run_force_posture(
 /// Local-only: parse `path` and report fingerprints. No socket
 /// involved.
 pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Lot 311 (bug hunt 1.4, partial BUG03): read as bytes, as the agent
+    // reads it — a byte that is not UTF-8 in a comment failed the check
+    // while the agent took the file's keys
+    let content = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let content = String::from_utf8_lossy(&content);
     // External audit MAIN-005: the agent's own parser — a key line may carry
     // its role list (`<hex> unlock,audit-read`, as install.sh writes it),
     // which a check for exactly 64 characters refused.
@@ -3347,6 +3350,21 @@ mod tests {
         for fp in &out.fingerprints {
             assert_eq!(fp.len(), 8);
         }
+    }
+
+    /// Lot 311 (bug hunt 1.4, partial BUG03): a byte that is not UTF-8 in
+    /// a comment costs nothing — the agent takes the file's keys, and so
+    /// does the check. On main the read itself failed.
+    #[test]
+    fn cli_verify_keys_reads_a_file_with_a_latin1_comment() {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        let key = hex::encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let mut body = b"# chiave di Jos\xe9\n".to_vec();
+        body.extend_from_slice(format!("{key}\n").as_bytes());
+        std::fs::write(&pub_path, body).unwrap();
+        let out = run_verify_keys(&pub_path).expect("verify");
+        assert_eq!(out.fingerprints.len(), 1);
     }
 
     #[test]

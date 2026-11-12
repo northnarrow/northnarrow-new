@@ -355,7 +355,7 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
             return false;
         };
         let base = proc_root.join(pid);
-        let root = std::fs::read_to_string(base.join("status"))
+        let root = crate::state_read::read_state(base.join("status"))
             .ok()
             .and_then(|st| {
                 st.lines()

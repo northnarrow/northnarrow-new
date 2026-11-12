@@ -158,7 +158,10 @@ impl<H: DecisionHost> ModuleOwners<H> {
             if entry.path().extension().is_none_or(|e| e != "list") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            // lot 311 (bug hunt 1.4, F4, BUG-105's sibling): read as bytes — a
+            // package that ships one file whose name is not UTF-8 had its whole
+            // list skipped, every file of it unowned
+            let Ok(text) = std::fs::read(entry.path()).map(crate::posture::host::state_text) else {
                 continue;
             };
             for line in text.lines() {
@@ -363,5 +366,24 @@ mod tests {
             ModuleOwners::new(t.path()).of("/lib/modules/6.8/kernel/x.ko"),
             Provenance::Unknown
         );
+    }
+
+    /// Lot 311 (F4): a package whose list names one file that is not UTF-8
+    /// still owns its modules (on main the whole list was skipped: R018
+    /// called them unowned).
+    #[test]
+    fn a_list_with_a_non_utf8_name_still_owns_its_modules() {
+        let d = tempfile::tempdir().unwrap();
+        let info = d.path().join("var/lib/dpkg/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("linux-modules-x.list"),
+            b"/usr/share/doc/x/caf\xe9\n/lib/modules/6.8.0/kernel/drivers/x.ko.zst\n",
+        )
+        .unwrap();
+        let owners = ModuleOwners::new(d.path());
+        assert!(owners
+            .read_dpkg_module_paths()
+            .contains("/lib/modules/6.8.0/kernel/drivers/x.ko.zst"));
     }
 }

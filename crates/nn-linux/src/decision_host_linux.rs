@@ -190,7 +190,8 @@ fn root_only(m: &std::fs::Metadata) -> bool {
 
 impl ActorFacts for ProcFacts {
     fn uid(&self, pid: u32) -> Option<u32> {
-        let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("status")).ok()?;
+        let s =
+            crate::state_read::read_state(self.root.join(pid.to_string()).join("status")).ok()?;
         s.lines()
             .find_map(|l| l.strip_prefix("Uid:"))
             .and_then(|r| r.split_whitespace().next())
@@ -198,7 +199,8 @@ impl ActorFacts for ProcFacts {
     }
 
     fn cgroup(&self, pid: u32) -> Option<String> {
-        let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("cgroup")).ok()?;
+        let s =
+            crate::state_read::read_state(self.root.join(pid.to_string()).join("cgroup")).ok()?;
         // lot 312 (review of #543, F7): the one reader of a cgroup text
         nn_core::response::cgroup::unified_path(&s).map(str::to_string)
     }
@@ -297,5 +299,25 @@ mod tests {
         std::fs::create_dir_all(proc_root.join("2")).unwrap();
         std::os::unix::fs::symlink(&mine, proc_root.join("2/exe")).unwrap();
         assert_eq!(f.trusted_exe(2), None);
+    }
+
+    /// Lot 311 (N6): the actor facts of a process whose `comm` is not UTF-8
+    /// — its uid for a policy's exception — are read; on main they were
+    /// not, and no `uid` condition matched it.
+    #[test]
+    fn the_facts_of_a_process_whose_comm_is_not_utf8_are_read() {
+        let t = tempfile::tempdir().unwrap();
+        crate::state_read::testing::write_non_utf8_proc(t.path(), 4302, 1, 33, 1);
+        std::fs::write(
+            t.path().join("4302/cgroup"),
+            b"0::/system.slice/\xff.service\n",
+        )
+        .unwrap();
+        let f = ProcFacts::new(t.path());
+        assert_eq!(f.uid(4302), Some(33));
+        assert_eq!(
+            f.cgroup(4302).as_deref(),
+            Some("/system.slice/\u{fffd}.service")
+        );
     }
 }

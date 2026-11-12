@@ -59,6 +59,47 @@ which point they are at (`root_kind`), so a file on a tmpfs `/tmp` is `tmp`
 and one on a separate `/home` is `home`. The exec quarantine refreshes them
 when it runs, the policy's controller otherwise.
 
+Lot 311 (bug hunt 1.4, BUG-98 and its sibling here, BUG-108, N8): the table
+is read as bytes (`nn_linux::mountinfo`). Read as text, one mount whose point
+or source is not UTF-8 — an unprivileged user's FUSE mount (`fusermount3`)
+at `~/\xff` — emptied it: the roots removed, and here the slices unpublished
+(every caller `UNKNOWN`, `NO_SLICES`: a service's deny became an audit). A
+table that cannot be read at all leaves the slices and roots last published
+in force, never zeros or an empty set, with a degradation
+(`execpol_mounts`, `execq_roots`) while it fails, withdrawn at the next good
+read. A btrfs subvolume mounted at a guarded point (`/home` on Fedora and
+openSUSE: `subvol=/home`) is published although its root field is not `/`,
+when no mount of that filesystem is its root (a bind mount of a directory of
+a filesystem mounted elsewhere stays out); the kernel's walk to it is lot 9's
+(the userland half only here).
+
+The independent review of #538 (lot 311b): a FUSE mount — any, wherever it
+is mounted (a user's, through `fusermount3`, in `~/mnt` or in a world-writable
+directory) — is classed by its type (`fuse`, `fuseblk`, `fuse.*`) and keyed
+in `EXECQ_ROOTS` by its device alone, `(dev, 0)`: its daemon (the user) names
+its root's inode and changes it at will (`fuse_change_attributes_common`
+takes the inode number from every answer), and root may not `stat` it (no
+`allow_other`) or be stalled by it. The kernel's half — telling a FUSE file
+by its superblock's magic in the exec hooks and looking `(s_dev, 0)` up — is
+lot 318's. Any other root is read without following a link
+(`O_PATH | O_NOFOLLOW | O_DIRECTORY`) and only while its mount point shows the
+line's device (a btrfs subvolume excepted): a mount point a user swapped for
+a link to another filesystem's root no longer gets that root published. A
+line of the table that is not in the kernel's shape is a degradation
+(`execq_roots_rows`, `execpol_mounts_rows`) while it lasts — a source `-`
+(`fsname=-`) or an empty one is a mount, read as such. The roots are
+ranked, the FUSE ones last (a user mounts up to `mount_max`, 1000): when
+the kernel's map (64 entries) is full, a FUSE root it holds gives way to a
+system root mounted after it (another user's `/run/user/<uid>`, an
+automounted `/home`). A root other than a FUSE one that the map still
+refuses is a degradation (`execq_roots_full`, `execpol_roots_full`), its
+text the same whatever the count and standing 5 minutes at least once
+reported (one signed record per hold, however often the count comes and
+goes); a FUSE root left out is no loss — the exec hooks class a FUSE file
+by its magic (lot 318) — and only logged. A degradation that ends within
+the 15 s before its flush is signed at its withdrawal: every one leaves its
+record in the chain.
+
 ## 3. Lineage tiers
 
 Computed in the kernel at the exec, from signals a process cannot set for
@@ -168,7 +209,7 @@ findings wait in `EXECPOL_ENV` (keyed by `task_struct`) for the exec's pass 0.
 | finding | kernel | record |
 |---|---|---|
 | `LD_PRELOAD` / `LD_AUDIT` entry under `/tmp/`, `/var/tmp/`, `/dev/shm/`, `/proc/` (`/proc/self/fd/N`: a memfd preload), `/dev/fd/` | denied for `service` and `unknown` on a server, for a root caller in `session` (on a desktop: `service`, and a root caller in `session` or `unknown`); recorded for `admin` | `NN-L-EXECENV-001` High (deny) / Medium / Low, T1574.006 |
-| the same at a **set-id target** | never denied | Medium, "the kernel sets AT_SECURE and the loader ignores the entry" |
+| the same at a **set-id target** | never denied on this head; lot 318 drops the set-id skip (denied as any other) | Medium: "the kernel sets AT_SECURE and the loader ignores the entry" when the exec changes the credentials; else "the exec ran; the target is set-id, but the exec changes no credential, so the loader honours the entry" (lot 315) |
 | `GLIBC_TUNABLES` at a set-id target | recorded | `NN-L-EXECENV-002` Medium; Critical for the shape of CVE-2023-4911 (a tunable whose value holds another assignment, or a value filling the buffer), T1068 |
 | `LD_LIBRARY_PATH` under a staging prefix | recorded for services, unknown callers, root | `NN-L-EXECENV-002` Medium, T1574.006 |
 | `HISTFILE` empty or `/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`, `HISTCONTROL=ignore*` exported, at the exec of a shell | recorded | `NN-L-EXECENV-002` Low, T1070.003 |
@@ -185,6 +226,24 @@ preload with root's credentials. That is what `deny-root` and the service
 deny are for. File capabilities are not visible to the program (the target
 is judged by its set-id bits): a preload into a capability binary from a
 service is refused, which the loader would have ignored anyway.
+
+Lot 315 (external bug hunt 1.4, BUG-101, the record's half): a set-id
+target is no `AT_SECURE` by its bits alone. The kernel sets it when the
+exec changes the credentials — a set-user-ID file owned by another user
+than the caller's real uid, or a set-group-ID file (the record does not
+carry the file's group: a set-group-ID target counts as changing it, as it
+does for every caller outside that group). Root running a set-user-ID-root
+file (`su`, `passwd`, `mount`) changes nothing: the loader honours the
+preload, as root, and the record said it ignored it. The record now says
+the exec ran (`at_secure: false`, Medium). The kernel's half is lot 318's:
+it drops the set-id skip entirely (a set-id target is denied as any other,
+whatever `AT_SECURE`); this record's `at_secure` stays as it is, the
+evidence of whether the loader would have ignored the entry. Residuals of
+the record's wording (no privilege at stake): a set-id bit the kernel does
+not apply (`nosuid` mount, `no_new_privs`, a set-id `#!` script) still reads
+`AT_SECURE`; a file capability sets it and the record says nothing.
+`GLIBC_TUNABLES` at a set-id target stays reported by the bits (an exploit
+attempt is one whatever the caller).
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128

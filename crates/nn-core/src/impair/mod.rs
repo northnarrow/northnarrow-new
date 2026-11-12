@@ -1125,7 +1125,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
 
 /// `starttime` of `/proc/<pid>/stat` (field 22, after the `(comm)` field).
 fn start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()

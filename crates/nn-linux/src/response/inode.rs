@@ -39,6 +39,15 @@ pub fn kernel_marks_deleted(link: &Path) -> bool {
         .ends_with(DELETED_MARK.as_bytes())
 }
 
+/// The name a removed dentry had, the kernel's mark taken off (`/a/x
+/// (deleted)` → `/a/x`): what a `/proc` link shows for a name unlinked
+/// while the file lives on under another (the copy-on-first-write guard
+/// restores to it). A name to try, never a proof the file is gone
+/// ([`exe_unlinked`] decides that); `None` without the mark.
+pub fn name_before_removal(link: &str) -> Option<&str> {
+    link.strip_suffix(DELETED_MARK)
+}
+
 /// What the kernel appends to the path of a removed dentry (`d_path`).
 const DELETED_MARK: &str = " (deleted)";
 

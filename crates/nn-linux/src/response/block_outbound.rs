@@ -189,7 +189,11 @@ fn blocked(pid: u32) -> ExecutionOutcome {
 
 /// The inet sockets (TCP, UDP, raw, v4 and v6) process `pid` holds: its
 /// descriptors that are sockets, found in its network namespace's tables
-/// (`<proc>/<pid>/net/{tcp,udp,raw,…}`, by inode). Unreadable: none known.
+/// (`<proc>/<pid>/net/{tcp,udp,raw,…}`, by inode). No descriptor table
+/// (the process gone): none. A table this kernel does not have (`ENOENT`):
+/// no socket of it. A table that cannot be read otherwise: every socket the
+/// process holds is counted — the block is never said whole on a read that
+/// failed.
 fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
     let dir = proc.join(pid.to_string());
     let Ok(fds) = fs::read_dir(dir.join("fd")) else {
@@ -213,8 +217,13 @@ fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
     for table in [
         "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6",
     ] {
-        let Ok(text) = crate::state_read::read_state(dir.join("net").join(table)) else {
-            continue;
+        let text = match crate::state_read::read_state(dir.join("net").join(table)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(pid, table, error = %e, "block outbound: a socket table could not be read, every socket held counted");
+                return held.len();
+            }
         };
         n += text
             .lines()
@@ -232,7 +241,9 @@ fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
 /// the cgroup the drop rule was loaded for (its id, `scope_id`). `Err`
 /// says which does not hold.
 fn in_effect(pid: u32, cfg: &ExecutorConfig, scope_id: u64) -> Result<(), &'static str> {
-    let text = crate::state_read::read_state(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let Ok(text) = crate::state_read::read_state(format!("/proc/{pid}/cgroup")) else {
+        return Err("its cgroup could not be read back");
+    };
     let now = fs::metadata(cfg.blocked_cgroup_dir()).ok().map(|m| m.ino());
     judge_effect(&text, &cfg.blocked_cgroup_match(), now, scope_id)
 }
@@ -811,6 +822,12 @@ mod bug91 {
                 Err("the blocked scope is no longer the cgroup the drop rule was loaded for")
             );
         }
+        // a cgroup that cannot be read back (no such process) is no block
+        // in effect
+        assert_eq!(
+            in_effect(u32::MAX, &ExecutorConfig::default(), 7),
+            Err("its cgroup could not be read back")
+        );
     }
 
     /// Lot 312 (F5): a move the cgroupfs took but that does not place the
@@ -1032,6 +1049,14 @@ mod review_f2 {
         fs::write(p.join("net/udp6"), format!("{header}{}", row(777))).unwrap();
         // 888: a unix socket, in no inet table
         assert_eq!(inet_sockets_of(tmp.path(), 4242), 2);
+        // a table that exists and cannot be read (a directory: EISDIR):
+        // every socket held is counted, the unix one too
+        fs::create_dir(p.join("net/raw")).unwrap();
+        assert_eq!(
+            inet_sockets_of(tmp.path(), 4242),
+            3,
+            "an unreadable table never makes the block whole"
+        );
         assert_eq!(
             inet_sockets_of(tmp.path(), 1),
             0,

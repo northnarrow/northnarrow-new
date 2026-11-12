@@ -242,7 +242,8 @@ where
 /// PID 1 is `systemd-shutdown` (its comm, truncated to 15 bytes): the
 /// machine is in the last stage of a shutdown.
 pub(crate) fn pid1_is_systemd_shutdown() -> bool {
-    std::fs::read_to_string("/proc/1/comm").is_ok_and(|c| c.trim_end() == "systemd-shutdow")
+    nn_linux::state_read::read_state("/proc/1/comm")
+        .is_ok_and(|c| c.trim_end() == "systemd-shutdow")
 }
 
 #[cfg(test)]

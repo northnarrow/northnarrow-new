@@ -926,7 +926,16 @@ fn quarantine_file_with(
     // over any name — the dynamic loader, the shells, init, sshd, the
     // agent's own binaries are never touched, whatever name (another mount
     // namespace's bind of /usr/bin) leads to them.
-    if is_protected_identity(cfg, handle) {
+    // The shells /etc/shells lists are among them: one that cannot be read
+    // leaves them unknown, and nothing is changed (lot 311b's rule: a read
+    // that fails never empties a protection).
+    let shells = listed_shells(Path::new(SHELLS)).map_err(|e| {
+        QuarantineError::Refused(format!(
+            "{SHELLS} could not be read ({e}): the shells it lists are not all known, so no file \
+             is changed"
+        ))
+    })?;
+    if is_protected_identity(cfg, handle, &shells) {
         return Err(QuarantineError::ProtectedFile);
     }
     let named = handle.verified_name();
@@ -1013,20 +1022,34 @@ fn quarantine_file_with(
     })
 }
 
+/// The system's list of login shells.
+const SHELLS: &str = "/etc/shells";
+
+/// Re-check of #543 (N1): the shells a `/etc/shells` lists, its bytes made
+/// text. A host with none lists none (the usual shells of
+/// [`PROTECTED_FILES`] stay protected); one that exists and cannot be read
+/// is an error, never an empty list.
+fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'))
+        .map(PathBuf::from)
+        .collect())
+}
+
 /// Re-check of #543 (N1): the files whose identity — `(dev, ino)`, not a
 /// name — the quarantine never touches: the dynamic loaders, the shells
-/// (`/etc/shells` and the usual ones), init and systemd, the SSH daemon,
-/// and the agent's own files and binaries.
-fn protected_identities(cfg: &ExecutorConfig) -> HashSet<(u64, u64)> {
+/// (`shells`, from `/etc/shells`, and the usual ones), init and systemd,
+/// the SSH daemon, and the agent's own files and binaries.
+fn protected_identities(cfg: &ExecutorConfig, shells: &[PathBuf]) -> HashSet<(u64, u64)> {
     let mut paths: Vec<PathBuf> = PROTECTED_FILES.iter().map(PathBuf::from).collect();
-    if let Ok(text) = fs::read_to_string("/etc/shells") {
-        paths.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| l.starts_with('/'))
-                .map(PathBuf::from),
-        );
-    }
+    paths.extend(shells.iter().cloned());
     for dir in LOADER_DIRS {
         if let Ok(entries) = fs::read_dir(dir) {
             paths.extend(entries.flatten().filter_map(|e| {
@@ -1055,8 +1078,8 @@ fn protected_identities(cfg: &ExecutorConfig) -> HashSet<(u64, u64)> {
 }
 
 /// Re-check of #543 (N1): the held inode is one of [`protected_identities`].
-fn is_protected_identity(cfg: &ExecutorConfig, handle: &ExeHandle) -> bool {
-    protected_identities(cfg).contains(&handle.key())
+fn is_protected_identity(cfg: &ExecutorConfig, handle: &ExeHandle, shells: &[PathBuf]) -> bool {
+    protected_identities(cfg, shells).contains(&handle.key())
 }
 
 /// The system files [`protected_identities`] names besides the shells of
@@ -1539,13 +1562,14 @@ pub struct VaultEntry {
 /// `index.json`, or rebuilt from the `.meta` files when the index is
 /// missing or does not parse (read-only: the index is left as it is).
 pub fn list_vault(cfg: &ExecutorConfig) -> Vec<VaultEntry> {
-    let entries: Vec<serde_json::Value> =
-        match fs::read_to_string(cfg.quarantine_dir.join("index.json")) {
-            Ok(s) => {
-                serde_json::from_str(&s).unwrap_or_else(|_| index_from_meta(&cfg.quarantine_dir))
-            }
-            Err(_) => index_from_meta(&cfg.quarantine_dir),
-        };
+    // lot 311 (bug hunt 1.4, BUG-95): bytes, parsed — an index that is
+    // not UTF-8 does not parse, and is rebuilt like any other
+    let entries: Vec<serde_json::Value> = match fs::read(cfg.quarantine_dir.join("index.json")) {
+        Ok(s) => {
+            serde_json::from_slice(&s).unwrap_or_else(|_| index_from_meta(&cfg.quarantine_dir))
+        }
+        Err(_) => index_from_meta(&cfg.quarantine_dir),
+    };
     entries
         .iter()
         .map(|e| VaultEntry {
@@ -1563,8 +1587,8 @@ fn index_from_meta(quarantine_dir: &Path) -> Vec<serde_json::Value> {
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.path().extension().is_some_and(|x| x == "meta"))
-                .filter_map(|e| fs::read_to_string(e.path()).ok())
-                .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .filter_map(|e| fs::read(e.path()).ok())
+                .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s).ok())
                 .map(|m| {
                     serde_json::json!({
                         "vault_id": m["vault_id"],
@@ -1589,8 +1613,12 @@ fn update_index(
     let index_path = quarantine_dir.join("index.json");
     let tmp_path = quarantine_dir.join("index.json.tmp");
 
-    let mut entries: Vec<serde_json::Value> = match fs::read_to_string(&index_path) {
-        Ok(s) => match serde_json::from_str(&s) {
+    // lot 311 (bug hunt 1.4, BUG-95): read as bytes and parsed — an index
+    // that is not UTF-8 (a disk's corruption) failed the read itself, and
+    // every quarantine after it, its `.bin` and `.meta` left behind; it is
+    // an index that does not parse, kept aside and rebuilt (CMB-017)
+    let mut entries: Vec<serde_json::Value> = match fs::read(&index_path) {
+        Ok(s) => match serde_json::from_slice(&s) {
             Ok(v) => v,
             Err(e) => {
                 // External audit CMB-017: an index that does not parse was
@@ -3381,6 +3409,31 @@ mod bug90 {
         assert!(list_vault(&cfg).is_empty());
     }
 
+    /// Re-check of #543 (N1), with lot 311b's rule: the shells a
+    /// `/etc/shells` lists, its bytes made text; none for a host without
+    /// one; an error — never an empty list — for one that cannot be read.
+    #[test]
+    fn n1_an_unreadable_shell_list_is_an_error_not_an_empty_one() {
+        let tmp = TempDir::new().unwrap();
+        let list = tmp.path().join("shells");
+        fs::write(
+            &list,
+            b"# comment\n/bin/sh\n  /usr/bin/fish \nnologin\n/opt/\xff/zsh\n",
+        )
+        .unwrap();
+        assert_eq!(
+            listed_shells(&list).unwrap(),
+            [
+                PathBuf::from("/bin/sh"),
+                PathBuf::from("/usr/bin/fish"),
+                PathBuf::from("/opt/\u{fffd}/zsh"),
+            ]
+        );
+        assert!(listed_shells(&tmp.path().join("none")).unwrap().is_empty());
+        // a directory in its place: EISDIR, not NotFound
+        assert!(listed_shells(tmp.path()).is_err());
+    }
+
     /// Re-check of #543 (N1): the system's own files are refused by
     /// IDENTITY, whatever name leads to them — the dynamic loader, the
     /// shells — the check winning over any name, verified or not.
@@ -3391,7 +3444,7 @@ mod bug90 {
         }
         let tmp = TempDir::new().unwrap();
         let cfg = cfg_for(&tmp);
-        let ids = protected_identities(&cfg);
+        let ids = protected_identities(&cfg, &listed_shells(Path::new(SHELLS)).unwrap());
         let loader = LOADER_DIRS
             .iter()
             .filter_map(|d| fs::read_dir(d).ok())
@@ -3570,5 +3623,74 @@ mod bug90 {
             elapsed: std::time::Duration::from_micros(1),
         });
         assert_eq!(result, super::super::journal::ActionResult::Failure);
+    }
+}
+
+/// Lot 311 (bug hunt 1.4, BUG-95): an index that is not UTF-8.
+#[cfg(test)]
+mod bug95 {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Promise (CMB-017): an index that does not parse is kept aside,
+    /// rebuilt from the `.meta` files, and the quarantine goes on — one
+    /// that is not UTF-8 too (on main: `Failed { errno: 0 }`, the original
+    /// left on disk, every later quarantine failing the same way).
+    #[test]
+    fn a_non_utf8_index_is_kept_aside_and_rebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = ExecutorConfig::for_test(tmp.path());
+        cfg.dry_run = false;
+        let intent = super::super::journal::test_intent();
+        let a = tmp.path().join("first.bin");
+        fs::write(&a, b"first").unwrap();
+        let first = quarantine_handle(&ExeHandle::open(&a).unwrap(), 4241, &cfg, &intent);
+        assert!(
+            matches!(first, ExecutionOutcome::Quarantined { .. }),
+            "premise: {first:?}"
+        );
+        let index = cfg.quarantine_dir.join("index.json");
+        let mut bytes = fs::read(&index).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] = 0xFF;
+        fs::write(&index, bytes).unwrap();
+        assert_eq!(list_vault(&cfg).len(), 1, "listed from the .meta files");
+        let b = tmp.path().join("payload.bin");
+        fs::write(&b, b"payload").unwrap();
+        let out = quarantine_handle(&ExeHandle::open(&b).unwrap(), 4242, &cfg, &intent);
+        let kept_aside = fs::read_dir(&cfg.quarantine_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("index.json.corrupt-")
+            });
+        let _ = take_index_notes(&cfg.quarantine_dir);
+        let still = b.exists();
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }) && !still && kept_aside,
+            "BUG-95: outcome {out:?}, original still on disk: {still}, index kept aside: {kept_aside}"
+        );
+        assert_eq!(list_vault(&cfg).len(), 2);
+    }
+
+    /// Guard (must stay): a UTF-8 index that does not parse is repaired.
+    #[test]
+    fn a_utf8_corrupt_index_is_repaired() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = ExecutorConfig::for_test(tmp.path());
+        cfg.dry_run = false;
+        let intent = super::super::journal::test_intent();
+        fs::create_dir_all(&cfg.quarantine_dir).unwrap();
+        fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
+        let b = tmp.path().join("payload.bin");
+        fs::write(&b, b"payload").unwrap();
+        let out = quarantine_handle(&ExeHandle::open(&b).unwrap(), 4242, &cfg, &intent);
+        let _ = take_index_notes(&cfg.quarantine_dir);
+        assert!(
+            matches!(out, ExecutionOutcome::Quarantined { .. }) && !b.exists(),
+            "{out:?}"
+        );
     }
 }

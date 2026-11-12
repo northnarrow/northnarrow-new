@@ -459,7 +459,8 @@ fn last_beat(path: &Path) -> (u64, Option<Head>) {
 }
 
 fn last_beat_in(path: &PathBuf) -> Option<(u64, Option<Head>)> {
-    let text = std::fs::read_to_string(path).ok()?;
+    // lot 311 (F4): read as bytes, as the detection store's last id
+    let text = nn_linux::state_read::read_state(path).ok()?;
     text.lines().rev().find_map(|l| {
         let v: serde_json::Value = serde_json::from_str(l).ok()?;
         if v.get("rotate").is_some() {
