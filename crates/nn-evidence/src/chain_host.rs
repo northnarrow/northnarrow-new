@@ -76,6 +76,15 @@ pub trait ChainHost: 'static {
     fn sync_all(file: &File) -> io::Result<()> {
         file.sync_all()
     }
+
+    /// Lot 319 (external bug hunt BUG10's partial): the retention of the
+    /// rotating log whose active file is `active` stalled (`Some(why)`) or
+    /// runs again (`None`) — told by its writer once per change. An archive
+    /// past the budget that cannot be removed stops every eviction pass
+    /// (removing the newer ones past it would leave a gap in the chain), and
+    /// the disk use grows: the host makes it seen (the agent: a degradation
+    /// in `nn-admin status`, signed in the audit chain). Default: nothing.
+    fn retention_stalled(_active: &Path, _why: Option<&str>) {}
 }
 
 /// The key a chain writer signs with.
@@ -143,6 +152,33 @@ pub(crate) mod testing {
         }
         fn anchor(path: &Path) -> PathBuf {
             path.to_path_buf()
+        }
+        fn retention_stalled(active: &Path, why: Option<&str>) {
+            stalls::told(active, why);
+        }
+    }
+
+    /// Lot 319: what the writers told the portable host of their retention
+    /// ([`ChainHost::retention_stalled`]), by log (the tests run in
+    /// parallel, each its own directory).
+    pub(crate) mod stalls {
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        static TOLD: Mutex<Vec<(PathBuf, Option<String>)>> = Mutex::new(Vec::new());
+
+        pub(crate) fn told(active: &Path, why: Option<&str>) {
+            TOLD.lock()
+                .unwrap()
+                .push((active.to_path_buf(), why.map(str::to_string)));
+        }
+
+        /// What the writer of `active` told, in order (taken).
+        pub(crate) fn take(active: &Path) -> Vec<Option<String>> {
+            let mut all = TOLD.lock().unwrap();
+            let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(p, _)| p == active);
+            *all = rest;
+            mine.into_iter().map(|(_, w)| w).collect()
         }
     }
 
@@ -321,6 +357,9 @@ pub(crate) mod testing {
                 return Err(io::Error::from_raw_os_error(5));
             }
             file.sync_all()
+        }
+        fn retention_stalled(active: &Path, why: Option<&str>) {
+            PortableHost::retention_stalled(active, why);
         }
     }
 

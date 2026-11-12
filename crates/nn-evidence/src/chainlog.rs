@@ -66,6 +66,7 @@
 //! are NOT under the protected dir (e.g. `combat-audit.jsonl`) use the
 //! [`NoProtection`] manager — no dance.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -907,10 +908,16 @@ pub struct RotatingChainLog<P, K> {
     /// before the seal skipped — set by every `rotate` before it seals,
     /// attested by that rotation's finish step (`ForeignArchive`, with the
     /// entries the rename meets), also when it is retried from
-    /// `pending_seal`. A writer opened on a sealed active file (the open's
-    /// `complete_interrupted_rotation`) has none: its probe ran in another
-    /// process.
+    /// `pending_seal`. Lot 319 (BUG28's partial): a writer opened on a
+    /// sealed active file (the open's `complete_interrupted_rotation`) had
+    /// none — its probe ran in the process that died; the open sounds the
+    /// slots below the sealed one again ([`Self::unattested_foreign_slots`]).
     foreign_before_seal: Vec<(u64, &'static str, u64)>,
+    /// Lot 319 (external bug hunt BUG10's partial): why the last eviction
+    /// pass stopped (an archive past the budget that cannot be removed), or
+    /// `None` when it ran. Told to the host at each change
+    /// ([`ChainHost::retention_stalled`]).
+    retention_stalled: Option<String>,
     /// External audit NET-019: lines written by [`Self::append_deferred`]
     /// that no fsync has covered yet.
     unsynced: bool,
@@ -1007,6 +1014,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             next_seq,
             pending_seal: None,
             foreign_before_seal: Vec::new(),
+            retention_stalled: None,
             unsynced: false,
             fsyncs: 0,
             since_checkpoint: 0,
@@ -1100,6 +1108,11 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                 active_rec.tail_hash
             };
             log.active_bytes = active_rec.clean_len;
+            // Lot 319 (the mini-hunt of BUG28's partial): a foreign entry
+            // planted at an archive name while the log was closed sits below
+            // the next seq the open takes (past every name on disk): no
+            // rotation probes it. It is attested here, once.
+            log.attest_foreign_slots_at_open();
         }
         // `active_records` is intentionally left 0 here: the O(1) open no
         // longer counts the file (that was the unbounded walk). It now
@@ -1510,6 +1523,14 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         self.rotation_owed || self.pending_seal.is_some()
     }
 
+    /// Lot 319 (BUG10's partial): why the retention stalled at the last
+    /// rotation (an archive past the budget that cannot be removed: every
+    /// pass stops there and the disk use grows), `None` when the last pass
+    /// ran — or no rotation ran since the open.
+    pub fn retention_stalled(&self) -> Option<&str> {
+        self.retention_stalled.as_deref()
+    }
+
     /// Lot 296: the owed rotation, done on the calling thread — one the
     /// protection lets lift the directory (the actions chain's rotation
     /// thread). `Ok(true)`: the active file was archived.
@@ -1545,18 +1566,20 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // the next free slot before sealing, so the terminator names the
         // archive it will really become (lstat: a symlink counts as taken).
         // Lot 298 (BUG28): each slot skipped is attested like one met at the
-        // rename (`ForeignArchive` and an ERROR); it went unsaid.
-        let mut seq = self.next_seq;
-        let mut skipped = Vec::new();
+        // rename (`ForeignArchive` and an ERROR); it went unsaid. Lot 319
+        // (the mini-hunt): and each one jumped over — the next candidate is
+        // past every archive name on disk, so a foreign name between the
+        // first slot probed and the one sealed went unsaid too.
+        let start = self.next_seq;
+        let mut seq = start;
         for _ in 0..MAX_SLOT_PROBES {
-            let Some((kind, bytes)) = slot_kind(&archive_path(&self.active_path, seq)) else {
+            if slot_kind(&archive_path(&self.active_path, seq)).is_none() {
                 break;
-            };
-            skipped.push((seq, kind, bytes));
+            }
             seq = next_free_candidate(&self.active_path, seq);
         }
         self.next_seq = seq;
-        self.foreign_before_seal = skipped;
+        self.foreign_before_seal = self.foreign_slots(start, seq);
         let term = TerminatorLine::sealed(
             RotateTerminator {
                 fmt_ver: CHAINLOG_FMT_V3,
@@ -1686,13 +1709,17 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             //    removed before its failure keep their `Evicted` rows.
             let (evicted, failed) =
                 evict_excess_archives(&active, max_archives, protection_inner.as_ref());
-            if let Some(e) = failed {
+            // Lot 319 (BUG10's partial): a pass that stopped is a stalled
+            // retention — said to the host, not an ERROR alone.
+            let stalled = failed.map(|(at, e)| {
                 error!(
                     error = %format!("{e:#}"),
                     evicted = evicted.len(),
                     "chainlog: archive eviction failed post-rotate (committed; continuing)"
                 );
-            }
+                stall_reason(at, &e)
+            });
+            self.note_retention(stalled);
             let rotated = self.manifest_append(ManifestEvent::Rotated {
                 seq,
                 terminator_hash: terminator_hash.clone(),
@@ -1749,10 +1776,17 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// (never over an existing name) and opens a fresh active. `self.last_hash` is already the terminator
     /// hash (set by `open` from the recovered tail), so it is the meta-chain
     /// link for the fresh active's first line.
+    ///
+    /// Lot 319 (external bug hunt BUG28's partial): the probe that chose
+    /// `seq` ran in the process that died, and the foreign slots it skipped
+    /// died with it: they are sounded again here, from the last rotation the
+    /// manifest records ([`Self::unattested_foreign_slots`]), and attested
+    /// by the finish step.
     fn complete_interrupted_rotation(&mut self, seq: u64) -> Result<()> {
         let terminator_hash = self.last_hash.clone();
         let sealed_bytes = self.active_bytes;
         let sealed_records = self.active_records;
+        self.foreign_before_seal = self.unattested_foreign_slots(seq);
         self.pending_seal = Some(PendingSeal {
             seq,
             terminator_hash: terminator_hash.clone(),
@@ -1760,6 +1794,162 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             records: sealed_records,
         });
         self.finish_rotation(seq, terminator_hash, sealed_bytes, sealed_records)
+    }
+
+    /// Lot 319 (BUG28's partial): the foreign entries at the archive names
+    /// below `seq` that no `ForeignArchive` row names — from the slot after
+    /// the newest `Rotated` row in the manifest's tail (this log's own
+    /// archives are below it), from the first slot without one. The
+    /// manifest is read only when a name below `seq` is not one of this
+    /// log's archives (an open's common case reads archives' last lines
+    /// alone).
+    fn unattested_foreign_slots(&self, seq: u64) -> Vec<(u64, &'static str, u64)> {
+        let found = self.foreign_names(0, seq);
+        if found.is_empty() {
+            return found;
+        }
+        let pk = self.key.verifying_key();
+        let tail = manifest_tail_events::<K::Host>(&self.active_path, P::KIND, &pk);
+        let from = tail
+            .iter()
+            .find_map(|e| match e {
+                ManifestEvent::Rotated { seq: r, .. } if *r < seq => Some(r + 1),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let attested: BTreeSet<u64> = tail
+            .iter()
+            .filter_map(|e| match e {
+                ManifestEvent::ForeignArchive { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        self.capped(
+            found
+                .into_iter()
+                .filter(|(s, _, _)| *s >= from && !attested.contains(s))
+                .collect(),
+        )
+    }
+
+    /// Lot 319 (the mini-hunt of BUG28's partial): the foreign entries at
+    /// the archive names below the next seq that no `ForeignArchive` row
+    /// names, each attested (`ForeignArchive` and an ERROR). Non-fatal.
+    fn attest_foreign_slots_at_open(&mut self) {
+        for (seq, kind, bytes) in self.unattested_foreign_slots(self.next_seq) {
+            error!(
+                seq, kind, bytes,
+                log = %self.active_path.display(),
+                "chainlog: a foreign entry holds an archive name (found at the open)"
+            );
+            if let Err(e) = self.manifest_append(ManifestEvent::ForeignArchive {
+                seq,
+                entry_type: kind.to_string(),
+                bytes,
+            }) {
+                error!(error = %format!("{e:#}"), seq, "chainlog: manifest ForeignArchive append failed");
+            }
+        }
+    }
+
+    /// Lot 319 (BUG28): the entries at the archive names `from..to` that are
+    /// not this log's archives (not a regular file ending in this log's
+    /// terminator for its seq — `lstat`, a link never followed):
+    /// `(seq, kind, lstat size)`, at most [`MAX_FOREIGN_ATTESTED`].
+    fn foreign_slots(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
+        self.capped(self.foreign_names(from, to))
+    }
+
+    /// [`Self::foreign_slots`] without the bound.
+    fn foreign_names(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
+        let seqs = list_archive_seqs(&self.active_path).unwrap_or_default();
+        seqs.into_iter()
+            .filter(|s| (from..to).contains(s))
+            .filter_map(|seq| {
+                let (kind, bytes) = slot_kind(&archive_path(&self.active_path, seq))?;
+                (kind != "file" || !self.is_own_archive(seq)).then_some((seq, kind, bytes))
+            })
+            .collect()
+    }
+
+    /// At most [`MAX_FOREIGN_ATTESTED`] of `found` (an ERROR says how many
+    /// more).
+    fn capped(&self, mut found: Vec<(u64, &'static str, u64)>) -> Vec<(u64, &'static str, u64)> {
+        if found.len() > MAX_FOREIGN_ATTESTED {
+            error!(
+                log = %self.active_path.display(),
+                more = found.len() - MAX_FOREIGN_ATTESTED,
+                "chainlog: more foreign entries at archive names than one pass attests"
+            );
+            found.truncate(MAX_FOREIGN_ATTESTED);
+        }
+        found
+    }
+
+    /// Lot 319 (BUG28): whether archive `seq` is this log's — its last line
+    /// (within [`OWN_TERMINATOR_WINDOW`]) is a terminator of this log naming
+    /// `seq`, verified with this writer's key, or with its hash recomputing
+    /// under another key (an archive sealed before the key was
+    /// regenerated). A sealed archive whose `Rotated` row the manifest lacks
+    /// (the row failed, BUG-030's degrade) is one.
+    fn is_own_archive(&self, seq: u64) -> bool {
+        let path = archive_path(&self.active_path, seq);
+        let Ok(mut f) = K::Host::open_read_nofollow(&path) else {
+            return false;
+        };
+        let Ok(len) = f.metadata().map(|m| m.len()) else {
+            return false;
+        };
+        let window = len.min(OWN_TERMINATOR_WINDOW);
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(len - window)).is_err()
+            || f.take(window).read_to_end(&mut buf).is_err()
+        {
+            return false;
+        }
+        let Some(body) = buf.strip_suffix(b"\n") else {
+            return false;
+        };
+        let last = body.rsplit(|&b| b == b'\n').next().unwrap_or(body);
+        let pk = self.key.verifying_key();
+        match check_active_line::<P>(last, &pk) {
+            LineCheck::Verified { terminator_seq } => terminator_seq == Some(seq),
+            // A terminator naming `seq` whose hash recomputes, signed with
+            // another key: an archive of this log written before the key
+            // was regenerated (`chain verify` reports its signature), not a
+            // name planted in a slot.
+            LineCheck::BadSignature => {
+                serde_json::from_slice::<serde_json::Value>(last).is_ok_and(|v| {
+                    v.get("rotate")
+                        .and_then(|r| r.get("this_seq"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(seq)
+                })
+            }
+            LineCheck::Invalid => false,
+        }
+    }
+
+    /// Lot 319 (BUG10's partial): the outcome of the last eviction pass —
+    /// `Some(why)` it stopped, `None` it ran — told to the host when it
+    /// changes.
+    fn note_retention(&mut self, stalled: Option<String>) {
+        if stalled == self.retention_stalled {
+            return;
+        }
+        match &stalled {
+            Some(why) => warn!(
+                log = %self.active_path.display(),
+                why = %why,
+                "chainlog: the retention is stalled"
+            ),
+            None => warn!(
+                log = %self.active_path.display(),
+                "chainlog: the retention runs again"
+            ),
+        }
+        K::Host::retention_stalled(&self.active_path, stalled.as_deref());
+        self.retention_stalled = stalled;
     }
 
     /// Attest a torn-tail repair (a boot-time truncation of this signed log)
@@ -2107,6 +2297,36 @@ pub fn is_terminator_line(line: &str) -> bool {
 /// Bound on the archive slots one rotation probes past foreign entries.
 const MAX_SLOT_PROBES: u32 = 16;
 
+/// Lot 319: bound on the `ForeignArchive` rows one rotation (or open)
+/// writes.
+const MAX_FOREIGN_ATTESTED: usize = 64;
+
+/// Lot 319: the bytes read from an archive's end for its terminator (a
+/// terminator line is a few hundred bytes).
+const OWN_TERMINATOR_WINDOW: u64 = 16 * 1024;
+
+/// Lot 319 (BUG10's partial): an eviction pass that stopped — the archive it
+/// could not remove (`None`: the archives could not be listed) and why.
+type EvictFailure = (Option<u64>, anyhow::Error);
+
+/// Lot 319 (BUG10's partial): why an eviction pass stopped, for the host —
+/// the archive it could not remove (`None`: the archives could not be
+/// listed) and the system's error, never a path (the writers' paths go
+/// through the anchor's `/proc/self/fd`).
+fn stall_reason(at: Option<u64>, e: &anyhow::Error) -> String {
+    let cause = e.root_cause();
+    match at {
+        Some(seq) => format!(
+            "the retention stopped at archive {seq}: it cannot be removed ({cause}); the archives \
+             past the budget stay and the disk use grows"
+        ),
+        None => format!(
+            "the archives could not be listed ({cause}): no archive is evicted and the disk use \
+             grows"
+        ),
+    }
+}
+
 /// What occupies `path`, by `lstat` (a symlink is reported, never
 /// followed): `None` if the name is free.
 fn slot_kind(path: &Path) -> Option<(&'static str, u64)> {
@@ -2159,14 +2379,18 @@ fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
 /// (it stopped every later pass, so retention never ran again). A regular
 /// archive that cannot be removed still stops the pass: removing the newer
 /// ones past it would leave a gap in the chain.
+///
+/// Lot 319 (BUG10's partial): the failure names the archive the pass could
+/// not remove (`None`: the listing failed) — the writer tells its host the
+/// retention stalled.
 fn evict_excess_archives(
     active: &Path,
     max_archives: usize,
     protection: &dyn ProtectionManager,
-) -> (Vec<(u64, String)>, Option<anyhow::Error>) {
+) -> (Vec<(u64, String)>, Option<EvictFailure>) {
     let seqs = match list_archive_seqs(active) {
         Ok(s) => s,
-        Err(e) => return (Vec::new(), Some(e)),
+        Err(e) => return (Vec::new(), Some((None, e))),
     };
     if seqs.len() <= max_archives {
         return (Vec::new(), None);
@@ -2194,7 +2418,7 @@ fn evict_excess_archives(
         }
         if let Err(e) = fs::remove_file(&path) {
             let e = anyhow!(e).context(format!("evicting archive {}", path.display()));
-            return (evicted, Some(e));
+            return (evicted, Some((Some(seq), e)));
         }
         evicted.push((seq, hash));
     }
@@ -7818,5 +8042,458 @@ mod tests {
             "no lift"
         );
         assert_eq!(manifest_events(&active).len(), 1, "the checkpoint");
+    }
+
+    // ── Lot 319 (external bug hunt, third edition: the partials 28, 10) ──
+
+    /// The terminator a rotation that crashed after its seal left at the
+    /// end of the active file: chained off `tail`, naming `this_seq`.
+    fn seal_by_hand(active: &Path, kp: &Path, tail: &str, this_seq: u64) {
+        let term = TerminatorLine::sealed(
+            RotateTerminator {
+                fmt_ver: CHAINLOG_FMT_V3,
+                this_seq,
+                next_seq: this_seq + 1,
+                record_count: 3,
+                bytes: 0,
+            },
+            &key_at(kp),
+            tail,
+            TestPayload::KIND,
+            &SystemClock,
+        )
+        .unwrap();
+        append_raw(active, to_jsonl(&term).unwrap().as_bytes());
+    }
+
+    fn foreign_rows(active: &Path) -> Vec<(u64, String, u64)> {
+        manifest_events(active)
+            .into_iter()
+            .filter_map(|e| match e {
+                ManifestEvent::ForeignArchive {
+                    seq,
+                    entry_type,
+                    bytes,
+                } => Some((seq, entry_type, bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// BUG28 (the partial left by lot 298): the probe before the seal skips
+    /// the slots foreign entries hold (here 1, and 2 it jumps past), the
+    /// process dies between the seal and the rename. The next open finishes
+    /// the rotation (`complete_interrupted_rotation`) — and the skipped
+    /// slots went unsaid: the probe's list died with the process. The open
+    /// sounds the slots between the last `Rotated` row and the sealed one
+    /// again: each foreign entry gets its `ForeignArchive` row, once.
+    #[test]
+    fn interrupted_rotation_attests_skipped_foreign_slots() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        // the crashed writer's probe: 1 taken, the next candidate past
+        // every archive name (2) is 3 — sealed as 3, then the crash
+        fs::write(archive_path(&active, 1), b"foreign\n").unwrap();
+        fs::create_dir(archive_path(&active, 2)).unwrap();
+        seal_by_hand(&active, &kp, &tail, 3);
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(3)).unwrap();
+        drop(log);
+        assert_eq!(
+            list_archive_seqs(&active).unwrap(),
+            vec![1, 2, 3],
+            "premise: the rotation finished into 3"
+        );
+        assert_eq!(data_lines(&archive_path(&active, 3)), 3);
+        let rows = foreign_rows(&active);
+        assert_eq!(
+            rows.iter()
+                .map(|(s, k, _)| (*s, k.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "file"), (2, "dir")],
+            "each foreign slot below the sealed one is attested, once"
+        );
+        assert_eq!(rows[0].2, 8, "the file's size");
+        // a later open (nothing interrupted) says nothing again
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(4)).unwrap();
+        drop(log);
+        assert_eq!(foreign_rows(&active).len(), 2);
+    }
+
+    /// Lot 319: the slots below the last `Rotated` row are this log's own
+    /// archives — the completion attests only the foreign entry past it.
+    /// And a genuine archive whose `Rotated` row is not in the manifest (the
+    /// row failed: BUG-030's degrade; here the manifest is gone) is not
+    /// taken for a foreign entry: its terminator is this log's.
+    #[test]
+    fn interrupted_rotation_attests_no_archive_of_its_own() {
+        for manifest_lost in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let active = dir.path().join("test.jsonl");
+            let kp = dir.path().join("key");
+            let tail = {
+                let mut log = open_log(&active, &kp, 2000);
+                let i = rotate_until(&mut log, &active, 1, 0);
+                // the next file stays under the cap
+                for n in i..i + 2 {
+                    log.append(payload(n)).unwrap();
+                }
+                log.last_hash().to_string()
+            };
+            assert_eq!(list_archive_seqs(&active).unwrap(), vec![1], "premise");
+            fs::write(archive_path(&active, 2), b"foreign\n").unwrap();
+            seal_by_hand(&active, &kp, &tail, 3);
+            if manifest_lost {
+                fs::remove_file(manifest_path_for(&active)).unwrap();
+            }
+            let mut log = open_log(&active, &kp, 1 << 30);
+            log.append(payload(99)).unwrap();
+            drop(log);
+            assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 2, 3]);
+            assert_eq!(
+                foreign_rows(&active),
+                vec![(2, "file".to_string(), 8)],
+                "manifest lost: {manifest_lost}"
+            );
+        }
+    }
+
+    /// Lot 319 (mini-hunt, a variant of BUG28 without a crash): the probe
+    /// skips the slot it finds taken and then jumps past every archive name
+    /// on disk; a foreign entry it jumped over (here 4) got no
+    /// `ForeignArchive` row — only the one it met (1) did.
+    #[test]
+    fn a_rotation_attests_the_foreign_slots_it_jumps_over() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 2000);
+        fs::write(archive_path(&active, 1), b"foreign\n").unwrap(); // after the open
+        fs::create_dir(archive_path(&active, 4)).unwrap();
+        rotate_until(&mut log, &active, 3, 0);
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 4, 5]);
+        let rows: Vec<(u64, String)> = foreign_rows(&active)
+            .into_iter()
+            .map(|(s, k, _)| (s, k))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, "file".to_string()), (4, "dir".to_string())],
+            "both foreign slots below the sealed one, once each"
+        );
+    }
+
+    /// An archive that cannot be removed (`chattr +i`, a read-only
+    /// filesystem), as a protection: while `on`, its release of archive
+    /// `seq` swaps it for a directory that is not empty (the removal then
+    /// fails), and the next dance swaps the archive back — a regular archive
+    /// again at every pass, unlike [`SwapOnRelease`].
+    struct Stuck {
+        active: PathBuf,
+        seq: u64,
+        on: std::sync::atomic::AtomicBool,
+    }
+
+    impl Stuck {
+        fn aside(&self) -> PathBuf {
+            self.active.with_file_name("aside")
+        }
+    }
+
+    impl ProtectionManager for Stuck {
+        fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            let held = archive_path(&self.active, self.seq);
+            if held.is_dir() {
+                fs::remove_dir_all(&held)?;
+                fs::rename(self.aside(), &held)?;
+            }
+            f()
+        }
+        fn register_active(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn release(&self, path: &Path) -> Result<()> {
+            if self.on.load(std::sync::atomic::Ordering::SeqCst)
+                && path == archive_path(&self.active, self.seq)
+            {
+                fs::rename(path, self.aside())?;
+                fs::create_dir(path)?;
+                fs::write(path.join("x"), b"x")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// BUG10 (the partial left by lot 296): an archive past the retention
+    /// that cannot be removed stops every eviction pass — by design: the
+    /// newer ones past it would leave a gap — and that was an `error!` at
+    /// each rotation alone, while the disk use grew. The writer now says
+    /// it: the host hears of the stall (the agent: a degradation in
+    /// `nn-admin status`, signed in the audit chain), once, and of its end.
+    #[test]
+    fn a_stalled_retention_is_told_to_the_host_and_so_is_its_end() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 300);
+        let mut i = rotate_until(&mut log, &active, 3, 0);
+        drop(log);
+        let stuck = std::sync::Arc::new(Stuck {
+            active: active.clone(),
+            seq: 2,
+            on: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key_at(&kp),
+            cfg(300, 1),
+            stuck.clone(),
+        )
+        .unwrap();
+        let mut rotate_to = |log: &mut RotatingChainLog<TestPayload, TestKey>, seq: u64| {
+            let from = i;
+            while !archive_path(&active, seq).exists() {
+                log.append(payload(i)).unwrap();
+                i += 1;
+                assert!(i < from + 100);
+            }
+        };
+        crate::chain_host::testing::stalls::take(&active);
+        assert!(log.retention_stalled().is_none(), "nothing yet");
+        rotate_to(&mut log, 4);
+        assert!(
+            archive_path(&active, 3).is_file() && !archive_path(&active, 1).exists(),
+            "premise: the pass removed 1 and stopped at 2"
+        );
+        let why = log
+            .retention_stalled()
+            .expect("the writer knows its retention stalled")
+            .to_string();
+        assert!(
+            why.contains("archive 2") && !why.contains(dir.path().to_str().unwrap()),
+            "the archive, no path: {why}"
+        );
+        assert_eq!(
+            crate::chain_host::testing::stalls::take(&active),
+            vec![Some(why.clone())],
+            "the host is told"
+        );
+        // the next pass stops at 2 again: the same stall, told once
+        rotate_to(&mut log, 5);
+        assert!(archive_path(&active, 3).is_file(), "stopped again");
+        assert_eq!(log.retention_stalled(), Some(why.as_str()));
+        assert!(crate::chain_host::testing::stalls::take(&active).is_empty());
+        // the archive can be removed again: the pass runs, the stall ends
+        stuck.on.store(false, std::sync::atomic::Ordering::SeqCst);
+        rotate_to(&mut log, 6);
+        assert!(log.retention_stalled().is_none());
+        assert_eq!(
+            crate::chain_host::testing::stalls::take(&active),
+            vec![None],
+            "the end is told too"
+        );
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![6]);
+        drop(log);
+        // a reopened writer knows nothing of the past stall: it tells
+        // nothing until its own pass
+        let log = open_log(&active, &kp, 300);
+        assert!(log.retention_stalled().is_none());
+        assert!(crate::chain_host::testing::stalls::take(&active).is_empty());
+    }
+
+    /// Lot 319: the listing of the archives failing (the directory cannot be
+    /// read) is a stalled retention too, said without a path.
+    #[test]
+    fn a_failed_listing_is_a_stall_without_a_path() {
+        let e = anyhow!(std::io::Error::from_raw_os_error(13)).context("read_dir /some/where");
+        let why = stall_reason(None, &e);
+        assert!(why.contains("could not be listed"), "{why}");
+        assert!(!why.contains("/some/where"), "{why}");
+        let why = stall_reason(Some(7), &e);
+        assert!(
+            why.contains("archive 7") && !why.contains("/some/where"),
+            "{why}"
+        );
+    }
+
+    /// Lot 319 (the mini-hunt of BUG28's partial): a foreign entry planted
+    /// at the next archive name while the log was closed: the open takes
+    /// the next seq past it, no rotation probes it, and it went unsaid. The
+    /// open attests it, once; a later open, nothing more.
+    #[test]
+    fn a_foreign_slot_planted_while_the_log_was_closed_is_attested_at_open() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 2000);
+        rotate_until(&mut log, &active, 1, 0);
+        drop(log);
+        fs::write(archive_path(&active, 2), b"foreign\n").unwrap();
+        fs::create_dir(archive_path(&active, 3)).unwrap();
+        for _ in 0..2 {
+            let mut log = open_log(&active, &kp, 2000);
+            log.append(payload(500)).unwrap();
+            drop(log);
+            let rows: Vec<(u64, String)> = foreign_rows(&active)
+                .into_iter()
+                .map(|(s, k, _)| (s, k))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(2, "file".to_string()), (3, "dir".to_string())],
+                "attested once, archive 1 (its own) not"
+            );
+        }
+    }
+
+    /// Lot 319 (the mini-hunt of BUG06's partial): the backdated head in an
+    /// ARCHIVE, the archive before it newer: read on there too.
+    #[test]
+    fn a_backdated_archive_head_with_a_newer_older_archive_reads_on() {
+        use crate::chain_tail::{read_chain_tail, TailQuery};
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");
+        fs::write(
+            archive_path(&active, 1),
+            line("2026-11-10T08:00:01.000000Z", 1),
+        )
+        .unwrap();
+        fs::write(
+            archive_path(&active, 2),
+            [
+                line("2025-01-01T00:00:00.000000Z", 99),
+                line("2026-11-10T08:00:02.000000Z", 2),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        fs::write(&active, line("2026-11-10T08:00:03.000000Z", 3)).unwrap();
+        let t = read_chain_tail::<PortableHost>(
+            &active,
+            &TailQuery {
+                since: Some("2026-11-10T08:00:00"),
+                keep: None,
+                soft_cap: 1 << 20,
+                max_rows: usize::MAX,
+            },
+        );
+        let ns: Vec<u64> = t
+            .jsonl
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["n"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!((ns, t.truncated), (vec![3, 2, 1], true));
+    }
+
+    /// Lot 319: the completion sounds the slots from the last `Rotated`
+    /// row on — a foreign entry below it (here one put in the place of
+    /// archive 1, a rewrite the verifier reports) is not a slot this
+    /// rotation skipped, and gets no `ForeignArchive` row from it.
+    #[test]
+    fn a_foreign_entry_below_the_last_rotation_is_not_the_completion_s() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let tail = {
+            let mut log = open_log(&active, &kp, 2000);
+            let i = rotate_until(&mut log, &active, 2, 0);
+            for n in i..i + 2 {
+                log.append(payload(n)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        fs::remove_file(archive_path(&active, 1)).unwrap();
+        fs::write(archive_path(&active, 1), b"foreign\n").unwrap();
+        seal_by_hand(&active, &kp, &tail, 3);
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(99)).unwrap();
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 2, 3]);
+        assert!(
+            foreign_rows(&active).is_empty(),
+            "{:?}",
+            foreign_rows(&active)
+        );
+    }
+
+    /// Lot 319: one pass attests at most [`MAX_FOREIGN_ATTESTED`] foreign
+    /// entries (an ERROR says how many more): root planting names by the
+    /// thousand does not grow the manifest by as many rows at every start.
+    #[test]
+    fn foreign_entries_past_the_bound_are_not_all_attested() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 2000);
+        log.append(payload(0)).unwrap();
+        drop(log);
+        for seq in 1..=(MAX_FOREIGN_ATTESTED as u64 + 6) {
+            fs::create_dir(archive_path(&active, seq)).unwrap();
+        }
+        let mut log = open_log(&active, &kp, 2000);
+        log.append(payload(1)).unwrap();
+        drop(log);
+        assert_eq!(foreign_rows(&active).len(), MAX_FOREIGN_ATTESTED);
+    }
+
+    /// Lot 319: archives sealed before the agent's key was regenerated are
+    /// the log's own (their signatures `chain verify` reports), not names
+    /// planted in a slot: the open attests none of them as foreign. A
+    /// planted file is still one.
+    #[test]
+    fn archives_of_an_earlier_key_are_not_foreign() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let old_key = dir.path().join("old-key");
+        let mut log = open_log(&active, &old_key, 2000);
+        rotate_until(&mut log, &active, 2, 0);
+        drop(log);
+        fs::write(archive_path(&active, 3), b"foreign\n").unwrap();
+        let new_key = dir.path().join("new-key");
+        let mut log = open_log(&active, &new_key, 2000);
+        log.append(payload(900)).unwrap();
+        drop(log);
+        let rows: Vec<u64> = foreign_rows(&active)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert_eq!(rows, vec![3], "only the planted file");
+    }
+
+    /// Lot 319: an archive is the log's own at its own seq only — a genuine
+    /// archive copied into another slot (a replay planted while the log was
+    /// closed) names another seq in its terminator, and is foreign there.
+    #[test]
+    fn a_copy_of_an_archive_in_another_slot_is_foreign() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let mut log = open_log(&active, &kp, 2000);
+        rotate_until(&mut log, &active, 1, 0);
+        drop(log);
+        fs::copy(archive_path(&active, 1), archive_path(&active, 2)).unwrap();
+        let mut log = open_log(&active, &kp, 2000);
+        log.append(payload(900)).unwrap();
+        drop(log);
+        let rows: Vec<(u64, String)> = foreign_rows(&active)
+            .into_iter()
+            .map(|(s, k, _)| (s, k))
+            .collect();
+        assert_eq!(rows, vec![(2, "file".to_string())]);
     }
 }

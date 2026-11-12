@@ -23,9 +23,16 @@
 //! longer a line of its own although acknowledged. The sink knows where its
 //! last `write` stopped and closes such a line with a newline before the
 //! next one; the worker keeps its sink across the error, so that knowledge
-//! is not lost. The worker cannot read its files (its seccomp list has no
-//! `read` of them): a start left by a process that ended in the middle of a
-//! line (a crash) is not seen.
+//! is not lost.
+//!
+//! Lot 319 (external bug hunt BUG31's partial): a start left by a process
+//! that ended in the middle of a line (a crash, a kill, a power loss) is
+//! closed too. The worker cannot read its files (its seccomp list has no
+//! `read` of them, and the file is opened write-only), so it does not know
+//! how the file it opens ends: a sink opened on a non-empty file closes the
+//! line before its first record — a fragment ends there, and a file that
+//! ended whole gets one empty line, which the shippers and `nn-admin export
+//! verify` skip. A record is never glued to a start it does not know of.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -64,7 +71,8 @@ pub struct JsonlSink {
     size: u64,
     /// Lot 296 (BUG31): the active file ends inside a line — the sink's
     /// last `write` stopped before a newline (the start of a line it was not
-    /// acknowledged for). The next write closes it first.
+    /// acknowledged for). The next write closes it first. Lot 319: set at
+    /// the open of a non-empty file too (its end is not known).
     torn: bool,
     /// Files rotated out (removed) since the sink opened.
     pub dropped_files: u64,
@@ -92,6 +100,10 @@ impl JsonlSink {
         };
         s.clear_past_bound()?;
         s.reopen()?;
+        // Lot 319 (BUG31's partial): how a non-empty file ends is not known
+        // (a dead writer may have left the start of a line): the first
+        // write closes the line first.
+        s.torn = s.size > 0;
         if s.size > s.max_bytes {
             // written under a larger `max_bytes`: rotated now, not at the
             // next line
@@ -340,12 +352,21 @@ mod tests {
         assert_eq!(f[0].1, vec!["{\"n\":005}".to_string()]);
         assert_eq!(f[2].1, vec!["{\"n\":003}".to_string()]);
         assert_eq!(s.dropped_files, 2);
-        // a reopened sink appends to the active file
+        // a reopened sink appends to the active file — lot 319 (BUG31's
+        // partial): after closing the line it cannot know was whole (one
+        // empty line, which the shippers skip)
         drop(s);
         let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
         assert_eq!(s.size(), 10);
         s.write(&[line(6)]).unwrap();
-        assert_eq!(files(d.path())[0].1.len(), 2);
+        assert_eq!(
+            files(d.path())[0].1,
+            vec![
+                "{\"n\":005}".to_string(),
+                String::new(),
+                "{\"n\":006}".to_string()
+            ]
+        );
         // a line longer than the size is written whole, in a file of its own
         let mut s = JsonlSink::open(d.path(), 20, 1).unwrap();
         s.write(&[vec![b'x'; 40]]).unwrap();
@@ -496,6 +517,54 @@ mod tests {
         drop(s);
         let s = JsonlSink::open(d.path(), 100, 3).unwrap();
         assert_eq!((s.size(), s.dropped_files), (0, 0));
+    }
+
+    /// Lot 319 (external bug hunt BUG31, the partial left by lot 296): a
+    /// process that died in the middle of a line (a crash, a kill) left its
+    /// start in the active file. The next worker's sink did not know — it
+    /// cannot read its files (its seccomp list has no `read` of them) — and
+    /// its first record was glued to that start: one line, neither record
+    /// readable. A sink opened on a non-empty file closes the line first: a
+    /// fragment ends there, a file that ended whole gets one empty line
+    /// (which the shippers skip), never a glued record.
+    #[test]
+    fn a_fragment_left_by_a_dead_writer_is_closed_at_open() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(ACTIVE), b"{\"n\":001}\n{\"n\":0").unwrap();
+        let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+        s.write(&[b"{\"n\":003}".to_vec()]).unwrap();
+        let text = std::fs::read_to_string(d.path().join(ACTIVE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            ["{\"n\":001}", "{\"n\":0", "{\"n\":003}"],
+            "the new record a line of its own: {text:?}"
+        );
+        // a file that ended whole: at most one empty line, every record whole
+        drop(s);
+        let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+        s.write(&[b"{\"n\":004}".to_vec()]).unwrap();
+        s.write(&[b"{\"n\":005}".to_vec()]).unwrap();
+        let text = std::fs::read_to_string(d.path().join(ACTIVE)).unwrap();
+        assert!(
+            text.ends_with("{\"n\":003}\n\n{\"n\":004}\n{\"n\":005}\n"),
+            "{text:?}"
+        );
+        // an empty file, or one the open rotates, gets no empty line
+        let d = tempfile::tempdir().unwrap();
+        let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+        s.write(&[b"{\"n\":001}".to_vec()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join(ACTIVE)).unwrap(),
+            "{\"n\":001}\n"
+        );
+        drop(s);
+        let mut s = JsonlSink::open(d.path(), 5, 3).unwrap();
+        s.write(&[b"{\"n\":002}".to_vec()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join(ACTIVE)).unwrap(),
+            "{\"n\":002}\n"
+        );
     }
 
     #[test]

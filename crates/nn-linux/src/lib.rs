@@ -137,6 +137,10 @@ pub mod canary {
 // the agent's `canary_host_linux`).
 pub mod canary_host_linux;
 
+// Lot 319 (lot 296's backlog): the flat chains' writer after a failed write
+// — the canary registry and access log, the FIM baseline, the listener log.
+pub mod flat_chain;
+
 // Lot 277: the start-in-cgroup tracker's agent half — the exemptions by
 // cgroup or unit hold for processes started in their cgroup only.
 pub mod cgroup_join;

@@ -1148,3 +1148,38 @@ configure; use the `nn-admin` of this release where the export is checked.
   monitor. Restart it inside a window (`nn-admin trusted-installer-grant`)
   to keep it; that load, seen by the agent, is signed Low.
 
+## 26. The evidence chains' residues of the third bug hunt (lot 319)
+
+- **The flat chains after a failed write**: the canary registry
+  (`canaries.jsonl`), the canary access log, the FIM baseline and the
+  listener log (`netflow_listeners.jsonl`) read their tail again before
+  the next row after a write the disk stopped part-way or a failed fsync.
+  The fragment is cut and the cut signed in the audit chain
+  (`chain_tail_repaired`, the file, the length and SHA-256 of what was cut;
+  at once, or within the next flush of 15 s when the audit log is busy). An
+  install that already holds a glued line keeps it (`nn-admin chain verify`
+  names it); nothing to do.
+- **A stalled retention is a degradation**: `nn-admin status` lists
+  `chain_retention: <log>: the retention stopped at archive N: it cannot be
+  removed (…)` while an archive past the budget cannot be removed, and the
+  trust level counts it; a `subsystem_degraded` row (source
+  `chain_retention`) is signed once. Make the archive removable again
+  (`chattr -i`, or move it aside to keep it): the next rotation's pass runs
+  and the line leaves the status. A SIEM keyed on the trust level sees the
+  degradation where it saw an ERROR alone.
+- **Foreign entries at archive names**: one `ForeignArchive` row each in
+  the log's manifest — new for those a rotation jumped over, those below a
+  rotation a crash interrupted, and those planted while the agent was
+  stopped (at the next start). Each is still refused by `nn-admin chain
+  verify`; the row says the agent saw it.
+- **The JSONL export**: each start of the export on a non-empty
+  `export.jsonl` writes a newline before its first record — one empty line
+  when the file had ended whole. Shippers and `nn-admin export verify`
+  skip empty lines; a reader that counts lines counts one more per start.
+- **`--since` and `--until`**: a value past any row's time (beyond year
+  9999, or 2^63 seconds and more) keeps no row for `fim report` and `net
+  flows`, and is the farthest time for `detections`; `nn-admin heartbeat
+  verify --max-skew-secs` holds at any value. They all kept every row, or
+  reported a skew, before.
+- Nothing to configure; the files' formats are unchanged.
+

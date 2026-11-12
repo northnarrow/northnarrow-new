@@ -63,9 +63,14 @@ skipped silently, as an archive evicted meanwhile); with `--since`, a row
 stamped before it that follows rows at or after it (the clock stepped back)
 no longer stops the read before the archives: they are read on, and the
 answer says `truncated` (the order the stop relies on does not hold). A
-row stamped before `--since` at the very head of a file still stops it: it
-cannot be told from rows in order. A row longer than the whole frame is
-skipped with `truncated`, as before.
+row stamped before `--since` at the very head of a file stops it only when
+the next, older file's last row is before `--since` too — rows in order
+(lot 319, third bug hunt, BUG06's partial: the archives were left unread,
+untruncated, also when the clock had stepped back before a file's first
+row). That row at or after `--since` reads on, with `truncated`. A
+`--since` past what a row's time can say (beyond year 9999, or 2^63
+seconds and more) keeps no row: it kept every row (lot 319). A row longer
+than the whole frame is skipped with `truncated`, as before.
 
 ### The actions chain (R12c, lab PR 270)
 
@@ -395,6 +400,36 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   (ERROR `a foreign entry holds an archive name past the retention`, and
   `nn-admin chain verify` names it) and the eviction goes on past it — it
   used to stop every later pass.
+- A stalled retention is a degradation (lot 319, BUG10's partial): a
+  regular archive past the budget that cannot be removed (`chattr +i`, a
+  read-only filesystem) stops every pass by design, and the disk use grows.
+  It was an ERROR at each rotation alone. Now `nn-admin status` lists
+  `chain_retention: <log>: the retention stopped at archive N: it cannot be
+  removed (<error>); …`, the trust level counts it, and it is signed once in
+  the audit chain (`subsystem_degraded`, source `chain_retention`, within
+  the next flush). It leaves the status at the first pass that runs again
+  (the archive removable: `chattr -i` it, or move it aside for the
+  investigation). A start knows of it from its first rotation.
+- Foreign entries at archive names (NN-AUD-115, lot 298's BUG28; lot 319):
+  every one the writer passes is attested once in the manifest
+  (`ForeignArchive`, with an ERROR) — the slot a rotation found taken, each
+  name it jumped over to the next free slot, those below the slot of a
+  rotation a crash interrupted (the open that finishes it sounds them again
+  from the last `Rotated` row; the probe's list died with the process), and
+  those planted while the log was closed (found at the open). An archive of
+  the log itself — a regular file ending in its own terminator for that
+  number — is never one, even when its `Rotated` row is missing.
+- The flat chains — the canary registry and access log, the FIM baseline,
+  the listener log — write the way the audit log does since lot 296 (lot
+  319): after a write the disk stopped part-way or a failed `fsync`, the
+  next row reads the file's tail again; the start of a row left at the end
+  is cut and the cut signed in the audit chain (`chain_tail_repaired`, the
+  file, the length and SHA-256 of what was cut — at once, or within the
+  next flush when the audit log is busy), and a row written whole is the
+  chain's tail. Before, the next row was glued to the fragment: the
+  registry and the access log skipped that line at the next start and
+  reported their chains broken there, and the listener log no longer opened
+  (the drain wrote no listener that boot).
 - A file of the detection or status-event set that cannot be read — a
   directory at its path, a disk error — ends that file's part of the read;
   the other files are still read, and a line that is not UTF-8 is skipped
