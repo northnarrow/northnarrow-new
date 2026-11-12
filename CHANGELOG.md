@@ -161,6 +161,35 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- State machines of the third external bug hunt (lot 314; editions 1.2/1.3/1.4
+  of the external bug hunt; `docs/operator/COMBAT_RECOVERY.md`):
+  - an unlocked COMBAT decays 30 minutes after the **last** escalation
+    signal, kept apart from the corroboration ledger (BUG-94): any event
+    with a hit pruned the ledger to its 15-minute window, and a scan by any
+    user 15 minutes after the last signal made COMBAT decay — and the ladder
+    stand down — up to 15 minutes early;
+  - `force-posture` toward the current state changes nothing (BUG-84): an
+    ALERTED or ENGAGED posture keeps its decay deadline (it was re-armed: an
+    hour, a day more); an unlocked COMBAT forced to COMBAT is locked
+    explicitly — a transition row naming the lock and the admin action (it
+    was locked with no trace). The posture's state is written in one place,
+    which records every change of its kind or of COMBAT's lock (a lock a
+    later signal acquires is a row too; ratchet
+    `xtask/tests/state_machines.rs`);
+  - NN-L-IOU-002 fires once per process, keyed by pid and start, its memory
+    capped (BUG-83): it fired again on most of the records the io_uring
+    sensor sends after the first (a High alert a second per process);
+  - the exec policy's repeat table keys a finding by everything its record
+    shows — the severity and the caller's tier among it — and is capped at
+    4096 (BUG-92, BUG-125): a Critical CVE-2023-4911 `GLIBC_TUNABLES` was
+    held back as a repeat of a Medium one with the same first 96 characters,
+    and a user grew the table without bound with distinct `HISTFILE`s;
+  - the heartbeat's check of the actions chain's head reads, for a head named
+    right after a rotation (N, 0, H), the last line of archive N-1 (BUG-107):
+    it was held without a read, so a cut of that archive's tail went unseen
+    for as long as the new file stayed empty;
+  - the targets of the `daemon-reload` rate limit are capped (the ratchet's
+    find, lot 314).
 - The DNS response sensor attaches on kernels whose `udp_recvmsg` and
   `udpv6_recvmsg` take four parameters (7.1, and Ubuntu 26.04's 7.0, which
   carries the change; lot 303; `docs/operator/KERNEL_COMPATIBILITY.md`): it

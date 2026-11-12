@@ -69,6 +69,10 @@ pub mod impair;
 // `posture`): the state machine, its triggers, the corroboration ledger, the
 // lineage, the stack exemption, the operator's two overlays, and what it
 // needs from its host (`posture::host`).
+/// Lot 314 (the third bug hunt, F3): the seeded generator and the runner of
+/// the state machines' model tests (here and in the agent's).
+#[cfg(any(test, feature = "test-util"))]
+pub mod model_check;
 pub mod posture;
 /// Review of #482: a worker thread whose work never falls back to its
 /// caller (the canary's access writer, the COMBAT ladder's worker).

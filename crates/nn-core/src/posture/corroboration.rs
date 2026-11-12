@@ -257,6 +257,13 @@ pub struct CorroborationLedger {
     /// The global bound was hit since the ledger was last half empty
     /// (one WARN per episode).
     full: bool,
+    /// Lot 314 (the third bug hunt, BUG-94): when the latest signal was
+    /// recorded — kept apart from the entries, which [`Self::prune`] drops
+    /// after [`CORROBORATION_WINDOW`] and the bounds evict. An unlocked
+    /// COMBAT's quiet window (twice as long) was read from the newest entry
+    /// left: any event with a hit pruned the ledger, and an ALERTED-tier one
+    /// 15 minutes after the last signal made COMBAT decay 15 minutes early.
+    last_signal: Option<Instant>,
 }
 
 impl CorroborationLedger {
@@ -390,6 +397,7 @@ impl CorroborationLedger {
     /// entry it repeats, else within the scope's bound and then the
     /// ledger's.
     fn insert(&mut self, scope: Scope, entry: LedgerEntry) {
+        self.last_signal = self.last_signal.max(Some(entry.at));
         let entries = self.scopes.entry(scope).or_default();
         if let Some(e) = entries.iter_mut().find(|e| e.same_signal(&entry)) {
             e.at = e.at.max(entry.at);
@@ -458,11 +466,14 @@ impl CorroborationLedger {
                 .is_some_and(|entries| entries.iter().any(|e| e.privileged && e.placed()))
     }
 
-    /// External audit POS-001: when the newest signal was recorded (any
-    /// scope); `None` when the ledger is empty. An unlocked COMBAT decays
-    /// once this is a quiet window old.
-    pub fn newest(&self) -> Option<Instant> {
-        self.scopes.values().filter_map(|e| newest_of(e)).max()
+    /// External audit POS-001: when the latest signal was recorded (any
+    /// scope); `None` when none was since the ledger was made or last
+    /// [cleared](Self::clear). An unlocked COMBAT decays once this is a
+    /// quiet window old. Lot 314 (BUG-94): kept apart from the entries —
+    /// neither [`Self::prune`] nor the bounds move it back (it was the
+    /// newest entry left, and a prune left none).
+    pub fn last_signal(&self) -> Option<Instant> {
+        self.last_signal
     }
 
     /// Review 52: record a configuration change whose writer could not be
@@ -563,6 +574,7 @@ impl CorroborationLedger {
         self.scopes.clear();
         self.len = 0;
         self.full = false;
+        self.last_signal = None;
     }
 
     /// Number of signals currently in the ledger.
@@ -912,7 +924,44 @@ mod tests {
         assert_eq!(l.len(), 2, "the privileged entry aged out");
         assert!(!l.has_privileged(&s));
         assert!(l.corroborated(TriggerType::ExfiltrationPattern, &s));
-        assert_eq!(l.newest(), Some(later));
+        assert_eq!(l.last_signal(), Some(later));
+    }
+
+    /// Lot 314 (BUG-94): the last signal's time outlives its entry — a
+    /// prune past the window, an eviction by the bounds — and only a clear
+    /// (an administrator's release) forgets it.
+    #[test]
+    fn the_last_signal_outlives_the_prune_and_the_bounds() {
+        let base = Instant::now();
+        let s = unit("x.service");
+        let mut l = CorroborationLedger::new();
+        assert_eq!(l.last_signal(), None);
+        l.record(TriggerType::ExploitAttempt, base, s.clone());
+        let later = base + Duration::from_secs(20 * 60);
+        l.record(TriggerType::ExfiltrationPattern, later, s.clone());
+        // an older signal recorded late does not move it back
+        l.record(TriggerType::PersistenceMechanism, base, unit("y.service"));
+        assert_eq!(l.last_signal(), Some(later));
+        l.prune(later + CORROBORATION_WINDOW + Duration::from_secs(1));
+        assert!(l.is_empty(), "every entry aged out");
+        assert_eq!(l.last_signal(), Some(later), "the prune left the time");
+        // a flood of one scope evicts entries, never the time
+        for i in 0..(LEDGER_CAP as u64 * 2) {
+            l.record(
+                TriggerType::ExploitAttempt,
+                later + Duration::from_secs(i),
+                unit(&format!("u{i}.service")),
+            );
+        }
+        let newest = later + Duration::from_secs(LEDGER_CAP as u64 * 2 - 1);
+        assert_eq!(l.len(), LEDGER_CAP);
+        assert_eq!(l.last_signal(), Some(newest));
+        l.clear();
+        assert_eq!(
+            l.last_signal(),
+            None,
+            "an administrator's release forgets it"
+        );
     }
 
     /// External audit POS-008: pending changes of two writers stay apart
@@ -1047,12 +1096,93 @@ mod tests {
             true,
         );
         assert_eq!(l.len(), 1, "recorded");
-        assert_eq!(l.newest(), Some(now));
+        assert_eq!(l.last_signal(), Some(now));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Unattributed));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &unit("x.service")));
         assert!(!l.has_privileged(&Scope::Unattributed));
         // Nor is an unplaced signal vouched for by a placed one.
         l.record(TriggerType::ExploitAttempt, now, unit("x.service"));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Unattributed));
+    }
+
+    /// Lot 314 (F3, [`crate::model_check`]): the ledger as a state machine.
+    /// Sequences of records (placed, privileged, pending) in a few scopes at
+    /// times that mostly move on and sometimes go back, prunes, placements
+    /// of the pending writers and clears; after every step the last signal
+    /// is the latest time recorded since the last clear (an oracle of the
+    /// model's own: a prune and the bounds never move it back, BUG-94), and
+    /// the bounds hold.
+    #[test]
+    fn the_ledger_keeps_its_invariants() {
+        use crate::model_check::{check, SEQUENCES};
+        let scopes: Vec<Scope> = (0..24)
+            .map(|i| unit(&format!("u{i}.service")))
+            .chain([Scope::Login(1000), Scope::Unattributed])
+            .collect();
+        let triggers = [
+            TriggerType::ExploitAttempt,
+            TriggerType::ExfiltrationPattern,
+            TriggerType::CriticalFileModification,
+            TriggerType::PersistenceMechanism,
+        ];
+        let base = Instant::now();
+        check("corroboration ledger", 0x3141_0000, SEQUENCES, |rng| {
+            let mut l = CorroborationLedger::new();
+            let mut oracle: Option<Instant> = None;
+            let mut t = base + Duration::from_secs(3600);
+            for step in 0..40 {
+                match rng.below(10) {
+                    0..=4 => {
+                        // mostly on, sometimes back (a late-read event)
+                        let at = if rng.one_in(4) {
+                            t - Duration::from_secs(rng.range(1, 1800))
+                        } else {
+                            t
+                        };
+                        let trigger = *rng.pick(&triggers);
+                        let scope = rng.pick(&scopes).clone();
+                        if rng.one_in(5) {
+                            l.record_pending(trigger, at, scope, rng.range(1, 9) as u32, false);
+                        } else {
+                            l.record_with(
+                                trigger,
+                                trigger.evidence_class(),
+                                at,
+                                scope,
+                                rng.one_in(6),
+                            );
+                        }
+                        oracle = oracle.max(Some(at));
+                    }
+                    5..=6 => t += Duration::from_secs(rng.range(1, 40 * 60)),
+                    7 => l.prune(t),
+                    8 => {
+                        let to = rng.pick(&scopes).clone();
+                        let admin = rng.one_in(2);
+                        l.resolve_pending(|w| (w % 3 != 0).then(|| (admin, to.clone())));
+                    }
+                    _ => {
+                        if rng.one_in(4) {
+                            l.clear();
+                            oracle = None;
+                        }
+                    }
+                }
+                if l.last_signal() != oracle {
+                    return Err(format!(
+                        "step {step}: last signal {:?}, the oracle says {:?}",
+                        l.last_signal().map(|x| x.duration_since(base)),
+                        oracle.map(|x| x.duration_since(base))
+                    ));
+                }
+                if l.len() > LEDGER_CAP || l.scopes.values().any(|e| e.len() > SCOPE_CAP) {
+                    return Err(format!("step {step}: past a bound ({} entries)", l.len()));
+                }
+                if l.len() != l.scopes.values().map(Vec::len).sum::<usize>() {
+                    return Err(format!("step {step}: the count drifted"));
+                }
+            }
+            Ok(())
+        });
     }
 }
