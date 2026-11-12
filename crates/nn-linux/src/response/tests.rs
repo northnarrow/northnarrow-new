@@ -437,3 +437,36 @@ fn a_thread_lowers_its_own_priority_only() {
     // SAFETY: getpriority(2) of this thread.
     assert_eq!(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }, before);
 }
+
+/// Lot 312 (review of #543, F2): the signed containment row of a block
+/// that leaves the sockets opened before the move is `partial`, with the
+/// count and what escapes; a full block's is `success`.
+#[test]
+fn a_partial_block_is_signed_partial() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let key =
+        crate::audit::AgentSigningKey::load_or_bootstrap(&tmp.path().join("agent.sig")).unwrap();
+    let log = std::sync::Arc::new(parking_lot::Mutex::new(
+        crate::audit::AuditLog::open(&tmp.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+    ));
+    let exec = Executor::with_config(cfg);
+    exec.set_audit_log(log);
+    exec.record_contain(42, "blocked", &ExecutionOutcome::BlockedNewOnly { pid: 42, sockets: 2 });
+    exec.record_contain(43, "blocked", &ExecutionOutcome::Blocked { pid: 43 });
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(tmp.path().join("audit.log"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["op"] == "response_contain")
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["result"], "partial");
+    assert_eq!(rows[0]["extra"]["sockets_before_the_move"], 2);
+    assert!(rows[0]["extra"]["why"]
+        .as_str()
+        .unwrap()
+        .starts_with("new connections blocked; 2 inet socket(s)"));
+    assert_eq!(rows[1]["result"], "success");
+}

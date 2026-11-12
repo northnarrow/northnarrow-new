@@ -114,13 +114,20 @@ impl Executor {
 
     /// External audit CMB-010: a process moved into a containment scope,
     /// with the cgroup it came from, in the signed audit log.
-    fn record_contain(&self, pid: u32, scope: &str) {
+    pub(super) fn record_contain(&self, pid: u32, scope: &str, outcome: &ExecutionOutcome) {
         let origin = super::containment::find(&self.config, pid, scope).map(|c| c.origin);
-        self.audit_entry(
-            "response_contain",
-            serde_json::json!({ "pid": pid, "scope": scope, "origin": origin }),
-            "success",
-        );
+        let mut extra = serde_json::json!({ "pid": pid, "scope": scope, "origin": origin });
+        // Lot 312 (review of #543, F2): a block that leaves the sockets
+        // opened before the move is partial, said with what holds.
+        let result = match outcome {
+            ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+                extra["sockets_before_the_move"] = serde_json::json!(sockets);
+                extra["why"] = serde_json::json!(super::blocked_new_only(*sockets));
+                "partial"
+            }
+            _ => "success",
+        };
+        self.audit_entry("response_contain", extra, result);
     }
 
     /// External audit CMB-010: a release (or a release left undone, with
@@ -520,7 +527,7 @@ impl Executor {
                         ExecutionOutcome::Blocked { .. } | ExecutionOutcome::BlockedNewOnly { .. }
                     ) && !self.config.dry_run
                     {
-                        self.record_contain(target_pid, "blocked");
+                        self.record_contain(target_pid, "blocked", &o);
                     }
                     o
                 }
@@ -542,7 +549,7 @@ impl Executor {
                     let o =
                         throttle::throttle_pid(target_pid, &self.protected, &self.config, intent);
                     if matches!(o, ExecutionOutcome::Throttled { .. }) && !self.config.dry_run {
-                        self.record_contain(target_pid, "throttled");
+                        self.record_contain(target_pid, "throttled", &o);
                     }
                     o
                 }

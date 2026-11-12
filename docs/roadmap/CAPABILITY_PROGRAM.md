@@ -9418,6 +9418,19 @@ number in parentheses is a lab PR.
     restore's inode number where no birth time is kept, the offender's
     filesystem uid, the partial block held until the stand-down, the
     in-place row's `partial`, the NEUTRALIZE text); the rerun caught all 29.
+    Measured after the fixes on our Ubuntu 24.04 guest (6.8.0-147, lease
+    k312) at 07a64f30, a real COMBAT each time: a root offender's own
+    `x (deleted)` removed (`quarantined`); its own binary kept under a
+    hidden hard link (`ln a .b; rm a`) emptied in place (0 bytes, mode
+    000, `success`); a binary hard-linked three times (a store and two
+    environments) made mode 000 under every name, its content kept
+    (`partial`, "shared: 3 links; owner uid 0"); the BUG-91 namesake moved,
+    new sockets refused, the socket opened before the move still sending,
+    the INVESTIGATE row `FAILED (PARTIAL: new connections blocked; 1 inet
+    socket(s) opened before the move are not …)` and the window shortened;
+    the three privileged tests passed. The round showed the containment row
+    of that partial block still signed `success`: fixed after it (`partial`,
+    with the count).
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
