@@ -174,7 +174,11 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
     let w = code("common/src/wire/mod.rs");
     let minor = &w[w.find("pub const fn is_minor_denial").unwrap()..];
     let minor = &minor[..minor.find("\n}\n").unwrap()];
-    for op in ["| FS_OP_SYSCTL\n", "| FS_OP_SYSCTL_VALUE\n", "| FS_OP_SYSCTL_OPT_OUT\n"] {
+    for op in [
+        "| FS_OP_SYSCTL\n",
+        "| FS_OP_SYSCTL_VALUE\n",
+        "| FS_OP_SYSCTL_OPT_OUT\n",
+    ] {
         assert!(minor.contains(op), "{op:?} not minor:\n{minor}");
     }
     assert!(code("agent-ebpf/src/main.rs").contains("mod sysctl_guard;"));
