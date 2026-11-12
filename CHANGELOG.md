@@ -8,25 +8,30 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ### Security
 - A response reports what the host holds after it, read back, not what
   the agent wrote (lot 312; external bug hunt, edition 1.4: BUG-90, 91,
-  114, 117, 120–123; `docs/operator/COMBAT_RECOVERY.md` §3.5). A payload
-  an unprivileged user named `x (deleted)` was killed by NEUTRALIZE and
-  left on disk, runnable, recorded as "no binary on disk": whether a
-  binary is gone is now the held inode's `st_nlink`, and one still linked
-  under a name the agent cannot see (a hard link) is vaulted and emptied,
-  or, a root-owned one, said not in effect. A user with a delegated cgroup
-  subtree (`user@<uid>.service`) made a cgroup named as the agent's
-  blocked scope and the soft egress block answered `Blocked`, moved
-  nothing and filtered nothing: the agent's scopes and the SSH unit are
-  now compared by components from the cgroup root (one helper,
-  `nn_core::response::cgroup`; a ratchet, `xtask/tests/response_truth.rs`),
-  the block, the throttle and their release read `/proc/<pid>/cgroup` back,
-  and the drop rule is loaded again for a scope made again. A container's
+  114, 117, 120–123, and the independent review of #543;
+  `docs/operator/COMBAT_RECOVERY.md` §3.5). A payload an unprivileged user
+  named `x (deleted)` was killed by NEUTRALIZE and left on disk, runnable,
+  recorded as "no binary on disk": whether a binary is gone is now the
+  held inode's `st_nlink`. A name is removed only when it is the file's
+  only name and the file is the offender's own; a shared file (a package
+  store's hard links) or another user's is never emptied — made mode 000
+  where the agent may, the row partial with owner and link count — and a
+  restore puts content and mode back into the same file, every name of
+  it. A user with a delegated cgroup subtree (`user@<uid>.service`) made a
+  cgroup named as the agent's blocked scope and the soft egress block
+  answered `Blocked`, moved nothing and filtered nothing: the agent's
+  scopes and the SSH unit are now compared by components from the cgroup
+  root (one helper, `nn_core::response::cgroup`; a ratchet,
+  `xtask/tests/response_truth.rs`), the block, the throttle and their
+  release read `/proc/<pid>/cgroup` back, the drop rule is loaded again
+  for a scope made again, and a process holding sockets from before the
+  move is blocked in part (said, INVESTIGATE shortened). A container's
   nested `ssh.service` no longer spares its root sshd, nor does a cgroup
   with no unit on a systemd host; a throttle's limit counts only as the
   value asked for; a second throttle keeps the real origin; a protected
-  tree-kill root keeps its tree, a host-critical one is spared alone; the
-  copy-on-first-write guard copies a file named `… (deleted)` too. Signed
-  rows say `not in effect: <reason>` where the read-back fails.
+  tree-kill root keeps its tree, and below a spared host-critical root
+  only the offending lineage can be killed; the copy-on-first-write guard
+  copies a file named `… (deleted)`, and one a rename races, too.
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

@@ -332,23 +332,40 @@ still verify (`nn-admin audit verify`); a reader takes a missing `cause` or
 ### 3.5 What a response reports: what the host holds, read back (lot 312)
 
 A response's signed row says what the host holds after the action, read
-back, never what the agent wrote. Where the read-back does not show the
-effect asked for, the row is a failure with the reason (`not in effect:
-…`; the detection record's `response` says `(not in effect: …)`), never a
-success:
+back — for the quarantine, the soft egress block, the throttle and their
+release. Where the read-back does not show the effect asked for, the row
+is a failure with the reason (`not in effect: …`; the detection record's
+`response` says `(not in effect: …)`), or partial with what holds, never a
+success. Not read back yet: the nft ruleset once applied in an episode
+(re-applied when the scope is another cgroup, not re-read), and
+`StripFileCapability` (its removal by path).
 
 - **Quarantine.** Whether an offender's binary is gone is decided on the
   file the agent holds open (no name left anywhere: `st_nlink` 0, as for a
-  memfd or a binary unlinked while it ran), never on the ` (deleted)` the
-  kernel appends to `/proc/<pid>/exe`: a payload named `x (deleted)` is
-  quarantined like any other. When the name the process ran was removed
-  while another hard link keeps the file (`ln a .b; rm a`), or the file has
-  a second hard link, the content is vaulted and the file itself is
-  emptied through the agent's descriptor (no name of it runs the binary
-  any more; `response restore` gives the content back), read back empty.
-  A root-owned file linked under a name the agent cannot see is left as
-  it is (its other name may be a system binary): the row says `not in
-  effect: still on disk under a name the agent cannot see …`. A binary
+  memfd or a binary unlinked while it ran — vaulted then as evidence, up
+  to 16 MiB), never on the ` (deleted)` the kernel appends to
+  `/proc/<pid>/exe`: a payload named `x (deleted)` is quarantined like any
+  other. A name is removed — the content left to the vault — only when it
+  is the file's only name and the file is the offender's own (owned by the
+  uid it acted as). Otherwise the file is neutralized where it is, its
+  names kept:
+  - the offender's own file with no other name, whose name the agent could
+    not verify (`ln a .b; rm a`) or not remove: emptied through the
+    agent's descriptor, read back empty (`success`);
+  - a shared file (a package store's binary hard-linked into
+    environments, as conda, pnpm or uv do) or another user's: never
+    emptied. Made mode 000 under every name where the agent may change its
+    mode, its content kept; the row is `partial` and names the owner and
+    the link count. The unit has no `CAP_FOWNER`, so a file the agent does
+    not own keeps its mode and the row says `NOT made unusable … still
+    runnable`.
+  `nn-admin response restore` of such an entry puts the content and the
+  mode back into that same file (checked by device, inode and birth
+  time), so every name of it comes back; it creates no name. Without a
+  verified name, give `--to` any current name of the file. A name the
+  agent could not verify (another mount namespace's, a name swapped
+  meanwhile) is never judged by the protected prefixes; the file itself
+  is, by identity (the agent's own files are refused). A binary
   NEUTRALIZE could not open is said so (`NOT quarantined: its binary could
   not be opened (…)`); `binary not quarantined: the process exited before
   NEUTRALIZE could open it` replaces the earlier "no binary on disk".
@@ -359,10 +376,12 @@ success:
   there is moved into the agent's scope like any other. After the move
   `/proc/<pid>/cgroup` is read again; the drop rule is loaded again when
   the scope is a different cgroup (another id) than the one it was loaded
-  for. The drop matches sockets by the cgroup they were created in: a
-  socket the process opened before the move is not dropped by it (lot
-  312's note in [the capability
-  program](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md));
+  for. The drop matches sockets by the cgroup they were created in: the
+  inet sockets the process held before the move, and sockets passed to it
+  later from outside the scope (`SCM_RIGHTS`), keep sending. A process
+  holding any is blocked in part — the row is `partial`, "new connections
+  blocked; N inet socket(s) opened before the move are not …" — and the
+  ladder shortens its INVESTIGATE window as for a failed block;
   NEUTRALIZE's kill and ISOLATE are what end such a connection.
 - **Throttle.** A limit counts only where it reads back as the value asked
   for (`io.weight` 10, `cpu.max` 10 %, `memory.high` 100 MiB): a default
@@ -381,12 +400,16 @@ success:
   on a host whose PID 1 is not systemd. On a cgroup v1 host where cgroup2
   is mounted too, systemd's own hierarchy places a process, never the
   unified root.
-- **A tree kill's spared processes.** A protected process (the agent, its
-  watchdog, init) is spared with its whole tree; a host-critical one (the
-  SSH service) alone — the offender's processes below an sshd are killed.
-  Each spared pid is in the outcome with its reason (`in the tree of a
-  protected process` for the ones below a protected pid), next to each
-  killed one.
+- **A tree kill's spared processes.** A host-critical process the ladder
+  attributes (the SSH service) is refused, its tree untouched. A protected
+  process (the agent, its watchdog, init) is spared with its whole tree; a
+  host-critical one found below an offender is spared alone. Below a
+  spared host-critical root only the offending lineage can be killed —
+  the chain from the root down to the attributed offender, and the
+  offender's own subtree — never the root's other processes (the other
+  sessions under an sshd listener). Each spared pid is in the outcome
+  with its reason (`in the tree of a protected process` for the ones
+  below a protected pid), next to each killed one.
 - **NEUTRALIZE with every offender host-critical** says so, not "no
   offending process attributed".
 

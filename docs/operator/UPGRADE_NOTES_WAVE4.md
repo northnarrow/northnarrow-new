@@ -1156,20 +1156,29 @@ configure; use the `nn-admin` of this release where the export is checked.
   record's `response` reads `BlockOutbound (not in effect: …)`. A SIEM rule
   keyed on the bare action name as success is unaffected: these rows are
   `failure` (`COMBAT_RECOVERY.md` §3.5).
-- **The quarantine empties a binary it cannot remove.** A binary whose name
-  was removed while another hard link keeps it, or with a second hard
-  link, is vaulted and then emptied in place (0 bytes; `nn-admin response
-  restore` gives it back). A root-owned one is left as it is, the row
-  `not in effect`. NEUTRALIZE's text for an offender gone before its
-  binary was opened is now "binary not quarantined: the process exited
-  before NEUTRALIZE could open it".
+- **The quarantine removes a binary's name only when it is its only name
+  and the file is the offender's own.** A shared file (a package store's
+  hard links) or another user's is never emptied: made mode 000 where the
+  agent may, its content kept, the row `partial` naming the owner and the
+  link count; the offender's own file under a name the agent cannot verify
+  is emptied in place. `nn-admin response restore` of those puts content
+  and mode back into the same file — every name of it — and creates no
+  name (without a verified name: `--to` any current name of the file). A
+  root-owned one is no longer left as it was. NEUTRALIZE's text for an
+  offender gone before its binary was opened is now "binary not
+  quarantined: the process exited before NEUTRALIZE could open it".
+- **A soft block of a process holding sockets is partial**: "new
+  connections blocked; N inet socket(s) opened before the move are not",
+  and the INVESTIGATE window is the short one.
 - **The SSH service is spared only in the system manager's own SSH unit**
   (`/system.slice/[<sub>.slice/]ssh.service`, one unit). A root sshd in a
   container's nested `ssh.service`, or — on a systemd host — in a cgroup
   with no unit, is no longer spared.
 - **A tree kill keeps a protected process's whole tree** (the agent, its
-  watchdog, init) and spares the SSH service alone: an offender's process
-  below an sshd is killed. Each spared pid is in the outcome.
+  watchdog, init) and spares a host-critical descendant (an sshd) alone;
+  below a spared host-critical root only the offending lineage (the chain
+  to the offender and its subtree) can be killed, never the root's other
+  sessions. Each spared pid is in the outcome.
 - **A release says `released` only once the process is back** in the
   cgroup it came from (`response release`: exit 9 with the reason
   otherwise).

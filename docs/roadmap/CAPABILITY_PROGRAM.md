@@ -9279,14 +9279,32 @@ number in parentheses is a lab PR.
       `/system.slice/nn-namesake-1161.service/northnarrow-test312.slice/
       blocked.scope`.
   - Mutation round on the new code: 41 targeted mutations, each a named
-    test run alone after it. First round: 34 caught, 7 survivors (the
+    test run alone after it. First round: 32 caught, 9 survivors (the
     verified name's `(dev, ino)`, the emptying's read-back, the early
     `AlreadyGone`, the removal's "no name left", `memory.high`'s value,
-    PID 1's `init.scope`, the SSH service's `Spare`) and 2 in the
-    copy-on-first-write guard; each got a named test, and the rerun caught
-    all but one, argued equivalent: `fd_path`'s `st_nlink == 0` check,
-    whose answer the `(dev, ino)` check gives anyway (no name leads to an
-    inode with no name).
+    PID 1's `init.scope`, the SSH service's `Spare`, and two in the
+    copy-on-first-write guard's `fd_path`); each got a named test, and the
+    rerun caught all but one, argued equivalent: `fd_path`'s
+    `st_nlink == 0` check, whose answer the `(dev, ino)` check gives anyway
+    (no name leads to an inode with no name).
+  - The independent review of #543 (merge after fixes; both P1 confirmed
+    closed) found the emptying of a held inode destructive through hard
+    links — a package store's binary shared by every environment, or
+    another user's file — and the restore unable to bring the other names
+    back. As the coordinator decided: a name is removed only when it is the
+    file's only name and the file is the offender's own; a shared or
+    another user's file is made mode 000 where the agent may, never
+    emptied, the row partial with owner and link count; a restore puts
+    content and mode back into the same inode. Also: a failed removal
+    (`EISDIR` after a swap with a directory) still neutralizes the held
+    inode; an unverified name never meets the prefix denylist (the inode's
+    identity does); a block of a process holding sockets from before the
+    move is partial and shortens INVESTIGATE (destroying them: lot 321); the
+    copy-on-first-write guard retries its check and copies anyway; below a
+    spared host-critical root only the offending lineage can be killed;
+    the ratchet reads past spacing and argument forms and covers the cow,
+    the offender's and the rule policy's cgroup readers. @REVIEW-LAB@
+    @REVIEW-MUT@
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
