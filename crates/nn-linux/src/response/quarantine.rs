@@ -3676,10 +3676,15 @@ mod bug90 {
         let m = fs::metadata(sys).unwrap();
         let before = m.mode();
         let (detail, effect) = neutralize_in_place(&h, &Identity::of(&h, &m), true);
-        assert_eq!(effect, InPlaceEffect::Unchanged, "{detail}");
+        // the messages leave the detail out: it names the owner's uid
+        assert_eq!(
+            effect,
+            InPlaceEffect::Unchanged,
+            "a root-owned file: unchanged"
+        );
         assert!(
             detail.starts_with("vaulted only, the file NOT changed"),
-            "{detail}"
+            "the detail says the file was not changed"
         );
         assert_eq!(fs::metadata(sys).unwrap().mode(), before);
         let (result, _, _) = super::super::journal_outcome(&super::super::ExecutionReport {
