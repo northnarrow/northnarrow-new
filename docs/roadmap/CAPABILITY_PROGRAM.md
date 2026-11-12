@@ -9195,7 +9195,11 @@ number in parentheses is a lab PR.
     device now — N8 is closed on the user side, its kernel half (the magic
     in the exec hooks) is lot 318's; the lost lines, the refused roots and
     a degradation withdrawn before its flush are signed; the ratchet became
-    semantic. @LABREV@
+    semantic. Lab (Ubuntu 26.04, `fusermount3` 3.18.2): a user's FUSE
+    mount at `~/k311mnt`, `fsname=-`, its daemon answering root inode 7,
+    root's `stat` refused (`EACCES`) — its line read (no line dropped),
+    published as `(dev, 0)` with the class `home`, its files placed by the
+    sensors' table by device. Mutation: 20 of 20 caught by a named test.
   - Level unchanged: the exec quarantine and policy stay EXPERIMENTAL (C12,
     C13), and BUG-108's kernel half (the walk to a subvolume's root) is
     lot 9's.
