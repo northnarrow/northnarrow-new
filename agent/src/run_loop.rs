@@ -289,9 +289,10 @@ fn decision_loop(
     loop {
         if ctl.stop.load(Ordering::Acquire) {
             // R12c: the bursts still with the dispatcher of slow work are
-            // judged before the thread ends (their I/O here, at the stop)
-            for e in p.slow.stop() {
-                judge(e);
+            // judged before the thread ends (lot 317, BUG-116: those it
+            // prepared on their assessment, the others with their I/O here)
+            for x in p.slow.stop() {
+                judge(p.slow.primed(x));
             }
             return;
         }
@@ -302,9 +303,8 @@ fn decision_loop(
         }
         // R12c (lab PR 270): the bursts the dispatcher of slow work
         // prepared — their assessment memoised, then judged.
-        for (e, a) in p.slow.take_ready() {
-            p.slow.tracker().prime(&e, a);
-            judge(e);
+        for x in p.slow.take_ready() {
+            judge(p.slow.primed(x));
         }
         // Lab PR 216: one round of the loop, for the watchdog's progress
         // check — the bus's wait brings a round at least every
@@ -348,8 +348,8 @@ fn decision_loop(
             Recv::Idle => {}
             Recv::Closed => {
                 warn!("sensor pump exited; shutting down");
-                for e in p.slow.stop() {
-                    judge(e);
+                for x in p.slow.stop() {
+                    judge(p.slow.primed(x));
                 }
                 return;
             }

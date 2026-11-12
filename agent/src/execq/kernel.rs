@@ -124,7 +124,79 @@ pub fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// `MEMBARRIER_CMD_GLOBAL` (`linux/membarrier.h`; `MEMBARRIER_CMD_SHARED`
+/// before 4.16): `synchronize_rcu()` for the caller.
+const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
+
+/// How long [`quiesce`] waits where `membarrier` is refused: a program
+/// run takes microseconds.
+pub const QUIESCE_FALLBACK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Lot 317 (bug hunt 1.4, BUG-118): return once every run of the exec
+/// programs that read the heartbeat before it was cleared has ended — the
+/// stop it decided is in `EXECQ_STOPPED`, where the agent's stop reads it.
+/// `maybe_stop` runs in the `sched_process_exec` tracepoint's program, with
+/// preemption off (a read-side section of RCU), and `membarrier(2)`'s
+/// `MEMBARRIER_CMD_GLOBAL` is `synchronize_rcu()`: it returns after every
+/// such section that began before the call has ended. Where it is refused
+/// (`EINVAL` with `nohz_full` CPUs) a sleep of [`QUIESCE_FALLBACK`] stands
+/// in for it. True: the kernel's grace period; false: the sleep.
+pub fn quiesce() -> bool {
+    // SAFETY: membarrier(2) with a command, flags 0 and cpu 0 (unused
+    // without MEMBARRIER_CMD_FLAG_CPU), no pointers.
+    let rc = unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) };
+    if rc != 0 {
+        std::thread::sleep(QUIESCE_FALLBACK);
+    }
+    rc == 0
+}
+
+/// Lot 317 (review F5, the re-check's N2): whether the map's entry of a pid,
+/// which names the process started at `found` (`None`: no entry, nothing to
+/// keep), may be removed or rewritten for the process started at
+/// `start_ns` — only its own.
+pub(crate) fn entry_is_its_own(found: Option<u64>, start_ns: u64) -> bool {
+    found.is_none_or(|f| f == start_ns)
+}
+
+/// Lot 317 (review F2): `ExecqStopped::stop_ns` as the agent marks the map's
+/// entry of a held process whose kill it owes (the kernel writes its stop
+/// time there, never this): the next start kills the process instead of
+/// resuming it.
+pub const KILL_OWED: u64 = u64::MAX;
+
 impl Kernel {
+    /// Lot 317 (review F5): the map's entry of process `pid` goes when it is
+    /// the one started at `start_ns` — a later holder of the pid, which the
+    /// kernel holds in its turn, keeps its own.
+    pub fn unstop(&mut self, pid: u32, start_ns: u64) {
+        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
+        if entry_is_its_own(found, start_ns) {
+            let _ = self.stopped.remove(&pid);
+        }
+    }
+
+    /// Lot 317 (review F2): mark the map's entry of process `(pid,
+    /// start_ns)` [`KILL_OWED`] (an update of an existing key succeeds on a
+    /// full map). A failure is logged: the process stays stopped, and is
+    /// resumed by the next start instead of killed. The re-check of #541
+    /// (N2): an entry a later holder of the pid has is left as it is — its
+    /// process is not this one, and a later unstop of this one would take
+    /// it out of the map.
+    pub fn owe_kill(&mut self, pid: u32, start_ns: u64) {
+        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
+        if !entry_is_its_own(found, start_ns) {
+            return;
+        }
+        let v = AyaStopped(ExecqStopped {
+            start_ns,
+            stop_ns: KILL_OWED,
+        });
+        if let Err(e) = self.stopped.insert(pid, v, 0) {
+            tracing::warn!(pid, error = %e, "exec quarantine: the owed kill could not be marked in the map");
+        }
+    }
+
     /// The heartbeat a stop needs (0: the kernel stops nothing).
     pub fn beat(&mut self, ns: u64) {
         let _ = self.alive.set(0, ns, 0);
@@ -224,6 +296,29 @@ pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 317 (review F5): an unstop removes the entry of its own process,
+    /// never the one a later holder of the pid has.
+    #[test]
+    fn an_unstop_removes_only_its_own_process() {
+        assert!(entry_is_its_own(Some(7), 7));
+        assert!(!entry_is_its_own(Some(8), 7), "a later holder of the pid");
+        assert!(entry_is_its_own(None, 7));
+    }
+
+    /// Lot 317 (BUG-118): the stop's wait for the exec programs is the
+    /// kernel's grace period (`membarrier` GLOBAL), not the fallback's
+    /// sleep, where the kernel offers it (`MEMBARRIER_CMD_QUERY`).
+    #[test]
+    fn quiesce_waits_on_the_kernel_not_on_a_sleep() {
+        // SAFETY: membarrier(2) MEMBARRIER_CMD_QUERY (0), no pointers.
+        let cmds = unsafe { libc::syscall(libc::SYS_membarrier, 0, 0, 0) };
+        if cmds < 0 || cmds & MEMBARRIER_CMD_GLOBAL == 0 {
+            eprintln!("membarrier GLOBAL not offered here ({cmds}): the fallback sleeps");
+            return;
+        }
+        assert!(quiesce(), "membarrier GLOBAL refused: the fallback slept");
+    }
 
     #[test]
     fn guarded_mount_points() {

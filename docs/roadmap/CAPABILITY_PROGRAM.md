@@ -9148,6 +9148,117 @@ number in parentheses is a lab PR.
     be read are moved and killed); with its mutant the new one fails.
   - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
     proved beyond it.
+- **Lot 317 — the exec quarantine's stop and its partial failures (third
+  bug hunt, edition 1.4: BUG-118, BUG-124, BUG-116, BUG-115; all P3; C13
+  and C17, no level change).**
+  - What was open: the stop resumed only the held processes whose report
+    the controller had read (BUG-118: one the kernel stopped after the last
+    read stayed in state T until the next start of an agent with the guard
+    on); a held process whose capture (`ProcRef`) failed was taken for one
+    that had ended at four sites — no `SIGCONT`, no `SIGKILL`, its pid out
+    of `EXECQ_STOPPED`, the record "ended while held" or "already ended"
+    (BUG-124); the dispatcher of slow work prepared its whole queue at the
+    stop and the stop threw the assessments away (BUG-116), and its
+    `catch_unwind` branch, alive only in unwinding builds, dropped the
+    burst saying it was judged (BUG-115).
+  - What changed: `ProcRef::liveness()` (live, gone, not captured) and a
+    ratchet (`xtask/tests/process_liveness.rs`); the controller captures
+    again and owes a decision it cannot carry out (the process stays held
+    and in the map; a signed `deferred` entry when it is carried out); the
+    stop clears the heartbeat, waits for the exec programs that read it
+    (`membarrier` `MEMBARRIER_CMD_GLOBAL`), then resumes the entries, the
+    owed decisions and the rest of `EXECQ_STOPPED` (`stopping`:
+    `unreported`, `recaptured`, `killed`, `left`); the slow work stops
+    before its next burst, hands back what it prepared with its assessment
+    and drops nothing; `xtask/tests/unwind_fallbacks.rs` lists the four
+    `catch_unwind` left.
+  - Measured on the host: 21 new named tests (the controller 11, the slow
+    work 4, nn-linux 4 of which 1 privileged, the e2e 1, the quiesce 1) and
+    the two ratchets; mutation 28 mutants, 28 caught by a named test (M26,
+    the tree kill's root through the kill cgroup, by the privileged test on
+    the 7.0 guest; M13 and M17 rewritten after a compile error).
+  - Lab, measured (the privileged e2e `execq_stop_privileged_e2e`: enforce
+    mode, a scanner that never says ready, a burst of new binaries from
+    four threads, a signed 2-of-N shutdown 1.5 s in, then every process of
+    the burst must end, no new process in state T, the cgroup not frozen):
+    - Ubuntu 24.04 (6.8.0-147), guest clean at boot (no agent, no overlay,
+      no pin): `main` 4c864565 with the test 3 runs, 2 failed — 1,065 and
+      1,061 execs held at the stop, one process of the burst still in state
+      T 15 s later; the fix 6 of 6 passed (964–997 held, 1,711–1,870
+      resumed, none left).
+    - Ubuntu 26.04 (7.0.0-43): `main` 4c864565 5 runs, 1 failed (974 held,
+      one left in T); the fix 5 of 5 passed (944–1,039 held, 1,419–1,664
+      resumed, none left); `main` 0420bbe7 (with lot 311a's #537) 5 of 5
+      passed; the fix again 5 of 5 (865–1,058 held, `unreported` and
+      `recaptured` 0). The privileged `a_tree_kill_whose_root_was_not_captured_reports_its_error`
+      passed there, and failed with mutant M26 applied on the guest
+      (`AlreadyGone` instead of `Failed{EMFILE}`).
+    - Every run's `unreported` was 0 (13 runs that print it): no run met
+      a process stopped without an entry; that path is proven on the host
+      (the fake kernel's map) only. `main` before #537 left one process
+      stopped in 4 of 16 runs (a diagnostic round on 7.0, 1 of 8, printed
+      the agent's log lines on the leftover pid: none — no capture failure
+      was logged for it, so its report was never read: BUG-118's case);
+      `main` with #537 passed 5 of 5. The lab shows the property (nothing
+      left stopped in 16 of 16 runs of the fix), not the sweep at work;
+      the review's round below forces the window.
+    - Every guest left powered off with no agent installed, no process in
+      state T, no test cgroup, no leftover file.
+  - Not done: the recovery of what a previous agent left stopped when the
+    next agent's guard is off or cannot start (documented limit, §2 of the
+    design; a follow-up); the systemd watch's relayed signals still waiting
+    at the decision loop's stop are not judged (mini-hunt, a follow-up).
+  - The independent review of #541 (MERGE AFTER FIXES), fixed in new
+    commits: a late block-list verdict on a process whose resume was owed
+    was "kill failed" and the owed resume then ran the binary (F1: the kill
+    is owed in its place, and no owed resume is paid to a process a verdict
+    asks to kill); a kill owed at the stop was resumed by the next start
+    (F2: the kill is marked in the pinned map, `stop_ns` = `u64::MAX`, and
+    the next start kills it); a stop the map could not take (4096) left a
+    process nothing resumes (F3: the kernel writes the map before `SIGSTOP`
+    and stops nothing it cannot name, `MAP_FULL`, signed fail-open; F7: the
+    stop reads the ring a last time); the ratchet passed `!= Liveness::Live`
+    (F4); the stop keyed processes by pid alone (F5: pid and start); no
+    e2e showed the stop's sweep at work (F6); nits (F8). The reviewer's
+    three probes are named tests now; 12 more tests; the second mutation
+    round 20 mutants, 20 caught by a named test.
+  - Lab, measured (ubuntu2604, 7.0.0-43, the review's fixes at 3ce97ad3):
+    the plain case and two cases with the window held open (a
+    `debug-trigger` hook that kept the ring unread for 600 ms at the stop;
+    one with the stop's last read of the ring skipped, so that the map
+    alone names them) passed in runs 2 and 3: 1,007–1,074 held at the stop
+    in the plain case; 404 processes resumed without an entry in each
+    window case (the ring's capacity: the kernel stopped no more once it
+    was full), none left in state T, the cgroup not frozen; the eBPF object
+    with the new order passed the 7.0 verifier. In run 1, on the fresh
+    guest, the two window cases were refused their start ("not the
+    directory the previous agent protected" — a second agent in one run on
+    a guest no agent had run on before; the purge of the pin root before
+    each agent, as the canary and FIM suites do, did not change it; not
+    this lot's, and not met in the CI, whose earlier suites run agents
+    first). The PR's CI on
+    22.04 (5.15) then failed both window cases: the 600 ms hold ate the
+    stop's 2 s budget (`stop_deadline`) and the controller's stop was cut
+    (no `stopping` entry; the processes left in the pinned map for a next
+    start the test never makes). The hook now pauses the ring's reads from
+    a file the test creates 300 ms *before* it asks the stop
+    (`NN_DEBUG_EXECQ_PAUSE_READS`), so the stop runs at its own pace. On
+    ubuntu2604 again (ffad8f1c), run 2: the three cases passed — 1,056
+    held in the plain case, 404 processes resumed without an entry in each
+    window case, no stop overran its wait, nothing left in state T; run 1:
+    the plain case passed (and resumed 1 process without an entry, the
+    window met unforced), the two others refused at their start as above.
+    The CI's 24.04 suite on the earlier hook resumed 1 process without an
+    entry in its plain case too.
+  - The re-check of #541 (MERGE): the stop also kills a held entry whose
+    verdict asks for it, the rules' verdict still awaited (N1, it was
+    resumed undecided); `owe_kill` rewrites a pid's entry only when it
+    names the same start (N2); the ratchet refuses a `match` on `Liveness`
+    with a catch-all arm. Mutation: 6 mutants, 4 caught, 1 equivalent (a
+    redundant clause, removed), 1 survivor: `Kernel::owe_kill`'s guard over
+    the aya map, which the host tests cannot build (its decision,
+    `entry_is_its_own`, is tested).
+  - Level unchanged.
 - **Lot 314 — the state machines of the third external bug hunt, tested as
   such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,
   family F3 "state, windows and counts"; no level changes).**

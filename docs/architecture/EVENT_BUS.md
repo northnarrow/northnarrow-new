@@ -561,7 +561,20 @@ lineage lookup is as of the burst's own time (R-F), so what the decision
 judged in between changes nothing there. A full queue (256) leaves the
 burst to the decision thread, which judges it with its I/O (counted:
 `ransomware_inline`, WARNed); at the stop the bursts still with it are
-judged before the decision thread ends.
+judged before the decision thread ends. Lot 317 (third bug hunt, BUG-116):
+at the stop the thread prepares nothing more — it used to prepare the whole
+queue first (up to 256 bursts with their I/O, inside the stop's budget) —
+and the bursts it had prepared come back with their assessment, primed
+before they are judged (the stop threw the assessments away, and the
+decision judged the same bursts again with their I/O); the others are
+judged with their I/O. Nothing handed over is dropped: an event the tracker
+has no assessment for comes back without one. No `catch_unwind` around the
+preparation (BUG-115): the release build aborts on a panic, so the fallback
+lived only in unwinding builds — where it dropped the event and said it was
+judged; a thread that has ended takes no more bursts (`defer` checks it
+runs), and what it had been handed comes back unprepared at the decision's
+next turn (`take_ready`), not at the stop. `xtask/tests/unwind_fallbacks.rs` lists the `catch_unwind` calls left
+in production code, each with what its fallback does.
 
 ## 3. The take order
 
