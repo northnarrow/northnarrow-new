@@ -22,7 +22,6 @@
 //! ([`crate::systemd_state::reload`]: not `Manager.Reload()`, which waits
 //! for polkit without `CAP_SYS_ADMIN`), from a thread of its own.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -32,11 +31,17 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
+use nn_core::decision::bounded::RepeatWindow;
 
 /// At most one reload this often.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// The same target triggers a reload at most once this often.
 pub const TARGET_QUIET: Duration = Duration::from_secs(600);
+/// Lot 314 (the third bug hunt, BUG-125's family): the targets the quiet is
+/// kept for; past it the one admitted least recently is forgotten (one more
+/// reload, still within [`MIN_INTERVAL`]). The table had no cap, and was
+/// swept whole at every refusal.
+pub const TARGETS_CAP: usize = 1024;
 
 /// Why a reload is asked: a refused write of PID 1 (its target, as the
 /// denial names it) or a window that opened.
@@ -83,10 +88,28 @@ pub enum Decision {
 }
 
 /// The decision of the rate limit (pure, for the tests).
-#[derive(Debug, Default)]
 pub struct Limiter {
     last: Option<Instant>,
-    targets: HashMap<(u64, u64), Instant>,
+    /// Lot 314: the targets' quiet, capped ([`TARGETS_CAP`]).
+    targets: RepeatWindow<(u64, u64)>,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Self {
+            last: None,
+            targets: RepeatWindow::new(TARGET_QUIET, TARGETS_CAP),
+        }
+    }
+}
+
+impl std::fmt::Debug for Limiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Limiter")
+            .field("last", &self.last)
+            .field("targets", &self.targets.len())
+            .finish()
+    }
 }
 
 impl Limiter {
@@ -96,14 +119,9 @@ impl Limiter {
     /// once per target per [`TARGET_QUIET`].
     pub fn decide(&mut self, reason: &Reason, now: Instant) -> Decision {
         if let Reason::Refused { dev, ino, .. } = reason {
-            if let Some(seen) = self.targets.get(&(*dev, *ino)) {
-                if now.saturating_duration_since(*seen) < TARGET_QUIET {
-                    return Decision::Skip;
-                }
+            if !self.targets.admit((*dev, *ino), now) {
+                return Decision::Skip;
             }
-            self.targets
-                .retain(|_, t| now.saturating_duration_since(*t) < TARGET_QUIET);
-            self.targets.insert((*dev, *ino), now);
         }
         if matches!(reason, Reason::WindowOpened) {
             return Decision::Now;
@@ -431,6 +449,30 @@ mod tests {
             l.decide(&a, t0 + TARGET_QUIET + MIN_INTERVAL),
             Decision::Now
         );
+    }
+
+    /// Lot 314: the targets' table keeps its cap under a flood of distinct
+    /// refused targets, each still a reload of its own once the interval
+    /// allows it.
+    #[test]
+    fn the_targets_table_is_capped() {
+        let mut l = Limiter::default();
+        let t0 = Instant::now();
+        for ino in 0..(TARGETS_CAP as u64 * 3) {
+            let r = Reason::Refused {
+                op: "cgroup_limit",
+                dev: 1,
+                ino,
+            };
+            assert_ne!(l.decide(&r, t0), Decision::Skip, "a new target");
+        }
+        assert_eq!(l.targets.len(), TARGETS_CAP);
+        let newest = Reason::Refused {
+            op: "cgroup_limit",
+            dev: 1,
+            ino: TARGETS_CAP as u64 * 3 - 1,
+        };
+        assert_eq!(l.decide(&newest, t0), Decision::Skip, "still quiet");
     }
 
     /// The review of #492 (C1), round 7: no reload while a host drop-in
