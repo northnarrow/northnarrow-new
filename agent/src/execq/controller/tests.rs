@@ -1556,3 +1556,94 @@ fn an_exec_the_map_could_not_name_is_not_held_and_is_signed() {
         "{d:?}"
     );
 }
+
+/// A held process the scanner judged block-listed, its decision still
+/// waiting for the rules' verdict on the exec (the ledger not judged): an
+/// entry with a kill verdict and no decision yet.
+fn held_with_a_kill_verdict(label: &str) -> (World, Held) {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), label);
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "nn-lab-owed".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 5000, false);
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.run_until(|w| w.ctl.entries.values().any(|p| p.scan.is_some()));
+    assert!(w.records().is_empty(), "decided before the rules");
+    drop(dir);
+    (w, h)
+}
+
+/// An owed resume for `h`, as a decision would have left it.
+fn owe_a_resume(w: &mut World, h: &Held) {
+    w.ctl.owed.push(Owed {
+        pid: h.pid,
+        start_ns: h.start_ns,
+        action: Action::Resume,
+        path: h.exe.display().to_string(),
+        origin: "decided",
+        since: Instant::now(),
+        errno: libc::EMFILE,
+    });
+}
+
+/// Review F1: an owed resume is never paid to a process a verdict asks to
+/// kill — `pay_owed` reads the verdicts first, and kills.
+#[test]
+fn an_owed_resume_is_never_paid_to_a_process_a_verdict_kills() {
+    let (mut w, h) = held_with_a_kill_verdict("nn-bad");
+    owe_a_resume(&mut w, &h);
+    w.ctl.pay_owed(Instant::now());
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "resumed: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["action"], "kill", "{}", a[0]);
+}
+
+/// Review F1: nor at the stop — an owed resume of a process a verdict asks
+/// to kill is a kill there too.
+#[test]
+fn the_stop_kills_an_owed_resume_a_verdict_kills() {
+    let (mut w, h) = held_with_a_kill_verdict("nn-bad");
+    owe_a_resume(&mut w, &h);
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "resumed: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["resumed"], serde_json::json!([]), "{}", a[0]);
+}
+
+/// Review F2: a process whose kill the map says is owed is never resumed
+/// by the stop, whatever this run knows of it.
+#[test]
+fn the_stop_never_resumes_a_process_whose_kill_the_map_owes() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, false);
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.k.0.lock().left.push((
+        h.pid,
+        ExecqStopped {
+            start_ns: h.start_ns,
+            stop_ns: kernel::KILL_OWED,
+        },
+    ));
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "resumed: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
+}

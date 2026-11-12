@@ -1445,7 +1445,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             let pr = (self.capture)(o.pid, o.start_ns);
             match (pr.liveness(), o.action) {
                 (Liveness::Uncaptured(_), action) => {
-                    if action == Action::Kill {
+                    // a kill owed is marked in the map since it was owed;
+                    // one a verdict turns into a kill only now is marked here
+                    if action == Action::Kill && kill_verdicts.contains(&(o.pid, o.start_ns)) {
                         self.k.owe_kill(o.pid, o.start_ns);
                     }
                     left.push(o.pid);
