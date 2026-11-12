@@ -100,14 +100,19 @@ judged as any hop; the independent review of #539):
 `systemd-run --user /usr/bin/openssl enc …` was a lineage of installed
 programs end to end. Its actor is the process it started, never the
 manager. A packaged tool such a shell or manager starts is judged; a package
-transaction and PID 1's units stay trusted. What this costs: a cron job, a
-unit's `ExecStart=/bin/sh -c …`, an administrator's non-interactive `ssh host
-'cmd'` (sshd runs `bash -c`), a make recipe, a desktop session's services
-and terminal (its user's manager starts the terminal emulator) start their
-tools through an inline shell or a user's manager, and those tools' bursts
-now count — NN-L-IMP-001's kill stays held by default, its Critical record
-and the posture's `RansomwareEncryption` remain (the lab's measure: the PR
-of lot 310). Never by `comm`, never by a name list.
+transaction and PID 1's units stay trusted — an installed shell PID 1
+started (a unit's `ExecStart=/bin/sh -c …`, root's `systemd-run`) inherits
+PID 1's vouching (`impact::trust::started_by_pid1`), its own writes still
+judged. What this costs: a cron job (a user's crontab or the system's: a
+job carries no owner in this judgement), an administrator's non-interactive
+`ssh host 'cmd'` (sshd runs `bash -c`), a make recipe, a desktop session's
+services and terminal (its user's manager starts the terminal emulator)
+start their tools through an inline shell or a user's manager, and those
+tools' bursts now count — NN-L-IMP-001's kill stays held by default, its
+Critical record and the posture's `RansomwareEncryption` remain (the lab, on
+Ubuntu 24.04: a user's crontab `sh -c 'rsync -a --inplace …'` of random data
+drew one NN-L-IMP-001; the PR of lot 310). Never by `comm`, never by a name
+list.
 
 What an interpreter runs is read from its argv with that interpreter's own
 option table (lot 292, BUG-44 and BUG-42: `python3 -O x.py` runs `x.py`,

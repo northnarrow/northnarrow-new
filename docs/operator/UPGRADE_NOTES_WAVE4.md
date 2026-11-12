@@ -1203,12 +1203,16 @@ configure; use the `nn-admin` of this release where the export is checked.
   lineage of installed programs end to end); the record names the process
   it started, never the manager. An interactive shell on a terminal (`-bash`,
   `bash -l`, `bash -i`) still vouches; a package transaction and PID 1's
-  units are trusted as before. Expect more ransomware assessments of the
-  tools a cron job, a unit's `ExecStart=/bin/sh -c …`, a non-interactive
+  units are trusted as before, a unit's `ExecStart=/bin/sh -c …` included
+  (an installed shell PID 1 started inherits PID 1's vouching). Expect more
+  ransomware assessments of the tools a cron job (a user's crontab or the
+  system's: a job carries no owner in this judgement), a non-interactive
   `ssh host 'cmd'` or a desktop session's services run (on a desktop the
   user's manager starts the terminal emulator: the commands typed in it are
-  judged); a record names the shell ("which runs an inline program") or the
-  manager ("a user's service manager").
+  judged); the lab measured one on Ubuntu 24.04 — a user's crontab
+  `sh -c 'rsync -a --inplace …'` of random data drew NN-L-IMP-001 (Critical,
+  its kill held). A record names the shell ("which runs an inline program")
+  or the manager ("a user's service manager").
 - **R004 decides on the executed file** (BUG-88). A memfd or an unlinked
   file is a fileless exec whatever path reached it:
   `/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`, `/dev/stdin`, a

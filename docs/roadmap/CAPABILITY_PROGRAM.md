@@ -9215,9 +9215,32 @@ number in parentheses is a lab PR.
     differential test has a program on standard input and a strict oracle:
     0 mismatches on the host (bash 5.2.21, dash 0.5.12, perl 5.38.2,
     Python 3.12.3; ~6,070 argvs, 3,183 judged) after the reader's fixes it
-    found; TBD-DIFF-GUEST. 40 mutants of the new code, 40 caught by named
-    tests (4 after their tests were strengthened); gates on dfb0d0e3: 98
-    suites, 4,560 passed, 0 failed.
-  - The review's lab: TBD-LAB-NOTE
+    found; in the guest (node 18.19, ruby 3.2.3, zsh 5.9, mksh R59c,
+    busybox 1.36 installed for the run and purged) 0 reader mismatches over
+    13,667 argvs after the fixes it found (node's `-` values and options
+    after its program, ruby's `-E`/`-C`/`-s`, busybox's table, `+c`). 51
+    mutants of the new code, 51 caught by named tests (5 after their tests
+    were strengthened); gates on 23c8e3e7: 98 suites, 4,561 passed, 0
+    failed.
+  - The review's lab (our guests, lease k310, clean and off at the end):
+    Ubuntu 24.04 r2 (dfb0d0e3) and r3 (ab726b7c), Ubuntu 26.04 r3: the
+    eight spellings of BUG-88 and the `/opt` executor name killed;
+    `systemd-run` through PID 1's unlinked executor ran (identities 1 → 2
+    at the 10 s re-read; 2 after an agent restart); NN-L-FIM-011 killed
+    six misread readers (`bash -noprofile`, `-rcfile`, `node --eval=`,
+    `perl '-i -e'`, `PYTHONPATH` with a `sitecustomize.py`, `node -r`); a
+    re-exec of the parent's unlinked image ran from a directory only root
+    writes and was killed from the user's home. Corpus on 24.04: `dev` and
+    `ci` as in r1; `db` as the 6/11 run plus NN-L-CHAIN-008 ×2 (Log) on
+    `unattended-upgrade --dry-run`'s `http` (a rule that reads none of
+    this identity). BUG-49's cases: a user's crontab `sh -c 'rsync
+    --inplace …'` of random data drew NN-L-IMP-001 (Critical, Log: the kill
+    held); a system cron job, a unit's `sh -c`, `ssh host 'cmd'`: no
+    record (their controls drew none either: a bound, not a proof). The
+    coordinator's refinement followed: an installed shell PID 1 started
+    vouches as PID 1 does; cron's stays judged (no owner in the judgement).
+    r2's BUG-49 script stopped at its `ssh` case (it read the script's
+    standard input) and left its lab key line and directories, removed
+    first thing in r3.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.

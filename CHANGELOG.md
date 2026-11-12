@@ -26,7 +26,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   not known, never a script. An inline program (`sh -c`, `python3 -c`),
   standard input (`bash < file`) or a user's service manager (`systemd
   --user`) no longer vouches for the packaged tools it starts (ransomware
-  signal, copy guard). R004 kills a memfd or unlinked file whatever path
+  signal, copy guard) — save the installed shell PID 1 starts (a unit's
+  `ExecStart=/bin/sh -c …`), which vouches as PID 1 does; a cron job's
+  `sh -c` is judged (the lab: a user's crontab `rsync --inplace` of random
+  data drew NN-L-IMP-001, its kill held). R004 kills a memfd or unlinked file whatever path
   reached it (`/proc/thread-self/fd/N`, `/proc/self/task/<tid>/fd/N`,
   `/dev/stdin`, a relative path, a symlink: unprivileged evasions of a kill
   that holds in every posture) — in LSM mode by the exec sensor's identity,
