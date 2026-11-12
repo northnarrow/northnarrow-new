@@ -9148,3 +9148,52 @@ number in parentheses is a lab PR.
     be read are moved and killed); with its mutant the new one fails.
   - Level unchanged: C17 stays 2 — the hole is closed, nothing new is
     proved beyond it.
+- **Lot 314 — the state machines of the third external bug hunt, tested as
+  such (C14, C17, C20, C23; editions 1.2/1.3/1.4 of the external bug hunt,
+  family F3 "state, windows and counts"; no level changes).**
+  - What was open: BUG-94 (an unlocked COMBAT's 30-minute quiet read from
+    the corroboration ledger's newest entry, which any event with a hit
+    prunes to 15 minutes: a scan by any user decayed COMBAT, and stood the
+    ladder down, up to 15 minutes early); BUG-84 (a force-posture toward the
+    current state rewrote it before the no-op check: ALERTED and ENGAGED
+    re-armed their decay, an unlocked COMBAT was locked with no transition
+    row); BUG-83 (NN-L-IOU-002's "once per process" had no memory: it fired
+    on most records the sensor sends after the first); BUG-92 and BUG-125
+    (the exec policy's repeat table keyed a finding without its severity or
+    tier, and had no cap); BUG-107 (the heartbeat's check held a head named
+    right after a rotation, (N, 0, H), without reading archive N-1).
+  - What changed, structurally: the posture's state is written in one place
+    (`PostureMachine::commit`), which records every change of its kind or of
+    COMBAT's lock as a transition row; a force toward the current state is
+    `transitions::forced` (the state as it is, an unlocked COMBAT locked
+    explicitly, with a row and the admin action — the decision of 11/11);
+    the last signal's time is kept apart from the ledger's entries; the
+    decision layer's "once" and "repeat" memories are
+    `decision::bounded::{BoundedMap, RepeatWindow, OncePerProcess}`, capped,
+    with the oldest entry evicted (NN-L-IOU-002 keyed by pid and start, the
+    repeat table by everything its record shows); a chain head names its
+    line through `chainlog::head_line`, and no line ends at byte 0. Ratchet
+    `xtask/tests/state_machines.rs`: the posture's state written only by
+    `commit`, and a table of last-seen times (`Map<…, Instant>`) only on the
+    bounded helpers or listed with what bounds it — it found the
+    `daemon-reload` limiter's targets without a cap (now capped at 1024).
+  - Model tests (`nn_core::model_check`: a SplitMix64 generator, no
+    dependency, a failing sequence named by its seed): 10,000 sequences each
+    of the posture machine (events, the clock, ticks, force-posture,
+    unlock), the corroboration ledger, NN-L-IOU-002 (processes that start
+    and exit, records read late) and the repeat table, checked after every
+    step against an oracle — a command toward the current state changes
+    nothing but the explicit COMBAT lock; the quiet counts from the last
+    signal; a "once" rule gives at most one verdict per key; every table
+    keeps its cap. The counterexamples are golden cases: `force-same-state`,
+    `force-locks-heuristic-combat` (a signed force-posture item in the
+    posture golden), `combat-quiet-after-a-prune`, `iou002-once-per-process`.
+  - Not done: the start a NN-L-IOU-002 record is keyed by is read from
+    `/proc` when the record is read, not carried by the record: a record
+    read after its pid went to another process is taken for that one's (the
+    reader runs milliseconds behind; the kernel half, N9 and a start in the
+    record, is lot 318's). The catalogue's text of NN-L-IOU-002 was left as
+    it was (still accurate).
+  - Measured on the host only (no lab: no unit, install, eBPF or self-test
+    changed; the agent's boot wiring is untouched): the gates in the PR.
+  - Level unchanged.

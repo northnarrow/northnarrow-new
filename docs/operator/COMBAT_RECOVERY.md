@@ -17,6 +17,27 @@ locked COMBAT has **no automatic exit** — that is by design (a confirmed
 compromise should stay contained). This page covers how to get a host
 back, and the safety nets that keep you from being locked out.
 
+"Quiet" (lot 314, BUG-94 of the third external bug hunt): an unlocked COMBAT
+decays to ENGAGED 30 minutes after the **last escalation signal** recorded
+(an ENGAGED-tier or stronger trigger: an offensive tool, an exfiltration
+pattern, a persistence change), or after its entry when none came since. The
+time of that last signal is kept apart from the corroboration ledger, whose
+entries age out after 15 minutes: before, any event with a hit — a scan by
+any user — pruned the ledger, and a COMBAT whose last signal was more than
+15 minutes old decayed at the next tick, up to 15 minutes early.
+
+`nn-admin force-posture` toward the state the posture is already in
+changes nothing (lot 314, BUG-84): an ALERTED or ENGAGED posture keeps its
+decay deadline (one hour, one day from its last trigger), and no transition
+or admin action is recorded. The one exception is an **unlocked** COMBAT
+forced to COMBAT: the order locks it — a transition COMBAT → COMBAT that
+names the lock ("COMBAT locked by the administrator's order") and the admin
+action in `nn-admin status`; the ladder, already engaged, is not engaged
+again, and now may isolate. Before, every force rewrote the state: the
+decay restarted, and an unlocked COMBAT was locked without a trace. A lock
+acquired by a later signal (kernel-adjudicated evidence in an unlocked
+COMBAT) is a transition row of its own too.
+
 ---
 
 ## 1. The admin key (do this at install time)
@@ -349,6 +370,9 @@ So after a crash + restart the host comes back on the network on its own.
 > ```sh
 > nn-admin force-posture combat --key /path/to/admin.key
 > ```
+>
+> On a COMBAT reached on heuristics (unlocked), the same command locks it
+> (lot 314): no decay, and the ladder may isolate.
 
 ### A stop in COMBAT (lot 288, #125)
 
@@ -435,6 +459,7 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 | Release failed (exit 9) | COMBAT stays; retry `unlock`, or remove the chain by hand and `unlock` (§3.1) |
 | An older `nn-admin` | refused (exit 5): use the `nn-admin` of the agent's release (§3.2) |
 | Re-engage after crash | `nn-admin force-posture combat --key <admin.key>` |
+| Lock a heuristic (unlocked) COMBAT | `nn-admin force-posture combat --key <admin.key>` (a transition row names the lock) |
 | Crash mid-COMBAT | automatic stale-chain reconcile on restart (see §4) |
 | Host cut off by an older agent's nftables isolation | agent restart removes it; by hand see §4 |
 | See what the response layer holds | `nn-admin response status --key <audit-read key>` (§6) |
