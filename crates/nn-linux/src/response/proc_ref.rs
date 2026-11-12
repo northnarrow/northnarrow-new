@@ -43,6 +43,30 @@ pub struct ProcRef {
     errno: Option<i32>,
 }
 
+/// What a [`ProcRef`] says about its process now ([`ProcRef::liveness`]).
+///
+/// Lot 317 (third bug hunt, BUG-124): `!is_live()` was read as "the
+/// process ended" where the capture had failed — `pidfd_open` out of
+/// descriptors or memory, a failure of the agent's, not of the process.
+/// The exec quarantine took a held process it could not capture for one
+/// that had ended: no `SIGCONT`, no `SIGKILL`, its pid taken out of the
+/// kernel's stopped map, a record saying "ended while held". The three
+/// answers are told apart here, and a caller that matches on them handles
+/// the third (`xtask/tests/process_liveness.rs` holds the callers to it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// Captured, and running (stopped included): a signal through its
+    /// pidfd reaches it.
+    Live,
+    /// It has exited (a zombie included), or no process — or another one
+    /// — held its PID when it was captured: a signal reaches no one, and
+    /// none is owed.
+    Gone,
+    /// The capture failed (the errno): the process may still run, and a
+    /// signal fails with this error. Not an exit.
+    Uncaptured(i32),
+}
+
 impl ProcRef {
     /// The process `pid` names now.
     pub fn open(pid: u32) -> ProcRef {
@@ -210,6 +234,18 @@ impl ProcRef {
         }
     }
 
+    /// Lot 317: a capture of `pid` (started at `start_ns`) that failed with
+    /// `errno` — what `pidfd_open` out of descriptors gives (tests: the
+    /// agent's descriptor limit is the whole test process's).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn uncaptured_for_test(pid: u32, start_ns: u64, errno: i32) -> ProcRef {
+        ProcRef {
+            start_ns: (start_ns != 0).then_some(start_ns),
+            errno: Some(errno),
+            ..ProcRef::unopened(pid)
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -263,6 +299,19 @@ impl ProcRef {
     /// still run.
     pub fn capture_errno(&self) -> Option<i32> {
         self.errno
+    }
+
+    /// Lot 317 (BUG-124): what this reference says about its process now —
+    /// running, gone, or not captured ([`Liveness`]). `is_live() == false`
+    /// is either of the last two; only [`Liveness::Gone`] is an exit.
+    pub fn liveness(&self) -> Liveness {
+        if self.is_live() {
+            Liveness::Live
+        } else if let Some(errno) = self.errno {
+            Liveness::Uncaptured(errno)
+        } else {
+            Liveness::Gone
+        }
     }
 
     /// An event about this PID — with the process start it reported
@@ -659,6 +708,32 @@ mod tests {
         assert!(!r.is_live() && !r.matches_event(0));
         assert_eq!(r.capture_errno(), Some(libc::EMFILE));
         assert!(ProcRef::unopened(4242).capture_errno().is_none());
+    }
+
+    /// Lot 317 (BUG-124): the three answers about a process — running,
+    /// gone, not captured — are told apart; a failed capture is never an
+    /// exit, whatever `is_live` says.
+    #[test]
+    fn a_failed_capture_is_neither_live_nor_gone() {
+        let mut child = sleeper();
+        let live = ProcRef::open(child.id());
+        assert_eq!(live.liveness(), Liveness::Live);
+        let failed = ProcRef::uncaptured_for_test(child.id(), 0, libc::EMFILE);
+        assert!(!failed.is_live(), "the premise: is_live() alone says no");
+        assert_eq!(failed.liveness(), Liveness::Uncaptured(libc::EMFILE));
+        assert_eq!(
+            failed.signal(libc::SIGCONT).unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(live.liveness(), Liveness::Gone, "exited");
+        assert_eq!(
+            ProcRef::open(999_999_999).liveness(),
+            Liveness::Gone,
+            "no such process"
+        );
+        assert_eq!(ProcRef::for_test(4242, Some(1)).liveness(), Liveness::Gone);
     }
 
     /// Lot 311 (N6): a process whose `comm` is not UTF-8 — any process

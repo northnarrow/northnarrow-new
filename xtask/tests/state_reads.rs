@@ -143,7 +143,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "agent/src/cow/trust.rs",
-        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
     ),
     ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),

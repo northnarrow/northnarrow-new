@@ -465,20 +465,30 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     );
     let _ = EXECQ_CAND.remove(&key);
     if m == mode::ENFORCE {
-        // Pending from here: delivered on the exit to user mode, before
-        // the new image's first instruction.
-        let rc = generated::bpf_send_signal(SIGSTOP);
-        (*raw).stop_rc = rc as i32;
-        if rc == 0 {
-            let v = ExecqStopped {
-                start_ns,
-                stop_ns: now,
-            };
-            let _ = EXECQ_STOPPED.insert(&tgid, &v, 0);
-            bump(counter::STOPPED);
+        // Lot 317 (third bug hunt, review F3): the map names the process
+        // before it is stopped, and a process the map cannot name is not
+        // stopped (fail-open, counted): the map is what the agent's stop,
+        // and the next start after a crash, resume — a stop it could not
+        // take (4096 entries, not an LRU) stayed in state T for good.
+        let v = ExecqStopped {
+            start_ns,
+            stop_ns: now,
+        };
+        if EXECQ_STOPPED.insert(&tgid, &v, 0).is_err() {
+            flags |= stop_flags::MAP_FULL;
+            bump(counter::MAP_FULL);
         } else {
-            flags |= stop_flags::SIGNAL_FAILED;
-            bump(counter::SIGNAL_FAILED);
+            // Pending from here: delivered on the exit to user mode, before
+            // the new image's first instruction.
+            let rc = generated::bpf_send_signal(SIGSTOP);
+            (*raw).stop_rc = rc as i32;
+            if rc == 0 {
+                bump(counter::STOPPED);
+            } else {
+                let _ = EXECQ_STOPPED.remove(&tgid);
+                flags |= stop_flags::SIGNAL_FAILED;
+                bump(counter::SIGNAL_FAILED);
+            }
         }
     } else {
         flags |= stop_flags::OBSERVE;

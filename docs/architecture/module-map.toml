@@ -226,6 +226,7 @@ planned = false
 # post-plan (lab PR 222): copy on first write; fanotify, copies, journal
 "cow" = "nn-linux"
 "cow::config" = "nn-core"
+"cow::identity" = "nn-core"
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
 # R08b (lab PR 251): the decision engine moved to nn-core. `decision.rs` is
