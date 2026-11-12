@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 29;
+pub const RING_DROP_SLOTS: u32 = 30;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -85,6 +85,14 @@ pub mod ring_slot {
     /// apart from the task denials' budget so that a loop of them never
     /// buries a refused signal or ptrace; the deny itself still applies).
     pub const DENIAL_RATE: u32 = 28;
+    /// Lot 318 (the review of #545, F1 and F7): the refusals signed at each
+    /// attempt that are not decisive (`wire::is_minor_denial`: a refused
+    /// read of the agent's key, a handle on its BPF objects, a refused
+    /// program type or root `cgroup/sysctl` attach) over their own per-CPU
+    /// record budget, not recorded. Apart from [`DENIAL_RATE`], whose
+    /// budget is the decisive refusals' alone: an administrator's `bpftool
+    /// map list` spends this one, never theirs. Not a security loss.
+    pub const MINOR_DENIAL_RATE: u32 = 29;
 }
 
 /// Human names, indexed by slot.
@@ -118,6 +126,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "tls",
     "tls_rate",
     "denial_rate",
+    "minor_denial_rate",
 ];
 
 #[cfg(test)]
@@ -164,7 +173,11 @@ mod tests {
             RING_DROP_NAMES[ring_slot::DENIAL_RATE as usize],
             "denial_rate"
         );
-        assert_eq!(ring_slot::DENIAL_RATE + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::MINOR_DENIAL_RATE as usize],
+            "minor_denial_rate"
+        );
+        assert_eq!(ring_slot::MINOR_DENIAL_RATE + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -202,6 +215,7 @@ mod tests {
             (ring_slot::TLS, "tls"),
             (ring_slot::TLS_RATE, "tls_rate"),
             (ring_slot::DENIAL_RATE, "denial_rate"),
+            (ring_slot::MINOR_DENIAL_RATE, "minor_denial_rate"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

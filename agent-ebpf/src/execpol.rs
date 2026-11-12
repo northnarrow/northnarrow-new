@@ -37,11 +37,11 @@ use northnarrow_common::wire::execpol::{
 use northnarrow_common::wire::execq::{class, ExecqKey};
 
 use crate::btf_offsets::{
-    DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_PATH_OFFSET, FS_STRUCT_ROOT_OFFSET,
+    DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_PATH_OFFSET,
     INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
     INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
     PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SIGNAL_STRUCT_TTY_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
-    SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FS_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
+    SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
     TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_SIGNAL_OFFSET,
     TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET, TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET,
     TP_SYS_ENTER_EXECVE_ENVP_OFFSET,
@@ -382,10 +382,21 @@ pub(crate) unsafe fn on_pass(
         let ef = (*e).flags;
         let tb = 1u64 << t;
         mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        // The target's set-id bits: what `GLIBC_TUNABLES` is reported at.
         let setid = mode_bits & 0o6000 != 0;
-        // A set-id target runs with `AT_SECURE`: the loader ignores these
-        // entries itself; recorded, not denied (no duplicate of the kernel).
-        if ef & env_flags::DENYABLE != 0 && !setid {
+        // Lot 318 (external bug hunt BUG101): a set-id target is judged as
+        // any other. It was let through on its mode bits ("the kernel sets
+        // `AT_SECURE` and the loader ignores the entry"), which the bits do
+        // not promise: root running a set-uid-root file changes no
+        // credential, and no set-id bit applies under `no_new_privs`, on a
+        // `nosuid` mount, to a `#!` script (its interpreter's bits decide)
+        // or for an owner the caller's user namespace does not map.
+        // `deny-root` was side-stepped with `su`, or with a set-gid copy of
+        // anything run under `setpriv --no-new-privs`. Telling those apart
+        // here would take four more kernel facts and could still miss one;
+        // a preload from a staging path refused at a set-id target whose
+        // loader would have ignored it costs nothing legitimate.
+        if ef & env_flags::DENYABLE != 0 {
             let root = tv & tier_sig::ROOT != 0;
             if conf(conf_slot::ENV_DENY) & tb != 0
                 || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0)
@@ -967,14 +978,7 @@ unsafe fn map_classify(file: *const u8) -> u32 {
             fl |= exe_flags::DELETED;
         }
     }
-    let task = bpf_get_current_task() as *const u8;
-    let mut task_root: *const u8 = core::ptr::null();
-    if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
-        if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
-            let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
-            task_root = peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-        }
-    }
+    let task_root = crate::exec_lsm::task_root_of(bpf_get_current_task() as *const u8);
     let key = inode_key(inode);
     (*s).dev = key.dev;
     (*s).ino = key.ino;

@@ -2354,7 +2354,38 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   guard's refusals (`bpf_handle`, `bpf_prog_type`, `bpf_map`, `bpf_link`)
   are not behind it: lot 290 records one per object on purpose (a
   `bpftool prog list` outside a window is a burst of them); their budget is
-  a follow-up with its own measure.
+  a follow-up with its own measure. **Lot 318** (the follow-up, the bug
+  hunt's "parziale" on BUG37): they are behind it now — they wrote the ring
+  themselves, and a root loop of `BPF_MAP_GET_FD_BY_ID` on one of the
+  agent's maps filled it as the `rm` loop had. A `bpftool prog list`
+  outside a window records the first 50 of its refusals on its CPU in the
+  second and counts the rest (`denial_rate`); the refusal of every one
+  holds. The ring's only writers are the budgeted emitters
+  (`xtask/tests/kernel_halves.rs`); the privileged e2e
+  `a_bpf_handle_loop_does_not_bury_a_refused_kill` runs the loop on every
+  CPU with five refused kills in it. **The review of #545 (F1, F7)**: one
+  budget for both let 50 refused handles hold back, that second on that
+  CPU, the record of a refused unlink — the posture's decisive trigger —
+  and a `bpftool map list` (about 150 refused handles) was a telemetry
+  loss. The records that decide nothing (`common::wire::is_minor_denial`,
+  exactly the operations the posture does not take as `AntiTamperDenial`:
+  a refused read of the key, `bpf_handle`, `bpf_prog_type`,
+  `bpf_prog_opt_out`, `sysctl_root_attach`; the re-check of #545, R1 and
+  R2: the kprobes and lockdown switches, the refused renices and sysctl
+  writes, `sigio`, the opt-outs' and the exempt-cgroup and code-injection
+  records) spend a per-CPU budget of their own (`MINOR_DENIAL_RATE`, 50 a
+  second; `RING_DROPS` `minor_denial_rate`, signed, not a security ring),
+  whether signed at each attempt or rate-limited per caller; the decisive
+  ones keep lot 293's attempt budget (`bpf_map`, `bpf_link` and the file
+  refusals) and the task denials' (signals, ptraces, kexecs, cgroup moves,
+  limits) to themselves, and one of them held back (`denial_rate`,
+  `task_denial_rate`) is a telemetry loss at once. The privileged e2e
+  `a_bpf_handle_loop_does_not_hide_a_decisive_refusal`,
+  `a_switch_refusal_loop_does_not_hide_a_decisive_refusal` and
+  `a_renice_loop_does_not_hide_a_refused_kill` flood one CPU (BPF handles,
+  `kprobes/enabled` write-opens, renices of the agent) and refuse a
+  `mkdir` in `/etc/northnarrow` or a `kill -9` of the agent on it: the
+  record, the posture's transition, no decisive drop.
 - **BUG05 (P2):** `BPF_RAW_TRACEPOINT_OPEN` (17) attaches a program — a raw
   tracepoint, and through it `tp_btf`, `fentry`/`fexit` and LSM programs —
   and the `bpf` hook did not look at it: an attach that way left no record

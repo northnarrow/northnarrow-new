@@ -9697,3 +9697,118 @@ number in parentheses is a lab PR.
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
+- **Lot 318 — the kernel halves of the third bug hunt: BUG37's residue,
+  BUG101, BUG108 and N9, and N8's kernel half from the review of #538
+  (C23, C14; no level changes).**
+  - What was open: the triage of edition 1.4 (11/11) left four kernel
+    halves to one lab lot. BUG37 ("parziale" since lot 293): the BPF
+    guard's refusals wrote the shared denial ring with no budget. BUG101:
+    the exec policy's environment deny skipped every set-id target, and
+    root running `su` with a staging preload kept root and the preload.
+    BUG108: a guarded mount was found by the root the dentry walk ended on,
+    which for a btrfs subvolume at `/home` (Fedora, openSUSE) or a bound
+    directory is no published root. N9: the io_uring sensor's per-process
+    state outlived its process. The review of #538 (F1, F3) added N8's
+    kernel half: a user's FUSE daemon picks its root's inode number at
+    every GETATTR, and `EXECQ_ROOTS` filled at 64.
+  - What changed: `emit_denial_kind` → `emit_attempt` (the ring's writers
+    all budgeted, `inode_protect::emit_denial` private); the set-id skip
+    removed (not the triage's formula: `no_new_privs`, a set-id `#!`
+    script, a `nosuid` mount and an unmapped owner kept root's preload
+    under it); `nn_guarded_root` (an ancestor's identity, each level's
+    device as `stat()` gives it) and the userland publication of binds at a
+    guarded point or a home; a walk that finds no root within 64 levels
+    classed `tmp`, `var_tmp`, `home`; a FUSE file (not `virtiofs`, told by
+    `sb->s_type->name`: two optional BTF offsets, slots 127–128, the later
+    slots +2) outside the task's root `guarded_mount` by its magic, its
+    point's kind from the agent's `(s_dev, 0)` key (lot 311b's contract);
+    `EXECQ_ROOTS` 1024; `io_uring_exit` on `sched_process_exit` (the state
+    and the creation budget of a dead thread group).
+  - The review of #545 (merge after fixes), in the same PR: #538's
+    `guarded_roots` taken whole, the bind rule on top (F3); the guarded
+    points published by their own identity, a point's class without
+    `guarded_mount` (F2: openSUSE's `/var/tmp` in `@/var`, ostree's `/home`
+    and `/var/tmp` under the `/var` bind); the refusals that decide nothing
+    (`is_minor_denial`: a refused read of the key, a BPF handle, a program
+    type, a root sysctl attach, an opt-out) on a per-CPU budget of their own
+    (`minor_denial_rate`, no telemetry loss), a decisive one held back a
+    telemetry loss at once (F1, F7); every use of the denial ring outside
+    its two budgeted writers caught by the ratchet (F5). Not this lot's,
+    recorded: a filesystem a user mounts in their own user namespace (an
+    overlay after `unshare -rm`, no container needed), a chroot into a FUSE
+    directory and a chroot below a guarded mount give no class
+    (F4, F6: lot 323); a new image keeps the io_uring state of the one it
+    replaced (`execve`, same tgid: a possible IOU-002 false positive).
+  - The re-check of #545 (merge after small fixes): the kprobes and
+    lockdown switches, non-decisive but refused at the write-open, still
+    spent the decisive attempt budget (R1), and the task denials' budget
+    carried the renices, sysctl writes and exempt-cgroup records with the
+    refused signals (R2): `is_minor_denial` is now exactly the operations
+    the posture does not take as `AntiTamperDenial` (pinned both ways), and
+    a rate-limited record spends the minor budget when it is one
+    (`limited_budget`). The identity search went past the task's root: a
+    container whose root is a directory in a home (LXC's dir backend,
+    rootless podman on vfs or btrfs) made every program of its image
+    `other_home` (R3, a false-positive scope F2 widened); it stops at the
+    task's root, as the walk does — containers and chroots as before lot
+    318, their policy lot 323's. Two stale comments (R4).
+  - Host: `xtask/tests/kernel_halves.rs` (8 tests; 7 fail on `main`, the
+    eighth plants a writer for the ratchet's reader), the userland tests of
+    `execq::kernel` (the openSUSE and ostree layouts), `ring_drops`'s
+    decisive and minor drops, `nn-core`'s minor-equals-non-decisive test,
+    `wire::execq`'s virtiofs name test; 50 mutants of the new code (32
+    before the review, 18 of its fixes), every one caught by a named test —
+    two of the review's (the points' dedup, the points' directory check)
+    survived until the points test pinned one entry per key and a
+    non-directory point. The eBPF mutants are caught by
+    the text ratchets: the score says the text is pinned; the behaviour is
+    the lab's and the e2e's.
+  - Lab, as measured (our guests, lease k318). The code before the review
+    (rounds r4): `verifier-check` 108 programs, 0 failing on 5.15.0-202
+    (102 OK, 6 not counted), 6.8.0-147 (106, 2), 6.12.115 (105, 3) and
+    7.0.0-43 (103, 5); on each, the e2e
+    `a_bpf_handle_loop_does_not_bury_a_refused_kill` and the guard's
+    `bpf_guard_enforce_refuses_protected_pids_write` pass (as the nightly
+    runs them); a nobody-owned `true` run by a service from a real btrfs
+    subvolume at `/home/nn318sv`, from a directory bound at `/home/nn318b`
+    (by its own path), 70 levels under `/var/tmp`, and from a user's FUSE
+    mount whose daemon refused the agent's `stat()` of its root: each
+    `guarded_mount`/`home` (`tmp`, `var_tmp` for the deep path and the
+    unplaced FUSE root) and recorded "would deny"; N9: a live process's
+    entry present, gone at its last thread's exit (the leader's first
+    too). BUG101 on 5.15, 6.8 and 6.12: a staging preload refused (EACCES,
+    the marker preload never ran) at `mount` (root, set-uid root), at a
+    set-gid `chage` under `setpriv --no-new-privs`, at a set-gid `#!`
+    script. Before (Ubuntu 24.04, 6.8.0-147): the e2e with BUG37's fix
+    reverted fails on the bug's own symptom ("the refused kill of process
+    3841 left no record", 3,947,268 `fs_protect` drops); `main`'s tree
+    gives the four BUG108/N8 cases no class, runs the four BUG101 preloads
+    ("recorded: the target is set-id"), and keeps the N9 entries after the
+    exit. After the review (round r6, `e05b96e6`, `main` merged): on
+    7.0.0-43, 6.12.115 and 5.15.0-202 `verifier-check` 0 failing and three
+    e2e of three — BUG37's, the guard's, and F1's
+    `a_bpf_handle_loop_does_not_hide_a_decisive_refusal` (a handle flood
+    on CPU 0, then a `mkdir` in `/etc/northnarrow` there: refused, its
+    record and the posture's transition arrive; its first version unlinked
+    the fixture agent's key in a tempdir, which no agent protects, and
+    failed on that premise on 6.12 and 7.0); F2's case 108c (a directory
+    under `/home`, a point that is no mount, bound at `/srv/nn318h` and run
+    by that path: `home`, `other_home`, not `guarded_mount`) on all three;
+    the benign set-id runs with a staging preload ran with no deny record
+    (12 of 12 each); and on 5.15 the re-check's R3 reproduced — a service
+    chrooted into a directory in a home (`RootDirectory=`, the image's
+    `true` owned by a subuid) recorded "would deny" with `home` and
+    `other_home`. The re-check's head: in the PR's body (round r7).
+  - Found, not this lot's (pre-existing on `main`): on 7.0 the exec
+    environment's check is nearly inert (0 of 11 preloads refused on
+    `main`; this branch's rounds 0 to 2 of 4 at random; pinned with
+    `taskset` to CPU 0, 20 of 20; unpinned, 6 of 20 and 2 of 10). This
+    lot's guess (a per-CPU scratch read back on another CPU) was wrong:
+    lot 322's lab shows the `sys_enter_execve` program running for CPU 0's
+    execs only on that kernel, and moves the scan into the exec's own
+    hook. Also seen: on 5.15 the record's path of a file on a btrfs
+    subvolume is empty (the walk ends on the top-level subvolume; the class
+    is right).
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds its e2e to the privileged suite the nightly and
+    the PR's KVM jobs run.

@@ -28,7 +28,9 @@ use aya_ebpf::{
     macros::map,
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
 };
-use northnarrow_common::wire::exe::{exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOT_LEN};
+use northnarrow_common::wire::exe::{
+    exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
+};
 use northnarrow_common::wire::execq::{
     class, conf_slot, counter, mode, root_kind, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown,
     ExecqStopRaw, ExecqStopped,
@@ -36,7 +38,9 @@ use northnarrow_common::wire::execq::{
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_PARENT_OFFSET, INODE_I_CTIME_NSEC_OFFSET,
-    INODE_I_CTIME_SEC_OFFSET, INODE_I_MODE_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET,
+    INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET, INODE_I_SB_OFFSET,
+    FILE_SYSTEM_TYPE_NAME_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    SUPER_BLOCK_S_MAGIC_OFFSET, SUPER_BLOCK_S_TYPE_OFFSET,
     TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
@@ -59,9 +63,17 @@ pub static EXECQ_ALIVE: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
 pub static EXECQ_KNOWN: LruHashMap<ExecqKey, ExecqKnown> = LruHashMap::with_max_entries(16384, 0);
 /// Roots of the guarded mounts (a separate `/home`, `/tmp`…), keyed like
-/// `ExeIdentityRaw::root_dev/root_ino`. Written by the agent.
+/// `ExeIdentityRaw::root_dev/root_ino` (`stat()`'s device and inode of the
+/// mount point). Written by the agent. Lot 318 (BUG108's mini-hunt): 1024
+/// entries — it had 64, and a user's FUSE mounts under their home (each a
+/// guarded root) filled them: the agent's inserts past the 64th failed
+/// unseen and those mounts had no class. FUSE's own limit (`mount_max`)
+/// is 1000.
 #[map]
-pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(64, 0);
+pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(EXECQ_ROOTS_CAPACITY, 0);
+
+/// [`EXECQ_ROOTS`]' capacity.
+pub const EXECQ_ROOTS_CAPACITY: u32 = 1024;
 /// The candidate of each exec in progress, keyed by `task_struct`.
 #[map]
 static EXECQ_CAND: LruHashMap<u64, ExecqCandRaw> = LruHashMap::with_max_entries(1024, 0);
@@ -179,12 +191,18 @@ pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags
         }
     }
     if flags & exe_flags::UNRESOLVED != 0 {
-        return c;
-    }
-    let levels = (*s).levels as usize;
-    if flags & exe_flags::TASK_ROOT != 0 {
+        // Lot 318 (external bug hunt BUG108's variant): no root within the
+        // walk's 64 levels — a path no installed program has, and one any
+        // user can make where they write (`mkdir` 65 times, by relative
+        // paths). It had no path class at all, so a binary placed that deep
+        // in a home or under /tmp was neither held nor judged by a cell.
+        // Classed where it most likely is, a user-writable place: tmp,
+        // var_tmp and home (other_home by its owner, below).
+        c |= class::TMP | class::VAR_TMP | class::HOME;
+    } else if flags & exe_flags::TASK_ROOT != 0 {
         // Levels 0..levels-1 are the names below the task's root: the top
         // one is the first directory of the task's own view.
+        let levels = (*s).levels as usize;
         if levels >= 2 && levels <= 64 {
             let top = level_name(s, levels - 1);
             if top & MASK4 == NAME_TMP {
@@ -200,28 +218,75 @@ pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags
                 }
             }
         }
+    }
+    // A guarded mount, and which point it is mounted at (lab PR 226).
+    // Lot 318 (external bug hunt BUG108): by the identity of an ancestor —
+    // the root of the mount at the guarded point — wherever the walk ended.
+    // It was the walk's end only, the root of the superblock: a btrfs
+    // subvolume mounted at `/home` (Fedora's and openSUSE's layout) ends on
+    // the top-level subvolume, a directory bound at `/home` on its own
+    // filesystem's root, and neither is the key the agent publishes. In a
+    // task's own view (a chroot, a container) it adds to the classes of the
+    // names.
+    // The re-check of #545 (R3): not past the task's own root — a
+    // container's or a chroot's root on a directory of the host (an
+    // unprivileged LXC container's `rootfs`, rootless podman's vfs or btrfs
+    // storage, both in a home) took the host's `home` from above it, and
+    // every program of the container's image (owned by its root, a host
+    // subuid) was `other_home`. As before lot 318 there: the task's view.
+    let task_root =
+        crate::exec_lsm::task_root_of(aya_ebpf::helpers::bpf_get_current_task() as *const u8);
+    let g = nn_guarded_root(dentry as u64, task_root as u64);
+    // Lot 318 (the review of #538, F1 and F3: N8's kernel half): a file of
+    // a FUSE filesystem outside the task's own root is guarded whatever the
+    // roots say. Its daemon answers every GETATTR, the root's included, and
+    // the kernel takes the inode number it gives (`fuse_change_attributes`):
+    // a user's daemon made its root's key one the agent never published
+    // (the review saw the root's 1 become 7 on 6.18), and a user's FUSE
+    // mounts past `EXECQ_ROOTS`' room had none. Where no published root
+    // places it, it is classed where a user writes, as a walk that finds no
+    // root is. Inside the task's root (a virtiofs root filesystem) the names
+    // decide, as for any other.
+    // The agent publishes a FUSE mount by its device alone, `(s_dev,
+    // FUSE_BY_DEVICE)` (lot 311b; it never `stat`s a FUSE root): found, its
+    // point's kind applies.
+    let mut g = g;
+    let fuse = if flags & exe_flags::TASK_ROOT == 0 {
+        fuse_dev(dentry)
     } else {
-        // The walk ended on a filesystem's root: a guarded mount, and
-        // which point it is mounted at (lab PR 226).
+        0
+    };
+    if fuse != 0 {
+        c |= class::GUARDED_MOUNT;
         let key = ExecqKey {
-            dev: (*s).root_dev,
-            ino: (*s).root_ino,
+            dev: fuse & FUSE_DEV_MASK,
+            ino: FUSE_BY_DEVICE,
         };
         if let Some(v) = EXECQ_ROOTS.get(&key) {
-            let v = *v;
+            g = GUARDED_ROOT_FOUND | u64::from(*v);
+        } else if g & GUARDED_ROOT_FOUND == 0 {
+            c |= class::TMP | class::VAR_TMP | class::HOME;
+        }
+    }
+    if g & GUARDED_ROOT_FOUND != 0 {
+        let v = g as u32;
+        // a guarded mount's root; a guarded point's own identity (lot 318,
+        // the review of #545, F2: `/var/tmp` in openSUSE's `@/var`, `/home`
+        // under ostree's `/var` bind) gives its path class only
+        if v & root_kind::GUARDED != 0 {
             c |= class::GUARDED_MOUNT;
-            if v & root_kind::TMP != 0 {
-                c |= class::TMP;
-            }
-            if v & root_kind::VAR_TMP != 0 {
-                c |= class::VAR_TMP;
-            }
-            if v & root_kind::DEV_SHM != 0 {
-                c |= class::DEV_SHM;
-            }
-            if v & root_kind::HOME != 0 {
-                c |= class::HOME;
-            }
+        }
+        if v & root_kind::TMP != 0 {
+            c |= class::TMP;
+        }
+        if v & root_kind::VAR_TMP != 0 {
+            c |= class::VAR_TMP;
+        }
+        if v & root_kind::DEV_SHM != 0 {
+            c |= class::DEV_SHM;
+        }
+        if v & root_kind::HOME != 0 {
+            c |= class::HOME;
         }
     }
     // Lab PR 226: a home file another account owns (neither the caller's
@@ -239,6 +304,143 @@ pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags
         }
     }
     c
+}
+
+/// `FUSE_SUPER_MAGIC` (include/uapi/linux/magic.h): `fuse`, `fuseblk`,
+/// `virtiofs`.
+const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+
+/// The inode number of a FUSE mount's key in [`EXECQ_ROOTS`]: the agent
+/// keys it by the device alone (`agent/src/execq/kernel.rs`,
+/// `FUSE_BY_DEVICE`; no inode is 0).
+const FUSE_BY_DEVICE: u64 = 0;
+/// [`fuse_dev`]: a FUSE superblock (the device in the low 32 bits).
+const FUSE_DEV_FOUND: u64 = 1 << 32;
+const FUSE_DEV_MASK: u64 = 0xffff_ffff;
+
+/// Lot 318 (the review of #538, F1): the file of `dentry` is on a user
+/// FUSE filesystem (its superblock's magic, and a type other than
+/// `virtiofs`): [`FUSE_DEV_FOUND`] with the superblock's device, the key's
+/// half the agent publishes; 0 otherwise. `virtiofs` shares the magic and
+/// is a VM's or a Kata container's shared directory (its root filesystem,
+/// at times): classed by its names and roots like any other — the agent's
+/// mount table reader leaves it out of FUSE too. Without the type's
+/// offsets (or a name that cannot be read) a FUSE-magic file is guarded.
+#[inline(always)]
+unsafe fn fuse_dev(dentry: *const u8) -> u64 {
+    let inode = peek_u64(dentry.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8;
+    if inode.is_null() {
+        return 0;
+    }
+    let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+    if sb.is_null() {
+        return 0;
+    }
+    if peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET))) != FUSE_SUPER_MAGIC {
+        return 0;
+    }
+    if fs_type_is_virtiofs(sb) {
+        return 0;
+    }
+    FUSE_DEV_FOUND | u64::from(peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET))))
+}
+
+/// Whether superblock `sb`'s type is `virtiofs` (`sb->s_type->name`, its
+/// first nine bytes: `wire::execq::is_virtiofs_name`). Optional offsets,
+/// one at a time (5.15 rule 3).
+#[inline(always)]
+unsafe fn fs_type_is_virtiofs(sb: *const u8) -> bool {
+    let Some(o_type) = off_opt!(SUPER_BLOCK_S_TYPE_OFFSET) else {
+        return false;
+    };
+    let Some(o_name) = off_opt!(FILE_SYSTEM_TYPE_NAME_OFFSET) else {
+        return false;
+    };
+    let ty = peek_u64(sb.add(o_type & 0xffff)) as *const u8;
+    if ty.is_null() {
+        return false;
+    }
+    let name = peek_u64(ty.add(o_name & 0xffff)) as *const u8;
+    if name.is_null() {
+        return false;
+    }
+    // Zeroed with volatile stores: `[0u64; 2]` would compile to a `memset`
+    // call (rule 9); the string read stops at its NUL.
+    let mut buf = core::mem::MaybeUninit::<[u64; 2]>::uninit();
+    let wp = buf.as_mut_ptr() as *mut u64;
+    core::ptr::write_volatile(wp, 0);
+    core::ptr::write_volatile(wp.add(1), 0);
+    if generated::bpf_probe_read_kernel_str(wp as *mut c_void, 16, name as *const c_void) < 0 {
+        return false;
+    }
+    let w = buf.assume_init();
+    northnarrow_common::wire::execq::is_virtiofs_name(w[0], w[1])
+}
+
+/// [`nn_guarded_root`]: an ancestor's key was found in [`EXECQ_ROOTS`] (its
+/// value in the low 32 bits).
+const GUARDED_ROOT_FOUND: u64 = 1 << 32;
+
+/// Lot 318 (external bug hunt BUG108): the value in [`EXECQ_ROOTS`] of the
+/// nearest ancestor of `dentry` whose key — `stat()`'s device and inode
+/// number, as the agent publishes a guarded mount's root — is there, with
+/// [`GUARDED_ROOT_FOUND`]; 0 when none is within [`EXE_WALK_DEPTH`] levels.
+/// The search stops at `task_root`, the task's root (the re-check of #545,
+/// R3): what lies above a container's or a chroot's root is not its view —
+/// a container whose root is a directory in a home took that home's class.
+/// For a task of the host the root is the top of its filesystem, and a
+/// file of another filesystem never meets it. On btrfs each level's device
+/// is its subvolume's (`SbDev`), so a subvolume's root (inode 256 under its
+/// own device) is found where the walk crosses it. A global function
+/// (integer arguments, never inlined): the verifier checks its loop once
+/// (5.15 rule 6).
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_guarded_root(dentry: u64, task_root: u64) -> u64 {
+    unsafe { guarded_root(dentry as *const u8, task_root as *const u8) }
+}
+
+#[inline(always)]
+unsafe fn guarded_root(dentry: *const u8, task_root: *const u8) -> u64 {
+    if dentry.is_null() {
+        return 0;
+    }
+    let o_parent = off!(DENTRY_D_PARENT_OFFSET);
+    let o_inode = off!(DENTRY_D_INODE_OFFSET);
+    let o_ino = off!(INODE_I_INO_OFFSET);
+    // The file's superblock is every ancestor's: `d_parent` stays in it.
+    let file_inode = peek_u64(dentry.add(o_inode)) as *const u8;
+    if file_inode.is_null() {
+        return 0;
+    }
+    let sb = peek_u64(file_inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+    let devs = crate::inode_dev::SbDev::of(sb, peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET))));
+    // From the directory the file is in (a guarded root is a directory).
+    let mut d = peek_u64(dentry.add(o_parent)) as *const u8;
+    if d == dentry {
+        return 0;
+    }
+    for _ in 0..EXE_WALK_DEPTH {
+        if d.is_null() || d == task_root {
+            break;
+        }
+        let inode = peek_u64(d.add(o_inode)) as *const u8;
+        if !inode.is_null() {
+            let key = ExecqKey {
+                dev: u64::from(devs.dev(inode)),
+                ino: peek_u64(inode.add(o_ino)),
+            };
+            if let Some(v) = EXECQ_ROOTS.get(&key) {
+                return GUARDED_ROOT_FOUND | u64::from(*v);
+            }
+        }
+        let up = peek_u64(d.add(o_parent)) as *const u8;
+        if up == d {
+            break;
+        }
+        d = up;
+    }
+    0
 }
 
 /// A binfmt pass of `bprm_check_security`, after `exec_lsm`'s walk filled

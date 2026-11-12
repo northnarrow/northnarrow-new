@@ -430,9 +430,10 @@ pub const SOURCES: [SourceContract; 16] = [
                 allows:
                     "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
                      273b) refused write through a descriptor: one record per caller and \
-                     operation a second, 50 a second per CPU (every one is refused); (lot 277) \
-                     a move into a cgroup an exemption names (cgroup_join, recorded, not \
-                     refused) shares that budget",
+                     operation a second, 50 a second per CPU (every one is refused); lot 318 \
+                     (the re-check of #545): the decisive ones only — a move into a cgroup an \
+                     exemption names (cgroup_join, lot 277), a refused renice or sysctl write \
+                     spend minor_denial_rate — and one held back is a loss at once",
                 counter: "task_denial_rate",
             },
             KernelBudget {
@@ -440,8 +441,21 @@ pub const SOURCES: [SourceContract; 16] = [
                      operation of a protected file or directory, or a refused open of a \
                      protected cgroup file: every attempt recorded, no dedup by caller, 50 a \
                      second per CPU in a budget of their own (a loop of them never takes the \
-                     refused signals' and ptraces' room; every one is refused)",
+                     refused signals' and ptraces' room; every one is refused); lot 318: the \
+                     decisive ones only, and one held back is a loss at once",
                 counter: "denial_rate",
+            },
+            KernelBudget {
+                allows: "(lot 318, the review of #545 and its re-check) the records that are not \
+                     decisive — a refused read of the agent's key, a handle on its BPF objects, \
+                     a refused program type or root cgroup/sysctl attach, a refused kprobes or \
+                     lockdown switch, a refused renice, nice or I/O priority change, a refused \
+                     sysctl write, a signal through a file's owner, a loader or sysctl opt-out's \
+                     record, a move into an exempt cgroup, code-injection access: 50 a second \
+                     per CPU in a budget of their own, after the per-caller dedup where they \
+                     had one (they never take a decisive record's room; every refusal holds); \
+                     not a loss",
+                counter: "minor_denial_rate",
             },
         ],
         overhead: FS_PROTECT_OVERHEAD,

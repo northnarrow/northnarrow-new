@@ -368,8 +368,16 @@ fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
             "emit_denial(operation, key);",
             "return;",
             "TASK_DENIAL_SEEN",
-            "TASK_DENIAL_RATE",
+            // lot 318 (the re-check of #545, R2): the task denials' budget,
+            // or the non-decisive records' (`limited_budget`, pinned in
+            // `kernel_halves.rs`), after the self-test's bypass
+            "if !limited_budget(operation, now) {",
         ],
+    )
+    .unwrap();
+    in_order(
+        body(&i, "limited_budget"),
+        &["return minor_budget();", "TASK_DENIAL_RATE"],
     )
     .unwrap();
     // the mark decides no verdict: read by the two emitters only
