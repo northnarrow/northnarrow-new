@@ -70,13 +70,11 @@ enum Why {
     /// Written and read only by the agent's own read of an iterator, or by
     /// a diagnostic mode: no other run on the CPU.
     SingleReader,
-    /// Preemptible and not fixed in lot 322: the FIM sensor's walks on the
-    /// file-open path (observations, not refusals). A per-task entry costs
-    /// a hash insert per open: the follow-up lot measures it first.
-    FollowUp,
 }
 
-/// Every per-CPU map of `agent-ebpf`, with why it is safe (or left).
+/// Every per-CPU map of `agent-ebpf`, with why it is safe. The review of
+/// #546 (F3): the FIM sensor's four buffers left here as a follow-up fed
+/// posture-floor kills (FIM-010..017) and are per-task entries now.
 const KNOWN: &[(&str, Why)] = &[
     ("RING_DROPS", Why::Counter),
     ("DENY_FAIL_OPEN", Why::Counter),
@@ -99,46 +97,104 @@ const KNOWN: &[(&str, Why)] = &[
     ("PROG_RECORD_SCRATCH", Why::SingleReader),
     // `--sensor-feasibility`'s probe program only
     ("PROBE_SCRATCH", Why::SingleReader),
-    ("OPEN_SCRATCH", Why::FollowUp),
-    ("OPEN_WIN", Why::FollowUp),
-    ("RENAME_SCRATCH", Why::FollowUp),
-    ("RENAME_EXT", Why::FollowUp),
 ];
 
-/// `(file, map)` of every per-CPU map declared in `agent-ebpf/src`.
-fn per_cpu_maps() -> Vec<(String, String)> {
+/// The per-CPU map types of aya-ebpf.
+const PER_CPU_TYPES: [&str; 3] = ["PerCpuArray<", "PerCpuHashMap<", "LruPerCpuHashMap<"];
+
+/// Whether the type text `ty` (after `static NAME:`) is a per-CPU map,
+/// however it is spelt: plain (`PerCpuArray<…>`) or path-qualified
+/// (`aya_ebpf::maps::PerCpuArray<…>`; the review of #546, F6).
+fn is_per_cpu_type(ty: &str) -> bool {
+    let head = ty.split('<').next().unwrap_or("");
+    let last = head.rsplit("::").next().unwrap_or("").trim();
+    PER_CPU_TYPES
+        .iter()
+        .any(|t| t.trim_end_matches('<') == last)
+}
+
+/// The names of the per-CPU maps `src` (comments stripped) declares, and
+/// the type aliases it declares to any per-CPU map type (forbidden: a
+/// `static X: Alias` would hide one; the review of #546, F6).
+fn per_cpu_decls(src: &str) -> (Vec<String>, Vec<String>) {
+    let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut maps = Vec::new();
+    for piece in flat.split("static ").skip(1) {
+        let Some((name, rest)) = piece.split_once(':') else {
+            continue;
+        };
+        if is_per_cpu_type(rest.trim_start()) {
+            maps.push(name.trim().to_string());
+        }
+    }
+    let mut aliases = Vec::new();
+    for piece in flat.split("type ").skip(1) {
+        let Some((name, rest)) = piece.split_once('=') else {
+            continue;
+        };
+        let rhs = rest.split(';').next().unwrap_or("");
+        if PER_CPU_TYPES
+            .iter()
+            .any(|t| rhs.contains(t.trim_end_matches('<')))
+        {
+            aliases.push(name.trim().to_string());
+        }
+    }
+    (maps, aliases)
+}
+
+/// `(file, map)` of every per-CPU map declared in `agent-ebpf/src`, and
+/// `(file, alias)` of every type alias to a per-CPU map type.
+fn per_cpu_maps() -> (Vec<(String, String)>, Vec<(String, String)>) {
     let root = repo_root();
     let mut files = Vec::new();
     support::rs_files(&root.join("agent-ebpf/src"), &mut files);
     let mut out = Vec::new();
+    let mut aliases = Vec::new();
     for f in &files {
         let c = strip_comments(&fs::read_to_string(f).unwrap());
-        let flat = c.split_whitespace().collect::<Vec<_>>().join(" ");
-        for piece in flat.split("static ").skip(1) {
-            let Some((name, rest)) = piece.split_once(':') else {
-                continue;
-            };
-            let ty = rest.trim_start();
-            if ["PerCpuArray<", "PerCpuHashMap<", "LruPerCpuHashMap<"]
-                .iter()
-                .any(|t| ty.starts_with(t))
-            {
-                let rel = f.strip_prefix(&root).unwrap().display().to_string();
-                out.push((rel, name.trim().to_string()));
-            }
-        }
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
+        let (m, a) = per_cpu_decls(&c);
+        out.extend(m.into_iter().map(|n| (rel.clone(), n)));
+        aliases.extend(a.into_iter().map(|n| (rel.clone(), n)));
     }
     out.sort();
-    out
+    (out, aliases)
 }
 
-/// Every per-CPU map is classified, and the list names no map that is
-/// gone. A new per-CPU buffer kept across a helper call in an LSM, fentry
-/// or iterator program fails here: make it the running task's own entry
-/// (`agent-ebpf/src/task_scratch.rs`), or say why it is safe.
+/// The review of #546 (F6): the scanner sees a per-CPU map however it is
+/// declared — plain, path-qualified, through a type alias — and nothing
+/// else. Planted in text, the scanner's own input.
+#[test]
+fn the_scanner_sees_every_spelling_of_a_per_cpu_map() {
+    let planted = "
+        static PLAIN: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+        pub(crate) static QUALIFIED: aya_ebpf::maps::PerCpuArray<[u8; 8]> = x;
+        static HASHED: aya_ebpf::maps::per_cpu_hash_map::PerCpuHashMap<u32, u64> = x;
+        static LRU: LruPerCpuHashMap<u32, u64> = x;
+        type Scratch = aya_ebpf::maps::PerCpuArray<[u8; 64]>;
+        static SNEAKY: Scratch = x;
+        static FINE: HashMap<TaskKey, u64> = x;
+        static ALSO_FINE: LruHashMap<u64, u64> = x;
+        static ARRAY: Array<u64> = x;
+    ";
+    let (maps, aliases) = per_cpu_decls(planted);
+    assert_eq!(maps, ["PLAIN", "QUALIFIED", "HASHED", "LRU"]);
+    assert_eq!(aliases, ["Scratch"]);
+}
+
+/// Every per-CPU map is classified, the list names no map that is gone,
+/// and no type alias hides one. A new per-CPU buffer kept across a helper
+/// call in an LSM, fentry or iterator program fails here: make it the
+/// running task's own entry (`agent-ebpf/src/task_scratch.rs`), or say why
+/// it is safe.
 #[test]
 fn every_per_cpu_map_is_safe_across_preemption_or_listed() {
-    let found = per_cpu_maps();
+    let (found, aliases) = per_cpu_maps();
+    assert!(
+        aliases.is_empty(),
+        "a type alias to a per-CPU map type (it would hide the map from this list): {aliases:?}"
+    );
     let unknown: Vec<String> = found
         .iter()
         .filter(|(_, m)| !KNOWN.iter().any(|(k, _)| k == m))
@@ -155,62 +211,91 @@ fn every_per_cpu_map_is_safe_across_preemption_or_listed() {
         .map(|(k, _)| *k)
         .collect();
     assert!(stale.is_empty(), "listed but gone: {stale:?}");
-    // the follow-up stays the FIM sensor's four, nothing of the exec guards
-    let follow: Vec<&str> = KNOWN
-        .iter()
-        .filter(|(_, w)| *w == Why::FollowUp)
-        .map(|(k, _)| *k)
-        .collect();
-    assert_eq!(
-        follow,
-        ["OPEN_SCRATCH", "OPEN_WIN", "RENAME_SCRATCH", "RENAME_EXT"]
-    );
-    for (f, m) in &found {
-        if KNOWN.iter().any(|(k, w)| k == m && *w == Why::FollowUp) {
-            assert_eq!(f, "agent-ebpf/src/open_sensor.rs", "{m}");
-        }
+    // the FIM sensor's buffers are no longer per CPU
+    for gone in ["OPEN_SCRATCH", "OPEN_WIN", "RENAME_SCRATCH", "RENAME_EXT"] {
+        assert!(!found.iter().any(|(_, m)| m == gone), "{gone}");
     }
 }
 
-/// The exec guards' buffers are the running task's own entries, made at
-/// the start of the run and removed before it returns: the exec sensor's
-/// walk (the classes the exec policy refuses on), the environment, the
-/// mapping check's walk, the quarantine's candidate and the BPF guard's
-/// `OBJ_GET` path. They were per-CPU buffers in preemptible programs.
+/// The exec guards' and the FIM sensor's buffers are the running task's
+/// own entries, made at the start of the run and removed before it
+/// returns: the exec sensor's walk (the classes the exec policy refuses
+/// on), the environment, the mapping check's walk, the quarantine's
+/// candidate, the BPF guard's `OBJ_GET` path, the FIM sensor's windows and
+/// names, a rename's names. They were per-CPU buffers in preemptible
+/// programs. The review of #546 (F4): plain hashes, never an LRU (whose
+/// insert can evict an entry in flight and hand its memory to another
+/// task), with a cap whose overflow fails closed.
 #[test]
 fn the_exec_guards_buffers_are_the_running_task_s_own() {
     let lsm = code("agent-ebpf/src/exec_lsm.rs");
     let pol = code("agent-ebpf/src/execpol.rs");
     let q = code("agent-ebpf/src/execq.rs");
     let bpf = code("agent-ebpf/src/bpf_defense.rs");
+    let open = code("agent-ebpf/src/open_sensor.rs");
+    let fim = code("agent-ebpf/src/fim_watch.rs");
+    let cap = "HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);";
     for (src, decl) in [
         (
             &lsm,
-            "static EXEC_SCRATCH: LruHashMap<TaskKey, ExeIdentityRaw>",
+            "static EXEC_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =",
         ),
-        (&pol, "static EXECPOL_ENV: LruHashMap<TaskKey, EnvStashRaw>"),
+        (&pol, "static EXECPOL_ENV: HashMap<TaskKey, EnvStashRaw> ="),
         (
             &pol,
-            "static EXECMAP_SCRATCH: LruHashMap<TaskKey, ExeIdentityRaw>",
+            "static EXECMAP_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =",
+        ),
+        (
+            &q,
+            "static EXECQ_CAND_SCRATCH: HashMap<TaskKey, ExecqCandRaw> =",
         ),
         (
             &bpf,
-            "static OBJ_GET_PATH_SCRATCH: LruHashMap<TaskKey, [u8; PATH_BUF_LEN]>",
+            "static OBJ_GET_PATH_SCRATCH: HashMap<TaskKey, [u8; PATH_BUF_LEN]> =",
         ),
+        (&open, "static OPEN_TASK: HashMap<u64, OpenTask> ="),
+        (&open, "static RENAME_TASK: HashMap<u64, RenameTask> ="),
     ] {
         let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains(decl), "{decl}");
+        let at = flat.find(decl).unwrap_or_else(|| panic!("{decl}"));
+        assert!(
+            flat[at + decl.len()..].trim_start().starts_with(cap),
+            "{decl}"
+        );
     }
+    let ts = code("agent-ebpf/src/task_scratch.rs");
     assert!(
-        !q.contains("EXECQ_CAND_SCRATCH"),
-        "the candidate is built in place"
+        !ts.contains("LruHashMap"),
+        "task_scratch.rs makes LRU entries"
     );
+    in_order(
+        &ts,
+        &[
+            "pub(crate) unsafe fn make<K, T>(map: &HashMap<K, T>, key: &K) -> Option<*mut T> {",
+            "map.insert(key, &*(zero as *const T), 0).ok()?;",
+            "map.get_ptr_mut(key)",
+        ],
+    )
+    .unwrap();
+    // the candidate: built in the task's own buffer, then copied
+    in_order(
+        body(&q, "note_pass"),
+        &[
+            "crate::task_scratch::make(&EXECQ_CAND_SCRATCH, &ck)",
+            "crate::execpol::count_lost();",
+            "EXECQ_CAND.insert(&task, &*cand, 0)",
+            "let _ = EXECQ_CAND_SCRATCH.remove(&ck);",
+        ],
+    )
+    .unwrap();
     // the exec sensor: made, walked by key, judged, removed
     in_order(
         body(&lsm, "try_exec_check_lsm"),
         &[
             "let key = crate::task_scratch::key_of(task);",
             "crate::task_scratch::make(&EXEC_SCRATCH, &key)",
+            // the map full: counted, refused in enforce mode
+            "None => return crate::execpol::walk_lost(),",
             "nn_exe_walk(",
             "crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);",
             "let _ = EXEC_SCRATCH.remove(&key);",
@@ -224,7 +309,15 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     // a walk gone is classed as one that could not place the file
     assert!(body(&q, "nn_execq_classify")
         .contains("None => u64::from(class::TMP | class::VAR_TMP | class::HOME),"));
-    assert!(body(&q, "note_pass").contains("crate::task_scratch::make(&EXECQ_CAND, &task)"));
+    in_order(
+        body(&pol, "walk_lost"),
+        &[
+            "bump(counter::LOST);",
+            "if conf(conf_slot::MODE) == mode::ENFORCE {",
+            "-EACCES",
+        ],
+    )
+    .unwrap();
     // the mapping check: the walk made per task, removed on every way out,
     // and walked again for a report from the cache
     in_order(
@@ -246,6 +339,24 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     )
     .unwrap();
     assert!(body(&pol, "map_classify").contains("crate::task_scratch::make(&EXECMAP_SCRATCH"));
+    // no walk: counted, classed as a file the walk cannot place, not cached
+    in_order(
+        body(&pol, "map_classify"),
+        &[
+            "bump(counter::LOST);",
+            "return MAP_WALK_LOST | class::TMP | class::VAR_TMP | class::HOME;",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&pol, "try_execmap"),
+        &[
+            "classes = r & !MAP_WALK_LOST;",
+            "if r & MAP_WALK_LOST == 0 {",
+            "EXECMAP_SEEN.insert",
+        ],
+    )
+    .unwrap();
     // the BPF guard's path buffer
     in_order(
         body(&bpf, "nn_obj_get_own_link"),
@@ -256,6 +367,39 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         ],
     )
     .unwrap();
+    // the FIM sensor (the review of #546, F3): the open's windows and names,
+    // a rename's names and extensions, each the running task's, removed at
+    // the end of the run; the map full: the plain observer, counted
+    in_order(
+        body(&open, "on_open"),
+        &[
+            "crate::task_scratch::make(&OPEN_TASK, &task)",
+            "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);",
+            "crate::fim_watch::observe_open_plain(file);",
+            "on_open_in(file, t);",
+            "let _ = OPEN_TASK.remove(&task);",
+        ],
+    )
+    .unwrap();
+    assert!(body(&open, "on_open_in").contains("observe(") && !open.contains("OPEN_WIN"));
+    assert!(body(&open, "walk").contains("crate::task_scratch::get_or_make(&OPEN_TASK, &task)"));
+    in_order(
+        body(&open, "nn_rename_burst"),
+        &["rename_burst(", "let _ = RENAME_TASK.remove(&task);"],
+    )
+    .unwrap();
+    assert!(body(&open, "rename_burst").contains("crate::task_scratch::make(&RENAME_TASK, &task)"));
+    for f in ["nn_rename_ext", "nn_rename_shape"] {
+        assert!(body(&open, f).contains("RENAME_TASK.get_ptr"), "{f}");
+    }
+    for f in ["try_fim_unlink_observe", "try_fim_rename_observe"] {
+        let b = body(&fim, f);
+        in_order(
+            b,
+            &["nn_unlink_burst(", "crate::open_sensor::forget_task();"],
+        )
+        .unwrap();
+    }
     // the key: thread id and start time, so a reused id inherits nothing
     let ts = code("agent-ebpf/src/task_scratch.rs");
     in_order(
@@ -303,15 +447,66 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
             "off_opt!(PT_REGS_ORIG_AX_OFFSET)",
             "off_opt!(PT_REGS_DX_OFFSET)",
             "off_opt!(PT_REGS_R10_OFFSET)",
+            "off_opt!(PT_REGS_SI_OFFSET)",
             "TASK_STRUCT_MM_OFFSET",
             "regs_are_the_writes(tflags)",
             "bpf_task_pt_regs(generated::bpf_get_current_task_btf())",
-            "match exec_envp_reg(nr) {",
-            "Some(EnvpReg::Dx) => Some(peek_u64((regs + dx as u64)",
-            "Some(EnvpReg::R10) => Some(peek_u64((regs + r10 as u64)",
+            "let (reg, compat) = exec_envp_reg(nr)?;",
+            "EnvpReg::Dx => dx,",
+            "EnvpReg::R10 => r10,",
+            "EnvpReg::Si => si,",
+            "envp_value(peek_u64((regs + off as u64) as *const u8), compat)",
         ],
     )
     .unwrap();
+    // the review of #546 (F1, F2): a compat call's array of 32-bit
+    // pointers is read; an entry or a string the scan cannot read is a
+    // finding (never skipped), counted and recorded, never refused
+    in_order(
+        body(&pol, "env_scan"),
+        &[
+            "let stride = envp_stride(compat);",
+            "stride as u32,",
+            "(envp + (i as u64) * stride)",
+            "(*e).flags |= env_flags::UNREADABLE;",
+            ") < 0",
+            "(*e).flags |= env_flags::UNREADABLE;",
+        ],
+    )
+    .unwrap();
+    let so = body(&pol, "scan_one");
+    assert_eq!(
+        so.matches("(*e).flags |= env_flags::UNREADABLE;").count(),
+        5,
+        "each captured value's read failure is flagged:\n{so}"
+    );
+    in_order(
+        body(&pol, "exec_env"),
+        &[
+            "None => return (env_flags::UNREADABLE, None),",
+            "if r & SCAN_LOST != 0 {",
+            "return (env_flags::UNREADABLE, None);",
+        ],
+    )
+    .unwrap();
+    let p = body(&pol, "on_pass");
+    in_order(
+        p,
+        &[
+            "if ef & env_flags::UNREADABLE != 0 {",
+            "bump(counter::ENV_UNREAD);",
+            "| env_flags::UNREADABLE)",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !p.contains("UNREADABLE) != 0 {\n                if m == mode::ENFORCE"),
+        "an unread environment is never refused"
+    );
+    // the agent reports both counters
+    let m = code("agent/src/execpol/mod.rs");
+    assert!(m.contains("s(&self.env_unread, counter::ENV_UNREAD);"));
+    assert!(m.contains("s(&self.lost, counter::LOST);"));
     in_order(
         body(&pol, "env_scan"),
         &[
@@ -332,14 +527,15 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     // the record carries the findings the judgment rested on
     assert!(body(&pol, "report_exec").contains("(*raw).env_flags = ef;"));
     // nothing in the agent attaches a program to the exec syscalls for it;
-    // it arms the check when the three registers' offsets resolved
+    // it arms the check when the four registers' offsets resolved
     let m = code("agent/src/execpol/mod.rs");
     assert!(!m.contains("sys_enter_execve"), "agent/src/execpol/mod.rs");
     assert!(m.contains("if offsets_resolved(&ENV_OFFSETS) {"));
     let flat = m.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains(
-        "pub const ENV_OFFSETS: [u32; 3] = [ common::btf_offsets::slot::PT_REGS_ORIG_AX_OFFSET, \
+        "pub const ENV_OFFSETS: [u32; 4] = [ common::btf_offsets::slot::PT_REGS_ORIG_AX_OFFSET, \
          common::btf_offsets::slot::PT_REGS_DX_OFFSET, \
-         common::btf_offsets::slot::PT_REGS_R10_OFFSET, ];"
+         common::btf_offsets::slot::PT_REGS_R10_OFFSET, \
+         common::btf_offsets::slot::PT_REGS_SI_OFFSET, ];"
     ));
 }

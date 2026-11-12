@@ -904,6 +904,15 @@ pub struct StatusResponse {
     pub execpol_map_denied_total: Option<u64>,
     #[serde(default)]
     pub execpol_map_recorded_total: Option<u64>,
+    /// Lot 322: exec environments not read whole (a string or the array
+    /// unreadable at the exec's first pass, an unknown call); each one is
+    /// also recorded (`NN-L-EXECENV-002`), none refused.
+    #[serde(default)]
+    pub execpol_env_unread_total: Option<u64>,
+    /// Lot 322: exec-guard runs whose per-task buffer could not be made
+    /// (the map full): judged fail-closed.
+    #[serde(default)]
+    pub execpol_lost_total: Option<u64>,
     /// Lab PR 226: scripts the exec quarantine refused at exec (enforce
     /// mode: the interpreter would re-read the file after the scan).
     #[serde(default)]
@@ -1313,6 +1322,8 @@ impl StatusResponse {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2396,6 +2407,8 @@ mod tests {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2470,6 +2483,8 @@ mod tests {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2726,6 +2741,8 @@ mod tests {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2829,6 +2846,8 @@ mod tests {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,

@@ -217,12 +217,17 @@ Why:
 ## 5. The exec environment (CM-25)
 
 The exec's first pass (`bprm_check_security`, pass 0) reads the new
-environment from the caller's `envp` (its old image: the new one is mapped
-later, by the binfmt's `load_binary`, and the kernel has just copied the
-same strings from it). `envp` is the exec's own syscall argument, as its
-registers hold it (`task_pt_regs`: `dx` for `execve`, `r10` for
-`execveat`). At most 64 variables are read, and the first 24 bytes of each
-are compared against a fixed set of names. The values of the loader
+environment from the caller's `envp`, in the caller's own memory (the new
+image is mapped later, by the binfmt's `load_binary`). `envp` is the exec's
+own syscall argument, as its registers hold it (`task_pt_regs`: `dx` for
+`execve`, `r10` for `execveat`; the review of #546, F1: a 32-bit
+`int $0x80` exec's `edx` / `esi` and an x32 exec's `dx` / `r10` too, an
+array of 32-bit pointers, the register's low half as the kernel reads it).
+The kernel copied the strings earlier in the exec, into the new image's
+stack, which the program cannot read: this is a second read of the
+caller's memory, after the kernel's copy (see the limits below). At most 64
+variables are read, and the first 24 bytes of each are compared against a
+fixed set of names. The values of the loader
 variables are captured: 128 bytes of `LD_PRELOAD`, 64 of `LD_AUDIT`, 64 of
 `LD_LIBRARY_PATH`, 128 of `GLIBC_TUNABLES` and 16 of `HISTFILE`. Nothing
 else of the environment is read or reported. The findings go into the
@@ -303,13 +308,25 @@ attempt is one whatever the caller).
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128
-bytes of `LD_PRELOAD`; the first 64 variables (`TRUNCATED` is counted); a
-caller racing its own memory between the syscall's entry and the kernel's
-copy (TOCTOU); a 32-bit (`int 0x80`) or x32 `execve`, whose registers hold
-32-bit pointers (not read, counted as `ENV_UNREAD`); another architecture
-than x86-64 (the `pt_regs` offsets do not resolve: a signed degradation).
-The mapping
-check (§6) does not depend on the string.
+bytes of `LD_PRELOAD`; the first 64 variables (`TRUNCATED` is counted);
+another architecture than x86-64 (the `pt_regs` offsets do not resolve: a
+signed degradation). The mapping check (§6) does not depend on the string.
+
+**The TOCTOU window (the review of #546, F2).** The scan re-reads the
+caller's memory after the kernel's copy: from `copy_strings(envp)` to
+`security_bprm_check` the kernel copies `argv` (up to about 6 MB), prepares
+the credentials, may migrate the task (`sched_exec`), opens the file (5.15)
+and reads its first page. Another thread of the caller, a process sharing
+the page (`MAP_SHARED`, `process_vm_writev`) can rewrite `LD_PRELOAD=` or
+unmap the page in that window, and make it deterministic with a
+FUSE-backed `argv` page whose read the daemon holds. The kernel keeps its
+copy; the scan judges what the memory holds when it reads. A string or an
+entry it cannot read is `UNREADABLE`: counted (`ENV_UNREAD`, `nn-admin
+status`: "environments not read") and recorded (`NN-L-EXECENV-002`, High),
+never refused. The tracepoint read before the copy had the mirror-image
+race. Reading the kernel's own copy (the new image's stack pages, or a
+check of `mm->env_start..env_end` after the point of no return, which no
+other thread shares) is lot 325's.
 
 ## 6. Executable mappings (`mmap_file`)
 

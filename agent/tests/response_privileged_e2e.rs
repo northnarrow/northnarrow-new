@@ -737,6 +737,64 @@ fn compile_marker_preload(dir: &Path) -> PathBuf {
     lib
 }
 
+/// Lot 322 (the review of #546, F1): a 64-bit program that execs
+/// `/usr/bin/true` through the 32-bit entry (`int $0x80`, eax 11) or the
+/// x32 one (`0x40000000 | 520`), with `LD_PRELOAD=<lib>` and the marker in
+/// an `envp` of 32-bit pointers below 4 GiB. Exit 77: refused (`EACCES`);
+/// 38: the call does not exist on this kernel (x32 off); 1: another error.
+fn compile_compat_exec(dir: &Path) -> PathBuf {
+    let src = dir.join("compat_exec.c");
+    std::fs::write(
+        &src,
+        r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 4) return 2;
+  char *low = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+  if (low == MAP_FAILED) return 3;
+  char *p = low + 1024;
+  char *path = p; strcpy(p, "/usr/bin/true"); p += strlen(p) + 1;
+  char *a0 = p; strcpy(p, "true"); p += strlen(p) + 1;
+  char *e0 = p; p += sprintf(p, "LD_PRELOAD=%s", argv[2]) + 1;
+  char *e1 = p; p += sprintf(p, "NN_E2E_PRELOAD_MARK=%s", argv[3]) + 1;
+  uint32_t *av = (uint32_t *)low; av[0] = (uint32_t)(uintptr_t)a0; av[1] = 0;
+  uint32_t *ev = (uint32_t *)(low + 64);
+  ev[0] = (uint32_t)(uintptr_t)e0; ev[1] = (uint32_t)(uintptr_t)e1; ev[2] = 0;
+  long ret;
+  if (!strcmp(argv[1], "ia32")) {
+    __asm__ volatile("int $0x80" : "=a"(ret)
+                     : "a"(11), "b"((uint32_t)(uintptr_t)path),
+                       "c"((uint32_t)(uintptr_t)av), "d"((uint32_t)(uintptr_t)ev)
+                     : "memory");
+  } else {
+    ret = syscall(0x40000000L | 520, path, av, ev);
+    if (ret < 0) ret = -(long)errno;
+  }
+  if (ret == -13) return 77;
+  if (ret == -38) return 38;
+  return 1;
+}
+"#,
+    )
+    .expect("write compat_exec.c");
+    let bin = dir.join("compat_exec");
+    let st = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(st.success(), "cc failed");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    bin
+}
+
 /// Lot 322: the exec environment's check refused 0 of 11 staging preloads
 /// on Ubuntu 26.04's 7.0 — its programs sat on the `sys_enter_execve{,at}`
 /// tracepoints, which ran there only for the execs entered on CPU 0 (20 of
@@ -782,9 +840,39 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
     let lib = compile_marker_preload(work.path());
     let mark = |who: &str, i: usize| work.path().join(format!("mark.{who}.{i}"));
 
-    // the control: the same exec without the preload runs
+    // the controls (the review of #546, F8): the same exec without the
+    // preload runs as root, as `nobody` and from a service, so a refusal
+    // below is the preload's
     let st = Command::new("/usr/bin/true").status().expect("spawn true");
     assert!(st.success(), "/usr/bin/true without a preload: {st}");
+    let st = Command::new("/usr/bin/true")
+        .uid(65534)
+        .gid(65534)
+        .status()
+        .expect("spawn true as nobody");
+    assert!(
+        st.success(),
+        "/usr/bin/true as nobody without a preload: {st}"
+    );
+    let out = Command::new("systemd-run")
+        .args([
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "-p",
+            "User=root",
+            "/usr/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn systemd-run");
+    assert!(
+        out.status.success(),
+        "a service's /usr/bin/true without a preload: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // every CPU busy for the run: the execs are spread by the scheduler
     let cpus = std::thread::available_parallelism()
@@ -860,6 +948,42 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
         }
     }
 
+    // the review of #546 (F1): through the 32-bit entry and the x32 one,
+    // envp an array of 32-bit pointers (x32 only where the kernel has it)
+    let compat = compile_compat_exec(work.path());
+    let mut x32_absent = 0;
+    for i in 0..N / 3 {
+        for abi in ["ia32", "x32"] {
+            let who = abi;
+            let st = Command::new(&compat)
+                .arg(abi)
+                .arg(&lib)
+                .arg(mark(who, i))
+                .stdin(Stdio::null())
+                .status()
+                .expect("spawn compat_exec");
+            match st.code() {
+                Some(77) => {}
+                Some(38) if abi == "x32" => x32_absent += 1,
+                other => {
+                    ran.entry((who, i))
+                        .or_default()
+                        .push(format!("not refused ({other:?})"));
+                }
+            }
+            if mark(who, i).exists() {
+                ran.entry((who, i))
+                    .or_default()
+                    .push("the preload ran".into());
+            }
+        }
+    }
+    eprintln!(
+        "compat execs: ia32 {} refused; x32 absent on this kernel in {x32_absent} of {}",
+        N / 3,
+        N / 3
+    );
+
     // from a service: the unit's exec fails, the preload never runs
     for i in 0..N {
         let out = Command::new("systemd-run")
@@ -900,13 +1024,15 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
     let of = |who: &str| ran.keys().filter(|(w, _)| *w == who).count();
     assert!(
         ran.is_empty(),
-        "{} of {} staging-preload execs were not refused (root {}, nobody {}, service {}, of {N} \
-         each; on {cpus} CPUs): {ran:#?}\nagent.log tail:\n{}",
+        "{} staging-preload execs were not refused (root {}, nobody {}, service {}, of {N} each; \
+         ia32 {}, x32 {}, of {} each; on {cpus} CPUs): {ran:#?}\nagent.log tail:\n{}",
         ran.len(),
-        3 * N,
         of("root"),
         of("nobody"),
         of("service"),
+        of("ia32"),
+        of("x32"),
+        N / 3,
         tail(&fx.agent_log)
     );
 }

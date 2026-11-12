@@ -1327,16 +1327,35 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   tracepoint and hook-argument slots move by one: 144 slots in all. Where
   the `pt_regs` offsets do not resolve (another architecture than x86-64),
   the environment is not judged: the start signs the `exec_policy`
-  degradation "the exec's registers cannot be read on this kernel". A
-  32-bit or x32 exec's environment is not read either, which was already
-  the case; it is counted in `EXECPOL_COUNTERS` slot 11 (`ENV_UNREAD`).
-- **The exec guards' buffers are per task.** The following moved from
-  per-CPU buffers to LRU hashes of 1024 entries keyed by the running task:
+  degradation "the exec's registers cannot be read on this kernel".
+- **32-bit and x32 execs are judged too** (the review of #546, F1). An exec
+  through the 32-bit entry (`int $0x80`, any process can make one) or the
+  x32 one carries an array of 32-bit pointers: it is read like a native
+  one, and a staging preload in it is refused like any other. It was not
+  read at all. A 32-bit runtime (Steam, Wine) running with a preload from a
+  staging path now meets the same rule as a 64-bit one.
+- **An environment the check cannot read whole is recorded** (F2): a
+  string or an entry unreadable when the scan reads it (the caller's memory
+  changed after the kernel's copy), an unknown call. `NN-L-EXECENV-002`,
+  High, "the new environment could not be read whole at exec"; the exec is
+  not refused. `nn-admin status` reports the count on the exec policy's
+  line ("environments not read"), and in `--json` as `env_unread`.
+- **The per-task buffers.** The following moved from per-CPU buffers to
+  plain hashes of 2048 entries keyed by the running task (never LRU: an
+  LRU insert can evict an entry in flight; the review of #546, F4):
   - the exec sensor's walk;
   - the mapping check's walk;
   - the environment;
-  - the BPF guard's `OBJ_GET` path.
+  - the exec quarantine's candidate (then copied into its own map);
+  - the BPF guard's `OBJ_GET` path;
+  - the FIM sensor's windows and names, a rename's names (F3: they feed
+    `NN-L-FIM-011`/`014`'s kills and the FIM-010..017 posture floors).
 
-  The exec quarantine's candidate is built in its own entry. A mapping
+  Each entry lives for one run of its program. Past 2048 runs in flight at
+  once (each one a task preempted in the middle of the program), the path
+  fails closed and counts it: an exec is refused in enforce mode, a mapping
+  is classed `tmp`, `var_tmp`, `home`, the FIM sensor falls back to the
+  plain observer (a ring drop). `nn-admin status` reports the exec guards'
+  count ("runs without their buffer", `lost` in `--json`). A mapping
   report from the check's cache now carries the file's own path; it had the
   path of whatever that CPU had walked last.

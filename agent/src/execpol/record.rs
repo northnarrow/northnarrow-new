@@ -459,6 +459,28 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
             evidence(raw, "record", policy),
         ));
     }
+    // Lot 322 (the review of #546, F1, F2): an environment the kernel could
+    // not read whole — an entry or a string unreadable at the exec's first
+    // pass (the caller's memory changed after the kernel's copy of it), an
+    // exec entered through a call the scan does not know, or no stash.
+    // Whatever loader variable it held was not judged: recorded, High,
+    // never refused (a 32-bit runtime's exec reads normally).
+    if ef & env_flags::UNREADABLE != 0 && ea & action::RECORD != 0 {
+        out.push(record(
+            event,
+            &path,
+            (RULE_ENV, RULE_ENV_NAME),
+            Severity::High,
+            format!(
+                "the new environment could not be read whole at exec ({tname} caller): an \
+                 entry or a string unreadable after the kernel's copy, or a call the check does \
+                 not know; a loader variable in it was not judged"
+            ),
+            "recorded: the exec ran".to_string(),
+            vec![pick(ATTACK_ENV, Tactic::Stealth, "T1574.006")],
+            evidence(raw, "record", policy),
+        ));
+    }
     out
 }
 
@@ -684,6 +706,33 @@ mod tests {
         assert!(r.response.contains("AT_SECURE"), "{}", r.response);
         assert!(r.evidence.at_secure);
         assert_eq!(r.verdict.severity, Severity::Medium);
+    }
+
+    /// Lot 322 (the review of #546, F1, F2): an environment the kernel
+    /// could not read whole is one High record under NN-L-EXECENV-002, with
+    /// the exec allowed; nothing without the record action.
+    #[test]
+    fn an_environment_not_read_whole_is_one_high_record() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::UNREADABLE;
+        raw.env_action = action::RECORD;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert_eq!(rs[0].techniques(), ["T1574.006"]);
+        // with a staging preload read before the unreadable entry: both
+        raw.env_flags = env_flags::UNREADABLE | env_flags::LD_PRELOAD | env_flags::PRELOAD_STAGING;
+        raw.env_action = action::RECORD | action::DENY;
+        put(&mut raw.preload, "/tmp/x.so");
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 2, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_PRELOAD);
+        assert_eq!(rs[1].verdict.rule_id, RULE_ENV);
+        // not recorded for that tier: nothing
+        raw.env_flags = env_flags::UNREADABLE;
+        raw.env_action = 0;
+        assert!(records_of(&raw, &ev("/usr/bin/true"), "p").is_empty());
     }
 
     #[test]

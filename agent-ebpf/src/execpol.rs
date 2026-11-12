@@ -21,10 +21,16 @@
 //! CPU 0) ran only for the calls made on CPU 0: the check refused 0 of 11
 //! staging preloads, 20 of 20 pinned to CPU 0, none pinned to CPU 1, 2 or
 //! 3. At `bprm_check_security` the caller's memory is still its own (the
-//! new image is mapped later, by the binfmt's `load_binary`) and the kernel
-//! has just copied the same strings from it: the environment is read here,
-//! into the task's own entry, and no state crosses from one program to
-//! another.
+//! new image is mapped later, by the binfmt's `load_binary`): the
+//! environment is read here, into the task's own entry, and the
+//! environment's findings no longer cross from one program to another.
+//! The kernel copied the strings earlier in the exec, into the new image's
+//! stack, which is not readable here: this is a second read of the
+//! caller's memory, and what changes it in between (another thread, a
+//! process sharing the page) changes what is judged — the review of #546,
+//! F2; reading the kernel's own copy is lot 325's. A string the scan
+//! cannot read is a finding (`UNREADABLE`: counted, recorded), never
+//! skipped.
 //!
 //! The exec's point of no return is past every one of these hooks: a deny
 //! is the syscall's error, the caller keeps running its old image.

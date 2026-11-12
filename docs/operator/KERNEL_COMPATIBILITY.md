@@ -642,7 +642,7 @@ agent:
 | Piece | Kernel interface | 5.14 | 5.15 | 6.1 | 6.8 | 6.12 | Without it |
 |---|---|---|---|---|---|---|---|
 | exec policy (the verdict) | LSM `bprm_check_security`: the exec sensor's program returns `-EACCES` | yes | yes | yes | yes | yes | nothing refused (the exec sensor not on LSM) |
-| exec environment (lot 322) | the exec's registers at `bprm_check_security`: `bpf_task_pt_regs` (5.15+), BTF `pt_regs.orig_ax`, `dx`, `r10` (optional slots 109, 108, 129; x86-64) | 5.15+ | yes | yes | yes | yes | no environment check |
+| exec environment (lot 322) | the exec's registers at `bprm_check_security`: `bpf_task_pt_regs` (5.15+), BTF `pt_regs.orig_ax`, `dx`, `r10`, `si` (optional slots 109, 108, 129, 107; x86-64) | 5.15+ | yes | yes | yes | yes | no environment check |
 | executable mappings | LSM `mmap_file` `(file, reqprot, prot, flags)`, argument 0 checked at boot (`HOOK_ARG_CHECKS`) | yes | yes | yes | yes | yes | no mapping check |
 | admin tier | BTF `task_struct.signal`, `signal_struct.tty` (optional slots 98, 99) | yes | yes | yes | yes | yes | no `admin` tier |
 | session tier | `task_struct.loginuid` (`CONFIG_AUDIT`) | yes | yes | yes | yes | yes | a login session is `unknown` |
@@ -688,11 +688,17 @@ A program on a non-syscall tracepoint, a raw tracepoint (the exploit
 guard's `sys_enter` / `sys_exit`), a BTF tracepoint, a kprobe or an LSM hook
 is not affected.
 
-The same lot moved the exec guards' per-CPU buffers to per-task entries.
-On a `full` or `lazy` preemption kernel an LSM program can be preempted,
-and another task's run on that CPU could rewrite the buffer. This is
-Ubuntu 26.04's default: `/sys/kernel/debug/sched/preempt` reads
-`full (lazy)`.
+The same lot moved the exec guards' and the FIM sensor's per-CPU buffers
+to per-task entries (plain hashes, one entry per run in flight). On a
+`full` or `lazy` preemption kernel an LSM program can be preempted, and
+another task's run on that CPU could rewrite the buffer. This is Ubuntu
+26.04's default: `/sys/kernel/debug/sched/preempt` reads `full (lazy)`.
+The default Ubuntu 22.04 and 24.04 kernels preempt voluntarily (no
+preemption inside a program), unless booted with `preempt=full` or a
+low-latency flavour.
+
+The environment check reads the 32-bit (`int $0x80`) and x32 execs as
+well; x32 calls exist only where the kernel has `CONFIG_X86_X32_ABI`.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
