@@ -41,9 +41,8 @@
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::io::BufReader;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -125,7 +124,9 @@ pub use nn_core::canary::host::CanaryAccessDraft;
 /// shape as [`AuditLog`](nn_evidence::audit::AuditLog) + Tappa 9 C3 +
 /// K2 `Registry`.
 pub struct CanaryAccessDb {
-    path: PathBuf,
+    /// Lot 319: the file's append side, poisoned by a failed write
+    /// ([`crate::flat_chain`]).
+    file: crate::flat_chain::FlatFile,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -159,7 +160,7 @@ impl CanaryAccessDb {
         let read = read_tail_hash(path, &key.verifying_key())?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
-            path: crate::anchored::anchor(path),
+            file: crate::flat_chain::FlatFile::new(path, ACCESS_LOG_FILE_MODE),
             key,
             agent_id,
             last_hash: read.last_hash,
@@ -191,7 +192,19 @@ impl CanaryAccessDb {
     /// detector can read `entry.entry_hash` to populate
     /// `Registry::mark_tripped(canary_id, access_hash)` for
     /// cross-chain reference).
+    ///
+    /// Lot 319 (lot 296's scheme): after a failed write the tail is read
+    /// again first — a fragment it left is cut and the cut signed, a row it
+    /// wrote whole is the tail ([`crate::flat_chain::FlatFile::heal`]).
     pub fn append(&mut self, draft: CanaryAccessDraft) -> Result<CanaryAccessEntry> {
+        let pk = self.key.verifying_key();
+        if let Some(read) = self.file.heal(
+            |l| serde_json::from_slice::<CanaryAccessEntry>(l).is_ok(),
+            |p| read_tail_hash(p, &pk),
+        )? {
+            self.last_hash = read.last_hash;
+            self.rows = read.rows;
+        }
         let entry = build_signed_entry(
             &draft,
             &self.key,
@@ -203,21 +216,9 @@ impl CanaryAccessDb {
             .map_err(|e| anyhow!("serialising canary access entry: {e}"))?;
         line.push('\n');
         crate::canary::chain_lines::check_row_len(&line)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(ACCESS_LOG_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| {
-                format!(
-                    "opening canary access log {} for append",
-                    self.path.display()
-                )
-            })?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending canary access entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.file
+            .append(line.as_bytes(), true)
+            .context("appending a canary access entry")?;
         self.last_hash = entry.entry_hash.clone();
         self.rows += 1;
         Ok(entry)
@@ -995,5 +996,28 @@ mod tests {
             hex::encode(compute_entry_hash(&stripped).unwrap()),
             row.entry_hash
         );
+    }
+
+    /// Lot 319 (lot 296's scheme): a row written whole whose fsync failed is
+    /// the chain's tail — the next row chains off it and takes the next
+    /// number (it chained off the row before: a fork, a number twice).
+    #[test]
+    fn a_row_whose_fsync_failed_is_the_tail() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        let (key, pk) = fresh_signing_key(&dir);
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        db.append(sample_draft(1, true)).unwrap();
+        db.file.fail_next_sync();
+        assert!(db.append(sample_draft(2, false)).is_err());
+        let third = db.append(sample_draft(3, false)).unwrap();
+        assert_eq!(third.seq, Some(2));
+        let rows: Vec<CanaryAccessEntry> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        verify_chain(&rows, &pk).unwrap();
     }
 }

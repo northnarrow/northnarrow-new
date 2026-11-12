@@ -35,10 +35,9 @@
 //! back is still written, flagged `decision_engine_skipped`.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -312,7 +311,9 @@ impl NetFlowDb {
 pub struct NetListenerDb {
     /// Lot 280c: the sensor self-test's child, whose rows are not written.
     self_test: Option<crate::telemetry_probe::SelfTestTag>,
-    path: PathBuf,
+    /// Lot 319: the file's append side, poisoned by a failed write or
+    /// fsync ([`crate::flat_chain`]).
+    file: crate::flat_chain::FlatFile,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -335,7 +336,7 @@ impl NetListenerDb {
         Ok(Self {
             self_test: None,
             // review 44: appends go through a directory fd taken now
-            path: crate::anchored::anchor(path),
+            file: crate::flat_chain::FlatFile::new(path, NET_LOG_FILE_MODE),
             key,
             agent_id,
             last_hash,
@@ -362,7 +363,18 @@ impl NetListenerDb {
             .is_some_and(|t| t.skip(ev.pid, ev.timestamp_ns))
     }
 
+    /// Append one listener row (fsynced by [`Self::sync_if_due`]).
+    ///
+    /// Lot 319 (lot 296's scheme): after a failed write or fsync the tail is
+    /// read again first — a fragment it left is cut and the cut signed, a
+    /// row written whole is the tail ([`crate::flat_chain::FlatFile::heal`]).
     pub fn append(&mut self, ev: &NetListenerEvent) -> Result<NetListenerEntry> {
+        if let Some(last_hash) = self.file.heal(
+            |l| serde_json::from_slice::<NetListenerEntry>(l).is_ok(),
+            read_tail_hash_listener,
+        )? {
+            self.last_hash = last_hash;
+        }
         let mut entry = NetListenerEntry {
             ts: format_ts(Utc::now()),
             timestamp_ns: ev.timestamp_ns,
@@ -386,23 +398,9 @@ impl NetListenerDb {
         let mut line = serde_json::to_string(&entry)
             .map_err(|e| anyhow!("serialising netflow_listener entry: {e}"))?;
         line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(NET_LOG_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| {
-                format!(
-                    "opening netflow_listeners log {} for append",
-                    self.path.display()
-                )
-            })?;
-        f.write_all(line.as_bytes()).with_context(|| {
-            format!(
-                "appending netflow_listeners entry to {}",
-                self.path.display()
-            )
-        })?;
+        self.file
+            .append(line.as_bytes(), false)
+            .context("appending a netflow_listeners entry")?;
         // External audit NET-019: committed by `sync_if_due`.
         self.unsynced = true;
         self.last_hash = entry.entry_hash.clone();
@@ -415,12 +413,7 @@ impl NetListenerDb {
             return Ok(false);
         }
         self.last_sync = now;
-        let f = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {} for fsync", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.file.sync()?;
         self.unsynced = false;
         Ok(true)
     }
@@ -1628,6 +1621,77 @@ mod tests {
     }
 
     /// The verifying key of the logs `open_db` opens in `dir`.
+    /// Lot 319 (lot 296's scheme): a group commit whose fsync failed after
+    /// its rows were written whole: they are the chain's tail, and the next
+    /// row chains off the last of them.
+    #[test]
+    fn a_failed_group_commit_keeps_the_rows_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow_listeners.jsonl");
+        let ev = |n: u64| NetListenerEvent {
+            timestamp_ns: n,
+            family: 2,
+            bind_addr: "0.0.0.0".parse().unwrap(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 42,
+            uid: 0,
+            comm: "nc".to_string(),
+            exe: None,
+        };
+        let mut db = NetListenerDb::open(&path, fresh_key(), [0u8; 16]).unwrap();
+        db.append(&ev(1)).unwrap();
+        let second = db.append(&ev(2)).unwrap();
+        db.file.fail_next_sync();
+        let later = Instant::now() + NETFLOW_SYNC_INTERVAL * 2;
+        assert!(db.sync_if_due(later).is_err());
+        let third = db.append(&ev(3)).unwrap();
+        assert_eq!(third.prev_hash, second.entry_hash);
+        let rows: Vec<NetListenerEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].prev_hash, rows[1].entry_hash);
+    }
+
+    /// Lot 319 (lot 296's scheme): a write the disk stopped one byte short
+    /// — the row whole but its newline — leaves a row the heal closes (its
+    /// newline added, signed): it is the chain's tail, and the next row
+    /// chains off it, not off the row before (a fork).
+    #[test]
+    fn a_row_cut_before_its_newline_is_the_tail() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow_listeners.jsonl");
+        let ev = |n: u64| NetListenerEvent {
+            timestamp_ns: n,
+            family: 2,
+            bind_addr: "0.0.0.0".parse().unwrap(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 42,
+            uid: 0,
+            comm: "nc".to_string(),
+            exe: None,
+        };
+        let mut db = NetListenerDb::open(&path, fresh_key(), [0u8; 16]).unwrap();
+        db.append(&ev(1)).unwrap();
+        db.file.cut_next_write(1);
+        assert!(db.append(&ev(2)).is_err());
+        let third = db.append(&ev(3)).unwrap();
+        let rows: Vec<NetListenerEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "the row written but its newline is kept");
+        assert_eq!(rows[1].timestamp_ns, 2);
+        assert_eq!(third.prev_hash, rows[1].entry_hash, "chained off it");
+        crate::boot::degradation::reset_for_tests();
+    }
+
     fn fresh_key_pk(dir: &Path) -> ed25519_dalek::VerifyingKey {
         AgentSigningKey::load_or_bootstrap(&dir.join("k.sig"))
             .unwrap()

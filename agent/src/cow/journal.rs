@@ -140,6 +140,15 @@ pub struct Journal {
     index: std::fs::File,
     /// Lines in `index.jsonl` (compaction).
     lines: u64,
+    /// Lot 319 (the mini-hunt of BUG31's partial): an append failed — it may
+    /// have left the start of its line (a full disk stops a write
+    /// part-way). The next append ends that line first, as the open ends a
+    /// torn last line (lot 297, BUG64): glued to it, the next record was
+    /// lost at the replay with it.
+    torn: bool,
+    /// Tests: the next line written stops after this many bytes (ENOSPC).
+    #[cfg(test)]
+    short_write: Option<usize>,
 }
 
 impl Journal {
@@ -191,6 +200,9 @@ impl Journal {
             evidence,
             index,
             lines,
+            torn: false,
+            #[cfg(test)]
+            short_write: None,
         })
     }
 
@@ -251,15 +263,36 @@ impl Journal {
         CString::new(format!("{id:016x}")).unwrap_or_default()
     }
 
-    /// Append records (one write per line).
+    /// Append records (one write per line). Lot 319: after a failed one,
+    /// the line it may have left unfinished is ended first (an empty line
+    /// when it left nothing: the replay skips it).
     pub fn append(&mut self, records: &[Record]) -> Result<()> {
+        if self.torn {
+            self.index
+                .write_all(b"\n")
+                .context("append index.jsonl: ending a line a failed append left")?;
+            self.torn = false;
+            self.lines += 1;
+        }
         for r in records {
             let mut line = serde_json::to_vec(r)?;
             line.push(b'\n');
-            self.index.write_all(&line).context("append index.jsonl")?;
+            if let Err(e) = self.write_line(&line) {
+                self.torn = true;
+                return Err(e).context("append index.jsonl");
+            }
             self.lines += 1;
         }
         Ok(())
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(keep) = self.short_write.take() {
+            self.index.write_all(&line[..keep.min(line.len())])?;
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        self.index.write_all(line)
     }
 
     pub fn sync(&self) {
@@ -422,6 +455,7 @@ impl Journal {
         .context("rename index.jsonl")?;
         self.index = f;
         self.lines = records.len() as u64;
+        self.torn = false;
         Ok(())
     }
 
@@ -614,6 +648,47 @@ mod tests {
         let body = std::fs::read(&index).unwrap();
         assert_eq!(body.iter().filter(|c| **c == b'\n').count(), 3);
         assert!(body.ends_with(b"{\"op\":\"drop\",\"object\":2}\n"));
+    }
+
+    /// Lot 319 (the mini-hunt of BUG31's partial): an append the disk
+    /// stopped part-way left the start of its line while the journal was
+    /// open; the next record was glued to it and lost at the replay with it
+    /// (only the open ended such a line, lot 297). The next append ends it.
+    #[test]
+    fn an_append_after_a_short_write_starts_a_line_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(".northnarrow-cow");
+        let mut j = Journal::open(&p).unwrap();
+        j.append(&[Record::Drop { object: 1 }]).unwrap();
+        j.short_write = Some(9);
+        assert!(j.append(&[Record::Drop { object: 2 }]).is_err());
+        j.append(&[Record::Drop { object: 3 }]).unwrap();
+        let body = std::fs::read(p.join("index.jsonl")).unwrap();
+        assert!(
+            body.ends_with(b"\n{\"op\":\"drop\",\"object\":3}\n"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let mut ix = JournalIndex::new(&[1000], u64::MAX, 0);
+        assert_eq!(j.replay(&mut ix, 0).unwrap(), 1, "the cut line alone");
+        assert_eq!(j.lines(), 3);
+        // a failed append that wrote nothing: an empty line, skipped
+        j.short_write = Some(0);
+        assert!(j.append(&[Record::Drop { object: 4 }]).is_err());
+        j.append(&[Record::Drop { object: 5 }]).unwrap();
+        assert_eq!(j.replay(&mut ix, 0).unwrap(), 1, "still the cut line alone");
+        // a compaction after a failed append writes a whole index: no line
+        // to end after it
+        j.short_write = Some(3);
+        assert!(j.append(&[Record::Drop { object: 6 }]).is_err());
+        let f = Journal::compaction_file(&p).unwrap();
+        j.compact_into(f, &[Record::Drop { object: 7 }]).unwrap();
+        j.append(&[Record::Drop { object: 8 }]).unwrap();
+        assert_eq!(j.lines(), 2);
+        assert_eq!(
+            std::fs::read(p.join("index.jsonl")).unwrap(),
+            b"{\"op\":\"drop\",\"object\":7}\n{\"op\":\"drop\",\"object\":8}\n"
+        );
     }
 
     #[test]

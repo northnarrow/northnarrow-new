@@ -699,7 +699,10 @@ pub fn check(
     let newest_ts = parse_ts(&newest.ts);
     match newest_ts {
         None => clock.push(format!("beat {} has no readable time", newest.seq)),
-        Some(t) if (t - now).num_seconds() > cfg.max_skew_secs as i64 => clock.push(format!(
+        // Lot 319 (BUG12's partial): the bound compared without a cast —
+        // `u64::MAX as i64` is -1, and a beat stamped this very second read
+        // as a clock ahead.
+        Some(t) if past((t - now).num_seconds(), cfg.max_skew_secs) => clock.push(format!(
             "the agent's clock is {} s ahead of the verifier's (beat {}; bound {} s)",
             (t - now).num_seconds(),
             newest.seq,
