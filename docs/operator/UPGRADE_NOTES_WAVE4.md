@@ -1235,7 +1235,8 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
 - **The quarantine does to a file only what the offender could have done
   itself.** Never the system's own files, by identity (the dynamic
   loaders, the shells, init, sshd, the agent's binaries), whatever name
-  leads to them; a non-root offender only a file it owns; a root offender
+  leads to them (an `/etc/shells` that cannot be read refuses every
+  quarantine); a non-root offender only a file it owns; a root offender
   any file under a verified name; never a root-owned file reached through
   a name that cannot be verified. Otherwise `refused`, the owner named. A
   name is removed only when it is the file's only name; a shared file (a

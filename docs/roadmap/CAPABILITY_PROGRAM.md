@@ -9684,6 +9684,16 @@ number in parentheses is a lab PR.
     the same bind refused as root's file with no verified name; the store
     binary with three links mode 000, content kept (`partial`); the three
     privileged tests passed.
+  - Merged with lot 311b (#538) and lot 315 (#542): the lot's new reads
+    follow 311b's rule — a failed read never empties a protection. The
+    block's cgroup read-back that fails is no block in effect; a socket
+    table that cannot be read (other than one the kernel lacks) counts
+    every socket the process holds (partial); an `/etc/shells` that cannot
+    be read refuses the quarantine instead of leaving its shells
+    unprotected; the offender's filesystem uid unread leaves it no owner
+    (refused). Lot 315's copy-on-write `fd_path` replaces the lot's F3
+    version, its ` (deleted)` stripped by the lot's helper. Six targeted
+    mutations of these reads, all caught (one after a test was added).
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).

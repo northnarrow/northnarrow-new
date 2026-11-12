@@ -16,7 +16,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   offender could have done itself: never the system's own files, judged by
   identity (the dynamic loaders, the shells, init, sshd, the agent's
   binaries) whatever name leads to them — a user namespace's bind of
-  `/usr/bin` no longer reaches them; a non-root offender only its own
+  `/usr/bin` no longer reaches them, and an `/etc/shells` that cannot be
+  read refuses the quarantine; a non-root offender only its own
   files, a root offender any file under a verified name, never a
   root-owned file without one. A name is removed only when it is the
   file's only name; a shared file (a package store's hard links) is never

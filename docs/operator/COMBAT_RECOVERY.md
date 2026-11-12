@@ -351,7 +351,10 @@ success. Not read back yet: the nft ruleset once applied in an episode
     inode), whatever name leads to them: the dynamic loaders, the shells,
     init and systemd, sshd, the agent's own binaries (`refused: a
     protected system file`); a verified name under the protected prefixes
-    is refused too, as before;
+    is refused too, as before. An `/etc/shells` that exists and cannot be
+    read leaves the shells unknown: every quarantine is then refused
+    (`/etc/shells could not be read …`), the offender's own file too, and
+    nothing is changed;
   - a non-root offender, only a file it owns; a root offender, any file
     under a VERIFIED name (the payload a user dropped and root ran); never
     a root-owned file reached through a name the agent cannot verify (a
