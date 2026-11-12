@@ -28,11 +28,12 @@ use aya_ebpf::{
         bpf_ktime_get_ns, generated,
     },
     macros::{lsm, map},
-    maps::{LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap},
     programs::LsmContext,
 };
 use northnarrow_common::wire::exe::{
-    exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOTS, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
+    exe_flags, exe_path_slot, ExeIdentityRaw, TaskKey, EXE_PATH_SLOTS, EXE_PATH_SLOT_LEN,
+    EXE_WALK_DEPTH,
 };
 use northnarrow_common::wire::{ExecCheckRaw, FILENAME_LEN};
 
@@ -58,9 +59,16 @@ const MEMFD_MASK: u64 = 0xffff_ffff_ffff;
 /// task's next exec overwrites at its own pass 0; the LRU bounds the rest.
 #[map]
 pub static EXEC_HANDOFF: LruHashMap<u64, ExeIdentityRaw> = LruHashMap::with_max_entries(1024, 0);
-/// Where a pass's identity is built (552 bytes: never on the stack).
+/// Where a pass's identity is built (552 bytes: never on the stack): the
+/// exec'ing task's own entry, made at the start of [`exec_check_lsm`] and
+/// removed before it returns. Lot 322: it was a per-CPU buffer, and the
+/// program runs preemptible (migration disabled only): on a `full` or
+/// `lazy` preemption kernel another task's exec on the same CPU could
+/// rewrite the walk between the write and the classes judged from it
+/// (`crate::task_scratch`: a plain hash, never an LRU).
 #[map]
-pub(crate) static EXEC_SCRATCH: PerCpuArray<ExeIdentityRaw> = PerCpuArray::with_max_entries(1, 0);
+pub(crate) static EXEC_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 
 /// `u64` at `src`, 0 when unreadable, without a branch on the result
 /// (the helper always writes its destination).
@@ -110,14 +118,17 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
         Some(o) => o & 0xffff,
         None => return 0,
     };
-    let s = match EXEC_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p,
-        None => return 0,
-    };
     let file = peek_u64(bprm.add(o_file)) as *const u8;
     let filename = peek_u64(bprm.add(o_filename)) as *const u8;
     let interp = peek_u64(bprm.add(o_interp)) as *const u8;
     let task = bpf_get_current_task() as *const u8;
+    let key = crate::task_scratch::key_of(task);
+    let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
+        Some(p) => p,
+        // The review of #546 (F4, F5): the map full — counted, and in
+        // enforce mode refused (nothing of the exec can be judged).
+        None => return crate::execpol::walk_lost(),
+    };
 
     // The file: identity, filesystem, memfd name, link count.
     let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
@@ -145,7 +156,13 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     (*s).ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
     (*s).pass = pass;
     (*s)._pad = 0;
-    (*s).flags = flags | (nn_exe_walk(dentry as u64, task_root as u64) as u32);
+    (*s).flags = flags
+        | (nn_exe_walk(
+            dentry as u64,
+            task_root as u64,
+            u64::from(key.tid),
+            key.start_ns,
+        ) as u32);
 
     // One record per pass.
     match crate::exec_check::EXEC_CHECK_EVENTS.reserve::<ExecCheckRaw>(0) {
@@ -182,7 +199,9 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     // Lab PR 226 (EXPERIMENTAL): the exec policy, then the exec
     // quarantine's candidate (lab PR 223), stopped by `sched_process_exec`
     // once the exec succeeded. Two array reads when both are off.
-    crate::execpol::on_pass(s, inode, dentry, task as u64, pass)
+    let rc = crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);
+    let _ = EXEC_SCRATCH.remove(&key);
+    rc
 }
 
 /// The dentry of `task`'s root (`task->fs->root.dentry`): where the walk
@@ -203,17 +222,18 @@ pub(crate) unsafe fn task_root_of(task: *const u8) -> *const u8 {
 }
 
 /// The dentry walk of [`exec_check_lsm`]: writes the path slots, the
-/// level count and the root key into the per-CPU scratch, and returns the
-/// walk's flags (`TASK_ROOT`, `DEEP`, `UNRESOLVED`).
+/// level count and the root key into the task's scratch entry (`tid`,
+/// `start`), and returns the walk's flags (`TASK_ROOT`, `DEEP`,
+/// `UNRESOLVED`).
 ///
 /// A global BPF function (exported, never inlined, integer arguments):
 /// the verifier checks its 64-level loop once, on its own
 /// (KERNEL_COMPATIBILITY, 5.15 rule 6).
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_exe_walk(dentry: u64, task_root: u64) -> u64 {
+pub extern "C" fn nn_exe_walk(dentry: u64, task_root: u64, tid: u64, start: u64) -> u64 {
     unsafe {
-        match EXEC_SCRATCH.get_ptr_mut(0) {
+        match EXEC_SCRATCH.get_ptr_mut(&crate::task_scratch::key(tid, start)) {
             Some(s) => exe_walk(s, dentry as *const u8, task_root as *const u8),
             None => u64::from(exe_flags::UNRESOLVED),
         }

@@ -654,6 +654,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         id: "NN-L-EXECENV-002_ExecEnvironmentTrick",
         severities: &[
             Severity::Critical,
+            Severity::High,
             Severity::Medium,
             Severity::Low,
         ],
@@ -662,12 +663,17 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0032"],
         observes: "The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id \
                    target (Critical in the shape of CVE-2023-4911), a library path into \
-                   staging for a service or root, shell history disabled.",
+                   staging for a service or root, shell history disabled; an environment \
+                   the exec sensor could not read whole (High: its loader variables \
+                   were not judged).",
         false_positives: "History disabled by a user's own shell configuration (Low, repeats \
                           held back).",
         how_to_test: "Run `su` with `GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A` \
                       on a lab guest with the exec policy on.",
-        tests: &["agent/src/execpol/record.rs::tunables_history_and_library_path"],
+        tests: &[
+            "agent/src/execpol/record.rs::tunables_history_and_library_path",
+            "agent/src/execpol/record.rs::an_environment_not_read_whole_is_one_high_record",
+        ],
         attack_note: "Per record: T1068 for the set-id exploit's environment, T1574.006 for \
                       the library path, T1070.003 for the history.",
     },

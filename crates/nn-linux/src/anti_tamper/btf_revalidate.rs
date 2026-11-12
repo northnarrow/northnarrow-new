@@ -1999,10 +1999,10 @@ mod tests {
                 12
             )]
         );
-        // sys_enter_execve (its filename and, lab PR 226, its envp),
-        // sys_enter_execveat's envp and the five io_uring fields are
-        // absent from the tree
-        assert_eq!(r.unresolved.len(), 8);
+        // sys_enter_execve's filename and the five io_uring fields are
+        // absent from the tree (lot 322: the two `envp` fields of lab PR
+        // 226 are no longer read)
+        assert_eq!(r.unresolved.len(), 6);
         assert_eq!(r.unresolved[0].0, "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET");
         assert!(r
             .values
@@ -2089,7 +2089,8 @@ mod tests {
         assert!(r.skipped_roots[0].1.contains("not tracefs"));
         let detail = r.degraded_detail().expect("attested");
         assert!(
-            detail.contains("11 of 11 on the compiled value"),
+            // lot 322: nine fields (lab PR 226's two `envp` fields gone)
+            detail.contains("9 of 9 on the compiled value"),
             "{detail}"
         );
         assert!(detail.contains("TP_SCHED_EXEC_FILENAME_OFFSET"), "{detail}");

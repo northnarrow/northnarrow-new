@@ -248,6 +248,10 @@ pub struct StatusOutcome {
     pub execpol_env_recorded_total: Option<u64>,
     pub execpol_map_denied_total: Option<u64>,
     pub execpol_map_recorded_total: Option<u64>,
+    /// Lot 322: environments not read whole (each recorded, none refused).
+    pub execpol_env_unread_total: Option<u64>,
+    /// Lot 322: exec-guard runs without their per-task buffer (fail-closed).
+    pub execpol_lost_total: Option<u64>,
     pub execq_script_refused_total: Option<u64>,
     /// Lab PR 267 (R12a): the priority event bus and the loss counters by
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
@@ -518,6 +522,8 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execpol_env_recorded_total: resp.execpol_env_recorded_total,
         execpol_map_denied_total: resp.execpol_map_denied_total,
         execpol_map_recorded_total: resp.execpol_map_recorded_total,
+        execpol_env_unread_total: resp.execpol_env_unread_total,
+        execpol_lost_total: resp.execpol_lost_total,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,
@@ -3934,6 +3940,8 @@ mod tests {
                     execpol_env_recorded_total: Some(16),
                     execpol_map_denied_total: Some(17),
                     execpol_map_recorded_total: Some(18),
+                    execpol_env_unread_total: Some(20),
+                    execpol_lost_total: Some(21),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
@@ -3951,6 +3959,9 @@ mod tests {
         assert_eq!(out.execpol_state.as_deref(), Some("enforce; 1 partial"));
         assert_eq!(out.execpol_denied_total, Some(11));
         assert_eq!(out.execpol_map_recorded_total, Some(18));
+        // Lot 322: the environments not read whole, the runs lost.
+        assert_eq!(out.execpol_env_unread_total, Some(20));
+        assert_eq!(out.execpol_lost_total, Some(21));
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

@@ -216,13 +216,31 @@ Why:
 
 ## 5. The exec environment (CM-25)
 
-`sys_enter_execve` / `sys_enter_execveat` read the new environment from the
-caller's `envp` (its old image, before the kernel's copy): at most 64
-variables, the first 24 bytes of each compared against a fixed set of names,
-the values of the loader variables captured (128 bytes of `LD_PRELOAD`, 64 of
-`LD_AUDIT`, 64 of `LD_LIBRARY_PATH`, 128 of `GLIBC_TUNABLES`, 16 of
-`HISTFILE`). Nothing else of the environment is read or reported. The
-findings wait in `EXECPOL_ENV` (keyed by `task_struct`) for the exec's pass 0.
+The exec's first pass (`bprm_check_security`, pass 0) reads the new
+environment from the caller's `envp`, in the caller's own memory (the new
+image is mapped later, by the binfmt's `load_binary`). `envp` is the exec's
+own syscall argument, as its registers hold it (`task_pt_regs`: `dx` for
+`execve`, `r10` for `execveat`; the review of #546, F1: a 32-bit
+`int $0x80` exec's `edx` / `esi` and an x32 exec's `dx` / `r10` too, an
+array of 32-bit pointers, the register's low half as the kernel reads it).
+The kernel copied the strings earlier in the exec, into the new image's
+stack, which the program cannot read: this is a second read of the
+caller's memory, after the kernel's copy (see the limits below). At most 64
+variables are read, and the first 24 bytes of each are compared against a
+fixed set of names. The values of the loader
+variables are captured: 128 bytes of `LD_PRELOAD`, 64 of `LD_AUDIT`, 64 of
+`LD_LIBRARY_PATH`, 128 of `GLIBC_TUNABLES` and 16 of `HISTFILE`. Nothing
+else of the environment is read or reported. The findings go into the
+task's own `EXECPOL_ENV` entry, keyed by its thread id and start time. They
+are judged in the same run, and the entry is removed.
+
+Lot 322: the environment was read by two programs on the
+`sys_enter_execve{,at}` tracepoints and handed to pass 0 through that map.
+On Ubuntu 26.04's 7.0 those programs ran only for the execs entered on
+CPU 0, so the check refused almost nothing: 0 of 11 staging preloads, and
+none pinned to CPU 1, 2 or 3. Their read also could not fault a page in: an
+`LD_PRELOAD` string in a file mapping that had never been touched read as
+nothing, while the kernel's copy faulted it in.
 
 | finding | kernel | record |
 |---|---|---|
@@ -290,10 +308,25 @@ attempt is one whatever the caller).
 
 Limits, by design: the string check reads prefixes of the value, not
 resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128
-bytes of `LD_PRELOAD`; the first 64 variables (`TRUNCATED` is counted); a
-caller racing its own memory between the syscall's entry and the kernel's
-copy (TOCTOU); 32-bit compat `execve` (no syscall tracepoint). The mapping
-check (§6) does not depend on the string.
+bytes of `LD_PRELOAD`; the first 64 variables (`TRUNCATED` is counted);
+another architecture than x86-64 (the `pt_regs` offsets do not resolve: a
+signed degradation). The mapping check (§6) does not depend on the string.
+
+**The TOCTOU window (the review of #546, F2).** The scan re-reads the
+caller's memory after the kernel's copy: from `copy_strings(envp)` to
+`security_bprm_check` the kernel copies `argv` (up to about 6 MB), prepares
+the credentials, may migrate the task (`sched_exec`), opens the file (5.15)
+and reads its first page. Another thread of the caller, a process sharing
+the page (`MAP_SHARED`, `process_vm_writev`) can rewrite `LD_PRELOAD=` or
+unmap the page in that window, and make it deterministic with a
+FUSE-backed `argv` page whose read the daemon holds. The kernel keeps its
+copy; the scan judges what the memory holds when it reads. A string or an
+entry it cannot read is `UNREADABLE`: counted (`ENV_UNREAD`, `nn-admin
+status`: "environments not read") and recorded (`NN-L-EXECENV-002`, High),
+never refused. The tracepoint read before the copy had the mirror-image
+race. Reading the kernel's own copy (the new image's stack pages, or a
+check of `mm->env_start..env_end` after the point of no return, which no
+other thread shares) is lot 325's.
 
 ## 6. Executable mappings (`mmap_file`)
 
@@ -368,7 +401,8 @@ denied / reported, mappings denied / reported; `execq_script_refused_total`
 for §7.
 
 Signed `subsystem_degraded`, one per cause at start: the exec sensor not on
-LSM (nothing can be refused); the environment programs or the mapping
+LSM (nothing can be refused); the exec's registers not readable (the
+`pt_regs` offsets unresolved: the environment is not judged) or the mapping
 program refused or not attachable; no slice ids (every caller `unknown`);
 `task_struct.signal` / `signal_struct.tty` absent (no admin tier);
 `task_struct.loginuid` absent (no session tier); `inode.i_uid` absent (no
@@ -388,11 +422,30 @@ The rules are outside the frozen V2 validation denominator, like
   every 10 s; the BPF guard keeps other processes away from the agent's maps.
 - New optional BTF offsets `TASK_STRUCT_SIGNAL_OFFSET`,
   `SIGNAL_STRUCT_TTY_OFFSET` (slots 98 and 99) and lab PR 219's
-  `INODE_I_UID_OFFSET` (slot 94), read here too; tracepoint fields
-  `sys_enter_execve.envp`, `sys_enter_execveat.envp` (slots 111 and 112);
-  the fixed-position check `bpf_lsm_mmap_file` argument 0 is a `struct
-  file`. The enum, tracepoint and hook-argument slots move up (116 slots in
-  all with lab PRs 219 to 224).
+  `INODE_I_UID_OFFSET` (slot 94), read here too; the fixed-position check
+  `bpf_lsm_mmap_file` argument 0 is a `struct file`. Lot 322: the
+  environment's `envp` from `pt_regs` (`PT_REGS_ORIG_AX_OFFSET`,
+  `PT_REGS_DX_OFFSET` of lot 273b, `PT_REGS_R10_OFFSET`, slot 129, all
+  optional and x86-64), through `bpf_task_pt_regs(bpf_get_current_task_btf())`
+  (5.15+); the tracepoint fields `sys_enter_execve.envp` and
+  `sys_enter_execveat.envp` of lab PR 226 are gone with their programs.
+- Lot 322: per-task buffers. `EXECPOL_ENV` (the environment), the exec
+  sensor's `EXEC_SCRATCH` (the walk the classes are read from), the
+  mapping check's `EXECMAP_SCRATCH` and the quarantine's candidate buffer
+  are hashes keyed by the running task (`TaskKey`: thread id, start time),
+  made zeroed at the start of the run, read by the global functions
+  through the key, removed before it returns (the candidate is then copied
+  into `EXECQ_CAND`, which `sched_process_exec` reads). They were per-CPU
+  buffers, and an LSM program runs with preemption enabled (migration
+  disabled only): on a `full` or `lazy` preemption kernel another task's
+  exec on the same CPU could rewrite the walk between its write and the
+  classes judged from it. A report of the mapping check from its cache
+  walks the file again (it copied the CPU's last walk, another file's
+  path). The review of #546 (F4): plain hashes, never LRU (an LRU insert
+  can evict an entry in flight and give its memory to another task), 2048
+  entries each; past them the exec is refused in enforce mode, a mapping
+  is classed `tmp`, `var_tmp`, `home` (not cached), each counted
+  (`LOST`, `nn-admin status`).
 - 5.15: every loop is in a global function verified on its own (`nn_env_scan`
   64 iterations, `nn_list_staging` 128 bytes, `nn_execpol_tier` 8 hops,
   `nn_map_classify` the 64-level walk); findings are kept in map memory, not
@@ -403,9 +456,10 @@ The rules are outside the frozen V2 validation denominator, like
   first build's growth of `exec_check_lsm` did not on 5.15 and 6.1
   (KERNEL_COMPATIBILITY "Older verifiers", rule 9), and the agent fell back
   to `sys_enter_execve`, with no exec refused. Owed: RHEL 9; the per-exec
-  cost (expected: two helper reads per variable at the syscall's entry, a
-  hash lookup and two map reads per classed exec, a cache lookup per
-  executable mapping).
+  cost (expected: two helper reads per variable at the exec's first pass,
+  a hash insert and remove for the walk (and one for an environment with a
+  finding), a hash lookup and two map reads per classed exec, a cache
+  lookup per executable mapping).
 - Fail-open: the programs are not pinned; they detach with the agent and
   nothing more is refused.
 

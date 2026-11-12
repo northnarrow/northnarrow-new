@@ -3573,7 +3573,7 @@ fn execpol_line(out: &StatusOutcome, tty: bool) -> String {
     if state == "off" {
         return format!("exec policy       : {shown}");
     }
-    format!(
+    let mut line = format!(
         "exec policy       : {shown} — denied {}, would deny {}, quarantine {} ({} inactive), \
          environment denied {} / reported {}, mappings denied {} / reported {}",
         n(out.execpol_denied_total),
@@ -3584,7 +3584,19 @@ fn execpol_line(out: &StatusOutcome, tty: bool) -> String {
         n(out.execpol_env_recorded_total),
         n(out.execpol_map_denied_total),
         n(out.execpol_map_recorded_total),
-    )
+    );
+    // Lot 322: what the kernel could not read or judge, when there was any
+    // (an agent before lot 322 reports neither).
+    let unread = n(out.execpol_env_unread_total);
+    let lost = n(out.execpol_lost_total);
+    if unread > 0 || lost > 0 {
+        line.push_str(&colorize(
+            &format!(", environments not read {unread}, runs without their buffer {lost}"),
+            "31",
+            tty,
+        ));
+    }
+    line
 }
 
 /// The exec policy's fields as a JSON object (`null` when absent).
@@ -3594,7 +3606,7 @@ fn execpol_json(out: &StatusOutcome) -> String {
     };
     let n = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
     format!(
-        "{{\"state\":{},\"denied\":{},\"would_deny\":{},\"quarantine\":{},\"quarantine_inactive\":{},\"env_denied\":{},\"env_recorded\":{},\"map_denied\":{},\"map_recorded\":{}}}",
+        "{{\"state\":{},\"denied\":{},\"would_deny\":{},\"quarantine\":{},\"quarantine_inactive\":{},\"env_denied\":{},\"env_recorded\":{},\"map_denied\":{},\"map_recorded\":{},\"env_unread\":{},\"lost\":{}}}",
         serde_json::to_string(state).unwrap_or_else(|_| "null".to_string()),
         n(out.execpol_denied_total),
         n(out.execpol_would_deny_total),
@@ -3604,6 +3616,8 @@ fn execpol_json(out: &StatusOutcome) -> String {
         n(out.execpol_env_recorded_total),
         n(out.execpol_map_denied_total),
         n(out.execpol_map_recorded_total),
+        n(out.execpol_env_unread_total),
+        n(out.execpol_lost_total),
     )
 }
 
@@ -5965,6 +5979,8 @@ mod flow_sock_line_tests {
             execpol_env_recorded_total: None,
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
+            execpol_env_unread_total: None,
+            execpol_lost_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,

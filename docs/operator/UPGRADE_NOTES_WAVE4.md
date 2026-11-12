@@ -1350,3 +1350,56 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
 - **A release says `released` only once the process is back** in the
   cgroup it came from (`response release`: exit 9 with the reason
   otherwise).
+
+## 30. The exec environment's check on every CPU (lot 322)
+
+- **On Ubuntu 26.04 (kernel 7.0) the check now refuses.** This is the
+  check of [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md):
+  an `LD_PRELOAD` or `LD_AUDIT` entry under a staging path, with
+  `--exec-policy enforce`. On that kernel it refused almost nothing. Its two
+  programs on the `sys_enter_execve{,at}` tracepoints ran only for the execs
+  made on CPU 0 (0 of 11 refused in the lab). The exec sensor's own
+  `bprm_check_security` program now reads the environment from the exec's
+  registers. Expect `NN-L-EXECENV-001` "denied at exec (EACCES)" records,
+  and refused execs, where there were none: a service, a cron job or a root
+  session that runs programs with a preload from `/tmp/`, `/var/tmp/`,
+  `/dev/shm/`, `/proc/` or `/dev/fd/`. On the other kernels nothing changes
+  but the way the environment is read. Nothing to configure.
+- **Programs and offsets.** The programs `execpol_env_execve` and
+  `execpol_env_execveat` are gone, and so are their two tracefs fields. One
+  optional BTF offset is new, `pt_regs.r10` (slot 129). The enum,
+  tracepoint and hook-argument slots move by one: 144 slots in all. Where
+  the `pt_regs` offsets do not resolve (another architecture than x86-64),
+  the environment is not judged: the start signs the `exec_policy`
+  degradation "the exec's registers cannot be read on this kernel".
+- **32-bit and x32 execs are judged too** (the review of #546, F1). An exec
+  through the 32-bit entry (`int $0x80`, any process can make one) or the
+  x32 one carries an array of 32-bit pointers: it is read like a native
+  one, and a staging preload in it is refused like any other. It was not
+  read at all. A 32-bit runtime (Steam, Wine) running with a preload from a
+  staging path now meets the same rule as a 64-bit one.
+- **An environment the check cannot read whole is recorded** (F2): a
+  string or an entry unreadable when the scan reads it (the caller's memory
+  changed after the kernel's copy), an unknown call. `NN-L-EXECENV-002`,
+  High, "the new environment could not be read whole at exec"; the exec is
+  not refused. `nn-admin status` reports the count on the exec policy's
+  line ("environments not read"), and in `--json` as `env_unread`.
+- **The per-task buffers.** The following moved from per-CPU buffers to
+  plain hashes of 2048 entries keyed by the running task (never LRU: an
+  LRU insert can evict an entry in flight; the review of #546, F4):
+  - the exec sensor's walk;
+  - the mapping check's walk;
+  - the environment;
+  - the exec quarantine's candidate (then copied into its own map);
+  - the BPF guard's `OBJ_GET` path;
+  - the FIM sensor's windows and names, a rename's names (F3: they feed
+    `NN-L-FIM-011`/`014`'s kills and the FIM-010..017 posture floors).
+
+  Each entry lives for one run of its program. Past 2048 runs in flight at
+  once (each one a task preempted in the middle of the program), the path
+  fails closed and counts it: an exec is refused in enforce mode, a mapping
+  is classed `tmp`, `var_tmp`, `home`, the FIM sensor falls back to the
+  plain observer (a ring drop). `nn-admin status` reports the exec guards'
+  count ("runs without their buffer", `lost` in `--json`). A mapping
+  report from the check's cache now carries the file's own path; it had the
+  path of whatever that CPU had walked last.

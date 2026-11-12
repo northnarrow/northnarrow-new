@@ -29,7 +29,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
 };
 use northnarrow_common::wire::exe::{
-    exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
+    exe_flags, exe_path_slot, ExeIdentityRaw, TaskKey, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
 };
 use northnarrow_common::wire::execq::{
     class, conf_slot, counter, mode, root_kind, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown,
@@ -74,12 +74,18 @@ pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(EXECQ
 
 /// [`EXECQ_ROOTS`]' capacity.
 pub const EXECQ_ROOTS_CAPACITY: u32 = 1024;
-/// The candidate of each exec in progress, keyed by `task_struct`.
+/// The candidate of each exec in progress, keyed by `task_struct`, from the
+/// exec's pass to its `sched_process_exec`.
 #[map]
 static EXECQ_CAND: LruHashMap<u64, ExecqCandRaw> = LruHashMap::with_max_entries(1024, 0);
-/// Where a candidate is built (584 bytes: never on the stack).
+/// Where a candidate is built (584 bytes: never on the stack): the running
+/// task's own entry, made, copied into [`EXECQ_CAND`] and removed in one
+/// run. Lot 322: it was a per-CPU buffer in a program that runs
+/// preemptible; built in place in the LRU it could be evicted under the
+/// writer (the review of #546, F4).
 #[map]
-static EXECQ_CAND_SCRATCH: PerCpuArray<ExecqCandRaw> = PerCpuArray::with_max_entries(1, 0);
+static EXECQ_CAND_SCRATCH: HashMap<TaskKey, ExecqCandRaw> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
 /// Processes stopped and not decided yet (tgid → start, stop time). Pinned:
 /// a restarted agent resumes what its predecessor left stopped.
 #[map]
@@ -154,16 +160,20 @@ unsafe fn level_name(s: *const ExeIdentityRaw, level: usize) -> u64 {
     peek_u64((*s).path.as_ptr().add(slot * EXE_PATH_SLOT_LEN))
 }
 
-/// The guarded classes of the file the walk just described (the per-CPU
-/// scratch of `exec_lsm`). A global function (integer arguments, never
-/// inlined): the verifier checks it once, apart from the LSM program.
+/// The guarded classes of the file the walk just described (the task's
+/// scratch entry of `exec_lsm`, `tid` and `start`). A global function
+/// (integer arguments, never inlined): the verifier checks it once, apart
+/// from the LSM program.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_execq_classify(dentry: u64, flags: u64) -> u64 {
+pub extern "C" fn nn_execq_classify(dentry: u64, flags: u64, tid: u64, start: u64) -> u64 {
     unsafe {
-        match crate::exec_lsm::EXEC_SCRATCH.get_ptr(0) {
+        match crate::exec_lsm::EXEC_SCRATCH.get_ptr(&crate::task_scratch::key(tid, start)) {
             Some(s) => classify(s, dentry as *const u8, flags as u32) as u64,
-            None => 0,
+            // Lot 322: the task's walk gone (the LRU's eviction under a
+            // flood of execs in flight): a file the walk cannot place, as
+            // an unresolved walk is.
+            None => u64::from(class::TMP | class::VAR_TMP | class::HOME),
         }
     }
 }
@@ -517,9 +527,14 @@ pub(crate) unsafe fn note_pass(
         }
         return 0;
     }
-    let cand = match EXECQ_CAND_SCRATCH.get_ptr_mut(0) {
+    let ck = crate::task_scratch::current_key();
+    let cand = match crate::task_scratch::make(&EXECQ_CAND_SCRATCH, &ck) {
         Some(p) => p,
-        None => return 0,
+        None => {
+            bump(counter::CAND_DROPPED);
+            crate::execpol::count_lost();
+            return 0;
+        }
     };
     (*cand).ctime_sec = ctime_sec;
     (*cand).ctime_nsec = ctime_nsec;
@@ -540,6 +555,7 @@ pub(crate) unsafe fn note_pass(
     if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {
         bump(counter::CAND_DROPPED);
     }
+    let _ = EXECQ_CAND_SCRATCH.remove(&ck);
     0
 }
 

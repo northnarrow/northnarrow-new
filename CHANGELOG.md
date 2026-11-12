@@ -6,6 +6,76 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 322: the exec environment's check works on every CPU; the exec
+  guards' and the FIM sensor's buffers are the running task's own.
+  - **The check was almost inert on Ubuntu 26.04 (kernel 7.0).** It refused
+    0 of 11 staging preloads there (lot 318's lab), on `main` too. Its two
+    programs sat on the `sys_enter_execve` / `sys_enter_execveat`
+    tracepoints. On that kernel a program on a syscall tracepoint, attached
+    as aya and libbpf attach it (one perf event, on CPU 0), ran only for the
+    calls made on CPU 0. The lab measured it with the kernel alone
+    (`bpftrace`, no agent): with the exec loop pinned to CPU 1, 2 or 3 the
+    tracepoint never fired; `sched_process_exec` and the LSM hook fired on
+    every CPU. Lot 318's hypothesis, a per-CPU buffer read back on another
+    CPU, did not hold.
+  - **The fix.** The exec sensor's own `bprm_check_security` program reads
+    the new environment at the exec's first pass, from `envp` as the exec's
+    registers hold it (`execve`'s `dx`, `execveat`'s `r10`; a new optional
+    BTF offset, `PT_REGS_R10_OFFSET`, slot 129), in the caller's own memory.
+    The findings go into the task's own `EXECPOL_ENV` entry, keyed by
+    thread id and start time, judged and removed in the same run: the
+    environment's findings no longer pass from one program to another. The
+    two tracepoint programs are gone, along with their tracefs slots.
+  - **The review of #546.**
+    - F1: a 32-bit (`int $0x80`) or x32 exec is read too (an array of
+      32-bit pointers; `edx` / `esi`, `dx` / `r10`). It was not read at all,
+      and a 64-bit program could exec any binary with a staging preload
+      through `int $0x80`.
+    - F2: this is a second read of the caller's memory, after the kernel's
+      copy (TOCTOU: another thread or a process sharing the page can change
+      it in between; reading the kernel's copy is lot 325's). A string or
+      an entry the scan cannot read is a finding now, counted and recorded
+      (High), never refused; it was skipped. `nn-admin status` reports the
+      count ("environments not read").
+    - F3: the FIM sensor's buffers on the file-open, unlink and rename paths
+      are the running task's own entries too (windows, names, a rename's
+      extensions). They fed records that FIM-011/014 kill on and the
+      posture floors FIM-010..017: another task's open on the same CPU could
+      put a credential file's path on an innocent task's pid.
+    - F4: the per-task buffers are plain hashes, never LRU (an LRU insert
+      can evict an entry in flight and hand its memory to another task),
+      capped at 2048 runs in flight; past the cap each path fails closed
+      and counts it (`nn-admin status`: "runs without their buffer").
+  - **Mini-hunt (fixed by the same change).** The old tracepoint read could
+    not fault a page in: an `LD_PRELOAD` string in a file mapping that was
+    never touched read as nothing, while the kernel's copy faulted it in and
+    the loader honoured it.
+  - **The audit of every per-CPU map.** LSM programs run with migration
+    disabled but preemption enabled: on a `full` or `lazy` preemption
+    kernel (Ubuntu 26.04's default), another task's run on the same CPU can
+    rewrite a per-CPU buffer kept across a helper call. These are now the
+    running task's own entries (`agent-ebpf/src/task_scratch.rs`):
+    - the exec sensor's path walk, which the exec policy's classes are read
+      from;
+    - the mapping check's walk;
+    - the environment;
+    - the exec quarantine's candidate, built in a per-task buffer and then
+      copied into its cross-program map (still keyed by `task_struct`, as
+      `EXEC_HANDOFF` is: both go from the exec's pass to its
+      `sched_process_exec`);
+    - the BPF guard's `OBJ_GET` path;
+    - the FIM sensor's windows and names, a rename's names.
+
+    The mapping check also re-walks a file before a report from its cache.
+    It copied whatever walk the CPU had made last, another file's path.
+    `xtask/tests/percpu_maps.rs` classifies every remaining per-CPU map:
+    counters, rate state, programs that run with preemption off, single
+    readers; it sees qualified and aliased spellings.
+  - Privileged e2e `response_privileged_e2e::a_staging_preload_is_refused_at_every_exec_on_every_cpu`:
+    24 execs with a staging `LD_PRELOAD` each as root, as `nobody` and from
+    a service, from unpinned threads with every CPU busy, and 8 through the
+    32-bit and x32 entries, after positive controls for each caller. All are
+    refused.
 - A response reports what the host holds after it, read back, not what
   the agent wrote (lot 312; external bug hunt, edition 1.4: BUG-90, 91,
   114, 117, 120–123, and the independent review of #543;

@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
-use aya::programs::{Lsm, TracePoint};
+use aya::programs::Lsm;
 use aya::{Btf, Ebpf};
 use common::wire::execpol::{counter, mode};
 use parking_lot::Mutex;
@@ -56,10 +56,23 @@ pub const CATEGORY: &str = "malware_prevention";
 /// The signed overlay (`nn-admin config overlay set exec-policy`).
 pub const DEFAULT_POLICY_LOCAL: &str = "/etc/northnarrow/exec-policy.local";
 
-/// The kernel programs.
-pub const ENV_EXECVE_PROGRAM: &str = "execpol_env_execve";
-pub const ENV_EXECVEAT_PROGRAM: &str = "execpol_env_execveat";
+/// The kernel program of the mapping check. Lot 322: the environment has
+/// no program of its own — the exec sensor's `bprm_check_security`
+/// program reads it from the exec's registers ([`ENV_OFFSETS`]).
 pub const MAP_PROGRAM: &str = "execmap_check";
+
+/// Lot 322: the `pt_regs` offsets the environment check reads `envp` with
+/// (x86-64: `orig_ax`, `dx`, `r10`). Lab PR 226 read it at the
+/// `sys_enter_execve{,at}` tracepoints; on Ubuntu 26.04's 7.0 those programs
+/// ran only for the execs entered on CPU 0, and the check refused almost
+/// none of the staging preloads.
+pub const ENV_OFFSETS: [u32; 4] = [
+    common::btf_offsets::slot::PT_REGS_ORIG_AX_OFFSET,
+    common::btf_offsets::slot::PT_REGS_DX_OFFSET,
+    common::btf_offsets::slot::PT_REGS_R10_OFFSET,
+    // the review of #546 (F1): ia32 `execveat`'s envp (`esi`)
+    common::btf_offsets::slot::PT_REGS_SI_OFFSET,
+];
 
 /// `--exec-policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -158,19 +171,6 @@ fn offsets_resolved(slots: &[u32]) -> bool {
     })
 }
 
-fn attach_tracepoint(ebpf: &mut Ebpf, program: &str, event: &str) -> Result<()> {
-    let prog: &mut TracePoint = ebpf
-        .program_mut(program)
-        .ok_or_else(|| anyhow!("program {program} missing from the eBPF object"))?
-        .try_into()
-        .with_context(|| format!("program {program} is not a tracepoint"))?;
-    prog.load()
-        .with_context(|| format!("verifier rejected `{program}`"))?;
-    prog.attach("syscalls", event)
-        .with_context(|| format!("attaching tracepoint syscalls/{event}"))?;
-    Ok(())
-}
-
 fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
     let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the mapping check")?;
     let prog: &mut Lsm = ebpf
@@ -212,15 +212,17 @@ pub fn install(
     let mut map_ok = false;
     if m != Mode::Off {
         if cfg.env && cfg.table.has_env_rules() {
-            match attach_tracepoint(ebpf, ENV_EXECVE_PROGRAM, "sys_enter_execve")
-                .and_then(|()| attach_tracepoint(ebpf, ENV_EXECVEAT_PROGRAM, "sys_enter_execveat"))
-            {
-                Ok(()) => env_ok = true,
-                Err(e) => note(format!(
-                    "exec policy: the environment programs are not attached ({}): LD_PRELOAD, \
-                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec",
-                    crate::sensors::exe_identity::verifier_tail(&e)
-                )),
+            // Lot 322: read by the exec sensor's program itself, from the
+            // exec's registers — nothing to attach.
+            if offsets_resolved(&ENV_OFFSETS) {
+                env_ok = true;
+            } else {
+                note(
+                    "exec policy: the exec's registers cannot be read on this kernel \
+                     (pt_regs.orig_ax, dx, r10 or si not resolved: not x86-64?): LD_PRELOAD, \
+                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec"
+                        .into(),
+                );
             }
         }
         if cfg.map && cfg.table.has_map_rules() {
@@ -308,6 +310,10 @@ pub struct Counters {
     pub map_denied: AtomicU64,
     pub map_recorded: AtomicU64,
     pub exempted: AtomicU64,
+    /// Lot 322: environments not read whole (`ENV_UNREAD`, each recorded).
+    pub env_unread: AtomicU64,
+    /// Lot 322: runs whose per-task buffer could not be made (`LOST`).
+    pub lost: AtomicU64,
     /// Records written (after the repeat window and before the per-rule
     /// budget).
     pub records: AtomicU64,
@@ -326,6 +332,8 @@ impl Counters {
         s(&self.map_denied, counter::MAP_DENIED);
         s(&self.map_recorded, counter::MAP_RECORDED);
         s(&self.exempted, counter::EXEMPTED);
+        s(&self.env_unread, counter::ENV_UNREAD);
+        s(&self.lost, counter::LOST);
     }
 }
 
@@ -343,6 +351,8 @@ pub struct Snapshot {
     pub env_recorded: u64,
     pub map_denied: u64,
     pub map_recorded: u64,
+    pub env_unread: u64,
+    pub lost: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -358,6 +368,8 @@ pub fn snapshot() -> Snapshot {
         env_recorded: g(&c.env_recorded),
         map_denied: g(&c.map_denied),
         map_recorded: g(&c.map_recorded),
+        env_unread: g(&c.env_unread),
+        lost: g(&c.lost),
     }
 }
 
