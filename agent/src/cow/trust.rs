@@ -72,7 +72,9 @@ pub fn validate_writer(entry: &str) -> Result<()> {
         ));
     }
     if entry.contains('/') {
-        if !(entry.ends_with('/') && in_system_tree(entry)) {
+        // a system tree is written with its closing `/` (the entry's
+        // syntax, not a path judged by its end)
+        if !(entry.chars().last() == Some('/') && in_system_tree(entry)) {
             return Err(anyhow!(
                 "a trusted writer is a program name or a system tree ending in `/` \
                  (/usr/, /opt/, …) — got `{entry}`"

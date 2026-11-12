@@ -43,8 +43,12 @@ pub struct ProcFacts {
 /// answer is systemd's line, and without one it is unknown (`None`): never
 /// the root, unless the host has no v1 hierarchy at all.
 pub fn cgroup_path(text: &str) -> Option<&str> {
-    let unified = text.lines().find_map(|l| l.strip_prefix("0::"));
-    let v1 = text.lines().any(|l| !l.is_empty() && !l.starts_with("0::"));
+    let unified = crate::response::cgroup::unified_path(text);
+    // a line of a v1 hierarchy names its controllers (`4:memory:/…`,
+    // `1:name=systemd:/…`); the unified one names none (`0::/…`)
+    let v1 = text
+        .lines()
+        .any(|l| l.splitn(3, ':').nth(1).is_some_and(|c| !c.is_empty()));
     if !v1 {
         return unified;
     }

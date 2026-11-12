@@ -199,9 +199,8 @@ impl ActorFacts for ProcFacts {
 
     fn cgroup(&self, pid: u32) -> Option<String> {
         let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("cgroup")).ok()?;
-        s.lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .map(str::to_string)
+        // lot 312 (review of #543, F7): the one reader of a cgroup text
+        nn_core::response::cgroup::unified_path(&s).map(str::to_string)
     }
 
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
