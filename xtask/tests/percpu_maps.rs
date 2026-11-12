@@ -448,17 +448,16 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         body(&pol, "exec_envp"),
         &[
             "off_opt!(PT_REGS_ORIG_AX_OFFSET)",
-            "off_opt!(PT_REGS_DX_OFFSET)",
-            "off_opt!(PT_REGS_R10_OFFSET)",
-            "off_opt!(PT_REGS_SI_OFFSET)",
             "TASK_STRUCT_MM_OFFSET",
             "regs_are_the_writes(tflags)",
             "bpf_task_pt_regs(generated::bpf_get_current_task_btf())",
-            "let (reg, compat) = exec_envp_reg(nr)?;",
-            "EnvpReg::Dx => dx,",
-            "EnvpReg::R10 => r10,",
-            "EnvpReg::Si => si,",
+            "let (reg, compat) = match exec_envp_reg(nr) {",
+            "None => return ENVP_UNREAD,",
+            "EnvpReg::Dx => off_opt!(PT_REGS_DX_OFFSET),",
+            "EnvpReg::R10 => off_opt!(PT_REGS_R10_OFFSET),",
+            "EnvpReg::Si => off_opt!(PT_REGS_SI_OFFSET),",
             "envp_value(peek_u64((regs + off as u64) as *const u8), compat)",
+            "v | ENVP_COMPAT",
         ],
     )
     .unwrap();
@@ -486,7 +485,10 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     in_order(
         body(&pol, "exec_env"),
         &[
-            "None => return (env_flags::UNREADABLE, None),",
+            "if raw == ENVP_UNREAD {",
+            "return (env_flags::UNREADABLE, None);",
+            "let compat = raw >> 63;",
+            "nn_env_scan(envp, u64::from(key.tid), key.start_ns, compat)",
             "if r & SCAN_LOST != 0 {",
             "return (env_flags::UNREADABLE, None);",
         ],

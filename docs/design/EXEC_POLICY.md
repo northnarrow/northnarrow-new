@@ -430,17 +430,22 @@ The rules are outside the frozen V2 validation denominator, like
   (5.15+); the tracepoint fields `sys_enter_execve.envp` and
   `sys_enter_execveat.envp` of lab PR 226 are gone with their programs.
 - Lot 322: per-task buffers. `EXECPOL_ENV` (the environment), the exec
-  sensor's `EXEC_SCRATCH` (the walk the classes are read from) and the
-  mapping check's `EXECMAP_SCRATCH` are LRU hashes keyed by the running
-  task (`TaskKey`: thread id, start time), made zeroed at the start of the
-  run, read by the global functions through the key, removed before it
-  returns. The exec quarantine's candidate is built in its own entry. They
-  were per-CPU buffers, and an LSM program runs with preemption enabled
-  (migration disabled only): on a `full` or `lazy` preemption kernel
-  another task's exec on the same CPU could rewrite the walk between its
-  write and the classes judged from it. A report of the mapping check from
-  its cache walks the file again (it copied the CPU's last walk, another
-  file's path).
+  sensor's `EXEC_SCRATCH` (the walk the classes are read from), the
+  mapping check's `EXECMAP_SCRATCH` and the quarantine's candidate buffer
+  are hashes keyed by the running task (`TaskKey`: thread id, start time),
+  made zeroed at the start of the run, read by the global functions
+  through the key, removed before it returns (the candidate is then copied
+  into `EXECQ_CAND`, which `sched_process_exec` reads). They were per-CPU
+  buffers, and an LSM program runs with preemption enabled (migration
+  disabled only): on a `full` or `lazy` preemption kernel another task's
+  exec on the same CPU could rewrite the walk between its write and the
+  classes judged from it. A report of the mapping check from its cache
+  walks the file again (it copied the CPU's last walk, another file's
+  path). The review of #546 (F4): plain hashes, never LRU (an LRU insert
+  can evict an entry in flight and give its memory to another task), 2048
+  entries each; past them the exec is refused in enforce mode, a mapping
+  is classed `tmp`, `var_tmp`, `home` (not cached), each counted
+  (`LOST`, `nn-admin status`).
 - 5.15: every loop is in a global function verified on its own (`nn_env_scan`
   64 iterations, `nn_list_staging` 128 bytes, `nn_execpol_tier` 8 hops,
   `nn_map_classify` the 64-level walk); findings are kept in map memory, not
@@ -452,7 +457,7 @@ The rules are outside the frozen V2 validation denominator, like
   (KERNEL_COMPATIBILITY "Older verifiers", rule 9), and the agent fell back
   to `sys_enter_execve`, with no exec refused. Owed: RHEL 9; the per-exec
   cost (expected: two helper reads per variable at the exec's first pass,
-  an LRU insert and remove for the walk (and one for an environment with a
+  a hash insert and remove for the walk (and one for an environment with a
   finding), a hash lookup and two map reads per classed exec, a cache
   lookup per executable mapping).
 - Fail-open: the programs are not pinned; they detach with the agent and

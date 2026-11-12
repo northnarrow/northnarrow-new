@@ -573,6 +573,11 @@ unsafe fn report_exec(
 
 // ── the new environment, at the exec's first pass ───────────────────
 
+/// [`exec_envp`]'s values: not read; and the bit of a compat call's
+/// `envp` (a user address is below 2^47: bit 63 is free).
+const ENVP_UNREAD: u64 = u64::MAX;
+const ENVP_COMPAT: u64 = 1 << 63;
+
 /// `nn_env_scan`'s result bit (above the 32 of [`env_flags`]): the task's
 /// own entry could not be made (the map full: that many execs in flight):
 /// nothing was read.
@@ -607,14 +612,16 @@ pub(crate) fn walk_lost() -> i32 {
 /// array or a string the scan could not read.
 #[inline(always)]
 unsafe fn exec_env(task: *const u8, key: &TaskKey) -> (u32, Option<TaskKey>) {
-    let (envp, compat) = match exec_envp(task) {
-        Some(p) => p,
-        None => return (env_flags::UNREADABLE, None),
-    };
-    if envp == 0 {
+    let raw = exec_envp(task);
+    if raw == ENVP_UNREAD {
+        return (env_flags::UNREADABLE, None);
+    }
+    if raw == 0 {
         return (0, None);
     }
-    let r = nn_env_scan(envp, u64::from(key.tid), key.start_ns, u64::from(compat));
+    let compat = raw >> 63;
+    let envp = raw & !ENVP_COMPAT;
+    let r = nn_env_scan(envp, u64::from(key.tid), key.start_ns, compat);
     if r & SCAN_LOST != 0 {
         return (env_flags::UNREADABLE, None);
     }
@@ -633,42 +640,51 @@ unsafe fn exec_env(task: *const u8, key: &TaskKey) -> (u32, Option<TaskKey>) {
 /// stack, which is not readable here), so this is a second read of memory
 /// the caller — another thread, a process sharing the page — can change in
 /// between (the review of #546, F2: the kernel's own copy is lot 325's).
-/// `Some((0, _))`: a task with no user call of its own (no `mm`: a
-/// kernel-started exec; an io-wq worker carries another call's registers).
-/// `None`: not read (the offsets are not resolved: another architecture;
-/// an unknown call).
+/// 0: a task with no user call of its own (no `mm`: a kernel-started
+/// exec; an io-wq worker carries another call's registers).
+/// [`ENVP_UNREAD`]: not read (the offsets are not resolved: another
+/// architecture; an unknown call). A compat call's `envp` carries
+/// [`ENVP_COMPAT`].
 #[inline(always)]
-unsafe fn exec_envp(task: *const u8) -> Option<(u64, bool)> {
-    let (Some(ax), Some(dx), Some(r10), Some(si)) = (
-        off_opt!(PT_REGS_ORIG_AX_OFFSET),
-        off_opt!(PT_REGS_DX_OFFSET),
-        off_opt!(PT_REGS_R10_OFFSET),
-        off_opt!(PT_REGS_SI_OFFSET),
-    ) else {
-        return None;
+unsafe fn exec_envp(task: *const u8) -> u64 {
+    // One value out, no tuple through the stack: on 5.15 an `Option<(u64,
+    // bool)>` left a stack slot unwritten on one path and the verifier
+    // refused the read ("invalid read from stack off -24").
+    let ax = match off_opt!(PT_REGS_ORIG_AX_OFFSET) {
+        Some(o) if o <= 0xff => o,
+        _ => return ENVP_UNREAD,
     };
-    if ax > 0xff || dx > 0xff || r10 > 0xff || si > 0xff {
-        return None;
-    }
     if peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) == 0 {
-        return Some((0, false));
+        return 0;
     }
     let tflags = peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET)));
     if !northnarrow_common::cgroup_limits::regs_are_the_writes(tflags) {
-        return Some((0, false));
+        return 0;
     }
     let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
     if regs == 0 {
-        return None;
+        return ENVP_UNREAD;
     }
     let nr = peek_u64((regs + ax as u64) as *const u8);
-    let (reg, compat) = exec_envp_reg(nr)?;
-    let off = match reg {
-        EnvpReg::Dx => dx,
-        EnvpReg::R10 => r10,
-        EnvpReg::Si => si,
+    let (reg, compat) = match exec_envp_reg(nr) {
+        Some(v) => v,
+        None => return ENVP_UNREAD,
     };
-    Some((envp_value(peek_u64((regs + off as u64) as *const u8), compat), compat))
+    let off = match reg {
+        EnvpReg::Dx => off_opt!(PT_REGS_DX_OFFSET),
+        EnvpReg::R10 => off_opt!(PT_REGS_R10_OFFSET),
+        EnvpReg::Si => off_opt!(PT_REGS_SI_OFFSET),
+    };
+    let off = match off {
+        Some(o) if o <= 0xff => o,
+        _ => return ENVP_UNREAD,
+    };
+    let v = envp_value(peek_u64((regs + off as u64) as *const u8), compat);
+    if compat {
+        v | ENVP_COMPAT
+    } else {
+        v
+    }
 }
 
 /// "LD_PRELO", "LD_AUDIT", "LD_LIBRA", "GLIBC_TU", "HISTFILE",
