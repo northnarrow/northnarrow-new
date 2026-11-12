@@ -87,6 +87,28 @@ pub enum ExecutionOutcome {
         original_path: String,
         vault_id: String,
     },
+    /// Lot 312 (review F1, F4, F5): the target's executable was encrypted
+    /// into the vault, and its inode — kept by other names (a shared store,
+    /// a hard link), owned by another user, its name not verified, or its
+    /// removal failed — neutralized where it is: emptied when it is the
+    /// offender's own file with no other name (`complete`), else made mode
+    /// 000 with its content kept, or not changed (`detail` says which, with
+    /// the owner and the link count). A restore puts content and mode back
+    /// into that inode; it creates no name.
+    QuarantinedInPlace {
+        vault_id: String,
+        /// A verified name of it, when one was.
+        original_path: Option<String>,
+        detail: String,
+        complete: bool,
+    },
+    /// Lot 312 (review F2): `BlockOutbound` moved the process into the
+    /// blocked scope and new sockets are dropped; `sockets` inet sockets
+    /// it held before the move are not (the drop matches a socket's cgroup
+    /// at its creation), nor sockets passed to it later from outside the
+    /// scope (`SCM_RIGHTS`). They may run until NEUTRALIZE's kill or
+    /// ISOLATE. Partial, never a success.
+    BlockedNewOnly { pid: u32, sockets: usize },
     /// `ThrottleProcess`: the PID was placed in
     /// `northnarrow.slice/throttled.scope`. External audit CMB-013: each
     /// limit as read back from the scope after it was written — `None`
@@ -212,6 +234,16 @@ pub fn journal_outcome(
         ExecutionOutcome::NotInEffect { reason, .. } => {
             (R::Failure, Some(format!("not in effect: {reason}")))
         }
+        ExecutionOutcome::QuarantinedInPlace {
+            detail, complete, ..
+        } => {
+            if *complete {
+                (R::Success, Some(detail.clone()))
+            } else {
+                (R::Partial, Some(detail.clone()))
+            }
+        }
+        ExecutionOutcome::BlockedNewOnly { sockets, .. } => (R::Partial, Some(blocked_new_only(*sockets))),
     };
     let mut text = format!("{:?}", report.primary);
     if !report.additional.is_empty() {
@@ -237,6 +269,15 @@ pub fn journal_outcome(
         }
     }
     (result, text, reason)
+}
+
+/// Lot 312 (review F2): what a [`ExecutionOutcome::BlockedNewOnly`] row says.
+pub fn blocked_new_only(sockets: usize) -> String {
+    format!(
+        "new connections blocked; {sockets} inet socket(s) opened before the move are not (the \
+         drop matches a socket's cgroup at its creation), nor sockets passed in later from \
+         outside the scope (SCM_RIGHTS): they may run until NEUTRALIZE's kill or ISOLATE"
+    )
 }
 
 /// Reviews 86 and 87: the host's view of `path`, for a response that

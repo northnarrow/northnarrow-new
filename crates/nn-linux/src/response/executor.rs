@@ -142,15 +142,30 @@ impl Executor {
     /// path, the content's SHA-256 and size, the process.
     fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
         let notes = quarantine::take_index_notes(&self.config.quarantine_dir);
-        let ExecutionOutcome::Quarantined {
-            original_path,
-            vault_id,
-        } = outcome
-        else {
-            if notes.is_empty() {
-                return;
+        // Lot 312 (review F1): an inode neutralized in place is recorded
+        // too, with what was done, `partial` when its content is kept.
+        let (original_path, vault_id, in_place, result) = match outcome {
+            ExecutionOutcome::Quarantined {
+                original_path,
+                vault_id,
+            } => (Some(original_path.clone()), vault_id, None, "success"),
+            ExecutionOutcome::QuarantinedInPlace {
+                vault_id,
+                original_path,
+                detail,
+                complete,
+            } => (
+                original_path.clone(),
+                vault_id,
+                Some(detail.clone()),
+                if *complete { "success" } else { "partial" },
+            ),
+            _ => {
+                if notes.is_empty() {
+                    return;
+                }
+                return self.record_index_notes(notes);
             }
-            return self.record_index_notes(notes);
         };
         let Some(log) = self.audit.read().clone() else {
             warn!(vault_id = %vault_id, "quarantine not recorded: the audit log is not open");
@@ -159,16 +174,22 @@ impl Executor {
         let meta = quarantine::vault_meta(vault_id, &self.config).unwrap_or_default();
         let draft = crate::audit::AuditEntryDraft {
             op: "response_quarantine".to_string(),
-            extra: serde_json::json!({
-                "vault_id": vault_id,
-                "original_path": original_path,
-                "sha256": meta["sha256"],
-                "size_bytes": meta["size_bytes"],
-                "pid": pid,
-            }),
+            extra: {
+                let mut x = serde_json::json!({
+                    "vault_id": vault_id,
+                    "original_path": original_path,
+                    "sha256": meta["sha256"],
+                    "size_bytes": meta["size_bytes"],
+                    "pid": pid,
+                });
+                if let Some(detail) = in_place {
+                    x["in_place"] = serde_json::json!(detail);
+                }
+                x
+            },
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
-            result: "success".to_string(),
+            result: result.to_string(),
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),

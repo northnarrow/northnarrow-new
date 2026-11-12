@@ -162,6 +162,21 @@ impl SystemActuator {
     pub fn quarantine_text(pid: u32, outcome: &ExecutionOutcome) -> String {
         match outcome {
             ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
+            // lot 312 (review F1): its inode neutralized in place
+            ExecutionOutcome::QuarantinedInPlace {
+                detail,
+                complete: true,
+                ..
+            } => format!("quarantined: {detail}"),
+            ExecutionOutcome::QuarantinedInPlace { detail, .. } => {
+                warn!(
+                    target: "combat.actuator",
+                    pid,
+                    detail = %detail,
+                    "NEUTRALIZE: binary quarantine partial (re-exec prevention degraded)"
+                );
+                format!("partially quarantined: {detail} (re-exec prevention degraded)")
+            }
             ExecutionOutcome::AlreadyGone { .. } => "binary already gone".to_string(),
             ExecutionOutcome::WouldExecute { .. } => {
                 "detect-only: would be quarantined".to_string()
