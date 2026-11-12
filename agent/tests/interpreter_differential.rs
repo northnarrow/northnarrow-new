@@ -518,8 +518,15 @@ const GENERATED: usize = 1500;
 
 /// What one argv ran: the names its markers appended.
 fn run(i: &Interp, dir: &Path, tokens: &[&str]) -> (Vec<String>, Vec<String>) {
-    let out = dir.join("out");
-    let _ = std::fs::remove_file(&out);
+    // a file of its own per argv: a shell with job control (`-i`, `-m`)
+    // puts its pipeline in a process group of its own, which the group's
+    // kill below misses — a `tee` left behind writes into its own run's
+    // file, never the next one's
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let out = dir.join(format!(
+        "out{}",
+        RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     // fresh markers: an option may edit them (`perl -i`)
     for n in ["S1", "S2", "S3"] {
         std::fs::write(dir.join(n), i.marker.replace("NAME", n)).unwrap();
