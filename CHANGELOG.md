@@ -140,6 +140,48 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- The exec quarantine's stop resumes every process the kernel holds (lot
+  317, third bug hunt BUG-118; `docs/design/EXEC_QUARANTINE.md` §3). It
+  resumed the processes whose report it had read from the ring: one the
+  kernel stopped after the last read stayed stopped until the next start of
+  an agent with the guard on. The stop clears the heartbeat, waits until
+  every run of the exec program that read it has returned (`membarrier`
+  `MEMBARRIER_CMD_GLOBAL`, `synchronize_rcu()`), then resumes everything in
+  `EXECQ_STOPPED` too (the signed `stopping` entry's `unreported`).
+- A held process the agent cannot capture is not taken for one that ended
+  (lot 317, BUG-124). With `pidfd_open` out of descriptors or memory, the
+  exec quarantine recorded "ended while held" or "already ended", sent no
+  `SIGCONT` or `SIGKILL` and took the pid out of `EXECQ_STOPPED`: the
+  process stayed stopped for good, a block-listed one unkilled. The capture
+  is tried again; while it fails the decision is deferred (`resume
+  deferred` / `kill deferred`), the process stays held and in the map, and
+  the decision is carried out once it is captured (signed `deferred`
+  entry); the rules' verdict is awaited as for any held process; the boot's
+  recovery and the stop leave such a process in the map for the next start.
+  `ProcRef::liveness()` tells running, gone and not captured apart; the
+  stand-down of a soft egress block and the executor's "already gone" use
+  it, and `xtask/tests/process_liveness.rs` keeps every caller on it — the
+  same confusion spelled `liveness() != Liveness::Live` included.
+- The review of #541 (lot 317): a late block-list verdict on a process
+  whose resume is owed is a kill owed, never a resume; a kill owed is
+  marked in the pinned `EXECQ_STOPPED` (`stop_ns` = `u64::MAX`) and the
+  next start kills the process instead of resuming it; the stop reads the
+  ring a last time after its wait, and keys every process by its pid and
+  start (a reused pid neither hides nor releases another); the kernel
+  writes `EXECQ_STOPPED` before it sends `SIGSTOP` and does not stop a
+  process the map cannot name (`MAP_FULL`, counted, signed as fail-open):
+  past 4096 held processes a stop used to leave one no stop, crash or next
+  start resumed.
+- The dispatcher of slow work prepares nothing at the stop (lot 317,
+  BUG-116; `docs/architecture/EVENT_BUS.md` §2d): it prepared its whole
+  queue (up to 256 bursts, with their I/O) inside the stop's budget, and
+  the stop then threw the assessments away and judged the same bursts again
+  with their I/O. What it prepared comes back with its assessment, the rest
+  unprepared, and nothing it is handed is dropped. Its `catch_unwind`, whose
+  fallback lived only in unwinding builds (the release aborts on a panic)
+  and dropped the burst saying it was judged, is gone (BUG-115);
+  `xtask/tests/unwind_fallbacks.rs` lists the four left, each with what its
+  fallback does.
 - The evidence chains' residues of the third external bug hunt (lot 319;
   edition 1.4's partials 06, 28, 31, 10, 12, and lot 296's backlog;
   `docs/operator/EVIDENCE_CHAINS.md`, `EXPORT.md` §3 and §8, upgrade notes

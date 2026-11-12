@@ -437,3 +437,40 @@ fn a_thread_lowers_its_own_priority_only() {
     // SAFETY: getpriority(2) of this thread.
     assert_eq!(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }, before);
 }
+
+/// Lot 317 (BUG-124's family): a kill whose target the agent could not
+/// capture (`pidfd_open` out of descriptors) is a failure with the
+/// capture's error — never "already gone" — and the process it names
+/// still runs (nothing reached it).
+#[test]
+fn a_kill_of_a_target_not_captured_fails_with_the_capture_s_error() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = sleeper.id();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let exec = Executor::with_config(cfg);
+    let target = super::proc_ref::ProcRef::uncaptured_for_test(pid, 0, libc::EMFILE);
+    for action in [ResponseAction::KillProcess, ResponseAction::KillProcessTree] {
+        let report = exec.execute_on(action.clone(), &target, &super::journal::test_intent());
+        assert_eq!(
+            report.primary,
+            ExecutionOutcome::Failed {
+                pid,
+                errno: libc::EMFILE
+            },
+            "{action:?}"
+        );
+    }
+    assert_eq!(
+        super::proc_ref::ProcRef::open(pid).liveness(),
+        super::proc_ref::Liveness::Live,
+        "the target was reached"
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
