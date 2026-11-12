@@ -929,10 +929,12 @@ fn quarantine_file_with(
     // The shells /etc/shells lists are among them: one that cannot be read
     // leaves them unknown, and nothing is changed (lot 311b's rule: a read
     // that fails never empties a protection).
-    let shells = listed_shells(Path::new(SHELLS)).map_err(|e| {
+    let list = shells_path();
+    let shells = listed_shells(&list).map_err(|e| {
         QuarantineError::Refused(format!(
-            "{SHELLS} could not be read ({e}): the shells it lists are not all known, so no file \
-             is changed"
+            "{} could not be read ({e}): the shells it lists are not all known, so no file is \
+             changed",
+            list.display()
         ))
     })?;
     if is_protected_identity(cfg, handle, &shells) {
@@ -1024,6 +1026,22 @@ fn quarantine_file_with(
 
 /// The system's list of login shells.
 const SHELLS: &str = "/etc/shells";
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the shell list read in place of [`SHELLS`] on this thread.
+    static SHELLS_AT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where the shell list is read: [`SHELLS`] (a test's own list under
+/// `cfg(test)`, when it set one).
+fn shells_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = SHELLS_AT.with(|s| s.borrow().clone()) {
+        return p;
+    }
+    PathBuf::from(SHELLS)
+}
 
 /// Re-check of #543 (N1): the shells a `/etc/shells` lists, its bytes made
 /// text. A host with none lists none (the usual shells of
@@ -3432,6 +3450,36 @@ mod bug90 {
         assert!(listed_shells(&tmp.path().join("none")).unwrap().is_empty());
         // a directory in its place: EISDIR, not NotFound
         assert!(listed_shells(tmp.path()).is_err());
+    }
+
+    /// Re-check of #543 (N1), with lot 311b's rule: a shell list that
+    /// cannot be read refuses the quarantine — even of the offender's own
+    /// payload — before anything is changed or vaulted; the same payload is
+    /// quarantined once the list reads.
+    #[test]
+    fn n1_an_unreadable_shell_list_refuses_the_quarantine() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let payload = tmp.path().join("payload.bin");
+        fs::write(&payload, b"the offender's own payload").unwrap();
+        let before = fs::metadata(&payload).unwrap().mode();
+        let h = ExeHandle::open(&payload).unwrap();
+        SHELLS_AT.with(|s| *s.borrow_mut() = Some(tmp.path().to_path_buf()));
+        let out = quarantine_file(&h, &cfg);
+        SHELLS_AT.with(|s| *s.borrow_mut() = None);
+        match &out {
+            Err(QuarantineError::Refused(why)) => assert!(
+                why.contains("could not be read") && why.contains("no file is changed"),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&payload).unwrap(), b"the offender's own payload");
+        assert_eq!(fs::metadata(&payload).unwrap().mode(), before);
+        assert!(list_vault(&cfg).is_empty(), "nothing vaulted");
+        // premise: the refusal was the list's
+        assert!(quarantine_file(&h, &cfg).is_ok());
+        assert!(!payload.exists());
     }
 
     /// Re-check of #543 (N1): the system's own files are refused by
