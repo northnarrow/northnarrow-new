@@ -243,7 +243,9 @@ pub fn journal_outcome(
                 (R::Partial, Some(detail.clone()))
             }
         }
-        ExecutionOutcome::BlockedNewOnly { sockets, .. } => (R::Partial, Some(blocked_new_only(*sockets))),
+        ExecutionOutcome::BlockedNewOnly { sockets, .. } => {
+            (R::Partial, Some(blocked_new_only(*sockets)))
+        }
     };
     let mut text = format!("{:?}", report.primary);
     if !report.additional.is_empty() {

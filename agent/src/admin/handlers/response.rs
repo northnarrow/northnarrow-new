@@ -246,8 +246,7 @@ fn response_restore(
             let path = path.to_string_lossy().into_owned();
             // lot 312 (review F1): an entry neutralized in place came back
             // into the same file, its mode its own, every name of it
-            let in_place =
-                crate::response::quarantine::is_in_place(&extra.vault_id, &state.config);
+            let in_place = crate::response::quarantine::is_in_place(&extra.vault_id, &state.config);
             warn!(
                 target: "admin.response_restore",
                 signer_fp = %v.signer_fp(),

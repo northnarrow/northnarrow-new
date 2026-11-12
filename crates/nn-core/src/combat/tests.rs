@@ -1356,7 +1356,9 @@ fn a_partial_soft_block_shortens_investigate_and_is_released() {
     let r = reasons.0.lock().clone();
     assert!(
         r[0].0 == "INVESTIGATE"
-            && r[0].1.contains("100 FAILED (PARTIAL: 2 inet socket(s) opened before the move)"),
+            && r[0]
+                .1
+                .contains("100 FAILED (PARTIAL: 2 inet socket(s) opened before the move)"),
         "{r:?}"
     );
     assert!(
@@ -1365,7 +1367,11 @@ fn a_partial_soft_block_shortens_investigate_and_is_released() {
         rec.log()
     );
     l.stand_down(t0 + Duration::from_secs(1));
-    assert!(rec.log().iter().any(|e| e == "soft_clear:100"), "{:?}", rec.log());
+    assert!(
+        rec.log().iter().any(|e| e == "soft_clear:100"),
+        "{:?}",
+        rec.log()
+    );
     // and the window is the short one
     let l = CombatLadder::new(
         Box::new(MockActuator {

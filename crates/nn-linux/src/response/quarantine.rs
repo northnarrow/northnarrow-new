@@ -593,13 +593,18 @@ fn restore_in_place(
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
     {
-        return Err(invalid("the name must be an absolute path without `.` or `..`"));
+        return Err(invalid(
+            "the name must be an absolute path without `.` or `..`",
+        ));
     }
     let inode = &meta["inode"];
     let want = |k: &str| {
-        inode[k]
-            .as_u64()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, format!("the entry records no inode {k}")))
+        inode[k].as_u64().ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("the entry records no inode {k}"),
+            )
+        })
     };
     let (dev, ino, mode) = (want("dev")?, want("ino")?, want("mode")? as u32);
     let held = super::on_host_path(path, |p| {
@@ -911,7 +916,9 @@ fn quarantine_file_with(
             Err(QuarantineError::ProtectedPath) => return Err(QuarantineError::ProtectedPath),
             // Review F4: a failed removal (a swap, EISDIR, EBUSY) leaves the
             // inode to be neutralized in place below.
-            Err(e) => warn!(error = ?e, "quarantine: the name could not be removed — neutralized in place"),
+            Err(e) => {
+                warn!(error = ?e, "quarantine: the name could not be removed — neutralized in place")
+            }
         }
         if handle.unlinked()? {
             return Ok(Done::Removed {
@@ -1105,9 +1112,8 @@ fn vault_nameless(handle: &ExeHandle, cfg: &ExecutorConfig) -> Option<String> {
     if m.len() > max {
         return None;
     }
-    let vaulted = read_bounded(handle, max).and_then(|content| {
-        vault_content(cfg, &content, None, &Identity::of(handle, &m), true)
-    });
+    let vaulted = read_bounded(handle, max)
+        .and_then(|content| vault_content(cfg, &content, None, &Identity::of(handle, &m), true));
     match vaulted {
         Ok(id) => Some(id),
         Err(e) => {
@@ -1143,7 +1149,9 @@ fn neutralize_in_place(handle: &ExeHandle, id: &Identity, named: bool) -> (Strin
             warn!(error = %e, "quarantine: emptying the held binary failed");
         }
         drop(emptied);
-        let _ = handle.file.set_permissions(fs::Permissions::from_mode(0o000));
+        let _ = handle
+            .file
+            .set_permissions(fs::Permissions::from_mode(0o000));
         if handle.file.metadata().is_ok_and(|m| m.len() == 0) {
             return (
                 format!(
@@ -2673,14 +2681,32 @@ mod bug90 {
             panic!("{out:?}");
         };
         assert!(detail.starts_with("emptied in place"), "{detail}");
-        assert_eq!(fs::metadata(&keep).unwrap().len(), 0, "the other name runs nothing");
+        assert_eq!(
+            fs::metadata(&keep).unwrap().len(),
+            0,
+            "the other name runs nothing"
+        );
         // the restore needs a name of it, and finds the same inode there
-        assert!(restore_entry(vault_id, None, &cfg).is_err(), "no name was verified");
+        assert!(
+            restore_entry(vault_id, None, &cfg).is_err(),
+            "no name was verified"
+        );
         let back = restore_entry(vault_id, Some(keep.to_str().unwrap()), &cfg).unwrap();
         assert_eq!(back, keep);
-        assert_eq!(fs::read(&keep).unwrap(), b"malware", "content back in the same file");
-        assert_eq!(fs::metadata(&keep).unwrap().mode() & 0o7777, 0o750, "its own mode");
-        assert!(!tmp.path().join("payload (deleted)").exists(), "no name created");
+        assert_eq!(
+            fs::read(&keep).unwrap(),
+            b"malware",
+            "content back in the same file"
+        );
+        assert_eq!(
+            fs::metadata(&keep).unwrap().mode() & 0o7777,
+            0o750,
+            "its own mode"
+        );
+        assert!(
+            !tmp.path().join("payload (deleted)").exists(),
+            "no name created"
+        );
     }
 
     /// Review F1: a SHARED inode — a package store's, as conda, pnpm or uv
@@ -2714,8 +2740,14 @@ mod bug90 {
         else {
             panic!("{out:?}");
         };
-        assert_eq!(original_path.as_deref(), Some(env.join("python3.11").to_str().unwrap()));
-        assert!(detail.contains("shared: 3 links") && detail.contains("mode 755 -> 000"), "{detail}");
+        assert_eq!(
+            original_path.as_deref(),
+            Some(env.join("python3.11").to_str().unwrap())
+        );
+        assert!(
+            detail.contains("shared: 3 links") && detail.contains("mode 755 -> 000"),
+            "{detail}"
+        );
         for p in [&c, &env.join("python3.11"), &env2.join("python3.11")] {
             let m = fs::metadata(p).unwrap();
             assert_eq!(m.len(), 18, "{} keeps its content", p.display());
@@ -2733,7 +2765,12 @@ mod bug90 {
         let back = restore_entry(vault_id, None, &cfg).unwrap();
         assert_eq!(back, env.join("python3.11"));
         for p in [&c, &env.join("python3.11"), &env2.join("python3.11")] {
-            assert_eq!(fs::metadata(p).unwrap().mode() & 0o7777, 0o755, "{}", p.display());
+            assert_eq!(
+                fs::metadata(p).unwrap().mode() & 0o7777,
+                0o755,
+                "{}",
+                p.display()
+            );
             assert_eq!(fs::read(p).unwrap(), b"python-interpreter");
         }
     }
@@ -2775,7 +2812,13 @@ mod bug90 {
         let h = ExeHandle::open(&g).unwrap().with_offender_uid(None);
         let out = quarantine_handle(&h, 4243, &cfg, &super::super::journal::test_intent());
         assert!(
-            matches!(out, ExecutionOutcome::QuarantinedInPlace { complete: false, .. }),
+            matches!(
+                out,
+                ExecutionOutcome::QuarantinedInPlace {
+                    complete: false,
+                    ..
+                }
+            ),
             "{out:?}"
         );
         assert!(g.exists());
@@ -2801,7 +2844,10 @@ mod bug90 {
         fs::remove_file(&f).unwrap();
         let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
         assert!(
-            matches!(out, ExecutionOutcome::QuarantinedInPlace { complete: true, .. }),
+            matches!(
+                out,
+                ExecutionOutcome::QuarantinedInPlace { complete: true, .. }
+            ),
             "not refused by the shown name: {out:?}"
         );
         // the agent's own file, held with no verified name: refused
@@ -2845,10 +2891,17 @@ mod bug90 {
         assert_eq!(h.current_path(), None, "the shown name leads to the decoy");
         let out = quarantine_handle(&h, 4242, &cfg, &super::super::journal::test_intent());
         assert!(
-            matches!(out, ExecutionOutcome::QuarantinedInPlace { complete: true, .. }),
+            matches!(
+                out,
+                ExecutionOutcome::QuarantinedInPlace { complete: true, .. }
+            ),
             "{out:?}"
         );
-        assert_eq!(fs::read(&decoy).unwrap(), b"decoy", "the decoy is untouched");
+        assert_eq!(
+            fs::read(&decoy).unwrap(),
+            b"decoy",
+            "the decoy is untouched"
+        );
         assert_eq!(fs::metadata(&keep).unwrap().len(), 0);
     }
 
@@ -2877,7 +2930,11 @@ mod bug90 {
             panic!("{out:?}");
         };
         assert!(detail.contains("it could not be emptied"), "{detail}");
-        assert_eq!(fs::metadata(&keep).unwrap().len(), 7, "still on disk, whole");
+        assert_eq!(
+            fs::metadata(&keep).unwrap().len(),
+            7,
+            "still on disk, whole"
+        );
     }
 
     /// Review F4: the name exchanged with a DIRECTORY between its check
@@ -2921,8 +2978,15 @@ mod bug90 {
         let Done::InPlace { complete: true, .. } = &done else {
             panic!("{done:?}");
         };
-        assert_eq!(h.file.metadata().unwrap().len(), 0, "the binary (now named d) emptied");
-        assert!(a.join("inside").exists(), "the directory now at `a` is untouched");
+        assert_eq!(
+            h.file.metadata().unwrap().len(),
+            0,
+            "the binary (now named d) emptied"
+        );
+        assert!(
+            a.join("inside").exists(),
+            "the directory now at `a` is untouched"
+        );
     }
 
     /// Review F9: a binary with no name left that the agent holds is gone
@@ -3006,7 +3070,10 @@ mod bug90 {
     /// as.
     #[test]
     fn review_f1_the_offenders_uid_is_its_filesystem_uid() {
-        assert_eq!(fsuid_in("Name:\tx\nUid:\t1000\t0\t0\t0\nGid:\t1\t1\t1\t1\n"), Some(0));
+        assert_eq!(
+            fsuid_in("Name:\tx\nUid:\t1000\t0\t0\t0\nGid:\t1\t1\t1\t1\n"),
+            Some(0)
+        );
         assert_eq!(fsuid_in("Uid:\t1000\t1000\t1000\t1001\n"), Some(1001));
         assert_eq!(fsuid_in("Uid:\t1000\n"), None);
         // SAFETY: getuid(2) takes no argument and cannot fail.
@@ -3031,7 +3098,10 @@ mod bug90 {
         else {
             panic!();
         };
-        let meta_path = cfg.quarantine_dir.join("vault").join(format!("{vault_id}.meta"));
+        let meta_path = cfg
+            .quarantine_dir
+            .join("vault")
+            .join(format!("{vault_id}.meta"));
         let mut meta: serde_json::Value =
             serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
         meta["inode"]["btime_ns"] = serde_json::Value::Null;
@@ -3070,7 +3140,11 @@ mod bug90 {
         let a = tmp.path().join("a");
         fs::write(&a, b"shared").unwrap();
         fs::hard_link(&a, tmp.path().join("a2")).unwrap();
-        exec.quarantine_handle(&ExeHandle::open(&a).unwrap(), 4242, &super::super::journal::test_intent());
+        exec.quarantine_handle(
+            &ExeHandle::open(&a).unwrap(),
+            4242,
+            &super::super::journal::test_intent(),
+        );
         // hidden link of its own: emptied
         let b = tmp.path().join("b");
         fs::write(&b, b"own").unwrap();
@@ -3081,9 +3155,15 @@ mod bug90 {
         let r = rows();
         assert_eq!(r.len(), 2, "{r:?}");
         assert_eq!(r[0]["result"], "partial");
-        assert!(r[0]["extra"]["in_place"].as_str().unwrap().contains("shared: 2 links"));
+        assert!(r[0]["extra"]["in_place"]
+            .as_str()
+            .unwrap()
+            .contains("shared: 2 links"));
         assert_eq!(r[1]["result"], "success");
-        assert!(r[1]["extra"]["in_place"].as_str().unwrap().starts_with("emptied in place"));
+        assert!(r[1]["extra"]["in_place"]
+            .as_str()
+            .unwrap()
+            .starts_with("emptied in place"));
         assert!(r[1]["extra"]["original_path"].is_null(), "no name invented");
     }
 }

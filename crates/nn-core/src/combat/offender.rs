@@ -48,7 +48,7 @@ pub fn cgroup_path(text: &str) -> Option<&str> {
     // `1:name=systemd:/…`); the unified one names none (`0::/…`)
     let v1 = text
         .lines()
-        .any(|l| l.splitn(3, ':').nth(1).is_some_and(|c| !c.is_empty()));
+        .any(|l| l.split(':').nth(1).is_some_and(|c| !c.is_empty()));
     if !v1 {
         return unified;
     }

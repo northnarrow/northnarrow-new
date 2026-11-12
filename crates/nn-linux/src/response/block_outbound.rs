@@ -179,7 +179,8 @@ fn blocked(pid: u32) -> ExecutionOutcome {
         sockets => {
             warn!(
                 pid,
-                sockets, "block outbound: new sockets dropped, the ones opened before the move are not"
+                sockets,
+                "block outbound: new sockets dropped, the ones opened before the move are not"
             );
             ExecutionOutcome::BlockedNewOnly { pid, sockets }
         }
@@ -209,7 +210,9 @@ fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
         return 0;
     }
     let mut n = 0;
-    for table in ["tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6"] {
+    for table in [
+        "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6",
+    ] {
         let Ok(text) = crate::state_read::read_state(dir.join("net").join(table)) else {
             continue;
         };
@@ -1018,12 +1021,22 @@ mod review_f2 {
         std::os::unix::fs::symlink("socket:[888]", p.join("fd/5")).unwrap();
         std::os::unix::fs::symlink("/dev/null", p.join("fd/0")).unwrap();
         let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
-        let row = |ino: u64| format!("   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {ino} 1 0000000000000000 100 0 0 10 0\n");
-        fs::write(p.join("net/tcp"), format!("{header}{}{}", row(555), row(999))).unwrap();
+        let row = |ino: u64| {
+            format!("   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {ino} 1 0000000000000000 100 0 0 10 0\n")
+        };
+        fs::write(
+            p.join("net/tcp"),
+            format!("{header}{}{}", row(555), row(999)),
+        )
+        .unwrap();
         fs::write(p.join("net/udp6"), format!("{header}{}", row(777))).unwrap();
         // 888: a unix socket, in no inet table
         assert_eq!(inet_sockets_of(tmp.path(), 4242), 2);
-        assert_eq!(inet_sockets_of(tmp.path(), 1), 0, "no such process: none known");
+        assert_eq!(
+            inet_sockets_of(tmp.path(), 1),
+            0,
+            "no such process: none known"
+        );
     }
 
     /// The test process holding a UDP socket: the block of such a process
@@ -1041,7 +1054,10 @@ mod review_f2 {
         drop(sock);
         let (result, _, reason) = super::super::journal_outcome(&super::super::ExecutionReport {
             action: nn_model::ResponseAction::BlockOutbound,
-            primary: ExecutionOutcome::BlockedNewOnly { pid: me, sockets: 2 },
+            primary: ExecutionOutcome::BlockedNewOnly {
+                pid: me,
+                sockets: 2,
+            },
             additional: Vec::new(),
             elapsed: std::time::Duration::from_micros(1),
         });
@@ -1054,10 +1070,12 @@ mod review_f2 {
         );
         // the ladder: partial, released at the stand-down, window shortened
         assert!(matches!(
-            crate::combat::actuator::SystemActuator::soft_block_of(ExecutionOutcome::BlockedNewOnly {
-                pid: me,
-                sockets: 2
-            }),
+            crate::combat::actuator::SystemActuator::soft_block_of(
+                ExecutionOutcome::BlockedNewOnly {
+                    pid: me,
+                    sockets: 2
+                }
+            ),
             nn_core::combat::actuator::SoftBlock::Partial(_)
         ));
     }

@@ -412,7 +412,9 @@ fn kill_tree_by_pid_toward(
     let mut outcomes = Vec::with_capacity(descendants.len() + 1);
     for (child_pid, start, parent) in descendants {
         let spare = match &lineage {
-            Some((chain, subtree)) if !chain.contains(&child_pid) && !subtree.contains(&child_pid) => {
+            Some((chain, subtree))
+                if !chain.contains(&child_pid) && !subtree.contains(&child_pid) =>
+            {
                 continue;
             }
             // on the chain: the offender's session, killed unless protected
@@ -423,30 +425,28 @@ fn kill_tree_by_pid_toward(
             }
             _ => spare_in_walk(child_pid, parent, &mut trees, protected, guard),
         };
-        outcomes.push(
-            match spare {
-                Some(spare) => ExecutionOutcome::Refused {
-                    pid: child_pid,
-                    reason: spare.reason,
-                },
-                None => {
-                    let child = ProcRef::open_checked_with(child_pid, None, read);
-                    if child.holds_start(start) {
-                        kill_one(&child, protected)
-                    } else if let Some(errno) = child.capture_errno() {
-                        // not captured (the agent out of descriptors): it may
-                        // still run
-                        ExecutionOutcome::Failed {
-                            pid: child_pid,
-                            errno,
-                        }
-                    } else {
-                        // exited since the snapshot (its PID free, or reused)
-                        ExecutionOutcome::AlreadyGone { pid: child_pid }
-                    }
-                }
+        outcomes.push(match spare {
+            Some(spare) => ExecutionOutcome::Refused {
+                pid: child_pid,
+                reason: spare.reason,
             },
-        );
+            None => {
+                let child = ProcRef::open_checked_with(child_pid, None, read);
+                if child.holds_start(start) {
+                    kill_one(&child, protected)
+                } else if let Some(errno) = child.capture_errno() {
+                    // not captured (the agent out of descriptors): it may
+                    // still run
+                    ExecutionOutcome::Failed {
+                        pid: child_pid,
+                        errno,
+                    }
+                } else {
+                    // exited since the snapshot (its PID free, or reused)
+                    ExecutionOutcome::AlreadyGone { pid: child_pid }
+                }
+            }
+        });
     }
     if let Some(errno) = walk_error {
         tracing::warn!(
@@ -1861,8 +1861,14 @@ mod bug122 {
         let d = tmp.path();
         let put = |n: &str, body: String| std::fs::write(d.join(n), body).unwrap();
         let dir = d.display();
-        put("l.sh", format!("sh {dir}/sa.sh & echo a $!; sh {dir}/sb.sh & echo b $!; exec sleep 30\n"));
-        put("sa.sh", format!("sh {dir}/o.sh & echo o $!; exec sleep 30\n"));
+        put(
+            "l.sh",
+            format!("sh {dir}/sa.sh & echo a $!; sh {dir}/sb.sh & echo b $!; exec sleep 30\n"),
+        );
+        put(
+            "sa.sh",
+            format!("sh {dir}/o.sh & echo o $!; exec sleep 30\n"),
+        );
         put("o.sh", "sleep 30 & echo c $!; exec sleep 30\n".to_string());
         put("sb.sh", "sleep 30 & echo x $!; exec sleep 30\n".to_string());
         let mut l = Command::new("sh")
@@ -1886,11 +1892,17 @@ mod bug122 {
             root,
             o,
             &HashSet::from([1, 2]),
-            &|p| sshd.contains(&p).then_some(Spare::process("ssh-service(sshd)")),
+            &|p| {
+                sshd.contains(&p)
+                    .then_some(Spare::process("ssh-service(sshd)"))
+            },
             &super::super::journal::test_intent(),
         );
         let live = |p: u32| ProcRef::open(p).is_live();
-        let state: Vec<(u32, bool)> = [root, a, b, o, c, x].iter().map(|&p| (p, live(p))).collect();
+        let state: Vec<(u32, bool)> = [root, a, b, o, c, x]
+            .iter()
+            .map(|&p| (p, live(p)))
+            .collect();
         for p in [root, a, b, o, c, x] {
             // SAFETY: plain kill(2) on processes this test started.
             unsafe { libc::kill(p as i32, libc::SIGKILL) };
@@ -1902,13 +1914,22 @@ mod bug122 {
         );
         assert_eq!(
             state,
-            vec![(root, true), (a, false), (b, true), (o, false), (c, false), (x, true)],
+            vec![
+                (root, true),
+                (a, false),
+                (b, true),
+                (o, false),
+                (c, false),
+                (x, true)
+            ],
             "only the offending lineage dies: {rest:?}"
         );
         let named: HashSet<u32> = rest
             .iter()
             .filter_map(|o| match o {
-                ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } => Some(*pid),
+                ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } => {
+                    Some(*pid)
+                }
                 _ => None,
             })
             .collect();

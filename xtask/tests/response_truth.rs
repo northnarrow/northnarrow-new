@@ -83,9 +83,15 @@ fn violations(rel: &str, code: &str) -> Vec<Violation> {
                 || arg.starts_with("format!")
                 || arg.starts_with("&format!")
                 || arg.starts_with("&*")
-                || [".as_str()", ".as_ref()", ".display()", "to_string_lossy", "to_str("]
-                    .iter()
-                    .any(|m| arg.contains(m))
+                || [
+                    ".as_str()",
+                    ".as_ref()",
+                    ".display()",
+                    "to_string_lossy",
+                    "to_str(",
+                ]
+                .iter()
+                .any(|m| arg.contains(m))
                 || [
                     "&rel", "&scope", "&path", "&exe", "&origin", "&cgroup", "&unit", "&name",
                     "&want", "&sub",
@@ -97,7 +103,12 @@ fn violations(rel: &str, code: &str) -> Vec<Violation> {
             }
             rest = &rest[at + 1..];
         }
-        for cut in ["rsplit('/')", "rsplit_once('/')", ".rsplitn(", ".strip_suffix("] {
+        for cut in [
+            "rsplit('/')",
+            "rsplit_once('/')",
+            ".rsplitn(",
+            ".strip_suffix(",
+        ] {
             if compact.contains(cut) {
                 hit("4: a last component cut off a path by hand");
             }

@@ -817,7 +817,10 @@ mod tests {
             detail: "D".into(),
             complete,
         };
-        assert_eq!(SystemActuator::quarantine_text(7, &in_place(true)), "quarantined: D");
+        assert_eq!(
+            SystemActuator::quarantine_text(7, &in_place(true)),
+            "quarantined: D"
+        );
         assert_eq!(
             SystemActuator::quarantine_text(7, &in_place(false)),
             "partially quarantined: D (re-exec prevention degraded)"
