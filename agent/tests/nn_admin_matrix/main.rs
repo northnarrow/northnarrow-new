@@ -30,7 +30,9 @@
 //! that feature.
 
 #![cfg(not(feature = "debug-trigger"))]
-#![recursion_limit = "256"]
+// Lot 325: 512 — the status fill of `cases/socket.rs` (one `json!` literal
+// of every status field) passed 256 with three more counters.
+#![recursion_limit = "512"]
 
 mod cases;
 mod fixtures;

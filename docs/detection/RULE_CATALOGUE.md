@@ -32,8 +32,8 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium | KillProcessTree, Log | T1547.006, T1014 |
 | [`R020_ShellWithSocketStdio`](#r020_shellwithsocketstdio) | Shell or interpreter with stdin/stdout on a network socket | Critical | Log | T1059.004, T1095 |
 | [`NN-L-EXECQ-001_FirstSightQuarantine`](#nn-l-execq-001_firstsightquarantine) | Exec quarantine at first sight | Critical, High, Medium, Low | Quarantine, KillProcess, Log | T1204.002, T1059.004, T1059.006, T1059.007, T1059 |
-| [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium | Log | T1620, T1070.004, T1204.002, T1564.001 |
-| [`NN-L-EXECENV-001_PreloadFromStaging`](#nn-l-execenv-001_preloadfromstaging) | Loader variable naming a staging path at exec | High, Medium, Low | Log | T1574.006 |
+| [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium, Low | Log | T1620, T1070.004, T1204.002, T1564.001 |
+| [`NN-L-EXECENV-001_PreloadFromStaging`](#nn-l-execenv-001_preloadfromstaging) | Loader variable naming a staging path at exec | Critical, High, Medium, Low | Log | T1574.006 |
 | [`NN-L-EXECENV-002_ExecEnvironmentTrick`](#nn-l-execenv-002_execenvironmenttrick) | Exec environment trick | Critical, High, Medium, Low | Log | T1068, T1574.006, T1070.003 |
 | [`NN-L-EXECENV-003_ExecMappingFromStaging`](#nn-l-execenv-003_execmappingfromstaging) | Executable mapping of a file from a staging location | High, Medium, Low | Log | T1574.006, T1129, T1620 |
 
@@ -477,19 +477,19 @@ Exec from a staging location refused by the exec policy — category `malware_pr
 
 | | |
 |---|---|
-| Severity | High, Medium |
+| Severity | High, Medium, Low |
 | Response | Log |
 | ATT&CK | T1620 Reflective Code Loading (Stealth); T1070.004 Indicator Removal: File Deletion (Stealth); T1204.002 User Execution: Malicious File (Execution); T1564.001 Hide Artifacts: Hidden Files and Directories (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | no proof |
 
-**Observes.** With --exec-policy: an exec of a file in a staging class (memfd, a deleted file, /dev/shm, /tmp… per the profile's table) by a caller of a lineage tier (admin, session, service) the table denies: refused with EACCES before the exec's point of no return (enforce, High) or recorded as "would deny" (audit, Medium). Recorded by the policy's controller.
+**Observes.** With --exec-policy: an exec of a file in a staging class (memfd, a deleted file, /dev/shm, /tmp… per the profile's table) by a caller of a lineage tier (admin, session, service) the table denies: refused with EACCES before the exec's point of no return (enforce, High) or recorded as "would deny" (audit, Medium). Recorded by the policy's controller. Lot 325: with the exec guards' per-task buffers full (a flood of execs in flight) an exec is judged without its walk — a protected target refused, every other exec let through and recorded (Low).
 
 **Known false positives.** The desktop profile allows a login session's own staging locations (AppImage, build trees); `exempt` lines of the signed exec-policy.local; audit mode first.
 
 **How to test.** `nn-lab.sh malsim-exec-check`: MS-01 (a copy of id in /dev/shm run from a service) refused in enforce, recorded in audit.
 
-**Tests.** `agent/src/execpol/record.rs::a_denied_exec_is_one_high_record`, `agent/src/execpol/record.rs::memfd_and_deleted_techniques`, `deploy/lab/malsim/exec-check.sh::MS-01`
+**Tests.** `agent/src/execpol/record.rs::a_denied_exec_is_one_high_record`, `agent/src/execpol/record.rs::memfd_and_deleted_techniques`, `agent/src/execpol/record.rs::an_exec_judged_without_its_walk_is_recorded`, `deploy/lab/malsim/exec-check.sh::MS-01`
 
 **ATT&CK note.** Per record: T1620 for a memfd or a deleted file (and T1070.004 for the deletion), T1204.002 for a staging location, T1564.001 for a hidden name on the way.
 
@@ -499,19 +499,19 @@ Loader variable naming a staging path at exec — category `malware_prevention`.
 
 | | |
 |---|---|
-| Severity | High, Medium, Low |
+| Severity | Critical, High, Medium, Low |
 | Response | Log |
 | ATT&CK | T1574.006 Hijack Execution Flow: Dynamic Linker Hijacking (Stealth); T1574.006 Hijack Execution Flow: Dynamic Linker Hijacking (Execution) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | no proof |
 
-**Observes.** A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging path: refused (enforce) for the tiers whose rule denies, a set-id target as any other (lot 318: the policy does not count on AT_SECURE), or recorded; a set-id target recorded says whether the loader ignores the entry (the exec changes the credentials: AT_SECURE) or honours it (root running a set-uid-root file changes none). On 7.0 the environment check sees the execs of one CPU only (lot 322).
+**Observes.** A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging path: refused (enforce) for the tiers whose rule denies, a set-id target as any other (lot 318: the policy does not count on AT_SECURE), or recorded; a set-id target recorded says whether the loader ignores the entry (the exec changes the credentials: AT_SECURE) or honours it (root running a set-uid-root file changes none). Lot 325: every variable is read (it was the first 64) and every occurrence judged; the new image's environment, the kernel's own copy, is read again past the exec's point of no return — an entry seen only there is the environment changed after the copy, and the image is killed before its first instruction where the tier refuses it (Critical).
 
 **Known false positives.** A developer's own preload from a build tree in a session (Low).
 
 **How to test.** `nn-lab.sh malsim-exec-check`: MS-32, LD_PRELOAD of a no-op library from /tmp into a service.
 
-**Tests.** `agent/src/execpol/record.rs::the_preload_record`, `deploy/lab/malsim/exec-check.sh::MS-32`
+**Tests.** `agent/src/execpol/record.rs::the_preload_record`, `agent/src/execpol/record.rs::a_preload_seen_only_in_the_kernel_s_copy_is_the_environment_changed`, `deploy/lab/malsim/exec-check.sh::MS-32`
 
 ### NN-L-EXECENV-002_ExecEnvironmentTrick
 
@@ -525,13 +525,13 @@ Exec environment trick — category `malware_prevention`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | no proof |
 
-**Observes.** The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id target (Critical in the shape of CVE-2023-4911), a library path into staging for a service or root, shell history disabled; an environment the exec sensor could not read whole (High: its loader variables were not judged).
+**Observes.** The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id target (Critical in the shape of CVE-2023-4911), a library path into staging for a service or root, shell history disabled; an environment the exec sensor could not read whole (High: its loader variables were not judged); lot 325: one the scan could not finish, more variables than any the kernel accepts, or a loader variable's value longer than the check reads (High; refused at a protected or set-id target).
 
 **Known false positives.** History disabled by a user's own shell configuration (Low, repeats held back).
 
 **How to test.** Run `su` with `GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A` on a lab guest with the exec policy on.
 
-**Tests.** `agent/src/execpol/record.rs::tunables_history_and_library_path`, `agent/src/execpol/record.rs::an_environment_not_read_whole_is_one_high_record`
+**Tests.** `agent/src/execpol/record.rs::tunables_history_and_library_path`, `agent/src/execpol/record.rs::an_environment_not_read_whole_is_one_high_record`, `agent/src/execpol/record.rs::an_environment_the_scan_could_not_finish_is_one_high_record`, `agent/src/execpol/record.rs::a_loader_value_longer_than_its_capture_is_not_judged_whole`
 
 **ATT&CK note.** Per record: T1068 for the set-id exploit's environment, T1574.006 for the library path, T1070.003 for the history.
 

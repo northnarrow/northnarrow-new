@@ -88,5 +88,21 @@ impl ExecGuards for AgentExecGuards {
                 }
             }
         }
+        // Lot 325 (the re-check of #546, R6): the exec quarantine's
+        // candidates (a plain hash now) and the exec policy's notes for its
+        // post-commit check are removed when their task is freed.
+        if self.execq_kernel.is_some() || self.execpol_kernel.is_some() {
+            let attached = aya::Btf::from_sys_fs()
+                .map_err(anyhow::Error::from)
+                .and_then(|btf| nn_linux::sensors::task_free::ensure(ebpf, &btf));
+            if let Err(e) = attached {
+                error!(
+                    error = format!("{e:#}"),
+                    "exec guards: the task_free program was refused — a failed exec's \
+                     quarantine candidate stays in its map (4096 entries; past them a \
+                     candidate is dropped, counted) until the task's next exec"
+                );
+            }
+        }
     }
 }

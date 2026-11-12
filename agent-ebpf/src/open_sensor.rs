@@ -45,9 +45,9 @@ use northnarrow_common::wire::open_sensor::{
         CHILDREN_PROBE, CHILD_FILES, CLASSIFIED, DEPTH_CAPPED, DIRECT, DIR_HAS_FILES,
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, OWN_DATA_BITS, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
-        TREE_USER_CACHE,
+        TREE_USER_CACHE, WALK_LOST,
     },
-    carved_class, cgroup_step, created_in_window, destroys_an_original, first_in_window,
+    carved_class, dir_class_cacheable, cgroup_step, created_in_window, destroys_an_original, first_in_window,
     first_write, kdbx_suffix, marks_had_data, name_ext, open_reason, own_after, own_code, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
     DestroySeenKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow,
     OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, WriteKind, CHILD_RULES_MAX, NAME_HEAD_LEN,
@@ -179,16 +179,30 @@ pub(crate) struct OpenTask {
 }
 /// Lot 322 (the review of #546, F3): [`OpenTask`] is the running task's own
 /// entry, keyed by its `task_struct` (`crate::task_scratch`), made by
-/// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`) and
-/// removed before the program returns. They were two per-CPU buffers in
-/// programs that run preemptible: on a `full`/`lazy` kernel another task's
-/// open on the same CPU could rewrite the window or the names between the
-/// read and the use, and a credential file's path went out with an
-/// innocent task's pid — `NN-L-FIM-011`/`014` kill that pid, and the
-/// FIM-010..017 records are posture floors.
+/// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`).
+/// They were two per-CPU buffers in programs that run preemptible: on a
+/// `full`/`lazy` kernel another task's open on the same CPU could rewrite
+/// the window or the names between the read and the use, and a credential
+/// file's path went out with an innocent task's pid — `NN-L-FIM-011`/`014`
+/// kill that pid, and the FIM-010..017 records are posture floors.
+///
+/// Lot 325 (cost): the entry lives as long as its task — made at its first
+/// open, removed when the kernel frees the task (`task_free`,
+/// `crate::task_scratch::nn_task_free`) — so an open costs one lookup. It
+/// was made zeroed and removed in each run: an insert of 512 bytes and a
+/// delete per open, +180 to +270 ns. Every byte a run reads it wrote first
+/// (the windows whole, each name zeroed before it is read), so nothing of
+/// the task's last open is read. Allocated as tasks come
+/// (`BPF_F_NO_PREALLOC`), up to [`OPEN_TASK_CAP`] tasks; past it, the plain
+/// observer (counted). Without the `task_free` program attached
+/// (`crate::task_scratch::task_free_armed`), each run removes its entry, as
+/// before.
 #[map]
 static OPEN_TASK: HashMap<u64, OpenTask> =
-    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
+    HashMap::with_max_entries(OPEN_TASK_CAP, crate::task_scratch::BPF_F_NO_PREALLOC);
+/// Tasks with an [`OPEN_TASK`] entry at once: the live tasks that opened a
+/// file (a busy host runs a few thousand).
+pub(crate) const OPEN_TASK_CAP: u32 = 65536;
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -359,7 +373,11 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
         gen,
         _pad: 0,
     };
-    let _ = DIR_CLASS.insert(dkey, &c, 0);
+    // Lot 325 (R3): a walk that could not run is not the directory's
+    // class: not cached, the next open walks again.
+    if dir_class_cacheable(c.bits) {
+        let _ = DIR_CLASS.insert(dkey, &c, 0);
+    }
     c
 }
 
@@ -446,7 +464,8 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         Some(p) => (*p).names.as_mut_ptr(),
         None => {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
-            return u64::from(u32::MAX) << 32;
+            // Lot 325 (R3): lost, never cached ([`dir_class`]).
+            return (u64::from(u32::MAX) << 32) | u64::from(WALK_LOST);
         }
     };
     let mut bits = 0u32;
@@ -777,7 +796,7 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
     let task = bpf_get_current_task();
-    let t = match crate::task_scratch::make(&OPEN_TASK, &task) {
+    let t = match crate::task_scratch::get_or_make(&OPEN_TASK, &task) {
         Some(p) => p,
         None => {
             // The map full: FIM still sees the open (the plain observer,
@@ -789,7 +808,11 @@ pub unsafe fn on_open(file: *const u8) {
         }
     };
     on_open_in(file, t);
-    let _ = OPEN_TASK.remove(&task);
+    // Lot 325: the entry stays for the task's next open, removed at
+    // `task_free`; without that program, at the end of the run.
+    if !crate::task_scratch::task_free_armed() {
+        let _ = OPEN_TASK.remove(&task);
+    }
 }
 
 #[inline(always)]
@@ -1540,10 +1563,20 @@ unsafe fn try_file_cap(ctx: &LsmContext) {
 
 /// Lot 322 (the review of #546, F3): the walk's buffers an unlink or a
 /// rename made ([`nn_open_walk`] from [`nn_unlink_burst`]), removed at the
-/// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe`.
+/// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe` — lot 325:
+/// unless they live as long as the task (`task_free` removes them).
 #[inline(always)]
 pub(crate) fn forget_task() {
+    if crate::task_scratch::task_free_armed() {
+        return;
+    }
     // SAFETY: a helper call with no argument.
     let task = unsafe { bpf_get_current_task() };
+    let _ = OPEN_TASK.remove(&task);
+}
+
+/// Lot 325: the task `task` (its `task_struct`) is being freed.
+#[inline(always)]
+pub(crate) fn forget_freed(task: u64) {
     let _ = OPEN_TASK.remove(&task);
 }

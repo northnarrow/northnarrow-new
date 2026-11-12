@@ -26,8 +26,9 @@
 use aya_ebpf::{
     cty::c_void,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, generated},
-    macros::map,
+    macros::{lsm, map},
     maps::{Array, HashMap},
+    programs::LsmContext,
 };
 use northnarrow_common::wire::exe::TaskKey;
 
@@ -100,4 +101,41 @@ pub(crate) unsafe fn get_or_make<K, T>(map: &HashMap<K, T>, key: &K) -> Option<*
         Some(p) => Some(p),
         None => make(map, key),
     }
+}
+
+/// `BPF_F_NO_PREALLOC`: a hash whose entries are allocated as they are
+/// made (the entries that live as long as their task).
+pub(crate) const BPF_F_NO_PREALLOC: u32 = 1;
+
+/// Lot 325: slot 0 is 1 once the agent attached [`nn_task_free`]: the
+/// entries keyed by a `task_struct` that live as long as their task
+/// (`open_sensor::OPEN_TASK`) are kept between runs then, and removed by it.
+#[map]
+pub(crate) static TASK_FREE_ARMED: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Whether [`nn_task_free`] runs (the agent attached it).
+#[inline(always)]
+pub(crate) fn task_free_armed() -> bool {
+    matches!(TASK_FREE_ARMED.get(0), Some(v) if *v == 1)
+}
+
+/// Lot 325 (cost, and the re-check of #546, R6): LSM `task_free`, when the
+/// kernel frees a `task_struct` — after every hook of that task has run,
+/// before its address can be another task's. It removes the entries keyed
+/// by that address that outlive one run: the FIM sensor's buffers
+/// (`open_sensor::OPEN_TASK`, kept between opens), the exec quarantine's
+/// candidate (`execq::EXECQ_CAND`, a plain hash since lot 325: a failed
+/// exec's candidate stayed until the LRU evicted it), the exec policy's
+/// note for the post-commit check (`execpol::EXECPOL_ENV_SEEN`). A void
+/// hook: its return is ignored.
+#[lsm(hook = "task_free")]
+pub fn nn_task_free(ctx: LsmContext) -> i32 {
+    // Kernel signature: (task).
+    let task: u64 = ctx.arg(0);
+    if task != 0 {
+        crate::open_sensor::forget_freed(task);
+        unsafe { crate::execq::forget(task) };
+        crate::execpol::forget_freed(task);
+    }
+    0
 }

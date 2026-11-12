@@ -6,6 +6,58 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 325: the exec environment's check complete and cheap (the re-check
+  of #546).
+  - **Every variable is read** (R2). The check read the first 64: 64
+    padding variables, then `LD_PRELOAD` from a staging path, passed without
+    a refusal and, for a root session, without a record — no privilege, no
+    race. The scan now reads every variable up to 1,048,576 (three loops of
+    global functions), above any environment the kernel accepts (699,050);
+    each costs its pointer and eight bytes, the judged names are read whole.
+    An array longer than that grew after the kernel counted it: counted
+    (`nn-admin status` "environments not finished", `env_truncated`),
+    recorded High, and refused at a protected target (the tier's rule
+    refuses a staging preload) or a set-id one.
+  - **Each occurrence of a loader variable is judged** (the mini-hunt): a
+    staging `LD_PRELOAD` first and a clean one last passed into a musl
+    target (musl's loader takes the first; the scan judged the last).
+  - **x32's `envp` is the register whole** (R1): only an ia32 exec's is
+    truncated to its low half, as the kernels' two stubs do.
+  - **The kernel's own copy is read again** (TOCTOU, the review of #546
+    F2). A new program on `sched_process_exec` (`execpol_env_commit`) reads
+    the new image's environment — `mm->env_start..env_end`, what the loader
+    will read, which no other task shares — past the exec's point of no
+    return. A staging loader entry there that the first pass did not see
+    (another thread rewrote the caller's memory after the kernel's copy, a
+    page unmapped) is counted ("changed after the kernel's copy",
+    `env_changed`), recorded (`NN-L-EXECENV-001`, Critical) and, where the
+    tier refuses it, the image is killed before its first instruction. Two
+    optional BTF offsets (`mm_struct.env_start`, `env_end`, slots 130–131;
+    146 slots). Reading the copy where the exec can still fail with
+    `EACCES` is not possible (the new `mm` belongs to no task yet; see
+    `EXEC_POLICY.md` §5).
+  - **A flood of execs in flight no longer refuses every exec** (R5).
+    Past 2048 execs preempted in the middle of the exec sensor, lot 322
+    refused all of them in enforce mode. They are judged without the walk:
+    a protected target (a deny the tier, memfd, deleted, tmpfs, a
+    world-writable directory or the environment support; an unreadable
+    environment at a protected or set-id target) is refused, every other
+    exec runs, counted ("execs let through without their walk",
+    `lost_open`) and recorded (`NN-L-EXECPOL-001`, Low); the agent signs
+    `execpol_capacity` while it lasts.
+  - **`EXECQ_CAND` is a plain hash** (R6), its entries removed when the
+    kernel frees the task (a new LSM `task_free` program, `nn_task_free`).
+  - **A FIM walk that could not run is not cached** (R3): it was the
+    directory's class (empty) until the cache entry went.
+  - **The file-open sensor's cost** (the review of #546): its per-task
+    buffer lives as long as the task (made at its first open, removed at
+    `task_free`): one lookup per open instead of an insert and a delete
+    (lot 322 measured +180 to +270 ns per open). Measured on 7.0 (bpf_stats,
+    300,000 opens, the same boot): 318 ns per open, 317 on `main` before
+    #546. The new programs: `execpol_env_commit` 2 to 3 µs per exec with a
+    common environment, `nn_task_free` about 1.5 µs per task freed; an
+    environment of 100,000 variables costs the two exec programs about
+    1.6 ms (the exec itself about 48 ms).
 - Lot 322: the exec environment's check works on every CPU; the exec
   guards' and the FIM sensor's buffers are the running task's own.
   - **The check was almost inert on Ubuntu 26.04 (kernel 7.0).** It refused

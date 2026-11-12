@@ -348,12 +348,43 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
             sev,
             format!(
                 "exec from a staging location ({classes}) by a {tname} caller: the exec policy \
-                 {}",
-                if deny { "denies it" } else { "would deny it" }
+                 {}{}",
+                if deny { "denies it" } else { "would deny it" },
+                if raw.action & action::UNWALKED != 0 {
+                    UNWALKED_NOTE
+                } else {
+                    ""
+                }
             ),
             resp.to_string(),
             attack,
             evidence(raw, decision_of(raw.action), policy),
+        ));
+    }
+    // Lot 325 (the re-check of #546, R5): an exec judged without its walk
+    // (the exec guards' per-task buffers full) and let through: recorded,
+    // and the agent signs a degradation while it lasts.
+    if raw.action & action::UNWALKED != 0
+        && raw.action & (action::DENY | action::WOULD_DENY) == 0
+        && raw.env_action & (action::DENY | action::WOULD_DENY) == 0
+    {
+        out.push(record(
+            event,
+            &path,
+            (RULE_EXEC, RULE_EXEC_NAME),
+            Severity::Low,
+            format!(
+                "exec by a {tname} caller judged without its walk ({}): no protected target, \
+                 let through{UNWALKED_NOTE}",
+                if classes.is_empty() {
+                    "no class it can know without one"
+                } else {
+                    classes.as_str()
+                }
+            ),
+            "recorded: the exec ran (the exec guards are past their capacity)".to_string(),
+            exec_attack(raw.classes, &path),
+            evidence(raw, "record", policy),
         ));
     }
     let ef = raw.env_flags;
@@ -368,7 +399,25 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
     let at_secure = raw.at_secure();
     // The loader variable into a staging path.
     if ef & env_flags::DENYABLE != 0 {
-        let (sev, resp) = if ea & action::DENY != 0 {
+        let changed = ef & env_flags::CHANGED != 0;
+        let (sev, resp) = if changed && ea & action::KILLED != 0 {
+            (
+                Severity::Critical,
+                "killed (SIGKILL) before its first instruction: the exec was past its point \
+                 of no return"
+                    .to_string(),
+            )
+        } else if changed && ea & action::WOULD_DENY != 0 {
+            (
+                Severity::High,
+                "would deny (audit): the exec ran with the entry".to_string(),
+            )
+        } else if changed {
+            (
+                Severity::High,
+                "recorded: the exec ran with the entry".to_string(),
+            )
+        } else if ea & action::DENY != 0 {
             (Severity::High, "denied at exec (EACCES)".to_string())
         } else if ea & action::WOULD_DENY != 0 {
             (
@@ -400,12 +449,20 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
             (RULE_PRELOAD, RULE_PRELOAD_NAME),
             sev,
             format!(
-                "a loader variable at exec names a staging path ({}) for a {tname} caller",
+                "a loader variable at exec names a staging path ({}) for a {tname} caller{}",
                 values(raw)
                     .into_iter()
                     .filter(|v| v.starts_with("LD_PRELOAD=") || v.starts_with("LD_AUDIT="))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                if changed {
+                    // Lot 325 (TOCTOU): seen in the kernel's own copy only
+                    "; it is in the kernel's own copy of the environment (the new image's) and \
+                     was not in the caller's memory when the exec's first pass read it: the \
+                     environment changed after the kernel's copy"
+                } else {
+                    ""
+                }
             ),
             resp,
             ATTACK_PRELOAD.to_vec(),
@@ -465,7 +522,58 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
     // exec entered through a call the scan does not know, or no stash.
     // Whatever loader variable it held was not judged: recorded, High,
     // never refused (a 32-bit runtime's exec reads normally).
-    if ef & env_flags::UNREADABLE != 0 && ea & action::RECORD != 0 {
+    // Lot 325 (the re-check of #546, R2): an environment the scan could
+    // not finish — more variables than any the kernel accepts, so its
+    // array grew after the kernel's count. Recorded High, as an unread
+    // one; refused at a protected target (the tier's rule refuses a
+    // staging preload) or a set-id one.
+    if ef & env_flags::UNFINISHED != 0
+        && ea & (action::RECORD | action::DENY | action::WOULD_DENY) != 0
+    {
+        let resp = if ea & action::DENY != 0 {
+            "denied at exec (EACCES): a protected or set-id target"
+        } else if ea & action::WOULD_DENY != 0 {
+            "would deny (audit): the exec ran"
+        } else {
+            "recorded: the exec ran"
+        };
+        out.push(record(
+            event,
+            &path,
+            (RULE_ENV, RULE_ENV_NAME),
+            Severity::High,
+            if ef & env_flags::TRUNCATED != 0 {
+                format!(
+                    "the new environment could not be read whole at exec ({tname} caller): \
+                     more than {} variables, more than any environment the kernel accepts — \
+                     the array grew after the kernel counted it; a loader variable past them \
+                     was not judged",
+                    common::wire::execpol::ENV_SCAN_CAP
+                )
+            } else {
+                // Lot 325 (the mini-hunt of R2)
+                format!(
+                    "a loader variable's value at exec is longer than the check reads \
+                     ({tname} caller; {} bytes of LD_PRELOAD, {} of LD_AUDIT): its entries \
+                     past them were not judged",
+                    common::wire::execpol::ENV_PRELOAD_LEN,
+                    common::wire::execpol::ENV_AUDIT_LEN
+                )
+            },
+            resp.to_string(),
+            vec![pick(ATTACK_ENV, Tactic::Stealth, "T1574.006")],
+            evidence(raw, decision_of(ea), policy),
+        ));
+    }
+    if ef & env_flags::UNREADABLE != 0
+        && ef & env_flags::UNFINISHED == 0
+        && ea & (action::RECORD | action::DENY) != 0
+    {
+        // Lot 325 (R5): refused on it only judged without its walk, at a
+        // protected target (the exec guards past their capacity).
+        let refused_on_it = ea & action::DENY != 0
+            && raw.action & action::UNWALKED != 0
+            && ef & env_flags::DENYABLE == 0;
         out.push(record(
             event,
             &path,
@@ -476,13 +584,25 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
                  entry or a string unreadable after the kernel's copy, or a call the check does \
                  not know; a loader variable in it was not judged"
             ),
-            "recorded: the exec ran".to_string(),
+            if refused_on_it {
+                "denied at exec (EACCES): judged without its walk, a protected or set-id target"
+            } else if ea & action::DENY != 0 {
+                "the exec was refused on another finding of its environment"
+            } else {
+                "recorded: the exec ran"
+            }
+            .to_string(),
             vec![pick(ATTACK_ENV, Tactic::Stealth, "T1574.006")],
-            evidence(raw, "record", policy),
+            evidence(raw, if refused_on_it { "deny" } else { "record" }, policy),
         ));
     }
     out
 }
+
+/// Lot 325 (R5): what a record of an exec judged without its walk adds.
+const UNWALKED_NOTE: &str = " (judged without its walk: the exec guards' per-task buffers were \
+     full — a flood of execs in flight — so only the tier, the set-id bits, memfd, deleted, \
+     tmpfs, a world-writable directory and the environment were judged)";
 
 /// Lot 314 (BUG-125): the record-only findings [`Repeats`] remembers; past
 /// it the one admitted least recently is forgotten (it may be recorded once
@@ -733,6 +853,157 @@ mod tests {
         raw.env_flags = env_flags::UNREADABLE;
         raw.env_action = 0;
         assert!(records_of(&raw, &ev("/usr/bin/true"), "p").is_empty());
+    }
+
+    /// Lot 325 (the re-check of #546, R2): an environment the scan could not
+    /// finish — more variables than any the kernel accepts — is one High
+    /// record, refused at a protected target, recorded elsewhere. It was a
+    /// count no one saw.
+    #[test]
+    fn an_environment_the_scan_could_not_finish_is_one_high_record() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::TRUNCATED;
+        raw.env_action = action::RECORD | action::DENY;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert!(
+            rs[0].response.starts_with("denied at exec"),
+            "{}",
+            rs[0].response
+        );
+        assert!(rs[0]
+            .verdict
+            .reasoning
+            .contains("grew after the kernel counted it"));
+        assert_eq!(rs[0].evidence.decision, "deny");
+        assert_eq!(rs[0].evidence.environment, ["truncated"]);
+        // an admin's: recorded, the exec ran
+        raw.tier = tier::ADMIN | tier_sig::TTY | tier_sig::ROOT;
+        raw.env_action = action::RECORD;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert_eq!(rs[0].response, "recorded: the exec ran");
+        // with an unreadable entry too: still one record
+        raw.env_flags = env_flags::TRUNCATED | env_flags::UNREADABLE;
+        assert_eq!(records_of(&raw, &ev("/usr/bin/true"), "p").len(), 1);
+    }
+
+    /// Lot 325 (the mini-hunt of R2): a loader variable's value longer than
+    /// its capture — a staging entry after a long clean one passed — is an
+    /// environment not judged to its end: one High record, refused at a
+    /// protected target.
+    #[test]
+    fn a_loader_value_longer_than_its_capture_is_not_judged_whole() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::LD_PRELOAD | env_flags::VALUE_CUT | env_flags::LOADER_CUT;
+        raw.env_action = action::RECORD | action::DENY;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert!(rs[0]
+            .verdict
+            .reasoning
+            .contains("longer than the check reads"));
+        assert!(
+            rs[0].response.starts_with("denied at exec"),
+            "{}",
+            rs[0].response
+        );
+        assert!(rs[0]
+            .evidence
+            .environment
+            .contains(&"loader_value_cut".to_string()));
+    }
+
+    /// Lot 325 (TOCTOU): a staging preload in the kernel's own copy that the
+    /// first pass did not see — killed before its first instruction where
+    /// the tier refuses it (Critical), High where it is recorded.
+    #[test]
+    fn a_preload_seen_only_in_the_kernel_s_copy_is_the_environment_changed() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::LD_PRELOAD | env_flags::PRELOAD_STAGING | env_flags::CHANGED;
+        raw.env_action = action::RECORD | action::DENY | action::KILLED;
+        put(&mut raw.preload, "/tmp/x.so");
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_PRELOAD);
+        assert_eq!(rs[0].verdict.severity, Severity::Critical);
+        assert!(
+            rs[0].response.starts_with("killed (SIGKILL)"),
+            "{}",
+            rs[0].response
+        );
+        assert!(rs[0]
+            .verdict
+            .reasoning
+            .contains("the environment changed after the kernel's copy"));
+        assert!(rs[0]
+            .evidence
+            .environment
+            .contains(&"changed_after_the_kernel_s_copy".to_string()));
+        raw.env_action = action::RECORD | action::WOULD_DENY;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert!(
+            rs[0].response.starts_with("would deny"),
+            "{}",
+            rs[0].response
+        );
+        raw.tier = tier::ADMIN | tier_sig::TTY;
+        raw.env_action = action::RECORD;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert_eq!(rs[0].response, "recorded: the exec ran with the entry");
+    }
+
+    /// Lot 325 (the re-check of #546, R5): an exec judged without its walk
+    /// is recorded whatever the verdict — refused (a protected target) or
+    /// let through (the exec guards past their capacity).
+    #[test]
+    fn an_exec_judged_without_its_walk_is_recorded() {
+        // let through: one Low record
+        let raw = raw_exec(
+            0,
+            action::UNWALKED | action::RECORD,
+            tier::ADMIN | tier_sig::TTY,
+        );
+        let rs = records_of(&raw, &ev(""), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_EXEC);
+        assert_eq!(rs[0].verdict.severity, Severity::Low);
+        assert!(rs[0].verdict.reasoning.contains("judged without its walk"));
+        assert!(
+            rs[0].response.contains("past their capacity"),
+            "{}",
+            rs[0].response
+        );
+        // a memfd from a service: refused, one High record that says so
+        let raw = raw_exec(
+            class::MEMFD,
+            action::UNWALKED | action::RECORD | action::DENY,
+            tier::SERVICE,
+        );
+        let rs = records_of(&raw, &ev(""), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert!(rs[0].verdict.reasoning.contains("judged without its walk"));
+        // the environment not read at a protected target: refused on it
+        let mut raw = raw_exec(0, action::UNWALKED | action::RECORD, tier::SERVICE);
+        raw.env_flags = env_flags::UNREADABLE;
+        raw.env_action = action::RECORD | action::DENY;
+        let rs = records_of(&raw, &ev(""), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
+        assert!(
+            rs[0].response.starts_with("denied at exec"),
+            "{}",
+            rs[0].response
+        );
+        assert_eq!(rs[0].evidence.decision, "deny");
     }
 
     #[test]

@@ -171,6 +171,13 @@ pub(crate) async fn load(
             source,
             env: !cli.exec_policy_no_env,
             map: !cli.exec_policy_no_map,
+            // Lot 325: `debug-trigger` builds take the lab's trigger files
+            // next to the admin socket.
+            debug_dir: if cfg!(feature = "debug-trigger") {
+                cli.admin_socket.parent().map(std::path::Path::to_path_buf)
+            } else {
+                None
+            },
         }
     };
     let execpol_mode = execpol_cfg.mode;

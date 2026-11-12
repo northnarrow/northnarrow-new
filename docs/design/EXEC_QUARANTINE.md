@@ -168,7 +168,12 @@ Why not stop at `bprm_check_security`: the exec can still fail after that
 hook (a later LSM, `ENOEXEC`, memory), and the stop would then hold the
 caller's old image. The LSM hook only classifies; the candidate travels in
 `EXECQ_CAND` (keyed by `task_struct`, cleared at every pass 0) to the
-tracepoint.
+tracepoint. Lot 325 (the re-check of #546, R6): a plain hash of 4096
+entries, never an LRU (an LRU insert could evict an entry a preemptible
+program holds and give its memory to another task's candidate); a failed
+exec's candidate goes when the kernel frees its task (the LSM `task_free`
+program, `nn_task_free`), and past 4096 in flight a candidate is dropped
+(`CAND_DROPPED`: the exec runs, unheld).
 
 **Fail-open by construction.** A stop needs the agent's heartbeat
 (`EXECQ_ALIVE`, written every 250 ms) younger than 1.5 s, a free entry on

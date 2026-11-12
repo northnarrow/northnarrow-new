@@ -75,9 +75,23 @@ pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(EXECQ
 /// [`EXECQ_ROOTS`]' capacity.
 pub const EXECQ_ROOTS_CAPACITY: u32 = 1024;
 /// The candidate of each exec in progress, keyed by `task_struct`, from the
-/// exec's pass to its `sched_process_exec`.
+/// exec's pass to its `sched_process_exec`. Lot 325 (the re-check of #546,
+/// R6): a plain hash, never an LRU — the interpreter's pass and
+/// [`refuse_script`] hold a pointer to the entry in a preemptible LSM
+/// program, and an LRU insert elsewhere that found its CPU's free list
+/// empty could evict the entry and hand its memory to another task's
+/// candidate (5.15/6.8 with `preempt=full` and more than 8 CPUs). An entry
+/// is removed at `sched_process_exec`, at the task's next exec, at a
+/// refused pass, and when the task is freed (`task_free`,
+/// `crate::task_scratch::nn_task_free`: a failed exec's candidate was left
+/// to the LRU). Past [`EXECQ_CAND_CAP`] in flight, a candidate is dropped
+/// (counted, `CAND_DROPPED`): the exec runs, unheld.
 #[map]
-static EXECQ_CAND: LruHashMap<u64, ExecqCandRaw> = LruHashMap::with_max_entries(1024, 0);
+static EXECQ_CAND: HashMap<u64, ExecqCandRaw> = HashMap::with_max_entries(EXECQ_CAND_CAP, 0);
+/// [`EXECQ_CAND`]'s room: the execs between their pass and their
+/// `sched_process_exec`, and failed execs' candidates until their task is
+/// freed.
+pub(crate) const EXECQ_CAND_CAP: u32 = 4096;
 /// Where a candidate is built (584 bytes: never on the stack): the running
 /// task's own entry, made, copied into [`EXECQ_CAND`] and removed in one
 /// run. Lot 322: it was a per-CPU buffer in a program that runs

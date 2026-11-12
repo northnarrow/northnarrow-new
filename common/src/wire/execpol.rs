@@ -166,6 +166,13 @@ pub mod action {
     pub const RECORD: u32 = 1 << 4;
     /// An exemption removed classes from a deny (`tier_sig` says which).
     pub const EXEMPTED: u32 = 1 << 5;
+    /// Lot 325 (R5): judged without the walk — the per-task buffers were
+    /// full — on what needs none (the tier, the file's set-id bits, memfd,
+    /// deleted, tmpfs, a world-writable directory, the environment).
+    pub const UNWALKED: u32 = 1 << 6;
+    /// Lot 325 (TOCTOU): refused after the exec's point of no return — the
+    /// new image killed (`SIGKILL`) before its first instruction.
+    pub const KILLED: u32 = 1 << 7;
 }
 
 /// `ExecPolRaw::kind`.
@@ -189,7 +196,12 @@ pub mod env_flags {
     pub const HISTFILESIZE_ZERO: u32 = 1 << 6;
     /// `HISTCONTROL=ignore…` exported.
     pub const HISTCONTROL_IGNORE: u32 = 1 << 7;
-    /// More than [`super::ENV_SCAN_MAX`] variables: the rest was not read.
+    /// The scan could not finish: more than [`super::ENV_SCAN_CAP`]
+    /// variables — above any environment the kernel accepts
+    /// ([`super::KERNEL_ENVC_MAX`]), so the array grew after the kernel's
+    /// count. Lot 325 (R2): counted, recorded High, and refused where the
+    /// tier's rule refuses a staging preload or at a set-id target. It was
+    /// the 65th variable, neither recorded nor refused.
     pub const TRUNCATED: u32 = 1 << 8;
     /// An `LD_PRELOAD` entry under a staging prefix ([`super::STAGING_PREFIXES`]).
     pub const PRELOAD_STAGING: u32 = 1 << 9;
@@ -203,6 +215,22 @@ pub mod env_flags {
     pub const UNREADABLE: u32 = 1 << 13;
     /// A captured value filled its buffer: entries past it were not seen.
     pub const VALUE_CUT: u32 = 1 << 14;
+    /// Lot 325 (TOCTOU, the review of #546 F2): the kernel's own copy of the
+    /// environment — the new image's, read once the exec is past its point
+    /// of no return — holds a staging loader entry the first pass did not
+    /// see in the caller's memory: the environment changed between the
+    /// kernel's copy and the first pass's read (or that read failed).
+    pub const CHANGED: u32 = 1 << 15;
+    /// Lot 325 (the mini-hunt of R2): an `LD_PRELOAD` or `LD_AUDIT` value
+    /// longer than its capture (128 / 64 bytes): its entries past the cut
+    /// were not judged — a staging entry after a long clean one passed.
+    /// Judged as an environment the scan could not finish
+    /// ([`Self::TRUNCATED`]): refused at a protected or set-id target,
+    /// recorded, counted with it.
+    pub const LOADER_CUT: u32 = 1 << 16;
+    /// Lot 325: what the scan could not judge to its end — refused at a
+    /// protected or set-id target.
+    pub const UNFINISHED: u32 = TRUNCATED | LOADER_CUT;
     /// Loader variables that can load code.
     pub const LOADER: u32 = LD_PRELOAD | LD_AUDIT;
     /// Findings a deny can rest on.
@@ -211,8 +239,6 @@ pub mod env_flags {
     pub const HISTORY: u32 = HISTFILE_NULL | HISTSIZE_ZERO | HISTFILESIZE_ZERO | HISTCONTROL_IGNORE;
 }
 
-/// Environment variables read at most per exec (bounded loop).
-pub const ENV_SCAN_MAX: usize = 64;
 /// Bytes of each variable compared (the name and the start of the value).
 pub const ENV_PREFIX_LEN: usize = 24;
 /// Captured value lengths.
@@ -304,7 +330,9 @@ pub mod counter {
     pub const EXEMPTED: u32 = 8;
     /// Reports the ring could not hold (the decision still applied).
     pub const RING_FULL: u32 = 9;
-    /// Environments with more than `ENV_SCAN_MAX` variables.
+    /// Environments the scan could not finish (`env_flags::TRUNCATED`:
+    /// more than `ENV_SCAN_CAP` variables). Lot 325: reported by the agent
+    /// (`nn-admin status`).
     pub const ENV_TRUNCATED: u32 = 10;
     /// Lot 322: environments not read whole (`env_flags::UNREADABLE`): the
     /// array or a string unreadable at the exec's first pass (the caller's
@@ -319,8 +347,20 @@ pub mod counter {
     /// (classed `tmp`, `var_tmp`, `home`), the quarantine's candidate. The
     /// agent reports the total.
     pub const LOST: u32 = 12;
+    /// Lot 325 (TOCTOU): execs whose new image's environment (the kernel's
+    /// copy) held a staging loader entry the first pass did not see
+    /// (`env_flags::CHANGED`); killed before their first instruction where
+    /// the tier's rule refuses it. The agent reports the total.
+    pub const ENV_CHANGED: u32 = 13;
+    /// Lot 325 (R5): execs let through without their walk — the exec
+    /// sensor's per-task buffer could not be made (the map full: a flood
+    /// of execs in flight) and the exec is no protected target: judged on
+    /// what needs no buffer, recorded. A protected target is refused and
+    /// counted in [`LOST`]. The agent reports the total and signs a
+    /// degradation while it moves.
+    pub const LOST_OPEN: u32 = 14;
     /// Slots in the map.
-    pub const SLOTS: u32 = 13;
+    pub const SLOTS: u32 = 15;
 }
 
 /// One policy report (a deny, a "would deny", an environment finding, an
@@ -493,6 +533,8 @@ pub fn env_names(bits: u32) -> alloc::vec::Vec<&'static str> {
         (env_flags::HISTFILE_NULL, "histfile_null"),
         (env_flags::UNREADABLE, "unreadable"),
         (env_flags::VALUE_CUT, "value_cut"),
+        (env_flags::CHANGED, "changed_after_the_kernel_s_copy"),
+        (env_flags::LOADER_CUT, "loader_value_cut"),
     ] {
         if bits & bit != 0 {
             out.push(name);
@@ -536,36 +578,63 @@ pub enum EnvpReg {
     Si,
 }
 
+/// Lot 325 (the re-check of #546, R1): the entry an exec came through,
+/// which says how the kernel reads `envp` from its register.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EnvpAbi {
+    /// x86-64: the register whole, an array of 64-bit pointers.
+    Native,
+    /// The 32-bit entry (`int $0x80`, `sysenter`): the register's low 32
+    /// bits — the ia32 stub casts it (`__SC_COMPAT_CAST`, `(unsigned
+    /// int)regs->dx`) — an array of 32-bit pointers.
+    Ia32,
+    /// The x32 ABI: the register whole — the x32 stub passes `regs->dx`
+    /// as an `unsigned long` (`SC_X86_64_REGS_TO_ARGS`, `__SC_DELOUSE`), and
+    /// `compat_do_execve` reads the array at that address — an array of
+    /// 32-bit pointers. Lot 322 truncated it as ia32's: a 64-bit caller of
+    /// the x32 call put the real array above 4 GiB and a clean decoy at
+    /// its low half, and the scan read the decoy.
+    X32,
+}
+
+impl EnvpAbi {
+    /// The array's entries are 32-bit pointers (zero-extended, as
+    /// `compat_ptr` does).
+    #[inline(always)]
+    pub const fn compat_pointers(self) -> bool {
+        !matches!(self, EnvpAbi::Native)
+    }
+}
+
 /// Lot 322: where the exec's new environment is, from the syscall number
-/// the exec entered with, and whether it is a compat one — `envp` then a
-/// 32-bit address (the register's low half: the kernel reads no more) of
-/// an array of 32-bit pointers. `bprm_check_security` is reached from
-/// these six calls (and `kernel_execve`, whose task has no user registers:
-/// the caller does not ask): 11 and 358 are no native exec (`munmap`, none),
-/// 59 and 322 no 32-bit one. `None`: not read (counted and recorded as
+/// the exec entered with, and through which entry (lot 325: [`EnvpAbi`]).
+/// `bprm_check_security` is reached from these six calls (and
+/// `kernel_execve`, whose task has no user registers: the caller does not
+/// ask): 11 and 358 are no native exec (`munmap`, none), 59 and 322 no
+/// 32-bit one. `None`: not read (counted and recorded as
 /// [`counter::ENV_UNREAD`]).
 #[inline(always)]
-pub const fn exec_envp_reg(orig_ax: u64) -> Option<(EnvpReg, bool)> {
+pub const fn exec_envp_reg(orig_ax: u64) -> Option<(EnvpReg, EnvpAbi)> {
     match orig_ax {
-        NR_EXECVE => Some((EnvpReg::Dx, false)),
-        NR_EXECVEAT => Some((EnvpReg::R10, false)),
-        IA32_NR_EXECVE => Some((EnvpReg::Dx, true)),
-        IA32_NR_EXECVEAT => Some((EnvpReg::Si, true)),
-        X32_NR_EXECVE => Some((EnvpReg::Dx, true)),
-        X32_NR_EXECVEAT => Some((EnvpReg::R10, true)),
+        NR_EXECVE => Some((EnvpReg::Dx, EnvpAbi::Native)),
+        NR_EXECVEAT => Some((EnvpReg::R10, EnvpAbi::Native)),
+        IA32_NR_EXECVE => Some((EnvpReg::Dx, EnvpAbi::Ia32)),
+        IA32_NR_EXECVEAT => Some((EnvpReg::Si, EnvpAbi::Ia32)),
+        X32_NR_EXECVE => Some((EnvpReg::Dx, EnvpAbi::X32)),
+        X32_NR_EXECVEAT => Some((EnvpReg::R10, EnvpAbi::X32)),
         _ => None,
     }
 }
 
-/// Lot 322: `envp` as the kernel reads it — a compat call's register
+/// `envp` as the kernel reads it from the register: an ia32 call's
 /// truncated to its low 32 bits (a 64-bit caller of `int $0x80` may leave
-/// the high half set: the kernel ignores it, so must the scan).
+/// the high half set: the kernel ignores it, so must the scan); a native
+/// or an x32 call's whole (lot 325, R1: x32's is not truncated).
 #[inline(always)]
-pub const fn envp_value(reg: u64, compat: bool) -> u64 {
-    if compat {
-        reg & 0xffff_ffff
-    } else {
-        reg
+pub const fn envp_value(reg: u64, abi: EnvpAbi) -> u64 {
+    match abi {
+        EnvpAbi::Ia32 => reg & 0xffff_ffff,
+        EnvpAbi::Native | EnvpAbi::X32 => reg,
     }
 }
 
@@ -575,6 +644,47 @@ pub const fn envp_value(reg: u64, compat: bool) -> u64 {
 #[inline(always)]
 pub const fn envp_stride(compat: u64) -> u64 {
     8 - 4 * (compat & 1)
+}
+
+/// Lot 325 (TOCTOU): bytes of the new image's environment the post-commit
+/// check reads at once (its task entry's buffer, after the findings): a
+/// string shorter than this is one read.
+pub const ENV_REGION_READ: usize = 256;
+
+/// Lot 325: the bytes of a task's `EXECPOL_ENV` entry (the findings, then
+/// the post-commit check's read buffer).
+pub const ENV_ENTRY_BYTES: usize = core::mem::size_of::<EnvStashRaw>() + ENV_REGION_READ;
+
+/// Lot 325 (the re-check of #546, R2): the most variables an exec the
+/// kernel accepts can carry. Its strings and its pointers share at most
+/// 3/4 of `_STK_LIM` (6 MiB, `bprm_stack_limits`; a quarter of the stack
+/// limit when that is lower), and each variable costs an 8-byte pointer
+/// and at least one byte of string: 6 MiB / 9.
+pub const KERNEL_ENVC_MAX: usize = (6 << 20) / 9;
+
+/// Lot 325 (R2): the scan reads every variable, `ENV_STEP` per step of
+/// the innermost loop, [`ENV_STEPS_MID`] steps per middle round and
+/// [`ENV_ROUNDS`] rounds: [`ENV_SCAN_CAP`] in all, above
+/// [`KERNEL_ENVC_MAX`]. It read the first 64 only: 64 padding variables
+/// hid an `LD_PRELOAD` after them (no privilege, no race).
+pub const ENV_STEP: usize = 64;
+pub const ENV_STEPS_MID: usize = 128;
+pub const ENV_ROUNDS: usize = 128;
+pub const ENV_SCAN_CAP: usize = ENV_STEP * ENV_STEPS_MID * ENV_ROUNDS;
+
+/// Lot 325 (R2): whether the first eight bytes of a variable (`w0`, little
+/// endian) start one of the names the scan reads whole — the loader
+/// variables, `GLIBC_TUNABLES`, the history ones. Every other variable
+/// costs its pointer and these eight bytes.
+#[inline(always)]
+pub const fn env_name_wanted(w0: u64) -> bool {
+    w0 == u64::from_le_bytes(*b"LD_PRELO")
+        || w0 == u64::from_le_bytes(*b"LD_AUDIT")
+        || w0 == u64::from_le_bytes(*b"LD_LIBRA")
+        || w0 == u64::from_le_bytes(*b"GLIBC_TU")
+        || w0 == u64::from_le_bytes(*b"HISTFILE")
+        || w0 == u64::from_le_bytes(*b"HISTSIZE")
+        || w0 == u64::from_le_bytes(*b"HISTCONT")
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -626,6 +736,10 @@ mod tests {
             env_names(env_flags::LD_PRELOAD | env_flags::PRELOAD_STAGING),
             ["LD_PRELOAD", "preload_staging"]
         );
+        assert_eq!(
+            env_names(env_flags::CHANGED),
+            ["changed_after_the_kernel_s_copy"]
+        );
     }
 
     #[test]
@@ -656,24 +770,103 @@ mod tests {
     /// 32-bit pointers; an unknown call is not.
     #[test]
     fn the_new_environment_is_found_in_the_exec_s_own_registers() {
-        assert_eq!(exec_envp_reg(59), Some((EnvpReg::Dx, false)));
-        assert_eq!(exec_envp_reg(322), Some((EnvpReg::R10, false)));
-        assert_eq!(exec_envp_reg(11), Some((EnvpReg::Dx, true)));
-        assert_eq!(exec_envp_reg(358), Some((EnvpReg::Si, true)));
-        assert_eq!(exec_envp_reg(0x4000_0000 | 520), Some((EnvpReg::Dx, true)));
-        assert_eq!(exec_envp_reg(0x4000_0000 | 545), Some((EnvpReg::R10, true)));
+        assert_eq!(exec_envp_reg(59), Some((EnvpReg::Dx, EnvpAbi::Native)));
+        assert_eq!(exec_envp_reg(322), Some((EnvpReg::R10, EnvpAbi::Native)));
+        assert_eq!(exec_envp_reg(11), Some((EnvpReg::Dx, EnvpAbi::Ia32)));
+        assert_eq!(exec_envp_reg(358), Some((EnvpReg::Si, EnvpAbi::Ia32)));
+        assert_eq!(
+            exec_envp_reg(0x4000_0000 | 520),
+            Some((EnvpReg::Dx, EnvpAbi::X32))
+        );
+        assert_eq!(
+            exec_envp_reg(0x4000_0000 | 545),
+            Some((EnvpReg::R10, EnvpAbi::X32))
+        );
         // kernel_execve's zeroed registers, a negative (no call), x32's
         // numbers without the bit (no native call), a native call that
         // never execs, a native number with the x32 bit
         for other in [0, u64::MAX, 520, 545, 9, 0x4000_0000 | 59] {
             assert_eq!(exec_envp_reg(other), None, "{other:#x}");
         }
-        // the kernel reads a compat envp's low half only, a native one whole
-        assert_eq!(envp_value(0xdead_beef_0040_1000, true), 0x0040_1000);
-        assert_eq!(envp_value(0x7ffd_0040_1000, false), 0x7ffd_0040_1000);
+        assert!(!EnvpAbi::Native.compat_pointers());
+        assert!(EnvpAbi::Ia32.compat_pointers());
+        assert!(EnvpAbi::X32.compat_pointers());
         assert_eq!(envp_stride(0), 8);
         assert_eq!(envp_stride(1), 4);
         assert_eq!(envp_stride(3), 4);
+    }
+
+    /// Lot 325 (the re-check of #546, R1): the kernel reads an ia32 exec's
+    /// `envp` from the register's low half (the ia32 stub's `(unsigned
+    /// int)` cast), a native or an x32 exec's from the register whole (the
+    /// x32 stub passes it as an `unsigned long`). Lot 322 truncated x32's
+    /// too: an x32 `execve` from a 64-bit caller with the real array at
+    /// `(1 << 32) | LO` and a clean decoy at `LO` loaded the preload, and
+    /// the scan read the decoy (the host PoC `x32hi.c`).
+    #[test]
+    fn an_x32_exec_s_envp_is_the_register_whole_and_an_ia32_one_its_low_half() {
+        assert_eq!(
+            envp_value(0xdead_beef_0040_1000, EnvpAbi::Ia32),
+            0x0040_1000
+        );
+        assert_eq!(
+            envp_value(0x0000_0001_0040_1000, EnvpAbi::X32),
+            0x0000_0001_0040_1000
+        );
+        assert_eq!(
+            envp_value(0x7ffd_0040_1000, EnvpAbi::Native),
+            0x7ffd_0040_1000
+        );
+    }
+
+    /// Lot 325 (the re-check of #546, R2): the scan's bound is above any
+    /// environment the kernel accepts — 64 padding variables hid an
+    /// `LD_PRELOAD` after them — and its three loops multiply to it.
+    #[test]
+    fn the_scan_reads_more_variables_than_the_kernel_accepts() {
+        assert_eq!(KERNEL_ENVC_MAX, 699_050);
+        assert_eq!(ENV_SCAN_CAP, ENV_STEP * ENV_STEPS_MID * ENV_ROUNDS);
+        // (through `black_box`: a runtime check, which a mutant of the
+        // constants fails as a test, not as a build)
+        let cap = std::hint::black_box(ENV_SCAN_CAP);
+        assert!(cap > KERNEL_ENVC_MAX, "{cap}");
+        // the innermost step's pointers fit one probe of 512 bytes
+        assert!(std::hint::black_box(ENV_STEP) * 8 <= 512);
+    }
+
+    /// Lot 325 (R2): the names the scan reads whole, by their first eight
+    /// bytes; every other variable costs its pointer and those bytes.
+    #[test]
+    fn the_scan_reads_whole_only_the_names_it_judges() {
+        let w = |s: &[u8]| {
+            let mut b = [0u8; 8];
+            let n = s.len().min(8);
+            b[..n].copy_from_slice(&s[..n]);
+            u64::from_le_bytes(b)
+        };
+        for yes in [
+            &b"LD_PRELOAD=/tmp/x.so"[..],
+            b"LD_AUDIT=/tmp/a.so",
+            b"LD_LIBRARY_PATH=/tmp",
+            b"GLIBC_TUNABLES=glibc.x=1",
+            b"HISTFILE=/dev/null",
+            b"HISTFILESIZE=0",
+            b"HISTSIZE=0",
+            b"HISTCONTROL=ignorespace",
+        ] {
+            assert!(env_name_wanted(w(yes)), "{}", String::from_utf8_lossy(yes));
+        }
+        for no in [
+            &b"PATH=/usr/bin"[..],
+            b"LD_BIND_NOW=1",
+            b"LD_PREL",
+            b"HOME=/root",
+            b"",
+            b"=",
+            b"ld_preload=/tmp/x.so",
+        ] {
+            assert!(!env_name_wanted(w(no)), "{}", String::from_utf8_lossy(no));
+        }
     }
 
     #[test]

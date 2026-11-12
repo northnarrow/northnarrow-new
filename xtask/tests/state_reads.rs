@@ -198,6 +198,12 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     ("agent/src/posture/golden.rs", "read_to_string(&path)", LAB),
     ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
+    // lot 325: the exec guards' map fill of the e2e (`debug-execpol-fill`)
+    (
+        "agent/src/execpol/controller.rs",
+        "read_to_string(&fill)",
+        LAB,
+    ),
     (
         "antitamper-bpf/src/cgroup_floors.rs",
         "read_to_string(&path)",

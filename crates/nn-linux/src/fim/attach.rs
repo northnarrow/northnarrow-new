@@ -204,6 +204,20 @@ pub fn attach_observe_programs(
                         hook, "fim: file_open observer with the file-open sensor attached"
                     );
                     attached.push(OPEN_SENSOR_PROGRAM);
+                    // Lot 325: the sensor's buffers live as long as their
+                    // task, removed when the kernel frees it (one lookup
+                    // per open); without that program, per run.
+                    match crate::sensors::task_free::ensure(ebpf, btf) {
+                        Ok(_) => info!(
+                            program = crate::sensors::task_free::PROGRAM,
+                            "fim: the file-open sensor keeps a task's buffers until task_free"
+                        ),
+                        Err(e) => warn!(
+                            error = %chain_tail(&e),
+                            "fim: the task_free program was refused — the file-open sensor \
+                             makes and removes its buffers at each open (correct, slower)"
+                        ),
+                    }
                     continue;
                 }
                 Err(e) => warn!(

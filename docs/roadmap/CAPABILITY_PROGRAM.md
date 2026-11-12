@@ -9904,3 +9904,78 @@ number in parentheses is a lab PR.
     (fixed by the same change); the check has no live self-test (proposed).
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds its e2e to the privileged suites.
+- **Lot 325 — the exec environment's check complete and cheap (C23, C14;
+  no level changes).**
+  - What was open (the re-check of #546): the scan read the first 64
+    variables (R2, P2: padding hid a staging `LD_PRELOAD`, no privilege, no
+    race; for a root session no record); an x32 exec's `envp` was truncated
+    as an ia32 one's (R1); a full per-task map refused every exec in enforce
+    mode (R5); `EXECQ_CAND` was an LRU (R6); a FIM walk that could not run
+    was cached as the directory's class (R3); the FIM sensor's per-task
+    buffer cost an insert and a delete per open (+180 to +270 ns); the scan
+    read the caller's memory after the kernel's copy (TOCTOU, F2).
+  - Done: every variable read, up to 1,048,576 (three loops of global
+    functions), above the kernel's own limit (699,050); an array past the
+    cap (`TRUNCATED`) or a loader value past its capture (`LOADER_CUT`, the
+    mini-hunt) is counted ("environments not finished"), recorded High, and
+    refused at a protected target (the tier's rule refuses a staging
+    preload) or a set-id one; each occurrence of a loader variable judged
+    (the mini-hunt: musl's loader takes the first, the scan judged the
+    last); x32 read from the register whole; past the exec guards'
+    capacity, execs judged without their walk — protected targets refused,
+    the rest let through and recorded, `execpol_capacity` signed;
+    `EXECQ_CAND` a plain hash, cleaned with the FIM buffer at LSM
+    `task_free` (`nn_task_free`); a lost FIM walk never cached; the FIM
+    buffer kept for the task's life; the kernel's own copy of the
+    environment read again at `sched_process_exec`
+    (`execpol_env_commit`, `mm->env_start..env_end`, two optional BTF
+    offsets, slots 130–131) — an entry the first pass did not see is
+    `CHANGED`, counted, recorded Critical, and the image killed before its
+    first instruction where the tier refuses it. Reading the bprm pages at
+    `bprm_check_security` is not possible (no helper reads an `mm` no task
+    runs; a hand walk of the page tables needs the KASLR'd direct-map base):
+    `EXEC_POLICY.md` §5.
+  - Host: wire, record, controller, counters, `nn-proto` and `btf_offsets`
+    unit tests; `xtask/tests/exec_env_complete.rs` (8 tests, each failing on
+    `main`) and the updated `percpu_maps.rs` and `kernel_halves.rs`; 42
+    mutants, each caught by a named test; gates green once (108 suites,
+    4,862 passed).
+  - Lab, as measured (our guests, lease k325; 20 execs of `true` per case,
+    `NN_EXEC_POLICY=enforce`, the server profile, an ssh root shell — the
+    session tier, `deny-root`): on 7.0.0-43, `main` (`3fe162ef`, the same
+    boot) refused 0 of 20 behind 64, 65, 1,000 and 50,000 padding
+    variables, 0 of 20 with a staging preload first and a clean one last, 0
+    of 20 with a staging entry past 128 bytes of clean ones, and in the flip
+    race (a thread rewriting `LD_PRELOAD`'s first byte during the exec, 300
+    execs) 63 ran with the preload; the final object refused 20 of 20 in
+    each case (and pinned to CPU 2), and the flip race ran none with it
+    (73 refused at the first pass, 124 killed past the point of no return,
+    103 ran without it). 5.15.0-202 (`e8122d17`): every case 20 of 20, x32
+    and x32 with `envp` above 4 GiB 20 of 20 (x32 is on in Ubuntu 22.04);
+    the final object (`8b709552`) the same, the duplicate and the long list included; 6.12.116: every case 20 of 20, the flip race none with the preload (59 refused, 117 killed). The four e2e
+    (`a_staging_preload_behind_many_variables_is_refused`,
+    `the_exec_guards_past_their_capacity_keep_protected_targets_closed`,
+    `a_preload_written_after_the_kernel_s_copy_never_runs`,
+    `a_staging_preload_is_refused_at_every_exec_on_every_cpu`) pass on 7.0
+    , 6.12.116 and 5.15.0-202. `verifier-check` of the final object, 108 programs, 0
+    failing: 7.0 (`exec_check_lsm` 13,166 insns, processed 627,971, the
+    call chain's stack 480 of 512; `execpol_env_commit` 3,309, processed
+    97,211), 6.8.0-149 (12,676; 412,219), 6.12.116 (13,148; 668,228), 5.15.0-202
+    (12,676; 5.15 reports no processed count). FIM across tasks (`fimx`): 0 misattributed of 1.94 million
+    opens, the reader's 40 credential records intact.
+  - Cost (bpf_stats, 7.0, the same boot): `fim_file_open_sensor` 318.3 ns
+    per open, 316.7 on `main` before #546 (#546: 497 to 590);
+    `exec_check_lsm` 26.5 µs per exec (27.0 before); `execpol_env_commit`
+    2.0 to 2.6 µs per exec; `nn_task_free` 1.5 µs per task. 100,000
+    variables cost the two exec programs 1.6 ms, 600,000 empty ones 8.4 ms
+    (the exec itself 149 ms).
+  - R2's decision, measured: the largest legitimate environments on our
+    hosts — 41 variables (this workstation's session), 17 to 19 (any
+    process of a guest, 7.0, 6.12, 5.15), 16 to 17 (a login shell), 4 to 7
+    (a service), 22 to 23 (the e2e harness), 68 to 69 (a cargo build
+    script); no `LD_PRELOAD` or `LD_AUDIT` set in a running process; a
+    Kubernetes pod carries about 7 per service of its namespace
+    (documented). Against a cap of 1,048,576 (the kernel's own
+    limit 699,050): fail-closed at protected and set-id targets.
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds three e2e to the privileged suites.
