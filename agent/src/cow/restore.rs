@@ -428,7 +428,9 @@ mod tests {
         // overwrite (main restored it in place: "the inode decides")
         reborn.btime_ns = None;
         match decide(&e, &reborn, &cx(&none, &attacker)) {
-            Plan::KeepBoth(why) => assert!(why.contains("no birth time"), "{why}"),
+            // the reason is not printed (CodeQL rust/cleartext-logging,
+            // alert 268: a test's panic message counts as a log)
+            Plan::KeepBoth(why) => assert!(why.contains("no birth time")),
             other => panic!("{other:?}"),
         }
         let mut no_btime = e.clone();
