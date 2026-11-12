@@ -1420,11 +1420,26 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             {
                 continue; // its decision is owed: below
             }
+            // the re-check of #541 (N1): a verdict that asks for the kill —
+            // the scan answered, the rules' verdict on the exec still awaited
+            // — is carried out at the stop, as for an owed resume: never a
+            // resume undecided
+            let kill = p.scan.as_ref().is_some_and(|r| {
+                decide(&self.s.policy, &Basis::Scanned(r.verdict)).action == Action::Kill
+            });
             let was_uncaptured = matches!(p.proc_ref.liveness(), Liveness::Uncaptured(_));
             match recheck(&mut self.capture, &mut p) {
                 Liveness::Uncaptured(_) => {
+                    if kill {
+                        self.k.owe_kill(p.raw.pid, p.raw.start_ns);
+                    }
                     left.push(p.raw.pid);
                     continue;
+                }
+                Liveness::Live if kill => {
+                    if self.kill(&p.proc_ref, p.raw.pid, &p.path, true).0 {
+                        killed.push(p.raw.pid);
+                    }
                 }
                 Liveness::Live if p.proc_ref.signal(libc::SIGCONT).is_ok() => {
                     resumed.push(p.raw.pid);

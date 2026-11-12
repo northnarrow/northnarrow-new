@@ -151,10 +151,11 @@ pub fn quiesce() -> bool {
     rc == 0
 }
 
-/// Lot 317 (review F5): whether the unstop of process `start_ns` removes the
-/// map's entry of its pid, which names the process started at `found`
-/// (`None`: no entry, nothing to keep) — only its own.
-pub(crate) fn unstop_removes(found: Option<u64>, start_ns: u64) -> bool {
+/// Lot 317 (review F5, the re-check's N2): whether the map's entry of a pid,
+/// which names the process started at `found` (`None`: no entry, nothing to
+/// keep), may be removed or rewritten for the process started at
+/// `start_ns` — only its own.
+pub(crate) fn entry_is_its_own(found: Option<u64>, start_ns: u64) -> bool {
     found.is_none_or(|f| f == start_ns)
 }
 
@@ -170,7 +171,7 @@ impl Kernel {
     /// kernel holds in its turn, keeps its own.
     pub fn unstop(&mut self, pid: u32, start_ns: u64) {
         let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
-        if unstop_removes(found, start_ns) {
+        if entry_is_its_own(found, start_ns) {
             let _ = self.stopped.remove(&pid);
         }
     }
@@ -178,8 +179,15 @@ impl Kernel {
     /// Lot 317 (review F2): mark the map's entry of process `(pid,
     /// start_ns)` [`KILL_OWED`] (an update of an existing key succeeds on a
     /// full map). A failure is logged: the process stays stopped, and is
-    /// resumed by the next start instead of killed.
+    /// resumed by the next start instead of killed. The re-check of #541
+    /// (N2): an entry a later holder of the pid has is left as it is — its
+    /// process is not this one, and a later unstop of this one would take
+    /// it out of the map.
     pub fn owe_kill(&mut self, pid: u32, start_ns: u64) {
+        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
+        if !entry_is_its_own(found, start_ns) {
+            return;
+        }
         let v = AyaStopped(ExecqStopped {
             start_ns,
             stop_ns: KILL_OWED,
@@ -293,9 +301,9 @@ mod tests {
     /// never the one a later holder of the pid has.
     #[test]
     fn an_unstop_removes_only_its_own_process() {
-        assert!(unstop_removes(Some(7), 7));
-        assert!(!unstop_removes(Some(8), 7), "a later holder of the pid");
-        assert!(unstop_removes(None, 7));
+        assert!(entry_is_its_own(Some(7), 7));
+        assert!(!entry_is_its_own(Some(8), 7), "a later holder of the pid");
+        assert!(entry_is_its_own(None, 7));
     }
 
     /// Lot 317 (BUG-118): the stop's wait for the exec programs is the

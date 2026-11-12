@@ -72,8 +72,11 @@ impl KernelIo for FakeKernel {
             start_ns,
             stop_ns: kernel::KILL_OWED,
         };
+        // as the kernel's map is keyed: one entry per pid — rewritten only
+        // when it is this process's (the re-check's N2)
         match st.left.iter_mut().find(|(p, _)| *p == pid) {
-            Some(e) => e.1 = v,
+            Some(e) if kernel::entry_is_its_own(Some(e.1.start_ns), start_ns) => e.1 = v,
+            Some(_) => {}
             None => st.left.push((pid, v)),
         }
     }
@@ -1646,4 +1649,81 @@ fn the_stop_never_resumes_a_process_whose_kill_the_map_owes() {
     );
     let a = w.rec.audits.lock();
     assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
+}
+
+// ── the re-check of #541: N1, N2 ─────────────────────────────────────
+
+/// The re-check's N1 (the reviewer's probe R1): a held process whose scan
+/// already asks for its kill, the rules' verdict on its exec still
+/// awaited and nothing owed: the stop kills it — the same verdict as an
+/// owed resume's, the same end. The probe found it resumed.
+#[test]
+fn the_stop_kills_a_held_process_whose_verdict_asks_for_it() {
+    let (mut w, h) = held_with_a_kill_verdict("nn-bad");
+    w.ctl.stop_all();
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "the stop resumed a held process whose block-list verdict it had: {:?}",
+        state(h.pid)
+    );
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["resumed"], serde_json::json!([]), "{}", a[0]);
+    assert!(w.k.0.lock().left.is_empty());
+}
+
+/// N1: the same with the capture failing — the kill is owed in the map,
+/// the process left stopped for the next start to kill.
+#[test]
+fn the_stop_owes_the_kill_of_a_held_process_it_cannot_capture() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-bad");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "nn-lab-owed".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 5000, false);
+    // not captured from its report on
+    let _broken = w.break_capture();
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.run_until(|w| w.ctl.entries.values().any(|p| p.scan.is_some()));
+    assert!(w.records().is_empty(), "decided before the rules");
+    w.ctl.stop_all();
+    assert_eq!(state(h.pid), Some('T'));
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["left"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(
+        w.k.0.lock().left[0].1.stop_ns,
+        kernel::KILL_OWED,
+        "the next start kills it"
+    );
+}
+
+/// The re-check's N2: a kill owed to an earlier holder of a pid leaves the
+/// entry of the pid's new process (another start) as it is — neither
+/// marked for a kill nor, later, taken out of the map.
+#[test]
+fn a_kill_owed_to_an_earlier_holder_of_a_pid_leaves_its_new_process_alone() {
+    let w = world(ScanConfig::default(), enforce(), 5000, true);
+    let h = held_copy(w.dir.path(), "nn-x");
+    hold_in_map(&w, h.pid, h.start_ns);
+    let earlier = h.start_ns - 10_000_000_000;
+    let mut k = w.k.clone();
+    k.owe_kill(h.pid, earlier);
+    k.unstop(h.pid, earlier);
+    assert_eq!(
+        w.k.0.lock().left,
+        [(
+            h.pid,
+            ExecqStopped {
+                start_ns: h.start_ns,
+                stop_ns: 1
+            }
+        )],
+        "the new process's entry was rewritten or removed"
+    );
 }
