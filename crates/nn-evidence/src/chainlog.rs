@@ -2276,16 +2276,27 @@ fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
 /// reads a head ([`crate::chain_anchor::check_head`]: a window growing from
 /// 64 KiB to 16 MiB); a fixed 64 KiB window called an intact line of 64 KiB
 /// or more "not held".
+///
+/// Lot 314 (the third bug hunt, BUG-107): no line ends at byte 0. A head
+/// there names nothing written — the genesis, held without a read — or,
+/// when another hash, not a line of this file: [`head_line`] says which
+/// line a head names. It answered `true` for any hash without reading.
 pub fn holds_line_ending_at(path: &Path, bytes: u64, entry_hash: &str) -> Result<bool> {
     if bytes == 0 {
-        return Ok(true);
+        return Ok(entry_hash == GENESIS_PREV_HASH);
     }
     let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let len = f.metadata()?.len();
     if len < bytes {
         return Ok(false);
     }
-    let Some(line) = crate::chain_anchor::line_ending_at(&mut f, bytes)? else {
+    line_at_has_hash(&mut f, bytes, entry_hash)
+}
+
+/// Whether the line of `f` ending at byte `end` (`0 < end <=` its length)
+/// carries `entry_hash`.
+fn line_at_has_hash(f: &mut std::fs::File, end: u64, entry_hash: &str) -> Result<bool> {
+    let Some(line) = crate::chain_anchor::line_ending_at(f, end)? else {
         return Ok(false);
     };
     let v: serde_json::Value = match serde_json::from_slice(&line) {
@@ -2293,6 +2304,37 @@ pub fn holds_line_ending_at(path: &Path, bytes: u64, entry_hash: &str) -> Result
         Err(_) => return Ok(false),
     };
     Ok(v.get("entry_hash").and_then(|h| h.as_str()) == Some(entry_hash))
+}
+
+/// Lot 314 (the third bug hunt, BUG-107): the line a rotating chain's head
+/// (`file`, `bytes`, `entry_hash`, as [`RotatingChainLog::position`] and
+/// [`RotatingChainLog::last_hash`] give it) names — `(file, Some(end))`: the
+/// line of `file` ending at byte `end`; `(file, None)`: the last line of
+/// archive `file`. Right after a rotation the head is (N, 0, H): the active
+/// file N is empty and H is the terminator that closed archive N-1, at that
+/// archive's end; a reader of (N, 0) held it without reading anything, so
+/// the archive's tail could be cut under it. A head rooted at the genesis
+/// names nothing written, and (`file` 1 or less, 0) is read as it is
+/// ([`holds_line_ending_at`]: only the genesis holds there).
+pub fn head_line(file: u64, bytes: u64, entry_hash: &str) -> (u64, Option<u64>) {
+    if bytes == 0 && file > 1 && entry_hash != GENESIS_PREV_HASH {
+        (file - 1, None)
+    } else {
+        (file, Some(bytes))
+    }
+}
+
+/// Lot 314 (BUG-107): whether the last line of the chain file at `path` is
+/// the line whose entry hash is `entry_hash` — the terminator a head named
+/// right after a rotation ([`head_line`]). An empty file holds no line.
+/// `Err`: the file cannot be read.
+pub fn holds_last_line(path: &Path, entry_hash: &str) -> Result<bool> {
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    line_at_has_hash(&mut f, len, entry_hash)
 }
 
 /// R12c (lab PR 270): the fsync [`RotatingChainLog::detach_sync`] left to
@@ -5915,6 +5957,41 @@ mod tests {
         }
         assert_eq!(plain_ts(&serde_json::json!({ "ts": 5 })), None);
         assert_eq!(plain_ts(&serde_json::json!({})), None);
+    }
+
+    // ── lot 314: the third bug hunt (BUG-107) ──
+
+    /// BUG-107: a head names the line it names. (N, 0, H) right after a
+    /// rotation is the last line of archive N-1; a head of nothing written
+    /// (the genesis) is read as it is; no line ends at byte 0, so only the
+    /// genesis holds there; an empty file holds no last line.
+    #[test]
+    fn a_head_at_byte_0_names_the_previous_archive_s_last_line() {
+        assert_eq!(head_line(3, 0, "hhhh"), (2, None));
+        assert_eq!(head_line(3, 120, "hhhh"), (3, Some(120)));
+        assert_eq!(head_line(3, 0, GENESIS_PREV_HASH), (3, Some(0)));
+        assert_eq!(head_line(1, 0, GENESIS_PREV_HASH), (1, Some(0)));
+        assert_eq!(head_line(1, 0, "hhhh"), (1, Some(0)));
+        assert_eq!(head_line(0, 0, "hhhh"), (0, Some(0)));
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("c.jsonl");
+        assert!(
+            holds_line_ending_at(&p, 0, GENESIS_PREV_HASH).unwrap(),
+            "no read"
+        );
+        fs::write(&p, "").unwrap();
+        assert!(!holds_line_ending_at(&p, 0, "hhhh").unwrap());
+        assert!(!holds_last_line(&p, "hhhh").unwrap(), "an empty file");
+        let a = r#"{"entry_hash":"aaaa"}"#;
+        let t = r#"{"rotate":{},"entry_hash":"tttt"}"#;
+        fs::write(&p, format!("{a}\n{t}\n")).unwrap();
+        assert!(holds_last_line(&p, "tttt").unwrap());
+        assert!(!holds_last_line(&p, "aaaa").unwrap(), "not the last line");
+        fs::write(&p, format!("{a}\n")).unwrap();
+        assert!(!holds_last_line(&p, "tttt").unwrap(), "its tail cut");
+        fs::write(&p, format!("{a}\n{t}\n{a}\n")).unwrap();
+        assert!(!holds_last_line(&p, "tttt").unwrap(), "a line after it");
+        assert!(holds_last_line(&dir.path().join("none"), "tttt").is_err());
     }
 
     // ── lot 298: the external bug hunt's verifier and readers (BUG11, 28, 29) ──
