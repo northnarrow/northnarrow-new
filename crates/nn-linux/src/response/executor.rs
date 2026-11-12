@@ -147,7 +147,7 @@ impl Executor {
     /// External audit CMB-017: a quarantine (and any repair of this
     /// executor's vault index) in the signed audit log — the vault id, the
     /// path, the content's SHA-256 and size, the process.
-    fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
+    pub(super) fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
         let notes = quarantine::take_index_notes(&self.config.quarantine_dir);
         // Lot 312 (review F1): an inode neutralized in place is recorded
         // too, with what was done, `partial` when its content is kept.

@@ -12,12 +12,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `docs/operator/COMBAT_RECOVERY.md` §3.5). A payload an unprivileged user
   named `x (deleted)` was killed by NEUTRALIZE and left on disk, runnable,
   recorded as "no binary on disk": whether a binary is gone is now the
-  held inode's `st_nlink`. A name is removed only when it is the file's
-  only name and the file is the offender's own; a shared file (a package
-  store's hard links) or another user's is never emptied — made mode 000
-  where the agent may, the row partial with owner and link count — and a
-  restore puts content and mode back into the same file, every name of
-  it. A user with a delegated cgroup subtree (`user@<uid>.service`) made a
+  held inode's `st_nlink`. The quarantine does to a file only what the
+  offender could have done itself: never the system's own files, judged by
+  identity (the dynamic loaders, the shells, init, sshd, the agent's
+  binaries) whatever name leads to them — a user namespace's bind of
+  `/usr/bin` no longer reaches them; a non-root offender only its own
+  files, a root offender any file under a verified name, never a
+  root-owned file without one. A name is removed only when it is the
+  file's only name; a shared file (a package store's hard links) is never
+  emptied — made mode 000 where the agent may (partial), else only vaulted
+  (a failure) — and a restore puts content and mode back into the same
+  file, every name of it. A user with a delegated cgroup subtree (`user@<uid>.service`) made a
   cgroup named as the agent's blocked scope and the soft egress block
   answered `Blocked`, moved nothing and filtered nothing: the agent's
   scopes and the SSH unit are now compared by components from the cgroup

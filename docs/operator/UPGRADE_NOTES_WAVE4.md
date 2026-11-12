@@ -1232,17 +1232,22 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   record's `response` reads `BlockOutbound (not in effect: …)`. A SIEM rule
   keyed on the bare action name as success is unaffected: these rows are
   `failure` (`COMBAT_RECOVERY.md` §3.5).
-- **The quarantine removes a binary's name only when it is its only name
-  and the file is the offender's own.** A shared file (a package store's
-  hard links) or another user's is never emptied: made mode 000 where the
-  agent may, its content kept, the row `partial` naming the owner and the
-  link count; the offender's own file under a name the agent cannot verify
-  is emptied in place. `nn-admin response restore` of those puts content
-  and mode back into the same file — every name of it — and creates no
-  name (without a verified name: `--to` any current name of the file). A
-  root-owned one is no longer left as it was. NEUTRALIZE's text for an
-  offender gone before its binary was opened is now "binary not
-  quarantined: the process exited before NEUTRALIZE could open it".
+- **The quarantine does to a file only what the offender could have done
+  itself.** Never the system's own files, by identity (the dynamic
+  loaders, the shells, init, sshd, the agent's binaries), whatever name
+  leads to them; a non-root offender only a file it owns; a root offender
+  any file under a verified name; never a root-owned file reached through
+  a name that cannot be verified. Otherwise `refused`, the owner named. A
+  name is removed only when it is the file's only name; a shared file (a
+  package store's hard links) is made mode 000 where the agent may, its
+  content kept (`partial`), or, where its mode cannot change, only vaulted
+  (`failure`); the offender's own file under an unverified name is emptied
+  in place. `nn-admin response restore` of those puts content and mode
+  back into the same file — every name of it — and creates no name
+  (without a verified name: `--to` any current name of the file).
+  NEUTRALIZE's text for an offender gone before its binary was opened is
+  now "binary not quarantined: the process exited before NEUTRALIZE could
+  open it".
 - **A soft block of a process holding sockets is partial**: "new
   connections blocked; N inet socket(s) opened before the move are not",
   and the INVESTIGATE window is the short one.

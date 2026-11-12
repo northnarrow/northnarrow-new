@@ -345,30 +345,36 @@ success. Not read back yet: the nft ruleset once applied in an episode
   memfd or a binary unlinked while it ran — vaulted then as evidence, up
   to 16 MiB), never on the ` (deleted)` the kernel appends to
   `/proc/<pid>/exe`: a payload named `x (deleted)` is quarantined like any
-  other. A name is removed — the content left to the vault — only when it
-  is the file's only name and the file is the offender's own (owned by the
-  uid it acted as). Otherwise the file is neutralized where it is, its
-  names kept:
-  - the offender's own file with no other name, whose name the agent could
-    not verify (`ln a .b; rm a`) or not remove: emptied through the
-    agent's descriptor, read back empty (`success`);
-  - a shared file (a package store's binary hard-linked into
-    environments, as conda, pnpm or uv do) or another user's: never
-    emptied. Made mode 000 under every name where the agent may change its
-    mode, its content kept; the row is `partial` and names the owner and
-    the link count. The unit has no `CAP_FOWNER`, so a file the agent does
-    not own keeps its mode and the row says `NOT made unusable … still
-    runnable`.
-  `nn-admin response restore` of such an entry puts the content and the
-  mode back into that same file (checked by device, inode and birth
-  time), so every name of it comes back; it creates no name. Without a
-  verified name, give `--to` any current name of the file. A name the
-  agent could not verify (another mount namespace's, a name swapped
-  meanwhile) is never judged by the protected prefixes; the file itself
-  is, by identity (the agent's own files are refused). A binary
-  NEUTRALIZE could not open is said so (`NOT quarantined: its binary could
-  not be opened (…)`); `binary not quarantined: the process exited before
-  NEUTRALIZE could open it` replaces the earlier "no binary on disk".
+  other. The quarantine does to the file only what the offender could have
+  done itself:
+  - never the system's own files, recognized by identity (device and
+    inode), whatever name leads to them: the dynamic loaders, the shells,
+    init and systemd, sshd, the agent's own binaries (`refused: a
+    protected system file`); a verified name under the protected prefixes
+    is refused too, as before;
+  - a non-root offender, only a file it owns; a root offender, any file
+    under a VERIFIED name (the payload a user dropped and root ran); never
+    a root-owned file reached through a name the agent cannot verify (a
+    mount namespace's bind of the host's binaries). Otherwise: `refused`,
+    the owner named, nothing touched;
+  - a name is removed — the content left to the vault — when it is the
+    file's only name. Otherwise the file is neutralized where it is, its
+    names kept: emptied when it has no other link (its name not verified,
+    or not removed), read back empty (`success`); a shared file (a package
+    store's binary hard-linked into environments, as conda, pnpm or uv do)
+    is never emptied — made mode 000 under every name where the agent may
+    change its mode, its content kept, the row `partial` with the owner and
+    the link count; where the mode cannot be changed (the unit has no
+    `CAP_FOWNER`) nothing changed but the vault, and the row is a
+    `failure`.
+  `nn-admin response restore` of an entry neutralized in place puts the
+  content and the mode back into that same file (checked by device, inode
+  and birth time), so every name of it comes back; it creates no name.
+  Without a verified name, give `--to` any current name of the file. A
+  binary NEUTRALIZE could not open is said so (`NOT quarantined: its
+  binary could not be opened (…)`); `binary not quarantined: the process
+  exited before NEUTRALIZE could open it` replaces the earlier "no binary
+  on disk".
 - **Soft egress block (BlockOutbound).** The agent's scope is
   `/<slice>/blocked.scope` from the cgroup root, compared by components: a
   cgroup a user names `northnarrow.slice/blocked.scope` in the subtree

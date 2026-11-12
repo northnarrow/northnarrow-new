@@ -514,3 +514,40 @@ fn a_kill_of_a_target_not_captured_fails_with_the_capture_s_error() {
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 }
+
+/// Re-check of #543 (N2): the signed row of a quarantine whose only effect
+/// was the vault is a `failure`; mode 000 with the content kept is
+/// `partial`; an emptied file is `success`.
+#[test]
+fn an_in_place_quarantine_is_signed_by_what_it_left() {
+    use super::quarantine::InPlaceEffect as E;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let key =
+        crate::audit::AgentSigningKey::load_or_bootstrap(&tmp.path().join("agent.sig")).unwrap();
+    let log = std::sync::Arc::new(parking_lot::Mutex::new(
+        crate::audit::AuditLog::open(&tmp.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+    ));
+    let exec = Executor::with_config(cfg);
+    exec.set_audit_log(log);
+    for effect in [E::Unchanged, E::MadeUnusable, E::Emptied] {
+        exec.record_quarantine(
+            42,
+            &ExecutionOutcome::QuarantinedInPlace {
+                vault_id: "00000000000000000000000000000000".into(),
+                original_path: None,
+                detail: format!("{effect:?}"),
+                effect,
+            },
+        );
+    }
+    let results: Vec<String> = std::fs::read_to_string(tmp.path().join("audit.log"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["op"] == "response_quarantine")
+        .map(|r| r["result"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(results, ["failure", "partial", "success"]);
+}

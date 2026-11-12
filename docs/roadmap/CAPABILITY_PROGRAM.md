@@ -9542,6 +9542,27 @@ number in parentheses is a lab PR.
     the three privileged tests passed. The round showed the containment row
     of that partial block still signed `success`: fixed after it (`partial`,
     with the count).
+  - The re-check of #543 found the F5 change a P1 (N1): with no verified
+    name the prefixes were skipped, so a user namespace's bind of the
+    host's `/usr/bin` let an unprivileged user have the agent set `bash`, or
+    the dynamic loader, to mode 000 for the whole host; and a regression
+    (N2): a root offender's payload dropped by another user stayed, signed
+    `partial` though nothing changed. Now the quarantine does to a file only
+    what the offender could do itself: the system's own files (the loaders,
+    the shells, init, sshd, the agent's binaries) refused by identity
+    whatever the name; a non-root offender only its own files; a root
+    offender any file under a verified name; never a root-owned file
+    without one; a vault-only quarantine signed a failure. Eleven targeted
+    mutations, all caught (one after a test was added). Measured on our
+    Ubuntu 24.04 guest (lease k312) at b30b21a2, a real COMBAT each time:
+    a `www-data` payload named `x (deleted)` run by root removed
+    (`quarantined`); the hidden-link variant, root's or `www-data`'s file,
+    refused and left whole (mode 755, the owner named); `bash` of the host
+    reached through a private bind of `/usr/bin` over `/usr/local/bin`
+    refused by identity, `/usr/bin/bash` still 755, and `python3` through
+    the same bind refused as root's file with no verified name; the store
+    binary with three links mode 000, content kept (`partial`); the three
+    privileged tests passed.
   - Levels unchanged: C17 stays 2 — the lot makes its outcomes truthful on
     the cases above, on two kernels; the soft block's established-socket
     hole stays open (above).
