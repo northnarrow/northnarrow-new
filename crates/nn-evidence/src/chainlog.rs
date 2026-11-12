@@ -1579,7 +1579,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             seq = next_free_candidate(&self.active_path, seq);
         }
         self.next_seq = seq;
-        self.foreign_before_seal = self.foreign_slots(start, seq);
+        self.foreign_before_seal = self.taken_slots(start, seq);
         let term = TerminatorLine::sealed(
             RotateTerminator {
                 fmt_ver: CHAINLOG_FMT_V3,
@@ -1803,20 +1803,33 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// manifest is read only when a name below `seq` is not one of this
     /// log's archives (an open's common case reads archives' last lines
     /// alone).
+    ///
+    /// The review of #544 (F1): a terminator signed with another key counts
+    /// as the log's own only when the manifest holds no `Rotated` row this
+    /// key verifies — the case of a regenerated key, whose archives all
+    /// predate it. With such a row, a slot above it holds nothing this log
+    /// sealed under another key, and a forged terminator there (its hash
+    /// recomputes: the pre-image is public) is a foreign entry.
     fn unattested_foreign_slots(&self, seq: u64) -> Vec<(u64, &'static str, u64)> {
-        let found = self.foreign_names(0, seq);
+        let found = self.foreign_names(0, seq, false);
         if found.is_empty() {
             return found;
         }
         let pk = self.key.verifying_key();
         let tail = manifest_tail_events::<K::Host>(&self.active_path, P::KIND, &pk);
-        let from = tail
-            .iter()
-            .find_map(|e| match e {
-                ManifestEvent::Rotated { seq: r, .. } if *r < seq => Some(r + 1),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let rotated = tail.iter().find_map(|e| match e {
+            ManifestEvent::Rotated { seq: r, .. } if *r < seq => Some(r + 1),
+            _ => None,
+        });
+        let found = match rotated {
+            Some(_) => found,
+            // no rotation this key verifies: an earlier key's archives
+            None => found
+                .into_iter()
+                .filter(|(s, kind, _)| *kind != "file" || !self.is_own_archive(*s, true))
+                .collect(),
+        };
+        let from = rotated.unwrap_or(0);
         let attested: BTreeSet<u64> = tail
             .iter()
             .filter_map(|e| match e {
@@ -1852,22 +1865,40 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         }
     }
 
-    /// Lot 319 (BUG28): the entries at the archive names `from..to` that are
-    /// not this log's archives (not a regular file ending in this log's
-    /// terminator for its seq — `lstat`, a link never followed):
-    /// `(seq, kind, lstat size)`, at most [`MAX_FOREIGN_ATTESTED`].
-    fn foreign_slots(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
-        self.capped(self.foreign_names(from, to))
+    /// Lot 319 (BUG28; the review of #544, F1): every entry at the archive
+    /// names `from..to` — the rotation's probe range, above every archive
+    /// this writer sealed: each name there is foreign, as on `main` (no
+    /// terminator read: a forged one would pass): `(seq, kind, lstat
+    /// size)`, at most [`MAX_FOREIGN_ATTESTED`].
+    fn taken_slots(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
+        let seqs = list_archive_seqs(&self.active_path).unwrap_or_default();
+        self.capped(
+            seqs.into_iter()
+                .filter(|s| (from..to).contains(s))
+                .filter_map(|seq| {
+                    let (kind, bytes) = slot_kind(&archive_path(&self.active_path, seq))?;
+                    Some((seq, kind, bytes))
+                })
+                .collect(),
+        )
     }
 
-    /// [`Self::foreign_slots`] without the bound.
-    fn foreign_names(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
+    /// The entries at the archive names `from..to` that are not this log's
+    /// archives ([`Self::is_own_archive`]; `earlier_key`: an earlier key's
+    /// terminator counts too), without the bound.
+    fn foreign_names(
+        &self,
+        from: u64,
+        to: u64,
+        earlier_key: bool,
+    ) -> Vec<(u64, &'static str, u64)> {
         let seqs = list_archive_seqs(&self.active_path).unwrap_or_default();
         seqs.into_iter()
             .filter(|s| (from..to).contains(s))
             .filter_map(|seq| {
                 let (kind, bytes) = slot_kind(&archive_path(&self.active_path, seq))?;
-                (kind != "file" || !self.is_own_archive(seq)).then_some((seq, kind, bytes))
+                (kind != "file" || !self.is_own_archive(seq, earlier_key))
+                    .then_some((seq, kind, bytes))
             })
             .collect()
     }
@@ -1888,11 +1919,11 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
 
     /// Lot 319 (BUG28): whether archive `seq` is this log's — its last line
     /// (within [`OWN_TERMINATOR_WINDOW`]) is a terminator of this log naming
-    /// `seq`, verified with this writer's key, or with its hash recomputing
-    /// under another key (an archive sealed before the key was
-    /// regenerated). A sealed archive whose `Rotated` row the manifest lacks
-    /// (the row failed, BUG-030's degrade) is one.
-    fn is_own_archive(&self, seq: u64) -> bool {
+    /// `seq`, verified with this writer's key, or — `earlier_key` — with its
+    /// hash recomputing under another key (an archive sealed before the key
+    /// was regenerated). A sealed archive whose `Rotated` row the manifest
+    /// lacks (the row failed, BUG-030's degrade) is one.
+    fn is_own_archive(&self, seq: u64, earlier_key: bool) -> bool {
         let path = archive_path(&self.active_path, seq);
         let Ok(mut f) = K::Host::open_read_nofollow(&path) else {
             return false;
@@ -1918,7 +1949,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             // another key: an archive of this log written before the key
             // was regenerated (`chain verify` reports its signature), not a
             // name planted in a slot.
-            LineCheck::BadSignature => {
+            LineCheck::BadSignature if earlier_key => {
                 serde_json::from_slice::<serde_json::Value>(last).is_ok_and(|v| {
                     v.get("rotate")
                         .and_then(|r| r.get("this_seq"))
@@ -1926,7 +1957,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                         == Some(seq)
                 })
             }
-            LineCheck::Invalid => false,
+            LineCheck::BadSignature | LineCheck::Invalid => false,
         }
     }
 
@@ -2520,7 +2551,7 @@ pub fn repair_torn_tail<H: ChainHost>(
     if is_line(&fragment) {
         f.seek(SeekFrom::End(0))?;
         f.write_all(b"\n")?;
-        f.sync_all()?;
+        synced_or_said::<H>(&f, path);
         return Ok(Some(TailRepair::Terminated));
     }
     if fragment_start == 0 {
@@ -2531,12 +2562,29 @@ pub fn repair_torn_tail<H: ChainHost>(
     }
     f.set_len(fragment_start)
         .with_context(|| format!("truncating the torn tail of {}", path.display()))?;
-    f.sync_all()?;
+    synced_or_said::<H>(&f, path);
     Ok(Some(TailRepair::Truncated {
         kept_len: fragment_start,
         dropped_len: fragment.len() as u64,
         dropped_sha256: sha256_hex(&fragment),
     }))
+}
+
+/// The review of #544 (F5): the fsync after a repair. The change is made
+/// (the cache holds it) when its fsync fails: the repair is returned all the
+/// same, so that it is signed — dropped with the error, the next look found
+/// a file ending in a newline and the cut was never attested. A crash before
+/// the change reaches the disk brings the fragment back, and the next open
+/// repairs and attests it again.
+fn synced_or_said<H: ChainHost>(f: &std::fs::File, path: &Path) {
+    if let Err(e) = H::sync_all(f) {
+        warn!(
+            error = %e,
+            path = %path.display(),
+            "chain log: the repair of a torn tail is made but its fsync failed; it is attested \
+             all the same"
+        );
+    }
 }
 
 impl TailRepair {
@@ -8495,5 +8543,90 @@ mod tests {
             .map(|(s, k, _)| (s, k))
             .collect();
         assert_eq!(rows, vec![(2, "file".to_string())]);
+    }
+
+    /// The review of #544 (F1, a regression against `main`): root plants at
+    /// the next archive name a file ending in a rotation terminator for that
+    /// seq — its hash recomputes (the pre-image is public), signed with any
+    /// key. The rotation's probe took it for an archive sealed under an
+    /// earlier key and attested nothing; `main` attested every taken slot
+    /// from `next_seq` up. Every name in the probe's range is foreign; at
+    /// the open, above a `Rotated` row this key verifies, such a terminator
+    /// is foreign too.
+    #[test]
+    fn a_forged_terminator_at_the_next_slot_is_foreign() {
+        fn forged(active: &Path, other: &Path, seq: u64) {
+            let term = TerminatorLine::sealed(
+                RotateTerminator {
+                    fmt_ver: CHAINLOG_FMT_V3,
+                    this_seq: seq,
+                    next_seq: seq + 1,
+                    record_count: 0,
+                    bytes: 0,
+                },
+                &key_at(other),
+                GENESIS_PREV_HASH,
+                TestPayload::KIND,
+                &SystemClock,
+            )
+            .unwrap();
+            fs::write(archive_path(active, seq), to_jsonl(&term).unwrap()).unwrap();
+        }
+        // the probe: planted while the log is open
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let other = dir.path().join("other-key");
+        let mut log = open_log(&active, &kp, 2000);
+        forged(&active, &other, 1);
+        rotate_until(&mut log, &active, 2, 0);
+        drop(log);
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![1, 2]);
+        let rows: Vec<u64> = foreign_rows(&active)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert_eq!(rows, vec![1], "the forged slot is attested by the rotation");
+        // the open: planted while the log is closed, above a verified
+        // `Rotated` row
+        forged(&active, &other, 3);
+        let mut log = open_log(&active, &kp, 2000);
+        log.append(payload(900)).unwrap();
+        drop(log);
+        let rows: Vec<u64> = foreign_rows(&active)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert_eq!(rows, vec![1, 3], "and at the open");
+    }
+
+    /// The review of #544 (F5, its cheap part): the fsync after a cut fails.
+    /// The cut is made; it is returned all the same — dropped with the
+    /// error, the next look found a whole file and the cut was never signed.
+    #[test]
+    fn a_cut_whose_fsync_failed_is_still_returned_for_its_attestation() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("flat.jsonl");
+        fs::write(&p, b"{\"n\":1}\n{\"n\":").unwrap();
+        host::fail_next_sync();
+        let r = repair_torn_tail::<host::FaultyHost>(&p, parses).unwrap();
+        assert!(
+            matches!(
+                r,
+                Some(TailRepair::Truncated {
+                    kept_len: 8,
+                    dropped_len: 5,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert_eq!(fs::read(&p).unwrap(), b"{\"n\":1}\n");
+        // a whole last line without its newline: closed, returned too
+        fs::write(&p, b"{\"n\":1}\n{\"n\":2}").unwrap();
+        host::fail_next_sync();
+        let r = repair_torn_tail::<host::FaultyHost>(&p, parses).unwrap();
+        assert_eq!(r, Some(TailRepair::Terminated));
+        assert_eq!(fs::read(&p).unwrap(), b"{\"n\":1}\n{\"n\":2}\n");
     }
 }

@@ -9190,7 +9190,8 @@ number in parentheses is a lab PR.
     fix): 28 — a rotation's probe jumps past every archive name on disk,
     and a foreign name it jumped over was never attested; one planted while
     the log was closed sits below the next seq and no rotation probes it
-    (attested at the open now); 06 — the backdated head of an archive (the
+    (attested at the open now, above the last `Rotated` row the manifest
+    holds); 06 — the backdated head of an archive (the
     same rule, per file); 12 — `fim report`/`net flows --since` past year
     9999 or 2^63 kept every row (`unix_ts as i64`, or `+10000-…` sorting
     before every row), and `detections --since/--until` likewise (`s as
@@ -9237,3 +9238,22 @@ number in parentheses is a lab PR.
       slots and the export's open are measured by the tests only (they need
       a rotated log with an archive made unremovable, or root's planting in
       the protected state directory).
+  - The independent review of #544 (verdict: merge; no P0–P2), its cheap
+    fixes in this PR: the rotation's probe takes every name in its range
+    for a foreign entry again, as `main` did — a planted file ending in a
+    forged terminator (its hash recomputes, signed with any key) passed the
+    "earlier key" rule and went unattested (test
+    `a_forged_terminator_at_the_next_slot_is_foreign`); an earlier key's
+    terminator counts as the log's own only when the manifest holds no
+    `Rotated` row this key verifies. The `time_bounds` ratchet catches the
+    cast it was written for (`.map(|s| s as i64)` on a time-named receiver),
+    a time-named call (`d.as_secs() as i64`: one site fixed in
+    `module_writes.rs`), `ts`, `…_ns`, `ttl`, `deadline`, `timeout` and
+    parenthesised expressions, over every crate (`common`, `cli`, `scan`
+    too). A repair's cut whose fsync fails is still returned and signed, and
+    the repairs dropped past the bound are counted in a signed row
+    (`chain_repairs`). The docs say what is left: names planted below the
+    last `Rotated` row, a clock step-back across a rotation, the shippers'
+    empty-line setting. In the backlog: the durability of a run-time cut's
+    record across a restart (F5's rest), the stall's end signed and a
+    transient listing failure (F7), the open's archive reads (F8).

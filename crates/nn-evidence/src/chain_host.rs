@@ -261,6 +261,12 @@ pub(crate) mod testing {
         FAULTS.with(|f| f.borrow_mut().push(fault));
     }
 
+    /// The next fsync on this thread fails (`EIO`), whatever it syncs (the
+    /// review of #544: the fsync after a repair's cut).
+    pub(crate) fn fail_next_sync() {
+        SYNC_FAILS_NEXT.with(|s| s.set(true));
+    }
+
     /// The faults armed and not fired yet on this thread.
     pub(crate) fn armed() -> usize {
         FAULTS.with(|f| f.borrow().len())

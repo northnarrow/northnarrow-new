@@ -170,8 +170,10 @@ Before lot 296 the batch's first record was glued to that start —
 delivered, its cursor moved past it, and no longer a line of its own. A
 worker that ended in the middle of a line is handled at the next sink's
 open (lot 319): a non-empty active file gets a newline before the first
-record, an empty line when the file had ended whole — shippers skip empty
-lines, and so does `nn-admin export verify`.
+record, an empty line when the file had ended whole. `nn-admin export
+verify` skips empty lines; configure your shipper to skip them too (Fluent
+Bit's `tail` input: `Skip_Empty_Lines On` — off by default, and with a JSON
+parser the empty line becomes an event that is no record).
 
 A signed configuration with **fewer or smaller files** holds from the
 sink's open, at the next start: the `export.jsonl.N` an earlier
@@ -457,8 +459,9 @@ fuzz/Cargo.lock): the lot's note lists them.
   file ends, so a sink opened on a non-empty file closes the line before
   its first record (lot 319, third bug hunt, BUG31's partial; lot 296 closes
   the one a failed write of the running worker leaves): a file that ended
-  whole gets one empty line at each start of the export, which the
-  shippers and `nn-admin export verify` skip. Before lot 319 the first
+  whole gets one empty line at each start of the export, which `nn-admin
+  export verify` skips (a shipper skips it when configured to: §3). Before
+  lot 319 the first
   record was glued to that start, and neither was readable.
 - No client certificate (mTLS): the receiver is authenticated, the agent
   is by its signed rows only.

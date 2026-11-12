@@ -31,8 +31,9 @@
 //! `read` of them, and the file is opened write-only), so it does not know
 //! how the file it opens ends: a sink opened on a non-empty file closes the
 //! line before its first record — a fragment ends there, and a file that
-//! ended whole gets one empty line, which the shippers and `nn-admin export
-//! verify` skip. A record is never glued to a start it does not know of.
+//! ended whole gets one empty line, which `nn-admin export verify` skips (a
+//! shipper when configured to: Fluent Bit's `Skip_Empty_Lines`). A record is
+//! never glued to a start it does not know of.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(s.dropped_files, 2);
         // a reopened sink appends to the active file — lot 319 (BUG31's
         // partial): after closing the line it cannot know was whole (one
-        // empty line, which the shippers skip)
+        // empty line, which `nn-admin export verify` skips)
         drop(s);
         let mut s = JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
         assert_eq!(s.size(), 10);
@@ -526,7 +527,7 @@ mod tests {
     /// its first record was glued to that start: one line, neither record
     /// readable. A sink opened on a non-empty file closes the line first: a
     /// fragment ends there, a file that ended whole gets one empty line
-    /// (which the shippers skip), never a glued record.
+    /// (which `nn-admin export verify` skips), never a glued record.
     #[test]
     fn a_fragment_left_by_a_dead_writer_is_closed_at_open() {
         let d = tempfile::tempdir().unwrap();

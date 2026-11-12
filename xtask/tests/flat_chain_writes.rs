@@ -22,7 +22,11 @@
 //! code's.
 //!
 //! The scan is lexical (comments blanked, test items and test files left
-//! out). The rule is shown failing on a planted violation.
+//! out). The rule is shown failing on a planted violation. It sees an
+//! append-open, not every append: a writer that opens with `.write(true)`
+//! and seeks to the end, or writes at an offset (`pwrite`), passes it — the
+//! review of #544 noted it; such a writer is a chain crate's own (the
+//! manifest's repair writes in place through `ChainHost::write_all_at`).
 
 mod support;
 
@@ -58,8 +62,15 @@ const ROW: &str = "entry_hash";
 /// An open to append.
 const APPEND: &[&str] = &[".append(true)", "O_APPEND"];
 
-/// The crates' sources scanned.
-const ROOTS: &[&str] = &["crates", "agent/src", "watchdog/src"];
+/// The crates' sources scanned: every crate of the workspace.
+const ROOTS: &[&str] = &[
+    "crates",
+    "agent/src",
+    "watchdog/src",
+    "common",
+    "cli",
+    "scan",
+];
 
 /// `true` when `code` (a production file's text) holds a row and an
 /// append-open.

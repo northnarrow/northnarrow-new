@@ -1170,12 +1170,16 @@ configure; use the `nn-admin` of this release where the export is checked.
 - **Foreign entries at archive names**: one `ForeignArchive` row each in
   the log's manifest — new for those a rotation jumped over, those below a
   rotation a crash interrupted, and those planted while the agent was
-  stopped (at the next start). Each is still refused by `nn-admin chain
-  verify`; the row says the agent saw it.
+  stopped above the last rotation the manifest records (at the next
+  start). Each is still refused by `nn-admin chain verify`; the row says
+  the agent saw it.
 - **The JSONL export**: each start of the export on a non-empty
   `export.jsonl` writes a newline before its first record — one empty line
-  when the file had ended whole. Shippers and `nn-admin export verify`
-  skip empty lines; a reader that counts lines counts one more per start.
+  when the file had ended whole. `nn-admin export verify` skips empty
+  lines; configure your shipper to skip them (Fluent Bit's `tail` input:
+  `Skip_Empty_Lines On`; its default is off, and with a JSON parser the
+  empty line is an event that is no record). A reader that counts lines
+  counts one more per start.
 - **`--since` and `--until`**: a value past any row's time (beyond year
   9999, or 2^63 seconds and more) keeps no row for `fim report` and `net
   flows`, and is the farthest time for `detections`; `nn-admin heartbeat

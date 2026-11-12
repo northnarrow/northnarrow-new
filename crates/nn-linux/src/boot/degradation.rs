@@ -218,6 +218,10 @@ pub fn attach_audit_log(log: Option<Arc<Mutex<AuditLog>>>) -> usize {
     flush()
 }
 
+/// Lot 319 (the review of #544, F5): the source of the signed count of the
+/// flat chains' repairs dropped past [`MAX_KEPT`].
+pub const REPAIRS_DROPPED: &str = "chain_repairs";
+
 /// Lot 319: a torn tail a flat chain's writer cut or closed at run time
 /// (after a failed write, [`crate::flat_chain::FlatFile::heal`]), to be
 /// signed in the audit chain as the open's repairs are (`chain_tail_repaired`,
@@ -257,7 +261,13 @@ fn sign_repairs(wait: bool) -> usize {
             None => return 0,
         }
     };
-    let pending = std::mem::take(&mut REGISTRY.lock().repairs);
+    let (pending, dropped) = {
+        let mut r = REGISTRY.lock();
+        (
+            std::mem::take(&mut r.repairs),
+            std::mem::take(&mut r.repairs_dropped),
+        )
+    };
     let mut written = 0;
     let mut failed = Vec::new();
     for (file, repair) in pending {
@@ -269,7 +279,26 @@ fn sign_repairs(wait: bool) -> usize {
             }
         }
     }
+    // The review of #544 (F5): the repairs dropped past the bound are said in
+    // the next signed row — their count, as a degradation of this run.
+    let dropped_said = dropped == 0
+        || sign_into(
+            &mut log,
+            REPAIRS_DROPPED,
+            &format!(
+                "{dropped} run-time repair(s) of the flat chains not signed: more than {MAX_KEPT} \
+                 waited for the audit log"
+            ),
+            false,
+        );
     drop(log);
+    if dropped > 0 {
+        if dropped_said {
+            written += 1;
+        } else {
+            REGISTRY.lock().repairs_dropped += dropped;
+        }
+    }
     if !failed.is_empty() {
         // Tried again at the next flush, before the ones that came since.
         let mut r = REGISTRY.lock();
@@ -574,6 +603,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         attach_audit_log(Some(open_log(dir.path())));
         assert_eq!(repaired_rows(dir.path(), "/k319/").len(), MAX_KEPT);
+        // the one dropped is said in the next signed row (the review of
+        // #544, F5)
+        let said: Vec<serde_json::Value> = degraded_rows(dir.path())
+            .into_iter()
+            .filter(|r| r["source"] == REPAIRS_DROPPED)
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 run-time repair(s)"));
         reset_for_tests();
     }
 

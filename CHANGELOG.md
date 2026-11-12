@@ -154,7 +154,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signed, and leaves it when a pass runs again; it was an ERROR at each
   rotation. Every foreign entry at an archive name is attested once: those
   below a rotation a crash interrupted (BUG28), those a rotation jumped
-  over, those planted while the log was closed. The read verbs read on
+  over, those planted while the log was closed above the last rotation its
+  manifest records (the verifier reports the others). The read verbs read on
   past a backdated row at a file's head when the next file's last row is at
   or after `--since` (BUG06), and a `--since` past any row's time keeps no
   row (it kept every one). The JSONL export closes a line a dead worker
