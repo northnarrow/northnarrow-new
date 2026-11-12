@@ -453,7 +453,14 @@ fn a_partial_block_is_signed_partial() {
     ));
     let exec = Executor::with_config(cfg);
     exec.set_audit_log(log);
-    exec.record_contain(42, "blocked", &ExecutionOutcome::BlockedNewOnly { pid: 42, sockets: 2 });
+    exec.record_contain(
+        42,
+        "blocked",
+        &ExecutionOutcome::BlockedNewOnly {
+            pid: 42,
+            sockets: 2,
+        },
+    );
     exec.record_contain(43, "blocked", &ExecutionOutcome::Blocked { pid: 43 });
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(tmp.path().join("audit.log"))
         .unwrap()
