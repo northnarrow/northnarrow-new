@@ -3482,6 +3482,29 @@ mod bug90 {
         assert!(!payload.exists());
     }
 
+    /// Re-check of #543 (N1): a shell the list names — here only there, by
+    /// a name of the test's own — is refused by identity, the offender's
+    /// own file too, and left as it was.
+    #[test]
+    fn n1_a_shell_the_list_names_is_refused_by_identity() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let shell = tmp.path().join("myshell");
+        fs::write(&shell, b"a login shell").unwrap();
+        let list = tmp.path().join("shells");
+        fs::write(&list, format!("# shells\n{}\n", shell.display())).unwrap();
+        let h = ExeHandle::open(&shell).unwrap();
+        SHELLS_AT.with(|s| *s.borrow_mut() = Some(list));
+        let out = quarantine_file(&h, &cfg);
+        SHELLS_AT.with(|s| *s.borrow_mut() = None);
+        assert!(
+            matches!(out, Err(QuarantineError::ProtectedFile)),
+            "{out:?}"
+        );
+        assert_eq!(fs::read(&shell).unwrap(), b"a login shell");
+        assert!(list_vault(&cfg).is_empty(), "nothing vaulted");
+    }
+
     /// Re-check of #543 (N1): the system's own files are refused by
     /// IDENTITY, whatever name leads to them — the dynamic loader, the
     /// shells — the check winning over any name, verified or not.
