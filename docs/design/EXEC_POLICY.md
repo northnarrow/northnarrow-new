@@ -87,11 +87,18 @@ line's device (a btrfs subvolume excepted): a mount point a user swapped for
 a link to another filesystem's root no longer gets that root published. A
 line of the table that is not in the kernel's shape is a degradation
 (`execq_roots_rows`, `execpol_mounts_rows`) while it lasts — a source `-`
-(`fsname=-`) or an empty one is a mount, read as such — and roots the
-kernel's map refuses (64 entries) are one too (`execq_roots_full`,
-`execpol_roots_full`). A degradation that ends within the 15 s before its
-flush is signed at its withdrawal: every one leaves its record in the
-chain.
+(`fsname=-`) or an empty one is a mount, read as such. The roots are
+ranked, the FUSE ones last (a user mounts up to `mount_max`, 1000): when
+the kernel's map (64 entries) is full, a FUSE root it holds gives way to a
+system root mounted after it (another user's `/run/user/<uid>`, an
+automounted `/home`). A root other than a FUSE one that the map still
+refuses is a degradation (`execq_roots_full`, `execpol_roots_full`), its
+text the same whatever the count and standing 5 minutes at least once
+reported (one signed record per hold, however often the count comes and
+goes); a FUSE root left out is no loss — the exec hooks class a FUSE file
+by its magic (lot 318) — and only logged. A degradation that ends within
+the 15 s before its flush is signed at its withdrawal: every one leaves its
+record in the chain.
 
 ## 3. Lineage tiers
 

@@ -56,6 +56,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     fallback; the ratchet is semantic (the tolerant readers, `if let Ok`,
     `unwrap_or*`, `match` arms, paths from consts and fields, each site
     named).
+  - After the re-check: a drop-in or an `EnvironmentFile=` the judge
+    cannot read — a FIFO (systemd reads it from its writer), a socket, a
+    device, a directory, a refused file — is harmful (a signed
+    `unit_dropin_harmful`, a reload withheld), never an empty file; the
+    path is opened `O_PATH` first (no device opened, no FIFO waited on),
+    `/dev/null` (a mask) reads empty. The guarded roots are ranked, the
+    FUSE ones last, so a user's FUSE mounts never keep a system root out
+    of the kernel's map; only a system root refused is a degradation, held
+    5 minutes. The ratchet also catches `is_ok_and`, `map_or`, a
+    `Type::default()` arm, a read defaulted in a later statement, and a
+    second site under a known key.
 - A kill reaches a process whatever it names itself (lot 311, the third
   bug hunt's N6; `docs/operator/RULE_POLICY.md` §6). A process whose `comm`
   is not UTF-8 — set by `prctl(PR_SET_NAME)`, a write to `/proc/self/comm`,

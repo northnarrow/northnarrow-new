@@ -9200,6 +9200,15 @@ number in parentheses is a lab PR.
     root's `stat` refused (`EACCES`) — its line read (no line dropped),
     published as `(dev, 0)` with the class `home`, its files placed by the
     sensors' table by device. Mutation: 20 of 20 caught by a named test.
+  - The re-check of #538 (merge after fixes): G1, opened by the bounded
+    configuration read — a FIFO `EnvironmentFile=` was judged empty while
+    systemd reads it from its writer (C23's `LD_PRELOAD`) — now what the
+    judge cannot read is harmful; G2, the roots ranked (FUSE last) so a
+    user's FUSE mounts never crowd a system root out of the 64-entry map,
+    and only a system root refused is a degradation, held 5 minutes; G3,
+    the ratchet's cheap extensions (helper functions stay a residual).
+    Host tests name each file type, the ranking and the hold; a mutant of
+    each fix is caught by one of them (the PR's body). No level moves.
   - Level unchanged: the exec quarantine and policy stay EXPERIMENTAL (C12,
     C13), and BUG-108's kernel half (the walk to a subvolume's root) is
     lot 9's.
