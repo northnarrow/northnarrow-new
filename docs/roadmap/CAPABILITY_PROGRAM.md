@@ -9231,16 +9231,25 @@ number in parentheses is a lab PR.
     window case (the ring's capacity: the kernel stopped no more once it
     was full), none left in state T, the cgroup not frozen; the eBPF object
     with the new order passed the 7.0 verifier. In run 1, on the fresh
-    guest, the two window cases were refused their start (a second agent
-    in one run against the first's pins): the e2e purges the pin root
-    before each agent now, as the canary and FIM suites do. The PR's CI on
+    guest, the two window cases were refused their start ("not the
+    directory the previous agent protected" — a second agent in one run on
+    a guest no agent had run on before; the purge of the pin root before
+    each agent, as the canary and FIM suites do, did not change it; not
+    this lot's, and not met in the CI, whose earlier suites run agents
+    first). The PR's CI on
     22.04 (5.15) then failed both window cases: the 600 ms hold ate the
     stop's 2 s budget (`stop_deadline`) and the controller's stop was cut
     (no `stopping` entry; the processes left in the pinned map for a next
     start the test never makes). The hook now pauses the ring's reads from
     a file the test creates 300 ms *before* it asks the stop
-    (`NN_DEBUG_EXECQ_PAUSE_READS`), so the stop runs at its own pace;
-    @LAB3@
+    (`NN_DEBUG_EXECQ_PAUSE_READS`), so the stop runs at its own pace. On
+    ubuntu2604 again (ffad8f1c), run 2: the three cases passed — 1,056
+    held in the plain case, 404 processes resumed without an entry in each
+    window case, no stop overran its wait, nothing left in state T; run 1:
+    the plain case passed (and resumed 1 process without an entry, the
+    window met unforced), the two others refused at their start as above.
+    The CI's 24.04 suite on the earlier hook resumed 1 process without an
+    entry in its plain case too.
   - The re-check of #541 (MERGE): the stop also kills a held entry whose
     verdict asks for it, the rules' verdict still awaited (N1, it was
     resumed undecided); `owe_kill` rewrites a pid's entry only when it
