@@ -824,15 +824,7 @@ mod tests {
         let l = [(400, id("/usr/bin/tar", None)), (300, sh()), (1, systemd())];
         // the re-check of #539 (N2): PID 1 FORKED the shell, the kernel's
         // record of its first exec
-        let forked = |by: u32| {
-            [
-                HopFacts::default(),
-                HopFacts {
-                    fork_parent: by,
-                    ..HopFacts::default()
-                },
-            ]
-        };
+        let forked = |by: u32| [HopFacts::default(), HopFacts { fork_parent: by }];
         assert_eq!(
             judge_with(400, Some(&l), &forked(1), false, &distro),
             Judged::Trusted(Trusted::PackagedProgram("/usr/bin/tar".into()))
