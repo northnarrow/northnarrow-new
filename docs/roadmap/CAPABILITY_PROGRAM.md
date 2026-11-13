@@ -9401,6 +9401,33 @@ number in parentheses is a lab PR.
     (9 survivors of the first round got a test each); the differential on
     the host (pkill and killall, unprivileged PID namespace): 0 mismatches;
     the golden case `eva-argv-spellings`; the full gates in the PR.
+  - The independent review of #548 (round 2): a unit glob matched as
+    systemd matches it (`FNM_NOESCAPE`, POSIX classes, a dotted unit as a
+    `.service`) in linear time — the first matcher backtracked and a 21-byte
+    glob of stars held the decision thread for hours; systemd's other verbs
+    that reach a unit (`condstop`, `clean`, `preset`, `revert`, `edit`,
+    `link`, `set-property`, `service-log-*`, `bind`, `mount-image`,
+    `isolate`, `rescue`, `emergency`, `preset-all`); units' aliases; procps'
+    `kill -s KILL -0`, a pid with blanks, killall's `//path`, `lt-pkill`; a
+    SIGHUP or SIGUSR1 every process reached catches (`SigCgt`) is Low —
+    logrotate's daily `rsyslog-rotate`. Ubuntu 24.04 (`6.8.0-149-generic`,
+    r3 at 5948856e, r4 at 9f7da2fb, the agent uninstalled and the guest
+    clean and off after each): `condstop`, `set-property`,
+    `service-log-level`, `[[:alpha:]]syslog.service`,
+    `rsyslo[[:alnum:]].service`, the alias `syslog`, `snap.amazon-ssm-agent.*`
+    each NN-L-EVA-001 High; `killall //usr/sbin/rsyslogd`, pgrep's binary
+    run as `lt-pkill`, `/usr/bin/kill -s KILL -0`, `-9 " <pid>"` NN-L-EVA-003
+    High; `rsyslog-rotate`, `systemctl kill -s HUP rsyslog.service` and
+    `/usr/bin/kill -HUP <rsyslogd>` Low (rsyslogd's `SigCgt`
+    `0000000100314001`), `-s TERM` High, `systemctl stop auditd` High;
+    `try-restart`, `condrestart` and an unmatched class glob no EVA record;
+    a 21- and a 200-star glob from the lab user, then `systemctl stop
+    auditd`: judged 0.08 s later. The differential as root with no agent:
+    1,027 argvs (kill and `argv[0]` added; systemctl with a snap-like unit,
+    the new verbs and classes), 0 mismatches. 32 mutations of the round's
+    code, all caught by named tests (8 after a test each). The kernel's
+    `task_kill` reports only SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP
+    (lot 330 is to report every default-fatal signal).
   - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
