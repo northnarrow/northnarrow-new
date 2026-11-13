@@ -634,7 +634,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use nn_proto::admin_signed_payload::{sign, OverlayKind, SignedPayload};
         use northnarrow_agent::config::overlay_auth::{content_sha256, sig_path, OverlaySignature};
-        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let key = SigningKey::generate(&mut northnarrow_agent::os_rng::OsRng);
         let admin_pub = dir.join("admin.pub");
         std::fs::write(
             &admin_pub,
@@ -646,8 +646,14 @@ mod tests {
         .unwrap();
         let p = dir.join("profile.local");
         std::fs::write(&p, body).unwrap();
+        // the request's nonce, from the OS (never a fixed value)
+        let mut nonce = [0u8; 32];
+        {
+            use rand::Rng;
+            northnarrow_agent::os_rng::OsRng.fill_bytes(&mut nonce);
+        }
         let payload = SignedPayload::new_config_overlay_set(
-            [9; 32],
+            nonce,
             100,
             [3; 16],
             OverlayKind::Profile,
