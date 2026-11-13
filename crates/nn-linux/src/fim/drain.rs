@@ -197,6 +197,9 @@ struct PathMapInner {
     /// External audit NN-AUD-122: the hop inodes watched behind each
     /// symlinked path.
     chains: HashMap<String, Vec<InodeKey>>,
+    /// Lot 340: the size of each watched file as the drain last read its
+    /// content ([`InodePathMap::last_size`]); dropped with its entry.
+    sizes: HashMap<InodeKey, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +226,7 @@ impl PathMapInner {
             }
             self.children.remove(i);
             let w = self.entries.remove(&k)?;
+            self.sizes.remove(&k);
             self.child_count -= 1;
             return Some((k, w.path));
         }
@@ -307,6 +311,9 @@ impl InodePathMap {
             inner.entries.insert(key, Watched { path, class });
             return None;
         }
+        // lot 340: a new entry for the key — a size read of an earlier file
+        // at that inode is not this one's
+        inner.sizes.remove(&key);
         inner.entries.insert(key, Watched { path, class });
         if class != WatchClass::RuntimeChild {
             return None;
@@ -329,6 +336,26 @@ impl InodePathMap {
         self.inner.read().entries.get(key).map(|w| w.path.clone())
     }
 
+    /// Lot 340 (the alpha's daily false positives): the size of the file
+    /// `key` names as the drain last read it ([`Self::note_size`]), `None`
+    /// before its first read. A drift's size is compared with it
+    /// ([`process_drift`]: `FimEvent::baseline_size`), not with the start's
+    /// baseline of the path only: after a rotation the path holds a new,
+    /// smaller file, and every append rsyslogd made to it was a "truncation"
+    /// (NN-L-FIM-005 High) until it outgrew the file rotated away.
+    pub fn last_size(&self, key: &InodeKey) -> Option<u64> {
+        self.inner.read().sizes.get(key).copied()
+    }
+
+    /// Lot 340: the drain read `size` bytes in the file `key` names (kept
+    /// only for a watched inode).
+    pub fn note_size(&self, key: &InodeKey, size: u64) {
+        let mut g = self.inner.write();
+        if g.entries.contains_key(key) {
+            g.sizes.insert(*key, size);
+        }
+    }
+
     /// Why `key` is watched.
     pub fn class_of(&self, key: &InodeKey) -> Option<WatchClass> {
         self.inner.read().entries.get(key).map(|w| w.class)
@@ -337,6 +364,7 @@ impl InodePathMap {
     /// Forget an inode whose file is gone (review 57).
     pub fn remove(&self, key: &InodeKey) {
         let mut g = self.inner.write();
+        g.sizes.remove(key);
         if let Some(w) = g.entries.remove(key) {
             if w.class == WatchClass::RuntimeChild {
                 g.child_count -= 1;
@@ -1920,7 +1948,19 @@ pub fn process_drift(
     let new_sha256 = content.as_ref().map(|c| c.sha256.clone());
     let new_size = content.as_ref().map(|c| c.size);
     let baseline_sha256 = last_baseline.map(|b| b.sha256.clone());
-    let baseline_size = last_baseline.map(|b| b.size_bytes);
+    // Lot 340: the size this inode had when the drain last read it (an
+    // append is a growth since then), else the start's baseline of the path
+    // — for a file read for the first time; then this read is the last.
+    // The review of #552 (F6): under the file the event is about — a child
+    // created in a watched directory is its own inode, not the directory's
+    // (`key`, the record's).
+    let size_key = ident.key.unwrap_or(key);
+    let baseline_size = path_map
+        .last_size(&size_key)
+        .or_else(|| last_baseline.map(|b| b.size_bytes));
+    if let Some(n) = new_size {
+        path_map.note_size(&size_key, n);
+    }
 
     // Wave 2 (TST-004): the kernel reports a chmod or chown as Modified,
     // and an unchanged hash used to drop it as a no-op below — `chmod u+s`
@@ -3559,6 +3599,233 @@ mod tests {
             !drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
             "unknown-path skip must NOT append to drift log"
         );
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): after
+    /// logrotate renamed a log away and created it again, every append
+    /// rsyslogd made to the new file was a "truncation" — its size was
+    /// compared with the start's baseline of the path (the rotated file's,
+    /// larger) — NN-L-FIM-005 High until the file outgrew it (the lab's
+    /// `rs:main Q:Reg` records on syslog and auth.log). A drift is measured
+    /// against the size the drain last read in that same file: rsyslogd's
+    /// append grows it (its carve-out holds), and a truncation in place
+    /// still shrinks it (High).
+    #[test]
+    fn a_rotated_log_s_appends_are_measured_against_the_file_last_read() {
+        use nn_core::decision::Rule;
+        use nn_core::fim::rules::NnLFim005LogTruncated;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let log = dir.path().join("syslog");
+        // the start's baseline: the file the rotation renamed away
+        let mut base = dummy_baseline(&log.to_string_lossy(), &"99".repeat(32));
+        base.size_bytes = 4096;
+        // the new file at the path, read when it is watched (a creation)
+        std::fs::write(&log, b"rotated.\n").unwrap();
+        let m = std::fs::metadata(&log).unwrap();
+        let k = InodeKey {
+            dev: m.dev(),
+            ino: m.ino(),
+        };
+        path_map.insert(k, log.to_string_lossy().to_string());
+        let mut drift = |op: FimOp| -> FimEvent {
+            let mut out = Vec::new();
+            let raw = fake_raw(k.dev, k.ino, op as u8);
+            process_drift(
+                &raw,
+                &path_map,
+                Some(&base),
+                &mut drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => fe,
+                other => panic!("{other:?}"),
+            }
+        };
+        let created = drift(FimOp::Created);
+        assert_eq!(created.new_size, Some(9));
+        let rule = NnLFim005LogTruncated::new(Some(102));
+        // the rule's view: the log's path, rsyslogd (the syslog user) the writer
+        let as_rsyslogd = |mut fe: FimEvent| {
+            fe.path = "/var/log/syslog".into();
+            fe.modifier_exe = Some("/usr/sbin/rsyslogd".into());
+            fe.modifier_uid = 102;
+            Event::Fim(fe)
+        };
+        // rsyslogd's append: measured against the 9 bytes read, not 4096
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"a line rsyslogd wrote\n")
+            .unwrap();
+        let fe = drift(FimOp::Modified);
+        assert_eq!((fe.baseline_size, fe.new_size), (Some(9), Some(31)));
+        assert!(
+            rule.evaluate(&as_rsyslogd(fe.clone())).is_none(),
+            "an append"
+        );
+        // as on `main`: against the start's baseline, the same append fired
+        let stale = FimEvent {
+            baseline_size: Some(4096),
+            ..fe
+        };
+        assert!(rule.evaluate(&as_rsyslogd(stale)).is_some());
+        // a truncation in place: a shrink, still High
+        std::fs::write(&log, b"x\n").unwrap();
+        let fe = drift(FimOp::Modified);
+        assert_eq!((fe.baseline_size, fe.new_size), (Some(31), Some(2)));
+        let v = rule.evaluate(&as_rsyslogd(fe)).expect("a truncation");
+        assert_eq!(v.severity, nn_model::Severity::High);
+        // a file removed from the map forgets its size
+        path_map.remove(&k);
+        assert_eq!(path_map.last_size(&k), None);
+    }
+
+    /// Lot 340 (named): the first write after the start, before the
+    /// path's baseline reached the drain's cache (the lab: rsyslogd's first
+    /// append to auth.log and syslog at every start, NN-L-FIM-005 High with
+    /// no baseline), is measured against the size the file had when it was
+    /// watched (`note_size` at the watch's population).
+    #[test]
+    fn the_first_write_after_the_start_is_measured_against_the_size_watched() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let log = dir.path().join("auth.log");
+        std::fs::write(&log, b"0123456789").unwrap();
+        let m = std::fs::metadata(&log).unwrap();
+        let k = InodeKey {
+            dev: m.dev(),
+            ino: m.ino(),
+        };
+        path_map.insert(k, log.to_string_lossy().to_string());
+        path_map.note_size(&k, 10);
+        std::fs::write(&log, b"0123456789 and a line\n").unwrap();
+        let mut out = Vec::new();
+        process_drift(
+            &fake_raw(k.dev, k.ino, FimOp::Modified as u8),
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        let Some(Event::Fim(fe)) = out.pop() else {
+            panic!("an event")
+        };
+        assert_eq!((fe.baseline_size, fe.new_size), (Some(10), Some(22)));
+        // a key no longer watched keeps no size
+        let other = InodeKey {
+            dev: k.dev,
+            ino: k.ino + 1,
+        };
+        path_map.note_size(&other, 5);
+        assert_eq!(path_map.last_size(&other), None);
+    }
+
+    /// Named test (the review of #552, F6): the size read at a child's
+    /// creation in a watched directory (BUG-022's reconstruction) is noted
+    /// under the child's own inode, not the directory's — so the child's
+    /// first write (rsyslogd's append to a log it recreated) is measured
+    /// against it, not against the start's baseline of the path (a
+    /// "truncation", NN-L-FIM-005 High).
+    #[test]
+    fn a_created_child_s_size_is_noted_under_its_own_inode() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let logs = dir.path().join("log");
+        std::fs::create_dir(&logs).unwrap();
+        let dir_key = InodeKey {
+            dev: 0x1234,
+            ino: 99,
+        };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, logs.to_string_lossy().into_owned());
+        let child = logs.join("syslog");
+        std::fs::write(&child, b"recreated\n").unwrap();
+        // the start's baseline of the path: the file rotated away
+        let mut base = dummy_baseline(&child.to_string_lossy(), &"99".repeat(32));
+        base.size_bytes = 4096;
+        let mut drift = |raw: FimDriftRaw| -> FimEvent {
+            let mut out = Vec::new();
+            process_drift(
+                &raw,
+                &path_map,
+                Some(&base),
+                &mut drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => fe,
+                other => panic!("{other:?}"),
+            }
+        };
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        raw.child_name[..6].copy_from_slice(b"syslog");
+        let created = drift(raw);
+        assert_eq!(created.new_size, Some(10));
+        let m = std::fs::metadata(&child).unwrap();
+        let k = InodeKey {
+            dev: crate::fim::attach::stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+        };
+        assert_eq!(created.file_key, Some(k));
+        assert_eq!(path_map.last_size(&k), Some(10), "the child's size");
+        assert_eq!(path_map.last_size(&dir_key), None, "not the directory's");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(b"a line\n")
+            .unwrap();
+        let fe = drift(fake_raw(k.dev, k.ino, FimOp::Modified as u8));
+        assert_eq!((fe.baseline_size, fe.new_size), (Some(10), Some(17)));
     }
 
     // ── C4 test 8: process_drift on real-drift emits + appends ──────

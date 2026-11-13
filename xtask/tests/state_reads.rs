@@ -469,6 +469,47 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(proc.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "fs::read(path)",
+        "lot 340: a container runtime's bundle (root's, writable by no one else, checked \
+         first): unreadable, the sender is not proven CoreDNS and is judged as any sender — \
+         never a protection emptied",
+    ),
+    (
+        // the review of #552 (F3): the container's init pid file
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "fs::read(path)",
+        "the review of #552 (F3): a container runtime's init pid file (root's, writable by \
+         no one else, checked first): unreadable, the sender is not proven CoreDNS and is \
+         judged as any sender — never a protection emptied",
+    ),
+    (
+        // the review of #552 (F4): a resolver service's parent, cgroup, uids
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(dir.join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(dir.join(\"status\"))",
+        PROC,
+    ),
+    (
         "crates/nn-linux/src/known_system_prog.rs",
         "read_state(pdir.join(\"status\"))",
         PROC,

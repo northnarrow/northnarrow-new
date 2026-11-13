@@ -278,6 +278,11 @@ pub mod net {
     // it (lab PR 229).
     pub mod dns_ingest;
 
+    // Lot 340: a DNS query's sender is a known resolver by its identity
+    // (the host's packaged file, the cluster's CoreDNS by its runtime's
+    // record), not by its name.
+    pub mod known_resolver;
+
     /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the DNS
     /// cache's state is nn-core's, with the rules that read it; the agent's
     /// cache carries the DNS pump's ingest ([`dns_ingest`], lab PR 229), and

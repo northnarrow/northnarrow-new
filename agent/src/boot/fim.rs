@@ -118,7 +118,14 @@ fn start_open_sensor(
     };
     // R12b (lab PR 269): the pump on a thread of its own, the bus's source
     // `open_sensor`, sending in batches.
-    let pump = match spawn_pump(ring, &sensor.event_tx(), &tokio::runtime::Handle::current()) {
+    // Lot 340: the lineage learns the writers' fork records the kernel
+    // carries (a backup's receiver, which never executes).
+    let pump = match spawn_pump(
+        ring,
+        &sensor.event_tx(),
+        &tokio::runtime::Handle::current(),
+        sensor.lineage(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "file-open sensor: its pump's thread did not start — keeping sys_enter_openat");

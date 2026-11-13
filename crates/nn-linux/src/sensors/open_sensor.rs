@@ -1529,7 +1529,10 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             capability: None,
             attrs: None,
             file_key: None,
-            is_dir: false,
+            // lot 340: a directory opened (`O_DIRECTORY`, kept in
+            // `f_flags`; a file opened so fails before `file_open`) — a
+            // listing of the store, an indexer's walk
+            is_dir: r.flags & (libc::O_DIRECTORY as u32) != 0,
             moved_in: false,
         }));
     }
@@ -1656,30 +1659,62 @@ pub(crate) fn decode_batch<'a>(
 /// The open sensor's pump (R12b, lab PR 269: a thread of its own, the
 /// bus's source `open_sensor`): drain the ring onto the agent's event bus
 /// until the receiver goes away ([`pump`]).
+/// Lot 340: `lineage` learns the writers' fork records the kernel carried
+/// ([`teach_fork`]).
 pub fn spawn_pump(
     ring: RingBuf<MapData>,
     tx: &crate::sensors::bus::BusSender,
     rt: &tokio::runtime::Handle,
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 ) -> std::io::Result<crate::sensors::pump::PumpThread> {
     let tx = tx.for_source(PUMP_LABEL);
     let rt = rt.clone();
     crate::sensors::pump::PumpThread::spawn(PUMP_LABEL, move |stop| {
         let mut ring = ring;
-        pump(&mut ring, &tx, &rt, stop);
+        pump(&mut ring, &tx, &rt, stop, lineage.as_ref());
         Ok(())
     })
+}
+
+/// Lot 340 (the alpha's daily false positives): the writer's fork record
+/// the kernel carried in `r` (`fork_ppid`: a process that executed nothing
+/// since its fork — a backup's receiver) taught to `lineage` before any of
+/// the record's events is sent: a burst of it judged after it exited is
+/// judged on its forker's lineage, not as a writer of unknown lineage.
+pub(crate) fn teach_fork(
+    r: &OpenRecordRaw,
+    lineage: Option<&crate::posture::lineage::AuthSessionTracker>,
+) {
+    let Some(l) = lineage.filter(|_| r.fork_ppid != 0) else {
+        return;
+    };
+    // the forker's own record first (rsync's generator: never executed
+    // either); its uid not known, the writer's taken (a fork changes it only
+    // by dropping root)
+    if r.fork_pppid != 0 {
+        l.ingest_kernel_fork(
+            r.fork_ppid,
+            r.fork_parent_start,
+            r.fork_pppid,
+            r.uid,
+            r.timestamp_ns,
+        );
+    }
+    l.ingest_kernel_fork(r.pid, r.fork_start, r.fork_ppid, r.uid, r.timestamp_ns);
 }
 
 /// Drain the ring onto the agent's event bus until the receiver goes away
 /// or the stop flag is set: each pass's records — at most
 /// [`crate::sensors::pump::PASS_MAX`] — decoded, the signals to a security
 /// tool first ([`send_order`]), sent in batches of at most
-/// [`crate::sensors::bus::BATCH_MAX`] events (R12b).
+/// [`crate::sensors::bus::BATCH_MAX`] events (R12b); each record's fork
+/// record taught to `lineage` first (lot 340, [`teach_fork`]).
 pub fn pump(
     ring: &mut dyn crate::sensors::pump::RingSource,
     tx: &crate::sensors::bus::BusSender,
     rt: &tokio::runtime::Handle,
     stop: &std::sync::atomic::AtomicBool,
+    lineage: Option<&crate::posture::lineage::AuthSessionTracker>,
 ) {
     use crate::sensors::bus::BATCH_MAX;
     use crate::sensors::pump::{PASS_MAX, POLL_MS};
@@ -1707,6 +1742,8 @@ pub fn pump(
             reject.flush_idle(PUMP_LABEL, size);
         }
         for r in send_order(&batch.records) {
+            // lot 340: before any event of the record can be judged
+            teach_fork(r, lineage);
             // Second review of #471: an open the opens' cap would drop is
             // not decoded, resolved and allocated first — counted as P2's.
             if open_only(r) && !tx.open_room() {
@@ -2429,6 +2466,66 @@ mod tests {
         r
     }
 
+    /// Lot 340 (named): a record that carries its writer's fork record
+    /// (`fork_ppid`, `fork_start`: the writer executed nothing since its
+    /// fork) teaches it to the lineage, which then reads the exited writer
+    /// as its forker's copy in a judgement at the record's time; a record
+    /// without one teaches nothing. The pump does it before the record's
+    /// events go out.
+    #[test]
+    fn a_record_s_fork_record_is_taught_to_the_lineage_first() {
+        use crate::posture::lineage::{AsOf, AuthSessionTracker};
+        const S: u64 = 1_000_000_000;
+        let proc = tempfile::tempdir().unwrap();
+        let lineage = AuthSessionTracker::new(proc.path());
+        lineage.ingest_exec(
+            701,
+            1,
+            "/usr/bin/rsync",
+            &["rsync".to_string()],
+            3 * S,
+            3 * S,
+            0,
+        );
+        let mut r = record(open_reason::MASS_OVERWRITE, &["x"], (0, 0));
+        (r.pid, r.timestamp_ns) = (702, 9 * S);
+        teach_fork(&r, Some(&lineage));
+        let at = AsOf::judged(9 * S);
+        assert!(
+            lineage.exec_identity(702, at).is_none(),
+            "no fork record carried"
+        );
+        (r.fork_ppid, r.fork_start) = (701, 4 * S);
+        teach_fork(&r, None);
+        assert!(
+            lineage.exec_identity(702, at).is_none(),
+            "no lineage to teach"
+        );
+        teach_fork(&r, Some(&lineage));
+        let id = lineage.exec_identity(702, at).expect("rsync's copy");
+        assert_eq!(id.exe, std::path::Path::new("/usr/bin/rsync"));
+        assert_eq!(lineage.fork_parent(702, at), None, "no exec of its own");
+        assert_eq!(lineage.lineage_fork_parents(702, at).first(), Some(&701));
+        // two levels: the receiver (712), a fork of the generator (711), a
+        // fork of rsync (701) — the generator known by the same record
+        (r.pid, r.fork_ppid, r.fork_start) = (712, 711, 5 * S);
+        (r.fork_pppid, r.fork_parent_start) = (701, 4 * S);
+        teach_fork(&r, Some(&lineage));
+        let walk = lineage.lineage_starts(712, at);
+        let pids: Vec<u32> = walk.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pids, [712, 711, 701]);
+        assert_eq!(walk[1].1, 4 * S, "the generator's start");
+        assert_eq!(
+            lineage.exec_identity(712, at).map(|id| id.exe),
+            Some("/usr/bin/rsync".into())
+        );
+        // the pump teaches before it decodes and sends the record's events
+        let pump = pump_source();
+        let taught = pump.find("teach_fork(r, lineage);").expect("taught");
+        assert!(taught < pump.find("events_of(r, &mut mounts)").unwrap());
+        assert!(taught < pump.find("if open_only(r) && !tx.open_room() {").unwrap());
+    }
+
     /// Lab PR 225: the rename and unlink bursts and the signal to a
     /// security tool, as the kernel reports them.
     #[test]
@@ -2610,7 +2707,7 @@ mod tests {
         let pump_tx = tx.for_source("open_sensor_test");
         let handle = rt.handle().clone();
         let stop2 = std::sync::Arc::clone(&stop);
-        let t = std::thread::spawn(move || pump(&mut ring, &pump_tx, &handle, &stop2));
+        let t = std::thread::spawn(move || pump(&mut ring, &pump_tx, &handle, &stop2, None));
         // the pump waits for room for the mass write; the signal is queued
         let started = Instant::now();
         while rx.stats().snapshot()[0].stats.enqueued == 0 {
@@ -2688,6 +2785,18 @@ mod tests {
         assert!(
             matches!(&events_of(&r, &mut mounts)[0], Event::Fim(fe) if fe.op == FimOp::Opened && fe.path == "/home/alice/.aws/credentials" && fe.modifier_comm == "cat")
         );
+        // lot 340: a directory of a store opened (its listing) says so
+        let mut r = record(
+            open_reason::CRED,
+            &["private-keys-v1.d", ".gnupg", "root", "/"],
+            (7, 2),
+        );
+        r.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK) as u32;
+        assert!(
+            matches!(&events_of(&r, &mut mounts)[0], Event::Fim(fe) if fe.is_dir && fe.path == "/root/.gnupg/private-keys-v1.d")
+        );
+        r.flags = libc::O_RDONLY as u32;
+        assert!(matches!(&events_of(&r, &mut mounts)[0], Event::Fim(fe) if !fe.is_dir));
         // An unknown root keeps the mount-relative path, marked (SNS-005).
         let r = record(open_reason::CRED, &["credentials", ".aws", "/"], (5, 5));
         assert!(

@@ -408,6 +408,15 @@ pub fn populate_watched_paths(
                     cred_watched += 1;
                 }
                 inode_map.insert(key, path_str.clone());
+                // Lot 340: the file's size as watched — the first write after
+                // the start is measured against it (the baseline of the path
+                // may not be in the drain's cache yet: rsyslogd's first
+                // append at every start read as a truncation)
+                if let Ok(m) = std::fs::symlink_metadata(path) {
+                    if m.is_file() && m.ino() == key.ino {
+                        inode_map.note_size(&key, m.len());
+                    }
+                }
                 // External audit EBPF-016: a watch on overlayfs, FUSE or NFS
                 // goes into the boot's signed identity record.
                 crate::fs_type::note_identity(path);

@@ -237,6 +237,65 @@ pub(crate) mod testing {
         }
     }
 
+    /// Lot 340: [`TestHost`] whose files have the identities a test gives
+    /// them ([`IdTestHost::set_file_id`], this thread's): a packaged
+    /// program's device and inode, which the portable host knows none of.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(crate) struct IdTestHost;
+
+    thread_local! {
+        static FILE_IDS: std::cell::RefCell<std::collections::HashMap<PathBuf, (u64, u64)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    impl IdTestHost {
+        /// The file at `path` has the identity `id` (`None`: none).
+        pub(crate) fn set_file_id(path: impl AsRef<Path>, id: Option<(u64, u64)>) {
+            FILE_IDS.with(|m| {
+                let mut m = m.borrow_mut();
+                match id {
+                    Some(id) => m.insert(path.as_ref().to_path_buf(), id),
+                    None => m.remove(path.as_ref()),
+                };
+            });
+        }
+    }
+
+    impl PostureHost for IdTestHost {
+        const PROC_ROOT: &'static str = TestHost::PROC_ROOT;
+        const HOST_ROOT: &'static str = TestHost::HOST_ROOT;
+        fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+            TestHost::read(path)
+        }
+        fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+            TestHost::read_link(path)
+        }
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
+            TestHost::read_dir(path)
+        }
+        fn is_dir(path: &Path) -> bool {
+            TestHost::is_dir(path)
+        }
+        fn exists(path: &Path) -> bool {
+            TestHost::exists(path)
+        }
+        fn dir_owner<P: AsRef<Path>>(path: P) -> Option<u32> {
+            TestHost::dir_owner(path)
+        }
+        fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
+            FILE_IDS.with(|m| m.borrow().get(path.as_ref()).copied())
+        }
+        fn suspended_ns() -> u64 {
+            TestHost::suspended_ns()
+        }
+        fn clock_tick_ns() -> u64 {
+            TestHost::clock_tick_ns()
+        }
+        fn monotonic_ns() -> u64 {
+            TestHost::monotonic_ns()
+        }
+    }
+
     /// What the posture consults in the agent, as its tests need it: the
     /// window whether it is open; the unlock capability is `()`. (R08b, lab
     /// PR 251: the engine's shapes and policy are read from the engine

@@ -1272,6 +1272,17 @@ unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32
     // Lot 282 (the review of #500, C1): the replacement's halves are
     // paired per cgroup too.
     (*raw).cgroup = bpf_get_current_cgroup_id();
+    // Lot 340: who forked a writer that executed nothing since (a backup's
+    // receiver): the lineage it has no exec record of.
+    let (own, forker) = crate::fork_parent::unexecuted_forks();
+    if let Some(f) = own {
+        (*raw).fork_ppid = f.ppid;
+        (*raw).fork_start = f.start;
+    }
+    if let Some(f) = forker {
+        (*raw).fork_pppid = f.ppid;
+        (*raw).fork_parent_start = f.start;
+    }
     let dst = (*raw).path.as_mut_ptr();
     let mut d = dentry;
     let mut n: usize = 0;

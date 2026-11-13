@@ -272,8 +272,8 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        10,
-        "FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, twice): stricter \
+        9,
+        "FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, once since lot 340: `names_npm_cli`): stricter \
          than the reader, which would take it after an option; a cgroup name's `-pod` and \
          `-conmon-` (no option) \
          — and `/proc` text fields read by position (`stat`, `mountinfo`, `cgroup`: \
@@ -423,6 +423,13 @@ const KNOWN: &[(&str, usize, &str)] = &[
          by name; `NODE_OPTIONS` goes to the reader (`node_options_load`); and (lot 316, the \
          re-check of #548) `POSIXLY_CORRECT` looked up by name in systemctl's and procps' \
          `kill`'s, no option read",
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        1,
+        "lot 340 (the review of #552, F4): a resolver service's environment split on its NULs \
+         (`/proc/<pid>/environ`): the dynamic loader's variables looked up by name, no \
+         interpreter's options",
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
