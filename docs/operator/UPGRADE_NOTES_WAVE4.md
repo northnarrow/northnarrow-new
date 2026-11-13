@@ -2046,9 +2046,13 @@ beside it is judged as before. `CHANGELOG.md` has the detail.
 - **The watchdog's start**: no NN-L-BPF-002 High any more for our own
   watchdog opening `PROTECTED_PIDS`' pin before it is a protected pid (its
   binary by device and inode, its role vacant, its main thread, its first
-  minute — the exemption the refusal already applied). A second watchdog
-  binary started beside the live one, one past its first minute, and any
-  handle on a link of the agent's are recorded (and refused) as before.
+  minute — the exemption the refusal already applied): one NN-L-BPF-002
+  **Low** record at each start of the agent or the watchdog instead
+  (`fresh_instance_get_fd`). A Low one with no such start beside it is a
+  program that made itself the watchdog's binary while the role was vacant
+  — worth a look. A second watchdog binary started beside the live one, one
+  past its first minute, and any handle on a link of the agent's are
+  recorded High (and refused) as before.
 - **A reboot**: systemd's SIGTERM to the watchdog and the agent during a
   shutdown is still refused until `systemd-shutdown`, and no longer
   recorded as an attempt (NN-L-AT-001 High after every reboot). The agent
@@ -2060,17 +2064,22 @@ beside it is judged as before. `CHANGELOG.md` has the detail.
   own, or any `truncate` of a log), rsyslogd's appends were read after the
   truncation and recorded as a truncation by rsyslogd (NN-L-FIM-005 High).
   The kernel now says whether every write since the file's last record was
-  an `O_APPEND` write by one process; rsyslogd's appends are not recorded
-  (on Debian too, where rsyslogd runs as root and every one was), the
-  truncation is, with its own writer (logrotate's scheduled run Low,
-  anyone else High). **What changed in the record**: a FIM event may carry
-  `appends_only: true`.
+  an `O_APPEND` write by one process, and whether another process
+  truncated the file meanwhile; rsyslogd's appends are not recorded (on
+  Debian too, where rsyslogd runs as root and every one was) when the file
+  grew, or when that other process's truncation explains the smaller size
+  — the truncation is recorded, with its own writer (logrotate's scheduled
+  run Low, anyone else High). A shrink nothing else explains (a
+  `fallocate` collapse through an `O_APPEND` file) is High as before.
+  **What changed in the record**: a FIM event may carry
+  `appends_only: true` and `truncated_by_another: true`.
 - **A writer that never executes**: a FIM drift's writer forked without an
   exec (a backup's receiver, a daemon's worker) and gone before its record
   was judged is read from the kernel's fork record (its forker's exec), and
   any writer gone from its exec record — the record's `exe` was empty. The
-  FIM ring record grew to 168 bytes (an agent and its eBPF object are one
-  build; nothing to do).
+  FIM ring record grew to 176 bytes (the writer's fork records, and the
+  writer's start for a write seen at close; an agent and its eBPF object
+  are one build; nothing to do).
 - **Not changed, measured**: the packaged rotation under `systemd-run`
   (`logrotate /etc/logrotate.conf`, root, PID 1's fork) was already Low —
   its High was rsyslogd's, above; `-f`, `-s` or another configuration keep

@@ -371,13 +371,18 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
 
-Lot 344: the `bpf` hook's observation skips the same fresh instance — a
-handle on the agent's maps, programs or pin directories it lets through is
+Lot 344: the `bpf` hook's observation tells the same fresh instance apart —
+a handle on the agent's maps, programs or pin directories it lets through is
 the family's own start, not a foreign handle. The watchdog opens
 `PROTECTED_PIDS`' pin to register itself before it is a protected pid, and
-every start of it was recorded NN-L-BPF-002 High. A second instance beside
-the live one, one past its first minute, and any handle on a link of the
-agent's are reported as before.
+every start of it was recorded NN-L-BPF-002 High. The review of #554 (F2):
+it is recorded on its own, Low (`BPF_CMD_FRESH_INSTANCE_GET_FD`), not
+silenced — "the watchdog by device and inode" is also a foreign program that
+replaced its `mm->exe_file` (`prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)`, root,
+`CAP_SYS_RESOURCE`) while the role was vacant, and a Low record without a
+start of the agent or the watchdog beside it is that. A second instance
+beside the live one, one past its first minute, and any handle on a link of
+the agent's are reported High as before.
 
 ### Residual
 
@@ -385,9 +390,11 @@ While a role is vacant — at boot, between the agent's start and the
 watchdog's registration, and in the respawn gap after a crash — a root
 process already running could start a preloaded binary of that role. It
 needs root present at that moment; the same gap exists wherever a defender
-restarts. Lot 344: such a process's handles are not reported either (as
-they are not refused); a watchdog gone, which leaves its role vacant, is
-signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),
+restarts. The same holds for a program that makes itself the role's binary
+by device and inode (`PR_SET_MM_EXE_FILE`). Lot 344, the review of #554:
+such a process's handles on the agent's maps, programs and pin directories
+are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
+its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),
 the slots are never claimed and the window is bounded by age only.
 
 ## Implementation surface summary

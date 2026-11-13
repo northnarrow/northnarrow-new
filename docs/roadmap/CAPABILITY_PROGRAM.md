@@ -10910,7 +10910,9 @@ number in parentheses is a lab PR.
     main thread, the first minute); a relayed signal is judged only on a
     systemd answer asked after it (the kernel's clock); the FIM write marker
     carries `FIM_WRITE_APPEND_ONLY`/`FIM_WRITE_ONE_WRITER` (FP-1 accepts the
-    kernel's append proof as well as a growth); `FimDriftRaw` (168 bytes)
+    kernel's record of rsyslogd's appends for a growth, and for a shrink
+    another process's truncation explains — the review of #554, below);
+    `FimDriftRaw` (176 bytes)
     carries the writer's unexecuted fork records, taught to the lineage
     before the judgement, and a gone writer's image is read from the
     lineage; the corpus control is a shell copy looping on `sleep 1`; three
@@ -10948,17 +10950,23 @@ number in parentheses is a lab PR.
     before or after on either guest — docker.io's install, a restart,
     `docker run`, `docker build`, a reinstall inside the package transaction.
   - Residuals: a root process that starts a preloaded watchdog (or agent)
-    binary while that role is vacant gets, in its first minute, handles that
-    are neither refused nor reported (EBPF-002's window; the watchdog's
-    absence is signed); a root that makes systemd `stopping` (`systemctl
+    binary while that role is vacant — or makes a program of its own the
+    watchdog's binary by device and inode (`prctl(PR_SET_MM,
+    PR_SET_MM_EXE_FILE)`) — gets, in its first minute, handles that are not
+    refused (EBPF-002's window; the watchdog's absence is signed), recorded
+    NN-L-BPF-002 Low since the review of #554; a root that makes systemd `stopping` (`systemctl
     start shutdown.target`) has its relayed signals judged a shutdown (still
     refused); a log renamed away and recreated (logrotate's `create`, or
     `mv` and a new file) is judged by no NN-L-FIM-005/019 verdict — the
     rename is not a `Modified`, the new file a creation without a writer;
     an open (`Opened`) carries no fork record; a FIM record's `exe` stays the
-    exec sensors' (the writer's image reaches the rules, not the record); 11
-    lab scripts still run a coreutils copy under another name (listed by the
-    ratchet). Item 3 (EVA-002 for `xtables-nft-multi` under docker) did not
+    exec sensors' (the writer's image reaches the rules, not the record); 15
+    lab script sites still run a coreutils copy under another name (listed by
+    the ratchet; 4 of them `cat` copies of `true` in execq-check.sh, seen by
+    its review-of-#554 form); code running inside rsyslogd (a module,
+    `LD_PRELOAD`) writes as rsyslogd — its growth of a log, or a collapse
+    inside another process's truncation window, is exempt (as on `main` for
+    the `syslog` user's rsyslogd). Item 3 (EVA-002 for `xtables-nft-multi` under docker) did not
     reproduce on a clean guest; lot 340's records came from its corpora on a
     shared guest — open until a corpus round shows it. Seen, not changed:
     NN-L-FIM-019 High (`would have: KillProcess`) for `systemd-update-utmp`
@@ -10969,3 +10977,29 @@ number in parentheses is a lab PR.
     overlay` at docker's install.
   - Levels unchanged: no capability's reach changes; the records a benign
     host made are fewer, every attack variant measured is still recorded.
+  - The review of #554 (fix round). F1 (blocking): an `O_APPEND` write is
+    no proof that nothing shrank — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on
+    an `O_APPEND` file removes a range through the same write check, with no
+    setattr, and the writer's pid may be reused before its record is read
+    (a root log wipe passed for rsyslogd's appends). The marker now says
+    whether ANOTHER process (pid and start) changed the file's size by a
+    setattr while the writes were pending (`FIM_WRITE_TRUNCATED_BY_ANOTHER`,
+    set by `inode_setattr`); a size setattr's own record says so
+    (`FIM_SETATTR_SIZE`); FP-1 exempts a shrink only when both hold, the
+    truncation's record read first from another pid (`FimEvent::
+    truncated_by_another`). The marker holds the writer's start, the record
+    carries it (`FimDriftRaw::modifier_start`, 168 → 176 bytes): `/proc` is
+    read for that start only, the lineage for that process only
+    (`recorded_identity_started`). Tests: `a_log_collapsed_through_an_o_
+    append_fd_is_not_rsyslogd_s_append`, `a_writer_s_pid_held_by_another_
+    process_lends_it_no_image`, `copytruncate_s_truncation_still_explains_
+    rsyslogd_s_appends`, `fim005_an_append_only_shrink_no_other_truncation_
+    explains_still_fires`. F2: the fresh instance's handle is recorded
+    (`BPF_CMD_FRESH_INSTANCE_GET_FD`, NN-L-BPF-002 Low), not silenced
+    (`a_fresh_instance_s_handle_is_recorded_low_not_silenced`; the eBPF
+    ratchet forbids a return before the report). F3: closed by F1 (the
+    over-claim removed). F4: the multicall ratchet asks no longer how a copy
+    is run — every renamed copy, inline destinations, links and renames, and
+    `ln`/`cat`/`command -v` in lab scripts. F5: the watchdog e2e finds the
+    start's own Low record by the same filter (positive control).
+

@@ -153,14 +153,35 @@ last record were read after the truncation, smaller than before, and judged
 a truncation by rsyslogd (High at every such rotation, and at every
 `truncate` of a log). The marker now also says whether every write since
 the file's last record went through a file opened with `O_APPEND`, by one
-process (the record's); rsyslogd's carve-out takes that kernel proof as
-well as a growth (`FimEvent::appends_only`), whatever its uid — Debian's
-packaged rsyslogd runs as root, where the carve-out (the `syslog` user)
-never applied. A truncation is a setattr,
-recorded on its own with its own writer: logrotate's scheduled run Low,
-anyone else High. Another writer's write between rsyslogd's clears both
-bits — the marker names the last writer, and a write no longer hides behind
-rsyslogd's identity.
+process (the record's; a pid reused is another process: the marker holds
+the writer's start), and whether ANOTHER process changed the file's size by
+a setattr (`truncate`, `ftruncate`, an `O_TRUNC` open) while those writes
+were pending. An `O_APPEND` write is no proof that nothing shrank:
+`fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an `O_APPEND` file removes a range
+through the same write check, with no setattr. So rsyslogd's carve-out
+takes the kernel's record of its `O_APPEND` writes (`FimEvent::appends_only`),
+whatever its uid — Debian's packaged rsyslogd runs as root, where the
+carve-out (the `syslog` user) never applied — for a growth, and for a size
+read smaller only when another process's truncation explains it
+(`FimEvent::truncated_by_another`: the kernel saw that setattr while the
+writes were pending, and the drain read its own record first, from another
+pid). That truncation is judged on its own record, with its own writer:
+logrotate's scheduled run Low, anyone else High. A shrink nothing else
+explains is judged as before (High). The record of a write seen at close
+carries the writer's start (`FimDriftRaw::modifier_start`): its pid may name
+another process by the time the drain reads it, so `/proc/<pid>/exe` is read
+only while `/proc/<pid>/stat` shows that start, and the lineage answers only
+for that process — an `rsyslogd` started at a reused pid lends nothing.
+
+Residuals, named: a process that runs rsyslogd's image itself (an rsyslog
+module, `LD_PRELOAD` into rsyslogd) writes as rsyslogd — its growth of a log,
+or its collapse inside the window of another process's truncation, is
+exempt (as on `main`, for the `syslog` user's rsyslogd); the marker's update
+is not atomic, so another writer's write racing rsyslogd's can be lost from
+the bits, and such a record is exempt only when another process's truncation
+explains its shrink, which is recorded on its own; a drift ring that drops
+records (counted, `fim` ring drops) drops a truncation's record with any
+other.
 
 Lot 344: a drift record carries its writer's fork record when the writer
 executed nothing since its fork (and its forker's, when that one did not

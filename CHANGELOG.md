@@ -820,10 +820,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     protected pid. The `bpf` hook let that through (the watchdog's binary by
     device and inode, its role vacant, its main thread, its first minute —
     external audit EBPF-002) and still reported it: NN-L-BPF-002 High at
-    every start, the first record a tester saw. The same identity now skips
-    the report. A second instance beside the live one, one past its first
-    minute, any handle on a link of the agent's: reported (and refused) as
-    before.
+    every start, the first record a tester saw. The same identity is now
+    recorded on its own, Low (`BPF_CMD_FRESH_INSTANCE_GET_FD`, the review of
+    #554: not silenced — a foreign program made the watchdog's binary by
+    device and inode through `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` while
+    the role is vacant takes the same path). A second instance beside the
+    live one, one past its first minute, any handle on a link of the
+    agent's: reported High (and refused) as before.
   - **A reboot is not an attempt on the agent.** systemd's SIGTERM to the
     watchdog and the agent during a shutdown is refused until
     `systemd-shutdown` and, when systemd says it is stopping the host, not
@@ -844,16 +847,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `truncate` of a log). The kernel's marker now says whether every write
     since the last record went through a file opened with `O_APPEND`, by
     that one process (`FIM_WRITE_APPEND_ONLY`, `FIM_WRITE_ONE_WRITER`,
-    `FimEvent::appends_only`); rsyslogd's carve-out accepts that proof as
-    well as a growth, whatever rsyslogd's uid (Debian's packaged rsyslogd
+    `FimEvent::appends_only`), and whether ANOTHER process truncated the
+    file by a setattr meanwhile (`FIM_WRITE_TRUNCATED_BY_ANOTHER`, with
+    the truncation's own record, `FIM_SETATTR_SIZE`, read first by the
+    drain: `FimEvent::truncated_by_another`). rsyslogd's carve-out accepts
+    those appends, whatever rsyslogd's uid (Debian's packaged rsyslogd
     runs as root, with no `syslog` user: the carve-out never applied there;
     what rsyslogd appends, any local process can have it append through
-    `logger`). The truncation is a setattr, recorded with its own
-    writer (logrotate's scheduled run Low, anyone else High). The marker
-    was last-writer-wins: another writer's write between rsyslogd's no
-    longer hides behind rsyslogd's identity (the bits are cleared).
+    `logger`), for a growth — and for a size read smaller only when that
+    other process's truncation explains it, judged on its own record
+    (logrotate's scheduled run Low, anyone else High). An `O_APPEND` write
+    alone proves no append (the review of #554):
+    `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an `O_APPEND` file shrinks it
+    with no setattr, and a shrink nothing else explains is High as before.
+    The marker holds the writer's start, and the record carries it
+    (`FimDriftRaw::modifier_start`): a pid reused by the time the drain
+    reads it lends no image (`/proc` read for that start only, the lineage
+    for that process only). Residual: code running inside rsyslogd itself
+    writes as rsyslogd.
   - **A drift's writer that executed nothing since its fork is known.** The
-    FIM drift record (`FimDriftRaw`, 144 → 168 bytes) carries the writer's
+    FIM drift record (`FimDriftRaw`, 144 → 176 bytes) carries the writer's
     unexecuted fork record and its forker's, as the open sensor's has since
     lot 340 (for a write seen at close, the writer's at its write); the
     drain teaches them to the lineage before the record is judged, and a

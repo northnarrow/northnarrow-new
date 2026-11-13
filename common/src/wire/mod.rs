@@ -1882,9 +1882,11 @@ pub struct FimDriftRaw {
 pub const FIM_WRITE_APPEND_ONLY: u8 = 0x04;
 
 /// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
-/// every write to the inode since its last record was by the record's
-/// process (no other writer's write hides behind its identity — the marker
-/// is last-writer-wins).
+/// every write to the inode since its last record the marker saw was by the
+/// record's process (one process: its pid and its start — the marker is
+/// last-writer-wins). Not exact (the review of #554, F3): the marker's
+/// update is not atomic, so a write racing another can be lost from it; a
+/// record read smaller is exempt only with [`FIM_WRITE_TRUNCATED_BY_ANOTHER`].
 pub const FIM_WRITE_ONE_WRITER: u8 = 0x08;
 
 /// [`FimDriftRaw::op_flags`] bit (the review of #554, F1) of a `Modified`
