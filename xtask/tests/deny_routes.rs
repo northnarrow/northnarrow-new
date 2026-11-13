@@ -455,6 +455,24 @@ fn a_helper_that_reads_the_gate_from_the_self_protection_is_caught() {
                 .contains("try_task_kill reaches EXECPOL_CONF through execpol.rs relaxed_inner")),
         "{r:#?}"
     );
+    // a bare call of a helper another file defines (`use`d), reading the
+    // switch in its own file
+    let mut bare = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    if is_relaxed() {\n        return 0;\n    }\n",
+        "\nuse crate::execq::is_relaxed;\n",
+    );
+    bare.get_mut("execq.rs")
+        .unwrap()
+        .push_str("\npub(crate) fn is_relaxed() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n");
+    let r = gate_reads(&bare);
+    assert!(
+        r.iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF through execq.rs is_relaxed")),
+        "{r:#?}"
+    );
     // an alias of the switch in a self-protection file
     let alias = planted(
         &code,
