@@ -1130,7 +1130,10 @@ int main(int argc, char **argv) {
 /// an entry past the first pass's reads is killed at the post-commit check
 /// (F7). The controls run: the padding without the preload, and long clean
 /// values — a 2,880-byte `LD_PRELOAD`, a 2,880-byte `LD_LIBRARY_PATH` (F7:
-/// a clean value past 128 bytes was refused).
+/// a clean value past 128 bytes was refused). The re-check of #547
+/// (G1–G4): a tab inside an `LD_PRELOAD` entry, an empty `LD_LIBRARY_PATH`
+/// element (`:`, a trailing `:`), a `$LIB` token and a newline (musl's
+/// library-path separator) are refused.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn a_staging_preload_behind_many_variables_is_refused() {
@@ -1259,6 +1262,58 @@ fn a_staging_preload_behind_many_variables_is_refused() {
         );
         if rc != Err(13) || mark(&case).exists() {
             failures.push(format!("{who}: a relative preload: {rc:?}"));
+        }
+        // The re-check of #547 (G1–G4): what the loader does with a
+        // control byte, an empty library-path element or a `$` token is not
+        // in the string as the check reads it — refused at a protected
+        // target, whatever the value names (glibc loaded the marker in G1–G3)
+        for (tag, vars) in [
+            (
+                "tab",
+                vec![("LD_PRELOAD".to_string(), "libmark.so\t/x.so".to_string())],
+            ),
+            (
+                "empty-element",
+                vec![
+                    ("LD_LIBRARY_PATH".to_string(), ":".to_string()),
+                    ("LD_PRELOAD".to_string(), "libmark.so".to_string()),
+                ],
+            ),
+            (
+                "trailing-element",
+                vec![
+                    ("LD_LIBRARY_PATH".to_string(), "/usr/lib:".to_string()),
+                    ("LD_PRELOAD".to_string(), "libmark.so".to_string()),
+                ],
+            ),
+            (
+                "dst",
+                vec![(
+                    "LD_PRELOAD".to_string(),
+                    "/usr/$LIB/libc.so.6".to_string(),
+                )],
+            ),
+            (
+                "newline",
+                vec![(
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/usr/lib\n/opt/lib".to_string(),
+                )],
+            ),
+        ] {
+            let case = format!("{who}-{tag}");
+            let mut v = vars;
+            v.push((
+                "NN_E2E_PRELOAD_MARK".to_string(),
+                mark(&case).display().to_string(),
+            ));
+            let rc = run_at(Some(work.path()), 0, &v, uid);
+            if rc != Err(13) || mark(&case).exists() {
+                failures.push(format!(
+                    "{who}: an irregular loader value ({tag}): {rc:?}, the preload ran: {}",
+                    mark(&case).exists()
+                ));
+            }
         }
         // F7: past the first pass's reads (about 4 KiB), the entry is
         // judged on the kernel's copy after the commit: killed

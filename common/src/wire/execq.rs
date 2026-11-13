@@ -165,8 +165,11 @@ pub mod counter {
     pub const SCRIPT_REFUSED: u32 = 7;
     /// Lot 317: candidates not stopped — `EXECQ_STOPPED` was full.
     pub const MAP_FULL: u32 = 8;
+    /// The re-check of #547 (G5): the oldest candidates removed for a newer
+    /// one, the candidates' map full — their execs run unheld.
+    pub const CAND_EVICTED: u32 = 9;
     /// Slots in the map.
-    pub const SLOTS: u32 = 9;
+    pub const SLOTS: u32 = 10;
 }
 
 /// Key of `EXECQ_KNOWN` and `EXECQ_ROOTS`: an inode as the exec sensor
@@ -226,15 +229,38 @@ pub struct ExecqCandRaw {
     pub ctime_nsec: u32,
     pub class: u32,
     pub flags: u32,
-    /// The review of #547 (F4): the caller's real uid, whose share of the
-    /// candidates' map this one takes (`EXECQ_CAND_UIDS`).
+    /// The review of #547 (F4; the re-check, G5): the share of the
+    /// candidates' map this one takes (`EXECQ_CAND_UIDS`) — the caller's
+    /// login uid, or its uid without one ([`share_key`]); [`OVERFLOW_SHARE`]
+    /// when the shares' map could not hold a row for it.
     pub uid: u32,
     /// The review of #547 (F4): the pass's inode (its address), by which a
     /// failed exec's candidate is found and removed when the kernel frees
     /// the exec's file.
     pub inode: u64,
+    /// The re-check of #547 (G5): when it was made (`bpf_ktime_get_ns`), by
+    /// which the oldest goes first when the map is full.
+    pub at: u64,
     pub exe: ExeIdentityRaw,
 }
+
+/// The re-check of #547 (G5): the key of a task's share of the maps whose
+/// entries outlive a run (the quarantine's candidates, the FIM sensor's task
+/// buffers) — its login uid (`task->loginuid`, set at login and kept by
+/// every process of the session, the container subuids of a rootless
+/// runtime included: they cannot change it), or its uid when it has none
+/// (`u32::MAX`: a service).
+pub const fn share_key(loginuid: u32, uid: u32) -> u32 {
+    if loginuid == u32::MAX {
+        uid
+    } else {
+        loginuid
+    }
+}
+
+/// The re-check of #547 (G5): the share of the keys the shares' map has no
+/// row for (it is full): one row, under the same cap, held apart.
+pub const OVERFLOW_SHARE: u32 = u32::MAX;
 
 impl ExecqCandRaw {
     pub const fn zeroed() -> Self {
@@ -246,6 +272,7 @@ impl ExecqCandRaw {
             flags: 0,
             uid: 0,
             inode: 0,
+            at: 0,
             exe: ExeIdentityRaw::zeroed(),
         }
     }
@@ -347,13 +374,32 @@ pub fn class_names(bits: u32) -> alloc::vec::Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// The re-check of #547 (G5): a login's processes share one row, the
+    /// container subuids of a rootless runtime (`/etc/subuid`) included —
+    /// they keep the login uid; a service (no login uid) is its uid's.
+    #[test]
+    fn a_login_s_subuids_share_one_row() {
+        let login = 1000;
+        let rows: Vec<u32> = (0..6)
+            .map(|i| share_key(login, 100_000 + i * 65_536))
+            .chain([share_key(login, 1000), share_key(login, 0)])
+            .collect();
+        assert!(rows.iter().all(|r| *r == login), "{rows:?}");
+        // services: their own uid each
+        assert_eq!(share_key(u32::MAX, 33), 33);
+        assert_eq!(share_key(u32::MAX, 0), 0);
+        assert_ne!(share_key(u32::MAX, 33), share_key(u32::MAX, 108));
+        // no key is the overflow row's
+        assert_ne!(share_key(u32::MAX, 65_534), OVERFLOW_SHARE);
+    }
+
     #[test]
     fn layouts_are_fixed() {
         assert_eq!(core::mem::size_of::<ExecqKey>(), 16);
         assert_eq!(core::mem::size_of::<ExecqKnown>(), 24);
         assert_eq!(core::mem::size_of::<ExecqStopped>(), 16);
         // the review of #547 (F4): the inode's address added (kernel only)
-        assert_eq!(core::mem::size_of::<ExecqCandRaw>(), 40 + 552);
+        assert_eq!(core::mem::size_of::<ExecqCandRaw>(), 48 + 552);
         assert_eq!(core::mem::size_of::<ExecqStopRaw>(), 640);
         assert_eq!(core::mem::offset_of!(ExecqStopRaw, exe), 88);
         assert_eq!(core::mem::align_of::<ExecqStopRaw>(), 8);

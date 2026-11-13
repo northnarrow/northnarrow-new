@@ -118,6 +118,13 @@ impl ShareRows for aya::maps::HashMap<MapData, u32, u64> {
     }
 }
 
+/// The re-check of #547 (G5): `want` without the overflow row
+/// (`OVERFLOW_SHARE`: the entries of the shares the rows' map had no room
+/// for), whose count is kept in a map of its own; returns that count.
+pub fn take_overflow(want: &mut BTreeMap<u32, u64>) -> u64 {
+    want.remove(&common::wire::execq::OVERFLOW_SHARE).unwrap_or(0)
+}
+
 /// The rows of a shares map (`EXECQ_CAND_UIDS`, `OPEN_TASK_UIDS`: 4096).
 pub const SHARE_ROWS_MAX: usize = 4096;
 
@@ -211,6 +218,11 @@ mod tests {
         let mut full = Rows(BTreeMap::new(), true);
         let r = rewrite_shares(&mut full, &want).unwrap();
         assert_eq!(r.failed, 3);
+        // the re-check of #547 (G5): the overflow row is counted apart
+        let mut want = uid_shares([1000, common::wire::execq::OVERFLOW_SHARE, 1000]);
+        assert_eq!(take_overflow(&mut want), 1);
+        assert_eq!(want, BTreeMap::from([(1000, 2)]));
+        assert_eq!(take_overflow(&mut want), 0);
     }
 
     /// The names match the eBPF object's (`agent-ebpf/src/task_scratch.rs`).

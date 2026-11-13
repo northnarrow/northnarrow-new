@@ -1755,7 +1755,7 @@ fn a_dropped_candidate_is_signed_and_the_shares_are_recounted() {
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(
             d[0].contains("4 exec(s) ran without being held")
-                && d[0].contains("the candidates' map (or a uid's share of it) was full for 4"),
+                && d[0].contains("(or the map was full with no candidate old enough to go) for 4"),
             "{}",
             d[0]
         );
@@ -1763,6 +1763,18 @@ fn a_dropped_candidate_is_signed_and_the_shares_are_recounted() {
     assert_eq!(w.k.0.lock().recounts, 1, "not before SHARES_EVERY");
     w.ctl.step(t0 + super::SHARES_EVERY);
     assert_eq!(w.k.0.lock().recounts, 2);
+    // the re-check of #547 (G5): an evicted candidate ran unheld too —
+    // counted into the next signed record
+    w.k.0.lock().counters[counter::CAND_EVICTED as usize] = 3;
+    w.ctl.step(t1 + super::DEGRADED_EVERY + HEARTBEAT_EVERY);
+    let d = w.rec.degraded.lock();
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert!(
+        d[1].contains("3 exec(s) ran without being held")
+            && d[1].contains("the oldest candidate went for a newer one, the map full, for 3"),
+        "{}",
+        d[1]
+    );
 }
 
 /// A held process the scanner judged block-listed, its decision still

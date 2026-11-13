@@ -591,6 +591,38 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
             evidence(raw, decision_of(ea), policy),
         ));
     }
+    // The re-check of #547 (G1–G4): a control byte, an empty library-path
+    // element or a `$` token in a loader variable — what the loader does
+    // with it is not in the string as the check reads it. Refused at a
+    // protected or set-id target, recorded elsewhere.
+    if ef & env_flags::LOADER_IRREGULAR != 0
+        && ea & (action::RECORD | action::DENY | action::WOULD_DENY) != 0
+    {
+        let refused = ea & action::DENY != 0;
+        out.push(record(
+            event,
+            &path,
+            (RULE_PRELOAD, RULE_PRELOAD_NAME),
+            if refused {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            format!(
+                "a loader variable at exec holds a control byte, an empty library-path \
+                 element (the caller's directory) or a `$` token ({}), for a {tname} caller: \
+                 what the loader makes of it is not in the string",
+                values(raw)
+                    .into_iter()
+                    .filter(|v| v.starts_with("LD_"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            env_response(ea, "a protected or set-id target"),
+            ATTACK_PRELOAD.to_vec(),
+            evidence(raw, decision_of(ea), policy),
+        ));
+    }
     if ef & env_flags::UNREADABLE != 0
         && ef & env_flags::UNFINISHED == 0
         && ea & (action::RECORD | action::DENY) != 0
@@ -599,7 +631,12 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
         // at the first pass (the post-commit check reads the kernel's copy);
         // killed there on it only at a protected or set-id target.
         let refused_on_it =
-            ea & action::DENY != 0 && ef & (env_flags::DENYABLE | env_flags::PRELOAD_RELATIVE) == 0;
+            ea & action::DENY != 0
+                && ef
+                    & (env_flags::DENYABLE
+                        | env_flags::PRELOAD_RELATIVE
+                        | env_flags::LOADER_IRREGULAR)
+                    == 0;
         out.push(record(
             event,
             &path,
@@ -1102,6 +1139,36 @@ mod tests {
             rs[0].response.starts_with("killed (SIGKILL)"),
             "{}",
             rs[0].response
+        );
+    }
+
+    /// The re-check of #547 (G1–G4): a control byte, an empty library-path
+    /// element or a `$` token — one record, High where refused, Medium
+    /// where only recorded, the value quoted with its control bytes escaped.
+    #[test]
+    fn an_irregular_loader_value_is_recorded() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::LD_PRELOAD | env_flags::LOADER_IRREGULAR;
+        raw.env_action = action::RECORD | action::DENY;
+        put(&mut raw.preload, "lib\t/x.so");
+        let rs = records_of(&raw, &ev("/usr/bin/su"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_PRELOAD);
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        let why = &rs[0].verdict.reasoning;
+        assert!(why.contains("control byte, an empty library-path element"), "{why}");
+        assert!(why.contains("lib\\t/x.so"), "the tab escaped: {why}");
+        assert!(rs[0].response.starts_with("denied at exec"), "{}", rs[0].response);
+        assert!(rs[0]
+            .evidence
+            .environment
+            .contains(&"irregular_loader_value".to_string()));
+        raw.env_action = action::RECORD;
+        assert_eq!(
+            records_of(&raw, &ev("/usr/bin/true"), "p")[0]
+                .verdict
+                .severity,
+            Severity::Medium
         );
     }
 

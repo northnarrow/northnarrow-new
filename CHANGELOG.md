@@ -94,6 +94,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       a new field appended last), never blind. The kernel's per-uid counts
       are recounted by the agent from the entries.
     - `task_free` is tracked as attached, not loaded (F9).
+  - The re-check of #547:
+    - **Irregular loader values are refused at protected and set-id
+      targets** (G1–G4): a control byte (a tab inside an `LD_PRELOAD`
+      entry, which glibc keeps; a newline, musl's library-path separator),
+      an empty `LD_LIBRARY_PATH` element (the caller's directory) or a `$`
+      token (`$LIB`, `$ORIGIN`, `$PLATFORM`) in `LD_PRELOAD`, `LD_AUDIT` or
+      `LD_LIBRARY_PATH` (`irregular_loader_value`); recorded elsewhere.
+    - **The shares are the login's** (G5): the quarantine's candidates and
+      the FIM buffers are counted per login uid (a session's container
+      subuids included), per uid for a service; an overflow row bounds the
+      shares the count map cannot track. The candidates' map full, the
+      oldest candidate (stuck at least a second) goes for the new one,
+      counted (`CAND_EVICTED`) and signed with the quarantine's fail-opens.
+    - **The environment's check is a program of its own** (G6):
+      `exec_env_lsm`, a second LSM program on `bprm_check_security`, with
+      its own verifier budget — with the scan inside it, `exec_check_lsm`
+      counted 930,372 of 1,000,000 instructions on 5.15 (now measured on
+      every kernel during `verifier-check`).
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision
