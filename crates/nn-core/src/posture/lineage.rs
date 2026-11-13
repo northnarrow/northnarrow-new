@@ -406,6 +406,9 @@ const LINEAGE_DEPTH_CAP: usize = 32;
 /// in the catalog for the FP this fixes.
 const LOGINUID_UNSET: u32 = u32::MAX;
 
+/// A file's identity as the kernel gives it: its device (`MKDEV`) and inode.
+type FileId = (u64, u64);
+
 /// PID→Entry cache entry recorded from `Event::ProcessSpawn`.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -1535,7 +1538,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
-        (image, fork_parent, exec_file): (Option<(u64, u64)>, u32, Option<(u64, u64)>),
+        (image, fork_parent, exec_file): (Option<FileId>, u32, Option<FileId>),
     ) {
         if pid == 0 {
             return;
