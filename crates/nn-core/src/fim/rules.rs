@@ -6808,8 +6808,21 @@ mod tests {
             );
             ingest(0, false, 786, 785, "/usr/bin/dash", daily, (8, 11), 785);
             ingest(0, false, 787, 786, LOGROTATE, conf, PACKAGED, 786);
+            // cron.daily's script run by cron's own fork, no run-parts
+            ingest(
+                0,
+                false,
+                790,
+                510,
+                "/usr/sbin/cron",
+                &["/usr/sbin/cron", "-f"],
+                (8, 10),
+                510,
+            );
+            ingest(0, false, 791, 790, "/usr/bin/dash", daily, (8, 11), 790);
+            ingest(0, false, 792, 791, LOGROTATE, conf, PACKAGED, 791);
             for pid in [
-                706u32, 714, 725, 733, 743, 750, 751, 752, 753, 754, 771, 776, 787,
+                706u32, 714, 725, 733, 743, 750, 751, 752, 753, 754, 771, 776, 787, 792,
             ] {
                 assert_eq!(judged(&t, pid), KEPT, "pid {pid}");
             }
