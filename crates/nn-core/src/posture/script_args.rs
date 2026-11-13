@@ -998,7 +998,34 @@ const MONO: Table = Table {
 };
 
 /// busybox's shells.
-const BUSYBOX_SHELLS: &[&str] = &["sh", "ash", "hush", "bash"];
+pub(crate) const BUSYBOX_SHELLS: &[&str] = &["sh", "ash", "hush", "bash"];
+
+/// The program busybox runs for `argv`, and where its own arguments start
+/// — as busybox reads it (`libbb/appletlib.c`, lot 313: one reading for the
+/// interpreters' reader and R020's shells). `main` takes `argv[0]`, a login
+/// shell's `-` dropped, then its basename; a name that starts with
+/// `busybox` (`busybox`, `busybox.static`) is busybox itself, whose
+/// `busybox_main` takes the next argument's basename (`busybox /bin/sh`),
+/// and again while that one starts with `busybox` (`busybox busybox sh`).
+/// `None`: busybox runs no program — no argument, or its own `--help`,
+/// `--list…`, `--install`. Lot 310 read only `busybox` exactly, and once.
+pub(crate) fn busybox_program(argv: &[String]) -> Option<(&str, usize)> {
+    fn base(a: &str) -> &str {
+        a.rsplit('/').next().unwrap_or(a)
+    }
+    let first = argv.first()?;
+    let mut name = base(first.strip_prefix('-').unwrap_or(first));
+    let mut at = 1;
+    while name.starts_with("busybox") {
+        let next = argv.get(at)?;
+        if next == "--help" || next == "--install" || next.starts_with("--list") {
+            return None;
+        }
+        name = base(next);
+        at += 1;
+    }
+    Some((name, at))
+}
 
 /// What `exe` runs for `argv` (its `argv[0]` first): [`Runs`]. A binary
 /// runs its executable ([`Runs::Inline`]).
@@ -1040,20 +1067,9 @@ impl From<Runs> for Reading {
 /// index of the argument naming one of its shells, `None` for another
 /// program.
 fn busybox_shell_at(argv: &[String]) -> Option<usize> {
-    let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
-    let first = argv.first()?;
-    let mut at = 0;
-    let mut program = base(first.strip_prefix('-').unwrap_or(first));
-    while program.starts_with("busybox") {
-        match argv.get(at + 1) {
-            Some(a) if !a.starts_with('-') => {
-                at += 1;
-                program = base(a);
-            }
-            _ => return None,
-        }
-    }
-    BUSYBOX_SHELLS.contains(&program.as_str()).then_some(at)
+    // lot 313: busybox's one reading (`busybox_program`), shared with R020
+    let (program, from) = busybox_program(argv)?;
+    BUSYBOX_SHELLS.contains(&program).then_some(from - 1)
 }
 
 /// A `/proc/<pid>/cmdline`'s arguments: its NUL-separated words, the
@@ -1472,6 +1488,242 @@ fn end(
         };
     }
     operand(argv, at, shell_code, stdin)
+}
+
+/// Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026):
+/// how an encryption tool's argv asks for encryption. The tools' own
+/// readers: gpg's (long options by any unambiguous start, letters
+/// clustered: `-sear`), openssl's (a command first), 7-Zip's and rar's (a
+/// command, a password switch anywhere), and plain option lists.
+#[derive(Clone, Copy)]
+enum Crypt {
+    /// Encrypts with one of these letters in a cluster of its options, or
+    /// one of these long options (gpg's start of a name accepted with
+    /// `abbreviated`).
+    With {
+        letters: &'static str,
+        long: &'static [&'static str],
+        abbreviated: bool,
+    },
+    /// Encrypts unless one of these letters or long options says otherwise
+    /// (decrypt, list, print).
+    Unless {
+        letters: &'static str,
+        long: &'static [&'static str],
+    },
+    /// A command first (`7z a`, `rar a`): one of `commands` with a switch
+    /// starting with one of `switches` anywhere (`-pSECRET`, `-hp`).
+    Command {
+        commands: &'static [&'static str],
+        switches: &'static [&'static str],
+    },
+    /// openssl: its command — `enc` or a cipher's name, unless `-d`; a
+    /// public-key command (`smime`, `cms`, `pkeyutl`, `rsautl`) with
+    /// `-encrypt`.
+    OpenSsl,
+    /// Always (`ccencrypt`, `zipcloak` reads `-d` as decrypt: see Unless).
+    Always,
+}
+
+/// The encryption tools, by the name of their executed file (a version
+/// suffix of digits and dots allowed: `gpg2`).
+const CRYPT_TOOLS: &[(&str, Crypt)] = &[
+    (
+        "gpg",
+        Crypt::With {
+            letters: "ce",
+            long: &["symmetric", "encrypt", "encrypt-files"],
+            abbreviated: true,
+        },
+    ),
+    (
+        "gpgtar",
+        Crypt::With {
+            letters: "ce",
+            long: &["symmetric", "encrypt"],
+            abbreviated: true,
+        },
+    ),
+    ("openssl", Crypt::OpenSsl),
+    (
+        "age",
+        Crypt::Unless {
+            letters: "d",
+            long: &["decrypt"],
+        },
+    ),
+    (
+        "rage",
+        Crypt::Unless {
+            letters: "d",
+            long: &["decrypt"],
+        },
+    ),
+    (
+        "7z",
+        Crypt::Command {
+            commands: &["a", "u"],
+            switches: &["-p", "-mhe"],
+        },
+    ),
+    (
+        "7za",
+        Crypt::Command {
+            commands: &["a", "u"],
+            switches: &["-p", "-mhe"],
+        },
+    ),
+    (
+        "7zr",
+        Crypt::Command {
+            commands: &["a", "u"],
+            switches: &["-p", "-mhe"],
+        },
+    ),
+    (
+        "7zz",
+        Crypt::Command {
+            commands: &["a", "u"],
+            switches: &["-p", "-mhe"],
+        },
+    ),
+    (
+        "rar",
+        Crypt::Command {
+            commands: &["a", "u", "m", "f"],
+            switches: &["-p", "-hp"],
+        },
+    ),
+    (
+        "zip",
+        Crypt::With {
+            letters: "eP",
+            long: &["encrypt", "password"],
+            abbreviated: false,
+        },
+    ),
+    (
+        "zipcloak",
+        Crypt::Unless {
+            letters: "d",
+            long: &["decrypt"],
+        },
+    ),
+    (
+        "ccrypt",
+        Crypt::Unless {
+            letters: "dcx",
+            long: &["decrypt", "cat", "keychange"],
+        },
+    ),
+    ("ccencrypt", Crypt::Always),
+    (
+        "mcrypt",
+        Crypt::Unless {
+            letters: "d",
+            long: &["decrypt"],
+        },
+    ),
+    (
+        "aescrypt",
+        Crypt::With {
+            letters: "e",
+            long: &[],
+            abbreviated: false,
+        },
+    ),
+    (
+        "scrypt",
+        Crypt::Command {
+            commands: &["enc"],
+            switches: &[""],
+        },
+    ),
+];
+
+/// The ciphers openssl runs as commands of their own (`openssl aes-256-cbc`),
+/// by the start of their names.
+const OPENSSL_CIPHERS: &[&str] = &[
+    "aes", "aria", "bf", "blowfish", "camellia", "cast", "chacha", "des", "idea", "rc2", "rc4",
+    "rc5", "seed", "sm4",
+];
+
+/// Lot 313 (BUG-49's residue): `exe` is an encryption tool (`openssl enc`,
+/// `gpg -c`/`--symmetric`/`-e`, `age`, `7z a -p`, `zip -e`/`-P`, `rar a -p`,
+/// `ccrypt`, `mcrypt`, `aescrypt -e`, `scrypt enc`) and `argv` asks it to
+/// encrypt. Every argument before `--` is looked at, whatever option takes
+/// it (a value read as an option only adds an encryption: the safe side).
+/// What the ransomware signal does not trust it for: its ciphertext-like
+/// content (b) and renames to a new extension (c), whoever started it.
+pub fn encrypts(exe: &Path, argv: &[String]) -> bool {
+    let Some(base) = exe.file_name().map(|n| n.to_string_lossy()) else {
+        return false;
+    };
+    let Some((_, crypt)) = CRYPT_TOOLS.iter().find(|(name, _)| {
+        base.strip_prefix(name)
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    }) else {
+        return false;
+    };
+    let args: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .take_while(|a| *a != "--")
+        .collect();
+    // a long option's name, `--name` or `--name=value`
+    fn long_name(a: &str) -> Option<&str> {
+        a.strip_prefix("--")
+            .map(|n| n.split('=').next().unwrap_or(n))
+    }
+    // a cluster of letters, `-abc`
+    fn cluster(a: &str) -> Option<&str> {
+        a.strip_prefix('-')
+            .filter(|l| !l.is_empty() && !l.starts_with('-'))
+    }
+    let has_long = |long: &[&str], abbreviated: bool| {
+        args.iter().filter_map(|a| long_name(a)).any(|n| {
+            long.contains(&n)
+                || (abbreviated && n.len() >= 3 && long.iter().any(|l| l.starts_with(n)))
+        })
+    };
+    let has_letter = |letters: &str| {
+        args.iter()
+            .filter_map(|a| cluster(a))
+            .any(|l| l.chars().any(|c| letters.contains(c)))
+    };
+    match *crypt {
+        Crypt::With {
+            letters,
+            long,
+            abbreviated,
+        } => has_letter(letters) || has_long(long, abbreviated),
+        Crypt::Unless { letters, long } => !(has_letter(letters) || has_long(long, false)),
+        Crypt::Command { commands, switches } => {
+            args.iter()
+                .find(|a| !a.starts_with('-'))
+                .is_some_and(|c| commands.contains(&c.to_ascii_lowercase().as_str()))
+                && args.iter().any(|a| {
+                    switches
+                        .iter()
+                        .any(|s| a.to_ascii_lowercase().starts_with(s))
+                })
+        }
+        Crypt::OpenSsl => {
+            let Some(command) = args.first() else {
+                return false;
+            };
+            let flag = |f: &str| args.iter().skip(1).any(|a| *a == f);
+            if *command == "enc" || OPENSSL_CIPHERS.iter().any(|c| command.starts_with(c)) {
+                !flag("-d")
+            } else if ["smime", "cms", "pkeyutl", "rsautl"].contains(command) {
+                flag("-encrypt")
+            } else {
+                false
+            }
+        }
+        Crypt::Always => true,
+    }
 }
 
 /// The first argument that is not an option, at `at`: the script; after a
@@ -1947,6 +2199,154 @@ mod tests {
         assert_eq!(p("/bin/sh", &["sh", "-c"]), None);
         assert_eq!(p("/usr/bin/cat", &["cat", "-c", "x"]), None);
     }
+
+    /// Lot 313 (BUG-49's residue): an encryption tool's argv in its
+    /// encryption mode, as each tool reads it; its other modes are not.
+    #[test]
+    fn an_encryption_tool_s_encryption_argv() {
+        let e = |exe: &str, a: &[&str]| encrypts(Path::new(exe), &argv(a));
+        for (exe, a) in [
+            (
+                "/usr/bin/openssl",
+                &[
+                    "openssl",
+                    "enc",
+                    "-aes-256-cbc",
+                    "-in",
+                    "a",
+                    "-out",
+                    "a.enc",
+                ][..],
+            ),
+            (
+                "/usr/bin/openssl",
+                &["openssl", "aes-256-cbc", "-salt", "-k", "x"],
+            ),
+            ("/usr/bin/openssl", &["openssl", "chacha20", "-in", "a"]),
+            (
+                "/usr/bin/openssl",
+                &["openssl", "smime", "-encrypt", "-in", "a", "cert.pem"],
+            ),
+            (
+                "/usr/bin/openssl",
+                &["openssl", "pkeyutl", "-encrypt", "-pubin"],
+            ),
+            ("/usr/bin/gpg", &["gpg", "-c", "a"]),
+            (
+                "/usr/bin/gpg",
+                &["gpg", "--batch", "--passphrase", "x", "--symmetric", "a"],
+            ),
+            ("/usr/bin/gpg", &["gpg", "--symm", "a"]),
+            ("/usr/bin/gpg", &["gpg", "-sear", "bob", "a"]),
+            ("/usr/bin/gpg", &["gpg", "--encrypt", "-r", "bob", "a"]),
+            (
+                "/usr/bin/gpg",
+                &["gpg", "--encrypt-files", "-r", "bob", "a", "b"],
+            ),
+            ("/usr/bin/gpg2", &["gpg2", "-e", "-r", "bob", "a"]),
+            (
+                "/usr/bin/gpgtar",
+                &["gpgtar", "--symmetric", "-o", "x.gpg", "dir"],
+            ),
+            ("/usr/bin/age", &["age", "-p", "-o", "a.age", "a"]),
+            ("/usr/bin/age", &["age", "-r", "age1xyz", "a"]),
+            (
+                "/usr/bin/7z",
+                &["7z", "a", "-pSECRET", "-mhe=on", "x.7z", "dir"],
+            ),
+            ("/usr/bin/7za", &["7za", "a", "x.7z", "dir", "-p"]),
+            ("/usr/bin/zip", &["zip", "-e", "-r", "x.zip", "dir"]),
+            ("/usr/bin/zip", &["zip", "-rP", "secret", "x.zip", "dir"]),
+            ("/usr/bin/zip", &["zip", "--password", "s", "x.zip", "a"]),
+            ("/usr/bin/zipcloak", &["zipcloak", "x.zip"]),
+            ("/usr/bin/rar", &["rar", "a", "-hpSECRET", "x.rar", "dir"]),
+            ("/usr/bin/ccrypt", &["ccrypt", "-K", "k", "a"]),
+            ("/usr/bin/ccencrypt", &["ccencrypt", "a"]),
+            ("/usr/bin/mcrypt", &["mcrypt", "a"]),
+            ("/usr/bin/aescrypt", &["aescrypt", "-e", "-p", "x", "a"]),
+            ("/usr/bin/scrypt", &["scrypt", "enc", "a", "a.enc"]),
+        ] {
+            assert!(e(exe, a), "{a:?}");
+        }
+        for (exe, a) in [
+            (
+                "/usr/bin/openssl",
+                &["openssl", "enc", "-d", "-aes-256-cbc", "-in", "a.enc"][..],
+            ),
+            (
+                "/usr/bin/openssl",
+                &["openssl", "x509", "-in", "c.pem", "-noout"],
+            ),
+            (
+                "/usr/bin/openssl",
+                &["openssl", "s_client", "-connect", "h:443"],
+            ),
+            ("/usr/bin/openssl", &["openssl", "dgst", "-sha256", "a"]),
+            ("/usr/bin/openssl", &["openssl", "base64", "-in", "a"]),
+            ("/usr/bin/openssl", &["openssl"]),
+            ("/usr/bin/gpg", &["gpg", "--verify", "a.sig", "a"]),
+            ("/usr/bin/gpg", &["gpg", "--decrypt", "a.gpg"]),
+            ("/usr/bin/gpg", &["gpg", "-d", "a.gpg"]),
+            ("/usr/bin/gpg", &["gpg", "--list-keys"]),
+            (
+                "/usr/bin/gpg",
+                &["gpg", "--encrypt-to", "bob", "--sign", "a"],
+            ),
+            // after `--`, a file's name, whatever it looks like
+            ("/usr/bin/gpg", &["gpg", "--decrypt", "--", "-ce.gpg"]),
+            ("/usr/bin/age", &["age", "-d", "-i", "key", "a.age"]),
+            ("/usr/bin/age", &["age", "--decrypt", "a.age"]),
+            ("/usr/bin/7z", &["7z", "x", "-pSECRET", "x.7z"]),
+            ("/usr/bin/7z", &["7z", "a", "x.7z", "dir"]),
+            ("/usr/bin/zip", &["zip", "-r", "x.zip", "dir"]),
+            ("/usr/bin/zipcloak", &["zipcloak", "-d", "x.zip"]),
+            ("/usr/bin/ccrypt", &["ccrypt", "-d", "a.cpt"]),
+            ("/usr/bin/ccrypt", &["ccrypt", "--cat", "a.cpt"]),
+            ("/usr/bin/aescrypt", &["aescrypt", "-d", "-p", "x", "a.aes"]),
+            ("/usr/bin/scrypt", &["scrypt", "dec", "a.enc", "a"]),
+            ("/usr/bin/tar", &["tar", "-czf", "x.tgz", "dir"]),
+            ("/usr/bin/agetty", &["agetty", "tty1"]),
+        ] {
+            assert!(!e(exe, a), "{a:?}");
+        }
+    }
+
+    /// Lot 313: busybox reads its program as busybox does — a name starting
+    /// with `busybox` is busybox itself, again and again, and `--help`,
+    /// `--list` and `--install` run none.
+    #[test]
+    fn busybox_reads_its_program_as_busybox_does() {
+        let p = |a: &[&str]| busybox_program(&argv(a)).map(|(n, at)| (n.to_string(), at));
+        assert_eq!(p(&["-sh"]), Some(("sh".into(), 1)));
+        assert_eq!(p(&["/bin/ash", "-i"]), Some(("ash".into(), 1)));
+        assert_eq!(p(&["busybox", "sh"]), Some(("sh".into(), 2)));
+        assert_eq!(p(&["busybox.static", "/bin/sh"]), Some(("sh".into(), 2)));
+        assert_eq!(p(&["busybox", "busybox", "hush"]), Some(("hush".into(), 3)));
+        assert_eq!(p(&["busybox", "-sh"]), Some(("-sh".into(), 2)));
+        for a in [
+            &["busybox"][..],
+            &["busybox", "--help", "sh"],
+            &["busybox", "--list"],
+            &["busybox", "--list-full"],
+            &["busybox", "--install", "-s"],
+            &[],
+        ] {
+            assert_eq!(p(a), None, "{a:?}");
+        }
+        // the interpreters' reader agrees
+        use crate::posture::lineage::ExecIdentity;
+        for a in [
+            &["busybox.static", "sh", "/tmp/steal.sh"][..],
+            &["busybox", "busybox", "sh", "/tmp/steal.sh"],
+        ] {
+            assert_eq!(
+                ExecIdentity::of_exec("/bin/busybox", &argv(a)).runs,
+                Runs::Script("/tmp/steal.sh".into()),
+                "{a:?}"
+            );
+        }
+    }
+
     // ── Lot 310, the independent review of #539 ─────────────────────────
 
     /// Finding 1: perl reads switches again after a space inside one

@@ -30,7 +30,6 @@
 //! hashed once is not hashed again until it changes.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -246,75 +245,9 @@ pub fn in_dkms_dir(tree: &Path, path: &Path) -> bool {
     rel.starts_with("updates/dkms") || rel.starts_with("extra")
 }
 
-/// DKMS registered module `module` (kmod's spelling) for `release`, built
-/// as the file `file` holds it: a
-/// `<registry>/<package>/<version>/<release>/<arch>/module/` directory
-/// holds a file of that module with the same content (DKMS installs its
-/// own copy, compressed and signed there).
-pub fn dkms_registered(registry: &Path, release: &str, module: &str, file: &Path) -> bool {
-    let Ok(want) = std::fs::metadata(file) else {
-        return false;
-    };
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                    .map(|e| e.path())
-                    .take(256)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    for package in dirs(registry) {
-        for version in dirs(&package) {
-            for arch in dirs(&version.join(release)) {
-                let Ok(rd) = std::fs::read_dir(arch.join("module")) else {
-                    continue;
-                };
-                if rd.flatten().any(|e| {
-                    e.file_name()
-                        .to_str()
-                        .and_then(module_name_of)
-                        .is_some_and(|m| m == module)
-                        && same_content(&e.path(), file, want.len())
-                }) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// `a` (a regular file, symbolic links not followed) holds the bytes `b`
-/// holds; `len` is `b`'s length, as its metadata gave it (a cheap first
-/// check).
-pub fn same_content(a: &Path, b: &Path, len: u64) -> bool {
-    let Ok(m) = std::fs::symlink_metadata(a) else {
-        return false;
-    };
-    if !m.is_file() || m.len() != len {
-        return false;
-    }
-    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
-        return false;
-    };
-    let mut ba = vec![0u8; 64 * 1024];
-    let mut bb = vec![0u8; 64 * 1024];
-    loop {
-        let Ok(n) = fa.read(&mut ba) else {
-            return false;
-        };
-        if n == 0 {
-            // b ends here too
-            return matches!(fb.read(&mut bb[..1]), Ok(0));
-        }
-        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
-            return false;
-        }
-    }
-}
+/// Lot 313 (BUG-87): one test of DKMS's build, R018's and this judge's —
+/// the content DKMS's registry holds, never a name.
+pub use nn_core::decision::rules::module_provenance::{dkms_registered, same_content};
 
 /// The boot's time from `/proc/stat` (`btime`).
 pub fn boot_time(proc_stat: &str) -> Option<i64> {

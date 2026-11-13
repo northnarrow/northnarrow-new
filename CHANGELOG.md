@@ -6,6 +6,33 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Shells and tools are recognised by what the kernel executed, not by a
+  name (lot 313; the external bug hunt's edition 1.4: BUG-85 (P1), N1 (P1),
+  BUG-112, BUG-119, BUG-87, BUG-111, and the decision of 11/11/2026 on
+  BUG-49's residue; `docs/operator/UPGRADE_NOTES_WAVE4.md` §32). R020 took a
+  shell from the executed file's basename: `cp /bin/bash ~/x` with its
+  stdio on a socket, `busybox sh`, `-sh` and `-ash` were no reverse shell.
+  Now the exec pump compares a running image with the installed shells and
+  interpreters (`/etc/shells` resolved and the system's binary
+  directories, recorded by the agent by device and inode at its start and
+  every minute) byte for byte, an installed one is known by its identity
+  under any name, and busybox runs the program its argv names as busybox
+  reads it. R006 reads socat's addresses in one place: a dual address
+  (`STDIO!!EXEC:/bin/sh`), a chain, `SYSTEM:`/`SHELL:` (always a shell),
+  `EXEC:` past `env`, `setsid`, `nohup`, `stdbuf`, `timeout` and the like,
+  an interpreter running inline code (`pty.spawn`); a link to
+  `/usr/bin/socat` under another name is socat. The system-tree exemptions
+  (the trusted actor's record of R011, R012, R013, R017; R011's package
+  transaction and initramfs build; R006's distribution socat) read the
+  kernel's executed file only: a caller's string cut at 255 bytes is no
+  system tree. A module file's name has one reader (`common::module_stem`:
+  the last `.ko[.xz|.zst|.gz]`, never `.`, `..` or empty), and R018 takes a
+  DKMS build from its content in DKMS's registry, as the kernel judge does,
+  not from a directory of its name. An encryption tool asked to encrypt
+  (`openssl enc`, `gpg -c`, `age`, `7z a -p`, `zip -e` and the like) is
+  never trusted for the ransomware signal's ciphertext and rename shapes,
+  whoever started it. A ratchet (`xtask/tests/program_names.rs`) keeps
+  program names in the rules' one helper.
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision

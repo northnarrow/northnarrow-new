@@ -1419,9 +1419,13 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
 /// ([`resolved`]). Lot 287: then the exec noted for the initramfs builds
 /// the later execs of module tools are read under (an exec of a builder
 /// remembered by its process, any other exec forgets its pid) — in the
-/// pump's order, before any exec its process forks.
+/// pump's order, before any exec its process forks. Lot 313: an exec with
+/// its stdio on an inet socket (R020's shapes) whose file is no installed
+/// program has its running image compared with the installed shells and
+/// interpreters, first too ([`crate::program_images`]).
 fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
     crate::sensors::kmod_exec::read_and_keep(&e);
+    crate::program_images::read_and_keep(&e);
     let (mut e, carried) = resolved(raw, e);
     // lot 310 (the review of #539): the image, its directory, an
     // interpreter's environment and standard input, read while it runs

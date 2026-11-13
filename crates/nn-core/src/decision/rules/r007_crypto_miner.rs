@@ -94,11 +94,8 @@ impl<H: PostureHost> Rule for R007CryptoMiner<H> {
         };
         let comm_lc = comm.to_ascii_lowercase();
         let image = exe.path_or(filename);
-        let base_lc = image
-            .rsplit('/')
-            .next()
-            .unwrap_or(image)
-            .to_ascii_lowercase();
+        // lot 313: a program's name read by the rules' one helper
+        let base_lc = super::program_identity::base_of(image).to_ascii_lowercase();
         let names = [comm_lc.as_str(), base_lc.as_str()];
         let exact = MINER_NAMES.iter().find(|n| names.contains(n));
         let found = match (self.fragments, exact) {

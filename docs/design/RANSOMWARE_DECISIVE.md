@@ -221,9 +221,26 @@ kill targets the nearest foreign program (the script, the payload).
   from a tarball: `go build` under `/usr/local/go` running `gcc`) is judged
   now; its bursts count against that program. Nothing is killed by default
   (NN-L-IMP-001's kill is held by the signed per-rule policy).
-- Residuals: an intruder in an interactive session who encrypts with
-  packaged tools only (`openssl`, `gpg` from that session) is a trusted
-  writer here; an encryptor that forks a new process every few files stays
+- Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026): an
+  encryption tool whose argv asks it to encrypt — `openssl enc` (or a
+  cipher as its command) without `-d`, `openssl smime|cms|pkeyutl -encrypt`,
+  `gpg`/`gpgtar` with `-c`, `-e`, `--symmetric`, `--encrypt` (gpg's
+  abbreviations and clusters such as `-sear` included), `age`/`rage` without
+  `-d`, `7z a|u` with `-p`, `rar a` with `-p`/`-hp`, `zip -e`/`-P`,
+  `zipcloak`, `ccrypt`, `ccencrypt`, `mcrypt`, `aescrypt -e`, `scrypt enc`
+  (`posture/script_args.rs`, `encrypts`) — is never trusted for (b) and
+  (c), whoever started it: an intruder's interactive session, a unit, a
+  package transaction. Its ciphertext-like content and its renames to a new
+  extension count under its own process (and its forked copies); two make
+  the assessment decisive. Its rewrites (a) and deletions (d) keep the trust
+  its lineage gives, and a decrypt, a verify or an archive without a
+  password is trusted as before. What it costs: a backup job that encrypts
+  in place with a packaged tool and renames its output in bulk can now be
+  decisive (NN-L-IMP-001's kill stays held by default).
+- Residuals: an intruder in an interactive session who encrypts with a
+  program no table names (a tool of its own is judged anyway: no package
+  installed it), or one that writes its ciphertext through another
+  process (`gpg -c -o - | dd of=…`: `dd` is trusted); an encryptor that forks a new process every few files stays
   under the per-process rename and unlink counts (the cgroup window covers
   rewrites only); a random new name per file (no extension streak); a
   program loaded into a trusted process (`LD_PRELOAD`, CM-25).

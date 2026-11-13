@@ -1547,3 +1547,52 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
   refused: a signed degradation) no unit's shell vouches and only PID 1's
   executor copies are exempt.
+
+## 32. Shells and tools by what the kernel executed (lot 313)
+
+- **R020 knows a shell by its file** (the external bug hunt's edition 1.4:
+  BUG-85, N1). A copy of an installed shell or interpreter under any name
+  (`cp /bin/bash ~/x`), an installed one under another name (a hard link, a
+  bind mount) and busybox running a shell (`busybox sh`, `/bin/busybox sh`,
+  the login shells `-sh`, `-ash`, a link named `sh`) with its stdin or
+  stdout on a socket is a reverse shell: Critical, the posture's
+  `ConfirmedIntrusion` (the kill stays held by the per-rule policy). The
+  agent records the host's shells, interpreters and busybox by device and
+  inode at its start and every minute ("R020: the installed shells and
+  interpreters known by their identity" in the journal): `/etc/shells`
+  and the files of `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`,
+  `/usr/local/bin`, each resolved, whose resolved file is named as one. Only an exec with its stdio on an inet
+  socket has its running image compared (same length, then byte for byte).
+  Residual: a shell rebuilt, patched or downloaded, under another name.
+- **R006 reads socat's addresses in one place** (BUG-112). The
+  distribution's socat whose address runs a shell is killed in more
+  spellings: each half of a dual address (`a!!b`) and each link of a chain
+  (`a|b`); `SYSTEM:` and `SHELL:` always (socat runs `/bin/sh -c`: a
+  `SYSTEM:` relay that runs a plain command is now killed too — allowlist
+  it in `process-comm-allowlist` if a harness needs one); `EXEC:` past
+  `env`, `setsid`, `nohup`, `stdbuf`, `timeout`, `nice`, `ionice`, `chrt`,
+  `taskset`, `sudo`, `doas`, busybox; a shell, `script`, or an interpreter
+  running inline code, its standard input or a REPL. A link to
+  `/usr/bin/socat` under another name is socat, and so is socat 1.8's own
+  file, `/usr/bin/socat1` (a tool's name takes a version suffix).
+- **System-tree exemptions read the kernel's executed file** (BUG-119):
+  the trusted actor's record (R011, R012, R013, R017), R011's package
+  transaction and initramfs build, and R006's distribution socat. An exec
+  whose kernel path is not known (a mount root the agent cannot place, an
+  argv string cut at 255 bytes with `/proc/<pid>/exe` unreadable) is in no
+  system tree: killed, as a copy would be.
+- **A module file's name, and a DKMS build, have one reader** (BUG-87,
+  BUG-111). `common::module_judge::module_stem` takes the last `.ko`,
+  `.ko.xz`, `.ko.zst` or `.ko.gz` that ends the name and refuses `.`, `..`
+  and empty: `acme.kontrol.ko` is `acme.kontrol` (the kernel judge vouched
+  for no such DKMS module), `..ko` nothing. R018 takes a file of
+  `updates/dkms/` or `extra/` for DKMS's build when DKMS's registry holds a
+  file of that module, for that kernel, with the same content — as the
+  kernel judge does — not when `/var/lib/dkms/<name>` is a directory.
+- **An encryption tool asked to encrypt is never trusted for (b) and (c)**
+  (BUG-49's residue, the decision of 11/11/2026). `openssl enc`, `gpg -c`,
+  `gpg -e`, `age`, `7z a -p`, `zip -e`, `rar a -p`, `ccrypt`, `mcrypt`,
+  `aescrypt -e`, `scrypt enc` — whoever started them — have their
+  ciphertext-like content and renames to a new extension counted by the
+  ransomware signal (NN-L-IMP-001/-002; the kill held by default). Expect an
+  assessment of a backup job that encrypts with a packaged tool in bulk.

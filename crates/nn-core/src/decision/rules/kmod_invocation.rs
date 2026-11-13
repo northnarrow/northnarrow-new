@@ -74,9 +74,9 @@ const COMPAT: &[&str] = &["insmod", "modprobe", "lsmod", "rmmod", "modinfo", "de
 /// The directories the distribution installs the module tools in.
 const TOOL_DIRS: &[&str] = &["/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"];
 
-/// The basename of `path`.
+/// The basename of `path` (lot 313: the rules' one helper).
 fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    super::program_identity::base_of(path)
 }
 
 /// The tool an exec of `image` (the file the kernel executed, or the path

@@ -234,10 +234,18 @@ const KNOWN: &[(&str, usize, &str)] = &[
          — and its options told by their hyphen (`starts_with('-')`)",
     ),
     (
+        "crates/nn-core/src/decision/rules/program_identity.rs",
+        3,
+        "lot 313: the launchers' own options (`env -u NAME`, `VAR=value`, `timeout -s SIG`, \
+         `stdbuf --output L`, `sudo -u user`…) a command line runs its program through \
+         (`command_runs_a_shell`, socat's `EXEC:`), read to find that program: no \
+         interpreter's; an interpreter found is read by the reader (`runs_of`)",
+    ),
+    (
         "crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs",
         1,
-        "socat's address arguments (`exec:`, `system:`): socat's own syntax, no interpreter's \
-         options",
+        "lot 313: socat's addresses, every argument after its name (`.skip(1)`), each split on \
+         `!!` and `|`: socat's own syntax, no interpreter's options",
     ),
     (
         "crates/nn-core/src/decision/rules/r015_encoding_tooling_service_uid.rs",

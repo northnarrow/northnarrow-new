@@ -65,23 +65,8 @@ pub const EXPOSED_SERVICES: &[&str] = &[
 /// Ancestors walked at most.
 const MAX_HOPS: usize = 8;
 
-/// `base` is the program `name`, or `name` with a version suffix
-/// (`php-fpm8.3`, `python3.12`).
-pub(crate) fn program_is(base: &str, name: &str) -> bool {
-    base.strip_prefix(name)
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
-}
-
-fn base_of(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-/// A shell, by the basename of what the kernel executed.
-pub(crate) fn is_shell_base(base: &str) -> bool {
-    crate::decision::rules::r020_shell_with_socket_stdio::SHELLS
-        .iter()
-        .any(|s| program_is(base, s))
-}
+// Lot 313: a program's name read by the rules' one helper.
+use crate::decision::rules::program_identity::{base_of, names_a_shell, program_is};
 
 /// What in `pid`'s lineage makes a transfer tool a dropper's instrument
 /// (module docs), at `now_ns` (the store's window); the lineage's images
@@ -139,7 +124,7 @@ pub fn precursor_of<H: PostureHost>(
         if shell_below && EXPOSED_SERVICES.iter().any(|s| program_is(program, s)) {
             return Some("a shell started by an exposed network service");
         }
-        if is_shell_base(base) {
+        if names_a_shell(base) {
             shell_below = true;
         }
     }

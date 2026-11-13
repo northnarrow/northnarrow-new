@@ -9338,6 +9338,89 @@ number in parentheses is a lab PR.
     this lot). Uninstalled each round, nothing left.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
+- **Lot 313 — shells and tools by what the kernel executed (C06, C14,
+  C19; the third bug hunt's lot 3: BUG-85 P1, N1 P1, BUG-112, BUG-119,
+  BUG-87, BUG-111; the decision of 11/11/2026 on BUG-49's residue).**
+  - What was open: R020 took a shell from the executed file's basename —
+    `cp /bin/bash ~/x` with its stdio on a socket connected out, `busybox
+    sh`, `/bin/busybox sh`, the login shells `-sh` and `-ash` were no
+    reverse shell (no Critical, no `ConfirmedIntrusion`; an unprivileged
+    user's evasion); R006 read socat's shell as the first word of an
+    argument that starts with `EXEC:`/`SYSTEM:`/`SHELL:` (`STDIO!!EXEC:/bin/sh`,
+    `EXEC:/usr/bin/env sh`, `SYSTEM:exec bash -i` were relays); the
+    system-tree exemptions (the trusted actor's record, R011's package
+    transaction, R006's distribution socat) took a caller's string cut at
+    255 bytes (`/usr/bin/./././…`) for `/usr/bin`; a module's name was cut
+    at its first `.ko` and DKMS's build was a directory of that name
+    (`..ko`, `nvidia.kox-rootkit.ko`, `mkdir /var/lib/dkms/rk`); a packaged
+    encryption tool started from a trusted lineage (`ccrypt -r` by a unit,
+    `gpg -c` from an interactive session) never counted for the ransomware
+    signal.
+  - What changed: one identity helper for the rules
+    (`rules/program_identity.rs`: the exec pump's byte comparison of a
+    running image with the installed shells and interpreters, their
+    `(dev, ino)` recorded by the agent at its start and every minute
+    (`nn_linux::program_images`), then the name; busybox read as busybox
+    reads its argv; a command line's program past its launchers; a tool by
+    its `comm` or the kernel's executed file, a version suffix allowed);
+    R020 and R006 ask it; the exemptions read the kernel's executed file
+    only, and `in_system_tree` refuses a non-canonical path; one
+    `common::module_stem`, DKMS's build by its content (the kernel judge's
+    `dkms_registered`, now shared); `script_args::encrypts` and the
+    lineage's flag: an encryption tool asked to encrypt counts (b) and (c)
+    whoever started it; a ratchet (`xtask/tests/program_names.rs`).
+  - The lab, as measured (our own guests under lease k313; the agent
+    uninstalled, the guests clean and off at the end):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255; r1 at
+      c7888ee5): the agent recorded 6 installed programs at its start. As
+      the lab user, with stdin and stdout on a socket the shell connected
+      out to a loopback listener: `-sh` (busybox run as a login shell) and
+      `busybox.x sh` (busybox's prefix rule): R020 Critical, recorded (the
+      kill held by default). socat 1.8.0.0, the distribution's:
+      `STDIO!!EXEC:/bin/sh`, `EXEC:/usr/bin/env sh`, `EXEC:/usr/bin/setsid
+      bash -i`, `SYSTEM:exec bash -i`, `EXEC:python3 -c 'import
+      pty;pty.spawn(…)'`: R006 KillProcessTree, rc 137 each; a relay
+      (`STDIO!!OPEN:/dev/null`): R006 High, recorded, ran. Found and fixed:
+      a link `~/relay` to `/usr/bin/socat` running `EXEC:/bin/sh` ran with
+      no record — socat 1.8 installs `/usr/bin/socat1`, `socat` a link to it,
+      and the kernel's executed file is `socat1` (94666f71: a tool's name
+      takes a version suffix). The round's other R020 cases ran through a
+      shell function under `timeout` (rc 127, the probe's fault) and the
+      round stopped at the relay case (socat read the rest of the probe
+      from its standard input): rerun in r2 below. Benign corpus: `dev` (24
+      steps) one kill, the `www-data` control's R001 (by design), R001 High
+      records (`go test`, `go run`, the AppImage runs, the user's control),
+      NN-L-IMP-001 (held) in `go test`, `ConfirmedIntrusion` (mass write)
+      on `rsync --inplace` — as lot 310's baseline; `ci` (15 steps) no kill,
+      R001 High (`go test`, `go run`), NN-L-AT-001 ×24 of
+      `deb-systemd-helper` in the purge (known), `ConfirmedIntrusion` (mass
+      write) raised on `go test` and on `npm ci` (an io_uring worker): the
+      posture's mass-write arm, which this lot does not touch. No R020,
+      R006 or ransomware record in either corpus.
+    - **Debian 13** (`6.12.115+deb13.1-cloud-amd64`, systemd 257; at
+      c7888ee5): 4 installed programs recorded; `-sh` and `busybox.x sh`:
+      R020 Critical; socat 1.8.0.3: the five shell spellings killed (rc
+      137), the relay recorded, the link to socat with no record (the same
+      `socat1`, fixed). BUG-49's residue: `ccrypt -e -r` run by a transient
+      unit (PID 1 → ccrypt: a lineage of installed programs, trusted on
+      main) over 30 text files: 30 renamed `.cpt`, NN-L-IMP-001 Critical
+      (its kill held by default).
+    - **Debian 13, round r2** (`6.12.115+deb13.1-cloud-amd64`, systemd
+      257; at 12809c64 with the encryption flag on the bus's ingest), the
+      cases r1 left invalid or missing, the probe's cases reading
+      `/dev/null`: as the lab user, with stdin and stdout on a socket the
+      shell connected out — a copy of bash `~/x`, a hard link of bash under
+      another name (root made it), `busybox sh`, a link `~/sh` to busybox:
+      R020 Critical, recorded, each; the copy without a socket and `busybox
+      cat` on the socket: nothing. A link `~/relay` to `/usr/bin/socat`
+      (`→ socat1`, 1.8.0.3) running `EXEC:/bin/sh`: R006 KillProcessTree, rc
+      137; the same link as a relay: R006 High, recorded, ran. No leftovers.
+  - Level unchanged (C06, C14, C19): the evasions are closed and measured
+    on two kernels; nothing new is proved beyond them. Residual, said so:
+    a shell that is not byte-identical to an installed one under another
+    name; a renamed copy of a shell with no socket on its stdio is R017's
+    only by its name; in tracepoint mode a path is the exec pump's lexical
+    normalisation of the caller's string (PROC-002/003).
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
   - What was open: a process whose `comm` is not UTF-8 — set with

@@ -290,6 +290,33 @@ pub(crate) fn spawn_executor_refresh(images: nn_core::decision::rules::ExecutorI
     });
 }
 
+/// Lot 313 (BUG-85, N1): record the host's shells, interpreters and busybox
+/// by their identity now, then every minute (an upgrade gives a program a
+/// new inode; the old one is kept): R020 tells a shell by the file the
+/// kernel executed, and the exec pump compares a running image with them
+/// (`nn_linux::program_images`).
+pub(crate) fn spawn_program_images_refresh() {
+    let n = nn_linux::program_images::seed();
+    info!(
+        programs = n,
+        "R020: the installed shells and interpreters known by their identity"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // seeded above
+        loop {
+            tick.tick().await;
+            let n = nn_linux::program_images::refresh();
+            if n > 0 {
+                info!(
+                    programs = n,
+                    "R020: an installed shell or interpreter changed on disk — its new identity recorded"
+                );
+            }
+        }
+    });
+}
+
 /// The signed audit log, as the watchdog refresh gets it once it is open.
 pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 

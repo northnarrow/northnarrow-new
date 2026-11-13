@@ -88,7 +88,7 @@ impl Host {
         std::fs::write(
             info.join("base.list"),
             "/usr/bin/bash\n/usr/sbin/sshd\n/usr/bin/tar\n/usr/bin/mv\n/usr/bin/rsync\n\
-             /usr/bin/python3\n/usr/bin/git\n",
+             /usr/bin/python3\n/usr/bin/git\n/usr/bin/gpg\n/usr/bin/openssl\n/usr/bin/7z\n",
         )
         .unwrap();
         let lineage = AuthSessionTracker::new(proc.path());
@@ -694,4 +694,125 @@ fn a_window_opened_unreadable_is_the_actor_s_once_read() {
         "a reused pid's shapes"
     );
     assert!(!b2.decisive);
+}
+
+/// Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026):
+/// the packaged encryption tools, run from an intruder's interactive
+/// session (a login shell under sshd: a lineage of installed programs), were
+/// trusted writers — none of their bursts counted. Asked to encrypt, they
+/// are never trusted for (b) and (c): ciphertext-like content and renames
+/// to a new extension count, under the tool's own process, and two of them
+/// are decisive; (a) and (d) keep the trust.
+#[test]
+fn an_encryption_tool_asked_to_encrypt_is_not_trusted_for_b_and_c() {
+    let h = Host::new();
+    h.exec(
+        500,
+        200,
+        "/usr/bin/gpg",
+        &["gpg", "--batch", "-c", "--multifile", "a", "b"],
+    );
+    h.exec(
+        501,
+        200,
+        "/usr/bin/openssl",
+        &[
+            "openssl",
+            "enc",
+            "-aes-256-cbc",
+            "-in",
+            "a",
+            "-out",
+            "a.enc",
+        ],
+    );
+    h.exec(
+        502,
+        200,
+        "/usr/bin/7z",
+        &["7z", "a", "-pSECRET", "x.7z", "dir"],
+    );
+    let t = h.tracker(Fixed::high("/srv/data/"));
+    for pid in [500, 501, 502] {
+        // (a), sampled: (b) counts, (a) does not
+        let a = t.assess(&rewrites(pid, T0, "/srv/data/f020")).unwrap();
+        assert!(a.trusted.is_none() && a.encrypting, "{pid}: {a:?}");
+        assert_eq!(a.actor, pid);
+        assert_eq!(a.added, vec![Signal::Entropy], "{pid}: {a:?}");
+        assert!(!a.decisive, "{pid}: one shape");
+        // (c): decisive with (b)
+        let a = t
+            .assess(&renames(pid, T0 + S, "/srv/data/f021.locked", 20, 5))
+            .unwrap();
+        assert!(a.added.contains(&Signal::RenameExtension), "{pid}: {a:?}");
+        assert!(a.decisive, "{pid}: {a:?}");
+        assert!(a.why.contains("encryption tool"), "{}", a.why);
+        // (d) keeps the trust: new files written, then originals deleted
+        t.assess(&new_files(pid, T0 + 2 * S, "/srv/data/y.gpg"))
+            .unwrap();
+        let a = t.assess(&unlinks(pid, T0 + 3 * S, "/srv/data/z")).unwrap();
+        assert!(!a.added.contains(&Signal::DeleteOriginals), "{pid}: {a:?}");
+    }
+    assert_eq!(t.counts().decisive, 3);
+}
+
+/// Guard: the same tools in another mode — decrypting, verifying, an
+/// archive without a password — keep the trust their lineage gives.
+#[test]
+fn an_encryption_tool_in_another_mode_keeps_its_trust() {
+    let h = Host::new();
+    h.exec(510, 200, "/usr/bin/gpg", &["gpg", "--decrypt", "a.gpg"]);
+    h.exec(
+        511,
+        200,
+        "/usr/bin/openssl",
+        &["openssl", "enc", "-d", "-in", "a.enc"],
+    );
+    h.exec(512, 200, "/usr/bin/7z", &["7z", "a", "x.7z", "dir"]);
+    let t = h.tracker(Fixed::high("/srv/data/"));
+    for pid in [510, 511, 512] {
+        for e in [
+            rewrites(pid, T0, "/srv/data/f020"),
+            renames(pid, T0 + S, "/srv/data/f021.locked", 20, 5),
+        ] {
+            let a = t.assess(&e).unwrap();
+            assert!(a.trusted.is_some() && !a.encrypting, "{pid}: {a:?}");
+            assert!(a.added.is_empty());
+        }
+    }
+    assert_eq!(t.counts().decisive, 0);
+}
+
+/// Lot 313: the agent's path — an exec event ingested as the bus ingests
+/// it (`ingest_spawn_event`), not the tests' plain ingest — keeps the
+/// encryption too: the merge with lot 310's review moved that path off the
+/// one that computed it, and nothing failed.
+#[test]
+fn an_exec_event_s_encryption_is_kept() {
+    let h = Host::new();
+    let mut e = crate::decision::rules::testutil::spawn_full(
+        "gpg",
+        "/usr/bin/gpg",
+        1000,
+        &["gpg", "--batch", "-c", "a"],
+        "bash",
+    );
+    if let Event::ProcessSpawn {
+        pid,
+        ppid,
+        timestamp_ns,
+        start_ns,
+        exe,
+        ..
+    } = &mut e
+    {
+        (*pid, *ppid) = (520, 200);
+        (*timestamp_ns, *start_ns) = (10 * S + 520, 10 * S + 520);
+        exe.path = "/usr/bin/gpg".into();
+    }
+    assert!(h.lineage.ingest_spawn_event(&e));
+    let t = h.tracker(Fixed::high("/srv/data/"));
+    let a = t.assess(&rewrites(520, T0, "/srv/data/f020")).unwrap();
+    assert!(a.encrypting && a.trusted.is_none(), "{a:?}");
+    assert_eq!(a.added, vec![Signal::Entropy]);
 }

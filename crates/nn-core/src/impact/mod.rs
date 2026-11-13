@@ -42,6 +42,15 @@
 //! foreign program of the writer's lineage (a script's `mv` and `rm` count
 //! against the script), or the writer.
 //!
+//! Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026): an
+//! encryption tool whose argv asks it to encrypt (`openssl enc`, `gpg -c`,
+//! `age`, `7z a -p`, `zip -e`: `crate::posture::script_args::encrypts`) is
+//! never trusted for (b) and (c), whoever started it — an intruder's
+//! interactive session, a unit, a package transaction: its ciphertext-like
+//! content and its renames to a new extension count, under its own process
+//! (and its forked copies); its rewrites (a) and deletions (d) keep the
+//! trust its lineage gives.
+//!
 //! The assessment of one event is memoised: the posture (which reads the
 //! event first) and the rule engine see the same answer, and the files are
 //! sampled once.
@@ -118,6 +127,8 @@ pub struct Assessment {
     pub program: String,
     /// `Some`: the writer is trusted (why); no signal counted.
     pub trusted: Option<String>,
+    /// Lot 313: a trusted writer that encrypts: only (b) and (c) counted.
+    pub encrypting: bool,
     /// The actor's shapes in the window, each with what showed it.
     pub signals: Vec<(Signal, String)>,
     /// The shapes this event added.
@@ -342,6 +353,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             key: pid,
             program: String::new(),
             trusted: None,
+            encrypting: false,
             signals: Vec::new(),
             added: Vec::new(),
             decisive: false,
@@ -349,6 +361,27 @@ impl<H: DecisionHost> RansomTracker<H> {
             why: String::new(),
         };
         match trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned) {
+            // lot 313 (BUG-49's residue): an encryption tool asked to
+            // encrypt is judged for (b) and (c) whoever started it
+            Judged::Trusted(t) if self.lineage.runs_encryption(pid, as_of) => {
+                let hops = lineage.as_deref().unwrap_or_default();
+                let actor = if hops.is_empty() {
+                    pid
+                } else {
+                    hops[trust::topmost_same(hops, 0)].0
+                };
+                a.encrypting = true;
+                a.actor = actor;
+                a.key = actor;
+                a.program = hops
+                    .first()
+                    .map_or_else(String::new, |(_, id)| trust::program_of(id));
+                a.why = format!(
+                    "an encryption tool asked to encrypt: never trusted for ciphertext-like \
+                     content or renames to a new extension (lot 313), though {}",
+                    t.describe()
+                );
+            }
             Judged::Trusted(t) => {
                 self.counters.trusted.fetch_add(1, Ordering::Relaxed);
                 a.trusted = Some(t.describe());
@@ -518,6 +551,11 @@ impl<H: DecisionHost> RansomTracker<H> {
         }
         if copy_checked {
             sample = None;
+        }
+        // lot 313: an encrypting writer its lineage trusts counts (b) and
+        // (c) only
+        if a.encrypting {
+            shapes.retain(|(s, _)| matches!(s, Signal::Entropy | Signal::RenameExtension));
         }
         let mut st = self.state.lock();
         let w = actor_window(&mut st, a.key, &a.program, ts);

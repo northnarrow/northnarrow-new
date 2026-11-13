@@ -277,6 +277,10 @@ async fn run(
     // executor, by its identities
     let launches = workers::known_launches(workers::own_launch(&image));
     tasks::spawn_executor_refresh(launches.executor.clone());
+    // Lot 313: the host's shells, interpreters and busybox by their
+    // identity, for R020 (before the sensors attach: the exec pump compares
+    // a running image with them)
+    tasks::spawn_program_images_refresh();
     // Lot 276: the export's signed configuration — off without it; on, its
     // worker starts with the others
     let export_loaded = northnarrow_agent::export::load(&overlay_gate);

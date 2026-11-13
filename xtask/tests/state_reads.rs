@@ -121,6 +121,12 @@ const READBACK: &str = "a response's read-back of what it did (lot 312): a read 
                         answered on the stricter side — a cgroup that cannot be read back is no \
                         block in effect, a failure with its reason";
 
+/// Why the installed shells' list may default (lot 313).
+const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed programs: an \
+                      unreadable file adds none, the binary directories are still read, and \
+                      what was recorded is never removed (the identities only add a program to \
+                      R020's shells, never exempt one; the executed file's name still counts)";
+
 /// Rule 2's sites, each by its read as written (spaces dropped): `(file,
 /// read, why)` — none reads a file a process or a user names into an empty
 /// answer that a protection then publishes. The readers that keep the last
@@ -475,6 +481,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/own_dropins.rs",
         "fs::read(&from)",
         CONFIG,
+    ),
+    (
+        "crates/nn-linux/src/program_images.rs",
+        "fs::read(root.join(\"etc/shells\"))",
+        SHELLS,
     ),
     (
         "crates/nn-linux/src/response/containment.rs",

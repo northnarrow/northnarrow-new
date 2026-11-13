@@ -5925,9 +5925,16 @@ mod tests {
             "/memfd:aws (deleted)",
             "/usr/bin/aws (deleted)",
             "/usr/../tmp/aws",
+            // lot 313 (BUG-119's family): a caller's string, not canonical
+            "/usr/bin/./././././././",
+            "/usr/bin//aws",
+            "/usr/bin/.",
+            "/usr/bin/..",
         ] {
             assert!(!crate::posture::lineage::in_system_tree(p), "{p}");
         }
+        // a directory entry's trailing slash is no segment
+        assert!(crate::posture::lineage::in_system_tree("/usr/lib/x/"));
     }
 
     // ── review 83 — account tools are recorded, not killed ────────────

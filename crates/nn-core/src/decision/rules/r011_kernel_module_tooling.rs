@@ -465,9 +465,12 @@ fn in_initramfs_build_at_exec(event: &Event, v: Verdict) -> Verdict {
         {
             "the system's modprobe, asked to load nothing (--show-depends or --dry-run)".to_string()
         }
+        // lot 313 (BUG-119): the script's place is the kernel's executed
+        // file, never the caller's string
         (Err(_), Some(interpreter))
-            if crate::posture::lineage::in_system_tree(image)
-                && !kmod_invocation::in_tool_place(image) =>
+            if super::program_identity::kernel_image(event).is_some_and(|k| {
+                crate::posture::lineage::in_system_tree(k) && !kmod_invocation::in_tool_place(k)
+            }) =>
         {
             format!("a script of a system tree, run by {interpreter} — no module tool")
         }
@@ -503,13 +506,12 @@ fn in_package_transaction_at_exec(event: &Event, v: Verdict) -> Verdict {
     if v.action == ResponseAction::Log {
         return v;
     }
-    let Event::ProcessSpawn {
-        uid, filename, exe, ..
-    } = event
-    else {
+    let Event::ProcessSpawn { uid, .. } = event else {
         return v;
     };
-    if *uid != 0 || !crate::posture::lineage::in_system_tree(exe.path_or(filename)) {
+    // lot 313 (BUG-119): the kernel's executed file, never the caller's
+    // string (a cut one named `/usr/bin/./././…`)
+    if *uid != 0 || !super::program_identity::exec_in_system_tree(event) {
         return v;
     }
     let Some(pm) = kmod_exec_facts::of(event).and_then(|f| f.package_manager) else {
@@ -1732,5 +1734,159 @@ mod tests {
             0,
         );
         assert!(r.evaluate(&e).is_none());
+    }
+}
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-119): a caller's string the kernel cut
+/// (`filename_truncated`) "names no path" (nn-model event.rs:92-96), but
+/// with no kernel path (`exe.path` empty: tracepoint mode, or a root the
+/// mount table does not know, and `/proc/<pid>/exe` unreadable) the
+/// exemptions judge `exe.path_or(filename)` with `in_system_tree`.
+#[cfg(test)]
+mod bug119 {
+    use super::*;
+    use crate::decision::rules::kmod_exec_facts::{Environment, ExecFacts};
+    use crate::posture::host::testing::TestHost as H;
+
+    /// `/usr/bin/` then `./` × 123: 255 bytes, what is left of
+    /// `/usr/bin/./././…/../../tmp/x/kmod` after the cut.
+    fn cut_string() -> String {
+        let s = format!("/usr/bin/{}", "./".repeat(123));
+        assert_eq!(s.len(), 255);
+        s
+    }
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A root exec of a copied `kmod` as the pump leaves it: the cut
+    /// string, no kernel path.
+    fn cut_exec(pid: u32, ppid: u32, ts: u64, start: u64) -> Event {
+        let mut e = crate::decision::rules::testutil::spawn("kmod", &cut_string());
+        if let Event::ProcessSpawn {
+            pid: p,
+            ppid: pp,
+            uid,
+            gid,
+            argv: a,
+            timestamp_ns,
+            start_ns,
+            filename_truncated,
+            parent_comm,
+            ..
+        } = &mut e
+        {
+            (*p, *pp, *uid, *gid) = (pid, ppid, 0, 0);
+            *a = argv(&["insmod", "/tmp/rk.ko"]);
+            (*timestamp_ns, *start_ns) = (ts, start);
+            *filename_truncated = true;
+            *parent_comm = "sh".to_string();
+        }
+        e
+    }
+
+    #[test]
+    fn bug119_a_cut_string_is_no_system_tree_for_the_package_transaction() {
+        let e = cut_exec(2_119_001, 1, 2_119_001, 0);
+        kmod_exec_facts::keep(
+            &e,
+            ExecFacts {
+                program: Err("its device and inode are not the system's tool's".into()),
+                environment: Environment::Clean,
+                package_manager: Some("/usr/bin/dpkg".into()),
+                initramfs_builder: None,
+                interpreter: None,
+            },
+        );
+        let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .evaluate(&e)
+            .expect("fires");
+        assert_ne!(
+            v.action,
+            ResponseAction::Log,
+            "a cut string names no path (event.rs:92-96), yet: {}",
+            v.reasoning
+        );
+    }
+
+    #[test]
+    fn bug119_a_cut_string_is_no_system_tree_for_judge_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::<H>::new(dir.path());
+        t.ingest_exec(100, 1, "/usr/bin/apt", &argv(&["apt", "install"]), 10, 5, 0);
+        t.ingest_exec(
+            200,
+            100,
+            "/usr/bin/dpkg",
+            &argv(&["dpkg", "--configure"]),
+            20,
+            15,
+            0,
+        );
+        t.ingest_exec(
+            300,
+            200,
+            "/usr/bin/dash",
+            &argv(&["/bin/sh", "/var/lib/dpkg/info/x.postinst"]),
+            30,
+            25,
+            0,
+        );
+        let e = cut_exec(2_119_500, 300, 50, 45);
+        t.ingest_exec(
+            2_119_500,
+            300,
+            &cut_string(),
+            &argv(&["insmod", "/tmp/rk.ko"]),
+            50,
+            45,
+            0,
+        );
+        let entries = crate::config::comm_allowlist::BUILTIN_PROCESS_COMM_ALLOWLIST_V1
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from);
+        let r = R011KernelModuleTooling::<H>::new(Arc::new(
+            CommAllowlist::<H>::from_iter_owned(entries).with_identity(t),
+        ));
+        let v = r.evaluate(&e).expect("fires");
+        assert_ne!(
+            v.action,
+            ResponseAction::Log,
+            "a cut string names no path (event.rs:92-96), yet: {}",
+            v.reasoning
+        );
+    }
+
+    /// Guard: the same string whole (not cut) is normalised by the pump
+    /// to its real place; a `/tmp` copy under dpkg is killed.
+    #[test]
+    fn bug119_guard_a_tmp_copy_under_dpkg_is_killed() {
+        let mut e = cut_exec(2_119_002, 1, 2_119_002, 0);
+        if let Event::ProcessSpawn {
+            filename,
+            filename_truncated,
+            ..
+        } = &mut e
+        {
+            *filename = "/tmp/x/kmod".into();
+            *filename_truncated = false;
+        }
+        kmod_exec_facts::keep(
+            &e,
+            ExecFacts {
+                program: Err("not the system's tool".into()),
+                environment: Environment::Clean,
+                package_manager: Some("/usr/bin/dpkg".into()),
+                initramfs_builder: None,
+                interpreter: None,
+            },
+        );
+        let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .evaluate(&e)
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "{}", v.reasoning);
     }
 }
