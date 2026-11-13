@@ -554,7 +554,7 @@ mod tests {
             format!("0::/user.slice/user-1000.slice/user@1000.service/app.slice/kubepods/{ID}\n"),
             format!("0::/kubepods/burstable/pod1a2b/{ID}/x\n"),
             format!("0::/{ID}\n"),
-            format!("0::/kubepods\n"),
+            "0::/kubepods\n".to_string(),
             // two ids, the last one CoreDNS's
             format!(
                 "12:pids:/kubepods/burstable/pod1/{}\n0::/kubepods/burstable/pod1/{ID}\n",
