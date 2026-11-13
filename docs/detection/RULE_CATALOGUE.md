@@ -30,7 +30,7 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`R016_DebuggerServiceUid`](#r016_debuggerserviceuid) | Debugger/tracer exec by service account | Medium | Log | T1055.008 |
 | [`R017_ShellFromNonstandardPath`](#r017_shellfromnonstandardpath) | Shell binary from non-standard path | High | KillProcessTree, Log | T1059.004 |
 | [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium | KillProcessTree, Log | T1547.006, T1014 |
-| [`R020_ShellWithSocketStdio`](#r020_shellwithsocketstdio) | Shell or interpreter with stdin/stdout on a network socket | Critical | Log | T1059.004, T1095 |
+| [`R020_ShellWithSocketStdio`](#r020_shellwithsocketstdio) | Shell or interpreter with stdin/stdout on a network socket | Critical, High | Log | T1059.004, T1095 |
 | [`NN-L-EXECQ-001_FirstSightQuarantine`](#nn-l-execq-001_firstsightquarantine) | Exec quarantine at first sight | Critical, High, Medium, Low | Quarantine, KillProcess, Log | T1204.002, T1059.004, T1059.006, T1059.007, T1059 |
 | [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium | Log | T1620, T1070.004, T1204.002, T1564.001 |
 | [`NN-L-EXECENV-001_PreloadFromStaging`](#nn-l-execenv-001_preloadfromstaging) | Loader variable naming a staging path at exec | High, Medium, Low | Log | T1574.006 |
@@ -159,9 +159,9 @@ Reverse shell tooling — category `lateral_movement`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** An exec of offensive tooling (`socat`, `msfvenom`, `meterpreter`, `sliver`, `havoc`), by its `comm` or the kernel's executed file (a link under another name). The distribution's `socat` — placed by the kernel's executed file, never the caller's string — is recorded unless one of its addresses runs a shell (lot 313: each address of a dual `a!!b` or a chain; `SYSTEM:` and `SHELL:` always; `EXEC:` past `env`, `setsid`, `nohup`, `stdbuf`, `timeout` and the like, a shell, `script`, or an interpreter running inline code), and recorded at Critical when the kernel cut its argv.
+**Observes.** An exec of offensive tooling (`socat`, `msfvenom`, `meterpreter`, `sliver`, `havoc`), by its `comm` or the kernel's executed file (a link under another name). The distribution's `socat` — placed by the kernel's executed file, never the caller's string — is recorded unless one of its addresses runs a shell (lot 313: each address of a dual `a!!b` or a chain, read as socat's lexer reads it — `\` and quotes dropped; `SYSTEM:` and `SHELL:` always; `EXEC:` past `env` (`-S` too), `setsid`, `nohup`, `stdbuf`, `timeout`, `sudo -i`, `su`, `chroot`, the dynamic loader and the like, a shell, `script`, or an interpreter running inline code), and recorded at Critical when the kernel cut its argv. A shell or an interpreter (by identity) that socat starts, directly or through a launcher that forks, is killed too: what an address ran, whatever its spelling.
 
-**Known false positives.** A `socat` from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` used as a relay is recorded (Log, High), not killed; a build of it elsewhere is killed unless allowlisted in `process-comm-allowlist`, which is judged on what the kernel executed.
+**Known false positives.** A `socat` from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` used as a relay is recorded (Log, High), not killed; a build of it elsewhere is killed unless allowlisted in `process-comm-allowlist`, which is judged on what the kernel executed. Lot 313: a `SYSTEM:` address runs `/bin/sh -c` and is killed whatever its command (a test harness's `SYSTEM:'echo …'` server too), and so is a shell or an interpreter socat starts (`EXEC:python3 /srv/app.py`): allowlist socat by identity where a harness needs one.
 
 **How to test.** `cp /bin/sleep /tmp/sliver && /tmp/sliver 5` (killed); `socat -V` (the distribution's socat, recorded); `socat TCP:127.0.0.1:9 STDIO!!EXEC:/bin/sh` (killed).
 
@@ -433,13 +433,13 @@ Shell or interpreter with stdin/stdout on a network socket — category `executi
 
 | | |
 |---|---|
-| Severity | Critical |
+| Severity | Critical, High |
 | Response | Log |
 | ATT&CK | T1059.004 Command and Scripting Interpreter: Unix Shell (Execution); T1095 Non-Application Layer Protocol (Command and Control) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation, DC0082 Network Connection Creation |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** A shell or interpreter, by exec identity (lot 313: a byte-identical copy of an installed shell or interpreter under any name, found by the exec pump; an installed one by its device and inode; else the executed file's name; busybox by the program its argv names, `busybox sh`, `-sh`), whose stdin/stdout is an outbound inet socket (the reverse shell), or an accepted one not handed over by an inetd-style launcher (the bind shell), or whose parent's stdio is an outbound socket (the pty-wrapped reverse shell): `sched_process_exec` reads the new image's fds 0..2 and its parent's. Critical, recorded, posture ConfirmedIntrusion; the kill of the tree (`KillProcessTree`) is held behind the per-rule response policy, off by default (a new rule of lab PR 224).
+**Observes.** A shell or interpreter, by exec identity (lot 313: a copy of an installed shell or interpreter under any name, found by the exec pump's bounded content check; an installed one by its device and inode; else the executed file's name; busybox by the program its argv names, `busybox sh`, `-sh`; the program the dynamic loader runs, `ld.so /bin/bash`), whose stdin/stdout is an outbound inet socket (the reverse shell), or an accepted one not handed over by an inetd-style launcher (the bind shell), or whose parent's stdio is an outbound socket (the pty-wrapped reverse shell): `sched_process_exec` reads the new image's fds 0..2 and its parent's. Critical, recorded, posture ConfirmedIntrusion; the kill of the tree (`KillProcessTree`) is held behind the per-rule response policy, off by default (a new rule of lab PR 224). Lot 313: an exec of a user-writable image on such a socket whose content check the exec pump's budget skipped is recorded High, "identity unverified".
 
 **Known false positives.** inetd-style services (PID 1 socket activation, inetd, xinetd, tcpserver), exempt by the launcher's identity; the process allowlist by identity. Without the optional BTF offsets the stdio is not read and the rule cannot fire.
 

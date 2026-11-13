@@ -454,6 +454,8 @@ fn spawn_rules<H: DecisionHost>(
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let r011_lineage = lineage.clone();
+    // lot 313 (the review of #549, F2): the shell socat starts
+    let r006_lineage = lineage.clone();
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -472,7 +474,7 @@ fn spawn_rules<H: DecisionHost>(
         // the tool and staging rules a shell copied to /tmp also meets.
         Box::new(r020),
         Box::new(R007CryptoMiner::new(al())),
-        Box::new(R006ReverseShellTooling::new(al())),
+        Box::new(R006ReverseShellTooling::new(al()).with_lineage(r006_lineage)),
         Box::new(r009),
         Box::new(R010BinaryInWebroot),
         Box::new(R011KernelModuleTooling::new(al()).with_lineage(r011_lineage)),

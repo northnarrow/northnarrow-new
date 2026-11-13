@@ -950,6 +950,15 @@ pub struct StatusResponse {
     /// (the map full): judged fail-closed.
     #[serde(default)]
     pub execpol_lost_total: Option<u64>,
+    /// Lot 313 (the review of #549, F1): the exec pump's content check of a
+    /// running image against the installed shells and interpreters (R020)
+    /// — images compared, and execs not compared because the second's
+    /// budget was spent (judged by their name); `None` from an agent older
+    /// than the fields. Appended after lot 322's.
+    #[serde(default)]
+    pub program_copy_compared_total: Option<u64>,
+    #[serde(default)]
+    pub program_copy_skipped_total: Option<u64>,
 }
 
 /// Lot 276: the export's state ([`StatusResponse::export`];
@@ -1328,6 +1337,8 @@ impl StatusResponse {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2413,6 +2424,8 @@ mod tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2489,6 +2502,8 @@ mod tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2747,6 +2762,8 @@ mod tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2852,6 +2869,8 @@ mod tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2953,11 +2972,15 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the six appended fields' tags: R12a's bus, R12b's decision
+        // the eight appended fields' tags: R12a's bus, R12b's decision
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
-        // lot 322's two exec-guard counters
-        assert!(a.ends_with(&[0, 0, 0, 0, 0, 0]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 6]) && b.len() > a.len());
+        // lot 322's two exec-guard counters, lot 313's two content-check
+        // counters
+        assert!(
+            a.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0]),
+            "the absent fields' tags"
+        );
+        assert!(b.starts_with(&a[..a.len() - 8]) && b.len() > a.len());
         assert!(
             b.ends_with(&[0, 0, 0, 0, 0]),
             "R12b's, R12c's, lot 276's and lot 322's fields, absent"
@@ -2987,9 +3010,9 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last five: the decision's delay, the dispatch, lot 276's
-        // export, lot 322's two counters — all absent)
-        assert!(c.starts_with(&b[..b.len() - 5]) && c.len() > b.len());
+        // (b's last seven: the decision's delay, the dispatch, lot 276's
+        // export, lot 322's two counters, lot 313's two — all absent)
+        assert!(c.starts_with(&b[..b.len() - 7]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3051,7 +3074,7 @@ mod tests {
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
         // (c's last four: the dispatch, lot 276's export and lot 322's two
         // counters, absent)
-        assert!(d.starts_with(&c[..c.len() - 4]) && d.len() > c.len());
+        assert!(d.starts_with(&c[..c.len() - 6]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3600,8 +3623,9 @@ mod tests {
         // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
         // `response_dispatch`, lot 276's `export`, lot 322's
-        // `execpol_env_unread_total` and `execpol_lost_total`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2;
+        // `execpol_env_unread_total` and `execpol_lost_total`, lot 313's
+        // `program_copy_compared_total` and `program_copy_skipped_total`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 2;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3627,11 +3651,30 @@ mod tests {
         status.execpol_env_unread_total = Some(300);
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
+        // lot 313's two counters (absent: one byte each) follow them
+        let before = without.len() - 4;
+        assert_eq!(&with[..before], &without[..before]);
+        assert_eq!(&without[before..], &[0, 0, 0, 0]);
+        // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
+        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0]);
+        roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// Lot 313 (the review of #549, F1): the content check's two counters
+    /// are the status's last fields, after lot 322's — an older `nn-admin`
+    /// reads every field it knows.
+    #[test]
+    fn the_content_check_counters_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.execpol_lost_total = Some(5);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.program_copy_compared_total = Some(3);
+        status.program_copy_skipped_total = Some(300);
+        let with = postcard::to_allocvec(&status).unwrap();
         let before = without.len() - 2;
         assert_eq!(&with[..before], &without[..before]);
         assert_eq!(&without[before..], &[0, 0]);
-        // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
-        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5]);
+        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -4433,10 +4476,13 @@ mod tests {
         // Lot 322: two bytes longer (0x4f -> 0x51) — the absent tags of
         // `execpol_env_unread_total` and `execpol_lost_total`, appended
         // last; every byte before them is lot 276's pin.
+        // Lot 313: two bytes longer (0x51 -> 0x53) — the absent tags of
+        // `program_copy_compared_total` and `program_copy_skipped_total`,
+        // appended last; every byte before them is lot 322's pin.
         const STATUS_RESPONSE: &str = concat!(
-            "00000051050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000053050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000",
+            "00000000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

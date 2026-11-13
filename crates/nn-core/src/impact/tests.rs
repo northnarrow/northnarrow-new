@@ -48,6 +48,21 @@ impl Fixed {
     fn low() -> Arc<Self> {
         Arc::new(Self::default())
     }
+    /// Lot 313 (the review of #549, F3): every file under `prefix` starts
+    /// with a container's header (OpenPGP `8c 0d`, age, 7-Zip, zip): the
+    /// real sampler counts it a container, never ciphertext.
+    fn containers(prefix: &str) -> Arc<Self> {
+        let f = Self::default();
+        f.answers.lock().insert(
+            prefix.to_string(),
+            Sample {
+                examined: 4,
+                high: 0,
+                containers: 4,
+            },
+        );
+        Arc::new(f)
+    }
 }
 
 impl Sampler for Fixed {
@@ -732,12 +747,15 @@ fn an_encryption_tool_asked_to_encrypt_is_not_trusted_for_b_and_c() {
         "/usr/bin/7z",
         &["7z", "a", "-pSECRET", "x.7z", "dir"],
     );
-    let t = h.tracker(Fixed::high("/srv/data/"));
+    // the review of #549 (F3): the tools' real outputs carry a container's
+    // header (OpenPGP, 7-Zip): they count as ciphertext all the same
+    let t = h.tracker(Fixed::containers("/srv/data/"));
     for pid in [500, 501, 502] {
         // (a), sampled: (b) counts, (a) does not
         let a = t.assess(&rewrites(pid, T0, "/srv/data/f020")).unwrap();
         assert!(a.trusted.is_none() && a.encrypting, "{pid}: {a:?}");
-        assert_eq!(a.actor, pid);
+        // the kill reaches what started the tool: the session's shell
+        assert_eq!((a.key, a.actor), (pid, 200), "{pid}");
         assert_eq!(a.added, vec![Signal::Entropy], "{pid}: {a:?}");
         assert!(!a.decisive, "{pid}: one shape");
         // (c): decisive with (b)
@@ -815,4 +833,132 @@ fn an_exec_event_s_encryption_is_kept() {
     let a = t.assess(&rewrites(520, T0, "/srv/data/f020")).unwrap();
     assert!(a.encrypting && a.trusted.is_none(), "{a:?}");
     assert_eq!(a.added, vec![Signal::Entropy]);
+}
+
+/// Lot 313 (the review of #549, F3, its probe): the triage's LOTL shape —
+/// `gpg --encrypt-files` writing new files, then the same session's packaged
+/// `rm` deleting the originals — counted nothing: (b) sampled only what (a)
+/// or (c) left, the new files were gpg's, the deletions the trusted rm's,
+/// and gpg's output is an OpenPGP container. Now the deletions beside the
+/// encryptor's outputs, by a process of the session that started it, are
+/// the encryptor's: the encrypted copies (c) and their content (b), headers
+/// or not — decisive, the kill aimed at the session's shell.
+#[test]
+fn gpg_encrypt_files_then_rm_is_decisive() {
+    let h = Host::new();
+    std::fs::write(
+        h.root.path().join("var/lib/dpkg/info/coreutils.list"),
+        "/usr/bin/rm\n",
+    )
+    .unwrap();
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("a.gpg"), b"\x8c\x0dOpenPGP").unwrap();
+    std::fs::write(dir.join("b.gpg"), b"\x8c\x0dOpenPGP").unwrap();
+    h.exec(
+        530,
+        200,
+        "/usr/bin/gpg",
+        &[
+            "gpg",
+            "--batch",
+            "--passphrase",
+            "x",
+            "-c",
+            "--encrypt-files",
+            "a",
+            "b",
+        ],
+    );
+    h.exec(531, 200, "/usr/bin/rm", &["rm", "-f", "a", "b"]);
+    let t = h.tracker(Fixed::containers(&d));
+    let a = t
+        .assess(&new_files(530, T0, &format!("{d}/a.gpg")))
+        .unwrap();
+    assert!(a.encrypting && a.added.is_empty(), "{a:?}");
+    let b = t.assess(&unlinks(531, T0 + S, &format!("{d}/a"))).unwrap();
+    assert!(b.trusted.is_none() && b.encrypting, "{b:?}");
+    assert_eq!((b.key, b.actor), (530, 200));
+    assert!(b.decisive, "{b:?}");
+    let shapes: Vec<Signal> = b.signals.iter().map(|(s, _)| *s).collect();
+    assert_eq!(shapes, vec![Signal::Entropy, Signal::RenameExtension]);
+    assert_eq!(t.counts().decisive, 1);
+}
+
+/// Guards: an `rm` of another session (not started where the encryptor
+/// was) keeps its trust; a plain archiver's containers (no encryption
+/// argv) are no ciphertext.
+#[test]
+fn an_unrelated_rm_and_a_plain_archive_count_nothing() {
+    let h = Host::new();
+    std::fs::write(
+        h.root.path().join("var/lib/dpkg/info/coreutils.list"),
+        "/usr/bin/rm\n/usr/bin/zip\n",
+    )
+    .unwrap();
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("a.gpg"), b"\x8c\x0d").unwrap();
+    h.exec(
+        540,
+        200,
+        "/usr/bin/gpg",
+        &["gpg", "-c", "--encrypt-files", "a"],
+    );
+    // another login (sshd 150 → bash 210 → rm)
+    h.exec(210, 150, "/usr/bin/bash", &["-bash"]);
+    h.exec(541, 210, "/usr/bin/rm", &["rm", "-f", "a"]);
+    h.exec(542, 200, "/usr/bin/zip", &["zip", "-r", "x.zip", "dir"]);
+    let t = h.tracker(Fixed::containers(&d));
+    t.assess(&new_files(540, T0, &format!("{d}/a.gpg")))
+        .unwrap();
+    let a = t.assess(&unlinks(541, T0 + S, &format!("{d}/a"))).unwrap();
+    assert!(a.trusted.is_some() && !a.encrypting, "{a:?}");
+    let z = t
+        .assess(&rewrites(542, T0 + 2 * S, &format!("{d}/x.zip")))
+        .unwrap();
+    assert!(z.trusted.is_some() && z.added.is_empty(), "{z:?}");
+    assert_eq!(t.counts().decisive, 0);
+}
+
+/// Lot 313 (the 2404 lab of 13/11): the triage's LOTL shape run as one
+/// session's inline command (`bash -c 'gpg --encrypt-files …; rm …'`: a
+/// webshell's, or a `ssh host '…'`) — the session vouches for nothing, so
+/// gpg and rm are judged, each under its own process, and the copies beside
+/// the deleted originals were rm's to find, with no files of its own: no
+/// shape. Now the deletions beside the encryptor's outputs are its own,
+/// whatever the deleting process's trust: decisive.
+#[test]
+fn an_inline_session_s_gpg_then_rm_is_decisive() {
+    let h = Host::new();
+    std::fs::write(
+        h.root.path().join("var/lib/dpkg/info/coreutils.list"),
+        "/usr/bin/rm\n",
+    )
+    .unwrap();
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("a.gpg"), b"\x85\x01\x0c").unwrap();
+    h.exec(
+        560,
+        200,
+        "/usr/bin/bash",
+        &["bash", "-c", "gpg -r x --encrypt-files a b; rm -f a b"],
+    );
+    h.exec(
+        561,
+        560,
+        "/usr/bin/gpg",
+        &["gpg", "-r", "x", "--encrypt-files", "a", "b"],
+    );
+    h.exec(562, 560, "/usr/bin/rm", &["rm", "-f", "a", "b"]);
+    let t = h.tracker(Fixed::containers(&d));
+    let a = t
+        .assess(&new_files(561, T0, &format!("{d}/a.gpg")))
+        .unwrap();
+    assert!(a.trusted.is_none(), "{a:?}");
+    let b = t.assess(&unlinks(562, T0 + S, &format!("{d}/a"))).unwrap();
+    assert!(b.encrypting && b.decisive, "{b:?}");
+    assert_eq!(b.key, a.key, "the encryptor's window");
+    assert_eq!(b.actor, 560, "the session that started it");
 }

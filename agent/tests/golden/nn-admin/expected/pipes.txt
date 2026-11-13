@@ -506,6 +506,7 @@ exit: 0
 | exploit guard     : strict detect (experimental) — 12 calls judged, 30 skipped (fully privileged), 1 anomalies, 0 killed; 2 task(s) untracked (task map full: their calls are not judged)
 | exec quarantine   : observe — held 1, resumed 1, killed 0 (0 quarantined), default policy 0, known identity 3, known content 2, not held 9, scanner deaths 0, scripts refused 0
 | ransomware        : 0 decisive (NN-L-IMP-001), 4 shapes counted, 1 trusted bursts not counted, 8 entropy samplings
+| shell copies      : 3 running images compared with the installed shells, 1 execs not compared (the second's budget spent: judged by their name)
 | security tools    : 1 switched off (NN-L-EVA-*), 1 sanctioned (package, admin session); 6 tool processes watched for signals
 | exec policy       : audit — denied 0, would deny 2, quarantine 0 (1 inactive), environment denied 0 / reported 1, mappings denied 0 / reported 0
 | last admin action : 42s ago

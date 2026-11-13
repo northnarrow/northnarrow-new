@@ -50,6 +50,9 @@
 //! hard link, a bind mount), else by the executed file's name as before;
 //! and busybox by the program its `argv` names, as busybox reads it
 //! (`busybox sh`, `/bin/busybox sh`, the login shells `-sh` and `-ash`).
+//! An exec of a user-writable image with its stdio on a socket whose
+//! content check the exec pump's budget skipped is recorded High,
+//! "identity unverified" — never silence (the review of #549).
 //!
 //! Not covered (said so): a shell that is not byte-identical to an
 //! installed program (rebuilt, patched, downloaded) and named otherwise; an
@@ -195,6 +198,48 @@ pub struct R020ShellWithSocketStdio<H: PostureHost> {
 }
 
 impl<H: PostureHost> R020ShellWithSocketStdio<H> {
+    /// Lot 313 (the coordinator's fail-safe for the content check's
+    /// budget): an exec of a user-writable image (not in a system tree, by
+    /// the kernel's path) with its stdin or stdout on an inet socket, whose
+    /// running image the exec pump did not compare — a flood spent the
+    /// second's budget ([`program_identity::unverified`]) — is recorded
+    /// High, "identity unverified": a flood followed by a renamed shell is
+    /// never silence.
+    fn unverified(&self, event: &Event) -> Option<Verdict> {
+        let Event::ProcessSpawn {
+            filename,
+            exe,
+            stdio,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if !stdio.own.stdin_or_stdout_inet()
+            || !program_identity::unverified(event)
+            || program_identity::exec_in_system_tree(event)
+        {
+            return None;
+        }
+        if super::judge_spawn(&self.allowlist, event) == Judgement::Allowed {
+            return None;
+        }
+        let image = exe.path_or(filename);
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            Severity::High,
+            &format!(
+                "{image} (a file a user can write) started with stdin/stdout on a {} socket \
+                 (peer {}) — its identity unverified: the exec pump did not compare it with the \
+                 installed shells, its budget spent by a flood of execs (lot 313); recorded",
+                stdio.own.proto_name(),
+                peer_text(stdio.own.peer)
+            ),
+        ))
+    }
+
     pub fn new(allowlist: Arc<CommAllowlist<H>>, lineage: Option<AuthSessionTracker<H>>) -> Self {
         Self {
             allowlist,
@@ -231,7 +276,9 @@ impl<H: PostureHost> Rule for R020ShellWithSocketStdio<H> {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let shape = shape(event, self.lineage.as_ref())?;
+        let Some(shape) = shape(event, self.lineage.as_ref()) else {
+            return self.unverified(event);
+        };
         if super::judge_spawn(&self.allowlist, event) == Judgement::Allowed {
             return None;
         }
@@ -695,5 +742,163 @@ mod bug85 {
             let e = busybox(argv, out, StdioSocket::default());
             assert_eq!(shape::<H>(&e, None), None, "{argv:?}");
         }
+    }
+}
+
+/// Lot 313 (the review of #549, F4): a shell run through the dynamic
+/// loader (`/lib64/ld-linux-x86-64.so.2 /bin/bash -i`): the kernel executed
+/// the loader (comm `ld-linux-x86-64`), which runs its operand — that
+/// program is what R020 judges.
+#[cfg(test)]
+mod review549 {
+    use super::*;
+    use crate::decision::rules::testutil::spawn_exe;
+    use crate::posture::host::testing::TestHost as H;
+    use nn_model::{StdioSocket, StdioSockets};
+
+    fn through_loader(loader: &str, argv: &[&str]) -> Event {
+        let mut e = spawn_exe("ld-linux-x86-64", loader, loader, 0);
+        if let Event::ProcessSpawn {
+            stdio,
+            ppid,
+            argv: a,
+            ..
+        } = &mut e
+        {
+            *stdio = StdioSockets {
+                own: StdioSocket {
+                    read: true,
+                    inet_fds: 0b011,
+                    outbound: true,
+                    proto: 6,
+                    peer: Some("127.0.0.1:44401".parse().unwrap()),
+                },
+                parent: StdioSocket::default(),
+            };
+            *ppid = 4000;
+            *a = argv.iter().map(|s| s.to_string()).collect();
+        }
+        e
+    }
+
+    #[test]
+    fn review549_a_shell_through_the_dynamic_loader_is_a_shell() {
+        let rule =
+            R020ShellWithSocketStdio::<H>::new(Arc::new(CommAllowlist::<H>::default()), None);
+        for (loader, argv) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["/lib64/ld-linux-x86-64.so.2", "/bin/bash", "-i"][..],
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["ld.so", "--library-path", "/x", "--argv0", "y", "/bin/sh"],
+            ),
+            (
+                "/lib/ld-musl-x86_64.so.1",
+                &["ld-musl-x86_64.so.1", "/bin/busybox", "sh"],
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["ld.so", "--", "/usr/bin/python3"],
+            ),
+        ] {
+            let e = through_loader(loader, argv);
+            assert_eq!(
+                shape::<H>(&e, None),
+                Some(StdioShellShape::Outbound),
+                "{argv:?}"
+            );
+            assert!(rule.evaluate(&e).is_some(), "{argv:?}");
+        }
+        // guards: a program that is no shell; the loader's own query
+        for argv in [
+            &["ld.so", "/usr/bin/id"][..],
+            &["ld.so", "--list", "/usr/bin/id"],
+            &["ld.so", "--help"],
+            &["ld.so"],
+        ] {
+            let e = through_loader("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", argv);
+            assert_eq!(shape::<H>(&e, None), None, "{argv:?}");
+        }
+    }
+}
+
+/// Lot 313 (the coordinator's fail-safe): when the exec pump skips the
+/// content check (its budget spent by a flood), a user-writable image with
+/// its stdio on a socket is recorded High, "identity unverified" — never
+/// silence; an image of a system tree, a compared one and one without a
+/// socket are not.
+#[cfg(test)]
+mod unverified_identity {
+    use super::*;
+    use crate::decision::rules::testutil::spawn_exe;
+    use crate::posture::host::testing::TestHost as H;
+    use nn_model::{StdioSocket, StdioSockets};
+
+    fn exec(pid: u32, path: &str, socket: bool) -> Event {
+        let mut e = spawn_exe("x", path, path, 0);
+        if let Event::ProcessSpawn {
+            pid: p,
+            timestamp_ns,
+            stdio,
+            argv,
+            ..
+        } = &mut e
+        {
+            (*p, *timestamp_ns) = (pid, u64::from(pid));
+            *argv = vec!["x".into(), "-i".into()];
+            if socket {
+                *stdio = StdioSockets {
+                    own: StdioSocket {
+                        read: true,
+                        inet_fds: 0b011,
+                        outbound: true,
+                        proto: 6,
+                        peer: Some("127.0.0.1:44401".parse().unwrap()),
+                    },
+                    parent: StdioSocket::default(),
+                };
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn a_skipped_compare_is_recorded_never_silent() {
+        let rule =
+            R020ShellWithSocketStdio::<H>::new(Arc::new(CommAllowlist::<H>::default()), None);
+        let flood = exec(313_601, "/home/u/x", true);
+        assert!(
+            rule.evaluate(&flood).is_none(),
+            "compared (or no budget asked): nothing"
+        );
+        program_identity::keep_unverified(&flood);
+        let v = rule.evaluate(&flood).expect("identity unverified");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("identity unverified"),
+            "{}",
+            v.reasoning
+        );
+        // guards: no socket; a system tree's image
+        let quiet = exec(313_602, "/home/u/x", false);
+        program_identity::keep_unverified(&quiet);
+        assert!(rule.evaluate(&quiet).is_none());
+        let system = exec(313_603, "/usr/lib/x/tool", true);
+        program_identity::keep_unverified(&system);
+        assert!(rule.evaluate(&system).is_none());
+        // a compared copy is verified: a copy of busybox running its `cat`
+        // is no shell, and no unverified identity either
+        let mut cat = exec(313_604, "/home/u/bb", true);
+        if let Event::ProcessSpawn { argv, .. } = &mut cat {
+            *argv = vec!["cat".into()];
+        }
+        program_identity::keep_copy(&cat, program_identity::ProgramKind::Busybox);
+        assert!(!program_identity::unverified(&cat));
+        assert!(rule.evaluate(&cat).is_none());
     }
 }

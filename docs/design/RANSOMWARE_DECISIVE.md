@@ -221,29 +221,56 @@ kill targets the nearest foreign program (the script, the payload).
   from a tarball: `go build` under `/usr/local/go` running `gcc`) is judged
   now; its bursts count against that program. Nothing is killed by default
   (NN-L-IMP-001's kill is held by the signed per-rule policy).
-- Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026): an
-  encryption tool whose argv asks it to encrypt — `openssl enc` (or a
-  cipher as its command) without `-d`, `openssl smime|cms|pkeyutl -encrypt`,
-  `gpg`/`gpgtar` with `-c`, `-e`, `--symmetric`, `--encrypt` (gpg's
-  abbreviations and clusters such as `-sear` included), `age`/`rage` without
+- Lot 313 (BUG-49's residue, the coordinator's decision of 11/11/2026; the
+  independent review of #549, F3): an encryption tool whose argv asks it
+  to encrypt — `openssl enc` (or a cipher as its command) without `-d`,
+  `openssl smime|cms|pkeyutl|rsautl -encrypt`, `gpg`/`gpgtar` with `-c`,
+  `-e`, `--symmetric`, `--encrypt`, `--encrypt-files` (gpg's abbreviations,
+  two letters or more, and clusters such as `-sear`), `age`/`rage` without
   `-d`, `7z a|u` with `-p`, `rar a` with `-p`/`-hp`, `zip -e`/`-P`,
   `zipcloak`, `ccrypt`, `ccencrypt`, `mcrypt`, `aescrypt -e`, `scrypt enc`
-  (`posture/script_args.rs`, `encrypts`) — is never trusted for (b) and
-  (c), whoever started it: an intruder's interactive session, a unit, a
-  package transaction. Its ciphertext-like content and its renames to a new
-  extension count under its own process (and its forked copies); two make
-  the assessment decisive. Its rewrites (a) and deletions (d) keep the trust
-  its lineage gives, and a decrypt, a verify or an archive without a
-  password is trusted as before. What it costs: a backup job that encrypts
-  in place with a packaged tool and renames its output in bulk can now be
-  decisive (NN-L-IMP-001's kill stays held by default).
+  (`posture/script_args.rs`, `encrypts`: each tool's option table, so a
+  value is never read as an option, `ccrypt -K -d` encrypts with the key
+  `-d`, and the last mode wins where the tool's does) — is never trusted
+  for (b) and (c), whoever started it: an intruder's interactive session, a
+  unit, a package transaction. Then:
+  - its outputs are ciphertext whatever their header: a file the sampler
+    classifies as a container (OpenPGP `8c 0d`, `age-encryption.org/`,
+    7-Zip, zip, rar) counts for (b) as a high-entropy one would;
+  - its renames to a new extension count (c), under its own process (and
+    its forked copies), and so do the encrypted copies beside originals
+    deleted: an unlink burst by another process of the session that
+    started the tool (an `rm` after `gpg --encrypt-files`, trusted or not —
+    an interactive session's, an inline command's), beside the tool's
+    outputs written in the window, is the tool's;
+  - two shapes make the assessment decisive; the kill (held by default)
+    aims at the process that started the tool (the session's shell, the
+    script), the tool being done by then;
+  - its rewrites (a) and deletions (d) keep the trust its lineage gives,
+    and a decrypt, a verify or an archive without a password is trusted as
+    before.
+
+  What it costs: a backup job that encrypts with a packaged tool in bulk,
+  then deletes or renames the originals, can be decisive.
+
+  **Open (lot 331)**: the encryption tool then `rm` shape (`gpg
+  --encrypt-files *; rm *`) is decisive in the unit tests
+  (`gpg_encrypt_files_then_rm_is_decisive`,
+  `an_inline_session_s_gpg_then_rm_is_decisive`) but was NOT reproduced
+  live on Ubuntu 24.04 (lot 313's lab r3 and r4: no NN-L-IMP-001, run as
+  two units, as one inline session and as one interactive session); `ccrypt
+  -r` (its renames, (b) + (c)) was decisive live on Debian 13.
 - Residuals: an intruder in an interactive session who encrypts with a
   program no table names (a tool of its own is judged anyway: no package
-  installed it), or one that writes its ciphertext through another
-  process (`gpg -c -o - | dd of=…`: `dd` is trusted); an encryptor that forks a new process every few files stays
-  under the per-process rename and unlink counts (the cgroup window covers
-  rewrites only); a random new name per file (no extension streak); a
-  program loaded into a trusted process (`LD_PRELOAD`, CM-25).
+  installed it); an encryptor run once per file (`for f; do openssl enc
+  …; done`): each process writes one file, under the per-process counts,
+  so neither its outputs nor the deletions beside them are attributed; a
+  deletion by a process of another session (another login's `rm`); a tool
+  that writes its ciphertext through another process (`gpg -c -o - | dd
+  of=…`: `dd` is trusted); an encryptor that forks a new process every few
+  files stays under the per-process rename and unlink counts (the cgroup
+  window covers rewrites only); a random new name per file (no extension
+  streak); a program loaded into a trusted process (`LD_PRELOAD`, CM-25).
 
 ## 2. NN-L-FIM-010: the destination is the file
 

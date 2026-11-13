@@ -9369,6 +9369,33 @@ number in parentheses is a lab PR.
     `dkms_registered`, now shared); `script_args::encrypts` and the
     lineage's flag: an encryption tool asked to encrypt counts (b) and (c)
     whoever started it; a ratchet (`xtask/tests/program_names.rs`).
+  - The independent review of #549 (MERGE AFTER FIXES), fixed here: the
+    content check ran unbounded on the exec ring's thread (a 64 MiB
+    near-copy cost 10 ms an exec, with no memory of the file) — now an
+    answer is remembered by `(dev, ino, size, ctime)`, a file above 4 MiB is
+    compared by samples, the compares share 64 MiB a second and the execs
+    past it are counted in `status`; socat's lexer was not read (`EXEC:/bin/s\h`,
+    `EX"EC":` were relays) — now it is, and the shell or interpreter socat
+    starts is killed by its identity whatever the spelling (`sudo -i`, `su
+    -`, `chroot /`, `env -S`, busybox's `hush`, `python3 /tmp/x.py`); a
+    shell run by the dynamic loader (`ld.so /bin/bash -i`) was no shell —
+    the loader is read with the interpreters' reader and its operand is the
+    program, for R020, R006 and every rule that judges the program; BUG-49's
+    residue counted only `ccrypt` and `mcrypt -u` in practice (the other
+    tools' outputs are containers to the sampler, and they never rename) —
+    now an encryption tool's outputs count as ciphertext whatever their
+    header, and the deletions beside them by the same session's other
+    processes count for the tool, trusted or not (`gpg --encrypt-files`
+    then `rm`: decisive); `encrypts` read option values as options
+    (`ccrypt -K -d`); a content check the budget skipped records the exec
+    of a user-writable image on a socket ("identity unverified", High).
+    **Open (lot 331)**: the LOTL shape encryption tool + `rm` is decisive in
+    the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
+    r4: one inline and one interactive session — the files encrypted and
+    deleted, no NN-L-IMP-001); not claimed closed.
+    Residuals stated: one appended byte or a patched sample defeats the
+    copy check; a container's own shells (and overlayfs' identities) are not
+    compared — lot 329's behaviour-based check is the answer to both.
   - The lab, as measured (our own guests under lease k313; the agent
     uninstalled, the guests clean and off at the end):
     - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255; r1 at
@@ -9415,6 +9442,22 @@ number in parentheses is a lab PR.
       cat` on the socket: nothing. A link `~/relay` to `/usr/bin/socat`
       (`→ socat1`, 1.8.0.3) running `EXEC:/bin/sh`: R006 KillProcessTree, rc
       137; the same link as a relay: R006 High, recorded, ran. No leftovers.
+    - **Ubuntu 24.04, the review's fixes** (`6.8.0-147-generic`; r3 at
+      17392143, r4 at 5b3951de): socat 1.8.0.0 with `EXEC:/bin/s\h`,
+      `EX"EC":/bin/sh`, `SY\STEM:id`, `EXEC:env -S/bin/sh`, `EXEC:<ld.so>
+      /bin/sh`: R006 Critical, killed (rc 137); `EXEC:python3 x.py`: R006
+      Critical on the python child; a relay recorded. `ld.so /bin/bash -c`
+      and `ld.so ~/x` (a copy of bash) on a socket: R020 Critical; `ld.so
+      /usr/bin/id`: nothing. The pump with a 64 MiB "installed" interpreter
+      (bash padded): 300 execs of one near-copy on a socket in 2.8 s (one
+      compare, the rest remembered), 40 execs each changing the file in
+      0.5 s; status before → after: compared 1 → 14, skipped 0 → 28, ring
+      drops 0 → 0; a renamed bash right after: R020 Critical. During a 20 s
+      flood spending the budget, a renamed bash run by root on a socket:
+      R020 Critical ×3 (never silence). The LOTL `gpg --encrypt-files` then
+      `rm` (r3: two units; r4: one inline session, one interactive
+      session): the 30 files encrypted and deleted, **no NN-L-IMP-001** —
+      open, lot 331.
   - Level unchanged (C06, C14, C19): the evasions are closed and measured
     on two kernels; nothing new is proved beyond them. Residual, said so:
     a shell that is not byte-identical to an installed one under another

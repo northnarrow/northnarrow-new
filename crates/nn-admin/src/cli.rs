@@ -3621,6 +3621,34 @@ fn execpol_json(out: &StatusOutcome) -> String {
     )
 }
 
+/// Lot 313 (the review of #549, F1): the exec pump's content check of a
+/// running image against the installed shells and interpreters (R020) —
+/// `None` from an agent before the counters.
+fn program_copies_line(out: &StatusOutcome, tty: bool) -> Option<String> {
+    let compared = out.program_copy_compared_total?;
+    let skipped = out.program_copy_skipped_total.unwrap_or(0);
+    Some(format!(
+        "shell copies      : {compared} running images compared with the installed shells, {} \
+         execs not compared (the second's budget spent: judged by their name)",
+        if skipped == 0 {
+            colorize("0", "32", tty)
+        } else {
+            colorize(&skipped.to_string(), "31", tty)
+        }
+    ))
+}
+
+/// The content check's counters as a JSON object (`null` when absent).
+fn program_copies_json(out: &StatusOutcome) -> String {
+    match (
+        out.program_copy_compared_total,
+        out.program_copy_skipped_total,
+    ) {
+        (Some(c), s) => format!("{{\"compared\":{c},\"skipped\":{}}}", s.unwrap_or(0)),
+        (None, _) => "null".to_string(),
+    }
+}
+
 /// Lab PR 225 (CM-16): the ransomware signal since boot.
 fn ransomware_line(out: &StatusOutcome, tty: bool) -> String {
     match out.ransomware_decisive_total {
@@ -3679,7 +3707,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{},\"program_copies\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3736,6 +3764,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             // R13 (lab PR 271).
             manifest_status_json(out),
             out.telemetry_signed,
+            // lot 313 (the review of #549, F1)
+            program_copies_json(out),
         );
         return;
     }
@@ -3786,6 +3816,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
         println!("{}", exploit_guard_line(out, tty));
         println!("{}", execq_line(out, tty));
         println!("{}", ransomware_line(out, tty));
+        if let Some(line) = program_copies_line(out, tty) {
+            println!("{line}");
+        }
         println!("{}", defense_line(out, tty));
         println!("{}", execpol_line(out, tty));
     }
@@ -5981,6 +6014,8 @@ mod flow_sock_line_tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,

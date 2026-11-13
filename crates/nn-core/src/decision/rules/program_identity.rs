@@ -130,19 +130,21 @@ pub fn names_busybox(word: &str) -> bool {
 /// Launchers a command line runs its program through (lot 313, BUG-112:
 /// socat's `EXEC:/usr/bin/env sh`, `EXEC:setsid bash -i`): each with the
 /// letters of its options that take a value (`-u NAME`), its long options
-/// that do (`--unset NAME`; `--name=value` carries its own), and the
-/// operands it reads before the program (`timeout`'s duration, `chrt`'s
-/// priority, `taskset`'s mask).
-const LAUNCHERS: &[(&str, &str, &[&str], usize)] = &[
-    ("env", "uCP", &["unset", "chdir"], 0),
-    ("setsid", "", &[], 0),
-    ("nohup", "", &[], 0),
-    ("stdbuf", "ioe", &["input", "output", "error"], 0),
-    ("timeout", "ks", &["kill-after", "signal"], 1),
-    ("nice", "n", &["adjustment"], 0),
-    ("ionice", "cnp", &["class", "classdata", "pid"], 0),
-    ("chrt", "", &[], 1),
-    ("taskset", "", &[], 1),
+/// that do (`--unset NAME`; `--name=value` carries its own), the operands
+/// it reads before the program (`timeout`'s duration, `chrt`'s priority,
+/// `taskset`'s mask, `chroot`'s root), and whether, given no program, it
+/// starts a shell itself (`chroot /`, `nsenter -t 1 -m`, `unshare -r`; the
+/// review of #549, F6).
+const LAUNCHERS: &[(&str, &str, &[&str], usize, bool)] = &[
+    ("env", "uCPS", &["unset", "chdir", "split-string"], 0, false),
+    ("setsid", "", &[], 0, false),
+    ("nohup", "", &[], 0, false),
+    ("stdbuf", "ioe", &["input", "output", "error"], 0, false),
+    ("timeout", "ks", &["kill-after", "signal"], 1, false),
+    ("nice", "n", &["adjustment"], 0, false),
+    ("ionice", "cnp", &["class", "classdata", "pid"], 0, false),
+    ("chrt", "", &[], 1, false),
+    ("taskset", "", &[], 1, false),
     (
         "sudo",
         "ugCDhprtUT",
@@ -157,32 +159,100 @@ const LAUNCHERS: &[(&str, &str, &[&str], usize)] = &[
             "type",
         ],
         0,
+        false,
     ),
-    ("doas", "uC", &[], 0),
+    ("doas", "uC", &[], 0, false),
+    ("chroot", "", &["userspec", "groups"], 1, true),
+    (
+        "nsenter",
+        "tSGwWNmuinpUCT",
+        &["target", "setuid", "setgid", "wd", "wdns"],
+        0,
+        true,
+    ),
+    (
+        "unshare",
+        "S",
+        &["setuid", "setgid", "map-user", "map-group"],
+        0,
+        true,
+    ),
+    (
+        "setpriv",
+        "",
+        &[
+            "reuid",
+            "regid",
+            "groups",
+            "inh-caps",
+            "bounding-set",
+            "securebits",
+        ],
+        0,
+        false,
+    ),
 ];
 
 /// Programs that start a shell of their own (`script -qc /bin/bash
-/// /dev/null`; `script` alone runs `$SHELL`).
-const STARTS_A_SHELL: &[&str] = &["script"];
+/// /dev/null`; `script` alone runs `$SHELL`; `su` and `runuser` run the
+/// target's shell, with `-c` too).
+const STARTS_A_SHELL: &[&str] = &["script", "su", "runuser"];
+
+/// Lot 313 (the review of #549, F2, F6): `exe` (a path or a name) is a
+/// program that starts another one in its process or as its child — a
+/// launcher ([`LAUNCHERS`]), `su`, `runuser`, `script`, busybox, the
+/// dynamic loader.
+pub fn names_a_launcher(exe: &str) -> bool {
+    let base = base_of(exe);
+    LAUNCHERS.iter().any(|(n, ..)| program_is(base, n))
+        || STARTS_A_SHELL.iter().any(|n| program_is(base, n))
+        || names_busybox(base)
+        || crate::posture::script_args::is_loader_name(base)
+}
 
 /// Lot 313 (BUG-112): the command line `words` (its program first, as a
 /// command line names it) runs a shell — its program, read past its
-/// launchers ([`LAUNCHERS`]) and busybox (the program its next word
-/// names), is a shell, a program that starts one, or an interpreter
+/// launchers ([`LAUNCHERS`]; `sudo -i`/`-s`; `env -S` splitting its
+/// string; the dynamic loader, read with its table; busybox, the program
+/// its argv names, as busybox reads it), is a shell, a program that starts
+/// one, a launcher that starts one given no program, or an interpreter
 /// running no script it names (inline code, its standard input, a REPL,
 /// options the interpreters' one reader does not understand).
 pub fn command_runs_a_shell(words: &[String]) -> bool {
     let mut at = 0;
+    let mut shell_if_none = false;
     while let Some(word) = words.get(at) {
         let base = base_of(word);
         if names_busybox(base) {
-            at += 1;
+            // busybox's own reading (`busybox_program`)
+            let Some((program, from)) = crate::posture::script_args::busybox_program(&words[at..])
+            else {
+                return false;
+            };
+            if crate::posture::script_args::BUSYBOX_SHELLS.contains(&program) {
+                return true;
+            }
+            // the program's own word, read on as any program
+            at += from - 1;
+            if names_busybox(base_of(program)) {
+                return false;
+            }
             continue;
         }
-        let Some((_, letters, long, operands)) = LAUNCHERS.iter().find(|(n, ..)| *n == base) else {
+        if crate::posture::script_args::is_loader_name(base) {
+            let Some((_, from)) = crate::posture::script_args::loader_program(&words[at..]) else {
+                return false;
+            };
+            at += from;
+            continue;
+        }
+        let Some((_, letters, long, operands, shell_alone)) =
+            LAUNCHERS.iter().find(|(n, ..)| *n == base)
+        else {
             break;
         };
         at += 1;
+        shell_if_none = *shell_alone;
         // its options, then its operands before the program
         while let Some(w) = words.get(at) {
             if w == "--" {
@@ -195,19 +265,43 @@ pub fn command_runs_a_shell(words: &[String]) -> bool {
             }
             if let Some(name) = w.strip_prefix("--") {
                 at += 1;
-                if !name.contains('=') && long.contains(&name) {
+                let (name, value) = name
+                    .split_once('=')
+                    .map_or((name, None), |(n, v)| (n, Some(v)));
+                if base == "env" && name == "split-string" {
+                    // env -S: its string is the command line
+                    let split = value.or_else(|| words.get(at).map(String::as_str));
+                    return split_string_runs_a_shell(
+                        split,
+                        &words[at + usize::from(value.is_none())..],
+                    );
+                }
+                if base == "sudo" && ["login", "shell"].contains(&name) {
+                    return true;
+                }
+                if value.is_none() && long.contains(&name) {
                     at += 1;
                 }
                 continue;
             }
             if let Some(cluster) = w.strip_prefix('-').filter(|c| !c.is_empty()) {
                 at += 1;
+                if base == "sudo" && cluster.contains(['i', 's']) {
+                    return true;
+                }
                 // a letter that takes a value: the rest, else the next word
-                if cluster
-                    .find(|c| letters.contains(c))
-                    .is_some_and(|i| i + 1 == cluster.len())
-                {
-                    at += 1;
+                if let Some(i) = cluster.find(|c| letters.contains(c)) {
+                    let rest = &cluster[i + 1..];
+                    if base == "env" && cluster[i..].starts_with('S') {
+                        let split = (!rest.is_empty())
+                            .then_some(rest)
+                            .or_else(|| words.get(at).map(String::as_str));
+                        let after = at + usize::from(rest.is_empty());
+                        return split_string_runs_a_shell(split, words.get(after..).unwrap_or(&[]));
+                    }
+                    if rest.is_empty() {
+                        at += 1;
+                    }
                 }
                 continue;
             }
@@ -216,15 +310,32 @@ pub fn command_runs_a_shell(words: &[String]) -> bool {
         at += operands;
     }
     let Some(program) = words.get(at) else {
-        return false;
+        // a launcher that starts a shell given no program (`chroot /`)
+        return shell_if_none;
     };
-    if names_a_shell(program) || STARTS_A_SHELL.contains(&base_of(program)) {
+    if names_a_shell(program)
+        || STARTS_A_SHELL
+            .iter()
+            .any(|n| program_is(base_of(program), n))
+    {
         return true;
     }
     names_an_interpreter(program)
         && crate::posture::script_args::runs_of(std::path::Path::new(program), &words[at..])
             .script()
             .is_none()
+}
+
+/// `env -S STRING [ARGS]`: the string split at its whitespace, then the
+/// arguments, is the command line.
+fn split_string_runs_a_shell(split: Option<&str>, rest: &[String]) -> bool {
+    let mut words: Vec<String> = split
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    words.extend(rest.iter().cloned());
+    command_runs_a_shell(&words)
 }
 
 /// The tool of `tools` an exec runs: by its `comm`, or by the kernel's
@@ -262,8 +373,10 @@ struct Known {
     /// The installed programs, oldest first (an upgrade adds an image and
     /// keeps the one it replaced: a process may still run it).
     installed: VecDeque<InstalledImage>,
-    /// The execs the pump found to be a copy of an installed program.
-    copies: HashMap<ExecKey, ProgramKind>,
+    /// The execs the pump found to be a copy of an installed program; lot
+    /// 313 (the 2404 lab's review): `None` for an exec the pump could not
+    /// compare (its budget spent), its identity unverified.
+    copies: HashMap<ExecKey, Option<ProgramKind>>,
     order: VecDeque<ExecKey>,
 }
 
@@ -282,8 +395,14 @@ impl Known {
     /// `image` recorded, at most `cap` kept (the oldest out); `true` when
     /// its identity is new.
     fn record(&mut self, image: InstalledImage, cap: usize) -> bool {
-        if image.id == (0, 0) || self.installed.iter().any(|i| i.id == image.id) {
+        if image.id == (0, 0) || self.installed.contains(&image) {
             return false;
+        }
+        // an inode number a removed file had, now another installed
+        // program's: the latest is the file
+        if let Some(old) = self.installed.iter_mut().find(|i| i.id == image.id) {
+            *old = image;
+            return true;
         }
         if self.installed.len() >= cap {
             self.installed.pop_front();
@@ -293,7 +412,7 @@ impl Known {
     }
 
     /// `kind` kept for the exec `key`, at most `cap` execs (the oldest out).
-    fn keep(&mut self, key: ExecKey, kind: ProgramKind, cap: usize) {
+    fn keep(&mut self, key: ExecKey, kind: Option<ProgramKind>, cap: usize) {
         if self.copies.insert(key, kind).is_none() {
             self.order.push_back(key);
         }
@@ -349,22 +468,46 @@ fn exec_key(event: &Event) -> Option<ExecKey> {
 /// installed program of `kind`.
 pub fn keep_copy(event: &Event, kind: ProgramKind) {
     if let Some(key) = exec_key(event) {
-        KNOWN.write().keep(key, kind, COPIES_CAP);
+        KNOWN.write().keep(key, Some(kind), COPIES_CAP);
     }
+}
+
+/// Lot 313 (the coordinator's fail-safe for F1's budget): the exec pump
+/// could not compare `event`'s running image (the second's budget spent):
+/// its identity is unverified ([`unverified`]).
+pub fn keep_unverified(event: &Event) {
+    if let Some(key) = exec_key(event) {
+        KNOWN.write().keep(key, None, COPIES_CAP);
+    }
+}
+
+/// The exec pump did not compare `event`'s running image: a flood spent
+/// the budget. R020 records such an exec of a user-writable image with its
+/// stdio on a socket ("identity unverified"), never lets it pass silently.
+pub fn unverified(event: &Event) -> bool {
+    exec_key(event).is_some_and(|key| matches!(KNOWN.read().copies.get(&key), Some(None)))
 }
 
 /// What the pump found `event`'s image to be a copy of.
 pub fn copy_of(event: &Event) -> Option<ProgramKind> {
     let key = exec_key(event)?;
-    KNOWN.read().copies.get(&key).copied()
+    KNOWN.read().copies.get(&key).copied().flatten()
 }
 
 /// What the kernel executed for `event` (an exec), by identity: the pump's
 /// content check, else the installed programs' device and inode (the LSM
 /// hook's: a tracepoint exec carries none), else the executed file's name
-/// (module docs).
+/// (module docs). Lot 313 (the review of #549, F4): the dynamic loader run
+/// as a program runs its operand — that program's name (the pump compares
+/// the operand's file: a copy is known by its content).
 pub fn image_kind(event: &Event) -> Option<ProgramKind> {
-    let Event::ProcessSpawn { filename, exe, .. } = event else {
+    let Event::ProcessSpawn {
+        filename,
+        exe,
+        argv,
+        ..
+    } = event
+    else {
         return None;
     };
     if let Some(kind) = copy_of(event) {
@@ -375,21 +518,43 @@ pub fn image_kind(event: &Event) -> Option<ProgramKind> {
             return Some(kind);
         }
     }
-    ProgramKind::of_name(exe.path_or(filename))
+    let image = exe.path_or(filename);
+    if crate::posture::script_args::is_loader_name(base_of(image)) {
+        let (program, _) = crate::posture::script_args::loader_program(argv)?;
+        return ProgramKind::of_name(program);
+    }
+    ProgramKind::of_name(image)
+}
+
+/// The arguments the program an exec runs reads: the exec's own, or under
+/// the dynamic loader its operand's (its `argv[0]` the operand).
+fn program_argv(event: &Event) -> &[String] {
+    let Event::ProcessSpawn {
+        filename,
+        exe,
+        argv,
+        ..
+    } = event
+    else {
+        return &[];
+    };
+    if crate::posture::script_args::is_loader_name(base_of(exe.path_or(filename))) {
+        if let Some((_, at)) = crate::posture::script_args::loader_program(argv) {
+            return &argv[at..];
+        }
+    }
+    argv
 }
 
 /// The program an exec runs is a shell (`Some(true)`) or an interpreter
 /// (`Some(false)`) — busybox's by the program its `argv` names; `None` for
 /// anything else.
 pub fn shell_or_interpreter(event: &Event) -> Option<bool> {
-    let Event::ProcessSpawn { argv, .. } = event else {
-        return None;
-    };
     match image_kind(event)? {
         ProgramKind::Shell => Some(true),
         ProgramKind::Interpreter => Some(false),
         ProgramKind::Busybox => {
-            let (program, _) = crate::posture::script_args::busybox_program(argv)?;
+            let (program, _) = crate::posture::script_args::busybox_program(program_argv(event))?;
             crate::posture::script_args::BUSYBOX_SHELLS
                 .contains(&program)
                 .then_some(true)
@@ -486,8 +651,8 @@ mod tests {
         }));
         assert!(!record_installed(InstalledImage {
             id: bash,
-            len: 1,
-            path: "/bin/bash".into(),
+            len: 1_446_024,
+            path: "/usr/bin/bash".into(),
             kind: ProgramKind::Shell,
         }));
         assert!(!record_installed(InstalledImage {
@@ -536,7 +701,7 @@ mod tests {
     fn the_tables_are_bounded() {
         let mut k = Known::default();
         for i in 0..5u32 {
-            k.keep((i, 1), ProgramKind::Shell, 3);
+            k.keep((i, 1), Some(ProgramKind::Shell), 3);
         }
         assert_eq!(k.copies.len(), 3);
         assert!(!k.copies.contains_key(&(0, 1)) && k.copies.contains_key(&(4, 1)));
@@ -550,6 +715,16 @@ mod tests {
             assert!(k.record(image(n), 3));
         }
         assert!(!k.record(image(4), 3), "known");
+        // an inode number reused by another installed program: the latest
+        let reused = InstalledImage {
+            id: (1, 4),
+            len: 99,
+            path: "/usr/bin/python3".into(),
+            kind: ProgramKind::Interpreter,
+        };
+        assert!(k.record(reused.clone(), 3));
+        assert_eq!(k.installed.iter().filter(|i| i.id == (1, 4)).count(), 1);
+        assert!(k.installed.contains(&reused));
         assert_eq!(k.installed.len(), 3);
         assert!(k.installed.iter().all(|i| i.id != (1, 1)), "the oldest out");
     }

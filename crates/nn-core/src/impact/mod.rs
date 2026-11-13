@@ -201,7 +201,16 @@ struct ActorWindow {
 struct State {
     actors: HashMap<u32, ActorWindow>,
     memo: VecDeque<((u32, u64, u8), Arc<Assessment>)>,
+    /// Lot 313 (the review of #549, F3): the encryption tools judged for
+    /// (b) and (c), by their window's key: when they were last seen, the
+    /// process that started them, their program — the originals a trusted
+    /// `rm` of that starter's session deletes beside their outputs count
+    /// for them.
+    encryptors: HashMap<u32, (u64, u32, String)>,
 }
+
+/// Encryption tools remembered at most for that attribution.
+const ENCRYPTORS_CAP: usize = 64;
 
 /// The tracker the posture and the rules share.
 pub struct RansomTracker<H: DecisionHost> {
@@ -337,6 +346,68 @@ impl<H: DecisionHost> RansomTracker<H> {
         Some(a)
     }
 
+    /// Lot 313 (F3): remember an encryption tool's window `key`, its
+    /// `starter` and its program, at `ts` (the oldest out at the bound).
+    fn note_encryptor(&self, key: u32, starter: u32, program: String, ts: u64) {
+        let mut st = self.state.lock();
+        if st.encryptors.len() >= ENCRYPTORS_CAP && !st.encryptors.contains_key(&key) {
+            if let Some(old) = st
+                .encryptors
+                .iter()
+                .min_by_key(|(_, (t, ..))| *t)
+                .map(|(k, _)| *k)
+            {
+                st.encryptors.remove(&old);
+            }
+        }
+        st.encryptors.insert(key, (ts, starter, program));
+    }
+
+    /// Lot 313 (the review of #549, F3): the encryption tool whose outputs
+    /// lie beside the original an unlink burst deleted (an original's name
+    /// with an extension appended, there now: [`copy_beside`]), started by a
+    /// process of the deleting writer's lineage (`hops`), seen in the
+    /// window: its window's key, its starter, its program.
+    fn encryptor_beside(
+        &self,
+        event: &Event,
+        hops: &[(u32, crate::posture::lineage::ExecIdentity)],
+        ts: u64,
+    ) -> Option<(u32, u32, String)> {
+        let Event::FileBurst {
+            kind: FileBurstKind::Unlink,
+            filename,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let candidates: Vec<(u32, u32, String, Vec<String>)> = {
+            let st = self.state.lock();
+            st.encryptors
+                .iter()
+                .filter(|(_, (t, starter, _))| {
+                    t.abs_diff(ts) <= RANSOM_WINDOW_NS && hops.iter().any(|(p, _)| p == starter)
+                })
+                .filter_map(|(key, (_, starter, program))| {
+                    let new: Vec<String> = st
+                        .actors
+                        .get(key)?
+                        .new_files
+                        .iter()
+                        .filter(|(t, _)| t.abs_diff(ts) <= RANSOM_WINDOW_NS)
+                        .map(|(_, f)| f.clone())
+                        .collect();
+                    (!new.is_empty()).then(|| (*key, *starter, program.clone(), new))
+                })
+                .collect()
+        };
+        candidates
+            .into_iter()
+            .find(|(_, _, _, new)| copy_beside::<H>(filename, new).is_some())
+            .map(|(key, starter, program, _)| (key, starter, program))
+    }
+
     fn judge(&self, event: &Event, pid: u32, ts: u64) -> Assessment {
         // R-F: the lineage as of the burst's own time
         let as_of = crate::posture::lineage::AsOf::judged(ts);
@@ -347,6 +418,9 @@ impl<H: DecisionHost> RansomTracker<H> {
         });
         let package_tx = self.lineage.in_package_transaction(pid, as_of);
         let owned = |p: &std::path::Path| self.owners.owned(p);
+        // lot 313 (BUG-49's residue): the writer is an encryption tool asked
+        // to encrypt — its outputs are ciphertext, whatever their header
+        let encrypts_writer = self.lineage.runs_encryption(pid, as_of);
         let mut a = Assessment {
             writer: pid,
             actor: pid,
@@ -360,47 +434,80 @@ impl<H: DecisionHost> RansomTracker<H> {
             rename_burst: false,
             why: String::new(),
         };
-        match trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned) {
-            // lot 313 (BUG-49's residue): an encryption tool asked to
-            // encrypt is judged for (b) and (c) whoever started it
-            Judged::Trusted(t) if self.lineage.runs_encryption(pid, as_of) => {
-                let hops = lineage.as_deref().unwrap_or_default();
-                let actor = if hops.is_empty() {
-                    pid
-                } else {
-                    hops[trust::topmost_same(hops, 0)].0
-                };
-                a.encrypting = true;
-                a.actor = actor;
-                a.key = actor;
-                a.program = hops
-                    .first()
-                    .map_or_else(String::new, |(_, id)| trust::program_of(id));
-                a.why = format!(
-                    "an encryption tool asked to encrypt: never trusted for ciphertext-like \
-                     content or renames to a new extension (lot 313), though {}",
-                    t.describe()
-                );
+        // lot 313 (F3): an unlink burst beside an encryption tool's outputs
+        let beside = self
+            .encryptor_beside(event, lineage.as_deref().unwrap_or_default(), ts)
+            .filter(|(key, ..)| *key != pid);
+        let hops = lineage.as_deref().unwrap_or_default();
+        // the writer's own process (its forked copies: the topmost one), and
+        // what started it — a session's shell, a script, a unit
+        let top = if hops.is_empty() {
+            0
+        } else {
+            trust::topmost_same(hops, 0)
+        };
+        let own = hops.get(top).map_or(pid, |(p, _)| *p);
+        let starter = hops.get(top + 1).map_or(own, |(p, _)| *p);
+        let judged = trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned);
+        if let Some((key, encryptor_starter, program)) = beside {
+            // lot 313 (the review of #549, F3, and the lab of 13/11): the
+            // originals another process of the encryption tool's session
+            // deletes beside its outputs (`gpg --encrypt-files *; rm *`)
+            // are the tool's — whoever deletes them, trusted or not: the
+            // copies-then-deleted shape counts for it
+            a.encrypting = true;
+            a.actor = encryptor_starter;
+            a.key = key;
+            a.program = program.clone();
+            a.why = format!(
+                "originals deleted beside the outputs of {program}, an encryption tool started \
+                 in the deleting process's session (lot 313)"
+            );
+        } else {
+            match judged {
+                // lot 313 (BUG-49's residue): an encryption tool asked to
+                // encrypt is judged for (b) and (c) whoever started it
+                Judged::Trusted(t) if encrypts_writer => {
+                    a.encrypting = true;
+                    // the kill reaches what started the tool: the tool
+                    // itself is done by then
+                    a.actor = starter;
+                    a.key = own;
+                    a.program = hops
+                        .first()
+                        .map_or_else(String::new, |(_, id)| trust::program_of(id));
+                    a.why = format!(
+                        "an encryption tool asked to encrypt: never trusted for ciphertext-like \
+                         content or renames to a new extension (lot 313), though {}",
+                        t.describe()
+                    );
+                }
+                Judged::Trusted(t) => {
+                    self.counters.trusted.fetch_add(1, Ordering::Relaxed);
+                    a.trusted = Some(t.describe());
+                    a.program = match t {
+                        trust::Trusted::PackagedProgram(p) => p,
+                        trust::Trusted::PackageTransaction => String::new(),
+                    };
+                    return a;
+                }
+                Judged::Untrusted {
+                    actor,
+                    key,
+                    program,
+                    why,
+                } => {
+                    a.actor = actor;
+                    a.key = key;
+                    a.program = program;
+                    a.why = why;
+                }
             }
-            Judged::Trusted(t) => {
-                self.counters.trusted.fetch_add(1, Ordering::Relaxed);
-                a.trusted = Some(t.describe());
-                a.program = match t {
-                    trust::Trusted::PackagedProgram(p) => p,
-                    trust::Trusted::PackageTransaction => String::new(),
-                };
-                return a;
-            }
-            Judged::Untrusted {
-                actor,
-                key,
-                program,
-                why,
-            } => {
-                a.actor = actor;
-                a.key = key;
-                a.program = program;
-                a.why = why;
+            // lot 313 (F3): an encryption tool, trusted or not, is
+            // remembered with its window's key and its starter — the
+            // deletions its session makes beside its outputs are its
+            if encrypts_writer {
+                self.note_encryptor(a.key, starter, a.program.clone(), ts);
             }
         }
         // What this event shows, and the files to sample for (b).
@@ -530,7 +637,7 @@ impl<H: DecisionHost> RansomTracker<H> {
                     *uid,
                     Duration::from_nanos(RANSOM_WINDOW_NS),
                 );
-                if s.holds() {
+                if counts_as_encrypted(&s, a.encrypting || encrypts_writer) {
                     shapes.push((
                         Signal::RenameExtension,
                         format!(
@@ -578,7 +685,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             let s = self
                 .sampler
                 .sample(path, Duration::from_nanos(RANSOM_WINDOW_NS));
-            if s.holds() {
+            if counts_as_encrypted(&s, a.encrypting || encrypts_writer) {
                 shapes.push((
                     Signal::Entropy,
                     format!(
@@ -616,6 +723,15 @@ impl<H: DecisionHost> RansomTracker<H> {
         a.signals = present;
         a
     }
+}
+
+/// The entropy signal (b) on `s`: ciphertext-like files (`Sample::holds`);
+/// lot 313 (BUG-49's residue, the review of #549's F3): for the outputs of
+/// an encryption tool asked to encrypt, a file with a container's header
+/// counts too — OpenPGP, age, 7-Zip, zip and rar wrap their ciphertext in
+/// one, and the tool's argv says what it holds.
+fn counts_as_encrypted(s: &entropy::Sample, encryptor: bool) -> bool {
+    s.holds() || (encryptor && s.high + s.containers >= entropy::HIGH_FILES_MIN)
 }
 
 /// The window of `actor`, a fresh one for a pid that now runs another
