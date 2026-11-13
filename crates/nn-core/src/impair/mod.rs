@@ -920,7 +920,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let asked = self.spawn_finding(*pid, &id, argv, as_of)?;
+                let asked = self.spawn_finding(*pid, &id, argv, as_of, GetoptEnv::of(exe))?;
                 stopped = asked.stopped;
                 reload = asked.reload;
                 (
@@ -1071,6 +1071,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         id: &ExecIdentity,
         argv: &[String],
         as_of: AsOf,
+        env: GetoptEnv,
     ) -> Option<Asked> {
         // lot 316: the program by its names (the xtables multi-call
         // binary's included), and where its own arguments start
@@ -1125,7 +1126,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let mut units: Vec<(String, String, String)> = Vec::new();
         let mut understood = true;
         let mut signals: Vec<Option<u8>> = Vec::new();
-        for t in service_targets(&prog, argv) {
+        for t in service_targets(&prog, argv, env) {
             for (tool, u) in self.tools.tools_of_unit(&t.unit) {
                 if !units.iter().any(|(n, x, _)| *n == tool.name && *x == u) {
                     units.push((tool.name.clone(), u, t.verb.clone()));
@@ -1227,10 +1228,11 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 }
                 let mut asked = asked?;
                 // the review of #548 (F12): a reload signal every process
-                // reached catches; the re-check (N1): the signal every
-                // reading sends (procps' TERM when it names none)
+                // reached catches; the re-check (N1): the signal of the
+                // reading its environment makes, or every reading's
+                // (procps' TERM when it names none)
                 asked.reload = one_reload(
-                    readings
+                    env.readings(&readings)
                         .iter()
                         .map(|r| r.understood.then(|| kill_signal(r).unwrap_or("TERM"))),
                 )
@@ -1529,6 +1531,53 @@ fn reload_signal(s: &str) -> Option<u8> {
         "HUP" | "1" => Some(1),
         _ => None,
     }
+}
+
+/// The re-check of #548: what the exec pump read of an exec's environment
+/// for getopt (`exe_flags::ENV_READ`, `exe_flags::POSIXLY_CORRECT`) — which
+/// of a tool's readings ([`SystemTool::read`]: GNU's first, then
+/// `POSIXLY_CORRECT`'s when it differs) its process makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GetoptEnv {
+    /// Not read (the process gone, its pid another's, its memory gone, a
+    /// read that failed): any reading may be the one.
+    Unknown,
+    /// Read, without `POSIXLY_CORRECT`: GNU's permutation.
+    Gnu,
+    /// Read, with `POSIXLY_CORRECT`: the first operand ends the options.
+    Posix,
+}
+
+impl GetoptEnv {
+    fn of(exe: &nn_model::ExeIdentity) -> Self {
+        use common::wire::exe::exe_flags::{ENV_READ, POSIXLY_CORRECT};
+        match (exe.has(ENV_READ), exe.has(POSIXLY_CORRECT)) {
+            (false, _) => Self::Unknown,
+            (true, false) => Self::Gnu,
+            (true, true) => Self::Posix,
+        }
+    }
+
+    /// The readings of `all` (a tool's, [`SystemTool::read`]) the process
+    /// makes: GNU's alone, `POSIXLY_CORRECT`'s alone (the last: the only
+    /// one when both agree), or all of them when not known. An argv not
+    /// understood has one reading, not understood, whichever.
+    fn readings<'r, 'a>(self, all: &'r [Parsed<'a>]) -> &'r [Parsed<'a>] {
+        match self {
+            Self::Unknown => all,
+            Self::Gnu => &all[..all.len().min(1)],
+            Self::Posix => &all[all.len().saturating_sub(1)..],
+        }
+    }
+}
+
+/// The re-check of #548 (lot 316): the exec of a system tool whose reload
+/// signal `POSIXLY_CORRECT` changes — systemctl, procps' `kill` (by the
+/// names its program goes by). The exec pump reads its environment for it
+/// (`exe_flags::ENV_READ`).
+pub fn reads_posixly_correct(exe: &Path, argv: &[String]) -> bool {
+    let prog = Program::of(exe, argv);
+    prog.is("systemctl") || prog.tool() == Some(SystemTool::Kill)
 }
 
 /// The re-check of #548 (N1): the reload signal every reading of an argv
@@ -1867,17 +1916,18 @@ fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(String, &'a str)> {
 /// (BUG-106: an option the old exact-match list did not hold moved the verb
 /// onto its value; `POSIXLY_CORRECT` makes an option after the verb a
 /// unit).
-fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
+fn service_targets(prog: &Program, argv: &[String], env: GetoptEnv) -> Vec<ServiceTarget> {
     let mut out: Vec<ServiceTarget> = Vec::new();
     if prog.is("systemctl") {
         let readings = SystemTool::Systemctl.read(argv, prog.args_from);
         // `systemctl kill`'s signal: a reading's last `-s`, TERM when it
-        // names none. The re-check of #548 (N1): a reload only when every
-        // reading sends it — under `POSIXLY_CORRECT` a `-s` after the verb
-        // is a unit and the signal TERM (`systemctl kill -s HUP
-        // rsyslog.service` is then `-s.service`, `HUP.service` and rsyslog
-        // killed).
-        let reload = one_reload(readings.iter().map(|r| {
+        // names none. The re-check of #548 (N1): a reload only when the
+        // reading its environment makes sends it, or every reading when
+        // the environment was not read — under `POSIXLY_CORRECT` a `-s`
+        // after the verb is a unit and the signal TERM (`systemctl kill -s
+        // HUP rsyslog.service` is then `-s.service`, `HUP.service` and
+        // rsyslog killed).
+        let reload = one_reload(env.readings(&readings).iter().map(|r| {
             r.understood.then(|| {
                 r.option("s")
                     .filter_map(|v| v.first().copied())

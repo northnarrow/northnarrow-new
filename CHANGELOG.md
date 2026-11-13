@@ -50,11 +50,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   ends it (`[a[:]uditd.servic[:e:]` stops auditd). A SIGHUP to a tool that
   documents it as its reload (auditd, rsyslog, firewalld, falco), which
   every process it reaches catches (`SigCgt`; for `systemctl kill`, every
-  process of the unit's cgroup) and every reading of the argv sends, is a
-  Low record: a reload, no stop. auditd's SIGUSR1 (a log rotation) is
-  High. logrotate's `systemctl kill -s HUP rsyslog.service` stays High: with
-  `POSIXLY_CORRECT` the same argv sends SIGTERM (`UPGRADE_NOTES_WAVE4.md`
-  §32).
+  process of the unit's cgroup), is a Low record: a reload, no stop —
+  logrotate's daily `systemctl kill -s HUP rsyslog.service`. The signal is
+  the one of the reading the process makes: the exec pump reads systemctl's
+  and `kill`'s environment for `POSIXLY_CORRECT`, under which that argv
+  sends SIGTERM (High); not read, every reading must send it. auditd's
+  SIGUSR1 (a log rotation) is High (`UPGRADE_NOTES_WAVE4.md` §32).
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision

@@ -71,12 +71,31 @@ fn host() -> Host {
 
 impl Host {
     fn run(&self, pid: u32, ppid: u32, exe: &str, argv: &[&str]) -> Option<Finding> {
+        self.run_flagged(pid, ppid, exe, argv, 0)
+    }
+
+    /// [`Self::run`], the exec pump's `flags` on the exec's identity (the
+    /// re-check of #548: `ENV_READ`, `POSIXLY_CORRECT`).
+    fn run_flagged(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        argv: &[&str],
+        flags: u32,
+    ) -> Option<Finding> {
         let argv_s: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
         let at = 100 * S + pid as u64;
         self.lineage.ingest_exec(pid, ppid, exe, &argv_s, at, at, 0);
         let mut e = spawn(pid, ppid, exe, argv);
-        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut e {
+        if let Event::ProcessSpawn {
+            timestamp_ns,
+            exe: id,
+            ..
+        } = &mut e
+        {
             *timestamp_ns = at;
+            id.flags |= flags;
         }
         self.det.assess(&e)
     }
@@ -2312,6 +2331,60 @@ mod rev548_recheck {
         assert_eq!(one_reload([Some("HUP"), None]), None);
         assert_eq!(one_reload([None, Some("HUP")]), None);
         assert_eq!(one_reload(std::iter::empty()), None);
+    }
+
+    /// The coordinator's decision on N1's consequence: the exec pump reads
+    /// the environment getopt reads (`ENV_READ`, `POSIXLY_CORRECT`), and the
+    /// reading it makes alone names the signal. logrotate's own argv
+    /// (`-s HUP` after the verb): SIGHUP without `POSIXLY_CORRECT` (Low),
+    /// SIGTERM with it (judged). Not read: every reading must agree.
+    #[test]
+    fn n1_the_environment_read_names_the_reading() {
+        use common::wire::exe::exe_flags::{ENV_READ, POSIXLY_CORRECT};
+        let h = host();
+        rsyslog(&h);
+        let gnu = ENV_READ;
+        let posix = ENV_READ | POSIXLY_CORRECT;
+        let rotate = ["systemctl", "kill", "-s", "HUP", "rsyslog.service"];
+        let sanction = |pid: u32, exe: &str, argv: &[&str], flags: u32| {
+            h.run_flagged(pid, 200, exe, argv, flags)
+                .unwrap_or_else(|| panic!("no finding: {argv:?}"))
+                .sanctioned
+        };
+        assert!(sanction(9780, SC, &rotate, gnu).is_some());
+        assert_eq!(sanction(9781, SC, &rotate, posix), None);
+        assert_eq!(sanction(9782, SC, &rotate, 0), None);
+        // POSIXLY_CORRECT without ENV_READ is no reading of the environment
+        assert_eq!(sanction(9783, SC, &rotate, POSIXLY_CORRECT), None);
+        // the reading made alone: a signal before the verb and another
+        // after it is the first under POSIXLY_CORRECT, the last without
+        let both = ["systemctl", "-s", "HUP", "kill", "rsyslog", "-s", "TERM"];
+        assert!(sanction(9784, SC, &both, posix).is_some());
+        assert_eq!(sanction(9785, SC, &both, gnu), None);
+        assert_eq!(sanction(9786, SC, &both, 0), None);
+        // procps' kill: a signal after the pid is GNU's only
+        let late = ["kill", "9710", "-s", "HUP"];
+        assert!(sanction(9787, KILL, &late, gnu).is_some());
+        assert_eq!(sanction(9788, KILL, &late, posix), None);
+        assert_eq!(sanction(9789, KILL, &late, 0), None);
+        // an argv not understood is not read, whatever the environment
+        let odd = ["systemctl", "--no-such", "-s", "HUP", "kill", "rsyslog"];
+        assert_eq!(sanction(9790, SC, &odd, gnu), None);
+        // the programs whose environment the pump reads
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (exe, a, want) in [
+            ("/usr/bin/systemctl", &["systemctl", "kill"][..], true),
+            ("/usr/bin/kill", &["kill", "-HUP", "1"], true),
+            ("/bin/kill", &["kill"], true),
+            ("/usr/bin/pkill", &["pkill", "x"], false),
+            ("/usr/bin/bash", &["bash", "-c", "kill 1"], false),
+        ] {
+            assert_eq!(
+                reads_posixly_correct(Path::new(exe), &argv(a)),
+                want,
+                "{exe}"
+            );
+        }
     }
 
     /// N2, through the detector: glibc reads `[a[:]` as the members `a`,

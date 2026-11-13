@@ -528,12 +528,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           (off by default, new in lab PR 225): a High record. A SIGHUP by \
                           `systemctl kill` to a tool that documents it as its reload (auditd, \
                           rsyslog, firewalld, falco), which every process of the unit's \
-                          cgroup catches (`SigCgt`) and every reading of the argv sends, is \
-                          Low: a reload (the review of #548 and its re-check). Known false \
-                          positive: logrotate's daily `rsyslog-rotate` (`systemctl kill -s \
-                          HUP rsyslog.service`) is High — with `POSIXLY_CORRECT` that argv \
-                          kills rsyslog with SIGTERM, and the exec does not show the \
-                          environment (lot 330).",
+                          cgroup catches (`SigCgt`), is Low: a reload (logrotate's daily \
+                          `rsyslog-rotate`; the review of #548 and its re-check). The signal \
+                          is the one of the reading the process makes: the exec pump reads \
+                          its environment for `POSIXLY_CORRECT` (with it, `systemctl kill -s \
+                          HUP rsyslog.service` sends SIGTERM: High); not read, every reading \
+                          must send it.",
         how_to_test: "`ransom-check.sh` MS-25: `systemctl stop auditd` (auditd installed).",
         tests: &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",

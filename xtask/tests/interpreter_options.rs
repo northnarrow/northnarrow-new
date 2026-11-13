@@ -418,9 +418,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/exec_facts.rs",
-        1,
+        2,
         "the exec's environment split on its NULs (`/proc/<pid>/environ`): variables, read \
-         by name; `NODE_OPTIONS` goes to the reader (`node_options_load`)",
+         by name; `NODE_OPTIONS` goes to the reader (`node_options_load`); and (lot 316, the \
+         re-check of #548) `POSIXLY_CORRECT` looked up by name in systemctl's and procps' \
+         `kill`'s, no option read",
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",

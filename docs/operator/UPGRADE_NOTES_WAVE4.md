@@ -1615,17 +1615,23 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
     cgroup (`cgroup.procs` of the cgroup a registered process runs in). A
     cgroup with cgroups below it, a unit no registered process runs in (an
     alias's name) or a list that cannot be read: High;
-  - every reading of the argv sends SIGHUP. Under `POSIXLY_CORRECT` an
-    option after systemctl's verb, or after a pid for procps' `kill`, is an
-    operand and the signal SIGTERM, and the exec does not show the
-    environment. `systemctl kill rsyslog -s HUP` and `kill <pid> -s HUP` are
-    therefore High. So is logrotate's own `rsyslog-rotate` (`systemctl kill
-    -s HUP rsyslog.service`, measured with systemd 255: under
-    `POSIXLY_CORRECT` it kills `-s.service`, `HUP.service` and
-    rsyslog.service with SIGTERM). That is a known false positive, daily on
-    Debian and Ubuntu with rsyslog, left to lot 330. `systemctl -s HUP kill
+  - the reading of the argv the process makes sends SIGHUP. Under
+    `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid for
+    procps' `kill`, is an operand and the signal SIGTERM: logrotate's own
+    `systemctl kill -s HUP rsyslog.service` then kills `-s.service`,
+    `HUP.service` and rsyslog.service with SIGTERM (measured with systemd
+    255). The exec pump reads the environment of an exec of systemctl or
+    `kill` while it runs (its start the exec's, its memory still there
+    after the read): without `POSIXLY_CORRECT` GNU's reading alone names
+    the signal (logrotate's rotation is Low), with it the
+    `POSIXLY_CORRECT` reading alone (High). When it could not be read (the
+    process gone, its memory gone, its pid another's, a read that failed),
+    every reading must send SIGHUP: `systemctl kill rsyslog -s HUP` and
+    `kill <pid> -s HUP` are then High, `systemctl -s HUP kill
     rsyslog.service` (the option before the verb), `kill -HUP <pid>` and
-    `kill -s HUP <pid>` are Low.
+    `kill -s HUP <pid>` Low. Residual: a process that rewrites its own
+    environment before the pump reads it (code injected into systemctl,
+    which could send any signal itself).
 - **Names.** iptables by any of its names (`iptables-nft`,
   `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
   command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part

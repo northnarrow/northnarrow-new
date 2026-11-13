@@ -588,6 +588,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         KNOB,
     ),
     (
+        "crates/nn-linux/src/sensors/exec_facts.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         "read_state(dir.join(\"stat\"))",
         PROC,
