@@ -46,9 +46,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`condstop`, `clean`, `preset`, `revert`, `edit`, `link`, `set-property`,
   `service-log-*`, `bind`, `isolate`, `rescue`, `emergency`, …); units'
   aliases (`syslog.service`); procps' `kill -s KILL -0 <pid>`, a pid with
-  blanks, killall's `//path`, `lt-pkill`. logrotate's daily `systemctl kill
-  -s HUP rsyslog.service` is a Low record now: a SIGHUP or SIGUSR1 every
-  process it reaches catches (`SigCgt`) is a reload, no stop.
+  blanks, killall's `//path`, `lt-pkill`; a bracket class ended as glibc
+  ends it (`[a[:]uditd.servic[:e:]` stops auditd). A SIGHUP to a tool that
+  documents it as its reload (auditd, rsyslog, firewalld, falco), which
+  every process it reaches catches (`SigCgt`; for `systemctl kill`, every
+  process of the unit's cgroup) and every reading of the argv sends, is a
+  Low record: a reload, no stop. auditd's SIGUSR1 (a log rotation) is
+  High. logrotate's `systemctl kill -s HUP rsyslog.service` stays High: with
+  `POSIXLY_CORRECT` the same argv sends SIGTERM (`UPGRADE_NOTES_WAVE4.md`
+  §32).
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision

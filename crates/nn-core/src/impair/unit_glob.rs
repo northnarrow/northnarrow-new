@@ -145,8 +145,7 @@ fn bracket(p: &[char], at: usize) -> Option<(Elem, usize)> {
         if c == '[' && matches!(p.get(i + 1), Some(':' | '.' | '=')) {
             let kind = p[i + 1];
             let start = i + 2;
-            let end = (start..p.len().saturating_sub(1)).find(|&k| p[k] == kind && p[k + 1] == ']');
-            if let Some(end) = end {
+            if let Some(end) = special_end(p, kind, start) {
                 let inner: String = p[start..end].iter().collect();
                 items.push(match kind {
                     ':' => Class::named(&inner).map_or(Item::AnyClass, Item::Class),
@@ -173,6 +172,37 @@ fn bracket(p: &[char], at: usize) -> Option<(Elem, usize)> {
         }
         items.push(Item::Char(c));
         i += 1;
+    }
+}
+
+/// The review of #548, re-check (N2): where the `[:`, `[.` or `[=` (`kind`)
+/// whose name starts at `p[start]` ends — the index of its closing `:`, `.`
+/// or `=` — as glibc's `fnmatch_loop.c` ends it; `None` when it is no such
+/// element (its `[` is then an ordinary member):
+/// - `[:` names a class in bytes `a`–`y` up to the first `:]`; any other
+///   byte first ends the attempt (`[a[:]uditd.servic[:e:]` is the members
+///   `a`, `[`, `:`, and it stops auditd);
+/// - `[=` holds exactly one character, then `=]`;
+/// - `[.` runs to the first `.]` (a name other than one character makes
+///   glibc match nothing in the C locale: any reading of it is at least as
+///   wide).
+fn special_end(p: &[char], kind: char, start: usize) -> Option<usize> {
+    match kind {
+        ':' => {
+            let mut k = start;
+            loop {
+                match p.get(k)? {
+                    ':' if p.get(k + 1) == Some(&']') => return Some(k),
+                    'a'..='y' => k += 1,
+                    _ => return None,
+                }
+            }
+        }
+        '=' => (p.get(start).is_some()
+            && p.get(start + 1) == Some(&'=')
+            && p.get(start + 2) == Some(&']'))
+        .then_some(start + 1),
+        _ => (start..p.len().saturating_sub(1)).find(|&k| p[k] == kind && p[k + 1] == ']'),
     }
 }
 
@@ -326,6 +356,22 @@ mod tests {
             ("[[=a=]]x", "bx", false),
             ("auditd.service?", "auditd.service", false),
             ("a*b*c*d*e*f*g", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+            // the re-check of #548 (N2), with glibc's fnmatch: a `[:` whose
+            // name meets a byte outside `a`–`y` before `:]` is no class, a
+            // `[=` holds one character — the `[` is then a member and the
+            // bracket ends at the next `]`
+            ("[a[:]uditd.servic[:e:]", "auditd.service", true),
+            ("[[:alpha]uditd.service", "auditd.service", true),
+            ("[[:alpha]uditd.service", ":uditd.service", true),
+            ("[[:z:]]x", "zx", false),
+            ("[[:z:]]x", ":]x", true),
+            ("[[=a]uditd.servic[=e=]", "auditd.service", true),
+            ("[[==]]x", "=]x", true),
+            ("[[===]]x", "=x", true),
+            ("[[=ab=]]x", "ax", false),
+            // glibc matches nothing here (a name of two characters, in the
+            // C locale): any character is wider
+            ("[[.ab.]]x", "ax", true),
         ] {
             assert_eq!(fnmatch(p, n), want, "{p} {n}");
             assert_eq!(reference(p, n), want, "reference: {p} {n}");

@@ -53,12 +53,15 @@ fn host() -> Host {
     let lineage = AuthSessionTracker::new(proc.path());
     lineage.ingest_exec(150, 1, "/usr/sbin/cron", &["cron".into()], S, S, 0);
     lineage.ingest_exec(200, 150, "/usr/bin/bash", &["bash".into()], 2 * S, 2 * S, 0);
+    // the re-check of #548 (N4): the fixture's cgroup tree, beside its
+    // `/proc` (a name no pid has)
     let det = DefenseDetector::with_proc_root(
         Arc::new(SecurityTools::builtin()),
         lineage.clone(),
         None,
         proc.path(),
-    );
+    )
+    .with_cgroup_root(proc.path().join("cgroupfs"));
     Host {
         _proc: proc,
         lineage,
@@ -2116,7 +2119,7 @@ mod rev548 {
 
     /// A process the fixture's `/proc` knows: its start, and the signals it
     /// catches (`SigCgt`).
-    fn a_process(h: &Host, pid: u32, start: u64, sigcgt: &str) {
+    pub(super) fn a_process(h: &Host, pid: u32, start: u64, sigcgt: &str) {
         let d = h._proc.path().join(pid.to_string());
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
@@ -2129,11 +2132,27 @@ mod rev548 {
         std::fs::write(d.join("status"), format!("Name:\tx\nSigCgt:\t{sigcgt}\n")).unwrap();
     }
 
-    /// F12 (the coordinator's decision): a SIGHUP or SIGUSR1 sent by
-    /// `systemctl kill` or `kill` to a tool's process that catches it
-    /// (`SigCgt`) is a reload — a Low record, no DefenseImpairment;
-    /// logrotate's `rsyslog-rotate` sends one every day. To one that does
-    /// not catch it, it ends the process: High. Any other signal: High.
+    /// The re-check of #548 (N4): `pids` the processes of the cgroup
+    /// `/system.slice/<unit>`, each of them in it (`/proc/<pid>/cgroup`).
+    pub(super) fn a_unit(h: &Host, unit: &str, pids: &[u32]) {
+        let d = h._proc.path().join("cgroupfs/system.slice").join(unit);
+        std::fs::create_dir_all(&d).unwrap();
+        let list: String = pids.iter().map(|p| format!("{p}\n")).collect();
+        std::fs::write(d.join("cgroup.procs"), list).unwrap();
+        for p in pids {
+            let c = h._proc.path().join(p.to_string());
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("cgroup"), format!("0::/system.slice/{unit}\n")).unwrap();
+        }
+    }
+
+    /// F12 (the coordinator's decision), as the re-check of #548 left it: a
+    /// SIGHUP sent by `systemctl kill` or `kill` to a tool that documents it
+    /// as its reload (N3), every process it reaches catching it (`SigCgt`;
+    /// N4: every process of the unit's cgroup) and every reading of the argv
+    /// sending it (N1), is a reload — a Low record, no DefenseImpairment. To
+    /// one that does not catch it, it ends the process: High. Any other
+    /// signal: High.
     #[test]
     fn a_reload_signal_the_process_catches_is_low() {
         let h = host();
@@ -2142,10 +2161,12 @@ mod rev548 {
         assert!(h
             .run(9400, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
             .is_none());
+        a_unit(&h, "rsyslog.service", &[9400]);
         a_process(&h, 9401, 4401, "0000000000000000");
         assert!(h
             .run(9401, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
             .is_none());
+        a_unit(&h, "auditd.service", &[9401]);
         let low = |pid: u32, exe: &str, argv: &[&str]| {
             let f = h
                 .run(pid, 200, exe, argv)
@@ -2153,9 +2174,9 @@ mod rev548 {
             f.sanctioned
         };
         for (k, argv) in [
-            &["systemctl", "kill", "-s", "HUP", "rsyslog.service"][..],
-            &["systemctl", "kill", "--signal=SIGUSR1", "rsyslog"],
-            &["systemctl", "kill", "-s", "1", "rsyslog"],
+            &["systemctl", "-s", "HUP", "kill", "rsyslog.service"][..],
+            &["systemctl", "--signal=SIGHUP", "kill", "rsyslog"],
+            &["systemctl", "-s", "1", "kill", "rsyslog"],
         ]
         .into_iter()
         .enumerate()
@@ -2168,7 +2189,7 @@ mod rev548 {
         }
         for (k, argv) in [
             &["kill", "-HUP", "9400"][..],
-            &["kill", "-s", "USR1", "9400"],
+            &["kill", "-s", "HUP", "9400"],
         ]
         .into_iter()
         .enumerate()
@@ -2176,16 +2197,19 @@ mod rev548 {
             let s = low(9420 + k as u32, "/usr/bin/kill", argv);
             assert!(s.is_some(), "{argv:?}");
         }
-        // High: the process does not catch it, another signal, a unit with
-        // no registered process, a pid no longer the one registered
+        // High: the process does not catch it, another signal (USR1 is no
+        // reload, N3), a unit with no registered process, a pid no longer
+        // the one registered
         for (k, (exe, argv)) in [
-            (SC, &["systemctl", "kill", "-s", "HUP", "auditd"][..]),
+            (SC, &["systemctl", "-s", "HUP", "kill", "auditd"][..]),
             (SC, &["systemctl", "kill", "rsyslog"]),
-            (SC, &["systemctl", "kill", "-s", "USR2", "rsyslog"]),
-            (SC, &["systemctl", "kill", "-s", "HUP", "rsyslog", "auditd"]),
-            (SC, &["systemctl", "kill", "-s", "HUP", "falco"]),
+            (SC, &["systemctl", "-s", "USR2", "kill", "rsyslog"]),
+            (SC, &["systemctl", "--signal=SIGUSR1", "kill", "rsyslog"]),
+            (SC, &["systemctl", "-s", "HUP", "kill", "rsyslog", "auditd"]),
+            (SC, &["systemctl", "-s", "HUP", "kill", "falco"]),
             ("/usr/bin/kill", &["kill", "-HUP", "9401"]),
             ("/usr/bin/kill", &["kill", "-TERM", "9400"]),
+            ("/usr/bin/kill", &["kill", "-s", "USR1", "9400"]),
             // procps: the last `-s` is the signal
             (
                 "/usr/bin/kill",
@@ -2202,9 +2226,202 @@ mod rev548 {
         // the pid now another process (its start changed)
         a_process(&h, 9400, 9999, "0000000180014203");
         assert_eq!(
-            low(9440, SC, &["systemctl", "kill", "-s", "HUP", "rsyslog"]),
+            low(9450, SC, &["systemctl", "-s", "HUP", "kill", "rsyslog"]),
             None
         );
-        assert_eq!(low(9441, "/usr/bin/kill", &["kill", "-HUP", "9400"]), None);
+        assert_eq!(low(9451, "/usr/bin/kill", &["kill", "-HUP", "9400"]), None);
+    }
+}
+
+mod rev548_recheck {
+    //! The re-check of #548: a reload only when every reading of the argv
+    //! sends it (N1), a class ended as glibc ends it (N2), the signals a
+    //! tool documents as its reload (N3), and every process of the unit's
+    //! cgroup (N4).
+    use super::rev548::{a_process, a_unit};
+    use super::*;
+
+    const SC: &str = "/usr/bin/systemctl";
+    const KILL: &str = "/usr/bin/kill";
+
+    /// The finding of `argv` (one there must be), and its sanction.
+    fn sanction(h: &Host, pid: u32, exe: &str, argv: &[&str]) -> Option<String> {
+        h.run(pid, 200, exe, argv)
+            .unwrap_or_else(|| panic!("no finding: {argv:?}"))
+            .sanctioned
+    }
+
+    /// rsyslogd (9710, catching HUP) registered, alone in its unit.
+    fn rsyslog(h: &Host) {
+        a_process(h, 9710, 4710, "0000000180014203");
+        assert!(h
+            .run(9710, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
+            .is_none());
+        a_unit(h, "rsyslog.service", &[9710]);
+    }
+
+    /// N1: under `POSIXLY_CORRECT` an option after the verb (systemctl's)
+    /// or after a pid (procps') is an operand, and the signal TERM — the
+    /// reviewer's r2 and r3, and logrotate's own `rsyslog-rotate` argv
+    /// (`-s HUP` after the verb: systemctl then kills `-s.service`,
+    /// `HUP.service` and rsyslog.service, measured with systemd 255). A
+    /// reading not understood sends a signal not known. Every reading
+    /// sending SIGHUP (it before the verb, or first for `kill`): Low.
+    #[test]
+    fn n1_a_reload_only_when_every_reading_sends_it() {
+        let h = host();
+        rsyslog(&h);
+        for (k, (exe, argv)) in [
+            (SC, &["systemctl", "kill", "rsyslog", "-s", "HUP"][..]),
+            (SC, &["systemctl", "kill", "-s", "HUP", "rsyslog.service"]),
+            (SC, &["systemctl", "kill", "--signal=HUP", "rsyslog"]),
+            (
+                SC,
+                &["systemctl", "--no-such", "-s", "HUP", "kill", "rsyslog"],
+            ),
+            (KILL, &["kill", "9710", "-s", "HUP"]),
+            (KILL, &["kill", "9710", "--signal", "HUP"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(sanction(&h, 9711 + k as u32, exe, argv), None, "{argv:?}");
+        }
+        for (k, (exe, argv)) in [
+            (
+                SC,
+                &["systemctl", "-s", "HUP", "kill", "rsyslog.service"][..],
+            ),
+            (KILL, &["kill", "-HUP", "9710"]),
+            (KILL, &["kill", "-s", "HUP", "9710"]),
+            (KILL, &["kill", "--signal=SIGHUP", "9710"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                sanction(&h, 9721 + k as u32, exe, argv).is_some(),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            one_reload([Some("HUP"), Some("SIGHUP"), Some("1")]),
+            Some(1)
+        );
+        assert_eq!(one_reload([Some("HUP"), None]), None);
+        assert_eq!(one_reload([None, Some("HUP")]), None);
+        assert_eq!(one_reload(std::iter::empty()), None);
+    }
+
+    /// N2, through the detector: glibc reads `[a[:]` as the members `a`,
+    /// `[`, `:` (a byte outside `a`–`y` ends a class's name), `[[=a]` as
+    /// `[`, `=`, `a` — both stop auditd.
+    #[test]
+    fn n2_a_class_ended_as_glibc_ends_it() {
+        let h = host();
+        for (k, glob) in ["[a[:]uditd.servic[:e:]", "[[=a]uditd.servic[=e=]"]
+            .into_iter()
+            .enumerate()
+        {
+            let f = h.run(9730 + k as u32, 200, SC, &["systemctl", "stop", glob]);
+            assert_eq!(
+                f.map(|f| (f.rule, f.tool)),
+                Some((EvaRule::ServiceStopped, "auditd".to_string())),
+                "{glob}"
+            );
+        }
+    }
+
+    /// N3: auditd catches SIGUSR1 to rotate its logs — five in a row delete
+    /// the older ones (`num_logs`, `max_log_file_action = ROTATE`): High;
+    /// its SIGHUP (reconfigure) is its reload. A tool that does not
+    /// document SIGHUP as its reload (fail2ban here) is judged even when
+    /// it catches it.
+    #[test]
+    fn n3_only_the_signal_a_tool_documents_as_its_reload() {
+        let h = host();
+        // auditd catches HUP and USR1 (bits 0 and 9)
+        a_process(&h, 9740, 4740, "0000000000004a03");
+        assert!(h
+            .run(9740, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        a_unit(&h, "auditd.service", &[9740]);
+        a_process(&h, 9741, 4741, "0000000000004a03");
+        assert!(h
+            .run(
+                9741,
+                1,
+                "/usr/bin/fail2ban-server",
+                &["/usr/bin/fail2ban-server", "-xf"]
+            )
+            .is_none());
+        a_unit(&h, "fail2ban.service", &[9741]);
+        for (k, (exe, argv)) in [
+            (KILL, &["kill", "-USR1", "9740"][..]),
+            (KILL, &["kill", "-10", "9740"]),
+            (SC, &["systemctl", "-s", "USR1", "kill", "auditd"]),
+            (KILL, &["kill", "-HUP", "9741"]),
+            (SC, &["systemctl", "-s", "HUP", "kill", "fail2ban"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(sanction(&h, 9742 + k as u32, exe, argv), None, "{argv:?}");
+        }
+        assert!(sanction(&h, 9750, KILL, &["kill", "-HUP", "9740"]).is_some());
+        assert!(sanction(&h, 9751, SC, &["systemctl", "-s", "HUP", "kill", "auditd"]).is_some());
+        assert_eq!(reload_signal("USR1"), None);
+        assert_eq!(reload_signal("sighup"), Some(1));
+    }
+
+    /// N4: `systemctl kill` signals every process of the unit's cgroup
+    /// (`--kill-whom=all`): a helper there that does not catch SIGHUP dies,
+    /// so it is High; a cgroup with cgroups below it (a delegated tree), a
+    /// unit no registered process runs in (an alias's name) or a list that
+    /// cannot be read: High. `kill` of two tools' processes: each must
+    /// catch it.
+    #[test]
+    fn n4_every_process_of_the_unit() {
+        let h = host();
+        rsyslog(&h);
+        let hup = ["systemctl", "-s", "HUP", "kill", "rsyslog"];
+        assert!(sanction(&h, 9760, SC, &hup).is_some());
+        // a helper of the unit that does not catch it
+        a_process(&h, 9761, 4761, "0000000000000000");
+        a_unit(&h, "rsyslog.service", &[9710, 9761]);
+        assert_eq!(sanction(&h, 9762, SC, &hup), None);
+        // the helper catches it too
+        a_process(&h, 9761, 4761, "0000000000000001");
+        assert!(sanction(&h, 9763, SC, &hup).is_some());
+        // a cgroup below the unit's
+        let unit = h._proc.path().join("cgroupfs/system.slice/rsyslog.service");
+        std::fs::create_dir_all(unit.join("payload")).unwrap();
+        assert_eq!(sanction(&h, 9764, SC, &hup), None);
+        std::fs::remove_dir(unit.join("payload")).unwrap();
+        assert!(sanction(&h, 9765, SC, &hup).is_some());
+        // an alias: no registered process runs in `syslog.service`
+        assert_eq!(
+            sanction(&h, 9766, SC, &["systemctl", "-s", "HUP", "kill", "syslog"]),
+            None
+        );
+        // the list unreadable, or empty
+        std::fs::remove_file(unit.join("cgroup.procs")).unwrap();
+        assert_eq!(sanction(&h, 9767, SC, &hup), None);
+        std::fs::write(unit.join("cgroup.procs"), "").unwrap();
+        assert_eq!(sanction(&h, 9768, SC, &hup), None);
+        std::fs::write(unit.join("cgroup.procs"), "9710\nx\n").unwrap();
+        assert_eq!(sanction(&h, 9769, SC, &hup), None);
+        std::fs::write(unit.join("cgroup.procs"), "9710\n").unwrap();
+        assert!(sanction(&h, 9770, SC, &hup).is_some());
+        // `kill` of rsyslogd and of auditd, which does not catch it
+        a_process(&h, 9771, 4771, "0000000000000000");
+        assert!(h
+            .run(9771, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        assert_eq!(
+            sanction(&h, 9772, KILL, &["kill", "-HUP", "9710", "9771"]),
+            None
+        );
+        assert!(sanction(&h, 9773, KILL, &["kill", "-HUP", "9710", "1"]).is_some());
     }
 }

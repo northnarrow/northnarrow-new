@@ -1583,7 +1583,15 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
   `snap.*.service` — in time linear in the pattern and the name (the
   review of #548: the first matcher backtracked, and a 21-byte glob of
-  stars held the decision thread for hours).
+  stars held the decision thread for hours). A bracket class ends as glibc
+  ends it (the re-check, N2): a `[:` whose name meets a byte outside
+  `a`–`y` before `:]` is no class, and a `[=` holds exactly one character,
+  so `[a[:]uditd.servic[:e:]` names auditd. Checked on 60,560 cases against
+  glibc: every name glibc matches is matched. The manager matches the
+  patterns itself, in the C locale. systemctl matches them on its own side
+  only when the manager refuses the listing (an old manager). There, its
+  locale's ranges and `POSIXLY_CORRECT`'s literal `^` are not modelled
+  (residual).
 - **systemd's verbs that reach a unit** (the review of #548). `stop`,
   `condstop`, `kill`, `freeze`, `clean`, `disable`, `mask`, `preset`,
   `revert`, `edit`, `link` (the unit file's name), `set-property`,
@@ -1594,17 +1602,30 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `try-restart`, `condrestart`, …: the unit runs again), `start`,
   `enable`, `unmask`. A unit's aliases are listed with it (rsyslog's
   `syslog.service`, firewalld's `dbus-org.fedoraproject.FirewallD1`).
-- **A reload signal the process catches is Low** (the review of #548, the
-  coordinator's decision). logrotate's `rsyslog-rotate` runs `systemctl
-  kill -s HUP rsyslog.service` every day: it was NN-L-EVA-001 High and a
-  DefenseImpairment. A SIGHUP or SIGUSR1 sent by `systemctl kill` or `kill`
-  to a tool's registered processes that all catch it (`SigCgt` in
-  `/proc/<pid>/status`, the process still the one registered) is a Low
-  record ("a reload, no stop"); to one that does not catch it — it ends —
-  to a unit with no registered process, or any other signal: High as
-  before. The signal is the one systemctl reads by default (GNU's
-  permutation); under `POSIXLY_CORRECT` a `-s` after the verb is a unit
-  and the signal TERM, which this cannot see (residual).
+- **A reload signal the processes catch is Low** (the review of #548, the
+  coordinator's decision, as its re-check left it). A SIGHUP sent by
+  `systemctl kill` or `kill` is a Low record ("a reload, no stop") when:
+  - the tool documents SIGHUP as its reload: auditd (reconfigure), rsyslog
+    (reopen its files), firewalld (reload), falco (hot reload). No other
+    signal is a reload: auditd's SIGUSR1 rotates its logs, and five in a
+    row delete the older ones (`num_logs`), so it is High;
+  - every process it reaches catches it (`SigCgt` in `/proc/<pid>/status`).
+    For `kill`, each tool's process it names, still the one registered.
+    For `systemctl kill` (`--kill-whom=all`), every process of the unit's
+    cgroup (`cgroup.procs` of the cgroup a registered process runs in). A
+    cgroup with cgroups below it, a unit no registered process runs in (an
+    alias's name) or a list that cannot be read: High;
+  - every reading of the argv sends SIGHUP. Under `POSIXLY_CORRECT` an
+    option after systemctl's verb, or after a pid for procps' `kill`, is an
+    operand and the signal SIGTERM, and the exec does not show the
+    environment. `systemctl kill rsyslog -s HUP` and `kill <pid> -s HUP` are
+    therefore High. So is logrotate's own `rsyslog-rotate` (`systemctl kill
+    -s HUP rsyslog.service`, measured with systemd 255: under
+    `POSIXLY_CORRECT` it kills `-s.service`, `HUP.service` and
+    rsyslog.service with SIGTERM). That is a known false positive, daily on
+    Debian and Ubuntu with rsyslog, left to lot 330. `systemctl -s HUP kill
+    rsyslog.service` (the option before the verb), `kill -HUP <pid>` and
+    `kill -s HUP <pid>` are Low.
 - **Names.** iptables by any of its names (`iptables-nft`,
   `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
   command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part

@@ -250,11 +250,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/impair/mod.rs",
-        4,
+        7,
         "the security-tool detector's registration of a tool's process (its start, its \
-         executable) — at a tool's exec only; and (lot 316, the review of #548) the \
-         `SigCgt` line of a registered tool's process for a SIGHUP or SIGUSR1 sent to it by \
-         `systemctl kill` or `kill` — one procfs read, at such an exec only",
+         executable) — at a tool's exec only; and (lot 316, the review of #548 and its \
+         re-check, N4) for a SIGHUP sent by `systemctl kill` or `kill` to a tool that \
+         documents it as its reload: the `SigCgt` line of each process it reaches, and for \
+         `systemctl kill` the unit's cgroup (a registered process's `/proc/<pid>/cgroup`, \
+         the unit's `cgroup.procs` and its directory) — procfs and cgroupfs reads, at such \
+         an exec only",
     ),
     (
         "crates/nn-core/src/posture/exempt.rs",

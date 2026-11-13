@@ -534,6 +534,9 @@ pub struct DefenseDetector<H: DecisionHost> {
     defenders: Mutex<HashMap<u32, (String, Option<u64>)>>,
     map: Mutex<Option<H::DefenderMap>>,
     proc_root: PathBuf,
+    /// The re-check of #548 (N4): the cgroup tree's root (`/sys/fs/cgroup`),
+    /// where a unit's processes are listed ([`Self::with_cgroup_root`]).
+    cgroup_root: PathBuf,
     counters: DefenseCounters,
     /// The last events assessed: the four rules and the posture read each
     /// event, and it is assessed (and counted) once.
@@ -685,6 +688,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             defenders: Mutex::new(HashMap::new()),
             map: Mutex::new(None),
             proc_root: proc_root.into(),
+            cgroup_root: Path::new(H::HOST_ROOT).join("sys/fs/cgroup"),
             counters: DefenseCounters::default(),
             memo: Mutex::new(std::collections::VecDeque::new()),
             rescans: Mutex::new((Vec::new(), None)),
@@ -692,6 +696,12 @@ impl<H: DecisionHost> DefenseDetector<H> {
             installer: std::sync::OnceLock::new(),
             owners: crate::impact::trust::ProgramOwners::default(),
         }
+    }
+
+    /// With a cgroup tree of its own (tests).
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cgroup_root = root.into();
+        self
     }
 
     /// Lot 282: judge package ownership on `owners` (a replay's fixture,
@@ -1114,14 +1124,14 @@ impl<H: DecisionHost> DefenseDetector<H> {
         // another tool's before the agent's own
         let mut units: Vec<(String, String, String)> = Vec::new();
         let mut understood = true;
-        let mut signals: Vec<Option<String>> = Vec::new();
+        let mut signals: Vec<Option<u8>> = Vec::new();
         for t in service_targets(&prog, argv) {
             for (tool, u) in self.tools.tools_of_unit(&t.unit) {
                 if !units.iter().any(|(n, x, _)| *n == tool.name && *x == u) {
                     units.push((tool.name.clone(), u, t.verb.clone()));
                 }
                 understood &= t.understood;
-                signals.push(t.signal.clone());
+                signals.push(t.reload);
             }
         }
         if !units.is_empty() {
@@ -1148,19 +1158,27 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 }
                 what.push(')');
             }
-            // the review of #548 (F12): `systemctl kill -s HUP` (logrotate's
-            // rsyslog-rotate) of units whose processes catch the signal
-            // one signal for every unit (TERM, unnamed, is no reload)
+            // the review of #548 (F12): `systemctl -s HUP kill` of units
+            // whose processes catch the signal, every reading of the argv
+            // sending it (the re-check, N1: `ServiceTarget::reload`); the
+            // re-check (N4): `systemctl kill` reaches every process of the
+            // unit's cgroup, and each must catch it
             let signal = match signals.split_first() {
-                Some((first, rest)) if rest.iter().all(|s| s == first) => first.as_deref(),
+                Some((first, rest)) if rest.iter().all(|s| s == first) => *first,
                 _ => None,
             };
             let reload = signal
                 .filter(|_| units.iter().all(|(_, _, v)| v == "kill"))
-                .and_then(reload_signal)
-                .map(|signal| Reload {
-                    signal,
-                    pids: self.defender_pids(units.iter().map(|(n, _, _)| n.as_str())),
+                .and_then(|signal| {
+                    let mut pids = Vec::new();
+                    for (tool, unit, _) in &units {
+                        pids.extend(self.unit_pids(tool, unit)?);
+                    }
+                    Some(Reload {
+                        signal,
+                        pids,
+                        tools: units.iter().map(|(n, _, _)| n.clone()).collect(),
+                    })
                 });
             return Some(Asked {
                 rule: EvaRule::ServiceStopped,
@@ -1176,37 +1194,57 @@ impl<H: DecisionHost> DefenseDetector<H> {
         // NN-L-EVA-003: kill, pkill, killall naming a tool's process.
         match prog.tool() {
             Some(SystemTool::Kill) => {
-                for r in SystemTool::Kill.read(argv, prog.args_from) {
-                    if kill_is_probe(&r) {
+                let readings = SystemTool::Kill.read(argv, prog.args_from);
+                // the first tool's process a reading signals names the
+                // finding; every one any reading signals is reached
+                let mut asked: Option<Asked> = None;
+                let mut reached: Vec<(u32, String)> = Vec::new();
+                for r in &readings {
+                    if kill_is_probe(r) {
                         continue;
                     }
                     for a in &r.operands {
                         let Some(target) = pid_of(a) else {
                             continue;
                         };
-                        if let Some(tool) = self.defender(target, as_of) {
-                            // the review of #548 (F12): a reload signal the
-                            // process catches
-                            let reload =
-                                kill_signal(&r)
-                                    .and_then(reload_signal)
-                                    .map(|signal| Reload {
-                                        signal,
-                                        pids: self.registered(target).into_iter().collect(),
-                                    });
-                            let mut asked = Asked::of(
+                        let Some(tool) = self.defender(target, as_of) else {
+                            continue;
+                        };
+                        asked.get_or_insert_with(|| {
+                            Asked::of(
                                 EvaRule::Killed,
                                 tool.clone(),
                                 with_reading(
                                     format!("`kill` of {tool}'s process {target}"),
                                     r.understood,
                                 ),
-                            );
-                            asked.reload = reload;
-                            return Some(asked);
+                            )
+                        });
+                        if !reached.iter().any(|(p, _)| *p == target) {
+                            reached.push((target, tool));
                         }
                     }
                 }
+                let mut asked = asked?;
+                // the review of #548 (F12): a reload signal every process
+                // reached catches; the re-check (N1): the signal every
+                // reading sends (procps' TERM when it names none)
+                asked.reload = one_reload(
+                    readings
+                        .iter()
+                        .map(|r| r.understood.then(|| kill_signal(r).unwrap_or("TERM"))),
+                )
+                .and_then(|signal| {
+                    Some(Reload {
+                        signal,
+                        pids: reached
+                            .iter()
+                            .map(|(p, _)| self.registered(*p))
+                            .collect::<Option<Vec<u32>>>()?,
+                        tools: reached.iter().map(|(_, t)| t.clone()).collect(),
+                    })
+                });
+                return Some(asked);
             }
             Some(tool @ (SystemTool::Pkill | SystemTool::Killall)) => {
                 for r in tool.read(argv, prog.args_from) {
@@ -1285,13 +1323,58 @@ impl<H: DecisionHost> DefenseDetector<H> {
         (start.is_some() && start_ticks::<H>(&self.proc_root, pid) == *start).then_some(pid)
     }
 
+    /// The re-check of #548 (N4): every process of the listed unit `unit`
+    /// of `tool` — the processes of its cgroup, which `systemctl kill`
+    /// signals (`--kill-whom=all`, the default). The cgroup is the one a
+    /// registered process of the tool runs in, its path down to the unit's
+    /// own name (`0::/system.slice/rsyslog.service`). `None` when no
+    /// registered process runs in it (an alias's name, a unit not
+    /// running), when it cannot be read, or when it has cgroups below it
+    /// (a delegated tree: its processes are not all listed here).
+    fn unit_pids(&self, tool: &str, unit: &str) -> Option<Vec<u32>> {
+        let full = full_unit_name(unit);
+        let dir = self
+            .defender_pids(std::iter::once(tool))
+            .into_iter()
+            .find_map(|pid| {
+                let text =
+                    H::read_state(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+                let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+                let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+                let at = parts.iter().position(|c| *c == full)?;
+                Some(
+                    parts[..=at]
+                        .iter()
+                        .fold(self.cgroup_root.clone(), |d, c| d.join(c)),
+                )
+            })?;
+        for e in H::read_dir(&dir).ok()? {
+            if e.ok()?.file_type().ok()?.is_dir() {
+                return None;
+            }
+        }
+        let procs = H::read_state(dir.join("cgroup.procs")).ok()?;
+        let pids: Vec<u32> = procs
+            .lines()
+            .map(|l| l.trim().parse().ok())
+            .collect::<Option<_>>()?;
+        (!pids.is_empty()).then_some(pids)
+    }
+
     /// The review of #548 (F12): a reload signal every process it reaches
     /// catches (`SigCgt` of `/proc/<pid>/status` has its bit) is no stop: a
     /// Low record, named. A process that does not catch it, none known or
-    /// one unreadable: no sanction (it ends, and is judged).
+    /// one unreadable: no sanction (it ends, and is judged). The re-check
+    /// (N3): only a signal every tool reached documents as its reload
+    /// ([`RELOADS`]).
     fn reload_caught(&self, reload: Option<&Reload>) -> Option<String> {
         let r = reload?;
-        if r.pids.is_empty() {
+        if r.pids.is_empty()
+            || !r
+                .tools
+                .iter()
+                .all(|t| RELOADS.contains(&(t.as_str(), r.signal)))
+        {
             return None;
         }
         let bit = 1u64 << (r.signal - 1);
@@ -1305,10 +1388,9 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 return None;
             }
         }
-        let name = if r.signal == 1 { "SIGHUP" } else { "SIGUSR1" };
         let pids: Vec<String> = r.pids.iter().map(u32::to_string).collect();
         Some(format!(
-            "{name}, which the tool's process {} catches (SigCgt): a reload, no stop",
+            "SIGHUP, which the tool's process {} catches (SigCgt): a reload, no stop",
             pids.join(", ")
         ))
     }
@@ -1390,8 +1472,8 @@ struct Asked {
     what: String,
     /// NN-L-EVA-001: what the command stops.
     stopped: Option<UnitsStopped>,
-    /// A reload signal (HUP, USR1) to the tool's processes, which a catch
-    /// of it makes no stop.
+    /// A reload signal (HUP) to the tool's processes, which a catch of it
+    /// makes no stop.
     reload: Option<Reload>,
 }
 
@@ -1407,26 +1489,56 @@ impl Asked {
     }
 }
 
-/// The review of #548 (F12): a reload signal sent to a tool's registered
-/// processes — `systemctl kill -s HUP rsyslog.service` (logrotate's
-/// `rsyslog-rotate`, daily on Debian and Ubuntu), `kill -USR1 <pid>`.
+/// The review of #548 (F12): a reload signal sent to a tool's processes —
+/// `systemctl -s HUP kill rsyslog.service`, `kill -HUP <pid>`.
 struct Reload {
-    /// Its number (1, 10).
+    /// Its number (1).
     signal: u8,
-    /// The registered processes it reaches, still the process registered
-    /// (their start read back).
+    /// The processes it reaches: `kill`'s, still the process registered
+    /// (their start read back); `systemctl kill`'s, every process of each
+    /// unit's cgroup (N4).
     pids: Vec<u32>,
+    /// The tools it reaches.
+    tools: Vec<String>,
 }
 
-/// SIGHUP and SIGUSR1, by name (`HUP`, `SIGHUP`, any case) or number: the
-/// signals a daemon catches to reopen its logs or reload. Any other: none.
+/// The re-check of #548 (N3): the signals a tool documents as a reload,
+/// which leaves it running — a tool and a signal not listed here are
+/// judged as any other signal. SIGHUP only: auditd's SIGUSR1 rotates its
+/// logs (with `num_logs`, five in a row delete the older ones), rsyslogd's
+/// toggles debugging.
+/// - auditd(8): SIGHUP makes auditd reconfigure (re-read `auditd.conf`);
+/// - rsyslogd(8): SIGHUP closes the open files (logrotate's
+///   `rsyslog-rotate`);
+/// - firewalld(1): SIGHUP reloads the configuration (its unit's
+///   `ExecReload`);
+/// - falco: SIGHUP restarts its engine on the configuration and rules
+///   (hot reload).
+const RELOADS: [(&str, u8); 4] = [
+    ("auditd", 1),
+    ("rsyslog", 1),
+    ("firewalld", 1),
+    ("falco", 1),
+];
+
+/// SIGHUP, by name (`HUP`, `SIGHUP`, any case) or number: the signal a
+/// daemon catches to reload or reopen its logs. Any other: none.
 fn reload_signal(s: &str) -> Option<u8> {
     let up = s.to_ascii_uppercase();
     match up.strip_prefix("SIG").unwrap_or(&up) {
         "HUP" | "1" => Some(1),
-        "USR1" | "10" => Some(10),
         _ => None,
     }
+}
+
+/// The re-check of #548 (N1): the reload signal every reading of an argv
+/// sends — `None` for a reading not understood (its signal unknown), and
+/// when they differ: under `POSIXLY_CORRECT`, `systemctl kill rsyslog -s
+/// HUP` and `kill <pid> -s HUP` send TERM.
+fn one_reload<'a>(each: impl IntoIterator<Item = Option<&'a str>>) -> Option<u8> {
+    let mut each = each.into_iter().map(|s| s.and_then(reload_signal));
+    let first = each.next()??;
+    each.all(|s| s == Some(first)).then_some(first)
 }
 
 /// The review of #548 (F9): a pid as procps' `strtol_or_err` reads it —
@@ -1629,8 +1741,9 @@ struct ServiceTarget {
     unit: String,
     /// Read from an argv its table understood (systemctl's).
     understood: bool,
-    /// `systemctl kill`'s signal (`-s`, `--signal`; TERM by default).
-    signal: Option<String>,
+    /// `systemctl kill`'s reload signal (`-s`, `--signal`), when every
+    /// reading of the argv sends it ([`one_reload`]).
+    reload: Option<u8>,
 }
 
 /// How a systemctl verb reaches the units it names.
@@ -1758,15 +1871,20 @@ fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
     let mut out: Vec<ServiceTarget> = Vec::new();
     if prog.is("systemctl") {
         let readings = SystemTool::Systemctl.read(argv, prog.args_from);
-        // `systemctl kill`'s signal: the last `-s` of the tool's own reading
-        // (GNU's). Under `POSIXLY_CORRECT` a `-s` after the verb is a unit
-        // and the signal TERM: that reading still names the units reached,
-        // never the signal (a residual, `UPGRADE_NOTES_WAVE4.md` §32).
-        let signal = readings
-            .first()
-            .filter(|r| r.understood)
-            .and_then(|r| r.option("s").filter_map(|v| v.first()).last())
-            .map(|v| v.to_string());
+        // `systemctl kill`'s signal: a reading's last `-s`, TERM when it
+        // names none. The re-check of #548 (N1): a reload only when every
+        // reading sends it — under `POSIXLY_CORRECT` a `-s` after the verb
+        // is a unit and the signal TERM (`systemctl kill -s HUP
+        // rsyslog.service` is then `-s.service`, `HUP.service` and rsyslog
+        // killed).
+        let reload = one_reload(readings.iter().map(|r| {
+            r.understood.then(|| {
+                r.option("s")
+                    .filter_map(|v| v.first().copied())
+                    .last()
+                    .unwrap_or("TERM")
+            })
+        }));
         for r in readings {
             out.extend(
                 systemctl_targets(&r)
@@ -1775,7 +1893,7 @@ fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
                         verb,
                         unit: unit.to_string(),
                         understood: r.understood,
-                        signal: signal.clone(),
+                        reload,
                     }),
             );
         }
@@ -1785,7 +1903,7 @@ fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
         verb: verb.to_string(),
         unit: unit.to_string(),
         understood: true,
-        signal: None,
+        reload: None,
     };
     let free: Vec<&str> = argv
         .iter()

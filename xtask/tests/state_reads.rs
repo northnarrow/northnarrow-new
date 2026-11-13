@@ -121,6 +121,12 @@ const READBACK: &str = "a response's read-back of what it did (lot 312): a read 
                         answered on the stricter side — a cgroup that cannot be read back is no \
                         block in effect, a failure with its reason";
 
+/// Why a tool's unit's process list may default (lot 316, the re-check of
+/// #548, N4).
+const UNITCG: &str = "a listed tool's unit's cgroup.procs, which the kernel writes: one that \
+                      cannot be read, is empty or holds a line that is not a pid sanctions no \
+                      reload — the signal is judged (High), the stricter side";
+
 /// Rule 2's sites, each by its read as written (spaces dropped): `(file,
 /// read, why)` — none reads a file a process or a user names into an empty
 /// answer that a protection then publishes. The readers that keep the last
@@ -270,6 +276,16 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-core/src/impair/mod.rs",
         "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
         PROC,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(dir.join(\"cgroup.procs\"))",
+        UNITCG,
     ),
     (
         "crates/nn-core/src/posture/exempt.rs",
