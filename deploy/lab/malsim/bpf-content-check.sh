@@ -38,7 +38,8 @@ since() { sudo tail -n +"$(( $2 + 1 ))" "$1" 2>/dev/null </dev/null; }
 recs() { since "$DET" "$1" | grep "\"operation\":\"$2\""; }
 count() { recs "$1" "$2" | wc -l; }
 agent_pid() { sudo cat /run/northnarrow/agent.pid 2>/dev/null </dev/null; }
-reason() { recs "$1" bpf_prog_type | grep -o '"reasoning":"[^"]*' | tail -1 | cut -c13-230; }
+# the signed record's `response` names what the content judge refused
+reason() { recs "$1" bpf_prog_type | grep -o '"response":"[^"]*' | tail -1 | cut -c13-230; }
 
 APID=$(agent_pid)
 [[ -n $APID ]] || { bad "no agent running"; exit 1; }
@@ -70,7 +71,7 @@ for call in send_signal send_signal_thread override_return write_user; do
         bad "B2 bpf_$call loaded by an opted-out loader"
     elif [[ $call == override_return && -z $r ]]; then
         measure "B2 bpf_override_return refused by the kernel itself ($o): no CONFIG_BPF_KPROBE_OVERRIDE here"
-    elif [[ $r == *"calls bpf_$call"* || ( $call == write_user && $r == *"calls bpf_probe_write_user"* ) ]]; then
+    elif [[ $r == *"a call of bpf_$call"* || ( $call == write_user && $r == *"a call of bpf_probe_write_user"* ) ]]; then
         pass "B2 bpf_$call refused ($o), signed: the helper named"
     else
         bad "B2 bpf_$call refused ($o) without its signed record"
@@ -83,7 +84,7 @@ sleep 1.5
 r=$(reason "$n0")
 echo "=== CASE B3 python3 fmod_ret security_file_open: rc=$rc $o"
 echo "    record: ${r:-(none)}"
-[[ $o == "ERR EPERM"* && $r == *fmod_ret* ]] && pass "B3 fmod_ret refused to an opted-out loader, signed" || bad "B3 fmod_ret: $o / ${r:-no record}"
+[[ $o == "ERR EPERM"* && $r == *"an fmod_ret"* ]] && pass "B3 fmod_ret refused to an opted-out loader, signed" || bad "B3 fmod_ret: $o / ${r:-no record}"
 o=$(sudo $PROBE load-fmod-ret --func security_file_open --fentry --name k345_fentry </dev/null 2>&1); rc=$?
 echo "=== CASE B3 python3 fentry security_file_open: rc=$rc $o"
 [[ $o == OK* ]] && pass "B3 an fentry (tracing) still loads under the opt-out" || bad "B3 fentry refused: $o"
@@ -99,7 +100,7 @@ if [[ -n $BT ]]; then
     r=$(reason "$n0")
     echo "=== CASE B4 bpftrace --unsafe signal(): rc=$rc $(echo "$o" | grep -iE -m1 'permit|error|fail' | cut -c1-160)"
     echo "    record: ${r:-(none)}"
-    [[ $rc -ne 0 && $r == *"calls bpf_send_signal"* ]] && pass "B4 bpftrace's signal() refused, signed" || bad "B4 bpftrace --unsafe signal(): rc $rc, ${r:-no record}"
+    [[ $rc -ne 0 && $r == *"a call of bpf_send_signal"* ]] && pass "B4 bpftrace's signal() refused, signed" || bad "B4 bpftrace --unsafe signal(): rc $rc, ${r:-no record}"
 else
     measure "B4 no bpftrace here"
 fi

@@ -272,6 +272,21 @@ pub const fn content_refusal(target_dev: u64) -> Option<ContentRefusal> {
     }
 }
 
+/// Lot 345: what a content refusal's signed record says it refused
+/// (`target_dev`, the `bpf_prog_type` record's): the record carries this,
+/// not the rule's reasoning — `None` for the type's own refusal.
+#[cfg(feature = "std")]
+pub fn content_response(target_dev: u64) -> Option<String> {
+    let what = match content_refusal(target_dev)? {
+        ContentRefusal::FmodRet => "an fmod_ret (BPF_MODIFY_RETURN)".to_string(),
+        ContentRefusal::Call(n) => format!("a call of {}", call_target_name(n)),
+        ContentRefusal::Unjudged => "a program it could not read whole".to_string(),
+    };
+    Some(format!(
+        "denied in kernel (the BPF content judge: {what}, refused to any loader outside a window)"
+    ))
+}
+
 /// Lot 345: the helper or kfunc slot `n` of [`CALL_TARGETS`] names.
 pub const fn call_target_name(n: u8) -> &'static str {
     if (n as usize) < FORBIDDEN_HELPERS.len() {
@@ -1355,6 +1370,18 @@ mod tests {
             None
         );
         assert_eq!(call_target_name(2), "bpf_send_signal");
+        // the signed record names it (the reasoning is not in the record)
+        assert_eq!(content_response(0), None);
+        let r = content_response((CONTENT_CALL + 2) as u64).unwrap();
+        assert!(
+            r.contains("content judge: a call of bpf_send_signal,"),
+            "{r}"
+        );
+        let r = content_response(CONTENT_FMOD_RET as u64).unwrap();
+        assert!(r.contains("BPF_MODIFY_RETURN"), "{r}");
+        assert!(content_response(CONTENT_UNJUDGED as u64)
+            .unwrap()
+            .contains("could not read whole"));
         assert_eq!(call_target_name(4), FORBIDDEN_KFUNC);
     }
 }
