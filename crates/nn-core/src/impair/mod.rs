@@ -56,6 +56,9 @@ use crate::content_host::ContentHost;
 use crate::decision::host::DecisionHost;
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::{AsOf, AuthSessionTracker, ExecIdentity};
+use crate::posture::script_args::Parsed;
+use tool_options::{read_listed, Program, SystemTool};
+use unit_glob::fnmatch;
 
 /// Deploy location of the list.
 pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
@@ -63,7 +66,10 @@ pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
 pub const BUILTIN_SECURITY_TOOLS_V1: &str =
     include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/security-tools.v1"));
 /// SHA-256 of every `security-tools.v1` an earlier release shipped.
-pub const EARLIER_SECURITY_TOOLS_V1_SHA256: &[&str] = &[];
+pub const EARLIER_SECURITY_TOOLS_V1_SHA256: &[&str] = &[
+    // lab PR 225 to lot 316 (before the units' aliases)
+    "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
+];
 /// The shipped `security-tools.v1` (built-in copy, earlier ones).
 pub const SECURITY_TOOLS_SHIPPED: Shipped<'static> =
     Shipped::new(BUILTIN_SECURITY_TOOLS_V1, EARLIER_SECURITY_TOOLS_V1_SHA256);
@@ -267,23 +273,32 @@ impl SecurityTools {
     }
 
     /// The tool a unit argument names (`auditd`, `auditd.service`, a
-    /// glob `falcon*`).
+    /// glob `falcon*`): the first of [`Self::tools_of_unit`].
     pub fn tool_of_unit(&self, arg: &str) -> Option<(&Tool, String)> {
+        self.tools_of_unit(arg).into_iter().next()
+    }
+
+    /// Every listed unit a unit argument names, with its tool: one for a
+    /// name (`auditd`, `auditd.service`); for a glob (`falcon*`), lot 316,
+    /// every one systemctl matches among the units in memory —
+    /// `fnmatch(…, FNM_NOESCAPE)` on the unit's full name ([`unit_glob`]:
+    /// `falcon*`, `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
+    /// `snap.*.service`). Linear in the pattern and the name: a glob of many
+    /// stars never holds the decision thread (the review of #548, F1).
+    pub fn tools_of_unit(&self, arg: &str) -> Vec<(&Tool, String)> {
         let key = unit_key(arg);
-        if let Some(prefix) = key
-            .strip_suffix('*')
-            .filter(|p| !p.is_empty() && !p.contains('*'))
-        {
-            return self.tools.iter().find_map(|t| {
-                t.units
-                    .iter()
-                    .find(|u| u.starts_with(prefix))
-                    .map(|u| (t, u.clone()))
-            });
+        let glob = arg.contains(['*', '?', '[']);
+        let mut out = Vec::new();
+        for t in &self.tools {
+            for u in &t.units {
+                let full = full_unit_name(u);
+                let named = if glob { fnmatch(arg, &full) } else { *u == key };
+                if named {
+                    out.push((t, u.clone()));
+                }
+            }
         }
-        self.tools
-            .iter()
-            .find_map(|t| t.units.iter().find(|u| *u == key).map(|u| (t, u.clone())))
+        out
     }
 
     /// The tool whose process `id` is (its executable, or the script an
@@ -295,6 +310,16 @@ impl SecurityTools {
             // run — a tool is registered to be watched, which trusts nothing
             .chain(id.runs.mentioned().filter(|s| s.starts_with('/')))
             .collect();
+        // Lot 316 (BUG-86): the program of a listed switch-off command (a
+        // cloud agent's uninstaller, in its own tool's tree) is that command
+        // run, never the tool's process starting
+        if self
+            .cmds
+            .iter()
+            .any(|c| c.program.starts_with('/') && paths.contains(&c.program.as_str()))
+        {
+            return None;
+        }
         self.tools.iter().find(|t| {
             t.procs.iter().any(|p| {
                 paths.iter().any(|x| {
@@ -312,16 +337,62 @@ impl SecurityTools {
     /// basename of a listed executable (or its first 15 bytes, the kernel's
     /// `comm`), or a listed unit.
     pub fn tool_of_name(&self, name: &str) -> Option<&Tool> {
+        self.tool_of_pattern(name, NameMatch::default())
+    }
+
+    /// Lot 316: the tool a name given to `pkill` or `killall` names, as
+    /// the tool matches it ([`NameMatch`]): a part of the name (pkill's
+    /// pattern, unless `-x`) at least half of it, in any case (`-i`,
+    /// killall's `-I`), the full
+    /// path of a listed program or tree (pkill's `-f`; killall's name with a
+    /// `/`, which it matches against the executable).
+    fn tool_of_pattern(&self, name: &str, m: NameMatch) -> Option<&Tool> {
         let name = name.trim_start_matches('^').trim_end_matches('$');
         if name.is_empty() || name.len() < 3 {
             return None;
         }
+        let fold = |s: &str| {
+            if m.ignore_case {
+                s.to_lowercase()
+            } else {
+                s.to_string()
+            }
+        };
+        let want = fold(name);
+        // a part names a program when it is at least half of its name: `pkill
+        // audit` ends auditd, `pkill -f agent` is no listed agent's (it may
+        // be anyone's; what it ends is seen on `task_kill`)
+        let hit = |have: &str| {
+            let have = fold(have);
+            if m.part {
+                have.contains(&want) && 2 * want.chars().count() >= have.chars().count()
+            } else {
+                have == want
+            }
+        };
         self.tools.iter().find(|t| {
-            t.units.iter().any(|u| u == name)
+            let by_path = || {
+                t.procs.iter().any(|p| {
+                    if m.full {
+                        hit(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
+                    } else if m.path && name.contains('/') {
+                        // killall: the executable itself, or one of a tree,
+                        // its path read as stat() reads it (`//usr/sbin/x`,
+                        // `/usr/bin/../sbin/x`: the review of #548, F10)
+                        let want = fold(&lexical_path(name));
+                        want == fold(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
+                    } else {
+                        false
+                    }
+                })
+            };
+            // a unit's name, as a process's, in full
+            t.units.iter().any(|u| fold(u) == want)
                 || t.procs.iter().filter(|p| !p.ends_with('/')).any(|p| {
                     let base = p.rsplit('/').next().unwrap_or(p);
-                    base == name || (name.len() == 15 && base.starts_with(name))
+                    hit(base) || (want.len() == 15 && fold(base).starts_with(&want))
                 })
+                || by_path()
         })
     }
 
@@ -463,6 +534,9 @@ pub struct DefenseDetector<H: DecisionHost> {
     defenders: Mutex<HashMap<u32, (String, Option<u64>)>>,
     map: Mutex<Option<H::DefenderMap>>,
     proc_root: PathBuf,
+    /// The re-check of #548 (N4): the cgroup tree's root (`/sys/fs/cgroup`),
+    /// where a unit's processes are listed ([`Self::with_cgroup_root`]).
+    cgroup_root: PathBuf,
     counters: DefenseCounters,
     /// The last events assessed: the four rules and the posture read each
     /// event, and it is assessed (and counted) once.
@@ -614,6 +688,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             defenders: Mutex::new(HashMap::new()),
             map: Mutex::new(None),
             proc_root: proc_root.into(),
+            cgroup_root: Path::new(H::HOST_ROOT).join("sys/fs/cgroup"),
             counters: DefenseCounters::default(),
             memo: Mutex::new(std::collections::VecDeque::new()),
             rescans: Mutex::new((Vec::new(), None)),
@@ -621,6 +696,12 @@ impl<H: DecisionHost> DefenseDetector<H> {
             installer: std::sync::OnceLock::new(),
             owners: crate::impact::trust::ProgramOwners::default(),
         }
+    }
+
+    /// With a cgroup tree of its own (tests).
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cgroup_root = root.into();
+        self
     }
 
     /// Lot 282: judge package ownership on `owners` (a replay's fixture,
@@ -817,6 +898,9 @@ impl<H: DecisionHost> DefenseDetector<H> {
     fn assess_once(&self, event: &Event) -> Option<Finding> {
         // R12b (R-F): the lineage as of the event's own time
         let as_of = AsOf::of_event(event);
+        // NN-L-EVA-001: the verb and every listed unit the command names
+        let mut stopped: Option<UnitsStopped> = None;
+        let mut reload: Option<Reload> = None;
         let (rule, tool, what, pid, filename, ts) = match event {
             Event::ProcessSpawn {
                 pid,
@@ -836,8 +920,17 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let (rule, tool, what) = self.spawn_finding(*pid, &id, argv, as_of)?;
-                (rule, tool, what, *pid, image, *timestamp_ns)
+                let asked = self.spawn_finding(*pid, &id, argv, as_of, GetoptEnv::of(exe))?;
+                stopped = asked.stopped;
+                reload = asked.reload;
+                (
+                    asked.rule,
+                    asked.tool,
+                    asked.what,
+                    *pid,
+                    image,
+                    *timestamp_ns,
+                )
             }
             Event::DefenderSignal {
                 pid,
@@ -884,7 +977,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
             .unwrap_or(ToolClass::Edr);
         let sanctioned = self
             .sanctioned(event, pid, ts)
-            .or_else(|| self.own_units_in_window(rule, &tool, &what));
+            .or_else(|| self.own_units_in_window(stopped.as_ref()))
+            .or_else(|| self.reload_caught(reload.as_ref()));
         let suspicious = if sanctioned.is_none() {
             self.suspicious(pid, as_of)
         } else {
@@ -977,64 +1071,203 @@ impl<H: DecisionHost> DefenseDetector<H> {
         id: &ExecIdentity,
         argv: &[String],
         as_of: AsOf,
-    ) -> Option<(EvaRule, String, String)> {
-        let prog = program_name(id, argv);
-        let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+        env: GetoptEnv,
+    ) -> Option<Asked> {
+        // lot 316: the program by its names (the xtables multi-call
+        // binary's included), and where its own arguments start
+        let prog = Program::of(&id.exe, argv);
+        let args: Vec<&str> = argv
+            .iter()
+            .skip(prog.args_from)
+            .map(String::as_str)
+            .collect();
         // NN-L-EVA-002: a listed switch-off command.
-        if let Some(c) = self.tools.cmds.iter().find(|c| {
+        for c in &self.tools.cmds {
             let named = if c.program.starts_with('/') {
                 id.exe.to_string_lossy() == c.program.as_str()
                     || id.runs.mentioned() == Some(c.program.as_str())
                     || argv.iter().any(|a| a == &c.program)
             } else {
-                prog.iter().any(|p| *p == c.program)
+                prog.is(&c.program)
             };
-            named && switches_off(&args, &c.args, || self.flushed_by_its_runtime(pid, as_of))
-        }) {
+            if !named {
+                continue;
+            }
+            // lot 316 (N4): a tool with a table is read by it — the
+            // listed command's options by name, whatever their spelling
+            let understood = match SystemTool::named(&c.program) {
+                Some(tool) => {
+                    let listed = read_listed(tool, &c.args);
+                    let by_its_runtime = || self.flushed_by_its_runtime(pid, as_of);
+                    tool.read(argv, prog.args_from)
+                        .iter()
+                        .find(|r| holds(tool, r, &listed, &by_its_runtime))
+                        .map(|r| r.understood)
+                }
+                None => switches_off(&args, &c.args).then_some(true),
+            };
+            let Some(understood) = understood else {
+                continue;
+            };
             let shown = if c.args.is_empty() {
                 format!("`{}`", c.program)
             } else {
                 format!("`{} {}`", c.program, c.args.join(" "))
             };
-            return Some((EvaRule::SwitchedOff, c.tool.clone(), shown));
+            return Some(Asked::of(
+                EvaRule::SwitchedOff,
+                c.tool.clone(),
+                with_reading(shown, understood),
+            ));
         }
-        // NN-L-EVA-001: a listed unit stopped, disabled, masked or killed.
-        for (verb, unit) in service_targets(&prog, argv) {
-            if let Some((t, u)) = self.tools.tool_of_unit(&unit) {
-                return Some((
-                    EvaRule::ServiceStopped,
-                    t.name.clone(),
-                    format!("unit {u} {verb}"),
-                ));
+        // NN-L-EVA-001: a listed unit stopped, disabled, masked or killed;
+        // lot 316 (BUG-96): every unit of the command, the finding named by
+        // another tool's before the agent's own
+        let mut units: Vec<(String, String, String)> = Vec::new();
+        let mut understood = true;
+        let mut signals: Vec<Option<u8>> = Vec::new();
+        for t in service_targets(&prog, argv, env) {
+            for (tool, u) in self.tools.tools_of_unit(&t.unit) {
+                if !units.iter().any(|(n, x, _)| *n == tool.name && *x == u) {
+                    units.push((tool.name.clone(), u, t.verb.clone()));
+                }
+                understood &= t.understood;
+                signals.push(t.reload);
             }
+        }
+        if !units.is_empty() {
+            let first = units
+                .iter()
+                .position(|(n, _, _)| n != AGENT_TOOL)
+                .unwrap_or(0);
+            let (tool, unit, unit_verb) = units[first].clone();
+            let others: Vec<&str> = units
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != first)
+                .map(|(_, (_, u, _))| u.as_str())
+                .collect();
+            let mut what = format!("unit {unit} {unit_verb}");
+            if !others.is_empty() {
+                // a glob or an isolate names many: the first five, and how
+                // many more
+                let shown: Vec<&str> = others.iter().take(5).copied().collect();
+                let more = others.len() - shown.len();
+                what.push_str(&format!(" (with {}", shown.join(", ")));
+                if more > 0 {
+                    what.push_str(&format!(" and {more} more"));
+                }
+                what.push(')');
+            }
+            // the review of #548 (F12): `systemctl -s HUP kill` of units
+            // whose processes catch the signal, every reading of the argv
+            // sending it (the re-check, N1: `ServiceTarget::reload`); the
+            // re-check (N4): `systemctl kill` reaches every process of the
+            // unit's cgroup, and each must catch it
+            let signal = match signals.split_first() {
+                Some((first, rest)) if rest.iter().all(|s| s == first) => *first,
+                _ => None,
+            };
+            let reload = signal
+                .filter(|_| units.iter().all(|(_, _, v)| v == "kill"))
+                .and_then(|signal| {
+                    let mut pids = Vec::new();
+                    for (tool, unit, _) in &units {
+                        pids.extend(self.unit_pids(tool, unit)?);
+                    }
+                    Some(Reload {
+                        signal,
+                        pids,
+                        tools: units.iter().map(|(n, _, _)| n.clone()).collect(),
+                    })
+                });
+            return Some(Asked {
+                rule: EvaRule::ServiceStopped,
+                tool,
+                what: with_reading(what, understood),
+                stopped: Some(UnitsStopped {
+                    verbs: units.iter().map(|(_, _, v)| v.clone()).collect(),
+                    units: units.into_iter().map(|(n, u, _)| (n, u)).collect(),
+                }),
+                reload,
+            });
         }
         // NN-L-EVA-003: kill, pkill, killall naming a tool's process.
-        if prog.contains(&"kill") {
-            if kill_signal_is_probe(&args) {
-                return None;
+        match prog.tool() {
+            Some(SystemTool::Kill) => {
+                let readings = SystemTool::Kill.read(argv, prog.args_from);
+                // the first tool's process a reading signals names the
+                // finding; every one any reading signals is reached
+                let mut asked: Option<Asked> = None;
+                let mut reached: Vec<(u32, String)> = Vec::new();
+                for r in &readings {
+                    if kill_is_probe(r) {
+                        continue;
+                    }
+                    for a in &r.operands {
+                        let Some(target) = pid_of(a) else {
+                            continue;
+                        };
+                        let Some(tool) = self.defender(target, as_of) else {
+                            continue;
+                        };
+                        asked.get_or_insert_with(|| {
+                            Asked::of(
+                                EvaRule::Killed,
+                                tool.clone(),
+                                with_reading(
+                                    format!("`kill` of {tool}'s process {target}"),
+                                    r.understood,
+                                ),
+                            )
+                        });
+                        if !reached.iter().any(|(p, _)| *p == target) {
+                            reached.push((target, tool));
+                        }
+                    }
+                }
+                let mut asked = asked?;
+                // the review of #548 (F12): a reload signal every process
+                // reached catches; the re-check (N1): the signal of the
+                // reading its environment makes, or every reading's
+                // (procps' TERM when it names none)
+                asked.reload = one_reload(
+                    env.readings(&readings)
+                        .iter()
+                        .map(|r| r.understood.then(|| kill_signal(r).unwrap_or("TERM"))),
+                )
+                .and_then(|signal| {
+                    Some(Reload {
+                        signal,
+                        pids: reached
+                            .iter()
+                            .map(|(p, _)| self.registered(*p))
+                            .collect::<Option<Vec<u32>>>()?,
+                        tools: reached.iter().map(|(_, t)| t.clone()).collect(),
+                    })
+                });
+                return Some(asked);
             }
-            for a in args.iter().filter(|a| !a.starts_with('-')) {
-                if let Ok(target) = a.parse::<u32>() {
-                    if let Some(tool) = self.defender(target, as_of) {
-                        return Some((
-                            EvaRule::Killed,
-                            tool.clone(),
-                            format!("`kill` of {tool}'s process {target}"),
-                        ));
+            Some(tool @ (SystemTool::Pkill | SystemTool::Killall)) => {
+                for r in tool.read(argv, prog.args_from) {
+                    let m = NameMatch::of(tool, &r);
+                    for a in &r.operands {
+                        if let Some(t) = self.tools.tool_of_pattern(a, m) {
+                            let name = if tool == SystemTool::Pkill {
+                                "pkill"
+                            } else {
+                                "killall"
+                            };
+                            return Some(Asked::of(
+                                EvaRule::Killed,
+                                t.name.clone(),
+                                with_reading(format!("`{name} {a}`"), r.understood),
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if prog.iter().any(|p| *p == "pkill" || *p == "killall") {
-            for a in pattern_args(&args) {
-                if let Some(t) = self.tools.tool_of_name(a) {
-                    return Some((
-                        EvaRule::Killed,
-                        t.name.clone(),
-                        format!("`{} {a}`", prog[0]),
-                    ));
-                }
-            }
+            _ => {}
         }
         None
     }
@@ -1043,18 +1276,20 @@ impl<H: DecisionHost> DefenseDetector<H> {
     /// [`AGENT_UNITS`]: `stop`, `force-stop`, `kill` — `systemctl kill` is
     /// how a window restarts it) inside a valid signed trusted-installer
     /// window: the window's grant, named. A disable, mask or freeze, another
-    /// tool, no window or an expired one: `None`.
-    fn own_units_in_window(&self, rule: EvaRule, tool: &str, what: &str) -> Option<String> {
-        if rule != EvaRule::ServiceStopped || tool != AGENT_TOOL {
-            return None;
-        }
-        // `what` is "unit <name> <verb>" for NN-L-EVA-001.
-        let mut w = what.split(' ');
-        let (Some("unit"), Some(unit), Some(verb), None) = (w.next(), w.next(), w.next(), w.next())
-        else {
-            return None;
+    /// tool, no window or an expired one: `None`. Lot 316 (BUG-96): every
+    /// listed unit the command stops must be the agent's own — auditd
+    /// stopped with the agent is High as anywhere.
+    fn own_units_in_window(&self, stopped: Option<&UnitsStopped>) -> Option<String> {
+        let stopped = stopped?;
+        let own = |(tool, unit): &(String, String)| {
+            tool == AGENT_TOOL && AGENT_UNITS.contains(&unit.as_str())
         };
-        if !AGENT_UNITS.contains(&unit) || !matches!(verb, "stop" | "force-stop" | "kill") {
+        let restart =
+            |verb: &String| matches!(verb.as_str(), "stop" | "condstop" | "force-stop" | "kill");
+        if stopped.units.is_empty()
+            || !stopped.units.iter().all(own)
+            || !stopped.verbs.iter().all(restart)
+        {
             return None;
         }
         let g = H::installer_grant(self.installer.get()?)?;
@@ -1062,6 +1297,103 @@ impl<H: DecisionHost> DefenseDetector<H> {
             "inside the signed trusted-installer window of key {} (until {}): a stop or restart \
              of the agent's own unit",
             g.key_id, g.expires_at
+        ))
+    }
+
+    /// The registered processes of the tools `tools`, still the process
+    /// registered.
+    fn defender_pids<'t>(&self, tools: impl Iterator<Item = &'t str>) -> Vec<u32> {
+        let tools: Vec<&str> = tools.collect();
+        let d = self.defenders.lock();
+        let mut pids: Vec<u32> = d
+            .iter()
+            .filter(|(p, (t, start))| {
+                tools.contains(&t.as_str())
+                    && start.is_some()
+                    && start_ticks::<H>(&self.proc_root, **p) == *start
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// `pid`, when it is a registered process still the one registered.
+    fn registered(&self, pid: u32) -> Option<u32> {
+        let d = self.defenders.lock();
+        let (_, start) = d.get(&pid)?;
+        (start.is_some() && start_ticks::<H>(&self.proc_root, pid) == *start).then_some(pid)
+    }
+
+    /// The re-check of #548 (N4): every process of the listed unit `unit`
+    /// of `tool` — the processes of its cgroup, which `systemctl kill`
+    /// signals (`--kill-whom=all`, the default). The cgroup is the one a
+    /// registered process of the tool runs in, its path down to the unit's
+    /// own name (`0::/system.slice/rsyslog.service`). `None` when no
+    /// registered process runs in it (an alias's name, a unit not
+    /// running), when it cannot be read, or when it has cgroups below it
+    /// (a delegated tree: its processes are not all listed here).
+    fn unit_pids(&self, tool: &str, unit: &str) -> Option<Vec<u32>> {
+        let full = full_unit_name(unit);
+        let dir = self
+            .defender_pids(std::iter::once(tool))
+            .into_iter()
+            .find_map(|pid| {
+                let text =
+                    H::read_state(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+                let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+                let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+                let at = parts.iter().position(|c| *c == full)?;
+                Some(
+                    parts[..=at]
+                        .iter()
+                        .fold(self.cgroup_root.clone(), |d, c| d.join(c)),
+                )
+            })?;
+        for e in H::read_dir(&dir).ok()? {
+            if e.ok()?.file_type().ok()?.is_dir() {
+                return None;
+            }
+        }
+        let procs = H::read_state(dir.join("cgroup.procs")).ok()?;
+        let pids: Vec<u32> = procs
+            .lines()
+            .map(|l| l.trim().parse().ok())
+            .collect::<Option<_>>()?;
+        (!pids.is_empty()).then_some(pids)
+    }
+
+    /// The review of #548 (F12): a reload signal every process it reaches
+    /// catches (`SigCgt` of `/proc/<pid>/status` has its bit) is no stop: a
+    /// Low record, named. A process that does not catch it, none known or
+    /// one unreadable: no sanction (it ends, and is judged). The re-check
+    /// (N3): only a signal every tool reached documents as its reload
+    /// ([`RELOADS`]).
+    fn reload_caught(&self, reload: Option<&Reload>) -> Option<String> {
+        let r = reload?;
+        if r.pids.is_empty()
+            || !r
+                .tools
+                .iter()
+                .all(|t| RELOADS.contains(&(t.as_str(), r.signal)))
+        {
+            return None;
+        }
+        let bit = 1u64 << (r.signal - 1);
+        for pid in &r.pids {
+            let status = H::read_state(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+            let mask = status
+                .lines()
+                .find_map(|l| l.strip_prefix("SigCgt:"))
+                .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())?;
+            if mask & bit == 0 {
+                return None;
+            }
+        }
+        let pids: Vec<String> = r.pids.iter().map(u32::to_string).collect();
+        Some(format!(
+            "SIGHUP, which the tool's process {} catches (SigCgt): a reload, no stop",
+            pids.join(", ")
         ))
     }
 
@@ -1135,184 +1467,512 @@ fn start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
         .ok()
 }
 
-/// The names a program goes by: its executable's basename and its
-/// `argv[0]`'s (`iptables` is `xtables-nft-multi`; a tool named by its
-/// `argv[0]` gains nothing from it but a detection).
-fn program_name<'a>(id: &'a ExecIdentity, argv: &'a [String]) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    if let Some(b) = id.exe.file_name().and_then(|b| b.to_str()) {
-        out.push(b);
-    }
-    if let Some(a0) = argv.first() {
-        let b = a0.rsplit('/').next().unwrap_or(a0);
-        if !out.contains(&b) {
-            out.push(b);
+/// Lot 316: what an exec asked, before it is judged.
+struct Asked {
+    rule: EvaRule,
+    tool: String,
+    what: String,
+    /// NN-L-EVA-001: what the command stops.
+    stopped: Option<UnitsStopped>,
+    /// A reload signal (HUP) to the tool's processes, which a catch of it
+    /// makes no stop.
+    reload: Option<Reload>,
+}
+
+impl Asked {
+    fn of(rule: EvaRule, tool: String, what: String) -> Self {
+        Self {
+            rule,
+            tool,
+            what,
+            stopped: None,
+            reload: None,
         }
     }
-    out
+}
+
+/// The review of #548 (F12): a reload signal sent to a tool's processes —
+/// `systemctl -s HUP kill rsyslog.service`, `kill -HUP <pid>`.
+struct Reload {
+    /// Its number (1).
+    signal: u8,
+    /// The processes it reaches: `kill`'s, still the process registered
+    /// (their start read back); `systemctl kill`'s, every process of each
+    /// unit's cgroup (N4).
+    pids: Vec<u32>,
+    /// The tools it reaches.
+    tools: Vec<String>,
+}
+
+/// The re-check of #548 (N3): the signals a tool documents as a reload,
+/// which leaves it running — a tool and a signal not listed here are
+/// judged as any other signal. SIGHUP only: auditd's SIGUSR1 rotates its
+/// logs (with `num_logs`, five in a row delete the older ones), rsyslogd's
+/// toggles debugging.
+/// - auditd(8): SIGHUP makes auditd reconfigure (re-read `auditd.conf`);
+/// - rsyslogd(8): SIGHUP closes the open files (logrotate's
+///   `rsyslog-rotate`);
+/// - firewalld(1): SIGHUP reloads the configuration (its unit's
+///   `ExecReload`);
+/// - falco: SIGHUP restarts its engine on the configuration and rules
+///   (hot reload).
+const RELOADS: [(&str, u8); 4] = [
+    ("auditd", 1),
+    ("rsyslog", 1),
+    ("firewalld", 1),
+    ("falco", 1),
+];
+
+/// SIGHUP, by name (`HUP`, `SIGHUP`, any case) or number: the signal a
+/// daemon catches to reload or reopen its logs. Any other: none.
+fn reload_signal(s: &str) -> Option<u8> {
+    let up = s.to_ascii_uppercase();
+    match up.strip_prefix("SIG").unwrap_or(&up) {
+        "HUP" | "1" => Some(1),
+        _ => None,
+    }
+}
+
+/// The re-check of #548: what the exec pump read of an exec's environment
+/// for getopt (`exe_flags::ENV_READ`, `exe_flags::POSIXLY_CORRECT`) — which
+/// of a tool's readings ([`SystemTool::read`]: GNU's first, then
+/// `POSIXLY_CORRECT`'s when it differs) its process makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GetoptEnv {
+    /// Not read (the process gone, its pid another's, its memory gone, a
+    /// read that failed): any reading may be the one.
+    Unknown,
+    /// Read, without `POSIXLY_CORRECT`: GNU's permutation.
+    Gnu,
+    /// Read, with `POSIXLY_CORRECT`: the first operand ends the options.
+    Posix,
+}
+
+impl GetoptEnv {
+    fn of(exe: &nn_model::ExeIdentity) -> Self {
+        use common::wire::exe::exe_flags::{ENV_READ, POSIXLY_CORRECT};
+        match (exe.has(ENV_READ), exe.has(POSIXLY_CORRECT)) {
+            (false, _) => Self::Unknown,
+            (true, false) => Self::Gnu,
+            (true, true) => Self::Posix,
+        }
+    }
+
+    /// The readings of `all` (a tool's, [`SystemTool::read`]) the process
+    /// makes: GNU's alone, `POSIXLY_CORRECT`'s alone (the last: the only
+    /// one when both agree), or all of them when not known. An argv not
+    /// understood has one reading, not understood, whichever.
+    fn readings<'r, 'a>(self, all: &'r [Parsed<'a>]) -> &'r [Parsed<'a>] {
+        match self {
+            Self::Unknown => all,
+            Self::Gnu => &all[..all.len().min(1)],
+            Self::Posix => &all[all.len().saturating_sub(1)..],
+        }
+    }
+}
+
+/// The re-check of #548 (lot 316): the exec of a system tool whose reload
+/// signal `POSIXLY_CORRECT` changes — systemctl, procps' `kill` (by the
+/// names its program goes by). The exec pump reads its environment for it
+/// (`exe_flags::ENV_READ`).
+pub fn reads_posixly_correct(exe: &Path, argv: &[String]) -> bool {
+    let prog = Program::of(exe, argv);
+    prog.is("systemctl") || prog.tool() == Some(SystemTool::Kill)
+}
+
+/// The re-check of #548 (N1): the reload signal every reading of an argv
+/// sends — `None` for a reading not understood (its signal unknown), and
+/// when they differ: under `POSIXLY_CORRECT`, `systemctl kill rsyslog -s
+/// HUP` and `kill <pid> -s HUP` send TERM.
+fn one_reload<'a>(each: impl IntoIterator<Item = Option<&'a str>>) -> Option<u8> {
+    let mut each = each.into_iter().map(|s| s.and_then(reload_signal));
+    let first = each.next()??;
+    each.all(|s| s == Some(first)).then_some(first)
+}
+
+/// The review of #548 (F9): a pid as procps' `strtol_or_err` reads it —
+/// leading blanks and a `+` skipped, digits to the end.
+fn pid_of(a: &str) -> Option<u32> {
+    let t = a.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    let t = t.strip_prefix('+').unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
+}
+
+/// Lot 316 (BUG-96): every listed unit a service-manager command names —
+/// its tool and unit — and the verb each is named with.
+struct UnitsStopped {
+    units: Vec<(String, String)>,
+    verbs: Vec<String>,
+}
+
+/// `what`, said as read from an argv not understood (an option its table
+/// does not hold: the over-approximation of the reader).
+fn with_reading(what: String, understood: bool) -> String {
+    if understood {
+        what
+    } else {
+        format!("{what} (options not understood)")
+    }
 }
 
 /// `args` holds the switch-off command `run` as consecutive arguments (an
-/// empty run: always). Lot 282 (Tappa Prove P0): except a listed flush
-/// (`iptables -F`, `--flush`) of a container runtime's own chain
-/// ([`is_runtime_chain`]) that the runtime itself runs
-/// (`by_its_runtime`, asked only then). Podman's CNI plugin flushes its NAT
-/// chain (`iptables -t nat -F CNI-…`) at a container's removal: NN-L-EVA-002
-/// recorded "`iptables -F`", and the posture's DefenseImpairment, recorded in
-/// the administrator's scope, corroborated podman's own mass write — COMBAT,
-/// locked, and the ladder killed podman (lab 04/11, on main). The same chain
-/// flushed by any other process, and any other chain — the host firewall's
-/// (ufw, fail2ban, firewalld), a built-in one, every chain of a table (no
-/// chain named) — is still the firewall switched off.
-fn switches_off(args: &[&str], run: &[String], by_its_runtime: impl Fn() -> bool) -> bool {
-    if run.is_empty() {
+/// empty run: always) — for a program with no table of its own
+/// ([`tool_options`]: `auditctl`, `ufw`, `setenforce`, the uninstallers).
+fn switches_off(args: &[&str], run: &[String]) -> bool {
+    run.is_empty()
+        || args
+            .windows(run.len())
+            .any(|w| w.iter().zip(run).all(|(a, b)| *a == b.as_str()))
+}
+
+/// Lot 316 (N4): the reading `r` of a tool's argv holds the listed command
+/// `listed`, read by the same table: each of its options, by name, with its
+/// arguments when the list gives them (`iptables -F` is a flush of any
+/// chain, `-P INPUT ACCEPT` that policy), and its operands next to each
+/// other (`nft flush ruleset`, nft's words). Lot 282 (Tappa Prove P0):
+/// except a flush of a container runtime's own chain ([`is_runtime_chain`])
+/// that the runtime itself runs (`by_its_runtime`, asked only then).
+/// Podman's CNI plugin flushes its NAT chain (`iptables -t nat -F CNI-…`)
+/// at a container's removal: NN-L-EVA-002 recorded "`iptables -F`", and the
+/// posture's DefenseImpairment, recorded in the administrator's scope,
+/// corroborated podman's own mass write — COMBAT, locked, and the ladder
+/// killed podman (lab 04/11, on main). The same chain flushed by any other
+/// process, and any other chain — the host firewall's (ufw, fail2ban,
+/// firewalld), a built-in one, every chain of a table (no chain named) — is
+/// still the firewall switched off.
+fn holds(
+    tool: SystemTool,
+    r: &Parsed<'_>,
+    listed: &Parsed<'_>,
+    by_its_runtime: &dyn Fn() -> bool,
+) -> bool {
+    let flush = |name: &str| tool == SystemTool::Iptables && name == tool_options::IPTABLES_FLUSH;
+    let options = listed.options.iter().all(|(name, values)| {
+        r.option(name).any(|v| {
+            (values.is_empty() || v == values.as_slice())
+                && !(flush(name)
+                    && values.is_empty()
+                    && v.first().is_some_and(|chain| is_runtime_chain(chain))
+                    && by_its_runtime())
+        })
+    });
+    let operands = listed.operands.is_empty()
+        || r.operands
+            .windows(listed.operands.len())
+            .any(|w| w == listed.operands.as_slice());
+    options && operands
+}
+
+/// The review of #548 (F8): the signal procps' `kill` sends for the
+/// reading `r` — the last `-s`/`--signal`, else the first `-SIGNAL` word
+/// (`skill_sig_option` takes it before the options are read): `kill -s KILL
+/// -0 <pid>` kills.
+fn kill_signal<'a>(r: &Parsed<'a>) -> Option<&'a str> {
+    r.option("s")
+        .filter_map(|v| v.first().copied())
+        .last()
+        .or_else(|| {
+            r.option(crate::posture::script_args::SIGNAL)
+                .filter_map(|v| v.first().copied())
+                .next()
+        })
+}
+
+/// Lot 316: `kill`'s reading `r` sends no signal that stops — an existence
+/// probe (`-0`, `-s 0`, `-SIG0`), `SIGCONT`, or a listing (`-l`, `-L`,
+/// help, version: procps' kill prints and exits). Never for an argv not
+/// understood, whose signal is not known.
+fn kill_is_probe(r: &Parsed<'_>) -> bool {
+    if !r.understood {
+        return false;
+    }
+    if ["l", "L", "h", "V"].iter().any(|o| r.has(o)) {
         return true;
     }
-    let flush = run.last().is_some_and(|a| a == "-F" || a == "--flush");
-    args.windows(run.len()).enumerate().any(|(i, w)| {
-        w.iter().zip(run).all(|(a, b)| *a == b.as_str())
-            && !(flush
-                && args
-                    .get(i + run.len())
-                    .is_some_and(|chain| is_runtime_chain(chain))
-                && by_its_runtime())
+    kill_signal(r).is_some_and(|s| {
+        let up = s.to_ascii_uppercase();
+        let name = up.strip_prefix("SIG").unwrap_or(&up);
+        matches!(name, "0" | "CONT" | "18")
     })
 }
 
-/// `kill -0 …` (an existence probe), `kill -l` (a listing).
-fn kill_signal_is_probe(args: &[&str]) -> bool {
-    args.iter().any(|a| {
-        matches!(
-            *a,
-            "-0" | "-l"
-                | "-L"
-                | "--list"
-                | "--table"
-                | "-s0"
-                | "-SIG0"
-                | "-CONT"
-                | "-SIGCONT"
-                | "-18"
-        )
-    }) || args
-        .windows(2)
-        .any(|w| matches!(w[0], "-s" | "-n" | "--signal") && w[1] == "0")
-}
-
-/// The pattern arguments of `pkill`/`killall`: what is not an option or
-/// an option's value.
-fn pattern_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    const WITH_VALUE: &[&str] = &[
-        "-s",
-        "--signal",
-        "-u",
-        "--euid",
-        "-U",
-        "--uid",
-        "-g",
-        "--pgroup",
-        "-G",
-        "--group",
-        "-P",
-        "--parent",
-        "-t",
-        "--terminal",
-        "--ns",
-        "--nslist",
-        "-o",
-        "--older-than",
-        "-y",
-        "--younger-than",
-        "-n",
-        "--session",
-        "-c",
-        "--cgroup",
-        "-F",
-        "--pidfile",
-    ];
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if WITH_VALUE.contains(a) {
-            it.next();
-        } else if !a.starts_with('-') {
-            out.push(*a);
+/// The review of #548 (F10): an absolute path with `//`, `.` and `..` folded
+/// as the kernel walks them (symbolic links aside).
+fn lexical_path(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
         }
     }
-    out
+    format!("/{}", parts.join("/"))
 }
 
-/// `(verb, unit)` pairs a service-manager command stops, disables, masks
-/// or kills. `prog`: the program's names.
-fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
-    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-    let is = |n: &str| prog.contains(&n);
-    let free: Vec<&str> = args
-        .iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    let mut out = Vec::new();
-    if is("systemctl") {
-        if args.iter().any(|a| matches!(*a, "--user" | "--global")) {
-            return out;
+/// Lot 316: how `pkill` or `killall` matches a name to a process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NameMatch {
+    /// A part of the name is enough (pkill's pattern, a regular expression
+    /// searched in the name, unless `-x`; killall's `-r`).
+    part: bool,
+    /// Against the full command line (pkill's `-f`).
+    full: bool,
+    /// In any case (pkill's `-i`, killall's `-I`).
+    ignore_case: bool,
+    /// A name with a `/` is the executable (killall).
+    path: bool,
+}
+
+impl NameMatch {
+    /// As `tool`'s reading `r` asks; for an argv not understood, every
+    /// way at once.
+    fn of(tool: SystemTool, r: &Parsed<'_>) -> Self {
+        if !r.understood {
+            return Self {
+                part: true,
+                full: true,
+                ignore_case: true,
+                path: true,
+            };
         }
-        const WITH_VALUE: &[&str] = &[
-            "-H",
-            "--host",
-            "-M",
-            "--machine",
-            "-t",
-            "--type",
-            "-s",
-            "--signal",
-            "-p",
-            "--property",
-            "-n",
-            "--lines",
-            "-o",
-            "--output",
-            "--kill-whom",
-            "--kill-value",
-            "--root",
-            "--image",
-            "--what",
-            "--job-mode",
-            "--state",
-            "--timestamp",
-            "--when",
-            "--drop-in",
-            "--boot-loader-entry",
-            "--reboot-argument",
-        ];
-        let mut words = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if WITH_VALUE.contains(a) {
-                it.next();
-            } else if !a.starts_with('-') {
-                words.push(*a);
+        match tool {
+            SystemTool::Pkill => Self {
+                part: !r.has("x"),
+                full: r.has("f"),
+                ignore_case: r.has("i"),
+                path: false,
+            },
+            _ => Self {
+                part: r.has("r"),
+                full: false,
+                ignore_case: r.has("I"),
+                path: true,
+            },
+        }
+    }
+}
+
+/// The unit types systemd knows by their suffix: a listed unit without one
+/// is a `.service` (`snap.amazon-ssm-agent.amazon-ssm-agent` included).
+const UNIT_TYPES: &[&str] = &[
+    ".service",
+    ".socket",
+    ".target",
+    ".device",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".timer",
+    ".path",
+    ".slice",
+    ".scope",
+];
+
+/// A listed unit's full name, as a glob is matched against it (the review
+/// of #548, F3: a dotted name with no type suffix is a service too).
+fn full_unit_name(u: &str) -> String {
+    if UNIT_TYPES.iter().any(|t| u.ends_with(t)) {
+        u.to_string()
+    } else {
+        format!("{u}.service")
+    }
+}
+
+/// One unit a service-manager command stops, disables, masks or kills.
+struct ServiceTarget {
+    verb: String,
+    unit: String,
+    /// Read from an argv its table understood (systemctl's).
+    understood: bool,
+    /// `systemctl kill`'s reload signal (`-s`, `--signal`), when every
+    /// reading of the argv sends it ([`one_reload`]).
+    reload: Option<u8>,
+}
+
+/// How a systemctl verb reaches the units it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// Every operand after the verb is a unit.
+    Units,
+    /// The first operand is the unit, the rest its settings
+    /// (`set-property auditd CPUQuota=1%`).
+    FirstUnit,
+    /// The operands are unit files' paths (`link /x/auditd.service`): the
+    /// unit their name is.
+    Paths,
+    /// Every unit (`rescue`, `emergency`, `preset-all`).
+    Every,
+    /// `isolate <target>`: every unit the target does not want — every
+    /// listed one, unless the target is the system's usual one.
+    Isolate,
+}
+
+/// The review of #548 (F2): systemd's verbs (`systemctl.c`, 249–262) that
+/// stop, freeze, signal, disable, mask, revert, re-point, reconfigure or
+/// clean a unit. Not judged: `start`, the reload and restart family
+/// (`restart`, `try-restart`, `condrestart`, …: the unit runs again after
+/// it, as an administrator's everyday restart), `enable`, `unmask`, and the
+/// system's own transitions (`reboot`, `poweroff`, `halt`, `suspend`, …).
+const SYSTEMCTL_VERBS: &[(&str, Reach)] = &[
+    ("stop", Reach::Units),
+    ("condstop", Reach::Units),
+    ("kill", Reach::Units),
+    ("freeze", Reach::Units),
+    ("clean", Reach::Units),
+    ("disable", Reach::Units),
+    ("mask", Reach::Units),
+    ("preset", Reach::Units),
+    ("revert", Reach::Units),
+    ("edit", Reach::Units),
+    ("link", Reach::Paths),
+    ("set-property", Reach::FirstUnit),
+    ("service-log-level", Reach::FirstUnit),
+    ("service-log-target", Reach::FirstUnit),
+    ("bind", Reach::FirstUnit),
+    ("mount-image", Reach::FirstUnit),
+    ("isolate", Reach::Isolate),
+    ("rescue", Reach::Every),
+    ("emergency", Reach::Every),
+    ("preset-all", Reach::Every),
+];
+
+/// The targets an `isolate` keeps the system's services under.
+const USUAL_TARGETS: &[&str] = &["default", "multi-user", "graphical"];
+
+/// The units a judged verb reaches, from its operands: the verb as the
+/// record says it, and each unit argument (`*`: every listed unit).
+fn reached<'a>(verb: &'a str, reach: Reach, rest: &[&'a str]) -> Vec<(String, &'a str)> {
+    let say = |v: &str| v.to_string();
+    match reach {
+        Reach::Units => rest.iter().map(|u| (say(verb), *u)).collect(),
+        Reach::FirstUnit => rest.first().map(|u| (say(verb), *u)).into_iter().collect(),
+        Reach::Paths => rest
+            .iter()
+            .map(|p| (say(verb), p.rsplit('/').next().unwrap_or(p)))
+            .collect(),
+        Reach::Every => vec![(say(verb), "*")],
+        Reach::Isolate => match rest.first() {
+            Some(t) => {
+                let name = t.strip_suffix(".target").unwrap_or(t);
+                if USUAL_TARGETS.contains(&name) {
+                    Vec::new()
+                } else {
+                    vec![(format!("{verb} {t}"), "*")]
+                }
             }
-        }
-        if let Some((verb, units)) = words.split_first() {
-            if matches!(*verb, "stop" | "disable" | "mask" | "kill" | "freeze") {
-                out.extend(units.iter().map(|u| (verb.to_string(), u.to_string())));
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Lot 316 (BUG-106, BUG-96): the units systemctl's reading `r` reaches —
+/// with each verb of [`SYSTEMCTL_VERBS`] its own way, on the system's
+/// manager (the last of `--system`, `--user`, `--global`, `--capsule`). For
+/// an argv not understood, any operand may be the verb and every later one
+/// a unit, and the manager is the system's.
+fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(String, &'a str)> {
+    let reach = |v: &str| {
+        SYSTEMCTL_VERBS
+            .iter()
+            .find(|(n, _)| *n == v)
+            .map(|(_, r)| *r)
+    };
+    if !r.understood {
+        let mut out = Vec::new();
+        for (i, verb) in r.operands.iter().enumerate() {
+            if let Some(how) = reach(verb) {
+                out.extend(reached(verb, how, &r.operands[i + 1..]));
             }
         }
         return out;
     }
-    let pair = |name: usize, action: usize, stops: &[&str]| -> Option<(String, String)> {
-        let (n, a) = (free.get(name)?, free.get(action)?);
-        stops.contains(a).then(|| (a.to_string(), n.to_string()))
+    let system = r
+        .options
+        .iter()
+        .rev()
+        .find_map(|(n, _)| match *n {
+            "system" => Some(true),
+            "user" | "global" | "C" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true);
+    match r.operands.split_first() {
+        Some((verb, rest)) if system => match reach(verb) {
+            Some(how) => reached(verb, how, rest),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The units a service-manager command stops, disables, masks or kills.
+/// Lot 316: systemctl's argv read by its table, every way it may be read
+/// (BUG-106: an option the old exact-match list did not hold moved the verb
+/// onto its value; `POSIXLY_CORRECT` makes an option after the verb a
+/// unit).
+fn service_targets(prog: &Program, argv: &[String], env: GetoptEnv) -> Vec<ServiceTarget> {
+    let mut out: Vec<ServiceTarget> = Vec::new();
+    if prog.is("systemctl") {
+        let readings = SystemTool::Systemctl.read(argv, prog.args_from);
+        // `systemctl kill`'s signal: a reading's last `-s`, TERM when it
+        // names none. The re-check of #548 (N1): a reload only when the
+        // reading its environment makes sends it, or every reading when
+        // the environment was not read — under `POSIXLY_CORRECT` a `-s`
+        // after the verb is a unit and the signal TERM (`systemctl kill -s
+        // HUP rsyslog.service` is then `-s.service`, `HUP.service` and
+        // rsyslog killed).
+        let reload = one_reload(env.readings(&readings).iter().map(|r| {
+            r.understood.then(|| {
+                r.option("s")
+                    .filter_map(|v| v.first().copied())
+                    .last()
+                    .unwrap_or("TERM")
+            })
+        }));
+        for r in readings {
+            out.extend(
+                systemctl_targets(&r)
+                    .into_iter()
+                    .map(|(verb, unit)| ServiceTarget {
+                        verb,
+                        unit: unit.to_string(),
+                        understood: r.understood,
+                        reload,
+                    }),
+            );
+        }
+        return out;
+    }
+    let target = |verb: &str, unit: &str| ServiceTarget {
+        verb: verb.to_string(),
+        unit: unit.to_string(),
+        understood: true,
+        reload: None,
     };
-    if is("service") || is("invoke-rc.d") || is("rc-service") {
+    let free: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let pair = |name: usize, action: usize, stops: &[&str]| -> Option<ServiceTarget> {
+        let (n, a) = (free.get(name)?, free.get(action)?);
+        stops.contains(a).then(|| target(a, n))
+    };
+    if prog.is("service") || prog.is("invoke-rc.d") || prog.is("rc-service") {
         out.extend(pair(0, 1, &["stop", "force-stop"]));
-    } else if is("update-rc.d") {
+    } else if prog.is("update-rc.d") {
         out.extend(pair(0, 1, &["disable", "remove"]));
-    } else if is("chkconfig") {
+    } else if prog.is("chkconfig") {
         out.extend(pair(0, 1, &["off"]));
-    } else if is("rc-update") && free.first() == Some(&"del") {
-        out.extend(free.get(1).map(|n| ("del".to_string(), n.to_string())));
+    } else if prog.is("rc-update") && free.first() == Some(&"del") {
+        out.extend(free.get(1).map(|n| target("del", n)));
     }
     // `/etc/init.d/<name> stop`: the script is an argument of its
     // interpreter's exec.
@@ -1322,7 +1982,7 @@ fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
                 .get(i + 1)
                 .is_some_and(|x| matches!(x.as_str(), "stop" | "force-stop"))
             {
-                out.push(("stop".to_string(), name.to_string()));
+                out.push(target("stop", name));
             }
         }
     }
@@ -1331,3 +1991,5 @@ fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests;
+mod tool_options;
+mod unit_glob;

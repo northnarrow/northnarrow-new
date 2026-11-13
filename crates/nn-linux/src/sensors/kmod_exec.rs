@@ -656,7 +656,7 @@ fn judged(read: std::io::Result<()>, env: &[u8], gone: bool) -> Environment {
 /// `/proc/<pid>/stat` (`stat`) shows a process with its memory: running
 /// (not a zombie), its virtual size (field 23) not 0 — a process past
 /// `exit_mm` shows 0.
-fn has_memory(stat: &str) -> bool {
+pub(crate) fn has_memory(stat: &str) -> bool {
     let Some((_, rest)) = stat.rsplit_once(')') else {
         return false;
     };

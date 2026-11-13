@@ -29,6 +29,15 @@
 //!
 //! A file's count may not grow above its pin, and a count below it fails
 //! until the pin comes down — the table is always the code's.
+//!
+//! Lot 316 (edition 1.4: BUG-106, BUG-89, N4): the same reader reads the
+//! system tools a security tool is switched off with — systemctl, kill,
+//! pkill, killall, iptables, nft, firewall-cmd — through their tables
+//! (`crates/nn-core/src/impair/tool_options.rs`, which hold no option
+//! literal: a letter or a long option's name). `impair/mod.rs` held 72 sites
+//! (their hand-written lists, `WITH_VALUE`) and holds 4 now, none an option
+//! read, and [`the_system_tools_options_stay_in_their_tables`] plants their
+//! shapes.
 
 mod support;
 
@@ -204,14 +213,20 @@ fn sites(text: &str) -> Vec<String> {
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-core/src/impair/mod.rs",
-        72,
-        "the option tables of the system tools a security tool is switched off with — pkill's, \
-         killall's, systemctl's, service's, iptables' and firewall-cmd's (`pattern_args`, \
-         `service_targets`, `switches_off`, `kill_signal_is_probe`) and their arguments after the \
-         program: their own options, not an interpreter's (the external bug hunt's lot 7 gives \
-         them a reader of their own) \
-         — and those tools' operands told from their options by the hyphen, a `/proc` stat \
-         field (`.nth(19)`)",
+        4,
+        "lot 316: the system tools' options are read by their tables (`tool_options`; it held \
+         72: `pattern_args`, `service_targets`, `switches_off`, `kill_signal_is_probe`). Left: \
+         the arguments after the program for the tools with no table (`.skip(prog.args_from)`: \
+         auditctl's, ufw's listed words), the SysV service managers' operands (`service`, \
+         `invoke-rc.d`, `chkconfig`: `.skip(1)` and a hyphen filter — no option read) and a \
+         `/proc` stat field (`.nth(19)`)",
+    ),
+    (
+        "crates/nn-core/src/impair/tool_options.rs",
+        1,
+        "lot 316: the system tools' tables — and the xtables multi-call binary's program, which \
+         it reads from `argv[1]` when `argv[0]` names none (`xtables-nft-multi main4 -F`, \
+         iptables' `subcmd_main`): a program's name, no option",
     ),
     (
         "crates/nn-core/src/decision/rules/r013_namespace_escape_tooling.rs",
@@ -403,9 +418,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/exec_facts.rs",
-        1,
+        2,
         "the exec's environment split on its NULs (`/proc/<pid>/environ`): variables, read \
-         by name; `NODE_OPTIONS` goes to the reader (`node_options_load`)",
+         by name; `NODE_OPTIONS` goes to the reader (`node_options_load`); and (lot 316, the \
+         re-check of #548) `POSIXLY_CORRECT` looked up by name in systemctl's and procps' \
+         `kill`'s, no option read",
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
@@ -582,6 +599,41 @@ fn the_ratchet_fails_on_planted_violations() {
         &root,
         "crates/nn-core/src/posture/lineage.rs"
     ));
+}
+
+/// Lot 316: the shapes of BUG-106, BUG-89 and N4 fail here — a hand-written
+/// list of systemctl's valued options in `impair/mod.rs` (`WITH_VALUE`), a
+/// comparison with iptables' `--policy` or pkill's `-n` in a new file; the
+/// tables (`tool_options.rs`) hold no option literal.
+#[test]
+fn the_system_tools_options_stay_in_their_tables() {
+    let root = repo_root();
+    let mut code = product_code(&root);
+    code.get_mut("crates/nn-core/src/impair/mod.rs")
+        .unwrap()
+        .push_str("\nconst WITH_VALUE: &[&str] = &[\"-s\", \"--signal\", \"--kill-whom\"];\n");
+    code.insert(
+        format!("crates/nn-core/src/decision/rules/{}.rs", "new_tool_rule"),
+        "fn f(a: &[String]) -> bool { a.iter().any(|x| x == \"--policy\" || x == \"-n\") }"
+            .to_string(),
+    );
+    let v = violations(&code);
+    assert_eq!(v.len(), 2, "{v:#?}");
+    assert!(v.iter().any(|x| x.contains("impair/mod.rs")
+        && x.contains("--kill-whom")
+        && x.contains("a new one")));
+    assert!(v
+        .iter()
+        .any(|x| x.contains("new_tool_rule.rs") && x.contains("--policy")));
+    let tables = &code["crates/nn-core/src/impair/tool_options.rs"];
+    assert_eq!(
+        string_literals(tables)
+            .iter()
+            .filter(|l| is_option_literal(l))
+            .count(),
+        0,
+        "the tables name options by their letters and long names, no literal"
+    );
 }
 
 /// The re-check of #539 (finding 9): the evasive twins — main's `ring_drops`

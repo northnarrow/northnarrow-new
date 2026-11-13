@@ -9338,6 +9338,122 @@ number in parentheses is a lab PR.
     this lot). Uninstalled each round, nothing left.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
+- **Lot 316 — the system tools' argv, read by the one reader (C14; the
+  third bug hunt's lot 7: BUG-106, BUG-86, N4 P2; BUG-89, BUG-96 P3; all
+  need root).**
+  - What was open: NN-L-EVA-001..003 read systemctl, pkill, killall,
+    iptables, nft and firewall-cmd by hand-written lists. An unlisted valued
+    option before the verb, a getopt_long prefix or a cluster (`systemctl -P
+    Id stop auditd`, `--si KILL kill auditd`, `-qs KILL kill auditd`) moved
+    the verb onto a value: no record, no DefenseImpairment, and systemd's
+    own signals have no `task_kill` backstop; `iptables --policy INPUT
+    ACCEPT` and `firewall-cmd --set-default-zone trusted` were not the
+    listed words; pkill's `-n`, `-o`, `-c` and killall's `-g` took the name
+    as their value; `systemctl stop northnarrow-agent auditd` inside a
+    trusted-installer window was judged on its first unit and sanctioned; a
+    cloud agent's uninstaller run by a shell was registered as the agent's
+    own process.
+  - What changed: lot 310's reader reads the system tools too (getopt_long
+    prefixes, getopt_long_only, GNU permutation and the `POSIXLY_CORRECT`
+    reading, aliases, `-SIGNAL`, iptables' optional and two-argument
+    options, nft's command line), through tables from the tools' sources
+    (`impair/tool_options.rs`); an option no table holds gives an
+    over-approximation, never `None`; every listed unit of a command judged,
+    globs by `fnmatch`; iptables by every name; pkill's and killall's names
+    matched as the tools match them; `impair/mod.rs` pinned at 4 sites by
+    lot 310's ratchet (`xtask/tests/interpreter_options.rs`; it held 72)
+    and these tools' shapes planted; the differential `#[ignore]` test
+    against the real tools.
+  - The lab, as measured (our own guest under lease k316; the agent
+    uninstalled, the guest clean and off at the end): **Ubuntu 24.04**
+    (`6.8.0-147-generic`, systemd 255, iptables 1.8.10 nf_tables, nftables
+    1.0.9; r2 at e36d8d9a, each command in a transient unit under a `sh` of
+    its own, what it switched off put back at once). 38 spellings, each an
+    NN-L-EVA record (High): systemctl `-P Id stop`, `--check-inhibitors no
+    stop`, `--si TERM kill`, `-qs TERM kill`, `--message x mask`,
+    `--kill-whom=main kill` (rsyslog), `POSIXLY_CORRECT=1 … stop rsyslog
+    --user`, `--user --system stop`, the globs `*syslo*` and `rsyslo?.service`,
+    `--frobnicate stop` (not understood), and the agent's own units (`-P Id
+    stop northnarrow-agent`, `-qs KILL kill northnarrow-watchdog` — also
+    NN-L-AT-001, denied — `--message x mask northnarrow-agent`): EVA-001;
+    `pkill -n`, `-o`, `-9 -n`, `killall -g`, `-signal TERM`, `pkill rsyslo`,
+    `pkill -f /usr/sbin/rsyslogd`, `killall /usr/sbin/rsyslogd`, `killall -I
+    RSYSLOGD`: EVA-003; `iptables -F`, `--flush`, `--fl INPUT`, `-FINPUT`,
+    `--policy INPUT ACCEPT`, `-PINPUT ACCEPT`, `iptables-nft -w -F`,
+    `xtables-nft-multi main4 --flush`, `ip6tables --flush`, `nft flush
+    ruleset` in one argument, after `--` and after another command, a cloud
+    agent's uninstaller run by `sh` and as itself: EVA-002. 15 benign
+    commands (systemctl status, restart, show, list-units; iptables -L, -S,
+    an ACCEPT rule, a LOG rule whose prefix starts with `-F`; nft list, add
+    table; `kill -0 1`; a `pkill -f` of nothing): no record. In r1 the probe
+    read the records under the wrong key (the records were written; r2
+    reads them). Measured, not changed: logrotate's rsyslog postrotate
+    (`/usr/lib/rsyslog/rsyslog-rotate`: `systemctl kill -s HUP
+    rsyslog.service`) is NN-L-EVA-001 High, as on main — the kernel side
+    leaves SIGHUP out of a stop, the exec side does not (a decision, left
+    open). The differential as root with no agent installed: 915 argvs
+    (pkill and killall 321 in a PID namespace, iptables 218 and nft 210 in a
+    network namespace, systemctl 166 on a transient unit), 0 mismatches;
+    three `pkill sleep` kills of `nn316diffsleep` are left to `task_kill` by
+    design (a pattern less than half a name).
+  - Host: named tests for each bug (the triage's, renamed; they fail on
+    lot 310's head); 59 mutations of the new code, all caught by named tests
+    (9 survivors of the first round got a test each); the differential on
+    the host (pkill and killall, unprivileged PID namespace): 0 mismatches;
+    the golden case `eva-argv-spellings`; the full gates in the PR.
+  - The independent review of #548 (round 2): a unit glob matched as
+    systemd matches it (`FNM_NOESCAPE`, POSIX classes, a dotted unit as a
+    `.service`) in linear time — the first matcher backtracked and a 21-byte
+    glob of stars held the decision thread for hours; systemd's other verbs
+    that reach a unit (`condstop`, `clean`, `preset`, `revert`, `edit`,
+    `link`, `set-property`, `service-log-*`, `bind`, `mount-image`,
+    `isolate`, `rescue`, `emergency`, `preset-all`); units' aliases; procps'
+    `kill -s KILL -0`, a pid with blanks, killall's `//path`, `lt-pkill`; a
+    SIGHUP or SIGUSR1 every process reached catches (`SigCgt`) is Low —
+    logrotate's daily `rsyslog-rotate`. Ubuntu 24.04 (`6.8.0-149-generic`,
+    r3 at 5948856e, r4 at 9f7da2fb, the agent uninstalled and the guest
+    clean and off after each): `condstop`, `set-property`,
+    `service-log-level`, `[[:alpha:]]syslog.service`,
+    `rsyslo[[:alnum:]].service`, the alias `syslog`, `snap.amazon-ssm-agent.*`
+    each NN-L-EVA-001 High; `killall //usr/sbin/rsyslogd`, pgrep's binary
+    run as `lt-pkill`, `/usr/bin/kill -s KILL -0`, `-9 " <pid>"` NN-L-EVA-003
+    High; `rsyslog-rotate`, `systemctl kill -s HUP rsyslog.service` and
+    `/usr/bin/kill -HUP <rsyslogd>` Low (rsyslogd's `SigCgt`
+    `0000000100314001`), `-s TERM` High, `systemctl stop auditd` High;
+    `try-restart`, `condrestart` and an unmatched class glob no EVA record;
+    a 21- and a 200-star glob from the lab user, then `systemctl stop
+    auditd`: judged 0.08 s later. The differential as root with no agent:
+    1,027 argvs (kill and `argv[0]` added; systemctl with a snap-like unit,
+    the new verbs and classes), 0 mismatches. 32 mutations of the round's
+    code, all caught by named tests (8 after a test each). The kernel's
+    `task_kill` reports only SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP
+    (lot 330 is to report every default-fatal signal).
+  - The re-check of #548 (round 3). A reload is Low only when:
+    - the reading of the argv the process makes sends SIGHUP (N1). Under
+      `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid
+      for `kill`, is an operand and the signal TERM. The exec pump reads
+      systemctl's and `kill`'s environment while they run (`ENV_READ`,
+      `POSIXLY_CORRECT`, the coordinator's decision): logrotate's own
+      `rsyslog-rotate` is Low without `POSIXLY_CORRECT` and High with it.
+      When it could not be read, every reading must send SIGHUP;
+    - the tool documents SIGHUP as its reload (N3): auditd, rsyslog,
+      firewalld, falco. auditd's SIGUSR1 rotates its logs: High;
+    - every process of the unit's cgroup catches it (N4).
+    A bracket class now ends as glibc ends it (N2:
+    `[a[:]uditd.servic[:e:]` stops auditd). Checked against glibc 2.39's
+    `fnmatch`: 60,560 cases, plus 40,000 around `[:`, `[=` and `[.`; every
+    name glibc matches is matched. 39 mutations of the round's code: 37
+    caught by named tests (2 after a test each), 2 argued equivalent.
+    Ubuntu 24.04 (`6.8.0-149-generic`, systemd 255, fdba3a6f, the agent
+    uninstalled and the guest clean and off after): logrotate forced on
+    rsyslog's own configuration, run as a transient unit as the timer runs
+    it, ran the real postrotate (`rsyslog-rotate`) four times: each a Low
+    NN-L-EVA-001 (rsyslogd's `SigCgt` `0000000100314001`, alone in its
+    cgroup) and no other record. With `POSIXLY_CORRECT=1`, rsyslogd got
+    SIGTERM and the record was High. Left to lot 330, with F5, F6, F7 and F13: a
+    listed unit's file and drop-ins (an empty `ExecStart=` in a
+    `.service.d` drop-in, `daemon-reload`, `restart`: no record).
+  - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
   - What was open: a process whose `comm` is not UTF-8 — set with

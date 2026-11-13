@@ -501,16 +501,39 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "A listed security tool's unit stopped, disabled, masked or killed \
                    (`systemctl stop/disable/mask/kill`, `service … stop`, `invoke-rc.d`, \
                    `update-rc.d`, `chkconfig`, `rc-service`, `rc-update`, `/etc/init.d/<name> \
-                   stop`); the tools are the shipped list `security-tools.v1`.",
+                   stop`); the tools are the shipped list `security-tools.v1`. Lot 316: \
+                   systemctl's options are read by its table, as getopt_long reads them (a \
+                   valued option before the verb, a unique prefix `--si`, a cluster `-qs \
+                   KILL`; an option after the verb read both as an option and, as under \
+                   `POSIXLY_CORRECT`, as a unit; the manager the last of `--system`, \
+                   `--user`); every listed unit the command names is judged, a glob as \
+                   systemd matches it (`fnmatch` with `FNM_NOESCAPE`, the POSIX classes, a \
+                   dotted unit as a `.service`; linear in the pattern and the name); an \
+                   option the table does not hold gives the reader's over-approximation \
+                   (any operand the verb, every later one a unit), said in the record. The \
+                   review of #548: systemd's verbs that reach a unit (`condstop`, `clean`, \
+                   `preset`, `revert`, `edit`, `link`, `set-property`, `service-log-*`, \
+                   `bind`, `mount-image`; `isolate` of an unusual target, `rescue`, \
+                   `emergency`, `preset-all`: every listed unit), and units' aliases.",
         false_positives: "Low in a package transaction, an administrator's interactive session \
                           or under a configuration-management actor, and — for the agent's own \
                           units only — a stop or restart inside a valid signed trusted-installer \
                           window (the record's `sanction` names its key id and deadline; the \
-                          posture does not move). Another tool stopped inside the window, or the \
-                          agent's units outside it or after it expired, stay High. Asked by a \
+                          posture does not move). Another tool stopped inside the window — \
+                          with the agent's units by the same command included (lot 316, \
+                          BUG-96) — or the agent's units outside it or after it expired, stay \
+                          High. Asked by a \
                           program run from a staging directory or a deleted executable, the kill \
                           of that program's tree is held behind the per-rule response policy \
-                          (off by default, new in lab PR 225): a High record.",
+                          (off by default, new in lab PR 225): a High record. A SIGHUP by \
+                          `systemctl kill` to a tool that documents it as its reload (auditd, \
+                          rsyslog, firewalld, falco), which every process of the unit's \
+                          cgroup catches (`SigCgt`), is Low: a reload (logrotate's daily \
+                          `rsyslog-rotate`; the review of #548 and its re-check). The signal \
+                          is the one of the reading the process makes: the exec pump reads \
+                          its environment for `POSIXLY_CORRECT` (with it, `systemctl kill -s \
+                          HUP rsyslog.service` sends SIGTERM: High); not read, every reading \
+                          must send it.",
         how_to_test: "`ransom-check.sh` MS-25: `systemctl stop auditd` (auditd installed).",
         tests: &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
@@ -519,6 +542,14 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "agent/src/impair/host_tests.rs::a_valid_window_sanctions_a_stop_or_restart_of_the_agents_own_units",
             "agent/src/impair/host_tests.rs::an_expired_window_sanctions_nothing",
             "agent/src/impair/host_tests.rs::a_valid_window_never_sanctions_another_tool",
+            "crates/nn-core/src/impair/tests.rs::bug106_valued_options_before_the_verb_keep_the_verb",
+            "crates/nn-core/src/impair/tests.rs::bug96_window_never_sanctions_auditd_stopped_with_the_agent",
+            "crates/nn-core/src/impair/tests.rs::systemctl_scope_order_and_globs",
+            "crates/nn-core/src/impair/tests.rs::a_window_sanctions_the_agents_units_only",
+            "crates/nn-core/src/impair/tests.rs::systemds_verbs_that_reach_a_unit_are_judged",
+            "crates/nn-core/src/impair/tests.rs::globs_and_aliases_as_systemd_names_units",
+            "crates/nn-core/src/impair/tests.rs::a_glob_of_many_stars_is_judged_at_once",
+            "crates/nn-core/src/impair/tests.rs::a_reload_signal_the_process_catches_is_low",
             "deploy/lab/malsim/ransom-check.sh::MS-25",
         ],
         attack_note: "T1685 for a tool, T1685.004 for the audit system, T1686 for the \
@@ -532,7 +563,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0032"],
         observes: "A listed tool switched off by its own command: `auditctl -e 0` and `-D`, \
                    `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F`, \
-                   `aa-teardown`, cloud-agent uninstallers.",
+                   `aa-teardown`, cloud-agent uninstallers. Lot 316: iptables, nft and \
+                   firewall-cmd are read by their tables — an option by any spelling \
+                   (`--policy`, `-PINPUT`, `--fl`, `--set-default-zone trusted`, a prefix), \
+                   nft's command line in one argument or several (`nft 'add table x; \
+                   flush ruleset'`), iptables by any of its names (`iptables-nft`, \
+                   `iptables-legacy`, the multi-call binaries' `main4`); an uninstaller is \
+                   that command run, never its tool's process starting (BUG-86).",
         false_positives: "As NN-L-EVA-001. One record per command and process tree (the \
                           children of one parent) within 10 s: `ufw disable` runs dozens of \
                           `iptables -F` through `ufw-init`; the repeats are counted \
@@ -550,6 +587,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable",
             "crates/nn-core/src/impair/tests.rs::switch_off_commands_need_their_arguments",
             "crates/nn-core/src/impair/tests.rs::a_runtime_flushing_its_own_chain_is_no_switch_off",
+            "crates/nn-core/src/impair/tests.rs::n4_switch_off_long_forms",
+            "crates/nn-core/src/impair/tests.rs::bug86_every_listed_uninstaller_in_every_form",
+            "crates/nn-core/src/impair/tests.rs::firewall_switch_offs_by_every_name_and_spelling",
+            "crates/nn-core/src/impair/tests.rs::an_option_no_table_holds_errs_toward_a_detection",
             "crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
             "deploy/lab/malsim/ransom-check.sh::MS-25",
         ],
@@ -562,15 +603,26 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::AntiTamper, Sensor::Exec],
         data_components: &["DC0021", "DC0032"],
         observes: "A stop or end signal to a listed tool's process: on `task_kill` \
-                   (`DEFENDER_PIDS`, filled at boot and from the tools' execs, and from \
+                   (SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP only; never one from PID 1 \
+                   or from another registered tool; `DEFENDER_PIDS`, filled at boot and \
+                   from the tools' execs, and from \
                    `/proc` scans after each for the daemon it forks; reported, never \
                    refused — a shell's builtin `kill` included), or a `kill`, `pkill`, \
-                   `killall` exec.",
+                   `killall` exec. Lot 316: their options read by their tables (BUG-89: \
+                   pkill's `-n`, `-o`, `-c`, killall's `-g` take no value; killall's \
+                   `-signal`), the name matched as the tool matches it (pkill's pattern a \
+                   part of the name, at least half of it, unless `-x`, `-f` the full command line, `-i`/`-I` any \
+                   case, killall's `/path` the executable, folded as stat() walks it; \
+                   procps' `kill`: the last `-s` over the first `-SIGNAL`, a pid with \
+                   blanks; pgrep's binary run as `lt-pkill`).",
         false_positives: "As NN-L-EVA-001; a service manager's own stop of a unit it restarts.",
         how_to_test: "`ransom-check.sh` MS-25: `kill -STOP` of auditd from a shell.",
         tests: &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
             "crates/nn-core/src/impair/tests.rs::a_forking_daemons_own_pid_is_registered_after_its_exec",
+            "crates/nn-core/src/impair/tests.rs::bug89_pkill_and_killall_flags_without_value_keep_the_name",
+            "crates/nn-core/src/impair/tests.rs::kill_family_names_as_the_tools_match_them",
+            "crates/nn-core/src/impair/tests.rs::kill_pids_paths_and_pkills_name",
             "deploy/lab/malsim/ransom-check.sh::kill -STOP of auditd",
         ],
         attack_note: "As NN-L-EVA-001.",

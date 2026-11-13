@@ -52,6 +52,22 @@
 //! (`PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, `BASH_ENV`) are not
 //! judged here: the identity is the script named. An interpreter no family
 //! names (`php`, `lua`, `tclsh`, `deno`) is read as the binary it is.
+//!
+//! Lot 316 (edition 1.4: BUG-106, BUG-89, N4): the same reader reads the
+//! options of the system tools a security tool is switched off with
+//! (`systemctl`, `pkill`, `killall`, `iptables`, `nft`, `firewall-cmd`: their
+//! tables are `crate::impair::tool_options`), as their own parsers do —
+//! `getopt_long`'s unique prefix of a long option (`--si KILL` is
+//! `--signal`), `getopt_long_only`'s long option with one hyphen (psmisc's
+//! `killall -signal KILL`), GNU's permutation (an option after an operand is
+//! an option, unless `POSIXLY_CORRECT` makes it an operand: both readings
+//! are judged), a long option and its letter as one ([`Table::aliases`]),
+//! the kill family's `-SIGNAL`, iptables' optional chain and its two-argument
+//! `-P chain policy`. What [`read_tool`] gives is every option by the name
+//! its table gives it and every operand ([`Parsed`]); an option the table
+//! does not hold gives no `None` but an over-approximation (every argument
+//! that may be an operand is one, every spelling that may be an option is
+//! one): what is judged on it errs toward a detection, never away from one.
 
 use std::path::Path;
 
@@ -183,7 +199,7 @@ pub(crate) fn family_of(exe: &Path) -> Option<Family> {
 
 /// How one option letter is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Opt {
+pub(crate) enum Opt {
     /// No argument: the letters after it are options too (`-O`, a shell's
     /// `-e`, `perl -w`).
     Flag,
@@ -247,11 +263,19 @@ enum Opt {
     /// letters (`perl -de 0`). The debugger (`perl5db.pl`, or `Devel::X`)
     /// runs commands of its own: it loads code (lot 310).
     PerlDebug,
+    /// Lot 316: iptables' optional argument — the rest of the argument,
+    /// else the next one unless it starts with `-` or `!` (`-F`, `-F
+    /// INPUT`, `-FINPUT`; `xs_has_arg` in iptables' `xshared.c`).
+    OptionalNext,
+    /// Lot 316: iptables' two arguments — the rest of the argument or the
+    /// next one, then the next one, which must not start with `-` or `!`
+    /// (`-P chain policy`, `-E old new`): the tool refuses it otherwise.
+    Arg2,
 }
 
 /// How a long option is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Long {
+pub(crate) enum Long {
     /// No argument (with `=value`, the value is its own: `node
     /// --inspect=9229`).
     Flag,
@@ -265,72 +289,169 @@ enum Long {
     /// Its argument is the program ([`Runs::Code`]): `node --eval`,
     /// `--print`, `--run`, written either way.
     Code,
+    /// Lot 316: getopt's optional argument: only `--name=value`.
+    Optional,
+    /// Lot 316: iptables' [`Opt::OptionalNext`], long (`--flush [chain]`).
+    OptionalNext,
+    /// Lot 316: iptables' [`Opt::Arg2`], long (`--policy chain policy`).
+    Arg2,
+    /// Lot 316: an option this reader does not read (argparse's `nargs=3`
+    /// or `REMAINDER` of firewall-cmd's direct interface): known by name, so
+    /// that a prefix is found as the tool finds it, and the argv is then
+    /// read as not understood.
+    Unread,
 }
 
 /// What a lone `-` means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dash {
+pub(crate) enum Dash {
     /// The end of the options: the next argument is the script (bash, dash).
     EndOfOptions,
     /// The program is standard input, named `-` as it is.
     Stdin,
     /// Not known (zsh, ksh).
     Unknown,
+    /// Lot 316: an operand, as getopt reads it.
+    Operand,
+}
+
+/// Lot 316: how a long option is found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Getopt {
+    /// By its name in full (the interpreters' own parsers).
+    Exact,
+    /// glibc's `getopt_long`, Python's argparse: by its name or a prefix of
+    /// it no other long option shares (`--si` is `--signal`); an ambiguous
+    /// prefix is refused.
+    Prefix,
+    /// glibc's `getopt_long_only` (psmisc's `killall`): as `Prefix`, and
+    /// with one hyphen too (`-signal KILL`, `-sig KILL`), unless it is a
+    /// single letter of its short options; a word no long option starts
+    /// with is a cluster of letters.
+    PrefixOneHyphen,
+}
+
+/// Lot 316: whether an option after an operand is read as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Permute {
+    /// No: the first operand ends the options (the interpreters; getopt's
+    /// `+`, nft).
+    No,
+    /// GNU getopt's default: yes, unless `POSIXLY_CORRECT` is in the
+    /// tool's environment, which the exec event does not carry — both
+    /// readings are given ([`read_tool`]).
+    Gnu,
+    /// Yes, whatever the environment (getopt's `-`, iptables; Python's
+    /// argparse, firewall-cmd).
+    Always,
 }
 
 /// One family's options, as its own parser reads them (lot 310: the one
-/// reader, [`read`], reads every family through its table).
-struct Table {
+/// reader, [`read`], reads every family through its table; lot 316: and
+/// every system tool's, `crate::impair::tool_options`).
+pub(crate) struct Table {
     /// Its single-letter options: the letters, and how each is read.
-    short: &'static [(&'static str, Opt)],
+    pub(crate) short: &'static [(&'static str, Opt)],
     /// Its long options, `--name` or `--name=value`.
-    long: &'static [(&'static str, Long)],
+    pub(crate) long: &'static [(&'static str, Long)],
     /// Long options by the start of their name (`--no-…`, ruby's
     /// `--enable-…`).
-    long_prefixes: &'static [(&'static str, Long)],
+    pub(crate) long_prefixes: &'static [(&'static str, Long)],
     /// bash (`parse_long_options` in `shell.c`): its long options are read
     /// with one hyphen or two (`-norc`, `--norc`), never with `=value`,
     /// and only before the first cluster of letters; after it, `--name`
     /// is refused ([`Runs::Unknown`]) and `-norc` is letters.
-    words: bool,
+    pub(crate) words: bool,
     /// node: `_` in a long option's name reads as `-` (V8's flags).
-    underscores: bool,
+    pub(crate) underscores: bool,
     /// A shell: `+` clusters (`+e`, `+o name`, busybox's `+c`).
-    plus: bool,
+    pub(crate) plus: bool,
     /// Lot 310 (finding 1): perl reads switches again after a space inside
     /// one argument (a space, then `-`, then more switches; anything else
     /// ends the argument). Any other family: whitespace in a cluster is no
     /// option it has ([`Runs::Unknown`]).
-    space_continues: bool,
+    pub(crate) space_continues: bool,
     /// Lot 310 (the review of #539, finding 11): the names a shell's `-o`
     /// (and bash's `-O`) take — another one it refuses, and nothing runs
     /// ([`Runs::Unknown`]). The names every supported version has; one only
     /// some have (dash's `pipefail`) is not known either.
-    names: &'static [(char, &'static [&'static str])],
+    pub(crate) names: &'static [(char, &'static [&'static str])],
     /// The values a long option takes, when it has a list (python's
     /// `--check-hash-based-pycs`): another one it refuses, and nothing runs.
-    long_names: &'static [(&'static str, &'static [&'static str])],
+    pub(crate) long_names: &'static [(&'static str, &'static [&'static str])],
     /// perl, ruby and node: after `-e CODE` the options go on (`perl -e A
     /// -e B -n`, `-e A -c`, `node -p A --version`), up to the program's
     /// arguments; any other family ends its options with the program.
-    code_continues: bool,
+    pub(crate) code_continues: bool,
     /// node and ruby: an option's value in the next argument never starts
     /// with `-` (node: "--title requires an argument"; ruby takes it and
     /// fails on it) — such an argv runs nothing.
-    arg_not_dash: bool,
+    pub(crate) arg_not_dash: bool,
     /// The options whose value is a word — never a path, never empty
     /// (ruby's `-E` encoding): another value the interpreter refuses.
-    word_values: &'static str,
+    pub(crate) word_values: &'static str,
     /// A `+c` cluster runs its program as `-c` does (bash, dash, busybox's
     /// ash); for the ksh family and zsh it is no option to rely on.
-    plus_code: bool,
+    pub(crate) plus_code: bool,
     /// The values of an option that load code (python's `-X
     /// pycache_prefix=DIR`: bytecode read from the caller's directory; `-X
     /// presite=MOD`): by prefix (the re-check of #539, N4).
-    loading_values: &'static [(char, &'static [&'static str])],
+    pub(crate) loading_values: &'static [(char, &'static [&'static str])],
     /// What a lone `-` means.
-    dash: Dash,
+    pub(crate) dash: Dash,
+    /// Lot 316: how a long option is found.
+    pub(crate) getopt: Getopt,
+    /// Lot 316: whether an option after an operand is one.
+    pub(crate) permute: Permute,
+    /// Lot 316: the long options that are a letter's other name (`--signal`
+    /// is `-s`): one option, named by its letter in what [`read_tool`]
+    /// gives.
+    pub(crate) aliases: &'static [(&'static str, char)],
+    /// Lot 316: the kill family's `-SIGNAL` (`-9`, `-KILL`, `-SIGKILL`,
+    /// any case, as procps' `signal_name_to_number` reads it): the option
+    /// [`SIGNAL`] with that value, before the letters are looked at.
+    pub(crate) signals: bool,
+    /// Lot 316: iptables' lone `!` (the next match inverted): no operand.
+    pub(crate) invert: bool,
+    /// Lot 316: long options found by their full name only, before any
+    /// prefix of [`Table::long`]'s (iptables' match and target extensions,
+    /// which it merges into its parser when one is loaded).
+    pub(crate) extensions: &'static [(&'static str, Long)],
+    /// Lot 316: nft: its operands are one command line, which it splits on
+    /// blanks and `;` — the operands [`read_tool`] gives are its words, a
+    /// `;` a word of its own (`nft 'flush ruleset'` is `nft flush ruleset`).
+    pub(crate) command_text: bool,
 }
+
+/// Lot 316: the name [`read_tool`] gives a kill-family `-SIGNAL`.
+pub(crate) const SIGNAL: &str = "SIGNAL";
+
+/// The fields an interpreter's table leaves as an interpreter's parser
+/// reads them (lot 316: the system tools' tables set them).
+const INTERPRETER: Table = Table {
+    short: &[],
+    long: &[],
+    long_prefixes: &[],
+    words: false,
+    underscores: false,
+    plus: false,
+    space_continues: false,
+    names: &[],
+    long_names: &[],
+    code_continues: false,
+    arg_not_dash: false,
+    word_values: "",
+    plus_code: false,
+    loading_values: &[],
+    dash: Dash::Stdin,
+    getopt: Getopt::Exact,
+    permute: Permute::No,
+    aliases: &[],
+    signals: false,
+    invert: false,
+    extensions: &[],
+    command_text: false,
+};
 
 impl Table {
     /// `value` is one long option `name` takes; `true` for one with no list.
@@ -352,29 +473,68 @@ impl Table {
         }
     }
 
-    fn short(&self, c: char) -> Option<Opt> {
-        self.short
-            .iter()
-            .find(|(letters, _)| letters.contains(c))
-            .map(|(_, opt)| *opt)
+    /// The letter `c`, as its name (a slice of the table's own letters),
+    /// and how it is read.
+    pub(crate) fn short(&self, c: char) -> Option<(&'static str, Opt)> {
+        self.short.iter().find_map(|(letters, opt)| {
+            letters
+                .find(c)
+                .map(|at| (&letters[at..at + c.len_utf8()], *opt))
+        })
     }
 
-    fn long(&self, name: &str) -> Option<Long> {
+    /// The long option `name` is (lot 316: a unique prefix of one, with
+    /// [`Getopt::Prefix`]): the name it is given — its letter's, for one of
+    /// [`Table::aliases`] — and how it is read. `None` when it is no
+    /// option's, or may be several's ([`Table::long_candidates`]).
+    fn long(&self, name: &str) -> Option<(&'static str, Long)> {
+        match self.long_candidates(name).as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        }
+    }
+
+    /// Lot 316: every long option `name` may be: its own (the name in
+    /// full), else an extension's of that name and every one it is a
+    /// prefix of — iptables reads `--pol` as `--policy`, unless the policy
+    /// match is loaded, whose `--pol` it is. Two options of one letter are
+    /// one.
+    fn long_candidates(&self, name: &str) -> Vec<(&'static str, Long)> {
         let name = if self.underscores {
             std::borrow::Cow::Owned(name.replace('_', "-"))
         } else {
             std::borrow::Cow::Borrowed(name)
         };
         let name = name.as_ref();
-        self.long
+        let exact = self.long.iter().find(|(n, _)| *n == name).or_else(|| {
+            self.long_prefixes
+                .iter()
+                .find(|(p, _)| name.len() > p.len() && name.starts_with(p))
+        });
+        if let Some((n, long)) = exact {
+            return vec![(self.named(n), *long)];
+        }
+        let mut out: Vec<(&'static str, Long)> = Vec::new();
+        let ext = self.extensions.iter().filter(|(n, _)| *n == name);
+        let prefixes = self.long.iter().filter(|(n, _)| {
+            self.getopt != Getopt::Exact && !name.is_empty() && n.starts_with(name)
+        });
+        for (n, long) in ext.chain(prefixes) {
+            let c = (self.named(n), *long);
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The name a long option `n` is given: its letter's, when it has one.
+    fn named(&self, n: &'static str) -> &'static str {
+        self.aliases
             .iter()
-            .find(|(n, _)| *n == name)
-            .or_else(|| {
-                self.long_prefixes
-                    .iter()
-                    .find(|(p, _)| name.len() > p.len() && name.starts_with(p))
-            })
-            .map(|(_, long)| *long)
+            .find(|(long, _)| *long == n)
+            .and_then(|(_, c)| self.short(*c))
+            .map_or(n, |(letter, _)| letter)
     }
 }
 
@@ -409,6 +569,7 @@ const PYTHON: Table = Table {
     plus_code: false,
     loading_values: &[('X', &["pycache_prefix", "presite"])],
     dash: Dash::Stdin,
+    ..INTERPRETER
 };
 
 /// perlrun, as `perl.c` reads it (`moreswitches`, `parse_body`); perl reads
@@ -441,6 +602,7 @@ const PERL: Table = Table {
     plus_code: false,
     loading_values: &[],
     dash: Dash::Stdin,
+    ..INTERPRETER
 };
 
 /// `ruby.c` (`proc_options`). `-v` prints the version and runs the script
@@ -505,6 +667,7 @@ const RUBY: Table = Table {
     plus_code: false,
     loading_values: &[],
     dash: Dash::Stdin,
+    ..INTERPRETER
 };
 
 /// node's own options (its `node_options.cc`, v18–v24; V8's flags read
@@ -687,6 +850,7 @@ const NODE: Table = Table {
     plus_code: false,
     loading_values: &[],
     dash: Dash::Stdin,
+    ..INTERPRETER
 };
 
 /// bash 5.2's `set -o` names.
@@ -884,6 +1048,7 @@ const BASH: Table = Table {
     plus_code: true,
     loading_values: &[],
     dash: Dash::EndOfOptions,
+    ..INTERPRETER
 };
 
 /// dash's `options.c` (0.5.12): its option letters (`-I` ignoreeof, `-V`
@@ -912,6 +1077,7 @@ const DASH: Table = Table {
     plus_code: true,
     loading_values: &[],
     dash: Dash::EndOfOptions,
+    ..INTERPRETER
 };
 
 /// busybox's ash and hush (`ash.c`, `options`): dash's letters, `+c` read
@@ -939,6 +1105,7 @@ const BUSYBOX_ASH: Table = Table {
     plus_code: true,
     loading_values: &[],
     dash: Dash::EndOfOptions,
+    ..INTERPRETER
 };
 
 /// zsh and the ksh family: what every shell reads the same way, and `-o`
@@ -966,6 +1133,7 @@ const OTHER_SHELL: Table = Table {
     plus_code: false,
     loading_values: &[],
     dash: Dash::Unknown,
+    ..INTERPRETER
 };
 
 /// mono(1).
@@ -995,6 +1163,7 @@ const MONO: Table = Table {
     plus_code: false,
     loading_values: &[],
     dash: Dash::Stdin,
+    ..INTERPRETER
 };
 
 /// busybox's shells.
@@ -1083,13 +1252,12 @@ pub fn node_options_load(options: &str) -> bool {
         .any(|w| match w.strip_prefix("--") {
             Some(long) => {
                 let name = long.split_once('=').map_or(long, |(n, _)| n);
-                NODE.long(name) == Some(Long::Loads)
+                NODE.long(name).map(|(_, l)| l) == Some(Long::Loads)
             }
             None => w.strip_prefix('-').is_some_and(|cluster| {
-                cluster
-                    .chars()
-                    .next()
-                    .is_some_and(|c| matches!(NODE.short(c), Some(Opt::Loads | Opt::LoadsRest)))
+                cluster.chars().next().is_some_and(|c| {
+                    matches!(NODE.short(c), Some((_, Opt::Loads | Opt::LoadsRest)))
+                })
             }),
         })
 }
@@ -1141,6 +1309,33 @@ fn reading(exe: &Path, argv: &[String]) -> Reading {
     read(table, argv, 1)
 }
 
+/// Lot 316: which reading of a system tool's argv [`read`] makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// As the tool reads it, its options permuted when its table says so.
+    Strict,
+    /// As the tool reads it with `POSIXLY_CORRECT` in its environment: the
+    /// first operand ends the options ([`Permute::Gnu`]).
+    Posix,
+    /// The over-approximation ([`Parsed::understood`] false): an option the
+    /// table does not hold is a letter or a word without argument, an
+    /// argument an option takes from the next one is read again as an
+    /// argument of its own (an option, or an operand), and options are read
+    /// after operands.
+    Lenient,
+}
+
+/// Lot 316: `argv[at]`, an operand of a tool's: kept; without permutation
+/// every later argument is one too. Whether the reading goes on.
+fn tool_operand<'a>(out: &mut Parsed<'a>, argv: &'a [String], at: usize, permute: bool) -> bool {
+    out.operands.push(argv[at].as_str());
+    if !permute {
+        out.operands
+            .extend(argv[at + 1..].iter().map(String::as_str));
+    }
+    permute
+}
+
 /// What the options seen so far change in what an interpreter runs (lot
 /// 310): a preload of the caller's code, or a program that does not run.
 #[derive(Default)]
@@ -1188,11 +1383,21 @@ impl Seen {
 /// The one reader: `argv` from `from` on, through `table`.
 fn read(table: &Table, argv: &[String], from: usize) -> Reading {
     let mut seen = Seen::default();
-    let r = read_options(table, argv, from, &mut seen);
+    let r = read_options(table, argv, from, &mut seen, None);
     seen.finish(r)
 }
 
-fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) -> Reading {
+/// Lot 316: with `tool`, a system tool's argv, whose options and operands
+/// [`read_options`] keeps there ([`read_tool`]); it then ends on
+/// [`Runs::Inline`], or [`Runs::Unknown`] when the table does not hold an
+/// option (never in [`Pass::Lenient`]).
+fn read_options<'a>(
+    table: &Table,
+    argv: &'a [String],
+    from: usize,
+    seen: &mut Seen,
+    mut tool: Option<(&mut Parsed<'a>, Pass)>,
+) -> Reading {
     let mut i = from;
     // bash: its long options with one hyphen, before the first cluster
     let mut words = table.words;
@@ -1203,16 +1408,38 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
     let mut stdin = false;
     // perl's and ruby's first `-e`, the switches going on after it
     let mut code: Option<(usize, usize)> = None;
+    // lot 316: the reading of a system tool's argv
+    let lenient = matches!(tool, Some((_, Pass::Lenient)));
+    let permute = match &tool {
+        Some((_, Pass::Strict)) => table.permute != Permute::No,
+        Some((_, Pass::Lenient)) => true,
+        Some((_, Pass::Posix)) | None => false,
+    };
     while let Some(a) = argv.get(i) {
         i += 1;
         let unknown = move || Runs::Unknown(guess(argv, i, table.plus)).into();
         if a == "--" {
+            if let Some((out, _)) = tool.as_mut() {
+                out.operands.extend(argv[i..].iter().map(String::as_str));
+                break;
+            }
             // `python3 -- -`: the standard input's program still
             if table.dash == Dash::Stdin && code.is_none() && argv.get(i).is_some_and(|n| n == "-")
             {
                 return Runs::Code.into();
             }
             return end(argv, i, shell_code, stdin, code);
+        }
+        if a == "-" && table.dash == Dash::Operand {
+            match tool.as_mut() {
+                Some((out, _)) => {
+                    if tool_operand(out, argv, i - 1, permute) {
+                        continue;
+                    }
+                    break;
+                }
+                None => return end(argv, i - 1, shell_code, stdin, code),
+            }
         }
         if a == "-" {
             return match table.dash {
@@ -1221,13 +1448,26 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 // differential test: it was taken for a script named `-`)
                 Dash::Stdin if code.is_none() => Runs::Code.into(),
                 Dash::Stdin => end(argv, i, shell_code, stdin, code),
-                Dash::Unknown => unknown(),
+                Dash::Unknown | Dash::Operand => unknown(),
             };
+        }
+        // lot 316: iptables' `!`, the kill family's `-SIGNAL`
+        if table.invert && a == "!" {
+            continue;
+        }
+        if let Some(sig) = a
+            .strip_prefix('-')
+            .filter(|s| table.signals && is_signal(s))
+        {
+            if let Some((out, _)) = tool.as_mut() {
+                out.options.push((SIGNAL, vec![sig]));
+            }
+            continue;
         }
         if words {
             if let Some(name) = a.strip_prefix('-') {
                 let two = name.strip_prefix('-');
-                match table.long(two.unwrap_or(name)) {
+                match table.long(two.unwrap_or(name)).map(|(_, l)| l) {
                     // never `=value`: `--rcfile=f` is no option of bash's
                     Some(Long::Flag) => continue,
                     Some(Long::NoRun) => {
@@ -1244,11 +1484,37 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     Some(Long::Code) => return Runs::Code.into(),
                     // letters from here on; a `--name` bash does not know is
                     // refused below
-                    None => words = false,
+                    _ => words = false,
                 }
             }
         }
-        if let Some(name) = a.strip_prefix("--") {
+        // a long option: `--name`, or with getopt_long_only `-name` (unless
+        // it is one of the short options' letters, or no long option's
+        // start, when it is letters)
+        let long_name = match a.strip_prefix("--") {
+            Some(name) => Some(name),
+            None if table.getopt == Getopt::PrefixOneHyphen => {
+                match a.strip_prefix('-').filter(|w| !w.is_empty()) {
+                    Some(w) => {
+                        let name = w.split_once('=').map_or(w, |(n, _)| n);
+                        let first = w.chars().next().and_then(|c| table.short(c));
+                        let letter = w.chars().count() == 1 && first.is_some();
+                        let starts_one = table.long.iter().any(|(n, _)| n.starts_with(name));
+                        match (letter, table.long(name).is_some(), starts_one) {
+                            (true, _, _) => None,
+                            (false, true, _) => Some(w),
+                            // an ambiguous start: refused
+                            (false, false, true) if !lenient => return unknown(),
+                            (false, false, _) if first.is_some() || lenient => None,
+                            (false, false, _) => return unknown(),
+                        }
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        if let Some(name) = long_name {
             if table.words {
                 // bash, after its first cluster: refused
                 return unknown();
@@ -1257,33 +1523,119 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 Some((n, v)) => (n, Some(v)),
                 None => (name, None),
             };
-            match table.long(name) {
-                Some(Long::Flag) => continue,
-                Some(Long::NoRun) => {
-                    seen.no_run = true;
-                    continue;
+            // the argument after this one, when it may be an option's: in
+            // the lenient reading it is read again as an argument of its own
+            let take_next = |i: &mut usize, cond: fn(&str) -> bool| {
+                let v = argv.get(*i).map(String::as_str).filter(|v| cond(v));
+                if v.is_some() && !lenient {
+                    *i += 1;
                 }
-                Some(long @ (Long::Arg | Long::Loads)) => {
-                    let value = match value {
-                        Some(v) => v,
-                        None => {
-                            let Some(v) = argv.get(i) else {
-                                return unknown();
+                v
+            };
+            let found = table.long(name);
+            if found.is_none() && lenient {
+                // no option, or several: each it may be, with what it may
+                // take (read again as arguments of their own)
+                for (n, long) in table.long_candidates(name) {
+                    let next = argv.get(i).map(String::as_str);
+                    let values: Vec<&'a str> = match long {
+                        Long::Flag | Long::NoRun | Long::Code | Long::Unread => Vec::new(),
+                        Long::Optional => value.into_iter().collect(),
+                        Long::Arg | Long::Loads => value.or(next).into_iter().collect(),
+                        Long::OptionalNext => value
+                            .or(next.filter(|v| may_be_an_argument(v)))
+                            .into_iter()
+                            .collect(),
+                        Long::Arg2 => {
+                            let (first, after) = match value {
+                                Some(v) => (Some(v), i),
+                                None => (next, i + 1),
                             };
-                            if table.arg_not_dash && v.starts_with('-') {
-                                return unknown();
-                            }
-                            i += 1;
-                            v.as_str()
+                            let second = argv
+                                .get(after)
+                                .map(String::as_str)
+                                .filter(|v| may_be_an_argument(v));
+                            first.into_iter().chain(second).collect()
                         }
                     };
-                    if !table.long_value_ok(name, value) {
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, values));
+                    }
+                }
+                continue;
+            }
+            match found {
+                Some((n, Long::Flag)) => {
+                    // getopt_long: `--flag=value` is refused
+                    if value.is_some() && table.getopt != Getopt::Exact && !lenient {
+                        return unknown();
+                    }
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, Vec::new()));
+                    }
+                    continue;
+                }
+                Some((n, Long::NoRun)) => {
+                    seen.no_run = true;
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, Vec::new()));
+                    }
+                    continue;
+                }
+                Some((n, long @ (Long::Arg | Long::Loads))) => {
+                    let v = match value {
+                        Some(v) => Some(v),
+                        None => take_next(&mut i, |_| true),
+                    };
+                    let Some(v) = v else {
+                        if lenient {
+                            if let Some((out, _)) = tool.as_mut() {
+                                out.options.push((n, Vec::new()));
+                            }
+                            continue;
+                        }
+                        return unknown();
+                    };
+                    if value.is_none() && table.arg_not_dash && v.starts_with('-') && !lenient {
+                        return unknown();
+                    }
+                    if !table.long_value_ok(name, v) && !lenient {
                         return unknown();
                     }
                     seen.loads |= long == Long::Loads;
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, vec![v]));
+                    }
                     continue;
                 }
-                Some(Long::Code) => {
+                Some((n, Long::Optional)) => {
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, value.into_iter().collect()));
+                    }
+                    continue;
+                }
+                Some((n, Long::OptionalNext)) => {
+                    let v = value.or_else(|| take_next(&mut i, may_be_an_argument));
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options.push((n, v.into_iter().collect()));
+                    }
+                    continue;
+                }
+                Some((n, Long::Arg2)) => {
+                    let first = value.or_else(|| take_next(&mut i, |_| true));
+                    let second = first.and_then(|_| take_next(&mut i, may_be_an_argument));
+                    if second.is_none() && !lenient {
+                        return unknown();
+                    }
+                    if let Some((out, _)) = tool.as_mut() {
+                        out.options
+                            .push((n, first.into_iter().chain(second).collect()));
+                    }
+                    continue;
+                }
+                Some((_, Long::Unread)) if lenient => continue,
+                Some((_, Long::Unread)) => return unknown(),
+                Some((_, Long::Code)) => {
                     let at = match value {
                         Some(v) => (i - 1, a.len() - v.len()),
                         // the interpreter refuses an option with no program
@@ -1313,7 +1665,15 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 // a shell's `+e`, `+o name`
                 Some("") => return unknown(),
                 Some(l) => l,
-                None => return end(argv, i - 1, shell_code, stdin, code),
+                None => match tool.as_mut() {
+                    Some((out, _)) => {
+                        if tool_operand(out, argv, i - 1, permute) {
+                            continue;
+                        }
+                        break;
+                    }
+                    None => return end(argv, i - 1, shell_code, stdin, code),
+                },
             },
         };
         words = false;
@@ -1338,11 +1698,28 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                         None => break,
                     }
                 }
+                if lenient {
+                    // the rest of the argument is no option
+                    break;
+                }
                 return unknown();
             }
-            let Some(opt) = table.short(c) else {
+            let Some((name, opt)) = table.short(c) else {
+                if lenient {
+                    // as a letter without argument, and the rest letters
+                    continue;
+                }
                 return unknown();
             };
+            // the argument after this one, as with a long option
+            let take_next = |i: &mut usize, cond: fn(&str) -> bool| {
+                let v = argv.get(*i).map(String::as_str).filter(|v| cond(v));
+                if v.is_some() && !lenient {
+                    *i += 1;
+                }
+                v
+            };
+            let mut values: Vec<&'a str> = Vec::new();
             match opt {
                 Opt::Flag => {}
                 Opt::NoRun => seen.no_run = true,
@@ -1378,7 +1755,10 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     code.get_or_insert(at);
                     break;
                 }
-                Opt::Rest => break,
+                Opt::Rest => {
+                    values.extend(Some(rest).filter(|r| !r.is_empty()));
+                    pos = letters.len();
+                }
                 Opt::LoadsRest if rest.is_empty() => return unknown(),
                 Opt::LoadsRest => {
                     seen.loads = true;
@@ -1393,14 +1773,16 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                 }
                 Opt::Arg | Opt::Loads | Opt::Module => {
                     let value = if rest.is_empty() {
-                        let Some(v) = argv.get(i) else {
+                        let Some(v) = take_next(&mut i, |_| true) else {
+                            if lenient {
+                                break;
+                            }
                             return unknown();
                         };
-                        if table.arg_not_dash && v.starts_with('-') {
+                        if table.arg_not_dash && v.starts_with('-') && !lenient {
                             return unknown();
                         }
-                        i += 1;
-                        v.as_str()
+                        v
                     } else {
                         rest
                     };
@@ -1417,7 +1799,7 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                         }
                         return Runs::Script(value.into()).into();
                     }
-                    if !table.names_ok(c, value) {
+                    if !table.names_ok(c, value) && !lenient {
                         return unknown();
                     }
                     seen.loads |= opt == Opt::Loads
@@ -1425,7 +1807,30 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                             .loading_values
                             .iter()
                             .any(|(o, v)| *o == c && v.iter().any(|p| value.starts_with(p)));
-                    break;
+                    values.push(value);
+                    pos = letters.len();
+                }
+                Opt::OptionalNext => {
+                    let value = if rest.is_empty() {
+                        take_next(&mut i, may_be_an_argument)
+                    } else {
+                        Some(rest)
+                    };
+                    values.extend(value);
+                    pos = letters.len();
+                }
+                Opt::Arg2 => {
+                    let first = if rest.is_empty() {
+                        take_next(&mut i, |_| true)
+                    } else {
+                        Some(rest)
+                    };
+                    let second = first.and_then(|_| take_next(&mut i, may_be_an_argument));
+                    if second.is_none() && !lenient {
+                        return unknown();
+                    }
+                    values.extend(first.into_iter().chain(second));
+                    pos = letters.len();
                 }
                 // Perl's `-0x1F`: the `x` then reads as `-x`, which takes
                 // the rest, as the hexadecimal digits would
@@ -1442,6 +1847,9 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
                     pos += rest.len() - after_t.len();
                 }
             }
+            if let Some((out, _)) = tool.as_mut() {
+                out.options.push((name, values));
+            }
         }
         if argv.len() < i + next.len() {
             return unknown();
@@ -1452,6 +1860,9 @@ fn read_options(table: &Table, argv: &[String], from: usize, seen: &mut Seen) ->
             }
         }
         i += next.len();
+    }
+    if tool.is_some() {
+        return Runs::Inline.into();
     }
     end(argv, i, shell_code, stdin, code)
 }
@@ -1489,6 +1900,127 @@ fn operand(argv: &[String], at: usize, shell_code: bool, stdin: bool) -> Reading
         Some(s) => Runs::Script(s.as_str().into()).into(),
         None => Runs::Inline.into(),
     }
+}
+
+/// Lot 316: iptables' `xs_has_arg`: an argument that starts with neither
+/// `-` nor `!` may be an option's.
+fn may_be_an_argument(a: &str) -> bool {
+    !a.starts_with(['-', '!'])
+}
+
+/// Lot 316: `s` names a signal as procps' `signal_name_to_number` reads it
+/// — a number up to 64, or a name with or without `SIG`, in any case
+/// (psmisc's `killall` takes them in capitals only: one more spelling here
+/// errs toward reading a `-SIGNAL`, which no judgement leans on).
+pub(crate) fn is_signal(s: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE", "KILL", "USR1", "SEGV",
+        "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD", "CLD", "CONT", "STOP", "TSTP", "TTIN",
+        "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "POLL", "IO", "PWR", "SYS",
+        "UNUSED", "RTMIN", "RTMAX",
+    ];
+    if !s.is_empty() && s.len() <= 2 && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<u32>().is_ok_and(|n| n <= 64);
+    }
+    let up = s.to_ascii_uppercase();
+    let name = up.strip_prefix("SIG").unwrap_or(&up);
+    let base = name
+        .split_once(['+', '-'])
+        .filter(|(b, n)| {
+            (*b == "RTMIN" || *b == "RTMAX")
+                && !n.is_empty()
+                && n.len() <= 2
+                && n.bytes().all(|c| c.is_ascii_digit())
+        })
+        .map_or(name, |(b, _)| b);
+    NAMES.contains(&base)
+}
+
+/// Lot 316: a system tool's argv, as [`read_tool`] reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Parsed<'a> {
+    /// Its options, in order: the name the table gives each (its letter,
+    /// else its long name in full, whatever prefix or spelling was used)
+    /// and the arguments it took.
+    pub(crate) options: Vec<(&'static str, Vec<&'a str>)>,
+    /// Its operands, in order (nft's: the words of its command line).
+    pub(crate) operands: Vec<&'a str>,
+    /// Every option was one of the table's, with its arguments. When not,
+    /// this is the over-approximation: every argument that may be an
+    /// operand is one, every spelling that may be an option is one (an
+    /// option's argument may be both).
+    pub(crate) understood: bool,
+}
+
+impl<'a> Parsed<'a> {
+    /// The arguments of every option named `name`.
+    pub(crate) fn option<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s [&'a str]> + 's {
+        self.options
+            .iter()
+            .filter(move |(n, _)| *n == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// The option `name` is present.
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.options.iter().any(|(n, _)| *n == name)
+    }
+}
+
+/// Lot 316: a system tool's argv (`argv[from]` on) through its table, every
+/// way it may be read: as the tool reads it, and with [`Permute::Gnu`] as it
+/// reads it under `POSIXLY_CORRECT` too; or, when an option is not in the
+/// table, the one over-approximating reading ([`Parsed::understood`]
+/// false). What is judged on them is judged on each: a detection on any of
+/// them is one.
+pub(crate) fn read_tool<'a>(table: &Table, argv: &'a [String], from: usize) -> Vec<Parsed<'a>> {
+    let pass = |p: Pass| {
+        let mut out = Parsed {
+            understood: true,
+            ..Parsed::default()
+        };
+        let r = read_options(table, argv, from, &mut Seen::default(), Some((&mut out, p)));
+        let understood = !matches!(r.runs, Runs::Unknown(_));
+        if table.command_text {
+            out.operands = command_words(&out.operands);
+        }
+        out.understood = understood && p != Pass::Lenient;
+        (out, understood)
+    };
+    let (strict, understood) = pass(Pass::Strict);
+    if !understood {
+        return vec![pass(Pass::Lenient).0];
+    }
+    let mut out = vec![strict];
+    if table.permute == Permute::Gnu {
+        let (posix, _) = pass(Pass::Posix);
+        if posix != out[0] {
+            out.push(posix);
+        }
+    }
+    out
+}
+
+/// Lot 316: nft's command line — its operands joined by blanks, split on
+/// blanks (newlines included) and `;`, each `;` a word of its own.
+fn command_words<'a>(operands: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for op in operands {
+        for word in op.split_whitespace() {
+            let mut rest = word;
+            while let Some(at) = rest.find(';') {
+                if at > 0 {
+                    out.push(&rest[..at]);
+                }
+                out.push(&rest[at..at + 1]);
+                rest = &rest[at + 1..];
+            }
+            if !rest.is_empty() {
+                out.push(rest);
+            }
+        }
+    }
+    out
 }
 
 /// What the script may be when the options could not be read: the first
@@ -1559,6 +2091,46 @@ mod tests {
     }
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Lot 316: getopt_long's prefix of a long option — one option, or
+    /// several that are one letter's names (`--sourc`, `--sr`, `--s` of a
+    /// table whose only `s…` options are `-s`'s two names), never two
+    /// options; an exact name before any prefix; an extension's name and a
+    /// prefix of another option: both.
+    #[test]
+    fn a_long_option_by_its_prefix() {
+        const T: Table = Table {
+            short: &[("s", Opt::Arg), ("v", Opt::Flag)],
+            long: &[
+                ("source", Long::Arg),
+                ("src", Long::Arg),
+                ("verbose", Long::Flag),
+                ("version", Long::Flag),
+                ("ver", Long::Flag),
+            ],
+            aliases: &[("source", 's'), ("src", 's'), ("verbose", 'v')],
+            extensions: &[("so", Long::Flag)],
+            getopt: Getopt::Prefix,
+            permute: Permute::Gnu,
+            dash: Dash::Operand,
+            ..INTERPRETER
+        };
+        assert_eq!(T.long("s"), Some(("s", Long::Arg)));
+        assert_eq!(T.long("sr"), Some(("s", Long::Arg)));
+        assert_eq!(T.long("verb"), Some(("v", Long::Flag)));
+        assert_eq!(T.long("ver"), Some(("ver", Long::Flag)));
+        assert_eq!(T.long("vers"), Some(("version", Long::Flag)));
+        assert_eq!(T.long("ve"), None, "verbose, version or ver");
+        assert_eq!(T.long("so"), None, "the extension's, or --source");
+        assert_eq!(T.long_candidates("so").len(), 2);
+        assert_eq!(T.long("x"), None);
+        let a = argv(&["t", "--sr", "1.2.3.4", "x", "--verb"]);
+        let r = read_tool(&T, &a, 1);
+        assert_eq!(r[0].options, vec![("s", vec!["1.2.3.4"]), ("v", vec![])]);
+        assert_eq!(r[0].operands, vec!["x"]);
+        // the POSIXLY_CORRECT reading: `--verb` after `x` is an operand
+        assert_eq!(r[1].operands, vec!["x", "--verb"]);
     }
 
     // ── Lot 310 (external bug hunt, edition 1.4) ────────────────────────
