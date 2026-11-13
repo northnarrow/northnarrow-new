@@ -841,7 +841,10 @@ mod tests {
         let now = Instant::now();
         let at = |us: u64| now + Duration::from_micros(us);
         for uid in 0..UIDS_CAP as u32 {
-            assert!(b.take(uid, 1000, at(uid.into())), "uid {uid}");
+            assert!(
+                b.take(uid, 1000, at(uid.into())),
+                "every uid of the table takes its first budget"
+            );
         }
         // uid 0 asks again (refused): uid 1 is now the least recently used
         assert!(!b.take(0, 1, at(299)));
@@ -852,7 +855,7 @@ mod tests {
             "the least recent out"
         );
         for uid in (0..UIDS_CAP as u32).filter(|uid| *uid != 1) {
-            assert!(!b.take(uid, 1, at(400)), "uid {uid}'s budget kept spent");
+            assert!(!b.take(uid, 1, at(400)), "a kept uid's budget stays spent");
         }
     }
 
