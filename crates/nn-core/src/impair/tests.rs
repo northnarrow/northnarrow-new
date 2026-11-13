@@ -2281,6 +2281,7 @@ mod rev548_recheck {
             ),
             (KILL, &["kill", "9710", "-s", "HUP"]),
             (KILL, &["kill", "9710", "--signal", "HUP"]),
+            (KILL, &["kill", "--no-such", "-HUP", "9710"]),
         ]
         .into_iter()
         .enumerate()
