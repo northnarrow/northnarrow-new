@@ -640,6 +640,76 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 340 (alpha 1/4): the daily false positives of a benign host, each
+  removed where the kernel proves the benign case; every attack variant is
+  still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §34).
+  - **A scheduled log rotation is Low.** NN-L-FIM-005 (a log modified) and
+    NN-L-FIM-019 (wtmp/btmp written by a non-login process, a kill) were
+    High for logrotate's daily run. A write by the packaged `logrotate`
+    (its path, and the device and inode of the file there) that PID 1
+    forked (its timer's `logrotate.service`, the kernel's fork record) or
+    that cron's daily run started is recorded Low, not acted on. Anything
+    else — another writer truncating btmp, a copy of logrotate, logrotate
+    run by hand — keeps its verdict.
+  - **rsyslogd's appends after a rotation, and at the start, are appends.**
+    The FIM drain measured a write against the start's baseline of the
+    path: after a rotation the path holds a new, smaller file, and every
+    append rsyslogd made was a "truncation" (NN-L-FIM-005 High) until the
+    file outgrew the one rotated away; at the agent's start the first append
+    raced the baseline (none yet: High). A write is now measured against the
+    size the drain last read in that same file, else the size it had when it
+    was watched (`FimEvent::baseline_size`); a truncation in place still
+    shrinks it.
+  - **A credential store's directory listed is no verdict** (the
+    mini-hunt). A `find /` (the lab's harness; plocate's daily `updatedb`
+    makes the same walk) opened `~/.gnupg/private-keys-v1.d` and its
+    siblings: NN-L-FIM-017 High, a kill, each time. A directory of a store
+    opened (`O_DIRECTORY`) names its files and reads none; a file of it
+    opened is judged as before.
+  - **A backup's receiver keeps its lineage.** A writer that never executes
+    (rsync's receiver, a fork of rsync) was read from `/proc` only: once it
+    exited, a burst judged after it had no lineage and was judged (lot
+    310's lab: 4 of 5 unit backups). The open sensor's record carries the
+    writer's fork record from the kernel (`fork_parent_record`, lot 310:
+    the forker, and the start, while the writer executed nothing since) and
+    its forker's when that one has not executed either (rsync's receiver is
+    a fork of its generator, a fork of rsync); the open pump teaches them
+    to the lineage before the record's events are sent, and the walk reads
+    the writer as its forker's copy as of its start (`OpenRecordRaw` 608 →
+    632 bytes).
+  - **npm's CLI run from `PATH`, and the Go toolchain in its own
+    directories, no longer raise ENGAGED.** npm run as `npm` is node with
+    `argv[1]` = `/usr/bin/npm`, the link the package installed (the kernel
+    hands the shebang's interpreter the path it executed): FP-2's
+    exemption never matched it, and `npm ci` from a CI runner raised
+    ConfirmedIntrusion. The link in a system tree whose target (folded) is
+    npm's CLI in one is now npm's CLI. The packaged `go` command rewriting
+    its archives in its work directory (`$TMPDIR/go-build<digits>/`), its
+    build cache or its module cache (`go test` stamping build ids) is
+    exempt from the mass-write arm; what it runs is judged as before.
+  - **R011: a clean system `modprobe` that exited at once is Medium.** The
+    system's tool by module name, run by root, whose process exited before
+    its environment could be read (a module already loaded or built in)
+    was High; it is Medium. Root with a clean environment read stays Low,
+    a non-root exec High, every kill a kill.
+  - **systemd's feature probes on Ubuntu 26.04 are Low.** The user
+    manager's `tracepoint` probe at the first login and networkd's
+    `kprobe` probe at its start were refused and signed High
+    (NN-L-AT-001, `bpf_prog_type`), raising ENGAGED at every boot. A
+    refused load whose loader the agent proves a known system probe's (the
+    packaged loader's device and inode, the same process, started before
+    the load) is still refused, recorded Low and raises no posture.
+  - **Resolvers by identity; CoreDNS one of them.** NN-L-NET-004/-005/-014
+    treated a query as a resolver's forwarded leg by the basename of its
+    sender's image (a tunnel run as `/tmp/x/dnsmasq` was never killed), and
+    CoreDNS was not one (its pods' names were its own). The DNS pump now
+    proves it: the host's packaged resolver (its image the host's file at
+    that path), or the cluster's CoreDNS as its container runtime's bundle
+    records it (`kube-system`, a `coredns` image, `/coredns`). A known
+    resolver's legs with no attributable originator stay one Medium record
+    each and no longer add up to a "tunnel" of the resolver (they are many
+    processes' names: hash-shaped lookups under one zone); the originator's
+    own query, and a leg traced back to it, still count against it.
 - The exec quarantine's stop resumes every process the kernel holds (lot
   317, third bug hunt BUG-118; `docs/design/EXEC_QUARANTINE.md` §3). It
   resumed the processes whose report it had read from the ring: one the

@@ -40,6 +40,7 @@
 //! comm.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::posture::host::PostureAgent;
@@ -1723,6 +1724,13 @@ fn evaluate_cred_store_access(
     if !path_fragments.iter().any(|f| fe.path.contains(f)) {
         return None;
     }
+    // Lot 340 (the mini-hunt, the alpha's daily false positives): a
+    // directory of the store opened — its listing, as an indexer's walk
+    // makes it (plocate's daily `updatedb`, a `find /`) — names the store's
+    // files and reads none: no verdict. A file of it opened is judged.
+    if fe.op == FimOp::Opened && fe.is_dir {
+        return None;
+    }
     // Review 85: the application that owns the store is exempted by
     // [`OwnClient`], which reads what the kernel executed.
     Some(fim_verdict(
@@ -2858,6 +2866,136 @@ impl<H: PostureHost> Rule for AccountTool<H> {
     }
 }
 
+/// Lot 340: the packaged log rotator, by the path the kernel executed (its
+/// device and inode are checked against the file there).
+const LOGROTATE_EXES: &[&str] = &["/usr/sbin/logrotate", "/sbin/logrotate"];
+
+/// Lot 340: the cron daemons whose daily run starts logrotate where no
+/// systemd timer does (`/etc/cron.daily/logrotate`), by exe basename in a
+/// root-owned system tree ([`ExecIdentity::is_known_binary`](crate::posture::lineage::ExecIdentity::is_known_binary)).
+const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron"];
+
+/// Lot 340 (the alpha's daily false positives) — a log rotated by the
+/// packaged `logrotate` under its timer or cron is recorded Low, not acted
+/// on.
+///
+/// `logrotate` renames and recreates (or truncates) the logs it rotates,
+/// `/var/log/wtmp` and `/var/log/btmp` among them, every day: NN-L-FIM-005
+/// (a log modified, truncation suspected) and NN-L-FIM-019 (wtmp/btmp
+/// written by a non-login process, a kill) were High on every host. The
+/// verdict becomes Log + Low only when all of this holds:
+///
+/// * the writer runs `logrotate` itself (no interpreter, no other program),
+///   at its packaged path ([`LOGROTATE_EXES`]), and the image the kernel
+///   executed is the file there — its device and inode
+///   ([`AuthSessionTracker::ran_host_file`]): a copy, a renamed or a
+///   replaced binary is not;
+/// * it was started as the system schedules it: forked by PID 1 (the
+///   kernel's fork record, carried through systemd's executor — the
+///   `logrotate.service` its timer starts), or with a cron daemon among its
+///   ancestors (`/etc/cron.daily/logrotate`).
+///
+/// Anything else keeps the rule's verdict: a non-logrotate writer that
+/// truncates wtmp or btmp (High, the kill), `logrotate` run by hand from a
+/// session, a copy of it. What this trusts: root's configuration of
+/// logrotate (`/etc/logrotate.conf`, `/etc/logrotate.d`) and root's units
+/// and crontabs — a root that rotates btmp away with its own configuration
+/// under `systemd-run` leaves a Low record, not none.
+pub struct LogRotation<H: PostureHost> {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker<H>,
+}
+
+impl<H: PostureHost> LogRotation<H> {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker<H>) -> Self {
+        Self { inner, lineage }
+    }
+
+    /// How the packaged logrotate `pid` was started by the system's
+    /// scheduler, or `None` (not the packaged logrotate, or not scheduled).
+    fn scheduled_rotation(&self, pid: u32, as_of: crate::posture::lineage::AsOf) -> Option<String> {
+        use crate::posture::lineage::Runs;
+        let id = self.lineage.exec_identity(pid, as_of)?;
+        if id.runs != Runs::Inline || !LOGROTATE_EXES.iter().any(|p| id.exe == Path::new(p)) {
+            return None;
+        }
+        let exe = id.exe.to_string_lossy().into_owned();
+        if !self.lineage.ran_host_file(pid, as_of, &exe) {
+            return None;
+        }
+        if self.lineage.fork_parent(pid, as_of) == Some(1) {
+            return Some(format!(
+                "the packaged {exe} (its device and inode), forked by PID 1 (its unit: the \
+                 timer's logrotate.service)"
+            ));
+        }
+        let hops = self.lineage.lineage_identities(pid, as_of)?;
+        hops.iter()
+            .skip(1)
+            .find(|(_, h)| h.runs == Runs::Inline && h.is_known_binary(CRON_DAEMONS))
+            .map(|(cron, h)| {
+                format!(
+                    "the packaged {exe} (its device and inode), run by cron ({}, pid {cron})",
+                    h.exe.display()
+                )
+            })
+    }
+}
+
+impl<H: PostureHost> Rule for LogRotation<H> {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        let as_of = crate::posture::lineage::AsOf::judged(fe.timestamp_ns);
+        let Some(how) = self.scheduled_rotation(fe.modifier_pid, as_of) else {
+            return Some(verdict);
+        };
+        Some(Verdict {
+            action: ResponseAction::Log,
+            severity: Severity::Low,
+            reasoning: format!(
+                "{} [a scheduled log rotation by {how}: recorded Low, not acted on]",
+                verdict.reasoning
+            ),
+            ..verdict
+        })
+    }
+}
+
+/// Lot 340: NN-L-FIM-005 and NN-L-FIM-019 as the rule set wires them — in
+/// [`LogRotation`] (and -019 in [`OwnClient`] over the login machinery) —
+/// for [`fim_rules_with_lineage`] and its tests.
+pub(crate) fn log_rules<H: PostureHost>(
+    syslog_uid: Option<u32>,
+    lineage: &AuthSessionTracker<H>,
+) -> [Box<dyn Rule>; 2] {
+    let rotated = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
+        Box::new(LogRotation::new(rule, lineage.clone()))
+    };
+    [
+        rotated(Box::new(NnLFim005LogTruncated::new(syslog_uid))),
+        rotated(Box::new(OwnClient::new(
+            Box::new(NnLFim019WtmpBtmpTampered),
+            LOGIN_RECORD_WRITERS,
+            lineage.clone(),
+        ))),
+    ]
+}
+
 /// The FIM rule set with a live `/proc`-backed lineage tracker for the
 /// package-manager carve-out ([`PackageManaged`]). Production threads the
 /// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
@@ -2874,7 +3012,8 @@ pub fn fim_rules<H: PostureAgent>(
 /// [`PackageManaged`] over `lineage`, and the configuration and scheduling
 /// ones also in [`InteractiveAdmin`]. The credential and login-record rules
 /// are wrapped in [`OwnClient`], and the account-file rules (NN-L-FIM-003,
-/// -018) in [`AccountTool`]. Order and ids are unchanged.
+/// -018) in [`AccountTool`]; lot 340: the log rules NN-L-FIM-005 and -019
+/// in [`LogRotation`]. Order and ids are unchanged.
 pub fn fim_rules_with_lineage<H: PostureAgent>(
     installer_override: Arc<H::InstallerWindow>,
     lineage: AuthSessionTracker<H>,
@@ -2898,6 +3037,7 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
     // of per-event; `None` on a host without the user → the carve-out
     // simply never applies and the rule fires as before.
     let syslog_uid = resolve_uid_by_name("syslog");
+    let [fim005, fim019] = log_rules(syslog_uid, &lineage);
     vec![
         // Critical first — fire on the worst-case signals
         // before any High/Medium rule has a chance to match.
@@ -2910,7 +3050,8 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
         // High next.
         admin(acct(Box::new(NnLFim003SensitiveConfigModified))),
         Box::new(NnLFim004AuthorizedKeysModified),
-        Box::new(NnLFim005LogTruncated::new(syslog_uid)),
+        // Lot 340: a scheduled rotation by the packaged logrotate, Low.
+        fim005,
         // Lot 283b: outside the carve-outs, the kill held (`SwitchHeld`).
         Box::new(SwitchHeld::new(
             admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
@@ -2946,7 +3087,7 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
             acct(Box::new(NnLFim018LastlogTampered)),
             LOGIN_RECORD_WRITERS,
         ),
-        own(Box::new(NnLFim019WtmpBtmpTampered), LOGIN_RECORD_WRITERS),
+        fim019,
         admin(Box::new(NnLFim023SystemdTimerCreated)),
         // Review 86 — a file capability grant, undone.
         admin(Box::new(NnLFim025FileCapabilityGranted::<H>::new(
@@ -5927,6 +6068,346 @@ mod tests {
             "/usr/../tmp/aws",
         ] {
             assert!(!crate::posture::lineage::in_system_tree(p), "{p}");
+        }
+    }
+
+    /// Lot 340 (named, the mini-hunt): a `find /` walking `/root/.gnupg`
+    /// and a home's opened their key directories (the lab: NN-L-FIM-017
+    /// High, a kill, 32 times — plocate's daily `updatedb` makes the same
+    /// walk). A directory of a credential store opened is no verdict; a
+    /// file of it opened, and a write of the directory, still are.
+    #[test]
+    fn a_credential_store_s_directory_listed_is_no_verdict() {
+        let rule = NnLFim017GpgKeyringAccessed;
+        let opened = |path: &str, dir: bool| {
+            let mut e = fim_event_with_comm(FimOp::Opened, path, "find");
+            if let Event::Fim(fe) = &mut e {
+                fe.is_dir = dir;
+            }
+            e
+        };
+        assert!(rule
+            .evaluate(&opened("/root/.gnupg/private-keys-v1.d", true))
+            .is_none());
+        let v = rule
+            .evaluate(&opened("/root/.gnupg/private-keys-v1.d/ABCD.key", false))
+            .expect("a key read");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcess, Severity::High)
+        );
+        let v = rule
+            .evaluate(&opened("/root/.gnupg/private-keys-v1.d", false))
+            .expect("not known a directory");
+        assert_eq!(v.severity, Severity::High);
+        let mut w = fim_event_with_comm(FimOp::Modified, "/root/.gnupg/pubring.kbx", "find");
+        if let Event::Fim(fe) = &mut w {
+            fe.is_dir = true;
+        }
+        assert!(rule.evaluate(&w).is_some(), "a write");
+    }
+
+    // ── lot 340 — a scheduled log rotation is recorded Low ────────────
+
+    mod log_rotation {
+        use super::*;
+        use crate::posture::host::testing::IdTestHost;
+        use crate::posture::lineage::AsOf;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+
+        type Tracker = crate::posture::lineage::AuthSessionTracker<IdTestHost>;
+        const S: u64 = 1_000_000_000;
+        const LOGROTATE: &str = "/usr/sbin/logrotate";
+        /// The root filesystem's device as `stat(2)` gives it (253:1), and
+        /// in the kernel's form (`MKDEV`), as the exec sensor records an
+        /// image: the lab found the two compared (lot 340).
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        const PACKAGED: (u64, u64) = (KDEV, 4242);
+
+        /// The exec of `exe` by `pid` (parent `ppid`, started `start`),
+        /// the image `(dev, ino)` the LSM program read, forked by `forker`.
+        fn exec(
+            pid: u32,
+            ppid: u32,
+            exe: &str,
+            argv: &[&str],
+            id: (u64, u64),
+            forker: u32,
+            start: u64,
+        ) -> Event {
+            Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: exe
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(exe)
+                    .chars()
+                    .take(15)
+                    .collect(),
+                filename: exe.into(),
+                timestamp_ns: start + S / 10,
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.0,
+                    ino: id.1,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: forker,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        }
+
+        /// A write of `path` by `pid` (`comm`) at 100 s.
+        fn write(path: &str, pid: u32, comm: &str) -> Event {
+            let mut e = written_by(FimOp::Modified, path, pid, comm);
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = 100 * S;
+                fe.new_size = Some(0);
+                fe.baseline_size = Some(4096);
+            }
+            e
+        }
+
+        /// The processes of the cases, in a tracker whose `/proc` is an
+        /// empty fixture (every judgement from the exec records):
+        /// - 500: logrotate.service's logrotate (PID 1's fork, the packaged
+        ///   image);
+        /// - 510..513: cron → sh -c → run-parts → sh /etc/cron.daily/logrotate
+        ///   → 514 the packaged logrotate;
+        /// - 520: logrotate run by hand from a session's bash (521);
+        /// - 530: a copy of logrotate in /tmp, PID 1's fork;
+        /// - 531: a binary at logrotate's path, another inode (replaced);
+        /// - 532: logrotate whose exec recorded no image;
+        /// - 540: `truncate` from a unit (PID 1's fork);
+        /// - 541: python named `logrotate` from a unit.
+        fn tracker() -> (tempfile::TempDir, Tracker) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            IdTestHost::set_file_id(LOGROTATE, Some((STAT_DEV, PACKAGED.1)));
+            // another packaged program: its own file, not logrotate
+            IdTestHost::set_file_id("/usr/bin/truncate", Some((STAT_DEV, 40)));
+            let mut start = S;
+            let mut ingest = |pid, ppid, exe: &str, argv: &[&str], id, forker| {
+                start += S;
+                assert!(t.ingest_spawn_event(&exec(pid, ppid, exe, argv, id, forker, start)));
+            };
+            ingest(
+                500,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "/etc/logrotate.conf"],
+                PACKAGED,
+                1,
+            );
+            ingest(
+                510,
+                1,
+                "/usr/sbin/cron",
+                &["/usr/sbin/cron", "-f"],
+                (8, 10),
+                1,
+            );
+            ingest(
+                511,
+                510,
+                "/usr/bin/dash",
+                &["/bin/sh", "-c", "run-parts /etc/cron.daily"],
+                (8, 11),
+                510,
+            );
+            ingest(
+                512,
+                511,
+                "/usr/bin/run-parts",
+                &["run-parts", "/etc/cron.daily"],
+                (8, 12),
+                511,
+            );
+            ingest(
+                513,
+                512,
+                "/usr/bin/dash",
+                &["/bin/sh", "/etc/cron.daily/logrotate"],
+                (8, 11),
+                512,
+            );
+            ingest(
+                514,
+                513,
+                LOGROTATE,
+                &[LOGROTATE, "/etc/logrotate.conf"],
+                PACKAGED,
+                513,
+            );
+            ingest(521, 1, "/usr/bin/bash", &["-bash"], (8, 21), 0);
+            ingest(
+                520,
+                521,
+                LOGROTATE,
+                &[LOGROTATE, "-f", "/etc/logrotate.conf"],
+                PACKAGED,
+                521,
+            );
+            ingest(
+                530,
+                1,
+                "/tmp/lr",
+                &["/tmp/lr", "-f", "/etc/logrotate.conf"],
+                (9, 30),
+                1,
+            );
+            ingest(
+                531,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "/etc/logrotate.conf"],
+                (KDEV, 31),
+                1,
+            );
+            // its exec's image not recorded (identity unknown)
+            ingest(
+                532,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "/etc/logrotate.conf"],
+                (0, 0),
+                1,
+            );
+            ingest(
+                540,
+                1,
+                "/usr/bin/truncate",
+                &["truncate", "-s", "0", "/var/log/btmp"],
+                (KDEV, 40),
+                1,
+            );
+            ingest(
+                541,
+                1,
+                "/usr/bin/python3.12",
+                &["logrotate", "-c", "x"],
+                (8, 41),
+                1,
+            );
+            (tmp, t)
+        }
+
+        /// Named test (lot 340, the alpha's daily false positives): forcing
+        /// the whole `logrotate.conf` on Ubuntu 24.04 gave NN-L-FIM-019 High
+        /// (a kill) for wtmp and btmp and NN-L-FIM-005 High for the other
+        /// logs. The packaged logrotate under its timer's unit, or under
+        /// cron's daily run, is recorded Low — never acted on.
+        #[test]
+        fn a_scheduled_rotation_by_the_packaged_logrotate_is_recorded_low() {
+            let (_tmp, t) = tracker();
+            let [fim005, fim019] = log_rules(None, &t);
+            for pid in [500, 514] {
+                for (rule, path) in [
+                    (&fim019, "/var/log/wtmp"),
+                    (&fim019, "/var/log/btmp"),
+                    (&fim005, "/var/log/syslog"),
+                    (&fim005, "/var/log/auth.log"),
+                ] {
+                    let v = rule
+                        .evaluate(&write(path, pid, "logrotate"))
+                        .expect("still recorded");
+                    assert_eq!(
+                        (v.action.clone(), v.severity),
+                        (ResponseAction::Log, Severity::Low),
+                        "pid {pid} {path}: {}",
+                        v.reasoning
+                    );
+                    assert!(
+                        v.reasoning.contains("scheduled log rotation"),
+                        "{}",
+                        v.reasoning
+                    );
+                }
+            }
+            assert_eq!(t.fork_parent(500, AsOf::judged(100 * S)), Some(1));
+        }
+
+        /// Lot 340: the attack variants keep the rules' verdicts — a
+        /// non-logrotate writer that truncates btmp from a unit (FIM-019:
+        /// High, the kill), python named `logrotate`, a copy of logrotate in
+        /// /tmp, a file replaced at logrotate's path (another inode), the
+        /// packaged logrotate run by hand from a session, a writer whose
+        /// exec was never seen; and with no packaged file to compare with,
+        /// no rotation is scheduled.
+        #[test]
+        fn a_writer_that_is_not_the_scheduled_packaged_logrotate_keeps_the_verdict() {
+            let (_tmp, t) = tracker();
+            let [fim005, fim019] = log_rules(None, &t);
+            for (pid, comm) in [
+                (540, "truncate"),
+                (541, "logrotate"),
+                (530, "lr"),
+                (531, "logrotate"),
+                (532, "logrotate"),
+                (520, "logrotate"),
+                (599, "logrotate"),
+            ] {
+                let v = fim019
+                    .evaluate(&write("/var/log/btmp", pid, comm))
+                    .expect("fires");
+                assert_eq!(
+                    (v.action.clone(), v.severity),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "pid {pid}: {}",
+                    v.reasoning
+                );
+                let v = fim005
+                    .evaluate(&write("/var/log/syslog", pid, comm))
+                    .expect("fires");
+                assert_eq!(v.severity, Severity::High, "pid {pid}");
+            }
+            IdTestHost::set_file_id(LOGROTATE, None);
+            let v = fim019
+                .evaluate(&write("/var/log/wtmp", 500, "logrotate"))
+                .expect("fires");
+            assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        }
+
+        /// Lot 340: the rule set wires FIM-005 and FIM-019 through
+        /// [`log_rules`] (one source), and the login machinery's own write
+        /// of wtmp stays exempt by [`OwnClient`] inside it.
+        #[test]
+        fn the_rule_set_wires_the_log_rules_through_the_rotation_wrapper() {
+            let src = include_str!("rules.rs");
+            let body = &src[src.find("pub fn fim_rules_with_lineage").unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            assert!(body.contains("log_rules(syslog_uid, &lineage)"), "{body}");
+            assert!(!body.contains("NnLFim005LogTruncated::new"), "{body}");
+            assert!(
+                !body.contains("Box::new(NnLFim019WtmpBtmpTampered)"),
+                "{body}"
+            );
+            let (_tmp, t) = tracker();
+            assert!(t.ingest_spawn_event(&exec(
+                560,
+                1,
+                "/usr/bin/login",
+                &["login", "--", "u"],
+                (8, 60),
+                1,
+                30 * S,
+            )));
+            let [_, fim019] = log_rules(None, &t);
+            assert!(fim019
+                .evaluate(&write("/var/log/wtmp", 560, "login"))
+                .is_none());
         }
     }
 

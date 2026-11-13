@@ -315,6 +315,87 @@ fn holders_by(
     out
 }
 
+/// Lot 340 (the alpha's daily false positives): a refused load of
+/// `prog_type` by `pid`, recorded at `at_ns` (`CLOCK_MONOTONIC`), is a known
+/// system program's feature probe ([`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`])
+/// — the entry, or why not. The kernel says it, read by the agent as the
+/// record is decoded (the loader is a long-lived daemon, the user manager or
+/// networkd):
+///
+/// * `/proc/<pid>/exe` has the device and the inode of the entry's packaged
+///   loader (`packaged`, on the host [`packaged`]: a regular file owned by
+///   root and writable by no one else; a copy, a renamed or a replaced
+///   binary is none) — whatever path its own mount namespace shows;
+/// * the process the same all along (its start read before and after) and
+///   started no later than the record (`suspended_ns`: the boot clock's lead
+///   on the monotonic clock now, all the host's suspended time; two ticks of
+///   rounding).
+///
+/// What this trusts: the packaged loader file (a root that replaced it is
+/// not told apart) and a loader process no one else steers (a debugger
+/// attached to it can make it load anything — of a type the hook refuses
+/// all the same).
+#[allow(clippy::too_many_arguments)]
+pub fn known_probe(
+    proc: &Path,
+    packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
+    read_stat: &dyn Fn(&Path) -> Option<String>,
+    pid: u32,
+    prog_type: u32,
+    at_ns: u64,
+    clk_tck: u64,
+    suspended_ns: u64,
+) -> Result<usize, String> {
+    use common::bpf_prog_class::{known_system_probe, KNOWN_SYSTEM_PROBES};
+    let pdir = proc.join(pid.to_string());
+    let start = start_ns_by(&pdir, clk_tck, read_stat).ok_or("its start cannot be read")?;
+    let exe = std::fs::metadata(pdir.join("exe")).map_err(|e| format!("its image: {e}"))?;
+    let id = (exe.dev(), exe.ino());
+    let entry = KNOWN_SYSTEM_PROBES
+        .iter()
+        .filter(|k| k.prog_type == prog_type)
+        .find(|k| packaged(k.loader) == Some(id))
+        .and_then(|k| known_system_probe(k.loader, prog_type))
+        .ok_or_else(|| {
+            format!(
+                "pid {pid} runs no packaged loader of a known probe of program type {prog_type}"
+            )
+        })?;
+    if start_ns_by(&pdir, clk_tck, read_stat) != Some(start) {
+        return Err(format!("pid {pid} named another process meanwhile"));
+    }
+    let tick = 1_000_000_000 / clk_tck.max(1);
+    if start > at_ns.saturating_add(suspended_ns).saturating_add(2 * tick) {
+        return Err(format!("pid {pid} started after the load"));
+    }
+    Ok(entry)
+}
+
+/// [`known_probe`] on this host (`/proc`, `/`, its clocks).
+pub fn known_probe_on_host(pid: u32, prog_type: u32, at_ns: u64) -> Result<usize, String> {
+    let now = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid clock id and a timespec to fill.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+    };
+    let suspended = now(libc::CLOCK_BOOTTIME).saturating_sub(now(libc::CLOCK_MONOTONIC));
+    known_probe(
+        Path::new("/proc"),
+        &|path| packaged(Path::new("/"), path, 0),
+        // lot 311 (N6): read as bytes — its `comm` is its own
+        &|p| crate::state_read::read_state(p).ok(),
+        pid,
+        prog_type,
+        at_ns,
+        clk_tck(),
+        suspended,
+    )
+}
+
 /// The host's clock ticks a second.
 pub fn clk_tck() -> u64 {
     // SAFETY: sysconf has no preconditions.
@@ -754,6 +835,72 @@ mod tests {
             std::os::unix::fs::symlink(target, d.join("fd").join(i.to_string())).unwrap();
             std::fs::write(d.join("fdinfo").join(i.to_string()), info).unwrap();
         }
+    }
+
+    /// Lot 340 (named): a refused probe's loader is proven a known system
+    /// probe's — it runs the packaged loader of an entry for that program
+    /// type, the same process at both reads, started before the load. A
+    /// copy of the loader, another type, a process started after the load,
+    /// a pid with no process: not proven (the record keeps High).
+    #[test]
+    fn a_known_probe_s_loader_is_proven_by_its_packaged_image() {
+        use common::bpf_prog_class::{PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_TRACEPOINT};
+        let t = tempfile::tempdir().unwrap();
+        let me = std::fs::metadata(t.path()).unwrap().uid();
+        let file = |rel: &str| {
+            let bin = t.path().join(rel);
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, b"\x7fELF").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        let networkd = file("usr/lib/systemd/systemd-networkd");
+        let systemd = file("usr/lib/systemd/systemd");
+        let copy = file("tmp/systemd-networkd");
+        let proc = t.path().join("proc");
+        proc_entry(&proc, 868, &networkd, &[], 772);
+        proc_entry(&proc, 2301, &systemd, &[], 900);
+        proc_entry(&proc, 4242, &copy, &[], 772);
+        let packaged = |p: &str| super::packaged(t.path(), p, me);
+        let s = 1_000_000_000;
+        let read = |p: &Path| crate::state_read::read_state(p).ok();
+        let probe = |pid, ty, at| known_probe(&proc, &packaged, &read, pid, ty, at, 100, 0);
+        assert_eq!(probe(868, PROG_TYPE_KPROBE, 9 * s), Ok(1));
+        assert_eq!(probe(2301, PROG_TYPE_TRACEPOINT, 10 * s), Ok(0));
+        for (pid, ty, at) in [
+            (4242, PROG_TYPE_KPROBE, 9 * s),
+            (868, PROG_TYPE_TRACEPOINT, 9 * s),
+            (868, PROG_TYPE_LSM, 9 * s),
+            (2301, PROG_TYPE_KPROBE, 10 * s),
+            (868, PROG_TYPE_KPROBE, 7 * s),
+            (999, PROG_TYPE_KPROBE, 9 * s),
+        ] {
+            assert!(probe(pid, ty, at).is_err(), "pid {pid} type {ty} at {at}");
+        }
+        // its pid another process's at the second read
+        let reads = std::cell::Cell::new(0);
+        let reused = |p: &Path| {
+            reads.set(reads.get() + 1);
+            let start = if reads.get() == 1 { 772 } else { 905 };
+            p.ends_with("868/stat").then(|| {
+                format!("868 (systemd-network) S 1 868 868 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 {start} 1 1\n")
+            })
+        };
+        assert!(known_probe(
+            &proc,
+            &packaged,
+            &reused,
+            868,
+            PROG_TYPE_KPROBE,
+            9 * s,
+            100,
+            0
+        )
+        .is_err());
+        assert_eq!(reads.get(), 2, "read before and after");
+        // a loader file another user may write is no packaged one
+        std::fs::set_permissions(&networkd, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(probe(868, PROG_TYPE_KPROBE, 9 * s).is_err());
     }
 
     /// Lot 304: a process whose start is not the same at the second read

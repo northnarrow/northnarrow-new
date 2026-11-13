@@ -10382,3 +10382,63 @@ number in parentheses is a lab PR.
     split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
+- **Lot 340 (alpha 1/4) — a benign host's daily records (C14, C17, C23;
+  no level changes).**
+  - What was open (the alpha's observe-only profile on testers' hosts): the
+    records a benign host made every day — logrotate's run (NN-L-FIM-019, a
+    kill, and NN-L-FIM-005 High), rsyslogd's appends after it (FIM-005 High
+    until the new log outgrew the rotated one: found by this lot's lab), a
+    backup's receiver judged with no lineage once it exited, `npm ci` and
+    `go test` raising ENGAGED, R011 High for a clean `modprobe` that exited
+    at once, systemd's BPF feature probes on Ubuntu 26.04 (High, ENGAGED at
+    every boot), CoreDNS acted on as the originator of its pods' names and
+    a resolver's unattributed legs adding up to its own "tunnel".
+  - Done: each benign case told by what the kernel proves — the packaged
+    logrotate (its image's device and inode) forked by PID 1 or started by
+    cron's daily run (Low); a log's size measured against the size the
+    drain last read in that same inode; the open sensor's record carries
+    the writer's unexecuted fork record (`fork_parent::unexecuted_fork`,
+    `OpenRecordRaw` 624 bytes), taught to the lineage before the record's
+    events (`teach_fork`, `kernel_fork_entry`); npm's CLI through its
+    packaged link path, the packaged `go` in its own directories; R011
+    exited + root + the system's tool by name: Medium; a refused
+    `bpf_prog_type` load proven a known system probe's (the packaged
+    loader's device and inode) marked as decoded: Low, no posture, still
+    refused; DNS resolvers by identity (`DnsQuery::known_resolver`: the
+    host's packaged file, or CoreDNS by its container runtime's bundle),
+    their unattributed legs one Medium record each, never their own tunnel.
+    Every attack variant stays judged (the PR's table).
+  - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and ubuntu2604 (7.0.0-43, systemd
+    259), each case before (`main` fd22fe5f) and after (the lot), counted from
+    the signed records. **logrotate** forced as its timer runs it (a unit):
+    2404 FIM-019 High 2 → Low 2 per run and FIM-005 Low 2; 2604 FIM-005
+    High 3 + FIM-019 High 1 → FIM-019 Low 3 per run (a first after-round
+    still High: the image's device compared in two forms, fixed); controls
+    (`dd` appending to btmp from a unit) High both. **rsyslogd**: FIM-005
+    High 2 (2404) after a rotation and at the start → none. **Backups** (a
+    unit's `sh -c 'rsync --inplace'`, 5 runs; only the runs whose burst
+    crossed count): 2404 JUDGED 1 (NN-L-IMP-001 Critical) → VOUCHED 1;
+    2604 JUDGED 2 → VOUCHED 1, JUDGED 1 (the receiver's forker, rsync's
+    generator, unexecuted too: two levels carried since) — the round on
+    the final code pending.
+    **Corpus** (2404; ConfirmedIntrusion raises by step): ci `go test` 1
+    and `npm ci` 1 → 0, dev `go test` 1 and `rsync --inplace` 1 → 0, db
+    `initdb` 1 + `postgres` 2 → 1 + 1 (not this lot's); the other verdicts
+    unchanged (R001 High of `go test`'s binary from /tmp, which still
+    raises ENGAGED by `StagingExec`). **R011**: `modprobe loop` ×20 Low on
+    both kernels before and after (the exited case did not occur). **26.04
+    probes**: user manager restart AT-001 High 1 → Low 1; networkd restart
+    High 2 → Low 1 + High 1; a kprobe load by python3 High
+    both. **Desktop-like** (a terminal under the user manager: vim, sed,
+    git, cargo, npm, venv, tar): 0 records before and after. The guests left
+    clean and off.
+  - Mutations: 52 on the new code in three rounds, 49 caught by named tests
+    (the first round's survivors closed with tests: an unrecorded image, a
+    resolver's legs counted, the probe's second read, a resolver outside a
+    system tree or under another name); one led to a change (a forker that
+    executed only after the fork is read from its own fork record, tested);
+    two argued equivalent (a self-parent fork record
+    yields nothing at the depth cap; npm's link without the node check is
+    gated by `is_npm_cli_writer`'s own).
+  - Level unchanged: the change removes false positives; no capability gains
+    evidence it lacked.

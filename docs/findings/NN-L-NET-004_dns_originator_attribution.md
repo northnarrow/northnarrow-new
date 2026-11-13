@@ -172,3 +172,23 @@ Add the known-resolver **exes** to the kill-protection set (and/or downgrade -00
 5. Unit tests: direct (A) still kills sender; stub (B) attributes to originator + suppresses the resolver verdict; Varlink (C) → `Log`, never kills the resolver; LAN-resolver → `Log`; loopback range + `::1`; stale-window non-correlation.
 
 All of the above is **detect-only / attribution-quality** — no change to true-positive *behaviour* (a real originator is still killed), only to *who* is named. No COMBAT/ladder/enforcement changes.
+
+## Lot 340: the forwarder proven, not named
+
+The forwarder set (`KNOWN_RESOLVER_PROGRAMS`) was matched on the basename of
+the sender's image: a tunnel run as `/tmp/x/dnsmasq` got the forwarder's
+treatment (never killed), and CoreDNS, absent from the list, had its pods'
+names counted as its own. The DNS pump now proves the sender
+(`known_resolver` on `Event::DnsQuery`, `crates/nn-linux/src/net/known_resolver.rs`):
+a name of the list in a root-owned system tree whose image is the host's
+file at that path (device and inode, whatever its mount namespace), or
+`/coredns` in a container its runtime records as the cluster's CoreDNS (the
+OCI bundle's annotations: namespace `kube-system`, container `coredns`, a
+`coredns` image; `process.args[0]` `/coredns`; the bundle root's and
+writable by no one else). NN-L-NET-004/-005/-014 read that proof. A proven
+resolver's leg with no attributable originator is one Medium record and is
+not counted as the resolver's own tunnel (NETR-002's corroboration is one
+process's labels; the resolver relays every process's names), as
+NN-L-NET-005 already counted none of its legs. Pods reach CoreDNS on the
+cluster's DNS address, not a loopback stub: their own queries are judged on
+the pod's process, and CoreDNS's upstream legs are recorded, not acted on.

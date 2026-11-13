@@ -33,7 +33,9 @@ use northnarrow_common::fork_record::{counts_as_lost, on_exec, OnExec, EXECUTOR_
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::InodeKey;
 
-use crate::btf_offsets::{TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
+use crate::btf_offsets::{
+    TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+};
 
 /// One task's fork: the forker's thread-group id, whether an exec used the
 /// record (the re-check 4: kept, not removed, so a later exec is told from a
@@ -142,6 +144,77 @@ pub fn take(task: *const u8, start: u64, dev: u64, ino: u64) -> u32 {
         _ => {}
     }
     outcome.fork_ppid(forker)
+}
+
+/// Lot 340: a process's fork record while it has executed nothing since
+/// its fork: the forker's tgid and the process's own start.
+#[derive(Clone, Copy)]
+pub struct Unexecuted {
+    pub ppid: u32,
+    pub start: u64,
+}
+
+/// Lot 340: the unexecuted fork record of the thread group whose leader is
+/// `leader` — the leader's `FORK_PARENTS` entry, unused, its start the
+/// leader's (an earlier task at the same address is not this one).
+#[inline(always)]
+fn unexecuted_of(leader: *const u8) -> Option<Unexecuted> {
+    if leader.is_null() {
+        return None;
+    }
+    let start =
+        unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }.ok()?;
+    match unsafe { FORK_PARENTS.get(&(leader as u64)) } {
+        Some(rec) if rec.used == 0 && rec.start == start && rec.parent_tgid != 0 => Some(Unexecuted {
+            ppid: rec.parent_tgid,
+            start,
+        }),
+        _ => None,
+    }
+}
+
+/// `task`'s thread-group leader.
+#[inline(always)]
+fn leader_of(task: *const u8) -> *const u8 {
+    if task.is_null() {
+        return core::ptr::null();
+    }
+    unsafe { bpf_probe_read_kernel::<*const u8>(task.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET)) as *const _) }
+        .unwrap_or(core::ptr::null())
+}
+
+/// Lot 340: the current process's fork record when it has executed nothing
+/// since its fork, and its forker's when that one has not either — two
+/// levels: rsync's receiver is a fork of its generator, itself a fork of
+/// rsync (the exec). A thread writing for the process reads its leader's
+/// record (a thread is no fork of its own); the forker is the leader's
+/// `real_parent` only while it still is the recorded forker (a reparented
+/// process's parent is its reaper). `None`: no record (forked before the
+/// agent, evicted, the record not attached), or an exec used it — that
+/// exec's record named the forker. The open sensor carries them in its
+/// record: a writer that never executes has no exec record, and the lineage
+/// read it from `/proc` only, lost once it (or its forker) exited.
+#[inline(always)]
+pub fn unexecuted_forks() -> (Option<Unexecuted>, Option<Unexecuted>) {
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    let leader = leader_of(task);
+    let Some(own) = unexecuted_of(leader) else {
+        return (None, None);
+    };
+    let parent = match unsafe {
+        bpf_probe_read_kernel::<*const u8>(leader.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const _)
+    } {
+        Ok(p) => leader_of(p),
+        Err(_) => core::ptr::null(),
+    };
+    if parent.is_null() {
+        return (Some(own), None);
+    }
+    let tgid = unsafe { bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const _) };
+    if tgid != Ok(own.ppid) {
+        return (Some(own), None);
+    }
+    (Some(own), unexecuted_of(parent))
 }
 
 /// A process the record should hold (started after it was attached) that

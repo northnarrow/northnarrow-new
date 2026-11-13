@@ -639,6 +639,13 @@ const STATICS: &[Kept] = &[
         "the repairs of a vault's index, by the vault's directory (lab PR 258)",
     ),
     kept(
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "COREDNS_PROOFS",
+        PerKey,
+        "lot 340: a process proven the cluster's CoreDNS by its runtime's record, by its pid \
+         and start, kept 60 s (at most 64): a fact of that process, read again after",
+    ),
+    kept(
         "crates/nn-linux/src/net/blind_spots.rs",
         "COUNTERS",
         Telemetry,

@@ -272,8 +272,8 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        10,
-        "FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, twice): stricter \
+        9,
+        "FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, once since lot 340: `names_npm_cli`): stricter \
          than the reader, which would take it after an option; a cgroup name's `-pod` and \
          `-conmon-` (no option) \
          — and `/proc` text fields read by position (`stat`, `mountinfo`, `cgroup`: \

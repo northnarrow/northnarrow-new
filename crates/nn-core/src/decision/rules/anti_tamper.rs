@@ -318,6 +318,16 @@ impl Rule for NnLAt001AntiTamperDenial {
                      program, only through a descriptor of it"
                 )
             }
+            // Lot 340: a known system program's feature probe, its loader
+            // proven by the agent (`nn_linux::known_system_probe`): refused
+            // all the same, Low.
+            FsProtectOperation::BpfProgType
+                if common::bpf_prog_class::known_probe_of(*target_dev, *target_ino).is_some() =>
+            {
+                return Some(known_probe_verdict(
+                    self, event, *pid, comm, *target_dev, *target_ino,
+                ));
+            }
             FsProtectOperation::BpfProgType => {
                 let t = u32::try_from(*target_ino).unwrap_or(u32::MAX);
                 format!(
@@ -391,6 +401,34 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 340: a known system program's feature probe
+/// ([`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`]) — refused by the `bpf`
+/// hook as every load of its type outside a window, recorded Low with the
+/// proof the agent read at the record: the loader runs the packaged file
+/// (its device and inode).
+fn known_probe_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    pid: u32,
+    comm: &str,
+    target_dev: u64,
+    prog_type: u64,
+) -> Verdict {
+    use common::bpf_prog_class::{known_probe_of, prog_type_name, KNOWN_SYSTEM_PROBES};
+    let k = KNOWN_SYSTEM_PROBES[known_probe_of(target_dev, prog_type).unwrap_or(0)];
+    let reasoning = format!(
+        "A known system program's feature probe, refused: `{comm}` (pid {pid}) loaded a `{}` \
+         BPF program (program type {prog_type}), a type the agent's bpf hook refuses outside a \
+         trusted-installer window — {}. The loader proven: it runs the packaged {} (its device \
+         and inode, read by the agent at the record). A probe learns whether the kernel \
+         supports the type and attaches nothing; the refusal stands, recorded Low.",
+        prog_type_name(u32::try_from(prog_type).unwrap_or(u32::MAX)),
+        k.what,
+        k.loader
+    );
+    build_verdict(rule, event, ResponseAction::Log, Severity::Low, &reasoning)
 }
 
 /// Lot 304: a known system program on the root cgroup's `cgroup/sysctl`
@@ -1263,6 +1301,62 @@ mod tests {
             "{}",
             v.reasoning
         );
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): on Ubuntu
+    /// 26.04 the user manager's `tracepoint` probe at the first login and
+    /// networkd's `kprobe` probe at its start were refused and signed High
+    /// at every boot. A record the agent proved a known system probe's
+    /// (`target_dev`: the bit and the entry) is Low, still a refusal; the
+    /// kernel's record (0), a stray marker, the entry's marker on another
+    /// program type, and any other loader keep High.
+    #[test]
+    fn a_proven_known_system_probe_is_low_and_every_other_load_keeps_high() {
+        use common::bpf_prog_class::{
+            known_probe_dev, KNOWN_PROBE_BIT, PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_TRACEPOINT,
+        };
+        let ev = |comm: &str, dev, ty: u32| Event::FsProtectDenial {
+            pid: 868,
+            uid: 998,
+            comm: comm.into(),
+            target_dev: dev,
+            target_ino: u64::from(ty),
+            operation: FsProtectOperation::BpfProgType,
+            timestamp_ns: 1,
+        };
+        let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        for (comm, entry, ty, loader) in [
+            (
+                "systemd",
+                0u16,
+                PROG_TYPE_TRACEPOINT,
+                "/usr/lib/systemd/systemd",
+            ),
+            (
+                "systemd-network",
+                1,
+                PROG_TYPE_KPROBE,
+                "/usr/lib/systemd/systemd-networkd",
+            ),
+        ] {
+            let k = v(ev(comm, known_probe_dev(entry), ty));
+            assert_eq!(
+                (k.action.clone(), k.severity),
+                (ResponseAction::Log, Severity::Low)
+            );
+            for part in ["feature probe, refused", loader, "device and inode"] {
+                assert!(k.reasoning.contains(part), "{part}: {}", k.reasoning);
+            }
+            for dev in [0, KNOWN_PROBE_BIT | 9, known_probe_dev(entry) | (1 << 20)] {
+                let h = v(ev(comm, dev, ty));
+                assert_eq!(h.severity, Severity::High, "dev {dev:#x}");
+                assert!(h.reasoning.contains("refused it"), "{}", h.reasoning);
+            }
+            let h = v(ev(comm, known_probe_dev(entry), PROG_TYPE_LSM));
+            assert_eq!(h.severity, Severity::High);
+        }
+        let h = v(ev("python3", 0, PROG_TYPE_KPROBE));
+        assert_eq!(h.severity, Severity::High);
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load

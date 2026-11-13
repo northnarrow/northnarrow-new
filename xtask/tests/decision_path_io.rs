@@ -272,7 +272,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        25,
+        26,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
          (`seed_from_proc`) and its sweep (`sweep` and its orphans' adoption, \
@@ -288,7 +288,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
          and uid are already a resolver's, not in a judgement; lot 310 (the review of #539): \
          the start's scan reads each running process's image (`seed_image`: \
          `/proc/<pid>/exe`'s link and identity, its directory in the process's root, its \
-         and PID 1's mount namespaces: the re-check of #539, N6), once, off the decision path",
+         and PID 1's mount namespaces: the re-check of #539, N6), once, off the decision path; \
+         lot 340: `ran_host_file`, the device and inode of a packaged program's file at its \
+         path (one `fstat`, the host's root), compared with the image the exec recorded — \
+         read only when a FIM-005/-019 verdict's writer already runs `logrotate`, never a \
+         process's `/proc` image",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

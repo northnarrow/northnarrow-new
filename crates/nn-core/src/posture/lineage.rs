@@ -309,6 +309,13 @@ pub const NODE_EXES: &[&str] = &["/usr/bin/node", "/usr/local/bin/node"];
 /// sole basis for the exemption.
 const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
 
+/// Lot 340: the links to npm's CLI a package installs in a root-owned
+/// system tree — the path a shell runs `npm` by, which the kernel hands
+/// node as `argv[1]` ([`AuthSessionTracker::names_npm_cli`]): the Debian
+/// and Ubuntu `npm` package's and NodeSource's `/usr/bin/npm` (`/bin/npm`
+/// with a merged `/usr`), an upstream archive's `/usr/local/bin/npm`.
+const NPM_CLI_LINKS: &[&str] = &["/usr/bin/npm", "/bin/npm", "/usr/local/bin/npm"];
+
 /// The pid→Entry map's size past which the entries of processes that
 /// have exited (and whose [`EXIT_GRACE`] has passed) are dropped, oldest
 /// first. Review of #475: the map was a FIFO of this size, so 2,048 execs
@@ -828,7 +835,27 @@ struct InnerState {
     /// unlinked since (not entered): pid → (its start, the image's
     /// identity), at most [`TRACKER_CAP`]; a later exec of the pid drops it.
     seeded_images: HashMap<u32, (u64, (u64, u64))>,
+    /// Lot 340: the kernel's fork records of writers that executed nothing
+    /// since their fork ([`AuthSessionTracker::ingest_kernel_fork`]), at most
+    /// [`KERNEL_FORKS_CAP`], oldest dropped first.
+    kernel_forks: HashMap<u32, KernelFork>,
+    kernel_fork_order: VecDeque<u32>,
 }
+
+/// Lot 340: a process the kernel recorded forked by `parent` at `start_ns`
+/// and seen, at `seen_ns`, still running what it was forked with (no exec
+/// since): the open sensor's record of its write carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KernelFork {
+    start_ns: u64,
+    parent: u32,
+    uid: u32,
+    seen_ns: u64,
+}
+
+/// Lot 340: kernel fork records kept (the writers that never executed: a
+/// backup's receivers, workers). Each costs 32 bytes.
+const KERNEL_FORKS_CAP: usize = 4096;
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
 /// `exec`, an interpreter re-executing, a `dpkg` run after the event).
@@ -1007,6 +1034,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     by_uid: HashMap::new(),
                     by_uid_len: 0,
                     seeded_images: HashMap::new(),
+                    kernel_forks: HashMap::new(),
+                    kernel_fork_order: VecDeque::new(),
                 }),
                 proc_root,
                 live,
@@ -1138,7 +1167,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             && (exe.dev, exe.ino) != (0, 0))
             .then_some((exe.dev, exe.ino));
         let path = exe.path_or(filename);
-        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let argv_npm_cli = self.names_npm_cli(Path::new(path), argv);
         let runs = with_pump_facts(
             runs_of(Path::new(path), argv),
             Path::new(path),
@@ -1178,7 +1207,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         start_ns: u64,
         uid: u32,
     ) {
-        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let argv_npm_cli = self.names_npm_cli(Path::new(exe), argv);
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
             pid,
@@ -1191,6 +1220,108 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             uid,
             (None, 0),
         );
+    }
+
+    /// Lot 340 (the alpha's daily false positives): the kernel's fork
+    /// record of `pid` — forked by `parent` at `start_ns` (the task's start,
+    /// `CLOCK_MONOTONIC`), run by `uid`, seen at `seen_ns` still running what
+    /// it was forked with — as the open sensor's record of a write carries
+    /// it (`OpenRecordRaw::fork_ppid`, from lot 310's `fork_parent_record`).
+    /// A writer that never executes (a backup's receiver: `rsync` forks it)
+    /// has no exec record; its lineage was read from `/proc`
+    /// ([`Self::fork_entry`]) and lost once it exited, so a burst judged
+    /// after its exit was a writer of unknown lineage (lot 310's lab: 4 of 5
+    /// unit backups judged). With the record, the walk reads it as its
+    /// forker's copy, as of its start, whether it runs still or not. The
+    /// pump ingests it before it sends the write's events: no event of the
+    /// write is judged without it.
+    pub fn ingest_kernel_fork(&self, pid: u32, start_ns: u64, parent: u32, uid: u32, seen_ns: u64) {
+        if pid <= 1 || parent == 0 || parent == pid || start_ns == 0 {
+            return;
+        }
+        let rec = KernelFork {
+            start_ns,
+            parent,
+            uid,
+            seen_ns,
+        };
+        let mut s = self.inner.state.write();
+        if let Some(k) = s.kernel_forks.get_mut(&pid) {
+            if (k.start_ns, k.parent) == (start_ns, parent) {
+                k.seen_ns = k.seen_ns.max(seen_ns);
+            } else {
+                // the pid of an earlier process: this record replaces it
+                *k = rec;
+            }
+            return;
+        }
+        s.kernel_forks.insert(pid, rec);
+        s.kernel_fork_order.push_back(pid);
+        while s.kernel_fork_order.len() > KERNEL_FORKS_CAP {
+            if let Some(old) = s.kernel_fork_order.pop_front() {
+                s.kernel_forks.remove(&old);
+            }
+        }
+    }
+
+    /// Lot 340: [`Self::fork_entry`] from the kernel's fork record of `pid`
+    /// ([`Self::ingest_kernel_fork`]) — its forker's exec as of its start
+    /// (the image it was forked with), the forker read the same way when it
+    /// never executed either — when the record describes the process the
+    /// pid named at `at`: started by then, and seen running its fork's image
+    /// no earlier than then (later, it may have executed: an exec event
+    /// would answer). A forker that executed only after the fork is read
+    /// from its own fork record alone. `None` without one, and without a time: the sweep
+    /// enters the processes running now from `/proc`, where a pid the
+    /// recorded writer left may name another process.
+    fn kernel_fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
+        let t = at?;
+        if depth > LINEAGE_DEPTH_CAP {
+            return None;
+        }
+        let k = self.inner.state.read().kernel_forks.get(&pid).copied()?;
+        if t < k.start_ns || t > k.seen_ns {
+            return None;
+        }
+        let parent = match self.cached_live(k.parent, Some(k.start_ns)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::Absent => self.fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
+            // the forker executed only later: what it ran at the fork is its
+            // own fork record's, if the kernel gave one (never `/proc`, which
+            // shows the later image)
+            CachedAt::LaterOnly => self.kernel_fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
+        };
+        Some(Entry {
+            ppid: k.parent,
+            exe: parent.exe,
+            spawn_ns: k.start_ns,
+            start_ns: k.start_ns,
+            // npm's own CLI is the process its exec named, never a fork of it
+            argv_npm_cli: false,
+            runs: parent.runs,
+            start_ticks: None,
+            uid: k.uid,
+            image: parent.image,
+            fork_parent: k.parent,
+        })
+    }
+
+    /// FP-2: `argv[1]` names npm's CLI ([`NPM_CLI_SUFFIX`]). Lot 340 (the
+    /// alpha's daily false positives): or, for a node of [`NODE_EXES`]
+    /// (`exe`), the link a package installs for it ([`NPM_CLI_LINKS`]). A
+    /// shell runs `npm` as `/usr/bin/npm`, a link to
+    /// `../share/nodejs/npm/bin/npm-cli.js` (Ubuntu, Debian; NodeSource's to
+    /// `../lib/node_modules/npm/bin/npm-cli.js`); the kernel hands the
+    /// shebang's interpreter the path it was asked to execute, so node's
+    /// `argv[1]` is `/usr/bin/npm`, and `npm ci` was never npm's CLI to the
+    /// mass-write arm (lot 313's ci corpus: ConfirmedIntrusion → ENGAGED).
+    /// The link's path, root's, is judged as the suffix is — what node runs
+    /// is the file there — with no read on the decision path.
+    fn names_npm_cli(&self, exe: &Path, argv: &[String]) -> bool {
+        argv.get(1).is_some_and(|script| {
+            script.ends_with(NPM_CLI_SUFFIX)
+                || (is_node_exe(exe) && NPM_CLI_LINKS.contains(&script.as_str()))
+        })
     }
 
     /// Review of #475 (R-F): enter every process running now into the
@@ -1745,6 +1876,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid <= 1 || depth > LINEAGE_DEPTH_CAP {
             return None;
         }
+        // lot 340: the kernel's record of the fork first — it holds once
+        // the process has exited, `/proc` does not
+        if let Some(e) = self.kernel_fork_entry(pid, at, depth) {
+            return Some(e);
+        }
         let (ppid, ticks) = self.proc_parent_and_start(pid)?;
         if ppid == 0 || ppid == pid {
             return None;
@@ -2200,6 +2336,25 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
     }
 
+    /// Lot 340: `pid` ran, as of `as_of`, the host's file at `path` — the
+    /// image its exec recorded (device and inode, [`Self::exec_image`]: the
+    /// LSM program's, or the exec pump's in tracepoint mode; the device in
+    /// the kernel's form, `MKDEV`) is the file at `path` under the host's
+    /// root now (one `fstat`, its `st_dev` put in the kernel's form: the
+    /// lab found the two forms compared). A copy of the
+    /// program, a file replaced at the path since, another mount
+    /// namespace's file at that path, an exec whose image was not recorded
+    /// (a process older than the agent): `false`. Never the process's
+    /// `/proc` image in a judgement (R-F).
+    pub fn ran_host_file(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        let Some(image) = self.exec_image(pid, as_of) else {
+            return false;
+        };
+        H::file_id(self.inner.host_root.join(path.trim_start_matches('/')))
+            .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
+            == Some(image)
+    }
+
     /// Lab PR 175: `pid` runs in a mount namespace other than init's whose
     /// root mount (the last `/` of its `mountinfo`) is an overlay with its
     /// `upperdir` and `workdir` in the container storage of `users`; that
@@ -2485,6 +2640,32 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) | CachedAt::Past(e) => e.argv_npm_cli && is_node_exe(&e.exe),
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
+    /// Lot 340 (the alpha's daily false positives): `pid` is the Go
+    /// toolchain's own `go` command — a binary ([`is_go_toolchain`]) in a
+    /// root-owned system tree, run as itself (no interpreter) — and `path`
+    /// lies in one of its own directories ([`in_go_own_dir`]): the build's
+    /// work directory (`$TMPDIR/go-build<digits>/`), the build cache
+    /// (`…/.cache/go-build/`) or the module cache (`…/go/pkg/mod/`). `go
+    /// test` rewrites its packages' archives in place in its work directory
+    /// to stamp their build ids (lot 313's ci corpus: 20 existing files
+    /// rewritten, ConfirmedIntrusion → ENGAGED). A DIRECT check of the
+    /// writer, like [`Self::is_npm_cli_writer`]: what `go` runs (a test
+    /// binary, `go run`'s program, `go generate`'s commands, a
+    /// `-toolexec` program) is another process, judged on its own; a
+    /// toolchain `go` downloaded into a home (`GOTOOLCHAIN`) is not one.
+    /// Cache-only (the exec seen), `false` otherwise.
+    pub fn is_go_toolchain_own_write(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        if pid <= 1 || !in_go_own_dir(path) {
+            return false;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.runs == Runs::Inline && is_go_toolchain(&e.exe)
+            }
             CachedAt::LaterOnly | CachedAt::Absent => false,
         }
     }
@@ -3357,6 +3538,50 @@ fn is_elevation_binary(exe: &Path) -> bool {
 /// ([`NODE_EXES`]). Same kernel-resolved-exe, never-`comm` keying as
 /// [`is_system_daemon_binary`]. Gates [`AuthSessionTracker::is_npm_cli_writer`]
 /// so a process-controlled argv is never the sole basis for the exemption.
+/// Lot 340: the Go toolchain's `go` command at a distribution's or the
+/// upstream archive's place, in a root-owned system tree: `/usr/lib/go/bin/go`,
+/// `/usr/lib/go-<version>/bin/go` (Debian, Ubuntu), `/usr/local/go/bin/go`,
+/// `/snap/go/<revision>/bin/go`.
+fn is_go_toolchain(exe: &Path) -> bool {
+    let e = exe.to_string_lossy();
+    if !in_system_tree(&e) {
+        return false;
+    }
+    if matches!(e.as_ref(), "/usr/lib/go/bin/go" | "/usr/local/go/bin/go") {
+        return true;
+    }
+    let versioned = e
+        .strip_prefix("/usr/lib/go-")
+        .and_then(|r| r.strip_suffix("/bin/go"))
+        .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+    let snap = e
+        .strip_prefix("/snap/go/")
+        .and_then(|r| r.strip_suffix("/bin/go"))
+        .is_some_and(|rev| !rev.is_empty() && !rev.contains('/'));
+    versioned || snap
+}
+
+/// Lot 340: `path` (absolute, no `..`) lies in one of the Go toolchain's own
+/// directories: a build's work directory (a segment `go-build` followed by
+/// digits: `$TMPDIR/go-build4098838642/b031/_pkg_.a`), the build cache (a
+/// `go-build` directory under `.cache`: `~/.cache/go-build/`) or the module
+/// cache (`…/go/pkg/mod/`). The whole path is judged, every segment.
+fn in_go_own_dir(path: &str) -> bool {
+    if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs = &segs[..segs.len().saturating_sub(1)];
+    dirs.iter().enumerate().any(|(i, s)| {
+        let work = s
+            .strip_prefix("go-build")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        let cache = *s == "go-build" && i > 0 && dirs[i - 1] == ".cache";
+        let modcache = *s == "mod" && i >= 2 && dirs[i - 1] == "pkg" && dirs[i - 2] == "go";
+        work || cache || modcache
+    })
+}
+
 fn is_node_exe(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     NODE_EXES.iter().any(|p| s == *p)

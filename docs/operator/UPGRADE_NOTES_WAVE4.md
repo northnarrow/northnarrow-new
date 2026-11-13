@@ -1736,3 +1736,57 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
   the degradation `execpol_capacity` while it lasts.
 
+
+## 34. A benign host's daily records (lot 340)
+
+What a benign host produced every day — and what an operator who reads the
+records after the upgrade will see instead. The attack variants beside each
+are judged as before; `CHANGELOG.md` has the detail.
+
+- **logrotate's daily run**: NN-L-FIM-005 and NN-L-FIM-019 records of a
+  write by the packaged `/usr/sbin/logrotate` that PID 1 forked (the
+  timer's `logrotate.service`) or cron's daily run started are **Low** and
+  never acted on (NN-L-FIM-019 killed). Run by hand from a session, a copy
+  of logrotate, any other writer of wtmp or btmp: as before. A root that
+  rotates btmp away with its own configuration under `systemd-run` leaves a
+  Low record.
+- **rsyslogd after a rotation, and at the start**: its appends no longer
+  read as truncations (NN-L-FIM-005 High until the file outgrew the rotated
+  one; the first append after the agent's start, before the baseline was
+  read). **What changed in the record**: a FIM event's `baseline_size` is
+  the size of that file when the agent last read it, else when it was
+  watched (else the path's baseline, as before).
+- **A key store's directory listed** (`find /`, plocate's daily
+  `updatedb`): no NN-L-FIM-015/016/017 verdict any more; opening a file of
+  the store is judged as before.
+- **Backups**: the writer that never executes (rsync's receiver) is judged
+  on its forker's lineage from the kernel's fork record, after it exited
+  too (and its forker's, when that one never executed either: rsync's
+  generator): a unit's `sh -c 'rsync …'` is vouched for by the unit. The
+  open sensor's ring record grew to 632 bytes (an agent and its eBPF object are
+  one build; nothing to do).
+- **`npm ci` / `go test`** do not raise ENGAGED any more: npm's CLI run
+  through `/usr/bin/npm` (the package's link), and the packaged `go`
+  command writing in its work directory (`$TMPDIR/go-build<digits>/`), its
+  build cache or its module cache. A `go` in a home (`GOTOOLCHAIN`), what
+  `go` runs, and node running any other script still count.
+- **R011**: root's `modprobe <name>` of the system's tool that exited
+  before its environment was read is **Medium** (was High).
+- **Ubuntu 26.04**: the user manager's and networkd's BPF feature probes are
+  still refused, now recorded **Low** (NN-L-AT-001, "A known system
+  program's feature probe, refused"), and the posture no longer goes
+  ENGAGED for them at every boot. The proof is the loader's image: the
+  packaged `/usr/lib/systemd/systemd` (a `tracepoint` probe) or
+  `/usr/lib/systemd/systemd-networkd` (a `kprobe` probe), device and
+  inode.
+- **DNS resolvers**: NN-L-NET-004/-005/-014 treat a sender as a resolver
+  only when the agent proves it — the host's packaged resolver at its path
+  (device and inode), or Kubernetes' CoreDNS as containerd, k3s'
+  containerd or CRI-O record it (`kube-system`, a `coredns` image,
+  `/coredns`). **What to check after the upgrade**: a resolver installed
+  outside the system trees (`/usr/local/sbin/unbound`, `/opt/…`) is now
+  judged as any process — its forwarded legs count against it, and a
+  tunnel's worth of hash-shaped names under one zone kills it. A known
+  resolver's legs that cannot be traced to the process that asked stay one
+  Medium record each and are no longer a High "tunnel" of the resolver. The
+  `DnsQuery` event gained `known_resolver` (absent when false).

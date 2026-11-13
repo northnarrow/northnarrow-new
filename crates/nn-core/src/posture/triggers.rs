@@ -835,9 +835,16 @@ impl<H: DecisionHost> TriggerDetector<H> {
             pid,
             operation,
             timestamp_ns,
+            target_dev,
+            target_ino,
             ..
         } = event
         {
+            // Lot 340: nor a known system program's feature probe, its
+            // loader proven (the user manager's, networkd's): refused and
+            // signed Low — every boot of Ubuntu 26.04 raised ENGAGED with it.
+            let known_probe = *operation == nn_model::FsProtectOperation::BpfProgType
+                && common::bpf_prog_class::known_probe_of(*target_dev, *target_ino).is_some();
             // Lot 280a: nor a write the signed per-sysctl opt-out let
             // through (`SysctlOptOut`): recorded, the operator's tuning.
             // Lot 280b: nor what the kernel-state round found (a new
@@ -849,7 +856,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 290: nor a load the signed per-loader opt-out let through,
             // nor the cross-view's findings (a program the hook never saw,
             // the start's baseline): signed, no refusal.
-            if !matches!(
+            if known_probe {
+                // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
+            } else if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
                     | nn_model::FsProtectOperation::SysctlOptOut
@@ -2056,7 +2065,9 @@ fn own_data_exempt<H: DecisionHost>(
 /// The mass-write arm's writers (review 49 (ii), FP-2): a package
 /// transaction's ([`AuthSessionTracker::in_package_transaction`]), mandb's
 /// own as a system account (its cache rebuild,
-/// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own,
+/// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own
+/// (lot 340: also run through `/usr/bin/npm`), the Go toolchain's in its own
+/// directories (lot 340, [`AuthSessionTracker::is_go_toolchain_own_write`]),
 /// and a user's package manager in that user's container storage —
 /// `Some` with which, `None` for any other writer.
 ///
@@ -2092,6 +2103,9 @@ fn mass_write_exempt<H: PostureHost>(
         Some("man-db cache rebuild")
     } else if auth.is_npm_cli_writer(pid, as_of) {
         Some("npm CLI")
+    } else if auth.is_go_toolchain_own_write(pid, as_of, path) {
+        // lot 340: `go test` stamping its archives' build ids in place
+        Some("the Go toolchain in its own work, build-cache or module-cache directory")
     } else if auth.is_user_container_storage_write(pid, as_of, path, path_from_user) {
         Some("a user's package manager in their container storage")
     } else {
@@ -2451,6 +2465,7 @@ pub mod testutil {
             family: 2,
             timestamp_ns: ts,
             qname_partial: false,
+            known_resolver: false,
         }
     }
 
@@ -4573,6 +4588,195 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "node running a non-npm script must still fire, got {hits:?}"
         );
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): a refused
+    /// load of a `kprobe`/`tracepoint` program raised DefenseImpairment
+    /// (ENGAGED) — on Ubuntu 26.04 at every boot, for networkd's and the
+    /// user manager's feature probes. A record the agent proved a known
+    /// system probe's raises nothing; the kernel's own record of the same
+    /// refusal (any other loader) still raises DefenseImpairment.
+    #[test]
+    fn a_proven_known_system_probe_raises_no_posture() {
+        use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_KPROBE, PROG_TYPE_TRACEPOINT};
+        let refused = |pid: u32, dev: u64, ty: u32| Event::FsProtectDenial {
+            pid,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: dev,
+            target_ino: u64::from(ty),
+            operation: nn_model::FsProtectOperation::BpfProgType,
+            timestamp_ns: 10,
+        };
+        let det = detector_with_empty_proc();
+        for (dev, ty) in [
+            (known_probe_dev(1), PROG_TYPE_KPROBE),
+            (known_probe_dev(0), PROG_TYPE_TRACEPOINT),
+        ] {
+            let hits = det.detect(&refused(868, dev, ty), &[]);
+            assert!(hits.is_empty(), "{hits:?}");
+        }
+        for (dev, ty) in [
+            (0, PROG_TYPE_KPROBE),
+            (known_probe_dev(1), PROG_TYPE_TRACEPOINT),
+            (0, PROG_TYPE_TRACEPOINT),
+        ] {
+            let hits = det.detect(&refused(4242, dev, ty), &[]);
+            assert!(
+                hits.contains(&TriggerType::DefenseImpairment),
+                "{dev:#x}: {hits:?}"
+            );
+        }
+    }
+
+    // ── lot 340 — npm and the Go toolchain in their own directories ──
+
+    /// A detector for npm's cases (lot 340: npm's links are judged by their
+    /// path, nothing is read).
+    fn detector_with_npm_links() -> TriggerDetector {
+        detector_with_empty_proc()
+    }
+
+    /// A kernel crossing of `pid` whose crossing file is `path`.
+    fn mass_write_at(pid: u32, path: &str, overwrites: bool, small: bool, ts: u64) -> Event {
+        let mut e = mass_write_in(pid, 0, overwrites, small, ts);
+        if let Event::MassWrite { filename, .. } = &mut e {
+            *filename = path.into();
+        }
+        e
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): `npm ci`
+    /// run by a CI runner (no session) deletes `node_modules` and extracts
+    /// it again — a replacement crossing — and npm run from `PATH` is node
+    /// with `argv[1]` = `/usr/bin/npm`, the link the package installed (the
+    /// kernel hands the shebang's interpreter the path it executed). On
+    /// `main` it was not npm's CLI to the arm: ConfirmedIntrusion → ENGAGED
+    /// (lot 313's ci corpus). Through the packaged link it is.
+    #[test]
+    fn npm_ci_run_through_the_packaged_npm_link_does_not_raise_the_posture() {
+        for script in ["/usr/bin/npm", "/usr/local/bin/npm", "/bin/npm"] {
+            let det = detector_with_npm_links();
+            let _ = det.detect(
+                &spawn_with_argv(7300, 1, "/usr/bin/node", &["node", script, "ci"], 1),
+                &[],
+            );
+            let w = "/srv/ci/web/node_modules/@types/lodash/assign.d.ts";
+            let _ = det.detect(&mass_write_at(7300, w, false, false, 10), &[]);
+            let hits = det.detect(&destroyed(7300, 11), &[]);
+            assert!(
+                !hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{script}: npm ci's replacement must not raise the posture: {hits:?}"
+            );
+        }
+    }
+
+    /// Lot 340: what is not npm's packaged link keeps the arm — another
+    /// name beside it, `npm` in a home or in `/tmp`, a relative `npm`, an
+    /// interpreter that is not node, a node outside the system's; and npm's
+    /// own children are judged as before
+    /// ([`mass_write_intact_for_npm_child_process`]).
+    #[test]
+    fn a_path_that_is_not_the_packaged_npm_link_keeps_the_mass_write_arm() {
+        for (pid, exe, script) in [
+            (7400, "/usr/bin/node", "/usr/bin/npm-evil"),
+            (7401, "/usr/bin/node", "/tmp/x/npm"),
+            (7402, "/usr/bin/node", "/home/u/npm"),
+            (7403, "/usr/bin/python3.12", "/usr/bin/npm"),
+            (7404, "/usr/bin/node", "npm"),
+            (7405, "/home/u/.nvm/node", "/usr/bin/npm"),
+            (7406, "/usr/bin/node", "/usr/bin/../../tmp/npm"),
+        ] {
+            let det = detector_with_npm_links();
+            let _ = det.detect(
+                &spawn_with_argv(pid, 1, exe, &["node", script, "ci"], 1),
+                &[],
+            );
+            let _ = det.detect(&mass_write(pid, false, 10), &[]);
+            let hits = det.detect(&destroyed(pid, 11), &[]);
+            assert!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{exe} {script}: {hits:?}"
+            );
+        }
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): `go test`
+    /// rewrites its packages' archives in place in its work directory to
+    /// stamp their build ids — 20 existing files, some under 4 KiB, from a
+    /// CI runner: ConfirmedIntrusion → ENGAGED on `main` (lot 313's ci
+    /// corpus, and the dev corpus' larger ones inside a session). The
+    /// packaged toolchain's `go` in its own work, build-cache or
+    /// module-cache directory does not raise the posture.
+    #[test]
+    fn go_test_rewriting_its_archives_in_its_own_directories_does_not_raise_the_posture() {
+        for (exe, path) in [
+            (
+                "/usr/lib/go-1.22/bin/go",
+                "/tmp/go-build4098838642/b031/_pkg_.a",
+            ),
+            ("/usr/lib/go/bin/go", "/var/tmp/go-build77/b001/_pkg_.a"),
+            ("/usr/local/go/bin/go", "/home/u/.cache/go-build/3f/3f9a-d"),
+            (
+                "/snap/go/10730/bin/go",
+                "/home/u/go/pkg/mod/cache/download/x.zip",
+            ),
+        ] {
+            for (overwrites, small) in [(true, true), (true, false)] {
+                let det = detector_with_empty_proc();
+                let _ = det.detect(&spawn_with_exe(7500, 1, exe, 1), &[]);
+                let hits = det.detect(&mass_write_at(7500, path, overwrites, small, 10), &[]);
+                assert!(
+                    !hits.contains(&TriggerType::ConfirmedIntrusion),
+                    "{exe} {path}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    /// Lot 340: the same rewrites keep the arm when the writer is not the
+    /// toolchain's `go` — the test binary it built, a `go` in a home
+    /// (`GOTOOLCHAIN`) or in `/tmp`, another binary in the toolchain's
+    /// tree — or when the file is not in its directories (a document, a
+    /// `go-build` without its digits, a `..` out of one).
+    #[test]
+    fn rewrites_outside_the_go_toolchain_s_own_directories_keep_the_mass_write_arm() {
+        for (exe, path) in [
+            ("/usr/lib/go-1.22/bin/go", "/home/u/docs/report.docx"),
+            ("/usr/lib/go-1.22/bin/go", "/tmp/go-build/b031/_pkg_.a"),
+            ("/usr/lib/go-1.22/bin/go", "/tmp/go-buildx1/b031/_pkg_.a"),
+            (
+                "/usr/lib/go-1.22/bin/go",
+                "/tmp/go-build123/../../home/u/docs/a.docx",
+            ),
+            ("/usr/lib/go-1.22/bin/go", "/home/u/go-build/x.docx"),
+            ("/usr/lib/go-1.22/bin/go", "/tmp/go-build123"),
+            ("/tmp/go-build123/b001/calc.test", "/tmp/go-build123/b001/x"),
+            (
+                "/home/u/go/pkg/mod/golang.org/toolchain@v0.0.1/bin/go",
+                "/tmp/go-build1/b/x.a",
+            ),
+            ("/tmp/go", "/tmp/go-build1/b/x.a"),
+            ("/usr/lib/go-1.22/bin/gofmt", "/tmp/go-build1/b/x.a"),
+            ("/usr/lib/go-/bin/go", "/tmp/go-build1/b/x.a"),
+            ("/usr/lib/go-x1/bin/go", "/tmp/go-build1/b/x.a"),
+            ("/snap/go//bin/go", "/tmp/go-build1/b/x.a"),
+            ("/snap/go/1/x/bin/go", "/tmp/go-build1/b/x.a"),
+            ("/usr/lib/go-1.22/bin/go", "/srv/pkg/mod/x.a"),
+            ("/usr/lib/go-1.22/bin/go", "/home/u/go-build/x.a"),
+            (
+                "/usr/lib/go-1.22/pkg/tool/linux_amd64/compile",
+                "/tmp/go-build1/b/x.a",
+            ),
+        ] {
+            let det = detector_with_empty_proc();
+            let _ = det.detect(&spawn_with_exe(7600, 1, exe, 1), &[]);
+            let hits = det.detect(&mass_write_at(7600, path, true, false, 10), &[]);
+            assert!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{exe} {path}: {hits:?}"
+            );
+        }
     }
 
     #[test]

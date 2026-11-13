@@ -408,6 +408,79 @@ pub const fn root_prog_known_of(target_dev: u64) -> Option<(usize, bool, u32)> {
     ))
 }
 
+/// Lot 340 (the alpha's daily false positives): a feature probe a packaged
+/// system program makes at its start — a program of a type the agent's
+/// `bpf` hook refuses outside a trusted-installer window, loaded to learn
+/// whether the kernel supports it and never attached. Refused all the same;
+/// the record is Low and raises no posture when its loader is proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownSystemProbe {
+    /// The packaged executable that makes the probe.
+    pub loader: &'static str,
+    /// The program type it loads.
+    pub prog_type: u32,
+    /// What it is, for the record.
+    pub what: &'static str,
+}
+
+/// Lot 340: the known system feature probes, measured on Ubuntu 26.04
+/// (systemd 259.5, kernel 7.0; lot 304's lab): the user manager (`systemd
+/// --user`, uid 1000) loads a `tracepoint` program at the user's first
+/// login, systemd-networkd a `kprobe` program when it starts (libbpf's
+/// feature probes) — each refused and signed High (NN-L-AT-001,
+/// `bpf_prog_type`), raising ENGAGED every boot. Debian 13 (systemd 257)
+/// makes neither.
+pub const KNOWN_SYSTEM_PROBES: [KnownSystemProbe; 2] = [
+    KnownSystemProbe {
+        loader: "/usr/lib/systemd/systemd",
+        prog_type: PROG_TYPE_TRACEPOINT,
+        what: "a systemd manager's feature probe (the user manager's at the first login)",
+    },
+    KnownSystemProbe {
+        loader: "/usr/lib/systemd/systemd-networkd",
+        prog_type: PROG_TYPE_KPROBE,
+        what: "systemd-networkd's feature probe at its start (libbpf)",
+    },
+];
+
+/// Lot 340: the entry of [`KNOWN_SYSTEM_PROBES`] for a load of `prog_type`
+/// by a process that runs `loader` (its packaged path; the caller proves the
+/// image is that file).
+pub fn known_system_probe(loader: &str, prog_type: u32) -> Option<usize> {
+    KNOWN_SYSTEM_PROBES
+        .iter()
+        .position(|k| k.loader == loader && k.prog_type == prog_type)
+}
+
+/// Lot 340: `target_dev` of a `bpf_prog_type` record whose loader the agent
+/// proved a known system probe's ([`known_probe_dev`]); the kernel's record
+/// carries 0 there.
+pub const KNOWN_PROBE_BIT: u64 = 1 << 63;
+
+/// Lot 340: the `target_dev` of a proven known probe's record: the bit and
+/// the entry of [`KNOWN_SYSTEM_PROBES`] (bits 0–15).
+#[inline(always)]
+pub const fn known_probe_dev(entry: u16) -> u64 {
+    KNOWN_PROBE_BIT | entry as u64
+}
+
+/// Lot 340: the entry of [`KNOWN_SYSTEM_PROBES`] a `bpf_prog_type` record's
+/// `target_dev` names, when the record's program type (`prog_type`, its
+/// `target_ino`) is that entry's; `None` otherwise (the kernel's 0, any
+/// other bit set, an entry not in the table, another type).
+#[inline(always)]
+pub const fn known_probe_of(target_dev: u64, prog_type: u64) -> Option<usize> {
+    let entry = (target_dev & 0xffff) as usize;
+    if target_dev & !(KNOWN_PROBE_BIT | 0xffff) != 0
+        || target_dev & KNOWN_PROBE_BIT == 0
+        || entry >= KNOWN_SYSTEM_PROBES.len()
+        || KNOWN_SYSTEM_PROBES[entry].prog_type as u64 != prog_type
+    {
+        return None;
+    }
+    Some(entry)
+}
+
 /// Length of a program's name in the kernel (`BPF_OBJ_NAME_LEN`).
 pub const OBJ_NAME_LEN: usize = 16;
 /// The bytes of a program's attach function's name an iterator record
@@ -528,6 +601,36 @@ pub fn object_of_comm(comm: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 340: a known probe's record names its entry only with the bit,
+    /// for that entry's program type; the kernel's 0, a stray bit, an
+    /// entry out of the table and another type name none.
+    #[test]
+    fn a_known_probe_s_record_names_its_entry_for_its_type_only() {
+        for (n, k) in KNOWN_SYSTEM_PROBES.iter().enumerate() {
+            let dev = known_probe_dev(n as u16);
+            assert_eq!(known_probe_of(dev, u64::from(k.prog_type)), Some(n));
+            assert_eq!(known_system_probe(k.loader, k.prog_type), Some(n));
+            assert_eq!(known_probe_of(dev, u64::from(PROG_TYPE_LSM)), None);
+            assert_eq!(
+                known_probe_of(dev | (1 << 40), u64::from(k.prog_type)),
+                None
+            );
+        }
+        assert_eq!(known_probe_of(0, u64::from(PROG_TYPE_KPROBE)), None);
+        assert_eq!(
+            known_probe_of(KNOWN_PROBE_BIT | 7, u64::from(PROG_TYPE_KPROBE)),
+            None
+        );
+        assert_eq!(
+            known_system_probe("/usr/lib/systemd/systemd-networkd", PROG_TYPE_LSM),
+            None
+        );
+        assert_eq!(
+            known_system_probe("/tmp/systemd-networkd", PROG_TYPE_KPROBE),
+            None
+        );
+    }
 
     const UAPI_HEADER: &str = "/usr/include/linux/bpf.h";
 

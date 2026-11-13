@@ -52,6 +52,9 @@ pub struct FimEvent {
     /// from. `None` when no baseline exists yet (path freshly
     /// watched) or the event carries no baseline. See
     /// [`Self::new_size`]; `#[serde(default)]` for forward-compat.
+    /// Lot 340: the size of this file (this inode) when the drain last
+    /// read it, when it read it before — an append is a growth since then,
+    /// a truncation a shrink — else the path's baseline at the start.
     #[serde(default)]
     pub baseline_size: Option<u64>,
     /// `/proc/<pid>/exe` of the modifying process if resolvable

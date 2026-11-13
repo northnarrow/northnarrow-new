@@ -2558,3 +2558,31 @@ PID 1 included.
   (`sysctl_root_attach`, High, ENGAGED): it runs without its sysctl monitor
   until it is restarted inside a window, or at the next boot.
 
+
+## Lot 340 — the known system probes: refused, recorded Low by their loader
+
+**Goal.** On Ubuntu 26.04 (systemd 259) two systemd programs make a BPF
+feature probe of a type the `bpf` hook refuses outside a window: the user
+manager (`systemd --user`) a `tracepoint` program at the user's first login,
+systemd-networkd a `kprobe` program when it starts (lot 304's lab). Each was
+refused, signed High (NN-L-AT-001, `bpf_prog_type`) and raised ENGAGED at
+every boot. A probe attaches nothing; the refusal costs systemd nothing.
+
+**The criterion** (`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`,
+`crates/nn-linux/src/known_system_prog.rs::known_probe`). As the record is
+decoded (the fs_protect pump, before the posture or the rule reads it), the
+refused load is a known system probe only when the program type is an
+entry's and the loader process runs that entry's packaged executable —
+`/proc/<pid>/exe` has the device and the inode of
+`/usr/lib/systemd/systemd` (`tracepoint`) or
+`/usr/lib/systemd/systemd-networkd` (`kprobe`), a regular file owned by root
+and writable by no one else — read twice around the image with the same
+start, a start no later than the load. The record's `target_dev` (0 from the
+kernel) then names the entry; NN-L-AT-001 signs it Low with the proof and
+the posture raises no trigger. **The load is refused all the same**; nothing
+in the kernel changed. Any other loader of the type — a copy of the binary,
+python, bpftool — stays High and raises DefenseImpairment.
+
+**What this trusts**: the packaged loader files (a root that replaced them
+is not told apart) and a loader no one else steers (a debugger attached to
+the user's manager can make it load a program of the type — refused, Low).

@@ -469,6 +469,29 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     (
+        // lot 340: `known_probe_on_host`'s loader's `stat`
+        "crates/nn-linux/src/known_system_prog.rs",
+        "read_state(p)",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "read_state(proc.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        "fs::read(path)",
+        "lot 340: a container runtime's bundle (root's, writable by no one else, checked \
+         first): unreadable, the sender is not proven CoreDNS and is judged as any sender — \
+         never a protection emptied",
+    ),
+    (
         "crates/nn-linux/src/known_system_prog.rs",
         "read_state(pdir.join(\"status\"))",
         PROC,

@@ -1047,6 +1047,7 @@ fn one_lookup_of_a_tunnel_shaped_name_is_one_record() {
         family: 2,
         timestamp_ns: ts_ns,
         qname_partial: false,
+        known_resolver: false,
     };
     let t = 1_000_000_000u64;
     let got: Vec<String> = [(1u16, t), (28, t + 5_000_000), (1, t + 130_000_000)]

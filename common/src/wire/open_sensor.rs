@@ -711,7 +711,8 @@ pub fn cgroup_step(w: &mut OpenCgWindow, add: u32, now: u64) -> u32 {
 }
 
 /// One interesting open. 8-aligned, no implicit padding:
-/// 8·6 + 4·7 + 16 + 2 + 1 + 1 + 512 = 608.
+/// 8·8 + 4·9 + 16 + 2 + 1 + 1 + 512 = 632 (lot 340: 608 before the fork
+/// records).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -730,6 +731,13 @@ pub struct OpenRecordRaw {
     /// written new, originals destroyed — within one cgroup as well as one
     /// process: an encryptor and a separate deleter.
     pub cgroup: u64,
+    /// Lot 340: the writer's start (`task_struct.start_time` of its thread
+    /// group's leader, `CLOCK_MONOTONIC` ns) when [`Self::fork_ppid`] is
+    /// set; 0 otherwise.
+    pub fork_start: u64,
+    /// Lot 340: the forker's start when [`Self::fork_pppid`] is set (its
+    /// own unexecuted fork record); 0 otherwise.
+    pub fork_parent_start: u64,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
@@ -742,6 +750,17 @@ pub struct OpenRecordRaw {
     /// Write-opens in the window when `reason` has `MASS_WRITE` or
     /// `MASS_OVERWRITE`.
     pub count: u32,
+    /// Lot 340: the thread group that forked the writer, from the kernel's
+    /// fork record (`agent-ebpf/src/fork_parent.rs`, lot 310), when the
+    /// writer has executed nothing since that fork — a backup's receiver
+    /// (`rsync`'s fork), a worker; its exec record names no lineage for it.
+    /// 0: not known, or the writer executed since (its exec record names
+    /// its fork parent).
+    pub fork_ppid: u32,
+    /// Lot 340: the thread group that forked the forker, when the forker
+    /// too has executed nothing since its fork (rsync's receiver is a fork
+    /// of its generator, a fork of rsync); 0: not known, or it executed.
+    pub fork_pppid: u32,
     pub comm: [u8; TASK_COMM_LEN],
     pub path_n: u16,
     pub path_truncated: u8,
@@ -1105,7 +1124,9 @@ mod tests {
 
     #[test]
     fn open_sensor_layouts() {
-        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 608);
+        // lot 340: + the fork records (fork_start, fork_parent_start,
+        // fork_ppid, fork_pppid)
+        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 632);
         assert_eq!(core::mem::align_of::<OpenRecordRaw>(), 8);
         assert_eq!(core::mem::size_of::<ChildRuleKey>(), 48);
         assert_eq!(core::mem::size_of::<DirClass>(), 16);
