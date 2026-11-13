@@ -100,6 +100,7 @@ command -v bpftrace >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get in
 if command -v bpftrace >/dev/null; then
     n0=$(lines "$DET")
     o=$(sudo timeout 30 bpftrace -e 'tracepoint:syscalls:sys_enter_openat { @opens = count(); } interval:s:1 { exit(); }' </dev/null 2>&1); rc=$?
+    echo "    bpftrace rc $rc: $(echo "$o" | grep -v '^$' | head -4 | tr '\n' ' ' | cut -c1-240)"
     [[ $rc -eq 0 && $o == *@opens* ]]; expect_load "H2 bpftrace" "$(command -v bpftrace)" $? "rc $rc $(echo "$o" | tail -2 | tr '\n' ' ')"
     sleep 2
     measure "H2 records: bpf_prog_type $(count "$n0" bpf_prog_type), bpf_prog_opt_out $(count "$n0" bpf_prog_opt_out)"
