@@ -83,7 +83,8 @@ PY=$(command -v python3)
 n0=$(lines "$DET")
 for t in tracepoint kprobe; do
     o=$(sudo $PROBE load-kprobe-write-user --type "$t" --name "k341_hd_${t:0:5}")
-    [[ $o == OK* ]]; expect_load "H1 $t" "$PY" $? "$o"
+    [[ $o == OK* ]]; ran=$?
+    expect_load "H1 $t" "$PY" "$ran" "$o"
     sleep 1.2
 done
 sleep 3
@@ -101,7 +102,8 @@ if command -v bpftrace >/dev/null; then
     n0=$(lines "$DET")
     o=$(sudo timeout 30 bpftrace -e 'tracepoint:syscalls:sys_enter_openat { @opens = count(); } interval:s:1 { exit(); }' </dev/null 2>&1); rc=$?
     echo "    bpftrace rc $rc: $(echo "$o" | grep -v '^$' | head -4 | tr '\n' ' ' | cut -c1-240)"
-    [[ $rc -eq 0 && $o == *@opens* ]]; expect_load "H2 bpftrace" "$(command -v bpftrace)" $? "rc $rc $(echo "$o" | tail -2 | tr '\n' ' ')"
+    [[ $rc -eq 0 && $o == *@opens* ]]; ran=$?
+    expect_load "H2 bpftrace" "$(command -v bpftrace)" "$ran" "rc $rc $(echo "$o" | tail -2 | tr '\n' ' ')"
     sleep 2
     measure "H2 records: bpf_prog_type $(count "$n0" bpf_prog_type), bpf_prog_opt_out $(count "$n0" bpf_prog_opt_out)"
 else
@@ -121,12 +123,13 @@ n0=$(lines "$DET")
 if [[ -n $TOOL ]]; then
     o=$(sudo timeout -s INT 4 "$TOOL" </dev/null 2>&1); rc=$?
     echo "    $TOOL (loader $LOADER) rc $rc: $(echo "$o" | head -2 | tr '\n' ' ' | cut -c1-160)"
-    [[ $rc -eq 0 || $rc -eq 124 || $rc -eq 130 ]] && [[ $o != *"failed to load"* && $o != *"ermission"* && $o != *"Failed"* ]]
-    expect_load "H3 $TOOL" "$LOADER" $? "$o"
+    [[ $rc -eq 0 || $rc -eq 124 || $rc -eq 130 ]] && [[ $o != *"failed to load"* && $o != *"ermission"* && $o != *"Failed"* ]]; ran=$?
+    expect_load "H3 $TOOL" "$LOADER" "$ran" "$o"
 else
     measure "H3 no BCC or libbpf tool here: bpf-probe.py's raw_tracepoint loader instead"
     o=$(sudo $PROBE load-kprobe-write-user --type raw_tracepoint --name k341_hd_raw)
-    [[ $o == OK* ]]; expect_load "H3 raw_tracepoint" "$PY" $? "$o"
+    [[ $o == OK* ]]; ran=$?
+    expect_load "H3 raw_tracepoint" "$PY" "$ran" "$o"
 fi
 sleep 2
 measure "H3 records: bpf_prog_type $(count "$n0" bpf_prog_type), bpf_prog_opt_out $(count "$n0" bpf_prog_opt_out)"
