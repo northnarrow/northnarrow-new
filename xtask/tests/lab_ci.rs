@@ -895,7 +895,14 @@ fn lab_vm_gates_the_verifier_headroom_of_every_program() {
         ".filter(|r| r.optional.is_none())",
         "info: *verified, kprobe: *kprobe,",
         "let verdict = verifier_headroom::judge(&measured, budget);",
-        "*kprobe = p.count(&name);",
+        // the review of #551 (F3): a load's line is the one with its
+        // program's tag, not only its 15-byte name, and a probe whose pid
+        // filter cannot be set is no probe (a foreign loader's line could
+        // be taken for ours)
+        "*kprobe = tag.and_then(|t| p.count(&name, t));",
+        "tag: info.as_ref().map(|i| i.tag()),",
+        "write_file( &probe.instance.join(\"set_event_pid\"), &std::process::id().to_string(), ) \
+         .map_err(|e| format!(\"the probe's pid filter: {e}\"))?;",
         "p.clear();",
     ] {
         assert!(
@@ -909,6 +916,104 @@ fn lab_vm_gates_the_verifier_headroom_of_every_program() {
     assert!(vc_src.contains("pub const TOP: usize = 10;"));
     assert!(vc_src.contains("out.push(format!(\"top {TOP} by instructions processed:\"));"));
     assert!(run.contains("top 10 by instructions processed:"));
+}
+
+/// The review of #551 (F2): `verifier-check` leaves no tracing instance or
+/// kprobe event behind in the guest, even when the agent dies on a panic
+/// (release builds abort: no `Drop`) or a signal. nn-lab.sh removes them
+/// before the run, in the run's own ssh session as soon as the agent
+/// returns, and again from the host after it. The teardown itself runs
+/// here against fake tracefs trees: the event disabled, the instance
+/// removed, the event deleted by appending to `kprobe_events` (the other
+/// events kept), nothing touched where there is no tracefs, exit 0.
+#[test]
+fn verifier_check_removes_its_probe_after_every_run() {
+    let text = read(NN_LAB);
+    let start = text.find("# >>> verifier-check-teardown").unwrap();
+    let end = text.find("# <<< verifier-check-teardown").unwrap();
+    let block = &text[start..end];
+    // the names are the agent's
+    let check = read("crates/nn-linux/src/verifier_check.rs");
+    assert!(check.contains("const KPROBE_GROUP: &str = \"nn_verifier_check\";"));
+    assert!(check.contains("const KPROBE_EVENT: &str = \"insn_processed\";"));
+    assert!(check.contains(
+        "const TRACEFS: [&str; 2] = [\"/sys/kernel/tracing\", \"/sys/kernel/debug/tracing\"];"
+    ));
+    assert!(block.contains("VC_TRACEFS='/sys/kernel/tracing /sys/kernel/debug/tracing'"));
+    // used before, inside and after the run
+    let body = &text[text.find("cmd_verifier_check() {").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let run = body
+        .find("--verifier-check; vc_rc=\\$?; $teardown </dev/null >/dev/null 2>&1; exit \\$vc_rc\"")
+        .unwrap();
+    let before = body
+        .find("vssh \"$teardown\" </dev/null >/dev/null 2>&1 || true")
+        .unwrap();
+    let after = body
+        .rfind("vssh \"$teardown\" </dev/null >/dev/null 2>&1 \\")
+        .unwrap();
+    assert!(
+        before < run && run < after,
+        "teardown before, in and after the run"
+    );
+    assert!(body.contains("teardown=\"sudo sh -c $(printf %q \"$VC_TEARDOWN\") sh $VC_TRACEFS\""));
+
+    // the teardown, on fake trees
+    let dir = case_dir("vc-teardown");
+    let _ = fs::remove_dir_all(&dir);
+    let armed = dir.join("armed");
+    let ev = armed.join("instances/nn_verifier_check/events/nn_verifier_check/insn_processed");
+    fs::create_dir_all(&ev).unwrap();
+    fs::write(ev.join("enable"), "1\n").unwrap();
+    let ours = "p:nn_verifier_check/insn_processed check_max_stack_depth insn=+8512($arg1):u32\n";
+    fs::write(
+        armed.join("kprobe_events"),
+        format!("p:other/x do_sys_open\n{ours}"),
+    )
+    .unwrap();
+    let empty = dir.join("empty-instance");
+    fs::create_dir_all(empty.join("instances/nn_verifier_check")).unwrap();
+    fs::write(empty.join("kprobe_events"), "p:other/x do_sys_open\n").unwrap();
+    let not_tracefs = dir.join("not-tracefs");
+    fs::create_dir_all(not_tracefs.join("instances/nn_verifier_check")).unwrap();
+    let script = format!(
+        "set -euo pipefail\n{block}\nsh -c \"$VC_TEARDOWN\" sh {} {} {} {}\n",
+        armed.display(),
+        empty.display(),
+        not_tracefs.display(),
+        dir.join("missing").display()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", self::text(&out));
+    assert!(text_of(&out).is_empty(), "silent: {}", self::text(&out));
+    // disabled (a real tracefs would also let the instance go: here its
+    // files keep the directory), deleted by appending
+    assert_eq!(fs::read_to_string(ev.join("enable")).unwrap(), "0\n");
+    assert_eq!(
+        fs::read_to_string(armed.join("kprobe_events")).unwrap(),
+        format!("p:other/x do_sys_open\n{ours}-:nn_verifier_check/insn_processed\n")
+    );
+    // an instance with nothing enabled: removed; no event: none deleted
+    assert!(!empty.join("instances/nn_verifier_check").exists());
+    assert_eq!(
+        fs::read_to_string(empty.join("kprobe_events")).unwrap(),
+        "p:other/x do_sys_open\n"
+    );
+    // no kprobe_events: not a tracefs, untouched
+    assert!(not_tracefs.join("instances/nn_verifier_check").exists());
+}
+
+fn text_of(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
 }
 
 // ── the scripts parse ─────────────────────────────────────────────────────

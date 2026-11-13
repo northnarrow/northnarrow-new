@@ -217,8 +217,9 @@ static OPEN_TASK: HashMap<u64, OpenTask> =
 pub(crate) const OPEN_TASK_CAP: u32 = 65536;
 /// The review of #547 (F6; the re-check, G5): one share of [`OPEN_TASK`] —
 /// an account's (`crate::task_scratch::nn_share_key`: its uid, or the
-/// creator of its user namespaces, a rootless container's subuids
-/// included): one user's idle threads cannot take every other task's.
+/// creator of its user namespaces; a user's subordinate uids, as the agent
+/// publishes them, are its own: the review of #551, F1): one user's idle
+/// threads cannot take every other task's.
 pub(crate) const OPEN_TASK_PER_SHARE: u64 = 16384;
 /// The tasks' entries each share holds.
 #[map]

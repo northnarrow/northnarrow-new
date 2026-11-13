@@ -10382,8 +10382,8 @@ number in parentheses is a lab PR.
     split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
-- **Lot 332 — verifier headroom on every kernel, and the shares no task
-  can choose (C23, C14; no level changes).**
+- **Lot 332 — verifier headroom on every kernel, and the shares an
+  account's (C23, C14; no level changes).**
   - What was open: `verifier-check` printed the verifier's count from 5.16
     only (5.15: `n/a`, aya keeps no log of a program it loaded), and
     nothing failed near the limit; `fim_file_open_sensor` was at 821,228 of
@@ -10442,6 +10442,51 @@ number in parentheses is a lab PR.
     ten rows on `main` and none after (all counted in the service's uid's
     row, 33); the lab user's processes in user namespaces it made, one and
     two deep, counted in its own row (1000); after the lot the same on 6.12.
+  - The review of #551 (MERGE AFTER FIXES; F1–F3, P3):
+    - F1: a user with an `/etc/subuid` range took any of its 65,536 uids as
+      a key — the real uid in the initial namespace (a binary owned by the
+      subuid made setuid inside a namespace the user made, then
+      `setresuid`) or a new namespace's creator — and about 67 keys filled
+      the candidates' map (on `main`, keyed by the login uid, those
+      processes stayed in the login's row: a regression for logged-in users
+      with subuids). The agent publishes the ranges into an LPM trie
+      (`SHARE_SUBUID`, 16,384 entries; `nn_linux::sensors::share_subuid`,
+      read again within 2 s of a change to `/etc/subuid` or `/etc/passwd`),
+      and `nn_share_key` looks the uid or the creator up there first: a
+      range's uid is its owner's share; one of the span no single owner is
+      known for is the overflow row's (fail closed), and an unreadable
+      `/etc/subuid` puts every uid from 65,536 up there. The claims "no
+      task can choose" and "subuids are its user's" are corrected to what
+      holds; the residual (a namespace root made is a share each, a
+      setuid-root helper's per-run namespaces included; NSS subids) is
+      recorded.
+    - F2: `nn-lab.sh verifier-check` removes the probe's instance and event
+      before the run, in the run's ssh session as soon as the agent
+      returns, and after it (a killed agent never ran its destructor).
+    - F3: the kprobe's line of a load is the one with its program's tag
+      (the program info's; the id is given after the verifier), not only
+      its 15-byte name; a pid filter that cannot be set fails the probe.
+    - Host: `share_subuid` (7 tests: the reviewer's setresuid case is the
+      owner's row; 100 keys of one user fill no map, two shares at most,
+      where the same keys without the trie fill it), `wire::execq` (the
+      key with the trie's answer), `verifier_headroom` (two programs
+      sharing 15 bytes told apart by their tag), `lab_ci.rs` (the teardown
+      run against fake tracefs trees), the updated `exec_env_complete.rs`;
+      38 mutants, each caught by a named test; gates green once more
+      (114 suites, 5,015 passed).
+    - Lab, as measured (our guests, lease k332): `verifier-check` 0 failing
+      on 5.15.0-202 and 7.0.0-43; `fim_file_open_sensor` 144,651 (5.15) and
+      263,427 (7.0) with the trie's lookup, its deepest chain still 480 of
+      512 bytes; on 7.0 the kprobe (tag-matched) and the program info
+      agree for 100 of 100 programs. F1, the agent installed, both kernels:
+      tasks whose real uid is the lab user's subuid 104242 (made with
+      `setpriv` as root: the reviewer's end state), and tasks in a
+      namespace that uid created, count in the user's row (1000), no row
+      104242; uid 70000 (no one's subuid) has its own; a range added for
+      an owner `/etc/passwd` does not know is the overflow row's (0 → 5);
+      the trie follows `/etc/subuid` (12 → 29 → 12 entries). F2: an agent
+      SIGKILLed once its probe was armed left the instance (and on 7.0 the
+      event); the same kill under `nn-lab.sh verifier-check` left nothing.
   - Level unchanged: the gate is the lab's and the nightly's; C23's
     provisional waits on the nightly on the five guests, now with the
     verifier step.

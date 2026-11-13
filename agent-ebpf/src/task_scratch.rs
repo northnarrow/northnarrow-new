@@ -27,12 +27,14 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, generated},
     macros::{lsm, map},
-    maps::{Array, HashMap},
+    maps::{lpm_trie::Key, Array, HashMap, LpmTrie},
     programs::LsmContext,
 };
 use northnarrow_common::wire::exe::TaskKey;
 
-use northnarrow_common::wire::execq::{share_admits, OVERFLOW_ROW, OVERFLOW_SHARE, TOTAL_ROW, USERNS_MAX_LEVEL};
+use northnarrow_common::wire::execq::{
+    share_account, share_admits, OVERFLOW_ROW, OVERFLOW_SHARE, SUBUID_TRIE_MAX, TOTAL_ROW, USERNS_MAX_LEVEL,
+};
 
 use crate::btf_offsets::{
     CRED_USER_NS_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_START_TIME_OFFSET, USER_NAMESPACE_INUM_OFFSET,
@@ -170,13 +172,19 @@ pub(crate) fn share_take(
     floor: u64,
 ) -> Option<u32> {
     let total = overflow.get_ptr_mut(TOTAL_ROW)?;
-    let (n, row) = match rows.get_ptr_mut(&key) {
-        Some(n) => (n, key),
-        None => {
-            let _ = rows.insert(&key, &0u64, BPF_NOEXIST);
-            match rows.get_ptr_mut(&key) {
-                Some(n) => (n, key),
-                None => (overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE),
+    // lot 332 (the review of #551, F1): a key no single owner is known for
+    // is the overflow row's, never a row of its own
+    let (n, row) = if key == OVERFLOW_SHARE {
+        (overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE)
+    } else {
+        match rows.get_ptr_mut(&key) {
+            Some(n) => (n, key),
+            None => {
+                let _ = rows.insert(&key, &0u64, BPF_NOEXIST);
+                match rows.get_ptr_mut(&key) {
+                    Some(n) => (n, key),
+                    None => (overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE),
+                }
             }
         }
     };
@@ -221,13 +229,25 @@ pub(crate) fn share_give(rows: &HashMap<u32, u64>, overflow: &Array<u64>, row: u
 /// `BPF_NOEXIST`: an insert that makes a new entry only.
 const BPF_NOEXIST: u64 = 1;
 
+/// Lot 332 (the review of #551, F1): the host's subordinate uid ranges
+/// (`/etc/subuid`), published by the agent
+/// (`nn_linux::sensors::share_subuid`, read again when the file or
+/// `/etc/passwd` changes): a uid of a user's range → that user's uid; one
+/// in the ranges' span no single owner is known for → `OVERFLOW_SHARE`.
+/// The key is the uid big-endian; the owners' entries never overlap, the
+/// span's own (the overflow row's) lie beneath their longer prefixes.
+#[map]
+static SHARE_SUBUID: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(SUBUID_TRIE_MAX, 0);
+
 /// The running task's share key (`northnarrow_common::wire::execq::share_key`):
 /// its real uid in the initial user namespace; in a user namespace, the
 /// creator of the outermost one below the initial namespace, or that
 /// namespace's inode number when root made it (a system container). Lot 332
 /// (the re-check 2 of #547, G5): it was the login uid, which a task whose
 /// login uid is unset (a service, a container under a root daemon) sets to
-/// any value without a privilege.
+/// any value without a privilege. Lot 332 (the review of #551, F1): the
+/// uid or the creator is a user's when it is one of that user's
+/// subordinate uids ([`SHARE_SUBUID`]).
 ///
 /// A global function (no argument): the walk up the namespaces is checked
 /// once, not on every way into its callers.
@@ -238,7 +258,11 @@ pub extern "C" fn nn_share_key() -> u64 {
     // SAFETY: reads of the running task's credentials and namespaces, each
     // through `bpf_probe_read_kernel` (0 when unreadable).
     let (level, owner, inum) = unsafe { outer_user_ns() };
-    u64::from(northnarrow_common::wire::execq::share_key(uid, level, owner, inum))
+    let sub = match share_account(uid, level, owner) {
+        Some(account) => SHARE_SUBUID.get(Key::new(32, account.to_be_bytes())).copied(),
+        None => None,
+    };
+    u64::from(northnarrow_common::wire::execq::share_key(uid, level, owner, inum, sub))
 }
 
 /// The running task's share key ([`nn_share_key`]).

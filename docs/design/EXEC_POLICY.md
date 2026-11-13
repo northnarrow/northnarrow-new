@@ -620,19 +620,35 @@ The rules are outside the frozen V2 validation denominator, like
   which removes the task's candidate naming that inode); each share holds
   at most 1024 candidates (`EXECQ_CAND_UIDS`) — the re-check of #547 (G5):
   it was the uid's, and four subuids of one login filled the map. Lot 332
-  (the re-check 2, G5): an account's share, a key the task cannot choose
+  (the re-check 2, G5): an account's share
   (`task_scratch::nn_share_key`, `wire::execq::share_key`) — its uid in
   the initial user namespace; in a user namespace, the account that made
-  the outermost one (a rootless container's subuids, nested namespaces
-  included, are its user's), or that namespace's inode number when root
-  made it (one share per system container). The login uid it was keyed by
-  is set to any value, without a privilege, by a task that has none (a
-  service, a container under a root daemon): one share per child. The
-  shares the rows' map has no room for share one overflow row under the
-  same cap, and every share's entries are counted together (lot 332, the
-  global cap): past the map's room less one share's (3072), a share
+  the outermost one (nested namespaces included), or that namespace's
+  inode number when root made it (one share per system container). The
+  login uid it was keyed by is set to any value, without a privilege, by a
+  task that has none (a service, a container under a root daemon): one
+  share per child. The review of #551 (F1): a user with an `/etc/subuid`
+  range takes any uid of it as its real uid in the initial namespace (a
+  binary owned by that subuid made setuid inside a namespace the user
+  made, run outside it, then `setresuid`) or as the creator of a new
+  namespace — 65,536 keys, about 67 of which filled the map. The uid or
+  the creator is first looked up in the host's ranges, which the agent
+  publishes (`SHARE_SUBUID`, an LPM trie of 16,384 entries,
+  `nn_linux::sensors::share_subuid`, read again within 2 s of a change to
+  `/etc/subuid` or `/etc/passwd`): a uid of a range is its owner's share;
+  one of the ranges' span no single owner is known for (an owner
+  `/etc/passwd` does not resolve, two users' ranges overlapping, a gap, a
+  range past the trie's room) is the overflow row's, never a share of its
+  own; an unreadable `/etc/subuid` puts every uid from 65,536 up there.
+  What a task can still choose: a namespace root made is one share each,
+  so a setuid-root helper that makes one per run gives its caller one
+  share per run, and ranges served by NSS (`subid:`) are not published.
+  The shares the rows' map has no room for share one overflow row under
+  the same cap, and every share's entries are counted together (lot 332,
+  the global cap): past the map's room less one share's (3072), a share
   holding 16 candidates or more takes no more, so the shares at their cap
-  leave room for 64 others. The map full, the oldest candidate still in it
+  leave room for 64 others — a bound on greedy shares, not on their
+  number: the map's room is that. The map full, the oldest candidate still in it
   — made at least a second ago (its exec is stuck: no program of its task
   holds it) — goes for the new one (`CAND_EVICTED`); lot 332: found by
   walking the map (`bpf_for_each_map_elem`, every entry, on the full map's

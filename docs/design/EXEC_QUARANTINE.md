@@ -176,11 +176,16 @@ exec's candidate goes when the kernel frees the exec's file (the review of
 stayed until the task's next exec or its end, the LSM `task_free` program
 `nn_task_free`), each account holds at most 1024 candidates (the re-check
 of #547, G5; lot 332, the re-check 2: the uid in the initial user
-namespace, in a user namespace the account that made the outermost one —
-a rootless container's subuids are its user's —, or that namespace when
-root made it; never the login uid, which a service's children set to any
-value; `EXECQ_CAND_UIDS`, recounted by the agent every 30 s, an overflow
-row for the shares it has no room for), past 3072 candidates in all a share
+namespace, in a user namespace the account that made the outermost one,
+or that namespace when root made it; never the login uid, which a
+service's children set to any value; the review of #551, F1: a uid of a
+user's `/etc/subuid` range — taken as a real uid, or the creator of a
+namespace — is that user's, as the agent publishes the ranges
+(`SHARE_SUBUID`), and one of their span no single owner is known for is the
+overflow row's; a namespace root made remains one share each, a
+setuid-root helper's per-run namespaces included — docs/design/EXEC_POLICY.md;
+`EXECQ_CAND_UIDS`, recounted by the agent every 30 s, an overflow row for
+the shares it has no room for), past 3072 candidates in all a share
 holding 16 or more takes no more (the global cap, lot 332), and past it a
 candidate is dropped (`CAND_DROPPED`). Past 4096 in flight, the oldest
 candidate made at least a second ago — found by walking the map, every

@@ -94,8 +94,9 @@ static EXECQ_CAND: HashMap<u64, ExecqCandRaw> = HashMap::with_max_entries(EXECQ_
 pub(crate) const EXECQ_CAND_CAP: u32 = 4096;
 /// The review of #547 (F4; the re-check, G5): one share of [`EXECQ_CAND`] —
 /// an account's (`crate::task_scratch::nn_share_key`: its uid, or the
-/// creator of its user namespaces — a rootless container's subuids are its
-/// user's), so one user's threads, each held in an exec (a FUSE-backed
+/// creator of its user namespaces — a user's subordinate uids, as the
+/// agent publishes them, are its own: the review of #551, F1), so one
+/// user's threads, each held in an exec (a FUSE-backed
 /// binary it never answers), cannot take the room every other user's execs
 /// need. It was the uid's: four subuids of one login filled the map.
 pub(crate) const EXECQ_CAND_PER_SHARE: u64 = 1024;

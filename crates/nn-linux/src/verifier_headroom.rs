@@ -83,21 +83,31 @@ pub fn kernel_name(prog: &str) -> &str {
 
 /// The byte offsets the kprobe event dereferences, from the running
 /// kernel's BTF: `bpf_verifier_env.insn_processed` (a `u32`),
-/// `bpf_verifier_env.prog`, `bpf_prog.aux`, `bpf_prog_aux.name`.
+/// `bpf_verifier_env.prog`, `bpf_prog.aux`, `bpf_prog_aux.name`, and (the
+/// review of #551, F3) `bpf_prog.tag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeOffsets {
     pub insn_processed: usize,
     pub prog: usize,
     pub aux: usize,
     pub name: usize,
+    pub tag: usize,
 }
 
 /// The `kprobe_events` line of the probe: at the entry of `func` (the
 /// verifier's last pass over an accepted program, `check_max_stack_depth`,
 /// whose first argument is the verifier's state), the count the verifier
-/// reached and the program's name. `arg` is how the first argument is
-/// fetched (`$arg1`, or the architecture's register on a kernel without
-/// argument access).
+/// reached, the program's tag and its name. `arg` is how the first
+/// argument is fetched (`$arg1`, or the architecture's register on a kernel
+/// without argument access).
+///
+/// The review of #551 (F3): the name the kernel keeps is 15 bytes, which
+/// several of the agent's programs share (`dns_answer_v4_ret4/5/6`,
+/// `sched_process_exec` / `_nostdio`, …). The tag — the SHA-1 of the
+/// program's instructions, computed before the verifier runs
+/// (`bpf_prog_calc_tag`) and handed out in the program info — tells them
+/// apart. The id cannot: it is given after the verifier accepted the
+/// program (`bpf_prog_alloc_id`), 0 when the probe fires.
 pub fn kprobe_definition(
     group: &str,
     event: &str,
@@ -106,38 +116,52 @@ pub fn kprobe_definition(
     o: ProbeOffsets,
 ) -> String {
     format!(
-        "p:{group}/{event} {func} insn=+{}({arg}):u32 name=+{}(+{}(+{}({arg}))):string",
-        o.insn_processed, o.name, o.aux, o.prog
+        "p:{group}/{event} {func} insn=+{}({arg}):u32 tag=+{}(+{}({arg})):x64 \
+         name=+{}(+{}(+{}({arg}))):string",
+        o.insn_processed, o.tag, o.prog, o.name, o.aux, o.prog
     )
 }
 
-/// `(count, name)` of one line of the probe's trace
+/// What the probe prints for a program whose program info gives `tag`
+/// (aya's, the eight bytes read big-endian): the same eight bytes read as
+/// a `u64` in this machine's order (`:x64`).
+pub fn probe_tag(tag: u64) -> u64 {
+    u64::from_ne_bytes(tag.to_be_bytes())
+}
+
+/// `(count, tag, name)` of one line of the probe's trace
 /// (`… insn_processed: (check_max_stack_depth+0x0/0x2b0) insn=821228
-/// name="fim_file_open_s"`).
-pub fn parse_trace_line(line: &str) -> Option<(u32, &str)> {
+/// tag=0x3e1f… name="fim_file_open_s"`).
+pub fn parse_trace_line(line: &str) -> Option<(u32, u64, &str)> {
     let rest = &line[line.find(" insn=")? + " insn=".len()..];
     let digits = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     let count = rest[..digits].parse::<u32>().ok()?;
-    let rest = &rest[digits..];
-    let name = &rest[rest.find(" name=\"")? + " name=\"".len()..];
+    let rest = rest[digits..].strip_prefix(" tag=0x")?;
+    let hex = rest
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(rest.len());
+    let tag = u64::from_str_radix(&rest[..hex], 16).ok()?;
+    let rest = &rest[hex..];
+    let name = rest.strip_prefix(" name=\"")?;
     let name = &name[..name.find('"')?];
-    Some((count, name))
+    Some((count, tag, name))
 }
 
 /// The count of `prog`'s load in `trace` (the probe's buffer, cleared
-/// before the load): its last line naming the program. `None` when the
-/// probe did not fire for it.
-pub fn count_in_trace(trace: &str, prog: &str) -> Option<u32> {
-    let want = kernel_name(prog);
+/// before the load): its last line naming the program with the tag its
+/// program info gives (`tag`, aya's). `None` when the probe did not fire
+/// for it — a line of another program sharing its 15-byte name is not its.
+pub fn count_in_trace(trace: &str, prog: &str, tag: u64) -> Option<u32> {
+    let want = (kernel_name(prog), probe_tag(tag));
     trace
         .lines()
         .rev()
         .filter(|l| !l.starts_with('#'))
         .filter_map(parse_trace_line)
-        .find(|(_, n)| *n == want)
-        .map(|(c, _)| c)
+        .find(|(_, t, n)| (*n, *t) == want)
+        .map(|(c, _, _)| c)
 }
 
 /// Where a count came from.
@@ -373,6 +397,7 @@ mod tests {
             prog: 0,
             aux: 56,
             name: 520,
+            tag: 24,
         };
         assert_eq!(
             kprobe_definition(
@@ -383,7 +408,8 @@ mod tests {
                 o
             ),
             "p:nn_verifier_check/insn_processed check_max_stack_depth \
-             insn=+8512($arg1):u32 name=+520(+56(+0($arg1))):string"
+             insn=+8512($arg1):u32 tag=+24(+0($arg1)):x64 \
+             name=+520(+56(+0($arg1))):string"
         );
     }
 
@@ -392,22 +418,77 @@ mod tests {
     /// header comments, are not.
     #[test]
     fn the_count_of_a_load_is_read_from_its_trace_line() {
-        let trace = "# tracer: nop\n\
-            #\n\
-            northnarrow-age-4242 [001] d..1. 120.1: insn_processed: (check_max_stack_depth+0x0/0x2b0) insn=12 name=\"aya_name_check\"\n\
-            northnarrow-age-4242 [001] d..1. 120.2: insn_processed: (check_max_stack_depth+0x0/0x2b0) insn=821228 name=\"fim_file_open_s\"\n\
-            northnarrow-age-4242 [001] d..1. 120.3: insn_processed: (check_max_stack_depth+0x0/0x2b0) insn=930372 name=\"exec_check_lsm\"\n";
-        assert_eq!(count_in_trace(trace, "fim_file_open_sensor"), Some(821_228));
-        assert_eq!(count_in_trace(trace, "exec_check_lsm"), Some(930_372));
-        assert_eq!(count_in_trace(trace, "exec_env_lsm"), None);
-        assert_eq!(count_in_trace("", "exec_check_lsm"), None);
-        assert_eq!(parse_trace_line("x: insn=7 name=\"a b\""), Some((7, "a b")));
-        assert_eq!(parse_trace_line("x: insn= name=\"a\""), None);
-        assert_eq!(parse_trace_line("x: insn=7 name=a"), None);
-        assert_eq!(parse_trace_line("x: insn=99999999999 name=\"a\""), None);
-        // two loads of one name in one buffer: the last is this load's
-        let twice = "a: insn=5 name=\"p\"\nb: insn=9 name=\"p\"\n";
-        assert_eq!(count_in_trace(twice, "p"), Some(9));
+        // the tags as the program info gives them (aya: big-endian) and as
+        // the probe prints them (this machine's order)
+        let (t1, t2, t3) = (0x3e1f_0011_2233_4455u64, 0x0102_0304_0506_0708u64, 0xaau64);
+        let line = |n: u32, t: u64, name: &str| {
+            format!(
+                "northnarrow-age-4242 [001] d..1. 120.1: insn_processed: \
+                 (check_max_stack_depth+0x0/0x2b0) insn={n} tag={:#x} name=\"{name}\"\n",
+                probe_tag(t)
+            )
+        };
+        let trace = format!(
+            "# tracer: nop\n#\n{}{}{}",
+            line(12, 0x99, "aya_name_check"),
+            line(821_228, t1, "fim_file_open_s"),
+            line(930_372, t2, "exec_check_lsm")
+        );
+        assert_eq!(
+            count_in_trace(&trace, "fim_file_open_sensor", t1),
+            Some(821_228)
+        );
+        assert_eq!(count_in_trace(&trace, "exec_check_lsm", t2), Some(930_372));
+        assert_eq!(count_in_trace(&trace, "exec_env_lsm", t3), None);
+        assert_eq!(count_in_trace("", "exec_check_lsm", t2), None);
+        // the name alone is not enough: another tag is another program
+        assert_eq!(count_in_trace(&trace, "exec_check_lsm", t1), None);
+        assert_eq!(
+            parse_trace_line("x: insn=7 tag=0x1f name=\"a b\""),
+            Some((7, 0x1f, "a b"))
+        );
+        assert_eq!(parse_trace_line("x: insn= tag=0x1 name=\"a\""), None);
+        assert_eq!(parse_trace_line("x: insn=7 tag=0x1 name=a"), None);
+        assert_eq!(parse_trace_line("x: insn=7 name=\"a\""), None, "no tag");
+        assert_eq!(parse_trace_line("x: insn=7 tag=0xz name=\"a\""), None);
+        assert_eq!(
+            parse_trace_line("x: insn=99999999999 tag=0x1 name=\"a\""),
+            None
+        );
+        // two loads of one program in one buffer: the last is this load's
+        let twice = format!("{}{}", line(5, t3, "p"), line(9, t3, "p"));
+        assert_eq!(count_in_trace(&twice, "p", t3), Some(9));
+        // the probe prints the program info's eight bytes in this
+        // machine's order
+        assert_eq!(probe_tag(t2).to_ne_bytes(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// The review of #551 (F3): two of the agent's programs share their 15
+    /// bytes (`dns_answer_v4_ret4`, `dns_answer_v4_ret5`: the kernel keeps
+    /// `dns_answer_v4_r`), and a foreign loader's program can too. Each
+    /// load's count is the line with its own tag, whichever order the
+    /// lines come in; a line with the name and another tag is never taken.
+    #[test]
+    fn programs_sharing_fifteen_bytes_are_told_apart_by_their_tag() {
+        assert_eq!(
+            kernel_name("dns_answer_v4_ret4"),
+            kernel_name("dns_answer_v4_ret5")
+        );
+        let (r4, r5, foreign) = (0x1111u64, 0x2222u64, 0x3333u64);
+        let l = |n: u32, t: u64| {
+            format!(
+                "a: insn={n} tag={:#x} name=\"dns_answer_v4_r\"\n",
+                probe_tag(t)
+            )
+        };
+        let trace = format!("{}{}{}", l(400, r4), l(500, r5), l(999_999, foreign));
+        assert_eq!(count_in_trace(&trace, "dns_answer_v4_ret4", r4), Some(400));
+        assert_eq!(count_in_trace(&trace, "dns_answer_v4_ret5", r5), Some(500));
+        let only_foreign = l(999_999, foreign);
+        assert_eq!(
+            count_in_trace(&only_foreign, "dns_answer_v4_ret4", r4),
+            None
+        );
     }
 
     /// A program over the budget fails the kernel, and so does one the gate

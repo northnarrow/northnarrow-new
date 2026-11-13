@@ -114,6 +114,10 @@ enum Outcome {
         verified: Option<u32>,
         /// Lot 332: the kprobe's count of this load ([`InsnProbe`]).
         kprobe: Option<u32>,
+        /// The review of #551 (F3): its tag (the program info's), by which
+        /// the kprobe's line of this load is told from another program's
+        /// with the same 15-byte name.
+        tag: Option<u64>,
         stack: Option<Stack>,
     },
     /// The attach target is not in this kernel's BTF (aya refuses before
@@ -252,8 +256,8 @@ fn execute() -> Result<bool> {
                 Some(p) => load_one(p, &section, &btf),
                 None => Outcome::Error("not in the loaded object".into()),
             };
-            if let (Some(p), Outcome::Loaded { kprobe, .. }) = (&probe, &mut outcome) {
-                *kprobe = p.count(&name);
+            if let (Some(p), Outcome::Loaded { kprobe, tag, .. }) = (&probe, &mut outcome) {
+                *kprobe = tag.and_then(|t| p.count(&name, t));
             }
             let optional = optional_reason(&name, &section, &outcome);
             rows.push(Row {
@@ -504,6 +508,7 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
                     .map(|b| b / 8),
                 verified: info.as_ref().and_then(|i| i.verified_instruction_count()),
                 kprobe: None,
+                tag: info.as_ref().map(|i| i.tag()),
                 stack,
             }
         }
@@ -569,6 +574,7 @@ fn print_table(rows: &[Row]) {
                 verified,
                 kprobe,
                 stack,
+                ..
             } => (
                 opt(*insns),
                 // lot 332: the kprobe's count where the program info has none
@@ -717,14 +723,15 @@ impl InsnProbe {
             .ok_or_else(|| {
                 "no tracefs with kprobe_events (CONFIG_KPROBE_EVENTS, tracefs mounted)".to_string()
             })?;
-        let q: [(&str, &[&str]); 4] = [
+        let q: [(&str, &[&str]); 5] = [
             ("bpf_verifier_env", &["insn_processed"]),
             ("bpf_verifier_env", &["prog"]),
             ("bpf_prog", &["aux"]),
             ("bpf_prog_aux", &["name"]),
+            ("bpf_prog", &["tag"]),
         ];
         let found = btf_revalidate::resolve_fields_from(Path::new(VMLINUX_BTF), &q)?;
-        let mut offs = [0usize; 4];
+        let mut offs = [0usize; 5];
         for (i, r) in found.into_iter().enumerate() {
             offs[i] = r.map_err(|e| format!("{}.{}: {e}", q[i].0, q[i].1.join(".")))?;
         }
@@ -733,6 +740,7 @@ impl InsnProbe {
             prog: offs[1],
             aux: offs[2],
             name: offs[3],
+            tag: offs[4],
         };
         let mut probe = Self {
             instance: tracing.join("instances").join(KPROBE_GROUP),
@@ -770,11 +778,14 @@ impl InsnProbe {
             .join("events")
             .join(KPROBE_GROUP)
             .join(KPROBE_EVENT);
-        // this process's loads only (the names tell them apart anyway)
-        let _ = write_file(
+        // this process's loads only. The review of #551 (F3): or no probe —
+        // a foreign loader's line could be taken for one of ours (on 5.15
+        // every program is then unmeasured, and the gate fails)
+        write_file(
             &probe.instance.join("set_event_pid"),
             &std::process::id().to_string(),
-        );
+        )
+        .map_err(|e| format!("the probe's pid filter: {e}"))?;
         write_file(&event.join("enable"), "1")?;
         Ok(probe)
     }
@@ -787,10 +798,11 @@ impl InsnProbe {
             .open(self.instance.join("trace"));
     }
 
-    /// The count of `prog`'s load, from the buffer (after it).
-    fn count(&self, prog: &str) -> Option<u32> {
+    /// The count of `prog`'s load (its program info's `tag`), from the
+    /// buffer (after it).
+    fn count(&self, prog: &str, tag: u64) -> Option<u32> {
         match fs::read_to_string(self.instance.join("trace")) {
-            Ok(t) => verifier_headroom::count_in_trace(&t, prog),
+            Ok(t) => verifier_headroom::count_in_trace(&t, prog, tag),
             Err(_) => None,
         }
     }

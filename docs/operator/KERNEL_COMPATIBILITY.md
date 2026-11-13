@@ -890,7 +890,15 @@ the agent needs and fails the kernel when one processed more than 900,000
   pass over an accepted program: created for the run, enabled only in a
   tracing instance of its own (`instances/nn_verifier_check`, the system's
   trace buffer untouched, `kprobe_events` only appended to), the offsets
-  from the running kernel's BTF, removed at the end. Where the program info
+  from the running kernel's BTF, removed at the end. Its pid filter is this
+  process's, or there is no probe (a filter that cannot be set fails it);
+  a load's line is the one with its program's tag (the program info's
+  `tag`, computed before the verifier runs), not only its name, whose 15
+  bytes several of the agent's programs share (the review of #551, F3).
+  `nn-lab.sh` removes the instance and the event before every run, in the
+  run's ssh session as soon as the agent returns, and after it: an agent
+  killed or panicking (release builds abort) never ran its own removal
+  (F2). Where the program info
   has a count too, the report compares the two (the "kprobe cross-check"
   line); a kernel where neither is available fails the gate, unmeasured;
 - the report ends with the ten programs with the highest count and the

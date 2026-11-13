@@ -197,6 +197,15 @@ pub fn attach_observe_programs(
         // sensor, when wanted; the plain observer if the verifier refuses
         // it, so FIM never depends on the sensor.
         if open_sensor && *program == "fim_file_open_observe" {
+            // Lot 332 (the review of #551, F1): the subordinate uid ranges
+            // the buffers' shares resolve a user's subuids through
+            if let Err(e) = crate::sensors::share_subuid::ensure(ebpf) {
+                warn!(
+                    error = %chain_tail(&e),
+                    "fim: the subordinate uid ranges were not published — a user's subuids \
+                     each take a share of the file-open sensor's buffers"
+                );
+            }
             match attach_transient(ebpf, OPEN_SENSOR_PROGRAM, hook, btf) {
                 Ok(()) => {
                     info!(

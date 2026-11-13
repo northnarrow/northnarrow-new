@@ -346,6 +346,14 @@ const STATICS: &[Kept] = &[
          F6), a counter of the one eBPF object, as sampled for the status",
     ),
     kept(
+        "crates/nn-linux/src/sensors/share_subuid.rs",
+        "STARTED",
+        Kernel,
+        "the one eBPF object's subordinate uid trie taken out of it and its publisher started \
+         (the review of #551, F1): the quarantine and the file-open sensor each ensure it, once \
+         per object",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/task_free.rs",
         "ATTACHED",
         Kernel,

@@ -55,6 +55,17 @@ impl ExecGuards for AgentExecGuards {
                 "module-load judge: maps not taken — module loads are not judged"
             ),
         }
+        // Lot 332 (the review of #551, F1): the subordinate uid ranges the
+        // shares' key resolves a user's subuids through, published before
+        // the quarantine's candidates are taken. Not fatal: without them a
+        // subuid is a share of its own (each still capped).
+        if let Err(e) = nn_linux::sensors::share_subuid::ensure(ebpf) {
+            error!(
+                error = format!("{e:#}"),
+                "exec guards: the subordinate uid ranges were not published — a user's subuids \
+                 each take a share of the quarantine's candidates"
+            );
+        }
         // Lab PR 223 (EXPERIMENTAL): the exec quarantine's kernel
         // configuration, once the exec sensor's mode is known — written OFF
         // too, then frozen — and its maps for the controller. Not fatal:

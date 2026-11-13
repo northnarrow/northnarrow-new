@@ -679,9 +679,38 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         &[
             "let uid = current_uid();",
             "outer_user_ns()",
-            "northnarrow_common::wire::execq::share_key(uid, level, owner, inum)",
+            // the review of #551 (F1): the uid or the creator looked up in
+            // the host's subordinate uid ranges first
+            "match share_account(uid, level, owner) {",
+            "Some(account) => SHARE_SUBUID.get(Key::new(32, account.to_be_bytes())).copied(),",
+            "None => None,",
+            "northnarrow_common::wire::execq::share_key(uid, level, owner, inum, sub)",
         ],
     );
+    assert!(ts.contains(
+        "static SHARE_SUBUID: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(SUBUID_TRIE_MAX, 0);"
+    ));
+    // the agent publishes it wherever a share is taken: the quarantine's
+    // candidates, the file-open sensor's buffers
+    assert!(
+        code("agent/src/exec_guards.rs").contains("nn_linux::sensors::share_subuid::ensure(ebpf)")
+    );
+    assert!(code("crates/nn-linux/src/fim/attach.rs")
+        .contains("crate::sensors::share_subuid::ensure(ebpf)"));
+    let pubr = code("crates/nn-linux/src/sensors/share_subuid.rs");
+    assert!(pubr.contains("pub const MAP: &str = \"SHARE_SUBUID\";"));
+    // the trie's key is the uid big-endian on both sides (an LPM trie
+    // matches from the first byte's high bit)
+    let flat_pubr = flat(&pubr);
+    assert_eq!(
+        flat_pubr
+            .matches("Key::new(len, base.to_be_bytes())")
+            .count(),
+        2,
+        "the insert's and the removal's key"
+    );
+    assert!(flat_pubr.contains("u32::from_be_bytes(k.data())"));
+    assert!(!flat_pubr.contains("_le_bytes") && !flat_pubr.contains("_ne_bytes"));
     in_order(
         body(&ts, "outer_user_ns"),
         &[
@@ -712,6 +741,11 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         body(&ts, "share_take"),
         &[
             "let total = overflow.get_ptr_mut(TOTAL_ROW)?;",
+            // the review of #551 (F1): a key no single owner is known for
+            // is the overflow row's, never a row of its own
+            "let (n, row) = if key == OVERFLOW_SHARE {",
+            "(overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE)",
+            "} else {",
             "Some(n) => (n, key),",
             "let _ = rows.insert(&key, &0u64, BPF_NOEXIST);",
             "match rows.get_ptr_mut(&key) {",
@@ -742,8 +776,13 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
     assert!(cg.contains("uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32, loginuid: 0,"));
     assert!(!cg.contains("loginuid()"), "{cg}");
     let wq = flat(&code("common/src/wire/execq.rs"));
+    assert!(wq.contains(
+        "let k = match share_account(uid, level, owner) { Some(account) => match sub { \
+         Some(OVERFLOW_SHARE) => return OVERFLOW_SHARE, Some(o) => o, None => account, }, \
+         None => inum, };"
+    ));
     assert!(
-        wq.contains("let k = if level == 0 { uid } else if owner != 0 { owner } else { inum };")
+        wq.contains("if level == 0 { Some(uid) } else if owner != 0 { Some(owner) } else { None }")
     );
     assert!(wq.contains("own < per_share && (total < global || own < floor)"));
     assert!(wq.contains("capacity - per_share"));
