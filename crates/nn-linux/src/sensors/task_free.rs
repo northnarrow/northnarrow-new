@@ -126,6 +126,12 @@ pub fn take_overflow(want: &mut BTreeMap<u32, u64>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Lot 332 (the re-check 2 of #547, G5): every share's entries together —
+/// the total row of the global cap (`TOTAL_ROW`), recounted with the rows.
+pub fn total_of(want: &BTreeMap<u32, u64>) -> u64 {
+    want.values().sum()
+}
+
 /// The rows of a shares map (`EXECQ_CAND_UIDS`, `OPEN_TASK_UIDS`: 4096).
 pub const SHARE_ROWS_MAX: usize = 4096;
 
@@ -224,6 +230,11 @@ mod tests {
         assert_eq!(take_overflow(&mut want), 1);
         assert_eq!(want, BTreeMap::from([(1000, 2)]));
         assert_eq!(take_overflow(&mut want), 0);
+        // lot 332 (the re-check 2 of #547, G5): the total row is every
+        // share's entries, the overflow's included
+        let want = uid_shares([1000, common::wire::execq::OVERFLOW_SHARE, 1000, 33]);
+        assert_eq!(total_of(&want), 4);
+        assert_eq!(total_of(&BTreeMap::new()), 0);
     }
 
     /// The names match the eBPF object's (`agent-ebpf/src/task_scratch.rs`).

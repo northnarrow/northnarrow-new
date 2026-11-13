@@ -216,17 +216,25 @@ static OPEN_TASK: HashMap<u64, OpenTask> =
 /// file (a busy host runs a few thousand).
 pub(crate) const OPEN_TASK_CAP: u32 = 65536;
 /// The review of #547 (F6; the re-check, G5): one share of [`OPEN_TASK`] —
-/// a login's (its container subuids included), or a service's uid
-/// (`crate::task_scratch::share_key`): one user's idle threads cannot take
-/// every other task's.
+/// an account's (`crate::task_scratch::nn_share_key`: its uid, or the
+/// creator of its user namespaces; a user's subordinate uids, as the agent
+/// publishes them, are its own: the review of #551, F1): one user's idle
+/// threads cannot take every other task's.
 pub(crate) const OPEN_TASK_PER_SHARE: u64 = 16384;
 /// The tasks' entries each share holds.
 #[map]
 static OPEN_TASK_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// Lot 332 (the re-check 2 of #547, G5): the shares' global cap, the
+/// map's room less one share's; past it a share takes no more than
+/// [`OPEN_TASK_FLOOR`] (`wire::execq::share_admits`).
+pub(crate) const OPEN_TASK_GLOBAL: u64 =
+    northnarrow_common::wire::execq::global_cap(OPEN_TASK_CAP as u64, OPEN_TASK_PER_SHARE);
+pub(crate) const OPEN_TASK_FLOOR: u64 = northnarrow_common::wire::execq::share_floor(OPEN_TASK_PER_SHARE);
 /// The entries of the shares [`OPEN_TASK_UIDS`] has no row for (it is
-/// full), under the same cap (`OVERFLOW_SHARE`).
+/// full), under the same cap (`OVERFLOW_ROW`: `OVERFLOW_SHARE`), and lot
+/// 332's total of every share's (`TOTAL_ROW`: the global cap).
 #[map]
-static OPEN_TASK_OVERFLOW: Array<u64> = Array::with_max_entries(1, 0);
+static OPEN_TASK_OVERFLOW: Array<u64> = Array::with_max_entries(northnarrow_common::wire::execq::SHARE_ROWS, 0);
 /// The review of #547 (F6): a run's own entry when [`OPEN_TASK`] has no room
 /// for the task (full, its uid's share taken) or `task_free` does not run —
 /// made and removed in the run, as lot 322's: the open is judged whole,
@@ -291,6 +299,8 @@ pub extern "C" fn nn_open_task_make(task: u64) -> u64 {
         &OPEN_TASK_OVERFLOW,
         crate::task_scratch::share_key(),
         OPEN_TASK_PER_SHARE,
+        OPEN_TASK_GLOBAL,
+        OPEN_TASK_FLOOR,
     ) {
         Some(r) => r,
         None => return 0,
@@ -808,8 +818,10 @@ unsafe fn count_write(
 /// `add` overwrites into the writer's cgroup window; the window's
 /// overwrites when they cross the threshold, else 0, and (lot 283c) the
 /// window's [`own_after`] summary with the process's `own`. A writer in the
-/// root cgroup (no cgroup v2 hierarchy in use) is keyed by uid and login
-/// uid.
+/// root cgroup (no cgroup v2 hierarchy in use) is keyed by its uid alone —
+/// lot 332 (the mini-hunt of G5): it was the uid and the login uid, which a
+/// task without one sets to any value, so a service's children each writing
+/// a few files under the threshold in a window of their own.
 #[inline(always)]
 unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
     let cgroup = bpf_get_current_cgroup_id();
@@ -823,7 +835,7 @@ unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
         OpenCgKey {
             cgroup: 0,
             uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32,
-            loginuid: loginuid(),
+            loginuid: 0,
         }
     };
     match OPEN_CG_WRITES.get_ptr_mut(&key) {
@@ -912,7 +924,7 @@ pub unsafe fn on_open(file: *const u8) {
             return;
         }
     };
-    on_open_in(file, t);
+    on_open_in(file, t, task, live);
     // Lot 325: a task's entry stays for its next open, removed at
     // `task_free`; a run's own, at the end of the run.
     if !live {
@@ -921,7 +933,7 @@ pub unsafe fn on_open(file: *const u8) {
 }
 
 #[inline(always)]
-unsafe fn on_open_in(file: *const u8, t: *mut OpenTask) {
+unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
     let w = (*t).win.as_mut_ptr();
     let inode = read_windows(file, w);
     if inode.is_null() {
@@ -966,24 +978,9 @@ unsafe fn on_open_in(file: *const u8, t: *mut OpenTask) {
     // writing `/dev/console` at shutdown) does not count.
     let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
     let size = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SIZE_OFFSET));
-    observe(&key, watched, watched, mode, flags, dentry, regular, size, (*t).names.as_mut_ptr());
-}
-
-/// The sensor proper. `family_checked`: the caller already knows the
-/// opener is not the agent itself.
-#[inline(always)]
-unsafe fn observe(
-    key: &InodeKey,
-    watched: bool,
-    family_checked: bool,
-    mode: u32,
-    flags: u32,
-    dentry: *const u8,
-    regular: bool,
-    size: u64,
-    scratch: *mut u8,
-) {
-    let write = mode & FMODE_WRITE != 0;
+    // Lot 332 (verifier headroom): the sensor proper in global functions,
+    // each checked once — the directory's class, the write count, the
+    // rest — not again for every state the FIM watch above leaves.
     if dentry.is_null() {
         return;
     }
@@ -997,24 +994,150 @@ unsafe fn observe(
     }
     // The parent is on the file's filesystem (and, on btrfs, in its
     // subvolume): only its inode number is read.
-    let pkey = InodeKey {
-        dev: key.dev,
-        ino: match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-            Ok(i) => i,
-            Err(_) => return,
-        },
+    let pino = match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+        Ok(i) => i,
+        Err(_) => return,
     };
-    let cls = dir_class(&pkey, parent, parent_inode);
+    let cls = nn_open_class(key.dev, pino, parent as u64, parent_inode as u64);
+    // For [`nn_open_observe`]: the class, the parent and its inode number,
+    // in the task's own buffer (every field of the windows is out of it).
+    let stash = w as *mut u64;
+    core::ptr::write_volatile(stash.add(STASH_CLASS), cls);
+    core::ptr::write_volatile(stash.add(STASH_PARENT), parent as u64);
+    core::ptr::write_volatile(stash.add(STASH_PINO), pino);
+    // Write-opens are counted before the family lookup; a crossing is
+    // emitted by the count itself, as a record of its own, and the agent's
+    // own writes are dropped there (once per window).
+    if mode & FMODE_WRITE != 0 && regular {
+        let created = mode & FMODE_CREATED != 0;
+        let _ = nn_open_count_write(
+            cls,
+            dentry as u64,
+            key.dev
+                | (u64::from(size != 0) << 63)
+                | (u64::from(created) << 62)
+                | (u64::from(size >= OVERWRITE_MIN_BYTES) << 61),
+            key.ino,
+            u64::from(flags) | (u64::from(mode) << 32),
+        );
+    }
+    let dev_bits = key.dev | (u64::from(watched) << OBS_WATCHED) | (u64::from(live) << OBS_LIVE);
+    let _ = nn_open_observe(task, dev_bits, key.ino, dentry as u64, u64::from(flags) | (u64::from(mode) << 32));
+}
+
+/// [`nn_open_observe`]'s flags, above the device (a `u32`, `stat_dev`): the
+/// inode is watched by FIM; the task's buffer is its [`OPEN_TASK`] entry
+/// (else the run's own, [`OPEN_TASK_RUN`]).
+const OBS_WATCHED: u64 = 63;
+const OBS_LIVE: u64 = 59;
+/// Where `on_open_in` leaves the class ([`nn_open_class`]'s), the parent
+/// dentry and its inode number for [`nn_open_observe`]: the first words of
+/// the task's window buffer, read whole before (every field it needs is
+/// out of it by then).
+const STASH_CLASS: usize = 0;
+const STASH_PARENT: usize = 1;
+const STASH_PINO: usize = 2;
+
+/// The running task `task`'s buffer, in the map `dev_bits` names
+/// ([`OBS_LIVE`]).
+#[inline(always)]
+unsafe fn buffer_of(task: u64, dev_bits: u64) -> Option<*mut OpenTask> {
+    if dev_bits >> OBS_LIVE & 1 != 0 {
+        OPEN_TASK.get_ptr_mut(&task)
+    } else {
+        OPEN_TASK_RUN.get_ptr_mut(&task)
+    }
+}
+
+/// Lot 332 (verifier headroom): the class of a directory ([`dir_class`]):
+/// the one of inode `pino` on device `dev`, `parent` its dentry and
+/// `parent_inode` its inode — the class's bits in the low half of the
+/// result, the runtime directory's owner in the high half (as
+/// [`dir_class`]'s walk). With the sensor inline in `fim_file_open_sensor`,
+/// 5.15 verified it again for every state the FIM watch left: 821,228
+/// instructions processed, 765k in the program's own body. A global
+/// function: checked once. Every argument is a plain value, as
+/// [`nn_open_walk`]'s.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_open_class(dev: u64, pino: u64, parent: u64, parent_inode: u64) -> u64 {
+    // SAFETY: reads of the kernel's objects through helpers and this
+    // module's maps.
+    unsafe {
+        let pkey = InodeKey { dev, ino: pino };
+        let cls = dir_class(&pkey, parent as *const u8, parent_inode as *const u8);
+        u64::from(cls.bits) | (u64::from(cls.uid) << 32)
+    }
+}
+
+/// Lot 332 (verifier headroom): the rest of the sensor ([`observe`]) — the
+/// leaf's names, the reason, the record — for the running task `task`'s
+/// open of the inode `ino` on the device in the low half of `dev_bits`,
+/// `dentry` the opened file's, `flags_mode` its `f_flags` with its `f_mode`
+/// in the high half; the directory's class ([`nn_open_class`]), its parent
+/// and its inode number from `on_open_in` (in the task's buffer, the one
+/// map lookup of its own: the names it reads are map keys, which 5.15 takes
+/// from a map value or the stack only). A global function: checked once.
+/// Returns 0.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_open_observe(task: u64, dev_bits: u64, ino: u64, dentry: u64, flags_mode: u64) -> u64 {
+    // SAFETY: the running task's own buffer, then reads of the kernel's
+    // objects through helpers.
+    unsafe {
+        let Some(t) = buffer_of(task, dev_bits) else {
+            return 0;
+        };
+        let w = (*t).win.as_ptr() as *const u64;
+        let watched = dev_bits >> OBS_WATCHED & 1 != 0;
+        observe(
+            &InodeKey {
+                dev: dev_bits & 0xFFFF_FFFF,
+                ino,
+            },
+            watched,
+            watched,
+            (flags_mode >> 32) as u32,
+            flags_mode as u32,
+            dentry as *const u8,
+            core::ptr::read_volatile(w.add(STASH_CLASS)) as u32,
+            core::ptr::read_volatile(w.add(STASH_PARENT)) as *const u8,
+            core::ptr::read_volatile(w.add(STASH_PINO)),
+            (*t).names.as_mut_ptr(),
+        );
+    }
+    0
+}
+
+/// The sensor proper, past the directory's class ([`nn_open_class`]):
+/// `cls_bits` the class of the opened file's directory, `parent` that
+/// directory's dentry and `pino` its inode number. `family_checked`: the
+/// caller already knows the opener is not the agent itself.
+#[inline(always)]
+unsafe fn observe(
+    key: &InodeKey,
+    watched: bool,
+    family_checked: bool,
+    mode: u32,
+    flags: u32,
+    dentry: *const u8,
+    cls_bits: u32,
+    parent: *const u8,
+    pino: u64,
+    scratch: *mut u8,
+) {
+    let write = mode & FMODE_WRITE != 0;
+    let pkey = InodeKey { dev: key.dev, ino: pino };
     // A file's own rule only where userland put one (DIR_HAS_FILES).
-    let mut own = if cls.bits & DIR_HAS_FILES != 0 { rule(key) } else { 0 };
+    let mut own = if cls_bits & DIR_HAS_FILES != 0 { rule(key) } else { 0 };
 
     // The leaf name, only where it matters: credential leaves (not for
     // an inode the FIM path already reports) and missing-file rules.
-    let leaf_cred = !watched && cls.bits & (LEAVES_CRED | TREE_HOME) != 0;
-    let mut cred = !watched && cls.bits & TREE_CRED != 0;
-    if leaf_cred || cls.bits & CHILD_FILES != 0 {
+    let leaf_cred = !watched && cls_bits & (LEAVES_CRED | TREE_HOME) != 0;
+    let mut cred = !watched && cls_bits & TREE_CRED != 0;
+    if leaf_cred || cls_bits & CHILD_FILES != 0 {
         read_name(dentry, scratch);
-        if cls.bits & CHILD_FILES != 0 {
+        if cls_bits & CHILD_FILES != 0 {
             let ck = scratch.add(64);
             core::ptr::write_volatile(ck as *mut u64, pkey.dev);
             core::ptr::write_volatile((ck as *mut u64).add(1), pkey.ino);
@@ -1026,7 +1149,7 @@ unsafe fn observe(
         if leaf_cred && !cred {
             // (leaf, parent name) where the parent's name decides
             // (`.aws/credentials`), then (leaf, any) in home trees.
-            if cls.bits & LEAVES_CRED != 0 {
+            if cls_bits & LEAVES_CRED != 0 {
                 read_name(parent, scratch.add(OPEN_NAME_LEN));
                 if let Some(v) = OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
                     cred = *v & LEAF_CRED != 0;
@@ -1038,7 +1161,7 @@ unsafe fn observe(
                     cred = *v & LEAF_CRED != 0;
                 }
             }
-            if !cred && cls.bits & TREE_HOME != 0 {
+            if !cred && cls_bits & TREE_HOME != 0 {
                 cred = kdbx_suffix(&*(scratch as *const [u8; OPEN_NAME_LEN]));
             }
         }
@@ -1048,41 +1171,27 @@ unsafe fn observe(
     if own & FILE_SENSITIVE != 0 {
         reason |= open_reason::SENSITIVE;
     }
-    if write && (own & FILE_CRITICAL != 0 || cls.bits & TREE_CRITICAL != 0) {
+    if write && (own & FILE_CRITICAL != 0 || cls_bits & TREE_CRITICAL != 0) {
         reason |= open_reason::CRITICAL;
     }
-    if write && (own & FILE_PERSIST != 0 || cls.bits & TREE_PERSIST != 0) {
+    if write && (own & FILE_PERSIST != 0 || cls_bits & TREE_PERSIST != 0) {
         reason |= open_reason::PERSIST;
     }
-    if cls.bits & CHILDREN_PROBE != 0 {
+    if cls_bits & CHILDREN_PROBE != 0 {
         reason |= open_reason::PROBE;
     }
     if cred {
         reason |= open_reason::CRED;
     }
-    // Write-opens are counted before the family lookup; a crossing is
-    // emitted by the count itself, as a record of its own, and the agent's
-    // own writes are dropped there (once per window).
+    // The write-open was counted before ([`nn_open_count_write`], from
+    // `on_open_in`).
     // Lab PR 137, 5.15 verifier budget: nothing of the count comes back
-    // here, and no value of `cls.bits` is folded into `reason` (the depth
+    // here, and no value of `cls_bits` is folded into `reason` (the depth
     // cap is counted in the walk). The branches below test `reason`: an
     // unknown folded into it keeps alive the paths that report nothing,
     // and a class bit folded into it is made precise back to the map read,
     // so states stop merging. The second took `fim_file_open_sensor` past
     // the million instructions.
-    if write && regular {
-        let created = mode & FMODE_CREATED != 0;
-        let _ = nn_open_count_write(
-            u64::from(cls.bits) | (u64::from(cls.uid) << 32),
-            dentry as u64,
-            key.dev
-                | (u64::from(size != 0) << 63)
-                | (u64::from(created) << 62)
-                | (u64::from(size >= OVERWRITE_MIN_BYTES) << 61),
-            key.ino,
-            u64::from(flags) | (u64::from(mode) << 32),
-        );
-    }
     if reason == 0 {
         return;
     }

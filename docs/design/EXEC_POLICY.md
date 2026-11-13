@@ -619,23 +619,56 @@ The rules are outside the frozen V2 validation denominator, like
   exec's file (the LSM `file_free_security` program `execq_exec_failed`,
   which removes the task's candidate naming that inode); each share holds
   at most 1024 candidates (`EXECQ_CAND_UIDS`) — the re-check of #547 (G5):
-  a login's share (`task->loginuid`, which every process of the session
-  keeps, the subuids of a rootless container included, and none can change
-  in a user namespace), a service's uid without one; it was the uid's, and
-  four subuids of one login filled the map. The shares the rows' map has no
-  room for share one overflow row under the same cap. The map full, the
-  oldest candidate still in it — made at least a second ago (its exec is
-  stuck: no program of its task holds it), found in a ring of the
-  candidates in the order they were made — goes for the new one
-  (`CAND_EVICTED`); none old enough, the new one is dropped
-  (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
+  it was the uid's, and four subuids of one login filled the map. Lot 332
+  (the re-check 2, G5): an account's share
+  (`task_scratch::nn_share_key`, `wire::execq::share_key`) — its uid in
+  the initial user namespace; in a user namespace, the account that made
+  the outermost one (nested namespaces included), or that namespace's
+  inode number when root made it (one share per system container). The
+  login uid it was keyed by is set to any value, without a privilege, by a
+  task that has none (a service, a container under a root daemon): one
+  share per child. The review of #551 (F1): a user with an `/etc/subuid`
+  range takes any uid of it as its real uid in the initial namespace (a
+  binary owned by that subuid made setuid inside a namespace the user
+  made, run outside it, then `setresuid`) or as the creator of a new
+  namespace — 65,536 keys, about 67 of which filled the map. The uid or
+  the creator is first looked up in the host's ranges, which the agent
+  publishes (`SHARE_SUBUID`, an LPM trie of 16,384 entries, one kept free
+  for an in-place rewrite on kernels before the upstream fix for full LPM
+  tries; `nn_linux::sensors::share_subuid`, read again within 2 s of a
+  change to `/etc/subuid` or `/etc/passwd`): a uid of a range is its
+  owner's share, and of a range root owns (LXD, Incus) the reserved row
+  `ROOT_SUBID_SHARE`, never root's own (the re-check of #551, G1: a domain
+  account with a uid there filled root's row); one of the ranges' span no
+  single owner is known for (an owner `/etc/passwd` does not resolve, two
+  users' ranges overlapping, a gap, a range past the trie's room) is the
+  overflow row's, never a share of its own — real accounts whose uid lies
+  there included; an unreadable `/etc/subuid` puts every uid from 65,536
+  up there.
+  What a task can still choose: a namespace root made is one share each,
+  so a setuid-root helper that makes one per run gives its caller one
+  share per run, and ranges served by NSS (`subid:`) are not published.
+  The shares the rows' map has no room for share one overflow row under
+  the same cap, and every share's entries are counted together (lot 332,
+  the global cap): past the map's room less one share's (3072), a share
+  holding 16 candidates or more takes no more, so the shares at their cap
+  leave room for 64 others — a bound on greedy shares, not on their
+  number: the map's room is that. The map full, the oldest candidate still in it
+  — made at least a second ago (its exec is stuck: no program of its task
+  holds it) — goes for the new one (`CAND_EVICTED`); lot 332: found by
+  walking the map (`bpf_for_each_map_elem`, every entry, on the full map's
+  path only), where it was the first 8 slots of a ring of the candidates
+  in the order they were made, which failed execs (a candidate made, then
+  removed with its file) filled with gone ones. None old enough, the new
+  one is dropped (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
   `not_held` and in the signed `exec quarantine fail-open` degradation (one
   per ten minutes while they move). `task_free` is attached
   once per object and the agent tracks "attached", not "loaded" (F9: a load
   whose attach failed made the next caller skip it, silently).
 - The review of #547 (F6): the FIM sensor's buffers (`OPEN_TASK`, 65,536
-  tasks) — each share (the login's, the re-check's G5, as above) holds at
-  most 16,384 (`OPEN_TASK_UIDS`); past it, or the
+  tasks) — each share (the account's, the re-check's G5 and lot 332, as
+  above) holds at most 16,384 (`OPEN_TASK_UIDS`), and past 49,152 entries
+  in all no more than 256 (the global cap); past it, or the
   map full, the open is judged in a buffer made and removed in the run
   (`OPEN_TASK_RUN`, the cost before lot 325: an insert and a delete), and
   counted (`nn-admin status`: `open_sensor_per_call_total`); only with no

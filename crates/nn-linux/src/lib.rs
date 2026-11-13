@@ -475,6 +475,11 @@ pub mod upgrade_rollback;
 #[cfg(feature = "debug-trigger")]
 pub mod verifier_check;
 
+// Lot 332: the verifier's headroom of every program (its count against the
+// million-instruction limit) and the lab's gate on it — the judgement
+// `verifier_check` prints, compiled and tested in every build.
+pub mod verifier_headroom;
+
 // R09a shims (lab PR 253; plan §4.1 rule 2, removed in R17): the paths the
 // moved code names for what is nn-evidence's and nn-core's, as the agent's
 // shims of the same names give them, so the files moved as they were.

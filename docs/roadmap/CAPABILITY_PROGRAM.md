@@ -10629,3 +10629,143 @@ number in parentheses is a lab PR.
     nested unit name, NetworkManager only in dnsmasq's units, four uids).
   - Level unchanged: the change removes false positives; no capability gains
     evidence it lacked.
+- **Lot 332 — verifier headroom on every kernel, and the shares an
+  account's (C23, C14; no level changes).**
+  - What was open: `verifier-check` printed the verifier's count from 5.16
+    only (5.15: `n/a`, aya keeps no log of a program it loaded), and
+    nothing failed near the limit; `fim_file_open_sensor` was at 821,228 of
+    1,000,000 on 5.15, and two of lot 325's rounds hit the limit on one
+    kernel first. The re-check 2 of #547 (G5, P3): the shares' key was the
+    login uid, which a task without one sets to any value without a
+    privilege; the overflow row bounded only the keys the rows' map could
+    not hold (four shares at their cap filled the 4,096 candidates); a full
+    candidates' map looked for its oldest in the first 8 slots of a ring
+    that failed execs could fill with gone ones.
+  - Done: `verifier-check` measures every program — the program info's
+    count, or on 5.15 the verifier's own counter read by a kprobe event on
+    `check_max_stack_depth` in a tracing instance of its own — and fails a
+    kernel above 900,000 for a program the agent needs, or with one it
+    could not measure; it prints the ten highest; the nightly `lab-vm.yml`
+    runs it on its five guests (a step of its own, its outcome in the gate
+    summary). `fim_file_open_sensor`'s sensor past the FIM watch is three
+    global functions called in turn (`nn_open_class`,
+    `nn_open_count_write`, `nn_open_observe`), the same work in the same
+    order. G5: the key is the uid in the initial user namespace, in a user
+    namespace the creator of the outermost one (its inode when root made
+    it), never the login uid (`nn_share_key`, three optional BTF slots
+    132–134); a total row and a global cap (the map's room less one
+    share's; past it a share of a 64th or more takes no more); the oldest
+    candidate found by walking the map (`bpf_for_each_map_elem`). The
+    mini-hunt: the mass-write window of a writer in the root cgroup was
+    keyed by its uid and login uid (one window per child of a service that
+    sets it): its uid alone now.
+  - Host: `verifier_headroom` (6 tests), `wire::execq` (the key's two
+    tests, the global cap), `task_free` (the total), `btf_offsets` (the
+    slots, the layout); `xtask/tests/verifier_headroom.rs` (3, new),
+    `lab_ci.rs` (the nightly step), the updated `exec_env_complete.rs` and
+    `percpu_maps.rs`; 40 mutants, each caught by a named test; gates green
+    once (114 suites, 5,004 passed).
+  - Lab, as measured (our guests, lease k332): every program loads within
+    the budget on 5.15.0-202, 6.8.0-149, 6.12.116 and 7.0.0-43, before and
+    after; `fim_file_open_sensor` 821,228 → 144,600 (5.15), 149,234 →
+    135,781 (6.8), 171,964 → 155,416 (6.12), 275,019 → 263,368 (7.0), its
+    deepest call chain 480 of 512 bytes; the highest program on any of them
+    after the lot is `module_read_file_observe`, 551,900 on 5.15. 5.15's counts came from the kprobe, equal to
+    `bpftrace`'s on the same counter for five programs; on 7.0 the kprobe
+    and the program info agreed for 100 of 100 programs. With the budget
+    lowered to 500,000 the 5.15 run failed, naming
+    `module_read_file_observe` 551,900. The FIM sensor's behaviour:
+    `open-sensor-check` 24 of 24 on 5.15 before and after,
+    `fim_privileged_e2e` 6 of 6 after; on 6.12 `open-sensor-check` 24 of 24 and
+    `fim_privileged_e2e` 6 of 6; on 7.0 `fim_privileged_e2e` 6 of 6, and
+    `open-sensor-check` stopped at its eighth case for `main` and the lot
+    alike, the same boot: the agent's COMBAT killed the check's own shell
+    (its mass write, corroborated by a High `NN-L-AT-001` on systemd loading
+    a tracepoint BPF program as the check starts) — a follow-up on 7.0,
+    not this lot's. Its cost on 5.15 (bpf_stats, 300,000
+    opens, best of three, the same boot): 406.4 ns per open on `main`,
+    358.7 ns after. G5 on 5.15 (the same boot): a service's ten children,
+    each writing its own login uid (5001–5010) before its first open, took
+    ten rows on `main` and none after (all counted in the service's uid's
+    row, 33); the lab user's processes in user namespaces it made, one and
+    two deep, counted in its own row (1000); after the lot the same on 6.12.
+  - The review of #551 (MERGE AFTER FIXES; F1–F3, P3):
+    - F1: a user with an `/etc/subuid` range took any of its 65,536 uids as
+      a key — the real uid in the initial namespace (a binary owned by the
+      subuid made setuid inside a namespace the user made, then
+      `setresuid`) or a new namespace's creator — and about 67 keys filled
+      the candidates' map (on `main`, keyed by the login uid, those
+      processes stayed in the login's row: a regression for logged-in users
+      with subuids). The agent publishes the ranges into an LPM trie
+      (`SHARE_SUBUID`, 16,384 entries; `nn_linux::sensors::share_subuid`,
+      read again within 2 s of a change to `/etc/subuid` or `/etc/passwd`),
+      and `nn_share_key` looks the uid or the creator up there first: a
+      range's uid is its owner's share; one of the span no single owner is
+      known for is the overflow row's (fail closed), and an unreadable
+      `/etc/subuid` puts every uid from 65,536 up there. The claims "no
+      task can choose" and "subuids are its user's" are corrected to what
+      holds; the residual (a namespace root made is a share each, a
+      setuid-root helper's per-run namespaces included; NSS subids) is
+      recorded.
+    - F2: `nn-lab.sh verifier-check` removes the probe's instance and event
+      before the run, in the run's ssh session as soon as the agent
+      returns, and after it (a killed agent never ran its destructor).
+    - F3: the kprobe's line of a load is the one with its program's tag
+      (the program info's; the id is given after the verifier), not only
+      its 15-byte name; a pid filter that cannot be set fails the probe.
+    - Host: `share_subuid` (7 tests: the reviewer's setresuid case is the
+      owner's row; 100 keys of one user fill no map, two shares at most,
+      where the same keys without the trie fill it), `wire::execq` (the
+      key with the trie's answer), `verifier_headroom` (two programs
+      sharing 15 bytes told apart by their tag), `lab_ci.rs` (the teardown
+      run against fake tracefs trees), the updated `exec_env_complete.rs`;
+      38 mutants, each caught by a named test; gates green once more
+      (114 suites, 5,015 passed).
+    - Lab, as measured (our guests, lease k332): `verifier-check` 0 failing
+      on 5.15.0-202 and 7.0.0-43; `fim_file_open_sensor` 144,651 (5.15) and
+      263,427 (7.0) with the trie's lookup, its deepest chain still 480 of
+      512 bytes; on 7.0 the kprobe (tag-matched) and the program info
+      agree for 100 of 100 programs. F1, the agent installed, both kernels:
+      tasks whose real uid is the lab user's subuid 104242 (made with
+      `setpriv` as root: the reviewer's end state), and tasks in a
+      namespace that uid created, count in the user's row (1000), no row
+      104242; uid 70000 (no one's subuid) has its own; a range added for
+      an owner `/etc/passwd` does not know is the overflow row's (0 → 5);
+      the trie follows `/etc/subuid` (12 → 29 → 12 entries). F2: an agent
+      SIGKILLed once its probe was armed left the instance (and on 7.0 the
+      event); the same kill under `nn-lab.sh verifier-check` left nothing.
+  - The re-check 1 of #551 (MERGE AFTER FIXES; G1, G2, P3):
+    - G1: a range root owns in `/etc/subuid` (LXD, Incus:
+      `root:1000000:1000000000`) was published as root's row (0), so a
+      real account whose uid lies in it (a domain account: sssd, FreeIPA,
+      LDAP ids run to 2·10⁹) and its namespaces counted in root's row, and
+      one such user's held execs could fill it (root's next candidate
+      `CAND_DROPPED`). Root's ranges are now a reserved row of their own,
+      `ROOT_SUBID_SHARE`, under the per-share cap (`wire::execq::
+      subuid_row`; `share_key` keys no account or namespace there without
+      the trie's answer). Accounts whose uid lies in a gap between ranges,
+      or in a range whose owner is not known, still count in the overflow
+      row (a residual, documented).
+    - G2: the table published keeps one node of the trie free (16,383 of
+      16,384 entries): before the upstream in-place fix for full LPM tries
+      a kernel refuses every update of a full trie, an existing key's too,
+      so a table landing exactly on the cap was never rewritten.
+    - The comment that the ranges are published "before the quarantine's
+      candidates are taken" is corrected (the first publish lands moments
+      later, on its own thread). The ranges' start and count stay read in
+      decimal (documented: `newuidmap` also reads hex and octal).
+    - Host: `share_subuid` (the reviewer's probe as
+      `real_accounts_inside_the_span_never_take_root_s_row`;
+      `root_s_execs_are_held_when_root_s_ranges_row_is_full`;
+      `a_full_table_keeps_one_node_free_for_an_in_place_rewrite`),
+      `wire::execq` (`root_s_subuid_ranges_are_not_root_s_row`), the
+      updated `exec_env_complete.rs`; 7 mutants of the new branches, each
+      caught by a named test.
+    - Lab, as measured (our guest, lease k332): `verifier-check` 0 failing
+      on 7.0.0-43 (112 programs, 107 OK, 5 not counted);
+      `fim_file_open_sensor` 263,427 instructions processed, as before the
+      re-check (6,271 instructions loaded, 3 more), its deepest chain still
+      480 of 512 bytes; no probe instance or kprobe event left.
+  - Level unchanged: the gate is the lab's and the nightly's; C23's
+    provisional waits on the nightly on the five guests, now with the
+    verifier step.

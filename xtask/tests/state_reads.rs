@@ -729,6 +729,13 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_to_string(\"/proc/sys/kernel/osrelease\")",
         KNOB,
     ),
+    // lot 332: the kprobe's trace of one load; unreadable, the program has
+    // no count and the headroom gate fails it ("unmeasured")
+    (
+        "crates/nn-linux/src/verifier_check.rs",
+        "read_to_string(self.instance.join(\"trace\"))",
+        LAB,
+    ),
     (
         "crates/nn-linux/src/worker/supervisor.rs",
         "read_state(format!(\"/proc/{pid}/stat\"))",
