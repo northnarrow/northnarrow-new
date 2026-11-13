@@ -10596,5 +10596,23 @@ number in parentheses is a lab PR.
     lines with the install's key through the started agent. An `alpha`
     start after an enforcing run with no signed `profile.local` signs an
     `integrity_drift` `profile_downgraded` (F8).
+    Lab, as measured (lease k341, the BPF guard enforcing, `nn-lab.sh
+    host-deny-check` rewritten: H0–H7): Ubuntu 24.04 (6.8), a plain alpha
+    install — a tracepoint and a kprobe program of a foreign root process
+    EPERM, `bpftrace` refused (rc 255, "Error loading program"),
+    `opensnoop-bpfcc` refused (`Operation not permitted`), the agent's map,
+    program and 82 link handles EPERM (33 pins kept), `sysctl -w
+    kernel.ftrace_enabled=0` refused (still 1), `kprobes/enabled=0` refused,
+    a SIGSTOP to the agent refused, a move into a mounted v1 freezer
+    hierarchy refused; the R001 probe not killed (`would have:
+    KillProcessTree`, 0 actions carried out). The same host with
+    `install.sh --allow-bpf-tools`: lines for `/usr/bin/bpftrace` and
+    `/usr/bin/python3` signed and applied, `bpftrace` ran (446 opens),
+    `opensnoop-bpfcc` ran, the python loads let through (`bpf_prog_opt_out`),
+    everything else refused as before. Debian 13 (6.12.116): the same
+    (`bpftrace` refused, then 460 opens with the flag; BCC cannot compile
+    there — no kheaders — the raw_tracepoint loader stood in). Every
+    `uninstall.sh --purge` rc 0; after a cold boot the diff against the host
+    before the round was empty on both (the check's own apt packages aside).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
