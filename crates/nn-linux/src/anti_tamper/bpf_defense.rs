@@ -41,6 +41,12 @@ pub const PROG_GUARD_PROGRAM: &str = "bpf_prog_guard";
 pub const PROG_GUARD_HOOK: &str = "bpf_prog";
 /// Lot 290: the signed per-loader opt-out's map (pinned by name).
 pub const LOADER_OPTOUT_MAP: &str = "BPF_LOADER_OPTOUT";
+/// Lot 345: the content judge at a load's kernel copy (6.9 and later).
+pub const PROG_LOAD_GUARD_PROGRAM: &str = "bpf_prog_load_guard";
+pub const PROG_LOAD_GUARD_HOOK: &str = "bpf_prog_load";
+/// Lot 345: the content judge's configuration (written and frozen before
+/// the guard is attached).
+pub const CONTENT_CONF_MAP: &str = "PROG_CONTENT_CONF";
 
 /// External audit EBPF-002: roles in `OWN_EXE_INODES` (mirrors
 /// `agent-ebpf/src/bpf_defense.rs`).
@@ -305,6 +311,49 @@ pub(crate) fn attach(
                 .push((ROLE_EXIT_PROGRAM, format!("{e:#}")));
         }
     }
+    // Lot 345 (the re-check of #550, point 1 (ii)): the content judge — a
+    // foreign program of a type refused by default (one only a signed
+    // per-loader opt-out lets through) that calls a helper or kfunc that
+    // signals, writes a process's memory or overrides a return is refused,
+    // opt-out or not. 6.9 and later: at `bpf_prog_load`, on the kernel's
+    // copy of the instructions (the helpers' ids). Before: at `bpf_prog`, on
+    // the verified ones, against targets the hook calibrates from the
+    // agent's own programs (below, once that hook is attached), and
+    // `bpf_probe_write_user` at the verifier's lockdown question.
+    let resolved = crate::anti_tamper::btf_revalidate::resolved();
+    let at_load = resolved.is_some_and(|r| r.prog_load_hook)
+        && match attach_guard_hook(
+            ebpf,
+            PROG_LOAD_GUARD_PROGRAM,
+            PROG_LOAD_GUARD_HOOK,
+            btf,
+            pin_root,
+            enforce,
+        ) {
+            Ok(()) => {
+                info!(
+                    program = PROG_LOAD_GUARD_PROGRAM,
+                    hook = PROG_LOAD_GUARD_HOOK,
+                    "BPF self-defence: content judge attached at the load (the kernel's copy)"
+                );
+                true
+            }
+            Err(e) => {
+                dump_verifier_log(PROG_LOAD_GUARD_PROGRAM, &e);
+                warn!(program = PROG_LOAD_GUARD_PROGRAM, error = format!("{e:#}"), "BPF self-defence: content judge at the load NOT attached — judged at the handle instead");
+                health
+                    .observe_failures
+                    .push((PROG_LOAD_GUARD_PROGRAM, format!("{e:#}")));
+                false
+            }
+        };
+    if at_load {
+        let judge = ContentJudge::at_load(resolved.and_then(|r| r.forbidden_kfunc_id));
+        if let Err(e) = write_content_judge(ebpf, &judge, true) {
+            warn!(error = %e, "BPF self-defence: content judge NOT armed");
+            health.observe_failures.push((CONTENT_JUDGE, e));
+        }
+    }
     // Lot 302: the bpf() guard pinned like the deny hooks (`prog_bpf`,
     // `link_bpf` under the pin root, attach-before-purge): it went with the
     // agent, so through a restart or an upgrade's gap a handle on one of the
@@ -356,6 +405,21 @@ pub(crate) fn attach(
                 .push((PROG_GUARD_PROGRAM, format!("{e:#}")));
         }
     }
+    // Lot 345: before 6.9, the content judge at the handle — calibrated by
+    // the `bpf_prog` hook just attached, then armed and frozen.
+    if !at_load {
+        let lockdown = resolved.and_then(|r| r.lockdown_bpf_write_user);
+        match arm_content_at_handle(ebpf, btf, pin_root, enforce, lockdown) {
+            Ok(judge) => info!(
+                targets = ?judge.targets,
+                "BPF self-defence: content judge armed at the handle (calibrated)"
+            ),
+            Err(e) => {
+                warn!(error = %e, "BPF self-defence: content judge at the handle NOT armed — an opted-out loader's program is not read for signalling helpers");
+                health.observe_failures.push((CONTENT_JUDGE, e));
+            }
+        }
+    }
     match crate::bpf_crossview::Parts::setup(ebpf, btf) {
         Ok(parts) => {
             *guard.0.census.lock() = Some(parts);
@@ -402,6 +466,209 @@ fn attach_guard_hook(
             Ok(())
         }
     }
+}
+
+/// Lot 345: the content judge, as its failures name it.
+pub const CONTENT_JUDGE: &str = "bpf content judge";
+
+/// Lot 345: the content judge's configuration for the running kernel —
+/// `PROG_CONTENT_CONF` (`bpf_prog_class::CONTENT_CONF_SLOTS`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentJudge {
+    /// `bpf_prog_class::CONTENT_STAGE_*`.
+    pub stage: u32,
+    /// `bpf_prog_class::CALL_TARGETS`, as the judged copy names them.
+    pub targets: [u32; common::bpf_prog_class::CALL_TARGETS],
+    /// Why there is no judge on this kernel (then `stage` is off).
+    pub off: Option<String>,
+}
+
+impl ContentJudge {
+    /// 6.9 and later, at `bpf_prog_load`: the helpers' uapi ids, and the
+    /// kfunc's BTF id where vmlinux has it.
+    pub fn at_load(kfunc_btf_id: Option<u32>) -> Self {
+        use common::bpf_prog_class::{CALL_TARGETS, CONTENT_STAGE_LOAD, FORBIDDEN_HELPERS};
+        let mut targets = [0u32; CALL_TARGETS];
+        for (slot, (id, _)) in FORBIDDEN_HELPERS.iter().enumerate() {
+            targets[slot] = *id;
+        }
+        targets[CALL_TARGETS - 1] = kfunc_btf_id.unwrap_or(0);
+        Self {
+            stage: CONTENT_STAGE_LOAD,
+            targets,
+            off: None,
+        }
+    }
+
+    /// Before 6.9, at `bpf_prog` once verified: a helper call's `imm` is
+    /// then the helper's address less `__bpf_call_base` (the verifier's
+    /// fix-up). `calibrated`: the targets the hook read from the agent's
+    /// calibration programs (`PROG_CONTENT_CONF` after their loads) — the
+    /// signals are required (without them nothing is judged); the return
+    /// override is absent from a kernel built without
+    /// `CONFIG_BPF_KPROBE_OVERRIDE`; `bpf_probe_write_user`'s slot stays 0
+    /// (refused at the `locked_down` hook instead).
+    pub fn at_handle(calibrated: [u32; common::bpf_prog_class::CALL_TARGETS]) -> Self {
+        use common::bpf_prog_class::{
+            CALL_TARGETS, CONTENT_STAGE_HANDLE, CONTENT_STAGE_OFF, FORBIDDEN_HELPERS,
+        };
+        let mut targets = [0u32; CALL_TARGETS];
+        // the slots the calibrations fill: override, send_signal, _thread
+        targets[1..4].copy_from_slice(&calibrated[1..4]);
+        let missing: Vec<&str> = [2, 3]
+            .iter()
+            .filter(|s| targets[**s] == 0)
+            .map(|s| FORBIDDEN_HELPERS[*s].1)
+            .collect();
+        if !missing.is_empty() {
+            return Self {
+                stage: CONTENT_STAGE_OFF,
+                targets: [0; CALL_TARGETS],
+                off: Some(format!(
+                    "the calibration found no verified call of {}",
+                    missing.join(", ")
+                )),
+            };
+        }
+        Self {
+            stage: CONTENT_STAGE_HANDLE,
+            targets,
+            off: None,
+        }
+    }
+}
+
+/// Lot 345 (before 6.9): calibrate the content judge — load each of the
+/// agent's calibration programs while `PROG_CONTENT_CALIB` asks for it (the
+/// `bpf_prog` hook writes the verified calls' targets), unload them, read
+/// the targets back — then arm the stage, attach the `locked_down` guard
+/// for `bpf_probe_write_user` (this kernel's `LOCKDOWN_BPF_WRITE_USER`,
+/// `lockdown`) and freeze the configuration.
+fn arm_content_at_handle(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+    enforce: bool,
+    lockdown: Option<u32>,
+) -> std::result::Result<ContentJudge, String> {
+    use common::bpf_prog_class::{
+        CALIB_NONE, CALIB_OVERRIDE, CALIB_SIGNALS, CALL_TARGETS, CONTENT_LOCKDOWN_SLOT,
+    };
+    for (kind, program) in [
+        (CALIB_SIGNALS, CALIB_SIGNALS_PROGRAM),
+        (CALIB_OVERRIDE, CALIB_OVERRIDE_PROGRAM),
+    ] {
+        set_calibration(ebpf, kind)?;
+        let loaded = load_calibration(ebpf, program);
+        set_calibration(ebpf, CALIB_NONE)?;
+        if let Err(e) = loaded {
+            // the override's helper is absent from some kernels' builds
+            debug!(program, error = %e, "BPF self-defence: calibration program not loaded");
+        }
+    }
+    freeze_named(ebpf, CALIB_MAP)?;
+    let mut calibrated = [0u32; CALL_TARGETS];
+    {
+        let m = ebpf
+            .map(CONTENT_CONF_MAP)
+            .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
+        let conf: Array<&MapData, u32> =
+            Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
+        for (i, t) in calibrated.iter_mut().enumerate() {
+            *t = conf.get(&(i as u32 + 1), 0).unwrap_or(0);
+        }
+    }
+    let judge = ContentJudge::at_handle(calibrated);
+    if let Some(why) = &judge.off {
+        freeze_named(ebpf, CONTENT_CONF_MAP)?;
+        return Err(why.clone());
+    }
+    let write_user = match lockdown {
+        Some(v) if v != 0 => match attach_guard_hook(
+            ebpf,
+            WRITE_USER_GUARD_PROGRAM,
+            WRITE_USER_GUARD_HOOK,
+            btf,
+            pin_root,
+            enforce,
+        ) {
+            Ok(()) => Ok(v),
+            Err(e) => {
+                dump_verifier_log(WRITE_USER_GUARD_PROGRAM, &e);
+                Err(format!("{WRITE_USER_GUARD_PROGRAM} not attached: {e:#}"))
+            }
+        },
+        _ => Err("this kernel's BTF names no LOCKDOWN_BPF_WRITE_USER".to_string()),
+    };
+    {
+        let m = ebpf
+            .map_mut(CONTENT_CONF_MAP)
+            .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
+        let mut conf: Array<&mut MapData, u32> =
+            Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
+        if let Ok(v) = &write_user {
+            conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)
+                .map_err(|e| format!("{CONTENT_CONF_MAP} slot {CONTENT_LOCKDOWN_SLOT}: {e}"))?;
+        }
+    }
+    write_content_judge(ebpf, &judge, true)?;
+    write_user.map(|_| judge).map_err(|e| {
+        format!("bpf_probe_write_user is not refused to an opted-out loader ({e}); the signals and the return override are")
+    })
+}
+
+/// Lot 345: the calibration programs and their request map.
+pub const CALIB_SIGNALS_PROGRAM: &str = "nn_calib_signals";
+pub const CALIB_OVERRIDE_PROGRAM: &str = "nn_calib_override";
+const CALIB_MAP: &str = "PROG_CONTENT_CALIB";
+/// Lot 345: the `bpf_probe_write_user` refusal at the verifier's lockdown
+/// question (before 6.9).
+pub const WRITE_USER_GUARD_PROGRAM: &str = "bpf_write_user_guard";
+pub const WRITE_USER_GUARD_HOOK: &str = "locked_down";
+
+fn set_calibration(ebpf: &mut Ebpf, kind: u32) -> std::result::Result<(), String> {
+    let m = ebpf
+        .map_mut(CALIB_MAP)
+        .ok_or_else(|| format!("{CALIB_MAP} missing from the eBPF object"))?;
+    let mut a: Array<&mut MapData, u32> =
+        Array::try_from(m).map_err(|e| format!("{CALIB_MAP}: {e}"))?;
+    a.set(0, kind, 0).map_err(|e| format!("{CALIB_MAP}: {e}"))
+}
+
+/// Load calibration program `name` (the hook reads it at the load) and
+/// unload it: it is never attached.
+fn load_calibration(ebpf: &mut Ebpf, name: &str) -> std::result::Result<(), String> {
+    let prog: &mut aya::programs::KProbe = ebpf
+        .program_mut(name)
+        .ok_or_else(|| format!("{name} missing from the eBPF object"))?
+        .try_into()
+        .map_err(|e| format!("{name}: {e}"))?;
+    prog.load().map_err(|e| format!("{name}: {e}"))?;
+    prog.unload().map_err(|e| format!("{name} unload: {e}"))
+}
+
+/// Lot 345: write `judge` to the object's `PROG_CONTENT_CONF`, and freeze it
+/// when `freeze` (no descriptor writes it again; the guard only reads it).
+fn write_content_judge(
+    ebpf: &mut Ebpf,
+    judge: &ContentJudge,
+    freeze: bool,
+) -> std::result::Result<(), String> {
+    let m = ebpf
+        .map_mut(CONTENT_CONF_MAP)
+        .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
+    let mut conf: Array<&mut MapData, u32> =
+        Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
+    conf.set(0, judge.stage, 0)
+        .map_err(|e| format!("{CONTENT_CONF_MAP} slot 0: {e}"))?;
+    for (i, t) in judge.targets.iter().enumerate() {
+        conf.set(i as u32 + 1, *t, 0)
+            .map_err(|e| format!("{CONTENT_CONF_MAP} slot {}: {e}", i + 1))?;
+    }
+    if freeze {
+        freeze_named(ebpf, CONTENT_CONF_MAP)?;
+    }
+    Ok(())
 }
 
 /// Attach the liveness watch and pin its link (`link_role_exit`): it must
@@ -837,14 +1104,24 @@ pub fn resolve_loader_opt_outs(
     let mut unresolved = Vec::new();
     for (path, mask) in lines {
         match stat(path) {
-            Ok((dev, ino)) => out.push(LoaderOptOut {
-                path: path.to_string(),
-                key: common::wire::InodeKey {
+            Ok((dev, ino)) => {
+                let key = common::wire::InodeKey {
                     dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(dev),
                     ino,
-                },
-                mask: *mask,
-            }),
+                };
+                // Lot 345 (the mini-hunt of N4): two lines that name one
+                // executable (`/usr/bin/python3` and the `python3.12` it
+                // links to) are one kernel entry with both lines' types —
+                // the last one written replaced the other's
+                match out.iter_mut().find(|o: &&mut LoaderOptOut| o.key == key) {
+                    Some(o) => o.mask |= *mask,
+                    None => out.push(LoaderOptOut {
+                        path: path.to_string(),
+                        key,
+                        mask: *mask,
+                    }),
+                }
+            }
             Err(e) => unresolved.push(format!("{path}: {e}")),
         }
     }
@@ -2021,6 +2298,40 @@ mod tests {
     /// device and inode its path names now (the kernel's device number), a
     /// path that is not there is named and not in force; the frozen maps
     /// are the three this module writes once.
+    /// Named (lot 345; the re-check of #550, point 1 (ii)): the content
+    /// judge's configuration — at the load (6.9+) the helpers' uapi ids and
+    /// the kfunc's BTF id; at the handle (before) the calibrated targets,
+    /// `bpf_probe_write_user`'s slot left to the lockdown guard, the judge
+    /// off without the signals' calibration (said), the override optional.
+    #[test]
+    fn the_content_judge_is_configured_for_the_kernel() {
+        use common::bpf_prog_class::{CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD, CONTENT_STAGE_OFF};
+        let j = ContentJudge::at_load(Some(61_234));
+        assert_eq!(j.stage, CONTENT_STAGE_LOAD);
+        assert_eq!(j.targets, [36, 58, 109, 117, 61_234]);
+        assert_eq!(j.off, None);
+        assert_eq!(ContentJudge::at_load(None).targets[4], 0);
+        // the calibration's slots: override, send_signal, send_signal_thread;
+        // whatever slot 0 and 4 held is not taken
+        let j = ContentJudge::at_handle([7, 0x10, 0x20, 0x30, 9]);
+        assert_eq!(j.stage, CONTENT_STAGE_HANDLE);
+        assert_eq!(j.targets, [0, 0x10, 0x20, 0x30, 0]);
+        // a kernel without the override helper
+        let j = ContentJudge::at_handle([0, 0, 0x20, 0x30, 0]);
+        assert_eq!(j.stage, CONTENT_STAGE_HANDLE);
+        assert_eq!(j.targets, [0, 0, 0x20, 0x30, 0]);
+        // no signal calibrated: off, said
+        let j = ContentJudge::at_handle([0, 0x10, 0x20, 0, 0]);
+        assert_eq!(j.stage, CONTENT_STAGE_OFF);
+        assert_eq!(j.targets, [0; 5]);
+        assert!(
+            j.off
+                .as_deref()
+                .is_some_and(|w| w.contains("bpf_send_signal_thread")),
+            "{j:?}"
+        );
+    }
+
     #[test]
     fn a_loader_opt_out_is_its_executable_s_device_and_inode() {
         let lines = [("/usr/bin/bpftrace", 0b100), ("/opt/gone", 0b1)];
@@ -2046,6 +2357,16 @@ mod tests {
             FROZEN_AT_REGISTRATION,
             ["BPF_DEFENSE_MODE", "OWN_EXE_INODES", "OWN_PIN_NAMES"]
         );
+        // lot 345 (the mini-hunt of N4): two lines of one executable (a
+        // symlink and its target) are one entry with both lines' types
+        let lines = [
+            ("/usr/bin/python3", 0b100),
+            ("/usr/bin/python3.12", 0b10010),
+        ];
+        let (ok, _) = resolve_loader_opt_outs(&lines, |_| Ok((2049, 77)));
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].mask, 0b10110);
+        assert_eq!(ok[0].path, "/usr/bin/python3");
         // an unsigned policy honours none
         let p = nn_core::decision::rule_policy::parse("bpf-loader-allow /usr/bin/true kprobe\n")
             .unwrap();

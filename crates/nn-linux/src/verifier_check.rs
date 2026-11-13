@@ -552,6 +552,26 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
                 .into(),
         );
     }
+    // Lot 345: the content judge at the load, on a kernel before the hook
+    // (6.9): the agent judges at the `bpf_prog` hook instead
+    if section == "lsm/bpf_prog_load" && matches!(outcome, Outcome::Absent(_)) {
+        return Some(
+            "optional: this kernel has no bpf_prog_load hook (before 6.9): the content is judged \
+             at bpf_prog once verified"
+                .into(),
+        );
+    }
+    // Lot 345: the return override's calibration program, on a kernel built
+    // without CONFIG_BPF_KPROBE_OVERRIDE (no such helper: nothing to judge)
+    if name == crate::anti_tamper::bpf_defense::CALIB_OVERRIDE_PROGRAM
+        && matches!(outcome, Outcome::Refused { log, .. } if log.contains("unknown func"))
+    {
+        return Some(
+            "optional: this kernel has no bpf_override_return (CONFIG_BPF_KPROBE_OVERRIDE off): \
+             no call of it to calibrate"
+                .into(),
+        );
+    }
     if let Outcome::Absent(_) = outcome {
         let hook = section.strip_prefix("lsm/").unwrap_or("");
         if OPTIONAL_DENY_HOOKS.contains(&hook) {
@@ -1273,6 +1293,10 @@ mod tests {
             "nn_link_id_of_fd",
             "nn_obj_get_own_link",
             "nn_loader_opted_out",
+            // lot 345: the content judge's scan
+            "nn_prog_forbidden_call",
+            "nn_scan_block",
+            "nn_scan_chunk",
         ] {
             assert!(!s.contains_key(sub), "{sub} is a subprogram");
         }
@@ -1304,5 +1328,20 @@ mod tests {
         assert!(optional_reason("census_links", "iter/bpf_link", &refused).is_none());
         let no_prog_iter = Outcome::Absent("bpf_iter_bpf_prog".into());
         assert!(optional_reason("census_progs", "iter/bpf_prog", &no_prog_iter).is_none());
+        // lot 345: the content judge at the load, before 6.9; the return
+        // override's calibration without its helper — and nothing else of
+        // theirs
+        let no_load_hook = Outcome::Absent("bpf_lsm_bpf_prog_load".into());
+        assert!(
+            optional_reason("bpf_prog_load_guard", "lsm/bpf_prog_load", &no_load_hook).is_some()
+        );
+        assert!(optional_reason("bpf_prog_load_guard", "lsm/bpf_prog_load", &refused).is_none());
+        let no_override = Outcome::Refused {
+            errno: Some(libc::EINVAL),
+            log: "0: R1=ctx() R10=fp0\n; unknown func bpf_override_return#58\n".into(),
+        };
+        assert!(optional_reason("nn_calib_override", "kprobe", &no_override).is_some());
+        assert!(optional_reason("nn_calib_override", "kprobe", &refused).is_none());
+        assert!(optional_reason("nn_calib_signals", "kprobe", &no_override).is_none());
     }
 }

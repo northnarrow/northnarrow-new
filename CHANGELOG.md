@@ -81,6 +81,35 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
+- Lot 345: hardening of the allowed BPF loaders before the alpha tag (the
+  re-check of #550).
+  - **The content judge.** A loader the signed per-loader opt-out names
+    (`install.sh --allow-bpf-tools`: python3, so any root Python script;
+    bpftrace) is still refused an fmod_ret (`BPF_MODIFY_RETURN`, read at
+    byte 68 of the kernel's copy of the attr: it overrides any `security_*`
+    function's return) and a program calling `bpf_send_signal`,
+    `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`
+    or the `bpf_send_signal_task` kfunc. From 6.9 at `bpf_prog_load` on the
+    kernel's copy of the instructions (no id given); before 6.9 at
+    `bpf_prog` once verified, on every foreign handle, against targets the
+    hook calibrates from two of the agent's own programs (kallsyms is hidden
+    from the agent's unit), and `bpf_probe_write_user` at the verifier's
+    `locked_down` question. The scan is three global BPF functions (256 ×
+    64 × 64 instructions, each verified once); a longer or unreadable
+    program is refused. Each refusal is a signed `bpf_prog_type` naming the
+    helper.
+  - **F8 profile to profile.** `agent_boot` signs the profile and its
+    source; the `profile_downgraded` alarm compares the previous boot's
+    profile (an observing boot in between no longer launders it) and is a
+    degradation in `nn-admin status`.
+  - **install.sh**: the policy's edges (a narrower existing line widened, a
+    missing final newline, no signing over an unverified policy, a script
+    warned about); `--help` and the summary say what `--allow-bpf-tools`
+    opens.
+  - **The `deny_routes` ratchet** follows macros, function pointers and
+    bare function names, and forbids a gate switch's name outside a function
+    of its own file (a re-export, a macro): the three plants of the
+    re-check's probe now fail it.
 - Lot 332: verifier headroom on every kernel, for alpha testers' kernels the
   lab has not seen.
   - **`verifier-check` measures every program and gates it.** The count

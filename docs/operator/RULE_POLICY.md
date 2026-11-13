@@ -600,11 +600,22 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
   §1.1). `install.sh --allow-bpf-tools` (this host's bpftrace and the
   interpreter of BCC's tools) and `--allow-bpf-loader <path>` write these
   lines at a fresh install, signed with the install's key and applied
-  through the started agent; a line already in the policy is kept
+  through the started agent; a line already in the policy is kept, widened
+  to the tools' five types when it lacks some (lot 345), and nothing is
+  signed over a policy on disk whose signature does not verify
   (ALPHA_PROFILE.md §1.2).
 - It names an executable, not a user: while it is in force any root process
   that runs that executable may load those types. bpftrace runs what it is
-  given — opt out a tool only where its use outside a window is routine.
+  given — opt out a tool only where its use outside a window is routine. A
+  script (`#!`) is never the executable the kernel sees: name its
+  interpreter (`install.sh --allow-bpf-loader` warns).
+- **What no line opens (lot 345).** A loader the opt-out names is still
+  refused an fmod_ret (`BPF_MODIFY_RETURN`: it overrides any `security_*`
+  function's return) and a program that calls `bpf_send_signal`,
+  `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`
+  or the `bpf_send_signal_task` kfunc — the agent's content judge
+  (ALPHA_PROFILE.md §1.2 says where each kernel judges it). NN-L-AT-001
+  `bpf_prog_type`, High, names the helper or the fmod_ret.
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 BPF loader opt-out`).
 - **bpftool needs a window, not an opt-out.** Its `pids` column comes from

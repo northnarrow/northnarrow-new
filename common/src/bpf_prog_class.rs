@@ -91,6 +91,196 @@ pub const fn type_bit(prog_type: u32) -> u32 {
     }
 }
 
+/// Lot 345: `BPF_MODIFY_RETURN` (`enum bpf_attach_type`): an fmod_ret
+/// `tracing` program, which overrides the return of the function it is
+/// attached to — any `security_*` hook's: `security_file_open` returning
+/// `-EPERM` for the agent blinds it the way an LSM program would.
+pub const ATTACH_MODIFY_RETURN: u32 = 26;
+
+/// Lot 345: the byte offset of `expected_attach_type` in a `BPF_PROG_LOAD`
+/// `union bpf_attr` (uapi-stable: `prog_type`, `insn_cnt`, `insns`,
+/// `license`, `log_level`, `log_size`, `log_buf`, `kern_version`,
+/// `prog_flags`, `prog_name[16]`, `prog_ifindex`, then it).
+pub const PROG_LOAD_ATTACH_TYPE_OFFSET: usize = 68;
+
+/// Lot 345: whether a load the signed per-loader opt-out lets through is
+/// refused all the same for its expected attach type — an fmod_ret, which
+/// no tracing tool loads (bpftrace's and BCC's probes are kprobes,
+/// tracepoints, perf events, raw tracepoints, fentry and fexit), whatever
+/// type it claims.
+#[inline(always)]
+pub const fn opt_out_refuses_attach(expected_attach_type: u32) -> bool {
+    expected_attach_type == ATTACH_MODIFY_RETURN
+}
+
+/// Lot 345: the helpers a foreign program may not call, opted out or not —
+/// by their uapi ids (`enum bpf_func_id`), in the order of the slots of the
+/// content judge's targets: `bpf_probe_write_user` rewrites a process's
+/// memory, `bpf_override_return` a kernel function's return,
+/// `bpf_send_signal` and `bpf_send_signal_thread` kill the agent past its
+/// `task_kill` hook (the kernel sends them as `SEND_SIG_PRIV`, which no LSM
+/// sees).
+pub const FORBIDDEN_HELPERS: [(u32, &str); 4] = [
+    (36, "bpf_probe_write_user"),
+    (58, "bpf_override_return"),
+    (109, "bpf_send_signal"),
+    (117, "bpf_send_signal_thread"),
+];
+
+/// Lot 345: the kfunc of the same reach (6.13 and later): a signal to any
+/// task the program holds, the agent's from `bpf_task_from_pid`.
+pub const FORBIDDEN_KFUNC: &str = "bpf_send_signal_task";
+
+/// Lot 345: the content judge's targets — the four helpers' (slots 0 to 3,
+/// a call with `src_reg` 0) and the kfunc's (slot 4, `src_reg`
+/// [`PSEUDO_KFUNC_CALL`]), each the `imm` of the call instruction as the
+/// judged copy holds it: the helper's id and the kfunc's BTF id in the
+/// kernel's copy of a load (the `bpf_prog_load` hook, 6.9 and later); the
+/// called address less `__bpf_call_base` once the verifier fixed the calls
+/// up (the `bpf_prog` hook, before 6.9). 0: no such call on this kernel.
+pub const CALL_TARGETS: usize = 5;
+
+/// Lot 345: the content judge's configuration map's slots: the stage (0),
+/// the [`CALL_TARGETS`] (1 to 5), then [`CONTENT_LOCKDOWN_SLOT`].
+pub const CONTENT_CONF_SLOTS: u32 = 2 + CALL_TARGETS as u32;
+
+/// Lot 345: the slot of the content judge's configuration that holds this
+/// kernel's `LOCKDOWN_BPF_WRITE_USER` (`enum lockdown_reason`, from its
+/// BTF; 0: not armed). Before 6.9 the verifier asks the `locked_down` hook
+/// with it when a program calls `bpf_probe_write_user` — the one target the
+/// agent cannot calibrate (a program calling it needs `CAP_SYS_ADMIN`,
+/// which the agent's unit does not have): a foreign caller is refused
+/// there, and the verifier refuses the program.
+pub const CONTENT_LOCKDOWN_SLOT: u32 = 1 + CALL_TARGETS as u32;
+
+/// Lot 345: the calibration the agent asks of the `bpf_prog` hook before
+/// 6.9 (`PROG_CONTENT_CALIB`), while it loads one of its own calibration
+/// programs: the signals' (`bpf_send_signal`, then
+/// `bpf_send_signal_thread`) or the return override's. The hook writes the
+/// verified call's `imm` (the helper's address less `__bpf_call_base`) to
+/// its target's slot: no kernel address is read from `kallsyms`, which the
+/// agent's capabilities hide.
+pub const CALIB_NONE: u32 = 0;
+pub const CALIB_SIGNALS: u32 = 1;
+pub const CALIB_OVERRIDE: u32 = 2;
+
+/// Lot 345: the configuration slot the `n`-th helper call (from 0) of
+/// calibration `kind`'s program fills — `None` past its calls.
+#[inline(always)]
+pub const fn calibration_slot(kind: u32, n: u32) -> Option<u32> {
+    // the slots of FORBIDDEN_HELPERS (0 write_user, 1 override, 2
+    // send_signal, 3 send_signal_thread), past the stage's slot
+    match (kind, n) {
+        (CALIB_SIGNALS, 0) => Some(1 + 2),
+        (CALIB_SIGNALS, 1) => Some(1 + 3),
+        (CALIB_OVERRIDE, 0) => Some(1 + 1),
+        _ => None,
+    }
+}
+
+/// Lot 345: the instructions of a calibration program the hook reads.
+pub const CALIB_MAX_INSNS: u32 = 16;
+
+/// Lot 345: no content judge on this kernel (the targets unknown).
+pub const CONTENT_STAGE_OFF: u32 = 0;
+/// Lot 345: the content is judged at `bpf_prog_load`, on the kernel's
+/// copy of the instructions before the verifier runs (6.9 and later): a
+/// program refused there never had an id.
+pub const CONTENT_STAGE_LOAD: u32 = 1;
+/// Lot 345: the content is judged at `bpf_prog`, on every handle of a
+/// program once verified — the load's and any later one by id or path
+/// (before 6.9: the load's program has an id before its descriptor).
+pub const CONTENT_STAGE_HANDLE: u32 = 2;
+
+/// `BPF_JMP | BPF_CALL`.
+pub const INSN_CALL: u8 = 0x85;
+/// `BPF_PSEUDO_KFUNC_CALL`: a call's `src_reg` for a kfunc.
+pub const PSEUDO_KFUNC_CALL: u8 = 2;
+
+/// Lot 345: the most instructions the content judge reads
+/// (`BPF_COMPLEXITY_LIMIT_INSNS`, the most a load may hold, rounded up to
+/// its 64 × 64 × 256 scan): a longer program is refused unjudged.
+pub const CONTENT_MAX_INSNS: u32 = 1 << 20;
+
+/// Lot 345: the slot of [`CALL_TARGETS`] that instruction `insn` (a
+/// `struct bpf_insn` read as one little-endian word: `code`, the registers
+/// — `src_reg` in the high nibble — `off`, `imm`) calls, plus one; 0 when
+/// it calls none of them.
+#[inline(always)]
+pub const fn forbidden_call(insn: u64, targets: &[u32; CALL_TARGETS]) -> u32 {
+    if insn as u8 != INSN_CALL {
+        return 0;
+    }
+    let src = ((insn >> 12) & 0xf) as u8;
+    let imm = (insn >> 32) as u32;
+    if imm == 0 {
+        return 0;
+    }
+    if src == 0 {
+        let mut slot = 0;
+        while slot < CALL_TARGETS - 1 {
+            if targets[slot] == imm {
+                return slot as u32 + 1;
+            }
+            slot += 1;
+        }
+        return 0;
+    }
+    if src == PSEUDO_KFUNC_CALL && targets[CALL_TARGETS - 1] == imm {
+        return CALL_TARGETS as u32;
+    }
+    0
+}
+
+/// Lot 345: a `bpf_prog_type` refusal's `target_dev` when the content
+/// refused it (the type itself is 0): an fmod_ret let through by no opt-out.
+pub const CONTENT_FMOD_RET: u8 = 1;
+/// Lot 345: … a program the judge could not read whole (longer than
+/// [`CONTENT_MAX_INSNS`], or a failed read): refused as if it called one.
+pub const CONTENT_UNJUDGED: u8 = 2;
+/// Lot 345: … a call of slot `n` of [`CALL_TARGETS`]: `CONTENT_CALL + n`.
+pub const CONTENT_CALL: u8 = 8;
+
+/// Lot 345: why the content refused a load, from a `bpf_prog_type`
+/// record's `target_dev`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentRefusal {
+    /// [`CONTENT_FMOD_RET`].
+    FmodRet,
+    /// [`CONTENT_UNJUDGED`].
+    Unjudged,
+    /// A call of [`FORBIDDEN_HELPERS`]`[n]`, or of [`FORBIDDEN_KFUNC`] (`n`
+    /// 4).
+    Call(u8),
+}
+
+/// Lot 345: [`ContentRefusal`] of a `target_dev` (`None`: the type's
+/// refusal, a known probe's mark, anything else).
+pub const fn content_refusal(target_dev: u64) -> Option<ContentRefusal> {
+    if target_dev == CONTENT_FMOD_RET as u64 {
+        Some(ContentRefusal::FmodRet)
+    } else if target_dev == CONTENT_UNJUDGED as u64 {
+        Some(ContentRefusal::Unjudged)
+    } else if target_dev >= CONTENT_CALL as u64
+        && target_dev < CONTENT_CALL as u64 + CALL_TARGETS as u64
+    {
+        Some(ContentRefusal::Call(
+            (target_dev - CONTENT_CALL as u64) as u8,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Lot 345: the helper or kfunc slot `n` of [`CALL_TARGETS`] names.
+pub const fn call_target_name(n: u8) -> &'static str {
+    if (n as usize) < FORBIDDEN_HELPERS.len() {
+        FORBIDDEN_HELPERS[n as usize].1
+    } else {
+        FORBIDDEN_KFUNC
+    }
+}
+
 /// Every type [`denied_by_default`] names, as a mask.
 pub const DENIED_MASK: u32 = type_bit(PROG_TYPE_KPROBE)
     | type_bit(PROG_TYPE_TRACEPOINT)
@@ -994,5 +1184,177 @@ mod tests {
         assert_eq!(core::mem::size_of::<ProgRecord>(), 16 + 8 + 8 + 16 + 64);
         assert_eq!(core::mem::size_of::<LinkRecord>(), 16);
         assert_eq!(core::mem::size_of::<SeenLoad>(), 32);
+    }
+
+    /// Lot 345 (named; the re-check of #550, N2 and point 1 (ii)): the
+    /// helpers the content judge refuses are the header's ids, the fmod_ret
+    /// attach type is the header's, and `expected_attach_type` sits at byte
+    /// 68 of a `BPF_PROG_LOAD` attr — the header's fields before it, by
+    /// their sizes.
+    #[test]
+    fn the_content_judge_s_numbers_are_the_uapi_header_s() {
+        let header = std::fs::read_to_string(UAPI_HEADER)
+            .unwrap_or_else(|e| panic!("{UAPI_HEADER}: {e} (linux-libc-dev)"));
+        for (id, name) in FORBIDDEN_HELPERS {
+            let short = name.strip_prefix("bpf_").unwrap();
+            assert!(
+                header.contains(&format!("FN({short}, {id}, ##ctx)")),
+                "{name} is helper {id}"
+            );
+        }
+        assert_eq!(
+            ATTACH_TYPES[ATTACH_MODIFY_RETURN as usize],
+            "BPF_MODIFY_RETURN"
+        );
+        assert!(opt_out_refuses_attach(ATTACH_MODIFY_RETURN));
+        for other in [0, 24, 25, 27, 28, 42] {
+            assert!(!opt_out_refuses_attach(other), "{other}");
+        }
+        // the anonymous struct of BPF_PROG_LOAD, to expected_attach_type
+        let start = header
+            .find("struct { /* anonymous struct used by BPF_PROG_LOAD command */")
+            .expect("BPF_PROG_LOAD's struct");
+        let body = &header[start..];
+        let body = &body[..body.find("};").unwrap()];
+        let mut off = 0usize;
+        let mut found = None;
+        for line in body.lines().skip(1) {
+            let decl = line.split("/*").next().unwrap().trim();
+            let Some(decl) = decl.strip_suffix(';') else {
+                continue;
+            };
+            let mut parts = decl.split_whitespace();
+            let (ty, name) = (parts.next().unwrap(), parts.last().unwrap());
+            if name == "expected_attach_type" {
+                found = Some(off);
+                break;
+            }
+            let size = match ty {
+                "__u32" => 4,
+                "__aligned_u64" => {
+                    off = off.next_multiple_of(8);
+                    8
+                }
+                "char" if name == "prog_name[BPF_OBJ_NAME_LEN]" => 16,
+                other => panic!("an unexpected field before expected_attach_type: {other} {name}"),
+            };
+            off += size;
+        }
+        assert_eq!(found, Some(PROG_LOAD_ATTACH_TYPE_OFFSET));
+    }
+
+    /// Lot 345 (named): the judge finds a call of each target in its slot —
+    /// a helper's with `src_reg` 0, the kfunc's with `src_reg` 2 — and no
+    /// other instruction: another opcode with the same `imm`, a call of
+    /// another helper, a bpf-to-bpf call (`src_reg` 1) to that offset, an
+    /// absent target (0).
+    #[test]
+    fn the_content_judge_finds_the_forbidden_calls_only() {
+        let insn = |code: u8, src: u8, imm: u32| -> u64 {
+            code as u64 | ((src as u64) << 12) | ((imm as u64) << 32)
+        };
+        let pre = [36, 58, 109, 117, 9_001];
+        for (slot, imm) in pre.iter().enumerate().take(4) {
+            assert_eq!(
+                forbidden_call(insn(INSN_CALL, 0, *imm), &pre),
+                slot as u32 + 1
+            );
+            // the same number elsewhere
+            assert_eq!(forbidden_call(insn(0xb7, 0, *imm), &pre), 0);
+            assert_eq!(forbidden_call(insn(INSN_CALL, 1, *imm), &pre), 0);
+            assert_eq!(
+                forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, *imm), &pre),
+                0
+            );
+        }
+        assert_eq!(
+            forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, 9_001), &pre),
+            5
+        );
+        assert_eq!(forbidden_call(insn(INSN_CALL, 0, 9_001), &pre), 0);
+        // a bpf-to-bpf call (src_reg 1) to an offset that is the kfunc's id
+        assert_eq!(forbidden_call(insn(INSN_CALL, 1, 9_001), &pre), 0);
+        // other helpers: bpf_map_lookup_elem, bpf_probe_read_kernel,
+        // bpf_get_current_task, bpf_ringbuf_output
+        for other in [1, 113, 35, 130] {
+            assert_eq!(forbidden_call(insn(INSN_CALL, 0, other), &pre), 0);
+        }
+        // the registers' nibble of dst_reg does not matter; src_reg does
+        assert_eq!(
+            forbidden_call(insn(INSN_CALL, 0, 109) | (0x3 << 8), &pre),
+            3
+        );
+        // a kernel without the kfunc (0): no call is it, not even imm 0
+        let no_kfunc = [36, 58, 109, 117, 0];
+        assert_eq!(
+            forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, 0), &no_kfunc),
+            0
+        );
+        assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0), &[0; CALL_TARGETS]), 0);
+        // after the fix-up: the address less __bpf_call_base, negative too
+        let post = [0x0012_3450, 0xfff0_0010, 0x0001_0000, 0x7fff_fff0, 0];
+        assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0xfff0_0010), &post), 2);
+        assert_eq!(forbidden_call(insn(INSN_CALL, 0, 109), &post), 0);
+    }
+
+    /// Lot 345 (named): each calibration fills the slot of the helper its
+    /// program calls in that order, and nothing past its calls.
+    #[test]
+    fn a_calibration_fills_its_helpers_slots() {
+        let name = |slot: Option<u32>| slot.map(|s| FORBIDDEN_HELPERS[s as usize - 1].1);
+        assert_eq!(
+            name(calibration_slot(CALIB_SIGNALS, 0)),
+            Some("bpf_send_signal")
+        );
+        assert_eq!(
+            name(calibration_slot(CALIB_SIGNALS, 1)),
+            Some("bpf_send_signal_thread")
+        );
+        assert_eq!(
+            name(calibration_slot(CALIB_OVERRIDE, 0)),
+            Some("bpf_override_return")
+        );
+        for (kind, n) in [
+            (CALIB_SIGNALS, 2),
+            (CALIB_OVERRIDE, 1),
+            (CALIB_NONE, 0),
+            (9, 0),
+        ] {
+            assert_eq!(calibration_slot(kind, n), None, "{kind} {n}");
+        }
+        const { assert!(CONTENT_LOCKDOWN_SLOT < CONTENT_CONF_SLOTS) };
+        assert_eq!(CONTENT_LOCKDOWN_SLOT, CALL_TARGETS as u32 + 1);
+    }
+
+    /// Lot 345 (named): a content refusal's record round-trips, and the
+    /// type's own refusal (0) and a known probe's mark are none.
+    #[test]
+    fn a_content_refusal_s_record_round_trips() {
+        assert_eq!(content_refusal(0), None);
+        assert_eq!(
+            content_refusal(CONTENT_FMOD_RET as u64),
+            Some(ContentRefusal::FmodRet)
+        );
+        assert_eq!(
+            content_refusal(CONTENT_UNJUDGED as u64),
+            Some(ContentRefusal::Unjudged)
+        );
+        for n in 0..CALL_TARGETS as u8 {
+            assert_eq!(
+                content_refusal((CONTENT_CALL + n) as u64),
+                Some(ContentRefusal::Call(n))
+            );
+        }
+        assert_eq!(
+            content_refusal((CONTENT_CALL + CALL_TARGETS as u8) as u64),
+            None
+        );
+        assert_eq!(content_refusal(known_probe_dev(0)), None);
+        assert_eq!(
+            known_probe_of(CONTENT_FMOD_RET as u64, PROG_TYPE_TRACING as u64),
+            None
+        );
+        assert_eq!(call_target_name(2), "bpf_send_signal");
+        assert_eq!(call_target_name(4), FORBIDDEN_KFUNC);
     }
 }

@@ -2035,3 +2035,42 @@ are judged as before; `CHANGELOG.md` has the detail.
   `profile` and `records_today`. An `nn-admin` of this release needs an
   agent of this release (the status reply grew two fields, as every
   appended field before).
+
+## 40. Allowed BPF loaders, the profile alarm, install's policy edges (lot 345)
+
+- **A loader `bpf-loader-allow` names is still refused what would kill or
+  blind the agent.** An fmod_ret (`BPF_MODIFY_RETURN`) program, and a
+  program that calls `bpf_send_signal`, `bpf_send_signal_thread`,
+  `bpf_probe_write_user`, `bpf_override_return` or the
+  `bpf_send_signal_task` kfunc, are refused to every loader outside the
+  agent's family and a trusted-installer window — the ones
+  `install.sh --allow-bpf-tools` / `--allow-bpf-loader` named included.
+  bpftrace's `signal()` (`--unsafe`) is refused this way; its other probes,
+  BCC's tools and plain tracing programs load as before. Each refusal is a
+  signed `bpf_prog_type` record (High) naming the helper or the fmod_ret
+  (`ALPHA_PROFILE.md` §1.2). Where the kernel judges it: from 6.9 at the
+  `bpf_prog_load` hook (`EPERM`, before the verifier); before 6.9 at the
+  `bpf_prog` hook once verified (`EPERM`), the targets calibrated at the
+  agent's start from its own programs (two programs loaded, read and
+  unloaded: `nn_calib_signals`, `nn_calib_override`), and
+  `bpf_probe_write_user` at the verifier's `locked_down` question (the
+  verifier reports `EINVAL`). The agent's unit gains no capability. Two
+  more pins under the pin root on such kernels (`prog_bpf_prog_load` /
+  `link_bpf_prog_load` from 6.9; `prog_locked_down` / `link_locked_down`
+  before) — `uninstall.sh` removes them with the rest.
+- **The profile alarm compares profiles.** The signed `agent_boot` row
+  carries `profile` and `profile_source`; an `alpha` start without a signed
+  `profile.local` alarms after a boot of the `enforcing` profile, observing
+  or not (a row written before this release: after one that ran its
+  responses). The alarm is also a degradation of source `profile` in
+  `nn-admin status --key` (and counts against the trust level). A reader of
+  the audit chain keyed on `detect_only` keeps working; one that wants the
+  profile reads `profile`.
+- **`install.sh --allow-bpf-tools` / `--allow-bpf-loader`**: an existing
+  line of a named loader that lacks some of the five tracing types is
+  widened (its own types kept); a policy file without a final newline no
+  longer makes the agent refuse the whole policy; nothing is signed over a
+  `rule-policy.local` whose signature does not verify (the install warns,
+  the lines are not applied — sign them by hand after a review); a script
+  named by `--allow-bpf-loader` is warned about (the kernel sees its
+  interpreter). `--help` and the summary say what the flag opens.

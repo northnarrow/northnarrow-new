@@ -72,16 +72,21 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
-    macros::{lsm, map, raw_tracepoint},
+    macros::{kprobe, lsm, map, raw_tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
-    programs::{LsmContext, RawTracePointContext},
+    programs::{LsmContext, ProbeContext, RawTracePointContext},
 };
 use northnarrow_common::bpf_cmd::{
     attach_target_offset, judges_attach_target, observed, BPF_LINK_CREATE, BPF_LINK_DETACH,
     BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
     BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD, BPF_RAW_TRACEPOINT_OPEN,
 };
-use northnarrow_common::bpf_prog_class::{denied_by_default, type_bit};
+use northnarrow_common::bpf_prog_class::{
+    calibration_slot, denied_by_default, forbidden_call, opt_out_refuses_attach, type_bit,
+    CALIB_MAX_INSNS, CALIB_NONE, CALL_TARGETS, CONTENT_CALL, CONTENT_CONF_SLOTS, CONTENT_FMOD_RET,
+    CONTENT_LOCKDOWN_SLOT, CONTENT_MAX_INSNS, CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD,
+    CONTENT_UNJUDGED, INSN_CALL, PROG_LOAD_ATTACH_TYPE_OFFSET,
+};
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
@@ -92,7 +97,8 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
+    BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_OFFSET,
+    BPF_PROG_INSNSI_OFFSET, BPF_PROG_LEN_OFFSET, BPF_PROG_TYPE_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
     FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
     INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
     TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
@@ -178,6 +184,20 @@ pub static BPF_LOADER_OPTOUT: HashMap<InodeKey, u32> = HashMap::pinned(64, 0);
 /// Slot 0: 1 = enforce (deny), 0 = observe.
 #[map]
 pub static BPF_DEFENSE_MODE: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Lot 345 (the re-check of #550, point 1 (ii)): the content judge's
+/// configuration, written by the agent for the running kernel and frozen
+/// before the guard is attached — slot 0 the stage
+/// (`bpf_prog_class::CONTENT_STAGE_*`: 0 none, 1 at `bpf_prog_load`, 2 at
+/// `bpf_prog`), slots 1 to 5 the call targets
+/// (`bpf_prog_class::CALL_TARGETS`).
+#[map]
+pub static PROG_CONTENT_CONF: Array<u32> = Array::with_max_entries(CONTENT_CONF_SLOTS, 0);
+
+/// Lot 345: the calibration the agent asks while it loads one of its
+/// calibration programs (`bpf_prog_class::CALIB_*`; 0 none), before 6.9.
+#[map]
+pub static PROG_CONTENT_CALIB: Array<u32> = Array::with_max_entries(1, 0);
 
 /// `(dev, ino)` of the agent's own binaries, registered by userland at
 /// boot, valued by role ([`ROLE_WATCHDOG`], [`ROLE_AGENT`]). External audit
@@ -791,6 +811,22 @@ unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
             return 0;
         }
     };
+    // Lot 345: before 6.9 the content is judged here, once verified, on
+    // every handle a foreign caller takes — the load's, and one by id or
+    // path (the load's program has an id before its descriptor: a second
+    // thread could take it by id in between). The agent's own programs
+    // (some signal) are the own-object guard's, below.
+    if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {
+        if let Some((why, ty)) = content_refusal(prog) {
+            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
+            return -EPERM;
+        }
+    }
+    // Lot 345: one of the agent's calibration programs, loaded while it
+    // asks for a calibration (before 6.9)
+    if loading && (caller_is_exempt() || fresh_instance_may_load()) {
+        calibrate(prog);
+    }
     if loading {
         crate::bpf_census::mark_seen(id, prog);
         return 0;
@@ -803,6 +839,282 @@ unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
         return -EPERM;
     }
     0
+}
+
+/// Lot 345 (the re-check of #550, point 1 (ii)): `bpf_prog_load(struct
+/// bpf_prog *prog, union bpf_attr *attr, …)`, 6.9 and later — called with
+/// the kernel's copy of the instructions, before the verifier runs: the
+/// content of a foreign load is judged here (helper ids as written), and a
+/// program refused here never gets an id. Attached only where the kernel
+/// has the hook; before 6.9 the `bpf_prog` hook judges.
+#[lsm(hook = "bpf_prog_load")]
+pub fn bpf_prog_load_guard(ctx: LsmContext) -> i32 {
+    unsafe { try_bpf_prog_load_guard(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_bpf_prog_load_guard(ctx: &LsmContext) -> i32 {
+    if content_stage() != CONTENT_STAGE_LOAD {
+        return 0;
+    }
+    let prog: *const c_void = ctx.arg(0);
+    if prog.is_null() {
+        return 0;
+    }
+    if let Some((why, ty)) = content_refusal(prog) {
+        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
+        return -EPERM;
+    }
+    0
+}
+
+/// Lot 345 (before 6.9): the verified `imm` of each helper call of the
+/// agent's calibration program `prog` — the helper's address less
+/// `__bpf_call_base`, which the agent cannot read from `kallsyms` — written
+/// to the slot of its target ([`calibration_slot`]). Only while the agent
+/// asks for one ([`PROG_CONTENT_CALIB`]), on its own load.
+#[inline(always)]
+unsafe fn calibrate(prog: *const c_void) {
+    let kind = match PROG_CONTENT_CALIB.get(0) {
+        Some(k) => *k,
+        None => return,
+    };
+    if kind == CALIB_NONE {
+        return;
+    }
+    let (Some(len_off), Some(insns_off)) = (off_opt!(BPF_PROG_LEN_OFFSET), off_opt!(BPF_PROG_INSNSI_OFFSET))
+    else {
+        return;
+    };
+    let len = match bpf_probe_read_kernel::<u32>((prog as *const u8).add(len_off) as *const u32) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let insns = (prog as *const u8).add(insns_off) as *const u64;
+    let mut n: u32 = 0;
+    let mut i: u32 = 0;
+    while i < CALIB_MAX_INSNS {
+        if i >= len {
+            break;
+        }
+        let insn = match bpf_probe_read_kernel::<u64>(insns.add(i as usize)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if insn as u8 == INSN_CALL && (insn >> 12) & 0xf == 0 {
+            if let Some(slot) = calibration_slot(kind, n) {
+                if let Some(p) = PROG_CONTENT_CONF.get_ptr_mut(slot) {
+                    *p = (insn >> 32) as u32;
+                }
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+}
+
+/// Lot 345: the calibration programs — loaded by the agent, verified, read
+/// by [`calibrate`] and unloaded; never attached, so the signal (0: none)
+/// is never sent. Each calls its helpers in the order of
+/// `bpf_prog_class::calibration_slot`, and nothing else.
+#[kprobe]
+pub fn nn_calib_signals(_ctx: ProbeContext) -> u32 {
+    unsafe {
+        let _ = aya_ebpf::helpers::generated::bpf_send_signal(0);
+        let _ = aya_ebpf::helpers::generated::bpf_send_signal_thread(0);
+    }
+    0
+}
+
+/// Lot 345: [`nn_calib_signals`]' for the return override (a kernel built
+/// without `CONFIG_BPF_KPROBE_OVERRIDE` refuses it: nothing to find).
+#[kprobe]
+pub fn nn_calib_override(ctx: ProbeContext) -> u32 {
+    unsafe {
+        let _ = aya_ebpf::helpers::generated::bpf_override_return(ctx.regs, 0);
+    }
+    0
+}
+
+/// Lot 345 (before 6.9): `locked_down(enum lockdown_reason what)` — the
+/// verifier asks it with `LOCKDOWN_BPF_WRITE_USER` when a program calls
+/// `bpf_probe_write_user`, the one target the agent cannot calibrate. A
+/// foreign caller outside a window is refused there (in every mode, as the
+/// type is), and the verifier refuses the program; any other reason is not
+/// this hook's. Attached only where the content is judged at the handle.
+#[lsm(hook = "locked_down")]
+pub fn bpf_write_user_guard(ctx: LsmContext) -> i32 {
+    unsafe { try_bpf_write_user_guard(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_bpf_write_user_guard(ctx: &LsmContext) -> i32 {
+    let want = match PROG_CONTENT_CONF.get(CONTENT_LOCKDOWN_SLOT) {
+        Some(v) => *v,
+        None => 0,
+    };
+    let what = ctx.arg::<c_int>(0) as u32;
+    if want == 0
+        || what != want
+        || caller_is_exempt()
+        || crate::inode_protect::override_active()
+        || fresh_instance_may_load()
+    {
+        return 0;
+    }
+    // the slot of bpf_probe_write_user; the type is not known here
+    emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_CALL, 0);
+    -EPERM
+}
+
+/// Lot 345: the stage the agent armed ([`PROG_CONTENT_CONF`] slot 0).
+#[inline(always)]
+fn content_stage() -> u32 {
+    match PROG_CONTENT_CONF.get(0) {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// Lot 345: why `prog`'s content refuses it to the caller, with its type —
+/// a program of a type refused by default (one only the signed per-loader
+/// opt-out lets a foreign caller load) that calls a helper or the kfunc of
+/// `bpf_prog_class::FORBIDDEN_HELPERS` / `FORBIDDEN_KFUNC`, or that cannot
+/// be read whole (longer than `CONTENT_MAX_INSNS`, a failed read): refused
+/// in every mode, as the type itself is. The family, a fresh instance of
+/// ours and a trusted-installer window load anything (the agent's own
+/// programs signal); `None` then, and for every other program.
+#[inline(always)]
+unsafe fn content_refusal(prog: *const c_void) -> Option<(u8, u32)> {
+    let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
+        .ok()?;
+    if !denied_by_default(ty)
+        || caller_is_exempt()
+        || crate::inode_protect::override_active()
+        || fresh_instance_may_load()
+    {
+        return None;
+    }
+    // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
+    // BTF pointer to the verifier, which a global function does not take
+    // ("R1 is not a scalar") — its address is passed as a plain number
+    let Some(addr) = ptr_scalar(prog) else {
+        return Some((CONTENT_UNJUDGED, ty));
+    };
+    match nn_prog_forbidden_call(addr) {
+        SCAN_CLEAN => None,
+        hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
+        _ => Some((CONTENT_UNJUDGED, ty)),
+    }
+}
+
+/// Lot 345: `p`'s address as a plain number, copied through the stack by
+/// `bpf_probe_read_kernel` (whose result the verifier types as a scalar):
+/// a global BPF function takes scalars only, and a hook's argument is a BTF
+/// pointer to the verifier, `as u64` or not.
+#[inline(always)]
+unsafe fn ptr_scalar(p: *const c_void) -> Option<u64> {
+    let v: u64 = p as u64;
+    bpf_probe_read_kernel::<u64>(&v as *const u64).ok()
+}
+
+/// Lot 345: [`nn_prog_forbidden_call`] found no forbidden call.
+const SCAN_CLEAN: u64 = 0;
+/// Lot 345: … could not read the program whole.
+const SCAN_UNJUDGED: u64 = u64::MAX;
+/// Lot 345: the instructions [`nn_scan_chunk`] reads, the chunks
+/// [`nn_scan_block`] scans, and the blocks [`nn_prog_forbidden_call`] scans
+/// — 256 × 64 × 64 = `CONTENT_MAX_INSNS`. Three global functions, each
+/// verified once on its own: the verifier walks 256 + 64 + 64 iterations,
+/// not a million.
+const SCAN_CHUNK: u64 = 256;
+const SCAN_BLOCK: u64 = 64;
+const SCAN_BLOCKS: u64 = 64;
+
+/// Lot 345: the first forbidden call of `prog` (a `struct bpf_prog *`): its
+/// target's slot plus one, [`SCAN_CLEAN`] or [`SCAN_UNJUDGED`]. A global
+/// BPF function (exported, never inlined, scalar argument).
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_prog_forbidden_call(prog: u64) -> u64 {
+    let (Some(len_off), Some(insns_off)) = (off_opt!(BPF_PROG_LEN_OFFSET), off_opt!(BPF_PROG_INSNSI_OFFSET))
+    else {
+        return SCAN_UNJUDGED;
+    };
+    let len = match unsafe { bpf_probe_read_kernel::<u32>((prog + len_off as u64) as *const u32) } {
+        Ok(v) => v as u64,
+        Err(_) => return SCAN_UNJUDGED,
+    };
+    if len > CONTENT_MAX_INSNS as u64 {
+        return SCAN_UNJUDGED;
+    }
+    let insns = prog + insns_off as u64;
+    let mut b: u64 = 0;
+    while b < SCAN_BLOCKS {
+        let from = b * SCAN_BLOCK * SCAN_CHUNK;
+        if from >= len {
+            break;
+        }
+        let r = nn_scan_block(insns, from, len);
+        if r != SCAN_CLEAN {
+            return r;
+        }
+        b += 1;
+    }
+    SCAN_CLEAN
+}
+
+/// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_BLOCK`] chunks from
+/// instruction `from`.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_scan_block(insns: u64, from: u64, len: u64) -> u64 {
+    let mut c: u64 = 0;
+    while c < SCAN_BLOCK {
+        let at = from + c * SCAN_CHUNK;
+        if at >= len {
+            break;
+        }
+        let r = nn_scan_chunk(insns, at, len);
+        if r != SCAN_CLEAN {
+            return r;
+        }
+        c += 1;
+    }
+    SCAN_CLEAN
+}
+
+/// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_CHUNK`]
+/// instructions from `from` (to `len`), against the armed targets.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64) -> u64 {
+    let mut targets = [0u32; CALL_TARGETS];
+    let mut t = 0;
+    while t < CALL_TARGETS {
+        targets[t] = match PROG_CONTENT_CONF.get(t as u32 + 1) {
+            Some(v) => *v,
+            None => 0,
+        };
+        t += 1;
+    }
+    let mut j: u64 = 0;
+    while j < SCAN_CHUNK {
+        let i = from + j;
+        if i >= len {
+            break;
+        }
+        let insn = match unsafe { bpf_probe_read_kernel::<u64>((insns + i * 8) as *const u64) } {
+            Ok(v) => v,
+            Err(_) => return SCAN_UNJUDGED,
+        };
+        let hit = forbidden_call(insn, &targets);
+        if hit != 0 {
+            return hit as u64;
+        }
+        j += 1;
+    }
+    SCAN_CLEAN
 }
 
 #[lsm(hook = "bpf")]
@@ -908,6 +1220,21 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
         {
             if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {
                 emit_denial(FS_OP_BPF_PROG_TYPE, arg);
+                return -EPERM;
+            }
+            // Lot 345 (the re-check of #550, N2): the opt-out never covers
+            // an fmod_ret — it overrides the return of any `security_*`
+            // function, and an allowed loader made `security_file_open`
+            // fail for the agent (the kernel's copy of the attr: an
+            // unreadable attach type is refused too)
+            let refused_attach = match bpf_probe_read_kernel::<u32>(
+                (attr as *const u8).add(PROG_LOAD_ATTACH_TYPE_OFFSET) as *const u32,
+            ) {
+                Ok(eat) => opt_out_refuses_attach(eat),
+                Err(_) => true,
+            };
+            if refused_attach {
+                emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);
                 return -EPERM;
             }
             if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {

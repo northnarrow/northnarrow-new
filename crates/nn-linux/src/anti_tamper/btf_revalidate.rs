@@ -183,6 +183,18 @@ pub struct ResolvedOffsets {
     /// non-empty, the two hooks are left out (signed): a judge built for
     /// other ids would refuse what it must not, or judge nothing.
     pub read_id_drift: Vec<String>,
+    /// Lot 345: whether this kernel has the `bpf_prog_load` LSM hook (6.9
+    /// and later): the BPF content judge reads the kernel's copy of a load
+    /// there, else at `bpf_prog` once verified.
+    pub prog_load_hook: bool,
+    /// Lot 345: the BTF type id of `bpf_prog_class::FORBIDDEN_KFUNC` in
+    /// vmlinux (a kfunc call's `imm` in a load's instructions), when the
+    /// kernel has it (6.13 and later).
+    pub forbidden_kfunc_id: Option<u32>,
+    /// Lot 345: `LOCKDOWN_BPF_WRITE_USER` (`enum lockdown_reason`; its
+    /// value moves with the kernel), what the verifier asks the
+    /// `locked_down` hook when a program calls `bpf_probe_write_user`.
+    pub lockdown_bpf_write_user: Option<u32>,
 }
 
 impl ResolvedOffsets {
@@ -695,6 +707,15 @@ fn resolve_with(
             func_params,
             cgroup_join_unavailable,
             read_id_drift,
+            prog_load_hook: btf.has_lsm_hook(super::bpf_defense::PROG_LOAD_GUARD_HOOK),
+            forbidden_kfunc_id: btf
+                .func_ids
+                .get(common::bpf_prog_class::FORBIDDEN_KFUNC)
+                .copied(),
+            lockdown_bpf_write_user: btf
+                .resolve_enum("lockdown_reason", "LOCKDOWN_BPF_WRITE_USER")
+                .ok()
+                .and_then(|v| u32::try_from(v).ok()),
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -1234,6 +1255,9 @@ struct Btf {
     /// Lot 277: the tracepoints of [`CGROUP_JOIN_TARGETS`] → their
     /// `btf_trace_<name>` typedef's type id.
     tracepoints: HashMap<String, u32>,
+    /// Lot 345: the FUNC's own type id of `bpf_prog_class::FORBIDDEN_KFUNC`
+    /// (what a kfunc call names), when the BTF has it.
+    func_ids: HashMap<String, u32>,
 }
 
 /// Prefix of the typedefs the kernel's BTF names its tracepoints'
@@ -1308,6 +1332,7 @@ impl Btf {
         let mut name_to_id: HashMap<String, u32> = HashMap::new();
         let mut lsm_funcs: HashMap<String, u32> = HashMap::new();
         let mut tracepoints: HashMap<String, u32> = HashMap::new();
+        let mut func_ids: HashMap<String, u32> = HashMap::new();
 
         let mut p = tstart;
         while p + 12 <= tend {
@@ -1384,6 +1409,12 @@ impl Btf {
                 KIND_FWD => types.push(Ty::Fwd { name_off }),
                 KIND_FUNC => {
                     if let Some(nm) = name_of(name_off) {
+                        if nm == common::bpf_prog_class::FORBIDDEN_KFUNC {
+                            // this type's id: the base's count plus its index
+                            func_ids
+                                .entry(nm.clone())
+                                .or_insert(first_id + types.len() as u32);
+                        }
                         if nm.starts_with(LSM_FUNC_PREFIX)
                             || FEXIT_TARGETS.iter().any(|t| t.func == nm)
                             || NO_ARG_TARGETS.iter().any(|f| *f == nm)
@@ -1475,6 +1506,7 @@ impl Btf {
             name_to_id,
             lsm_funcs,
             tracepoints,
+            func_ids,
         })
     }
 
@@ -2892,6 +2924,43 @@ mod tests {
             ResolveOutcome::Resolved(r) => r,
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    /// Named (lot 345; the re-check of #550, point 1 (ii)): the content
+    /// judge's facts are read from the kernel's BTF — whether it has the
+    /// `bpf_prog_load` hook (6.9+), the type id of `bpf_send_signal_task`
+    /// (what a kfunc call names; 6.13+) and `LOCKDOWN_BPF_WRITE_USER`, whose
+    /// value moves with the kernel; a 6.8 has the enum only.
+    #[test]
+    fn the_content_judge_s_btf_facts_are_read() {
+        let build = |new_kernel: bool| {
+            let mut b = BtfBuilder::new();
+            let int = b.int("int");
+            let prog = b.composite(Some("bpf_prog"), false, false, &[]);
+            let p = b.ptr(prog);
+            let value = if new_kernel { 19 } else { 16 };
+            b.enumeration(
+                "lockdown_reason",
+                &[("LOCKDOWN_NONE", 0), ("LOCKDOWN_BPF_WRITE_USER", value)],
+            );
+            b.func("bpf_lsm_bpf_prog", int, &[p]);
+            let kfunc = new_kernel.then(|| {
+                b.func("bpf_lsm_bpf_prog_load", int, &[p]);
+                b.func(common::bpf_prog_class::FORBIDDEN_KFUNC, int, &[p])
+            });
+            (Btf::parse(&b.build()).expect("parses"), kfunc)
+        };
+        let (btf, kfunc) = build(true);
+        let r = hooks_only(&btf);
+        assert!(r.prog_load_hook);
+        assert!(kfunc.is_some());
+        assert_eq!(r.forbidden_kfunc_id, kfunc);
+        assert_eq!(r.lockdown_bpf_write_user, Some(19));
+        let (btf, _) = build(false);
+        let r = hooks_only(&btf);
+        assert!(!r.prog_load_hook);
+        assert_eq!(r.forbidden_kfunc_id, None);
+        assert_eq!(r.lockdown_bpf_write_user, Some(16));
     }
 
     fn slot_value(r: &ResolvedOffsets, slot: u32) -> u32 {

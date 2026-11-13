@@ -622,6 +622,13 @@ pub(crate) fn process_event(
                         ) {
                             "not refused: found by the BPF cross-view of the kernel-state round"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfProgType
+                            && common::bpf_prog_class::content_refusal(*target_dev).is_some()
+                        {
+                            // lot 345: the content, not the type
+                            "denied in kernel (the BPF content judge: an fmod_ret, or a helper \
+                             that kills or blinds the agent, from any loader)"
+                                .to_string()
                         } else if *operation == nn_model::FsProtectOperation::BpfProgType {
                             "denied in kernel (the bpf LSM hook: a refused program type)"
                                 .to_string()

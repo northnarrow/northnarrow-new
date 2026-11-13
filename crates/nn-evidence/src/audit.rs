@@ -355,6 +355,10 @@ pub struct AuditLog<K> {
     /// ran its responses (its `agent_boot`'s `detect_only` false); `None`
     /// without such a row.
     previous_boot_enforced: Option<bool>,
+    /// Lot 345 (the re-check of #550, N3): the response profile the last
+    /// run that booted ran (its `agent_boot`'s `profile`; for a row written
+    /// before the field, `enforcing` when it ran its responses).
+    previous_boot_profile: Option<String>,
     /// External audit ATP-004: the chain holds a successful
     /// `rotate_keys_add` — the one-key bootstrap is over for good. The
     /// log is never rotated (module doc); a rotation must carry this.
@@ -439,6 +443,7 @@ impl<K: ChainSigner> AuditLog<K> {
             last_hash: tail.last_hash,
             previous_run: tail.previous_run,
             previous_boot_enforced: tail.previous_boot_enforced,
+            previous_boot_profile: tail.previous_boot_profile,
             second_key_added: tail.second_key_added,
             rows: tail.seq.rows(),
             numbered: tail.seq.numbered(),
@@ -472,6 +477,7 @@ impl<K: ChainSigner> AuditLog<K> {
             last_hash: GENESIS_PREV_HASH.to_string(),
             previous_run: PreviousRun::None,
             previous_boot_enforced: None,
+            previous_boot_profile: None,
             second_key_added: false,
             rows: 0,
             numbered: false,
@@ -582,6 +588,15 @@ impl<K: ChainSigner> AuditLog<K> {
     /// `detect_only: false`. `None`: no earlier boot in this chain.
     pub fn previous_boot_enforced(&self) -> Option<bool> {
         self.previous_boot_enforced
+    }
+
+    /// Lot 345 (the re-check of #550, N3): the response profile the run that
+    /// booted last before this one ran — its signed `agent_boot`'s
+    /// `profile`; a row of an agent before the field: `enforcing` when it
+    /// ran its responses, `None` otherwise (unknown). `None` too without an
+    /// earlier boot in this chain.
+    pub fn previous_boot_profile(&self) -> Option<&str> {
+        self.previous_boot_profile.as_deref()
     }
 
     /// Lot 341 (the review of #550, F8): sign that this boot observes only
@@ -956,25 +971,45 @@ impl<K: ChainSigner> AuditLog<K> {
         provenance: &str,
         build: &AgentBuild,
     ) -> Result<AuditEntry> {
+        self.boot_probe_profiled(detect_only, None, integrity, provenance, build)
+    }
+
+    /// Lot 345 (the re-check of #550, N3): [`Self::boot_probe`] with the
+    /// response profile in force and its source (`("alpha", "install
+    /// manifest")`), signed in the row: the next start compares profile to
+    /// profile ([`Self::previous_boot_profile`]).
+    pub fn boot_probe_profiled(
+        &mut self,
+        detect_only: Option<&str>,
+        profile: Option<(&str, &str)>,
+        integrity: &str,
+        provenance: &str,
+        build: &AgentBuild,
+    ) -> Result<AuditEntry> {
+        let mut extra = serde_json::json!({
+            "version": build.version,
+            "detect_only": detect_only.is_some(),
+            // External audit MAIN-008: the source, not only the bool.
+            "detect_only_source": detect_only,
+            "binary_integrity": integrity,
+            "install_provenance": provenance,
+            "previous_run": self.previous_run.to_json(),
+            // External audit ATP-009: what the build is and how the BPF
+            // guard runs — a debug-trigger build only observes.
+            "build_features": build.features,
+            "bpf_guard": if build.bpf_guard_enforce {
+                "enforce"
+            } else {
+                "observe"
+            },
+        });
+        if let Some((name, source)) = profile {
+            extra["profile"] = serde_json::Value::String(name.to_string());
+            extra["profile_source"] = serde_json::Value::String(source.to_string());
+        }
         self.append(AuditEntryDraft {
             op: "agent_boot".to_string(),
-            extra: serde_json::json!({
-                "version": build.version,
-                "detect_only": detect_only.is_some(),
-                // External audit MAIN-008: the source, not only the bool.
-                "detect_only_source": detect_only,
-                "binary_integrity": integrity,
-                "install_provenance": provenance,
-                "previous_run": self.previous_run.to_json(),
-                // External audit ATP-009: what the build is and how the BPF
-                // guard runs — a debug-trigger build only observes.
-                "build_features": build.features,
-                "bpf_guard": if build.bpf_guard_enforce {
-                    "enforce"
-                } else {
-                    "observe"
-                },
-            }),
+            extra,
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "success".to_string(),
@@ -1149,6 +1184,8 @@ struct TailState {
     last_agent_id: Option<String>,
     /// Lot 341 (F8): the last run's `agent_boot` said `detect_only: false`.
     previous_boot_enforced: Option<bool>,
+    /// Lot 345: the last run's `agent_boot`'s profile.
+    previous_boot_profile: Option<String>,
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -1181,6 +1218,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 verified_boot: false,
                 last_agent_id: None,
                 previous_boot_enforced: None,
+                previous_boot_profile: None,
             });
         }
         Err(e) => return Err(refused_open::<H>(e, path, "to read its chain")),
@@ -1198,6 +1236,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     let mut anchoring_started = false;
     let mut last_agent_id = None;
     let mut previous_boot_enforced = None;
+    let mut previous_boot_profile = None;
     for (n, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -1238,6 +1277,14 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                     .get("detect_only")
                     .and_then(|v| v.as_bool())
                     .map(|d| !d);
+                // Lot 345 (the re-check of #550, N3): the profile itself — an
+                // observing boot of the enforcing profile (a detect-only
+                // drop-in) is still an enforcing profile's, so it no longer
+                // launders the downgrade that follows it
+                previous_boot_profile = match entry.extra.get("profile").and_then(|v| v.as_str()) {
+                    Some(p) => Some(p.to_string()),
+                    None => (previous_boot_enforced == Some(true)).then(|| "enforcing".to_string()),
+                };
                 previous = PreviousRun::Abrupt {
                     booted_at: entry.ts.clone(),
                     last_entry_at: entry.ts.clone(),
@@ -1276,6 +1323,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
         verified_boot,
         last_agent_id,
         previous_boot_enforced,
+        previous_boot_profile,
     })
 }
 
@@ -2290,6 +2338,73 @@ mod tests {
             .unwrap();
         assert_eq!(e.extra["detect_only"], false);
         assert!(e.extra["detect_only_source"].is_null());
+    }
+
+    /// Named (lot 345; the re-check of #550, N3): the next open knows the
+    /// PROFILE the run that booted last ran — signed in its `agent_boot` with
+    /// its source — not only whether it enforced: an observing boot of the
+    /// enforcing profile (a detect-only drop-in) reads `enforcing`; a row of
+    /// an agent before the field reads `enforcing` when it enforced, unknown
+    /// when it observed.
+    #[test]
+    fn the_previous_boot_s_profile_is_read_from_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key_path = dir.path().join("agent.sig.key");
+        let open = || {
+            let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+            AuditLog::open(&path, key, [7u8; 16]).unwrap()
+        };
+        let mut log = open();
+        assert_eq!(log.previous_boot_profile(), None);
+        let e = log
+            .boot_probe_profiled(
+                None,
+                Some(("enforcing", "install manifest")),
+                "verified",
+                "attested",
+                &test_build(),
+            )
+            .unwrap();
+        assert_eq!(e.extra["profile"], "enforcing");
+        assert_eq!(e.extra["profile_source"], "install manifest");
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.previous_boot_profile(), Some("enforcing"));
+        // an observing boot of the enforcing profile (NN_DETECT_ONLY=1)
+        log.boot_probe_profiled(
+            Some("NN_DETECT_ONLY=1"),
+            Some(("enforcing", "install manifest")),
+            "verified",
+            "attested",
+            &test_build(),
+        )
+        .unwrap();
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.previous_boot_enforced(), Some(false));
+        assert_eq!(log.previous_boot_profile(), Some("enforcing"));
+        log.boot_probe_profiled(
+            Some("profile alpha (signed profile.local)"),
+            Some(("alpha", "signed profile.local")),
+            "verified",
+            "attested",
+            &test_build(),
+        )
+        .unwrap();
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.previous_boot_profile(), Some("alpha"));
+        // rows before the field
+        log.boot_probe(None, "verified", "attested", &test_build())
+            .unwrap();
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.previous_boot_profile(), Some("enforcing"));
+        log.boot_probe(Some("--detect-only"), "verified", "attested", &test_build())
+            .unwrap();
+        drop(log);
+        assert_eq!(open().previous_boot_profile(), None);
     }
 
     /// Named (lot 341, the review of #550 F8): the next open knows whether

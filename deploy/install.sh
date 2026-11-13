@@ -257,10 +257,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --allow-bpf-tools      fresh install, started: let bpftrace and BCC's tools load tracing BPF"
             echo "                         programs (kprobe, tracepoint, perf_event, raw_tracepoint, tracing) — signed"
             echo "                         bpf-loader-allow lines for this host's bpftrace and the interpreter BCC's tools"
-            echo "                         run under, applied with the install's key. Any root process running them may"
-            echo "                         then load those types (bpftrace runs what it is given): a tester's choice"
+            echo "                         run under, applied with the install's key. RISK: the kernel knows a loader by"
+            echo "                         its executable only, so BCC's line is the Python interpreter's — ANY root"
+            echo "                         script run by python3 (and anything bpftrace is given) may then load those"
+            echo "                         types: a tracing program can read the memory of every process, the agent's"
+            echo "                         included. The agent still refuses fmod_ret programs and any program that"
+            echo "                         calls bpf_send_signal, bpf_probe_write_user or bpf_override_return (the ones"
+            echo "                         that would kill or blind it), whoever loads it (docs/operator/ALPHA_PROFILE.md"
+            echo "                         §1.2). A tester's choice, for a test host"
             echo "  --allow-bpf-loader PATH"
-            echo "                         the same for one executable (absolute path; repeatable)"
+            echo "                         the same for one executable (absolute path; repeatable). A script (#!) is"
+            echo "                         not one: the kernel sees its interpreter, so name that"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -1407,26 +1414,91 @@ bpf_tool_loaders() {
     return 0
 }
 
+# Lot 345 (the re-check of #550, N5): a script named by --allow-bpf-loader
+# is a silent no-op — the kernel matches the executable it runs, which is
+# the script's interpreter. Warned about, with the interpreter to name.
+bpf_loader_script_warning() {
+    local l=$1 first
+    first=$(head -c 2 "$l" 2>/dev/null || true)
+    if [[ $first == '#!' ]]; then
+        echo "install.sh: WARNING: --allow-bpf-loader '$l' is a script: the kernel sees its interpreter" >&2
+        echo "install.sh: ($(head -n1 "$l" | sed 's/^#![[:space:]]*//')), never the script, so this line allows nothing." >&2
+        echo "install.sh: Name the interpreter instead (every script it runs may then load those types)." >&2
+    fi
+    return 0
+}
+
 # The policy to sign: the policy in force ($1, may be absent) and one
 # `bpf-loader-allow <path> $BPF_TOOL_TYPES` line for each loader on stdin
-# that it does not name yet (a line already there is kept as it is).
+# that it does not name yet. Lot 345 (the re-check of #550, N4): a line
+# already there that lacks some of $BPF_TOOL_TYPES is widened to them (its
+# own types kept, the missing ones appended; it was kept as it was, and the
+# summary said "allowed" while those types stayed refused); a policy whose
+# last line has no newline gets one before the appended lines (they were
+# glued to it, and the agent refused the whole policy).
 # BPF_ALLOWED: the loaders the result names this way.
 bpf_loader_policy() {
-    local current=$1 l
+    local current=$1 l loaders=() missing
     BPF_ALLOWED=()
-    if [[ -r $current ]]; then
-        cat "$current"
-    fi
     while read -r l; do
         [[ -n $l ]] || continue
+        case " ${loaders[*]-} " in *" $l "*) continue ;; esac
+        loaders+=("$l")
+    done
+    if [[ -r $current ]]; then
+        # each line naming one of the loaders, widened; every other as it is
+        awk -v want="$BPF_TOOL_TYPES" -v loaders="${loaders[*]-}" '
+            BEGIN { n = split(loaders, L, " "); for (i = 1; i <= n; i++) is[L[i]] = 1 }
+            $1 == "bpf-loader-allow" && ($2 in is) && NF >= 3 && $3 !~ /^#/ {
+                k = split($3, have, ",")
+                for (i = 1; i <= k; i++) got[have[i]] = 1
+                m = split(want, W, ",")
+                add = ""
+                for (i = 1; i <= m; i++) if (!(W[i] in got)) add = add "," W[i]
+                delete got
+                if (add != "") {
+                    rest = ""
+                    for (i = 4; i <= NF; i++) rest = rest " " $i
+                    print "bpf-loader-allow " $2 " " $3 add rest
+                    next
+                }
+            }
+            { print }
+        ' "$current"
+    fi
+    for l in ${loaders[@]+"${loaders[@]}"}; do
         if [[ -r $current ]] && awk -v p="$l" '$1 == "bpf-loader-allow" && $2 == p { f = 1 } END { exit !f }' "$current"; then
-            BPF_ALLOWED+=("$l (already in the policy)")
+            missing=$(awk -v p="$l" -v want="$BPF_TOOL_TYPES" '
+                $1 == "bpf-loader-allow" && $2 == p {
+                    k = split($3, have, ","); for (i = 1; i <= k; i++) got[have[i]] = 1
+                    m = split(want, W, ","); out = ""
+                    for (i = 1; i <= m; i++) if (!(W[i] in got)) out = out (out == "" ? "" : ",") W[i]
+                    print out; exit
+                }' "$current")
+            if [[ -n $missing ]]; then
+                BPF_ALLOWED+=("$l (widened: +$missing)")
+            else
+                BPF_ALLOWED+=("$l (already in the policy)")
+            fi
             continue
         fi
-        case " ${BPF_ALLOWED[*]-} " in *" $l "*) continue ;; esac
         echo "bpf-loader-allow $l $BPF_TOOL_TYPES"
         BPF_ALLOWED+=("$l")
     done
+}
+
+# Lot 345 (the re-check of #550, N3b): the policy on disk is signed with the
+# install's key only when it is the verified policy in force — on a reinstall
+# over a kept configuration, an unsigned edit of it would have been signed
+# with the rest. `nn-admin config overlay status` says NOT LOADED for a
+# rule-policy.local whose signature does not verify; then nothing is signed.
+bpf_loader_policy_verified() {
+    local current=$1 line
+    [[ -e $current ]] || return 0
+    line=$("$BIN_DIR/nn-admin" config overlay status --dir "$ETC_DIR" --admin-pub "$ETC_DIR/admin.pub" \
+        --agent-id-file "$ETC_DIR/agent_id" --audit-log "$ETC_DIR/audit.log" 2>/dev/null \
+        | awk '$1 == "rule-policy" { print; exit }' || true)
+    [[ -n $line && $line != *"NOT LOADED"* && $line == *signed* ]]
 }
 
 # Sign and apply the lines through the running agent with the install's key
@@ -1449,6 +1521,14 @@ apply_bpf_loader_allow() {
         rm -f "$candidate"
         return 0
     fi
+    if ! bpf_loader_policy_verified "$ETC_DIR/rule-policy.local"; then
+        echo "install.sh: WARNING: $ETC_DIR/rule-policy.local is not the verified policy in force (its signature" >&2
+        echo "install.sh: does not verify: nn-admin config overlay status): the bpf-loader-allow lines are NOT signed" >&2
+        echo "install.sh: over it. Review it, then sign the lines yourself: docs/operator/RULE_POLICY.md §2.5" >&2
+        BPF_ALLOWED=()
+        rm -f "$candidate"
+        return 0
+    fi
     if "$BIN_DIR/nn-admin" policy set --file "$candidate" --key "$key"; then
         echo "install.sh: signed bpf-loader-allow lines applied: ${BPF_ALLOWED[*]}"
     else
@@ -1465,6 +1545,7 @@ for l in ${ALLOW_BPF_LOADERS[@]+"${ALLOW_BPF_LOADERS[@]}"}; do
         echo "install.sh: whitespace, of an executable on this host. Nothing was changed." >&2
         exit 2
     fi
+    bpf_loader_script_warning "$l"
 done
 
 # >>> install_summary (run by xtask/tests/install_scripts.rs)
@@ -1494,7 +1575,11 @@ install_summary() {
     fi
     if (( ${#BPF_ALLOWED[@]} )); then
         echo "  bpf tools : allowed for ${BPF_ALLOWED[*]} — signed bpf-loader-allow lines: any root"
-        echo "              process running them may load tracing BPF programs"
+        echo "              process running them may load tracing BPF programs (for python3: ANY root"
+        echo "              Python script), which read every process's memory, the agent's included."
+        echo "              Programs that would kill or blind the agent (fmod_ret, bpf_send_signal,"
+        echo "              bpf_probe_write_user, bpf_override_return) stay refused. Remove the lines on a"
+        echo "              host that is not a test host (docs/operator/RULE_POLICY.md §2.5)"
     else
         echo "  bpf tools : refused (bpftrace, BCC) — $([[ $MODE == full ]] && echo "install with --allow-bpf-tools, or ")sign"
         echo "              bpf-loader-allow lines (docs/operator/RULE_POLICY.md §2.5)"

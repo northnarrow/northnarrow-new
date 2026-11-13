@@ -501,3 +501,133 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
     );
     assert!(c.contains("HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);"));
 }
+
+/// Named (lot 345; the re-check of #550, N2 and point 1 (ii)): what an
+/// allowed loader (`install.sh --allow-bpf-tools`, `--allow-bpf-loader`)
+/// still cannot load — read in the code the kernel runs, in the order that
+/// makes it hold:
+/// - the `bpf` hook refuses an fmod_ret (`expected_attach_type` at byte 68
+///   of the kernel's copy of the attr) to a load the opt-out let through,
+///   an unreadable one too;
+/// - 6.9 and later: `bpf_prog_load` judges the kernel's copy of a foreign
+///   load's instructions (a type refused by default: an opted-out one) for
+///   the forbidden helpers and kfunc, before the verifier and any id;
+/// - before 6.9: `bpf_prog` judges every foreign handle (the load's and one
+///   by id) once verified, against targets it calibrates from the agent's
+///   own programs, and the verifier's lockdown question for
+///   `bpf_probe_write_user` is refused to a foreign caller;
+/// - the agent arms one stage or the other, and freezes the configuration.
+#[test]
+fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "try_bpf_syscall_observe"),
+        &[
+            "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {",
+            "(attr as *const u8).add(PROG_LOAD_ATTACH_TYPE_OFFSET) as *const u32,",
+            "Ok(eat) => opt_out_refuses_attach(eat),\n                Err(_) => true,",
+            "if refused_attach {\n                emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);\n                return -EPERM;",
+            "emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "content_refusal"),
+        &[
+            "if !denied_by_default(ty)\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
+            "let Some(addr) = ptr_scalar(prog) else {\n        return Some((CONTENT_UNJUDGED, ty));",
+            "match nn_prog_forbidden_call(addr) {\n        SCAN_CLEAN => None,",
+            "_ => Some((CONTENT_UNJUDGED, ty)),",
+        ],
+    )
+    .unwrap();
+    assert!(c.contains("#[lsm(hook = \"bpf_prog_load\")]\npub fn bpf_prog_load_guard("));
+    in_order(
+        body(&c, "try_bpf_prog_load_guard"),
+        &[
+            "if content_stage() != CONTENT_STAGE_LOAD {",
+            "if let Some((why, ty)) = content_refusal(prog) {\n        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n        return -EPERM;",
+        ],
+    )
+    .unwrap();
+    // before the load's seen mark and any own-object exemption: every
+    // handle of a foreign caller
+    in_order(
+        body(&c, "try_bpf_prog_guard"),
+        &[
+            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n        if let Some((why, ty)) = content_refusal(prog) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
+            "if loading && (caller_is_exempt() || fresh_instance_may_load()) {\n        calibrate(prog);",
+            "if loading {\n        crate::bpf_census::mark_seen(id, prog);",
+        ],
+    )
+    .unwrap();
+    // the whole program read: CONTENT_MAX_INSNS = 64 blocks x 64 chunks x 256
+    in_order(
+        body(&c, "nn_prog_forbidden_call"),
+        &[
+            "if len > CONTENT_MAX_INSNS as u64 {\n        return SCAN_UNJUDGED;",
+            "while b < SCAN_BLOCKS {",
+            "let r = nn_scan_block(insns, from, len);",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        256 * 64 * 64,
+        northnarrow_common_max_insns(),
+        "the scan covers the most a load may hold"
+    );
+    in_order(
+        body(&c, "nn_scan_chunk"),
+        &[
+            "Err(_) => return SCAN_UNJUDGED,",
+            "let hit = forbidden_call(insn, &targets);",
+        ],
+    )
+    .unwrap();
+    assert!(c.contains("#[lsm(hook = \"locked_down\")]\npub fn bpf_write_user_guard("));
+    in_order(
+        body(&c, "try_bpf_write_user_guard"),
+        &[
+            "if want == 0\n        || what != want\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
+            "emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_CALL, 0);\n    -EPERM",
+        ],
+    )
+    .unwrap();
+    // the agent's side
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "attach"),
+        &[
+            "let at_load = resolved.is_some_and(|r| r.prog_load_hook)",
+            "PROG_LOAD_GUARD_PROGRAM,\n            PROG_LOAD_GUARD_HOOK,",
+            "write_content_judge(ebpf, &judge, true)",
+            "attach_guard_hook(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf, pin_root, enforce)",
+            "PROG_GUARD_PROGRAM,\n        PROG_GUARD_HOOK,",
+            "if !at_load {",
+            "match arm_content_at_handle(ebpf, btf, pin_root, enforce, lockdown) {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&u, "arm_content_at_handle"),
+        &[
+            "set_calibration(ebpf, kind)?;\n        let loaded = load_calibration(ebpf, program);\n        set_calibration(ebpf, CALIB_NONE)?;",
+            "freeze_named(ebpf, CALIB_MAP)?;",
+            "WRITE_USER_GUARD_PROGRAM,\n            WRITE_USER_GUARD_HOOK,",
+            "write_content_judge(ebpf, &judge, true)?;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&u, "load_calibration").contains("prog.unload()"));
+}
+
+/// `bpf_prog_class::CONTENT_MAX_INSNS`, read from its source.
+fn northnarrow_common_max_insns() -> u64 {
+    let c = code("common/src/bpf_prog_class.rs");
+    assert!(c.contains("pub const CONTENT_MAX_INSNS: u32 = 1 << 20;"));
+    let e = code("agent-ebpf/src/bpf_defense.rs");
+    assert!(e.contains("const SCAN_CHUNK: u64 = 256;"));
+    assert!(e.contains("const SCAN_BLOCK: u64 = 64;"));
+    assert!(e.contains("const SCAN_BLOCKS: u64 = 64;"));
+    1 << 20
+}
