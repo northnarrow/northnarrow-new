@@ -127,7 +127,7 @@ broke legitimate work, so the rule records the write instead.
 | The package manager: `dpkg`, `rpm`, `apt`, `dnf`, `yum`, `snapd`, `packagekitd` and their children (kernel-resolved lineage) | system binaries, setuid binaries, kernel and PAM modules, sensitive configs, cron drop-ins, units, timers, file capabilities | Log, Low |
 | An interactive administrator session: `sudo` or `su` in the lineage, a login uid and a terminal | sensitive configs (NN-L-FIM-003), cron drop-ins (-007), units (-009), timers (-023), file capabilities (-025) | Log, at the rule's severity |
 | An account tool (`passwd`, `useradd`, `usermod`, `chpasswd`, `systemd-sysusers`, libuser's `l*` tools…), told by its exe | `/etc/passwd` and `/etc/shadow` (NN-L-FIM-003), `/var/log/lastlog` (-018) | Log: Low when a user other than root ran it, else the rule's severity |
-| Lot 340: the packaged `logrotate` (its path, and the device and inode of the file there) forked by PID 1 (its timer's `logrotate.service`) or started by cron's daily run | logs (NN-L-FIM-005), wtmp and btmp (-019) | Log, Low |
+| Lot 340: the packaged `logrotate` (its path, and the device and inode of the file there), as root, run exactly as `logrotate /etc/logrotate.conf`, forked by PID 1 (its timer's `logrotate.service`) or run by cron's daily run (`/etc/cron.daily/logrotate` under `run-parts`, a short root chain up to a cron daemon PID 1 forked) | logs (NN-L-FIM-005), wtmp and btmp (-019) | Log, Low |
 
 Everything else keeps the rule's response. That includes:
 
@@ -136,7 +136,7 @@ Everything else keeps the rule's response. That includes:
 - a command run without a terminal (`ssh host 'sudo …'`, most automation);
 - a root process with no `sudo`/`su` above it;
 - `doas` and `pkexec`, which replace themselves with the command and so leave no trace in the lineage;
-- `logrotate` run by hand, a copy of it, and any other writer of wtmp or btmp (lot 340).
+- `logrotate` run by hand, with any other argument (`-f`, `-s`, another configuration), by a non-root user, under anacron or cron run by hand or below a cron `@reboot` entry, a copy of it, and any other writer of wtmp or btmp (lot 340; the review of #552).
 
 Lot 340: a log's size is compared with the size the agent last read in that
 same file (else the size it had when it was watched), not with the path's

@@ -2109,6 +2109,28 @@ mod tests {
     use super::*;
     use crate::audit::AuditLog;
 
+    /// Named test (the review of #552, F5a): a refused BPF load is marked a
+    /// known system probe's after the bus's lineage barrier — in `teach`,
+    /// once the execs the record overtook are taught, on the loader's exec
+    /// as of the load (`known_system_prog::known_probe_by`'s test) — and no
+    /// longer as the fs_protect pump decodes it from `/proc`.
+    #[test]
+    fn a_known_probe_is_marked_after_the_lineage_barrier() {
+        let src = include_str!("bus.rs");
+        let body = &src[src.find("fn teach(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let taught = body.find("l.ingest_spawn_event(e)").expect("the barrier");
+        let marked = body
+            .find("mark_known_probe_on_host(&mut r.envelope.event, l)")
+            .expect("the mark");
+        assert!(taught < marked, "{body}");
+        let mux = include_str!("multiplexer.rs");
+        let pump = &mux[mux.find("\"fs_protect\",\n").unwrap()..];
+        let pump = &pump[..pump.find(")?),").unwrap()];
+        assert!(pump.contains("no_carry"), "{pump}");
+        assert!(!mux.contains("fn known_probe_marked"));
+    }
+
     fn open(pid: u32) -> Event {
         Event::FileOpen {
             pid,

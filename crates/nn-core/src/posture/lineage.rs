@@ -447,9 +447,11 @@ struct Entry {
     /// event's, from the kernel's credentials; 0 for the plain ingest
     /// calls of tests and tools).
     uid: u32,
-    /// Lot 310: the executed file's `(st_dev, st_ino)` as the exec sensor's
-    /// LSM identity gave it (`None`: tracepoint mode, a process older than
-    /// the agent, the plain ingest calls). A fork runs its parent's.
+    /// Lot 310: the executed file's device and inode as the exec sensor's
+    /// LSM identity gave it — the device in the kernel's form (`MKDEV`, not
+    /// `stat(2)`'s `st_dev`: `common::wire::exe::kernel_dev` converts one)
+    /// (`None`: tracepoint mode without the pump's read, a process older
+    /// than the agent, the plain ingest calls). A fork runs its parent's.
     image: Option<(u64, u64)>,
     /// Lot 310 (the re-check of #539, N2): the process that forked this
     /// one, when this exec was the first since that fork (the exec record's
@@ -3450,8 +3452,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(ExecIdentity { exe, runs })
     }
 
-    /// Lot 310: the identity (`(st_dev, st_ino)`) of the file `pid` executed,
-    /// as the exec sensor's LSM program gave it — from the spawn cache only
+    /// Lot 310: the identity (device and inode; the device in the kernel's
+    /// form, `MKDEV` — the review of #552, F7: not `stat(2)`'s `st_dev`) of
+    /// the file `pid` executed, as the exec sensor's LSM program gave it —
+    /// from the spawn cache only
     /// (no `/proc`: it is read on the decision path), as of `as_of`
     /// ([`Self::exec_identity`]'s cache lookup); `None` when the cache does
     /// not hold the exec, or holds no identity for it (tracepoint mode, a

@@ -6762,7 +6762,55 @@ mod tests {
                 1,
             );
             ingest(0, true, 754, 1, LOGROTATE, conf, PACKAGED, 1);
-            for pid in [706u32, 714, 725, 733, 743, 750, 751, 752, 753, 754] {
+            // cron.daily's script without run-parts (a crontab line running
+            // it), a cron daemon whose exec PID 1 did not fork (its parent at
+            // the exec PID 1, the kernel's record a shell's), a chain longer
+            // than cron's own between run-parts and the daemon
+            ingest(0, false, 770, 510, "/usr/bin/dash", daily, (8, 11), 510);
+            ingest(0, false, 771, 770, LOGROTATE, conf, PACKAGED, 770);
+            ingest(
+                0,
+                false,
+                772,
+                1,
+                "/usr/sbin/cron",
+                &["cron", "-f"],
+                (8, 10),
+                720,
+            );
+            ingest(0, false, 773, 772, "/usr/bin/dash", line, (8, 11), 772);
+            ingest(
+                0,
+                false,
+                774,
+                773,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                773,
+            );
+            ingest(0, false, 775, 774, "/usr/bin/dash", daily, (8, 11), 774);
+            ingest(0, false, 776, 775, LOGROTATE, conf, PACKAGED, 775);
+            let mut up = 510;
+            for pid in 780..785 {
+                ingest(0, false, pid, up, "/usr/bin/dash", line, (8, 11), up);
+                up = pid;
+            }
+            ingest(
+                0,
+                false,
+                785,
+                784,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                784,
+            );
+            ingest(0, false, 786, 785, "/usr/bin/dash", daily, (8, 11), 785);
+            ingest(0, false, 787, 786, LOGROTATE, conf, PACKAGED, 786);
+            for pid in [
+                706u32, 714, 725, 733, 743, 750, 751, 752, 753, 754, 771, 776, 787,
+            ] {
                 assert_eq!(judged(&t, pid), KEPT, "pid {pid}");
             }
             // the controls: the same invocation by the timer's unit, and by

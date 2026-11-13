@@ -192,3 +192,21 @@ process's labels; the resolver relays every process's names), as
 NN-L-NET-005 already counted none of its legs. Pods reach CoreDNS on the
 cluster's DNS address, not a loopback stub: their own queries are judged on
 the pod's process, and CoreDNS's upstream legs are recorded, not acted on.
+
+The review of #552 tightened both proofs, so that no user obtains them:
+
+- **F4, a resolver is the system's service**, not its packaged image: the
+  sender runs in its own unit's cgroup right under `system.slice` (only
+  root places a process there; a webshell runs in its web server's unit),
+  PID 1 forked it (the kernel's record of its exec; else its parent now)
+  or, for dnsmasq, the packaged NetworkManager did, every uid it runs as is
+  a system user's, and its environment holds no dynamic loader variable
+  (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`). A user's
+  `LD_PRELOAD=/tmp/t.so /usr/lib/systemd/systemd-resolved` and a user's
+  `dnsmasq -p 5353` relay are judged as any process.
+- **F3, CoreDNS by its container**: the container's id must be the last
+  segment of a cgroup path whose first is the kubelet's
+  (`kubepods`/`kubepods.slice`) — a user's delegated cgroup named with
+  CoreDNS's id passed — and the sender must share its PID and mount
+  namespaces with the container's init, whose pid the runtime recorded in
+  the bundle (containerd's `init.pid`, CRI-O's `userdata/pidfile`, root's).

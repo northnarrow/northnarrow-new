@@ -555,8 +555,9 @@ mod tests {
             format!("0::/kubepods/burstable/pod1a2b/{ID}/x\n"),
             format!("0::/{ID}\n"),
             format!("0::/kubepods\n"),
+            // two ids, the last one CoreDNS's
             format!(
-                "12:pids:/kubepods/burstable/pod1/{ID}\n0::/kubepods/burstable/pod1/{}\n",
+                "12:pids:/kubepods/burstable/pod1/{}\n0::/kubepods/burstable/pod1/{ID}\n",
                 "a".repeat(64)
             ),
         ] {
@@ -575,12 +576,29 @@ mod tests {
             !coredns_in(&t.path().join("proc"), t.path(), 4242),
             "own namespaces"
         );
+        // its PID namespace the init's, its mount namespace its own
+        namespaces(t.path(), 4300, "4026532901");
+        let mnt = t.path().join("proc/4300/ns/mnt");
+        std::fs::remove_file(&mnt).unwrap();
+        std::os::unix::fs::symlink("mnt:[4026532999]", &mnt).unwrap();
+        assert!(
+            !coredns_in(&t.path().join("proc"), t.path(), 4242),
+            "its own mounts"
+        );
         // ... and with the init's: CoreDNS (its worker, not the init)
         namespaces(t.path(), 4300, "4026532901");
         assert!(
             coredns_in(&t.path().join("proc"), t.path(), 4242),
             "the init's namespaces"
         );
+        // an init file naming PID 1 (the host's init, whatever it shares)
+        std::fs::write(&init, "1").unwrap();
+        namespaces(t.path(), 1, "4026532901");
+        assert!(
+            !coredns_in(&t.path().join("proc"), t.path(), 4242),
+            "PID 1 as the init"
+        );
+        std::fs::write(&init, "4300").unwrap();
         // an init file another user may write, none at all, no init's entry
         std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(
@@ -737,12 +755,30 @@ mod tests {
             )
         };
         let proven = is("/usr/sbin/dnsmasq");
+        // the same image, not run as dnsmasq's service (a user's session)
+        let user = t.path().join("user");
+        service(
+            &user,
+            pid,
+            "/user.slice/user-1000.slice/session-2.scope",
+            1,
+            1000,
+            b"\0",
+        );
+        let not_a_service = known_resolver(
+            &lineage,
+            pid,
+            Some("/usr/sbin/dnsmasq"),
+            &|exe| system_service_in(&user, &lineage, pid, exe),
+            &|| true,
+        );
         let outside = is("/srv/x/dnsmasq");
         let not_a_resolver = is("/usr/bin/curl");
         let other = is("/usr/sbin/unbound");
         let _ = child.kill();
         let _ = child.wait();
         assert!(proven, "the host's file at the resolver's path");
+        assert!(!not_a_service, "the host's file, run by a user");
         assert!(!outside, "the same file outside a system tree");
         assert!(!not_a_resolver, "the same file under a name no resolver's");
         assert!(!other, "no file at /usr/sbin/unbound");

@@ -646,11 +646,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **A scheduled log rotation is Low.** NN-L-FIM-005 (a log modified) and
     NN-L-FIM-019 (wtmp/btmp written by a non-login process, a kill) were
     High for logrotate's daily run. A write by the packaged `logrotate`
-    (its path, and the device and inode of the file there) that PID 1
-    forked (its timer's `logrotate.service`, the kernel's fork record) or
-    that cron's daily run started is recorded Low, not acted on. Anything
-    else — another writer truncating btmp, a copy of logrotate, logrotate
-    run by hand — keeps its verdict.
+    (its path, and the device and inode of the file there), run as root
+    with exactly the packaged invocation (`logrotate /etc/logrotate.conf`:
+    its unit's `ExecStart=`, `/etc/cron.daily/logrotate`'s command), that
+    PID 1 forked (its timer's `logrotate.service`, the kernel's fork record)
+    or that cron's daily run started (`/etc/cron.daily/logrotate` under
+    `run-parts`, a short root chain up to a cron daemon PID 1 forked) is
+    recorded Low, not acted on. Anything else — another writer truncating
+    btmp, a copy of logrotate, logrotate run by hand or with any other
+    argument (`-f`, `-s`, a configuration of the caller's), by a non-root
+    user, under anacron or cron run by hand (`anacron -t /tmp/t`) or below a
+    cron `@reboot` entry — keeps its verdict (the review of #552, F1).
   - **rsyslogd's appends after a rotation, and at the start, are appends.**
     The FIM drain measured a write against the start's baseline of the
     path: after a rotation the path holds a new, smaller file, and every
@@ -659,7 +665,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     raced the baseline (none yet: High). A write is now measured against the
     size the drain last read in that same file, else the size it had when it
     was watched (`FimEvent::baseline_size`); a truncation in place still
-    shrinks it.
+    shrinks it. The review of #552 (F6): the size read at a child's
+    creation in a watched directory is the child's, not the directory's.
   - **A credential store's directory listed is no verdict** (the
     mini-hunt). A `find /` (the lab's harness; plocate's daily `updatedb`
     makes the same walk) opened `~/.gnupg/private-keys-v1.d` and its
@@ -683,7 +690,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     hands the shebang's interpreter the path it executed): FP-2's
     exemption never matched it, and `npm ci` from a CI runner raised
     ConfirmedIntrusion. The link in a system tree whose target (folded) is
-    npm's CLI in one is now npm's CLI. The packaged `go` command rewriting
+    npm's CLI in one is now npm's CLI. The review of #552 (F2): only when
+    node runs npm's script alone — no `NODE_OPTIONS=--require`/`--import`
+    or `NODE_PATH` read by the exec pump (`ENV_LOADS`) — and npm's CLI by
+    its suffix (`…/npm/bin/npm-cli.js`) only in a root-owned system tree:
+    a package's own copy, one in a home (a user prefix the postinstall can
+    write) or a path through `..` is the caller's code under npm's name
+    and keeps the arm. The packaged `go` command rewriting
     its archives in its work directory (`$TMPDIR/go-build<digits>/`), its
     build cache or its module cache (`go test` stamping build ids) is
     exempt from the mass-write arm; what it runs is judged as before.
@@ -700,17 +713,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     into COMBAT, where the ladder killed a shell. A refused load of a type
     systemd's programs use (`tracepoint`, `kprobe`; PID 1's `lsm` at a
     `daemon-reexec`) whose loader the agent proves the packaged
-    `/usr/lib/systemd/systemd` or `systemd-networkd` (device and inode, the
-    same process, started before the load) is still refused, recorded Low,
-    and raises no posture trigger, so it corroborates nothing. Any other
-    loader keeps High and its trigger.
+    `/usr/lib/systemd/systemd` or `systemd-networkd` is still refused,
+    recorded Low, and raises no posture trigger, so it corroborates
+    nothing. The review of #552 (F5): the proof is the image the loader's
+    exec recorded (device and inode) as of the load, read from the lineage
+    once the bus taught it the execs that came first — never
+    `/proc/<pid>/exe` at the record's decode, which a root process that
+    loads and then executes systemd showed as systemd's; and `lsm` is PID
+    1's alone. Any other loader keeps High and its trigger.
   - **Resolvers by identity; CoreDNS one of them.** NN-L-NET-004/-005/-014
     treated a query as a resolver's forwarded leg by the basename of its
     sender's image (a tunnel run as `/tmp/x/dnsmasq` was never killed), and
     CoreDNS was not one (its pods' names were its own). The DNS pump now
     proves it: the host's packaged resolver (its image the host's file at
-    that path), or the cluster's CoreDNS as its container runtime's bundle
-    records it (`kube-system`, a `coredns` image, `/coredns`). A known
+    that path) running as the system's service — the review of #552 (F4):
+    in its own unit's cgroup under `system.slice`, forked by PID 1 (or, for
+    dnsmasq, the packaged NetworkManager), as system users, with no dynamic
+    loader variable (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`); the same
+    image run by a user or a webshell is judged as any process — or the
+    cluster's CoreDNS as its container runtime's bundle records it
+    (`kube-system`, a `coredns` image, `/coredns`), its container's id the
+    leaf of the sender's `kubepods` cgroup and the sender in the PID and
+    mount namespaces of the container's init the runtime recorded (F3: a
+    user's delegated cgroup named with CoreDNS's id passed). A known
     resolver's legs with no attributable originator stay one Medium record
     each and no longer add up to a "tunnel" of the resolver (they are many
     processes' names: hash-shaped lookups under one zone); the originator's
