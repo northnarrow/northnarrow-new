@@ -1062,12 +1062,16 @@ impl BusWaker {
     }
 }
 
-/// The lineage taught the execs `r` overtook (lab PR 267).
-fn teach(r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
+/// The lineage taught the execs `r` overtook (lab PR 267). The review of
+/// #552 (F5a): then, past that barrier, a refused BPF load proven a known
+/// system probe's by its loader's exec as of the load is marked
+/// ([`crate::sensors::multiplexer::mark_known_probe_on_host`]).
+fn teach(mut r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
     if let Some(l) = lineage {
         for e in &r.overtaken {
             l.ingest_spawn_event(e);
         }
+        crate::sensors::multiplexer::mark_known_probe_on_host(&mut r.envelope.event, l);
     }
     r
 }

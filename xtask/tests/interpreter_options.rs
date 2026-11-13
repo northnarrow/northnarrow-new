@@ -425,6 +425,13 @@ const KNOWN: &[(&str, usize, &str)] = &[
          `kill`'s, no option read",
     ),
     (
+        "crates/nn-linux/src/net/known_resolver.rs",
+        1,
+        "lot 340 (the review of #552, F4): a resolver service's environment split on its NULs \
+         (`/proc/<pid>/environ`): the dynamic loader's variables looked up by name, no \
+         interpreter's options",
+    ),
+    (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         1,
         "a module tool's environment split on its NULs (`MODPROBE_OPTIONS`): kmod's, no \

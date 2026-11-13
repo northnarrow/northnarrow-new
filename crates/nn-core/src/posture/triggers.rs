@@ -4701,6 +4701,67 @@ mod tests {
         }
     }
 
+    /// Named test (the review of #552, F2; its probe `rev552_probe_npm_paths`
+    /// made a test): a malicious postinstall — npm's child, judged — that
+    /// runs its own code in a node named npm keeps the mass-write arm: a
+    /// package-shipped `npm-cli.js` (`node_modules/evil/npm/bin/`), one in
+    /// a home (a user prefix the postinstall can write), a path out of a
+    /// system tree through `..`, and the packaged `/usr/bin/npm` with an
+    /// environment that loads the caller's code (`NODE_OPTIONS=--require`:
+    /// the exec pump's `ENV_LOADS`). The packaged npm run clean stays
+    /// exempt; node running a project script raises (the control).
+    #[test]
+    fn npm_running_the_caller_s_code_keeps_the_mass_write_arm() {
+        use common::wire::exe::exe_flags::ENV_LOADS;
+        let run = |pid: u32, script: &str, flags: u32| {
+            let det = detector_with_npm_links();
+            let mut e = spawn_with_argv(pid, 1, "/usr/bin/node", &["node", script, "ci"], 1);
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.flags = flags;
+            }
+            let _ = det.detect(&e, &[]);
+            let _ = det.detect(
+                &mass_write_at(pid, "/home/u/Documents/a.pdf", false, false, 10),
+                &[],
+            );
+            det.detect(&destroyed(pid, 11), &[])
+        };
+        for (pid, script, flags) in [
+            (7600, "/home/u/p/node_modules/evil/npm/bin/npm-cli.js", 0),
+            (7601, "/usr/bin/npm", ENV_LOADS),
+            (7602, "/usr/share/nodejs/npm/bin/npm-cli.js", ENV_LOADS),
+            (
+                7603,
+                "/home/u/.npm-global/lib/node_modules/npm/bin/npm-cli.js",
+                0,
+            ),
+            (
+                7604,
+                "/usr/lib/../../home/u/p/node_modules/npm/bin/npm-cli.js",
+                0,
+            ),
+            (7605, "node_modules/npm/bin/npm-cli.js", 0),
+            (7606, "/home/u/p/x.js", 0),
+        ] {
+            let hits = run(pid, script, flags);
+            assert!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{script} {flags:#x}: {hits:?}"
+            );
+        }
+        for (pid, script) in [
+            (7610, "/usr/bin/npm"),
+            (7611, "/usr/share/nodejs/npm/bin/npm-cli.js"),
+            (7612, "/usr/local/lib/node_modules/npm/bin/npm-cli.js"),
+        ] {
+            let hits = run(pid, script, 0);
+            assert!(
+                !hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{script}: {hits:?}"
+            );
+        }
+    }
+
     /// Named test (lot 340, the alpha's daily false positives): `go test`
     /// rewrites its packages' archives in place in its work directory to
     /// stamp their build ids — 20 existing files, some under 4 KiB, from a

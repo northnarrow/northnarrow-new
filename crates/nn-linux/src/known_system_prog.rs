@@ -47,6 +47,8 @@ use common::bpf_prog_class::{
     known_system_program, KnownLink, SeenLoad, ATTACH_LSM_MAC, KNOWN_SYSTEM_PROGRAMS,
 };
 
+use crate::posture::lineage::{AsOf, AuthSessionTracker};
+
 /// What the kernel's enumeration says of a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
@@ -316,83 +318,86 @@ fn holders_by(
 }
 
 /// Lot 340 (the alpha's daily false positives): a refused load of
-/// `prog_type` by `pid`, recorded at `at_ns` (`CLOCK_MONOTONIC`), is a known
-/// system program's feature probe ([`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`])
-/// — the entry, or why not. The kernel says it, read by the agent as the
-/// record is decoded (the loader is a long-lived daemon, the user manager or
-/// networkd):
+/// `prog_type` by `pid` is a known system program's feature probe
+/// ([`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`]) — the entry, or why
+/// not. The review of #552 (F5a): the proof is the loader's identity WHEN
+/// IT LOADED — `image`, the device and inode its exec recorded (the LSM
+/// program's, in the kernel's form), as of the load
+/// ([`AuthSessionTracker::exec_image`]) — never `/proc/<pid>/exe` read as
+/// the record is decoded: a root process that loads, then executes the
+/// packaged systemd before the decode, showed systemd's image there.
 ///
-/// * `/proc/<pid>/exe` has the device and the inode of the entry's packaged
-///   loader (`packaged`, on the host [`packaged`]: a regular file owned by
-///   root and writable by no one else; a copy, a renamed or a replaced
-///   binary is none) — whatever path its own mount namespace shows;
-/// * the process the same all along (its start read before and after) and
-///   started no later than the record (`suspended_ns`: the boot clock's lead
-///   on the monotonic clock now, all the host's suspended time; two ticks of
-///   rounding).
+/// * `image` is the device and inode of the entry's packaged loader
+///   (`packaged`, on the host [`packaged`]: a regular file owned by root and
+///   writable by no one else; a copy, a renamed or a replaced binary is
+///   none);
+/// * the review of #552 (F5b): an entry for PID 1 (`lsm`, at a
+///   `daemon-reexec`) only for PID 1 itself.
 ///
 /// What this trusts: the packaged loader file (a root that replaced it is
 /// not told apart) and a loader process no one else steers (a debugger
-/// attached to it can make it load anything — of a type the hook refuses
-/// all the same).
-#[allow(clippy::too_many_arguments)]
+/// attached to it, or a preload root gave it, can make it load anything —
+/// of a type the hook refuses all the same).
 pub fn known_probe(
-    proc: &Path,
+    image: Option<(u64, u64)>,
     packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
-    read_stat: &dyn Fn(&Path) -> Option<String>,
+    pid: u32,
+    prog_type: u32,
+) -> Result<usize, String> {
+    use common::bpf_prog_class::{known_system_probe, KNOWN_SYSTEM_PROBES};
+    let image = image.ok_or_else(|| {
+        format!("pid {pid}: no exec of it recorded with its image as of the load")
+    })?;
+    KNOWN_SYSTEM_PROBES
+        .iter()
+        .filter(|k| k.prog_type == prog_type)
+        .find(|k| {
+            packaged(k.loader).map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
+                == Some(image)
+        })
+        .and_then(|k| known_system_probe(k.loader, prog_type, pid))
+        .ok_or_else(|| {
+            format!(
+                "pid {pid} ran no packaged loader of a known probe of program type {prog_type} \
+                 when it loaded"
+            )
+        })
+}
+
+/// [`known_probe`] of a load at `at_ns` (`CLOCK_MONOTONIC`): the loader's
+/// image as `lineage`'s exec records give it as of the load, the packaged
+/// loaders by `packaged`.
+pub fn known_probe_by(
+    lineage: &AuthSessionTracker,
+    packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
     pid: u32,
     prog_type: u32,
     at_ns: u64,
-    clk_tck: u64,
-    suspended_ns: u64,
 ) -> Result<usize, String> {
-    use common::bpf_prog_class::{known_system_probe, KNOWN_SYSTEM_PROBES};
-    let pdir = proc.join(pid.to_string());
-    let start = start_ns_by(&pdir, clk_tck, read_stat).ok_or("its start cannot be read")?;
-    let exe = std::fs::metadata(pdir.join("exe")).map_err(|e| format!("its image: {e}"))?;
-    let id = (exe.dev(), exe.ino());
-    let entry = KNOWN_SYSTEM_PROBES
-        .iter()
-        .filter(|k| k.prog_type == prog_type)
-        .find(|k| packaged(k.loader) == Some(id))
-        .and_then(|k| known_system_probe(k.loader, prog_type))
-        .ok_or_else(|| {
-            format!(
-                "pid {pid} runs no packaged loader of a known probe of program type {prog_type}"
-            )
-        })?;
-    if start_ns_by(&pdir, clk_tck, read_stat) != Some(start) {
-        return Err(format!("pid {pid} named another process meanwhile"));
-    }
-    let tick = 1_000_000_000 / clk_tck.max(1);
-    if start > at_ns.saturating_add(suspended_ns).saturating_add(2 * tick) {
-        return Err(format!("pid {pid} started after the load"));
-    }
-    Ok(entry)
+    known_probe(
+        lineage.exec_image(pid, AsOf::judged(at_ns)),
+        packaged,
+        pid,
+        prog_type,
+    )
 }
 
-/// [`known_probe`] on this host (`/proc`, `/`, its clocks).
-pub fn known_probe_on_host(pid: u32, prog_type: u32, at_ns: u64) -> Result<usize, String> {
-    let now = |clock| {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a valid clock id and a timespec to fill.
-        unsafe { libc::clock_gettime(clock, &mut ts) };
-        (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
-    };
-    let suspended = now(libc::CLOCK_BOOTTIME).saturating_sub(now(libc::CLOCK_MONOTONIC));
-    known_probe(
-        Path::new("/proc"),
+/// [`known_probe_by`] on this host (the packaged loaders under `/`). Called
+/// once the bus taught the lineage every exec that reached it before the
+/// record (the review of #552, F5a: an exec still on its way is no proof —
+/// the record keeps High).
+pub fn known_probe_on_host(
+    lineage: &AuthSessionTracker,
+    pid: u32,
+    prog_type: u32,
+    at_ns: u64,
+) -> Result<usize, String> {
+    known_probe_by(
+        lineage,
         &|path| packaged(Path::new("/"), path, 0),
-        // lot 311 (N6): read as bytes — its `comm` is its own
-        &|p| crate::state_read::read_state(p).ok(),
         pid,
         prog_type,
         at_ns,
-        clk_tck(),
-        suspended,
     )
 }
 
@@ -860,56 +865,119 @@ mod tests {
         let networkd = file("usr/lib/systemd/systemd-networkd");
         let systemd = file("usr/lib/systemd/systemd");
         let copy = file("tmp/systemd-networkd");
-        let proc = t.path().join("proc");
-        proc_entry(&proc, 868, &networkd, &[], 772);
-        proc_entry(&proc, 2301, &systemd, &[], 900);
-        proc_entry(&proc, 4242, &copy, &[], 772);
         let packaged = |p: &str| super::packaged(t.path(), p, me);
-        let s = 1_000_000_000;
-        let read = |p: &Path| crate::state_read::read_state(p).ok();
-        let probe = |pid, ty, at| known_probe(&proc, &packaged, &read, pid, ty, at, 100, 0);
-        assert_eq!(probe(868, PROG_TYPE_KPROBE, 9 * s), Ok(1));
-        assert_eq!(probe(2301, PROG_TYPE_TRACEPOINT, 10 * s), Ok(0));
+        // the review of #552 (F5a): the image the loader's exec recorded,
+        // in the kernel's form
+        let image = |f: &Path| {
+            let m = std::fs::metadata(f).unwrap();
+            Some((common::wire::exe::kernel_dev(m.dev()), m.ino()))
+        };
+        let probe = |img, pid, ty| known_probe(img, &packaged, pid, ty);
+        assert_eq!(probe(image(&networkd), 868, PROG_TYPE_KPROBE), Ok(1));
+        assert_eq!(probe(image(&systemd), 2301, PROG_TYPE_TRACEPOINT), Ok(0));
         // the coordinator's rule: systemd's own loads of the types its
         // programs use
-        assert_eq!(probe(868, PROG_TYPE_TRACEPOINT, 9 * s), Ok(2));
-        assert_eq!(probe(2301, PROG_TYPE_KPROBE, 10 * s), Ok(3));
-        assert_eq!(probe(2301, PROG_TYPE_LSM, 10 * s), Ok(4));
-        for (pid, ty, at) in [
-            (4242, PROG_TYPE_KPROBE, 9 * s),
-            (4242, PROG_TYPE_TRACEPOINT, 9 * s),
-            (868, PROG_TYPE_LSM, 9 * s),
-            (2301, PROG_TYPE_EXT, 10 * s),
-            (2301, PROG_TYPE_PERF_EVENT, 10 * s),
-            (868, PROG_TYPE_KPROBE, 7 * s),
-            (999, PROG_TYPE_KPROBE, 9 * s),
+        assert_eq!(probe(image(&networkd), 868, PROG_TYPE_TRACEPOINT), Ok(2));
+        assert_eq!(probe(image(&systemd), 2301, PROG_TYPE_KPROBE), Ok(3));
+        // the review of #552 (F5b): `lsm` is PID 1's (the input: PID 1)
+        assert_eq!(probe(image(&systemd), 1, PROG_TYPE_LSM), Ok(4));
+        for (img, pid, ty) in [
+            (image(&copy), 4242, PROG_TYPE_KPROBE),
+            (image(&copy), 4242, PROG_TYPE_TRACEPOINT),
+            (image(&networkd), 868, PROG_TYPE_LSM),
+            (image(&systemd), 2301, PROG_TYPE_EXT),
+            (image(&systemd), 2301, PROG_TYPE_PERF_EVENT),
+            (image(&systemd), 2301, PROG_TYPE_LSM),
+            (None, 999, PROG_TYPE_KPROBE),
         ] {
-            assert!(probe(pid, ty, at).is_err(), "pid {pid} type {ty} at {at}");
+            assert!(probe(img, pid, ty).is_err(), "pid {pid} type {ty}");
         }
-        // its pid another process's at the second read
-        let reads = std::cell::Cell::new(0);
-        let reused = |p: &Path| {
-            reads.set(reads.get() + 1);
-            let start = if reads.get() == 1 { 772 } else { 905 };
-            p.ends_with("868/stat").then(|| {
-                format!("868 (systemd-network) S 1 868 868 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 {start} 1 1\n")
-            })
-        };
-        assert!(known_probe(
-            &proc,
-            &packaged,
-            &reused,
-            868,
-            PROG_TYPE_KPROBE,
-            9 * s,
-            100,
-            0
-        )
-        .is_err());
-        assert_eq!(reads.get(), 2, "read before and after");
         // a loader file another user may write is no packaged one
         std::fs::set_permissions(&networkd, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(probe(868, PROG_TYPE_KPROBE, 9 * s).is_err());
+        assert!(probe(image(&networkd), 868, PROG_TYPE_KPROBE).is_err());
+    }
+
+    /// Named test (the review of #552, F5a): a refused load is proven a
+    /// known probe's by the image its loader ran WHEN IT LOADED — its exec
+    /// record as of the load. A root process that loads a `kprobe` program
+    /// (refused) and executes the packaged systemd at once showed systemd's
+    /// image in `/proc` as the record was decoded (AT-001 Low, no posture);
+    /// as of the load it ran its own program: not proven. A load before any
+    /// recorded exec of its loader (only a later one known) is not proven
+    /// either; the packaged loader that executed before its load is.
+    #[test]
+    fn a_known_probe_is_proven_by_the_loader_s_image_at_the_load() {
+        use common::bpf_prog_class::PROG_TYPE_KPROBE;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let t = tempfile::tempdir().unwrap();
+        let me = std::fs::metadata(t.path()).unwrap().uid();
+        let systemd = t.path().join("usr/lib/systemd/systemd");
+        std::fs::create_dir_all(systemd.parent().unwrap()).unwrap();
+        std::fs::write(&systemd, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&systemd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let m = std::fs::metadata(&systemd).unwrap();
+        let packaged_image = (common::wire::exe::kernel_dev(m.dev()), m.ino());
+        let s = 1_000_000_000u64;
+        let exec =
+            |pid: u32, path: &str, image: (u64, u64), at: u64| nn_model::Event::ProcessSpawn {
+                pid,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: path.into(),
+                timestamp_ns: at,
+                argv: vec![path.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: s,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: path.into(),
+                    dev: image.0,
+                    ino: image.1,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: 1,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+        let lineage = AuthSessionTracker::new(t.path().join("proc"));
+        // the user manager: the packaged systemd since 5 s, its load at 9 s
+        assert!(lineage.ingest_spawn_event(&exec(
+            2301,
+            "/usr/lib/systemd/systemd",
+            packaged_image,
+            5 * s
+        )));
+        // the attack: its own program at 5 s, the load at 9 s, the packaged
+        // systemd executed at 9.5 s (before the record is decoded)
+        assert!(lineage.ingest_spawn_event(&exec(3000, "/tmp/x", (packaged_image.0, 77), 5 * s)));
+        assert!(lineage.ingest_spawn_event(&exec(
+            3000,
+            "/usr/lib/systemd/systemd",
+            packaged_image,
+            9 * s + s / 2
+        )));
+        // a loader whose only recorded exec is later than its load
+        assert!(lineage.ingest_spawn_event(&exec(
+            3001,
+            "/usr/lib/systemd/systemd",
+            packaged_image,
+            9 * s + s / 2
+        )));
+        let packaged = |p: &str| super::packaged(t.path(), p, me);
+        let probe = |pid| known_probe_by(&lineage, &packaged, pid, PROG_TYPE_KPROBE, 9 * s);
+        assert_eq!(probe(2301), Ok(3));
+        assert!(probe(3000).is_err(), "its own program at the load");
+        assert!(probe(3001).is_err(), "no exec recorded as of the load");
+        assert_eq!(
+            known_probe_by(&lineage, &packaged, 3000, PROG_TYPE_KPROBE, 10 * s),
+            Ok(3),
+            "a load after its exec of the packaged systemd"
+        );
     }
 
     /// Lot 304: a process whose start is not the same at the second read

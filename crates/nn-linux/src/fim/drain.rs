@@ -1951,11 +1951,15 @@ pub fn process_drift(
     // Lot 340: the size this inode had when the drain last read it (an
     // append is a growth since then), else the start's baseline of the path
     // — for a file read for the first time; then this read is the last.
+    // The review of #552 (F6): under the file the event is about — a child
+    // created in a watched directory is its own inode, not the directory's
+    // (`key`, the record's).
+    let size_key = ident.key.unwrap_or(key);
     let baseline_size = path_map
-        .last_size(&key)
+        .last_size(&size_key)
         .or_else(|| last_baseline.map(|b| b.size_bytes));
     if let Some(n) = new_size {
-        path_map.note_size(&key, n);
+        path_map.note_size(&size_key, n);
     }
 
     // Wave 2 (TST-004): the kernel reports a chmod or chown as Modified,
@@ -3748,6 +3752,80 @@ mod tests {
         };
         path_map.note_size(&other, 5);
         assert_eq!(path_map.last_size(&other), None);
+    }
+
+    /// Named test (the review of #552, F6): the size read at a child's
+    /// creation in a watched directory (BUG-022's reconstruction) is noted
+    /// under the child's own inode, not the directory's — so the child's
+    /// first write (rsyslogd's append to a log it recreated) is measured
+    /// against it, not against the start's baseline of the path (a
+    /// "truncation", NN-L-FIM-005 High).
+    #[test]
+    fn a_created_child_s_size_is_noted_under_its_own_inode() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let logs = dir.path().join("log");
+        std::fs::create_dir(&logs).unwrap();
+        let dir_key = InodeKey {
+            dev: 0x1234,
+            ino: 99,
+        };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, logs.to_string_lossy().into_owned());
+        let child = logs.join("syslog");
+        std::fs::write(&child, b"recreated\n").unwrap();
+        // the start's baseline of the path: the file rotated away
+        let mut base = dummy_baseline(&child.to_string_lossy(), &"99".repeat(32));
+        base.size_bytes = 4096;
+        let mut drift = |raw: FimDriftRaw| -> FimEvent {
+            let mut out = Vec::new();
+            process_drift(
+                &raw,
+                &path_map,
+                Some(&base),
+                &mut drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => fe,
+                other => panic!("{other:?}"),
+            }
+        };
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        raw.child_name[..6].copy_from_slice(b"syslog");
+        let created = drift(raw);
+        assert_eq!(created.new_size, Some(10));
+        let m = std::fs::metadata(&child).unwrap();
+        let k = InodeKey {
+            dev: crate::fim::attach::stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+        };
+        assert_eq!(created.file_key, Some(k));
+        assert_eq!(path_map.last_size(&k), Some(10), "the child's size");
+        assert_eq!(path_map.last_size(&dir_key), None, "not the directory's");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(b"a line\n")
+            .unwrap();
+        let fe = drift(fake_raw(k.dev, k.ino, FimOp::Modified as u8));
+        assert_eq!((fe.baseline_size, fe.new_size), (Some(10), Some(17)));
     }
 
     // ── C4 test 8: process_drift on real-drift emits + appends ──────

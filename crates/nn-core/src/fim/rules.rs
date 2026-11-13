@@ -2875,6 +2875,26 @@ const LOGROTATE_EXES: &[&str] = &["/usr/sbin/logrotate", "/sbin/logrotate"];
 /// root-owned system tree ([`ExecIdentity::is_known_binary`](crate::posture::lineage::ExecIdentity::is_known_binary)).
 const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron"];
 
+/// Lot 340 (the review of #552, F1): the one invocation of logrotate a
+/// scheduled rotation makes — the packaged `logrotate.service`'s
+/// `ExecStart=` and `/etc/cron.daily/logrotate`'s command on every
+/// distribution the agent supports (Debian, Ubuntu; Fedora's and upstream's
+/// unit too): root's configuration, no option. `argv[0]` by its basename.
+const LOGROTATE_ARGV: &[&str] = &["logrotate", "/etc/logrotate.conf"];
+
+/// Lot 340 (the review of #552, F1): the script cron's daily run executes
+/// for logrotate, through `run-parts` (root's directory).
+const CRON_DAILY_LOGROTATE: &str = "/etc/cron.daily/logrotate";
+
+/// The shells that run cron's command line and `/etc/cron.daily`'s scripts.
+const CRON_SHELLS: &[&str] = &["sh", "dash", "bash"];
+
+/// Lot 340 (the review of #552, F1): the most hops between `run-parts` and
+/// the cron daemon PID 1 started — cron's own fork for the job and the
+/// shell of its command line (`sh -c "… run-parts --report
+/// /etc/cron.daily"`), with one to spare.
+const CRON_HOPS_MAX: usize = 3;
+
 /// Lot 340 (the alpha's daily false positives) — a log rotated by the
 /// packaged `logrotate` under its timer or cron is recorded Low, not acted
 /// on.
@@ -2883,24 +2903,34 @@ const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron"];
 /// `/var/log/wtmp` and `/var/log/btmp` among them, every day: NN-L-FIM-005
 /// (a log modified, truncation suspected) and NN-L-FIM-019 (wtmp/btmp
 /// written by a non-login process, a kill) were High on every host. The
-/// verdict becomes Log + Low only when all of this holds:
+/// verdict becomes Log + Low only when all of this holds, each from the
+/// kernel's exec records (the review of #552, F1: an exemption no attacker
+/// can obtain):
 ///
 /// * the writer runs `logrotate` itself (no interpreter, no other program),
 ///   at its packaged path ([`LOGROTATE_EXES`]), and the image the kernel
 ///   executed is the file there — its device and inode
 ///   ([`AuthSessionTracker::ran_host_file`]): a copy, a renamed or a
 ///   replaced binary is not;
-/// * it was started as the system schedules it: forked by PID 1 (the
-///   kernel's fork record, carried through systemd's executor — the
-///   `logrotate.service` its timer starts), or with a cron daemon among its
-///   ancestors (`/etc/cron.daily/logrotate`).
+/// * as root (the exec's real uid), with exactly the packaged invocation
+///   ([`LOGROTATE_ARGV`]: `logrotate /etc/logrotate.conf`) — no `-f`, no
+///   `-s` state file, no configuration of the caller's;
+/// * started as the system schedules it: forked by PID 1 (the kernel's fork
+///   record, carried through systemd's executor — the `logrotate.service`
+///   its timer starts), or by cron's daily run — the shell running
+///   [`CRON_DAILY_LOGROTATE`], under `run-parts`, under at most
+///   [`CRON_HOPS_MAX`] hops of cron's own fork and command-line shell, up
+///   to a cron daemon PID 1 forked, every hop root's.
 ///
 /// Anything else keeps the rule's verdict: a non-logrotate writer that
 /// truncates wtmp or btmp (High, the kill), `logrotate` run by hand from a
-/// session, a copy of it. What this trusts: root's configuration of
-/// logrotate (`/etc/logrotate.conf`, `/etc/logrotate.d`) and root's units
-/// and crontabs — a root that rotates btmp away with its own configuration
-/// under `systemd-run` leaves a Low record, not none.
+/// session (any argv), anacron or cron run by hand with a crontab of the
+/// caller's (`anacron -t /tmp/t`), a descendant of a cron `@reboot` entry,
+/// a non-root logrotate, a copy of it. What this trusts: root's
+/// configuration of logrotate (`/etc/logrotate.conf`, `/etc/logrotate.d`,
+/// watched files) and root's units and crontabs — a root that runs the
+/// packaged rotation under `systemd-run` leaves a Low record of what the
+/// timer would have done.
 pub struct LogRotation<H: PostureHost> {
     inner: Box<dyn Rule>,
     lineage: AuthSessionTracker<H>,
@@ -2912,7 +2942,8 @@ impl<H: PostureHost> LogRotation<H> {
     }
 
     /// How the packaged logrotate `pid` was started by the system's
-    /// scheduler, or `None` (not the packaged logrotate, or not scheduled).
+    /// scheduler, or `None` (not the packaged logrotate, not root's packaged
+    /// invocation, or not scheduled).
     fn scheduled_rotation(&self, pid: u32, as_of: crate::posture::lineage::AsOf) -> Option<String> {
         use crate::posture::lineage::Runs;
         let id = self.lineage.exec_identity(pid, as_of)?;
@@ -2923,23 +2954,68 @@ impl<H: PostureHost> LogRotation<H> {
         if !self.lineage.ran_host_file(pid, as_of, &exe) {
             return None;
         }
+        // the review of #552 (F1): root's packaged invocation, nothing else
+        if self.lineage.exec_uid(pid, as_of) != Some(0)
+            || !self.lineage.exec_argv_is(pid, as_of, LOGROTATE_ARGV)
+        {
+            return None;
+        }
         if self.lineage.fork_parent(pid, as_of) == Some(1) {
             return Some(format!(
-                "the packaged {exe} (its device and inode), forked by PID 1 (its unit: the \
-                 timer's logrotate.service)"
+                "the packaged {exe} (its device and inode) as root with root's configuration, \
+                 forked by PID 1 (its unit: the timer's logrotate.service)"
             ));
         }
-        let hops = self.lineage.lineage_identities(pid, as_of)?;
-        hops.iter()
-            .skip(1)
-            .find(|(_, h)| h.runs == Runs::Inline && h.is_known_binary(CRON_DAEMONS))
-            .map(|(cron, h)| {
-                format!(
-                    "the packaged {exe} (its device and inode), run by cron ({}, pid {cron})",
-                    h.exe.display()
-                )
-            })
+        let hops = self.lineage.lineage_hops(pid, as_of)?;
+        let (cron, daemon) = cron_daily_run(&hops)?;
+        Some(format!(
+            "the packaged {exe} (its device and inode) as root with root's configuration, \
+             run by cron's daily run ({CRON_DAILY_LOGROTATE} under run-parts, under {} pid \
+             {cron}, forked by PID 1)",
+            daemon.display()
+        ))
     }
+}
+
+/// Lot 340 (the review of #552, F1): the lineage `hops` (the writer first)
+/// is cron's daily run of logrotate — the shell running
+/// [`CRON_DAILY_LOGROTATE`] right above the writer, `run-parts` above it,
+/// then at most [`CRON_HOPS_MAX`] hops each a shell running its command
+/// line or a fork of a cron daemon, up to a cron daemon whose exec PID 1
+/// forked (the kernel's record) and whose parent is PID 1. Every hop's exec
+/// was seen and is root's. The cron daemon's pid and executable.
+fn cron_daily_run(hops: &[crate::posture::lineage::HopFacts]) -> Option<(u32, std::path::PathBuf)> {
+    use crate::posture::lineage::Runs;
+    let root = |h: &crate::posture::lineage::HopFacts| h.uid == Some(0);
+    let script = hops.get(1)?;
+    let run_parts = hops.get(2)?;
+    if !root(script)
+        || !script.cached
+        || !script.id.is_known_binary(CRON_SHELLS)
+        || script.id.runs != Runs::Script(CRON_DAILY_LOGROTATE.into())
+    {
+        return None;
+    }
+    if !root(run_parts)
+        || !run_parts.cached
+        || run_parts.id.runs != Runs::Inline
+        || !run_parts.id.is_known_binary(&["run-parts"])
+    {
+        return None;
+    }
+    for (n, h) in hops.iter().enumerate().skip(3).take(CRON_HOPS_MAX + 1) {
+        let cron = h.id.runs == Runs::Inline && h.id.is_known_binary(CRON_DAEMONS);
+        // the command line of root's crontab (`sh -c "…"`: its inline code)
+        let shell =
+            matches!(h.id.runs, Runs::Code | Runs::Inline) && h.id.is_known_binary(CRON_SHELLS);
+        if !root(h) || !(cron || shell) {
+            return None;
+        }
+        if cron && h.cached && h.fork_parent == 1 && h.ppid == 1 && n + 1 == hops.len() {
+            return Some((h.pid, h.id.exe.clone()));
+        }
+    }
+    None
 }
 
 impl<H: PostureHost> Rule for LogRotation<H> {
@@ -6378,6 +6454,339 @@ mod tests {
                 .evaluate(&write("/var/log/wtmp", 500, "logrotate"))
                 .expect("fires");
             assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        }
+
+        /// `exec` as uid `uid`, its argv cut by the sensor or not.
+        fn exec_by(uid: u32, cut: bool, e: Event) -> Event {
+            let mut e = e;
+            if let Event::ProcessSpawn {
+                uid: u,
+                argv_truncated,
+                ..
+            } = &mut e
+            {
+                *u = uid;
+                *argv_truncated = cut;
+            }
+            e
+        }
+
+        /// The verdicts of FIM-019 on btmp and FIM-005 on nginx's log
+        /// written by `pid`.
+        fn judged(t: &Tracker, pid: u32) -> [(ResponseAction, Severity); 2] {
+            let [fim005, fim019] = log_rules(None, t);
+            let v = fim019
+                .evaluate(&write("/var/log/btmp", pid, "logrotate"))
+                .expect("fires");
+            let w = fim005
+                .evaluate(&write("/var/log/nginx/access.log", pid, "logrotate"))
+                .expect("fires");
+            [(v.action, v.severity), (w.action, w.severity)]
+        }
+
+        const KEPT: [(ResponseAction, Severity); 2] = [
+            (ResponseAction::KillProcess, Severity::High),
+            (ResponseAction::Log, Severity::High),
+        ];
+
+        /// Named test (the review of #552, F1; its probe
+        /// `rev552_probe_attacker_logrotate_paths` made a test): the
+        /// packaged logrotate run with a configuration of the caller's —
+        /// under anacron run by hand from a webshell (`anacron -t /tmp/t -S
+        /// /tmp/s -fnd`, nothing written to a watched tree) or under PID 1
+        /// (`systemd-run logrotate -f /tmp/evil.conf`) — keeps the rules'
+        /// verdicts: FIM-019 kills on btmp, FIM-005 is High on nginx's log.
+        /// Both were Low.
+        #[test]
+        fn a_logrotate_with_the_caller_s_configuration_keeps_the_verdict() {
+            let (_tmp, t) = tracker();
+            let mut start = 40 * S;
+            let mut ingest = |pid, ppid, exe: &str, argv: &[&str], id, forker| {
+                start += S;
+                assert!(t.ingest_spawn_event(&exec(pid, ppid, exe, argv, id, forker, start)));
+            };
+            ingest(
+                600,
+                1,
+                "/usr/sbin/php-fpm8.3",
+                &["php-fpm: pool www"],
+                (8, 60),
+                1,
+            );
+            ingest(
+                601,
+                600,
+                "/usr/bin/dash",
+                &["sh", "-c", "anacron -t /tmp/t -S /tmp/s -fnd"],
+                (8, 11),
+                600,
+            );
+            ingest(
+                602,
+                601,
+                "/usr/sbin/anacron",
+                &["anacron", "-t", "/tmp/t", "-S", "/tmp/s", "-fnd"],
+                (8, 62),
+                601,
+            );
+            ingest(
+                603,
+                602,
+                "/usr/bin/dash",
+                &["/bin/sh", "-c", "/usr/sbin/logrotate -f /tmp/evil.conf"],
+                (8, 11),
+                602,
+            );
+            ingest(
+                604,
+                603,
+                LOGROTATE,
+                &[LOGROTATE, "-f", "-s", "/tmp/st", "/tmp/evil.conf"],
+                PACKAGED,
+                603,
+            );
+            ingest(
+                610,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "-f", "/tmp/evil.conf"],
+                PACKAGED,
+                1,
+            );
+            for pid in [604u32, 610] {
+                assert_eq!(judged(&t, pid), KEPT, "pid {pid}");
+            }
+        }
+
+        /// Named test (the review of #552, F1): with root's packaged
+        /// invocation exactly, the start must still be the system's — not
+        /// anacron run by hand (its daily run's chain, but anacron forked by
+        /// a webshell's shell), not a descendant of a cron `@reboot` entry,
+        /// not a cron daemon root started from a shell, not a script other
+        /// than `/etc/cron.daily/logrotate`, not a user's crontab; and under
+        /// PID 1 never a non-root logrotate, another configuration, an
+        /// option added, an argv the sensor cut.
+        #[test]
+        fn a_packaged_invocation_not_started_by_the_system_keeps_the_verdict() {
+            let (_tmp, t) = tracker();
+            let mut start = 40 * S;
+            let mut ingest =
+                |uid: u32, cut: bool, pid, ppid, exe: &str, argv: &[&str], id, forker| {
+                    start += S;
+                    let e = exec_by(uid, cut, exec(pid, ppid, exe, argv, id, forker, start));
+                    assert!(t.ingest_spawn_event(&e));
+                };
+            let conf = &[LOGROTATE, "/etc/logrotate.conf"][..];
+            let daily = &["/bin/sh", "/etc/cron.daily/logrotate"][..];
+            let parts = &["run-parts", "--report", "/etc/cron.daily"][..];
+            let line = &["/bin/sh", "-c", "run-parts --report /etc/cron.daily"][..];
+            // anacron run by hand from a webshell: its daily chain below it
+            ingest(
+                0,
+                false,
+                700,
+                1,
+                "/usr/sbin/php-fpm8.3",
+                &["php-fpm"],
+                (8, 60),
+                1,
+            );
+            ingest(
+                0,
+                false,
+                701,
+                700,
+                "/usr/bin/dash",
+                &["sh", "-c", "anacron -fn"],
+                (8, 11),
+                700,
+            );
+            ingest(
+                0,
+                false,
+                702,
+                701,
+                "/usr/sbin/anacron",
+                &["anacron", "-fn"],
+                (8, 62),
+                701,
+            );
+            ingest(0, false, 703, 702, "/usr/bin/dash", line, (8, 11), 702);
+            ingest(
+                0,
+                false,
+                704,
+                703,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                703,
+            );
+            ingest(0, false, 705, 704, "/usr/bin/dash", daily, (8, 11), 704);
+            ingest(0, false, 706, 705, LOGROTATE, conf, PACKAGED, 705);
+            // a cron @reboot entry's app, its descendant running logrotate
+            ingest(
+                0,
+                false,
+                710,
+                1,
+                "/usr/sbin/cron",
+                &["/usr/sbin/cron", "-f"],
+                (8, 10),
+                1,
+            );
+            ingest(
+                0,
+                false,
+                711,
+                710,
+                "/usr/bin/dash",
+                &["/bin/sh", "-c", "/opt/app/run"],
+                (8, 11),
+                710,
+            );
+            ingest(
+                0,
+                false,
+                712,
+                711,
+                "/opt/app/run",
+                &["/opt/app/run"],
+                (8, 70),
+                711,
+            );
+            ingest(
+                0,
+                false,
+                713,
+                712,
+                "/usr/bin/dash",
+                &["sh", "-c", "logrotate /etc/logrotate.conf"],
+                (8, 11),
+                712,
+            );
+            ingest(0, false, 714, 713, LOGROTATE, conf, PACKAGED, 713);
+            // cron's daily chain under a cron daemon root ran from a shell
+            ingest(0, false, 720, 1, "/usr/bin/bash", &["-bash"], (8, 21), 0);
+            ingest(
+                0,
+                false,
+                721,
+                720,
+                "/usr/sbin/cron",
+                &["cron", "-f"],
+                (8, 10),
+                720,
+            );
+            ingest(0, false, 722, 721, "/usr/bin/dash", line, (8, 11), 721);
+            ingest(
+                0,
+                false,
+                723,
+                722,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                722,
+            );
+            ingest(0, false, 724, 723, "/usr/bin/dash", daily, (8, 11), 723);
+            ingest(0, false, 725, 724, LOGROTATE, conf, PACKAGED, 724);
+            // the system cron daemon running another script of cron.daily
+            ingest(0, false, 730, 510, "/usr/bin/dash", line, (8, 11), 510);
+            ingest(
+                0,
+                false,
+                731,
+                730,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                730,
+            );
+            ingest(
+                0,
+                false,
+                732,
+                731,
+                "/usr/bin/dash",
+                &["/bin/sh", "/etc/cron.daily/x"],
+                (8, 11),
+                731,
+            );
+            ingest(0, false, 733, 732, LOGROTATE, conf, PACKAGED, 732);
+            // a user's crontab: the same chain as uid 1000 above run-parts
+            ingest(1000, false, 740, 510, "/usr/bin/dash", line, (8, 11), 510);
+            ingest(
+                0,
+                false,
+                741,
+                740,
+                "/usr/bin/run-parts",
+                parts,
+                (8, 12),
+                740,
+            );
+            ingest(0, false, 742, 741, "/usr/bin/dash", daily, (8, 11), 741);
+            ingest(0, false, 743, 742, LOGROTATE, conf, PACKAGED, 742);
+            // under PID 1: a non-root logrotate, another configuration, an
+            // option added, an argv the sensor cut
+            ingest(1000, false, 750, 1, LOGROTATE, conf, PACKAGED, 1);
+            ingest(
+                0,
+                false,
+                751,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "/tmp/evil.conf"],
+                PACKAGED,
+                1,
+            );
+            ingest(
+                0,
+                false,
+                752,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "-f", "/etc/logrotate.conf"],
+                PACKAGED,
+                1,
+            );
+            ingest(
+                0,
+                false,
+                753,
+                1,
+                LOGROTATE,
+                &[LOGROTATE, "/etc/logrotate.conf", "/tmp/x.conf"],
+                PACKAGED,
+                1,
+            );
+            ingest(0, true, 754, 1, LOGROTATE, conf, PACKAGED, 1);
+            for pid in [706u32, 714, 725, 733, 743, 750, 751, 752, 753, 754] {
+                assert_eq!(judged(&t, pid), KEPT, "pid {pid}");
+            }
+            // the controls: the same invocation by the timer's unit, and by
+            // cron's daily run (the tracker's 500 and 514), a bare argv[0]
+            ingest(
+                0,
+                false,
+                760,
+                1,
+                LOGROTATE,
+                &["logrotate", "/etc/logrotate.conf"],
+                PACKAGED,
+                1,
+            );
+            for pid in [500u32, 514, 760] {
+                assert_eq!(
+                    judged(&t, pid),
+                    [
+                        (ResponseAction::Log, Severity::Low),
+                        (ResponseAction::Log, Severity::Low)
+                    ],
+                    "pid {pid}"
+                );
+            }
         }
 
         /// Lot 340: the rule set wires FIM-005 and FIM-019 through

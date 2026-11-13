@@ -422,6 +422,10 @@ pub struct KnownSystemProbe {
     pub prog_type: u32,
     /// What it is, for the record.
     pub what: &'static str,
+    /// The review of #552 (F5b): the loader must be PID 1 itself — the
+    /// system manager, not a user manager or another instance of the same
+    /// program.
+    pub pid_one: bool,
 }
 
 /// Lot 340: systemd's own refused BPF loads, measured on Ubuntu 26.04
@@ -435,7 +439,8 @@ pub struct KnownSystemProbe {
 /// rule: systemd's own BPF loads, told by the packaged loader's identity,
 /// are a known system program's — so the types systemd's programs load
 /// that the hook refuses are listed for both loaders: `tracepoint` and
-/// `kprobe` (libbpf's probes), and PID 1's `lsm` (`RestrictFileSystems=`,
+/// `kprobe` (libbpf's probes), and PID 1's `lsm` (the review of #552, F5b:
+/// PID 1 itself, [`KnownSystemProbe::pid_one`]; `RestrictFileSystems=`,
 /// loaded again at a `daemon-reexec`; before the agent's start it is lot
 /// 304's known program). A load of any other type, or by any other loader,
 /// keeps High. The index of an entry is its record's (`known_probe_dev`):
@@ -445,37 +450,43 @@ pub const KNOWN_SYSTEM_PROBES: [KnownSystemProbe; 5] = [
         loader: "/usr/lib/systemd/systemd",
         prog_type: PROG_TYPE_TRACEPOINT,
         what: "a systemd manager's feature probe (the user manager's at the first login)",
+        pid_one: false,
     },
     KnownSystemProbe {
         loader: "/usr/lib/systemd/systemd-networkd",
         prog_type: PROG_TYPE_KPROBE,
         what: "systemd-networkd's feature probe at its start (libbpf)",
+        pid_one: false,
     },
     KnownSystemProbe {
         loader: "/usr/lib/systemd/systemd-networkd",
         prog_type: PROG_TYPE_TRACEPOINT,
         what: "systemd-networkd's feature probe at its start (libbpf)",
+        pid_one: false,
     },
     KnownSystemProbe {
         loader: "/usr/lib/systemd/systemd",
         prog_type: PROG_TYPE_KPROBE,
         what: "a systemd manager's feature probe (libbpf)",
+        pid_one: false,
     },
     KnownSystemProbe {
         loader: "/usr/lib/systemd/systemd",
         prog_type: PROG_TYPE_LSM,
         what: "systemd's RestrictFileSystems= program, loaded again (a daemon-reexec); its units \
                run without it until the next boot or a trusted-installer window",
+        pid_one: true,
     },
 ];
 
 /// Lot 340: the entry of [`KNOWN_SYSTEM_PROBES`] for a load of `prog_type`
 /// by a process that runs `loader` (its packaged path; the caller proves the
-/// image is that file).
-pub fn known_system_probe(loader: &str, prog_type: u32) -> Option<usize> {
+/// image is that file). The review of #552 (F5b): `pid` is the loader's, and
+/// an entry for PID 1 only ([`KnownSystemProbe::pid_one`]) is no other's.
+pub fn known_system_probe(loader: &str, prog_type: u32, pid: u32) -> Option<usize> {
     KNOWN_SYSTEM_PROBES
         .iter()
-        .position(|k| k.loader == loader && k.prog_type == prog_type)
+        .position(|k| k.loader == loader && k.prog_type == prog_type && (!k.pid_one || pid == 1))
 }
 
 /// Lot 340: `target_dev` of a `bpf_prog_type` record whose loader the agent
@@ -636,7 +647,7 @@ mod tests {
         for (n, k) in KNOWN_SYSTEM_PROBES.iter().enumerate() {
             let dev = known_probe_dev(n as u16);
             assert_eq!(known_probe_of(dev, u64::from(k.prog_type)), Some(n));
-            assert_eq!(known_system_probe(k.loader, k.prog_type), Some(n));
+            assert_eq!(known_system_probe(k.loader, k.prog_type, 1), Some(n));
             assert_eq!(known_probe_of(dev, u64::from(PROG_TYPE_EXT)), None);
             assert_eq!(
                 known_probe_of(dev | (1 << 40), u64::from(k.prog_type)),
@@ -649,21 +660,31 @@ mod tests {
             None
         );
         assert_eq!(
-            known_system_probe("/usr/lib/systemd/systemd-networkd", PROG_TYPE_LSM),
+            known_system_probe("/usr/lib/systemd/systemd-networkd", PROG_TYPE_LSM, 1),
             None
         );
         assert_eq!(
-            known_system_probe("/tmp/systemd-networkd", PROG_TYPE_KPROBE),
+            known_system_probe("/tmp/systemd-networkd", PROG_TYPE_KPROBE, 868),
             None
         );
         // lot 340 (the coordinator's rule): systemd's own loads only, of the
         // types its programs use; an entry's index never moves
         let systemd = "/usr/lib/systemd/systemd";
-        assert_eq!(known_system_probe(systemd, PROG_TYPE_TRACEPOINT), Some(0));
-        assert_eq!(known_system_probe(systemd, PROG_TYPE_LSM), Some(4));
-        assert_eq!(known_system_probe(systemd, PROG_TYPE_EXT), None);
         assert_eq!(
-            known_system_probe("/usr/bin/bpftool", PROG_TYPE_TRACEPOINT),
+            known_system_probe(systemd, PROG_TYPE_TRACEPOINT, 2301),
+            Some(0)
+        );
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_LSM, 1), Some(4));
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_EXT, 1), None);
+        // the review of #552 (F5b): `lsm` is PID 1's only — never a user
+        // manager's or another instance's of the same program
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_LSM, 2301), None);
+        assert_eq!(
+            known_system_probe(systemd, PROG_TYPE_TRACEPOINT, 1),
+            Some(0)
+        );
+        assert_eq!(
+            known_system_probe("/usr/bin/bpftool", PROG_TYPE_TRACEPOINT, 1),
             None
         );
     }

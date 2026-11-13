@@ -721,7 +721,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     fs_protect_rb,
                     &tx,
                     &rt,
-                    known_probe_marked,
+                    // the review of #552 (F5a): a known probe is marked after
+                    // the bus's lineage barrier ([`mark_known_probe_on_host`])
+                    no_carry,
                 )?),
             ),
             (
@@ -1405,20 +1407,23 @@ fn no_carry<T>(_: &T, e: Event) -> (Event, [Option<Event>; 2]) {
 /// type (`bpf_prog_type`) whose loader the agent proves a known system
 /// program's feature probe (the user manager's, networkd's:
 /// [`crate::known_system_prog::known_probe`]) is marked in its `target_dev`
-/// (`common::bpf_prog_class::known_probe_dev`) as it is decoded, before the
-/// posture or the rule reads it: NN-L-AT-001 signs it Low and the posture
-/// raises nothing. Still refused. Any other record passes unchanged.
-fn known_probe_marked(_: &FsProtectDenialRaw, e: Event) -> (Event, [Option<Event>; 2]) {
-    (
-        mark_known_probe(e, &|pid, ty, at| {
-            crate::known_system_prog::known_probe_on_host(pid, ty, at)
-        }),
-        [None, None],
-    )
+/// (`common::bpf_prog_class::known_probe_dev`) before the posture or the
+/// rule reads it: NN-L-AT-001 signs it Low and the posture raises nothing.
+/// Still refused. Any other record passes unchanged.
+///
+/// The review of #552 (F5a): the proof is the loader's image as its exec
+/// recorded it AS OF THE LOAD, from the lineage — so the record is marked
+/// as the decision thread takes it from the bus, once the bus taught the
+/// lineage every exec that reached it first (`bus::teach`), never as its
+/// pump decodes it from `/proc`.
+pub(crate) fn mark_known_probe_on_host(e: &mut Event, lineage: &AuthSessionTracker) {
+    mark_known_probe(e, &|pid, ty, at| {
+        crate::known_system_prog::known_probe_on_host(lineage, pid, ty, at)
+    });
 }
 
-/// [`known_probe_marked`]'s decision, the proof read by `prove`.
-fn mark_known_probe(mut e: Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize, String>) -> Event {
+/// [`mark_known_probe_on_host`]'s decision, the proof read by `prove`.
+fn mark_known_probe(e: &mut Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize, String>) {
     if let Event::FsProtectDenial {
         pid,
         operation: nn_model::FsProtectOperation::BpfProgType,
@@ -1426,13 +1431,13 @@ fn mark_known_probe(mut e: Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize,
         target_ino,
         timestamp_ns,
         ..
-    } = &mut e
+    } = e
     {
         let Ok(ty) = u32::try_from(*target_ino) else {
-            return e;
+            return;
         };
         if *target_dev != 0 {
-            return e;
+            return;
         }
         match prove(*pid, ty, *timestamp_ns) {
             Ok(entry) => {
@@ -1446,7 +1451,6 @@ fn mark_known_probe(mut e: Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize,
             ),
         }
     }
-    e
 }
 
 /// R12b (lab PR 269, plan §3.4: the normalisation in the adapter): an
@@ -2288,7 +2292,8 @@ mod tests {
         let not = |_: u32, _: u32, _: u64| -> Result<usize, String> { Err("no".into()) };
         let ty = u64::from(PROG_TYPE_KPROBE);
         let bpt = nn_model::FsProtectOperation::BpfProgType;
-        let marked = mark_known_probe(denial(bpt, 0, ty), &proven);
+        let mut marked = denial(bpt, 0, ty);
+        mark_known_probe(&mut marked, &proven);
         assert!(
             matches!(marked, Event::FsProtectDenial { target_dev, .. } if target_dev == known_probe_dev(1)),
             "{marked:?}"
@@ -2305,7 +2310,9 @@ mod tests {
             ),
         ] {
             let before = format!("{e:?}");
-            assert_eq!(format!("{:?}", mark_known_probe(e, prove)), before);
+            let mut e = e;
+            mark_known_probe(&mut e, prove);
+            assert_eq!(format!("{e:?}"), before);
         }
     }
 

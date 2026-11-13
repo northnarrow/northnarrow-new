@@ -640,10 +640,11 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "crates/nn-linux/src/net/known_resolver.rs",
-        "COREDNS_PROOFS",
+        "RESOLVER_PROOFS",
         PerKey,
-        "lot 340: a process proven the cluster's CoreDNS by its runtime's record, by its pid \
-         and start, kept 60 s (at most 64): a fact of that process, read again after",
+        "lot 340: a process proven the cluster's CoreDNS (its runtime's record) or a resolver's \
+         system service (the review of #552, F4), by its pid, start and image, kept 60 s (at \
+         most 64): a fact of that process, read again after",
     ),
     kept(
         "crates/nn-linux/src/net/blind_spots.rs",
