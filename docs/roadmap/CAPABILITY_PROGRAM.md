@@ -10917,15 +10917,15 @@ number in parentheses is a lab PR.
     packaged `initdb` (and the bootstrap `postgres` it starts) writing only
     the service account's own data is that account's service.
   - Lab (as measured; ubuntu2404 6.8.0-149 and debian13 6.12, `main`
-    1d8f427d before, the lot after — ubuntu2404's after-round on 49ecceca,
-    before the pre-exec fix and the tracker's go trust; debian13's on
-    be075d5b): **db corpus** `pg_createcluster` + start: ConfirmedIntrusion
+    1d8f427d before, the lot after): **db corpus** `pg_createcluster` + start: ConfirmedIntrusion
     for `initdb` and `postgres` and ENGAGED → no raise, both guests.
     **dev corpus** `go test`: `StagingExec` ENGAGED + NN-L-IMP-001
-    Critical → on debian13 (final code) posture still OBSERVING at the go
-    steps, no IMP-001; on ubuntu2404 (49ecceca) still both — the pre-exec
-    check, found there and fixed since. R001 High for the test binary on
-    both, before and after (lot 283b). **Package managers as a CI runner**
+    Critical → posture still OBSERVING at the go steps, no IMP-001, on
+    debian13 (be075d5b) and on ubuntu2404's second after-round (be075d5b);
+    its first (49ecceca) still showed both — the pre-exec check and the
+    tracker, found there and fixed. As a CI runner (a unit) `go test`:
+    ENGAGED → no transition. R001 High for the test binary on both, before
+    and after (lot 283b). **Package managers as a CI runner**
     (units): `npm ci`, `pnpm install --force`, `bun install --force` 0
     raises before and after (the corpus project crosses no threshold:
     pnpm and bun link from their stores); `yarnpkg install` fails on
