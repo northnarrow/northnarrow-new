@@ -856,7 +856,9 @@ impl SystemTool {
         Some(match name {
             "systemctl" => Self::Systemctl,
             "kill" => Self::Kill,
-            "pkill" => Self::Pkill,
+            // procps' pgrep binary runs as pkill when its argv[0] is
+            // `pkill` or `lt-pkill` (the review of #548, F11)
+            "pkill" | "lt-pkill" => Self::Pkill,
             "killall" => Self::Killall,
             "iptables" | "ip6tables" => Self::Iptables,
             "nft" => Self::Nft,

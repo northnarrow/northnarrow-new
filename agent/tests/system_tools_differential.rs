@@ -93,7 +93,8 @@ impl Judge {
         lineage.ingest_exec(150, 1, "/usr/sbin/cron", &["cron".into()], S, S, 0);
         lineage.ingest_exec(200, 150, "/usr/bin/bash", &["bash".into()], 2 * S, 2 * S, 0);
         let list = format!(
-            "{BUILTIN_SECURITY_TOOLS_V1}\ntool nn316diff class=edr unit=nn316diff proc={}\n",
+            "{BUILTIN_SECURITY_TOOLS_V1}\ntool nn316diff class=edr unit=nn316diff proc={}\n\
+             tool nn316snap class=edr unit=snap.nn316.diff\n",
             sleep_copy.display()
         );
         let tools = SecurityTools::parse(&list).expect("the list parses");
@@ -105,6 +106,36 @@ impl Judge {
             det,
             pid: std::cell::Cell::new(10_000),
         }
+    }
+
+    /// The tool's process `pid` started (registered, as at its exec).
+    fn started(&self, pid: u32, exe: &Path) {
+        let argv = vec![exe.to_string_lossy().into_owned()];
+        let at = 50 * S + u64::from(pid);
+        let exe = exe.to_string_lossy().into_owned();
+        self.lineage.ingest_exec(pid, 1, &exe, &argv, at, at, 0);
+        let e = Event::ProcessSpawn {
+            pid,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: exe.rsplit('/').next().unwrap().chars().take(15).collect(),
+            filename: exe.clone(),
+            timestamp_ns: at,
+            argv,
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 0,
+            parent_is_kthread: false,
+            exe: ExeIdentity::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        assert!(
+            self.det.assess(&e).is_none(),
+            "the tool's process registered"
+        );
     }
 
     /// What the detector makes of `exe` run with `argv`: the rule and tool.
@@ -145,8 +176,11 @@ struct Tally {
     unclear: usize,
     /// Kills by a pattern less than half of the target's name (`pkill
     /// sleep` ends `nn316diffsleep`): no exec-side record by design — the
-    /// pattern names no tool (`pkill -f agent` is anyone's) — and the signal
-    /// itself is NN-L-EVA-003 on `task_kill` (a registered tool's process).
+    /// pattern names no tool (`pkill -f agent` is anyone's). The signal is
+    /// NN-L-EVA-003 on `task_kill` only for SIGINT, QUIT, ABRT, KILL, TERM,
+    /// STOP and TSTP to a registered tool's process, from anyone but PID 1
+    /// or another registered tool (the review of #548, F5; the other
+    /// default-fatal signals: lot 330).
     left_to_task_kill: usize,
     mismatches: Vec<String>,
 }
@@ -346,6 +380,116 @@ fn kill_family(judge: &Judge, sleep_copy: &Path, tally: &mut Tally) {
     }
 }
 
+/// The review of #548 (F8, F9, F11): procps' `kill` of the tool's process
+/// (the copy of sleep, in a PID namespace of its own) and `pkill` run as pgrep's
+/// binary under another `argv[0]` (`lt-pkill` is pkill, `mypkill` pgrep).
+/// In the namespace `timeout` is pid 1, the probe's shell 2, the copy of
+/// sleep 3.
+fn kill_and_names(judge: &Judge, sleep_copy: &Path, tally: &mut Tally) {
+    let ns: &[&str] = if is_root() {
+        &["unshare", "-p", "-f", "--mount-proc"]
+    } else {
+        &["unshare", "-r", "-p", "-f", "--mount-proc"]
+    };
+    // the sleeper is the namespace's pid 3: `kill … 3` names it
+    let probe = "\"$1\" 600 & p=$!; shift; [ \"$p\" = 3 ] || { echo NOT3; exit; }; i=0; \
+                 while [ \"$(cut -d' ' -f3 /proc/$p/stat 2>/dev/null)\" != S ] && [ $i -lt 50 ]; do \
+                 i=$((i+1)); sleep 0.01; done; \
+                 timeout 5 \"$@\" >/dev/null 2>&1; sleep 0.1; \
+                 st=$(cut -d' ' -f3 /proc/$p/stat 2>/dev/null); \
+                 case \"$st\" in S|R|D) echo ALIVE;; *) echo ENDED;; esac";
+    let path = sleep_copy.to_string_lossy().into_owned();
+    judge.started(3, sleep_copy);
+    let mut g = Gen(0x316_0005);
+    let mut cases: Vec<Vec<String>> = [
+        &["-9", "3"][..],
+        &["-KILL", "3"],
+        &["-s", "KILL", "3"],
+        &["-s", "KILL", "-0", "3"],
+        &["-0", "-s", "KILL", "3"],
+        &["-0", "3"],
+        &["-s", "0", "3"],
+        &["--signal=TERM", "3"],
+        &["-CONT", "3"],
+        &["-HUP", "3"],
+        &["-9", " 3"],
+        &["-9", "+3"],
+        &["-l", "9", "3"],
+        &["-9", "3", "-l"],
+        &["--", "3"],
+    ]
+    .iter()
+    .map(|a| a.iter().map(|x| x.to_string()).collect())
+    .collect();
+    let vocab = [
+        "-9",
+        "-KILL",
+        "-0",
+        "-CONT",
+        "-STOP",
+        "-HUP",
+        "-s",
+        "KILL",
+        "0",
+        "TERM",
+        "-l",
+        "-L",
+        "--signal=TERM",
+        "--",
+        "3",
+        " 3",
+        "+3",
+        "-q",
+        "1",
+    ];
+    for _ in 0..80 {
+        let n = 1 + (g.next() % 4) as usize;
+        let mut a: Vec<String> = (0..n).map(|_| g.pick(&vocab).to_string()).collect();
+        a.push("3".to_string());
+        cases.push(a);
+    }
+    if let Some(kill) = which("kill") {
+        for args in cases {
+            let mut run = vec![path.clone(), kill.to_string_lossy().into_owned()];
+            run.extend(args.iter().cloned());
+            let effect = match sh(ns, probe, &run).as_deref() {
+                Some("ENDED") => Some(true),
+                Some("ALIVE") => Some(false),
+                _ => None,
+            };
+            let argv = [vec!["kill".to_string()], args].concat();
+            let found = judge
+                .judge(&kill, &argv)
+                .is_some_and(|(r, t)| r == EvaRule::Killed && t == "nn316diff");
+            tally.add(&argv, effect, found);
+        }
+    }
+    // pgrep's binary under another argv[0]
+    if let Some(pgrep) = which("pgrep") {
+        for argv0 in ["lt-pkill", "pkill", "mypkill", "pgrep"] {
+            let run = vec![
+                path.clone(),
+                "bash".to_string(),
+                "-c".to_string(),
+                "exec -a \"$0\" \"$@\"".to_string(),
+                argv0.to_string(),
+                pgrep.to_string_lossy().into_owned(),
+                "nn316diffsleep".to_string(),
+            ];
+            let effect = match sh(ns, probe, &run).as_deref() {
+                Some("ENDED") => Some(true),
+                Some("ALIVE") => Some(false),
+                _ => None,
+            };
+            let argv = vec![argv0.to_string(), "nn316diffsleep".to_string()];
+            let found = judge
+                .judge(&pgrep, &argv)
+                .is_some_and(|(r, t)| r == EvaRule::Killed && t == "nn316diff");
+            tally.add(&argv, effect, found);
+        }
+    }
+}
+
 /// iptables and nft, root, in a network namespace of their own.
 fn firewall(judge: &Judge, ipt: &mut Tally, nft: &mut Tally) {
     let ipt_probe = "iptables -P INPUT DROP && iptables -A INPUT -s 192.0.2.7 -j DROP || exit 3; \
@@ -521,77 +665,129 @@ fn systemctl(judge: &Judge, tally: &mut Tally) {
     if !Path::new("/run/systemd/system").exists() {
         return;
     }
-    let unit = "nn316diff";
+    // the review of #548 (F3): a dotted unit with no type suffix, as a
+    // snap's, matched by a glob of its own (never a broad one: the guest's
+    // own snaps)
+    systemctl_on(
+        judge,
+        tally,
+        &exe,
+        "snap.nn316.diff",
+        "nn316snap",
+        &[
+            &["stop", "snap.nn316.diff"],
+            &["stop", "snap.nn316*.service"],
+            &["stop", "snap.nn316.[[:alpha:]]iff.service"],
+            &["condstop", "snap.nn316.diff.service"],
+            &["status", "snap.nn316*"],
+        ],
+        &[],
+    );
+    systemctl_on(
+        judge,
+        tally,
+        &exe,
+        "nn316diff",
+        "nn316diff",
+        &[
+            &["stop", "nn316diff"],
+            &["-P", "Id", "stop", "nn316diff"],
+            &["--preset-mode", "full", "stop", "nn316diff"],
+            &["--check-inhibitors", "no", "stop", "nn316diff"],
+            &["--kill-whom", "main", "kill", "nn316diff"],
+            &["--message", "x", "stop", "nn316diff"],
+            &["--si", "KILL", "kill", "nn316diff"],
+            &["-qs", "KILL", "kill", "nn316diff"],
+            &["stop", "nn316diff", "--user"],
+            &["--user", "--system", "stop", "nn316diff"],
+            &["stop", "*316diff*"],
+            &["stop", "nn316dif?.service"],
+            &["freeze", "[n]n316diff.service"],
+            &["stop", "-p", "nn316diff"],
+            &["status", "nn316diff"],
+            &["restart", "nn316diff"],
+            // the review of #548 (F2, F3): systemd's other verbs, POSIX
+            // classes, `\` as itself, a reload signal sleep does not catch
+            &["condstop", "nn316diff"],
+            &["try-restart", "nn316diff"],
+            &["condrestart", "nn316diff"],
+            &["stop", "[[:alpha:]]n316diff.service"],
+            &["stop", "nn316dif[[:alnum:]].service"],
+            &["stop", "nn316\\diff.service"],
+            &["kill", "-s", "HUP", "nn316diff"],
+            &["kill", "--signal=USR1", "nn316diff"],
+        ],
+        &[
+            "stop",
+            "condstop",
+            "kill",
+            "freeze",
+            "status",
+            "restart",
+            "try-restart",
+            "show",
+            "nn316diff",
+            "nn316diff.service",
+            "nn316dif*",
+            "*316diff*",
+            "[[:alpha:]]n316diff.service",
+            "-q",
+            "--no-block",
+            "-s",
+            "KILL",
+            "HUP",
+            "--signal=TERM",
+            "--si",
+            "-P",
+            "Id",
+            "-p",
+            "--kill-whom=main",
+            "--kill-whom",
+            "all",
+            "--message",
+            "x",
+            "-i",
+            "--now",
+            "--job-mode",
+            "replace",
+            "--user",
+            "--system",
+            "-qs",
+            "--",
+            "--no-pager",
+        ],
+    );
+}
+
+/// One transient unit `unit` (a `sleep`), judged as the listed tool `tool`:
+/// the fixed argvs, then generated ones from `vocab`.
+#[allow(clippy::too_many_arguments)]
+fn systemctl_on(
+    judge: &Judge,
+    tally: &mut Tally,
+    exe: &Path,
+    unit: &str,
+    tool: &str,
+    fixed: &[&[&str]],
+    vocab: &[&str],
+) {
     let reset = || {
         for a in [
             vec!["thaw", unit],
             vec!["stop", unit],
             vec!["reset-failed", unit],
         ] {
-            let _ = Command::new(&exe).args(&a).stderr(Stdio::null()).status();
+            let _ = Command::new(exe).args(&a).stderr(Stdio::null()).status();
         }
     };
-    let fixed: &[&[&str]] = &[
-        &["stop", "nn316diff"],
-        &["-P", "Id", "stop", "nn316diff"],
-        &["--preset-mode", "full", "stop", "nn316diff"],
-        &["--check-inhibitors", "no", "stop", "nn316diff"],
-        &["--kill-whom", "main", "kill", "nn316diff"],
-        &["--message", "x", "stop", "nn316diff"],
-        &["--si", "KILL", "kill", "nn316diff"],
-        &["-qs", "KILL", "kill", "nn316diff"],
-        &["stop", "nn316diff", "--user"],
-        &["--user", "--system", "stop", "nn316diff"],
-        &["stop", "*316diff*"],
-        &["stop", "nn316dif?.service"],
-        &["freeze", "[n]n316diff.service"],
-        &["stop", "-p", "nn316diff"],
-        &["status", "nn316diff"],
-        &["restart", "nn316diff"],
-    ];
-    let vocab = [
-        "stop",
-        "kill",
-        "freeze",
-        "status",
-        "restart",
-        "show",
-        "nn316diff",
-        "nn316diff.service",
-        "nn316dif*",
-        "*316diff*",
-        "-q",
-        "--no-block",
-        "-s",
-        "KILL",
-        "--signal=TERM",
-        "--si",
-        "-P",
-        "Id",
-        "-p",
-        "--kill-whom=main",
-        "--kill-whom",
-        "all",
-        "--message",
-        "x",
-        "-i",
-        "--now",
-        "--job-mode",
-        "replace",
-        "--user",
-        "--system",
-        "-qs",
-        "--",
-        "--no-pager",
-    ];
     let mut g = Gen(0x316_0004);
     let mut cases: Vec<Vec<String>> = fixed
         .iter()
         .map(|a| a.iter().map(|s| s.to_string()).collect())
         .collect();
-    for _ in 0..150 {
+    for _ in 0..if vocab.is_empty() { 0 } else { 150 } {
         let n = 2 + (g.next() % 4) as usize;
-        cases.push((0..n).map(|_| g.pick(&vocab).to_string()).collect());
+        cases.push((0..n).map(|_| g.pick(vocab).to_string()).collect());
     }
     for args in cases {
         reset();
@@ -606,14 +802,14 @@ fn systemctl(judge: &Judge, tally: &mut Tally) {
         }
         let _ = Command::new("timeout")
             .arg("10")
-            .arg(&exe)
+            .arg(exe)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let show = Command::new(&exe)
+        let show = Command::new(exe)
             .args(["show", "-p", "ActiveState", "-p", "FreezerState", unit])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -627,8 +823,8 @@ fn systemctl(judge: &Judge, tally: &mut Tally) {
         };
         let argv = [vec!["systemctl".to_string()], args].concat();
         let found = judge
-            .judge(&exe, &argv)
-            .is_some_and(|(r, t)| r == EvaRule::ServiceStopped && t == "nn316diff");
+            .judge(exe, &argv)
+            .is_some_and(|(r, t)| r == EvaRule::ServiceStopped && t == tool);
         tally.add(&argv, effect, found);
     }
     reset();
@@ -648,6 +844,7 @@ fn the_detector_reads_the_system_tools_as_they_read_themselves() {
     let judge = Judge::new(&sleep_copy);
     let mut kills = Tally::default();
     kill_family(&judge, &sleep_copy, &mut kills);
+    kill_and_names(&judge, &sleep_copy, &mut kills);
     kills.report("pkill/killall");
     let (mut ipt, mut nft, mut sctl) = (Tally::default(), Tally::default(), Tally::default());
     if is_root() {

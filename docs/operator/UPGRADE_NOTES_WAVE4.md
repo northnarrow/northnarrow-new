@@ -1577,15 +1577,45 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   northnarrow-agent auditd` is auditd's High record (`unit auditd stop
   (with northnarrow-agent)`), inside a trusted-installer window too: the
   window sanctions a command only when every listed unit it stops is the
-  agent's own. A glob is matched as systemctl matches it (`fnmatch` on the
-  unit's full name: `*uditd*`, `audit?.service`).
+  agent's own. A glob is matched as systemd matches it — `fnmatch` with
+  `FNM_NOESCAPE` (`\` is itself) on the unit's full name, a listed unit
+  with no type suffix a `.service` (`snap.amazon-ssm-agent.amazon-ssm-agent`):
+  `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
+  `snap.*.service` — in time linear in the pattern and the name (the
+  review of #548: the first matcher backtracked, and a 21-byte glob of
+  stars held the decision thread for hours).
+- **systemd's verbs that reach a unit** (the review of #548). `stop`,
+  `condstop`, `kill`, `freeze`, `clean`, `disable`, `mask`, `preset`,
+  `revert`, `edit`, `link` (the unit file's name), `set-property`,
+  `service-log-level`, `service-log-target`, `bind`, `mount-image` (their
+  first operand), `isolate` of a target other than `default`, `multi-user`
+  or `graphical`, `rescue`, `emergency` and `preset-all` (every listed
+  unit). Not judged: the restart and reload family (`restart`,
+  `try-restart`, `condrestart`, …: the unit runs again), `start`,
+  `enable`, `unmask`. A unit's aliases are listed with it (rsyslog's
+  `syslog.service`, firewalld's `dbus-org.fedoraproject.FirewallD1`).
+- **A reload signal the process catches is Low** (the review of #548, the
+  coordinator's decision). logrotate's `rsyslog-rotate` runs `systemctl
+  kill -s HUP rsyslog.service` every day: it was NN-L-EVA-001 High and a
+  DefenseImpairment. A SIGHUP or SIGUSR1 sent by `systemctl kill` or `kill`
+  to a tool's registered processes that all catch it (`SigCgt` in
+  `/proc/<pid>/status`, the process still the one registered) is a Low
+  record ("a reload, no stop"); to one that does not catch it — it ends —
+  to a unit with no registered process, or any other signal: High as
+  before. The signal is the one systemctl reads by default (GNU's
+  permutation); under `POSIXLY_CORRECT` a `-s` after the verb is a unit
+  and the signal TERM, which this cannot see (residual).
 - **Names.** iptables by any of its names (`iptables-nft`,
   `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
   command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part
   of the process name at least half of it, unless `-x` (`pkill audit` ends
   auditd; `pkill -f agent` names no listed agent), `-f` the full
   command line, `-i` (killall `-I`) any case; killall's name with a `/` the
-  executable (`killall /usr/sbin/auditd`).
+  executable, its path folded as stat() walks it (`killall
+  //usr/sbin/auditd`, `/usr/bin/../sbin/auditd`); procps' pgrep binary run
+  as `pkill` or `lt-pkill` is pkill. procps' `kill`: the last `-s` over the
+  first `-SIGNAL` (`kill -s KILL -0 <pid>` kills), a pid with leading blanks
+  or a `+`.
 - **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
   /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
   as the agent's own process starting.
@@ -1593,5 +1623,9 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   /tmp/x`), a command read from a file or standard input (`nft -f`,
   `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
   regular expression beyond a part of the name, or a part less than half of
-  it (the signal itself is NN-L-EVA-003 on `task_kill`, unless PID 1 sends
-  it).
+  it, a symbolic link to a tool given to killall. The kernel's `task_kill`
+  reports to NN-L-EVA-003 only SIGINT, QUIT, ABRT, KILL, TERM, STOP and
+  TSTP to a registered tool's process, and never one from PID 1 or from
+  another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
+  signal that ends a tool, sent by a command line this reader does not
+  name, is not recorded (lot 330 is to report every default-fatal signal).

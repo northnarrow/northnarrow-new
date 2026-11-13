@@ -58,6 +58,7 @@ use crate::posture::host::PostureHost;
 use crate::posture::lineage::{AsOf, AuthSessionTracker, ExecIdentity};
 use crate::posture::script_args::Parsed;
 use tool_options::{read_listed, Program, SystemTool};
+use unit_glob::fnmatch;
 
 /// Deploy location of the list.
 pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
@@ -276,20 +277,18 @@ impl SecurityTools {
 
     /// Every listed unit a unit argument names, with its tool: one for a
     /// name (`auditd`, `auditd.service`); for a glob (`falcon*`), lot 316,
-    /// every one systemctl's `fnmatch` matches among the units in memory —
-    /// on the unit's full name (`falcon*`, `*uditd*`, `audit?.service`,
-    /// `[a]uditd.service`).
+    /// every one systemctl matches among the units in memory —
+    /// `fnmatch(…, FNM_NOESCAPE)` on the unit's full name ([`unit_glob`]:
+    /// `falcon*`, `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
+    /// `snap.*.service`). Linear in the pattern and the name: a glob of many
+    /// stars never holds the decision thread (the review of #548, F1).
     pub fn tools_of_unit(&self, arg: &str) -> Vec<(&Tool, String)> {
         let key = unit_key(arg);
         let glob = arg.contains(['*', '?', '[']);
         let mut out = Vec::new();
         for t in &self.tools {
             for u in &t.units {
-                let full = if u.contains('.') {
-                    u.to_string()
-                } else {
-                    format!("{u}.service")
-                };
+                let full = full_unit_name(u);
                 let named = if glob { fnmatch(arg, &full) } else { *u == key };
                 if named {
                     out.push((t, u.clone()));
@@ -374,7 +373,10 @@ impl SecurityTools {
                     if m.full {
                         hit(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
                     } else if m.path && name.contains('/') {
-                        // killall: the executable itself, or one of a tree
+                        // killall: the executable itself, or one of a tree,
+                        // its path read as stat() reads it (`//usr/sbin/x`,
+                        // `/usr/bin/../sbin/x`: the review of #548, F10)
+                        let want = fold(&lexical_path(name));
                         want == fold(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
                     } else {
                         false
@@ -885,6 +887,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let as_of = AsOf::of_event(event);
         // NN-L-EVA-001: the verb and every listed unit the command names
         let mut stopped: Option<UnitsStopped> = None;
+        let mut reload: Option<Reload> = None;
         let (rule, tool, what, pid, filename, ts) = match event {
             Event::ProcessSpawn {
                 pid,
@@ -906,6 +909,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 }
                 let asked = self.spawn_finding(*pid, &id, argv, as_of)?;
                 stopped = asked.stopped;
+                reload = asked.reload;
                 (
                     asked.rule,
                     asked.tool,
@@ -960,7 +964,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
             .unwrap_or(ToolClass::Edr);
         let sanctioned = self
             .sanctioned(event, pid, ts)
-            .or_else(|| self.own_units_in_window(stopped.as_ref()));
+            .or_else(|| self.own_units_in_window(stopped.as_ref()))
+            .or_else(|| self.reload_caught(reload.as_ref()));
         let suspicious = if sanctioned.is_none() {
             self.suspicious(pid, as_of)
         } else {
@@ -1106,12 +1111,14 @@ impl<H: DecisionHost> DefenseDetector<H> {
         // another tool's before the agent's own
         let mut units: Vec<(String, String, String)> = Vec::new();
         let mut understood = true;
+        let mut signals: Vec<Option<String>> = Vec::new();
         for t in service_targets(&prog, argv) {
             for (tool, u) in self.tools.tools_of_unit(&t.unit) {
                 if !units.iter().any(|(n, x, _)| *n == tool.name && *x == u) {
                     units.push((tool.name.clone(), u, t.verb.clone()));
                 }
                 understood &= t.understood;
+                signals.push(t.signal.clone());
             }
         }
         if !units.is_empty() {
@@ -1128,8 +1135,30 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 .collect();
             let mut what = format!("unit {unit} {unit_verb}");
             if !others.is_empty() {
-                what.push_str(&format!(" (with {})", others.join(", ")));
+                // a glob or an isolate names many: the first five, and how
+                // many more
+                let shown: Vec<&str> = others.iter().take(5).copied().collect();
+                let more = others.len() - shown.len();
+                what.push_str(&format!(" (with {}", shown.join(", ")));
+                if more > 0 {
+                    what.push_str(&format!(" and {more} more"));
+                }
+                what.push(')');
             }
+            // the review of #548 (F12): `systemctl kill -s HUP` (logrotate's
+            // rsyslog-rotate) of units whose processes catch the signal
+            // one signal for every unit (TERM, unnamed, is no reload)
+            let signal = match signals.split_first() {
+                Some((first, rest)) if rest.iter().all(|s| s == first) => first.as_deref(),
+                _ => None,
+            };
+            let reload = signal
+                .filter(|_| units.iter().all(|(_, _, v)| v == "kill"))
+                .and_then(reload_signal)
+                .map(|signal| Reload {
+                    signal,
+                    pids: self.defender_pids(units.iter().map(|(n, _, _)| n.as_str())),
+                });
             return Some(Asked {
                 rule: EvaRule::ServiceStopped,
                 tool,
@@ -1138,6 +1167,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     verbs: units.iter().map(|(_, _, v)| v.clone()).collect(),
                     units: units.into_iter().map(|(n, u, _)| (n, u)).collect(),
                 }),
+                reload,
             });
         }
         // NN-L-EVA-003: kill, pkill, killall naming a tool's process.
@@ -1148,18 +1178,29 @@ impl<H: DecisionHost> DefenseDetector<H> {
                         continue;
                     }
                     for a in &r.operands {
-                        let Ok(target) = a.parse::<u32>() else {
+                        let Some(target) = pid_of(a) else {
                             continue;
                         };
                         if let Some(tool) = self.defender(target, as_of) {
-                            return Some(Asked::of(
+                            // the review of #548 (F12): a reload signal the
+                            // process catches
+                            let reload =
+                                kill_signal(&r)
+                                    .and_then(reload_signal)
+                                    .map(|signal| Reload {
+                                        signal,
+                                        pids: self.registered(target).into_iter().collect(),
+                                    });
+                            let mut asked = Asked::of(
                                 EvaRule::Killed,
                                 tool.clone(),
                                 with_reading(
                                     format!("`kill` of {tool}'s process {target}"),
                                     r.understood,
                                 ),
-                            ));
+                            );
+                            asked.reload = reload;
+                            return Some(asked);
                         }
                     }
                 }
@@ -1200,7 +1241,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let own = |(tool, unit): &(String, String)| {
             tool == AGENT_TOOL && AGENT_UNITS.contains(&unit.as_str())
         };
-        let restart = |verb: &String| matches!(verb.as_str(), "stop" | "force-stop" | "kill");
+        let restart =
+            |verb: &String| matches!(verb.as_str(), "stop" | "condstop" | "force-stop" | "kill");
         if stopped.units.is_empty()
             || !stopped.units.iter().all(own)
             || !stopped.verbs.iter().all(restart)
@@ -1212,6 +1254,59 @@ impl<H: DecisionHost> DefenseDetector<H> {
             "inside the signed trusted-installer window of key {} (until {}): a stop or restart \
              of the agent's own unit",
             g.key_id, g.expires_at
+        ))
+    }
+
+    /// The registered processes of the tools `tools`, still the process
+    /// registered.
+    fn defender_pids<'t>(&self, tools: impl Iterator<Item = &'t str>) -> Vec<u32> {
+        let tools: Vec<&str> = tools.collect();
+        let d = self.defenders.lock();
+        let mut pids: Vec<u32> = d
+            .iter()
+            .filter(|(p, (t, start))| {
+                tools.contains(&t.as_str())
+                    && start.is_some()
+                    && start_ticks::<H>(&self.proc_root, **p) == *start
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// `pid`, when it is a registered process still the one registered.
+    fn registered(&self, pid: u32) -> Option<u32> {
+        let d = self.defenders.lock();
+        let (_, start) = d.get(&pid)?;
+        (start.is_some() && start_ticks::<H>(&self.proc_root, pid) == *start).then_some(pid)
+    }
+
+    /// The review of #548 (F12): a reload signal every process it reaches
+    /// catches (`SigCgt` of `/proc/<pid>/status` has its bit) is no stop: a
+    /// Low record, named. A process that does not catch it, none known or
+    /// one unreadable: no sanction (it ends, and is judged).
+    fn reload_caught(&self, reload: Option<&Reload>) -> Option<String> {
+        let r = reload?;
+        if r.pids.is_empty() {
+            return None;
+        }
+        let bit = 1u64 << (r.signal - 1);
+        for pid in &r.pids {
+            let status = H::read_state(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+            let mask = status
+                .lines()
+                .find_map(|l| l.strip_prefix("SigCgt:"))
+                .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())?;
+            if mask & bit == 0 {
+                return None;
+            }
+        }
+        let name = if r.signal == 1 { "SIGHUP" } else { "SIGUSR1" };
+        let pids: Vec<String> = r.pids.iter().map(u32::to_string).collect();
+        Some(format!(
+            "{name}, which the tool's process {} catches (SigCgt): a reload, no stop",
+            pids.join(", ")
         ))
     }
 
@@ -1292,6 +1387,9 @@ struct Asked {
     what: String,
     /// NN-L-EVA-001: what the command stops.
     stopped: Option<UnitsStopped>,
+    /// A reload signal (HUP, USR1) to the tool's processes, which a catch
+    /// of it makes no stop.
+    reload: Option<Reload>,
 }
 
 impl Asked {
@@ -1301,8 +1399,42 @@ impl Asked {
             tool,
             what,
             stopped: None,
+            reload: None,
         }
     }
+}
+
+/// The review of #548 (F12): a reload signal sent to a tool's registered
+/// processes — `systemctl kill -s HUP rsyslog.service` (logrotate's
+/// `rsyslog-rotate`, daily on Debian and Ubuntu), `kill -USR1 <pid>`.
+struct Reload {
+    /// Its number (1, 10).
+    signal: u8,
+    /// The registered processes it reaches, still the process registered
+    /// (their start read back).
+    pids: Vec<u32>,
+}
+
+/// SIGHUP and SIGUSR1, by name (`HUP`, `SIGHUP`, any case) or number: the
+/// signals a daemon catches to reopen its logs or reload. Any other: none.
+fn reload_signal(s: &str) -> Option<u8> {
+    let up = s.to_ascii_uppercase();
+    match up.strip_prefix("SIG").unwrap_or(&up) {
+        "HUP" | "1" => Some(1),
+        "USR1" | "10" => Some(10),
+        _ => None,
+    }
+}
+
+/// The review of #548 (F9): a pid as procps' `strtol_or_err` reads it —
+/// leading blanks and a `+` skipped, digits to the end.
+fn pid_of(a: &str) -> Option<u32> {
+    let t = a.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    let t = t.strip_prefix('+').unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
 }
 
 /// Lot 316 (BUG-96): every listed unit a service-manager command names —
@@ -1370,6 +1502,21 @@ fn holds(
     options && operands
 }
 
+/// The review of #548 (F8): the signal procps' `kill` sends for the
+/// reading `r` — the last `-s`/`--signal`, else the first `-SIGNAL` word
+/// (`skill_sig_option` takes it before the options are read): `kill -s KILL
+/// -0 <pid>` kills.
+fn kill_signal<'a>(r: &Parsed<'a>) -> Option<&'a str> {
+    r.option("s")
+        .filter_map(|v| v.first().copied())
+        .last()
+        .or_else(|| {
+            r.option(crate::posture::script_args::SIGNAL)
+                .filter_map(|v| v.first().copied())
+                .next()
+        })
+}
+
 /// Lot 316: `kill`'s reading `r` sends no signal that stops — an existence
 /// probe (`-0`, `-s 0`, `-SIG0`), `SIGCONT`, or a listing (`-l`, `-L`,
 /// help, version: procps' kill prints and exits). Never for an argv not
@@ -1381,18 +1528,27 @@ fn kill_is_probe(r: &Parsed<'_>) -> bool {
     if ["l", "L", "h", "V"].iter().any(|o| r.has(o)) {
         return true;
     }
-    // the last signal named: `-SIGNAL` first, then `-s` (procps)
-    let signal = r
-        .options
-        .iter()
-        .filter(|(n, _)| *n == crate::posture::script_args::SIGNAL || *n == "s")
-        .filter_map(|(_, v)| v.first())
-        .next_back();
-    signal.is_some_and(|s| {
+    kill_signal(r).is_some_and(|s| {
         let up = s.to_ascii_uppercase();
         let name = up.strip_prefix("SIG").unwrap_or(&up);
         matches!(name, "0" | "CONT" | "18")
     })
+}
+
+/// The review of #548 (F10): an absolute path with `//`, `.` and `..` folded
+/// as the kernel walks them (symbolic links aside).
+fn lexical_path(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// Lot 316: how `pkill` or `killall` matches a name to a process.
@@ -1438,54 +1594,30 @@ impl NameMatch {
     }
 }
 
-/// `fnmatch(3)` without flags: `*`, `?`, a bracket expression (`!` or `^`
-/// negates, `a-z` ranges), `\` quotes the next character — how systemctl
-/// matches a pattern against the units in memory.
-fn fnmatch(pattern: &str, name: &str) -> bool {
-    fn class(p: &[char], c: char) -> Option<(bool, usize)> {
-        // p starts after `[`; the class and its length up to `]`
-        let mut i = 0;
-        let negate = matches!(p.first(), Some('!' | '^'));
-        if negate {
-            i += 1;
-        }
-        let mut hit = false;
-        let mut first = true;
-        while i < p.len() {
-            if p[i] == ']' && !first {
-                return Some((hit != negate, i + 1));
-            }
-            first = false;
-            let lo = p[i];
-            if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
-                hit |= lo <= c && c <= p[i + 2];
-                i += 3;
-            } else {
-                hit |= lo == c;
-                i += 1;
-            }
-        }
-        None
+/// The unit types systemd knows by their suffix: a listed unit without one
+/// is a `.service` (`snap.amazon-ssm-agent.amazon-ssm-agent` included).
+const UNIT_TYPES: &[&str] = &[
+    ".service",
+    ".socket",
+    ".target",
+    ".device",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".timer",
+    ".path",
+    ".slice",
+    ".scope",
+];
+
+/// A listed unit's full name, as a glob is matched against it (the review
+/// of #548, F3: a dotted name with no type suffix is a service too).
+fn full_unit_name(u: &str) -> String {
+    if UNIT_TYPES.iter().any(|t| u.ends_with(t)) {
+        u.to_string()
+    } else {
+        format!("{u}.service")
     }
-    fn go(p: &[char], n: &[char]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
-            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
-            Some('[') => match (n.first(), class(&p[1..], *n.first().unwrap_or(&'\0'))) {
-                (Some(_), Some((true, len))) => go(&p[1 + len..], &n[1..]),
-                (Some(_), Some((false, _))) | (None, _) => false,
-                // no closing `]`: a `[` as itself
-                (Some(c), None) => *c == '[' && go(&p[1..], &n[1..]),
-            },
-            Some('\\') if p.len() > 1 => n.first() == Some(&p[1]) && go(&p[2..], &n[1..]),
-            Some(c) => n.first() == Some(c) && go(&p[1..], &n[1..]),
-        }
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    // a bounded pattern: systemctl's unit names are short
-    p.len() <= 256 && n.len() <= 256 && go(&p, &n)
 }
 
 /// One unit a service-manager command stops, disables, masks or kills.
@@ -1494,22 +1626,103 @@ struct ServiceTarget {
     unit: String,
     /// Read from an argv its table understood (systemctl's).
     understood: bool,
+    /// `systemctl kill`'s signal (`-s`, `--signal`; TERM by default).
+    signal: Option<String>,
 }
 
-/// The verbs of systemctl that stop a unit or keep it from starting.
-const SYSTEMCTL_STOPS: &[&str] = &["stop", "disable", "mask", "kill", "freeze"];
+/// How a systemctl verb reaches the units it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// Every operand after the verb is a unit.
+    Units,
+    /// The first operand is the unit, the rest its settings
+    /// (`set-property auditd CPUQuota=1%`).
+    FirstUnit,
+    /// The operands are unit files' paths (`link /x/auditd.service`): the
+    /// unit their name is.
+    Paths,
+    /// Every unit (`rescue`, `emergency`, `preset-all`).
+    Every,
+    /// `isolate <target>`: every unit the target does not want — every
+    /// listed one, unless the target is the system's usual one.
+    Isolate,
+}
 
-/// Lot 316 (BUG-106, BUG-96): the units systemctl's reading `r` stops —
-/// every unit after the verb, on the system's manager (the last of
-/// `--system`, `--user`, `--global`, `--capsule`). For an argv not
-/// understood, any operand may be the verb and every later one a unit, and
-/// the manager is the system's.
-fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(&'a str, &'a str)> {
+/// The review of #548 (F2): systemd's verbs (`systemctl.c`, 249–262) that
+/// stop, freeze, signal, disable, mask, revert, re-point, reconfigure or
+/// clean a unit. Not judged: `start`, the reload and restart family
+/// (`restart`, `try-restart`, `condrestart`, …: the unit runs again after
+/// it, as an administrator's everyday restart), `enable`, `unmask`, and the
+/// system's own transitions (`reboot`, `poweroff`, `halt`, `suspend`, …).
+const SYSTEMCTL_VERBS: &[(&str, Reach)] = &[
+    ("stop", Reach::Units),
+    ("condstop", Reach::Units),
+    ("kill", Reach::Units),
+    ("freeze", Reach::Units),
+    ("clean", Reach::Units),
+    ("disable", Reach::Units),
+    ("mask", Reach::Units),
+    ("preset", Reach::Units),
+    ("revert", Reach::Units),
+    ("edit", Reach::Units),
+    ("link", Reach::Paths),
+    ("set-property", Reach::FirstUnit),
+    ("service-log-level", Reach::FirstUnit),
+    ("service-log-target", Reach::FirstUnit),
+    ("bind", Reach::FirstUnit),
+    ("mount-image", Reach::FirstUnit),
+    ("isolate", Reach::Isolate),
+    ("rescue", Reach::Every),
+    ("emergency", Reach::Every),
+    ("preset-all", Reach::Every),
+];
+
+/// The targets an `isolate` keeps the system's services under.
+const USUAL_TARGETS: &[&str] = &["default", "multi-user", "graphical"];
+
+/// The units a judged verb reaches, from its operands: the verb as the
+/// record says it, and each unit argument (`*`: every listed unit).
+fn reached<'a>(verb: &'a str, reach: Reach, rest: &[&'a str]) -> Vec<(String, &'a str)> {
+    let say = |v: &str| v.to_string();
+    match reach {
+        Reach::Units => rest.iter().map(|u| (say(verb), *u)).collect(),
+        Reach::FirstUnit => rest.first().map(|u| (say(verb), *u)).into_iter().collect(),
+        Reach::Paths => rest
+            .iter()
+            .map(|p| (say(verb), p.rsplit('/').next().unwrap_or(p)))
+            .collect(),
+        Reach::Every => vec![(say(verb), "*")],
+        Reach::Isolate => match rest.first() {
+            Some(t) => {
+                let name = t.strip_suffix(".target").unwrap_or(t);
+                if USUAL_TARGETS.contains(&name) {
+                    Vec::new()
+                } else {
+                    vec![(format!("{verb} {t}"), "*")]
+                }
+            }
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Lot 316 (BUG-106, BUG-96): the units systemctl's reading `r` reaches —
+/// with each verb of [`SYSTEMCTL_VERBS`] its own way, on the system's
+/// manager (the last of `--system`, `--user`, `--global`, `--capsule`). For
+/// an argv not understood, any operand may be the verb and every later one
+/// a unit, and the manager is the system's.
+fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(String, &'a str)> {
+    let reach = |v: &str| {
+        SYSTEMCTL_VERBS
+            .iter()
+            .find(|(n, _)| *n == v)
+            .map(|(_, r)| *r)
+    };
     if !r.understood {
         let mut out = Vec::new();
         for (i, verb) in r.operands.iter().enumerate() {
-            if SYSTEMCTL_STOPS.contains(verb) {
-                out.extend(r.operands[i + 1..].iter().map(|u| (*verb, *u)));
+            if let Some(how) = reach(verb) {
+                out.extend(reached(verb, how, &r.operands[i + 1..]));
             }
         }
         return out;
@@ -1525,9 +1738,10 @@ fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(&'a str, &'a str)> {
         })
         .unwrap_or(true);
     match r.operands.split_first() {
-        Some((verb, units)) if system && SYSTEMCTL_STOPS.contains(verb) => {
-            units.iter().map(|u| (*verb, *u)).collect()
-        }
+        Some((verb, rest)) if system => match reach(verb) {
+            Some(how) => reached(verb, how, rest),
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -1540,14 +1754,25 @@ fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(&'a str, &'a str)> {
 fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
     let mut out: Vec<ServiceTarget> = Vec::new();
     if prog.is("systemctl") {
-        for r in SystemTool::Systemctl.read(argv, prog.args_from) {
+        let readings = SystemTool::Systemctl.read(argv, prog.args_from);
+        // `systemctl kill`'s signal: the last `-s` of the tool's own reading
+        // (GNU's). Under `POSIXLY_CORRECT` a `-s` after the verb is a unit
+        // and the signal TERM: that reading still names the units reached,
+        // never the signal (a residual, `UPGRADE_NOTES_WAVE4.md` §32).
+        let signal = readings
+            .first()
+            .filter(|r| r.understood)
+            .and_then(|r| r.option("s").filter_map(|v| v.first()).last())
+            .map(|v| v.to_string());
+        for r in readings {
             out.extend(
                 systemctl_targets(&r)
                     .into_iter()
                     .map(|(verb, unit)| ServiceTarget {
-                        verb: verb.to_string(),
+                        verb,
                         unit: unit.to_string(),
                         understood: r.understood,
+                        signal: signal.clone(),
                     }),
             );
         }
@@ -1557,6 +1782,7 @@ fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
         verb: verb.to_string(),
         unit: unit.to_string(),
         understood: true,
+        signal: None,
     };
     let free: Vec<&str> = argv
         .iter()
@@ -1595,3 +1821,4 @@ fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
 #[cfg(test)]
 mod tests;
 mod tool_options;
+mod unit_glob;

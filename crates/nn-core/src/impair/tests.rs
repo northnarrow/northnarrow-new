@@ -1847,7 +1847,8 @@ mod lot316_variants {
         }
     }
 
-    /// `fnmatch` as systemctl's: `*`, `?`, classes, ranges, negation, `\`.
+    /// `fnmatch` as systemctl's: `*`, `?`, classes, ranges, negation, and
+    /// `\` as itself (`FNM_NOESCAPE`).
     #[test]
     fn unit_globs_match_as_fnmatch() {
         for (p, n, want) in [
@@ -1858,7 +1859,9 @@ mod lot316_variants {
             ("[^a]uditd.service", "auditd.service", false),
             ("[a-c]uditd.*", "auditd.service", true),
             ("[]a]uditd.service", "auditd.service", true),
-            ("\\auditd.service", "auditd.service", true),
+            // FNM_NOESCAPE, as systemd matches (the review of #548, F3):
+            // `\` is itself
+            ("\\auditd.service", "auditd.service", false),
             ("audit?", "auditd.service", false),
             ("*", "auditd.service", true),
             ("[a", "[a", true),
@@ -1867,5 +1870,323 @@ mod lot316_variants {
         ] {
             assert_eq!(fnmatch(p, n), want, "{p} {n}");
         }
+    }
+}
+
+// ── The review of #548 (lot 316's second round) ─────────────────────────
+
+mod rev548 {
+    //! The independent review of #548: the glob's cost (F1), systemd's
+    //! verbs (F2), its globs (F3), the units' aliases (F4), procps' `kill`
+    //! (F8, F9), psmisc's paths (F10), `lt-pkill` (F11), and logrotate's
+    //! reload signal (F12).
+    use super::*;
+
+    const SC: &str = "/usr/bin/systemctl";
+
+    fn got(h: &Host, pid: u32, exe: &str, argv: &[&str]) -> Option<(EvaRule, String)> {
+        h.run(pid, 200, exe, argv).map(|f| (f.rule, f.tool))
+    }
+
+    fn stopped(t: &str) -> Option<(EvaRule, String)> {
+        Some((EvaRule::ServiceStopped, t.to_string()))
+    }
+
+    fn killed(t: &str) -> Option<(EvaRule, String)> {
+        Some((EvaRule::Killed, t.to_string()))
+    }
+
+    /// F1: a glob of many stars, refused by systemctl, is judged in
+    /// microseconds through the detector — it held the decision thread for
+    /// hours (158 s at eight stars in a debug build).
+    #[test]
+    fn a_glob_of_many_stars_is_judged_at_once() {
+        let h = host();
+        for (k, stars) in [21usize, 64, 200].into_iter().enumerate() {
+            let glob = format!("{}Z", "*".repeat(stars));
+            let t = std::time::Instant::now();
+            assert_eq!(
+                got(&h, 9000 + k as u32, SC, &["systemctl", "stop", &glob]),
+                None
+            );
+            let mixed = format!("{}{}", "*a".repeat(stars), "*Z");
+            assert_eq!(
+                got(&h, 9010 + k as u32, SC, &["systemctl", "stop", &mixed]),
+                None
+            );
+            assert!(
+                t.elapsed() < std::time::Duration::from_millis(500),
+                "{stars} stars: {:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    /// F2: every verb of systemd's that stops, freezes, signals, disables,
+    /// masks, reverts, re-points, reconfigures or cleans a unit is judged.
+    #[test]
+    fn systemds_verbs_that_reach_a_unit_are_judged() {
+        let h = host();
+        let mut missed = Vec::new();
+        for (k, argv) in [
+            &["systemctl", "condstop", "auditd"][..],
+            &["systemctl", "clean", "--what=all", "auditd"],
+            &["systemctl", "preset", "auditd"],
+            &["systemctl", "revert", "auditd"],
+            &["systemctl", "edit", "--stdin", "auditd"],
+            &["systemctl", "link", "/tmp/x/auditd.service"],
+            &["systemctl", "set-property", "auditd", "CPUQuota=1%"],
+            &["systemctl", "service-log-target", "auditd", "null"],
+            &["systemctl", "service-log-level", "auditd", "emerg"],
+            &["systemctl", "bind", "auditd", "/tmp/x", "/etc/audit"],
+            &["systemctl", "isolate", "rescue.target"],
+            &["systemctl", "isolate", "nn.target"],
+            &["systemctl", "rescue"],
+            &["systemctl", "emergency"],
+            &["systemctl", "preset-all"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let g = got(&h, 9100 + k as u32, SC, argv);
+            if g.as_ref().map(|(r, _)| *r) != Some(EvaRule::ServiceStopped) {
+                missed.push(format!("{argv:?} -> {g:?}"));
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        assert_eq!(
+            got(&h, 9130, SC, &["systemctl", "condstop", "auditd"]),
+            stopped("auditd")
+        );
+        let f = h
+            .run(9131, 200, SC, &["systemctl", "isolate", "rescue.target"])
+            .unwrap();
+        assert!(
+            f.what.contains("isolate rescue.target") && f.what.contains("more"),
+            "{f:?}"
+        );
+        // the unit runs again, or the system's usual target: not judged
+        for (k, argv) in [
+            &["systemctl", "restart", "auditd"][..],
+            &["systemctl", "try-restart", "auditd"],
+            &["systemctl", "condrestart", "auditd"],
+            &["systemctl", "reload-or-restart", "auditd"],
+            &["systemctl", "isolate", "multi-user.target"],
+            &["systemctl", "isolate", "graphical"],
+            &["systemctl", "enable", "--now", "auditd"],
+            &["systemctl", "unmask", "auditd"],
+            &["systemctl", "set-property", "nginx", "auditd=1"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(got(&h, 9140 + k as u32, SC, argv), None, "{argv:?}");
+        }
+    }
+
+    /// F3: a glob as systemd matches it — POSIX classes, a dotted unit with
+    /// no type suffix (`snap.amazon-ssm-agent.amazon-ssm-agent`) as a
+    /// `.service`, `\` as itself; F4: a unit's alias (rsyslog's
+    /// `syslog.service`).
+    #[test]
+    fn globs_and_aliases_as_systemd_names_units() {
+        let h = host();
+        for (k, (argv, want)) in [
+            (
+                &["systemctl", "stop", "[[:alpha:]]uditd.service"][..],
+                "auditd",
+            ),
+            (&["systemctl", "stop", "snap.*.service"], "amazon-ssm"),
+            (
+                &[
+                    "systemctl",
+                    "stop",
+                    "snap.amazon-ssm-agent.amazon-ssm-agent",
+                ],
+                "amazon-ssm",
+            ),
+            (&["systemctl", "stop", "syslog"], "rsyslog"),
+            (&["systemctl", "kill", "syslog.service"], "rsyslog"),
+            (
+                &[
+                    "systemctl",
+                    "stop",
+                    "dbus-org.fedoraproject.FirewallD1.service",
+                ],
+                "firewalld",
+            ),
+            (&["service", "syslog", "stop"], "rsyslog"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let exe = if argv[0] == "service" {
+                "/usr/sbin/service"
+            } else {
+                SC
+            };
+            assert_eq!(
+                got(&h, 9200 + k as u32, exe, argv),
+                stopped(want),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            got(&h, 9220, SC, &["systemctl", "stop", "\\auditd.service"]),
+            None,
+            "FNM_NOESCAPE"
+        );
+    }
+
+    /// F8, F9: procps' kill — the last `-s` over the `-SIGNAL` word, a pid
+    /// with leading blanks or a `+`; F10: psmisc's killall reads a path as
+    /// stat() does; F11: pgrep's binary run as `lt-pkill` is pkill.
+    #[test]
+    fn kill_pids_paths_and_pkills_name() {
+        let h = host();
+        assert!(h
+            .run(9300, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        for (k, argv) in [
+            &["kill", "-s", "KILL", "-0", "9300"][..],
+            &["kill", "-9", " 9300"],
+            &["kill", "-9", "\t+9300"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                got(&h, 9310 + k as u32, "/usr/bin/kill", argv),
+                killed("auditd"),
+                "{argv:?}"
+            );
+        }
+        // `-0` then `-s 0`: a probe still; a pid with trailing junk is no pid
+        assert_eq!(
+            got(
+                &h,
+                9320,
+                "/usr/bin/kill",
+                &["kill", "-0", "-s", "0", "9300"]
+            ),
+            None
+        );
+        assert_eq!(
+            got(&h, 9321, "/usr/bin/kill", &["kill", "-9", "9300x"]),
+            None
+        );
+        for (k, p) in [
+            "//usr/sbin/auditd",
+            "/usr/sbin/./auditd",
+            "/usr/bin/../sbin/auditd",
+            "/opt/CrowdStrike//falcond",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let want = if p.contains("CrowdStrike") {
+                "crowdstrike"
+            } else {
+                "auditd"
+            };
+            assert_eq!(
+                got(&h, 9330 + k as u32, "/usr/bin/killall", &["killall", p]),
+                killed(want),
+                "{p}"
+            );
+        }
+        assert_eq!(
+            got(&h, 9340, "/usr/bin/pgrep", &["lt-pkill", "auditd"]),
+            killed("auditd")
+        );
+        assert_eq!(got(&h, 9341, "/usr/bin/pgrep", &["pgrep", "auditd"]), None);
+        assert_eq!(lexical_path("/a/./b//c/../d"), "/a/b/d");
+        assert_eq!(lexical_path("/../x"), "/x");
+    }
+
+    /// A process the fixture's `/proc` knows: its start, and the signals it
+    /// catches (`SigCgt`).
+    fn a_process(h: &Host, pid: u32, start: u64, sigcgt: &str) {
+        let d = h._proc.path().join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!(
+                "{pid} (x) S 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join("status"), format!("Name:\tx\nSigCgt:\t{sigcgt}\n")).unwrap();
+    }
+
+    /// F12 (the coordinator's decision): a SIGHUP or SIGUSR1 sent by
+    /// `systemctl kill` or `kill` to a tool's process that catches it
+    /// (`SigCgt`) is a reload — a Low record, no DefenseImpairment;
+    /// logrotate's `rsyslog-rotate` sends one every day. To one that does
+    /// not catch it, it ends the process: High. Any other signal: High.
+    #[test]
+    fn a_reload_signal_the_process_catches_is_low() {
+        let h = host();
+        // rsyslogd catches HUP and USR1 (bits 0 and 9); auditd catches none
+        a_process(&h, 9400, 4400, "0000000180014203");
+        assert!(h
+            .run(9400, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
+            .is_none());
+        a_process(&h, 9401, 4401, "0000000000000000");
+        assert!(h
+            .run(9401, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        let low = |pid: u32, exe: &str, argv: &[&str]| {
+            let f = h
+                .run(pid, 200, exe, argv)
+                .unwrap_or_else(|| panic!("{argv:?}"));
+            f.sanctioned
+        };
+        for (k, argv) in [
+            &["systemctl", "kill", "-s", "HUP", "rsyslog.service"][..],
+            &["systemctl", "kill", "--signal=SIGUSR1", "rsyslog"],
+            &["systemctl", "kill", "-s", "1", "rsyslog"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = low(9410 + k as u32, SC, argv);
+            assert!(
+                s.as_deref().is_some_and(|s| s.contains("SigCgt")),
+                "{argv:?}: {s:?}"
+            );
+        }
+        for (k, argv) in [
+            &["kill", "-HUP", "9400"][..],
+            &["kill", "-s", "USR1", "9400"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = low(9420 + k as u32, "/usr/bin/kill", argv);
+            assert!(s.is_some(), "{argv:?}");
+        }
+        // High: the process does not catch it, another signal, a unit with
+        // no registered process, a pid no longer the one registered
+        for (k, (exe, argv)) in [
+            (SC, &["systemctl", "kill", "-s", "HUP", "auditd"][..]),
+            (SC, &["systemctl", "kill", "rsyslog"]),
+            (SC, &["systemctl", "kill", "-s", "USR2", "rsyslog"]),
+            (SC, &["systemctl", "kill", "-s", "HUP", "rsyslog", "auditd"]),
+            (SC, &["systemctl", "kill", "-s", "HUP", "falco"]),
+            ("/usr/bin/kill", &["kill", "-HUP", "9401"]),
+            ("/usr/bin/kill", &["kill", "-TERM", "9400"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(low(9430 + k as u32, exe, argv), None, "{argv:?}");
+        }
+        // the pid now another process (its start changed)
+        a_process(&h, 9400, 9999, "0000000180014203");
+        assert_eq!(
+            low(9440, SC, &["systemctl", "kill", "-s", "HUP", "rsyslog"]),
+            None
+        );
     }
 }

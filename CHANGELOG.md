@@ -37,7 +37,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`xtask/tests/interpreter_options.rs`: every option literal and argv read
   in the product crates) pins `impair/mod.rs` at 4 sites, none an option read (it held 72), and
   plants these tools' shapes; an `#[ignore]` differential test runs the
-  tables against the real pkill, killall, iptables, nft and systemctl.
+  tables against the real kill, pkill, killall, iptables, nft and
+  systemctl. The independent review of #548: a unit glob is matched as
+  systemd matches it (`FNM_NOESCAPE`, the POSIX classes, a dotted unit as a
+  `.service`) in linear time — the first matcher backtracked, and a
+  21-byte `systemctl stop '********************Z'` from any user held the
+  decision thread for hours; systemd's other verbs that reach a unit
+  (`condstop`, `clean`, `preset`, `revert`, `edit`, `link`, `set-property`,
+  `service-log-*`, `bind`, `isolate`, `rescue`, `emergency`, …); units'
+  aliases (`syslog.service`); procps' `kill -s KILL -0 <pid>`, a pid with
+  blanks, killall's `//path`, `lt-pkill`. logrotate's daily `systemctl kill
+  -s HUP rsyslog.service` is a Low record now: a SIGHUP or SIGUSR1 every
+  process it reaches catches (`SigCgt`) is a reload, no stop.
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision
