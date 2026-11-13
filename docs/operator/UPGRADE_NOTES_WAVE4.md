@@ -1736,3 +1736,79 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
   the degradation `execpol_capacity` while it lasts.
 
+
+## 34. A benign host's daily records (lot 340)
+
+What a benign host produced every day — and what an operator who reads the
+records after the upgrade will see instead. The attack variants beside each
+are judged as before; `CHANGELOG.md` has the detail.
+
+- **logrotate's daily run**: NN-L-FIM-005 and NN-L-FIM-019 records of a
+  write by the packaged `/usr/sbin/logrotate`, as root, run exactly as
+  `logrotate /etc/logrotate.conf`, that PID 1 forked (the timer's
+  `logrotate.service`) or cron's daily run started
+  (`/etc/cron.daily/logrotate` under `run-parts`, up to a cron daemon PID 1
+  forked) are **Low** and never acted on (NN-L-FIM-019 killed). Run by hand
+  from a session, with any other argument (`-f`, `-s`, another
+  configuration), by a non-root user, under anacron or cron run by hand or
+  a cron `@reboot` entry, a copy of logrotate, any other writer of wtmp or
+  btmp: as before. A root that runs the packaged rotation under
+  `systemd-run` leaves the Low record the timer would have.
+  **What to check after the upgrade**: a host whose logrotate runs with
+  other arguments (a unit or crontab of its own) keeps its records at the
+  rules' verdicts.
+- **rsyslogd after a rotation, and at the start**: its appends no longer
+  read as truncations (NN-L-FIM-005 High until the file outgrew the rotated
+  one; the first append after the agent's start, before the baseline was
+  read). **What changed in the record**: a FIM event's `baseline_size` is
+  the size of that file when the agent last read it, else when it was
+  watched (else the path's baseline, as before).
+- **A key store's directory listed** (`find /`, plocate's daily
+  `updatedb`): no NN-L-FIM-015/016/017 verdict any more; opening a file of
+  the store is judged as before.
+- **Backups**: the writer that never executes (rsync's receiver) is judged
+  on its forker's lineage from the kernel's fork record, after it exited
+  too (and its forker's, when that one never executed either: rsync's
+  generator): a unit's `sh -c 'rsync …'` is vouched for by the unit. The
+  open sensor's ring record grew to 632 bytes (an agent and its eBPF object are
+  one build; nothing to do).
+- **`npm ci` / `go test`** do not raise ENGAGED any more: npm's CLI run
+  through `/usr/bin/npm` (the package's link) or npm's CLI under a system
+  path prefix, with no `NODE_OPTIONS`/`NODE_PATH` loading code (known limit:
+  the prefix is not a proof of root ownership, and npm loads
+  `~/.npm-init.js` itself; a follow-up narrows the exemption to npm's own
+  write paths), and the packaged `go`
+  command writing in its work directory (`$TMPDIR/go-build<digits>/`), its
+  build cache or its module cache. A `go` in a home (`GOTOOLCHAIN`), what
+  `go` runs, and node running any other script still count.
+- **R011**: root's `modprobe <name>` of the system's tool that exited
+  before its environment was read is **Medium** (was High).
+- **Ubuntu 26.04**: systemd's own BPF loads the hook refuses (the user
+  manager's and networkd's feature probes; PID 1's `RestrictFileSystems=`
+  program at a `daemon-reexec`) are still refused, now recorded **Low**
+  (NN-L-AT-001, "A known system program's BPF load, refused"); the posture
+  no longer goes ENGAGED for them, and they never corroborate another
+  signal into COMBAT. The proof is the loader's image as its exec recorded
+  it when it loaded: the packaged `/usr/lib/systemd/systemd` or
+  `/usr/lib/systemd/systemd-networkd`, device and inode, loading a
+  `tracepoint` or `kprobe` program, or PID 1 itself an `lsm` one. A loader
+  whose exec the agent has not received when the refusal arrives stays
+  High.
+- **DNS resolvers**: NN-L-NET-004/-005/-014 treat a sender as a resolver
+  only when the agent proves it — the host's packaged resolver at its path
+  (device and inode) running as the system's service (its own unit under
+  `system.slice`, forked by PID 1 or, for dnsmasq, NetworkManager, system
+  users, no `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH`), or Kubernetes'
+  CoreDNS as containerd, k3s' containerd or CRI-O record it (`kube-system`,
+  a `coredns` image, `/coredns`; the container's id the leaf of a
+  `kubepods` cgroup, the sender in its init's namespaces). **What to check
+  after the upgrade**: a resolver installed outside the system trees
+  (`/usr/local/sbin/unbound`, `/opt/…`), or run in a unit of another name
+  (the units known: `systemd-resolved`, `named`/`bind9`, `unbound`,
+  `dnsmasq` or the network manager's that starts it, `dnscrypt-proxy`,
+  `pdns-recursor`, `kresd@`, `stubby`, `connman`), is now judged as any
+  process — its forwarded legs count against it, and a tunnel's worth of
+  hash-shaped names under one zone kills it. A known
+  resolver's legs that cannot be traced to the process that asked stay one
+  Medium record each and are no longer a High "tunnel" of the resolver. The
+  `DnsQuery` event gained `known_resolver` (absent when false).

@@ -10382,3 +10382,114 @@ number in parentheses is a lab PR.
     split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
+- **Lot 340 (alpha 1/4) — a benign host's daily records (C14, C17, C23;
+  no level changes).**
+  - What was open (the alpha's observe-only profile on testers' hosts): the
+    records a benign host made every day — logrotate's run (NN-L-FIM-019, a
+    kill, and NN-L-FIM-005 High), rsyslogd's appends after it (FIM-005 High
+    until the new log outgrew the rotated one: found by this lot's lab), a
+    backup's receiver judged with no lineage once it exited, `npm ci` and
+    `go test` raising ENGAGED, R011 High for a clean `modprobe` that exited
+    at once, systemd's BPF feature probes on Ubuntu 26.04 (High, ENGAGED at
+    every boot), CoreDNS acted on as the originator of its pods' names and
+    a resolver's unattributed legs adding up to its own "tunnel".
+  - Done: each benign case told by what the kernel proves — the packaged
+    logrotate (its image's device and inode) forked by PID 1 or started by
+    cron's daily run (Low); a log's size measured against the size the
+    drain last read in that same inode; the open sensor's record carries
+    the writer's unexecuted fork record (`fork_parent::unexecuted_fork`,
+    `OpenRecordRaw` 624 bytes), taught to the lineage before the record's
+    events (`teach_fork`, `kernel_fork_entry`); npm's CLI through its
+    packaged link path, the packaged `go` in its own directories; R011
+    exited + root + the system's tool by name: Medium; a refused
+    `bpf_prog_type` load proven systemd's own (the packaged
+    `systemd`/`systemd-networkd` loader's device and inode; `tracepoint`,
+    `kprobe`, PID 1's `lsm`) marked as decoded: Low, no posture trigger —
+    never a corroborating signal (the coordinator's input from lot 332's
+    lab: it promoted an unrelated mass write to COMBAT) — still refused; DNS resolvers by identity (`DnsQuery::known_resolver`: the
+    host's packaged file, or CoreDNS by its container runtime's bundle),
+    their unattributed legs one Medium record each, never their own tunnel.
+    Every attack variant stays judged (the PR's table).
+  - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and ubuntu2604 (7.0.0-43, systemd
+    259), each case before (`main` fd22fe5f) and after (the lot), counted from
+    the signed records. **logrotate** forced as its timer runs it (a unit):
+    2404 FIM-019 High 2 → Low 2 per run and FIM-005 Low 2; 2604 FIM-005
+    High 3 + FIM-019 High 1 → FIM-019 Low 3 per run (a first after-round
+    still High: the image's device compared in two forms, fixed); controls
+    (`dd` appending to btmp from a unit) High both. **rsyslogd**: FIM-005
+    High 2 (2404) after a rotation and at the start → none. **Backups** (a
+    unit's `sh -c 'rsync --inplace'`, 5 runs; only the runs whose burst
+    crossed count): 2404 JUDGED 1 (NN-L-IMP-001 Critical) → VOUCHED 1;
+    2604 JUDGED 2 → VOUCHED 1, JUDGED 1 (the receiver's forker, rsync's
+    generator, unexecuted too: two levels carried since) → VOUCHED 1,
+    JUDGED 0 on the final code (2404's last round: no burst crossed).
+    **Corpus** (2404; ConfirmedIntrusion raises by step): ci `go test` 1
+    and `npm ci` 1 → 0, dev `go test` 1 and `rsync --inplace` 1 → 0, db
+    `initdb` 1 + `postgres` 2 → 1 + 1 (not this lot's); the other verdicts
+    unchanged (R001 High of `go test`'s binary from /tmp, which still
+    raises ENGAGED by `StagingExec`). **R011**: `modprobe loop` ×20 Low on
+    both kernels before and after (the exited case did not occur). **26.04
+    probes**: user manager restart AT-001 High 1 → Low 1 (both
+    after-rounds); networkd restart High 2 → Low 1 + High 1 (the second
+    load's kind not read; networkd's `tracepoint` load added to the known
+    ones since, not re-measured); a kprobe load by python3 High both.
+    **Desktop-like** (a terminal under the user manager: vim, sed,
+    git, cargo, npm, venv, tar): 0 records before and after. The guests left
+    clean and off.
+  - Mutations: 52 on the new code in three rounds, 49 caught by named tests
+    (the first round's survivors closed with tests: an unrecorded image, a
+    resolver's legs counted, the probe's second read, a resolver outside a
+    system tree or under another name); one led to a change (a forker that
+    executed only after the fork is read from its own fork record, tested);
+    two argued equivalent (a self-parent fork record
+    yields nothing at the depth cap; npm's link without the node check is
+    gated by `is_npm_cli_writer`'s own).
+  - **The review of #552 (F1–F7): no attacker obtains an exemption.**
+    logrotate's needs root's packaged invocation (`logrotate
+    /etc/logrotate.conf`, the exec's uid 0; the lineage keeps a keyed
+    digest of each exec's argv) and PID 1's fork or cron's daily run
+    (`/etc/cron.daily/logrotate` under `run-parts`, a short root chain up to
+    a cron daemon PID 1 forked); npm's writer has no code-loading environment
+    (`ENV_LOADS`) and npm's CLI under a system path prefix (a prefix, not a
+    proof of root ownership; `~/.npm-init.js` and user-owned or namespaced
+    prefixes remain a declared residual, follow-up lot); CoreDNS's id is the leaf of a
+    `kubepods` cgroup and the sender shares the container init's PID and
+    mount namespaces; a resolver is the system's service (its unit's cgroup
+    under `system.slice`, PID 1's fork or NetworkManager's for dnsmasq,
+    system uids, no loader variable); the BPF probe's loader is its exec's
+    image as of the load (after the bus barrier), `lsm` PID 1's alone; the
+    drain notes a created child's size under its own inode. The lab found
+    the timer's real `logrotate.service` still High: it runs in a mount
+    namespace of its own, where the exec record kept no image — the lineage
+    now keeps the LSM identity of the executed file for a packaged-file
+    comparison (`exec_file`; networkd's probes run in one too).
+    Lab, ubuntu2404 (6.8, systemd 255), as measured: the timer's
+    `logrotate.service` with every log due (rsyslog's logs by `copytruncate`
+    for the round, so each rotation is a judged in-place write): FIM-005
+    Low ×3 and ×2 by logrotate, no High from it (before the mount-namespace
+    fix: High ×2 and ×1 on syslog); controls — `systemd-run logrotate -f
+    /etc/logrotate.conf` FIM-005 High by logrotate (and FIM-019 High on wtmp
+    in another round), the packaged invocation by hand FIM-005 High; the
+    review's anacron-by-hand probe and PID 1's fork, each with a
+    configuration of the caller's (syslog and wtmp by `copytruncate`):
+    FIM-005 High on syslog and FIM-019 High (the kill) on wtmp, by
+    logrotate, each;
+    `npm ci` from a unit and from the session: ConfirmedIntrusion 0 and no
+    record; the review's postinstall probe (`NODE_OPTIONS=--require` an
+    encryptor into `npm -v`), a package-shipped `npm-cli.js` and `node
+    enc.js`: ConfirmedIntrusion 1 and NN-L-IMP-001 Critical each;
+    systemd-resolved relaying 12 hash-shaped names under one zone: no
+    record, not restarted. Not measured in the lab: CoreDNS (no cluster on
+    the guests; unit tests), the BPF probes (systemd 255 makes none).
+    Seen, not changed: with `copytruncate` (not Ubuntu's default) rsyslogd's
+    first write after the truncation is FIM-005 High; the default rename
+    and create races the drain's enrollment of the new file (no FIM record
+    at all for some runs).
+  - Mutations of the review's round: 37 mutants of the new guards, 37
+    caught by named tests (one after a test added: cron.daily's script
+    without `run-parts`); 9 argued equivalent (an argv count before
+    length-prefixed elements, an empty argv's digest, `ppid == 1` and the
+    last hop, `..` and a relative path already outside `in_system_tree`, a
+    nested unit name, NetworkManager only in dnsmasq's units, four uids).
+  - Level unchanged: the change removes false positives; no capability gains
+    evidence it lacked.

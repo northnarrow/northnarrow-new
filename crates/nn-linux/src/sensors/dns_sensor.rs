@@ -420,6 +420,8 @@ pub fn query_event(raw: &DnsQueryRaw, decoded: Option<&QnameOut>) -> Event {
         family: raw.family,
         timestamp_ns: raw.timestamp_ns,
         qname_partial,
+        // lot 340: proven by the pump with the sender's image
+        known_resolver: false,
     }
 }
 
