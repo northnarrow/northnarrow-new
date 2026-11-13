@@ -193,8 +193,13 @@ fn every_rule_response_writes_its_intent_then_its_outcome() {
     // every intent before its own outcome, and each record written after
     let records: Vec<DetectionRecord> = sink.queued_for_test();
     assert_eq!(records.len(), actions.len());
+    // lot 341: each record names the action that would have run
     assert!(
-        records.iter().all(|r| r.response.contains("detect-only")),
+        records.iter().all(|r| matches!(
+            &r.verdict,
+            northnarrow_agent::detection_store::DetectionVerdict::Rule(a)
+                if r.response == nn_core::response::profile::would_have(&format!("{a:?}"))
+        )),
         "{records:#?}"
     );
     let st = d.status();

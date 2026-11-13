@@ -1116,8 +1116,10 @@ mod tests {
             .filter(|r| format!("{:?}", r.verdict).contains("KillProcessTree"))
             .collect();
         assert_eq!(r001.len(), 150, "every acting decision is recorded");
+        // lot 341: the record names the action that would have run
         assert!(
-            r001.iter().all(|r| r.response.contains("detect-only")),
+            r001.iter()
+                .all(|r| r.response == "would have: KillProcessTree"),
             "{r001:#?}"
         );
         let rows = journal.rows();

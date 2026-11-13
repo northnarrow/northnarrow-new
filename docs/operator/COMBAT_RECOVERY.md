@@ -73,7 +73,8 @@ that key on its own: upgrades and removals take it only when you pass it
 A line **without** a role list — which is what `nn-admin init` writes —
 gets the default allowlist **`unlock,audit-read`** only. `install.sh`
 appends an explicit list to the line it bootstraps,
-`unlock,audit-read,trusted-installer,config-manage`: `trusted-installer` is
+`unlock,audit-read,telemetry-read,trusted-installer,config-manage` (lot 341:
+`telemetry-read` reads the records, `nn-admin detections`): `trusted-installer` is
 what `install.sh --upgrade --grant-key` and `uninstall.sh --grant-key` use
 to open the window that lets them purge the protected pin root (review
 entry 39); `config-manage` signs the `*.local` overlays the agent loads

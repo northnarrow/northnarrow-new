@@ -253,6 +253,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // Lot 283c: the daemons' data directories (the mass-write arm's
     // own-data exemption). Write-denied like the other shipped lists.
     "daemon-data.v1",
+    // Lot 341 (alpha 2/4): the signed response profile and its signature.
+    // MUTATE-only like the other overlays (`config overlay set profile`).
+    "profile.local",
+    "profile.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -2951,6 +2955,9 @@ mod tests {
                 "export.local.sig",
                 // Lot 283c — APPENDED.
                 "daemon-data.v1",
+                // Lot 341 — APPENDED.
+                "profile.local",
+                "profile.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

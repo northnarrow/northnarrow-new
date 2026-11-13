@@ -351,6 +351,10 @@ pub struct AuditLog<K> {
     stamps: AuditStamps,
     /// How the run before this one ended (from the chain at open).
     previous_run: PreviousRun,
+    /// Lot 341 (the review of #550, F8): whether the last run that booted
+    /// ran its responses (its `agent_boot`'s `detect_only` false); `None`
+    /// without such a row.
+    previous_boot_enforced: Option<bool>,
     /// External audit ATP-004: the chain holds a successful
     /// `rotate_keys_add` — the one-key bootstrap is over for good. The
     /// log is never rotated (module doc); a rotation must carry this.
@@ -434,6 +438,7 @@ impl<K: ChainSigner> AuditLog<K> {
             agent_id,
             last_hash: tail.last_hash,
             previous_run: tail.previous_run,
+            previous_boot_enforced: tail.previous_boot_enforced,
             second_key_added: tail.second_key_added,
             rows: tail.seq.rows(),
             numbered: tail.seq.numbered(),
@@ -466,6 +471,7 @@ impl<K: ChainSigner> AuditLog<K> {
             agent_id,
             last_hash: GENESIS_PREV_HASH.to_string(),
             previous_run: PreviousRun::None,
+            previous_boot_enforced: None,
             second_key_added: false,
             rows: 0,
             numbered: false,
@@ -569,6 +575,38 @@ impl<K: ChainSigner> AuditLog<K> {
     /// How the previous run ended (see [`PreviousRun`]).
     pub fn previous_run(&self) -> &PreviousRun {
         &self.previous_run
+    }
+
+    /// Lot 341 (the review of #550, F8): whether the run that booted last
+    /// before this one ran its responses — its signed `agent_boot` said
+    /// `detect_only: false`. `None`: no earlier boot in this chain.
+    pub fn previous_boot_enforced(&self) -> Option<bool> {
+        self.previous_boot_enforced
+    }
+
+    /// Lot 341 (the review of #550, F8): sign that this boot observes only
+    /// although the run before it enforced, and nothing signed asked for it
+    /// (`detail`: the profile and where it came from) — an
+    /// `integrity_drift` of kind [`PROFILE_DOWNGRADED_KIND`].
+    pub fn attest_profile_downgrade(&mut self, detail: &str) -> Result<()> {
+        let pid = self.stamps.self_pid;
+        self.append(AuditEntryDraft {
+            op: INTEGRITY_DRIFT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": PROFILE_DOWNGRADED_KIND,
+                "detail": detail,
+                "at_boot": true,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: pid,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .map(|_| ())
+        .context("audit log: profile_downgraded entry")
     }
 
     /// External audit ATP-004: a second admin key was added at some point
@@ -961,6 +999,11 @@ pub struct AgentBuild {
     pub bpf_guard_enforce: bool,
 }
 
+/// Lot 341 (the review of #550, F8): the `integrity_drift` kind of a boot
+/// that observes only after a run that enforced, with no signed
+/// `profile.local` asking for it ([`AuditLog::attest_profile_downgrade`]).
+pub const PROFILE_DOWNGRADED_KIND: &str = "profile_downgraded";
+
 /// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
@@ -1104,6 +1147,8 @@ struct TailState {
     verified_boot: bool,
     /// External audit EVD-020: the last row's `agent_id`.
     last_agent_id: Option<String>,
+    /// Lot 341 (F8): the last run's `agent_boot` said `detect_only: false`.
+    previous_boot_enforced: Option<bool>,
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -1135,6 +1180,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 anchoring_started: false,
                 verified_boot: false,
                 last_agent_id: None,
+                previous_boot_enforced: None,
             });
         }
         Err(e) => return Err(refused_open::<H>(e, path, "to read its chain")),
@@ -1151,6 +1197,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     let mut verified_boot = false;
     let mut anchoring_started = false;
     let mut last_agent_id = None;
+    let mut previous_boot_enforced = None;
     for (n, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -1186,6 +1233,11 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 {
                     verified_boot = true;
                 }
+                previous_boot_enforced = entry
+                    .extra
+                    .get("detect_only")
+                    .and_then(|v| v.as_bool())
+                    .map(|d| !d);
                 previous = PreviousRun::Abrupt {
                     booted_at: entry.ts.clone(),
                     last_entry_at: entry.ts.clone(),
@@ -1223,6 +1275,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
         anchoring_started,
         verified_boot,
         last_agent_id,
+        previous_boot_enforced,
     })
 }
 
@@ -2237,6 +2290,44 @@ mod tests {
             .unwrap();
         assert_eq!(e.extra["detect_only"], false);
         assert!(e.extra["detect_only_source"].is_null());
+    }
+
+    /// Named (lot 341, the review of #550 F8): the next open knows whether
+    /// the run that booted last enforced — from its signed `agent_boot` —
+    /// and a downgrade is signed as an `integrity_drift`.
+    #[test]
+    fn the_previous_boot_s_enforcement_is_read_from_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key_path = dir.path().join("agent.sig.key");
+        let open = || {
+            let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+            AuditLog::open(&path, key, [7u8; 16]).unwrap()
+        };
+        let mut log = open();
+        assert_eq!(log.previous_boot_enforced(), None);
+        log.boot_probe(None, "verified", "attested", &test_build())
+            .unwrap();
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.previous_boot_enforced(), Some(true));
+        log.boot_probe(
+            Some("profile alpha (install manifest)"),
+            "verified",
+            "attested",
+            &test_build(),
+        )
+        .unwrap();
+        log.attest_profile_downgrade("alpha (install manifest) after an enforcing run")
+            .unwrap();
+        drop(log);
+        let log = open();
+        assert_eq!(log.previous_boot_enforced(), Some(false));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["op"], INTEGRITY_DRIFT_OP);
+        assert_eq!(last["extra"]["kind"], PROFILE_DOWNGRADED_KIND);
+        assert_eq!(last["result"], "detected");
     }
 
     // ── External audit NN-AUD-108 (lab PR 160) ──────────────────────

@@ -69,10 +69,11 @@ cp -p docs/operator/*.md "$tree/docs/operator/"
 cat > "$tree/README-RELEASE.md" <<EOT
 NorthNarrow ${ver} (${arch}-linux)
 
-Install:   sudo ./deploy/install.sh            then: systemctl enable --now northnarrow-agent northnarrow-watchdog
-Upgrade:   sudo ./deploy/install.sh --upgrade
-Uninstall: sudo ./deploy/uninstall.sh [--purge]
-Docs:      docs/operator/INSTALL_UPGRADE_UNINSTALL.md, docs/operator/COMBAT_RECOVERY.md
+Install:   sudo ./deploy/install.sh            the observe-only alpha profile, started and enabled at boot
+           (--no-enable: installed, not started; --profile enforcing: an enforcing install)
+Upgrade:   sudo ./deploy/install.sh --upgrade --grant-key <admin key>
+Uninstall: sudo ./deploy/uninstall.sh [--purge] --grant-key <admin key>
+Docs:      docs/operator/ALPHA_PROFILE.md, docs/operator/INSTALL_UPGRADE_UNINSTALL.md, docs/operator/COMBAT_RECOVERY.md
 Verify:    sha256sum -c SHA256SUMS, then for each file (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5):
            gh attestation verify <file> --repo northnarrow/northnarrow-new --deny-self-hosted-runners --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v'
 Build:     \$(git describe --always --dirty 2>/dev/null || echo unknown) — $(date -u +%Y-%m-%dT%H:%M:%SZ)

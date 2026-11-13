@@ -10769,3 +10769,126 @@ number in parentheses is a lab PR.
   - Level unchanged: the gate is the lab's and the nightly's; C23's
     provisional waits on the nightly on the five guests, now with the
     verifier step.
+
+- **Lot 341 — the observe-only `alpha` profile, install and uninstall as a
+  tester meets them (alpha 2/4; C17, C23, C27, C28; no level changes).**
+  - What was open: a tester's first install had to choose between an
+    enforcing agent (a false positive kills) and `--detect-only` in a unit
+    drop-in (a weakening the agent itself reports); detect-only was resolved
+    in three places (the integrity phase, the attach, the capability check),
+    and two paths ignored it — the module-load judge refused untrusted modules
+    (its default deny mode) and the exec quarantine killed, at its start and
+    its stop, a process an earlier enforcing run owed a kill; a suppressed
+    response was recorded `suppressed (detect-only)`, naming no action;
+    `install.sh` started nothing, checked no kernel, ended with ten steps; an
+    agent whose socket did not answer could not be uninstalled without a
+    manual reboot procedure.
+  - Done: the `alpha` profile, one more input of the single gate (a signed
+    `profile.local`, overlay kind 18, else the install manifest's, else
+    enforcing), resolved once (`boot::integrity::resolve_gate`, ratchet
+    `xtask/tests/alpha_profile.rs`); the exec quarantine's owed kill gated
+    (the module-load judge too in round 1, undone in round 3); `would have:
+    <action>`; the agent's self-protection unchanged. `install.sh`: alpha on a fresh install, `enable --now`
+    with the upgrade's health check (`--no-enable`), a host support check
+    before any change, a short summary; `uninstall.sh`: a wedged agent's
+    removal finished at the next boot (exit 3); `nn-admin status`: a human
+    summary first. 48 targeted mutants, each caught by a named test.
+  - Lab, as measured (our guests, lease k341): Debian 13 (6.12.116) and Ubuntu 26.04 (7.0.0):
+    a fresh `install.sh` (alpha, its own `enable --now`, health check passed,
+    the summary printed), then a cold boot: agent and watchdog active and
+    enabled right after and 30 s later, 77 pins, 49 LSM programs; `status`
+    `OBSERVE-ONLY — profile alpha (install manifest)`, sensors OK. The dev
+    corpus (24 steps): no kill (the corpus report's kills: none; would have:
+    `KillProcessTree` ×1, the control run as www-data, which ran its 20 s —
+    rc 137 on an enforcing agent). The R001 probe (a copy of bash run from
+    `/tmp` as www-data, 12 s): rc 0 after 12 s, its record `would have:
+    KillProcessTree`; the actions chain since the install: every outcome
+    `would_execute`, none carried out. `uninstall.sh --purge`, then a cold
+    boot: against the host before the install, no package, no `/etc` file,
+    no unit file, no bpffs entry, no LSM program, no account or group and no
+    NorthNarrow path changed (the corpus's own apt runs aside, on Debian
+    13's first round). Ubuntu 24.04 (6.8), the full round: the same —
+    active and enabled after the cold boot (77 pins, 48 LSM programs), the
+    corpus without a kill (the control as www-data ran its 20 s; would have
+    `KillProcessTree` ×1), the probe not killed, the diff empty. A wedged
+    agent, Debian 13: the agent and its watchdog frozen (`systemctl freeze`
+    inside a window that then closed; a SIGSTOP is refused by the task_kill
+    hook even inside one), `nn-admin status` silent; `uninstall.sh --purge`
+    without a key: exit 3, both units disabled, `northnarrow-uninstall`
+    enabled; after the reboot the one-shot removed everything (`uninstall
+    complete`, itself gone) and the diff against the host before the
+    install was empty.
+  - Round 2 (the coordinator's decision of 13/11: the alpha never breaks
+    anything on a tester's machine; SUPERSEDED by round 3): under `alpha` the host-wide denies —
+    a foreign tracing, LSM, extension or struct_ops BPF program's load, a
+    root cgroup/sysctl attach, the kprobes and lockdown switches, kexec, the
+    sysctl guard, cgroup v1 writes, a ptrace of PID 1 — observe, each
+    recorded "would deny" (a bit of the record's operation, `would have:
+    deny:<op>`); the denies that protect the agent (its processes, files,
+    units, pins, cgroup and BPF objects) hold under every profile. One
+    kernel switch (`HOST_DENY_MODE`, written from the resolved profile
+    before any attach, frozen; `--detect-only` leaves the denies on); a ratchet (`xtask/tests/host_deny.rs`) classifies
+    every deny site of the eBPF object (routed through the switch, or the
+    agent's self-protection with its reason, or a response path the gate
+    already sets). Lab, as measured
+    (lease k341, the BPF guard enforcing — `NN_BPF_DEFENSE_ENFORCE=1`, the
+    production default — and `nn-lab.sh host-deny-check`): Ubuntu 24.04
+    (6.8), an alpha install: a tracepoint and a kprobe program loaded by a
+    foreign root process, `bpftrace -e 'tracepoint:syscalls:sys_enter_openat
+    …'` ran (1379 opens counted), `opensnoop-bpfcc` (BCC) ran, each recorded
+    `would have: deny:bpf_prog_type (would deny: …)` (status: `would have :
+    deny:bpf_prog_type x5`); a handle on `PROTECTED_PIDS` (read-write and
+    read-only), on one of the agent's programs by id, `bpftool map delete`
+    on it, a handle on and `bpftool link detach` of a link pin, a handle by
+    id on each of its 82 links: all EPERM, the 33 link pins kept, the agent
+    the same pid. An enforcing install, the same check: both loads EPERM,
+    bpftrace and `opensnoop-bpfcc` refused (`Operation not permitted`), each
+    signed `bpf_prog_type` "denied in kernel"; the agent's objects refused as
+    under alpha. Debian 13 (6.12), alpha: the same (bpftrace 732 opens; no
+    BCC tool there, the raw_tracepoint loader instead; 84 link handles
+    refused). Both alpha installs uninstalled to the host before them (the
+    check's own apt packages aside); the enforcing one's `uninstall.sh`, run
+    from the lab user's tree 30 s after the agent's start, was killed (rc
+    137; most likely R009's root exec from a user path, the lab's known
+    flake after a start — the purge took the journal) and the install was
+    removed by a later round.
+  - Round 3 (the review of #550; the coordinator's corrected decision of
+    13/11): round 2's host-wide denies were self-protection in disguise —
+    `kernel.ftrace_enabled=0`, `kprobes/enabled=0` and lockdown blind the
+    deny hooks, a foreign tracing program's `bpf_send_signal` kills the
+    agent past `task_kill` (`SEND_SIG_PRIV`), a v1 freezer freezes it, a
+    ptrace of PID 1 races the trusted writes the hooks let PID 1 make, an
+    untrusted module or a kexec image runs code no hook sees. They are
+    enforced under every profile again: `HOST_DENY_MODE`, the "would deny"
+    bit and record are removed (no switch left to race, the review's F5),
+    the module-load judge takes no gate (F2, F7). The ratchet
+    (`xtask/tests/deny_routes.rs`) lists every deny site as self-protection
+    with its reason or as a gated response path, and walks every function a
+    self-protection site calls: a gate's switch named anywhere in that
+    closure, or outside its own file, fails it — the review's planted
+    helper (F6) and three variants (two calls deep, an alias, the old
+    switch back) are its cases. Testers' tracing tools: `install.sh
+    --allow-bpf-tools` / `--allow-bpf-loader <path>` sign `bpf-loader-allow`
+    lines with the install's key through the started agent. An `alpha`
+    start after an enforcing run with no signed `profile.local` signs an
+    `integrity_drift` `profile_downgraded` (F8).
+    Lab, as measured (lease k341, the BPF guard enforcing, `nn-lab.sh
+    host-deny-check` rewritten: H0–H7): Ubuntu 24.04 (6.8), a plain alpha
+    install — a tracepoint and a kprobe program of a foreign root process
+    EPERM, `bpftrace` refused (rc 255, "Error loading program"),
+    `opensnoop-bpfcc` refused (`Operation not permitted`), the agent's map,
+    program and 82 link handles EPERM (33 pins kept), `sysctl -w
+    kernel.ftrace_enabled=0` refused (still 1), `kprobes/enabled=0` refused,
+    a SIGSTOP to the agent refused, a move into a mounted v1 freezer
+    hierarchy refused; the R001 probe not killed (`would have:
+    KillProcessTree`, 0 actions carried out). The same host with
+    `install.sh --allow-bpf-tools`: lines for `/usr/bin/bpftrace` and
+    `/usr/bin/python3` signed and applied, `bpftrace` ran (446 opens),
+    `opensnoop-bpfcc` ran, the python loads let through (`bpf_prog_opt_out`),
+    everything else refused as before. Debian 13 (6.12.116): the same
+    (`bpftrace` refused, then 460 opens with the flag; BCC cannot compile
+    there — no kheaders — the raw_tracepoint loader stood in). Every
+    `uninstall.sh --purge` rc 0; after a cold boot the diff against the host
+    before the round was empty on both (the check's own apt packages aside).
+  - Levels unchanged: the profile changes no capability's reach; it is the
+    alpha's default (C17's responses run only after a signed switch).

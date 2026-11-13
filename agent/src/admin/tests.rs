@@ -1014,6 +1014,8 @@ fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
         event_bus_decision: None,
         response_dispatch: None,
         export: None,
+        profile: None,
+        records_today: None,
     });
     emit_audit_for(
         &status_req,
@@ -2247,6 +2249,51 @@ fn the_signed_telemetry_status_needs_a_read_role() {
         };
         assert_eq!(row.result, want, "{roles}");
     }
+}
+
+/// Named (lot 341): the signed status carries the response profile and
+/// today's records the start handed the socket; the unsigned one neither.
+#[test]
+fn the_signed_status_carries_the_profile_and_today_s_records() {
+    let dir = TempDir::new().unwrap();
+    let isolator = NetworkIsolator::new(rules_path()).unwrap();
+    let posture = PostureMachine::new();
+    let state = response_state(&dir);
+    let agent_id = [0x1e; 16];
+    let today = nn_proto::admin_protocol::RecordsToday {
+        day: "2026-11-13".to_string(),
+        since: "2026-11-13T00:00:00Z".to_string(),
+        by_severity: vec![("High".to_string(), 1)],
+        would_have: vec![("KillProcessTree".to_string(), 1)],
+    };
+    let handles = AdminHandles {
+        profile: Some("alpha (install manifest)".to_string()),
+        records_today: Some({
+            let t = today.clone();
+            Arc::new(move || t.clone()) as crate::admin::RecordsTodaySource
+        }),
+        ..AdminHandles::default()
+    };
+    let signing = SigningKey::generate(&mut OsRng);
+    let (auth, _d) = build_auth_with_roles(&signing, "telemetry-read", agent_id);
+    let auth = ConnAuth::new(&auth);
+    let req = telemetry_req(&signing, &auth, agent_id);
+    let mut fps = Vec::new();
+    let r = dispatch_telemetry_status(
+        req,
+        &auth,
+        &posture,
+        &isolator,
+        Some(&state),
+        &handles,
+        &mut fps,
+    );
+    let st = r.status.expect("the whole status");
+    assert_eq!(st.profile.as_deref(), Some("alpha (install manifest)"));
+    assert_eq!(st.records_today, Some(today));
+    let public = public_status(&posture, &isolator, Some(&state));
+    assert_eq!(public.profile, None);
+    assert_eq!(public.records_today, None);
 }
 
 /// The signed verb refuses a payload signed for another operation (a

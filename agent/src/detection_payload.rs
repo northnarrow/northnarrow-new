@@ -249,7 +249,8 @@ pub struct DetectionRecord {
     /// What the response layer actually did: a [`ResponseAction`] name
     /// when the action was carried out, the name followed by the outcome
     /// when it was not (`"KillProcess (already gone)"`, see
-    /// [`describe_response`]), `"suppressed (detect-only)"`, or `"none"`.
+    /// [`describe_response`]), `"would have: <action>"` (lot 341; `"suppressed (detect-only)"`
+    /// before), or `"none"`.
     pub response: String,
     /// Detection sub-type: the rule `category` (rule path) or, in a record
     /// written before Wave 4, the advisor's threat-classification `kind`.

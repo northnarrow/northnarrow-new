@@ -21,6 +21,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -45,6 +46,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -69,6 +71,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -93,6 +96,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -117,6 +121,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -141,6 +146,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -165,6 +171,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -189,6 +196,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -213,6 +221,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -237,6 +246,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -261,6 +271,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -285,6 +296,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -309,6 +321,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -333,6 +346,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -357,6 +371,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -381,6 +396,7 @@ exit: 0
 | rule-policy              signed (ts 1750000000, keys 730a5edc)
 | nodns-allow              signed (ts 1750000000, keys 730a5edc)
 | export                   signed (ts 1750000000, keys 730a5edc)
+| profile                  signed (ts 1750000000, keys 730a5edc)
 --- stderr
 (empty)
 
@@ -406,6 +422,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -431,6 +448,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -456,6 +474,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -480,6 +499,7 @@ exit: 1
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 --- stderr
 (empty)
 
@@ -965,6 +985,14 @@ exit: 0
 |   "v": 1
 | }
 
+### overlay-sign.kind.profile
+$ nn-admin config overlay sign profile --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a profile overlay: profile.local: no `profile = alpha|enforcing` line
+
 ### overlay-sign.to-out
 $ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --out elsewhere.sig
 exit: 0
@@ -1048,7 +1076,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow, export
+| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow, export, profile
 
 ### overlay-sign.kind-by-file-name
 $ nn-admin config overlay sign process-comm-allowlist.local --file overlay.local --key key-a --agent-id-file agent_id

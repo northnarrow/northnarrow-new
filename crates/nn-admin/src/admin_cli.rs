@@ -283,6 +283,13 @@ pub struct StatusOutcome {
     /// Lot 276: the export (`StatusResponse::export`; `None` from an older
     /// agent, the unsigned reply, or an agent with no export configured).
     pub export: Option<nn_proto::admin_protocol::ExportStatus>,
+    /// Lot 341 (alpha 2/4): the response profile and its source
+    /// (`StatusResponse::profile`; `None` from an older agent or the
+    /// unsigned reply).
+    pub profile: Option<String>,
+    /// Lot 341: today's records by severity and the suppressed responses
+    /// (`StatusResponse::records_today`).
+    pub records_today: Option<nn_proto::admin_protocol::RecordsToday>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -549,6 +556,8 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         event_bus_decision: resp.event_bus_decision,
         response_dispatch: resp.response_dispatch,
         export: resp.export,
+        profile: resp.profile,
+        records_today: resp.records_today,
         telemetry_signed: signed,
     }
 }
@@ -3973,6 +3982,8 @@ mod tests {
                     event_bus_decision: None,
                     response_dispatch: None,
                     export: None,
+                    profile: None,
+                    records_today: None,
                 }),
             );
         });

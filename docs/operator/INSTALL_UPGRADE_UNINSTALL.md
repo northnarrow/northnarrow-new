@@ -13,7 +13,7 @@ with `rm -f` or `kill -9`, they are denied by design.
 
 | Operation | Command | Keeps keys / audit chain / state |
 |---|---|---|
-| Fresh install | `sudo ./deploy/install.sh` then `systemctl enable --now …` | n/a (bootstraps them) |
+| Fresh install | `sudo ./deploy/install.sh` (lot 341: the observe-only `alpha` profile, both units started and enabled at boot; `--no-enable`, `--profile enforcing`; `--allow-bpf-tools` / `--allow-bpf-loader <path>` for a tester's bpftrace and BCC, ALPHA_PROFILE.md §1.2) | n/a (bootstraps them) |
 | Upgrade in place | `sudo ./deploy/install.sh --upgrade --grant-key <admin.key>` | **yes** |
 | Uninstall | `sudo ./deploy/uninstall.sh` | **yes** (`/etc/northnarrow`, `/var/lib/northnarrow`) |
 | Retire the host | `sudo ./deploy/uninstall.sh --purge --grant-key <admin.key>` | no — everything removed |
@@ -67,10 +67,36 @@ control-surface bait files; bootstraps an admin keypair if
 `admin.pub` is absent — the private half goes to
 `/root/northnarrow-admin.key` (`--admin-key-out PATH`; never under
 `/etc/northnarrow` or `/var/lib/northnarrow`): move it off the host, see
-`COMBAT_RECOVERY.md` §1 — and does **not** start anything. Enable the
-agent first, then the watchdog. If a file already exists at the key path
+`COMBAT_RECOVERY.md` §1. If a file already exists at the key path
 and `admin.pub` does not, `install.sh` leaves both alone and says so
 (`uninstall.sh --purge` removes the bootstrap key with the rest).
+
+**Lot 341 (alpha 2/4): a fresh install starts the agent.** Before it
+changes anything `install.sh` refuses a host it cannot run on, each reason
+with what to do (not x86_64, systemd not the init system, no kernel BTF, a
+kernel the agent's `--btf-check` does not support, and — when it is to
+start the units — the BPF LSM off or bpffs not mounted); a distribution
+outside the verified matrix is named, not refused. It records the response
+profile in `install-manifest.json` — **`alpha`, observe-only**, unless
+`--profile enforcing` ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)) — then starts
+the agent, then the watchdog, and enables both at boot (`systemctl enable
+--now`), and checks their health as an upgrade does (both active, every
+deny hook attached, the admin socket answering, the watchdog registered):
+a start that does not pass is named and the run fails. `--no-enable` leaves
+both stopped and not enabled (`systemctl enable --now northnarrow-agent
+northnarrow-watchdog` later). The run ends with a short summary: the
+profile, whether the agent runs, whether bpftrace and BCC may load
+(`--allow-bpf-tools`, `--allow-bpf-loader <path>`: signed `bpf-loader-allow`
+lines applied through the started agent, [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)
+§1.2), how to see the status and the records, how to uninstall, and the
+admin key to move off the host. Every later run of
+`install.sh` (an upgrade, a reinstall over a kept `/etc/northnarrow`) keeps
+the profile the manifest has; a `--profile` that would switch it is refused
+— switching an installed agent is a signed `nn-admin config overlay set
+profile`. The bootstrap key's `admin.pub` line also carries
+`telemetry-read`, for `nn-admin detections`. A package's configure step
+records the profile the same way and leaves the start to the package
+manager.
 
 If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
@@ -448,6 +474,18 @@ If an unrelated NorthNarrow process (an e2e test, a manual
 `northnarrow-agent` run) still holds the LSM programs, the script stops
 and names the condition instead of leaving a half-removed host.
 
+**A wedged agent** (lot 341): its unit active but `nn-admin status` not
+answered within 10 s (`ANSWER_TIMEOUT`), or, with stale protected pins, an
+installed agent that does not come up for the window. No window can open,
+and its hooks refuse the stop until the next boot (bpffs does not survive
+one). The script disables both units (their enablement links are not
+protected), copies itself to `/var/lib/northnarrow-uninstall/`, installs and
+enables `northnarrow-uninstall.service` — a one-shot ordered before the
+agent's unit that runs that copy with the same options and `--at-boot`,
+then removes itself — and exits **3**: reboot to finish. No key is needed on
+that path; nothing else is removed before the reboot. An agent that
+answers keeps the rule above: without the window, nothing is disabled.
+
 The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
 NorthNarrow program, config, state or bait behind — and every foreign LSM
 program in place — then reinstalls (`nn-lab.sh uninstall-check`).
@@ -485,7 +523,9 @@ on.
 kexec kernel image load (`kexec -l`, `kexec -p`, `systemctl kexec`; both
 `kexec_load` and `kexec_file_load`) outside the trusted-installer window,
 and records it as an anti-tamper denial (NN-L-AT-001). A loaded image let
-root reboot at once into a kernel without the agent. kdump is not affected
+root reboot at once into a kernel without the agent. Lot 341: the same
+under the observe-only `alpha` profile — the host's integrity, not a
+response ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). kdump is not affected
 at boot: the agent's unit starts after `kdump.service`, so the crash kernel
 is already loaded. To reload it later (`kdumpctl restart`, a crashkernel
 change), open the window first:
@@ -823,7 +863,8 @@ come (`rollback-floor`).
 
 Kinds: `fim-paths`, `process-comm-allowlist`, `netflow-comm-allowlist`,
 `netflow-blocklist`, `netflow-ja3-blocklist`, `mass-write-carveout`,
-`escalation-allow`. Content is checked with the loader's own rules before
+`escalation-allow`, and since lot 341 `profile` (`profile = alpha` or
+`profile = enforcing`: the response profile, [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)). Content is checked with the loader's own rules before
 it is signed or stored (a malformed line is refused, not silently dropped).
 Lot 283c: a line `+<unit>.service <directory>/` in `mass-write-carveout`
 is no carve-out — it adds a daemon's data directory to the shipped

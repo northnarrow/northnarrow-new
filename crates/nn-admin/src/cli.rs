@@ -2741,6 +2741,8 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.event_bus.is_none()
         && out.event_bus_decision.is_none()
         && out.response_dispatch.is_none()
+        && out.profile.is_none()
+        && out.records_today.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2969,6 +2971,97 @@ fn flow_sock_line(out: &StatusOutcome) -> String {
         _ => "kernel FLOW_SOCK_MAP                  : (unknown: agent predates the counters)"
             .to_string(),
     }
+}
+
+/// Lot 341 (alpha 2/4): the human summary at the top of `nn-admin status`
+/// — the posture and the response profile, the sensors' health, today's
+/// records by severity and the responses that would have run — before the
+/// details. Without `--key` the agent withholds all but the posture.
+fn summary_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
+    let mut lines = vec!["── summary ──────────────────────────────────────────────".to_string()];
+    let posture = format!("{:?}", out.posture);
+    if telemetry_withheld(out) {
+        lines.push(format!("posture           : {posture}"));
+        lines.push(
+            "profile, sensors, records: withheld — `nn-admin status --key <key>` (a key with \
+             audit-read or telemetry-read) shows them"
+                .to_string(),
+        );
+        lines.push("─────────────────────────────────────────────────────────".to_string());
+        return lines;
+    }
+    let observe = out.detect_only == Some(true);
+    let mode = match (&out.profile, observe) {
+        (Some(p), true) if p.starts_with("alpha") => format!(
+            "{} — profile {p}: nothing is killed, blocked or quarantined; every verdict is \
+             recorded with what it would have done",
+            colorize("OBSERVE-ONLY", "33", tty)
+        ),
+        (_, true) => format!(
+            "{} ({}) — no response action runs",
+            colorize("OBSERVE-ONLY", "33", tty),
+            out.detect_only_source
+                .as_deref()
+                .unwrap_or("source not reported")
+        ),
+        (Some(p), false) => format!("{} — profile {p}", colorize("ENFORCING", "32", tty)),
+        (None, false) if out.detect_only == Some(false) => {
+            colorize("ENFORCING", "32", tty).to_string()
+        }
+        (None, _) => "(not reported: the agent predates the profile)".to_string(),
+    };
+    lines.push(format!("posture           : {posture}, {mode}"));
+    let lost = out.ringbuf_drops_total.unwrap_or(0);
+    let sensors = match &out.degradations {
+        None => "(not reported: the agent predates it)".to_string(),
+        Some(d) if d.is_empty() && lost == 0 => format!(
+            "{} — no degradation, no event lost",
+            colorize("OK", "32", tty)
+        ),
+        Some(d) => {
+            let mut why = Vec::new();
+            if !d.is_empty() {
+                why.push(format!("{} degradation(s), listed below", d.len()));
+            }
+            if lost > 0 {
+                why.push(format!("{lost} event(s) lost since the start"));
+            }
+            format!("{} — {}", colorize("DEGRADED", "31", tty), why.join(", "))
+        }
+    };
+    lines.push(format!("sensors           : {sensors}"));
+    match &out.records_today {
+        None => lines.push("records today     : (not reported: the agent predates it)".to_string()),
+        Some(r) => {
+            let total: u64 = r.by_severity.iter().map(|(_, n)| n).sum();
+            let by = if r.by_severity.is_empty() {
+                "none".to_string()
+            } else {
+                r.by_severity
+                    .iter()
+                    .map(|(sev, n)| format!("{n} {sev}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            lines.push(format!(
+                "records today     : {total} ({by}) — UTC day {}, counted since {}; \
+                 `nn-admin detections` lists them",
+                r.day, r.since
+            ));
+            let would = if r.would_have.is_empty() {
+                "none".to_string()
+            } else {
+                r.would_have
+                    .iter()
+                    .map(|(a, n)| format!("{a} x{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            lines.push(format!("would have        : {would}"));
+        }
+    }
+    lines.push("─────────────────────────────────────────────────────────".to_string());
+    lines
 }
 
 /// External audit CMB-018 (lab PR 193): whether the agent enforces, and
@@ -3726,7 +3819,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{},\"program_copies\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3784,6 +3877,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.response_dispatch).unwrap_or_else(|_| "null".to_string()),
             // R13 (lab PR 271).
             manifest_status_json(out),
+            // Lot 341 (alpha 2/4).
+            serde_json::to_string(&out.profile).unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&out.records_today).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
             // lot 313 (the review of #549, F1)
             program_copies_json(out),
@@ -3791,6 +3887,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
         return;
     }
     let tty = std::io::stdout().is_terminal();
+    // Lot 341 (alpha 2/4): the human summary first, then the details.
+    for line in summary_lines(out, tty) {
+        println!("{line}");
+    }
     println!("posture           : {:?}", out.posture);
     let iso = if out.network_isolation_engaged {
         colorize("ENGAGED", "31", tty)
@@ -5920,8 +6020,8 @@ mod flow_sock_line_tests {
     use super::{
         capability_lines, combat_evidence_line, degradation_lines, deny_fail_open_line,
         encrypted_flow_lines, exploit_guard_line, flow_sock_line, manifest_status_json,
-        manifest_status_lines, open_flow_lines, response_mode_line, telemetry_withheld, trust_line,
-        withheld_line,
+        manifest_status_lines, open_flow_lines, response_mode_line, summary_lines,
+        telemetry_withheld, trust_line, withheld_line,
     };
     use crate::admin_cli::StatusOutcome;
 
@@ -6053,8 +6153,86 @@ mod flow_sock_line_tests {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: None,
+            records_today: None,
             telemetry_signed: true,
         }
+    }
+
+    /// Named (lot 341, alpha 2/4): `status` starts with a human summary —
+    /// the posture and the profile, the sensors' health, today's records by
+    /// severity and what would have run — and without `--key` withholds
+    /// all but the posture.
+    #[test]
+    fn status_starts_with_a_human_summary() {
+        let mut o = outcome(None, None, None);
+        o.detect_only = Some(true);
+        o.detect_only_source = Some("profile alpha (install manifest)".to_string());
+        o.profile = Some("alpha (install manifest)".to_string());
+        o.degradations = Some(vec![]);
+        o.ringbuf_drops_total = Some(0);
+        o.records_today = Some(nn_proto::admin_protocol::RecordsToday {
+            day: "2026-11-13".to_string(),
+            since: "2026-11-13T09:30:00Z".to_string(),
+            by_severity: vec![("High".to_string(), 2), ("Low".to_string(), 7)],
+            would_have: vec![("KillProcessTree".to_string(), 2)],
+        });
+        let l = summary_lines(&o, false);
+        assert!(l[0].starts_with("── summary"), "{l:?}");
+        assert!(
+            l[1].starts_with("posture           : Observing, OBSERVE-ONLY — profile alpha (install manifest): nothing is killed"),
+            "{l:?}"
+        );
+        assert_eq!(
+            l[2],
+            "sensors           : OK — no degradation, no event lost"
+        );
+        assert!(
+            l[3].starts_with("records today     : 9 (2 High, 7 Low) — UTC day 2026-11-13, counted since 2026-11-13T09:30:00Z"),
+            "{l:?}"
+        );
+        assert_eq!(l[4], "would have        : KillProcessTree x2");
+        assert!(l[5].starts_with("────"), "{l:?}");
+        // degraded: the count, and the events lost
+        o.degradations = Some(vec!["module_load: x".to_string()]);
+        o.ringbuf_drops_total = Some(4);
+        assert_eq!(
+            summary_lines(&o, false)[2],
+            "sensors           : DEGRADED — 1 degradation(s), listed below, 4 event(s) lost since the start"
+        );
+        // no degradation, events lost: degraded too
+        o.degradations = Some(vec![]);
+        assert_eq!(
+            summary_lines(&o, false)[2],
+            "sensors           : DEGRADED — 4 event(s) lost since the start"
+        );
+        // enforcing, nothing today
+        o.detect_only = Some(false);
+        o.detect_only_source = None;
+        o.profile = Some("enforcing (signed profile.local)".to_string());
+        o.records_today = Some(nn_proto::admin_protocol::RecordsToday::default());
+        let l = summary_lines(&o, false);
+        assert_eq!(
+            l[1],
+            "posture           : Observing, ENFORCING — profile enforcing (signed profile.local)"
+        );
+        assert!(l[3].starts_with("records today     : 0 (none)"), "{l:?}");
+        assert_eq!(l[4], "would have        : none");
+        // detect-only by the flag, not the profile
+        o.detect_only = Some(true);
+        o.detect_only_source = Some("--detect-only".to_string());
+        assert!(
+            summary_lines(&o, false)[1]
+                .contains("OBSERVE-ONLY (--detect-only) — no response action runs"),
+            "{:?}",
+            summary_lines(&o, false)
+        );
+        // the unsigned reply: the posture only
+        let mut public = outcome(None, None, None);
+        public.telemetry_signed = false;
+        let l = summary_lines(&public, false);
+        assert_eq!(l[1], "posture           : Observing");
+        assert!(l[2].contains("withheld") && l[2].contains("--key"), "{l:?}");
     }
 
     /// Lab PR 215: `status` reports the operations the deny hooks let

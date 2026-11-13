@@ -147,6 +147,10 @@ fn telemetry_status(
         response_dispatch: dispatch,
         // Lot 276: the export, stage 8.
         export: handles.export.as_ref().map(|e| e.status()),
+        // Lot 341 (alpha 2/4): the profile and today's records, the
+        // summary at the top of `nn-admin status --key`.
+        profile: handles.profile.clone(),
+        records_today: handles.records_today.as_ref().map(|f| f()),
     }
 }
 

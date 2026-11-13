@@ -354,9 +354,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "the agent's own command line (its first argument, logged; `--worker`): no interpreter's",
     ),
     (
-        "agent/src/boot/integrity.rs",
+        // lot 341: moved from agent/src/boot/integrity.rs with the gate's
+        // resolver (the label `agent_boot` records)
+        "crates/nn-core/src/response/profile.rs",
         1,
-        "the agent's own `--detect-only` flag: no interpreter's",
+        "the agent's own `--detect-only` flag, named as the gate's source: no interpreter's",
     ),
     (
         "agent/src/boot/deny_selftest.rs",

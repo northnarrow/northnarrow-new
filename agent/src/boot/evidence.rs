@@ -54,6 +54,7 @@ pub(crate) fn attest(
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     identity: agent_id::AgentIdentity,
     detect_only_source: &Option<String>,
+    profile: &nn_core::response::profile::ResolvedProfile,
     integrity: northnarrow_agent::install_manifest::IntegrityOutcome,
     tracepoint_degraded: Option<String>,
     hook_args_degraded: Option<String>,
@@ -189,6 +190,18 @@ pub(crate) fn attest(
                                  wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
                                  crash or power loss; recorded in this boot's audit entry"
                             );
+                        }
+                        // Lot 341 (the review of #550, F8): an observe-only
+                        // start after a run that enforced, with no signed
+                        // profile.local asking for it, is signed
+                        if let Some(detail) = nn_core::response::profile::unsigned_downgrade(
+                            log.previous_boot_enforced(),
+                            profile,
+                        ) {
+                            error!(detail = %detail, "PROFILE DOWNGRADED WITHOUT A SIGNATURE");
+                            if let Err(e) = log.attest_profile_downgrade(&detail) {
+                                warn!(error = %format!("{e:#}"), "profile downgrade not recorded");
+                            }
                         }
                         Some(Arc::new(parking_lot::Mutex::new(log)))
                     }

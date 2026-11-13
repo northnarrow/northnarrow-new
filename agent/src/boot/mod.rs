@@ -246,6 +246,7 @@ async fn run(
         exec_cfg,
         detect_only,
         detect_only_source,
+        profile,
         caps_degraded,
         integrity,
         host_checks,
@@ -313,6 +314,7 @@ async fn run(
         &bpf_lsm_state,
         image,
         export_loaded.on().is_some(),
+        detect_only,
     )
     .await?;
     // the second review of #495 (R2): NN-L-NET-028's judgements in the beat
@@ -343,6 +345,7 @@ async fn run(
         &overlay_gate,
         identity,
         &detect_only_source,
+        &profile,
         integrity,
         tracepoint_degraded,
         hook_args_degraded,
@@ -590,6 +593,12 @@ async fn run(
                     .status_source(canary_detector.clone(), Some(Arc::clone(&ransom_tracker))),
             ),
             export: export.clone(),
+            // lot 341: the profile and today's records, for the summary
+            profile: Some(profile.describe()),
+            records_today: detection_sink.clone().map(|sink| {
+                Arc::new(move || sink.records_today())
+                    as northnarrow_agent::admin_socket::RecordsTodaySource
+            }),
         },
         armed_for_admin,
     );

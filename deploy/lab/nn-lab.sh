@@ -66,6 +66,7 @@
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh foreign-bpf-check  # lot 290: foreign BPF — the refused program types (a kprobe with bpf_probe_write_user, bpftrace outside/inside a window, the signed per-loader opt-out), the agent's objects off limits (FOREIGN_BPF_ONLY="F2 F4" a subset), the frozen maps, the cross-view (its status file, a program loaded in the agent's gap), systemd's BPF unit features, R011 Low
+#   deploy/lab/nn-lab.sh host-deny-check    # lot 341: the host's integrity and the agent's self-protection under every profile — a foreign tracing program, bpftrace and a BCC/libbpf tool refused unless the signed policy names their loader (install.sh --allow-bpf-tools), the agent's maps, programs and links, kernel.ftrace_enabled=0, kprobes/enabled=0, a SIGSTOP to the agent and a cgroup v1 freezer move refused (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1 in the units' environment)
 #   deploy/lab/nn-lab.sh own-pins-check     # lot 301: every BPF object the agent pins is its own to the guard — no link of the agent's (the start-in-cgroup tracker's among them) given to root by id, a handle on and a detach of the tracker's links refused and signed, the tracker still marking (the guard enforcing for the run; KEEP_ENFORCE=1 leaves it so)
 #   deploy/lab/nn-lab.sh deny-selftest-check  # lot 302: every deny hook proves it denies each round — the guard enforcing for the run, ROUNDS rounds with every attempt refused and reported, nothing judged or held back, the budgets spent before 2 rounds, one hook detached on purpose (DETACH=inode_mknod: the degradation, then the alert), the bpf() guard refusing through a restart gap (SKIP_DETACH=1 / SKIP_GAP=1 leave those out; KEEP_ENFORCE=1)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
@@ -105,7 +106,9 @@
 #   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
 #   NN_REPO (git toplevel of this script), NN_LAB_NIGHTLY_DOWN=1 (power the guest off at the end),
 #   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored"),
-#   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above).
+#   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above),
+#   NN_LAB_PROFILE (enforcing; alpha: `install` as an operator's fresh install —
+#   the observe-only profile, the units started by install.sh — lot 341).
 #   NN_LAB_CI=1: CI mode (.github/workflows/lab-vm.yml, lab PR 227), one KVM guest on a
 #   GitHub-hosted runner. KVM only (whpx and tcg refused), every cargo build --locked (the
 #   host's eBPF build, the guest's builds and test runs), ssh in batch mode with keepalives
@@ -1161,7 +1164,15 @@ cmd_install() {
     guest_provision_nftables
     # External audit DEP-007: the lab installs its synced source tree (no
     # MANIFEST.sha256), which install.sh now refuses without --source-tree.
-    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload' || die "install.sh failed (its output above)"
+    # Lot 341: the suites expect an enforcing agent, started by
+    # lab_start_units: `--profile enforcing --no-enable`. NN_LAB_PROFILE=alpha
+    # installs the operator's default instead — the observe-only alpha
+    # profile, started and enabled by install.sh itself (lot 341's round).
+    local flags="--source-tree --no-enable --profile enforcing"
+    if [[ ${NN_LAB_PROFILE:-enforcing} == alpha ]]; then
+        flags="--source-tree"
+    fi
+    vcargo "sudo ./deploy/install.sh $flags && sudo systemctl daemon-reload" || die "install.sh failed (its output above)"
     lab_start_units
 }
 
@@ -1744,6 +1755,17 @@ cmd_foreign_bpf_check() {
     # configuration maps, the cross-view. Needs a sync + install.
     vm_running || die "guest is not running"
     vssh "cd ~/northnarrow && FOREIGN_BPF_ONLY='${FOREIGN_BPF_ONLY:-}' bash deploy/lab/malsim/foreign-bpf-check.sh"
+}
+
+cmd_host_deny_check() {
+    # Lot 341 (deploy/lab/malsim/host-deny-check.sh): the host's integrity
+    # and the agent's self-protection under every profile — a foreign
+    # tracing load refused unless the signed policy names its loader; the
+    # agent's own BPF objects, the ftrace and kprobes switches, a signal to
+    # the agent and a v1 freezer move refused. Needs an install whose BPF
+    # guard enforces (NN_BPF_DEFENSE_ENFORCE=1).
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && bash deploy/lab/malsim/host-deny-check.sh"
 }
 
 cmd_own_pins_check() {
@@ -2391,7 +2413,7 @@ if [[ -n $left ]]; then echo "FAIL: northnarrow process still running: $left"; f
 if getent passwd northnarrow-worker >/dev/null || getent passwd northnarrow-scan >/dev/null || getent passwd northnarrow-export >/dev/null; then echo "FAIL: an agent account is left (northnarrow-worker / northnarrow-scan / northnarrow-export)"; fail=1; fi
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
-sudo ./deploy/install.sh --source-tree >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
+sudo ./deploy/install.sh --source-tree --no-enable --profile enforcing >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
 # External audit DEP-001: the bootstrap private key is written outside
 # /etc/northnarrow
 sudo test -s /root/northnarrow-admin.key || { echo "FAIL: no bootstrap key at /root/northnarrow-admin.key"; fail=1; }
@@ -2563,6 +2585,7 @@ case "${1:-help}" in
     sysctl-check)  cmd_sysctl_check ;;
     switches-check) cmd_switches_check ;;
     foreign-bpf-check) cmd_foreign_bpf_check ;;
+    host-deny-check) cmd_host_deny_check ;;
     own-pins-check) cmd_own_pins_check ;;
     selftest-check) cmd_selftest_check ;;
     deny-selftest-check) cmd_deny_selftest_check ;;

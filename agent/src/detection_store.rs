@@ -270,6 +270,13 @@ impl DetectionRecord {
 /// surfaced distinctly from a real action; a `Log` action (observe-only)
 /// is `"none"`.
 ///
+/// Lot 341 (alpha 2/4): a response the no-enforcement gate suppressed
+/// (`--detect-only`, a detect-only variable, the `alpha` profile) reads
+/// `"would have: <action>"` — `would have: KillProcessTree` — where it read
+/// `"suppressed (detect-only)"` and did not say which action; a `Log`
+/// decision, which would have run nothing, is `"none"` in either mode.
+/// Records already written keep their text.
+///
 /// External audit NN-AUD-234: the bare action name (`"KillProcess"`) means
 /// the action was carried out. It was also what a kill that found the
 /// process gone, was refused (a protected PID), was denied by the kernel or
@@ -290,8 +297,10 @@ impl DetectionRecord {
 /// partial: 2 not killed, 1 spared)"`.
 pub fn describe_response(report: &ExecutionReport) -> String {
     let root = match &report.primary {
-        ExecutionOutcome::WouldExecute { .. } => return "suppressed (detect-only)".to_string(),
         _ if report.action == ResponseAction::Log => return "none".to_string(),
+        ExecutionOutcome::WouldExecute { .. } => {
+            return nn_core::response::profile::would_have(&format!("{:?}", report.action))
+        }
         ExecutionOutcome::Killed { .. }
         | ExecutionOutcome::Blocked { .. }
         | ExecutionOutcome::Quarantined { .. }
@@ -440,6 +449,8 @@ struct SinkInner {
     /// [`DetectionSink::set_exe_resolver`]); without it, `/proc` alone
     /// ([`caller_exe`]).
     exe_resolver: std::sync::OnceLock<ExeResolver>,
+    /// Lot 341: today's records, counted as the writer appends them.
+    today: Mutex<crate::records_today::TodayCounts>,
 }
 
 /// Lot 273: `(pid, the denial's kernel time)` → the executable that pid ran
@@ -587,6 +598,12 @@ impl DetectionSink {
                 .fetch_max(q.len() as u64, Ordering::Relaxed);
         }
         self.inner.notify.notify_one();
+    }
+
+    /// Lot 341: today's records in the chain by severity, and the responses
+    /// the no-enforcement gate suppressed.
+    pub fn records_today(&self) -> nn_proto::admin_protocol::RecordsToday {
+        self.inner.today.lock().snapshot(Utc::now())
     }
 
     /// R12c (lab PR 270): stage 7's counts.
@@ -864,6 +881,7 @@ impl SinkInner {
             append_failed: AtomicU64::new(0),
             defense,
             exe_resolver: std::sync::OnceLock::new(),
+            today: Mutex::new(crate::records_today::TodayCounts::new(Utc::now())),
         }
     }
 }
@@ -963,6 +981,10 @@ fn spawn_writer(
                     }
                 }
                 let id = record.id;
+                // lot 341: what today's count reads of it
+                let severity = record.severity;
+                let would_have = crate::records_today::would_have_action(&record.response)
+                    .map(nn_core::response::profile::would_have);
                 // R12c (lab PR 270): stage 7's wait, queue to chain
                 inner
                     .wait_max_us
@@ -977,6 +999,11 @@ fn spawn_writer(
                     );
                 } else {
                     inner.written.fetch_add(1, Ordering::Relaxed);
+                    inner.today.lock().note(
+                        Utc::now(),
+                        severity,
+                        would_have.as_deref().unwrap_or(""),
+                    );
                 }
             }
             // Surface backpressure drops once per change, off the hot path.
@@ -2802,17 +2829,35 @@ mod tests {
                 ),
                 "StripFileCapability",
             ),
+            // lot 341: the suppressed response names its action
             (
                 report(
                     KillProcess,
                     ExecutionOutcome::WouldExecute { pid: 7 },
                     vec![],
                 ),
-                "suppressed (detect-only)",
+                "would have: KillProcess",
             ),
             (
+                report(
+                    KillProcessTree,
+                    ExecutionOutcome::WouldExecute { pid: 7 },
+                    vec![],
+                ),
+                "would have: KillProcessTree",
+            ),
+            (
+                report(
+                    Quarantine,
+                    ExecutionOutcome::WouldExecute { pid: 7 },
+                    vec![],
+                ),
+                "would have: Quarantine",
+            ),
+            // a Log decision would have run nothing
+            (
                 report(Log, ExecutionOutcome::WouldExecute { pid: 7 }, vec![]),
-                "suppressed (detect-only)",
+                "none",
             ),
             (
                 report(
@@ -2944,6 +2989,48 @@ mod tests {
             lines[0]
         );
         assert!(!lines[1].contains("/usr/bin/bash"), "{}", lines[1]);
+    }
+
+    /// Named (lot 341): the writer counts today's records as it appends
+    /// them — by severity, and the suppressed responses by action — for the
+    /// summary of `nn-admin status`.
+    #[tokio::test]
+    async fn the_writer_counts_today_s_records_and_what_would_have_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let (sink, _writer) = open(
+            &path,
+            test_key(),
+            RotationConfig::default(),
+            Arc::new(NoProtection),
+            DEFAULT_QUEUE_CAP,
+            None,
+        )
+        .expect("open detection store");
+        for response in [
+            "would have: KillProcessTree",
+            "would have: KillProcessTree",
+            "none",
+        ] {
+            sink.record_rule(
+                &sample_event(),
+                &sample_verdict(),
+                &[],
+                PostureKind::Observing,
+                response.to_string(),
+                0,
+            );
+        }
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if count_data_lines(&path) >= 3 {
+                break;
+            }
+        }
+        let t = sink.records_today();
+        let sev = format!("{:?}", sample_verdict().severity);
+        assert_eq!(t.by_severity, vec![(sev, 3)]);
+        assert_eq!(t.would_have, vec![("KillProcessTree".to_string(), 2)]);
     }
 
     #[tokio::test]

@@ -860,6 +860,18 @@ pub(crate) struct Cli {
     )]
     pub(crate) nodns_allow_local: PathBuf,
 
+    /// Lot 341 (alpha 2/4): the signed response profile (`profile =
+    /// alpha|enforcing`), stored with `nn-admin config overlay set
+    /// profile`; it applies at the next start and wins over the install
+    /// manifest's profile. Without it: the install's profile (install.sh
+    /// writes `alpha` on a fresh install), else enforcing.
+    #[arg(
+        long = "profile-local",
+        value_name = "PATH",
+        default_value = nn_core::response::profile::DEFAULT_LOCAL
+    )]
+    pub(crate) profile_local: PathBuf,
+
     /// Do not read the new environment at exec (no LD_PRELOAD / LD_AUDIT /
     /// GLIBC_TUNABLES / history checks). Also `NN_EXEC_POLICY_NO_ENV=1`
     /// (1/0, true/false, yes/no, on/off).

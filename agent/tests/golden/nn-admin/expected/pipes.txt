@@ -343,6 +343,7 @@ exit: 0
 | rule-policy              absent
 | nodns-allow              absent
 | export                   absent
+| profile                  absent
 
 ### pipe.stdout.policy-show
 $ nn-admin policy show --file rule-policy.local --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
@@ -463,6 +464,10 @@ $ nn-admin status --socket admin.sock
 stderr: a pipe closed before the start
 exit: 0
 --- stdout
+| ── summary ──────────────────────────────────────────────
+| posture           : Observing
+| profile, sensors, records: withheld — `nn-admin status --key <key>` (a key with audit-read or telemetry-read) shows them
+| ─────────────────────────────────────────────────────────
 | posture           : Observing
 | network isolation : clear
 | combat stage      : (agent predates the field)
@@ -494,6 +499,11 @@ $ nn-admin status --key key-a --agent-id-file agent_id --socket admin.sock
 stderr: a pipe closed before the start
 exit: 0
 --- stdout
+| ── summary ──────────────────────────────────────────────
+| posture           : Engaged, OBSERVE-ONLY (config file) — no response action runs
+| sensors           : DEGRADED — 1 degradation(s), listed below, 3 event(s) lost since the start
+| records today     : (not reported: the agent predates it)
+| ─────────────────────────────────────────────────────────
 | posture           : Engaged
 | network isolation : ENGAGED (IPv4 isolated, IPv6 clear)
 | combat stage      : investigate

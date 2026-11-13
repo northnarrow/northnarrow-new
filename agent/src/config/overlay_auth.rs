@@ -100,6 +100,11 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::Export => {
             nn_export::config::ExportConfig::validate(text)?;
         }
+        // Lot 341: exactly one `profile = alpha|enforcing` line.
+        OverlayKind::Profile => {
+            nn_core::response::profile::Profile::parse(text)
+                .map_err(|e| anyhow!("{label}: {e}"))?;
+        }
         OverlayKind::NetflowBlocklist => {
             crate::net::blocklist::parse_blocklist_overlay_text(&label, text)?;
         }

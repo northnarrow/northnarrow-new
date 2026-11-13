@@ -328,7 +328,16 @@ pub struct AdminHandles {
     pub response_dispatch: Option<ResponseDispatchSource>,
     /// Lot 276: the export and its stage 8 (`None`: no configuration).
     pub export: Option<crate::export::ExportHandle>,
+    /// Lot 341 (alpha 2/4): the response profile in force and its source
+    /// (`alpha (install manifest)`), for the status (`None`: tests).
+    pub profile: Option<String>,
+    /// Lot 341: today's records by severity and the suppressed responses
+    /// (`None`: no detection store).
+    pub records_today: Option<RecordsTodaySource>,
 }
+
+/// Lot 341: where the status reads today's records.
+pub type RecordsTodaySource = Arc<dyn Fn() -> nn_proto::admin_protocol::RecordsToday + Send + Sync>;
 
 /// R12c (lab PR 270): where the status reads stages 6 and 7.
 pub type ResponseDispatchSource =

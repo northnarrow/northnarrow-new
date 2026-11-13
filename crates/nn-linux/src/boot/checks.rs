@@ -415,15 +415,14 @@ fn btf_offsets_decided(
 
 /// This thread's effective capabilities against what the response needs
 /// ([`caps::read_effective`], [`caps::boot_gate`]): [`BootGate::Start`]
-/// passes (its degradations are the caller's to sign). Detect-only is the
-/// command line's `--detect-only` (`cli_detect_only`) or the process's
-/// environment (`NN_DETECT_ONLY`, `NORTHNARROW_DRY_RUN`), read here (review
-/// #466 F3), as the response reads it.
+/// passes (its degradations are the caller's to sign). `detect_only` is the
+/// start's one no-enforcement gate (review #466 F3: the value the response
+/// reads; lot 341: resolved once, from the flag, the environment and the
+/// response profile, by the start's resolver).
 pub fn capabilities(
     boot: &mut BootSequence,
-    cli_detect_only: bool,
+    detect_only: bool,
 ) -> Result<(CapsReading, BootGate), BootOrderError> {
-    let detect_only = cli_detect_only || nn_core::response::config::detect_only_env().is_some();
     let reading = caps::read_effective();
     let gate = capabilities_decided(boot, &reading, detect_only)?;
     Ok((reading, gate))
