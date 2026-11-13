@@ -78,6 +78,12 @@ pub struct InstallManifest {
     pub tarball_sha256: Option<String>,
     #[serde(default)]
     pub attestation: Option<serde_json::Value>,
+    /// Lot 341 (alpha 2/4): the install's response profile (`alpha` |
+    /// `enforcing`): `install.sh` writes `alpha` on a fresh install unless
+    /// `--profile enforcing`, and every upgrade keeps the one it found.
+    /// Absent in manifests written before it (their agents enforce).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// One file that did not match.
@@ -225,19 +231,11 @@ pub fn check_with(
     own_exe: &Path,
     ebpf_object_sha: &str,
 ) -> IntegrityOutcome {
-    // Only the installed agent itself is compared: a copy with another
-    // name — even inside bin_dir, like the e2e fixtures'
-    // `northnarrow-agent-e2etest-<ts>-<pid>` — describes a different
-    // build and must not be judged by this manifest.
     let bin_dir = Path::new(&manifest.bin_dir);
-    let bin_dir_canon = bin_dir
-        .canonicalize()
-        .unwrap_or_else(|_| bin_dir.to_path_buf());
-    let installed_agent = bin_dir_canon.join("northnarrow-agent");
     let own_canon = own_exe
         .canonicalize()
         .unwrap_or_else(|_| own_exe.to_path_buf());
-    if own_canon != installed_agent {
+    if !describes_canonical(manifest, &own_canon) {
         return IntegrityOutcome::NotApplicable {
             own_exe: own_exe.to_path_buf(),
             bin_dir: manifest.bin_dir.clone(),
@@ -292,6 +290,64 @@ pub fn check_with(
             provenance: manifest.provenance.clone(),
             mismatches,
         }
+    }
+}
+
+/// Only the installed agent itself is described by the manifest: a copy
+/// with another name — even inside bin_dir, like the e2e fixtures'
+/// `northnarrow-agent-e2etest-<ts>-<pid>` — is a different build and must
+/// not be judged (nor configured) by it. `own_canon`: the running binary,
+/// canonical.
+fn describes_canonical(manifest: &InstallManifest, own_canon: &Path) -> bool {
+    let bin_dir = Path::new(&manifest.bin_dir);
+    let bin_dir_canon = bin_dir
+        .canonicalize()
+        .unwrap_or_else(|_| bin_dir.to_path_buf());
+    own_canon == bin_dir_canon.join("northnarrow-agent")
+}
+
+/// Lot 341: the install's profile, as [`install_profile`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallProfile {
+    /// No manifest, a manifest of another binary, or no `profile` field: the
+    /// install names none.
+    None,
+    /// The profile `install.sh` recorded.
+    Named(nn_core::response::profile::Profile),
+    /// A manifest for this binary whose `profile` (or whose text) no
+    /// profile reads — only install.sh writes it, under `inode_protect`.
+    Invalid(String),
+}
+
+/// Lot 341 (alpha 2/4): the response profile the install recorded for the
+/// running binary (`own_exe`) in the manifest at `manifest_path`. A
+/// developer run, an e2e copy outside the installed name, or an install
+/// older than the field name none; the integrity verdict on the same file
+/// is [`check`]'s.
+pub fn install_profile(manifest_path: &Path, own_exe: &Path) -> InstallProfile {
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return InstallProfile::None,
+        Err(e) => return InstallProfile::Invalid(format!("unreadable: {e}")),
+    };
+    let manifest = match parse_manifest(&text) {
+        Ok(m) => m,
+        Err(reason) => return InstallProfile::Invalid(reason),
+    };
+    let own_canon = own_exe
+        .canonicalize()
+        .unwrap_or_else(|_| own_exe.to_path_buf());
+    if !describes_canonical(&manifest, &own_canon) {
+        return InstallProfile::None;
+    }
+    match manifest.profile.as_deref() {
+        None => InstallProfile::None,
+        Some(name) => match nn_core::response::profile::Profile::from_name(name) {
+            Some(p) => InstallProfile::Named(p),
+            None => {
+                InstallProfile::Invalid(format!("profile `{name}` is neither alpha nor enforcing"))
+            }
+        },
     }
 }
 
@@ -394,6 +450,58 @@ mod tests {
             matches!(out, IntegrityOutcome::NotApplicable { .. }),
             "{out:?}"
         );
+    }
+
+    /// Lot 341 (alpha 2/4): the profile install.sh recorded applies to the
+    /// installed binary only — an e2e copy, a developer run or a manifest
+    /// older than the field take none; a value no profile names is said.
+    #[test]
+    fn the_install_profile_is_the_installed_binary_s_only() {
+        use nn_core::response::profile::Profile;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = write(dir.path(), "northnarrow-agent", b"installed");
+        let with = |profile: Option<&str>| {
+            let base = manifest_json(dir.path(), "00", "11", "22", "33");
+            let text = match profile {
+                Some(p) => base.replacen("{", &format!("{{\"profile\":\"{p}\","), 1),
+                None => base,
+            };
+            write(dir.path(), "install-manifest.json", text.as_bytes())
+        };
+        let mp = with(Some("alpha"));
+        assert_eq!(
+            install_profile(&mp, &agent),
+            InstallProfile::Named(Profile::Alpha)
+        );
+        let mp = with(Some("enforcing"));
+        assert_eq!(
+            install_profile(&mp, &agent),
+            InstallProfile::Named(Profile::Enforcing)
+        );
+        // an install older than the field
+        let mp = with(None);
+        assert_eq!(install_profile(&mp, &agent), InstallProfile::None);
+        // a copy of the agent (the e2e fixtures') is not the installed one
+        let mp = with(Some("alpha"));
+        let fixture = write(dir.path(), "northnarrow-agent-e2etest-1-2", b"fixture");
+        assert_eq!(install_profile(&mp, &fixture), InstallProfile::None);
+        // no manifest at all
+        assert_eq!(
+            install_profile(&dir.path().join("nope.json"), &agent),
+            InstallProfile::None
+        );
+        // a value that is no profile
+        let mp = with(Some("observe"));
+        assert!(matches!(
+            install_profile(&mp, &agent),
+            InstallProfile::Invalid(why) if why.contains("observe")
+        ));
+        // a manifest that does not parse
+        let mp = write(dir.path(), "install-manifest.json", b"{not json");
+        assert!(matches!(
+            install_profile(&mp, &agent),
+            InstallProfile::Invalid(_)
+        ));
     }
 
     /// External audit DEP-009: a binary that never ran against a manifest

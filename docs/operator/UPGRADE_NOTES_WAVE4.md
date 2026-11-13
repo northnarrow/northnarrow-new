@@ -1736,3 +1736,42 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
   the degradation `execpol_capacity` while it lasts.
 
+
+## 35. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
+
+- **A fresh install is observe-only and starts.** `install.sh` on a host
+  without `/etc/northnarrow/install-manifest.json` records the `alpha`
+  profile (no response touches a user program; every verdict recorded with
+  what it would have done — [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)), starts
+  the agent then the watchdog and enables both at boot. Automation that
+  wants the old behaviour passes `--profile enforcing --no-enable` and
+  starts the units itself.
+- **An existing install keeps enforcing.** An upgrade, or a reinstall over a
+  kept `/etc/northnarrow`, keeps the profile its manifest has; a manifest
+  from before this lot has none, and its agent enforces as before.
+  `install.sh --profile` never switches an installed agent: switching is a
+  signed `nn-admin config overlay set profile` (kind 18), applied at the
+  agent's next start.
+- **Records say what would have run.** A response the no-enforcement gate
+  suppressed (`--detect-only`, `NN_DETECT_ONLY`, `alpha`) reads `"response":
+  "would have: KillProcessTree"`; it read `"suppressed (detect-only)"`. A
+  `Log` decision under the gate reads `"none"`. Records already written keep
+  their text; a reader keyed on the old string matches neither.
+- **Detect-only also stops the module-load judge's refusals** (R018's deny
+  mode: record mode under the gate) and an earlier enforcing run's owed
+  exec-quarantine kills (resumed). The agent's self-protection, and the
+  host-wide guards that keep it able to see (foreign tracing BPF programs,
+  `kexec_load`, the sysctl guard), are unchanged under the gate.
+- **`install.sh` refuses a host it cannot run on** before any change:
+  not x86_64, systemd not the init system, no kernel BTF, a kernel the new
+  agent's `--btf-check` refuses; on a fresh install that starts the units,
+  also the BPF LSM off or bpffs not mounted (`--no-enable` installs anyway).
+- **The bootstrap key** a fresh install writes also has `telemetry-read`
+  (`nn-admin detections`). Keys bootstrapped before keep their line.
+- **`uninstall.sh` exits 3** when the agent is wedged: both units disabled,
+  the removal finished at the next boot by `northnarrow-uninstall.service`.
+  Automation that treated any non-zero exit as a failure should reboot on 3.
+- **`nn-admin status`** prints a summary block first; `--json` gains
+  `profile` and `records_today`. An `nn-admin` of this release needs an
+  agent of this release (the status reply grew two fields, as every
+  appended field before).

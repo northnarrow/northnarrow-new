@@ -195,6 +195,9 @@ pub mod response {
     // R12c (lab PR 270): the response dispatcher's queue (stage 6) — by
     // severity, in order per process, bounded, never dropping silently.
     pub mod dispatch;
+    // Lot 341 (alpha 2/4): the response profile (alpha observe-only,
+    // enforcing) and the one resolver of the no-enforcement gate.
+    pub mod profile;
 }
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management

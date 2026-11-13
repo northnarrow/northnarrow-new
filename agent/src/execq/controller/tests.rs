@@ -1655,6 +1655,62 @@ fn a_kill_owed_by_a_previous_agent_stays_a_kill_while_the_capture_fails() {
     assert_eq!(a[1]["origin"], "a kill a previous agent owed");
 }
 
+/// Named (lot 341, alpha 2/4): a run under the no-enforcement gate (the
+/// `alpha` profile, detect-only: the exec quarantine observes) kills
+/// nothing, not even a kill an enforcing run before it owed — the held
+/// process is resumed, and the boot's record says it would have been killed.
+#[test]
+fn an_observing_run_resumes_a_kill_an_enforcing_run_owed() {
+    let observe = Policy {
+        enforce: false,
+        ..Policy::default()
+    };
+    let mut w = world(ScanConfig::default(), observe, 2000, false);
+    let h = held_copy(w.dir.path(), "nn-x");
+    w.k.0.lock().left.push((
+        h.pid,
+        ExecqStopped {
+            start_ns: h.start_ns,
+            stop_ns: kernel::KILL_OWED,
+        },
+    ));
+    w.ctl.recover();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "an observing run killed (or left stopped) a process: {:?}",
+        state(h.pid)
+    );
+    {
+        let a = w.rec.audits.lock();
+        assert_eq!(a[0]["kind"], "recovered_at_boot");
+        assert_eq!(a[0]["killed"], serde_json::json!([]), "{}", a[0]);
+        assert_eq!(a[0]["resumed"], serde_json::json!([h.pid]), "{}", a[0]);
+        assert_eq!(
+            a[0]["would_have_killed"],
+            serde_json::json!([h.pid]),
+            "{}",
+            a[0]
+        );
+    }
+    // the stop's sweep of an unreported hold owing a kill: resumed too
+    w.k.0.lock().left.clear();
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.k.0.lock().left[0].1.stop_ns = kernel::KILL_OWED;
+    // SAFETY: stopping our own child, as the kernel's hold would
+    unsafe { libc::kill(h.pid as i32, libc::SIGSTOP) };
+    assert!(wait_state(h.pid, |s| s == Some('T')), "{:?}", state(h.pid));
+    w.ctl.stop_all();
+    // a kill takes the process to a zombie: given the time to land, it
+    // would no longer read as running
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "the stop of an observing run killed (or left stopped) a process: {:?}",
+        state(h.pid)
+    );
+}
+
 /// Review F5 (the reviewer's probe): an entry whose process has ended
 /// (its pid since taken by a process the kernel holds, its report not read
 /// yet) neither takes the new process's map entry out nor hides it from

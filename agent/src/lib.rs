@@ -160,6 +160,9 @@ pub mod execq;
 /// Lot 276: the export — its signed configuration, the core's thread that
 /// reads the chains as the write-ahead log, the export worker's entry.
 pub mod export;
+/// Lot 341 (alpha 2/4): today's records by severity and what would have
+/// run, for the summary of `nn-admin status`.
+pub mod records_today;
 /// R09b shim (lab PR 254): file integrity monitoring — the observers'
 /// attach, the drain and its drift log, the baseline, the honeypot baits,
 /// the recompute, the watched paths' loader on the Linux host — is

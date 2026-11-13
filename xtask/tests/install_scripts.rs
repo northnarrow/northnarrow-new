@@ -307,6 +307,10 @@ case "$cmd" in
         u=${1%.service}; st=$(cat "$T/enabled.$u" 2>/dev/null || echo enabled)
         [ -n "$q" ] || echo "$st"
         [ "$st" = enabled ] ;;
+    # lot 341: a disable is read back by is-enabled (one that does not take:
+    # $T/disable-fails)
+    disable) [ -e "$T/disable-fails" ] && exit 0
+        for a; do case "$a" in --*) ;; *) echo disabled > "$T/enabled.${a%.service}" ;; esac; done ;;
     get-default) echo multi-user.target ;;
     list-dependencies)
         echo multi-user.target
@@ -338,6 +342,25 @@ fi
 exit 0"#,
         );
         write_exec(&stub.join("sleep"), "exit 0");
+        // lot 341: the host facts the support check reads — a supported
+        // host (x86_64, systemd, BTF, the BPF LSM on, bpffs mounted)
+        let host = dir.join("host");
+        fs::create_dir_all(host.join("systemd")).unwrap();
+        fs::write(host.join("btf"), "BTF").unwrap();
+        fs::write(
+            host.join("lsm"),
+            "lockdown,capability,landlock,yama,apparmor,bpf\n",
+        )
+        .unwrap();
+        fs::write(host.join("os-release"), "ID=ubuntu\nVERSION_ID=\"24.04\"\n").unwrap();
+        write_exec(
+            &stub.join("uname"),
+            r#"case "${1:-}" in -m) cat "$NN_TEST_DIR/host/arch" 2>/dev/null || echo x86_64 ;; -r) echo 6.8.0-test ;; *) echo Linux ;; esac"#,
+        );
+        write_exec(
+            &stub.join("mountpoint"),
+            r#"[ ! -e "$NN_TEST_DIR/host/no-bpffs" ]"#,
+        );
         // lot 278: `help trusted-installer-grant` names `--for-installer`
         // unless `$T/old-nn-admin` exists (an nn-admin older than the flag);
         // the grant records whether it was asked for an installer
@@ -362,6 +385,8 @@ if [ "$1" = trusted-installer-grant ]; then
     echo "$f" >> "$NN_TEST_DIR/for-installer"
     : > "$NN_TEST_DIR/window"
 fi
+# lot 341: a wedged agent answers nothing on its socket
+if [ "$1" = status ] && [ -e "$NN_TEST_DIR/wedged" ]; then exit 1; fi
 exit 0"#,
         );
         write_exec(
@@ -444,7 +469,7 @@ exit 0"#,
         let prelude = format!(
             "MODE={mode}; UPGRADE={}; GRANT_KEY={}\n\
              BIN_DIR=$T/bin; AGENT_BIN={agent_bin}\n\
-             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins\n{extra}",
+             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins\n{HOST_FACTS}\n{extra}",
             u8::from(upgrade),
             key.map(|k| format!("$T/{k}")).unwrap_or_default(),
         );
@@ -454,16 +479,29 @@ exit 0"#,
 
     /// uninstall.sh from `log()` to its step 2 (the pin root's removal).
     fn uninstall(&self, package: bool, key: Option<&str>) -> Run {
+        self.uninstall_with(package, key, "")
+    }
+
+    /// [`Self::uninstall`] with `extra` (shell) set before the run.
+    fn uninstall_with(&self, package: bool, key: Option<&str>, extra: &str) -> Run {
         let body = section("deploy/uninstall.sh", "log() {", "# ── 2. LSM programs");
         let prelude = format!(
             "PURGE=0; YES=1; PACKAGE={}; GRANT_KEY={}\n\
-             BIN_DIR=$T/bin; UNIT_DIR=$T/units; ETC_DIR=$T/etc; STATE_DIR=$T/state; BPFFS_ROOT=$T/pins",
+             BIN_DIR=$T/bin; UNIT_DIR=$T/units; ETC_DIR=$T/etc; STATE_DIR=$T/state; BPFFS_ROOT=$T/pins\n\
+             AT_BOOT=0; ANSWER_TIMEOUT=2; FINISH_DIR=$T/finish; FINISH_UNIT=northnarrow-uninstall.service\n\
+             DROPIN_ROOT=$T/dropins; RUN_DIR=$T/run; SELF_SCRIPT=$T/uninstall-self.sh\n{extra}",
             u8::from(package),
             key.map(|k| format!("$T/{k}")).unwrap_or_default(),
         );
         self.run(&prelude, &body)
     }
 }
+
+/// Lot 341: the support check's facts in the case's directory, and the
+/// default of a fresh install (the units started).
+const HOST_FACTS: &str = "HOST_BTF=$T/host/btf; HOST_LSM=$T/host/lsm; \
+     HOST_SYSTEMD_DIR=$T/host/systemd; HOST_OS_RELEASE=$T/host/os-release; HOST_BPFFS=$T/host; \
+     ENABLE_AT_BOOT=1";
 
 const START_AGENT: &str = "systemctl start northnarrow-agent.service";
 const START_WATCHDOG: &str = "systemctl start northnarrow-watchdog.service";
@@ -1538,6 +1576,17 @@ impl Lab {
         }
         fs::create_dir_all(case.join("tmp")).unwrap();
         fs::create_dir_all(&stub).unwrap();
+        // lot 341: a supported host for the support check
+        let host = root.join("host");
+        fs::create_dir_all(host.join("systemd")).unwrap();
+        fs::write(host.join("btf"), "BTF").unwrap();
+        fs::write(host.join("lsm"), "lockdown,capability,bpf\n").unwrap();
+        fs::write(host.join("os-release"), "ID=debian\nVERSION_ID=\"13\"\n").unwrap();
+        write_exec(
+            &stub.join("uname"),
+            r#"case "${1:-}" in -m) echo x86_64 ;; -r) echo 6.12.0-test ;; *) echo Linux ;; esac"#,
+        );
+        write_exec(&stub.join("mountpoint"), "exit 0");
         for u in ["northnarrow-agent", "northnarrow-watchdog"] {
             fs::create_dir_all(root.join("cg").join(u)).unwrap();
             fs::write(root.join("cg").join(u).join("cgroup.procs"), "").unwrap();
@@ -1572,9 +1621,13 @@ case "$cmd" in
         done
         exit 0 ;;
     enable)
-        st=enabled
-        for a; do [ "$a" = --runtime ] && st=enabled-runtime; done
-        for a; do case "$a" in --*) ;; *) echo "$st" > "$T/enabled.${{a%.service}}" ;; esac; done ;;
+        st=enabled; now=
+        for a; do [ "$a" = --runtime ] && st=enabled-runtime; [ "$a" = --now ] && now=1; done
+        for a; do case "$a" in --*) ;; *) echo "$st" > "$T/enabled.${{a%.service}}" ;; esac; done
+        # lot 341: `enable --now` starts the units too, as systemd's
+        if [ -n "$now" ]; then
+            for a; do case "$a" in --*) ;; *) "$0" start "$a" || exit 1 ;; esac; done
+        fi ;;
     disable) for a; do /bin/rm -f "$T/enabled.${{a%.service}}"; done ;;
     start)
         u=${{1%.service}}
@@ -1883,6 +1936,11 @@ exit 0"#
             .env("ADMIN_SOCKET", r.join("run/admin.sock"))
             .env("PKG_RESTART_FILE", r.join("pkg-restart"))
             .env("NFT_DIRS", r.join("nonft"))
+            .env("HOST_BTF", r.join("host/btf"))
+            .env("HOST_LSM", r.join("host/lsm"))
+            .env("HOST_SYSTEMD_DIR", r.join("host/systemd"))
+            .env("HOST_OS_RELEASE", r.join("host/os-release"))
+            .env("HOST_BPFFS", r.join("host"))
             .env("LOGIN_DEFS", self.case.join("login.defs"))
             .env("PROC_ROOT", self.case.join("proc"))
             .env("HEALTH_TIMEOUT", "2")
@@ -1890,8 +1948,19 @@ exit 0"#
             .env("ADMIN_SOCKET_WAIT", "1");
     }
 
-    /// install.sh from tree `tree` (the `require_root` call left out).
+    /// install.sh from tree `tree` (the `require_root` call left out), the
+    /// units left stopped on a fresh install (`--no-enable`: these cases
+    /// start and enable them themselves, as the operator did before lot
+    /// 341).
     fn install(&self, tree: &str, args: &[&str]) -> Run {
+        let mut all = args.to_vec();
+        all.push("--no-enable");
+        self.install_as(tree, &all)
+    }
+
+    /// install.sh from tree `tree` with `args` alone (lot 341: a fresh
+    /// install then starts and enables the units).
+    fn install_as(&self, tree: &str, args: &[&str]) -> Run {
         let text = read("deploy/install.sh");
         assert_eq!(text.matches("\nrequire_root\n").count(), 1);
         let script = text.replace("\nrequire_root\n", "\n");
@@ -2774,11 +2843,19 @@ fn a_source_tree_installs_with_either_flag_and_the_flag_is_logged() {
             lab.logged()
         );
     }
-    // the lab installs with --source-tree (deploy/lab/nn-lab.sh install)
+    // the lab installs with --source-tree (deploy/lab/nn-lab.sh install;
+    // lot 341: its flags in one variable, both of its profiles' sets)
     let lab_sh = read("deploy/lab/nn-lab.sh");
-    assert!(
-        lab_sh.contains("sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload")
-    );
+    assert!(lab_sh.contains("sudo ./deploy/install.sh $flags && sudo systemctl daemon-reload"));
+    let sets: Vec<&str> = lab_sh
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("flags=\"") || l.starts_with("local flags=\""))
+        .collect();
+    assert_eq!(sets.len(), 2, "{sets:?}");
+    for l in sets {
+        assert!(l.contains("flags=\"--source-tree"), "{l}");
+    }
 }
 
 /// `install.sh --help` (no root needed) names the opt-out, the rollback's
@@ -3584,5 +3661,532 @@ fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
     assert!(
         dir.join("pins-cgroup-join-v1-64").exists(),
         "the upgrade keeps the tracker's pins"
+    );
+}
+
+// ── lot 341 (alpha 2/4): the profile, the start, the support check and the
+// summary a tester meets ──────────────────────────────────────────────────
+
+/// `install_profile <manifest> <asked>` from install.sh: (status, stdout,
+/// stderr).
+fn install_profile_of(case: &str, manifest: Option<&str>, asked: &str) -> (i32, String, String) {
+    let dir = case_dir(case);
+    let file = dir.join("install-manifest.json");
+    if let Some(m) = manifest {
+        fs::write(&file, m).unwrap();
+    }
+    let script = format!(
+        "set -euo pipefail\n{}\ninstall_profile \"$1\" \"$2\"\n",
+        block("deploy/install.sh", "install_profile")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(&file)
+        .arg(asked)
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Named (lot 341): a fresh install records `alpha` (or the profile asked
+/// for); an install keeps the one it has — one older than the field keeps
+/// none (its agent enforces) — and a `--profile` that would switch an
+/// installed agent is refused, naming the signed way.
+#[test]
+fn a_fresh_install_is_alpha_and_an_install_keeps_its_profile() {
+    assert_eq!(install_profile_of("p-fresh", None, "").1, "alpha");
+    assert_eq!(
+        install_profile_of("p-fresh-enf", None, "enforcing").1,
+        "enforcing"
+    );
+    let alpha = "{\n  \"version\": \"0.1.0\",\n  \"profile\": \"alpha\"\n}\n";
+    assert_eq!(install_profile_of("p-keep", Some(alpha), "").1, "alpha");
+    assert_eq!(
+        install_profile_of("p-same", Some(alpha), "alpha").1,
+        "alpha"
+    );
+    let (status, out, err) = install_profile_of("p-switch", Some(alpha), "enforcing");
+    assert_eq!(status, 2, "{out} {err}");
+    assert!(
+        err.contains("nn-admin config overlay set profile") && err.contains("Nothing was changed"),
+        "{err}"
+    );
+    // an install older than the field: none recorded, its agent enforces
+    let old = "{\n  \"version\": \"0.0.1\",\n  \"profile\": null\n}\n";
+    assert_eq!(install_profile_of("p-old", Some(old), "").1, "");
+    assert_eq!(install_profile_of("p-old-legacy", Some("{}"), "").1, "");
+    assert_eq!(
+        install_profile_of("p-old-enf", Some(old), "enforcing").1,
+        "enforcing"
+    );
+    assert_eq!(install_profile_of("p-old-alpha", Some(old), "alpha").0, 2);
+}
+
+/// `host_support_check` from install.sh on the host facts under `dir`:
+/// (status, stdout, stderr).
+fn host_support(dir: &Path, extra: &str) -> (i32, String, String) {
+    let script = format!(
+        "set -euo pipefail\nT='{t}'\n{facts}\nUPGRADE=0\n{extra}\n{}\nhost_support_check\n",
+        block("deploy/install.sh", "host_support"),
+        t = dir.display(),
+        facts = HOST_FACTS,
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.join("stub").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("NN_TEST_DIR", dir)
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Named (lot 341): a host this release cannot run on is refused before
+/// anything changes, each reason with what to do; the BPF LSM and bpffs are
+/// asked for only when the units are to start now; a distribution outside
+/// the verified matrix is said, not refused.
+#[test]
+fn a_host_the_release_cannot_run_on_is_refused_with_what_to_do() {
+    let h = Host::new("host-support", &[], false, false);
+    let d = &h.dir;
+    let (status, out, err) = host_support(d, "");
+    assert_eq!(status, 0, "a supported host: {out} {err}");
+    assert!(!out.contains("NOTE"), "{out}");
+    // each fact, alone
+    for (what, setup, extra, want) in [
+        (
+            "arch",
+            "echo aarch64 > \"$T/host/arch\"",
+            "",
+            "built for x86_64 only",
+        ),
+        (
+            "systemd",
+            "rmdir \"$T/host/systemd\"",
+            "",
+            "systemd is not the init system",
+        ),
+        ("btf", "rm \"$T/host/btf\"", "", "CONFIG_DEBUG_INFO_BTF=y"),
+        (
+            "kernel",
+            "",
+            "BTF_RC=2; BTF_VERDICT='btf-check x: NOT SUPPORTED — 3 field(s)'",
+            "is NOT SUPPORTED by this release",
+        ),
+        ("unreadable", "", "BTF_RC=3", "could not be read"),
+        (
+            "lsm",
+            "echo lockdown,capability > \"$T/host/lsm\"",
+            "",
+            "add 'bpf' to the kernel's lsm= list",
+        ),
+        (
+            "bpffs",
+            ": > \"$T/host/no-bpffs\"",
+            "",
+            "bpffs is not mounted",
+        ),
+    ] {
+        let case = Host::new(&format!("host-support-{what}"), &[], false, false);
+        let pre = Command::new("bash")
+            .arg("-c")
+            .arg(format!("T='{}'\n{setup}", case.dir.display()))
+            .status()
+            .unwrap();
+        assert!(pre.success(), "{what}");
+        let (status, out, err) = host_support(&case.dir, extra);
+        assert_eq!(status, 1, "{what}: {out} {err}");
+        assert!(
+            err.contains("cannot run NorthNarrow — nothing was changed") && err.contains(want),
+            "{what}: {err}"
+        );
+        assert!(err.contains("KERNEL_COMPATIBILITY.md"), "{what}: {err}");
+    }
+    // the BPF LSM off is no refusal when the units are not started now
+    let lsm = Host::new("host-support-lsm-later", &[], false, false);
+    fs::write(lsm.dir.join("host/lsm"), "lockdown,capability\n").unwrap();
+    let (status, _, err) = host_support(&lsm.dir, "ENABLE_AT_BOOT=0");
+    assert_eq!(status, 0, "{err}");
+    // a distribution outside the verified matrix: said, installed
+    let other = Host::new("host-support-arch-linux", &[], false, false);
+    fs::write(other.dir.join("host/os-release"), "ID=arch\n").unwrap();
+    let (status, out, _) = host_support(&other.dir, "");
+    assert_eq!(status, 0);
+    assert!(
+        out.contains("NOTE: arch") && out.contains("not in the verified matrix"),
+        "{out}"
+    );
+}
+
+/// `install_summary` from install.sh with `vars` set: its stdout.
+fn install_summary(case: &str, vars: &str, key_on_host: bool) -> String {
+    let dir = case_dir(case);
+    let key = dir.join("northnarrow-admin.key");
+    if key_on_host {
+        fs::write(&key, "k").unwrap();
+    }
+    let script = format!(
+        "set -euo pipefail\nADMIN_KEY_OUT='{}'; REPO_ROOT=/opt/northnarrow-0.1.0; STATE_DIR=/var/lib/northnarrow\n{vars}\n{}\ninstall_summary\n",
+        key.display(),
+        block("deploy/install.sh", "install_summary")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Named (lot 341): the summary says the profile, whether the agent runs,
+/// where the records are, how to see the status and how to uninstall.
+#[test]
+fn the_install_summary_says_profile_records_status_and_uninstall() {
+    let s = install_summary(
+        "summary-alpha",
+        "PROFILE_RECORDED=alpha; STARTED_NOW=1; MODE=full",
+        true,
+    );
+    let key = case_dir("summary-alpha-key-path")
+        .parent()
+        .unwrap()
+        .join("summary-alpha/northnarrow-admin.key");
+    let key = key.display();
+    for want in [
+        "NorthNarrow is installed.",
+        "profile   : alpha — observe-only: nothing is killed, blocked or quarantined",
+        "running   : yes — agent and watchdog active, started again at every boot",
+        &format!("status    : sudo nn-admin status --key {key}"),
+        &format!(
+            "records   : sudo nn-admin detections --key {key}   (signed, in /var/lib/northnarrow)"
+        ),
+        "logs: journalctl --namespace=northnarrow -u northnarrow-agent",
+        &format!(
+            "uninstall : sudo /opt/northnarrow-0.1.0/deploy/uninstall.sh --purge --grant-key {key}"
+        ),
+        &format!("admin key : {key} — it switches the profile"),
+        "docs/operator/ALPHA_PROFILE.md",
+    ] {
+        assert!(s.contains(want), "{want:?} not in:\n{s}");
+    }
+    let s = install_summary(
+        "summary-enforcing",
+        "PROFILE_RECORDED=enforcing; STARTED_NOW=0; MODE=full",
+        false,
+    );
+    assert!(
+        s.contains("profile   : enforcing — the agent's responses run"),
+        "{s}"
+    );
+    assert!(
+        s.contains("running   : no — start it (and at every boot): sudo systemctl enable --now"),
+        "{s}"
+    );
+    assert!(s.contains("--key <your admin key>"), "{s}");
+    assert!(!s.contains("admin key :"), "{s}");
+    // an install older than the profile reads as enforcing
+    let s = install_summary(
+        "summary-none",
+        "PROFILE_RECORDED=; STARTED_NOW=0; MODE=configure",
+        false,
+    );
+    assert!(s.contains("profile   : enforcing"), "{s}");
+    assert!(
+        s.contains("uninstall : remove the northnarrow package"),
+        "{s}"
+    );
+}
+
+/// Named (lot 341): a fresh install starts the agent, then the watchdog,
+/// enables both at boot, passes the health check and records `alpha`; an
+/// upgrade keeps the profile; a `--profile` that would switch it is
+/// refused before anything is stopped.
+#[test]
+fn a_fresh_install_starts_and_enables_the_units_in_alpha() {
+    let lab = Lab::new("fresh-enabled");
+    let r = lab.install_as("old", &["--source-tree"]);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!(
+        started(&r, "northnarrow-agent"),
+        ["northnarrow-agent 0.0.1"]
+    );
+    assert_eq!(started(&r, "northnarrow-watchdog").len(), 1, "{r:#?}");
+    let agent = r
+        .index("systemctl enable --now northnarrow-agent.service")
+        .expect("agent enabled");
+    let wd = r
+        .index("systemctl enable --now northnarrow-watchdog.service")
+        .expect("watchdog enabled");
+    assert!(agent < wd, "the agent first: {:?}", r.calls);
+    assert!(lab.root.join("enabled.northnarrow-agent").exists());
+    assert!(lab.root.join("enabled.northnarrow-watchdog").exists());
+    assert_eq!(lab.state("northnarrow-agent"), "active");
+    assert!(r.stdout.contains("profile   : alpha"), "{}", r.stdout);
+    assert!(r.stdout.contains("running   : yes"), "{}", r.stdout);
+    let manifest = fs::read_to_string(lab.root.join("etc/install-manifest.json")).unwrap();
+    assert!(manifest.contains("\"profile\": \"alpha\""), "{manifest}");
+    // an upgrade keeps it
+    let r = lab.upgrade();
+    assert_eq!(r.status, 0, "{r:#?}");
+    let manifest = fs::read_to_string(lab.root.join("etc/install-manifest.json")).unwrap();
+    assert!(manifest.contains("\"profile\": \"alpha\""), "{manifest}");
+    // a switch through install.sh is refused, nothing stopped
+    let key = lab.key();
+    let r = lab.install(
+        "new",
+        &[
+            "--source-tree",
+            "--upgrade",
+            "--grant-key",
+            &key,
+            "--profile",
+            "enforcing",
+        ],
+    );
+    assert_eq!(r.status, 2, "{r:#?}");
+    assert!(
+        r.stderr.contains("nn-admin config overlay set profile"),
+        "{r:#?}"
+    );
+    assert!(
+        !r.calls.iter().any(|c| c.starts_with("systemctl kill")),
+        "{r:#?}"
+    );
+    assert_eq!(lab.state("northnarrow-agent"), "active");
+}
+
+/// Named (lot 341): `--no-enable` leaves the units stopped and not enabled,
+/// and says how to start them; `--profile enforcing` on a fresh install is
+/// recorded.
+#[test]
+fn no_enable_leaves_the_units_stopped_and_says_how_to_start() {
+    let lab = Lab::new("fresh-no-enable");
+    let r = lab.install("old", &["--source-tree", "--profile", "enforcing"]);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(started(&r, "northnarrow-agent").is_empty(), "{r:#?}");
+    assert!(
+        !r.calls.iter().any(|c| c.contains("enable --now")),
+        "{r:#?}"
+    );
+    assert!(!lab.root.join("enabled.northnarrow-agent").exists());
+    assert!(
+        r.stdout.contains("running   : no — start it"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("profile   : enforcing"), "{}", r.stdout);
+    let manifest = fs::read_to_string(lab.root.join("etc/install-manifest.json")).unwrap();
+    assert!(
+        manifest.contains("\"profile\": \"enforcing\""),
+        "{manifest}"
+    );
+    // a bad value is a usage error
+    let lab = Lab::new("fresh-bad-profile");
+    let r = lab.install("old", &["--source-tree", "--profile", "observe"]);
+    assert_eq!(r.status, 2, "{r:#?}");
+    assert!(
+        r.stderr.contains("--profile observe: alpha or enforcing"),
+        "{r:#?}"
+    );
+}
+
+/// Named (lot 341): the install's enable step is the operator's — agent
+/// then watchdog, `enable --now`, skipped by `--no-enable`, never for units
+/// started only for the window — followed by the upgrade's health check.
+#[test]
+fn the_fresh_install_start_is_enable_now_then_the_health_check() {
+    let text = read("deploy/install.sh");
+    let tail = &text[text.rfind("STARTED_NOW=0\n").expect("the start step")..];
+    assert!(tail.contains(
+        "if [[ $MODE == full ]] && (( ENABLE_AT_BOOT )) && (( ! STARTED_FOR_WINDOW )); then"
+    ));
+    let a = tail
+        .find("systemctl enable --now northnarrow-agent.service")
+        .unwrap();
+    let w = tail
+        .find("systemctl enable --now northnarrow-watchdog.service")
+        .unwrap();
+    let h = tail
+        .find("upgrade_health_check northnarrow-agent northnarrow-watchdog")
+        .unwrap();
+    assert!(a < w && w < h);
+    assert!(tail.trim_end().ends_with("install_summary"));
+}
+
+/// Named (lot 341): a wedged agent — active, not answering on its socket —
+/// cannot open a window and its hooks refuse the stop: the uninstall
+/// disables both units, schedules the rest for the next boot (a one-shot
+/// running a copy of the script with the same options, `--at-boot`) and
+/// exits 3, with or without a key; nothing else is removed, nothing is
+/// granted. An agent that answers keeps the old behaviour.
+#[test]
+fn uninstall_finishes_a_wedged_agent_s_removal_at_the_next_boot() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    for key in [None, Some("key-role")] {
+        let host = Host::new(
+            &format!("uninstall-wedged-{}", key.is_some()),
+            &both,
+            true,
+            true,
+        );
+        fs::write(host.dir.join("wedged"), "").unwrap();
+        fs::write(
+            host.dir.join("uninstall-self.sh"),
+            "#!/bin/bash\n# the script\n",
+        )
+        .unwrap();
+        fs::create_dir_all(host.dir.join("units")).unwrap();
+        let r = host.uninstall(false, key);
+        assert_eq!(r.status, 3, "{r:#?}");
+        assert!(r.stderr.contains("WEDGED"), "{r:#?}");
+        for u in ["northnarrow-watchdog", "northnarrow-agent"] {
+            assert_eq!(
+                r.called(&format!("systemctl disable {u}.service")),
+                1,
+                "{r:#?}"
+            );
+        }
+        assert_eq!(
+            r.called(GRANT),
+            0,
+            "no window asked of a wedged agent: {r:#?}"
+        );
+        assert!(
+            r.called("systemctl enable northnarrow-uninstall.service") == 1,
+            "{r:#?}"
+        );
+        let unit =
+            fs::read_to_string(host.dir.join("units/northnarrow-uninstall.service")).unwrap();
+        assert!(
+            unit.contains(&format!(
+                "ExecStart=/bin/bash {}/finish/uninstall.sh --yes --at-boot",
+                host.dir.display()
+            )),
+            "{unit}"
+        );
+        assert!(unit.contains("Before=northnarrow-agent.service"), "{unit}");
+        assert!(host.dir.join("finish/uninstall.sh").exists());
+        assert!(r.stdout.contains("REBOOT NOW"), "{r:#?}");
+        assert!(host.pins_left(), "nothing removed before the reboot");
+    }
+    // an installed agent that does not come up for the window (stale
+    // protected pins, units stopped): wedged too, with the key
+    let host = Host::new("uninstall-wedged-nostart", &[], true, true);
+    fs::write(host.dir.join("start-fails"), "").unwrap();
+    fs::write(host.dir.join("uninstall-self.sh"), "#!/bin/bash\n").unwrap();
+    fs::create_dir_all(host.dir.join("units")).unwrap();
+    let r = host.uninstall(false, Some("key-role"));
+    assert_eq!(r.status, 3, "{r:#?}");
+    assert!(
+        r.stderr.contains("did not come up for the window"),
+        "{r:#?}"
+    );
+    assert!(host
+        .dir
+        .join("units/northnarrow-uninstall.service")
+        .exists());
+    // a disable that does not take: the mask named, nothing else changed
+    let host = Host::new("uninstall-wedged-nodisable", &both, true, true);
+    fs::write(host.dir.join("wedged"), "").unwrap();
+    fs::write(host.dir.join("disable-fails"), "").unwrap();
+    fs::create_dir_all(host.dir.join("units")).unwrap();
+    let r = host.uninstall(false, None);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stderr.contains("systemd.mask="), "{r:#?}");
+    assert!(!host
+        .dir
+        .join("units/northnarrow-uninstall.service")
+        .exists());
+    assert!(!host.dir.join("finish").exists());
+    // --purge reaches the boot-time run
+    let host = Host::new("uninstall-wedged-purge", &both, true, true);
+    fs::write(host.dir.join("wedged"), "").unwrap();
+    fs::write(host.dir.join("uninstall-self.sh"), "#!/bin/bash\n").unwrap();
+    fs::create_dir_all(host.dir.join("units")).unwrap();
+    let r = host.uninstall_with(false, None, "PURGE=1");
+    assert_eq!(r.status, 3, "{r:#?}");
+    let unit = fs::read_to_string(host.dir.join("units/northnarrow-uninstall.service")).unwrap();
+    assert!(unit.contains("--yes --at-boot --purge"), "{unit}");
+    // an agent that answers: the old behaviour (no key: nothing disabled)
+    let host = Host::new("uninstall-answers", &both, true, true);
+    let r = host.uninstall(false, None);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(
+        !r.calls.iter().any(|c| c.starts_with("systemctl disable")),
+        "{r:#?}"
+    );
+    assert!(!host
+        .dir
+        .join("units/northnarrow-uninstall.service")
+        .exists());
+}
+
+/// Named (lot 341): the boot-time run removes its own one-shot and copy at
+/// its end, and waits for no LSM program (none of ours can be loaded: the
+/// units were disabled before the boot).
+#[test]
+fn the_boot_time_uninstall_removes_itself() {
+    let text = read("deploy/uninstall.sh");
+    let end = &text[text.rfind("# ── 5. config + state").unwrap()..];
+    assert!(
+        end.contains("if (( AT_BOOT )); then\n    finish_done\nfi"),
+        "{end}"
+    );
+    assert!(text.contains("elif (( AT_BOOT )); then"));
+    let dir = case_dir("uninstall-finish-done");
+    fs::create_dir_all(dir.join("units")).unwrap();
+    fs::create_dir_all(dir.join("finish")).unwrap();
+    fs::write(dir.join("units/northnarrow-uninstall.service"), "x").unwrap();
+    fs::write(dir.join("finish/uninstall.sh"), "x").unwrap();
+    let stub = dir.join("stub");
+    fs::create_dir_all(&stub).unwrap();
+    write_exec(
+        &stub.join("systemctl"),
+        r#"echo "systemctl $*" >> "$NN_TEST_DIR/calls""#,
+    );
+    let script = format!(
+        "set -euo pipefail\nT='{t}'\nUNIT_DIR=$T/units; FINISH_DIR=$T/finish; FINISH_UNIT=northnarrow-uninstall.service\n{}\nfinish_done\n",
+        block("deploy/uninstall.sh", "finish_at_boot"),
+        t = dir.display()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("NN_TEST_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!dir.join("units/northnarrow-uninstall.service").exists());
+    assert!(!dir.join("finish").exists());
+    let calls = fs::read_to_string(dir.join("calls")).unwrap();
+    assert!(
+        calls.contains("systemctl disable northnarrow-uninstall.service"),
+        "{calls}"
     );
 }

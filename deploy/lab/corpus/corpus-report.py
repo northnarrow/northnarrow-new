@@ -110,6 +110,12 @@ def is_kill(resp):
     return "Kill" in str(resp or "")
 
 
+# Lot 341: an action the no-enforcement gate suppressed (the alpha profile,
+# detect-only) — its outcome row's result, and a record's response text.
+WOULD_EXECUTE = "would_execute"
+WOULD_HAVE = "would have: "
+
+
 def short(s, n):
     s = str(s if s is not None else "")
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -158,11 +164,12 @@ def actions(path, steps):
                 why=why,
             )
         elif row == "outcome":
-            outcomes[r.get("action")] = str((r.get("outcome") or {}).get("outcome"))
+            o = r.get("outcome") or {}
+            outcomes[r.get("action")] = (str(o.get("outcome")), o.get("result"))
     out = []
     for k, i in intents.items():
         i["id"] = k
-        i["outcome"] = outcomes.get(k, "(no outcome row)")
+        i["outcome"], i["result"] = outcomes.get(k, ("(no outcome row)", None))
         i["step"] = attribute(steps, i["ns"])
         out.append(i)
     out.sort(key=lambda x: x["ns"] or 0)
@@ -287,7 +294,7 @@ def main():
 
     print("== report %s: %d steps, %d verdicts, %d action intents, %d COMBAT stages" % (C, len(steps), len(dets), len(acts), len(stages)))
     print("  kills (actions chain: intent → outcome; the process and posture from its verdict):")
-    kills = [i for i in acts if is_kill(i["resp"])]
+    kills = [i for i in acts if is_kill(i["resp"]) and i["result"] != WOULD_EXECUTE]
     for i in kills:
         d = detection_of(i) or {}
         print(
@@ -309,7 +316,13 @@ def main():
         )
     if not kills:
         print("    none")
-    other = [i for i in acts if not is_kill(i["resp"])]
+    # lot 341: what the gate suppressed — approved, never executed
+    would = [i for i in acts if i["result"] == WOULD_EXECUTE]
+    print("  would have (the no-enforcement gate: approved, not executed): %d" % len(would))
+    for resp, n in Counter(i["resp"] for i in would).most_common():
+        print("    %s ×%d" % (resp, n))
+        print("TSV	would	%s	%s	%d" % (C, resp, n))
+    other = [i for i in acts if not is_kill(i["resp"]) and i["result"] != WOULD_EXECUTE]
     if other:
         print("  other actions:")
         for i in other:

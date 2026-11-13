@@ -5,6 +5,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Added
+- Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
+  and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
+  - **Profile.** `alpha` is one more input of the agent's single
+    no-enforcement gate: no kill, no isolation, no quarantine, no exec
+    quarantine hold, no exec-policy, connect, exploit-guard or module-load
+    refusal of a user program; every suppressed response is recorded as
+    `would have: <action>` (it read `suppressed (detect-only)`, naming no
+    action; a `Log` decision reads `none`). The agent's self-protection, and
+    the host-wide guards that keep it able to see, stay on. The profile
+    comes from a signed `profile.local` (overlay kind 18, `config overlay
+    set profile`, the only switch of an installed agent, at its next start),
+    else the install manifest's `profile` (the installed binary only), else
+    `enforcing`.
+  - **One resolver.** The gate's inputs (`--detect-only`, the detect-only
+    variables, the profile) are read once, at the start
+    (`boot::integrity::resolve_gate`): the attach (exec quarantine, exec
+    policy) and the capability check each read the flag and the environment
+    themselves, so an input added in one place would have left the others
+    enforcing. A ratchet (`xtask/tests/alpha_profile.rs`) keeps every reader
+    in the resolver and every switch on its value.
+  - **Two paths that ignored the gate**: the module-load judge refused
+    untrusted modules under detect-only (its default deny mode), and the
+    exec quarantine's controller killed, at its start and its stop, a
+    process an earlier enforcing run owed a kill. Both observe now.
+  - **`install.sh`**: a fresh install records `alpha` (`--profile
+    enforcing`), starts the agent then the watchdog and enables both at boot
+    (`--no-enable` opts out), checks their health as an upgrade does, and
+    ends with a short summary (profile, status, records, uninstall, the key
+    to move off the host). A host it cannot run on (architecture, init
+    system, kernel BTF, a kernel `--btf-check` refuses, the BPF LSM off or
+    bpffs not mounted when starting) is refused before any change, with what
+    to do. An install keeps its profile; `--profile` never switches one.
+    The bootstrap key also carries `telemetry-read` (`nn-admin detections`).
+  - **`uninstall.sh`** also works when the agent is wedged (active, its
+    socket not answering): both units disabled, the rest finished at the
+    next boot by a self-removing one-shot (`northnarrow-uninstall.service`),
+    exit 3. Every call to the agent is bounded by `timeout`.
+  - **`nn-admin status`** starts with a human summary: posture and profile,
+    sensors OK or DEGRADED, today's records by severity, the responses that
+    would have run (`StatusResponse.profile`, `records_today`, appended).
+  - **Lab**: `nn-lab.sh install` keeps installing an enforcing agent for the
+    suites (`--profile enforcing --no-enable`); `NN_LAB_PROFILE=alpha`
+    installs as an operator would.
+
 ### Security
 - Lot 325: the exec environment's check complete and cheap (the re-check
   of #546).

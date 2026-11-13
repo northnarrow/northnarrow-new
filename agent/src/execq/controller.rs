@@ -1364,11 +1364,21 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         }
         let mut resumed = Vec::new();
         let mut killed = Vec::new();
+        // lot 341: the kills owed by an enforcing run that this observing
+        // one does not carry out (resumed, said)
+        let mut would_have_killed = Vec::new();
         let mut gone = 0u64;
         let mut deferred = Vec::new();
         let now = Instant::now();
         for (pid, st) in &left {
-            let kill = st.stop_ns == kernel::KILL_OWED;
+            let owed_kill = st.stop_ns == kernel::KILL_OWED;
+            // Lot 341 (alpha 2/4): an observing run (the no-enforcement
+            // gate: the `alpha` profile, detect-only) kills nothing — not
+            // even a kill an enforcing run before it owed: it resumes it.
+            let kill = owed_kill && self.s.policy.enforce;
+            if owed_kill && !kill {
+                would_have_killed.push(*pid);
+            }
             let pr = (self.capture)(*pid, st.start_ns);
             match pr.liveness() {
                 Liveness::Uncaptured(errno) => {
@@ -1418,6 +1428,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 "resumed": resumed,
                 // lot 317 (review F2): the kills the previous agent owed
                 "killed": killed,
+                // lot 341: owed kills an observing run resumed instead
+                "would_have_killed": would_have_killed,
                 "gone": gone,
                 // lot 317: not captured yet — still held, carried out once they are
                 "deferred": deferred,
@@ -1432,6 +1444,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// its kill if the map says one is owed. `None`: not captured, left in
     /// the map for the next start.
     fn release_unreported(&mut self, pid: u32, start_ns: u64, kill: bool) -> Option<Released> {
+        // Lot 341 (alpha 2/4): an observing run kills nothing — a kill the
+        // map says is owed is resumed instead.
+        let kill = kill && self.s.policy.enforce;
         let pr = (self.capture)(pid, start_ns);
         let r = match pr.liveness() {
             Liveness::Uncaptured(_) => return None,

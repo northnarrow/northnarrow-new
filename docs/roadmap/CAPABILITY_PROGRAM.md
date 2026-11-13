@@ -10382,3 +10382,47 @@ number in parentheses is a lab PR.
     split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
+- **Lot 341 — the observe-only `alpha` profile, install and uninstall as a
+  tester meets them (alpha 2/4; C17, C23, C27, C28; no level changes).**
+  - What was open: a tester's first install had to choose between an
+    enforcing agent (a false positive kills) and `--detect-only` in a unit
+    drop-in (a weakening the agent itself reports); detect-only was resolved
+    in three places (the integrity phase, the attach, the capability check),
+    and two paths ignored it — the module-load judge refused untrusted modules
+    (its default deny mode) and the exec quarantine killed, at its start and
+    its stop, a process an earlier enforcing run owed a kill; a suppressed
+    response was recorded `suppressed (detect-only)`, naming no action;
+    `install.sh` started nothing, checked no kernel, ended with ten steps; an
+    agent whose socket did not answer could not be uninstalled without a
+    manual reboot procedure.
+  - Done: the `alpha` profile, one more input of the single gate (a signed
+    `profile.local`, overlay kind 18, else the install manifest's, else
+    enforcing), resolved once (`boot::integrity::resolve_gate`, ratchet
+    `xtask/tests/alpha_profile.rs`); both ignoring paths gated; `would have:
+    <action>`; the agent's self-protection and its host-wide anti-blinding
+    guards unchanged. `install.sh`: alpha on a fresh install, `enable --now`
+    with the upgrade's health check (`--no-enable`), a host support check
+    before any change, a short summary; `uninstall.sh`: a wedged agent's
+    removal finished at the next boot (exit 3); `nn-admin status`: a human
+    summary first. 48 targeted mutants, each caught by a named test.
+  - Lab, as measured (our guests, lease k341): Debian 13 (6.12.116) and Ubuntu 26.04 (7.0.0):
+    a fresh `install.sh` (alpha, its own `enable --now`, health check passed,
+    the summary printed), then a cold boot: agent and watchdog active and
+    enabled right after and 30 s later, 77 pins, 49 LSM programs; `status`
+    `OBSERVE-ONLY — profile alpha (install manifest)`, sensors OK. The dev
+    corpus (24 steps): no kill (the corpus report's kills: none; would have:
+    `KillProcessTree` ×1, the control run as www-data, which ran its 20 s —
+    rc 137 on an enforcing agent). The R001 probe (a copy of bash run from
+    `/tmp` as www-data, 12 s): rc 0 after 12 s, its record `would have:
+    KillProcessTree`; the actions chain since the install: every outcome
+    `would_execute`, none carried out. `uninstall.sh --purge`, then a cold
+    boot: against the host before the install, no package, no `/etc` file,
+    no unit file, no bpffs entry, no LSM program, no account or group and no
+    NorthNarrow path changed (the corpus's own apt runs aside, on Debian
+    13's first round). Ubuntu 24.04 (6.8) and the wedged-agent round
+    (the agent and its watchdog stopped by SIGSTOP inside a window that then
+    closed, `uninstall.sh --purge` without a key, the reboot): queued when
+    this note was written, both guest slots taken by other lots; added here
+    when measured.
+  - Levels unchanged: the profile changes no capability's reach; it is the
+    alpha's default (C17's responses run only after a signed switch).

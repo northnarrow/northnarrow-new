@@ -105,7 +105,9 @@
 #   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
 #   NN_REPO (git toplevel of this script), NN_LAB_NIGHTLY_DOWN=1 (power the guest off at the end),
 #   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored"),
-#   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above).
+#   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above),
+#   NN_LAB_PROFILE (enforcing; alpha: `install` as an operator's fresh install —
+#   the observe-only profile, the units started by install.sh — lot 341).
 #   NN_LAB_CI=1: CI mode (.github/workflows/lab-vm.yml, lab PR 227), one KVM guest on a
 #   GitHub-hosted runner. KVM only (whpx and tcg refused), every cargo build --locked (the
 #   host's eBPF build, the guest's builds and test runs), ssh in batch mode with keepalives
@@ -1161,7 +1163,15 @@ cmd_install() {
     guest_provision_nftables
     # External audit DEP-007: the lab installs its synced source tree (no
     # MANIFEST.sha256), which install.sh now refuses without --source-tree.
-    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload' || die "install.sh failed (its output above)"
+    # Lot 341: the suites expect an enforcing agent, started by
+    # lab_start_units: `--profile enforcing --no-enable`. NN_LAB_PROFILE=alpha
+    # installs the operator's default instead — the observe-only alpha
+    # profile, started and enabled by install.sh itself (lot 341's round).
+    local flags="--source-tree --no-enable --profile enforcing"
+    if [[ ${NN_LAB_PROFILE:-enforcing} == alpha ]]; then
+        flags="--source-tree"
+    fi
+    vcargo "sudo ./deploy/install.sh $flags && sudo systemctl daemon-reload" || die "install.sh failed (its output above)"
     lab_start_units
 }
 
@@ -2363,7 +2373,7 @@ if [[ -n $left ]]; then echo "FAIL: northnarrow process still running: $left"; f
 if getent passwd northnarrow-worker >/dev/null || getent passwd northnarrow-scan >/dev/null || getent passwd northnarrow-export >/dev/null; then echo "FAIL: an agent account is left (northnarrow-worker / northnarrow-scan / northnarrow-export)"; fail=1; fi
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
-sudo ./deploy/install.sh --source-tree >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
+sudo ./deploy/install.sh --source-tree --no-enable --profile enforcing >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
 # External audit DEP-001: the bootstrap private key is written outside
 # /etc/northnarrow
 sudo test -s /root/northnarrow-admin.key || { echo "FAIL: no bootstrap key at /root/northnarrow-admin.key"; fail=1; }

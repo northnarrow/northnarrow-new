@@ -214,6 +214,11 @@ pub const INPUT_FLAGS: &[(&str, &str)] = &[
         "--nodns-allow-local",
         "NN-L-NET-028's signed allowlist (lot 275)",
     ),
+    (
+        "--profile-local",
+        "the signed response profile (lot 341; absent: the install manifest's, which applies \
+         to the installed binary only — a test's copy enforces)",
+    ),
 ];
 
 /// The paths an agent uses with no flag to move them. Every agent a test

@@ -4625,6 +4625,8 @@ mod tests {
                 event_bus_decision: None,
                 response_dispatch: None,
                 export: None,
+                profile: None,
+                records_today: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

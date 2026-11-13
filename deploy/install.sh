@@ -3,12 +3,18 @@
 #
 # Copies the release-mode agent + watchdog binaries to
 # /usr/local/bin/ and the two systemd unit files to
-# /etc/systemd/system/, then `daemon-reload`s. Does NOT enable
-# or start the units — operators run that explicitly after
-# inspecting the install layout.
+# /etc/systemd/system/, then `daemon-reload`s. Lot 341 (alpha 2/4): a fresh
+# install then starts both units and enables them at boot (`enable --now`;
+# --no-enable leaves them stopped), in the `alpha` profile — observe-only,
+# every verdict recorded with what it would have done (--profile enforcing
+# for an enforcing install) — and prints a short summary: the profile, where
+# the records are, how to see the status and how to uninstall. A host the
+# release cannot run on (architecture, init system, kernel BTF, a kernel the
+# agent does not support, the BPF LSM off) is refused before anything
+# changes, with what to do.
 #
 # Usage:
-#   sudo ./deploy/install.sh
+#   sudo ./deploy/install.sh [--profile alpha|enforcing] [--no-enable]
 #
 # Assumes `cargo xtask build --release` has already run and produced
 # ./target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}.
@@ -157,6 +163,19 @@ COW_GUARD=keep
 # release's agent would quarantine are listed and the run refused, unless
 # the operator accepts their move (own_dropins_preflight).
 ACCEPT_DROPIN_QUARANTINE=0
+# Lot 341 (alpha 2/4): the response profile a fresh install records in the
+# install manifest (`alpha` unless --profile enforcing; an existing install
+# keeps its own: switching is a signed `nn-admin config overlay set
+# profile`), and whether a fresh install starts the units and enables them
+# at boot (--no-enable clears it).
+PROFILE=""
+ENABLE_AT_BOOT=1
+# The host facts the support check reads (overridable for its tests).
+HOST_BTF=${HOST_BTF:-/sys/kernel/btf/vmlinux}
+HOST_LSM=${HOST_LSM:-/sys/kernel/security/lsm}
+HOST_SYSTEMD_DIR=${HOST_SYSTEMD_DIR:-/run/systemd/system}
+HOST_OS_RELEASE=${HOST_OS_RELEASE:-/etc/os-release}
+HOST_BPFFS=${HOST_BPFFS:-/sys/fs/bpf}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -179,6 +198,8 @@ while [[ $# -gt 0 ]]; do
         --cow-guard) COW_GUARD=1 ;;
         --no-cow-guard) COW_GUARD=0 ;;
         --accept-dropin-quarantine) ACCEPT_DROPIN_QUARANTINE=1 ;;
+        --profile) PROFILE=${2:-}; shift ;;
+        --no-enable) ENABLE_AT_BOOT=0 ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade --grant-key KEY] [--tarball FILE] [--sums FILE] [--attestation BUNDLE]"
             echo "                 [--source-tree | --allow-unverified | --no-verify] [--without-nftables]"
@@ -213,6 +234,13 @@ while [[ $# -gt 0 ]]; do
             echo "  install manifest and reported by nn-admin host-check."
             echo "  --without-nftables     install on a host without nft (nftables): the agent's per-process"
             echo "                         outbound block then cannot work (recorded in the install manifest)"
+            echo "  --profile alpha|enforcing"
+            echo "                         fresh install: the response profile (default alpha: observe-only, every"
+            echo "                         verdict recorded with what it would have done, nothing killed, blocked or"
+            echo "                         quarantined; the agent's self-protection stays on). An installed agent"
+            echo "                         keeps its profile: switch it with a signed nn-admin config overlay set profile"
+            echo "  --no-enable            fresh install: do not start the units nor enable them at boot"
+            echo "                         (default: systemctl enable --now, then a health check)"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -224,6 +252,10 @@ if (( REQUIRE_ATTESTATION_FLAG )) && { (( ALLOW_UNVERIFIED )) || (( ! VERIFY ));
 fi
 if (( ALLOW_UNVERIFIED )) || (( ! VERIFY )); then
     REQUIRE_ATTESTATION=0
+fi
+if [[ -n "$PROFILE" && "$PROFILE" != alpha && "$PROFILE" != enforcing ]]; then
+    echo "install.sh: --profile $PROFILE: alpha or enforcing" >&2
+    exit 2
 fi
 if (( DEFER_HEALTH )) && [[ $MODE != configure ]]; then
     echo "install.sh: --defer-health-check goes with --package-configure only" >&2
@@ -590,7 +622,8 @@ write_install_manifest() {
     "ebpf_object": "$sha_ebpf"
   },
   "tarball_sha256": $([[ -n "$TARBALL_SHA256" ]] && echo "\"$TARBALL_SHA256\"" || echo null),
-  "attestation": {"verified": $([[ $ATTEST_VERIFIED == 1 ]] && echo true || echo false), "method": "$ATTEST_METHOD", "signer_workflow": "$SIGNER_WORKFLOW", "failure": $([[ -n "$ATTEST_FAILURE" ]] && echo "\"$ATTEST_FAILURE\"" || echo null)}
+  "attestation": {"verified": $([[ $ATTEST_VERIFIED == 1 ]] && echo true || echo false), "method": "$ATTEST_METHOD", "signer_workflow": "$SIGNER_WORKFLOW", "failure": $([[ -n "$ATTEST_FAILURE" ]] && echo "\"$ATTEST_FAILURE\"" || echo null)},
+  "profile": $([[ -n "${PROFILE_RECORDED:-}" ]] && echo "\"$PROFILE_RECORDED\"" || echo null)
 }
 EOT
     # Lab PR 220: next to the old one, then rename(2) over it — the agent
@@ -1269,6 +1302,70 @@ start_units() {   # <unit>...
     return 0
 }
 
+# >>> install_profile (run by xtask/tests/install_scripts.rs)
+# Lot 341 (alpha 2/4): the response profile this run records in the install
+# manifest, from the manifest already there ($1) and --profile ($2, may be
+# empty). A host without a manifest is a fresh install: --profile, else
+# `alpha` (observe-only). An install keeps its profile (none recorded: an
+# install older than the field, whose agent enforces); a --profile that
+# differs from it is refused (exit 2) — switching an installed agent is a
+# signed operator action. Prints the profile to record, empty for none.
+install_profile() {   # <existing manifest> <asked profile>
+    local manifest=$1 asked=$2 current=""
+    if [[ ! -e "$manifest" ]]; then
+        echo "${asked:-alpha}"
+        return 0
+    fi
+    current=$(sed -n 's/^[[:space:]]*"profile":[[:space:]]*"\([a-z]*\)".*/\1/p' "$manifest" | head -1)
+    if [[ -n "$asked" && "$asked" != "${current:-enforcing}" ]]; then
+        echo "install.sh: this install's profile is ${current:-enforcing}; --profile $asked does not switch an installed agent." >&2
+        echo "install.sh: Switching is a signed operator action, applied at the agent's next start:" >&2
+        echo "install.sh:   echo 'profile = $asked' > /root/profile.local" >&2
+        echo "install.sh:   nn-admin config overlay set profile --file /root/profile.local --key <config-manage key>" >&2
+        echo "install.sh: (docs/operator/ALPHA_PROFILE.md). Nothing was changed." >&2
+        return 2
+    fi
+    echo "${asked:-$current}"
+}
+# <<< install_profile
+
+# >>> install_summary (run by xtask/tests/install_scripts.rs)
+# Lot 341 (alpha 2/4): what a tester reads at the end — the profile, whether
+# the agent runs, where the records are, how to see the status, how to
+# uninstall. PROFILE_RECORDED, STARTED_NOW, MODE, ADMIN_KEY_OUT, REPO_ROOT.
+install_summary() {
+    local key="<your admin key>" profile=${PROFILE_RECORDED:-enforcing}
+    [[ -f "$ADMIN_KEY_OUT" ]] && key=$ADMIN_KEY_OUT
+    echo ""
+    echo "NorthNarrow is installed."
+    case $profile in
+        alpha) echo "  profile   : alpha — observe-only: nothing is killed, blocked or quarantined; every verdict is"
+               echo "              recorded with what it would have done. The agent still protects itself." ;;
+        *)     echo "  profile   : $profile — the agent's responses run (kill, quarantine, isolation)." ;;
+    esac
+    if (( STARTED_NOW )); then
+        echo "  running   : yes — agent and watchdog active, started again at every boot"
+    elif [[ $MODE == full ]]; then
+        echo "  running   : no — start it (and at every boot): sudo systemctl enable --now northnarrow-agent northnarrow-watchdog"
+    else
+        echo "  running   : as the package manager left it (systemctl status northnarrow-agent)"
+    fi
+    echo "  status    : sudo nn-admin status --key $key"
+    echo "  records   : sudo nn-admin detections --key $key   (signed, in $STATE_DIR)"
+    echo "              logs: journalctl --namespace=northnarrow -u northnarrow-agent"
+    if [[ $MODE == full ]]; then
+        echo "  uninstall : sudo $REPO_ROOT/deploy/uninstall.sh --purge --grant-key $key"
+    else
+        echo "  uninstall : remove the northnarrow package with your package manager"
+    fi
+    if [[ -f "$ADMIN_KEY_OUT" ]]; then
+        echo "  admin key : $ADMIN_KEY_OUT — it switches the profile, unlocks and uninstalls: keep it safe, off this host"
+    fi
+    echo "  more      : docs/operator/ALPHA_PROFILE.md (the profile, switching to enforcing),"
+    echo "              docs/operator/INSTALL_UPGRADE_UNINSTALL.md, sudo nn-admin host-check (host hardening)"
+}
+# <<< install_summary
+
 require_root
 if [[ $MODE == verify ]]; then
     # Lab PR 220: the rpm %posttrans, after the whole transaction (the old
@@ -1336,6 +1433,9 @@ for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag 
 done
 # Before anything on the host changes, a running install's stop included.
 require_nft
+# Lot 341: the profile this run records (refused before any change when
+# --profile would switch an installed agent).
+PROFILE_RECORDED=$(install_profile "$ETC_DIR/install-manifest.json" "$PROFILE") || exit 2
 
 # Review of #480 (F11): an account of the agent's names that already exists
 # is used as it is — the agent drops its workers and its scanner to it. It
@@ -1579,6 +1679,57 @@ wait_own_programs_unloaded() {
 # in a child of it): the binary is this script's shell's child, the window's
 # installer (nn-admin's parent), with no fork between that R009's lineage walk
 # would need to read while it still runs.
+# >>> host_support (run by xtask/tests/install_scripts.rs)
+# Lot 341 (alpha 2/4): a host this release cannot run on is refused before
+# anything changes, each reason with what to do: not x86_64, systemd not the
+# init system, no kernel BTF, a kernel the agent's own check says it does
+# not support (`--btf-check`: BTF_RC 2, or 3 when it cannot read it; read
+# by tree_version), and — when the units are to start now — the BPF LSM off
+# or bpffs not mounted. A distribution outside the verified matrix is said,
+# not refused (the kernel check decides). HOST_* name the facts' files.
+host_support_check() {
+    local why=() arch id ver lsm
+    [[ ${HOST_CHECKED:-0} == 1 ]] && return 0
+    arch=$(uname -m 2>/dev/null || echo unknown)
+    [[ $arch == x86_64 ]] || why+=("the architecture is $arch: this release is built for x86_64 only")
+    [[ -d "$HOST_SYSTEMD_DIR" ]] || why+=("systemd is not the init system ($HOST_SYSTEMD_DIR missing): the agent and its watchdog run as systemd units")
+    if [[ ! -r "$HOST_BTF" ]]; then
+        why+=("the kernel has no BTF ($HOST_BTF): the agent needs a kernel built with CONFIG_DEBUG_INFO_BTF=y")
+    elif [[ ${BTF_RC:-0} == 2 ]]; then
+        why+=("kernel $(uname -r 2>/dev/null) is NOT SUPPORTED by this release (northnarrow-agent --btf-check: ${BTF_VERDICT:-no detail})")
+    elif [[ ${BTF_RC:-0} == 3 ]]; then
+        why+=("the kernel's BTF could not be read (northnarrow-agent --btf-check: ${BTF_VERDICT:-no detail})")
+    fi
+    if (( ENABLE_AT_BOOT )) && (( ! UPGRADE )); then
+        lsm=$(cat "$HOST_LSM" 2>/dev/null || true)
+        if [[ ",$lsm," != *,bpf,* ]]; then
+            why+=("the BPF LSM is off (${HOST_LSM}: ${lsm:-unreadable}): add 'bpf' to the kernel's lsm= list and reboot (docs/operator/KERNEL_COMPATIBILITY.md, \"Enabling the bpf LSM\"); or install now with --no-enable and enable the units after the reboot")
+        fi
+        if ! mountpoint -q "$HOST_BPFFS" 2>/dev/null; then
+            why+=("bpffs is not mounted at $HOST_BPFFS (mount -t bpf bpf $HOST_BPFFS; systemd mounts it at boot on every supported distribution)")
+        fi
+    fi
+    if (( ${#why[@]} )); then
+        echo "install.sh: this host cannot run NorthNarrow — nothing was changed:" >&2
+        local w
+        for w in "${why[@]}"; do echo "install.sh:   - $w" >&2; done
+        echo "install.sh: supported systems: docs/operator/KERNEL_COMPATIBILITY.md" >&2
+        return 1
+    fi
+    id="" ver=""
+    if [[ -r "$HOST_OS_RELEASE" ]]; then
+        id=$(sed -n 's/^ID=//p' "$HOST_OS_RELEASE" | tr -d '"' | head -1)
+        ver=$(sed -n 's/^VERSION_ID=//p' "$HOST_OS_RELEASE" | tr -d '"' | head -1)
+    fi
+    case "$id:${ver%%.*}:$ver" in
+        ubuntu:*:22.04|ubuntu:*:24.04|ubuntu:*:26.04|debian:12:*|debian:13:*|almalinux:9:*|rocky:9:*|rhel:9:*) ;;
+        *) echo "install.sh: NOTE: ${id:-this distribution} ${ver} is not in the verified matrix (Ubuntu 22.04/24.04/26.04, Debian 12/13, the RHEL 9 family); its kernel passed the agent's check — installing. Tell the project what you see (its issue tracker)." ;;
+    esac
+    HOST_CHECKED=1
+    return 0
+}
+# <<< host_support
+
 tree_version() {
     new_ver=$(exec "$AGENT_BIN" --version 2>/dev/null) || true
     new_ver=${new_ver%%$'\n'*}
@@ -1590,6 +1741,15 @@ tree_version() {
     # tree's agent has no such check (an older release).
     DROPINS_RC=0
     DROPINS_FOUND=$(exec "$AGENT_BIN" --own-dropins check 2>/dev/null) || DROPINS_RC=$?
+    # Lot 341: this release's verdict on the running kernel (host_support):
+    # 0 supported (degraded included), 2 not supported, 3 unreadable
+    BTF_RC=0
+    BTF_VERDICT=""
+    if [[ -r "$HOST_BTF" ]]; then
+        BTF_VERDICT=$(exec "$AGENT_BIN" --btf-check "$HOST_BTF" 2>&1) || BTF_RC=$?
+        # the verdict's own line (`btf-check <file>: NOT SUPPORTED — …`)
+        BTF_VERDICT=$(grep -m1 -E '^btf-check .*(SUPPORTED|UNREADABLE|UNPARSEABLE)' <<<"$BTF_VERDICT" | cut -c1-240 || true)
+    fi
 }
 # The re-review of #497 (RR2): with --accept-dropin-quarantine, the tree's
 # agent moves them (inside the window, or with no agent left to judge the
@@ -1847,6 +2007,9 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
     if [[ $MODE == full ]]; then
         # the window is open: R009 records the tree's execs at Low (lot 278)
         tree_version
+        # Lot 341: a release that cannot run on this host is refused before
+        # the running units are stopped
+        host_support_check || exit 1
         if ! own_dropins_preflight; then
             (( STARTED_FOR_WINDOW )) &&
                 echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
@@ -1889,6 +2052,9 @@ if [[ $MODE == full && ${new_ver:-unknown} == unknown ]]; then
     tree_version
 fi
 if [[ $MODE == full ]]; then
+    # Lot 341: a host this release cannot run on, refused before any change
+    # (an upgrade checked it above, before its stop)
+    if (( ! UPGRADE )); then host_support_check || exit 1; fi
     own_dropins_preflight || exit 1
 fi
 
@@ -2253,7 +2419,9 @@ else
         # Explicit role list: the defaults (unlock, audit-read) plus
         # trusted-installer, which `install.sh --upgrade --grant-key` and
         # `uninstall.sh --grant-key` need to purge the protected pin root.
-        sed -i '$ s/[[:space:]]*$/ unlock,audit-read,trusted-installer,config-manage/' "$ETC_DIR/admin.pub"
+        # Lot 341: and telemetry-read, the read of the records
+        # (`nn-admin detections`) the summary below points a tester to.
+        sed -i '$ s/[[:space:]]*$/ unlock,audit-read,telemetry-read,trusted-installer,config-manage/' "$ETC_DIR/admin.pub"
         echo ""
         echo "  ##########################################################################"
         echo "  #  SECURITY — an admin PRIVATE key was just written to this host:         #"
@@ -2264,9 +2432,10 @@ else
         echo "  #  store it offline, e.g.:                                                #"
         echo "  #      mv $ADMIN_KEY_OUT  <secure-offline-location>"
         echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
-        echo "  #  Roles: unlock, audit-read, trusted-installer (what --upgrade and       #"
-        echo "  #  uninstall.sh --grant-key use to purge the protected pin root) and      #"
-        echo "  #  config-manage (signs *.local overlays). canary-manage / fim-manage /  #"
+        echo "  #  Roles: unlock, audit-read, telemetry-read (nn-admin detections),      #"
+        echo "  #  trusted-installer (what --upgrade and uninstall.sh --grant-key use to  #"
+        echo "  #  purge the protected pin root) and config-manage (signs *.local        #"
+        echo "  #  overlays, the profile's too). canary-manage / fim-manage /            #"
         echo "  #  force-posture need a role list on its admin.pub line.                  #"
         echo "  #  Until it is gone the agent records it (integrity_drift, signed) and    #"
         echo "  #  nn-admin host-check reports WARN admin_key.                            #"
@@ -2572,79 +2741,40 @@ if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
 fi
 txn_commit
 
+# Lot 341 (alpha 2/4): a fresh install starts the agent, then the watchdog,
+# and enables both at boot — the operator's `systemctl enable --now` — unless
+# --no-enable. The start must pass the upgrade's health check (both units
+# active, every deny hook attached, the admin socket answering, the
+# watchdog registered); a start that does not is named and the run fails.
+# Units stopped with a protected pin root (started above only for the
+# window, external audit DEP-020) end as they were; so does a package's
+# configure step (its maintainer scripts decide).
+STARTED_NOW=0
+if [[ $MODE == full ]] && (( ENABLE_AT_BOOT )) && (( ! STARTED_FOR_WINDOW )); then
+    echo "install.sh: enabling at boot and starting northnarrow-agent, then northnarrow-watchdog (--no-enable skips this)"
+    if ! systemctl enable --now northnarrow-agent.service; then
+        echo "install.sh: FAILED: systemctl enable --now northnarrow-agent.service — see: systemctl status northnarrow-agent;" >&2
+        echo "install.sh: journalctl --namespace=northnarrow -u northnarrow-agent. Remove with: sudo ./deploy/uninstall.sh --purge" >&2
+        exit 1
+    fi
+    if ! systemctl enable --now northnarrow-watchdog.service; then
+        echo "install.sh: FAILED: systemctl enable --now northnarrow-watchdog.service — see: systemctl status northnarrow-watchdog" >&2
+        exit 1
+    fi
+    echo "install.sh: health check of northnarrow-agent northnarrow-watchdog (up to ${HEALTH_TIMEOUT}s)"
+    if ! upgrade_health_check northnarrow-agent northnarrow-watchdog; then
+        echo "install.sh: the agent did not pass its health check: $HEALTH_FAILURE" >&2
+        echo "install.sh: see: systemctl status northnarrow-agent; journalctl --namespace=northnarrow -u northnarrow-agent" >&2
+        echo "install.sh: remove it with: sudo ./deploy/uninstall.sh --purge --grant-key $ADMIN_KEY_OUT" >&2
+        exit 1
+    fi
+    if ! boot_enablement northnarrow-agent northnarrow-watchdog; then
+        echo "install.sh: WARNING: $ENABLE_FAILURE — the next boot would start no agent" >&2
+    fi
+    if [[ -n "$HEALTH_NOTE" ]]; then echo "install.sh: WARNING: $HEALTH_NOTE" >&2; fi
+    STARTED_NOW=1
+fi
+
 echo ""
 echo "install.sh: install complete."
-echo ""
-echo "Host hardening (nn-admin host-check — the anti-tamper holds only while root cannot rewrite the kernel at runtime):"
-"$BIN_DIR/nn-admin" host-check 2>/dev/null | sed 's/^/  /' || true
-echo ""
-echo "Next steps (operator runs explicitly — install.sh does NOT auto-start):"
-echo "(The docs/operator/ guides named below are in the release tree; a package"
-echo " installs them in /usr/share/doc/northnarrow/operator/.)"
-echo ""
-echo "  1. Verify the install layout:"
-echo "       systemctl status northnarrow-agent.service"
-echo "       systemctl status northnarrow-watchdog.service"
-echo ""
-echo "  2. Confirm /etc/northnarrow/ has admin.pub +"
-echo "     combat-rules.v4 + combat-rules.v6 + combat-allow.cidrs + agent_id +"
-echo "     fim-paths.v1 + canary-templates/ +"
-echo "     netflow-blocklist.v1 + netflow-ja3-blocklist.v1 +"
-echo "     process-comm-allowlist.v1 + netflow-comm-allowlist.v1 (the"
-echo "     agent bootstraps agent_id on first start; admin.pub and the"
-echo "     private key $ADMIN_KEY_OUT were auto-generated above IF admin.pub"
-echo "     was absent — MOVE that key OFFLINE now (docs/operator/COMBAT_RECOVERY.md);"
-echo "     combat-rules.v4 + .v6 are operator-provided (configs/ has both;"
-echo "     v6 preserves NDP — see its header); combat-allow.cidrs +"
-echo "     fim-paths.v1 + canary-templates/ + netflow-{,ja3-}blocklist.v1 +"
-echo "     {process,netflow}-comm-allowlist.v1 were just installed above)."
-echo "     Optional: add management CIDRs to combat-allow.cidrs to keep an"
-echo "     SSH path open during COMBAT (anti-lockout — empty by default;"
-echo "     see docs/operator/COMBAT_RECOVERY.md §2)."
-echo "     Overlays (*.local) are loaded only when signed by a key with the"
-echo "     config-manage role: write the overlay to a file, then"
-echo "       nn-admin config overlay set <kind> --file <file> --key <key>"
-echo "     (stored by the running agent; applies at its next start)."
-echo "     (A file dropped into /etc/northnarrow by hand is refused while the"
-echo "     agent runs.) Optional: a fim-paths overlay to customise"
-echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
-echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."
-echo "     Optional: netflow-blocklist + netflow-ja3-blocklist overlays to"
-echo "     extend the NetFlow blocklists from a threat-intel feed (\`+entry\` add,"
-echo "     \`-entry\` disable — same schema as fim-paths.local; the entry format"
-echo "     is in the header of $ETC_DIR/netflow-{,ja3-}blocklist.v1)."
-echo "     Optional: process-comm-allowlist + netflow-comm-allowlist overlays"
-echo "     to tune the Tappa 10.5 detection-rule comm exemptions (\`+comm\` add,"
-echo "     \`-comm\` re-enable detection on a default — same schema; the format"
-echo "     is in the header of $ETC_DIR/{process,netflow}-comm-allowlist.v1)."
-echo "     Overlay kinds and signing: docs/operator/INSTALL_UPGRADE_UNINSTALL.md §3.6."
-echo "     CONTAINER HOSTS: set process-comm-allowlist.local.example as the"
-echo "     process-comm-allowlist overlay to exempt container-runtime comms (\`runc\` etc.). This"
-echo "     weakens R013 escape-to-host detection — read the security note"
-echo "     in docs/operator/CONTAINER_HOST_DEPLOY.md before enabling."
-echo "     Deploy canaries with \`nn-admin canary deploy <type> --path ...\`"
-echo "     (Tappa 9.5 §12 Q1 EXPLICIT-PER-HOST: no default canaries —"
-echo "     placement is operator-curated)."
-echo ""
-echo "  3. Confirm bpffs is mounted at /sys/fs/bpf:"
-echo "       mount | grep ' /sys/fs/bpf'"
-echo "     If absent: mount -t bpf bpf /sys/fs/bpf"
-echo ""
-echo "  4. Confirm the 'bpf' LSM is in the kernel's lsm= chain:"
-echo "       cat /sys/kernel/security/lsm"
-echo "     Without it the agent refuses to start (exit 78; NN_ANTI_TAMPER_ALLOW_DEGRADED=1"
-echo "     starts it without enforcement, trust level L0: docs/operator/BOOT_INTEGRITY.md)."
-echo "     If absent: ADD 'bpf' to the list the kernel runs, then reboot. Never"
-echo "     write a fixed lsm= list: it replaces the kernel's own and can switch"
-echo "     SELinux or AppArmor off (update-grub on Debian/Ubuntu, grubby on the"
-echo "     RHEL family: docs/operator/KERNEL_COMPATIBILITY.md, \"Enabling the bpf LSM\")."
-echo ""
-echo "  5. Enable + start:"
-echo "       systemctl enable --now northnarrow-agent.service"
-echo "       systemctl enable --now northnarrow-watchdog.service"
-echo ""
-echo "  6. Follow logs:"
-echo "       journalctl --namespace=northnarrow -u northnarrow-agent.service -f"
-echo "       journalctl --namespace=northnarrow -u northnarrow-watchdog.service -f"
-echo "     (NN logs live in the 'northnarrow' journal namespace — capped 1G,"
-echo "      NOT forwarded to rsyslog/syslog. The --namespace flag is required.)"
+install_summary
