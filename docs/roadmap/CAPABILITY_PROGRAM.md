@@ -9474,6 +9474,122 @@ number in parentheses is a lab PR.
     name; a renamed copy of a shell with no socket on its stdio is R017's
     only by its name; in tracepoint mode a path is the exec pump's lexical
     normalisation of the caller's string (PROC-002/003).
+- **Lot 316 — the system tools' argv, read by the one reader (C14; the
+  third bug hunt's lot 7: BUG-106, BUG-86, N4 P2; BUG-89, BUG-96 P3; all
+  need root).**
+  - What was open: NN-L-EVA-001..003 read systemctl, pkill, killall,
+    iptables, nft and firewall-cmd by hand-written lists. An unlisted valued
+    option before the verb, a getopt_long prefix or a cluster (`systemctl -P
+    Id stop auditd`, `--si KILL kill auditd`, `-qs KILL kill auditd`) moved
+    the verb onto a value: no record, no DefenseImpairment, and systemd's
+    own signals have no `task_kill` backstop; `iptables --policy INPUT
+    ACCEPT` and `firewall-cmd --set-default-zone trusted` were not the
+    listed words; pkill's `-n`, `-o`, `-c` and killall's `-g` took the name
+    as their value; `systemctl stop northnarrow-agent auditd` inside a
+    trusted-installer window was judged on its first unit and sanctioned; a
+    cloud agent's uninstaller run by a shell was registered as the agent's
+    own process.
+  - What changed: lot 310's reader reads the system tools too (getopt_long
+    prefixes, getopt_long_only, GNU permutation and the `POSIXLY_CORRECT`
+    reading, aliases, `-SIGNAL`, iptables' optional and two-argument
+    options, nft's command line), through tables from the tools' sources
+    (`impair/tool_options.rs`); an option no table holds gives an
+    over-approximation, never `None`; every listed unit of a command judged,
+    globs by `fnmatch`; iptables by every name; pkill's and killall's names
+    matched as the tools match them; `impair/mod.rs` pinned at 4 sites by
+    lot 310's ratchet (`xtask/tests/interpreter_options.rs`; it held 72)
+    and these tools' shapes planted; the differential `#[ignore]` test
+    against the real tools.
+  - The lab, as measured (our own guest under lease k316; the agent
+    uninstalled, the guest clean and off at the end): **Ubuntu 24.04**
+    (`6.8.0-147-generic`, systemd 255, iptables 1.8.10 nf_tables, nftables
+    1.0.9; r2 at e36d8d9a, each command in a transient unit under a `sh` of
+    its own, what it switched off put back at once). 38 spellings, each an
+    NN-L-EVA record (High): systemctl `-P Id stop`, `--check-inhibitors no
+    stop`, `--si TERM kill`, `-qs TERM kill`, `--message x mask`,
+    `--kill-whom=main kill` (rsyslog), `POSIXLY_CORRECT=1 … stop rsyslog
+    --user`, `--user --system stop`, the globs `*syslo*` and `rsyslo?.service`,
+    `--frobnicate stop` (not understood), and the agent's own units (`-P Id
+    stop northnarrow-agent`, `-qs KILL kill northnarrow-watchdog` — also
+    NN-L-AT-001, denied — `--message x mask northnarrow-agent`): EVA-001;
+    `pkill -n`, `-o`, `-9 -n`, `killall -g`, `-signal TERM`, `pkill rsyslo`,
+    `pkill -f /usr/sbin/rsyslogd`, `killall /usr/sbin/rsyslogd`, `killall -I
+    RSYSLOGD`: EVA-003; `iptables -F`, `--flush`, `--fl INPUT`, `-FINPUT`,
+    `--policy INPUT ACCEPT`, `-PINPUT ACCEPT`, `iptables-nft -w -F`,
+    `xtables-nft-multi main4 --flush`, `ip6tables --flush`, `nft flush
+    ruleset` in one argument, after `--` and after another command, a cloud
+    agent's uninstaller run by `sh` and as itself: EVA-002. 15 benign
+    commands (systemctl status, restart, show, list-units; iptables -L, -S,
+    an ACCEPT rule, a LOG rule whose prefix starts with `-F`; nft list, add
+    table; `kill -0 1`; a `pkill -f` of nothing): no record. In r1 the probe
+    read the records under the wrong key (the records were written; r2
+    reads them). Measured, not changed: logrotate's rsyslog postrotate
+    (`/usr/lib/rsyslog/rsyslog-rotate`: `systemctl kill -s HUP
+    rsyslog.service`) is NN-L-EVA-001 High, as on main — the kernel side
+    leaves SIGHUP out of a stop, the exec side does not (a decision, left
+    open). The differential as root with no agent installed: 915 argvs
+    (pkill and killall 321 in a PID namespace, iptables 218 and nft 210 in a
+    network namespace, systemctl 166 on a transient unit), 0 mismatches;
+    three `pkill sleep` kills of `nn316diffsleep` are left to `task_kill` by
+    design (a pattern less than half a name).
+  - Host: named tests for each bug (the triage's, renamed; they fail on
+    lot 310's head); 59 mutations of the new code, all caught by named tests
+    (9 survivors of the first round got a test each); the differential on
+    the host (pkill and killall, unprivileged PID namespace): 0 mismatches;
+    the golden case `eva-argv-spellings`; the full gates in the PR.
+  - The independent review of #548 (round 2): a unit glob matched as
+    systemd matches it (`FNM_NOESCAPE`, POSIX classes, a dotted unit as a
+    `.service`) in linear time — the first matcher backtracked and a 21-byte
+    glob of stars held the decision thread for hours; systemd's other verbs
+    that reach a unit (`condstop`, `clean`, `preset`, `revert`, `edit`,
+    `link`, `set-property`, `service-log-*`, `bind`, `mount-image`,
+    `isolate`, `rescue`, `emergency`, `preset-all`); units' aliases; procps'
+    `kill -s KILL -0`, a pid with blanks, killall's `//path`, `lt-pkill`; a
+    SIGHUP or SIGUSR1 every process reached catches (`SigCgt`) is Low —
+    logrotate's daily `rsyslog-rotate`. Ubuntu 24.04 (`6.8.0-149-generic`,
+    r3 at 5948856e, r4 at 9f7da2fb, the agent uninstalled and the guest
+    clean and off after each): `condstop`, `set-property`,
+    `service-log-level`, `[[:alpha:]]syslog.service`,
+    `rsyslo[[:alnum:]].service`, the alias `syslog`, `snap.amazon-ssm-agent.*`
+    each NN-L-EVA-001 High; `killall //usr/sbin/rsyslogd`, pgrep's binary
+    run as `lt-pkill`, `/usr/bin/kill -s KILL -0`, `-9 " <pid>"` NN-L-EVA-003
+    High; `rsyslog-rotate`, `systemctl kill -s HUP rsyslog.service` and
+    `/usr/bin/kill -HUP <rsyslogd>` Low (rsyslogd's `SigCgt`
+    `0000000100314001`), `-s TERM` High, `systemctl stop auditd` High;
+    `try-restart`, `condrestart` and an unmatched class glob no EVA record;
+    a 21- and a 200-star glob from the lab user, then `systemctl stop
+    auditd`: judged 0.08 s later. The differential as root with no agent:
+    1,027 argvs (kill and `argv[0]` added; systemctl with a snap-like unit,
+    the new verbs and classes), 0 mismatches. 32 mutations of the round's
+    code, all caught by named tests (8 after a test each). The kernel's
+    `task_kill` reports only SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP
+    (lot 330 is to report every default-fatal signal).
+  - The re-check of #548 (round 3). A reload is Low only when:
+    - the reading of the argv the process makes sends SIGHUP (N1). Under
+      `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid
+      for `kill`, is an operand and the signal TERM. The exec pump reads
+      systemctl's and `kill`'s environment while they run (`ENV_READ`,
+      `POSIXLY_CORRECT`, the coordinator's decision): logrotate's own
+      `rsyslog-rotate` is Low without `POSIXLY_CORRECT` and High with it.
+      When it could not be read, every reading must send SIGHUP;
+    - the tool documents SIGHUP as its reload (N3): auditd, rsyslog,
+      firewalld, falco. auditd's SIGUSR1 rotates its logs: High;
+    - every process of the unit's cgroup catches it (N4).
+    A bracket class now ends as glibc ends it (N2:
+    `[a[:]uditd.servic[:e:]` stops auditd). Checked against glibc 2.39's
+    `fnmatch`: 60,560 cases, plus 40,000 around `[:`, `[=` and `[.`; every
+    name glibc matches is matched. 39 mutations of the round's code: 37
+    caught by named tests (2 after a test each), 2 argued equivalent.
+    Ubuntu 24.04 (`6.8.0-149-generic`, systemd 255, fdba3a6f, the agent
+    uninstalled and the guest clean and off after): logrotate forced on
+    rsyslog's own configuration, run as a transient unit as the timer runs
+    it, ran the real postrotate (`rsyslog-rotate`) four times: each a Low
+    NN-L-EVA-001 (rsyslogd's `SigCgt` `0000000100314001`, alone in its
+    cgroup) and no other record. With `POSIXLY_CORRECT=1`, rsyslogd got
+    SIGTERM and the record was High. Left to lot 330, with F5, F6, F7 and F13: a
+    listed unit's file and drop-ins (an empty `ExecStart=` in a
+    `.service.d` drop-in, `daemon-reload`, `restart`: no record).
+  - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
   - What was open: a process whose `comm` is not UTF-8 — set with
@@ -10261,3 +10377,144 @@ number in parentheses is a lab PR.
     (fixed by the same change); the check has no live self-test (proposed).
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds its e2e to the privileged suites.
+- **Lot 325 — the exec environment's check complete and cheap (C23, C14;
+  no level changes).**
+  - What was open (the re-check of #546): the scan read the first 64
+    variables (R2, P2: padding hid a staging `LD_PRELOAD`, no privilege, no
+    race; for a root session no record); an x32 exec's `envp` was truncated
+    as an ia32 one's (R1); a full per-task map refused every exec in enforce
+    mode (R5); `EXECQ_CAND` was an LRU (R6); a FIM walk that could not run
+    was cached as the directory's class (R3); the FIM sensor's per-task
+    buffer cost an insert and a delete per open (+180 to +270 ns); the scan
+    read the caller's memory after the kernel's copy (TOCTOU, F2).
+  - Done: every variable read, up to 1,048,576 (three loops of global
+    functions), above the kernel's own limit (699,050); an array past the
+    cap (`TRUNCATED`) or a loader value past its capture (`LOADER_CUT`, the
+    mini-hunt) is counted ("environments not finished"), recorded High, and
+    refused at a protected target (the tier's rule refuses a staging
+    preload) or a set-id one; each occurrence of a loader variable judged
+    (the mini-hunt: musl's loader takes the first, the scan judged the
+    last); x32 read from the register whole; past the exec guards'
+    capacity, execs judged without their walk — protected targets refused,
+    the rest let through and recorded, `execpol_capacity` signed;
+    `EXECQ_CAND` a plain hash, cleaned with the FIM buffer at LSM
+    `task_free` (`nn_task_free`); a lost FIM walk never cached; the FIM
+    buffer kept for the task's life; the kernel's own copy of the
+    environment read again at `sched_process_exec`
+    (`execpol_env_commit`, `mm->env_start..env_end`, two optional BTF
+    offsets, slots 130–131) — an entry the first pass did not see is
+    `CHANGED`, counted, recorded Critical, and the image killed before its
+    first instruction where the tier refuses it. Reading the bprm pages at
+    `bprm_check_security` is not possible (no helper reads an `mm` no task
+    runs; a hand walk of the page tables needs the KASLR'd direct-map base):
+    `EXEC_POLICY.md` §5.
+  - Host: wire, record, controller, counters, `nn-proto` and `btf_offsets`
+    unit tests; `xtask/tests/exec_env_complete.rs` (8 tests, each failing on
+    `main`) and the updated `percpu_maps.rs` and `kernel_halves.rs`; 42
+    mutants, each caught by a named test; gates green once (108 suites,
+    4,862 passed).
+  - Lab, as measured (our guests, lease k325; 20 execs of `true` per case,
+    `NN_EXEC_POLICY=enforce`, the server profile, an ssh root shell — the
+    session tier, `deny-root`): on 7.0.0-43, `main` (`3fe162ef`, the same
+    boot) refused 0 of 20 behind 64, 65, 1,000 and 50,000 padding
+    variables, 0 of 20 with a staging preload first and a clean one last, 0
+    of 20 with a staging entry past 128 bytes of clean ones, and in the flip
+    race (a thread rewriting `LD_PRELOAD`'s first byte during the exec, 300
+    execs) 63 ran with the preload; the final object refused 20 of 20 in
+    each case (and pinned to CPU 2), and the flip race ran none with it
+    (73 refused at the first pass, 124 killed past the point of no return,
+    103 ran without it). 5.15.0-202 (`e8122d17`): every case 20 of 20, x32
+    and x32 with `envp` above 4 GiB 20 of 20 (x32 is on in Ubuntu 22.04);
+    the final object (`8b709552`) the same, the duplicate and the long list included; 6.12.116: every case 20 of 20, the flip race none with the preload (59 refused, 117 killed). The four e2e
+    (`a_staging_preload_behind_many_variables_is_refused`,
+    `the_exec_guards_past_their_capacity_keep_protected_targets_closed`,
+    `a_preload_written_after_the_kernel_s_copy_never_runs`,
+    `a_staging_preload_is_refused_at_every_exec_on_every_cpu`) pass on 7.0
+    , 6.12.116 and 5.15.0-202. `verifier-check` of the final object, 108 programs, 0
+    failing: 7.0 (`exec_check_lsm` 13,166 insns, processed 627,971, the
+    call chain's stack 480 of 512; `execpol_env_commit` 3,309, processed
+    97,211), 6.8.0-149 (12,676; 412,219), 6.12.116 (13,148; 668,228), 5.15.0-202
+    (12,676; 5.15 reports no processed count). FIM across tasks (`fimx`): 0 misattributed of 1.94 million
+    opens, the reader's 40 credential records intact.
+  - Cost (bpf_stats, 7.0, the same boot): `fim_file_open_sensor` 318.3 ns
+    per open, 316.7 on `main` before #546 (#546: 497 to 590);
+    `exec_check_lsm` 26.5 µs per exec (27.0 before); `execpol_env_commit`
+    2.0 to 2.6 µs per exec; `nn_task_free` 1.5 µs per task. 100,000
+    variables cost the two exec programs 1.6 ms, 600,000 empty ones 8.4 ms
+    (the exec itself 149 ms).
+  - R2's decision, measured: the largest legitimate environments on our
+    hosts — 41 variables (this workstation's session), 17 to 19 (any
+    process of a guest, 7.0, 6.12, 5.15), 16 to 17 (a login shell), 4 to 7
+    (a service), 22 to 23 (the e2e harness), 68 to 69 (a cargo build
+    script); no `LD_PRELOAD` or `LD_AUDIT` set in a running process; a
+    Kubernetes pod carries about 7 per service of its namespace
+    (documented). Against a cap of 1,048,576 (the kernel's own
+    limit 699,050): fail-closed at protected and set-id targets.
+  - The independent review of #547 (MERGE AFTER FIXES; new commits): F1
+    each loader entry judged as the loader reads it (the value read whole,
+    about 4 KiB, split on colons and white space, the path normalised; a
+    relative loader path fails closed at a protected or set-id target); F2
+    the post-commit check kills a protected or set-id target on what it
+    cannot clear, in a per-CPU buffer; F3 `orig_ax`'s low 32 bits; F4 a
+    failed exec's quarantine candidate goes with its file (LSM
+    `file_free_security`), 1,024 candidates per uid, a dropped one counted
+    and signed; F5 an unread environment goes to the post-commit check
+    instead of refusing every protected exec; F6 the FIM buffers 16,384 per
+    uid, a per-run buffer past it, counted (`open_sensor_per_call_total`);
+    F7 no refusal of a long clean value, the capture's off-by-one; F8 64
+    judged names per exec, the commit bounded at 98,304 reads; F9 the docs,
+    `task_free` tracked as attached, `KILLED` only when the signal went. The
+    per-uid shares are plain read-modify-writes (no atomics in the eBPF
+    crate), recounted by the agent. The first object of the round was
+    refused on 7.0 and on 5.15 (past a million instructions: the value's
+    judgment inline in the scan's loops); the judgment moved into global
+    functions (`nn_env_pending`, `nn_env_judge`, `nn_value_end`,
+    `nn_value_slash`, `nn_env_resolve`, `nn_execq_cand_put` /
+    `_remove`). Lab (the object of this code, our guests, lease k325): verifier-check 0 failing on 5.15.0-202,
+    6.8.0-149 (487,281), 6.12.116 and 7.0.0-43 (`exec_check_lsm` processed 816,949
+    on 7.0 and 803,595 on 6.12, 627,971 / 668,228 before the review; stack
+    448 of 512); the four e2e pass on 7.0 with the reviewer's forms (120
+    spaces, `//tmp/`, `/./tmp/`, a relative path, `rax`'s high half set:
+    refused; past the first pass's reads: killed; 2,880-byte clean
+    `LD_PRELOAD` and `LD_LIBRARY_PATH`: run; both per-task maps full: root,
+    `su` and `nobody` run, root's staging preload killed). Cost, 7.0
+    (bpf_stats): `exec_check_lsm` 33 µs per exec with no variable, 35 with
+    60, 44 with 1,000, 154 with 10,000; the commit 1.9 / 2.5 / 9.1 / 70.8
+    µs; 64 clean 4 KiB `LD_PRELOAD` values 361 + 231 µs; the commit's worst
+    case is bounded — 600,000 empty strings 509 µs (3,274 before),
+    100,000 variables 602 µs, past its 98,304 reads, and killed at a
+    protected target (`TRUNCATED`); 100,000 judged names refused at the
+    first pass in 42 µs (the 64-name cap). A failed exec's candidate goes with its file: 1,500 processes each failing an exec (no loader) and staying alive left no candidate (6.8; the uid's share back to 0, its row removed at the next recount); the FIM buffers' shares equal their entries, uid by uid. 40 targeted mutants,
+    each caught by a named test.
+  - The re-check of #547 (MERGE AFTER FIXES; new commits). G1–G4: a loader
+    value holding a control byte (a tab inside an `LD_PRELOAD` entry, which
+    glibc keeps; musl's newline) or a `$` token (`$LIB`, `$ORIGIN`,
+    `$PLATFORM`) is `irregular_loader_value`: refused at a protected or
+    set-id target, recorded elsewhere; an empty `LD_LIBRARY_PATH` element
+    (the caller's directory) is a relative directory — refused only with a
+    bare preload name searched in it, recorded alone (re-check 2: alone it
+    was refused, a false refusal of the variable's commonest shape). G5: the shares of the quarantine's candidates and of
+    the FIM buffers are the login's (`task->loginuid`, kept by a session's
+    container subuids), the uid's without one; an overflow row bounds the
+    shares the count map cannot track; the candidates' map full, the oldest
+    candidate stuck at least a second goes for the new one (`CAND_EVICTED`,
+    counted and signed). G6: measured with a kprobe on the verifier's
+    `check_max_stack_depth` during `verifier-check` (5.15 has no
+    `verified_insns`; the loader keeps no log of a successful load), the
+    re-check's first object counted 930,372 of 1,000,000 for
+    `exec_check_lsm` on 5.15 — above the coordinator's 900k line — so the
+    environment's check became a second LSM program on
+    `bprm_check_security`, `exec_env_lsm` (its record a global function:
+    inline, its path walk was verified once per state, 921,358 alone).
+    Final object, processed: 5.15.0-202 `exec_check_lsm` 141,595,
+    `exec_env_lsm` 292,123 (`fim_file_open_sensor` 821,228, pre-existing);
+    6.12.116 96,410 and 269,131; 7.0.0-43 87,234 and 330,221; 6.8.0-149
+    87,890 and 268,903; 0 failing on each, the deepest call chains 384 and 352 of 512.
+    Lab, 7.0: the R2 e2e passes with the four forms (tab, `:`, trailing
+    `:`, `$LIB`, newline: refused as root and as `nobody`); with the split
+    object, the capacity and TOCTOU e2e pass too; five subuids of login 1000
+    holding open files added 200 FIM buffers to login 1000's row and none
+    to a subuid's. 26 more mutants (21 of the re-check's fixes, 5 of the
+    split), each caught by a named test.
+  - Level unchanged: C23's provisional waits on the nightly on the five
+    guests; this lot adds three e2e to the privileged suites.

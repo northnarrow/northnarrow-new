@@ -217,7 +217,7 @@ mod tests {
             ),
             (
                 "security-tools.v1",
-                "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
+                "e5db7acd7b19a5d62e37322597ccc8994568cacf41e7b01311e0761de953cbfb",
             ),
             (
                 "daemon-data.v1",

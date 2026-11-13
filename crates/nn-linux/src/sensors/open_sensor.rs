@@ -32,9 +32,9 @@ use common::wire::open_sensor::{
         TREE_PERSIST, TREE_RUNTIME, TREE_SHM, TREE_SVC_DATA, TREE_UNIT_DATA, TREE_USER_CACHE,
         UNIT_TAG_SHIFT,
     },
-    open_reason, ChildRuleKey, OpenRecordRaw, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN,
-    OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
-    RUNTIME_UIDS_MAX,
+    open_reason, ChildRuleKey, OpenRecordRaw, OpenTaskRaw, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH,
+    OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX,
+    OPEN_SENSOR_ARMED, RUNTIME_UIDS_MAX,
 };
 use common::wire::InodeKey;
 use nn_model::telemetry::{FileCapability, FimEvent, FimOp};
@@ -696,7 +696,32 @@ pub struct OpenSensorMaps {
     last_generation: u32,
     armed: Array<MapData, u32>,
     depth_capped: PerCpuArray<MapData, u64>,
+    /// The review of #547 (F6): `OPEN_TASK_COUNTERS` (opens judged in a
+    /// run's own buffer while `task_free` runs; opens with no buffer).
+    task_counters: PerCpuArray<MapData, u64>,
+    /// The review of #547 (F6): the tasks' buffers (`OPEN_TASK`) and each
+    /// uid's share of them (`OPEN_TASK_UIDS`), recounted
+    /// ([`Self::recount_shares`]).
+    tasks: BpfHashMap<MapData, u64, AyaOpenTask>,
+    task_uids: BpfHashMap<MapData, u32, u64>,
+    /// The re-check of #547 (G5): the overflow row's count.
+    task_overflow: Array<MapData, u64>,
+    /// [`Self::per_call_total`] at the last recount, and when.
+    recounted: (u64, Option<Instant>),
 }
+
+/// `OpenTaskRaw` for aya (its own `Pod` marker).
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct AyaOpenTask(OpenTaskRaw);
+// SAFETY: `#[repr(C)]`, 512 bytes then two u32, no padding.
+unsafe impl aya::Pod for AyaOpenTask {}
+
+/// The review of #547 (F6): `OPEN_TASK` holds at most this many entries
+/// (`OPEN_TASK_CAP`): a recount reads no more.
+const OPEN_TASK_ENTRIES_MAX: usize = 65536;
+/// At most one recount of the tasks' shares this often.
+pub const OPEN_TASK_RECOUNT_EVERY: Duration = Duration::from_secs(300);
 
 /// External audit SNS-011: the slot that holds the directory-class
 /// generation (`DIR_CLASS_GEN`), as [`bump_generation_in`] reads and writes
@@ -767,6 +792,11 @@ impl OpenSensorMaps {
             last_generation: 0,
             armed: Array::try_from(take(ebpf, "OPEN_SENSOR")?)?,
             depth_capped: PerCpuArray::try_from(take(ebpf, "OPEN_DEPTH_CAPPED")?)?,
+            task_counters: PerCpuArray::try_from(take(ebpf, "OPEN_TASK_COUNTERS")?)?,
+            tasks: BpfHashMap::try_from(take(ebpf, "OPEN_TASK")?)?,
+            task_uids: BpfHashMap::try_from(take(ebpf, "OPEN_TASK_UIDS")?)?,
+            task_overflow: Array::try_from(take(ebpf, "OPEN_TASK_OVERFLOW")?)?,
+            recounted: (0, None),
         })
     }
 
@@ -782,6 +812,45 @@ impl OpenSensorMaps {
         Ok(self.depth_capped.get(&0, 0)?.iter().sum())
     }
 
+    /// The review of #547 (F6): opens judged in a run's own buffer because
+    /// the task's could not be kept (`OPEN_TASK` full, or its uid's share
+    /// taken) — correct, at an insert and a delete each — since the sensor
+    /// loaded (all CPUs). Also published for `nn-admin status`
+    /// ([`per_call_total`]).
+    pub fn per_call_total(&self) -> Result<u64> {
+        let n = self.task_counters.get(&0, 0)?.iter().sum();
+        PER_CALL_TOTAL.store(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+
+    /// The review of #547 (F6): each uid's share of the tasks' buffers
+    /// recounted from the entries
+    /// ([`crate::sensors::task_free::rewrite_shares`]) when opens went to a
+    /// run's own buffer since the last recount — the only effect of a share
+    /// that drifted up (a lost update) — at most once per
+    /// [`OPEN_TASK_RECOUNT_EVERY`]. `None`: nothing to do.
+    pub fn recount_shares(&mut self, now: Instant) -> Option<crate::sensors::task_free::Rewritten> {
+        let per_call = self.per_call_total().ok()?;
+        let (at, when) = self.recounted;
+        if per_call <= at || when.is_some_and(|t| now.duration_since(t) < OPEN_TASK_RECOUNT_EVERY) {
+            return None;
+        }
+        self.recounted = (per_call, Some(now));
+        let uids = self
+            .tasks
+            .iter()
+            .take(OPEN_TASK_ENTRIES_MAX)
+            .filter_map(|r| r.ok())
+            .map(|(_, t)| t.0.uid);
+        let mut want = crate::sensors::task_free::uid_shares(uids);
+        let overflow = crate::sensors::task_free::take_overflow(&mut want);
+        let mut r = crate::sensors::task_free::rewrite_shares(&mut self.task_uids, &want).ok()?;
+        if self.task_overflow.set(0, overflow, 0).is_err() {
+            r.failed += 1;
+        }
+        Some(r)
+    }
+
     /// Invalidate every cached directory class ([`bump_generation_in`]).
     pub fn bump_generation(&mut self) -> Result<()> {
         bump_generation_in(&mut self.generation, &mut self.last_generation)
@@ -794,6 +863,16 @@ impl OpenSensorMaps {
             .set(0, if on { OPEN_SENSOR_ARMED } else { 0 }, 0)?;
         Ok(())
     }
+}
+
+/// The review of #547 (F6): the last [`OpenSensorMaps::per_call_total`]
+/// read, for `nn-admin status` (0 until the sensor runs).
+static PER_CALL_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The file-open sensor's opens judged in a run's own buffer (the review of
+/// #547, F6), as last sampled.
+pub fn per_call_total() -> u64 {
+    PER_CALL_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A rule already absent is removed (`ENOENT`).
@@ -1712,6 +1791,8 @@ impl DepthCapLog {
 
     /// Read the counter from `maps` and log what is due.
     pub fn sample(&mut self, maps: &OpenSensorMaps) {
+        // the review of #547 (F6): published for the status, at each sample
+        let _ = maps.per_call_total();
         let Ok(total) = maps.depth_capped_total() else {
             return;
         };

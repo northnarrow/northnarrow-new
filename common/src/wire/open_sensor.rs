@@ -96,6 +96,13 @@ pub mod open_class {
     /// The class bits [`super::own_code`] reads: a write elsewhere is no
     /// one's own data, and its inodes are not read.
     pub const OWN_DATA_BITS: u32 = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | TREE_SHM;
+    /// Lot 325 (the re-check of #546, R3): computed class only (never a
+    /// rule, never cached): the ancestor walk could not run — the running
+    /// task's buffer could not be made (`OPEN_TASK` full) — so nothing of
+    /// the directory is known; the next open there walks again. It was
+    /// cached as the directory's (empty) class: `~/.aws/` lost
+    /// `LEAVES_CRED` until the cache entry went.
+    pub const WALK_LOST: u32 = 1 << 30;
     /// A computed `DIR_CLASS` entry (an empty class is still cached).
     pub const CLASSIFIED: u32 = 1 << 31;
     /// What a directory passes to every descendant.
@@ -112,6 +119,30 @@ pub mod open_class {
         | TREE_SHM;
     /// What a directory's own rule says about its direct children.
     pub const DIRECT: u32 = SUBTREE | CHILDREN_PROBE | LEAVES_CRED | CHILD_FILES | DIR_HAS_FILES;
+}
+
+/// The review of #547 (F6): the bytes of an `OPEN_TASK` entry before its
+/// uid — the task's windows and names (`agent-ebpf/src/open_sensor.rs`,
+/// `OpenTask`, which asserts the layout).
+pub const OPEN_TASK_BUFFERS: usize = 512;
+
+/// The review of #547 (F6): an `OPEN_TASK` entry as the agent reads it to
+/// recount each uid's share of the map (`OPEN_TASK_UIDS`): only `uid` is
+/// read.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct OpenTaskRaw {
+    pub buffers: [u8; OPEN_TASK_BUFFERS],
+    pub uid: u32,
+    pub _pad: u32,
+}
+
+/// Lot 325 (R3): whether a computed directory class may go into the
+/// cache (`DIR_CLASS`): not one whose walk could not run.
+#[inline(always)]
+pub const fn dir_class_cacheable(bits: u32) -> bool {
+    bits & open_class::WALK_LOST == 0
 }
 
 /// Why a record was emitted (`OpenRecordRaw::reason`, any combination).
@@ -1021,6 +1052,31 @@ pub fn kdbx_suffix(name: &[u8; OPEN_NAME_LEN]) -> bool {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    /// Lot 325 (the re-check of #546, R3): a walk that could not run is no
+    /// class of the directory — never cached, so the next open walks again;
+    /// a walk that found nothing (an empty class) still is.
+    #[test]
+    fn a_lost_walk_is_never_cached() {
+        use super::open_class::*;
+        assert!(!super::dir_class_cacheable(WALK_LOST));
+        assert!(!super::dir_class_cacheable(WALK_LOST | CLASSIFIED));
+        assert!(super::dir_class_cacheable(0));
+        assert!(super::dir_class_cacheable(
+            CLASSIFIED | TREE_CRED | DEPTH_CAPPED
+        ));
+        // a bit of its own: no rule or other computed class carries it
+        for b in [
+            SUBTREE,
+            DIRECT,
+            LEAF_CRED,
+            DEPTH_CAPPED,
+            CLASSIFIED,
+            OWNER_BITS,
+        ] {
+            assert_eq!(b & WALK_LOST, 0, "{b:#x}");
+        }
+    }
+
     use super::*;
 
     fn name(s: &str) -> [u8; OPEN_NAME_LEN] {

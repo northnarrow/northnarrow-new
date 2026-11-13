@@ -165,12 +165,6 @@ const KNOWN: &[(&str, usize, &str)] = &[
          (`/proc/`, `/dev/fd/`: a string prefix of an `LD_PRELOAD` entry, which the `mmap_file` \
          hook then judges on the file mapped), and their test (gated on `std`)",
     ),
-    (
-        "agent-ebpf/src/execpol.rs",
-        1,
-        "the same staging prefix as eight bytes in the eBPF program (`/dev/fd/`): the kernel \
-         cannot call the reader; the `mmap_file` hook judges the file",
-    ),
 ];
 
 fn which(text: &str) -> String {

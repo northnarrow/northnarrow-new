@@ -63,7 +63,15 @@ pub trait KernelIo {
     /// that read the heartbeat before it was cleared has ended — the stop
     /// it decided is in [`Self::stopped`] by then.
     fn quiesce(&mut self);
+    /// The review of #547 (F4): each uid's share of the candidates
+    /// recounted from the entries (the kernel's counts are plain
+    /// read-modify-writes). Every [`SHARES_EVERY`].
+    fn recount_shares(&mut self) {}
 }
+
+/// The review of #547 (F4): how often the uids' shares of the candidates
+/// are recounted (at most 4096 entries read).
+pub const SHARES_EVERY: Duration = Duration::from_secs(30);
 
 impl KernelIo for kernel::Kernel {
     fn ring_fd(&self) -> Option<RawFd> {
@@ -110,6 +118,18 @@ impl KernelIo for kernel::Kernel {
     fn quiesce(&mut self) {
         if !kernel::quiesce() {
             debug!("exec quarantine stop: membarrier refused — waited a fixed time instead");
+        }
+    }
+    fn recount_shares(&mut self) {
+        match kernel::Kernel::recount_shares(self) {
+            Ok(r) if r.corrected + r.removed + r.failed > 0 => debug!(
+                corrected = r.corrected,
+                removed = r.removed,
+                failed = r.failed,
+                "exec quarantine: uids' shares of the candidates recounted"
+            ),
+            Ok(_) => {}
+            Err(e) => debug!(error = %e, "exec quarantine: recounting the uids' shares failed"),
         }
     }
 }
@@ -292,6 +312,8 @@ pub struct Controller<K: KernelIo, B: Backend> {
     next_id: u64,
     last_beat: Option<Instant>,
     last_roots: Option<Instant>,
+    /// The review of #547 (F4): the last recount of the uids' shares.
+    last_shares: Option<Instant>,
     roots_source: std::path::PathBuf,
     /// Lot 311 (bug hunt 1.4, BUG-98): a mount table that cannot be read
     /// leaves the roots last published in force, signed.
@@ -310,7 +332,7 @@ pub struct Controller<K: KernelIo, B: Backend> {
     /// The kernel's fail-open counts already reported (the events ring
     /// full, the stop signal refused) and when: one signed degradation per
     /// [`DEGRADED_EVERY`] at most, with the counts since the previous one.
-    fail_open_seen: (u64, u64, u64),
+    fail_open_seen: (u64, u64, u64, u64, u64),
     fail_open_at: Option<Instant>,
     /// Lot 317 (BUG-124): how a held process is captured.
     capture: Capture,
@@ -355,6 +377,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             next_id: 1,
             last_beat: None,
             last_roots: None,
+            last_shares: None,
             roots_source: "/proc/self/mountinfo".into(),
             roots_read: nn_linux::state_read::LastGood::new("execq_roots", "the mount table"),
             roots_rows: nn_linux::state_read::Condition::new("execq_roots_rows"),
@@ -362,7 +385,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
-            fail_open_seen: (0, 0, 0),
+            fail_open_seen: (0, 0, 0, 0, 0),
             fail_open_at: None,
             capture: Box::new(ProcRef::open_started_at),
             owed: Vec::new(),
@@ -421,12 +444,16 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             COUNTERS
                 .known_identity
                 .store(c[counter::KNOWN_SKIP as usize], Ordering::Relaxed);
+            // the review of #547 (F4): a candidate the kernel dropped (its
+            // map full, its uid's share taken) ran unheld too
             COUNTERS.not_held.store(
                 c[counter::OBSERVED as usize]
                     + c[counter::STALE as usize]
                     + c[counter::RING_FULL as usize]
                     + c[counter::SIGNAL_FAILED as usize]
-                    + c[counter::MAP_FULL as usize],
+                    + c[counter::MAP_FULL as usize]
+                    + c[counter::CAND_DROPPED as usize]
+                    + c[counter::CAND_EVICTED as usize],
                 Ordering::Relaxed,
             );
             self.report_fail_open(
@@ -434,9 +461,18 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     c[counter::RING_FULL as usize],
                     c[counter::SIGNAL_FAILED as usize],
                     c[counter::MAP_FULL as usize],
+                    c[counter::CAND_DROPPED as usize],
+                    c[counter::CAND_EVICTED as usize],
                 ],
                 now,
             );
+        }
+        if self
+            .last_shares
+            .is_none_or(|t| now.duration_since(t) >= SHARES_EVERY)
+        {
+            self.k.recount_shares();
+            self.last_shares = Some(now);
         }
         if self
             .last_roots
@@ -733,10 +769,15 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// [`DEGRADED_EVERY`], with the counts since the previous one. Lot 317
     /// (review F3): and one the map of stopped processes could not name
     /// (`MAP_FULL`: the kernel stops only a process the map names).
-    fn report_fail_open(&mut self, counts: [u64; 3], now: Instant) {
-        let [ring_full, signal_failed, map_full] = counts;
-        let (ring0, sig0, map0) = self.fail_open_seen;
-        if ring_full <= ring0 && signal_failed <= sig0 && map_full <= map0 {
+    fn report_fail_open(&mut self, counts: [u64; 5], now: Instant) {
+        let [ring_full, signal_failed, map_full, dropped, evicted] = counts;
+        let (ring0, sig0, map0, drop0, ev0) = self.fail_open_seen;
+        if ring_full <= ring0
+            && signal_failed <= sig0
+            && map_full <= map0
+            && dropped <= drop0
+            && evicted <= ev0
+        {
             return;
         }
         if self
@@ -748,19 +789,26 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let ring = ring_full.saturating_sub(ring0);
         let sig = signal_failed.saturating_sub(sig0);
         let map = map_full.saturating_sub(map0);
+        let cand = dropped.saturating_sub(drop0);
+        let ev = evicted.saturating_sub(ev0);
         warn!(
             ring_full = ring,
             signal_failed = sig,
             map_full = map,
+            candidates_dropped = cand,
+            candidates_evicted = ev,
             "exec quarantine fail-open: execs ran without being held"
         );
         self.r.degraded(&format!(
             "exec quarantine fail-open: {} exec(s) ran without being held or scanned since the \
              previous record — the events ring was full for {ring} (ring-drop slot execq), the \
-             stop signal was refused for {sig}, the map of stopped processes was full for {map}",
-            ring + sig + map
+             stop signal was refused for {sig}, the map of stopped processes was full for {map}, \
+             a login's share of the candidates' map was taken (or the map was full with no \
+             candidate old enough to go) for {cand}, the oldest candidate went for a newer one, \
+             the map full, for {ev}",
+            ring + sig + map + cand + ev
         ));
-        self.fail_open_seen = (ring_full, signal_failed, map_full);
+        self.fail_open_seen = (ring_full, signal_failed, map_full, dropped, evicted);
         self.fail_open_at = Some(now);
     }
 

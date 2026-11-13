@@ -61,6 +61,25 @@ pub const DEFAULT_POLICY_LOCAL: &str = "/etc/northnarrow/exec-policy.local";
 /// program reads it from the exec's registers ([`ENV_OFFSETS`]).
 pub const MAP_PROGRAM: &str = "execmap_check";
 
+/// Lot 325 (TOCTOU, the review of #546 F2): the program that reads the new
+/// image's environment — the kernel's own copy — at `sched_process_exec`,
+/// past the exec's point of no return, and kills the image before its
+/// first instruction when it holds a staging loader entry the first pass
+/// did not see ([`COMMIT_OFFSETS`]).
+pub const COMMIT_PROGRAM: &str = "execpol_env_commit";
+/// The re-check of #547 (G6): the environment's check at the exec's first
+/// pass, its own LSM program on `bprm_check_security` (beside the exec
+/// sensor's `exec_check_lsm`, attached before it: each has its own
+/// verifier budget).
+pub const ENV_PROGRAM: &str = "exec_env_lsm";
+
+/// Lot 325: the `mm_struct` offsets [`COMMIT_PROGRAM`] reads the new image's
+/// environment with (`env_start`, `env_end`).
+pub const COMMIT_OFFSETS: [u32; 2] = [
+    common::btf_offsets::slot::MM_STRUCT_ENV_START_OFFSET,
+    common::btf_offsets::slot::MM_STRUCT_ENV_END_OFFSET,
+];
+
 /// Lot 322: the `pt_regs` offsets the environment check reads `envp` with
 /// (x86-64: `orig_ax`, `dx`, `r10`). Lab PR 226 read it at the
 /// `sys_enter_execve{,at}` tracepoints; on Ubuntu 26.04's 7.0 those programs
@@ -116,6 +135,9 @@ pub struct Config {
     pub env: bool,
     /// The executable-mapping checks (`--exec-policy-map`).
     pub map: bool,
+    /// Lot 325: the admin socket's directory, for the `debug-trigger`
+    /// builds' trigger files (`None` otherwise).
+    pub debug_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -126,6 +148,7 @@ impl Default for Config {
             source: "server profile (built in)".into(),
             env: true,
             map: true,
+            debug_dir: None,
         }
     }
 }
@@ -171,6 +194,36 @@ fn offsets_resolved(slots: &[u32]) -> bool {
     })
 }
 
+/// Lot 325: [`COMMIT_PROGRAM`] on `sched/sched_process_exec` (a tracepoint
+/// that is no syscall's: it runs on every CPU, lot 322).
+fn attach_commit(ebpf: &mut Ebpf) -> Result<()> {
+    let prog: &mut aya::programs::TracePoint = ebpf
+        .program_mut(COMMIT_PROGRAM)
+        .ok_or_else(|| anyhow!("program {COMMIT_PROGRAM} missing from the eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {COMMIT_PROGRAM} is not a tracepoint"))?;
+    prog.load()
+        .with_context(|| format!("verifier rejected `{COMMIT_PROGRAM}`"))?;
+    prog.attach("sched", "sched_process_exec")
+        .with_context(|| format!("attaching `{COMMIT_PROGRAM}`"))?;
+    Ok(())
+}
+
+/// The re-check of #547 (G6): [`ENV_PROGRAM`] on `bprm_check_security`.
+fn attach_env_lsm(ebpf: &mut Ebpf) -> Result<()> {
+    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the environment check")?;
+    let prog: &mut Lsm = ebpf
+        .program_mut(ENV_PROGRAM)
+        .ok_or_else(|| anyhow!("program {ENV_PROGRAM} missing from the eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {ENV_PROGRAM} is not LSM"))?;
+    prog.load("bprm_check_security", &btf)
+        .with_context(|| format!("verifier rejected `{ENV_PROGRAM}`"))?;
+    prog.attach()
+        .with_context(|| format!("attaching `{ENV_PROGRAM}`"))?;
+    Ok(())
+}
+
 fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
     let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the mapping check")?;
     let prog: &mut Lsm = ebpf
@@ -212,17 +265,42 @@ pub fn install(
     let mut map_ok = false;
     if m != Mode::Off {
         if cfg.env && cfg.table.has_env_rules() {
-            // Lot 322: read by the exec sensor's program itself, from the
-            // exec's registers — nothing to attach.
-            if offsets_resolved(&ENV_OFFSETS) {
-                env_ok = true;
-            } else {
+            // Lot 322: read from the exec's registers at its first pass —
+            // the re-check of #547 (G6): by a program of its own on the
+            // exec sensor's hook.
+            if !offsets_resolved(&ENV_OFFSETS) {
                 note(
                     "exec policy: the exec's registers cannot be read on this kernel \
                      (pt_regs.orig_ax, dx, r10 or si not resolved: not x86-64?): LD_PRELOAD, \
                      LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec"
                         .into(),
                 );
+            } else if let Err(e) = attach_env_lsm(ebpf) {
+                note(format!(
+                    "exec policy: the environment check is not attached ({}): LD_PRELOAD, \
+                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec",
+                    crate::sensors::exe_identity::verifier_tail(&e)
+                ));
+            } else {
+                env_ok = true;
+                // Lot 325 (TOCTOU): the kernel's own copy, read again past
+                // the point of no return.
+                if !offsets_resolved(&COMMIT_OFFSETS) {
+                    note(
+                        "exec policy: mm_struct.env_start / env_end not resolved on this kernel: \
+                         the new image's environment (the kernel's copy) is not read again, \
+                         so a loader variable written into the caller's memory after the \
+                         kernel's copy is not caught"
+                            .into(),
+                    );
+                } else if let Err(e) = attach_commit(ebpf) {
+                    note(format!(
+                        "exec policy: the post-commit environment check is not attached ({}): \
+                         a loader variable written into the caller's memory after the \
+                         kernel's copy is not caught",
+                        crate::sensors::exe_identity::verifier_tail(&e)
+                    ));
+                }
             }
         }
         if cfg.map && cfg.table.has_map_rules() {
@@ -312,8 +390,18 @@ pub struct Counters {
     pub exempted: AtomicU64,
     /// Lot 322: environments not read whole (`ENV_UNREAD`, each recorded).
     pub env_unread: AtomicU64,
-    /// Lot 322: runs whose per-task buffer could not be made (`LOST`).
+    /// Lot 322: runs whose per-task buffer could not be made (`LOST`; lot
+    /// 325: the execs refused then, protected targets).
     pub lost: AtomicU64,
+    /// Lot 325 (R2): environments the scan could not finish
+    /// (`ENV_TRUNCATED`, each recorded; refused at protected targets).
+    pub env_truncated: AtomicU64,
+    /// Lot 325 (TOCTOU): new images whose environment (the kernel's copy)
+    /// held a staging loader entry the first pass did not see
+    /// (`ENV_CHANGED`).
+    pub env_changed: AtomicU64,
+    /// Lot 325 (R5): execs let through without their walk (`LOST_OPEN`).
+    pub lost_open: AtomicU64,
     /// Records written (after the repeat window and before the per-rule
     /// budget).
     pub records: AtomicU64,
@@ -334,6 +422,9 @@ impl Counters {
         s(&self.exempted, counter::EXEMPTED);
         s(&self.env_unread, counter::ENV_UNREAD);
         s(&self.lost, counter::LOST);
+        s(&self.env_truncated, counter::ENV_TRUNCATED);
+        s(&self.env_changed, counter::ENV_CHANGED);
+        s(&self.lost_open, counter::LOST_OPEN);
     }
 }
 
@@ -353,6 +444,9 @@ pub struct Snapshot {
     pub map_recorded: u64,
     pub env_unread: u64,
     pub lost: u64,
+    pub env_truncated: u64,
+    pub env_changed: u64,
+    pub lost_open: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -370,6 +464,9 @@ pub fn snapshot() -> Snapshot {
         map_recorded: g(&c.map_recorded),
         env_unread: g(&c.env_unread),
         lost: g(&c.lost),
+        env_truncated: g(&c.env_truncated),
+        env_changed: g(&c.env_changed),
+        lost_open: g(&c.lost_open),
     }
 }
 
@@ -398,11 +495,10 @@ pub fn start(
             _ => "the policy's kernel objects were not installed".to_string(),
         });
     };
-    let mut ctl = controller::Controller::new(
-        k,
-        recorder,
-        controller::Settings::for_host(cfg.table.exempt.clone(), cfg.source.clone(), !execq_on),
-    );
+    let mut settings =
+        controller::Settings::for_host(cfg.table.exempt.clone(), cfg.source.clone(), !execq_on);
+    settings.debug_dir = cfg.debug_dir.clone();
+    let mut ctl = controller::Controller::new(k, recorder, settings);
     let (system, user, _ours) = ctl.refresh(std::time::Instant::now());
     if system == 0 && user == 0 {
         note(
@@ -570,5 +666,25 @@ mod tests {
         assert_eq!(c.map_recorded.load(Ordering::Relaxed), 5);
         assert_eq!(c.quarantine_inactive.load(Ordering::Relaxed), 3);
         assert_eq!(c.denied.load(Ordering::Relaxed), 0);
+    }
+
+    /// Lot 325: the environments the scan could not finish (R2), the
+    /// environments changed after the kernel's copy (TOCTOU) and the execs
+    /// let through without their walk (R5) are read from the kernel, each
+    /// from its own slot.
+    #[test]
+    fn the_lot_325_counters_follow_the_kernel() {
+        let mut k = [0u64; counter::SLOTS as usize];
+        k[counter::ENV_TRUNCATED as usize] = 7;
+        k[counter::ENV_CHANGED as usize] = 11;
+        k[counter::LOST_OPEN as usize] = 13;
+        k[counter::LOST as usize] = 17;
+        let c = Counters::default();
+        c.store_kernel(&k);
+        assert_eq!(c.env_truncated.load(Ordering::Relaxed), 7);
+        assert_eq!(c.env_changed.load(Ordering::Relaxed), 11);
+        assert_eq!(c.lost_open.load(Ordering::Relaxed), 13);
+        assert_eq!(c.lost.load(Ordering::Relaxed), 17);
+        assert_eq!(c.env_unread.load(Ordering::Relaxed), 0);
     }
 }

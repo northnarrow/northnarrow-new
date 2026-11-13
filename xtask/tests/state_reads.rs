@@ -121,6 +121,11 @@ const READBACK: &str = "a response's read-back of what it did (lot 312): a read 
                         answered on the stricter side — a cgroup that cannot be read back is no \
                         block in effect, a failure with its reason";
 
+/// Why a tool's unit's process list may default (lot 316, the re-check of
+/// #548, N4).
+const UNITCG: &str = "a listed tool's unit's cgroup.procs, which the kernel writes: one that \
+                      cannot be read, is empty or holds a line that is not a pid sanctions no \
+                      reload — the signal is judged (High), the stricter side";
 /// Why the installed shells' list may default (lot 313).
 const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed programs: an \
                       unreadable file adds none, the binary directories are still read, and \
@@ -204,6 +209,12 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     ("agent/src/posture/golden.rs", "read_to_string(&path)", LAB),
     ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
+    // lot 325: the exec guards' map fill of the e2e (`debug-execpol-fill`)
+    (
+        "agent/src/execpol/controller.rs",
+        "read_to_string(&fill)",
+        LAB,
+    ),
     (
         "antitamper-bpf/src/cgroup_floors.rs",
         "read_to_string(&path)",
@@ -271,6 +282,21 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-core/src/impair/mod.rs",
         "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"cgroup\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(dir.join(\"cgroup.procs\"))",
+        UNITCG,
     ),
     (
         "crates/nn-core/src/posture/exempt.rs",
@@ -576,6 +602,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/sensors/epg.rs",
         "read_to_string(\"/proc/sys/kernel/threads-max\")",
         KNOB,
+    ),
+    (
+        "crates/nn-linux/src/sensors/exec_facts.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",

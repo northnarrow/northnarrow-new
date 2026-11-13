@@ -250,8 +250,18 @@ pub struct StatusOutcome {
     pub execpol_map_recorded_total: Option<u64>,
     /// Lot 322: environments not read whole (each recorded, none refused).
     pub execpol_env_unread_total: Option<u64>,
-    /// Lot 322: exec-guard runs without their per-task buffer (fail-closed).
+    /// Lot 322: exec-guard runs without their per-task buffer (fail-closed;
+    /// lot 325: the protected targets refused then).
     pub execpol_lost_total: Option<u64>,
+    /// Lot 325 (R2): environments the scan could not finish.
+    pub execpol_env_truncated_total: Option<u64>,
+    /// Lot 325 (TOCTOU): environments changed after the kernel's copy.
+    pub execpol_env_changed_total: Option<u64>,
+    /// Lot 325 (R5): execs let through without their walk.
+    pub execpol_lost_open_total: Option<u64>,
+    /// Lot 325 (the review of #547, F6): file opens judged in a run's own
+    /// buffer.
+    pub open_sensor_per_call_total: Option<u64>,
     /// Lot 313: the exec pump's content check — images compared, execs not
     /// compared (the second's budget spent).
     pub program_copy_compared_total: Option<u64>,
@@ -528,6 +538,10 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execpol_map_recorded_total: resp.execpol_map_recorded_total,
         execpol_env_unread_total: resp.execpol_env_unread_total,
         execpol_lost_total: resp.execpol_lost_total,
+        execpol_env_truncated_total: resp.execpol_env_truncated_total,
+        execpol_env_changed_total: resp.execpol_env_changed_total,
+        execpol_lost_open_total: resp.execpol_lost_open_total,
+        open_sensor_per_call_total: resp.open_sensor_per_call_total,
         program_copy_compared_total: resp.program_copy_compared_total,
         program_copy_skipped_total: resp.program_copy_skipped_total,
         execq_script_refused_total: resp.execq_script_refused_total,
@@ -3948,8 +3962,12 @@ mod tests {
                     execpol_map_recorded_total: Some(18),
                     execpol_env_unread_total: Some(20),
                     execpol_lost_total: Some(21),
-                    program_copy_compared_total: Some(22),
-                    program_copy_skipped_total: Some(23),
+                    execpol_env_truncated_total: Some(22),
+                    execpol_env_changed_total: Some(23),
+                    execpol_lost_open_total: Some(24),
+                    open_sensor_per_call_total: Some(25),
+                    program_copy_compared_total: Some(26),
+                    program_copy_skipped_total: Some(27),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
@@ -3970,8 +3988,14 @@ mod tests {
         // Lot 322: the environments not read whole, the runs lost.
         assert_eq!(out.execpol_env_unread_total, Some(20));
         assert_eq!(out.execpol_lost_total, Some(21));
-        assert_eq!(out.program_copy_compared_total, Some(22));
-        assert_eq!(out.program_copy_skipped_total, Some(23));
+        // Lot 325: the environments not finished, changed after the
+        // kernel's copy, the execs let through without their walk.
+        assert_eq!(out.execpol_env_truncated_total, Some(22));
+        assert_eq!(out.execpol_env_changed_total, Some(23));
+        assert_eq!(out.execpol_lost_open_total, Some(24));
+        assert_eq!(out.open_sensor_per_call_total, Some(25));
+        assert_eq!(out.program_copy_compared_total, Some(26));
+        assert_eq!(out.program_copy_skipped_total, Some(27));
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

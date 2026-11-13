@@ -1548,7 +1548,195 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   refused: a signed degradation) no unit's shell vouches and only PID 1's
   executor copies are exempt.
 
-## 32. Shells and tools by what the kernel executed (lot 313)
+## 32. The system tools' options, read by their tables (lot 316)
+
+- **systemctl, kill, pkill, killall, iptables, nft and firewall-cmd are read
+  by the interpreters' reader, through a table each**
+  (`crates/nn-core/src/impair/tool_options.rs`, the external bug hunt's
+  edition 1.4: BUG-106, BUG-89, N4). NN-L-EVA-001..003 used to compare their
+  argv with hand-written lists: an unlisted valued option before the verb
+  (`systemctl -P Id stop auditd`, `--check-inhibitors no`, `--kill-who
+  main`), a getopt_long prefix (`--si KILL`), a cluster (`-qs KILL`), a
+  long or separate form (`iptables --policy INPUT ACCEPT`, `firewall-cmd
+  --set-default-zone trusted`) switched a tool off unrecorded, and `pkill
+  -n auditd` or `killall -g auditd` lost the name. The tables come from the
+  tools' sources (systemd 249–262, procps-ng 4.0.4, psmisc 23.7, iptables
+  1.8.11, nftables 1.0.6/1.1.3, firewalld 2.3.1).
+- **An option after the verb is read both ways.** GNU getopt reads it as an
+  option, and with `POSIXLY_CORRECT` in the tool's environment (which the
+  exec event does not carry) as an operand: `systemctl stop auditd --user`
+  stops the system's auditd then, and is NN-L-EVA-001. The manager is the
+  last of `--system`, `--user`, `--global`, `--capsule`.
+- **An option a table does not hold errs toward a detection.** The record
+  says "(options not understood)": any operand may be systemctl's verb and
+  every later one a unit, any spelling of iptables' `-F` or `-P` counts,
+  pkill's name is matched every way. Expect it for an iptables extension's
+  option the table does not list, or a newer systemctl's — report it, it
+  joins the table.
+- **Every listed unit of a command is judged** (BUG-96). `systemctl stop
+  northnarrow-agent auditd` is auditd's High record (`unit auditd stop
+  (with northnarrow-agent)`), inside a trusted-installer window too: the
+  window sanctions a command only when every listed unit it stops is the
+  agent's own. A glob is matched as systemd matches it — `fnmatch` with
+  `FNM_NOESCAPE` (`\` is itself) on the unit's full name, a listed unit
+  with no type suffix a `.service` (`snap.amazon-ssm-agent.amazon-ssm-agent`):
+  `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
+  `snap.*.service` — in time linear in the pattern and the name (the
+  review of #548: the first matcher backtracked, and a 21-byte glob of
+  stars held the decision thread for hours). A bracket class ends as glibc
+  ends it (the re-check, N2): a `[:` whose name meets a byte outside
+  `a`–`y` before `:]` is no class, and a `[=` holds exactly one character,
+  so `[a[:]uditd.servic[:e:]` names auditd. Checked on 60,560 cases against
+  glibc: every name glibc matches is matched. The manager matches the
+  patterns itself, in the C locale. systemctl matches them on its own side
+  only when the manager refuses the listing (an old manager). There, its
+  locale's ranges and `POSIXLY_CORRECT`'s literal `^` are not modelled
+  (residual).
+- **systemd's verbs that reach a unit** (the review of #548). `stop`,
+  `condstop`, `kill`, `freeze`, `clean`, `disable`, `mask`, `preset`,
+  `revert`, `edit`, `link` (the unit file's name), `set-property`,
+  `service-log-level`, `service-log-target`, `bind`, `mount-image` (their
+  first operand), `isolate` of a target other than `default`, `multi-user`
+  or `graphical`, `rescue`, `emergency` and `preset-all` (every listed
+  unit). Not judged: the restart and reload family (`restart`,
+  `try-restart`, `condrestart`, …: the unit runs again), `start`,
+  `enable`, `unmask`. A unit's aliases are listed with it (rsyslog's
+  `syslog.service`, firewalld's `dbus-org.fedoraproject.FirewallD1`).
+- **A reload signal the processes catch is Low** (the review of #548, the
+  coordinator's decision, as its re-check left it). A SIGHUP sent by
+  `systemctl kill` or `kill` is a Low record ("a reload, no stop") when:
+  - the tool documents SIGHUP as its reload: auditd (reconfigure), rsyslog
+    (reopen its files), firewalld (reload), falco (hot reload). No other
+    signal is a reload: auditd's SIGUSR1 rotates its logs, and five in a
+    row delete the older ones (`num_logs`), so it is High;
+  - every process it reaches catches it (`SigCgt` in `/proc/<pid>/status`).
+    For `kill`, each tool's process it names, still the one registered.
+    For `systemctl kill` (`--kill-whom=all`), every process of the unit's
+    cgroup (`cgroup.procs` of the cgroup a registered process runs in). A
+    cgroup with cgroups below it, a unit no registered process runs in (an
+    alias's name) or a list that cannot be read: High;
+  - the reading of the argv the process makes sends SIGHUP. Under
+    `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid for
+    procps' `kill`, is an operand and the signal SIGTERM: logrotate's own
+    `systemctl kill -s HUP rsyslog.service` then kills `-s.service`,
+    `HUP.service` and rsyslog.service with SIGTERM (measured with systemd
+    255). The exec pump reads the environment of an exec of systemctl or
+    `kill` while it runs (its start the exec's, its memory still there
+    after the read): without `POSIXLY_CORRECT` GNU's reading alone names
+    the signal (logrotate's rotation is Low), with it the
+    `POSIXLY_CORRECT` reading alone (High). When it could not be read (the
+    process gone, its memory gone, its pid another's, a read that failed),
+    every reading must send SIGHUP: `systemctl kill rsyslog -s HUP` and
+    `kill <pid> -s HUP` are then High, `systemctl -s HUP kill
+    rsyslog.service` (the option before the verb), `kill -HUP <pid>` and
+    `kill -s HUP <pid>` Low. Residual: a process that rewrites its own
+    environment before the pump reads it (code injected into systemctl,
+    which could send any signal itself).
+- **Names.** iptables by any of its names (`iptables-nft`,
+  `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
+  command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part
+  of the process name at least half of it, unless `-x` (`pkill audit` ends
+  auditd; `pkill -f agent` names no listed agent), `-f` the full
+  command line, `-i` (killall `-I`) any case; killall's name with a `/` the
+  executable, its path folded as stat() walks it (`killall
+  //usr/sbin/auditd`, `/usr/bin/../sbin/auditd`); procps' pgrep binary run
+  as `pkill` or `lt-pkill` is pkill. procps' `kill`: the last `-s` over the
+  first `-SIGNAL` (`kill -s KILL -0 <pid>` kills), a pid with leading blanks
+  or a `+`.
+- **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
+  /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
+  as the agent's own process starting.
+- Residual, declared: a renamed copy of the tool (`cp /usr/bin/systemctl
+  /tmp/x`), a command read from a file or standard input (`nft -f`,
+  `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
+  regular expression beyond a part of the name, or a part less than half of
+  it, a symbolic link to a tool given to killall. The kernel's `task_kill`
+  reports to NN-L-EVA-003 only SIGINT, QUIT, ABRT, KILL, TERM, STOP and
+  TSTP to a registered tool's process, and never one from PID 1 or from
+  another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
+  signal that ends a tool, sent by a command line this reader does not
+  name, is not recorded (lot 330 is to report every default-fatal signal).
+
+## 33. The exec environment's check complete (lot 325)
+
+- **A staging preload behind other variables is refused now.** The check of
+  [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)
+  read the first 64 variables of an exec's environment. It reads all of
+  them. Expect `NN-L-EXECENV-001` records and refused execs where a staging
+  `LD_PRELOAD` / `LD_AUDIT` sat past the 64th variable: CI jobs, IDE
+  terminals and Kubernetes pods carry far more than 64. Nothing to
+  configure.
+- **An environment longer than any the kernel accepts** (more than
+  1,048,576 variables: its array grew after the kernel counted it) is
+  refused at a protected target — a tier whose rule refuses a staging
+  preload — or a set-id one, and recorded High (`NN-L-EXECENV-002`, "could
+  not be read whole"). No legitimate program comes near it (the lab's
+  measurements are in the lot's note in the [capability program](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md)).
+- **Each `LD_PRELOAD` is judged, each entry as the loader reads it.** An
+  environment with two (a staging one and a clean one) is refused whichever
+  comes last. Each value is read whole (about 4 KiB at the exec's check),
+  split as the loader splits it (colons and white space for `LD_PRELOAD`)
+  and each path normalised: `//tmp/x.so`, `/./tmp/x.so`, 120 spaces then
+  `/tmp/x.so` are refused like `/tmp/x.so`. **A relative loader path**
+  (`LD_PRELOAD=./x.so`, `lib/x.so`, or a bare name with a relative
+  `LD_LIBRARY_PATH`) **is refused where a staging preload is** (a tier whose
+  rule refuses one, a set-id target) and recorded elsewhere
+  (`relative_loader_path`). **A clean value longer than 128 bytes is no
+  longer refused** (it was, as "not finished"). **A loader value with a
+  control byte or a `$` token is refused where a staging preload is**
+  (`irregular_loader_value`), and so is a bare `LD_PRELOAD` / `LD_AUDIT`
+  name with an empty `LD_LIBRARY_PATH` element (the caller's directory). An
+  empty element alone — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the
+  variable unset — is only recorded.
+- **New status counts** on the exec policy's line of `nn-admin status`, when
+  not zero: "environments not finished", "changed after the kernel's copy",
+  "execs let through without their walk" (`--json`: `env_truncated`,
+  `env_changed`, `lost_open`).
+- **A new program, `execpol_env_commit`, on `sched_process_exec`.** It reads
+  the new image's environment — the kernel's own copy — after the exec's
+  point of no return and kills the image (`SIGKILL`, before its first
+  instruction) when it holds a staging loader entry the exec's first check
+  did not see. A legitimate program never shows one there: the first check
+  would have refused it. Two optional BTF offsets (`mm_struct.env_start`,
+  `env_end`, slots 130–131; the enum, tracepoint and hook-argument slots
+  move by two: 146 slots). Without them, or with the program refused by the
+  verifier, the start signs an `exec_policy` degradation and the first check
+  works alone. It also kills a protected or set-id target on what it cannot
+  clear (a loader value longer than about 4 KiB, a relative path, an
+  unreadable string), and records it elsewhere.
+- **A new LSM program, `nn_task_free`** (`task_free`), attached with the
+  file-open sensor or the exec guards. It removes, when the kernel frees a
+  task, the entries that live as long as the task: the file-open sensor's
+  buffer (kept between opens now: one lookup per open), the exec
+  quarantine's candidate (`EXECQ_CAND`, a plain hash now), the exec
+  policy's note for the post-commit check. **A new LSM program,
+  `execq_exec_failed`** (`file_free_security`), attached with the exec
+  quarantine, removes a failed exec's candidate when its file is freed;
+  each login holds at most 1,024 candidates (a session's container
+  subuids count as the login), and a dropped one is counted in `not_held`
+  and signed (`exec quarantine fail-open`); the map full, the oldest
+  stuck candidate goes for the new one, counted and signed the same way.
+- **A new LSM program, `exec_env_lsm`** (`bprm_check_security`), attached by
+  the exec policy when it judges the environment: the environment's check,
+  moved out of the exec sensor's `exec_check_lsm` (each program has its own
+  verifier budget). A tool that lists the agent's programs sees one more on
+  the hook; without it the start signs an `exec_policy` degradation.
+- **The file-open sensor's per-task buffers** are capped per login (16,384);
+  past it the open is judged in a buffer of its own run (correct, at the
+  cost before lot 325), counted in `nn-admin status --json`
+  (`open_sensor_per_call_total`, appended last: a reader that requires the
+  key set must accept it).
+- **Past the exec guards' capacity** (2048 execs preempted in the middle
+  of the exec sensor at once: a fork bomb), enforce mode refused every exec,
+  an administrator's shell's included. A protected target (a deny that the
+  tier, memfd, deleted, tmpfs, a world-writable directory or the
+  environment support) is still refused; an environment that could not be
+  read is judged on the kernel's copy after the commit (a staging preload
+  killed there); every other exec runs and is recorded
+  (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
+  the degradation `execpol_capacity` while it lasts.
+
+## 34. Shells and tools by what the kernel executed (lot 313)
 
 - **R020 knows a shell by its file** (the external bug hunt's edition 1.4:
   BUG-85, N1). A copy of an installed shell or interpreter under any name

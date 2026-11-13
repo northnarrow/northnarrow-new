@@ -25,8 +25,9 @@
 use aya_ebpf::{
     cty::c_void,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, generated},
-    macros::map,
+    macros::{lsm, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    programs::LsmContext,
 };
 use northnarrow_common::wire::exe::{
     exe_flags, exe_path_slot, ExeIdentityRaw, TaskKey, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
@@ -37,7 +38,7 @@ use northnarrow_common::wire::execq::{
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_PARENT_OFFSET, INODE_I_CTIME_NSEC_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_INODE_OFFSET, INODE_I_CTIME_NSEC_OFFSET,
     INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET, INODE_I_SB_OFFSET,
     FILE_SYSTEM_TYPE_NAME_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, SUPER_BLOCK_S_TYPE_OFFSET,
@@ -75,9 +76,55 @@ pub static EXECQ_ROOTS: HashMap<ExecqKey, u32> = HashMap::with_max_entries(EXECQ
 /// [`EXECQ_ROOTS`]' capacity.
 pub const EXECQ_ROOTS_CAPACITY: u32 = 1024;
 /// The candidate of each exec in progress, keyed by `task_struct`, from the
-/// exec's pass to its `sched_process_exec`.
+/// exec's pass to its `sched_process_exec`. Lot 325 (the re-check of #546,
+/// R6): a plain hash, never an LRU — the interpreter's pass and
+/// [`refuse_script`] hold a pointer to the entry in a preemptible LSM
+/// program, and an LRU insert elsewhere that found its CPU's free list
+/// empty could evict the entry and hand its memory to another task's
+/// candidate (5.15/6.8 with `preempt=full` and more than 8 CPUs). An entry
+/// is removed at `sched_process_exec`, at the task's next exec, at a
+/// refused pass, and when the task is freed (`task_free`,
+/// `crate::task_scratch::nn_task_free`: a failed exec's candidate was left
+/// to the LRU). Past [`EXECQ_CAND_CAP`] in flight, a candidate is dropped
+/// (counted, `CAND_DROPPED`): the exec runs, unheld.
 #[map]
-static EXECQ_CAND: LruHashMap<u64, ExecqCandRaw> = LruHashMap::with_max_entries(1024, 0);
+static EXECQ_CAND: HashMap<u64, ExecqCandRaw> = HashMap::with_max_entries(EXECQ_CAND_CAP, 0);
+/// [`EXECQ_CAND`]'s room: the execs between their pass and their
+/// `sched_process_exec`.
+pub(crate) const EXECQ_CAND_CAP: u32 = 4096;
+/// The review of #547 (F4; the re-check, G5): one share of [`EXECQ_CAND`] —
+/// a login's (its container subuids included: they keep the login uid), or
+/// a service's uid (`crate::task_scratch::share_key`): one user's threads,
+/// each held in an exec (a FUSE-backed binary it never answers), cannot
+/// take the room every other user's execs need. It was the uid's: four
+/// subuids of one login filled the map.
+pub(crate) const EXECQ_CAND_PER_SHARE: u64 = 1024;
+/// The candidates each share holds ([`EXECQ_CAND_PER_SHARE`]).
+#[map]
+static EXECQ_CAND_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// The candidates of the shares [`EXECQ_CAND_UIDS`] has no row for (it is
+/// full), under the same cap (`OVERFLOW_SHARE`).
+#[map]
+static EXECQ_CAND_OVERFLOW: Array<u64> = Array::with_max_entries(1, 0);
+/// The re-check of #547 (G5): the candidates in the order they were made
+/// (task, time), a ring over [`EXECQ_CAND_CAP`] slots from
+/// [`EXECQ_CAND_HEAD`]: with the map full, the oldest goes for the newest
+/// ([`evict_oldest`]).
+#[map]
+static EXECQ_CAND_RING: Array<CandSlot> = Array::with_max_entries(EXECQ_CAND_CAP, 0);
+#[map]
+static EXECQ_CAND_HEAD: Array<u64> = Array::with_max_entries(1, 0);
+/// One slot of [`EXECQ_CAND_RING`].
+#[repr(C)]
+pub(crate) struct CandSlot {
+    task: u64,
+    at: u64,
+}
+/// A candidate younger than this is never evicted: its exec is in flight,
+/// and its own program may hold it.
+const EVICT_MIN_AGE_NS: u64 = 1_000_000_000;
+/// The ring slots looked at, oldest first, for one to evict.
+const EVICT_PROBES: u64 = 8;
 /// Where a candidate is built (584 bytes: never on the stack): the running
 /// task's own entry, made, copied into [`EXECQ_CAND`] and removed in one
 /// run. Lot 322: it was a per-CPU buffer in a program that runs
@@ -473,7 +520,7 @@ pub(crate) unsafe fn note_pass(
     }
     // A failed exec may have left a candidate; this exec starts afresh.
     if pass == 0 {
-        let _ = EXECQ_CAND.remove(&task);
+        cand_remove(task);
     } else if m == mode::ENFORCE {
         // Lab PR 226: the pass-0 candidate was a `#!` script (or a
         // binfmt_misc input) — this pass is its interpreter. Held, the
@@ -483,7 +530,7 @@ pub(crate) unsafe fn note_pass(
         if let Some(cand) = EXECQ_CAND.get_ptr(&task) {
             if (*cand).flags & stop_flags::INTERP_PASS == 0 {
                 let refused = refuse_script(cand, task);
-                let _ = EXECQ_CAND.remove(&task);
+                cand_remove(task);
                 if refused {
                     return -EACCES;
                 }
@@ -546,23 +593,188 @@ pub(crate) unsafe fn note_pass(
         } else {
             0
         };
-    (*cand)._pad = 0;
+    (*cand).inode = inode as u64;
     let _ = generated::bpf_probe_read_kernel(
         &mut (*cand).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         s as *const c_void,
     );
-    if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {
-        bump(counter::CAND_DROPPED);
+    let _ = nn_execq_cand_put(task, u64::from(ck.tid), ck.start_ns);
+    0
+}
+
+/// The review of #547 (F4): the candidate built in the running task's
+/// scratch entry ([`EXECQ_CAND_SCRATCH`], `tid`, `start`) copied into
+/// [`EXECQ_CAND`] for `task` ([`cand_put`]), then the scratch entry removed.
+/// A global function (integer arguments): the share's branches are checked
+/// once, not on every way into the exec sensor's tail — inline, 5.15
+/// refused `exec_check_lsm` past a million instructions.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_execq_cand_put(task: u64, tid: u64, start: u64) -> u64 {
+    let ck = crate::task_scratch::key(tid, start);
+    // SAFETY: the task's own scratch entry, then this module's maps.
+    unsafe {
+        if let Some(cand) = EXECQ_CAND_SCRATCH.get_ptr_mut(&ck) {
+            cand_put(task, cand);
+        }
     }
     let _ = EXECQ_CAND_SCRATCH.remove(&ck);
     0
 }
 
-/// Forget the exec's candidate (the exec policy refused the pass).
+/// The review of #547 (F4; the re-check, G5): the candidate `cand` for
+/// `task`, within its share ([`EXECQ_CAND_PER_SHARE`]); past it, dropped
+/// (`CAND_DROPPED`: the exec runs unheld — the agent counts it as not held
+/// and signs a degradation while it moves). The map full: the oldest
+/// candidate goes for it ([`evict_oldest`], `CAND_EVICTED`: that exec runs
+/// unheld, counted and signed the same way) — it held nothing new, silently.
+#[inline(always)]
+unsafe fn cand_put(task: u64, cand: *mut ExecqCandRaw) {
+    cand_take(task);
+    let row = match crate::task_scratch::share_take(
+        &EXECQ_CAND_UIDS,
+        &EXECQ_CAND_OVERFLOW,
+        crate::task_scratch::share_key(),
+        EXECQ_CAND_PER_SHARE,
+    ) {
+        Some(r) => r,
+        None => {
+            bump(counter::CAND_DROPPED);
+            return;
+        }
+    };
+    let now = bpf_ktime_get_ns();
+    (*cand).uid = row;
+    (*cand).at = now;
+    if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {
+        if !(evict_oldest(now) && EXECQ_CAND.insert(&task, &*cand, 0).is_ok()) {
+            crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, row);
+            bump(counter::CAND_DROPPED);
+            return;
+        }
+        bump(counter::CAND_EVICTED);
+    }
+    ring_note(task, now);
+}
+
+/// The re-check of #547 (G5): the candidate made at `at` for `task`, noted
+/// in the ring ([`EXECQ_CAND_RING`]) over its oldest slot. The head is a
+/// plain read-modify-write (no atomics here): two candidates made at the
+/// same instant can share a slot — the one lost from the ring is still
+/// removed by its exec's end, its file or its task.
+#[inline(always)]
+unsafe fn ring_note(task: u64, at: u64) {
+    if let Some(h) = EXECQ_CAND_HEAD.get_ptr_mut(0) {
+        let i = (*h % EXECQ_CAND_CAP as u64) as u32;
+        if let Some(slot) = EXECQ_CAND_RING.get_ptr_mut(i) {
+            (*slot).task = task;
+            (*slot).at = at;
+        }
+        *h = (*h).wrapping_add(1);
+    }
+}
+
+/// The re-check of #547 (G5): with the map full, the oldest candidate still
+/// in it (the ring's slots from its head, [`EVICT_PROBES`] of them) is
+/// removed — one made at least [`EVICT_MIN_AGE_NS`] ago, whose exec is
+/// stuck (a binary served by a FUSE file system that never answers): no
+/// program of its task holds it then. `false`: none of them.
+#[inline(always)]
+unsafe fn evict_oldest(now: u64) -> bool {
+    let head = match EXECQ_CAND_HEAD.get(0) {
+        Some(h) => *h,
+        None => return false,
+    };
+    let mut k = 0u64;
+    while k < EVICT_PROBES {
+        let i = ((head + k) % EXECQ_CAND_CAP as u64) as u32;
+        if let Some(slot) = EXECQ_CAND_RING.get(i) {
+            let (t, at) = (slot.task, slot.at);
+            if t != 0 {
+                let live = match EXECQ_CAND.get(&t) {
+                    Some(c) => c.at == at,
+                    None => false,
+                };
+                if live && now > at && now - at >= EVICT_MIN_AGE_NS {
+                    cand_take(t);
+                    return true;
+                }
+            }
+        }
+        k += 1;
+    }
+    false
+}
+
+/// `task`'s candidate removed, its uid's share given back
+/// ([`nn_execq_cand_remove`]).
+#[inline(always)]
+pub(crate) unsafe fn cand_remove(task: u64) {
+    let _ = nn_execq_cand_remove(task);
+}
+
+/// `task`'s candidate removed, its uid's share given back. A global
+/// function: called from every exec's pass (and `sched_process_exec`,
+/// `task_free`, a failed exec's file), checked once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_execq_cand_remove(task: u64) -> u64 {
+    cand_take(task);
+    0
+}
+
+/// `task_free`'s removal ([`crate::task_scratch::nn_task_free`]), inline:
+/// the freed `task_struct` is a BTF pointer there, which a global
+/// function's scalar argument refuses (5.15: "Caller passes invalid args").
+#[inline(always)]
+pub(crate) fn forget_freed(task: u64) {
+    cand_take(task);
+}
+
+#[inline(always)]
+fn cand_take(task: u64) {
+    // SAFETY: a lookup and a delete in this module's maps.
+    let uid = match unsafe { EXECQ_CAND.get(&task) } {
+        Some(c) => c.uid,
+        None => return,
+    };
+    if EXECQ_CAND.remove(&task).is_ok() {
+        crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, uid);
+    }
+}
+
+/// The review of #547 (F4): LSM `file_free_security`, in the task that held
+/// the file (the kernel's last `fput` runs on the task's way back to user
+/// mode). A failed exec's file — the pass's inode a candidate names — frees
+/// that candidate: it stayed until the task's next exec or its end, and a
+/// user's idle threads filled the map. A successful exec's candidate is
+/// gone by then (`sched_process_exec`). One lookup per file freed while the
+/// exec quarantine runs. A void hook.
+#[lsm(hook = "file_free_security")]
+pub fn execq_exec_failed(ctx: LsmContext) -> i32 {
+    if conf(conf_slot::MODE) == mode::OFF {
+        return 0;
+    }
+    let file: *const u8 = ctx.arg(0);
+    unsafe {
+        let task = aya_ebpf::helpers::bpf_get_current_task();
+        let inode = match EXECQ_CAND.get(&task) {
+            Some(c) => c.inode,
+            None => return 0,
+        };
+        if !file.is_null() && peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) == inode {
+            cand_remove(task);
+        }
+    }
+    0
+}
+
+/// Forget the exec's candidate (the exec policy refused the pass, a pass
+/// without its walk, the task freed).
 #[inline(always)]
 pub(crate) unsafe fn forget(task: u64) {
-    let _ = EXECQ_CAND.remove(&task);
+    cand_remove(task);
 }
 
 /// Lab PR 226: report a script refused at its interpreter's pass, as a
@@ -635,7 +847,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     if m == mode::OFF || crate::task_kill::is_exempt_pid(tgid) {
-        let _ = EXECQ_CAND.remove(&key);
+        cand_remove(key);
         return;
     }
     let now = bpf_ktime_get_ns();
@@ -646,7 +858,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     // Nobody listening: the process runs (fail-open), counted.
     if beat == 0 || (now > beat && now - beat > conf(conf_slot::HEARTBEAT_MAX_NS)) {
         bump(counter::STALE);
-        let _ = EXECQ_CAND.remove(&key);
+        cand_remove(key);
         return;
     }
     let mut entry = match EXECQ_EVENTS.reserve::<ExecqStopRaw>(0) {
@@ -654,7 +866,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
         None => {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECQ);
             bump(counter::RING_FULL);
-            let _ = EXECQ_CAND.remove(&key);
+            cand_remove(key);
             return;
         }
     };
@@ -681,7 +893,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         &(*cand).exe as *const ExeIdentityRaw as *const c_void,
     );
-    let _ = EXECQ_CAND.remove(&key);
+    cand_remove(key);
     if m == mode::ENFORCE {
         // Lot 317 (third bug hunt, review F3): the map names the process
         // before it is stopped, and a process the map cannot name is not

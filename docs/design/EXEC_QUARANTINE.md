@@ -168,7 +168,21 @@ Why not stop at `bprm_check_security`: the exec can still fail after that
 hook (a later LSM, `ENOEXEC`, memory), and the stop would then hold the
 caller's old image. The LSM hook only classifies; the candidate travels in
 `EXECQ_CAND` (keyed by `task_struct`, cleared at every pass 0) to the
-tracepoint.
+tracepoint. Lot 325 (the re-check of #546, R6): a plain hash of 4096
+entries, never an LRU (an LRU insert could evict an entry a preemptible
+program holds and give its memory to another task's candidate); a failed
+exec's candidate goes when the kernel frees the exec's file (the review of
+#547, F4: the LSM `file_free_security` program `execq_exec_failed`; it
+stayed until the task's next exec or its end, the LSM `task_free` program
+`nn_task_free`), each login holds at most 1024 candidates (the re-check of
+#547, G5: `task->loginuid`, kept by a session's container subuids; a
+service's uid without one; `EXECQ_CAND_UIDS`, recounted by the agent every
+30 s, an overflow row for the shares it has no room for), and past it a
+candidate is dropped (`CAND_DROPPED`). Past 4096 in flight, the oldest
+candidate made at least a second ago goes for the new one
+(`CAND_EVICTED`), or, none that old, the new one is dropped. Either exec
+runs unheld — counted in `not_held` and signed, with the ring's and the
+stop signal's fail-opens, as `exec quarantine fail-open`.
 
 **Fail-open by construction.** A stop needs the agent's heartbeat
 (`EXECQ_ALIVE`, written every 250 ms) younger than 1.5 s, a free entry on

@@ -64,6 +64,15 @@ pub mod exe_flags {
     /// An interpreter naming no program whose standard input is no
     /// terminal (`bash < file`, `curl … | sh`): its program is its input.
     pub const STDIN_PROGRAM: u32 = 1 << 19;
+    /// Lot 316 (the re-check of #548): the environment of an exec of a
+    /// system tool whose arguments `POSIXLY_CORRECT` reorders (systemctl,
+    /// procps' `kill`) was read whole while the exec's process still ran
+    /// (its start the exec's, its memory there after the read).
+    pub const ENV_READ: u32 = 1 << 20;
+    /// With [`ENV_READ`]: `POSIXLY_CORRECT` is set in that environment
+    /// (any value, as glibc's `getenv` finds it): getopt reads no option
+    /// after the first operand.
+    pub const POSIXLY_CORRECT: u32 = 1 << 21;
 }
 
 /// Lot 310: a device number as `stat(2)` reports it, in the kernel's

@@ -26,6 +26,14 @@
 //! - `STDIN_PROGRAM`: an interpreter naming no program whose standard input
 //!   is a file, a pipe or a socket (`bash < file`, `curl … | sh`): it runs
 //!   its input.
+//! - `ENV_READ`, `POSIXLY_CORRECT` (lot 316, the re-check of #548): an exec
+//!   of systemctl or procps' `kill` (`impair::reads_posixly_correct`), its
+//!   environment read whole while the exec's process ran — its start the
+//!   exec's, its memory still there after the read (a process past its
+//!   exit reads an empty environment) — and whether `POSIXLY_CORRECT` is
+//!   set in it: which reading of its argv sends the signal (logrotate's
+//!   `systemctl kill -s HUP rsyslog.service` is a SIGHUP without it, a
+//!   SIGTERM with it). Not read: neither flag, and every reading is judged.
 //!
 //! Residual, said: a process may rewrite its own environment before the
 //! pump reads it (milliseconds), as R011's environment read says; a pid
@@ -38,6 +46,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use common::wire::exe::{exe_flags, kernel_dev};
+use nn_core::impair::reads_posixly_correct;
 use nn_core::posture::lineage::{in_system_tree, ExecIdentity, Runs};
 use nn_core::posture::script_args::{node_options_load, reads_a_program};
 use nn_model::Event;
@@ -95,6 +104,7 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
         filename,
         argv,
         exe,
+        start_ns,
         ..
     } = event
     else {
@@ -152,6 +162,49 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     if names_nothing && stdin_is_a_program(&dir) {
         exe.flags |= exe_flags::STDIN_PROGRAM;
     }
+    // lot 316 (the re-check of #548): the environment getopt reads
+    if reads_posixly_correct(Path::new(&path), argv) {
+        if let Some(set) = posixly_correct(&dir, *start_ns) {
+            exe.flags |= exe_flags::ENV_READ;
+            if set {
+                exe.flags |= exe_flags::POSIXLY_CORRECT;
+            }
+        }
+    }
+}
+
+/// Lot 316 (the re-check of #548): `POSIXLY_CORRECT` is set in the
+/// environment of the process `dir` (`/proc/<pid>`), the exec's process
+/// that started at `start_ns` — an entry named so, as glibc's `getenv`
+/// finds it. `None` when it cannot be told: its start unknown or not the
+/// exec's (the pid reused), its memory gone (it exited: a process past its
+/// exit reads an empty environment), the read failed, or the environment
+/// is larger than [`MAX_ENVIRON`]. Checked after the read: a pid is not
+/// reused before its process is reaped, so the exec's process with its
+/// memory then is the one whose environment was read, whole.
+fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
+    use crate::response::proc_ref::{started_at, stat_start_ticks};
+    use std::io::Read;
+    if start_ns == 0 {
+        return None;
+    }
+    let mut env = Vec::new();
+    std::fs::File::open(dir.join("environ"))
+        .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env))
+        .ok()?;
+    // after the read: still the exec's process, still with its memory
+    let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
+    let ticks = stat_start_ticks(&stat)?;
+    if !started_at(ticks, start_ns)
+        || !super::kmod_exec::has_memory(&stat)
+        || env.len() as u64 > MAX_ENVIRON
+    {
+        return None;
+    }
+    Some(
+        env.split(|b| *b == 0)
+            .any(|var| var.starts_with(b"POSIXLY_CORRECT=")),
+    )
 }
 
 /// The path an image was executed by, from its `exe` link's text: the
@@ -666,5 +719,95 @@ mod tests {
         // another applet reads no program
         let f = read(82, bb, &[], Some(Path::new("pipe:[9]")), &["wget", "x"]);
         assert_eq!(f & (exe_flags::STDIN_PROGRAM | exe_flags::ENV_LOADS), 0);
+    }
+
+    /// Lot 316 (the re-check of #548): systemctl's and procps' `kill`'s
+    /// environment, read while the exec's process runs: `ENV_READ`, and
+    /// `POSIXLY_CORRECT` when an entry is named so (any value, as `getenv`
+    /// finds it). Neither flag when it cannot be told — the process a
+    /// zombie or past its memory, another process on the pid (its start),
+    /// the start unknown, no environment to read, one past the read limit
+    /// — nor for a program whose reading it does not change.
+    #[test]
+    fn a_system_tool_s_getopt_environment() {
+        let proc = tempfile::tempdir().unwrap();
+        // SAFETY: sysconf reads a constant of the C library.
+        let tick = 1_000_000_000 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let ticks = 4_000u64;
+        let read =
+            |pid: u32, filename: &str, argv: &[&str], env: &[&str], stat: (&str, u64, u64)| {
+                proc_with(proc.path(), pid, Path::new("/usr/bin/env"), env, None);
+                let (state, start, vsize) = stat;
+                std::fs::write(
+                    proc.path().join(pid.to_string()).join("stat"),
+                    format!(
+                        "{pid} (x) {state} 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} \
+                     {vsize} 0\n"
+                    ),
+                )
+                .unwrap();
+                let mut e = spawn(pid, Default::default(), filename, argv);
+                if let Event::ProcessSpawn { start_ns, .. } = &mut e {
+                    *start_ns = ticks * tick;
+                }
+                read_under(proc.path(), &mut e);
+                flags(&e).0 & (exe_flags::ENV_READ | exe_flags::POSIXLY_CORRECT)
+            };
+        let sc = "/usr/bin/systemctl";
+        let rotate = ["systemctl", "kill", "-s", "HUP", "rsyslog.service"];
+        let ok = ("S", ticks, 4096);
+        let (read_only, posix) = (
+            exe_flags::ENV_READ,
+            exe_flags::ENV_READ | exe_flags::POSIXLY_CORRECT,
+        );
+        assert_eq!(
+            read(90, sc, &rotate, &["PATH=/usr/bin", "LANG=C"], ok),
+            read_only
+        );
+        assert_eq!(read(91, sc, &rotate, &["POSIXLY_CORRECT=1"], ok), posix);
+        assert_eq!(
+            read(92, sc, &rotate, &["A=b", "POSIXLY_CORRECT="], ok),
+            posix
+        );
+        // no `=`, or another name: getenv finds no POSIXLY_CORRECT
+        assert_eq!(read(93, sc, &rotate, &["POSIXLY_CORRECT"], ok), read_only);
+        assert_eq!(
+            read(94, sc, &rotate, &["XPOSIXLY_CORRECT=1"], ok),
+            read_only
+        );
+        // procps' kill by its path and by its argv[0]
+        let kill = ["kill", "9", "-s", "HUP"];
+        assert_eq!(
+            read(95, "/usr/bin/kill", &kill, &["POSIXLY_CORRECT=y"], ok),
+            posix
+        );
+        assert_eq!(read(96, "/bin/kill", &kill, &[], ok), read_only);
+        // not told: a zombie, no memory, another start, no start, no
+        // environment, one too large
+        let p = &["POSIXLY_CORRECT=1"][..];
+        assert_eq!(read(97, sc, &rotate, p, ("Z", ticks, 4096)), 0);
+        assert_eq!(read(98, sc, &rotate, p, ("S", ticks, 0)), 0);
+        assert_eq!(read(99, sc, &rotate, p, ("S", ticks + 360_000, 4096)), 0);
+        // (a process of the boot's first tick: its start would pass for 0)
+        read(100, sc, &rotate, p, ("S", 1, 4096));
+        let mut e = spawn(100, Default::default(), sc, &rotate);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut e {
+            *start_ns = 0;
+        }
+        read_under(proc.path(), &mut e);
+        assert_eq!(flags(&e).0 & exe_flags::ENV_READ, 0);
+        read(101, sc, &rotate, p, ok);
+        std::fs::remove_file(proc.path().join("101/environ")).unwrap();
+        let mut e = spawn(101, Default::default(), sc, &rotate);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut e {
+            *start_ns = ticks * tick;
+        }
+        read_under(proc.path(), &mut e);
+        assert_eq!(flags(&e).0 & exe_flags::ENV_READ, 0);
+        let big = format!("X={}", "a".repeat(MAX_ENVIRON as usize));
+        assert_eq!(read(102, sc, &rotate, &[&big], ok), 0);
+        // a program whose reading it does not change
+        assert_eq!(read(103, "/usr/bin/pkill", &["pkill", "x"], p, ok), 0);
+        assert_eq!(read(104, "/usr/bin/bash", &["bash", "-c", "x"], p, ok), 0);
     }
 }

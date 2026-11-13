@@ -24,6 +24,10 @@ pub struct Kernel {
     /// otherwise) is off.
     pub roots: Option<HashMap<MapData, AyaKey, u32>>,
     pub(crate) reject: crate::sensors::reject::RejectThrottle,
+    /// `debug-trigger` builds (lot 325, R5's e2e): the exec guards'
+    /// per-task maps, to fill and empty on request.
+    #[cfg(feature = "debug-trigger")]
+    pub(crate) debug: debug_fill::Maps,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -75,7 +79,101 @@ pub fn take(ebpf: &mut Ebpf, take_roots: bool) -> Result<Kernel> {
         counters: PerCpuArray::try_from(take("EXECPOL_COUNTERS")?).context("EXECPOL_COUNTERS")?,
         roots,
         reject: crate::sensors::reject::RejectThrottle::new(),
+        #[cfg(feature = "debug-trigger")]
+        debug: debug_fill::Maps::open(ebpf),
     })
+}
+
+/// `debug-trigger` builds only (lot 325, the re-check of #546, R5): fill the
+/// exec sensor's per-task walk map (`EXEC_SCRATCH`) — and the environment's
+/// (`EXECPOL_ENV`) — with entries no task has (start time near `u64::MAX`),
+/// as a flood of execs in flight would, and empty them again: the e2e's
+/// fork-bomb shape, bounded and deterministic.
+#[cfg(feature = "debug-trigger")]
+pub(crate) mod debug_fill {
+    use std::os::fd::AsFd;
+
+    use aya::maps::{HashMap, Map, MapData};
+    use aya::Ebpf;
+    use common::wire::exe::ExeIdentityRaw;
+    use common::wire::execpol::ENV_ENTRY_BYTES;
+
+    const WALK_BYTES: usize = std::mem::size_of::<ExeIdentityRaw>();
+
+    /// The two maps, through their own descriptors (the object keeps its).
+    pub(crate) struct Maps {
+        walk: Option<HashMap<MapData, [u8; 16], [u8; WALK_BYTES]>>,
+        env: Option<HashMap<MapData, [u8; 16], [u8; ENV_ENTRY_BYTES]>>,
+        filled: Vec<[u8; 16]>,
+    }
+
+    fn dup(ebpf: &Ebpf, name: &str) -> Option<MapData> {
+        let Some(Map::HashMap(d)) = ebpf.map(name) else {
+            return None;
+        };
+        let fd = d.fd().as_fd().try_clone_to_owned().ok()?;
+        MapData::from_fd(fd).ok()
+    }
+
+    /// A key no task has: `TaskKey { start_ns: u64::MAX - i, tid: u32::MAX }`.
+    fn key(i: u64) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[..8].copy_from_slice(&(u64::MAX - i).to_le_bytes());
+        k[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        k
+    }
+
+    impl Maps {
+        pub(crate) fn open(ebpf: &Ebpf) -> Self {
+            Maps {
+                walk: dup(ebpf, "EXEC_SCRATCH")
+                    .and_then(|d| HashMap::try_from(Map::HashMap(d)).ok()),
+                env: dup(ebpf, "EXECPOL_ENV").and_then(|d| HashMap::try_from(Map::HashMap(d)).ok()),
+                filled: Vec::new(),
+            }
+        }
+
+        /// Fill the walk map (and, with `env`, the environment's) until the
+        /// kernel refuses an entry; the entries made.
+        pub(crate) fn fill(&mut self, env: bool) -> usize {
+            let mut n = 0;
+            for i in 0..crate::execpol::kernel::debug_fill::LIMIT {
+                let k = key(i);
+                let mut made = false;
+                if let Some(m) = self.walk.as_mut() {
+                    made |= m.insert(k, [0u8; WALK_BYTES], 0).is_ok();
+                }
+                if env {
+                    if let Some(m) = self.env.as_mut() {
+                        made |= m.insert(k, [0u8; ENV_ENTRY_BYTES], 0).is_ok();
+                    }
+                }
+                if !made {
+                    break;
+                }
+                self.filled.push(k);
+                n += 1;
+            }
+            n
+        }
+
+        /// Remove every entry [`Maps::fill`] made; how many.
+        pub(crate) fn empty(&mut self) -> usize {
+            let n = self.filled.len();
+            for k in self.filled.drain(..) {
+                if let Some(m) = self.walk.as_mut() {
+                    let _ = m.remove(&k);
+                }
+                if let Some(m) = self.env.as_mut() {
+                    let _ = m.remove(&k);
+                }
+            }
+            n
+        }
+    }
+
+    /// The most entries a fill makes (the maps hold 2048 each).
+    pub(crate) const LIMIT: u64 = 4096;
 }
 
 impl Kernel {
