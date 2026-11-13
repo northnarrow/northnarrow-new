@@ -1070,19 +1070,17 @@ mod tests {
         };
         let unknown = |got: &Judged| matches!(got, Judged::Untrusted { program, .. } if program == LINEAGE_UNKNOWN);
         // on `main`: the receiver (702, gone) has no record — not known
-        assert!(unknown(&judged(702)), "{:?}", judged(702));
+        // (no judgement in the messages: CodeQL reads it as a record)
+        assert!(unknown(&judged(702)), "702 before its record");
         // the kernel's record, carried by its write: rsync's copy, vouched
         t.ingest_kernel_fork(702, 4 * S, 701, 0, write);
-        assert_eq!(
-            judged(702),
-            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/rsync".into()))
-        );
+        let rsync = |got: Judged| matches!(got, Judged::Trusted(Trusted::PackagedProgram(p)) if p == "/usr/bin/rsync");
+        assert!(rsync(judged(702)), "702 with its record");
         // under the unpackaged script's rsync: judged, the script the actor
         t.ingest_kernel_fork(802, 4 * S, 801, 0, write);
         assert!(
             matches!(judged(802), Judged::Untrusted { actor: 800, .. }),
-            "{:?}",
-            judged(802)
+            "802 under the script"
         );
         // seen before the write (it may have executed since), started after
         // it, a forker not known, a record of itself or of no one: not used
@@ -1092,7 +1090,7 @@ mod tests {
         t.ingest_kernel_fork(706, 4 * S, 706, 0, write);
         t.ingest_kernel_fork(707, 4 * S, 0, 0, write);
         for pid in [703, 704, 705, 706, 707] {
-            assert!(unknown(&judged(pid)), "pid {pid}: {:?}", judged(pid));
+            assert!(unknown(&judged(pid)), "pid {pid}");
         }
         // a forker that executed only after the fork (forked from rsync at
         // 3.5 s, seen unexecuted at 5 s, `gzip` at 6 s): at the fork it ran
@@ -1104,10 +1102,7 @@ mod tests {
         }
         assert!(t.ingest_spawn_event(&gz));
         t.ingest_kernel_fork(902, 4 * S, 900, 0, write);
-        assert_eq!(
-            judged(902),
-            Judged::Trusted(Trusted::PackagedProgram("/usr/bin/rsync".into()))
-        );
+        assert!(rsync(judged(902)), "902 through its forker's record");
         // without that record: not known
         t.ingest_kernel_fork(904, 4 * S, 903, 0, write);
         let mut gz = exec(903, 701, "/usr/bin/gzip", &["gzip"], 0, 3 * S + S / 2);
@@ -1115,7 +1110,7 @@ mod tests {
             *timestamp_ns = 6 * S;
         }
         assert!(t.ingest_spawn_event(&gz));
-        assert!(unknown(&judged(904)), "{:?}", judged(904));
+        assert!(unknown(&judged(904)), "904 without it");
     }
 
     /// Re-check 3 (decision 4): a user's manager vouches for nothing, a

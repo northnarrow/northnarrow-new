@@ -1449,19 +1449,16 @@ mod tests {
             ),
         ] {
             // lot 340: a non-root exec (a root one is Medium)
+            // (no record text in the messages: it names the exec's user)
             let v = r
                 .evaluate(&read_as(as_uid(e, 1000), exited()))
                 .expect("recorded");
-            assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+            assert_eq!(v.action, ResponseAction::Log, "{what}");
             assert_eq!(v.severity, Severity::High);
             for part in [what, EXITED_NOTE, "T1547.006", "parent=bash"] {
-                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+                assert!(v.reasoning.contains(part), "{part}");
             }
-            assert!(
-                !v.reasoning.contains("no MODPROBE_OPTIONS"),
-                "{}",
-                v.reasoning
-            );
+            assert!(!v.reasoning.contains("no MODPROBE_OPTIONS"), "{what}");
         }
         for (e, facts, why) in [
             (modprobe(&["/tmp/rk.ko"]), exited(), "names a file"),
