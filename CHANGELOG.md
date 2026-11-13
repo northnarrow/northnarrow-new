@@ -10,11 +10,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single
     no-enforcement gate: no kill, no isolation, no quarantine, no exec
-    quarantine hold, no exec-policy, connect, exploit-guard or module-load
-    refusal of a user program; every suppressed response is recorded as
-    `would have: <action>` (it read `suppressed (detect-only)`, naming no
-    action; a `Log` decision reads `none`). The agent's self-protection stays
-    on. The profile
+    quarantine hold, no exec-policy, connect or exploit-guard refusal of a
+    user program; every suppressed response is recorded as `would have:
+    <action>` (it read `suppressed (detect-only)`, naming no action; a `Log`
+    decision reads `none`). The host's integrity and the agent's
+    self-protection stay enforced. The profile
     comes from a signed `profile.local` (overlay kind 18, `config overlay
     set profile`, the only switch of an installed agent, at its next start),
     else the install manifest's `profile` (the installed binary only), else
@@ -26,35 +26,45 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     themselves, so an input added in one place would have left the others
     enforcing. A ratchet (`xtask/tests/alpha_profile.rs`) keeps every reader
     in the resolver and every switch on its value.
-  - **The host-wide denies observe under `alpha`** (the coordinator's
-    decision of 13/11: the alpha never breaks anything on a tester's
-    machine). A foreign tracing, LSM, extension or `struct_ops` BPF
-    program's load (`bpftrace`, BCC, another EDR), a `cgroup/sysctl`
-    program on the root cgroup, the kprobes and lockdown switches, a kexec
-    image, the sysctl guard (write deny and `cgroup/sysctl` judge; the
-    integrity round puts no guarded value back, `sysctl_would_restore`), a cgroup
-    v1 write and a ptrace of PID 1 go through under `alpha`
-    (`--detect-only` keeps its meaning and leaves them on), each recorded
-    "would deny" (`would have:
-    deny:<operation> (would deny: …)`, counted in the status summary). The
-    denies that protect the agent — a signal, ptrace or limit change aimed
-    at it or its watchdog; a write, rename or unlink of its files, units and
-    pins; a handle on, a write of, a detach or replacement of its BPF maps,
-    programs and links — hold under every profile. The start writes the
-    profile's answer into the kernel's `HOST_DENY_MODE` before anything attaches and
-    freezes it; a ratchet (`xtask/tests/host_deny.rs`) keeps every deny site
-    of the eBPF object routed through it or listed as self-protection with
-    its reason; `deploy/lab/malsim/host-deny-check.sh` (`nn-lab.sh
-    host-deny-check`) measures both profiles on a guest.
-  - **Two paths that ignored the gate**: the module-load judge refused
-    untrusted modules under detect-only (its default deny mode), and the
-    exec quarantine's controller killed, at its start and its stop, a
-    process an earlier enforcing run owed a kill. Both observe now.
+  - **The host's integrity and the agent's self-protection are enforced
+    under every profile** (the coordinator's decision of 13/11, corrected
+    after the review of #550, which showed the "host-wide" denies were
+    self-protection in disguise): a foreign BPF load of the nine refused
+    types (`bpftrace`, BCC, another EDR: `bpf_send_signal` kills the agent
+    past `task_kill`), an untrusted kernel module, a kexec image, the sysctl
+    guard and its put-back (`kernel.ftrace_enabled=0` silences every deny
+    hook's trampoline), a `cgroup/sysctl` program on the root cgroup, the
+    kprobes and lockdown switches, a cgroup v1 move or freeze and a ptrace
+    of PID 1 are refused under `alpha` as under `enforcing`, besides the
+    denies on the agent's processes, files, cgroup and BPF objects. No
+    switch of the profile reaches them; a ratchet
+    (`xtask/tests/deny_routes.rs`) lists every deny site of the eBPF object
+    as self-protection with its reason or as a gated response path, and
+    fails when a self-protection site, or a function of the object it calls
+    at any depth, names a switch of the gate (the review's planted helper
+    is one of its cases); `deploy/lab/malsim/host-deny-check.sh`
+    (`nn-lab.sh host-deny-check`) measures it on a guest.
+  - **`install.sh --allow-bpf-tools` / `--allow-bpf-loader <path>`**: for a
+    tester who runs bpftrace or BCC, signed `bpf-loader-allow` lines (this
+    host's bpftrace and the interpreter of BCC's tools, or the given
+    executable; the tracing types) applied through the started agent with
+    the install's key; the summary says which loaders may load, and that any
+    root process running them may.
+  - **An unsigned downgrade is signed**: an `alpha` start right after a run
+    that enforced, with no signed `profile.local` asking for it (a deleted
+    overlay, a manifest edited offline), writes an `integrity_drift` of kind
+    `profile_downgraded`.
+  - **A path that ignored the gate**: the exec quarantine's controller
+    killed, at its start and its stop, a process an earlier enforcing run
+    owed a kill. It observes now. (The module-load judge, which refused
+    untrusted modules under detect-only, keeps refusing them under every
+    profile: the host's integrity.)
   - **`install.sh`**: a fresh install records `alpha` (`--profile
     enforcing`), starts the agent then the watchdog and enables both at boot
     (`--no-enable` opts out), checks their health as an upgrade does, and
-    ends with a short summary (profile, status, records, uninstall, the key
-    to move off the host). A host it cannot run on (architecture, init
+    ends with a short summary (profile, what stays enforced, whether
+    bpftrace and BCC may load, status, records, uninstall, the key to move
+    off the host). A host it cannot run on (architecture, init
     system, kernel BTF, a kernel `--btf-check` refuses, the BPF LSM off or
     bpffs not mounted when starting) is refused before any change, with what
     to do. An install keeps its profile; `--profile` never switches one.

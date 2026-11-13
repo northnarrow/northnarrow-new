@@ -58,7 +58,6 @@ pub(crate) fn start(
         execpol_kernel,
         module_kernel,
     } = exec_guards;
-    let observe_only = execq_exec_cfg.dry_run;
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
     // idle, ENGAGED→ALERTED after 24h idle, and — external audit POS-001 —
     // an unlocked COMBAT, reached on heuristics alone, to ENGAGED after
@@ -176,10 +175,7 @@ pub(crate) fn start(
     // Lot 285: the module-load judge's controller — the trust map filled
     // from the running kernel's tree, then the mode the policy asks; one
     // that cannot start leaves the judge unarmed, signed.
-    // Lot 341: under the no-enforcement gate (the executor's `dry_run`:
-    // `--detect-only`, a detect-only variable, the `alpha` profile) the
-    // judge records and refuses nothing.
-    if let Err(why) = northnarrow_agent::module_trust::start(module_kernel, observe_only) {
+    if let Err(why) = northnarrow_agent::module_trust::start(module_kernel) {
         error!(reason = %why, "module-load judge NOT armed — module loads are not judged");
         attest_degraded(audit_log.as_ref(), &format!("module-load judge: {why}"));
     }

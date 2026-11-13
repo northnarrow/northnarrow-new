@@ -622,8 +622,7 @@ fn sysctls_at_close() -> Vec<String> {
     crate::sysctl_guard::check(
         std::path::Path::new("/"),
         antitamper_bpf::cgroup_floors::Host::read().mem_total,
-        // lot 341: under the alpha profile, nothing put back
-        !crate::anti_tamper::host_deny::observing(),
+        true,
     )
     .into_iter()
     .filter(|s| s.kind != "sysctl_strict" && s.kind != "sysctl_opted_out")

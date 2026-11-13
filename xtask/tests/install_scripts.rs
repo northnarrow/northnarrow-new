@@ -1901,6 +1901,7 @@ case "${{1:-}}" in
     trusted-installer-grant) grep -q trusted-installer "$3" || exit 1; [ -e "$T/sock-up" ] || exit 1; : > "$T/window" ;;
     status) [ -e "$T/sock-up" ] || exit 1; echo '{{"posture":"Normal"}}' ;;
     init) echo private > "$3"; echo "ed25519 AAAA" >> "$5" ;;
+    policy) [ "$2" = set ] && [ -e "$T/sock-up" ] && [ ! -e "$T/policy-refuse" ] || exit 1; cp "$4" "$T/policy-set"; echo "$6" > "$T/policy-key" ;;
 esac
 exit 0"#
             ),
@@ -1945,7 +1946,10 @@ exit 0"#
             .env("PROC_ROOT", self.case.join("proc"))
             .env("HEALTH_TIMEOUT", "2")
             .env("LSM_DRAIN_TIMEOUT", "2")
-            .env("ADMIN_SOCKET_WAIT", "1");
+            .env("ADMIN_SOCKET_WAIT", "1")
+            // lot 341 (the review of #550, F2): the tracing tools a host has
+            .env("BPF_TOOL_PATH", r.join("tools"))
+            .env("BCC_TOOL_GLOBS", format!("{}/bcc/*-bpfcc", r.display()));
     }
 
     /// install.sh from tree `tree` (the `require_root` call left out), the
@@ -3872,7 +3876,9 @@ fn the_install_summary_says_profile_records_status_and_uninstall() {
     let key = key.display();
     for want in [
         "NorthNarrow is installed.",
-        "profile   : alpha — observe-only: nothing is killed, blocked or quarantined",
+        "profile   : alpha — observe-only: nothing of yours is killed, blocked or quarantined",
+        "self-protection stay enforced: foreign tracing BPF programs (bpftrace, BCC),",
+        "bpf tools : refused (bpftrace, BCC) — install with --allow-bpf-tools, or sign",
         "running   : yes — agent and watchdog active, started again at every boot",
         &format!("status    : sudo nn-admin status --key {key}"),
         &format!(
@@ -4189,4 +4195,219 @@ fn the_boot_time_uninstall_removes_itself() {
         calls.contains("systemctl disable northnarrow-uninstall.service"),
         "{calls}"
     );
+}
+
+/// `bpf_loader_allow` from install.sh in `dir` with `vars` set, then `body`:
+/// (status, stdout, stderr).
+fn bpf_loader_allow(dir: &Path, vars: &str, body: &str) -> (i32, String, String) {
+    let script = format!(
+        "set -euo pipefail\nBPF_TOOL_PATH='{tools}'; BCC_TOOL_GLOBS='{bcc}/*-bpfcc'\n{vars}\n{}\n{body}\n",
+        block("deploy/install.sh", "bpf_loader_allow"),
+        tools = dir.join("tools").display(),
+        bcc = dir.join("bcc").display(),
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Named (lot 341, the review of #550 F2): `--allow-bpf-tools` names this
+/// host's bpftrace and the interpreter BCC's tools run under (an absolute
+/// shebang or `env`'s), each once; a host with neither names nothing.
+#[test]
+fn allow_bpf_tools_names_bpftrace_and_the_bcc_interpreter() {
+    let dir = case_dir("bpf-tools-loaders");
+    let (status, out, _) = bpf_loader_allow(&dir, "", "bpf_tool_loaders");
+    assert_eq!((status, out.as_str()), (0, ""), "nothing on the host");
+    fs::create_dir_all(dir.join("tools")).unwrap();
+    fs::create_dir_all(dir.join("bcc")).unwrap();
+    write_exec(&dir.join("tools/bpftrace"), "exit 0");
+    write_exec(&dir.join("tools/python3"), "exit 0");
+    write_exec(&dir.join("bcc/opensnoop-bpfcc"), "exit 0");
+    // a BCC tool through env
+    fs::write(
+        dir.join("bcc/opensnoop-bpfcc"),
+        "#!/usr/bin/env python3\nimport bcc\n",
+    )
+    .unwrap();
+    let (status, out, err) = bpf_loader_allow(&dir, "", "bpf_tool_loaders");
+    assert_eq!(status, 0, "{err}");
+    let tools = dir.join("tools");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            tools.join("bpftrace").display().to_string(),
+            tools.join("python3").display().to_string()
+        ]
+    );
+    // an absolute shebang, an interpreter that is not there
+    let python = dir.join("tools/python3.12");
+    write_exec(&python, "exit 0");
+    fs::write(
+        dir.join("bcc/opensnoop-bpfcc"),
+        format!("#!{} -E\n", python.display()),
+    )
+    .unwrap();
+    let (_, out, _) = bpf_loader_allow(&dir, "", "bpf_tool_loaders");
+    assert!(out.contains(&format!("{}\n", python.display())), "{out}");
+    fs::write(dir.join("bcc/opensnoop-bpfcc"), "#!/nonexistent/python9\n").unwrap();
+    let (_, out, _) = bpf_loader_allow(&dir, "", "bpf_tool_loaders");
+    assert_eq!(out.lines().count(), 1, "bpftrace only: {out}");
+    // a path a line refuses
+    for bad in [
+        "relative/bpftrace",
+        "/usr/../bin/sh",
+        "/usr/./bin/sh",
+        "/a b",
+        "/nonexistent",
+    ] {
+        let (status, _, _) = bpf_loader_allow(&dir, "", &format!("bpf_loader_path_ok '{bad}'"));
+        assert_ne!(status, 0, "{bad}");
+    }
+    let (status, _, _) = bpf_loader_allow(&dir, "", "bpf_loader_path_ok /bin/sh");
+    assert_eq!(status, 0);
+}
+
+/// Named (lot 341, the review of #550 F2): the policy signed keeps the
+/// policy in force and adds one line for each loader it does not name yet,
+/// with the tracing types; a line already there is kept as it is.
+#[test]
+fn allow_bpf_tools_adds_lines_to_the_policy_in_force() {
+    let dir = case_dir("bpf-tools-policy");
+    let current = dir.join("rule-policy.local");
+    fs::write(
+        &current,
+        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe\n",
+    )
+    .unwrap();
+    let (status, out, err) = bpf_loader_allow(
+        &dir,
+        "",
+        &format!(
+            "bpf_loader_policy '{}' <<< $'/usr/bin/bpftrace\\n/usr/bin/python3.12'\necho \"allowed=${{BPF_ALLOWED[*]}}\"",
+            current.display()
+        ),
+    );
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        out,
+        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe\n\
+         bpf-loader-allow /usr/bin/python3.12 kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n\
+         allowed=/usr/bin/bpftrace (already in the policy) /usr/bin/python3.12\n"
+    );
+    // no key to sign with: nothing applied, nothing claimed, the lines
+    // and the command said
+    let (status, out, err) = bpf_loader_allow(
+        &dir,
+        &format!(
+            "ETC_DIR='{}'; BIN_DIR=/nonexistent; ALLOW_BPF_TOOLS=0; ALLOW_BPF_LOADERS=(/bin/sh)",
+            dir.display()
+        ),
+        "apply_bpf_loader_allow ''\necho \"allowed=${BPF_ALLOWED[*]-}\"",
+    );
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("no config-manage key"), "{err}");
+    assert!(err.contains("bpf-loader-allow /bin/sh kprobe,"), "{err}");
+    assert!(err.contains("sudo nn-admin policy set --file"), "{err}");
+    assert!(out.ends_with("allowed=\n"), "{out}");
+    // no policy in force: the lines alone
+    let (_, out, _) = bpf_loader_allow(
+        &dir,
+        "",
+        "bpf_loader_policy /nonexistent <<< /usr/bin/bpftrace",
+    );
+    assert_eq!(
+        out,
+        "bpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n"
+    );
+}
+
+/// Named (lot 341, the review of #550 F2): a fresh alpha install with
+/// `--allow-bpf-tools` signs the lines through the agent it started, with
+/// the install's key, and says so; without the flag the summary says the
+/// tools are refused; the flag where no agent is started is refused before
+/// anything changes; a path `--allow-bpf-loader` cannot take too.
+#[test]
+fn a_fresh_install_with_allow_bpf_tools_signs_the_loader_lines() {
+    let lab = Lab::new("fresh-bpf-tools");
+    fs::create_dir_all(lab.root.join("tools")).unwrap();
+    write_exec(&lab.root.join("tools/bpftrace"), "exit 0");
+    let r = lab.install_as("old", &["--source-tree", "--allow-bpf-tools"]);
+    assert_eq!(r.status, 0, "{r:#?}");
+    let bpftrace = lab.root.join("tools/bpftrace");
+    let policy = fs::read_to_string(lab.root.join("policy-set")).expect("policy set");
+    assert_eq!(
+        policy,
+        format!(
+            "bpf-loader-allow {} kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n",
+            bpftrace.display()
+        )
+    );
+    let key = fs::read_to_string(lab.root.join("policy-key")).unwrap();
+    assert_eq!(key.trim(), lab.root.join("admin.key").display().to_string());
+    let set = r.index("nn-admin policy").expect("policy set called");
+    let started = r
+        .index("systemctl enable --now northnarrow-watchdog.service")
+        .unwrap();
+    assert!(started < set, "after the start: {:?}", r.calls);
+    assert!(
+        r.stdout
+            .contains(&format!("bpf tools : allowed for {}", bpftrace.display())),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("self-protection stay enforced"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("still protects itself"), "{}", r.stdout);
+
+    // without the flag: nothing signed, the summary says refused
+    let lab = Lab::new("fresh-bpf-tools-none");
+    let r = lab.install_as("old", &["--source-tree"]);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(!lab.root.join("policy-set").exists());
+    assert!(r.index("nn-admin policy").is_none(), "{:?}", r.calls);
+    assert!(
+        r.stdout.contains("bpf tools : refused (bpftrace, BCC)"),
+        "{}",
+        r.stdout
+    );
+
+    // where this run starts no agent: refused, nothing changed
+    let lab = Lab::new("fresh-bpf-tools-no-enable");
+    let r = lab.install("old", &["--source-tree", "--allow-bpf-tools"]);
+    assert_eq!(r.status, 2, "{r:#?}");
+    assert!(r.stderr.contains("Nothing was changed"), "{r:#?}");
+    assert!(!lab.installed());
+    let r = lab.install_as(
+        "old",
+        &["--source-tree", "--allow-bpf-loader", "/usr/../bin/sh"],
+    );
+    assert_eq!(r.status, 2, "{r:#?}");
+    assert!(
+        r.stderr.contains("--allow-bpf-loader '/usr/../bin/sh'"),
+        "{r:#?}"
+    );
+    assert!(!lab.installed());
+
+    // an agent that refuses the lines: a warning, the install stands
+    let lab = Lab::new("fresh-bpf-tools-refused");
+    fs::write(lab.root.join("policy-refuse"), "").unwrap();
+    let r = lab.install_as("old", &["--source-tree", "--allow-bpf-loader", "/bin/sh"]);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr
+            .contains("the agent refused the bpf-loader-allow lines"),
+        "{r:#?}"
+    );
+    assert!(r.stdout.contains("bpf tools : refused"), "{}", r.stdout);
 }

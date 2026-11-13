@@ -29,7 +29,6 @@ fn refusal(e: &Expected) -> Event {
         target_ino: e.ino.unwrap_or(1234),
         operation: e.op,
         timestamp_ns: 1,
-        would_deny: false,
     }
 }
 

@@ -311,7 +311,6 @@ async fn run(
         image,
         export_loaded.on().is_some(),
         detect_only,
-        profile.host_wide_denies_observe(),
     )
     .await?;
     // the second review of #495 (R2): NN-L-NET-028's judgements in the beat
@@ -342,6 +341,7 @@ async fn run(
         &overlay_gate,
         identity,
         &detect_only_source,
+        &profile,
         integrity,
         tracepoint_degraded,
         hook_args_degraded,

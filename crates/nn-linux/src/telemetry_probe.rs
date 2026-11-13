@@ -2707,7 +2707,6 @@ pub fn deny_events_for_tests(
                     target_ino: e.ino.unwrap_or(1234),
                     operation: e.op,
                     timestamp_ns: ts,
-                    would_deny: false,
                 },
             )
         })

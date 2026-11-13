@@ -86,7 +86,6 @@ fn main() {
         target_ino: 2,
         operation: FsProtectOperation::Unlink,
         timestamp_ns: 600,
-        would_deny: false,
     };
     if let Some(state) = machine.observe(&denial, &[]) {
         println!(

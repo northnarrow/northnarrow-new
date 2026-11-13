@@ -13,7 +13,7 @@ with `rm -f` or `kill -9`, they are denied by design.
 
 | Operation | Command | Keeps keys / audit chain / state |
 |---|---|---|
-| Fresh install | `sudo ./deploy/install.sh` (lot 341: the observe-only `alpha` profile, both units started and enabled at boot; `--no-enable`, `--profile enforcing`) | n/a (bootstraps them) |
+| Fresh install | `sudo ./deploy/install.sh` (lot 341: the observe-only `alpha` profile, both units started and enabled at boot; `--no-enable`, `--profile enforcing`; `--allow-bpf-tools` / `--allow-bpf-loader <path>` for a tester's bpftrace and BCC, ALPHA_PROFILE.md §1.2) | n/a (bootstraps them) |
 | Upgrade in place | `sudo ./deploy/install.sh --upgrade --grant-key <admin.key>` | **yes** |
 | Uninstall | `sudo ./deploy/uninstall.sh` | **yes** (`/etc/northnarrow`, `/var/lib/northnarrow`) |
 | Retire the host | `sudo ./deploy/uninstall.sh --purge --grant-key <admin.key>` | no — everything removed |
@@ -85,8 +85,11 @@ deny hook attached, the admin socket answering, the watchdog registered):
 a start that does not pass is named and the run fails. `--no-enable` leaves
 both stopped and not enabled (`systemctl enable --now northnarrow-agent
 northnarrow-watchdog` later). The run ends with a short summary: the
-profile, whether the agent runs, how to see the status and the records, how
-to uninstall, and the admin key to move off the host. Every later run of
+profile, whether the agent runs, whether bpftrace and BCC may load
+(`--allow-bpf-tools`, `--allow-bpf-loader <path>`: signed `bpf-loader-allow`
+lines applied through the started agent, [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)
+§1.2), how to see the status and the records, how to uninstall, and the
+admin key to move off the host. Every later run of
 `install.sh` (an upgrade, a reinstall over a kept `/etc/northnarrow`) keeps
 the profile the manifest has; a `--profile` that would switch it is refused
 — switching an installed agent is a signed `nn-admin config overlay set
@@ -520,9 +523,9 @@ on.
 kexec kernel image load (`kexec -l`, `kexec -p`, `systemctl kexec`; both
 `kexec_load` and `kexec_file_load`) outside the trusted-installer window,
 and records it as an anti-tamper denial (NN-L-AT-001). A loaded image let
-root reboot at once into a kernel without the agent. Lot 341: under the
-observe-only `alpha` profile the load goes through, recorded "would deny"
-([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). kdump is not affected
+root reboot at once into a kernel without the agent. Lot 341: the same
+under the observe-only `alpha` profile — the host's integrity, not a
+response ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). kdump is not affected
 at boot: the agent's unit starts after `kdump.service`, so the crash kernel
 is already loaded. To reload it later (`kdumpctl restart`, a crashkernel
 change), open the window first:

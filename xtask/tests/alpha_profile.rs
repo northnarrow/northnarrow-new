@@ -94,8 +94,8 @@ fn the_no_enforcement_gate_is_resolved_in_one_place() {
 
 /// Named: every response path and deny switch the start arms takes the one
 /// gate — the exec quarantine's holds, the exec policy's denies, the kernel
-/// connect deny, the exploit guard, the module-load judge, the COMBAT
-/// ladder — and the attach no longer recomputes it.
+/// connect deny, the exploit guard, the COMBAT ladder — and the attach no
+/// longer recomputes it; the module-load judge takes none.
 #[test]
 fn every_enforcing_switch_takes_the_resolved_gate() {
     let code = product_code(&repo_root());
@@ -115,24 +115,21 @@ fn every_enforcing_switch_takes_the_resolved_gate() {
     assert!(body(attach, "execpol_mode").contains("Mode::Enforce if detect_only => Mode::Audit"));
     let boot = at("agent/src/boot/mod.rs");
     assert!(
-        // lot 341 round 2: and the profile's host-wide switch after it
-        boot.contains(
-            "export_loaded.on().is_some(),\n        detect_only,\n        profile.host_wide_denies_observe(),\n    )"
-        ),
+        boot.contains("export_loaded.on().is_some(),\n        detect_only,\n    )"),
         "the start hands attach::load the resolved gate"
     );
     let policy = at("agent/src/boot/policy.rs");
     assert!(policy.contains("arming(cli.net_connect_deny, detect_only)"));
     let response = at("agent/src/boot/response.rs");
     assert!(response.contains("effective_response(requested, detect_only)"));
+    // the module-load judge takes NO gate (the review of #550, F2/F7): an
+    // untrusted module is refused under every profile, as kexec is
     let tasks = at("agent/src/boot/tasks.rs");
-    assert!(tasks.contains("let observe_only = execq_exec_cfg.dry_run;"));
-    assert!(tasks.contains("module_trust::start(module_kernel, observe_only)"));
+    assert!(tasks.contains("module_trust::start(module_kernel)"));
+    assert!(!tasks.contains("observe_only"));
     let module = at("agent/src/module_trust/mod.rs");
-    assert!(body(module, "kernel_mode").contains("(!deny_ok || observe_only)"));
-    assert!(
-        body(module, "look").contains("kernel_mode(want.mode, self.deny_ok, self.observe_only)")
-    );
+    assert!(signature(module, "kernel_mode").contains("(want: u64, deny_ok: bool)"));
+    assert!(body(module, "look").contains("kernel_mode(want.mode, self.deny_ok)"));
     // the COMBAT ladder and the response build take the start's value
     assert!(boot.contains("&isolator,\n        detect_only,\n        &audit_log,"));
     // the exec quarantine's controller kills only when it enforces — a kill
@@ -150,4 +147,33 @@ fn a_suppressed_response_says_what_would_have_run() {
     let describe = body(store, "describe_response");
     assert!(describe.contains("nn_core::response::profile::would_have("));
     assert!(!describe.contains("\"suppressed (detect-only)\""));
+}
+
+/// Named (lot 341, the review of #550 F8): the start signs an unsigned
+/// downgrade — after its own `agent_boot`, from the chain's previous boot
+/// and the resolved profile — and the profile reaches the attest phase.
+#[test]
+fn the_start_signs_an_unsigned_downgrade_to_alpha() {
+    let code = product_code(&repo_root());
+    let at = |rel: &str| {
+        code.get(rel)
+            .unwrap_or_else(|| panic!("{rel} not found"))
+            .as_str()
+    };
+    let evidence = at("agent/src/boot/evidence.rs");
+    assert!(signature(evidence, "attest")
+        .contains("profile: &nn_core::response::profile::ResolvedProfile,"));
+    let attest = body(evidence, "attest");
+    let probe = attest
+        .find("match log.boot_probe(")
+        .expect("the boot's row");
+    let check = attest
+        .find("nn_core::response::profile::unsigned_downgrade(\n                            log.previous_boot_enforced(),\n                            profile,\n                        )")
+        .expect("the downgrade judged from the chain and the profile");
+    let sign = attest
+        .find("log.attest_profile_downgrade(&detail)")
+        .expect("and signed");
+    assert!(probe < check && check < sign);
+    let boot = at("agent/src/boot/mod.rs");
+    assert!(boot.contains("        &detect_only_source,\n        &profile,\n        integrity,"));
 }

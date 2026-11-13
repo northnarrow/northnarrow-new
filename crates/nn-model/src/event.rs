@@ -364,10 +364,6 @@ pub enum Event {
         target_ino: u64,
         operation: FsProtectOperation,
         timestamp_ns: u64,
-        /// Lot 341: a host-wide deny the start's `alpha` profile let through — the kernel did NOT refuse it; the
-        /// enforcing profile would have (`FS_OP_WOULD_DENY` on the wire).
-        #[serde(default)]
-        would_deny: bool,
     },
     /// Tappa 9 (C4) — file-integrity drift detected by the
     /// observe-only FIM LSM hooks. The drain loop has already
@@ -1806,10 +1802,8 @@ impl From<&FsProtectDenialRaw> for Event {
             comm: crate::wire::cstr_lossy(&raw.attacker_comm).into_owned(),
             target_dev: raw.target_dev,
             target_ino: raw.target_ino,
-            // Lot 341: the code without its "would deny" bit
-            operation: FsProtectOperation::from_wire(crate::wire::fs_op_of(raw.operation)),
+            operation: FsProtectOperation::from_wire(raw.operation),
             timestamp_ns: raw.timestamp_ns,
-            would_deny: crate::wire::is_would_deny(raw.operation),
         }
     }
 }
@@ -1882,41 +1876,6 @@ pub struct Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Named (lot 341): a host-wide deny the alpha profile let through
-    /// decodes to its own operation, marked "would deny"; a refusal is not.
-    #[test]
-    fn a_would_deny_record_decodes_to_its_operation() {
-        use crate::wire::{FS_OP_BPF_PROG_TYPE, FS_OP_KEXEC, FS_OP_WOULD_DENY};
-        let mut raw = FsProtectDenialRaw::zeroed();
-        raw.operation = FS_OP_BPF_PROG_TYPE | FS_OP_WOULD_DENY;
-        raw.target_ino = 2;
-        match Event::from(&raw) {
-            Event::FsProtectDenial {
-                operation,
-                would_deny,
-                target_ino,
-                ..
-            } => {
-                assert_eq!(operation, FsProtectOperation::BpfProgType);
-                assert!(would_deny);
-                assert_eq!(target_ino, 2);
-            }
-            other => panic!("{other:?}"),
-        }
-        raw.operation = FS_OP_KEXEC;
-        match Event::from(&raw) {
-            Event::FsProtectDenial {
-                operation,
-                would_deny,
-                ..
-            } => {
-                assert_eq!(operation, FsProtectOperation::Kexec);
-                assert!(!would_deny);
-            }
-            other => panic!("{other:?}"),
-        }
-    }
 
     /// External audit EBPF-015: the six denial codes of the new-entry and
     /// extended-attribute hooks decode to their own operation (not

@@ -170,6 +170,15 @@ ACCEPT_DROPIN_QUARANTINE=0
 # at boot (--no-enable clears it).
 PROFILE=""
 ENABLE_AT_BOOT=1
+# Lot 341 (the review of #550, F2): a foreign tracing BPF program's load is
+# refused under every profile — `bpf_send_signal` kills the agent past its
+# task_kill hook. A tester who runs bpftrace or BCC names the loaders at
+# install time: signed `bpf-loader-allow` lines (--allow-bpf-tools: the
+# packaged bpftrace and the interpreter of BCC's tools; --allow-bpf-loader
+# PATH: any executable), applied through the started agent with the
+# install's key.
+ALLOW_BPF_TOOLS=0
+ALLOW_BPF_LOADERS=()
 # The host facts the support check reads (overridable for its tests).
 HOST_BTF=${HOST_BTF:-/sys/kernel/btf/vmlinux}
 HOST_LSM=${HOST_LSM:-/sys/kernel/security/lsm}
@@ -200,6 +209,8 @@ while [[ $# -gt 0 ]]; do
         --accept-dropin-quarantine) ACCEPT_DROPIN_QUARANTINE=1 ;;
         --profile) PROFILE=${2:-}; shift ;;
         --no-enable) ENABLE_AT_BOOT=0 ;;
+        --allow-bpf-tools) ALLOW_BPF_TOOLS=1 ;;
+        --allow-bpf-loader) ALLOW_BPF_LOADERS+=("${2:-}"); shift ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade --grant-key KEY] [--tarball FILE] [--sums FILE] [--attestation BUNDLE]"
             echo "                 [--source-tree | --allow-unverified | --no-verify] [--without-nftables]"
@@ -236,11 +247,20 @@ while [[ $# -gt 0 ]]; do
             echo "                         outbound block then cannot work (recorded in the install manifest)"
             echo "  --profile alpha|enforcing"
             echo "                         fresh install: the response profile (default alpha: observe-only, every"
-            echo "                         verdict recorded with what it would have done, nothing killed, blocked or"
-            echo "                         quarantined; the agent's self-protection stays on). An installed agent"
-            echo "                         keeps its profile: switch it with a signed nn-admin config overlay set profile"
+            echo "                         verdict recorded with what it would have done, nothing of the users' killed,"
+            echo "                         blocked or quarantined; the host's integrity and the agent's self-protection"
+            echo "                         stay enforced, foreign tracing BPF programs and untrusted modules refused"
+            echo "                         included). An installed agent keeps its profile: switch it with a signed"
+            echo "                         nn-admin config overlay set profile"
             echo "  --no-enable            fresh install: do not start the units nor enable them at boot"
             echo "                         (default: systemctl enable --now, then a health check)"
+            echo "  --allow-bpf-tools      fresh install, started: let bpftrace and BCC's tools load tracing BPF"
+            echo "                         programs (kprobe, tracepoint, perf_event, raw_tracepoint, tracing) — signed"
+            echo "                         bpf-loader-allow lines for this host's bpftrace and the interpreter BCC's tools"
+            echo "                         run under, applied with the install's key. Any root process running them may"
+            echo "                         then load those types (bpftrace runs what it is given): a tester's choice"
+            echo "  --allow-bpf-loader PATH"
+            echo "                         the same for one executable (absolute path; repeatable)"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -256,6 +276,16 @@ fi
 if [[ -n "$PROFILE" && "$PROFILE" != alpha && "$PROFILE" != enforcing ]]; then
     echo "install.sh: --profile $PROFILE: alpha or enforcing" >&2
     exit 2
+fi
+if (( ALLOW_BPF_TOOLS )) || (( ${#ALLOW_BPF_LOADERS[@]} )); then
+    # Lot 341 (the review of #550, F2): the lines are applied through the
+    # agent this run starts — refused, before anything changes, where none is
+    if [[ $MODE != full ]] || (( UPGRADE )) || (( ! ENABLE_AT_BOOT )); then
+        echo "install.sh: --allow-bpf-tools / --allow-bpf-loader go with a fresh install this run starts" >&2
+        echo "install.sh: (not --upgrade, --no-enable or a package step); on a running agent sign the lines" >&2
+        echo "install.sh: yourself: docs/operator/RULE_POLICY.md §2.5 (nn-admin policy set). Nothing was changed." >&2
+        exit 2
+    fi
 fi
 if (( DEFER_HEALTH )) && [[ $MODE != configure ]]; then
     echo "install.sh: --defer-health-check goes with --package-configure only" >&2
@@ -1329,18 +1359,130 @@ install_profile() {   # <existing manifest> <asked profile>
 }
 # <<< install_profile
 
+# >>> bpf_loader_allow (run by xtask/tests/install_scripts.rs)
+# Lot 341 (the review of #550, F2): the program types a tester's tracing
+# tools load — bpftrace's and BCC's kprobe:, tracepoint:, interval:/profile:
+# (perf_event), rawtracepoint: and kfunc:/fentry: (tracing) probes. The other
+# refused types (raw_tracepoint_writable, struct_ops, ext, lsm) take a hook's
+# place: a policy line signed by hand (docs/operator/RULE_POLICY.md §2.5).
+BPF_TOOL_TYPES=kprobe,tracepoint,perf_event,raw_tracepoint,tracing
+# Where BCC's tools are (Debian and Ubuntu: /usr/sbin/*-bpfcc; Fedora, RHEL:
+# /usr/share/bcc/tools).
+BCC_TOOL_GLOBS=${BCC_TOOL_GLOBS:-"/usr/sbin/*-bpfcc /usr/share/bcc/tools/*"}
+# Where bpftrace and an `env` shebang's interpreter are looked up.
+BPF_TOOL_PATH=${BPF_TOOL_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+
+# A path a bpf-loader-allow line takes: absolute, no '.' or '..' component,
+# no whitespace, an executable file.
+bpf_loader_path_ok() {
+    local p=$1
+    [[ $p == /?* && $p != *[[:space:]]* ]] || return 1
+    case "/$p/" in
+        */./*|*/../*) return 1 ;;
+    esac
+    [[ -f $p && -x $p ]]
+}
+
+# The loaders --allow-bpf-tools names on this host, one a line: bpftrace,
+# and the interpreter of BCC's tools (the kernel matches a loader by the
+# executable it runs — a BCC tool's is its Python interpreter, so its line
+# lets any root Python program load those types).
+bpf_tool_loaders() {
+    local p g f interp rest
+    p=$(PATH=$BPF_TOOL_PATH command -v bpftrace 2>/dev/null || true)
+    [[ -n $p ]] && bpf_loader_path_ok "$p" && echo "$p"
+    for g in $BCC_TOOL_GLOBS; do
+        for f in $g; do
+            [[ -f $f ]] || continue
+            read -r interp rest < <(head -n1 "$f" 2>/dev/null | sed -n 's/^#![[:space:]]*//p') || continue
+            if [[ ${interp:-} == */env ]]; then
+                interp=$(PATH=$BPF_TOOL_PATH command -v "${rest%% *}" 2>/dev/null || true)
+            fi
+            if [[ -n ${interp:-} ]] && bpf_loader_path_ok "$interp"; then
+                echo "$interp"
+                return 0
+            fi
+        done
+    done
+    return 0
+}
+
+# The policy to sign: the policy in force ($1, may be absent) and one
+# `bpf-loader-allow <path> $BPF_TOOL_TYPES` line for each loader on stdin
+# that it does not name yet (a line already there is kept as it is).
+# BPF_ALLOWED: the loaders the result names this way.
+bpf_loader_policy() {
+    local current=$1 l
+    BPF_ALLOWED=()
+    if [[ -r $current ]]; then
+        cat "$current"
+    fi
+    while read -r l; do
+        [[ -n $l ]] || continue
+        if [[ -r $current ]] && awk -v p="$l" '$1 == "bpf-loader-allow" && $2 == p { f = 1 } END { exit !f }' "$current"; then
+            BPF_ALLOWED+=("$l (already in the policy)")
+            continue
+        fi
+        case " ${BPF_ALLOWED[*]-} " in *" $l "*) continue ;; esac
+        echo "bpf-loader-allow $l $BPF_TOOL_TYPES"
+        BPF_ALLOWED+=("$l")
+    done
+}
+
+# Sign and apply the lines through the running agent with the install's key
+# ($1: a config-manage key). Prints what to do when it cannot.
+apply_bpf_loader_allow() {
+    local key=$1 candidate loaders
+    loaders=$( { (( ALLOW_BPF_TOOLS )) && bpf_tool_loaders; printf '%s\n' ${ALLOW_BPF_LOADERS[@]+"${ALLOW_BPF_LOADERS[@]}"}; } | awk 'NF && !seen[$0]++')
+    if [[ -z $loaders ]]; then
+        echo "install.sh: WARNING: --allow-bpf-tools found no bpftrace and no BCC tool on this host: nothing allowed" >&2
+        BPF_ALLOWED=()
+        return 0
+    fi
+    candidate=$(mktemp)
+    bpf_loader_policy "$ETC_DIR/rule-policy.local" <<< "$loaders" > "$candidate"
+    if [[ -z $key || ! -r $key ]]; then
+        echo "install.sh: WARNING: no config-manage key to sign the bpf-loader-allow lines with (--grant-key)." >&2
+        echo "install.sh: sign them yourself: sudo nn-admin policy set --file <policy> --key <config-manage key>" >&2
+        sed -n 's/^bpf-loader-allow /  bpf-loader-allow /p' "$candidate" >&2
+        BPF_ALLOWED=()
+        rm -f "$candidate"
+        return 0
+    fi
+    if "$BIN_DIR/nn-admin" policy set --file "$candidate" --key "$key"; then
+        echo "install.sh: signed bpf-loader-allow lines applied: ${BPF_ALLOWED[*]}"
+    else
+        echo "install.sh: WARNING: the agent refused the bpf-loader-allow lines (above): those loaders stay refused" >&2
+        BPF_ALLOWED=()
+    fi
+    rm -f "$candidate"
+}
+# <<< bpf_loader_allow
+# each --allow-bpf-loader path checked before anything changes
+for l in ${ALLOW_BPF_LOADERS[@]+"${ALLOW_BPF_LOADERS[@]}"}; do
+    if ! bpf_loader_path_ok "$l"; then
+        echo "install.sh: --allow-bpf-loader '$l': an absolute path with no '.' or '..' component and no" >&2
+        echo "install.sh: whitespace, of an executable on this host. Nothing was changed." >&2
+        exit 2
+    fi
+done
+
 # >>> install_summary (run by xtask/tests/install_scripts.rs)
 # Lot 341 (alpha 2/4): what a tester reads at the end — the profile, whether
 # the agent runs, where the records are, how to see the status, how to
 # uninstall. PROFILE_RECORDED, STARTED_NOW, MODE, ADMIN_KEY_OUT, REPO_ROOT.
 install_summary() {
     local key="<your admin key>" profile=${PROFILE_RECORDED:-enforcing}
+    [[ -n ${BPF_ALLOWED+x} ]] || BPF_ALLOWED=()
     [[ -f "$ADMIN_KEY_OUT" ]] && key=$ADMIN_KEY_OUT
     echo ""
     echo "NorthNarrow is installed."
     case $profile in
-        alpha) echo "  profile   : alpha — observe-only: nothing is killed, blocked or quarantined; every verdict is"
-               echo "              recorded with what it would have done. The agent still protects itself." ;;
+        alpha) echo "  profile   : alpha — observe-only: nothing of yours is killed, blocked or quarantined; every verdict"
+               echo "              is recorded with what it would have done. The host's integrity and the agent's"
+               echo "              self-protection stay enforced: foreign tracing BPF programs (bpftrace, BCC),"
+               echo "              untrusted kernel modules, kexec, the ftrace/kprobes/lockdown switches and the"
+               echo "              guarded sysctls are refused (docs/operator/ALPHA_PROFILE.md §1)." ;;
         *)     echo "  profile   : $profile — the agent's responses run (kill, quarantine, isolation)." ;;
     esac
     if (( STARTED_NOW )); then
@@ -1349,6 +1491,13 @@ install_summary() {
         echo "  running   : no — start it (and at every boot): sudo systemctl enable --now northnarrow-agent northnarrow-watchdog"
     else
         echo "  running   : as the package manager left it (systemctl status northnarrow-agent)"
+    fi
+    if (( ${#BPF_ALLOWED[@]} )); then
+        echo "  bpf tools : allowed for ${BPF_ALLOWED[*]} — signed bpf-loader-allow lines: any root"
+        echo "              process running them may load tracing BPF programs"
+    else
+        echo "  bpf tools : refused (bpftrace, BCC) — $([[ $MODE == full ]] && echo "install with --allow-bpf-tools, or ")sign"
+        echo "              bpf-loader-allow lines (docs/operator/RULE_POLICY.md §2.5)"
     fi
     echo "  status    : sudo nn-admin status --key $key"
     echo "  records   : sudo nn-admin detections --key $key   (signed, in $STATE_DIR)"
@@ -2773,6 +2922,10 @@ if [[ $MODE == full ]] && (( ENABLE_AT_BOOT )) && (( ! STARTED_FOR_WINDOW )); th
     fi
     if [[ -n "$HEALTH_NOTE" ]]; then echo "install.sh: WARNING: $HEALTH_NOTE" >&2; fi
     STARTED_NOW=1
+fi
+BPF_ALLOWED=()
+if (( STARTED_NOW )) && { (( ALLOW_BPF_TOOLS )) || (( ${#ALLOW_BPF_LOADERS[@]} )); }; then
+    apply_bpf_loader_allow "${GRANT_KEY:-$ADMIN_KEY_OUT}"
 fi
 
 echo ""

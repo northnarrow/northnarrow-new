@@ -56,11 +56,7 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
             "| BPF_PROG_LOAD",
             "crate::fail_open::bump(fail_open_hook::BPF);",
             "if cmd == BPF_PROG_LOAD {\n        if denied_by_default(arg)\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
-            // lot 341: a host-wide deny, decided by the profile's switch
-            // (`xtask/tests/host_deny.rs`): refused unless the observe-only
-            // gate is on, then let through and signed "would deny" once a
-            // second per loader and type
-            "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {\n                let (refuse, op) = crate::host_deny::judge(FS_OP_BPF_PROG_TYPE);\n                if refuse {\n                    emit_denial(op, arg);\n                    return -EPERM;\n                }\n                if should_report(pid, WOULD_DENY_REPORT | (arg & 0xff)) {\n                    emit_denial(op, arg);\n                }\n            } else if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {",
+            "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {\n                emit_denial(FS_OP_BPF_PROG_TYPE, arg);\n                return -EPERM;\n            }",
             "emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);",
             "crate::bpf_census::mark_load();",
             "should_report(pid, dedup)",

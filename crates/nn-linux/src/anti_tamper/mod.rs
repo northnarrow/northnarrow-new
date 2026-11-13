@@ -50,8 +50,6 @@ pub use nn_core::anti_tamper::combat_allow;
 /// Lab PR 215: the deny hooks' fail-open counters (`DENY_FAIL_OPEN`).
 pub mod fail_open;
 pub mod filesystem;
-/// Lot 341: the host-wide denies' mode (`HOST_DENY_MODE`), from the gate.
-pub mod host_deny;
 pub mod network_isolate;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`

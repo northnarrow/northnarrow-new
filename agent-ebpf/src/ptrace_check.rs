@@ -135,16 +135,12 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // swap them between the hook's read and the kernel's. Read-mode
     // access (`ps`, `/proc/1/environ`) is untouched, and a window lets a
     // debugger attach.
-    //
-    // Lot 341: PID 1's is a host-wide deny ([`crate::host_deny`]): under the
-    // start's `alpha` profile (the `alpha` profile) the access goes
-    // through, signed "would deny"; one of the agent's, its watchdog's or a
-    // worker's is refused under every profile.
     let mode: u32 = ctx.arg(1);
     let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
-    let own_target = crate::task_kill::is_protected_pid(target_tgid)
-        || crate::bpf_defense::task_runs_own_binary(target as *const u8);
-    if !init_attach && !own_target {
+    if !init_attach
+        && !crate::task_kill::is_protected_pid(target_tgid)
+        && !crate::bpf_defense::task_runs_own_binary(target as *const u8)
+    {
         return 0;
     }
 
@@ -211,14 +207,6 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // /proc/<pid>/mem, process_vm_readv/writev). READ-mode checks are what
     // `ps`, `lsof` and journald (/proc/<pid>/exe) trigger all day, and
     // NOAUDIT asks LSMs explicitly not to report: those stay silent denials.
-    if !own_target {
-        // PID 1 (attach mode only): the host-wide deny
-        let (refuse, op) = crate::host_deny::judge(FS_OP_PTRACE);
-        if mode & PTRACE_MODE_NOAUDIT == 0 {
-            crate::inode_protect::emit_task_denial(op, mode as u64, target_tgid);
-        }
-        return if refuse { -EPERM } else { 0 };
-    }
     if mode & PTRACE_MODE_ATTACH != 0 && mode & PTRACE_MODE_NOAUDIT == 0 {
         crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
     }

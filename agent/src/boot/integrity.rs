@@ -775,14 +775,15 @@ mod tests {
             northnarrow_agent::sensors::epg::Response::Detect,
             "exploit guard kills under alpha"
         );
+        // the review of #550 (F2): the host's integrity and the agent's
+        // self-protection hold under alpha — an untrusted module refused
         assert_eq!(
             northnarrow_agent::module_trust::kernel_mode(
                 northnarrow_agent::module_trust::DEFAULT_MODE,
-                true,
-                gate.on
+                true
             ),
-            common::module_judge::mode::RECORD,
-            "module loads refused under alpha"
+            common::module_judge::mode::DENY,
+            "an untrusted module loads under alpha"
         );
     }
 

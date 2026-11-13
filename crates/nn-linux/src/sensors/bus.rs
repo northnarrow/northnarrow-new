@@ -2154,7 +2154,6 @@ mod tests {
             target_ino: 2,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 0,
-            would_deny: false,
         }
     }
 
@@ -2807,7 +2806,6 @@ mod tests {
                 target_ino: ino,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: ts,
-                would_deny: false,
             };
             for i in 0..1_500u64 {
                 tx.send(at(9, 2, 1_000 + i * 1_000)).await.unwrap(); // 1.5 ms
@@ -2878,7 +2876,6 @@ mod tests {
                 target_ino: 2,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: ts,
-                would_deny: false,
             };
             for pid in [100, 101, 102] {
                 tx.send(at(pid, 1)).await.unwrap();
@@ -2947,7 +2944,6 @@ mod tests {
                 target_ino: 2,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: ts,
-                would_deny: false,
             })
             .unwrap()
         };
@@ -3283,7 +3279,6 @@ mod tests {
                         target_ino: 2,
                         operation: nn_model::FsProtectOperation::Setattr,
                         timestamp_ns: ts,
-                        would_deny: false,
                     };
                     let events = vec![
                         spawn(1),
@@ -3480,7 +3475,6 @@ mod tests {
                 target_ino: ino,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: 0,
-                would_deny: false,
             };
             // new processes (no repeat to coalesce): 300 on one target, one
             // on another
@@ -3626,7 +3620,6 @@ mod tests {
                 target_ino: ino,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: ts,
-                would_deny: false,
             };
             // uid 0: one process repeating (1 queued + 9 coalesced)
             for i in 0..10u64 {
@@ -3722,7 +3715,6 @@ mod tests {
                 target_ino: u64::from(pid),
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: ts,
-                would_deny: false,
             };
             tx.send(denial_at(1, now - 500_000_000)).await.unwrap(); // 0.5 s ago: late for P0
             tx.send(denial_at(2, now)).await.unwrap();

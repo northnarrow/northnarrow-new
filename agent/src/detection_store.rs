@@ -2579,7 +2579,6 @@ mod tests {
             target_dev: 1,
             target_ino: 2,
             operation: nn_model::FsProtectOperation::Unlink,
-            would_deny: false,
         };
         let r = DetectionRecord::from_rule(
             1,
@@ -2963,7 +2962,6 @@ mod tests {
             target_dev: 1,
             target_ino: 2,
             operation: nn_model::FsProtectOperation::CgroupKill,
-            would_deny: false,
         };
         let mut logged = sample_verdict();
         logged.action = ResponseAction::Log;

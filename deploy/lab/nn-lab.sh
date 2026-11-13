@@ -66,7 +66,7 @@
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh foreign-bpf-check  # lot 290: foreign BPF — the refused program types (a kprobe with bpf_probe_write_user, bpftrace outside/inside a window, the signed per-loader opt-out), the agent's objects off limits (FOREIGN_BPF_ONLY="F2 F4" a subset), the frozen maps, the cross-view (its status file, a program loaded in the agent's gap), systemd's BPF unit features, R011 Low
-#   deploy/lab/nn-lab.sh host-deny-check    # lot 341: the host-wide denies under the profile — a foreign tracing program, bpftrace and a BCC/libbpf tool loaded and signed "would deny" under alpha, refused under enforcing; a handle on, a write of and a detach of the agent's maps, programs and links refused under both (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1 in the units' environment; HOST_DENY_EXPECT=observe|enforce overrides the boot line)
+#   deploy/lab/nn-lab.sh host-deny-check    # lot 341: the host's integrity and the agent's self-protection under every profile — a foreign tracing program, bpftrace and a BCC/libbpf tool refused unless the signed policy names their loader (install.sh --allow-bpf-tools), the agent's maps, programs and links, kernel.ftrace_enabled=0, kprobes/enabled=0, a SIGSTOP to the agent and a cgroup v1 freezer move refused (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1 in the units' environment)
 #   deploy/lab/nn-lab.sh own-pins-check     # lot 301: every BPF object the agent pins is its own to the guard — no link of the agent's (the start-in-cgroup tracker's among them) given to root by id, a handle on and a detach of the tracker's links refused and signed, the tracker still marking (the guard enforcing for the run; KEEP_ENFORCE=1 leaves it so)
 #   deploy/lab/nn-lab.sh deny-selftest-check  # lot 302: every deny hook proves it denies each round — the guard enforcing for the run, ROUNDS rounds with every attempt refused and reported, nothing judged or held back, the budgets spent before 2 rounds, one hook detached on purpose (DETACH=inode_mknod: the degradation, then the alert), the bpf() guard refusing through a restart gap (SKIP_DETACH=1 / SKIP_GAP=1 leave those out; KEEP_ENFORCE=1)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
@@ -1730,12 +1730,14 @@ cmd_foreign_bpf_check() {
 }
 
 cmd_host_deny_check() {
-    # Lot 341 (deploy/lab/malsim/host-deny-check.sh): the host-wide denies
-    # observed under the alpha profile ("would deny"), refused under
-    # enforcing; the agent's own BPF objects refused under both. Needs an
-    # install whose BPF guard enforces (NN_BPF_DEFENSE_ENFORCE=1).
+    # Lot 341 (deploy/lab/malsim/host-deny-check.sh): the host's integrity
+    # and the agent's self-protection under every profile — a foreign
+    # tracing load refused unless the signed policy names its loader; the
+    # agent's own BPF objects, the ftrace and kprobes switches, a signal to
+    # the agent and a v1 freezer move refused. Needs an install whose BPF
+    # guard enforces (NN_BPF_DEFENSE_ENFORCE=1).
     vm_running || die "guest is not running"
-    vssh "cd ~/northnarrow && HOST_DENY_EXPECT='${HOST_DENY_EXPECT:-}' bash deploy/lab/malsim/host-deny-check.sh"
+    vssh "cd ~/northnarrow && bash deploy/lab/malsim/host-deny-check.sh"
 }
 
 cmd_own_pins_check() {

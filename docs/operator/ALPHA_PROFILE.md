@@ -3,10 +3,11 @@
 A tester installs NorthNarrow on a VM or a spare machine, and it must never
 break anything there. The `alpha` profile is how: the agent detects, judges
 and records exactly as it does in production, and **no response touches a
-user program** — every verdict is recorded with what it *would have* done,
-and a host-wide deny (a tester's `bpftrace`, a kexec, a sysctl) is recorded
-as what it *would have* refused (§1.1). The agent's protection of itself
-stays on.
+user program** — every verdict is recorded with what it *would have* done.
+The host's integrity and the agent's protection of itself stay **enforced**
+(§1.1): among them, a foreign tracing BPF program's load is refused — a
+tester who runs `bpftrace` or BCC names them at install time
+(`install.sh --allow-bpf-tools`, §1.2).
 
 `alpha` is the profile of every fresh install made with `install.sh` (and of
 a fresh package install). The other profile is `enforcing`.
@@ -26,91 +27,94 @@ and hands the same value to every response path and deny switch it arms:
 | Exec policy (`--exec-policy enforce`): exec / preload / mmap denies | denied | audit mode: recorded, not denied |
 | Kernel connect deny (`--net-connect-deny`) | armed | not armed, said at the start |
 | Exploit guard (`--exploit-guard-response enforce`) | SIGKILL / EPERM | detect mode |
-| Module-load judge (R018: untrusted `.ko` loads, `init_module`) | refused (the default deny mode) | record mode: let through, recorded |
 | Copy-on-first-write guard's automatic restore | restored | copies kept, nothing restored |
 
 Unchanged in `alpha`: **detection, posture and evidence.** Every rule runs,
 the posture ladder moves (a COMBAT is entered and recorded, without
-isolation), every record is signed in its chain.
+isolation), every record is signed in its chain. And every deny of §1.1.
 
-### 1.1 The kernel's denies: what stays enforced, what is only observed
+### 1.1 The kernel's denies: enforced under every profile
 
-The alpha promises a tester it never breaks anything on the machine. The
-deny hooks therefore split in two under `alpha` (the coordinator's decision of
-13/11/2026, lot 341's second round):
+`alpha` means no response against **the users' programs**. The host's
+integrity and the agent's self-protection are not responses: every deny
+hook below holds under `alpha` as under `enforcing` (outside a
+trusted-installer window), because without it anyone could blind, freeze or
+kill the agent, and the record of what it observed would mean nothing. (Lot
+341's first rounds left the host-wide ones in observe under `alpha`; the
+review of #550 showed each of them is self-protection in disguise, and the
+coordinator's corrected decision of 13/11/2026 puts them back.)
 
-- the denies that refuse a **third-party tool something on the host** are
-  only **observed** under `alpha`: the action goes through, and the
-  attempt is recorded as a **"would deny"** — what the enforcing profile
-  would have refused;
-- the denies that **protect the agent itself** stay **enforced** under
-  every profile: without them anyone could switch the agent off, and the
-  record of what it observed would mean nothing.
-
-**Observed in `alpha`** (recorded "would deny"; refused under `enforcing`
-outside a trusted-installer window):
-
-| Deny | What a tester meets | Why it is only observed |
-|---|---|---|
-| A foreign tracing, LSM, extension or `struct_ops` BPF program's load (`bpftrace`, BCC and libbpf tools, another EDR, Netdata- or Cilium-like agents) | the tool loads and runs | it attaches elsewhere on the host; refusing it breaks the tester's own tooling |
-| A `cgroup/sysctl` program attached to the root cgroup | attached | it guards the sysctl guard, which is itself only observed |
-| The kprobes switch (`/sys/kernel/debug/kprobes/enabled`) and the lockdown file (`/sys/kernel/security/lockdown`) | written | a host setting the tester owns |
-| A kexec image (`kexec -l`, `kdumpctl restart`) | loaded | kdump and live-patch tooling must keep working |
-| The sysctl guard (`kernel.ftrace_enabled`, `kernel.sched_rt_*`, overcommit, `pid_max`, `threads-max`, `max_map_count`) — its write deny and its `cgroup/sysctl` judge; the integrity round's and a window's close's put-back of a harmful value (and of `kprobes/enabled`) | written, and left as written (the round records `sysctl_would_restore`) | the tester's tuning |
-| A write to a cgroup v1 hierarchy where the unified one runs | written | an older container runtime's |
-| A ptrace attach of PID 1 (a debugger, `/proc/1/mem`) | allowed | a debugging session on the tester's machine |
-
-**Enforced under every profile** (the agent's self-protection):
-
-| Deny | Why it stays enforced |
+| Deny | What it would allow under `alpha` if it only observed |
 |---|---|
 | A signal (`kill`, `pkill`, `systemctl stop` outside a window), a signal through a file's owner (`F_SETOWN`/`O_ASYNC`), a ptrace or `/proc/<pid>/mem` access, a `prlimit`/`renice`/scheduling/I/O-priority change, `oom_score_adj`, a move out of its cgroup — aimed at the agent, its watchdog or a worker | they stop, blind or starve the agent |
 | A write, rename, unlink, `chattr`, extended attribute or new entry on the agent's files, units, drop-ins, state and pins; a read of its signing key | they change or remove what it runs and what it signs |
 | A write to its units' cgroup files (`cgroup.kill`, `cgroup.freeze`, limits) | they kill or freeze it |
 | A BPF operation on the agent's **own** programs, maps and links: a handle on one by id or through its pin (`bpftool map/prog/link … id`, `BPF_OBJ_GET`), a map update or delete, a link detach or replacement | they detach its hooks or rewrite its configuration |
+| A foreign BPF load of the nine refused types — tracing (`kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, `tracing`: `bpftrace`, BCC and libbpf tools, another EDR), `raw_tracepoint_writable`, `struct_ops`, `ext`, `lsm` — outside the signed per-loader opt-out (§1.2) | `bpf_send_signal` kills the agent and its watchdog with a signal the `task_kill` hook never sees (the kernel checks no permission for it), at every restart; `bpf_probe_write_user` rewrites its memory; a foreign LSM program refuses its operations |
+| An untrusted kernel module (the module-load judge, R018: `init_module`, `finit_module`) — outside the signed policy's `module-allow` lines or a mode other than `enforce` for R018 | a module can do anything to the agent |
+| A kexec image (`kexec -l`) | a kernel booted without the agent's hooks |
+| The sysctl guard (`kernel.ftrace_enabled`, `kernel.sched_rt_*`, overcommit, `pid_max`, `threads-max`, `max_map_count`) — its write deny, its `cgroup/sysctl` judge, and the integrity round's and a window's close's put-back of a harmful value; a `cgroup/sysctl` program attached to the root cgroup | `kernel.ftrace_enabled=0` silences the BPF trampolines — every deny hook of the agent among them, on 6.0 to 7.2 — and then a plain `kill -9` reaches it; the other values abort or starve it; a root `cgroup/sysctl` program runs after the guard and rewrites what it judged |
+| The kprobes switch (`/sys/kernel/debug/kprobes/enabled`) and the lockdown file (`/sys/kernel/security/lockdown`) | `0` disarms every kprobe of the agent; lockdown takes the kernel-memory helpers from its programs |
+| A write to a cgroup v1 hierarchy that binds a controller (`cgroup.procs`, `tasks`, `freezer.state`) where the unified one runs | a v1 `freezer` moves the agent past the v2 move guard and freezes it |
+| A ptrace attach of PID 1 (a debugger, `/proc/1/mem`) | PID 1's memory rewritten between a deny hook's read of a write PID 1 may make (a unit's limit, a thaw) and the kernel's |
 
-A foreign BPF program that would **target** the agent's programs or maps
-(an `freplace` of one of its functions, a program loaded against one of its
-maps) still needs a descriptor of that object, which the last row refuses:
-it stays denied. A foreign tracing program that merely attaches elsewhere
-is only observed.
+Each refusal is recorded as it is under `enforcing` (`NN-L-AT-001`, the
+operation, signed). A refused foreign load raises the posture to ENGAGED
+(never the decisive tamper on its own); under `alpha` nothing follows from
+it but the record.
 
-The deny self-test (every round) still sees its own probe's tracing program
-refused: the hook judges, whatever the profile; only a third party's
-attempt is let through.
+How it holds: none of these hooks reads the profile — the start writes no
+switch for them. A ratchet (`xtask/tests/deny_routes.rs`) lists every deny
+site of the eBPF object as self-protection or host integrity with its
+reason, or as a response path whose own mode the gate sets (the exec
+quarantine, the exec policy, the connect deny, the exploit guard), and
+fails when a self-protection site — or any function of the object it
+calls, at any depth — names one of the gate's switches. The module-load
+judge takes no gate either (`module_trust::kernel_mode`).
+
+The deny self-test (every round) sees its own probe's tracing program
+refused, as before.
 
 An operator still needs a trusted-installer window to stop, upgrade or
 remove the agent ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md)
 §3.7).
 
-How it holds: the start writes its resolved profile into the kernel's
-`HOST_DENY_MODE` right after the eBPF object loads, before any program
-attaches, and freezes it (no descriptor writes it again, the agent's
-included; a write that fails leaves every deny enforcing, a signed
-`host_deny` degradation). The start's log says which: `host-wide denies
-OBSERVED (the alpha profile) …` or `host-wide denies ENFORCED …`. A
-ratchet (`xtask/tests/host_deny.rs`) keeps every deny site of the eBPF
-object either routed through that switch or listed as the agent's
-self-protection with its reason. The switch follows the **profile** alone:
-`--detect-only` and `NN_DETECT_ONLY`, the gate's other inputs, keep their
-meaning (no response) and leave these denies on — the lab and the
-privileged suites measure them that way.
+### 1.2 bpftrace, BCC and other tracing tools
 
-### 1.2 A "would deny" record
+They are refused under `alpha` too (the table above). A tester who uses
+them names their loaders at install time:
 
-`nn-admin detections` shows it as the refusal it would have been
-(`NN-L-AT-001_AntiTamperDenial`, the same operation and severity), with
-
-```
-"response": "would have: deny:bpf_prog_type (would deny: not refused — the alpha profile leaves the host-wide guards in observe)"
-"reasoning": "`bpftrace` attempted to load a `tracepoint` BPF program … Would deny: NOT refused — …"
+```sh
+sudo ./deploy/install.sh --allow-bpf-tools                       # this host's bpftrace and BCC
+sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executable (repeatable)
 ```
 
-and the status summary counts it with the suppressed responses
-(`would have : deny:bpf_prog_type x3`). A loader is recorded once a second
-per program type; a switch, kexec, sysctl or cgroup write once a second per
-process and operation; the agent's journal reads `WOULD DENY: a host-wide
-guard let it through`.
+- After the agent starts and passes its health check, `install.sh` signs
+  one `bpf-loader-allow <path> kprobe,tracepoint,perf_event,raw_tracepoint,tracing`
+  line per loader with the install's key (the bootstrap key it wrote, or
+  `--grant-key`) and applies it through the agent (`nn-admin policy set`):
+  the signed per-loader opt-out of [`RULE_POLICY.md`](RULE_POLICY.md) §2.5.
+  The lines join the policy in force; a loader it already names keeps its
+  line.
+- `--allow-bpf-tools` names `bpftrace` (as found on the system path) and the
+  interpreter BCC's tools run under (`/usr/sbin/*-bpfcc` on Debian and
+  Ubuntu, `/usr/share/bcc/tools/*` on Fedora: their shebang, `python3`).
+  Install the tools **before** `install.sh`; one installed later needs a
+  signed line by hand (RULE_POLICY.md §2.5).
+- **What it opens.** The kernel matches a loader by the executable it runs:
+  while a line is in force, **any root process running that executable**
+  may load the tracing types — bpftrace runs the script it is given (its
+  `signal()` is `bpf_send_signal`), and BCC's line names the Python
+  interpreter, so any root Python program may. That is the hole §1.1
+  closes, reopened for the tools the tester chose: an alpha host with
+  `--allow-bpf-tools` is not protected against a local root that uses
+  them. The other refused types (`raw_tracepoint_writable`, `struct_ops`,
+  `ext`, `lsm`) take a hook's place and are never named by these flags.
+- The flags go with a fresh install that `install.sh` starts (not
+  `--upgrade`, `--no-enable` or a package step: refused before anything
+  changes). Every load they let through is recorded (`bpf_prog_opt_out`,
+  Low). `install.sh`'s summary says which loaders it named (`bpf tools :
+  allowed for …`) or that the tools are refused.
 
 ## 2. Where the profile comes from
 
@@ -139,6 +143,14 @@ signed `agent_boot` row names the source of detect-only
 (`detect_only_source: "profile alpha (install manifest)"`); the trust level
 is at most L2 while no response runs.
 
+**An unsigned downgrade is an alarm.** A start whose profile is `alpha`
+from the install manifest (or no overlay) right after a run that enforced
+(the chain's last `agent_boot` said `detect_only: false`) signs an
+`integrity_drift` of kind `profile_downgraded` and logs `PROFILE DOWNGRADED
+WITHOUT A SIGNATURE`: a signed `profile.local` that was deleted, or a
+manifest edited while the agent was stopped. A signed `profile = alpha` is
+the operator's switch and raises nothing.
+
 ## 3. What you see
 
 ```sh
@@ -160,9 +172,7 @@ would have        : KillProcessTree x2
   (listed below the summary, each signed) and the events lost, if any.
 - `records today` counts the records this agent appended to its detection
   chain in the current UTC day (since its start, if it started that day).
-- `would have` counts the responses the gate suppressed, by action, and the
-  host-wide denies `alpha` let through, by operation (`deny:bpf_prog_type`,
-  §1.2).
+- `would have` counts the responses the gate suppressed, by action.
 
 Without `--key` the agent shows the posture only (external audit ASK-009).
 
