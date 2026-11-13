@@ -2370,6 +2370,20 @@ mod rev548_recheck {
         }
         assert!(sanction(&h, 9750, KILL, &["kill", "-HUP", "9740"]).is_some());
         assert!(sanction(&h, 9751, SC, &["systemctl", "-s", "HUP", "kill", "auditd"]).is_some());
+        // firewalld's SIGHUP (reload) and falco's (hot reload)
+        for (pid, exe, unit) in [
+            (9752, "/usr/sbin/firewalld", "firewalld.service"),
+            (9753, "/usr/bin/falco", "falco.service"),
+        ] {
+            a_process(&h, pid, pid as u64, "0000000000004a03");
+            assert!(h.run(pid, 1, exe, &[exe]).is_none());
+            a_unit(&h, unit, &[pid]);
+            let p = pid.to_string();
+            assert!(
+                sanction(&h, pid + 10, KILL, &["kill", "-HUP", &p]).is_some(),
+                "{exe}"
+            );
+        }
         assert_eq!(reload_signal("USR1"), None);
         assert_eq!(reload_signal("sighup"), Some(1));
     }
@@ -2413,6 +2427,27 @@ mod rev548_recheck {
         assert_eq!(sanction(&h, 9769, SC, &hup), None);
         std::fs::write(unit.join("cgroup.procs"), "9710\n").unwrap();
         assert!(sanction(&h, 9770, SC, &hup).is_some());
+        // two units: falco's, no registered process in it; auditd's, its
+        // list empty
+        assert_eq!(
+            sanction(
+                &h,
+                9774,
+                SC,
+                &["systemctl", "-s", "HUP", "kill", "rsyslog", "falco"]
+            ),
+            None
+        );
+        a_process(&h, 9775, 4775, "0000000000000001");
+        assert!(h
+            .run(9775, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        a_unit(&h, "auditd.service", &[9775]);
+        let both = ["systemctl", "-s", "HUP", "kill", "rsyslog", "auditd"];
+        assert!(sanction(&h, 9776, SC, &both).is_some());
+        let audit = h._proc.path().join("cgroupfs/system.slice/auditd.service");
+        std::fs::write(audit.join("cgroup.procs"), "").unwrap();
+        assert_eq!(sanction(&h, 9777, SC, &both), None);
         // `kill` of rsyslogd and of auditd, which does not catch it
         a_process(&h, 9771, 4771, "0000000000000000");
         assert!(h

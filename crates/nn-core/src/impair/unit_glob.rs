@@ -368,6 +368,7 @@ mod tests {
             ("[[=a]uditd.servic[=e=]", "auditd.service", true),
             ("[[==]]x", "=]x", true),
             ("[[===]]x", "=x", true),
+            ("[[=a=x]y", "xy", true),
             ("[[=ab=]]x", "ax", false),
             // glibc matches nothing here (a name of two characters, in the
             // C locale): any character is wider
