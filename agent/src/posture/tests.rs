@@ -1946,6 +1946,7 @@ fn fim(op: nn_model::telemetry::FimOp, path: &str, pid: u32) -> Event {
         is_dir: false,
         moved_in: false,
         appends_only: false,
+        truncated_by_another: false,
     })
 }
 

@@ -183,6 +183,19 @@ fn leader_of(task: *const u8) -> *const u8 {
         .unwrap_or(core::ptr::null())
 }
 
+/// The review of #554 (F1): the current process's start — its thread group
+/// leader's `task->start_time` (`CLOCK_MONOTONIC` ns, the start `/proc/<pid>`
+/// shows for the process) — 0 when unread.
+#[inline(always)]
+pub fn current_start() -> u64 {
+    let leader = leader_of(unsafe { bpf_get_current_task() } as *const u8);
+    if leader.is_null() {
+        return 0;
+    }
+    unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }
+        .unwrap_or(0)
+}
+
 /// Lot 340: the current process's fork record when it has executed nothing
 /// since its fork, and its forker's when that one has not either — two
 /// levels: rsync's receiver is a fork of its generator, itself a fork of

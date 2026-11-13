@@ -740,6 +740,7 @@ fn config_changes_are_findings_and_paths_are_watched() {
             is_dir: false,
             moved_in: false,
             appends_only: false,
+            truncated_by_another: false,
         })
     };
     let f = h

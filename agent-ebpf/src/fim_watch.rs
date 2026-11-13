@@ -82,7 +82,8 @@ use aya_ebpf::{
 use northnarrow_common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
     FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_DEST_LEAF,
-    FIM_RENAME_REPLACED, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER, TASK_COMM_LEN,
+    FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
+    FIM_WRITE_TRUNCATED_BY_ANOTHER, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -185,21 +186,32 @@ const MAY_WRITE: i32 = 0x2;
 /// the marker's process's ([`FIM_WRITE_ONE_WRITER`]) — `rsyslogd`'s appends
 /// emitted at the close of the file `logrotate` had just truncated (its
 /// `copytruncate`) were judged a truncation by `rsyslogd` (NN-L-FIM-005
-/// High): an append shrinks nothing, the truncation is a setattr recorded
-/// with its own writer. And the writer's fork records at its write.
+/// High). And the writer's fork records at its write.
+///
+/// The review of #554 (F1): an `O_APPEND` write is no proof that nothing
+/// shrank — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an `O_APPEND` file goes
+/// through the same write check and removes a range, with no setattr. So
+/// the marker also says whether ANOTHER process changed the file's size by a
+/// setattr while it was pending ([`FIM_WRITE_TRUNCATED_BY_ANOTHER`], set by
+/// [`fim_setattr_observe`]: `copytruncate`'s own truncation, its own
+/// record), and holds the writer's start: one writer is one process (a pid
+/// reused is another), and userland reads `/proc` for that process only.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DirtyMeta {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; TASK_COMM_LEN],
-    /// [`FIM_WRITE_APPEND_ONLY`] | [`FIM_WRITE_ONE_WRITER`] as they hold.
+    /// [`FIM_WRITE_APPEND_ONLY`] | [`FIM_WRITE_ONE_WRITER`] as they hold,
+    /// and [`FIM_WRITE_TRUNCATED_BY_ANOTHER`].
     pub flags: u32,
     pub fork_ppid: u32,
     pub fork_pppid: u32,
     pub _pad: u32,
     pub fork_start: u64,
     pub fork_parent_start: u64,
+    /// The writer's start ([`crate::fork_parent::current_start`]).
+    pub start: u64,
 }
 
 /// `O_APPEND` in `file->f_flags` (uapi, every architecture the agent runs
@@ -482,7 +494,11 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
         (*raw_ptr).op = FIM_OP_MODIFIED;
         // lot 344: how the writes went, and the writer's fork records at
         // its write
-        (*raw_ptr).op_flags = (meta.flags & u32::from(FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER)) as u8;
+        (*raw_ptr).op_flags = (meta.flags
+            & u32::from(FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER | FIM_WRITE_TRUNCATED_BY_ANOTHER))
+            as u8;
+        // the review of #554 (F1): which process the pid named
+        (*raw_ptr).modifier_start = meta.start;
         (*raw_ptr).fork_ppid = meta.fork_ppid;
         (*raw_ptr).fork_start = meta.fork_start;
         (*raw_ptr).fork_pppid = meta.fork_pppid;
@@ -584,17 +600,51 @@ unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
         Some(d) => d,
         None => return 0,
     };
+    let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
     if let Some(inode) = inode_from_dentry(dentry) {
         if let Some(key) = should_emit(inode) {
-            emit_drift(FIM_OP_MODIFIED, key);
+            // the review of #554 (F1): a size change (`ATTR_SIZE` in
+            // `ia_valid`, `struct iattr`'s first member) is said in the
+            // record, and in the marker of another process's pending writes
+            let sized = iattr != 0
+                && bpf_probe_read_kernel::<u32>(iattr as *const u32).is_ok_and(|v| v & ATTR_SIZE != 0);
+            if sized {
+                truncated_by_another(key);
+            }
+            let flags = if sized { FIM_SETATTR_SIZE } else { 0 };
+            emit_drift_with_dest(FIM_OP_MODIFIED, key, NO_DEST, flags);
         }
     }
     // Lot 282 (the review of #500, C1): a file that holds data before a
     // truncate empties it — its unlink then destroys an original (the
     // re-review: a size change only, read from the `iattr`).
-    let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
     let _ = crate::open_sensor::nn_setattr_mark(dentry as u64, iattr);
     0 // observe-only — NEVER return -EPERM
+}
+
+/// `ATTR_SIZE` in `struct iattr`'s `ia_valid` (`include/linux/fs.h`, the
+/// same on every kernel the agent supports).
+const ATTR_SIZE: u32 = 1 << 3;
+
+/// The review of #554 (F1): a size setattr on the watched inode `key` by a
+/// process other than its pending writer's (another tgid, or the same pid
+/// at another start) is said in the writer's marker
+/// ([`FIM_WRITE_TRUNCATED_BY_ANOTHER`]): `logrotate`'s `copytruncate`
+/// truncating the log `rsyslogd` appends to. The writer's own truncation is
+/// not. A write racing this update can drop the bit (the marker is
+/// replaced whole): its record is then judged as a shrink — fail closed.
+#[inline(always)]
+fn truncated_by_another(key: InodeKey) {
+    let Some(m) = FIM_DIRTY_INODES.get_ptr_mut(&key) else {
+        return;
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let start = crate::fork_parent::current_start();
+    unsafe {
+        if (*m).pid != pid || (*m).start != start {
+            (*m).flags |= u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER);
+        }
+    }
 }
 
 /// `inode_create` observation — fires on creation of a new
@@ -871,9 +921,13 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
                 .is_ok_and(|f| f & O_APPEND != 0);
             let mut flags = if append { u32::from(FIM_WRITE_APPEND_ONLY) } else { 0 };
             flags |= u32::from(FIM_WRITE_ONE_WRITER);
+            // the review of #554 (F1): one writer is one process — a pid
+            // reused is another
+            let start = crate::fork_parent::current_start();
             if let Some(prev) = FIM_DIRTY_INODES.get(&key) {
-                flags &= prev.flags;
-                if prev.pid != pid {
+                // another's truncation while pending stays said
+                flags = (flags & prev.flags) | (prev.flags & u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER));
+                if prev.pid != pid || prev.start != start {
                     flags &= !u32::from(FIM_WRITE_ONE_WRITER);
                 }
             }
@@ -887,6 +941,7 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
                 _pad: 0,
                 fork_start: 0,
                 fork_parent_start: 0,
+                start,
             };
             if let Ok(comm) = bpf_get_current_comm() {
                 meta.comm = comm;

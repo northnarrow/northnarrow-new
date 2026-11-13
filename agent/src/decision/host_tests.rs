@@ -92,6 +92,7 @@ fn fim_event(path: &str, op: nn_model::telemetry::FimOp, pid: u32, uid: u32, ts:
         is_dir: false,
         moved_in: false,
         appends_only: false,
+        truncated_by_another: false,
     })
 }
 

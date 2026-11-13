@@ -506,10 +506,12 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
 /// opening the agent's pins (maps, programs, the pin directories) before it
 /// is a protected pid is the family's own start — let through by the deny
 /// path above, and no longer reported as a foreign handle (NN-L-BPF-002
-/// High for OUR watchdog at every start). The skip comes after every
+/// High for OUR watchdog at every start). The choice comes after every
 /// refusal (a link handle is never exempt by executable, and is judged
 /// first), names the maps', programs' and directories' handles only, and is
-/// before the report.
+/// the report's own command — the review of #554 (F2): recorded (Low in
+/// userland), never silenced, so a foreign program made the watchdog's
+/// binary (`PR_SET_MM_EXE_FILE`) while the role is vacant leaves a trace.
 #[test]
 fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
     let c = code("agent-ebpf/src/bpf_defense.rs");
@@ -521,12 +523,21 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
             "&& !fresh_instance_may_load()\n    {\n        let kind",
             "if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {",
             "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
-            "if (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load() {\n        return 0;\n    }",
-            "let report_cmd = if foreign_handle {",
-            "emit_syscall(report_cmd, arg);",
+            "let fresh_instance =\n        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
+            "let report_cmd = if fresh_instance {\n        BPF_CMD_FRESH_INSTANCE_GET_FD\n    } else if foreign_handle {\n        BPF_CMD_FOREIGN_GET_FD",
+            "if should_report(pid, dedup) {\n        emit_syscall(report_cmd, arg);",
         ],
     )
     .unwrap();
+    // the review of #554 (F2): nothing between the choice and the report
+    // returns — the fresh instance's handle is recorded, not silenced
+    let from = h.find("let foreign_handle =").unwrap();
+    let to = h.find("emit_syscall(report_cmd, arg);").unwrap();
+    assert!(
+        !h[from..to].contains("return"),
+        "a handle silenced before its report: {}",
+        &h[from..to]
+    );
     // the exemption is the deny path's: the binary by device and inode,
     // the role vacant, the main thread, the first minute
     in_order(

@@ -3524,6 +3524,53 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(ExecIdentity { exe, runs })
     }
 
+    /// The review of #554 (F1): what the process `pid` that started at
+    /// `start_ns` (`CLOCK_MONOTONIC`, the kernel's `task->start_time`)
+    /// executed, as of `as_of`, from the records only: its exec as the spawn
+    /// cache holds it, at that start; else, for a process that executed
+    /// nothing since its fork, its forker's exec through the kernel's fork
+    /// record at that start ([`Self::kernel_fork_entry`]). A later (or
+    /// earlier) holder of the pid is not that process: `None`, as when
+    /// neither record holds it — never `/proc`, which shows whoever holds
+    /// the pid now (the caller reads it for that start only).
+    pub fn recorded_identity_started(
+        &self,
+        pid: u32,
+        start_ns: u64,
+        as_of: AsOf,
+    ) -> Option<ExecIdentity> {
+        if pid == 0 || start_ns == 0 {
+            return None;
+        }
+        let at = as_of.time();
+        if let CachedAt::Current(e) | CachedAt::Past(e) = self.cached_at(pid, at) {
+            let started = match e.start_ticks {
+                Some(ticks) => self.ticks_show_start(ticks, start_ns),
+                None => e.start_ns == start_ns,
+            };
+            if started {
+                return Some(ExecIdentity {
+                    exe: e.exe,
+                    runs: e.runs,
+                });
+            }
+        }
+        let forked = self
+            .inner
+            .state
+            .read()
+            .kernel_forks
+            .get(&pid)
+            .is_some_and(|k| k.start_ns == start_ns);
+        if !forked {
+            return None;
+        }
+        self.kernel_fork_entry(pid, at, 0).map(|e| ExecIdentity {
+            exe: e.exe,
+            runs: e.runs,
+        })
+    }
+
     /// Lot 310: the identity (device and inode; the device in the kernel's
     /// form, `MKDEV` — the review of #552, F7: not `stat(2)`'s `st_dev`) of
     /// the file `pid` executed, as the exec sensor's LSM program gave it —

@@ -1977,6 +1977,7 @@ mod tests {
             is_dir: false,
             moved_in: false,
             appends_only: false,
+            truncated_by_another: false,
         });
         let r = DetectionRecord::from_rule(
             2,

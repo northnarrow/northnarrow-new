@@ -323,6 +323,7 @@ mod stop_tests {
             is_dir: false,
             moved_in: false,
             appends_only: false,
+            truncated_by_another: false,
         })
     }
 

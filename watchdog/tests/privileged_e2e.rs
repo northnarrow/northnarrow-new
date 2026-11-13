@@ -1300,7 +1300,7 @@ fn ptrace_access_check_exempts_caller_in_protected_pids() {
 
 /// The detection records whose principal is `pid` and whose rule is
 /// `rule` (the agent's detections file, read through `sudo`: the agent
-/// writes it as root).
+/// writes it as root), whole.
 fn records_of(path: &Path, rule: &str, pid: u32) -> Vec<String> {
     let out = Command::new("sudo")
         .arg("cat")
@@ -1311,6 +1311,14 @@ fn records_of(path: &Path, rule: &str, pid: u32) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.contains(rule) && l.contains(&pid_field))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The first 400 characters of each record, for a message.
+fn heads(records: &[&String]) -> Vec<String> {
+    records
+        .iter()
         .map(|l| l.chars().take(400).collect())
         .collect()
 }
@@ -1322,6 +1330,12 @@ fn records_of(path: &Path, rule: &str, pid: u32) -> Vec<String> {
 /// still reported it: NN-L-BPF-002 High "took a handle to one of
 /// NorthNarrow's own BPF objects" for OUR watchdog at every start, the
 /// first record a tester saw. The start leaves no such record now.
+///
+/// The review of #554: the start is recorded on its own, Low (F2: a
+/// foreign program made the watchdog's binary through `PR_SET_MM_EXE_FILE`
+/// takes the same path) — and that record, found by the same filter, is
+/// this test's positive control (F5): the start was seen and judged, not
+/// lost to a filter or a profile that records nothing.
 #[test]
 fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
     let mut fx = E2eFixture::setup();
@@ -1347,8 +1361,19 @@ fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
         "NN-L-BPF-002_BpfForeignHandleOrDetach",
         wd_pid,
     );
+    let low = "\"severity\":\"Low\"";
+    let (start, foreign): (Vec<&String>, Vec<&String>) =
+        found.iter().partition(|l| l.contains(low));
     assert!(
-        found.is_empty(),
-        "the watchdog's own start recorded as a foreign BPF handle: {found:?}"
+        foreign.is_empty(),
+        "the watchdog's own start recorded as a foreign BPF handle: {:?}",
+        heads(&foreign)
+    );
+    assert!(
+        start
+            .iter()
+            .any(|l| l.contains("a fresh instance of the agent or the watchdog")),
+        "the watchdog's start was not seen: no Low record of its own (pid {wd_pid}): {:?}",
+        heads(&start)
     );
 }

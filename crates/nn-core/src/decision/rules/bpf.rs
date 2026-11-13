@@ -26,7 +26,9 @@ use common::bpf_cmd::{
     BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_LOAD,
     BPF_RAW_TRACEPOINT_OPEN,
 };
-use common::wire::{bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
+use common::wire::{
+    bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
@@ -187,6 +189,30 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
         else {
             return None;
         };
+        // The review of #554 (F2): a fresh instance of the agent or the
+        // watchdog opening the agent's pins at its start, let through by the
+        // kernel — the family's own start, recorded Low (not silent: a
+        // foreign program made "the watchdog by device and inode" through
+        // `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` while the role was vacant
+        // takes the same path).
+        if *cmd == BPF_CMD_FRESH_INSTANCE_GET_FD {
+            let reasoning = format!(
+                "`{comm}` (pid {pid}), a fresh instance of the agent or the watchdog — its binary \
+                 by device and inode, its role vacant, its first minute — took a handle to one of \
+                 NorthNarrow's own BPF objects (id {arg}) before it was a protected pid: the \
+                 family's own start, let through. Recorded because the same path is open to a \
+                 program that made itself the watchdog's binary (PR_SET_MM_EXE_FILE) while the \
+                 role was vacant: a second record here, without a restart of the agent or the \
+                 watchdog, is not a start."
+            );
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Low,
+                &reasoning,
+            ));
+        }
         let own_object = matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE);
         let detach = matches!(*cmd, BPF_PROG_DETACH | BPF_LINK_DETACH);
         if !own_object && !detach {
@@ -302,6 +328,37 @@ mod tests {
             .is_none());
         assert!(r2
             .evaluate(&ev("implant", BPF_RAW_TRACEPOINT_OPEN, 5))
+            .is_none());
+    }
+
+    /// The review of #554 (named, F2): a fresh instance of the agent or the
+    /// watchdog taking a handle to the agent's own objects at its start is
+    /// let through by the kernel and recorded on its own, Low — not silent
+    /// (a foreign program made the watchdog's binary through
+    /// `PR_SET_MM_EXE_FILE` while the role is vacant takes the same path),
+    /// and not the foreign handle's High.
+    #[test]
+    fn a_fresh_instance_s_handle_is_recorded_low_not_silenced() {
+        let (r1, r2) = rules();
+        let v = r2
+            .evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
+            .expect("a fresh instance's handle is recorded");
+        assert_eq!(v.rule_id, BPF002_ID);
+        assert_eq!(v.severity, Severity::Low);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning.contains("PR_SET_MM_EXE_FILE"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("(id 9)"), "{}", v.reasoning);
+        // the same handle from anyone else is still the foreign one, High
+        let f = r2
+            .evaluate(&ev("northnarrow-wat", BPF_CMD_FOREIGN_GET_FD, 9))
+            .expect("fires");
+        assert_eq!(f.severity, Severity::High);
+        assert!(r1
+            .evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
             .is_none());
     }
 

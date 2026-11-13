@@ -49,6 +49,12 @@ const MULTICALL_UTILS: &[&str] = &[
 /// on Ubuntu 26.04's lab round or keep a name the test reads — each a
 /// residual of its own, never a pattern to follow (a new one fails).
 const KNOWN_RENAMED_COPIES: &[&str] = &[
+    // the review of #554 (F4): by `cat`, seen since — each copy is the
+    // program with random bytes appended (a new file id), run for its exec
+    "deploy/lab/execq/execq-check.sh: /usr/bin/true \"$1\"",
+    "deploy/lab/execq/execq-check.sh: /usr/bin/true \"$S\"",
+    "deploy/lab/execq/execq-check.sh: /usr/bin/true \"$B\"",
+    "deploy/lab/execq/execq-check.sh: /usr/bin/true \"$f\"",
     "deploy/lab/heartbeat/watch-lab.sh: /bin/sleep /tmp/nn-hb-kill",
     "deploy/lab/release/release-check.sh: /bin/true /tmp/nn-release-probe",
     "deploy/lab/bus/responses.sh: /bin/sleep \"$STAGE/nn-exp13r-crash\"",
@@ -62,16 +68,51 @@ const KNOWN_RENAMED_COPIES: &[&str] = &[
     "deploy/lab/adversarial/anti-tamper.sh: /bin/true \"$TMPD/nn-sat\"",
 ];
 
-/// `(source, destination)` of each `cp`/`install` of a coreutils program
-/// on `line` whose destination does not keep the program's name.
+/// `line` with each lookup of a coreutils program by name
+/// (`$(command -v sleep)`, `$(which sleep)`, in backquotes too) written as
+/// its path (the review of #554, F4).
+fn resolved_lookups(line: &str) -> String {
+    let mut out = line.to_string();
+    for u in MULTICALL_UTILS {
+        for form in [
+            format!("$(command -v {u})"),
+            format!("$(which {u})"),
+            format!("`command -v {u}`"),
+            format!("`which {u}`"),
+        ] {
+            out = out.replace(&form, &format!("/usr/bin/{u}"));
+        }
+    }
+    out
+}
+
+/// `(source, destination)` of each `cp`/`install`/`ln` (the review of
+/// #554, F4: and `cat … >`) of a coreutils program on `line` whose
+/// destination does not keep the program's name.
 fn renamed_util_copies(line: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
+    let line = resolved_lookups(line);
     let words: Vec<&str> = line
         .split(|c: char| c.is_whitespace() || c == ';' || c == '(' || c == ')' || c == '\'')
         .filter(|w| !w.is_empty())
         .collect();
     for (i, w) in words.iter().enumerate() {
-        if *w != "cp" && *w != "install" {
+        if *w == "cat" {
+            // `cat /bin/sleep > dst`, `cat /bin/sleep >dst`
+            let src = words[i + 1..].iter().find(|a| !a.starts_with('-'));
+            let to = words[i + 1..].iter().position(|a| a.starts_with('>'));
+            let dst = to.and_then(|j| match words[i + 1 + j].trim_start_matches('>') {
+                "" => words.get(i + 2 + j).copied(),
+                d => Some(d),
+            });
+            if let (Some(src), Some(dst)) = (src, dst) {
+                if let Some(found_one) = renamed(src, dst) {
+                    found.push(found_one);
+                }
+            }
+            continue;
+        }
+        if *w != "cp" && *w != "install" && *w != "ln" {
             continue;
         }
         // the first non-option word is the source, the next the destination
@@ -88,21 +129,25 @@ fn renamed_util_copies(line: &str) -> Vec<(String, String)> {
         } else {
             (src, dst)
         };
-        let Some(util) = src
-            .strip_prefix("/usr/bin/")
-            .or_else(|| src.strip_prefix("/bin/"))
-        else {
-            continue;
-        };
-        if !MULTICALL_UTILS.contains(&util) {
-            continue;
-        }
-        let leaf = dst.trim_matches('"').rsplit('/').next().unwrap_or("");
-        if leaf != util {
-            found.push((src.to_string(), dst.to_string()));
+        if let Some(found_one) = renamed(src, dst) {
+            found.push(found_one);
         }
     }
     found
+}
+
+/// `(src, dst)` when `src` is a coreutils program and `dst` does not keep
+/// its name.
+fn renamed(src: &str, dst: &str) -> Option<(String, String)> {
+    let path = src.trim_matches('"');
+    let util = path
+        .strip_prefix("/usr/bin/")
+        .or_else(|| path.strip_prefix("/bin/"))?;
+    if !MULTICALL_UTILS.contains(&util) {
+        return None;
+    }
+    let leaf = dst.trim_matches('"').rsplit('/').next().unwrap_or("");
+    (leaf != util).then(|| (src.to_string(), dst.to_string()))
 }
 
 /// Lot 344 (named, item 8): on Ubuntu 26.04 the coreutils are uutils' one
@@ -121,6 +166,44 @@ fn no_lab_script_runs_a_coreutils_copy_under_another_name() {
     );
     assert!(renamed_util_copies("install -m 755 /bin/sh /tmp/nn-corpus-control").is_empty());
     assert!(renamed_util_copies("cp /usr/bin/true \"$APPD/AppRun/true\"").is_empty());
+    // the review of #554 (F4): a link, a lookup by name, a `cat`
+    for (line, src, dst) in [
+        ("ln -sf /bin/sleep /tmp/nn-x", "/bin/sleep", "/tmp/nn-x"),
+        (
+            "ln /usr/bin/sleep \"$D/mal\"",
+            "/usr/bin/sleep",
+            "\"$D/mal\"",
+        ),
+        (
+            "cp \"$(command -v sleep)\" /tmp/mal",
+            "\"/usr/bin/sleep\"",
+            "/tmp/mal",
+        ),
+        (
+            "install -m 755 `which sleep` /tmp/mal",
+            "/usr/bin/sleep",
+            "/tmp/mal",
+        ),
+        (
+            "cat /bin/sleep > /tmp/mal; chmod +x /tmp/mal",
+            "/bin/sleep",
+            "/tmp/mal",
+        ),
+        ("cat /bin/sleep >/tmp/mal", "/bin/sleep", "/tmp/mal"),
+    ] {
+        assert_eq!(
+            renamed_util_copies(line),
+            vec![(src.to_string(), dst.to_string())],
+            "{line}"
+        );
+    }
+    for line in [
+        "ln -s /bin/sleep \"$D/sleep\"",
+        "cat /etc/hostname > /tmp/x",
+        "cp \"$(command -v sh)\" /tmp/mal",
+    ] {
+        assert!(renamed_util_copies(line).is_empty(), "{line}");
+    }
     let mut files = Vec::new();
     sh_files(&repo_root().join("deploy/lab"), &mut files);
     assert!(files.len() > 20, "{} lab scripts", files.len());
@@ -182,18 +265,90 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     out.sort();
 }
 
-/// The string literal of the last `join("…")` on `line`.
-fn last_join(line: &str) -> Option<&str> {
-    let at = line.rfind("join(\"")? + "join(\"".len();
-    let end = line[at..].find('"')?;
-    Some(&line[at..at + end])
+/// The last component of the last string literal in `text`, `None`
+/// without one.
+fn last_literal_leaf(text: &str) -> Option<String> {
+    let mut quotes = text.match_indices('"').map(|(i, _)| i);
+    let mut last = None;
+    while let (Some(a), Some(b)) = (quotes.next(), quotes.next()) {
+        last = Some(&text[a + 1..b]);
+    }
+    let lit = last?.trim_end_matches('/');
+    Some(lit.rsplit('/').next().unwrap_or(lit).to_string())
+}
+
+/// The first identifier in `expr` past `&`, `*` and spaces (`&mal`,
+/// `&*mal`, `mal.as_path()`, `mal.clone()`).
+fn first_ident(expr: &str) -> String {
+    expr.trim_start_matches([',', ' ', '&', '*', '('])
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Is `word` a whole identifier in `text`?
+fn has_ident(text: &str, word: &str) -> bool {
+    !word.is_empty()
+        && text.match_indices(word).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + word.len()..].chars().next();
+            let id = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !id(before) && !id(after)
+        })
+}
+
+/// The arguments of a call whose text after `(` is `text`, split at its
+/// own commas, up to its closing parenthesis.
+fn call_args(text: &str) -> Vec<&str> {
+    let (mut depth, mut from, mut args) = (0i32, 0, Vec::new());
+    let mut quoted = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '(' | '[' => depth += 1,
+            ')' | ']' if depth == 0 => {
+                args.push(&text[from..i]);
+                return args;
+            }
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(&text[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(&text[from..]);
+    args
+}
+
+/// The leaf the path expression `expr` (one argument, on `lines[n]`)
+/// names: a literal in the expression itself (`dir.join("mal")`,
+/// `"/tmp/mal"`), else the last literal of `let var = …` (`var` its first
+/// identifier) up to 40 lines above; `"?"` when neither says (a path built
+/// elsewhere). With `var`.
+fn leaf_of(lines: &[&str], n: usize, expr: &str) -> (String, String) {
+    let var = first_ident(expr);
+    if expr.contains('"') {
+        return (var, last_literal_leaf(expr).unwrap_or_else(|| "?".into()));
+    }
+    let built = lines[n.saturating_sub(40)..n]
+        .iter()
+        .rev()
+        .find(|l| l.contains(&format!("let {var} = ")) || l.contains(&format!("let {var}: ")))
+        .and_then(|l| last_literal_leaf(l));
+    (var, built.unwrap_or_else(|| "?".into()))
 }
 
 /// `(line number, utility, destination leaf)` of each copy in `code` of a
-/// coreutils program (`fs::copy("/bin/sleep", &var)`) to a path built by a
-/// `let var = ….join("…")` just above, whose last component is not the
-/// utility's name, and that is then run (`Command::new(&var)`) below — a
-/// copy renamed into place before it runs is not one.
+/// coreutils program (`fs::copy("/bin/sleep", …)`) whose destination does
+/// not keep the utility's name — or that cannot be read here (`"?"`) —
+/// and of each link or rename (`hard_link`, `symlink`, `rename`) of such a
+/// copy to another name within 30 lines. The review of #554 (F4): whether
+/// it is then run, and how (`Command::new(mal.as_path())`, `&*mal`,
+/// `.clone()`, `PathBuf::from`), is no longer asked: a copy of a uutils
+/// program under another name is run by that name or not made.
 fn renamed_spawned_copies(code: &str) -> Vec<(usize, String, String)> {
     let lines: Vec<&str> = code.lines().collect();
     let mut found = Vec::new();
@@ -215,29 +370,35 @@ fn renamed_spawned_copies(code: &str) -> Vec<(usize, String, String)> {
         if !MULTICALL_UTILS.contains(&util) {
             continue;
         }
-        let var: String = rest[end + 1..]
-            .trim_start_matches([',', ' ', '&'])
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
+        let dest = call_args(rest[end + 1..].trim_start_matches(','));
+        let (var, leaf) = leaf_of(&lines, n, dest[0]);
+        // each link or rename of the copy below: (line, the name it gets)
+        let moves: Vec<(usize, String)> = lines
+            .iter()
+            .enumerate()
+            .take((n + 30).min(lines.len()))
+            .skip(n + 1)
+            .filter_map(|(m, l)| {
+                let call = ["hard_link(", "symlink(", "rename("]
+                    .iter()
+                    .find_map(|c| l.find(c).map(|i| &l[i + c.len()..]))?;
+                let args = call_args(call);
+                let (first, second) = (args.first()?, args.get(1)?);
+                has_ident(first, &var).then(|| (m, leaf_of(&lines, m, second).1))
+            })
             .collect();
-        if var.is_empty() {
+        if leaf != util {
+            // a copy renamed into place, by the utility's name, before it runs
+            if !moves.iter().any(|(_, to)| to == util) {
+                found.push((n + 1, util.to_string(), leaf));
+            }
             continue;
         }
-        let built = lines[n.saturating_sub(8)..n]
-            .iter()
-            .rev()
-            .find(|l| l.contains(&format!("let {var} = ")))
-            .and_then(|l| last_join(l));
-        let Some(dest) = built else {
-            continue;
-        };
-        let leaf = dest.rsplit('/').next().unwrap_or(dest);
-        let spawned = lines[n + 1..(n + 30).min(lines.len())].iter().any(|l| {
-            l.contains(&format!("Command::new(&{var})"))
-                || l.contains(&format!("Command::new({var})"))
-        });
-        if spawned && leaf != util {
-            found.push((n + 1, util.to_string(), leaf.to_string()));
+        // the copy keeps the name: a link or rename of it to another
+        for (m, to) in moves {
+            if to != util {
+                found.push((m + 1, util.to_string(), to));
+            }
         }
     }
     found
@@ -262,6 +423,35 @@ fn no_test_runs_a_coreutils_copy_under_another_name() {
     );
     let kept = "        let mal = tmp.path().join(\"mal\").join(\"sleep\");\n        std::fs::copy(\"/bin/sleep\", &mal).unwrap();\n        let c = std::process::Command::new(&mal).arg(\"60\").spawn();\n";
     assert!(renamed_spawned_copies(kept).is_empty());
+    // the review of #554 (F4): however the copy is then run, or made
+    for (code, leaf) in [
+        // run through another expression of the path
+        ("let mal = tmp.path().join(\"mal\");\nstd::fs::copy(\"/bin/sleep\", &mal).unwrap();\nCommand::new(mal.as_path()).spawn();", "mal"),
+        ("let mal = tmp.path().join(\"mal\");\nfs::copy(\"/bin/sleep\", &*mal).unwrap();\nCommand::new(&*mal).spawn();", "mal"),
+        ("let mal: PathBuf = PathBuf::from(\"/tmp/x/mal\");\nfs::copy(\"/bin/sleep\", mal.clone()).unwrap();", "mal"),
+        // the destination inline
+        ("fs::copy(\"/usr/bin/sleep\", dir.path().join(\"mal\")).unwrap();", "mal"),
+        // a path built where this test cannot read it
+        ("fs::copy(\"/bin/sleep\", &helper_path()).unwrap();", "?"),
+        // a copy that keeps the name, linked or renamed to another
+        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nstd::fs::hard_link(&s, d.join(\"mal\")).unwrap();", "mal"),
+        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nlet m = d.join(\"mal\");\nstd::os::unix::fs::symlink(s.as_path(), &m).unwrap();", "mal"),
+        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nfs::rename(&s, d.join(\"x\").join(\"evil\")).unwrap();", "evil"),
+    ] {
+        let got = renamed_spawned_copies(code);
+        assert_eq!(got.len(), 1, "{code}: {got:?}");
+        assert_eq!(got[0].2, leaf, "{code}");
+    }
+    // a link that keeps the name, of another file, a copy renamed into
+    // place by the utility's name, or a copy of the shell
+    for code in [
+        "let sleep = tmp.path().join(\"sleep\");\nlet up = tmp.path().join(\"sleep.new\");\nfs::copy(\"/bin/sleep\", &up).unwrap();\nfs::rename(&up, &sleep).unwrap();",
+        "let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nstd::fs::hard_link(&s, e.join(\"sleep\")).unwrap();",
+        "let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nstd::fs::hard_link(&sleeper, d.join(\"mal\")).unwrap();",
+        "fs::copy(\"/bin/sh\", dir.join(\"mal\")).unwrap();",
+    ] {
+        assert!(renamed_spawned_copies(code).is_empty(), "{code}");
+    }
     let mut files = Vec::new();
     for top in ["agent", "crates", "watchdog", "cli", "scan", "xtask/src"] {
         rs_files(&repo_root().join(top), &mut files);

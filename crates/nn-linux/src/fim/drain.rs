@@ -78,7 +78,8 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF,
-    FIM_RENAME_REPLACED, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
+    FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
+    FIM_WRITE_TRUNCATED_BY_ANOTHER,
 };
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use nn_model::Event;
@@ -200,6 +201,10 @@ struct PathMapInner {
     /// Lot 340: the size of each watched file as the drain last read its
     /// content ([`InodePathMap::last_size`]); dropped with its entry.
     sizes: HashMap<InodeKey, u64>,
+    /// The review of #554 (F1): the writer (pid) of the last size setattr's
+    /// record of each watched file since the file's last other `Modified`
+    /// record ([`InodePathMap::note_truncation`]); dropped with its entry.
+    truncations: HashMap<InodeKey, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +232,7 @@ impl PathMapInner {
             self.children.remove(i);
             let w = self.entries.remove(&k)?;
             self.sizes.remove(&k);
+            self.truncations.remove(&k);
             self.child_count -= 1;
             return Some((k, w.path));
         }
@@ -314,6 +320,7 @@ impl InodePathMap {
         // lot 340: a new entry for the key — a size read of an earlier file
         // at that inode is not this one's
         inner.sizes.remove(&key);
+        inner.truncations.remove(&key);
         inner.entries.insert(key, Watched { path, class });
         if class != WatchClass::RuntimeChild {
             return None;
@@ -356,6 +363,23 @@ impl InodePathMap {
         }
     }
 
+    /// The review of #554 (F1): the drain read the record of a size setattr
+    /// (`truncate`, `ftruncate`, an `O_TRUNC` open) by process `pid` on the
+    /// file `key` names (kept only for a watched inode, the last one).
+    pub fn note_truncation(&self, key: &InodeKey, pid: u32) {
+        let mut g = self.inner.write();
+        if g.entries.contains_key(key) {
+            g.truncations.insert(*key, pid);
+        }
+    }
+
+    /// The review of #554 (F1): the writer of the size setattr whose record
+    /// the drain read on `key` since the file's last other `Modified`
+    /// record, taken: each such record answers once.
+    pub fn take_truncation(&self, key: &InodeKey) -> Option<u32> {
+        self.inner.write().truncations.remove(key)
+    }
+
     /// Why `key` is watched.
     pub fn class_of(&self, key: &InodeKey) -> Option<WatchClass> {
         self.inner.read().entries.get(key).map(|w| w.class)
@@ -365,6 +389,7 @@ impl InodePathMap {
     pub fn remove(&self, key: &InodeKey) {
         let mut g = self.inner.write();
         g.sizes.remove(key);
+        g.truncations.remove(key);
         if let Some(w) = g.entries.remove(key) {
             if w.class == WatchClass::RuntimeChild {
                 g.child_count -= 1;
@@ -1759,6 +1784,9 @@ pub fn process_drift(
     };
     let op = FimOp::try_from(raw.op).map_err(|e| anyhow!("decoding raw.op: {e}"))?;
     let class = path_map.class_of(&key).unwrap_or(WatchClass::RuntimeChild);
+    // The review of #554 (F1): before anything can drop the record — the
+    // drain's own sight of a truncation by another writer.
+    let truncated_by_another = truncation_seen(raw, op, &key, path_map);
 
     // BUG-022 — child-leaf reconstruction. When the kernel carried a
     // child leaf (a Create in, or a rename INTO, a watched DIRECTORY),
@@ -1923,6 +1951,7 @@ pub fn process_drift(
                 is_dir: false,
                 moved_in: ident.moved_in,
                 appends_only: false,
+                truncated_by_another: false,
             }));
             return Ok(true);
         }
@@ -2147,7 +2176,9 @@ pub fn process_drift(
             // writer gone that executed nothing since its fork is read
             // from the kernel's fork record the record carried
             // ([`writer_exe`]).
-            modifier_exe: resolve_pid_exe(raw.modifier_pid).or_else(|| writer_exe(raw, lineage)),
+            // The review of #554 (F1): of the process that started at the
+            // record's writer start only ([`writer_exe_of`]).
+            modifier_exe: writer_exe_of(raw, lineage),
             modifier_pid: raw.modifier_pid,
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
@@ -2162,6 +2193,7 @@ pub fn process_drift(
             is_dir: ident.is_dir,
             moved_in: ident.moved_in,
             appends_only: appends_only(raw, op),
+            truncated_by_another,
         }));
     }
     Ok(true)
@@ -2176,16 +2208,69 @@ fn appends_only(raw: &FimDriftRaw, op: FimOp) -> bool {
     op == FimOp::Modified && raw.op_flags & BOTH == BOTH
 }
 
+/// The review of #554 (F1): the kernel's record that ANOTHER process changed
+/// the file's size by a setattr while this `Modified`'s writes were pending
+/// ([`FIM_WRITE_TRUNCATED_BY_ANOTHER`]), with that truncation's own record
+/// read by the drain before it, from another writer's pid — the size the
+/// drain reads smaller is that truncation's, judged on its own record
+/// (`FimEvent::truncated_by_another`). A size setattr's record
+/// ([`FIM_SETATTR_SIZE`]) is noted; every other `Modified` takes the note,
+/// so a truncation answers for the inode's next record only. Not a proof
+/// by itself that the writer appended: NN-L-FIM-005's carve-out also needs
+/// `appends_only`.
+fn truncation_seen(raw: &FimDriftRaw, op: FimOp, key: &InodeKey, path_map: &InodePathMap) -> bool {
+    if op != FimOp::Modified {
+        return false;
+    }
+    if raw.op_flags & FIM_SETATTR_SIZE != 0 {
+        path_map.note_truncation(key, raw.modifier_pid);
+        return false;
+    }
+    let seen = path_map.take_truncation(key);
+    raw.op_flags & FIM_WRITE_TRUNCATED_BY_ANOTHER != 0
+        && seen.is_some_and(|pid| pid != raw.modifier_pid)
+}
+
+/// The review of #554 (F1): the executable of the record's writer. A write
+/// seen at close carries its writer's start (`modifier_start`): the record
+/// leaves the kernel when the file closes, its writer may be gone, and its
+/// pid then names another process — an `rsyslogd` started at that pid lent
+/// its image to a log's shrink (NN-L-FIM-005's carve-out). So
+/// `/proc/<pid>/exe` is read only while `/proc/<pid>/stat` shows that start
+/// (read before and after the link), else the lineage's records of that
+/// process ([`writer_exe`]). A record without a start (any other) reads
+/// `/proc` as before: it left the kernel at the writer's own call.
+fn writer_exe_of(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) -> Option<String> {
+    let pid = raw.modifier_pid;
+    if raw.modifier_start == 0 {
+        return resolve_pid_exe(pid).or_else(|| writer_exe(raw, lineage));
+    }
+    let same = || {
+        crate::response::proc_ref::proc_start_ticks(pid)
+            .is_some_and(|t| crate::response::proc_ref::started_at(t, raw.modifier_start))
+    };
+    if same() {
+        if let Some(exe) = resolve_pid_exe(pid).filter(|_| same()) {
+            return Some(exe);
+        }
+    }
+    writer_exe(raw, lineage)
+}
+
 /// Lot 344: the image of a writer gone before its record was judged
 /// (`/proc` read nothing), as the lineage holds it at the record's time:
 /// its exec record, or — a writer that executed nothing since its fork —
 /// its forker's exec, from the kernel's fork record the drift record
 /// carried ([`teach_fork`] taught it first). `None` when neither is known.
+/// The review of #554 (F1): of the process that started at the record's
+/// writer start, when it carries one — a later holder of the pid is not it.
 fn writer_exe(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) -> Option<String> {
-    let id = lineage?.exec_identity(
-        raw.modifier_pid,
-        crate::posture::lineage::AsOf::judged(raw.timestamp_ns),
-    )?;
+    let as_of = crate::posture::lineage::AsOf::judged(raw.timestamp_ns);
+    let id = if raw.modifier_start == 0 {
+        lineage?.exec_identity(raw.modifier_pid, as_of)?
+    } else {
+        lineage?.recorded_identity_started(raw.modifier_pid, raw.modifier_start, as_of)?
+    };
     Some(id.exe.to_string_lossy().into_owned())
 }
 
@@ -2639,6 +2724,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         is_dir: false,
         moved_in: false,
         appends_only: false,
+        truncated_by_another: false,
     })
 }
 
@@ -2817,6 +2903,7 @@ mod tests {
             fork_pppid: 0,
             fork_start: 0,
             fork_parent_start: 0,
+            modifier_start: 0,
         }
     }
 
@@ -3664,6 +3751,237 @@ mod tests {
             !drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
             "unknown-path skip must NOT append to drift log"
         );
+    }
+
+    /// The review of #554: a watched log of `n` bytes the drain has read
+    /// once (its size noted), its key, and a `process_drift` of `raw` on it
+    /// with the drain's own state, the event judged as rsyslogd's (the log's
+    /// path, rsyslogd its writer as `uid`) by NN-L-FIM-005.
+    struct LogFixture {
+        _dir: TempDir,
+        log: std::path::PathBuf,
+        key: InodeKey,
+        path_map: InodePathMap,
+        drift_db: FimDriftDb,
+        base: BaselineEntry,
+    }
+
+    impl LogFixture {
+        fn new(n: usize) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let dir = TempDir::new().unwrap();
+            let sk = fresh_signing_key(&dir);
+            let drift_db = FimDriftDb::open(
+                &dir.path().join("drift.jsonl"),
+                sk,
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap();
+            let log = dir.path().join("auth.log");
+            std::fs::write(&log, vec![b'x'; n]).unwrap();
+            let m = std::fs::metadata(&log).unwrap();
+            let key = InodeKey {
+                dev: m.dev(),
+                ino: m.ino(),
+            };
+            let path_map = InodePathMap::new();
+            path_map.insert(key, log.to_string_lossy().to_string());
+            path_map.note_size(&key, n as u64);
+            let base = dummy_baseline(&log.to_string_lossy(), &"99".repeat(32));
+            Self {
+                _dir: dir,
+                log,
+                key,
+                path_map,
+                drift_db,
+                base,
+            }
+        }
+
+        fn raw(&self, pid: u32, op_flags: u8) -> FimDriftRaw {
+            let mut raw = fake_raw(self.key.dev, self.key.ino, FimOp::Modified as u8);
+            raw.modifier_pid = pid;
+            raw.op_flags = op_flags;
+            raw
+        }
+
+        /// The record's event, `None` when the drain emitted none.
+        fn drift(&mut self, raw: &FimDriftRaw) -> Option<FimEvent> {
+            let mut out = Vec::new();
+            process_drift(
+                raw,
+                &self.path_map,
+                Some(&self.base),
+                &mut self.drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::with_caps(100, 100),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => Some(fe),
+                None => None,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// NN-L-FIM-005's verdict on `fe` as rsyslogd's record (`uid`).
+        fn judged_as_rsyslogd(fe: &FimEvent, uid: u32) -> Option<nn_model::Verdict> {
+            use nn_core::decision::Rule;
+            let mut fe = fe.clone();
+            fe.path = "/var/log/auth.log".into();
+            fe.modifier_exe = Some("/usr/sbin/rsyslogd".into());
+            fe.modifier_uid = uid;
+            nn_core::fim::rules::NnLFim005LogTruncated::new(Some(102)).evaluate(&Event::Fim(fe))
+        }
+    }
+
+    /// The review of #554 (named, F1): `fallocate(FALLOC_FL_COLLAPSE_RANGE)`
+    /// on a log opened `O_WRONLY|O_APPEND` removes its first blocks through
+    /// the write check (the kernel's record: `O_APPEND` writes by one
+    /// writer), with no setattr. Read smaller, with no other process's
+    /// truncation seen, the record is NOT rsyslogd's append: NN-L-FIM-005
+    /// fires, High — root's rsyslogd (Debian) and the syslog user's alike,
+    /// as on `main`. (On #554's head the kernel's append bits alone exempted
+    /// it: a root log wipe behind rsyslogd's image.)
+    #[test]
+    fn a_log_collapsed_through_an_o_append_fd_is_not_rsyslogd_s_append() {
+        let mut fx = LogFixture::new(8_292);
+        // the kernel's operation where the file system has it (ext4, xfs),
+        // else the size it leaves: the drain reads only the file
+        let collapsed = {
+            use std::os::unix::io::AsRawFd;
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&fx.log)
+                .unwrap();
+            // SAFETY: a valid fd; FALLOC_FL_COLLAPSE_RANGE of the first block.
+            unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_COLLAPSE_RANGE, 0, 4096) == 0 }
+        };
+        if !collapsed {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fx.log)
+                .unwrap()
+                .set_len(4_196)
+                .unwrap();
+        }
+        let raw = fx.raw(4_100, FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER);
+        let fe = fx.drift(&raw).expect("the shrink is a drift");
+        assert_eq!(fe.new_size, Some(4_196));
+        for uid in [0, 102] {
+            let v = LogFixture::judged_as_rsyslogd(&fe, uid)
+                .expect("a collapsed log is no rsyslogd append");
+            assert_eq!(v.severity, nn_model::Severity::High);
+        }
+    }
+
+    /// The review of #554 (named, F1): `logrotate`'s `copytruncate`
+    /// truncates the log rsyslogd appends to (a size setattr: its own record,
+    /// `FIM_SETATTR_SIZE`, logrotate's), and rsyslogd's pending appends leave
+    /// at logrotate's close with the kernel's word that ANOTHER process
+    /// truncated the file meanwhile — read smaller, they stay exempt from
+    /// NN-L-FIM-005. The kernel's word without the truncation's record read
+    /// first, a truncation by the writer's own pid, a record in between that
+    /// took it, or the record read without the kernel's word: judged as a
+    /// shrink (High).
+    #[test]
+    fn copytruncate_s_truncation_still_explains_rsyslogd_s_appends() {
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let (logrotate, rsyslogd) = (4_200, 600);
+        let mut fx = LogFixture::new(81_920);
+        std::fs::write(&fx.log, b"a line after the rotation\n").unwrap();
+        // logrotate's truncation, read first: judged on its own
+        let setattr = fx.raw(logrotate, FIM_SETATTR_SIZE);
+        let own = fx.drift(&setattr).expect("the truncation's own record");
+        assert!(!own.truncated_by_another && !own.appends_only);
+        let at_close = fx.raw(rsyslogd, BOTH | FIM_WRITE_TRUNCATED_BY_ANOTHER);
+        // the drain read the size after the truncation; the appends' record
+        // is measured against the size before it
+        fx.path_map.note_size(&fx.key, 81_920);
+        let fe = fx.drift(&at_close).expect("rsyslogd's appends");
+        assert!(fe.truncated_by_another);
+        for uid in [0, 102] {
+            assert!(LogFixture::judged_as_rsyslogd(&fe, uid).is_none());
+        }
+        // the truncation's record answers once
+        fx.path_map.note_size(&fx.key, 81_920);
+        let again = fx.drift(&at_close).unwrap();
+        assert!(!again.truncated_by_another);
+        assert!(LogFixture::judged_as_rsyslogd(&again, 0).is_some());
+        // the writer's own truncation
+        fx.drift(&fx.raw(rsyslogd, FIM_SETATTR_SIZE));
+        fx.path_map.note_size(&fx.key, 81_920);
+        assert!(!fx.drift(&at_close).unwrap().truncated_by_another);
+        // a record in between took it (a chmod's: no size)
+        fx.drift(&fx.raw(logrotate, FIM_SETATTR_SIZE));
+        fx.drift(&fx.raw(logrotate, 0));
+        fx.path_map.note_size(&fx.key, 81_920);
+        assert!(!fx.drift(&at_close).unwrap().truncated_by_another);
+        // read, but the kernel did not see it while the writes were pending
+        fx.drift(&fx.raw(logrotate, FIM_SETATTR_SIZE));
+        fx.path_map.note_size(&fx.key, 81_920);
+        let unseen = fx.drift(&fx.raw(rsyslogd, BOTH)).unwrap();
+        assert!(!unseen.truncated_by_another);
+        assert!(LogFixture::judged_as_rsyslogd(&unseen, 0).is_some());
+    }
+
+    /// The review of #554 (named, F1): a record seen at close carries its
+    /// writer's start, and its pid may name another process by then — an
+    /// `rsyslogd` started at the pid lent its image to a log's shrink. The
+    /// writer's executable is read from `/proc` only while it shows that
+    /// start, else from the lineage's records of that process: a later
+    /// holder of the pid (its `/proc`, its exec record) lends nothing.
+    #[test]
+    fn a_writer_s_pid_held_by_another_process_lends_it_no_image() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
+        let mut raw = fake_raw(1, 2, FimOp::Modified as u8);
+        raw.modifier_pid = pid;
+        // the process that wrote: its /proc
+        raw.modifier_start = start;
+        assert_eq!(writer_exe_of(&raw, None).as_deref(), Some(exe.as_str()));
+        // another process than the one at the pid now (another start)
+        raw.modifier_start = start + 60_000_000_000;
+        assert_eq!(writer_exe_of(&raw, None), None);
+        let dir = TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        // the pid's holder now, its exec recorded: not the writer
+        lineage.ingest_exec(pid, 1, "/usr/sbin/rsyslogd", &[], start, start, 0);
+        raw.timestamp_ns = start + 120_000_000_000;
+        assert_eq!(writer_exe_of(&raw, Some(&lineage)), None);
+        // the writer's own exec, recorded at its start: its image
+        let own = AuthSessionTracker::new(dir.path().join("no-proc"));
+        own.ingest_exec(
+            pid,
+            1,
+            "/usr/bin/dd",
+            &[],
+            raw.modifier_start,
+            raw.modifier_start,
+            0,
+        );
+        assert_eq!(
+            writer_exe_of(&raw, Some(&own)).as_deref(),
+            Some("/usr/bin/dd")
+        );
+        // a record without a start (left at the writer's own call): /proc
+        raw.modifier_start = 0;
+        assert_eq!(writer_exe_of(&raw, None).as_deref(), Some(exe.as_str()));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Named test (lot 340, the alpha's daily false positives): after
