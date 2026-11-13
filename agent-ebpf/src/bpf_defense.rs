@@ -1013,6 +1013,19 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     }
     let foreign_handle =
         own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
+    // Lot 344 (the alpha's false positives): a fresh agent or watchdog —
+    // its binary by device and inode, its role vacant, its main thread, its
+    // first minute — opening the agent's pins before it is a protected pid
+    // is the family's own start (the watchdog registers itself through
+    // `PROTECTED_PIDS`' pin), let through above for that reason: not a
+    // foreign handle, not reported (NN-L-BPF-002 High at every start). A
+    // second instance beside the live one, or one past its first minute,
+    // is still reported; a handle on one of the agent's LINKS (by id, or
+    // its pin) is never exempt by executable (external audit EBPF-002),
+    // nor here.
+    if (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load() {
+        return 0;
+    }
     let report_cmd = if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
     } else {

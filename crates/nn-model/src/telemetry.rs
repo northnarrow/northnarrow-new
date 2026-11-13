@@ -131,6 +131,17 @@ pub struct FimEvent {
     /// rename, reported as [`FimOp::Created`]), not created there.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub moved_in: bool,
+    /// Lot 344 (the alpha's false positives): a `Modified` seen at close
+    /// whose kernel record says every write since the file's last record
+    /// went through a file opened with `O_APPEND`, by this event's writer
+    /// alone (`FIM_WRITE_APPEND_ONLY` and `FIM_WRITE_ONE_WRITER`): the
+    /// writer appended, it shrank nothing — a size read smaller than before
+    /// is another operation's (a truncation is a setattr, recorded with its
+    /// own writer). `rsyslogd`'s appends emitted at the close of a file
+    /// `logrotate` had just truncated (`copytruncate`) were judged a
+    /// truncation by `rsyslogd` (NN-L-FIM-005 High).
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub appends_only: bool,
 }
 
 /// Wave 2 (TST-004): a watched file's permission bits and ownership, as
@@ -737,6 +748,7 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -841,6 +853,7 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

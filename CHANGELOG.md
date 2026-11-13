@@ -812,6 +812,75 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 344 (alpha FP round 2A): what the host itself and the agent made a
+  tester see — each removed where the kernel proves the benign case, every
+  attack variant still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §38).
+  - **Our watchdog's start is not a foreign BPF handle.** A freshly started
+    watchdog opens `PROTECTED_PIDS`' pin to register itself before it is a
+    protected pid. The `bpf` hook let that through (the watchdog's binary by
+    device and inode, its role vacant, its main thread, its first minute —
+    external audit EBPF-002) and still reported it: NN-L-BPF-002 High at
+    every start, the first record a tester saw. The same identity now skips
+    the report. A second instance beside the live one, one past its first
+    minute, any handle on a link of the agent's: reported (and refused) as
+    before.
+  - **A reboot is not an attempt on the agent.** systemd's SIGTERM to the
+    watchdog and the agent during a shutdown is refused until
+    `systemd-shutdown` and, when systemd says it is stopping the host, not
+    recorded (external audit EBPF-001). The decision judged it on the
+    systemd watch's last answer, under a second old — asked just before
+    `systemctl poweroff`, `running` — and recorded NN-L-AT-001 High after
+    every reboot (the agent's journal: `not a shutdown …
+    systemd_state="running"`). An answer now carries the kernel's clock
+    (`CLOCK_MONOTONIC`, the records' `timestamp_ns`) and judges only a
+    signal recorded before it was asked; an older one hands the signal to
+    the watch, which asks at once. `systemctl kill`/`stop` of either unit
+    while the host runs: High, as before.
+  - **rsyslogd's appends around another's truncation are appends.** A write
+    is reported at the close of the file, with the writer the marker kept;
+    `logrotate`'s `copytruncate` truncated the log and closed it, the
+    drain read the file after the truncation, and rsyslogd's appends read
+    as a truncation by rsyslogd (NN-L-FIM-005 High, each rotation and each
+    `truncate` of a log). The kernel's marker now says whether every write
+    since the last record went through a file opened with `O_APPEND`, by
+    that one process (`FIM_WRITE_APPEND_ONLY`, `FIM_WRITE_ONE_WRITER`,
+    `FimEvent::appends_only`); rsyslogd's carve-out accepts that proof as
+    well as a growth, whatever rsyslogd's uid (Debian's packaged rsyslogd
+    runs as root, with no `syslog` user: the carve-out never applied there;
+    what rsyslogd appends, any local process can have it append through
+    `logger`). The truncation is a setattr, recorded with its own
+    writer (logrotate's scheduled run Low, anyone else High). The marker
+    was last-writer-wins: another writer's write between rsyslogd's no
+    longer hides behind rsyslogd's identity (the bits are cleared).
+  - **A drift's writer that executed nothing since its fork is known.** The
+    FIM drift record (`FimDriftRaw`, 144 → 168 bytes) carries the writer's
+    unexecuted fork record and its forker's, as the open sensor's has since
+    lot 340 (for a write seen at close, the writer's at its write); the
+    drain teaches them to the lineage before the record is judged, and a
+    writer gone before its record was judged is read from the lineage
+    (`modifier_exe`: its exec record, or its forker's exec). It was
+    "unknown" once `/proc` was gone. An open (`Opened`) carries none: the
+    file-open hooks are the longest programs the verifier walks.
+  - **The dev corpus's control runs on Ubuntu 26.04.** A copy of `sleep`
+    named `nn-corpus-control` is no program on uutils' multicall coreutils
+    ("unknown program", rc 1): the control is a copy of the shell looping on
+    `sleep 1`. Ratchet `xtask/tests/multicall_copies.rs`: no lab script
+    copies a coreutils program under another name (the copies made before
+    it are listed, each a residual).
+  - **`neutralize_quarantines_the_offenders_binary` on the hosted runners.**
+    Its root cause (#549's CI, twice): the runners' coreutils are uutils
+    (Ubuntu 26.04), and the test's copy of `sleep` named `mal` printed
+    "coreutils: unknown program 'mal'" and exited at once — NEUTRALIZE then
+    found no binary whenever it read the child after that exit. The copy
+    keeps the name `sleep` in a directory of its own; so do
+    `an_unlinked_image_is_deleted` (`payload`) and
+    `a_resolver_is_proven_by_the_host_file_it_runs` (a shell copy at
+    `usr/sbin/dnsmasq`), which raced the same way. The same ratchet keeps
+    tests from running such a copy. And
+    `the_exec_pump_reads_a_module_tool_s_exec` (its gates run, under load)
+    waits for the child's environment as well as its image: the exe link
+    names the new image at `exec_mmap`, before the new stack holds the
+    environment.
 - Lot 340 (alpha 1/4): the daily false positives of a benign host, each
   removed where the kernel proves the benign case; every attack variant is
   still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §34).

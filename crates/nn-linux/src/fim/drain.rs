@@ -78,7 +78,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF,
-    FIM_RENAME_REPLACED,
+    FIM_RENAME_REPLACED, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
 };
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use nn_model::Event;
@@ -1922,6 +1922,7 @@ pub fn process_drift(
                 file_key: ident.key,
                 is_dir: false,
                 moved_in: ident.moved_in,
+                appends_only: false,
             }));
             return Ok(true);
         }
@@ -2142,8 +2143,11 @@ pub fn process_drift(
             // Best-effort `/proc/<pid>/exe` of the writer. Feeds the
             // NN-L-FIM-005 rsyslogd-append exemption; a miss (writer
             // already exited, PID reused, unreadable link) leaves it
-            // None → the rule falls through and still fires.
-            modifier_exe: resolve_pid_exe(raw.modifier_pid),
+            // None → the rule falls through and still fires. Lot 344: a
+            // writer gone that executed nothing since its fork is read
+            // from the kernel's fork record the record carried
+            // ([`writer_exe`]).
+            modifier_exe: resolve_pid_exe(raw.modifier_pid).or_else(|| writer_exe(raw, lineage)),
             modifier_pid: raw.modifier_pid,
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
@@ -2157,9 +2161,61 @@ pub fn process_drift(
             file_key: ident.key,
             is_dir: ident.is_dir,
             moved_in: ident.moved_in,
+            appends_only: appends_only(raw, op),
         }));
     }
     Ok(true)
+}
+
+/// Lot 344 (the alpha's false positives): a `Modified` seen at close whose
+/// kernel record says every write since the file's last record was an
+/// `O_APPEND` write by the record's process ([`FIM_WRITE_APPEND_ONLY`] and
+/// [`FIM_WRITE_ONE_WRITER`]) — `FimEvent::appends_only`.
+fn appends_only(raw: &FimDriftRaw, op: FimOp) -> bool {
+    const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+    op == FimOp::Modified && raw.op_flags & BOTH == BOTH
+}
+
+/// Lot 344: the image of a writer gone before its record was judged
+/// (`/proc` read nothing), as the lineage holds it at the record's time:
+/// its exec record, or — a writer that executed nothing since its fork —
+/// its forker's exec, from the kernel's fork record the drift record
+/// carried ([`teach_fork`] taught it first). `None` when neither is known.
+fn writer_exe(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) -> Option<String> {
+    let id = lineage?.exec_identity(
+        raw.modifier_pid,
+        crate::posture::lineage::AsOf::judged(raw.timestamp_ns),
+    )?;
+    Some(id.exe.to_string_lossy().into_owned())
+}
+
+/// Lot 344 (the alpha's false positives): the writer's fork records the
+/// kernel carried in `raw` (`fork_ppid`: a process that executed nothing
+/// since its fork) taught to `lineage` before the record is judged — as the
+/// open sensor's pump does since lot 340: a drift judged after the writer
+/// exited is judged on its forker's lineage, not as a writer of unknown
+/// lineage.
+pub(crate) fn teach_fork(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) {
+    let Some(l) = lineage.filter(|_| raw.fork_ppid != 0) else {
+        return;
+    };
+    // the forker's own record first; its uid not known, the writer's taken
+    if raw.fork_pppid != 0 {
+        l.ingest_kernel_fork(
+            raw.fork_ppid,
+            raw.fork_parent_start,
+            raw.fork_pppid,
+            raw.modifier_uid,
+            raw.timestamp_ns,
+        );
+    }
+    l.ingest_kernel_fork(
+        raw.modifier_pid,
+        raw.fork_start,
+        raw.fork_ppid,
+        raw.modifier_uid,
+        raw.timestamp_ns,
+    );
 }
 
 /// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
@@ -2398,6 +2454,9 @@ pub async fn drain_loop(
     // path, the hash and the rules' input built off the runtime's threads,
     // the drift log locked for its append only (external audit FIMP-003).
     let check = |raw: &FimDriftRaw, outbox: &mut Vec<Event>| -> Result<bool> {
+        // lot 344: the writer's fork records, before anything of the record
+        // is judged
+        teach_fork(raw, Some(&lineage));
         let last_baseline = inode_map
             .lookup(&InodeKey {
                 dev: raw.target_dev,
@@ -2579,6 +2638,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         file_key: None,
         is_dir: false,
         moved_in: false,
+        appends_only: false,
     })
 }
 
@@ -2752,6 +2812,11 @@ mod tests {
             child_name: [0u8; common::wire::FIM_CHILD_NAME_LEN],
             child_name_flags: 0,
             _pad2: [0u8; 7],
+            // Lot 344: a writer with an exec record of its own
+            fork_ppid: 0,
+            fork_pppid: 0,
+            fork_start: 0,
+            fork_parent_start: 0,
         }
     }
 
@@ -4355,6 +4420,108 @@ mod tests {
     /// Review 76: spent buckets no longer let any other writer skip the
     /// rules. Root wrote 60 throwaway files in /etc/cron.d, and the real
     /// drop-in after them never reached NN-L-FIM-007.
+    /// Lot 344 (named, the alpha's false positives): a drift record carries
+    /// its writer's fork record when the writer executed nothing since its
+    /// fork (the open sensor's since lot 340). Taught to the lineage before
+    /// the record is judged, a writer gone (no `/proc`) is read as the
+    /// program its forker ran — the drift's writer was "unknown" — and the
+    /// forker's own record (rsync's receiver: a fork of a fork) reaches the
+    /// exec; a writer gone that executed is read from its exec record.
+    /// Nothing known, nothing invented; the kernel's append-only bits reach
+    /// the event only on a `Modified`, both together.
+    #[test]
+    fn a_drift_carries_its_writer_s_fork_record_and_how_it_wrote() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("watched.log");
+        std::fs::write(&watched, b"after").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&watched).unwrap();
+        path_map.insert(
+            InodeKey {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            watched.to_string_lossy().to_string(),
+        );
+        let baseline = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        let mut run = |raw: &FimDriftRaw, lineage: &AuthSessionTracker| -> FimEvent {
+            teach_fork(raw, Some(lineage));
+            let mut out: Vec<Event> = Vec::new();
+            process_drift(
+                raw,
+                &path_map,
+                Some(&baseline),
+                &mut drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::with_caps(100, 100),
+                None,
+                Some(lineage),
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => fe,
+                other => panic!("{other:?}"),
+            }
+        };
+        let mut raw = fake_raw(meta.dev(), meta.ino(), FimOp::Modified as u8);
+        let t = raw.timestamp_ns;
+        // a pid no process holds here: the writer is gone
+        raw.modifier_pid = 4_000_007;
+        // rsync's receiver: a fork of its generator, itself a fork of rsync
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        lineage.ingest_spawn(4_000_005, 1, "/usr/bin/rsync", t - 3_000);
+        raw.fork_ppid = 4_000_006;
+        raw.fork_start = t - 1_000;
+        raw.fork_pppid = 4_000_005;
+        raw.fork_parent_start = t - 2_000;
+        let fe = run(&raw, &lineage);
+        assert_eq!(fe.modifier_exe.as_deref(), Some("/usr/bin/rsync"));
+        // each record at its own start: a forker forked before its own
+        // forker executed rsync runs what that one ran then (not known
+        // here), not rsync
+        let late = AuthSessionTracker::new(dir.path().join("no-proc"));
+        late.ingest_spawn(4_000_005, 1, "/usr/bin/rsync", t - 1_500);
+        assert_eq!(run(&raw, &late).modifier_exe, None);
+        // no fork record and no exec record: not known, as before
+        let mut bare = fake_raw(meta.dev(), meta.ino(), FimOp::Modified as u8);
+        let fresh = AuthSessionTracker::new(dir.path().join("no-proc"));
+        bare.modifier_pid = 4_000_008;
+        assert_eq!(run(&bare, &fresh).modifier_exe, None);
+        // a writer gone that executed: its exec record (it had none: /proc)
+        let gone = AuthSessionTracker::new(dir.path().join("no-proc"));
+        gone.ingest_spawn(4_000_008, 1, "/usr/bin/dd", t - 500);
+        assert_eq!(
+            run(&bare, &gone).modifier_exe.as_deref(),
+            Some("/usr/bin/dd")
+        );
+        // the kernel's write shape: both bits, on a Modified only
+        let mut w = bare;
+        w.op_flags = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        assert!(run(&w, &fresh).appends_only);
+        w.op_flags = FIM_WRITE_APPEND_ONLY;
+        assert!(!run(&w, &fresh).appends_only);
+        w.op_flags = FIM_WRITE_ONE_WRITER;
+        assert!(!run(&w, &fresh).appends_only);
+        assert!(!appends_only(
+            &FimDriftRaw {
+                op_flags: FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER,
+                ..bare
+            },
+            FimOp::Created
+        ));
+    }
+
     #[test]
     fn process_drift_never_throttles_a_writer_outside_the_package_manager() {
         let dir = TempDir::new().unwrap();

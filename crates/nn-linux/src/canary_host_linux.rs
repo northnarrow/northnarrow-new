@@ -322,6 +322,7 @@ mod stop_tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         })
     }
 

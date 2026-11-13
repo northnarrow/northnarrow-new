@@ -72,7 +72,9 @@ fn the_fim_sensor_past_the_watch_is_global_functions() {
         body(&open, "on_open_in"),
         &[
             "crate::fim_watch::WATCHED_PATHS.get(&key).is_some()",
-            "crate::fim_watch::emit_drift(FIM_OP_OPENED, key);",
+            // lot 344: the open's drift carries no fork record (the open
+            // hooks are the longest programs the verifier walks)
+            "crate::fim_watch::emit_drift_opened(key);",
             "if !armed() {",
             "if dentry.is_null() {",
             "let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));",

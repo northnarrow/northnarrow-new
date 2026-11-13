@@ -146,6 +146,29 @@ truncations against the rotated file's size, every day, and the first one
 after the agent's start raced the baseline. A truncation in place still
 shrinks the file and is recorded High.
 
+Lot 344: a write is reported when the file is closed, with the writer the
+kernel's marker kept — and the drain reads the file later. `logrotate`'s
+`copytruncate` truncates a log and closes it: rsyslogd's appends since the
+last record were read after the truncation, smaller than before, and judged
+a truncation by rsyslogd (High at every such rotation, and at every
+`truncate` of a log). The marker now also says whether every write since
+the file's last record went through a file opened with `O_APPEND`, by one
+process (the record's); rsyslogd's carve-out takes that kernel proof as
+well as a growth (`FimEvent::appends_only`), whatever its uid — Debian's
+packaged rsyslogd runs as root, where the carve-out (the `syslog` user)
+never applied. A truncation is a setattr,
+recorded on its own with its own writer: logrotate's scheduled run Low,
+anyone else High. Another writer's write between rsyslogd's clears both
+bits — the marker names the last writer, and a write no longer hides behind
+rsyslogd's identity.
+
+Lot 344: a drift record carries its writer's fork record when the writer
+executed nothing since its fork (and its forker's, when that one did not
+either), taught to the lineage before the record is judged; a writer gone
+before its record was judged is read from the lineage — its exec record, or
+its forker's exec — not from `/proc` alone. An open of a watched file
+(`Opened`, the credential reads) carries no fork record.
+
 Lot 340: a directory of a credential store opened (a listing: `find /`,
 plocate's `updatedb`) is no verdict of NN-L-FIM-015/016/017; a file of the
 store opened is judged as before.

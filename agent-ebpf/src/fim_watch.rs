@@ -82,11 +82,12 @@ use aya_ebpf::{
 use northnarrow_common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
     FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_DEST_LEAF,
-    FIM_RENAME_REPLACED, TASK_COMM_LEN,
+    FIM_RENAME_REPLACED, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_FLAGS_OFFSET, FILE_F_INODE_OFFSET,
+    FILE_F_MODE_OFFSET,
     INODE_I_INO_OFFSET, INODE_I_SB_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
     SUPER_BLOCK_S_DEV_OFFSET,
 };
@@ -178,13 +179,32 @@ const MAY_WRITE: i32 = 0x2;
 /// or overwrite the mark — `should_emit` excludes them at write-intent
 /// — so a legitimate agent/watchdog write cannot clobber an attacker's
 /// already-recorded attribution, nor manufacture a spurious one.
+///
+/// Lot 344: the marker also says whether every write since it was set went
+/// through a file opened with `O_APPEND` ([`FIM_WRITE_APPEND_ONLY`]) and was
+/// the marker's process's ([`FIM_WRITE_ONE_WRITER`]) — `rsyslogd`'s appends
+/// emitted at the close of the file `logrotate` had just truncated (its
+/// `copytruncate`) were judged a truncation by `rsyslogd` (NN-L-FIM-005
+/// High): an append shrinks nothing, the truncation is a setattr recorded
+/// with its own writer. And the writer's fork records at its write.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DirtyMeta {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; TASK_COMM_LEN],
+    /// [`FIM_WRITE_APPEND_ONLY`] | [`FIM_WRITE_ONE_WRITER`] as they hold.
+    pub flags: u32,
+    pub fork_ppid: u32,
+    pub fork_pppid: u32,
+    pub _pad: u32,
+    pub fork_start: u64,
+    pub fork_parent_start: u64,
 }
+
+/// `O_APPEND` in `file->f_flags` (uapi, every architecture the agent runs
+/// on).
+const O_APPEND: u32 = 0o2000;
 
 /// Inodes written-but-not-yet-closed (BUG-023 write-then-close).
 /// PROCESS-LOCAL (NOT pinned): purely per-boot transient state, same
@@ -279,6 +299,29 @@ pub(crate) fn emit_drift(op: u8, key: InodeKey) {
     emit_drift_with_dest(op, key, NO_DEST, 0);
 }
 
+/// [`emit_drift`] of an open (`Opened`): without the writer's fork records
+/// (lot 344) — the file-open hooks are the longest programs the verifier
+/// walks (`fim_file_open_sensor`), and an open changes nothing.
+#[inline(always)]
+pub(crate) fn emit_drift_opened(key: InodeKey) {
+    emit_drift_raw(FIM_OP_OPENED, key, NO_DEST, 0, false);
+}
+
+/// Lot 344: the current process's fork records when it has executed nothing
+/// since its fork ([`crate::fork_parent::unexecuted_forks`]) into `raw`.
+#[inline(always)]
+unsafe fn fill_forks(raw: *mut FimDriftRaw) {
+    let (own, forker) = crate::fork_parent::unexecuted_forks();
+    if let Some(f) = own {
+        (*raw).fork_ppid = f.ppid;
+        (*raw).fork_start = f.start;
+    }
+    if let Some(f) = forker {
+        (*raw).fork_pppid = f.ppid;
+        (*raw).fork_parent_start = f.start;
+    }
+}
+
 /// "No destination" marker for [`emit_drift_with_dest`]: dev 0 / ino 0
 /// is what the zeroed entry carried before, so userland needs no new
 /// case.
@@ -300,6 +343,13 @@ const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 /// tolerate that read for privileged loaders; 5.15 does not.
 #[inline(always)]
 fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
+    emit_drift_raw(op, key, dest, op_flags, true);
+}
+
+/// [`emit_drift_with_dest`], the writer's fork records carried when
+/// `forks` (lot 344).
+#[inline(always)]
+fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bool) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => {
@@ -330,6 +380,9 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
         // KERNEL_COMPATIBILITY "Older verifiers", rule 9).
         core::ptr::write_volatile(&mut (*raw_ptr).dest_dev, dest.dev);
         core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
+        if forks {
+            fill_forks(raw_ptr);
+        }
     }
     entry.submit(0);
 }
@@ -366,6 +419,7 @@ fn emit_drift_with_dest_leaf(op: u8, key: InodeKey, dest: InodeKey, new_dentry: 
         core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
         let flags = read_child_leaf(new_dentry, &mut (*raw_ptr).child_name);
         (*raw_ptr).child_name_flags = flags;
+        fill_forks(raw_ptr);
     }
     entry.submit(0);
 }
@@ -399,6 +453,7 @@ fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
         crate::comm::comm_into(&mut (*raw_ptr).modifier_comm);
         let flags = read_child_leaf(child_dentry, &mut (*raw_ptr).child_name);
         (*raw_ptr).child_name_flags = flags;
+        fill_forks(raw_ptr);
     }
     entry.submit(0);
 }
@@ -425,6 +480,13 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
         (*raw_ptr).target_dev = key.dev;
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).op = FIM_OP_MODIFIED;
+        // lot 344: how the writes went, and the writer's fork records at
+        // its write
+        (*raw_ptr).op_flags = (meta.flags & u32::from(FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER)) as u8;
+        (*raw_ptr).fork_ppid = meta.fork_ppid;
+        (*raw_ptr).fork_start = meta.fork_start;
+        (*raw_ptr).fork_pppid = meta.fork_pppid;
+        (*raw_ptr).fork_parent_start = meta.fork_parent_start;
     }
     entry.submit(0);
 }
@@ -768,7 +830,7 @@ pub(crate) unsafe fn observe_open_plain(file: *const u8) {
             let mode = bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32)
                 .unwrap_or(FMODE_WRITE);
             if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&FIM_READ_SEEN, &key) {
-                emit_drift(FIM_OP_OPENED, key);
+                emit_drift_opened(key);
             }
         }
     }
@@ -801,13 +863,43 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
         if let Some(key) = should_emit(inode) {
             let pid_tgid = bpf_get_current_pid_tgid();
             let uid_gid = bpf_get_current_uid_gid();
+            let pid = (pid_tgid >> 32) as u32;
+            // Lot 344: an append (`O_APPEND`; an unreadable `f_flags` is
+            // not one) by the marker's process keeps each bit; any other
+            // write clears it for good — until the record at close.
+            let append = bpf_probe_read_kernel::<u32>((file as *const u8).add(off!(FILE_F_FLAGS_OFFSET)) as *const u32)
+                .is_ok_and(|f| f & O_APPEND != 0);
+            let mut flags = if append { u32::from(FIM_WRITE_APPEND_ONLY) } else { 0 };
+            flags |= u32::from(FIM_WRITE_ONE_WRITER);
+            if let Some(prev) = FIM_DIRTY_INODES.get(&key) {
+                flags &= prev.flags;
+                if prev.pid != pid {
+                    flags &= !u32::from(FIM_WRITE_ONE_WRITER);
+                }
+            }
             let mut meta = DirtyMeta {
-                pid: (pid_tgid >> 32) as u32,
+                pid,
                 uid: (uid_gid & 0xFFFF_FFFF) as u32,
                 comm: [0u8; TASK_COMM_LEN],
+                flags,
+                fork_ppid: 0,
+                fork_pppid: 0,
+                _pad: 0,
+                fork_start: 0,
+                fork_parent_start: 0,
             };
             if let Ok(comm) = bpf_get_current_comm() {
                 meta.comm = comm;
+            }
+            // lot 344: the writer's fork records, at its write
+            let (own, forker) = crate::fork_parent::unexecuted_forks();
+            if let Some(f) = own {
+                meta.fork_ppid = f.ppid;
+                meta.fork_start = f.start;
+            }
+            if let Some(f) = forker {
+                meta.fork_pppid = f.ppid;
+                meta.fork_parent_start = f.start;
             }
             // Last writer wins (an existing key is updated in place even
             // when the map is full). External audit EBPF-009: a refused

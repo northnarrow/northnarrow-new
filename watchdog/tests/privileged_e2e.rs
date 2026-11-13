@@ -1295,3 +1295,60 @@ fn ptrace_access_check_exempts_caller_in_protected_pids() {
          /proc/{agent_pid}/exe returned {post:?} (PHASE_D_002 regression)"
     );
 }
+
+// ── Lot 344: the watchdog's own start is not a foreign BPF handle ────
+
+/// The detection records whose principal is `pid` and whose rule is
+/// `rule` (the agent's detections file, read through `sudo`: the agent
+/// writes it as root).
+fn records_of(path: &Path, rule: &str, pid: u32) -> Vec<String> {
+    let out = Command::new("sudo")
+        .arg("cat")
+        .arg(path)
+        .output()
+        .expect("sudo cat the detections file");
+    let pid_field = format!("\"pid\":{pid},");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(rule) && l.contains(&pid_field))
+        .map(|l| l.chars().take(400).collect())
+        .collect()
+}
+
+/// Lot 344 (the alpha's false positives, item 1): a freshly started
+/// watchdog opens `PROTECTED_PIDS`' pin to register itself before it is
+/// a protected pid. The `bpf` hook let that through (the watchdog's
+/// binary by device and inode, its role vacant, its first minute) but
+/// still reported it: NN-L-BPF-002 High "took a handle to one of
+/// NorthNarrow's own BPF objects" for OUR watchdog at every start, the
+/// first record a tester saw. The start leaves no such record now.
+#[test]
+fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
+    let mut fx = E2eFixture::setup();
+    let _agent_pid = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let wd_pid: u32 = fs::read_to_string(fx.watchdog_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("watchdog pidfile");
+    // registered (a protected pid): its start is over
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !dump_protected_pids().contains(&wd_pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        dump_protected_pids().contains(&wd_pid),
+        "the watchdog never registered itself in PROTECTED_PIDS"
+    );
+    // the bpf observations' pump and the rule's record: well under this
+    std::thread::sleep(Duration::from_secs(5));
+    let found = records_of(
+        &fx.state().detections(),
+        "NN-L-BPF-002_BpfForeignHandleOrDetach",
+        wd_pid,
+    );
+    assert!(
+        found.is_empty(),
+        "the watchdog's own start recorded as a foreign BPF handle: {found:?}"
+    );
+}

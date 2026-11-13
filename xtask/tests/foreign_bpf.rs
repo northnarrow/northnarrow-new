@@ -501,3 +501,42 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
     );
     assert!(c.contains("HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);"));
 }
+
+/// Lot 344 (named, the alpha's false positives): a fresh agent or watchdog
+/// opening the agent's pins (maps, programs, the pin directories) before it
+/// is a protected pid is the family's own start — let through by the deny
+/// path above, and no longer reported as a foreign handle (NN-L-BPF-002
+/// High for OUR watchdog at every start). The skip comes after every
+/// refusal (a link handle is never exempt by executable, and is judged
+/// first), names the maps', programs' and directories' handles only, and is
+/// before the report.
+#[test]
+fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let h = body(&c, "try_bpf_syscall_observe");
+    in_order(
+        h,
+        &[
+            "if (own_link_handle || own_link_pin) && enforce() {",
+            "&& !fresh_instance_may_load()\n    {\n        let kind",
+            "if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {",
+            "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
+            "if (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load() {\n        return 0;\n    }",
+            "let report_cmd = if foreign_handle {",
+            "emit_syscall(report_cmd, arg);",
+        ],
+    )
+    .unwrap();
+    // the exemption is the deny path's: the binary by device and inode,
+    // the role vacant, the main thread, the first minute
+    in_order(
+        body(&c, "fresh_instance_may_load"),
+        &[
+            "if (pid_tgid >> 32) as u32 != pid_tgid as u32 {\n        return false;\n    }",
+            "let role = caller_role();",
+            "Some(t) => *t == 0,",
+            "< FRESH_INSTANCE_NS",
+        ],
+    )
+    .unwrap();
+}

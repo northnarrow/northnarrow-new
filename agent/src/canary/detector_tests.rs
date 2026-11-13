@@ -171,6 +171,7 @@ fn fim_event_on(path: &str, pid: u32) -> Event {
         file_key: None,
         is_dir: false,
         moved_in: false,
+        appends_only: false,
     })
 }
 
@@ -975,6 +976,7 @@ fn the_trips_own_connection_draws_no_chain_verdict_in_any_order() {
         file_key: None,
         is_dir: false,
         moved_in: false,
+        appends_only: false,
     });
     let late_exec = Event::ProcessSpawn {
         pid: PID,

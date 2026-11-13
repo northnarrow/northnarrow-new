@@ -1282,6 +1282,7 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         })
     }
 
@@ -1557,6 +1558,7 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

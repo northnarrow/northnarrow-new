@@ -739,6 +739,7 @@ fn config_changes_are_findings_and_paths_are_watched() {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
         })
     };
     let f = h

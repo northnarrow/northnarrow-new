@@ -10892,3 +10892,80 @@ number in parentheses is a lab PR.
     before the round was empty on both (the check's own apt packages aside).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
+- **Lot 344 (alpha FP round 2A) — the host's and the agent's own records
+  (C14, C17, C23; no level changes).**
+  - What was open (lab rounds of lots 340/341, the alpha profile on plain
+    hosts): NN-L-BPF-002 High for our own watchdog at every start; NN-L-AT-001
+    High after every reboot (systemd's SIGTERM to the watchdog during the
+    poweroff, judged on systemd's `running` asked just before it);
+    rsyslogd's appends read after logrotate's `copytruncate` (or any
+    `truncate` of a log) judged a truncation by rsyslogd (NN-L-FIM-005 High);
+    a FIM drift's writer forked without an exec unknown once gone; the dev
+    corpus's control not running on Ubuntu 26.04 (a renamed copy of uutils'
+    multicall `sleep`); a CI-only failure of
+    `neutralize_quarantines_the_offenders_binary` (root cause: the same
+    multicall copy, named `mal`, on the hosted runners).
+  - Done: the `bpf` hook's report skips the fresh instance its refusal
+    already exempts (the binary by device and inode, the role vacant, the
+    main thread, the first minute); a relayed signal is judged only on a
+    systemd answer asked after it (the kernel's clock); the FIM write marker
+    carries `FIM_WRITE_APPEND_ONLY`/`FIM_WRITE_ONE_WRITER` (FP-1 accepts the
+    kernel's append proof as well as a growth); `FimDriftRaw` (168 bytes)
+    carries the writer's unexecuted fork records, taught to the lineage
+    before the judgement, and a gone writer's image is read from the
+    lineage; the corpus control is a shell copy looping on `sleep 1`; three
+    tests keep the utility's name; ratchet `xtask/tests/multicall_copies.rs`.
+    Mutation: 15 mutants of the userland code, 14 caught by named tests
+    (two found by survivors: a forker's own start, the watch's kernel-clock
+    stamp), one argued equivalent (`>=`/`>` on equal nanoseconds); the eBPF
+    halves are the lab's and the privileged CI's.
+  - Lab, as measured (our guests, lease k344; before = main 1d8f427d, after =
+    this lot; an alpha install, a cold boot, the probe of each item with its
+    control). Debian 13 (6.12.116, systemd 257), before: our watchdog's
+    NN-L-BPF-002 High ×2 (the install's start, the boot's), NN-L-AT-001 High
+    `signal` by PID 1 ×1 (the agent's journal at the previous shutdown: `not
+    a shutdown … systemd_state="running"`); with rsyslog and logrotate added
+    (not on the image), rsyslogd's appends High after each `copytruncate`
+    rotation (×1–2), also under `systemd-run logrotate /etc/logrotate.conf`.
+    After (twice): none of these — the rotation's own records Low; still High:
+    `truncate -s 0` of the new log, `logrotate -f` (the review of #552's F1),
+    `dd` on wtmp, `iptables -F`, and `systemctl kill -s TERM
+    northnarrow-watchdog` (NN-L-AT-001 High, refused). plocate's `updatedb`:
+    no record before or after. 49 LSM programs at the boot both ways. Ubuntu
+    26.04 (7.0), after: the same at boot (no BPF-002, no AT-001 High); the
+    copytruncate rotations Low with no rsyslogd record; the controls High;
+    the dev corpus's control ran (3.0 s as the lab user, recorded; 20.1 s as
+    www-data, `would have: KillProcessTree`) — it exited 1 at once before
+    (lot 341's round). Ubuntu 24.04 (6.8, systemd 255, rsyslogd as
+    `syslog`), before (two rounds): our watchdog's BPF-002 High ×2, AT-001
+    High `signal` by PID 1 in one of the two, rsyslogd's FIM-005 High ×2 at
+    the boot, ×1 at the packaged rename+create rotation, ×1–2 at each
+    `copytruncate` rotation (the timer's and `systemd-run`'s) and beside each
+    `truncate`. After: none of these; the rotations' records Low; `truncate`,
+    `logrotate -f`, a configuration of the caller's under `systemd-run`, the
+    packaged invocation by hand, `dd` on wtmp, `iptables -F`, `systemctl
+    kill` of the watchdog: High, as before. NN-L-EVA-002 for docker: none
+    before or after on either guest — docker.io's install, a restart,
+    `docker run`, `docker build`, a reinstall inside the package transaction.
+  - Residuals: a root process that starts a preloaded watchdog (or agent)
+    binary while that role is vacant gets, in its first minute, handles that
+    are neither refused nor reported (EBPF-002's window; the watchdog's
+    absence is signed); a root that makes systemd `stopping` (`systemctl
+    start shutdown.target`) has its relayed signals judged a shutdown (still
+    refused); a log renamed away and recreated (logrotate's `create`, or
+    `mv` and a new file) is judged by no NN-L-FIM-005/019 verdict — the
+    rename is not a `Modified`, the new file a creation without a writer;
+    an open (`Opened`) carries no fork record; a FIM record's `exe` stays the
+    exec sensors' (the writer's image reaches the rules, not the record); 11
+    lab scripts still run a coreutils copy under another name (listed by the
+    ratchet). Item 3 (EVA-002 for `xtables-nft-multi` under docker) did not
+    reproduce on a clean guest; lot 340's records came from its corpora on a
+    shared guest — open until a corpus round shows it. Seen, not changed:
+    NN-L-FIM-019 High (`would have: KillProcess`) for `systemd-update-utmp`
+    writing wtmp at a shutdown (Ubuntu 24.04, two rounds of three, before
+    and after); NN-L-R004 Critical for runc's
+    memfd re-exec (`memfd:runc_clon`) at every `docker run`/`build` (Debian
+    13; `would have: KillProcessTree`); R011 High for containerd's `modprobe
+    overlay` at docker's install.
+  - Levels unchanged: no capability's reach changes; the records a benign
+    host made are fewer, every attack variant measured is still recorded.

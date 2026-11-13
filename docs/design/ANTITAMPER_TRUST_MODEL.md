@@ -371,13 +371,23 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
 
+Lot 344: the `bpf` hook's observation skips the same fresh instance — a
+handle on the agent's maps, programs or pin directories it lets through is
+the family's own start, not a foreign handle. The watchdog opens
+`PROTECTED_PIDS`' pin to register itself before it is a protected pid, and
+every start of it was recorded NN-L-BPF-002 High. A second instance beside
+the live one, one past its first minute, and any handle on a link of the
+agent's are reported as before.
+
 ### Residual
 
 While a role is vacant — at boot, between the agent's start and the
 watchdog's registration, and in the respawn gap after a crash — a root
 process already running could start a preloaded binary of that role. It
 needs root present at that moment; the same gap exists wherever a defender
-restarts. If the liveness watch cannot be attached (logged as an ERROR),
+restarts. Lot 344: such a process's handles are not reported either (as
+they are not refused); a watchdog gone, which leaves its role vacant, is
+signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),
 the slots are never claimed and the window is bounded by age only.
 
 ## Implementation surface summary

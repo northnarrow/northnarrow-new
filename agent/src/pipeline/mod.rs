@@ -90,8 +90,9 @@ pub(crate) struct SystemdSnapshot(std::sync::Arc<SnapshotInner>);
 
 #[derive(Default)]
 struct SnapshotInner {
-    /// The last answer and when it was asked.
-    last: parking_lot::Mutex<Option<(Instant, Option<String>)>>,
+    /// The last answer, when it was asked, and (lot 344) when on the
+    /// kernel's clock (`CLOCK_MONOTONIC`, a record's `timestamp_ns`).
+    last: parking_lot::Mutex<Option<(Instant, u64, Option<String>)>>,
     /// The watch runs and serves deferrals.
     watched: std::sync::atomic::AtomicBool,
     /// The decision wants a newer answer.
@@ -130,18 +131,27 @@ impl SystemdSnapshot {
         }
     }
 
-    /// The answer for the relayed signal `event` at `now`: a fresh one,
-    /// else — the watch running, the event not handed over before, room
-    /// for it — [`SystemdAnswer::Deferred`], else the latest answer.
+    /// The answer for the relayed signal `event` at `now`: a fresh one
+    /// asked after the signal, else — the watch running, the event not
+    /// handed over before, room for it — [`SystemdAnswer::Deferred`], else
+    /// the latest answer.
+    ///
+    /// Lot 344 (the alpha's false positives): an answer asked before the
+    /// signal says nothing of systemd's state when it sent it. `systemctl
+    /// poweroff` stops the watchdog at once: the watch's last answer, under
+    /// a second old, was the `running` of just before the poweroff, and the
+    /// shutdown's SIGTERM was judged "not a shutdown" — NN-L-AT-001 High
+    /// after every reboot (lab: debian13 and ubuntu2404, `systemd_state=
+    /// "running"` in the agent's journal at the stop).
     pub(crate) fn judge(&self, event: &nn_model::Event, now: Instant) -> SystemdAnswer {
         let last = self.0.last.lock().clone();
-        if let Some((at, state)) = &last {
-            if now.saturating_duration_since(*at) < SYSTEMD_FRESH {
+        let key = signal_key(event);
+        if let Some((at, asked_ns, state)) = &last {
+            if *asked_ns >= key.0 && now.saturating_duration_since(*at) < SYSTEMD_FRESH {
                 return SystemdAnswer::Judge(state.clone());
             }
         }
-        let latest = || SystemdAnswer::Judge(last.clone().and_then(|(_, s)| s));
-        let key = signal_key(event);
+        let latest = || SystemdAnswer::Judge(last.clone().and_then(|(_, _, s)| s));
         if self.0.handed.lock().remove(&key) {
             return latest();
         }
@@ -165,9 +175,9 @@ impl SystemdSnapshot {
         std::mem::take(&mut *self.0.answered.lock())
     }
 
-    /// Store an answer asked at `at`.
-    fn store(&self, at: Instant, state: Option<String>) {
-        *self.0.last.lock() = Some((at, state));
+    /// Store an answer asked at `at`, `asked_ns` on the kernel's clock.
+    fn store(&self, at: Instant, asked_ns: u64, state: Option<String>) {
+        *self.0.last.lock() = Some((at, asked_ns, state));
     }
 }
 
@@ -220,8 +230,11 @@ where
             () = snapshot.0.wanted.notified() => {}
         }
         let asked = Instant::now();
+        // lot 344: on the records' clock too — an answer asked before a
+        // signal judges nothing of it
+        let asked_ns = northnarrow_agent::execq::kernel::monotonic_ns();
         let state = ask().await;
-        snapshot.store(asked, state.clone());
+        snapshot.store(asked, asked_ns, state.clone());
         if state.as_deref() == Some("stopping") {
             stopping();
         }
@@ -272,7 +285,7 @@ mod tests {
         let t0 = Instant::now();
         // no watch: the latest answer (none yet)
         assert_eq!(snap.judge(&relayed(1), t0), SystemdAnswer::Judge(None));
-        snap.store(t0, Some("stopping".into()));
+        snap.store(t0, 10, Some("stopping".into()));
         assert_eq!(
             snap.judge(&relayed(1), t0 + Duration::from_millis(999)),
             SystemdAnswer::Judge(Some("stopping".into())),
@@ -311,6 +324,60 @@ mod tests {
         assert_eq!(
             snap.judge(&relayed(999), later),
             SystemdAnswer::Judge(Some("stopping".into()))
+        );
+    }
+
+    /// Lot 344 (named, the alpha's false positives): `systemctl poweroff`
+    /// stops the watchdog at once — the watch's last answer, fresh, was
+    /// asked just before the poweroff (`running`), and the shutdown's
+    /// SIGTERM was judged "not a shutdown" (NN-L-AT-001 High after every
+    /// reboot). An answer asked before the signal does not judge it: handed
+    /// to the watch, judged on the answer asked after it (`stopping`). A
+    /// `systemctl stop` outside a shutdown is answered `running` after the
+    /// signal too, and stays an attempt.
+    #[test]
+    fn an_answer_asked_before_the_signal_does_not_judge_it() {
+        let snap = SystemdSnapshot::default();
+        snap.0
+            .watched
+            .store(true, std::sync::atomic::Ordering::Release);
+        let t0 = Instant::now();
+        // asked at 1_000 on the kernel's clock, the signal at 1_500: fresh,
+        // but older than the signal
+        snap.store(t0, 1_000, Some("running".into()));
+        let poweroff = relayed(1_500);
+        assert_eq!(
+            snap.judge(&poweroff, t0 + Duration::from_millis(100)),
+            SystemdAnswer::Deferred
+        );
+        // the watch asks at once (after the signal): the host is stopping
+        let back = std::mem::take(&mut *snap.0.deferred.lock());
+        snap.store(
+            t0 + Duration::from_millis(120),
+            1_600,
+            Some("stopping".into()),
+        );
+        for e in &back {
+            snap.0.handed.lock().insert(signal_key(e));
+        }
+        assert_eq!(
+            snap.judge(&poweroff, t0 + Duration::from_millis(130)),
+            SystemdAnswer::Judge(Some("stopping".into()))
+        );
+        // a signal before the answer it is judged on: at once
+        assert_eq!(
+            snap.judge(&relayed(1_550), t0 + Duration::from_millis(140)),
+            SystemdAnswer::Judge(Some("stopping".into()))
+        );
+        // a `systemctl stop` while the host runs: answered `running` after it
+        snap.store(
+            t0 + Duration::from_millis(150),
+            2_000,
+            Some("running".into()),
+        );
+        assert_eq!(
+            snap.judge(&relayed(1_900), t0 + Duration::from_millis(160)),
+            SystemdAnswer::Judge(Some("running".into()))
         );
     }
 
@@ -353,6 +420,7 @@ mod tests {
         // an hour's tick: a stale answer makes the decision ask
         snap.store(
             Instant::now() - Duration::from_secs(10),
+            0,
             Some("running".into()),
         );
         *answer.lock() = Some("stopping".into());
@@ -391,6 +459,13 @@ mod tests {
         assert!(
             stood_down.load(std::sync::atomic::Ordering::Acquire),
             "the ladder stood down"
+        );
+        // lot 344: the watch's answer is asked on the records' clock too — a
+        // signal recorded before it is judged on it at once
+        assert_eq!(
+            snap.judge(&relayed(8), Instant::now()),
+            SystemdAnswer::Judge(Some("stopping".into())),
+            "asked after the signal, fresh"
         );
         watch.abort();
     }

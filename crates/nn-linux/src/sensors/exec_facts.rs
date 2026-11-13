@@ -427,7 +427,11 @@ mod tests {
     #[test]
     fn an_unlinked_image_is_deleted() {
         let tmp = tempfile::tempdir().unwrap();
-        let copy = tmp.path().join("payload");
+        // lot 344: the copy keeps the name `sleep` (uutils' multicall
+        // coreutils — Ubuntu 26.04, the hosted runners — run no utility
+        // named `payload`: the child exited at once)
+        std::fs::create_dir(tmp.path().join("payload")).unwrap();
+        let copy = tmp.path().join("payload").join("sleep");
         std::fs::copy("/bin/sleep", &copy).unwrap();
         // another test's fork may hold the copy's write descriptor until its
         // exec (the parallel harness): `ETXTBSY` for a moment

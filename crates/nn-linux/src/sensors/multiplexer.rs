@@ -2388,7 +2388,15 @@ mod tests {
         let mut start = 0;
         for _ in 0..200 {
             let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
-            if exe.file_name().is_some_and(|n| n == "sleep") {
+            // lot 344 (gates2, under load): the exe link names the new image
+            // at `exec_mmap`, before the new stack holds the environment —
+            // an `environ` read in between was empty ("Clean"). Wait for both.
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            if exe.file_name().is_some_and(|n| n == "sleep")
+                && environ
+                    .split(|b| *b == 0)
+                    .any(|v| v.starts_with(b"MODPROBE_OPTIONS="))
+            {
                 start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
                 break;
             }

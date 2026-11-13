@@ -1786,8 +1786,8 @@ pub const FIM_RENAME_DEST_LEAF: u8 = 0x02;
 /// these into the richer userland [`FimEvent`].
 ///
 /// Layout: timestamp + (dev,ino) target + (dev,ino) dest +
-/// modifier triple + op byte + pad + child-name tail. **144 bytes**,
-/// 8-byte aligned. Tappa 9 polish #3 (rename dest-path resolution)
+/// modifier triple + op byte + pad + child-name tail + the writer's fork
+/// records. **168 bytes**, 8-byte aligned (lot 344: 144 → 168). Tappa 9 polish #3 (rename dest-path resolution)
 /// grew this from 56 → 72 bytes by appending `dest_dev` + `dest_ino`
 /// for `Renamed` events; BUG-022 (dir child-leaf reconstruction)
 /// grew it 72 → 144 by appending `child_name` + flags. All additions
@@ -1839,7 +1839,35 @@ pub struct FimDriftRaw {
     /// [`FIM_CHILD_TRUNCATED`]. Zero when `child_name` is empty.
     pub child_name_flags: u8,
     pub _pad2: [u8; 7],
+    /// Lot 344 (the alpha's false positives): the writer's fork record when
+    /// it has executed nothing since its fork (`fork_parent::
+    /// unexecuted_forks`, the open sensor's since lot 340) — its forker's
+    /// tgid and its own start; 0 otherwise. A writer that never executes
+    /// has no exec record, and a drift judged after it exited had no
+    /// lineage (`/proc` gone): userland teaches these to the lineage first.
+    /// For a write seen at close, the writer's at its write.
+    pub fork_ppid: u32,
+    /// Lot 344: the forker's own fork record when it has executed nothing
+    /// either (rsync's receiver, a fork of its generator, a fork of rsync):
+    /// its forker's tgid; 0 otherwise.
+    pub fork_pppid: u32,
+    /// Lot 344: the writer's start (`task->start_time`) of its fork record.
+    pub fork_start: u64,
+    /// Lot 344: the forker's start of its own fork record.
+    pub fork_parent_start: u64,
 }
+
+/// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
+/// every write to the inode since its last record went through a file
+/// opened with `O_APPEND` — the writes grew the file, they shrank nothing.
+/// A truncation is a setattr, recorded on its own with its own writer.
+pub const FIM_WRITE_APPEND_ONLY: u8 = 0x04;
+
+/// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
+/// every write to the inode since its last record was by the record's
+/// process (no other writer's write hides behind its identity — the marker
+/// is last-writer-wins).
+pub const FIM_WRITE_ONE_WRITER: u8 = 0x08;
 
 impl FimDriftRaw {
     pub const fn zeroed() -> Self {
@@ -1858,6 +1886,10 @@ impl FimDriftRaw {
             child_name: [0u8; FIM_CHILD_NAME_LEN],
             child_name_flags: 0,
             _pad2: [0u8; 7],
+            fork_ppid: 0,
+            fork_pppid: 0,
+            fork_start: 0,
+            fork_parent_start: 0,
         }
     }
 }
@@ -2153,7 +2185,7 @@ mod tests {
     // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
 
     /// C1 (+ polish #3) test #1: [`FimDriftRaw`] layout matches
-    /// the kernel↔userland ABI exactly. **144 bytes**, 8-aligned.
+    /// the kernel↔userland ABI exactly. **168 bytes**, 8-aligned (lot 344).
     /// Polish #3 grew this from 56 → 72 bytes by appending
     /// `dest_dev` + `dest_ino` (each `u64`); BUG-022 grew it
     /// 72 → 144 by appending the `child_name` tail so
@@ -2163,8 +2195,11 @@ mod tests {
     #[test]
     fn fim_drift_raw_layout_is_stable() {
         // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 (= 72, polish #3)
-        // + 64 + 1 + 7 (= 144, BUG-022 child-name tail), 8-aligned.
-        assert_eq!(size_of::<FimDriftRaw>(), 144);
+        // + 64 + 1 + 7 (= 144, BUG-022 child-name tail)
+        // + 4 + 4 + 8 + 8 (= 168, lot 344: the writer's fork records), 8-aligned.
+        assert_eq!(size_of::<FimDriftRaw>(), 168);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_ppid), 144);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_parent_start), 160);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
         // FsProtectDenialRaw stays at the original 56-byte
         // shape; the FIM drift record is now a SUPERSET (first
@@ -2198,6 +2233,10 @@ mod tests {
             },
             child_name_flags: 0,
             _pad2: [0u8; 7],
+            fork_ppid: 7,
+            fork_pppid: 3,
+            fork_start: 11,
+            fork_parent_start: 5,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
@@ -2210,6 +2249,15 @@ mod tests {
         assert_eq!(restored.op, original.op);
         assert_eq!(restored.dest_dev, original.dest_dev);
         assert_eq!(restored.dest_ino, original.dest_ino);
+        assert_eq!(
+            (
+                restored.fork_ppid,
+                restored.fork_pppid,
+                restored.fork_start,
+                restored.fork_parent_start
+            ),
+            (7, 3, 11, 5)
+        );
     }
 
     /// C1 test #3: [`FimOp`] discriminants lock in the wire bytes
