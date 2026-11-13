@@ -419,11 +419,12 @@ fn known_probe_verdict(
     use common::bpf_prog_class::{known_probe_of, prog_type_name, KNOWN_SYSTEM_PROBES};
     let k = KNOWN_SYSTEM_PROBES[known_probe_of(target_dev, prog_type).unwrap_or(0)];
     let reasoning = format!(
-        "A known system program's feature probe, refused: `{comm}` (pid {pid}) loaded a `{}` \
+        "A known system program's BPF load, refused: `{comm}` (pid {pid}) loaded a `{}` \
          BPF program (program type {prog_type}), a type the agent's bpf hook refuses outside a \
          trusted-installer window — {}. The loader proven: it runs the packaged {} (its device \
          and inode, read by the agent at the record). A probe learns whether the kernel \
-         supports the type and attaches nothing; the refusal stands, recorded Low.",
+         supports the type and attaches nothing; the refusal stands, recorded Low, and \
+         raises no posture (never a corroborating signal).",
         prog_type_name(u32::try_from(prog_type).unwrap_or(u32::MAX)),
         k.what,
         k.loader
@@ -1344,7 +1345,7 @@ mod tests {
                 (k.action.clone(), k.severity),
                 (ResponseAction::Log, Severity::Low)
             );
-            for part in ["feature probe, refused", loader, "device and inode"] {
+            for part in ["BPF load, refused", loader, "device and inode"] {
                 assert!(k.reasoning.contains(part), "{part}: {}", k.reasoning);
             }
             for dev in [0, KNOWN_PROBE_BIT | 9, known_probe_dev(entry) | (1 << 20)] {

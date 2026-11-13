@@ -467,3 +467,79 @@ fn a_lock_a_later_signal_acquires_is_a_transition_row() {
     assert!(row.reason.starts_with("COMBAT locked: "), "{}", row.reason);
     assert_eq!(heard.lock().len(), 1, "the ladder is not engaged again");
 }
+
+/// A refused BPF load of `prog_type` by `pid` (`target_dev`: the agent's
+/// proof of a known system program's loader, 0 none), then a mass write of
+/// existing files by `writer`: the posture after each.
+fn bpf_load_then_mass_write(
+    pid: u32,
+    target_dev: u64,
+    prog_type: u32,
+    writer: u32,
+) -> (PostureKind, PostureKind) {
+    let m = PostureMachine::new();
+    m.observe(
+        &Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "systemd".into(),
+            target_dev,
+            target_ino: u64::from(prog_type),
+            operation: nn_model::FsProtectOperation::BpfProgType,
+            timestamp_ns: 10,
+        },
+        &[],
+    );
+    let after_load = m.current_kind();
+    m.observe(
+        &Event::MassWrite {
+            pid: writer,
+            uid: 1000,
+            comm: "bash".into(),
+            count: 20,
+            filename: "/home/u/docs/report.docx".into(),
+            timestamp_ns: 20,
+            overwrites: true,
+            cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
+            own_data: 0,
+        },
+        &[],
+    );
+    (after_load, m.current_kind())
+}
+
+/// Lot 340 (named, the coordinator's input from lot 332's lab, on `main`
+/// too): on Ubuntu 26.04 systemd's own BPF tracepoint load, refused, raised
+/// a DefenseImpairment that then corroborated an unrelated mass write into
+/// COMBAT — the ladder killed a test shell. Proven a known system
+/// program's load (the packaged loader's device and inode: the record's
+/// `target_dev`), it raises nothing and corroborates nothing: the mass write
+/// alone is ENGAGED. A foreign load of the same type (no proof) stays
+/// judged — it raises the posture, and the mass write after it is COMBAT.
+#[test]
+fn a_known_system_program_s_bpf_load_never_corroborates_combat() {
+    use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_TRACEPOINT};
+    // one workload, the test's own process: the two signals share a scope
+    let pid = std::process::id();
+    let (load, write) =
+        bpf_load_then_mass_write(pid, known_probe_dev(0), PROG_TYPE_TRACEPOINT, pid);
+    assert_eq!(
+        load,
+        PostureKind::Observing,
+        "a known program's load raises nothing"
+    );
+    assert_eq!(
+        write,
+        PostureKind::Engaged,
+        "the mass write alone: ENGAGED, not COMBAT"
+    );
+    let (load, write) = bpf_load_then_mass_write(pid, 0, PROG_TYPE_TRACEPOINT, pid);
+    assert_eq!(load, PostureKind::Engaged, "a foreign load is judged");
+    assert_eq!(
+        write,
+        PostureKind::Combat,
+        "and corroborates the mass write"
+    );
+}

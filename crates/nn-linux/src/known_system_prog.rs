@@ -844,7 +844,10 @@ mod tests {
     /// a pid with no process: not proven (the record keeps High).
     #[test]
     fn a_known_probe_s_loader_is_proven_by_its_packaged_image() {
-        use common::bpf_prog_class::{PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_TRACEPOINT};
+        use common::bpf_prog_class::{
+            PROG_TYPE_EXT, PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_PERF_EVENT,
+            PROG_TYPE_TRACEPOINT,
+        };
         let t = tempfile::tempdir().unwrap();
         let me = std::fs::metadata(t.path()).unwrap().uid();
         let file = |rel: &str| {
@@ -867,11 +870,17 @@ mod tests {
         let probe = |pid, ty, at| known_probe(&proc, &packaged, &read, pid, ty, at, 100, 0);
         assert_eq!(probe(868, PROG_TYPE_KPROBE, 9 * s), Ok(1));
         assert_eq!(probe(2301, PROG_TYPE_TRACEPOINT, 10 * s), Ok(0));
+        // the coordinator's rule: systemd's own loads of the types its
+        // programs use
+        assert_eq!(probe(868, PROG_TYPE_TRACEPOINT, 9 * s), Ok(2));
+        assert_eq!(probe(2301, PROG_TYPE_KPROBE, 10 * s), Ok(3));
+        assert_eq!(probe(2301, PROG_TYPE_LSM, 10 * s), Ok(4));
         for (pid, ty, at) in [
             (4242, PROG_TYPE_KPROBE, 9 * s),
-            (868, PROG_TYPE_TRACEPOINT, 9 * s),
+            (4242, PROG_TYPE_TRACEPOINT, 9 * s),
             (868, PROG_TYPE_LSM, 9 * s),
-            (2301, PROG_TYPE_KPROBE, 10 * s),
+            (2301, PROG_TYPE_EXT, 10 * s),
+            (2301, PROG_TYPE_PERF_EVENT, 10 * s),
             (868, PROG_TYPE_KPROBE, 7 * s),
             (999, PROG_TYPE_KPROBE, 9 * s),
         ] {

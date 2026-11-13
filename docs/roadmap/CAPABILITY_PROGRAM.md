@@ -10402,9 +10402,11 @@ number in parentheses is a lab PR.
     events (`teach_fork`, `kernel_fork_entry`); npm's CLI through its
     packaged link path, the packaged `go` in its own directories; R011
     exited + root + the system's tool by name: Medium; a refused
-    `bpf_prog_type` load proven a known system probe's (the packaged
-    loader's device and inode) marked as decoded: Low, no posture, still
-    refused; DNS resolvers by identity (`DnsQuery::known_resolver`: the
+    `bpf_prog_type` load proven systemd's own (the packaged
+    `systemd`/`systemd-networkd` loader's device and inode; `tracepoint`,
+    `kprobe`, PID 1's `lsm`) marked as decoded: Low, no posture trigger —
+    never a corroborating signal (the coordinator's input from lot 332's
+    lab: it promoted an unrelated mass write to COMBAT) — still refused; DNS resolvers by identity (`DnsQuery::known_resolver`: the
     host's packaged file, or CoreDNS by its container runtime's bundle),
     their unattributed legs one Medium record each, never their own tunnel.
     Every attack variant stays judged (the PR's table).
@@ -10419,17 +10421,19 @@ number in parentheses is a lab PR.
     unit's `sh -c 'rsync --inplace'`, 5 runs; only the runs whose burst
     crossed count): 2404 JUDGED 1 (NN-L-IMP-001 Critical) → VOUCHED 1;
     2604 JUDGED 2 → VOUCHED 1, JUDGED 1 (the receiver's forker, rsync's
-    generator, unexecuted too: two levels carried since) — the round on
-    the final code pending.
+    generator, unexecuted too: two levels carried since) → VOUCHED 1,
+    JUDGED 0 on the final code (2404's last round: no burst crossed).
     **Corpus** (2404; ConfirmedIntrusion raises by step): ci `go test` 1
     and `npm ci` 1 → 0, dev `go test` 1 and `rsync --inplace` 1 → 0, db
     `initdb` 1 + `postgres` 2 → 1 + 1 (not this lot's); the other verdicts
     unchanged (R001 High of `go test`'s binary from /tmp, which still
     raises ENGAGED by `StagingExec`). **R011**: `modprobe loop` ×20 Low on
     both kernels before and after (the exited case did not occur). **26.04
-    probes**: user manager restart AT-001 High 1 → Low 1; networkd restart
-    High 2 → Low 1 + High 1; a kprobe load by python3 High
-    both. **Desktop-like** (a terminal under the user manager: vim, sed,
+    probes**: user manager restart AT-001 High 1 → Low 1 (both
+    after-rounds); networkd restart High 2 → Low 1 + High 1 (the second
+    load's kind not read; networkd's `tracepoint` load added to the known
+    ones since, not re-measured); a kprobe load by python3 High both.
+    **Desktop-like** (a terminal under the user manager: vim, sed,
     git, cargo, npm, venv, tar): 0 records before and after. The guests left
     clean and off.
   - Mutations: 52 on the new code in three rounds, 49 caught by named tests

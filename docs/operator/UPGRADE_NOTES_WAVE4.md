@@ -1772,13 +1772,15 @@ are judged as before; `CHANGELOG.md` has the detail.
   `go` runs, and node running any other script still count.
 - **R011**: root's `modprobe <name>` of the system's tool that exited
   before its environment was read is **Medium** (was High).
-- **Ubuntu 26.04**: the user manager's and networkd's BPF feature probes are
-  still refused, now recorded **Low** (NN-L-AT-001, "A known system
-  program's feature probe, refused"), and the posture no longer goes
-  ENGAGED for them at every boot. The proof is the loader's image: the
-  packaged `/usr/lib/systemd/systemd` (a `tracepoint` probe) or
-  `/usr/lib/systemd/systemd-networkd` (a `kprobe` probe), device and
-  inode.
+- **Ubuntu 26.04**: systemd's own BPF loads the hook refuses (the user
+  manager's and networkd's feature probes; PID 1's `RestrictFileSystems=`
+  program at a `daemon-reexec`) are still refused, now recorded **Low**
+  (NN-L-AT-001, "A known system program's BPF load, refused"); the posture
+  no longer goes ENGAGED for them, and they never corroborate another
+  signal into COMBAT. The proof is the loader's image: the packaged
+  `/usr/lib/systemd/systemd` or `/usr/lib/systemd/systemd-networkd`, device
+  and inode, loading a `tracepoint`, `kprobe` (or, PID 1's binary, `lsm`)
+  program.
 - **DNS resolvers**: NN-L-NET-004/-005/-014 treat a sender as a resolver
   only when the agent proves it — the host's packaged resolver at its path
   (device and inode), or Kubernetes' CoreDNS as containerd, k3s'

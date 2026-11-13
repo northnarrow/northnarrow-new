@@ -692,13 +692,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     its environment could be read (a module already loaded or built in)
     was High; it is Medium. Root with a clean environment read stays Low,
     a non-root exec High, every kill a kill.
-  - **systemd's feature probes on Ubuntu 26.04 are Low.** The user
-    manager's `tracepoint` probe at the first login and networkd's
-    `kprobe` probe at its start were refused and signed High
-    (NN-L-AT-001, `bpf_prog_type`), raising ENGAGED at every boot. A
-    refused load whose loader the agent proves a known system probe's (the
-    packaged loader's device and inode, the same process, started before
-    the load) is still refused, recorded Low and raises no posture.
+  - **systemd's own BPF loads on Ubuntu 26.04 are Low and never
+    corroborate.** The user manager's `tracepoint` probe at the first login
+    and networkd's probes at its start were refused and signed High
+    (NN-L-AT-001, `bpf_prog_type`), raising ENGAGED at every boot — and
+    (lot 332's lab, on `main` too) corroborating an unrelated mass write
+    into COMBAT, where the ladder killed a shell. A refused load of a type
+    systemd's programs use (`tracepoint`, `kprobe`; PID 1's `lsm` at a
+    `daemon-reexec`) whose loader the agent proves the packaged
+    `/usr/lib/systemd/systemd` or `systemd-networkd` (device and inode, the
+    same process, started before the load) is still refused, recorded Low,
+    and raises no posture trigger, so it corroborates nothing. Any other
+    loader keeps High and its trigger.
   - **Resolvers by identity; CoreDNS one of them.** NN-L-NET-004/-005/-014
     treated a query as a resolver's forwarded leg by the basename of its
     sender's image (a tunnel run as `/tmp/x/dnsmasq` was never killed), and

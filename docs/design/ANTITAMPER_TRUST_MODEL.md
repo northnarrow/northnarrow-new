@@ -2574,12 +2574,16 @@ decoded (the fs_protect pump, before the posture or the rule reads it), the
 refused load is a known system probe only when the program type is an
 entry's and the loader process runs that entry's packaged executable —
 `/proc/<pid>/exe` has the device and the inode of
-`/usr/lib/systemd/systemd` (`tracepoint`) or
-`/usr/lib/systemd/systemd-networkd` (`kprobe`), a regular file owned by root
-and writable by no one else — read twice around the image with the same
+`/usr/lib/systemd/systemd` (`tracepoint`, `kprobe`, and `lsm`: PID 1's
+`RestrictFileSystems=` program at a `daemon-reexec`) or
+`/usr/lib/systemd/systemd-networkd` (`kprobe`, `tracepoint`), a regular file
+owned by root and writable by no one else — read twice around the image with the same
 start, a start no later than the load. The record's `target_dev` (0 from the
 kernel) then names the entry; NN-L-AT-001 signs it Low with the proof and
-the posture raises no trigger. **The load is refused all the same**; nothing
+the posture raises no trigger — so it never corroborates another signal
+into COMBAT (lot 332's lab saw systemd's tracepoint load promote an
+unrelated mass write and the ladder kill a shell). **The load is refused all
+the same**; nothing
 in the kernel changed. Any other loader of the type — a copy of the binary,
 python, bpftool — stays High and raises DefenseImpairment.
 

@@ -408,11 +408,12 @@ pub const fn root_prog_known_of(target_dev: u64) -> Option<(usize, bool, u32)> {
     ))
 }
 
-/// Lot 340 (the alpha's daily false positives): a feature probe a packaged
-/// system program makes at its start — a program of a type the agent's
-/// `bpf` hook refuses outside a trusted-installer window, loaded to learn
-/// whether the kernel supports it and never attached. Refused all the same;
-/// the record is Low and raises no posture when its loader is proven.
+/// Lot 340 (the alpha's daily false positives): a BPF load a packaged
+/// system program makes — mostly a feature probe at its start (a program
+/// loaded to learn whether the kernel supports its type, never attached) —
+/// of a type the agent's `bpf` hook refuses outside a trusted-installer
+/// window. Refused all the same; the record is Low and raises no posture
+/// (so it never corroborates COMBAT) when its loader is proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnownSystemProbe {
     /// The packaged executable that makes the probe.
@@ -423,14 +424,23 @@ pub struct KnownSystemProbe {
     pub what: &'static str,
 }
 
-/// Lot 340: the known system feature probes, measured on Ubuntu 26.04
-/// (systemd 259.5, kernel 7.0; lot 304's lab): the user manager (`systemd
-/// --user`, uid 1000) loads a `tracepoint` program at the user's first
-/// login, systemd-networkd a `kprobe` program when it starts (libbpf's
-/// feature probes) — each refused and signed High (NN-L-AT-001,
-/// `bpf_prog_type`), raising ENGAGED every boot. Debian 13 (systemd 257)
-/// makes neither.
-pub const KNOWN_SYSTEM_PROBES: [KnownSystemProbe; 2] = [
+/// Lot 340: systemd's own refused BPF loads, measured on Ubuntu 26.04
+/// (systemd 259.5, kernel 7.0; lot 304's lab and this lot's): the user
+/// manager (`systemd --user`) loads a `tracepoint` program at the user's
+/// first login, systemd-networkd a `kprobe` program and another when it
+/// starts (libbpf's feature probes) — each refused and signed High
+/// (NN-L-AT-001, `bpf_prog_type`), raising ENGAGED every boot, and (the
+/// coordinator's input from lot 332's lab) corroborating an unrelated mass
+/// write into COMBAT. Debian 13 (systemd 257) makes none. The coordinator's
+/// rule: systemd's own BPF loads, told by the packaged loader's identity,
+/// are a known system program's — so the types systemd's programs load
+/// that the hook refuses are listed for both loaders: `tracepoint` and
+/// `kprobe` (libbpf's probes), and PID 1's `lsm` (`RestrictFileSystems=`,
+/// loaded again at a `daemon-reexec`; before the agent's start it is lot
+/// 304's known program). A load of any other type, or by any other loader,
+/// keeps High. The index of an entry is its record's (`known_probe_dev`):
+/// entries are only ever appended.
+pub const KNOWN_SYSTEM_PROBES: [KnownSystemProbe; 5] = [
     KnownSystemProbe {
         loader: "/usr/lib/systemd/systemd",
         prog_type: PROG_TYPE_TRACEPOINT,
@@ -440,6 +450,22 @@ pub const KNOWN_SYSTEM_PROBES: [KnownSystemProbe; 2] = [
         loader: "/usr/lib/systemd/systemd-networkd",
         prog_type: PROG_TYPE_KPROBE,
         what: "systemd-networkd's feature probe at its start (libbpf)",
+    },
+    KnownSystemProbe {
+        loader: "/usr/lib/systemd/systemd-networkd",
+        prog_type: PROG_TYPE_TRACEPOINT,
+        what: "systemd-networkd's feature probe at its start (libbpf)",
+    },
+    KnownSystemProbe {
+        loader: "/usr/lib/systemd/systemd",
+        prog_type: PROG_TYPE_KPROBE,
+        what: "a systemd manager's feature probe (libbpf)",
+    },
+    KnownSystemProbe {
+        loader: "/usr/lib/systemd/systemd",
+        prog_type: PROG_TYPE_LSM,
+        what: "systemd's RestrictFileSystems= program, loaded again (a daemon-reexec); its units \
+               run without it until the next boot or a trusted-installer window",
     },
 ];
 
@@ -611,7 +637,7 @@ mod tests {
             let dev = known_probe_dev(n as u16);
             assert_eq!(known_probe_of(dev, u64::from(k.prog_type)), Some(n));
             assert_eq!(known_system_probe(k.loader, k.prog_type), Some(n));
-            assert_eq!(known_probe_of(dev, u64::from(PROG_TYPE_LSM)), None);
+            assert_eq!(known_probe_of(dev, u64::from(PROG_TYPE_EXT)), None);
             assert_eq!(
                 known_probe_of(dev | (1 << 40), u64::from(k.prog_type)),
                 None
@@ -628,6 +654,16 @@ mod tests {
         );
         assert_eq!(
             known_system_probe("/tmp/systemd-networkd", PROG_TYPE_KPROBE),
+            None
+        );
+        // lot 340 (the coordinator's rule): systemd's own loads only, of the
+        // types its programs use; an entry's index never moves
+        let systemd = "/usr/lib/systemd/systemd";
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_TRACEPOINT), Some(0));
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_LSM), Some(4));
+        assert_eq!(known_system_probe(systemd, PROG_TYPE_EXT), None);
+        assert_eq!(
+            known_system_probe("/usr/bin/bpftool", PROG_TYPE_TRACEPOINT),
             None
         );
     }
