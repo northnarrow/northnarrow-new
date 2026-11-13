@@ -2558,3 +2558,41 @@ PID 1 included.
   (`sysctl_root_attach`, High, ENGAGED): it runs without its sysctl monitor
   until it is restarted inside a window, or at the next boot.
 
+
+## Lot 340 — the known system probes: refused, recorded Low by their loader
+
+**Goal.** On Ubuntu 26.04 (systemd 259) two systemd programs make a BPF
+feature probe of a type the `bpf` hook refuses outside a window: the user
+manager (`systemd --user`) a `tracepoint` program at the user's first login,
+systemd-networkd a `kprobe` program when it starts (lot 304's lab). Each was
+refused, signed High (NN-L-AT-001, `bpf_prog_type`) and raised ENGAGED at
+every boot. A probe attaches nothing; the refusal costs systemd nothing.
+
+**The criterion** (`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`,
+`crates/nn-linux/src/known_system_prog.rs::known_probe`). As the decision
+thread takes the record from the bus — after the bus taught the lineage
+every exec that reached it first, before the posture or the rule reads it
+(`sensors::bus::teach`) — the refused load is a known system probe only
+when the program type is an entry's and the loader ran that entry's
+packaged executable WHEN IT LOADED: the image its exec recorded (the LSM
+program's device and inode, as of the load: `AuthSessionTracker::exec_image`)
+is `/usr/lib/systemd/systemd` (`tracepoint`, `kprobe`; and `lsm` for PID 1
+itself — its `RestrictFileSystems=` program at a `daemon-reexec`) or
+`/usr/lib/systemd/systemd-networkd` (`kprobe`, `tracepoint`), a regular file
+owned by root and writable by no one else. The review of #552 (F5): it read
+`/proc/<pid>/exe` as the record was decoded — a root process that loaded
+and then executed the packaged systemd at once showed systemd's image —
+and took `lsm` from any instance of systemd. A loader whose exec has not
+reached the bus when the refusal does is not proven (High, as before). The record's `target_dev` (0 from the
+kernel) then names the entry; NN-L-AT-001 signs it Low with the proof and
+the posture raises no trigger — so it never corroborates another signal
+into COMBAT (lot 332's lab saw systemd's tracepoint load promote an
+unrelated mass write and the ladder kill a shell). **The load is refused all
+the same**; nothing
+in the kernel changed. Any other loader of the type — a copy of the binary,
+python, bpftool — stays High and raises DefenseImpairment.
+
+**What this trusts**: the packaged loader files (a root that replaced them
+is not told apart) and a loader no one else steers (a debugger attached to
+the user's manager, or a preload root gave the packaged binary, can make it
+load a program of the type — refused, Low).

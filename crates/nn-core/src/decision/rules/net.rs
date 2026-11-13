@@ -788,7 +788,14 @@ impl Rule for NnLNet003BadJa3 {
 /// `comm=systemd-resolve` would dodge the kill); the exe symlink is not
 /// forgeable from userspace. This is the same exe-over-comm discipline
 /// `combat/protected.rs` and `posture/lineage.rs` enforce.
-const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
+///
+/// Lot 340: a name in this list only makes a sender a candidate; the DNS
+/// pump proves the identity (`known_resolver` of `Event::DnsQuery`: the
+/// host's packaged file, or the cluster's CoreDNS as its container runtime
+/// records it), and the rules read that proof — a program merely named
+/// `dnsmasq` (`/tmp/x/dnsmasq`) is judged as any sender. `coredns`: a
+/// Kubernetes cluster's DNS, which forwards its pods' names.
+pub const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
     "systemd-resolved",
     "systemd-resolve",
     "named",
@@ -799,6 +806,7 @@ const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
     "kresd",
     "stubby",
     "connmand",
+    "coredns",
 ];
 
 /// DNS originator back-correlation window — deliberately TIGHT (≤2 s)
@@ -858,15 +866,18 @@ impl DnsAttribution {
 ///   * sender IS a forwarder, originator back-correlated → act on the
 ///     originator PID (correct kill target, resolver spared);
 ///   * sender IS a forwarder, no originator → downgrade to `Log`.
+///
+/// Lot 340: "is a forwarder" is the pump's proof of the sender's identity
+/// (`known_resolver`), no longer the basename of its image alone.
 fn attribute_dns_query<I: Default>(
     dns_cache: &DnsCache<I>,
     sender_pid: u32,
     sender_comm: &str,
-    sender_exe: Option<&str>,
+    known_resolver: bool,
     query_name: &str,
     now_ns: u64,
 ) -> DnsAttribution {
-    if !sender_is_forwarder(sender_exe) {
+    if !known_resolver {
         return DnsAttribution::Act {
             pid: sender_pid,
             label: sender_comm.to_string(),
@@ -1230,10 +1241,10 @@ impl<H: DecisionHost> Rule for NnLNet004SuspiciousDnsQname<H> {
         let Event::DnsQuery {
             pid,
             comm,
-            exe,
             query_name,
             timestamp_ns,
             qname_partial,
+            known_resolver,
             ..
         } = event
         else {
@@ -1278,7 +1289,7 @@ impl<H: DecisionHost> Rule for NnLNet004SuspiciousDnsQname<H> {
             &self.dns_cache,
             *pid,
             comm,
-            exe.as_deref(),
+            *known_resolver,
             query_name,
             *timestamp_ns,
         );
@@ -1361,9 +1372,9 @@ impl Rule for NnLNet005DnsBurst {
         let Event::DnsQuery {
             pid,
             comm,
-            exe,
             query_type,
             timestamp_ns,
+            known_resolver,
             ..
         } = event
         else {
@@ -1382,7 +1393,9 @@ impl Rule for NnLNet005DnsBurst {
         // Residual: a Varlink/nss-resolve burst (no originator stub
         // query) goes uncounted here — the documented case-(C) gap; -005
         // is Log-only and the connect-side NetFlow rules still apply.
-        if sender_is_forwarder(exe.as_deref()) {
+        // Lot 340: a known resolver proven by its identity
+        // (`known_resolver`), no longer by its name.
+        if *known_resolver {
             return None;
         }
         let count = self.window.lock().observe(*pid, *timestamp_ns);
@@ -2655,9 +2668,9 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
         let Event::DnsQuery {
             pid,
             comm,
-            exe,
             query_name,
             timestamp_ns,
+            known_resolver,
             ..
         } = event
         else {
@@ -2678,7 +2691,7 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
             &self.dns_cache,
             *pid,
             comm,
-            exe.as_deref(),
+            *known_resolver,
             query_name,
             *timestamp_ns,
         );
@@ -2706,13 +2719,26 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
         // (`net::registrable::tunnel_zone`: never finer than before) — and
         // neither it nor the label counts its letters' case.
         let parent = crate::net::registrable::tunnel_zone(query_name);
-        let distinct = self.corroboration.lock().observe(
-            attribution.target_pid(),
-            hash_name_ci(parent),
-            hash_name_ci(first_label),
-            *timestamp_ns,
-        );
-        let tunnel = distinct >= DNS_TUNNEL_DISTINCT_LABELS;
+        // Lot 340 (the alpha's daily false positives): a known resolver's
+        // leg with no attributable originator is not counted as the
+        // resolver's own tunnel — its pid relays every process's names (the
+        // nss-resolve clients', its own cache prefetches), and NETR-002's
+        // corroboration is the labels of ONE process; hash-shaped names of
+        // many clients under one zone added up to a "tunnel" of the
+        // resolver. As NN-L-NET-005 counts none of a resolver's legs, it
+        // stays one Medium record per name; the originator's own query,
+        // and a leg traced back to it, are counted against the originator.
+        let tunnel = match attribution {
+            DnsAttribution::Downgrade { .. } => false,
+            DnsAttribution::Act { .. } => {
+                self.corroboration.lock().observe(
+                    attribution.target_pid(),
+                    hash_name_ci(parent),
+                    hash_name_ci(first_label),
+                    *timestamp_ns,
+                ) >= DNS_TUNNEL_DISTINCT_LABELS
+            }
+        };
         Some(match attribution {
             DnsAttribution::Act { pid, label } if tunnel => net_verdict(
                 self,
@@ -2742,15 +2768,12 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
             } => net_verdict(
                 self,
                 ResponseAction::Log,
-                if tunnel {
-                    Severity::High
-                } else {
-                    Severity::Medium
-                },
+                Severity::Medium,
                 "High-entropy DNS label observed on a forwarded leg with no \
                  attributable originator (Varlink/nss-resolve, LAN-resolver, \
                  or correlation miss) — surfaced as Log; the local resolver \
-                 is NOT the originator and must not be killed",
+                 is NOT the originator and must not be killed, nor its legs \
+                 (every process's names) counted as its own tunnel",
                 forwarder_pid,
                 label,
                 *timestamp_ns,
@@ -3062,7 +3085,170 @@ mod tests {
             family: 2,
             timestamp_ns: ts_ns,
             qname_partial: false,
+            // lot 340: a resolver's image in these tests is one the DNS
+            // pump proved (`known_resolver`); [`dns_event_proof`] sets it
+            known_resolver: sender_is_forwarder(exe),
         }
+    }
+
+    /// Lot 340: [`dns_event_full`] with the DNS pump's proof of the
+    /// sender's identity given.
+    fn dns_event_proof(
+        pid: u32,
+        qname: &str,
+        comm: &str,
+        exe: &str,
+        proven: bool,
+        ts_ns: u64,
+    ) -> Event {
+        let mut e = dns_event_full(pid, qname, 1, comm, Some(exe), ts_ns);
+        if let Event::DnsQuery { known_resolver, .. } = &mut e {
+            *known_resolver = proven;
+        }
+        e
+    }
+
+    /// Named test (lot 340, the alpha's daily false positives): a known
+    /// resolver's legs with no attributable originator (nss-resolve's
+    /// clients, its own prefetches) relay many processes' names; eight
+    /// hash-shaped labels under one zone made a "tunnel" of systemd-resolved
+    /// (High) on `main`. They stay one Medium record each, never counted as
+    /// the resolver's own tunnel — as NN-L-NET-005 counts none of its legs.
+    /// The attack variants: the same names sent by a process (its own
+    /// query) are killed at the eighth, and a leg traced back to its
+    /// originator still adds up against that originator.
+    #[test]
+    fn a_known_resolver_s_unattributed_legs_are_not_its_own_tunnel() {
+        let rule = net_014();
+        let name = |i: u32| format!("k{i:02}x9f3a7c1e5b2d8f4a6c0e9b7d1f3a5c7e.hashes.example.net");
+        for i in 0..12 {
+            let leg = dns_event_proof(
+                673,
+                &name(i),
+                "systemd-resolve",
+                RESOLVER_EXE,
+                true,
+                1_000 + u64::from(i),
+            );
+            let v = rule.evaluate(&leg).expect("recorded");
+            assert_eq!(
+                (v.action.clone(), v.severity),
+                (ResponseAction::Log, Severity::Medium),
+                "leg {i}: {}",
+                v.reasoning
+            );
+        }
+        // the legs it relayed are not counted under its pid: a query of
+        // that pid the pump could not prove (judged as its own) starts at one
+        let v = rule
+            .evaluate(&dns_event_proof(
+                673,
+                &name(40),
+                "systemd-resolve",
+                RESOLVER_EXE,
+                false,
+                1_100,
+            ))
+            .expect("recorded");
+        assert_eq!(
+            (v.event_pid, v.action),
+            (673, ResponseAction::Log),
+            "{}",
+            v.reasoning
+        );
+        // a process's own queries: killed at the eighth distinct label
+        let rule = net_014();
+        let mut last = None;
+        for i in 0..8 {
+            last = rule.evaluate(&dns_event_full(
+                4242,
+                &name(i),
+                1,
+                "curl",
+                Some("/usr/bin/curl"),
+                2_000 + u64::from(i),
+            ));
+        }
+        let v = last.expect("verdict");
+        assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+        // legs traced back to their originator add up against it
+        let cache = Arc::new(DnsCache::default());
+        let rule = NnLNet014DnsTunnelEntropy::new(Arc::clone(&cache));
+        let mut last = None;
+        for i in 0..8 {
+            let at = 3_000 + u64::from(i) * 10;
+            cache.on_dns_query(5050, name(i), 1, [127, 0, 0, 53].into(), at);
+            last = rule.evaluate(&dns_event_proof(
+                673,
+                &name(i),
+                "systemd-resolve",
+                RESOLVER_EXE,
+                true,
+                at + 1,
+            ));
+        }
+        let v = last.expect("verdict");
+        assert_eq!((v.event_pid, v.action), (5050, ResponseAction::KillProcess));
+    }
+
+    /// Named test (lot 340): CoreDNS (the pump's proof: the cluster's DNS
+    /// as its container runtime records it) is a forwarder — its upstream
+    /// legs are recorded (Log, Medium), never acted on nor counted as
+    /// CoreDNS's own tunnel (on `main` it was no known resolver at all: the
+    /// eighth of its pods' hash-shaped names killed it); the pod's own query
+    /// (sent to the cluster's DNS address, a sender of its own) is judged on
+    /// the pod's process. And a process only NAMED like a resolver
+    /// (`/tmp/x/dnsmasq`, a container's `/coredns` without the runtime's
+    /// record) is judged as any sender — its tunnel killed.
+    #[test]
+    fn coredns_proven_is_a_forwarder_and_a_resolver_by_name_only_is_judged() {
+        let name = |i: u64| format!("z{i}q8w7e6r5t4y3u2i1o0p9a8s7d6f5g4h3j2k1.t.example.org");
+        let rule = net_014();
+        for i in 0..10 {
+            let v = rule
+                .evaluate(&dns_event_proof(
+                    8100,
+                    &name(i),
+                    "coredns",
+                    "/coredns",
+                    true,
+                    4_000 + i,
+                ))
+                .expect("recorded");
+            assert_eq!(
+                (v.event_pid, v.action.clone(), v.severity),
+                (8100, ResponseAction::Log, Severity::Medium),
+                "leg {i}"
+            );
+        }
+        let v = rule
+            .evaluate(&dns_event_full(
+                9100,
+                &name(0),
+                1,
+                "app",
+                Some("/app/bin/app"),
+                4_000,
+            ))
+            .expect("recorded");
+        assert_eq!(v.event_pid, 9100, "the pod's own query, its sender judged");
+        for (pid, comm, exe) in [
+            (8200, "dnsmasq", "/tmp/x/dnsmasq"),
+            (8300, "coredns", "/coredns"),
+        ] {
+            let rule = net_014();
+            let mut last = None;
+            for i in 0..8u64 {
+                last = rule.evaluate(&dns_event_proof(pid, &name(i), comm, exe, false, 5_000 + i));
+            }
+            let v = last.expect("verdict");
+            assert_eq!(
+                (v.event_pid, v.action),
+                (pid, ResponseAction::KillProcess),
+                "{exe}"
+            );
+        }
+        assert!(sender_is_forwarder(Some("/coredns")));
     }
 
     fn listener(port: u16, comm: &str) -> Event {

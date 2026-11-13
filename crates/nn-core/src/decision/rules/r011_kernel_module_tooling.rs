@@ -207,11 +207,20 @@ fn is_module_tool_image(exe: &str) -> bool {
 /// Lot 290 (backlog lot 289): the severity of R011's verdict on a module
 /// tool's exec — Low for the system's tool asked for modules by name by
 /// root, its environment read clean (`Ok((_, false))`); High for the rest:
-/// a record whose process had exited before its environment could be read,
 /// a non-root exec, and every kill.
+///
+/// Lot 340 (the alpha's daily false positives): the same exec by root whose
+/// process had exited before its environment could be read
+/// (`Ok((_, true))`) is Medium, not High. Everything the exec pump could
+/// check held — the system's tool by its device and inode, modules by name,
+/// nothing moved or forced — and only the environment is not verified (a
+/// `modprobe` of a module already loaded, or built in, exits at once: on an
+/// active host that was most of R011's High records). A variable that WAS
+/// read stays a kill, a non-root exec stays High.
 pub fn plain_root_record_severity(judged: &Result<(String, bool), String>, uid: u32) -> Severity {
     match judged {
         Ok((_, false)) if uid == 0 => Severity::Low,
+        Ok((_, true)) if uid == 0 => Severity::Medium,
         _ => Severity::High,
     }
 }
@@ -648,6 +657,82 @@ mod tests {
         let mut argv = vec!["/sbin/modprobe"];
         argv.extend_from_slice(args);
         exec("/sbin/modprobe", "/usr/bin/kmod", &argv)
+    }
+
+    /// `e` run by `uid`.
+    fn as_uid(mut e: Event, to: u32) -> Event {
+        if let Event::ProcessSpawn { uid, .. } = &mut e {
+            *uid = to;
+        }
+        e
+    }
+
+    /// Lot 340 (named, the alpha's daily false positives): the system's
+    /// `modprobe` by module name, run by root, whose process exited before
+    /// the exec pump could read its environment (a module already loaded, or
+    /// built in: it exits at once) is recorded Medium — on `main` High. The
+    /// attack variants keep High: the same exec by a user, a variable that
+    /// was read (`MODPROBE_OPTIONS`, `LD_PRELOAD`: killed even once the
+    /// process has gone), a file named, a copy of the tool, an option that
+    /// moves the tree.
+    #[test]
+    fn a_root_system_modprobe_that_exited_before_its_environment_was_read_is_medium() {
+        let r = rule();
+        let exited = || ExecFacts {
+            program: Ok(()),
+            environment: Environment::Exited("no process had its pid any more".into()),
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+        };
+        let v = r
+            .evaluate(&read_as(modprobe(&["loop"]), exited()))
+            .expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::Medium),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains(EXITED_NOTE), "{}", v.reasoning);
+        // the same exec by a user: High
+        let v = r
+            .evaluate(&read_as(as_uid(modprobe(&["loop"]), 1000), exited()))
+            .expect("recorded");
+        assert_eq!(v.severity, Severity::High);
+        // a variable read before the process went: killed, High
+        for why in [
+            "MODPROBE_OPTIONS='-d /tmp/x' in its environment",
+            "LD_PRELOAD='/tmp/x.so' in its environment",
+        ] {
+            let facts = ExecFacts {
+                environment: Environment::Refused(why.into()),
+                ..exited()
+            };
+            let v = r
+                .evaluate(&read_as(modprobe(&["loop"]), facts))
+                .expect("killed");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{why}");
+            assert_eq!(v.severity, Severity::High, "{why}");
+        }
+        // a file, a moved tree, a copy of the tool: killed, High
+        for (e, program) in [
+            (modprobe(&["/tmp/rk.ko"]), Ok(())),
+            (modprobe(&["-d", "/tmp/x", "loop"]), Ok(())),
+            (
+                exec("/tmp/modprobe", "/tmp/modprobe", &["modprobe", "loop"]),
+                Err("not the system's tool".to_string()),
+            ),
+        ] {
+            let what = format!("{e:?}");
+            let facts = ExecFacts {
+                program,
+                ..exited()
+            };
+            let v = r.evaluate(&read_as(e, facts)).expect("killed");
+            assert_ne!(v.action, ResponseAction::Log, "{what}");
+            assert_eq!(v.severity, Severity::High, "{what}");
+        }
     }
 
     /// `e` as the exec pump read it: `facts`.
@@ -1298,7 +1383,9 @@ mod tests {
     /// Lot 290 (named; backlog lot 289): the system's tool by module name
     /// run by root, its environment read clean, is recorded Low; the same
     /// exec whose process exited before its environment was read stays
-    /// High, a non-root one and every kill stay High.
+    /// High, a non-root one and every kill stay High. Lot 340: that exited
+    /// exec is a non-root one here — a root one is Medium
+    /// ([`a_root_system_modprobe_that_exited_before_its_environment_was_read_is_medium`]).
     #[test]
     fn a_plain_root_modprobe_is_low_and_the_suspicious_keep_high() {
         let r = rule();
@@ -1317,7 +1404,7 @@ mod tests {
             interpreter: None,
         };
         let v = r
-            .evaluate(&read_as(modprobe(&["br_netfilter"]), exited))
+            .evaluate(&read_as(as_uid(modprobe(&["br_netfilter"]), 1000), exited))
             .expect("recorded");
         assert_eq!(
             (v.action, v.severity),
@@ -1332,7 +1419,7 @@ mod tests {
         assert_eq!(plain_root_record_severity(&ok, 0), Severity::Low);
         assert_eq!(plain_root_record_severity(&ok, 1000), Severity::High);
         assert_eq!(
-            plain_root_record_severity(&Ok(("x".to_string(), true)), 0),
+            plain_root_record_severity(&Ok(("x".to_string(), true)), 1000),
             Severity::High
         );
         assert_eq!(
@@ -1363,17 +1450,17 @@ mod tests {
                 "kmod: the version printed",
             ),
         ] {
-            let v = r.evaluate(&read_as(e, exited())).expect("recorded");
-            assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+            // lot 340: a non-root exec (a root one is Medium)
+            // (no record text in the messages: it names the exec's user)
+            let v = r
+                .evaluate(&read_as(as_uid(e, 1000), exited()))
+                .expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log, "{what}");
             assert_eq!(v.severity, Severity::High);
             for part in [what, EXITED_NOTE, "T1547.006", "parent=bash"] {
-                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+                assert!(v.reasoning.contains(part), "{part}");
             }
-            assert!(
-                !v.reasoning.contains("no MODPROBE_OPTIONS"),
-                "{}",
-                v.reasoning
-            );
+            assert!(!v.reasoning.contains("no MODPROBE_OPTIONS"), "{what}");
         }
         for (e, facts, why) in [
             (modprobe(&["/tmp/rk.ko"]), exited(), "names a file"),

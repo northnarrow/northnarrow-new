@@ -495,6 +495,7 @@ fn without_usr(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nn_model::Event;
     // R08b (lab PR 251): on the portable test host.
     use crate::posture::host::testing::TestHost as H;
     type ProgramOwners = super::ProgramOwners<H>;
@@ -976,6 +977,140 @@ mod tests {
                 "{l:?}"
             );
         }
+    }
+
+    /// Lot 340 (named, the alpha's daily false positives): a unit's
+    /// `ExecStart=/bin/sh -c 'rsync -a --inplace …'` backs up through
+    /// rsync's receiver — a fork of rsync that never executes, the writer.
+    /// Judged after it exited, its lineage was unknown (`/proc` was its only
+    /// record) and the backup was judged (lot 310's lab: 4 of 5 runs). The
+    /// kernel's fork record the open sensor carries
+    /// ([`AuthSessionTracker::ingest_kernel_fork`]) makes it rsync's copy:
+    /// vouched by the unit. The attack variants stay judged: the same
+    /// receiver under an rsync an unpackaged script drives, a record seen
+    /// before the write (the process may have executed since), a record that
+    /// started after it, one whose forker is not known.
+    #[test]
+    fn a_backup_s_receiver_inherits_its_forker_s_lineage_from_the_kernel_s_record() {
+        use crate::posture::lineage::{AsOf, AuthSessionTracker};
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const S: u64 = 1_000_000_000;
+        let exec = |pid: u32, ppid: u32, exe: &str, argv: &[&str], forker: u32, start: u64| {
+            Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: start + S / 10,
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: 8,
+                    ino: u64::from(pid),
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: forker,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        };
+        let proc = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::<H>::new(proc.path());
+        // the unit: PID 1 forked the shell (carried through the executor)
+        assert!(t.ingest_spawn_event(&exec(
+            700,
+            1,
+            "/usr/bin/dash",
+            &["sh", "-c", "rsync -a --inplace d/ b/"],
+            1,
+            2 * S
+        )));
+        assert!(t.ingest_spawn_event(&exec(
+            701,
+            700,
+            "/usr/bin/rsync",
+            &["rsync", "-a", "--inplace", "d/", "b/"],
+            700,
+            3 * S
+        )));
+        // the control: an unpackaged script drives the same rsync
+        assert!(t.ingest_spawn_event(&exec(
+            800,
+            1,
+            "/usr/bin/bash",
+            &["bash", "/srv/x/ctl.sh"],
+            1,
+            2 * S
+        )));
+        assert!(t.ingest_spawn_event(&exec(
+            801,
+            800,
+            "/usr/bin/rsync",
+            &["rsync", "-a"],
+            800,
+            3 * S
+        )));
+        let write = 9 * S;
+        let judged = |pid: u32| {
+            let as_of = AsOf::judged(write);
+            let hops = t.lineage_identities(pid, as_of);
+            let facts = hops
+                .as_deref()
+                .map(|h| hop_facts(&t, pid, as_of, h))
+                .unwrap_or_default();
+            judge_with(pid, hops.as_deref(), &facts, false, &distro)
+        };
+        let unknown = |got: &Judged| matches!(got, Judged::Untrusted { program, .. } if program == LINEAGE_UNKNOWN);
+        // on `main`: the receiver (702, gone) has no record — not known
+        // (no judgement in the messages: CodeQL reads it as a record)
+        assert!(unknown(&judged(702)), "702 before its record");
+        // the kernel's record, carried by its write: rsync's copy, vouched
+        t.ingest_kernel_fork(702, 4 * S, 701, 0, write);
+        let rsync = |got: Judged| matches!(got, Judged::Trusted(Trusted::PackagedProgram(p)) if p == "/usr/bin/rsync");
+        assert!(rsync(judged(702)), "702 with its record");
+        // under the unpackaged script's rsync: judged, the script the actor
+        t.ingest_kernel_fork(802, 4 * S, 801, 0, write);
+        assert!(
+            matches!(judged(802), Judged::Untrusted { actor: 800, .. }),
+            "802 under the script"
+        );
+        // seen before the write (it may have executed since), started after
+        // it, a forker not known, a record of itself or of no one: not used
+        t.ingest_kernel_fork(703, 4 * S, 701, 0, write - 1);
+        t.ingest_kernel_fork(704, write + 1, 701, 0, write + 2);
+        t.ingest_kernel_fork(705, 4 * S, 999, 0, write);
+        t.ingest_kernel_fork(706, 4 * S, 706, 0, write);
+        t.ingest_kernel_fork(707, 4 * S, 0, 0, write);
+        for pid in [703, 704, 705, 706, 707] {
+            assert!(unknown(&judged(pid)), "pid {pid}");
+        }
+        // a forker that executed only after the fork (forked from rsync at
+        // 3.5 s, seen unexecuted at 5 s, `gzip` at 6 s): at the fork it ran
+        // rsync's image — its own fork record says so, not `/proc`
+        t.ingest_kernel_fork(900, 3 * S + S / 2, 701, 0, 5 * S);
+        let mut gz = exec(900, 701, "/usr/bin/gzip", &["gzip"], 0, 3 * S + S / 2);
+        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut gz {
+            *timestamp_ns = 6 * S;
+        }
+        assert!(t.ingest_spawn_event(&gz));
+        t.ingest_kernel_fork(902, 4 * S, 900, 0, write);
+        assert!(rsync(judged(902)), "902 through its forker's record");
+        // without that record: not known
+        t.ingest_kernel_fork(904, 4 * S, 903, 0, write);
+        let mut gz = exec(903, 701, "/usr/bin/gzip", &["gzip"], 0, 3 * S + S / 2);
+        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut gz {
+            *timestamp_ns = 6 * S;
+        }
+        assert!(t.ingest_spawn_event(&gz));
+        assert!(unknown(&judged(904)), "904 without it");
     }
 
     /// Re-check 3 (decision 4): a user's manager vouches for nothing, a

@@ -288,6 +288,7 @@ fn detector_returns_none_for_non_canary_events() {
         family: 2,
         timestamp_ns: 0,
         qname_partial: false,
+        known_resolver: false,
     };
     assert!(detector.process_event(&dns_event).is_none());
 }

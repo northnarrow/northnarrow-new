@@ -721,7 +721,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     fs_protect_rb,
                     &tx,
                     &rt,
-                    no_carry::<FsProtectDenialRaw>,
+                    // the review of #552 (F5a): a known probe is marked after
+                    // the bus's lineage barrier ([`mark_known_probe_on_host`])
+                    no_carry,
                 )?),
             ),
             (
@@ -1401,6 +1403,56 @@ fn no_carry<T>(_: &T, e: Event) -> (Event, [Option<Event>; 2]) {
     (e, [None, None])
 }
 
+/// Lot 340 (the alpha's daily false positives): a refused load of a program
+/// type (`bpf_prog_type`) whose loader the agent proves a known system
+/// program's feature probe (the user manager's, networkd's:
+/// [`crate::known_system_prog::known_probe`]) is marked in its `target_dev`
+/// (`common::bpf_prog_class::known_probe_dev`) before the posture or the
+/// rule reads it: NN-L-AT-001 signs it Low and the posture raises nothing.
+/// Still refused. Any other record passes unchanged.
+///
+/// The review of #552 (F5a): the proof is the loader's image as its exec
+/// recorded it AS OF THE LOAD, from the lineage — so the record is marked
+/// as the decision thread takes it from the bus, once the bus taught the
+/// lineage every exec that reached it first (`bus::teach`), never as its
+/// pump decodes it from `/proc`.
+pub(crate) fn mark_known_probe_on_host(e: &mut Event, lineage: &AuthSessionTracker) {
+    mark_known_probe(e, &|pid, ty, at| {
+        crate::known_system_prog::known_probe_on_host(lineage, pid, ty, at)
+    });
+}
+
+/// [`mark_known_probe_on_host`]'s decision, the proof read by `prove`.
+fn mark_known_probe(e: &mut Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize, String>) {
+    if let Event::FsProtectDenial {
+        pid,
+        operation: nn_model::FsProtectOperation::BpfProgType,
+        target_dev,
+        target_ino,
+        timestamp_ns,
+        ..
+    } = e
+    {
+        let Ok(ty) = u32::try_from(*target_ino) else {
+            return;
+        };
+        if *target_dev != 0 {
+            return;
+        }
+        match prove(*pid, ty, *timestamp_ns) {
+            Ok(entry) => {
+                *target_dev = common::bpf_prog_class::known_probe_dev(entry as u16);
+            }
+            Err(why) => tracing::debug!(
+                pid = *pid,
+                prog_type = ty,
+                why,
+                "bpf_prog_type: no known system probe"
+            ),
+        }
+    }
+}
+
 /// R12b (lab PR 269, plan §3.4: the normalisation in the adapter): an
 /// exec's path made absolute in its pump, right after the kernel recorded
 /// it ([`crate::sensors::exe_identity::resolve`]: the mount table, and
@@ -1830,6 +1882,7 @@ fn dns_events(
         dns_server,
         family,
         timestamp_ns,
+        known_resolver,
         ..
     } = &mut event
     {
@@ -1838,6 +1891,9 @@ fn dns_events(
         // leg so a KillProcess verdict never lands on the local stub
         // resolver.
         *exe = dns_sender_exe(lineage, *pid, *timestamp_ns);
+        // Lot 340: a forwarder by its identity, never by its name alone.
+        *known_resolver =
+            crate::net::known_resolver::is_known_resolver(lineage, *pid, exe.as_deref());
         // R14b: a name only the worker decoded feeds the cache; without
         // one there is nothing to attribute a connect to
         if let (Some(cache), false) = (dns_cache, decoded.is_none()) {
@@ -2218,6 +2274,51 @@ mod module_path_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 340 (named): a refused program-type load is marked a known
+    /// system probe's as it is decoded only when its loader is proven; the
+    /// mark is the entry's, for the posture and NN-L-AT-001 to read. A load
+    /// not proven, another operation, a record that already carries a
+    /// `target_dev` pass unchanged.
+    #[test]
+    fn a_refused_load_is_marked_a_known_probe_only_when_proven() {
+        use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_KPROBE};
+        let denial = |op, dev, ino| Event::FsProtectDenial {
+            pid: 868,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 5,
+        };
+        let proven = |_: u32, _: u32, _: u64| -> Result<usize, String> { Ok(1) };
+        let not = |_: u32, _: u32, _: u64| -> Result<usize, String> { Err("no".into()) };
+        let ty = u64::from(PROG_TYPE_KPROBE);
+        let bpt = nn_model::FsProtectOperation::BpfProgType;
+        let mut marked = denial(bpt, 0, ty);
+        mark_known_probe(&mut marked, &proven);
+        assert!(
+            matches!(marked, Event::FsProtectDenial { target_dev, .. } if target_dev == known_probe_dev(1)),
+            "{marked:?}"
+        );
+        for (e, prove) in [
+            (
+                denial(bpt, 0, ty),
+                &not as &dyn Fn(u32, u32, u64) -> Result<usize, String>,
+            ),
+            (denial(bpt, 7, ty), &proven),
+            (
+                denial(nn_model::FsProtectOperation::BpfHandle, 0, ty),
+                &proven,
+            ),
+        ] {
+            let before = format!("{e:?}");
+            let mut e = e;
+            mark_known_probe(&mut e, prove);
+            assert_eq!(format!("{e:?}"), before);
+        }
+    }
 
     /// External audit SNS-001: a pump that ends — returned, failed or
     /// panicked — is reported by its label; running ones are not.

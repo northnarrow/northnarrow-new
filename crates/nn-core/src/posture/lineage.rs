@@ -306,8 +306,16 @@ pub const NODE_EXES: &[&str] = &["/usr/bin/node", "/usr/local/bin/node"];
 /// file merely *named* `npm-cli.js` in some other directory can't
 /// satisfy it. Only ever consulted together with a [`NODE_EXES`] exe
 /// match, so argv (which a process controls for itself) is never the
-/// sole basis for the exemption.
+/// sole basis for the exemption. The review of #552 (F2): and only in a
+/// root-owned system tree ([`AuthSessionTracker::names_npm_cli`]).
 const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
+
+/// Lot 340: the links to npm's CLI a package installs in a root-owned
+/// system tree — the path a shell runs `npm` by, which the kernel hands
+/// node as `argv[1]` ([`AuthSessionTracker::names_npm_cli`]): the Debian
+/// and Ubuntu `npm` package's and NodeSource's `/usr/bin/npm` (`/bin/npm`
+/// with a merged `/usr`), an upstream archive's `/usr/local/bin/npm`.
+const NPM_CLI_LINKS: &[&str] = &["/usr/bin/npm", "/bin/npm", "/usr/local/bin/npm"];
 
 /// The pid→Entry map's size past which the entries of processes that
 /// have exited (and whose [`EXIT_GRACE`] has passed) are dropped, oldest
@@ -398,6 +406,9 @@ const LINEAGE_DEPTH_CAP: usize = 32;
 /// in the catalog for the FP this fixes.
 const LOGINUID_UNSET: u32 = u32::MAX;
 
+/// A file's identity as the kernel gives it: its device (`MKDEV`) and inode.
+type FileId = (u64, u64);
+
 /// PID→Entry cache entry recorded from `Event::ProcessSpawn`.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -421,6 +432,14 @@ struct Entry {
     /// to encrypt ([`crate::posture::script_args::encrypts`]), precomputed
     /// at ingest as [`Self::argv_npm_cli`] is (the argv is not kept).
     encrypts: bool,
+    /// Lot 340 (the review of #552, F1): the exec's whole argv as a digest
+    /// ([`AuthSessionTracker::argv_digest`]: `argv[0]`'s basename, then
+    /// every argument), so a rule can ask for one exact invocation
+    /// ([`AuthSessionTracker::exec_argv_is`]) with no argv kept in the
+    /// bounded cache. `None`: an argv the sensor cut or an empty one, and
+    /// every entry no exec of its own gave (a fork, an orphan, the start's
+    /// scan) — its argv is not known.
+    argv: Option<u64>,
     /// Review 85: what an interpreter `exe` runs ([`runs_of`]): a script
     /// path or a `-m` module; [`Runs::Inline`] for a binary or an inline
     /// program; lot 292: [`Runs::Unknown`] for an argv its table could not
@@ -435,15 +454,48 @@ struct Entry {
     /// event's, from the kernel's credentials; 0 for the plain ingest
     /// calls of tests and tools).
     uid: u32,
-    /// Lot 310: the executed file's `(st_dev, st_ino)` as the exec sensor's
-    /// LSM identity gave it (`None`: tracepoint mode, a process older than
-    /// the agent, the plain ingest calls). A fork runs its parent's.
+    /// Lot 310: the executed file's device and inode as the exec sensor's
+    /// LSM identity gave it — the device in the kernel's form (`MKDEV`, not
+    /// `stat(2)`'s `st_dev`: `common::wire::exe::kernel_dev` converts one)
+    /// (`None`: tracepoint mode without the pump's read, a process older
+    /// than the agent, the plain ingest calls). A fork runs its parent's.
     image: Option<(u64, u64)>,
+    /// Lot 340 (the lab of the review of #552): the file the kernel
+    /// executed, by the LSM program's identity (the device in the kernel's
+    /// form), kept whatever directory it was executed from or mount
+    /// namespace it runs in — for [`AuthSessionTracker::ran_host_file`]
+    /// only: the same inode as a packaged file now is that file's code, so
+    /// a unit's private mount namespace (`ProtectSystem=`, `PrivateTmp=`:
+    /// logrotate.service, systemd-networkd), which takes `ROOT_DIR` and the
+    /// [`Self::image`] away, still compares. Else [`Self::image`] (the exec
+    /// pump's read in tracepoint mode, a seeded process). A fork runs its
+    /// parent's.
+    exec_file: Option<(u64, u64)>,
     /// Lot 310 (the re-check of #539, N2): the process that forked this
     /// one, when this exec was the first since that fork (the exec record's
     /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
     /// known — read from `/proc`, a later exec, an older eBPF object.
     fork_parent: u32,
+}
+
+/// Lot 340 (the review of #552, F1): one hop of a whole lineage
+/// ([`AuthSessionTracker::lineage_hops`]), nearest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopFacts {
+    pub pid: u32,
+    /// Its parent on the walk (PID 1 or 0 for the last hop).
+    pub ppid: u32,
+    /// What the kernel executed for it.
+    pub id: ExecIdentity,
+    /// The real uid its exec recorded (the spawn cache), or it runs as
+    /// (`/proc`); `None` not known.
+    pub uid: Option<u32>,
+    /// The process that forked it when its exec was the first since that
+    /// fork — the kernel's record, carried through systemd's executor
+    /// ([`AuthSessionTracker::fork_parent`]); 0 not known.
+    pub fork_parent: u32,
+    /// Its exec was seen (the spawn cache), not read from `/proc`.
+    pub cached: bool,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -840,7 +892,27 @@ struct InnerState {
     /// unlinked since (not entered): pid → (its start, the image's
     /// identity), at most [`TRACKER_CAP`]; a later exec of the pid drops it.
     seeded_images: HashMap<u32, (u64, (u64, u64))>,
+    /// Lot 340: the kernel's fork records of writers that executed nothing
+    /// since their fork ([`AuthSessionTracker::ingest_kernel_fork`]), at most
+    /// [`KERNEL_FORKS_CAP`], oldest dropped first.
+    kernel_forks: HashMap<u32, KernelFork>,
+    kernel_fork_order: VecDeque<u32>,
 }
+
+/// Lot 340: a process the kernel recorded forked by `parent` at `start_ns`
+/// and seen, at `seen_ns`, still running what it was forked with (no exec
+/// since): the open sensor's record of its write carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KernelFork {
+    start_ns: u64,
+    parent: u32,
+    uid: u32,
+    seen_ns: u64,
+}
+
+/// Lot 340: kernel fork records kept (the writers that never executed: a
+/// backup's receivers, workers). Each costs 32 bytes.
+const KERNEL_FORKS_CAP: usize = 4096;
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
 /// `exec`, an interpreter re-executing, a `dpkg` run after the event).
@@ -980,6 +1052,10 @@ struct Inner {
     /// Lab PR 175: the host's `/` for `/etc/passwd`, `/etc/subuid` and the
     /// owners of container storage directories; a fixture tree in tests.
     host_root: PathBuf,
+    /// Lot 340 (the review of #552, F1): the key of the argv digests
+    /// ([`AuthSessionTracker::argv_digest`]), drawn at random per tracker:
+    /// no argv can be chosen to collide with another's.
+    argv_key: std::collections::hash_map::RandomState,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -1019,6 +1095,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     by_uid: HashMap::new(),
                     by_uid_len: 0,
                     seeded_images: HashMap::new(),
+                    kernel_forks: HashMap::new(),
+                    kernel_fork_order: VecDeque::new(),
                 }),
                 proc_root,
                 live,
@@ -1031,6 +1109,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     grace: EXIT_GRACE,
                 },
                 host_root: PathBuf::from(H::HOST_ROOT),
+                argv_key: std::collections::hash_map::RandomState::new(),
             }),
             host: PhantomData,
         }
@@ -1091,12 +1170,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (false, false),
+            (false, false, None),
             Runs::Inline,
             spawn_ns,
             (0, None),
             0,
-            (None, 0),
+            (None, 0, None),
         );
     }
 
@@ -1135,6 +1214,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             timestamp_ns,
             exe,
             start_ns,
+            argv_truncated,
             ..
         } = event
         else {
@@ -1149,10 +1229,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             && exe.has(ROOT_DIR)
             && (exe.dev, exe.ino) != (0, 0))
             .then_some((exe.dev, exe.ino));
+        // the LSM program's identity of the executed file, whatever its
+        // directory or mount namespace ([`Entry::exec_file`])
+        let exec_file = (exe.has(KNOWN) && (exe.dev, exe.ino) != (0, 0))
+            .then_some((exe.dev, exe.ino))
+            .or(image);
         let path = exe.path_or(filename);
-        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let argv_npm_cli = self.names_npm_cli(Path::new(path), argv);
         // lot 313 (BUG-49's residue): an encryption tool asked to encrypt
         let encrypts = crate::posture::script_args::encrypts(Path::new(path), argv);
+        // the review of #552 (F1): an argv the sensor cut is not the whole
+        let digest = if *argv_truncated {
+            None
+        } else {
+            self.argv_digest(argv)
+        };
         let runs = with_pump_facts(
             runs_of(Path::new(path), argv),
             Path::new(path),
@@ -1166,12 +1257,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *pid,
             *ppid,
             path,
-            (argv_npm_cli, encrypts),
+            (argv_npm_cli, encrypts, digest),
             runs,
             *timestamp_ns,
             (*start_ns, None),
             *uid,
-            (image, fork_parent),
+            (image, fork_parent, exec_file),
         );
         let _ = filename;
         true
@@ -1192,20 +1283,156 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         start_ns: u64,
         uid: u32,
     ) {
-        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let argv_npm_cli = self.names_npm_cli(Path::new(exe), argv);
         let encrypts = crate::posture::script_args::encrypts(Path::new(exe), argv);
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
             pid,
             ppid,
             exe,
-            (argv_npm_cli, encrypts),
+            (argv_npm_cli, encrypts, self.argv_digest(argv)),
             runs,
             spawn_ns,
             (start_ns, None),
             uid,
-            (None, 0),
+            (None, 0, None),
         );
+    }
+
+    /// Lot 340 (the alpha's daily false positives): the kernel's fork
+    /// record of `pid` — forked by `parent` at `start_ns` (the task's start,
+    /// `CLOCK_MONOTONIC`), run by `uid`, seen at `seen_ns` still running what
+    /// it was forked with — as the open sensor's record of a write carries
+    /// it (`OpenRecordRaw::fork_ppid`, from lot 310's `fork_parent_record`).
+    /// A writer that never executes (a backup's receiver: `rsync` forks it)
+    /// has no exec record; its lineage was read from `/proc`
+    /// ([`Self::fork_entry`]) and lost once it exited, so a burst judged
+    /// after its exit was a writer of unknown lineage (lot 310's lab: 4 of 5
+    /// unit backups judged). With the record, the walk reads it as its
+    /// forker's copy, as of its start, whether it runs still or not. The
+    /// pump ingests it before it sends the write's events: no event of the
+    /// write is judged without it.
+    pub fn ingest_kernel_fork(&self, pid: u32, start_ns: u64, parent: u32, uid: u32, seen_ns: u64) {
+        if pid <= 1 || parent == 0 || parent == pid || start_ns == 0 {
+            return;
+        }
+        let rec = KernelFork {
+            start_ns,
+            parent,
+            uid,
+            seen_ns,
+        };
+        let mut s = self.inner.state.write();
+        if let Some(k) = s.kernel_forks.get_mut(&pid) {
+            if (k.start_ns, k.parent) == (start_ns, parent) {
+                k.seen_ns = k.seen_ns.max(seen_ns);
+            } else {
+                // the pid of an earlier process: this record replaces it
+                *k = rec;
+            }
+            return;
+        }
+        s.kernel_forks.insert(pid, rec);
+        s.kernel_fork_order.push_back(pid);
+        while s.kernel_fork_order.len() > KERNEL_FORKS_CAP {
+            if let Some(old) = s.kernel_fork_order.pop_front() {
+                s.kernel_forks.remove(&old);
+            }
+        }
+    }
+
+    /// Lot 340: [`Self::fork_entry`] from the kernel's fork record of `pid`
+    /// ([`Self::ingest_kernel_fork`]) — its forker's exec as of its start
+    /// (the image it was forked with), the forker read the same way when it
+    /// never executed either — when the record describes the process the
+    /// pid named at `at`: started by then, and seen running its fork's image
+    /// no earlier than then (later, it may have executed: an exec event
+    /// would answer). A forker that executed only after the fork is read
+    /// from its own fork record alone. `None` without one, and without a time: the sweep
+    /// enters the processes running now from `/proc`, where a pid the
+    /// recorded writer left may name another process.
+    fn kernel_fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
+        let t = at?;
+        if depth > LINEAGE_DEPTH_CAP {
+            return None;
+        }
+        let k = self.inner.state.read().kernel_forks.get(&pid).copied()?;
+        if t < k.start_ns || t > k.seen_ns {
+            return None;
+        }
+        let parent = match self.cached_live(k.parent, Some(k.start_ns)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::Absent => self.fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
+            // the forker executed only later: what it ran at the fork is its
+            // own fork record's, if the kernel gave one (never `/proc`, which
+            // shows the later image)
+            CachedAt::LaterOnly => self.kernel_fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
+        };
+        Some(Entry {
+            ppid: k.parent,
+            exe: parent.exe,
+            spawn_ns: k.start_ns,
+            start_ns: k.start_ns,
+            // npm's own CLI is the process its exec named, never a fork of it
+            argv_npm_cli: false,
+            // lot 313 (BUG-49's residue): a forked copy runs its forker's
+            // exec, an encryption it was asked for included (as `fork_entry`)
+            encrypts: parent.encrypts,
+            argv: None,
+            runs: parent.runs,
+            start_ticks: None,
+            uid: k.uid,
+            image: parent.image,
+            exec_file: parent.exec_file,
+            fork_parent: k.parent,
+        })
+    }
+
+    /// FP-2: `argv[1]` names npm's CLI ([`NPM_CLI_SUFFIX`]). Lot 340 (the
+    /// alpha's daily false positives): or, for a node of [`NODE_EXES`]
+    /// (`exe`), the link a package installs for it ([`NPM_CLI_LINKS`]). A
+    /// shell runs `npm` as `/usr/bin/npm`, a link to
+    /// `../share/nodejs/npm/bin/npm-cli.js` (Ubuntu, Debian; NodeSource's to
+    /// `../lib/node_modules/npm/bin/npm-cli.js`); the kernel hands the
+    /// shebang's interpreter the path it was asked to execute, so node's
+    /// `argv[1]` is `/usr/bin/npm`, and `npm ci` was never npm's CLI to the
+    /// mass-write arm (lot 313's ci corpus: ConfirmedIntrusion → ENGAGED).
+    /// The link's path, root's, is judged as the suffix is — what node runs
+    /// is the file there — with no read on the decision path.
+    ///
+    /// The review of #552 (F2): npm's CLI by its suffix only in a root-owned
+    /// system tree, named by an absolute path ([`in_system_tree`], no `..`)
+    /// — the installed npm, as the links are. A package's own copy
+    /// (`node_modules/evil/npm/bin/npm-cli.js`), or one in a home, is the
+    /// caller's code under npm's name: the very postinstall the mass-write
+    /// arm guards against can write it.
+    fn names_npm_cli(&self, exe: &Path, argv: &[String]) -> bool {
+        argv.get(1).is_some_and(|script| {
+            (script.ends_with(NPM_CLI_SUFFIX)
+                && script.starts_with('/')
+                && !script.split('/').any(|s| s == "..")
+                && in_system_tree(script))
+                || (is_node_exe(exe) && NPM_CLI_LINKS.contains(&script.as_str()))
+        })
+    }
+
+    /// Lot 340 (the review of #552, F1): the digest of an exec's whole argv
+    /// — `argv[0]`'s basename (what a shell or a unit's `ExecStart=` names
+    /// the program by: a path or a bare name), then every argument, each
+    /// with its length — keyed by this tracker's random key
+    /// ([`Inner::argv_key`]). `None` for an empty argv.
+    fn argv_digest<S: AsRef<str>>(&self, argv: &[S]) -> Option<u64> {
+        use std::hash::{BuildHasher, Hasher};
+        let (first, rest) = argv.split_first()?;
+        let first = first.as_ref();
+        let base = first.rsplit('/').next().unwrap_or(first);
+        let mut h = self.inner.argv_key.build_hasher();
+        h.write_usize(argv.len());
+        for a in std::iter::once(base).chain(rest.iter().map(AsRef::as_ref)) {
+            h.write_usize(a.len());
+            h.write(a.as_bytes());
+        }
+        Some(h.finish())
     }
 
     /// Review of #475 (R-F): enter every process running now into the
@@ -1267,12 +1494,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 pid,
                 ppid,
                 &exe,
-                (false, false),
+                (false, false, None),
                 runs,
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
-                (image, 0),
+                (image, 0, image),
             );
             seeded += 1;
         }
@@ -1324,12 +1551,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
-        (argv_npm_cli, encrypts): (bool, bool),
+        (argv_npm_cli, encrypts, argv): (bool, bool, Option<u64>),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
-        (image, fork_parent): (Option<(u64, u64)>, u32),
+        (image, fork_parent, exec_file): (Option<FileId>, u32, Option<FileId>),
     ) {
         if pid == 0 {
             return;
@@ -1341,10 +1568,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
             encrypts,
+            argv,
             runs,
             start_ticks,
             uid,
             image,
+            exec_file,
             fork_parent,
         };
         let mut s = self.inner.state.write();
@@ -1625,12 +1854,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     e.ppid,
                     &e.exe.to_string_lossy(),
-                    (e.argv_npm_cli, e.encrypts),
+                    (e.argv_npm_cli, e.encrypts, e.argv),
                     e.runs,
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
-                    (e.image, e.fork_parent),
+                    (e.image, e.fork_parent, e.exec_file),
                 );
                 if orphan {
                     orphans += 1;
@@ -1717,10 +1946,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ns,
             argv_npm_cli: first.argv_npm_cli,
             encrypts: first.encrypts,
+            // the review of #552 (F1): its own argv is not known
+            argv: None,
             runs: first.runs.clone(),
             start_ticks: Some(ticks),
             uid,
             image: first.image,
+            exec_file: first.exec_file,
             // no exec of its own: no fork parent recorded for one
             fork_parent: 0,
         })
@@ -1762,6 +1994,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     fn fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
         if pid <= 1 || depth > LINEAGE_DEPTH_CAP {
             return None;
+        }
+        // lot 340: the kernel's record of the fork first — it holds once
+        // the process has exited, `/proc` does not
+        if let Some(e) = self.kernel_fork_entry(pid, at, depth) {
+            return Some(e);
         }
         let (ppid, ticks) = self.proc_parent_and_start(pid)?;
         if ppid == 0 || ppid == pid {
@@ -1837,10 +2074,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ns,
             argv_npm_cli: parent.argv_npm_cli,
             encrypts: parent.encrypts,
+            // the review of #552 (F1): an exec's argv is its own process's
+            argv: None,
             runs: parent.runs,
             start_ticks: Some(ticks),
             uid,
             image: parent.image,
+            exec_file: parent.exec_file,
             fork_parent: 0,
         })
     }
@@ -2222,6 +2462,30 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
     }
 
+    /// Lot 340: `pid` ran, as of `as_of`, the host's file at `path` — the
+    /// image its exec recorded (device and inode, [`Self::exec_image`]: the
+    /// LSM program's, or the exec pump's in tracepoint mode; the device in
+    /// the kernel's form, `MKDEV`) is the file at `path` under the host's
+    /// root now (one `fstat`, its `st_dev` put in the kernel's form: the
+    /// lab found the two forms compared). A copy of the
+    /// program, a file replaced at the path since, another mount
+    /// namespace's file at that path, an exec whose image was not recorded
+    /// (a process older than the agent): `false`. Never the process's
+    /// `/proc` image in a judgement (R-F).
+    ///
+    /// The lab of the review of #552: from the LSM program's identity of
+    /// the executed file ([`Self::exec_file`]), not only [`Self::exec_image`]
+    /// — the timer's logrotate.service runs in a mount namespace of its own
+    /// (`ProtectSystem=`), which kept no image, and its run was High.
+    pub fn ran_host_file(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        let Some(image) = self.exec_file(pid, as_of) else {
+            return false;
+        };
+        H::file_id(self.inner.host_root.join(path.trim_start_matches('/')))
+            .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
+            == Some(image)
+    }
+
     /// Lab PR 175: `pid` runs in a mount namespace other than init's whose
     /// root mount (the last `/` of its `mountinfo`) is an overlay with its
     /// `upperdir` and `workdir` in the container storage of `users`; that
@@ -2478,6 +2742,25 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .is_some_and(|tty| tty != 0)
     }
 
+    /// Lot 313 (BUG-49's residue): `pid`, as of `as_of`, runs an
+    /// encryption tool asked to encrypt ([`Entry::encrypts`]) — its own
+    /// exec, or the exec its forked copy runs. Cache-only, as
+    /// [`Self::is_npm_cli_writer`]: a miss is no encryption (the writer is
+    /// judged by its trust as before).
+    pub fn runs_encryption(&self, pid: u32, as_of: AsOf) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.encrypts,
+            CachedAt::LaterOnly => false,
+            CachedAt::Absent if as_of.is_judged() => self
+                .fork_entry(pid, as_of.time(), 0)
+                .is_some_and(|e| e.encrypts),
+            CachedAt::Absent => false,
+        }
+    }
+
     /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
     /// (non-lineage) check that the focal writer's `exe` ∈ [`NODE_EXES`]
     /// AND its precomputed [`Entry::argv_npm_cli`] flag is set (argv[1]
@@ -2501,31 +2784,71 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// benign install from a malicious one) but remains covered by the
     /// exec / network / persistence arms. See the FP-2 note in
     /// [`super::triggers::confirmed_intrusion`].
-    /// Lot 313 (BUG-49's residue): `pid`, as of `as_of`, runs an
-    /// encryption tool asked to encrypt ([`Entry::encrypts`]) — its own
-    /// exec, or the exec its forked copy runs. Cache-only, as
-    /// [`Self::is_npm_cli_writer`]: a miss is no encryption (the writer is
-    /// judged by its trust as before).
-    pub fn runs_encryption(&self, pid: u32, as_of: AsOf) -> bool {
-        if pid == 0 || pid == 1 {
-            return false;
-        }
-        match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => e.encrypts,
-            CachedAt::LaterOnly => false,
-            CachedAt::Absent if as_of.is_judged() => self
-                .fork_entry(pid, as_of.time(), 0)
-                .is_some_and(|e| e.encrypts),
-            CachedAt::Absent => false,
-        }
-    }
-
+    ///
+    /// The review of #552 (F2): and node runs npm's script alone — its exec
+    /// pump read no environment that loads the caller's code beside it
+    /// (`NODE_OPTIONS=--require …`, `--import`, `NODE_PATH`: `ENV_LOADS`,
+    /// [`with_pump_facts`]; what it runs is then [`Runs::Unknown`]). A
+    /// postinstall's `NODE_OPTIONS=--require=./p.js npm -v` runs the
+    /// package's code in a process named npm: judged as any node.
     pub fn is_npm_cli_writer(&self, pid: u32, as_of: AsOf) -> bool {
         if pid == 0 || pid == 1 {
             return false;
         }
         match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => e.argv_npm_cli && is_node_exe(&e.exe),
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.argv_npm_cli && is_node_exe(&e.exe) && matches!(e.runs, Runs::Script(_))
+            }
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
+    /// Lot 340 (the review of #552, F1): the real uid `pid` executed its
+    /// image as, as of `as_of` — the exec event's, from the kernel's
+    /// credentials. From the spawn cache only; `None` when it does not hold
+    /// the exec.
+    pub fn exec_uid(&self, pid: u32, as_of: AsOf) -> Option<u32> {
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => Some(e.uid),
+            CachedAt::LaterOnly | CachedAt::Absent => None,
+        }
+    }
+
+    /// Lot 340 (the review of #552, F1): `pid`'s exec, as of `as_of`, had
+    /// exactly the argv `argv` — `argv[0]` by its basename, every argument
+    /// as given, no more ([`Self::argv_digest`]). From the spawn cache only:
+    /// `false` when it does not hold the exec, for an argv the sensor cut,
+    /// and for a process that never executed (a fork: [`Entry::argv`]).
+    pub fn exec_argv_is(&self, pid: u32, as_of: AsOf, argv: &[&str]) -> bool {
+        let want = self.argv_digest(argv);
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.argv.is_some() && e.argv == want,
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
+    /// Lot 340 (the alpha's daily false positives): `pid` is the Go
+    /// toolchain's own `go` command — a binary ([`is_go_toolchain`]) in a
+    /// root-owned system tree, run as itself (no interpreter) — and `path`
+    /// lies in one of its own directories ([`in_go_own_dir`]): the build's
+    /// work directory (`$TMPDIR/go-build<digits>/`), the build cache
+    /// (`…/.cache/go-build/`) or the module cache (`…/go/pkg/mod/`). `go
+    /// test` rewrites its packages' archives in place in its work directory
+    /// to stamp their build ids (lot 313's ci corpus: 20 existing files
+    /// rewritten, ConfirmedIntrusion → ENGAGED). A DIRECT check of the
+    /// writer, like [`Self::is_npm_cli_writer`]: what `go` runs (a test
+    /// binary, `go run`'s program, `go generate`'s commands, a
+    /// `-toolexec` program) is another process, judged on its own; a
+    /// toolchain `go` downloaded into a home (`GOTOOLCHAIN`) is not one.
+    /// Cache-only (the exec seen), `false` otherwise.
+    pub fn is_go_toolchain_own_write(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        if pid <= 1 || !in_go_own_dir(path) {
+            return false;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.runs == Runs::Inline && is_go_toolchain(&e.exe)
+            }
             CachedAt::LaterOnly | CachedAt::Absent => false,
         }
     }
@@ -2743,6 +3066,31 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             LINEAGE_DEPTH_CAP,
         )?;
         Some((hops.into_inner(), end))
+    }
+
+    /// Lot 340 (the review of #552, F1): [`Self::lineage_identities`] with
+    /// what each hop's exec recorded beside its identity — its parent, its
+    /// real uid, the kernel's fork record ([`HopFacts`]). `None` when the
+    /// lineage is not whole (the walk did not reach PID 1).
+    pub fn lineage_hops(&self, pid: u32, as_of: AsOf) -> Option<Vec<HopFacts>> {
+        let hops = std::cell::RefCell::new(Vec::new());
+        let end = self.lineage_walk_to(
+            pid,
+            as_of,
+            |hop| {
+                hops.borrow_mut().push(HopFacts {
+                    pid: hop.pid,
+                    ppid: hop.ppid,
+                    id: self.hop_identity(hop),
+                    uid: hop.uid,
+                    fork_parent: hop.fork_parent,
+                    cached: hop.cached,
+                });
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        )?;
+        matches!(end, WalkEnd::Root).then(|| hops.into_inner())
     }
 
     /// Lot 310 (the re-check of #539, N2): for each hop of
@@ -3176,8 +3524,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(ExecIdentity { exe, runs })
     }
 
-    /// Lot 310: the identity (`(st_dev, st_ino)`) of the file `pid` executed,
-    /// as the exec sensor's LSM program gave it — from the spawn cache only
+    /// Lot 310: the identity (device and inode; the device in the kernel's
+    /// form, `MKDEV` — the review of #552, F7: not `stat(2)`'s `st_dev`) of
+    /// the file `pid` executed, as the exec sensor's LSM program gave it —
+    /// from the spawn cache only
     /// (no `/proc`: it is read on the decision path), as of `as_of`
     /// ([`Self::exec_identity`]'s cache lookup); `None` when the cache does
     /// not hold the exec, or holds no identity for it (tracepoint mode, a
@@ -3196,6 +3546,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 let (start, image) = s.seeded_images.get(&pid).copied()?;
                 as_of.time().is_none_or(|t| t >= start).then_some(image)
             }
+        }
+    }
+
+    /// Lot 340 (the lab of the review of #552): the file `pid` executed, as
+    /// of `as_of`, by the LSM program's identity whatever its directory or
+    /// mount namespace ([`Entry::exec_file`]), else [`Self::exec_image`]'s —
+    /// for a comparison with a packaged file only ([`Self::ran_host_file`],
+    /// a known BPF probe's loader). From the spawn cache only.
+    pub fn exec_file(&self, pid: u32, as_of: AsOf) -> Option<(u64, u64)> {
+        if pid == 0 {
+            return None;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.exec_file,
+            CachedAt::LaterOnly | CachedAt::Absent => self.exec_image(pid, as_of),
         }
     }
 
@@ -3398,6 +3763,50 @@ fn is_elevation_binary(exe: &Path) -> bool {
 /// ([`NODE_EXES`]). Same kernel-resolved-exe, never-`comm` keying as
 /// [`is_system_daemon_binary`]. Gates [`AuthSessionTracker::is_npm_cli_writer`]
 /// so a process-controlled argv is never the sole basis for the exemption.
+/// Lot 340: the Go toolchain's `go` command at a distribution's or the
+/// upstream archive's place, in a root-owned system tree: `/usr/lib/go/bin/go`,
+/// `/usr/lib/go-<version>/bin/go` (Debian, Ubuntu), `/usr/local/go/bin/go`,
+/// `/snap/go/<revision>/bin/go`.
+fn is_go_toolchain(exe: &Path) -> bool {
+    let e = exe.to_string_lossy();
+    if !in_system_tree(&e) {
+        return false;
+    }
+    if matches!(e.as_ref(), "/usr/lib/go/bin/go" | "/usr/local/go/bin/go") {
+        return true;
+    }
+    let versioned = e
+        .strip_prefix("/usr/lib/go-")
+        .and_then(|r| r.strip_suffix("/bin/go"))
+        .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+    let snap = e
+        .strip_prefix("/snap/go/")
+        .and_then(|r| r.strip_suffix("/bin/go"))
+        .is_some_and(|rev| !rev.is_empty() && !rev.contains('/'));
+    versioned || snap
+}
+
+/// Lot 340: `path` (absolute, no `..`) lies in one of the Go toolchain's own
+/// directories: a build's work directory (a segment `go-build` followed by
+/// digits: `$TMPDIR/go-build4098838642/b031/_pkg_.a`), the build cache (a
+/// `go-build` directory under `.cache`: `~/.cache/go-build/`) or the module
+/// cache (`…/go/pkg/mod/`). The whole path is judged, every segment.
+fn in_go_own_dir(path: &str) -> bool {
+    if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs = &segs[..segs.len().saturating_sub(1)];
+    dirs.iter().enumerate().any(|(i, s)| {
+        let work = s
+            .strip_prefix("go-build")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        let cache = *s == "go-build" && i > 0 && dirs[i - 1] == ".cache";
+        let modcache = *s == "mod" && i >= 2 && dirs[i - 1] == "pkg" && dirs[i - 2] == "go";
+        work || cache || modcache
+    })
+}
+
 fn is_node_exe(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     NODE_EXES.iter().any(|p| s == *p)
@@ -4574,16 +4983,44 @@ mod tests {
     }
 
     #[test]
-    fn npm_cli_flag_matches_user_prefix_path_too() {
-        // npm-cli.js can live under a user global prefix; the suffix
-        // match (…/npm/bin/npm-cli.js) is location-independent.
+    fn npm_cli_flag_matches_a_global_prefix_path_too() {
+        // npm-cli.js can live under a global prefix (an upstream archive's
+        // or NodeSource's `/usr/local/lib`, Debian's `/usr/share/nodejs`).
+        // The review of #552 (F2): a root-owned one — a user prefix in a
+        // home is writable by the postinstall the exemption guards against
+        // (`npm_cli_flag_refuses_a_path_a_user_can_write`).
         let t = AuthSessionTracker::new("/proc");
-        let argv = vec![
-            "node".to_string(),
-            "/home/alice/.npm-global/lib/node_modules/npm/bin/npm-cli.js".to_string(),
-        ];
-        t.ingest_spawn_with_argv(7004, 50, "/usr/bin/node", &argv, 1);
-        assert!(t.is_npm_cli_writer(7004, AsOf::Now));
+        for (pid, path) in [
+            (7004, "/usr/local/lib/node_modules/npm/bin/npm-cli.js"),
+            (7008, "/usr/share/nodejs/npm/bin/npm-cli.js"),
+        ] {
+            let argv = vec!["node".to_string(), path.to_string()];
+            t.ingest_spawn_with_argv(pid, 50, "/usr/bin/node", &argv, 1);
+            assert!(t.is_npm_cli_writer(pid, AsOf::Now), "{path}");
+        }
+    }
+
+    /// Named test (the review of #552, F2): npm's CLI by its suffix only in
+    /// a root-owned system tree, by an absolute path — never a package's
+    /// own copy, a user prefix in a home, a relative path or one leaving a
+    /// system tree through `..`.
+    #[test]
+    fn npm_cli_flag_refuses_a_path_a_user_can_write() {
+        let t = AuthSessionTracker::new("/proc");
+        for (pid, path) in [
+            (7020, "/home/u/p/node_modules/evil/npm/bin/npm-cli.js"),
+            (
+                7021,
+                "/home/alice/.npm-global/lib/node_modules/npm/bin/npm-cli.js",
+            ),
+            (7022, "/tmp/npm/bin/npm-cli.js"),
+            (7023, "node_modules/npm/bin/npm-cli.js"),
+            (7024, "/usr/lib/../../home/u/npm/bin/npm-cli.js"),
+        ] {
+            let argv = vec!["node".to_string(), path.to_string()];
+            t.ingest_spawn_with_argv(pid, 50, "/usr/bin/node", &argv, 1);
+            assert!(!t.is_npm_cli_writer(pid, AsOf::Now), "{path}");
+        }
     }
 
     #[test]
@@ -7368,10 +7805,12 @@ mod tests {
             start_ns,
             argv_npm_cli: false,
             encrypts: false,
+            argv: None,
             runs: Runs::Inline,
             start_ticks,
             uid: 0,
             image: None,
+            exec_file: None,
             fork_parent: 0,
         };
         let exact = e(4_003_217_000, None);
