@@ -148,3 +148,32 @@ fn a_suppressed_response_says_what_would_have_run() {
     assert!(describe.contains("nn_core::response::profile::would_have("));
     assert!(!describe.contains("\"suppressed (detect-only)\""));
 }
+
+/// Named (lot 341, the review of #550 F8): the start signs an unsigned
+/// downgrade — after its own `agent_boot`, from the chain's previous boot
+/// and the resolved profile — and the profile reaches the attest phase.
+#[test]
+fn the_start_signs_an_unsigned_downgrade_to_alpha() {
+    let code = product_code(&repo_root());
+    let at = |rel: &str| {
+        code.get(rel)
+            .unwrap_or_else(|| panic!("{rel} not found"))
+            .as_str()
+    };
+    let evidence = at("agent/src/boot/evidence.rs");
+    assert!(signature(evidence, "attest")
+        .contains("profile: &nn_core::response::profile::ResolvedProfile,"));
+    let attest = body(evidence, "attest");
+    let probe = attest
+        .find("match log.boot_probe(")
+        .expect("the boot's row");
+    let check = attest
+        .find("nn_core::response::profile::unsigned_downgrade(\n                            log.previous_boot_enforced(),\n                            profile,\n                        )")
+        .expect("the downgrade judged from the chain and the profile");
+    let sign = attest
+        .find("log.attest_profile_downgrade(&detail)")
+        .expect("and signed");
+    assert!(probe < check && check < sign);
+    let boot = at("agent/src/boot/mod.rs");
+    assert!(boot.contains("        &detect_only_source,\n        &profile,\n        integrity,"));
+}
