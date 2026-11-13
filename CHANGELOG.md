@@ -656,7 +656,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     btmp, a copy of logrotate, logrotate run by hand or with any other
     argument (`-f`, `-s`, a configuration of the caller's), by a non-root
     user, under anacron or cron run by hand (`anacron -t /tmp/t`) or below a
-    cron `@reboot` entry — keeps its verdict (the review of #552, F1).
+    cron `@reboot` entry — keeps its verdict (the review of #552, F1). The
+    packaged file is told by the LSM program's identity of the executed
+    file whatever the unit's mount namespace: the timer's
+    `logrotate.service` runs in one of its own (`ProtectSystem=`), where the
+    exec record kept no image, and the review's lab round found its run
+    still NN-L-FIM-005 High on syslog.
   - **rsyslogd's appends after a rotation, and at the start, are appends.**
     The FIM drain measured a write against the start's baseline of the
     path: after a rotation the path holds a new, smaller file, and every

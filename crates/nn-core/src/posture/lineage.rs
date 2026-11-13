@@ -453,6 +453,17 @@ struct Entry {
     /// (`None`: tracepoint mode without the pump's read, a process older
     /// than the agent, the plain ingest calls). A fork runs its parent's.
     image: Option<(u64, u64)>,
+    /// Lot 340 (the lab of the review of #552): the file the kernel
+    /// executed, by the LSM program's identity (the device in the kernel's
+    /// form), kept whatever directory it was executed from or mount
+    /// namespace it runs in — for [`AuthSessionTracker::ran_host_file`]
+    /// only: the same inode as a packaged file now is that file's code, so
+    /// a unit's private mount namespace (`ProtectSystem=`, `PrivateTmp=`:
+    /// logrotate.service, systemd-networkd), which takes `ROOT_DIR` and the
+    /// [`Self::image`] away, still compares. Else [`Self::image`] (the exec
+    /// pump's read in tracepoint mode, a seeded process). A fork runs its
+    /// parent's.
+    exec_file: Option<(u64, u64)>,
     /// Lot 310 (the re-check of #539, N2): the process that forked this
     /// one, when this exec was the first since that fork (the exec record's
     /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
@@ -1149,7 +1160,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (0, None),
             0,
-            (None, 0),
+            (None, 0, None),
         );
     }
 
@@ -1203,6 +1214,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             && exe.has(ROOT_DIR)
             && (exe.dev, exe.ino) != (0, 0))
             .then_some((exe.dev, exe.ino));
+        // the LSM program's identity of the executed file, whatever its
+        // directory or mount namespace ([`Entry::exec_file`])
+        let exec_file = (exe.has(KNOWN) && (exe.dev, exe.ino) != (0, 0))
+            .then_some((exe.dev, exe.ino))
+            .or(image);
         let path = exe.path_or(filename);
         let argv_npm_cli = self.names_npm_cli(Path::new(path), argv);
         // the review of #552 (F1): an argv the sensor cut is not the whole
@@ -1229,7 +1245,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *timestamp_ns,
             (*start_ns, None),
             *uid,
-            (image, fork_parent),
+            (image, fork_parent, exec_file),
         );
         let _ = filename;
         true
@@ -1261,7 +1277,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
-            (None, 0),
+            (None, 0, None),
         );
     }
 
@@ -1346,6 +1362,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks: None,
             uid: k.uid,
             image: parent.image,
+            exec_file: parent.exec_file,
             fork_parent: k.parent,
         })
     }
@@ -1461,7 +1478,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
-                (image, 0),
+                (image, 0, image),
             );
             seeded += 1;
         }
@@ -1518,7 +1535,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
-        (image, fork_parent): (Option<(u64, u64)>, u32),
+        (image, fork_parent, exec_file): (Option<(u64, u64)>, u32, Option<(u64, u64)>),
     ) {
         if pid == 0 {
             return;
@@ -1534,6 +1551,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks,
             uid,
             image,
+            exec_file,
             fork_parent,
         };
         let mut s = self.inner.state.write();
@@ -1819,7 +1837,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
-                    (e.image, e.fork_parent),
+                    (e.image, e.fork_parent, e.exec_file),
                 );
                 if orphan {
                     orphans += 1;
@@ -1910,6 +1928,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks: Some(ticks),
             uid,
             image: first.image,
+            exec_file: first.exec_file,
             // no exec of its own: no fork parent recorded for one
             fork_parent: 0,
         })
@@ -2036,6 +2055,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ticks: Some(ticks),
             uid,
             image: parent.image,
+            exec_file: parent.exec_file,
             fork_parent: 0,
         })
     }
@@ -2424,8 +2444,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// namespace's file at that path, an exec whose image was not recorded
     /// (a process older than the agent): `false`. Never the process's
     /// `/proc` image in a judgement (R-F).
+    ///
+    /// The lab of the review of #552: from the LSM program's identity of
+    /// the executed file ([`Self::exec_file`]), not only [`Self::exec_image`]
+    /// — the timer's logrotate.service runs in a mount namespace of its own
+    /// (`ProtectSystem=`), which kept no image, and its run was High.
     pub fn ran_host_file(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
-        let Some(image) = self.exec_image(pid, as_of) else {
+        let Some(image) = self.exec_file(pid, as_of) else {
             return false;
         };
         H::file_id(self.inner.host_root.join(path.trim_start_matches('/')))
@@ -3474,6 +3499,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 let (start, image) = s.seeded_images.get(&pid).copied()?;
                 as_of.time().is_none_or(|t| t >= start).then_some(image)
             }
+        }
+    }
+
+    /// Lot 340 (the lab of the review of #552): the file `pid` executed, as
+    /// of `as_of`, by the LSM program's identity whatever its directory or
+    /// mount namespace ([`Entry::exec_file`]), else [`Self::exec_image`]'s —
+    /// for a comparison with a packaged file only ([`Self::ran_host_file`],
+    /// a known BPF probe's loader). From the spawn cache only.
+    pub fn exec_file(&self, pid: u32, as_of: AsOf) -> Option<(u64, u64)> {
+        if pid == 0 {
+            return None;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.exec_file,
+            CachedAt::LaterOnly | CachedAt::Absent => self.exec_image(pid, as_of),
         }
     }
 
@@ -7722,6 +7762,7 @@ mod tests {
             start_ticks,
             uid: 0,
             image: None,
+            exec_file: None,
             fork_parent: 0,
         };
         let exact = e(4_003_217_000, None);

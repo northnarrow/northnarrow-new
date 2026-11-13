@@ -6850,6 +6850,46 @@ mod tests {
             }
         }
 
+        /// Named test (lot 340, the lab of the review of #552): the timer's
+        /// `logrotate.service` runs in a mount namespace of its own
+        /// (`ProtectSystem=`, `PrivateTmp=`): the exec pump sets no
+        /// `ROOT_DIR` there, the lineage kept no image, and the real timer's
+        /// run was NN-L-FIM-005 High on syslog (ubuntu2404). The LSM
+        /// program's identity of the executed file is the packaged file's
+        /// all the same: Low. Not an identity the pump read from `/proc` in
+        /// tracepoint mode without `ROOT_DIR`, nor the LSM's of another
+        /// file.
+        #[test]
+        fn the_timer_s_logrotate_in_its_unit_s_mount_namespace_is_recorded_low() {
+            use common::wire::exe::exe_flags::PROC_EXE;
+            let (_tmp, t) = tracker();
+            let conf = &[LOGROTATE, "/etc/logrotate.conf"][..];
+            let flagged = |pid, id, flags| {
+                let mut e = exec(pid, 1, LOGROTATE, conf, id, 1, 60 * S);
+                if let Event::ProcessSpawn { exe, .. } = &mut e {
+                    exe.flags = flags;
+                }
+                e
+            };
+            for e in [
+                flagged(800, PACKAGED, KNOWN),
+                flagged(801, PACKAGED, PROC_EXE),
+                flagged(802, (KDEV, 31), KNOWN),
+            ] {
+                assert!(t.ingest_spawn_event(&e));
+            }
+            assert_eq!(
+                judged(&t, 800),
+                [
+                    (ResponseAction::Log, Severity::Low),
+                    (ResponseAction::Log, Severity::Low)
+                ]
+            );
+            for pid in [801u32, 802] {
+                assert_eq!(judged(&t, pid), KEPT, "pid {pid}");
+            }
+        }
+
         /// Lot 340: the rule set wires FIM-005 and FIM-019 through
         /// [`log_rules`] (one source), and the login machinery's own write
         /// of wtmp stays exempt by [`OwnClient`] inside it.

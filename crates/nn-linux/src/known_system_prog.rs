@@ -322,8 +322,9 @@ fn holders_by(
 /// ([`common::bpf_prog_class::KNOWN_SYSTEM_PROBES`]) — the entry, or why
 /// not. The review of #552 (F5a): the proof is the loader's identity WHEN
 /// IT LOADED — `image`, the device and inode its exec recorded (the LSM
-/// program's, in the kernel's form), as of the load
-/// ([`AuthSessionTracker::exec_image`]) — never `/proc/<pid>/exe` read as
+/// program's, in the kernel's form, whatever the loader's mount namespace:
+/// systemd-networkd runs in its own), as of the load
+/// ([`AuthSessionTracker::exec_file`]) — never `/proc/<pid>/exe` read as
 /// the record is decoded: a root process that loads, then executes the
 /// packaged systemd before the decode, showed systemd's image there.
 ///
@@ -375,7 +376,7 @@ pub fn known_probe_by(
     at_ns: u64,
 ) -> Result<usize, String> {
     known_probe(
-        lineage.exec_image(pid, AsOf::judged(at_ns)),
+        lineage.exec_file(pid, AsOf::judged(at_ns)),
         packaged,
         pid,
         prog_type,
@@ -945,6 +946,13 @@ mod tests {
                 stdio: Default::default(),
             };
         let lineage = AuthSessionTracker::new(t.path().join("proc"));
+        // networkd: the packaged binary in its unit's own mount namespace
+        // (`ProtectSystem=`: no `ROOT_DIR`, the LSM identity all the same)
+        let mut networkd = exec(868, "/usr/lib/systemd/systemd", packaged_image, 5 * s);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut networkd {
+            exe.flags = KNOWN;
+        }
+        assert!(lineage.ingest_spawn_event(&networkd));
         // the user manager: the packaged systemd since 5 s, its load at 9 s
         assert!(lineage.ingest_spawn_event(&exec(
             2301,
@@ -971,6 +979,7 @@ mod tests {
         let packaged = |p: &str| super::packaged(t.path(), p, me);
         let probe = |pid| known_probe_by(&lineage, &packaged, pid, PROG_TYPE_KPROBE, 9 * s);
         assert_eq!(probe(2301), Ok(3));
+        assert_eq!(probe(868), Ok(3), "in a mount namespace of its own");
         assert!(probe(3000).is_err(), "its own program at the load");
         assert!(probe(3001).is_err(), "no exec recorded as of the load");
         assert_eq!(
