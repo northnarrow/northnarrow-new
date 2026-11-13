@@ -253,25 +253,32 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
 #[test]
 fn a_set_id_target_does_not_escape_the_environment_deny() {
     let e = code("agent-ebpf/src/execpol.rs");
-    let p = body(&e, "on_pass");
+    // the re-check of #547 (G6): the environment's own program
+    let p = body(&e, "try_exec_env_lsm");
     in_order(
         p,
         &[
             "let setid = mode_bits & 0o6000 != 0;",
-            "if ef & env_flags::DENYABLE != 0 {",
             "let root = tv & tier_sig::ROOT != 0;",
-            "if conf(conf_slot::ENV_DENY) & tb != 0",
-            "|| (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0)",
+            "let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0",
+            "|| (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);",
+            // lot 325 (R2; the review of #547, F1): the bits make an
+            // environment the first pass cannot clear fail closed —
+            // stricter, never an exemption
+            "let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);",
+            "if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {",
             "env_act |= action::DENY;",
             "|| (setid && ef & env_flags::GLIBC_TUNABLES != 0);",
         ],
     )
     .unwrap();
-    // the bits are read for the tunables' report only
+    // the bits are read for the tunables' report and (lot 325) to refuse an
+    // environment the scan could not finish, nothing else
     assert_eq!(
         p.matches("setid").count(),
-        2,
-        "the set-id bits decide something besides GLIBC_TUNABLES' report:\n{p}"
+        3,
+        "the set-id bits decide something besides GLIBC_TUNABLES' report and lot 325's \
+         fail-closed:\n{p}"
     );
     assert!(!p.contains("!setid"), "{p}");
     // the operator's document says so

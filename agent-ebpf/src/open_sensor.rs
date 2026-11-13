@@ -45,9 +45,9 @@ use northnarrow_common::wire::open_sensor::{
         CHILDREN_PROBE, CHILD_FILES, CLASSIFIED, DEPTH_CAPPED, DIRECT, DIR_HAS_FILES,
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, OWN_DATA_BITS, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
-        TREE_USER_CACHE,
+        TREE_USER_CACHE, WALK_LOST,
     },
-    carved_class, cgroup_step, created_in_window, destroys_an_original, first_in_window,
+    carved_class, dir_class_cacheable, cgroup_step, created_in_window, destroys_an_original, first_in_window,
     first_write, kdbx_suffix, marks_had_data, name_ext, open_reason, own_after, own_code, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
     DestroySeenKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow,
     OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, WriteKind, CHILD_RULES_MAX, NAME_HEAD_LEN,
@@ -176,19 +176,138 @@ const INODE_WIN: usize = 128;
 pub(crate) struct OpenTask {
     win: [u8; FILE_WIN + INODE_WIN],
     names: [u8; 128],
+    /// The review of #547 (F6; the re-check, G5): the share's row
+    /// ([`OPEN_TASK_PER_SHARE`]: the login's, or the uid's)
+    /// the entry takes, given back when the task is freed.
+    uid: u32,
+    _pad: u32,
 }
+// The agent reads the uid of each entry to recount the shares
+// (`northnarrow_common::wire::open_sensor::OpenTaskRaw`).
+const _: () = assert!(
+    core::mem::offset_of!(OpenTask, uid) == northnarrow_common::wire::open_sensor::OPEN_TASK_BUFFERS
+        && core::mem::size_of::<OpenTask>()
+            == core::mem::size_of::<northnarrow_common::wire::open_sensor::OpenTaskRaw>()
+);
 /// Lot 322 (the review of #546, F3): [`OpenTask`] is the running task's own
 /// entry, keyed by its `task_struct` (`crate::task_scratch`), made by
-/// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`) and
-/// removed before the program returns. They were two per-CPU buffers in
-/// programs that run preemptible: on a `full`/`lazy` kernel another task's
-/// open on the same CPU could rewrite the window or the names between the
-/// read and the use, and a credential file's path went out with an
-/// innocent task's pid — `NN-L-FIM-011`/`014` kill that pid, and the
-/// FIM-010..017 records are posture floors.
+/// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`).
+/// They were two per-CPU buffers in programs that run preemptible: on a
+/// `full`/`lazy` kernel another task's open on the same CPU could rewrite
+/// the window or the names between the read and the use, and a credential
+/// file's path went out with an innocent task's pid — `NN-L-FIM-011`/`014`
+/// kill that pid, and the FIM-010..017 records are posture floors.
+///
+/// Lot 325 (cost): the entry lives as long as its task — made at its first
+/// open, removed when the kernel frees the task (`task_free`,
+/// `crate::task_scratch::nn_task_free`) — so an open costs one lookup. It
+/// was made zeroed and removed in each run: an insert of 512 bytes and a
+/// delete per open, +180 to +270 ns. Every byte a run reads it wrote first
+/// (the windows whole, each name zeroed before it is read), so nothing of
+/// the task's last open is read. Allocated as tasks come
+/// (`BPF_F_NO_PREALLOC`), up to [`OPEN_TASK_CAP`] tasks; past it, the plain
+/// observer (counted). Without the `task_free` program attached
+/// (`crate::task_scratch::task_free_armed`), each run removes its entry, as
+/// before.
 #[map]
 static OPEN_TASK: HashMap<u64, OpenTask> =
+    HashMap::with_max_entries(OPEN_TASK_CAP, crate::task_scratch::BPF_F_NO_PREALLOC);
+/// Tasks with an [`OPEN_TASK`] entry at once: the live tasks that opened a
+/// file (a busy host runs a few thousand).
+pub(crate) const OPEN_TASK_CAP: u32 = 65536;
+/// The review of #547 (F6; the re-check, G5): one share of [`OPEN_TASK`] —
+/// a login's (its container subuids included), or a service's uid
+/// (`crate::task_scratch::share_key`): one user's idle threads cannot take
+/// every other task's.
+pub(crate) const OPEN_TASK_PER_SHARE: u64 = 16384;
+/// The tasks' entries each share holds.
+#[map]
+static OPEN_TASK_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// The entries of the shares [`OPEN_TASK_UIDS`] has no row for (it is
+/// full), under the same cap (`OVERFLOW_SHARE`).
+#[map]
+static OPEN_TASK_OVERFLOW: Array<u64> = Array::with_max_entries(1, 0);
+/// The review of #547 (F6): a run's own entry when [`OPEN_TASK`] has no room
+/// for the task (full, its uid's share taken) or `task_free` does not run —
+/// made and removed in the run, as lot 322's: the open is judged whole,
+/// at an insert and a delete's cost. Never blind.
+#[map]
+static OPEN_TASK_RUN: HashMap<u64, OpenTask> =
     HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
+/// The review of #547 (F6): per-CPU counts — [`OPEN_TASK_PER_CALL`] opens
+/// judged in a run's own entry while `task_free` runs, [`OPEN_TASK_LOST`]
+/// opens with no entry at all (the plain observer). The agent reports them.
+#[map]
+pub static OPEN_TASK_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+pub(crate) const OPEN_TASK_PER_CALL: u32 = 0;
+pub(crate) const OPEN_TASK_LOST: u32 = 1;
+
+#[inline(always)]
+fn open_task_bump(slot: u32) {
+    if let Some(c) = OPEN_TASK_COUNTERS.get_ptr_mut(slot) {
+        // SAFETY: per-CPU slot, bounded by the map size.
+        unsafe { *c = (*c).wrapping_add(1) };
+    }
+}
+
+/// The running task's buffers (`task`: its `task_struct`), and whether they
+/// live as long as the task: its [`OPEN_TASK`] entry — made at its first
+/// open while `task_free` runs, within its uid's share — or this run's own
+/// ([`OPEN_TASK_RUN`]). `None`: neither has room (counted).
+#[inline(always)]
+unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
+    if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
+        return Some((p, true));
+    }
+    if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {
+        return Some((p, false));
+    }
+    if crate::task_scratch::task_free_armed() {
+        if nn_open_task_make(task) != 0 {
+            if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
+                return Some((p, true));
+            }
+        }
+        open_task_bump(OPEN_TASK_PER_CALL);
+    }
+    match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {
+        Some(p) => Some((p, false)),
+        None => {
+            open_task_bump(OPEN_TASK_LOST);
+            None
+        }
+    }
+}
+/// The re-check of #547 (G5): the running task's [`OPEN_TASK`] entry made
+/// (zeroed), within its share ([`OPEN_TASK_PER_SHARE`]; the row it is
+/// counted in kept in the entry). 1: made; 0: the share taken or the map
+/// full. A global function: checked once, its share's branches not in the
+/// sensor's states.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_open_task_make(task: u64) -> u64 {
+    let row = match crate::task_scratch::share_take(
+        &OPEN_TASK_UIDS,
+        &OPEN_TASK_OVERFLOW,
+        crate::task_scratch::share_key(),
+        OPEN_TASK_PER_SHARE,
+    ) {
+        Some(r) => r,
+        None => return 0,
+    };
+    // SAFETY: the running task's own entry of this module's map.
+    match unsafe { crate::task_scratch::make(&OPEN_TASK, &task) } {
+        Some(p) => {
+            unsafe { (*p).uid = row };
+            1
+        }
+        None => {
+            crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, row);
+            0
+        }
+    }
+}
+
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -359,7 +478,11 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
         gen,
         _pad: 0,
     };
-    let _ = DIR_CLASS.insert(dkey, &c, 0);
+    // Lot 325 (R3): a walk that could not run is not the directory's
+    // class: not cached, the next open walks again.
+    if dir_class_cacheable(c.bits) {
+        let _ = DIR_CLASS.insert(dkey, &c, 0);
+    }
     c
 }
 
@@ -442,11 +565,12 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
     // The running task's buffers: [`on_open`]'s, or made here for an
     // unlink or a rename (`forget_task` removes them).
     let task = bpf_get_current_task();
-    let scratch = match crate::task_scratch::get_or_make(&OPEN_TASK, &task) {
-        Some(p) => (*p).names.as_mut_ptr(),
+    let scratch = match task_buffer(task) {
+        Some((p, _)) => (*p).names.as_mut_ptr(),
         None => {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
-            return u64::from(u32::MAX) << 32;
+            // Lot 325 (R3): lost, never cached ([`dir_class`]).
+            return (u64::from(u32::MAX) << 32) | u64::from(WALK_LOST);
         }
     };
     let mut bits = 0u32;
@@ -773,23 +897,27 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 /// The whole `file_open` work of the sensor variant of the FIM observer
 /// (`fim_watch::fim_file_open_sensor`): the FIM watch and the sensor, from
 /// one read of `struct file` and one of the inode, in the running task's
-/// own buffers ([`OPEN_TASK`]), removed at the end.
+/// own buffers ([`task_buffer`]: kept for the task's life, or this run's).
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
     let task = bpf_get_current_task();
-    let t = match crate::task_scratch::make(&OPEN_TASK, &task) {
-        Some(p) => p,
+    let (t, live) = match task_buffer(task) {
+        Some(x) => x,
         None => {
-            // The map full: FIM still sees the open (the plain observer,
-            // field by field, no shared buffer); the sensor's look is
-            // lost, counted.
+            // No room anywhere: FIM still sees the open (the plain observer,
+            // field by field, no shared buffer); the sensor's look is lost,
+            // counted.
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
             crate::fim_watch::observe_open_plain(file);
             return;
         }
     };
     on_open_in(file, t);
-    let _ = OPEN_TASK.remove(&task);
+    // Lot 325: a task's entry stays for its next open, removed at
+    // `task_free`; a run's own, at the end of the run.
+    if !live {
+        let _ = OPEN_TASK_RUN.remove(&task);
+    }
 }
 
 #[inline(always)]
@@ -1540,10 +1668,25 @@ unsafe fn try_file_cap(ctx: &LsmContext) {
 
 /// Lot 322 (the review of #546, F3): the walk's buffers an unlink or a
 /// rename made ([`nn_open_walk`] from [`nn_unlink_burst`]), removed at the
-/// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe`.
+/// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe` — lot 325:
+/// a run's own entry; a task's lives until `task_free`.
 #[inline(always)]
 pub(crate) fn forget_task() {
     // SAFETY: a helper call with no argument.
     let task = unsafe { bpf_get_current_task() };
-    let _ = OPEN_TASK.remove(&task);
+    let _ = OPEN_TASK_RUN.remove(&task);
+}
+
+/// Lot 325: the task `task` (its `task_struct`) is being freed: its entry
+/// goes, its uid's share given back.
+#[inline(always)]
+pub(crate) fn forget_freed(task: u64) {
+    // SAFETY: lookups and a delete in this module's maps.
+    let uid = match unsafe { OPEN_TASK.get(&task) } {
+        Some(t) => t.uid,
+        None => return,
+    };
+    if OPEN_TASK.remove(&task).is_ok() {
+        crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, uid);
+    }
 }

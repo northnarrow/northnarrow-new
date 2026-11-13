@@ -156,6 +156,10 @@ pub fn state() -> String {
 /// kept for the signed degradation. R11c (lab PR 264): the configuration
 /// and the maps are the start's (`exec_guards::AgentExecGuards`); they were
 /// process-wide statics (`configure`, `take_kernel`).
+/// The review of #547 (F4): the program that frees a failed exec's
+/// candidate (`agent-ebpf/src/execq.rs`).
+pub const FAILED_EXEC_PROGRAM: &str = "execq_exec_failed";
+
 pub fn install(
     ebpf: &mut aya::Ebpf,
     cfg: &Config,
@@ -182,6 +186,21 @@ pub fn install(
         return Ok(None);
     }
     let taken = kernel::take(ebpf)?;
+    // The review of #547 (F4): a failed exec's candidate is freed with the
+    // exec's file (LSM `file_free_security`); without it, at the task's next
+    // exec or end only — logged, the guard runs.
+    let failed = aya::Btf::from_sys_fs()
+        .map_err(anyhow::Error::from)
+        .and_then(|btf| {
+            antitamper_bpf::attach_transient(ebpf, FAILED_EXEC_PROGRAM, "file_free_security", &btf)
+        });
+    if let Err(e) = failed {
+        tracing::error!(
+            error = format!("{e:#}"),
+            "exec quarantine: the failed-exec program was refused — a failed exec's candidate \
+             stays until the task's next exec or its end (its uid's share bounds them)"
+        );
+    }
     set_state(format!("{} (starting)", m.as_str()));
     info!(
         mode = m.as_str(),

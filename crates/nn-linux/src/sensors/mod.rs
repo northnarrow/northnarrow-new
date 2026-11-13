@@ -37,6 +37,9 @@ pub mod open_sensor;
 pub mod pump;
 pub mod reject;
 pub mod ring_drops;
+/// Lot 325: the `task_free` program, which removes the entries that live as
+/// long as their task.
+pub mod task_free;
 
 pub use exec::ExecSensor;
 pub use multiplexer::SensorMultiplexer;

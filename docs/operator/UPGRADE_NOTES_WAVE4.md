@@ -1656,3 +1656,83 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
   signal that ends a tool, sent by a command line this reader does not
   name, is not recorded (lot 330 is to report every default-fatal signal).
+
+## 33. The exec environment's check complete (lot 325)
+
+- **A staging preload behind other variables is refused now.** The check of
+  [the exec policy's design, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)
+  read the first 64 variables of an exec's environment. It reads all of
+  them. Expect `NN-L-EXECENV-001` records and refused execs where a staging
+  `LD_PRELOAD` / `LD_AUDIT` sat past the 64th variable: CI jobs, IDE
+  terminals and Kubernetes pods carry far more than 64. Nothing to
+  configure.
+- **An environment longer than any the kernel accepts** (more than
+  1,048,576 variables: its array grew after the kernel counted it) is
+  refused at a protected target — a tier whose rule refuses a staging
+  preload — or a set-id one, and recorded High (`NN-L-EXECENV-002`, "could
+  not be read whole"). No legitimate program comes near it (the lab's
+  measurements are in the lot's note in the [capability program](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md)).
+- **Each `LD_PRELOAD` is judged, each entry as the loader reads it.** An
+  environment with two (a staging one and a clean one) is refused whichever
+  comes last. Each value is read whole (about 4 KiB at the exec's check),
+  split as the loader splits it (colons and white space for `LD_PRELOAD`)
+  and each path normalised: `//tmp/x.so`, `/./tmp/x.so`, 120 spaces then
+  `/tmp/x.so` are refused like `/tmp/x.so`. **A relative loader path**
+  (`LD_PRELOAD=./x.so`, `lib/x.so`, or a bare name with a relative
+  `LD_LIBRARY_PATH`) **is refused where a staging preload is** (a tier whose
+  rule refuses one, a set-id target) and recorded elsewhere
+  (`relative_loader_path`). **A clean value longer than 128 bytes is no
+  longer refused** (it was, as "not finished"). **A loader value with a
+  control byte or a `$` token is refused where a staging preload is**
+  (`irregular_loader_value`), and so is a bare `LD_PRELOAD` / `LD_AUDIT`
+  name with an empty `LD_LIBRARY_PATH` element (the caller's directory). An
+  empty element alone — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the
+  variable unset — is only recorded.
+- **New status counts** on the exec policy's line of `nn-admin status`, when
+  not zero: "environments not finished", "changed after the kernel's copy",
+  "execs let through without their walk" (`--json`: `env_truncated`,
+  `env_changed`, `lost_open`).
+- **A new program, `execpol_env_commit`, on `sched_process_exec`.** It reads
+  the new image's environment — the kernel's own copy — after the exec's
+  point of no return and kills the image (`SIGKILL`, before its first
+  instruction) when it holds a staging loader entry the exec's first check
+  did not see. A legitimate program never shows one there: the first check
+  would have refused it. Two optional BTF offsets (`mm_struct.env_start`,
+  `env_end`, slots 130–131; the enum, tracepoint and hook-argument slots
+  move by two: 146 slots). Without them, or with the program refused by the
+  verifier, the start signs an `exec_policy` degradation and the first check
+  works alone. It also kills a protected or set-id target on what it cannot
+  clear (a loader value longer than about 4 KiB, a relative path, an
+  unreadable string), and records it elsewhere.
+- **A new LSM program, `nn_task_free`** (`task_free`), attached with the
+  file-open sensor or the exec guards. It removes, when the kernel frees a
+  task, the entries that live as long as the task: the file-open sensor's
+  buffer (kept between opens now: one lookup per open), the exec
+  quarantine's candidate (`EXECQ_CAND`, a plain hash now), the exec
+  policy's note for the post-commit check. **A new LSM program,
+  `execq_exec_failed`** (`file_free_security`), attached with the exec
+  quarantine, removes a failed exec's candidate when its file is freed;
+  each login holds at most 1,024 candidates (a session's container
+  subuids count as the login), and a dropped one is counted in `not_held`
+  and signed (`exec quarantine fail-open`); the map full, the oldest
+  stuck candidate goes for the new one, counted and signed the same way.
+- **A new LSM program, `exec_env_lsm`** (`bprm_check_security`), attached by
+  the exec policy when it judges the environment: the environment's check,
+  moved out of the exec sensor's `exec_check_lsm` (each program has its own
+  verifier budget). A tool that lists the agent's programs sees one more on
+  the hook; without it the start signs an `exec_policy` degradation.
+- **The file-open sensor's per-task buffers** are capped per login (16,384);
+  past it the open is judged in a buffer of its own run (correct, at the
+  cost before lot 325), counted in `nn-admin status --json`
+  (`open_sensor_per_call_total`, appended last: a reader that requires the
+  key set must accept it).
+- **Past the exec guards' capacity** (2048 execs preempted in the middle
+  of the exec sensor at once: a fork bomb), enforce mode refused every exec,
+  an administrator's shell's included. A protected target (a deny that the
+  tier, memfd, deleted, tmpfs, a world-writable directory or the
+  environment support) is still refused; an environment that could not be
+  read is judged on the kernel's copy after the commit (a staging preload
+  killed there); every other exec runs and is recorded
+  (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
+  the degradation `execpol_capacity` while it lasts.
+

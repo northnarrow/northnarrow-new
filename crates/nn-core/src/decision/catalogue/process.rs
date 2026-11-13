@@ -632,7 +632,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     // ── exec policy (lab PR 226, experimental, off by default) ──────
     RuleDoc {
         id: "NN-L-EXECPOL-001_StagingExecDenied",
-        severities: &[Severity::High, Severity::Medium],
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
@@ -640,7 +640,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    file, /dev/shm, /tmp… per the profile's table) by a caller of a lineage \
                    tier (admin, session, service) the table denies: refused with EACCES \
                    before the exec's point of no return (enforce, High) or recorded as \
-                   \"would deny\" (audit, Medium). Recorded by the policy's controller.",
+                   \"would deny\" (audit, Medium). Recorded by the policy's controller. Lot \
+                   325: with the exec guards' per-task buffers full (a flood of execs in \
+                   flight) an exec is judged without its walk — a protected target refused, \
+                   every other exec let through and recorded (Low).",
         false_positives: "The desktop profile allows a login session's own staging locations \
                           (AppImage, build trees); `exempt` lines of the signed \
                           exec-policy.local; audit mode first.",
@@ -649,6 +652,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "agent/src/execpol/record.rs::a_denied_exec_is_one_high_record",
             "agent/src/execpol/record.rs::memfd_and_deleted_techniques",
+            "agent/src/execpol/record.rs::an_exec_judged_without_its_walk_is_recorded",
             "deploy/lab/malsim/exec-check.sh::MS-01",
         ],
         attack_note: "Per record: T1620 for a memfd or a deleted file (and T1070.004 for the \
@@ -657,7 +661,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-EXECENV-001_PreloadFromStaging",
-        severities: &[Severity::High, Severity::Medium, Severity::Low],
+        severities: &[
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
@@ -666,13 +675,18 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    as any other (lot 318: the policy does not count on AT_SECURE), or \
                    recorded; a set-id target recorded says whether the loader ignores the \
                    entry (the exec changes the credentials: AT_SECURE) or honours it (root \
-                   running a set-uid-root file changes none). On 7.0 the environment check \
-                   sees the execs of one CPU only (lot 322).",
+                   running a set-uid-root file changes none). Lot 325: every variable is \
+                   read (it was the first 64) and every occurrence judged; the new image's \
+                   environment, the kernel's own copy, is read again past the exec's point \
+                   of no return — an entry seen only there is the environment changed after \
+                   the copy, and the image is killed before its first instruction where the \
+                   tier refuses it (Critical).",
         false_positives: "A developer's own preload from a build tree in a session (Low).",
         how_to_test: "`nn-lab.sh malsim-exec-check`: MS-32, LD_PRELOAD of a no-op library \
                       from /tmp into a service.",
         tests: &[
             "agent/src/execpol/record.rs::the_preload_record",
+            "agent/src/execpol/record.rs::a_preload_seen_only_in_the_kernel_s_copy_is_the_environment_changed",
             "deploy/lab/malsim/exec-check.sh::MS-32",
         ],
         attack_note: "",
@@ -692,7 +706,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    target (Critical in the shape of CVE-2023-4911), a library path into \
                    staging for a service or root, shell history disabled; an environment \
                    the exec sensor could not read whole (High: its loader variables \
-                   were not judged).",
+                   were not judged); lot 325: one the scan could not finish, more \
+                   variables than any the kernel accepts, or a loader variable's value \
+                   longer than the check reads (High; refused at a protected or set-id \
+                   target).",
         false_positives: "History disabled by a user's own shell configuration (Low, repeats \
                           held back).",
         how_to_test: "Run `su` with `GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A` \
@@ -700,6 +717,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "agent/src/execpol/record.rs::tunables_history_and_library_path",
             "agent/src/execpol/record.rs::an_environment_not_read_whole_is_one_high_record",
+            "agent/src/execpol/record.rs::an_environment_the_scan_could_not_finish_is_one_high_record",
+            "agent/src/execpol/record.rs::a_loader_value_longer_than_its_capture_is_not_judged_whole",
         ],
         attack_note: "Per record: T1068 for the set-id exploit's environment, T1574.006 for \
                       the library path, T1070.003 for the history.",

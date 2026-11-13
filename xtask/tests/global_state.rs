@@ -339,6 +339,20 @@ const STATICS: &[Kept] = &[
         "the fail-open counters are read (the object exports them)",
     ),
     kept(
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "PER_CALL_TOTAL",
+        Kernel,
+        "the file-open sensor's opens judged without the task's buffer (the review of #547, \
+         F6), a counter of the one eBPF object, as sampled for the status",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/task_free.rs",
+        "ATTACHED",
+        Kernel,
+        "the one eBPF object's `task_free` program attached and armed (the review of #547, \
+         F9): the sensor, the quarantine and the policy each ensure it, once per object",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/filesystem.rs",
         "BOOT_KEYS",
         Kernel,

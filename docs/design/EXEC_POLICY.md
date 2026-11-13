@@ -225,12 +225,72 @@ own syscall argument, as its registers hold it (`task_pt_regs`: `dx` for
 array of 32-bit pointers, the register's low half as the kernel reads it).
 The kernel copied the strings earlier in the exec, into the new image's
 stack, which the program cannot read: this is a second read of the
-caller's memory, after the kernel's copy (see the limits below). At most 64
-variables are read, and the first 24 bytes of each are compared against a
-fixed set of names. The values of the loader
-variables are captured: 128 bytes of `LD_PRELOAD`, 64 of `LD_AUDIT`, 64 of
-`LD_LIBRARY_PATH`, 128 of `GLIBC_TUNABLES` and 16 of `HISTFILE`. Nothing
-else of the environment is read or reported. The findings go into the
+caller's memory, after the kernel's copy (see the limits below). Lot 325
+(the re-check of #546, R2): **every variable is read**. Each costs its
+pointer and the first eight bytes of its name; the names the scan judges
+(`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `GLIBC_TUNABLES`, the history
+ones) are then read whole, 24 bytes compared against a fixed set of names.
+The scan is three loops of global functions, 128 rounds of 128 steps of 64
+variables: 1,048,576, above any environment the kernel accepts (its strings
+and pointers share at most 6 MiB, and each variable costs 9 bytes at least:
+699,050). It read the first 64: 64 padding variables, then a staging
+`LD_PRELOAD`, passed — no privilege, no race — and for a root session left
+no record. An array longer than the cap can only have grown after the
+kernel counted it: `TRUNCATED`, counted (`nn-admin status`: "environments
+not finished"), recorded (`NN-L-EXECENV-002`, High), and **refused at a
+protected target** (the tier's rule refuses a staging preload: `deny`, or
+`deny-root` with a root caller) **or a set-id one**. The choice rests on
+what legitimate programs carry, measured: see the lot note in
+`docs/roadmap/CAPABILITY_PROGRAM.md` (tens to a few hundred variables on our
+hosts, a CI runner and a build script; a Kubernetes pod carries about seven
+per service of its namespace, thousands at most — every one far below the
+cap, which no exec the kernel accepts can reach). Each occurrence of a
+loader variable is judged when it is read (the mini-hunt): glibc's loader
+takes the last `LD_PRELOAD`, musl's (and any `getenv`) the first, and the
+scan judged the last only, so a staging preload first and a clean one last
+passed into a musl target.
+
+The review of #547 (F1, F7): **each loader value is judged whole, entry by
+entry, as the loader reads it.** The value is read 255 bytes at a time, up
+to 16 reads (about 4 KiB, `ENV_VALUE_READS`), and every byte goes through
+one parser (`value_parse` in `common/src/wire/execpol.rs`, the same code
+the host tests run): `LD_PRELOAD` splits on colons, spaces and the other
+`isspace` bytes (glibc and musl), `LD_AUDIT` on colons, `LD_LIBRARY_PATH`
+on colons and semicolons; each entry's path is normalised (`//`, `/./`,
+`..`) and judged against the staging directories (`/tmp`, `/var/tmp`,
+`/dev/shm`, `/proc`, `/dev/fd`). A relative entry (a `/` not at its start:
+`./x.so`, `lib/x.so`), or a bare name searched through a relative
+`LD_LIBRARY_PATH` directory, says nothing of where it resolves:
+`relative_loader_path` (`PRELOAD_RELATIVE`), refused at a protected or
+set-id target and recorded elsewhere; a bare name searched through a
+staging `LD_LIBRARY_PATH` directory is a staging preload. The re-check of
+#547 (G1–G4): a loader value holding a control byte (glibc keeps a tab
+inside an `LD_PRELOAD` entry, which the musl split read as two entries;
+musl splits its library path on a newline) or a `$` (glibc expands `$LIB`,
+`$ORIGIN`, `$PLATFORM` — `$LIB` is two components on Ubuntu, so
+`/tmp/$LIB/../../x.so` is `/tmp/x.so`) is `irregular_loader_value`
+(`LOADER_IRREGULAR`), whichever variable: refused at a protected or set-id
+target, recorded elsewhere — legitimate set-id execs carry none of them.
+An empty `LD_LIBRARY_PATH` element (`:`, `a::b`, a trailing `:`: glibc
+searches the caller's directory there) is a relative directory (the
+re-check 2 of #547): alone it is recorded (`library_path_staging`), never
+refused — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the variable
+unset is its commonest shape, and it was refused in containers, root shells
+and `sudo`; a bare `LD_PRELOAD` / `LD_AUDIT` name searched in it, the
+combination that loads from the caller's directory, is `relative_loader_path`,
+refused where a staging preload is. It compared the
+first nine bytes of each entry of a 128-byte capture: 120 spaces then
+`/tmp/x.so`, `//tmp/`, `/./tmp/`, a tab (musl) passed, and a clean value
+longer than 128 bytes was refused as not finished. A value longer than the
+reads (`LOADER_CUT`, and a bare name with an `LD_LIBRARY_PATH` that long) is
+not refused at the first pass when what it read is clean: the post-commit
+check judges the kernel's copy of it (below). At most 64 judged names are
+read whole per exec (`ENV_JUDGED_MAX`; past them, `TRUNCATED`): no
+legitimate environment carries that many. The values of the loader
+variables are captured for the record: 128 bytes of `LD_PRELOAD`, 64 of
+`LD_AUDIT`, 64 of `LD_LIBRARY_PATH`, 128 of `GLIBC_TUNABLES` and 16 of
+`HISTFILE` (a longer one is quoted cut, `VALUE_CUT`: the judgment rests on
+the whole value). Nothing else of the environment is read or reported. The findings go into the
 task's own `EXECPOL_ENV` entry, keyed by its thread id and start time. They
 are judged in the same run, and the entry is removed.
 
@@ -274,19 +334,30 @@ the same way: a preload into a capability binary from a service is refused,
 which the loader would have ignored anyway. The set-id bits still decide
 where `GLIBC_TUNABLES` is reported.
 
-**On 7.0 the environment check is unreliable** (Ubuntu 26.04's 7.0.0-43;
-pre-existing, not lot 318's; follow-up lot 322). The scan runs in the
-`sys_enter_execve` / `sys_enter_execveat` tracepoint programs, and on that
-kernel a syscall tracepoint's BPF program runs for the execs of one CPU
-only (lot 322's lab: attached as aya and libbpf attach it, it fired for
-CPU 0's execs and for no other CPU's). An exec on another CPU reaches pass 0
-with no finding: on `main`, 0 of 11 staging preloads were refused; on this
-branch, pinned to CPU 0 with `taskset` 20 of 20, unpinned 6 of 20, from a
-service 2 of 10. On 5.15, 6.8 and 6.12 the lab's cases are all refused.
-Until lot 322 moves the scan into the exec's own hook, the deny of this
-section (and its set-id case) holds on 7.0 only for the execs the scan
-sees; the policy's cells by class and tier are judged in the exec's LSM
-hook and are unaffected.
+Lot 322 moved the read from the `sys_enter_execve{,at}` tracepoints (on
+Ubuntu 26.04's 7.0 they ran for CPU 0's execs only) into the exec's own
+`bprm_check_security` run. The re-check of #547 (G6): that run is a second
+LSM program on the hook, `exec_env_lsm`, beside the exec sensor's
+`exec_check_lsm` — the scan, the judgment, the record of the first pass and
+the note for the post-commit check, at the exec's first pass. The verifier
+gives each program its own million instructions: with the scan inside it,
+`exec_check_lsm` counted 930,372 on 5.15 (measured by a kprobe on the
+verifier's `check_max_stack_depth` while `verifier-check` loaded it: 5.15
+has no `verified_insns`, and the loader keeps the verifier's log only for a
+refusal). BPF-LSM runs a hook's programs in turn and the first refusal
+refuses the exec; the policy attaches `exec_env_lsm` after the exec sensor's
+program, so an exec refused on its classes is recorded on them, not also on
+its environment. Without the program (refused by the verifier, not
+attached), the start signs an `exec_policy` degradation and the environment
+is not judged at exec.
+
+Lot 325 (the re-check of #546, R1): an **x32** exec's `envp` is the
+register whole, as the kernel's x32 stub passes it (`SC_X86_64_REGS_TO_ARGS`,
+`__SC_DELOUSE`); only an **ia32** exec's is the register's low half (the
+ia32 stub's `(unsigned int)` cast). Lot 322 truncated both: a 64-bit caller
+of the x32 `execve` put the real array above 4 GiB and a clean decoy at its
+low half, and the scan read the decoy (where the kernel has x32 at run
+time; Ubuntu's 7.0 has not).
 
 Lot 315 (external bug hunt 1.4, BUG-101, the record's half): a set-id
 target is no `AT_SECURE` by its bits alone. The kernel sets it when the
@@ -306,9 +377,15 @@ not apply (`nosuid` mount, `no_new_privs`, a set-id `#!` script) still reads
 `GLIBC_TUNABLES` at a set-id target stays reported by the bits (an exploit
 attempt is one whatever the caller).
 
-Limits, by design: the string check reads prefixes of the value, not
-resolved paths (`//tmp/x.so`, `/./tmp/x.so`, a symlink, `..`); the first 128
-bytes of `LD_PRELOAD`; the first 64 variables (`TRUNCATED` is counted);
+Limits, by design: the string check normalises the path's text (`//`,
+`/./`, `..`; the review of #547) but resolves no link (a symlink to a
+staging file); a relative path (a bare name in an empty library-path
+element included), a control byte or a `$` token is refused at a protected
+or set-id target whatever it names; about 4 KiB of each loader value at the first pass (a
+longer value is judged on the kernel's copy after the commit: killed at a
+protected or set-id target, recorded elsewhere); an array longer than any
+the kernel accepts (`TRUNCATED`, refused at a protected or set-id target,
+above);
 another architecture than x86-64 (the `pt_regs` offsets do not resolve: a
 signed degradation). The mapping check (§6) does not depend on the string.
 
@@ -322,11 +399,60 @@ unmap the page in that window, and make it deterministic with a
 FUSE-backed `argv` page whose read the daemon holds. The kernel keeps its
 copy; the scan judges what the memory holds when it reads. A string or an
 entry it cannot read is `UNREADABLE`: counted (`ENV_UNREAD`, `nn-admin
-status`: "environments not read") and recorded (`NN-L-EXECENV-002`, High),
-never refused. The tracepoint read before the copy had the mirror-image
-race. Reading the kernel's own copy (the new image's stack pages, or a
-check of `mm->env_start..env_end` after the point of no return, which no
-other thread shares) is lot 325's.
+status`: "environments not read") and recorded (`NN-L-EXECENV-002`, High).
+
+**The kernel's own copy, past the point of no return (lot 325).** A second
+program, `execpol_env_commit` on `sched_process_exec` (a tracepoint that is
+no syscall's: it runs on every CPU), reads the new image's environment —
+`[mm->env_start, mm->env_end)`, the strings the kernel copied and
+`create_elf_tables` placed, which the loader will read — after the exec's
+point of no return and before the image's first instruction. No other task
+shares that memory (the exec ended every other thread of the caller; the
+new `mm` is no one else's), so this read cannot be raced. It reads the
+strings one after another, compares each one's first eight bytes, and reads
+the judged names whole and judges their values with the first pass's
+parser (above) — in a per-CPU buffer (`COMMIT_ENV`: the tracepoint runs
+with preemption off), which no flood of execs in flight can take, and
+bounded (the review of #547, F8): at most 8 rounds of 192 steps of 64 reads
+(98,304 reads of the strings) and 64 judged names; past them, not finished
+(`TRUNCATED`). A staging loader entry there that the first pass did not
+see — or saw and refused, which leaves no image — is the environment
+**changed after the kernel's copy** (`CHANGED`): counted (`nn-admin
+status`: "changed after the kernel's copy", `env_changed`), recorded
+(`NN-L-EXECENV-001`, Critical when killed), and, where the tier's rule
+refuses it in enforce mode, the image is **killed** (`SIGKILL`, delivered
+before it returns to user mode: the loader never runs). The review of #547
+(F2): what this read cannot clear is never silent either — a loader value
+longer than the reads, an environment past the bound, a relative loader
+path, a string it cannot read (`relative_loader_path`, `loader_value_cut`,
+`truncated`, `unreadable`): a protected target (the tier's rule refuses a
+staging preload) or a set-id one is killed, any other exec recorded and
+counted. It acted on new staging entries only. The record says `killed`
+only when the signal went (`bpf_send_signal` refuses for the global init,
+or a task already exiting): else "would deny" (F9). The first pass notes
+what it judged and let through (a tier that records, or an environment it
+could not read), so an entry it judged is no news. Audit mode records
+"would deny". The exec cannot fail with `EACCES` at that point; that is why
+the first pass stays.
+Two new optional BTF offsets, `mm_struct.env_start` and `env_end` (slots 130
+and 131); without them the program is not attached (a signed `exec_policy`
+degradation).
+
+Reading the kernel's copy at `bprm_check_security` itself, where the exec
+can still fail with `EACCES`, is not possible: the new image's memory
+(`bprm->mm`) belongs to no task yet, and no BPF helper reads an `mm` no task
+runs (`bpf_probe_read_user` reads the current one, the caller's;
+`bpf_copy_from_user_task` reads a task's, and is sleepable only). Walking its
+page tables by hand from the program would take the direct map's base
+(`page_offset_base`, randomised by KASLR, not in the BTF), the paging depth
+(4 or 5 levels), the memory-encryption mask, and up to 1,536 pages per exec.
+
+Limits of the post-commit check: a tracer the caller attached
+(`PTRACE_EVENT_EXEC` stops after it) can still write the new image's memory —
+it needs `ptrace` rights over it, which a set-id exec drops and which already
+give it the image; the tier is computed again from the new image (the one
+difference: an elevation binary that execs in place, `doas`, is no longer in
+the lineage — only when the first pass did not see the entry).
 
 ## 6. Executable mappings (`mmap_file`)
 
@@ -398,7 +524,15 @@ name.
 `; N partial` when a part could not start, or `degraded: …`) and the kernel's
 counts: denied, would deny, quarantine, quarantine inactive, environment
 denied / reported, mappings denied / reported; `execq_script_refused_total`
-for §7.
+for §7. Shown when not zero: environments not read (lot 322), runs without
+their buffer (lot 322; lot 325: the protected targets refused past the
+capacity), environments not finished, environments changed after the
+kernel's copy, execs let through without their walk (lot 325; `--json`:
+`env_unread`, `lost`, `env_truncated`, `env_changed`, `lost_open`).
+
+Lot 325: while the exec guards are past their capacity (§9), the runtime
+degradation `execpol_capacity`; `mm_struct.env_start` / `env_end` not
+resolved, or the post-commit program refused, a start degradation.
 
 Signed `subsystem_degraded`, one per cause at start: the exec sensor not on
 LSM (nothing can be refused); the exec's registers not readable (the
@@ -443,11 +577,97 @@ The rules are outside the frozen V2 validation denominator, like
   walks the file again (it copied the CPU's last walk, another file's
   path). The review of #546 (F4): plain hashes, never LRU (an LRU insert
   can evict an entry in flight and give its memory to another task), 2048
-  entries each; past them the exec is refused in enforce mode, a mapping
-  is classed `tmp`, `var_tmp`, `home` (not cached), each counted
-  (`LOST`, `nn-admin status`).
-- 5.15: every loop is in a global function verified on its own (`nn_env_scan`
-  64 iterations, `nn_list_staging` 128 bytes, `nn_execpol_tier` 8 hops,
+  entries each; past them a mapping is classed `tmp`, `var_tmp`, `home`
+  (not cached), counted (`LOST`, `nn-admin status`).
+- Lot 325 (the re-check of #546, R5): **the exec guards past their
+  capacity.** Past 2048 execs in flight (each a task preempted in the
+  middle of `exec_check_lsm`: a fork bomb's flood) lot 322 refused every
+  exec in enforce mode — the administrator's shell's too. An exec whose walk
+  cannot be made is now judged on what needs none (`nn_exec_unwalked`): the
+  caller's tier, memfd, deleted, tmpfs, a world-writable directory. It is
+  refused (counted in `LOST`) when those classes meet a deny cell. The
+  environment is judged by its own program (`exec_env_lsm`, the re-check of
+  #547), into its own entry whether or not the walk could be made: a staging
+  loader entry where the tier's rule refuses it, an environment past the cap,
+  a relative or irregular loader value at a **protected target** (the
+  tier's rule refuses a staging preload, or the file is set-id) are refused
+  there. The review of #547 (F5): an environment the flood left unread (its
+  own map full too) is no longer refused — that refused every root and service exec of a server
+  once both maps were full: it is noted for the post-commit check, which
+  reads the kernel's copy in its per-CPU buffer and kills a protected or
+  set-id target on a staging entry or on what it cannot clear (§5); the e2e
+  fills both maps and checks root's plain exec, `su`, and root's staging
+  preload (killed). Every other exec runs, counted in
+  `LOST_OPEN` ("execs let through without their walk", `lost_open`) and
+  recorded (`NN-L-EXECPOL-001`, Low, "judged without its walk"); the
+  quarantine holds nothing then (it needs the walk's path). While either
+  count moves, the agent signs the degradation `execpol_capacity` (held five
+  minutes at least: one record per episode), so that refusals the capacity
+  caused are told apart from the policy's. The e2e fills the maps itself
+  (`debug-execpol-fill`, `debug-trigger` builds): bounded, deterministic.
+- Lot 325 (the re-check of #546, R6): `EXECQ_CAND`, the candidate from the
+  exec's pass to its `sched_process_exec`, is a plain hash (4096 entries)
+  — an LRU insert could evict an entry a preemptible program holds and give
+  its memory to another task's candidate. Its entries go at
+  `sched_process_exec`, at the task's next exec, at a refused pass, and when
+  the kernel frees the task: the LSM `task_free` program `nn_task_free`
+  (also the FIM sensor's buffers, kept for the task's life since lot 325,
+  and `EXECPOL_ENV_SEEN`, the first pass's note for the post-commit check).
+  The review of #547 (F4): a failed exec's candidate stayed until the
+  task's next exec or its end, and one user's idle threads (each failing an
+  exec) filled the map for everyone: it goes when the kernel frees the
+  exec's file (the LSM `file_free_security` program `execq_exec_failed`,
+  which removes the task's candidate naming that inode); each share holds
+  at most 1024 candidates (`EXECQ_CAND_UIDS`) — the re-check of #547 (G5):
+  a login's share (`task->loginuid`, which every process of the session
+  keeps, the subuids of a rootless container included, and none can change
+  in a user namespace), a service's uid without one; it was the uid's, and
+  four subuids of one login filled the map. The shares the rows' map has no
+  room for share one overflow row under the same cap. The map full, the
+  oldest candidate still in it — made at least a second ago (its exec is
+  stuck: no program of its task holds it), found in a ring of the
+  candidates in the order they were made — goes for the new one
+  (`CAND_EVICTED`); none old enough, the new one is dropped
+  (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
+  `not_held` and in the signed `exec quarantine fail-open` degradation (one
+  per ten minutes while they move). `task_free` is attached
+  once per object and the agent tracks "attached", not "loaded" (F9: a load
+  whose attach failed made the next caller skip it, silently).
+- The review of #547 (F6): the FIM sensor's buffers (`OPEN_TASK`, 65,536
+  tasks) — each share (the login's, the re-check's G5, as above) holds at
+  most 16,384 (`OPEN_TASK_UIDS`); past it, or the
+  map full, the open is judged in a buffer made and removed in the run
+  (`OPEN_TASK_RUN`, the cost before lot 325: an insert and a delete), and
+  counted (`nn-admin status`: `open_sensor_per_call_total`); only with no
+  room in either is it the plain observer (counted as a ring drop). The
+  uids' shares are plain read-modify-writes (the eBPF crate has no atomics:
+  the re-review of #494, R1), so two runs that update one uid's share at the
+  same instant can lose an update: the agent recounts the shares from the
+  entries — the candidates' every 30 s, the FIM buffers' when opens went to
+  a run's own buffer (at most every five minutes) — and removes the rows of
+  uids that hold nothing.
+- Lot 325: the post-commit check `execpol_env_commit` (§5) and its maps:
+  `COMMIT_ENV` (the review of #547: one entry per CPU, sound there — the
+  tracepoint runs with preemption off — and out of a flood's reach; it was
+  the task's `EXECPOL_ENV` entry), `EXECPOL_ENV_SEEN` (keyed by
+  `task_struct`, written for what the first pass judged and let through).
+- 5.15: every loop is in a global function verified on its own (lot 325:
+  `nn_env_scan` 128 rounds of `nn_env_round`'s 128 steps of `nn_env_step`'s
+  64 variables (and 64 stops at judged names), the judged names in
+  `nn_env_var`; the post-commit check's
+  `nn_env_region` / `_round` / `_step`; the review of #547: a judged
+  name read whole by the scan itself (`nn_env_pending`), its value by
+  `nn_env_judge` in 255-byte reads (`nn_env_chunk`, each separator and `/`
+  in `nn_value_end` / `nn_value_slash`), the rounds and steps calling
+  nothing below them — inline, the judgment multiplied the loops' states
+  past the verifier's million instructions (7.0 and 5.15 refused
+  `exec_check_lsm`); the re-check of #547 (G6): the environment in its own
+  program, `exec_env_lsm` (processed on 5.15: 292,123, `exec_check_lsm`
+  141,595; 6.8: 268,903 and 87,890; 6.12: 269,131 and 96,410; 7.0: 330,221
+  and 87,234); the deepest
+  call chains 384 (`exec_check_lsm`) and 352 (`exec_env_lsm`) of 512 bytes
+  of stack,
+  `nn_execpol_tier` 8 hops,
   `nn_map_classify` the 64-level walk); findings are kept in map memory, not
   registers, so the loop states do not multiply; helper reads only
   (`bpf_probe_read_user{,_str}`, `bpf_get_current_ancestor_cgroup_id`, 5.10+

@@ -34,6 +34,17 @@ pub trait KernelIo {
     /// What the kernel's map refused of the (ranked) roots.
     fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> RootsRefused;
     fn counters(&self) -> [u64; counter::SLOTS as usize];
+    /// `debug-trigger` builds (lot 325, R5's e2e): fill the exec guards'
+    /// per-task maps (the environment's too with `env`); the entries made.
+    #[cfg(feature = "debug-trigger")]
+    fn debug_fill(&mut self, _env: bool) -> usize {
+        0
+    }
+    /// Empty what [`KernelIo::debug_fill`] made; how many.
+    #[cfg(feature = "debug-trigger")]
+    fn debug_empty(&mut self) -> usize {
+        0
+    }
 }
 
 impl KernelIo for kernel::Kernel {
@@ -63,6 +74,14 @@ impl KernelIo for kernel::Kernel {
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         kernel::Kernel::counters(self)
     }
+    #[cfg(feature = "debug-trigger")]
+    fn debug_fill(&mut self, env: bool) -> usize {
+        self.debug.fill(env)
+    }
+    #[cfg(feature = "debug-trigger")]
+    fn debug_empty(&mut self) -> usize {
+        self.debug.empty()
+    }
 }
 
 /// The controller's inputs from the host.
@@ -79,6 +98,9 @@ pub struct Settings {
     /// The guarded roots are this side's to refresh (the exec quarantine is
     /// off).
     pub own_roots: bool,
+    /// Lot 325: the admin socket's directory, where `debug-trigger` builds
+    /// take their trigger files (`None`: none taken).
+    pub debug_dir: Option<PathBuf>,
 }
 
 impl Settings {
@@ -89,6 +111,7 @@ impl Settings {
             proc_root: PathBuf::from("/proc"),
             mountinfo: PathBuf::from("/proc/self/mountinfo"),
             own_roots,
+            debug_dir: None,
         }
     }
 }
@@ -109,6 +132,9 @@ pub struct Controller<K: KernelIo> {
     /// kernel's shape, and roots the kernel's map refused, signed.
     mounts_rows: nn_linux::state_read::Condition,
     roots_full: RootsFull,
+    /// Lot 325 (the re-check of #546, R5): the exec guards past their
+    /// capacity, signed while their counts move.
+    capacity: Capacity,
 }
 
 impl<K: KernelIo> Controller<K> {
@@ -124,6 +150,7 @@ impl<K: KernelIo> Controller<K> {
             mounts_read: nn_linux::state_read::LastGood::new("execpol_mounts", "the mount table"),
             mounts_rows: nn_linux::state_read::Condition::new("execpol_mounts_rows"),
             roots_full: RootsFull::new("execpol_roots_full"),
+            capacity: Capacity::new(),
         }
     }
 
@@ -196,7 +223,46 @@ impl<K: KernelIo> Controller<K> {
                 }
             }
         }
-        COUNTERS.store_kernel(&self.k.counters());
+        #[cfg(feature = "debug-trigger")]
+        self.debug_triggers();
+        let c = self.k.counters();
+        COUNTERS.store_kernel(&c);
+        self.capacity.seen(
+            c[counter::LOST as usize],
+            c[counter::LOST_OPEN as usize],
+            now,
+        );
+    }
+
+    /// `debug-trigger` builds only (lot 325, the re-check of #546, R5): a
+    /// file `debug-execpol-fill` next to the admin socket fills the exec
+    /// guards' per-task maps as a flood of execs in flight would (with
+    /// `env` in it, the environment's too); `debug-execpol-empty` empties
+    /// them. The e2e's fork-bomb shape, bounded.
+    #[cfg(feature = "debug-trigger")]
+    fn debug_triggers(&mut self) {
+        let Some(dir) = self.s.debug_dir.clone() else {
+            return;
+        };
+        let fill = dir.join("debug-execpol-fill");
+        if let Ok(text) = std::fs::read_to_string(&fill) {
+            let _ = std::fs::remove_file(&fill);
+            let n = self.k.debug_fill(text.contains("env"));
+            warn!(
+                entries = n,
+                env = text.contains("env"),
+                "debug-trigger: the exec guards' per-task maps filled (lab test of lot 325)"
+            );
+        }
+        let empty = dir.join("debug-execpol-empty");
+        if std::fs::symlink_metadata(&empty).is_ok() {
+            let _ = std::fs::remove_file(&empty);
+            let n = self.k.debug_empty();
+            warn!(
+                entries = n,
+                "debug-trigger: the exec guards' per-task maps emptied (lab test of lot 325)"
+            );
+        }
     }
 
     /// The loop, until `stopping`.
@@ -219,6 +285,63 @@ impl<K: KernelIo> Controller<K> {
             // SAFETY: a valid array of pollfds for the duration of the call.
             unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 250) };
         }
+    }
+}
+
+/// Lot 325 (the re-check of #546, R5): the exec guards' per-task buffers
+/// full — a flood of execs in flight (a fork bomb) — so execs are judged
+/// without their walk: protected targets refused (`LOST`), the rest let
+/// through and recorded (`LOST_OPEN`). A degradation of `execpol_capacity`
+/// while either count moves, held [`CAPACITY_HOLD`] at least (one signed
+/// record per episode, not one per step), so that refusals the capacity
+/// caused are told apart from the policy's.
+#[derive(Debug)]
+pub(crate) struct Capacity {
+    cond: nn_linux::state_read::Condition,
+    last: Option<(u64, u64)>,
+}
+
+/// Lot 325 (R5): the least time a capacity episode stands once reported.
+pub(crate) const CAPACITY_HOLD: Duration = Duration::from_secs(300);
+
+/// Lot 325 (R5): the capacity degradation's text (the same whatever the
+/// counts: one record per episode).
+pub(crate) const CAPACITY_DETAIL: &str = "the exec guards' per-task buffers are full (a flood \
+     of execs in flight): execs are judged without their walk — protected targets (a deny the \
+     facts without a walk support, a set-id file, an environment the tier's rule protects that \
+     could not be read) refused, every other exec let through and recorded";
+
+impl Capacity {
+    pub(crate) const fn new() -> Self {
+        Capacity {
+            cond: nn_linux::state_read::Condition::with_hold("execpol_capacity", CAPACITY_HOLD),
+            last: None,
+        }
+    }
+
+    /// The kernel's `LOST` and `LOST_OPEN` at `now`. The first reading is
+    /// the baseline (what an earlier run counted is no new episode).
+    pub(crate) fn seen(&mut self, lost: u64, lost_open: u64, now: Instant) {
+        let moved = match self.last {
+            Some((l, o)) => lost > l || lost_open > o,
+            None => false,
+        };
+        self.last = Some((lost, lost_open));
+        if moved {
+            self.cond.holds_at(CAPACITY_DETAIL.into(), now);
+        } else {
+            self.cond.ended_at(now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holding(&self) -> bool {
+        self.cond.holding()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> u32 {
+        self.cond.reports()
     }
 }
 
@@ -362,6 +485,7 @@ mod tests {
             proc_root: d.to_path_buf(),
             mountinfo: mi,
             own_roots,
+            debug_dir: None,
         }
     }
 
@@ -404,6 +528,41 @@ mod tests {
         );
         c.refresh(Instant::now());
         assert!(c.k.roots.is_empty());
+    }
+
+    /// Lot 325 (the re-check of #546, R5): the exec guards past their
+    /// capacity are one signed degradation per episode, held while the
+    /// counts move and at least `CAPACITY_HOLD`, ended once they stand
+    /// still; a count left from before the agent's start is no episode.
+    #[test]
+    fn the_exec_guards_past_their_capacity_are_a_signed_degradation() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = FakeKernel::default();
+        k.counters[counter::LOST_OPEN as usize] = 5;
+        let mut c = Controller::new(
+            k,
+            Box::new(VecRecorder::default()),
+            settings(d.path(), true),
+        );
+        let t0 = Instant::now();
+        c.step(t0);
+        assert!(!c.capacity.holding(), "the first reading is the baseline");
+        c.k.counters[counter::LOST_OPEN as usize] = 9;
+        c.step(t0 + Duration::from_secs(1));
+        assert!(c.capacity.holding());
+        c.k.counters[counter::LOST as usize] = 1;
+        c.step(t0 + Duration::from_secs(2));
+        assert_eq!(c.capacity.reports(), 1, "one record per episode");
+        // standing still: held for its least time, then ended
+        c.step(t0 + Duration::from_secs(60));
+        assert!(c.capacity.holding());
+        c.step(t0 + CAPACITY_HOLD + Duration::from_secs(10));
+        assert!(!c.capacity.holding());
+        // a new episode
+        c.k.counters[counter::LOST as usize] = 2;
+        c.step(t0 + CAPACITY_HOLD + Duration::from_secs(20));
+        assert!(c.capacity.holding());
+        assert_eq!(c.capacity.reports(), 2);
     }
 
     #[test]

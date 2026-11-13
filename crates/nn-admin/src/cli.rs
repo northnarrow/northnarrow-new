@@ -3596,6 +3596,22 @@ fn execpol_line(out: &StatusOutcome, tty: bool) -> String {
             tty,
         ));
     }
+    // Lot 325: environments the scan could not finish, environments changed
+    // after the kernel's copy, execs let through without their walk (an
+    // agent before lot 325 reports none).
+    let truncated = n(out.execpol_env_truncated_total);
+    let changed = n(out.execpol_env_changed_total);
+    let open = n(out.execpol_lost_open_total);
+    if truncated > 0 || changed > 0 || open > 0 {
+        line.push_str(&colorize(
+            &format!(
+                ", environments not finished {truncated}, changed after the kernel's copy \
+                 {changed}, execs let through without their walk {open}"
+            ),
+            "31",
+            tty,
+        ));
+    }
     line
 }
 
@@ -3606,7 +3622,7 @@ fn execpol_json(out: &StatusOutcome) -> String {
     };
     let n = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
     format!(
-        "{{\"state\":{},\"denied\":{},\"would_deny\":{},\"quarantine\":{},\"quarantine_inactive\":{},\"env_denied\":{},\"env_recorded\":{},\"map_denied\":{},\"map_recorded\":{},\"env_unread\":{},\"lost\":{}}}",
+        "{{\"state\":{},\"denied\":{},\"would_deny\":{},\"quarantine\":{},\"quarantine_inactive\":{},\"env_denied\":{},\"env_recorded\":{},\"map_denied\":{},\"map_recorded\":{},\"env_unread\":{},\"lost\":{},\"env_truncated\":{},\"env_changed\":{},\"lost_open\":{}}}",
         serde_json::to_string(state).unwrap_or_else(|_| "null".to_string()),
         n(out.execpol_denied_total),
         n(out.execpol_would_deny_total),
@@ -3618,6 +3634,9 @@ fn execpol_json(out: &StatusOutcome) -> String {
         n(out.execpol_map_recorded_total),
         n(out.execpol_env_unread_total),
         n(out.execpol_lost_total),
+        n(out.execpol_env_truncated_total),
+        n(out.execpol_env_changed_total),
+        n(out.execpol_lost_open_total),
     )
 }
 
@@ -3679,7 +3698,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3729,6 +3748,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.cow_guard).unwrap_or_else(|_| "null".to_string()),
             execq_json(out),
             execpol_json(out),
+            // Lot 325 (the review of #547, F6).
+            opt(out.open_sensor_per_call_total),
             // Lab PR 267 (R12a).
             serde_json::to_string(&out.event_bus).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.event_bus_decision).unwrap_or_else(|_| "null".to_string()),
@@ -3788,6 +3809,13 @@ fn print_status(out: &StatusOutcome, json: bool) {
         println!("{}", ransomware_line(out, tty));
         println!("{}", defense_line(out, tty));
         println!("{}", execpol_line(out, tty));
+        // Lot 325 (the review of #547, F6): shown when not zero.
+        if let Some(n) = out.open_sensor_per_call_total.filter(|n| *n > 0) {
+            println!(
+                "file-open sensor  : {n} opens judged in a run's own buffer (the task's could \
+                 not be kept: its map full, or its uid's share taken)"
+            );
+        }
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -5981,6 +6009,10 @@ mod flow_sock_line_tests {
             execpol_map_recorded_total: None,
             execpol_env_unread_total: None,
             execpol_lost_total: None,
+            execpol_env_truncated_total: None,
+            execpol_env_changed_total: None,
+            execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,

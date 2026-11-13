@@ -123,12 +123,6 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     let interp = peek_u64(bprm.add(o_interp)) as *const u8;
     let task = bpf_get_current_task() as *const u8;
     let key = crate::task_scratch::key_of(task);
-    let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
-        Some(p) => p,
-        // The review of #546 (F4, F5): the map full — counted, and in
-        // enforce mode refused (nothing of the exec can be judged).
-        None => return crate::execpol::walk_lost(),
-    };
 
     // The file: identity, filesystem, memfd name, link count.
     let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
@@ -149,9 +143,29 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
             flags |= exe_flags::DELETED;
         }
     }
+    let pass: u8 = if interp == filename { 0 } else { 1 };
+    let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
+        Some(p) => p,
+        // The review of #546 (F4, F5): the map full — counted. Lot 325
+        // (the re-check, R5): judged on what needs no walk; a protected
+        // target refused, the rest let through and recorded. It refused
+        // every exec in enforce mode: a flood of execs in flight (a fork
+        // bomb) stopped the host's.
+        // The verdict as a constant (a global function's result is a
+        // scalar the verifier cannot range: 6.12+ checks an LSM program's
+        // return value).
+        None => {
+            let refuse = crate::execpol::nn_exec_unwalked(
+                inode as u64,
+                dentry as u64,
+                task as u64,
+                u64::from(flags) | (u64::from(pass) << 32),
+            );
+            return if refuse != 0 { -13 } else { 0 };
+        }
+    };
     // The task's root, where the walk stops.
     let task_root = task_root_of(task);
-    let pass: u8 = if interp == filename { 0 } else { 1 };
     (*s).dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
     (*s).ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
     (*s).pass = pass;

@@ -767,7 +767,22 @@ int main(int argc, char **argv) {
   uint32_t *ev = (uint32_t *)(low + 64);
   ev[0] = (uint32_t)(uintptr_t)e0; ev[1] = (uint32_t)(uintptr_t)e1; ev[2] = 0;
   long ret;
-  if (!strcmp(argv[1], "ia32")) {
+  if (!strcmp(argv[1], "x32hi")) {
+    /* lot 325 (R1): the real array above 4 GiB, a clean decoy at its low
+       half; the kernel's x32 stub reads the register whole */
+    unsigned long lo_a = 0x10000000UL, hi_a = lo_a | (1UL << 32);
+    char *dlo = mmap((void *)lo_a, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    char *dhi = mmap((void *)hi_a, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (dlo != (char *)lo_a || dhi != (char *)hi_a) return 3;
+    char *d0 = p; strcpy(p, "DECOY=clean"); p += strlen(p) + 1;
+    uint32_t *decoy = (uint32_t *)dlo; decoy[0] = (uint32_t)(uintptr_t)d0; decoy[1] = 0;
+    uint32_t *real = (uint32_t *)dhi;
+    real[0] = (uint32_t)(uintptr_t)e0; real[1] = (uint32_t)(uintptr_t)e1; real[2] = 0;
+    ret = syscall(0x40000000L | 520, path, av, (void *)hi_a);
+    if (ret < 0) ret = -(long)errno;
+  } else if (!strcmp(argv[1], "ia32")) {
     __asm__ volatile("int $0x80" : "=a"(ret)
                      : "a"(11), "b"((uint32_t)(uintptr_t)path),
                        "c"((uint32_t)(uintptr_t)av), "d"((uint32_t)(uintptr_t)ev)
@@ -953,7 +968,8 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
     let compat = compile_compat_exec(work.path());
     let mut x32_absent = 0;
     for i in 0..N / 3 {
-        for abi in ["ia32", "x32"] {
+        // lot 325 (R1): x32's envp the register whole (`x32hi`)
+        for abi in ["ia32", "x32", "x32hi"] {
             let who = abi;
             let st = Command::new(&compat)
                 .arg(abi)
@@ -964,7 +980,7 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
                 .expect("spawn compat_exec");
             match st.code() {
                 Some(77) => {}
-                Some(38) if abi == "x32" => x32_absent += 1,
+                Some(38) if abi.starts_with("x32") => x32_absent += 1,
                 other => {
                     ran.entry((who, i))
                         .or_default()
@@ -979,9 +995,10 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
         }
     }
     eprintln!(
-        "compat execs: ia32 {} refused; x32 absent on this kernel in {x32_absent} of {}",
+        "compat execs: ia32 {} refused; x32 (both shapes) absent on this kernel in {x32_absent} \
+         of {}",
         N / 3,
-        N / 3
+        2 * (N / 3)
     );
 
     // from a service: the unit's exec fails, the preload never runs
@@ -1035,4 +1052,727 @@ fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
         N / 3,
         tail(&fx.agent_log)
     );
+}
+
+/// A C program that execs `argv[1]` with `n` padding variables, then the
+/// variables given after `--` (`NAME=value`), from a thread-free process;
+/// exit 77 when the exec is refused (`EACCES`), 1 on another error. Lot 325
+/// (the re-check of #546, R2).
+fn compile_env_exec(dir: &Path) -> PathBuf {
+    let src = dir.join("env_exec.c");
+    std::fs::write(
+        &src,
+        r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 3) return 2;
+  /* "hi": no padding, execve entered with garbage in rax's high half (the
+     kernel runs the low half; pt_regs->orig_ax keeps all 64 bits) */
+  int hi = strcmp(argv[2], "hi") == 0;
+  long pad = hi ? 0 : atol(argv[2]);
+  int extra = argc - 3;
+  char **envv = calloc(pad + extra + 1, sizeof(char *));
+  if (!envv) return 3;
+  for (long i = 0; i < pad; i++) {
+    char *v = malloc(24);
+    snprintf(v, 24, "NN_PAD_%ld=x", i);
+    envv[i] = v;
+  }
+  for (int j = 0; j < extra; j++) envv[pad + j] = argv[3 + j];
+  envv[pad + extra] = NULL;
+  char *args[] = {argv[1], NULL};
+#if defined(__x86_64__)
+  if (hi) {
+    long r;
+    register long rdx __asm__("rdx") = (long)envv;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "0"((1UL << 32) | 59), "D"(argv[1]), "S"(args), "r"(rdx)
+                     : "rcx", "r11", "memory");
+    errno = (int)-r;
+    return errno == EACCES ? 77 : 1;
+  }
+#endif
+  execve(argv[1], args, envv);
+  return errno == EACCES ? 77 : 1;
+}
+"#,
+    )
+    .expect("write env_exec.c");
+    let bin = dir.join("env_exec");
+    let st = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(st.success(), "cc failed");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    bin
+}
+
+/// Lot 325 (the re-check of #546, R2): the scan read the first 64
+/// variables only — 64 padding variables, then `LD_PRELOAD` from a staging
+/// path, went through without a refusal and, for a root session, without
+/// a record. With a table that refuses a staging preload in every tier,
+/// the same exec behind 64, 65, 1,000 and 50,000 padding variables is
+/// refused, as root and as `nobody`, and the preload never runs; so are a
+/// staging entry past the first 128 bytes of a clean list and (as root) a
+/// staging `LD_PRELOAD` followed by a clean one (musl's loader takes the
+/// first) — the mini-hunt. The review of #547: the forms each passed —
+/// 120 spaces before the entry, `//tmp/`, `/./tmp/` (F1), a relative path
+/// (refused where a staging preload is: where it resolves is not in the
+/// string), an `execve` entered with garbage in `rax`'s high half (F3);
+/// an entry past the first pass's reads is killed at the post-commit check
+/// (F7). The controls run: the padding without the preload, and long clean
+/// values — a 2,880-byte `LD_PRELOAD`, a 2,880-byte `LD_LIBRARY_PATH` (F7:
+/// a clean value past 128 bytes was refused). The re-check of #547
+/// (G1–G4): a tab inside an `LD_PRELOAD` entry, a bare preload name with
+/// an empty `LD_LIBRARY_PATH` element (`:`, a trailing `:`), a `$LIB` token
+/// and a newline (musl's library-path separator) are refused; the re-check
+/// 2: the empty element alone runs.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_staging_preload_behind_many_variables_is_refused() {
+    use std::os::unix::process::CommandExt;
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup_opts(None, Some("preload * deny\n"));
+    let armed = common::wait_until(Duration::from_secs(30), || {
+        std::fs::read_to_string(&fx.agent_log).ok().and_then(|l| {
+            l.lines()
+                .find(|l| l.contains("exec policy armed in the kernel") && l.contains("env=true"))
+                .map(str::to_string)
+        })
+    });
+    assert!(
+        armed.is_some_and(|a| a.contains("enforce")),
+        "the exec policy did not arm with the environment check; agent.log tail:\n{}",
+        tail(&fx.agent_log)
+    );
+    let work = tempfile::Builder::new()
+        .prefix("nn-e2e-325-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod the work directory");
+    let lib = compile_marker_preload(work.path());
+    let exe = compile_env_exec(work.path());
+    let mark = |case: &str| work.path().join(format!("mark.{case}"));
+    // `/usr/bin/true` itself with `pad` padding variables, then `vars`
+    // (exec'd by this test: a helper of the test's own under /tmp is the
+    // agent's `R001_ExecFromTmp` for `nobody`, killed); Err(errno) when the
+    // exec is refused
+    // (Ok: its exit code, 128 + the signal that killed it)
+    let run_at = |cwd: Option<&Path>,
+                  pad: usize,
+                  vars: &[(String, String)],
+                  uid: Option<u32>|
+     -> Result<i32, i32> {
+        let mut c = Command::new("/usr/bin/true");
+        c.env_clear()
+            .envs((0..pad).map(|i| (format!("NN_PAD_{i}"), "x".to_string())))
+            .envs(vars.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        if let Some(u) = uid {
+            c.uid(u).gid(u);
+        }
+        match c.status() {
+            Ok(st) => Ok(st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))),
+            Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+        }
+    };
+    let run =
+        |pad: usize, vars: &[(String, String)], uid: Option<u32>| run_at(None, pad, vars, uid);
+    let preload = |case: &str, value: String| {
+        vec![
+            ("LD_PRELOAD".to_string(), value),
+            (
+                "NN_E2E_PRELOAD_MARK".to_string(),
+                mark(case).display().to_string(),
+            ),
+        ]
+    };
+    let mut failures = Vec::new();
+    for (who, uid) in [("root", None), ("nobody", Some(NOBODY))] {
+        // controls: the padding alone runs (50,000 padding variables: about
+        // 1.2 MB, inside the default stack limit's quarter)
+        for pad in [64usize, 50_000] {
+            let rc = run(pad, &[], uid);
+            if rc != Ok(0) {
+                failures.push(format!("{who}: {pad} padding variables alone: {rc:?}"));
+            }
+        }
+        for pad in [0usize, 63, 64, 65, 1_000, 50_000] {
+            let case = format!("{who}-{pad}");
+            let rc = run(pad, &preload(&case, lib.display().to_string()), uid);
+            if rc != Err(13) || mark(&case).exists() {
+                failures.push(format!(
+                    "{who}: a staging preload behind {pad} variables: {rc:?}, the preload \
+                     ran: {}",
+                    mark(&case).exists()
+                ));
+            }
+        }
+        // the mini-hunt: a staging entry past the first 128 bytes of a long
+        // clean list (`LD_PRELOAD`'s capture)
+        let case = format!("{who}-long");
+        let long = format!(
+            "{}:{}",
+            ["/usr/lib/x86_64-linux-gnu/libc.so.6"; 5].join(":"),
+            lib.display()
+        );
+        let rc = run(0, &preload(&case, long), uid);
+        if rc != Err(13) || mark(&case).exists() {
+            failures.push(format!(
+                "{who}: a staging preload past 128 bytes of clean ones: {rc:?}"
+            ));
+        }
+        // the review of #547 (F1): the forms the 9-byte compare missed
+        let l = lib.display().to_string();
+        for (tag, value) in [
+            ("spaces", format!("{}{l}", " ".repeat(120))),
+            ("slashes", format!("/{l}")),
+            ("dot", format!("/.{l}")),
+        ] {
+            let case = format!("{who}-{tag}");
+            let rc = run(0, &preload(&case, value), uid);
+            if rc != Err(13) || mark(&case).exists() {
+                failures.push(format!(
+                    "{who}: a staging preload written {tag}: {rc:?}, the preload ran: {}",
+                    mark(&case).exists()
+                ));
+            }
+        }
+        // a relative path (here, the staging directory's): refused where a
+        // staging preload is
+        let case = format!("{who}-relative");
+        let rc = run_at(
+            Some(work.path()),
+            0,
+            &preload(&case, "./libmark.so".to_string()),
+            uid,
+        );
+        if rc != Err(13) || mark(&case).exists() {
+            failures.push(format!("{who}: a relative preload: {rc:?}"));
+        }
+        // The re-check of #547 (G1–G4): what the loader does with a
+        // control byte or a `$` token is not in the string as the check
+        // reads it — refused at a protected target, whatever the value names
+        // (glibc loaded the marker in G1–G3); a bare preload name searched in
+        // an empty library-path element (the caller's directory) is a
+        // relative path, refused the same way
+        for (tag, vars) in [
+            (
+                "tab",
+                vec![("LD_PRELOAD".to_string(), "libmark.so\t/x.so".to_string())],
+            ),
+            (
+                "empty-element",
+                vec![
+                    ("LD_LIBRARY_PATH".to_string(), ":".to_string()),
+                    ("LD_PRELOAD".to_string(), "libmark.so".to_string()),
+                ],
+            ),
+            (
+                "trailing-element",
+                vec![
+                    ("LD_LIBRARY_PATH".to_string(), "/usr/lib:".to_string()),
+                    ("LD_PRELOAD".to_string(), "libmark.so".to_string()),
+                ],
+            ),
+            (
+                "dst",
+                vec![("LD_PRELOAD".to_string(), "/usr/$LIB/libc.so.6".to_string())],
+            ),
+            (
+                "newline",
+                vec![(
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/usr/lib\n/opt/lib".to_string(),
+                )],
+            ),
+        ] {
+            let case = format!("{who}-{tag}");
+            let mut v = vars;
+            v.push((
+                "NN_E2E_PRELOAD_MARK".to_string(),
+                mark(&case).display().to_string(),
+            ));
+            let rc = run_at(Some(work.path()), 0, &v, uid);
+            if rc != Err(13) || mark(&case).exists() {
+                failures.push(format!(
+                    "{who}: an irregular loader value ({tag}): {rc:?}, the preload ran: {}",
+                    mark(&case).exists()
+                ));
+            }
+        }
+        // The re-check 2 of #547 (G2, a false refusal): an empty library
+        // path element alone — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib`
+        // with the variable unset, its commonest shape — runs at a protected
+        // target; only a bare preload name searched in it is refused (above)
+        for (tag, value) in [("leading", ":/usr/lib"), ("trailing", "/usr/lib:")] {
+            let rc = run(
+                0,
+                &[("LD_LIBRARY_PATH".to_string(), value.to_string())],
+                uid,
+            );
+            if rc != Ok(0) {
+                failures.push(format!(
+                    "{who}: an empty library-path element ({tag}) alone: {rc:?}"
+                ));
+            }
+        }
+        // F7: past the first pass's reads (about 4 KiB), the entry is
+        // judged on the kernel's copy after the commit: killed
+        let case = format!("{who}-past-reads");
+        let far = format!(
+            "{}:{l}",
+            ["/usr/lib/x86_64-linux-gnu/libc.so.6"; 120].join(":")
+        );
+        let rc = run(0, &preload(&case, far), uid);
+        if rc != Ok(128 + 9) || mark(&case).exists() {
+            failures.push(format!(
+                "{who}: a staging preload past the first pass's reads: {rc:?}, the preload \
+                 ran: {}",
+                mark(&case).exists()
+            ));
+        }
+        // the controls: long clean values run
+        let clean = ["/usr/lib/x86_64-linux-gnu/libc.so.6"; 80].join(":");
+        for (name, value) in [("LD_PRELOAD", &clean), ("LD_LIBRARY_PATH", &clean)] {
+            let rc = run(0, &[(name.to_string(), value.clone())], uid);
+            if rc != Ok(0) {
+                failures.push(format!(
+                    "{who}: a clean {name} of {} bytes: {rc:?}",
+                    value.len()
+                ));
+            }
+        }
+    }
+    // the mini-hunt: a staging preload first, a clean one last (two
+    // `LD_PRELOAD` entries, which only a raw `envp` can carry: the helper,
+    // as root — the agent's `R009` on a root exec from /tmp only logs)
+    let st = Command::new(&exe)
+        .arg("/usr/bin/true")
+        .arg("70")
+        .arg(format!("LD_PRELOAD={}", lib.display()))
+        .arg(format!("NN_E2E_PRELOAD_MARK={}", mark("first").display()))
+        .arg("LD_PRELOAD=libc.so.6")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn env_exec");
+    if st.code() != Some(77) {
+        failures.push(format!(
+            "root: a staging preload followed by a clean one: {st:?}"
+        ));
+    }
+    // the review of #547 (F3): `execve` entered with garbage in `rax`'s
+    // high half — the kernel runs it; the scan read no environment
+    #[cfg(target_arch = "x86_64")]
+    {
+        let st = Command::new(&exe)
+            .arg("/usr/bin/true")
+            .arg("hi")
+            .arg(format!("LD_PRELOAD={}", lib.display()))
+            .arg(format!("NN_E2E_PRELOAD_MARK={}", mark("hi").display()))
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn env_exec");
+        if st.code() != Some(77) || mark("hi").exists() {
+            failures.push(format!(
+                "root: an execve with rax's high half set: {st:?}, the preload ran: {}",
+                mark("hi").exists()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{failures:#?}\nagent.log tail:\n{}",
+        tail(&fx.agent_log)
+    );
+}
+
+/// Lot 325 (the re-check of #546, R5): the exec guards' per-task maps full —
+/// the shape of a fork bomb's flood of execs in flight, made here by the
+/// agent itself (`debug-execpol-fill`, `debug-trigger` builds) so that it
+/// is bounded and deterministic. Lot 322 refused every exec then. The
+/// server profile (a session's staging preload refused for root): with the
+/// walk's map full, a plain exec runs as root and as `nobody`, and a burst
+/// of 256 of them from 16 threads runs whole; a staging preload as root
+/// and a memfd as root (a deny cell without a walk) are still refused.
+/// With the environment's map full too (the review of #547, F5: root's
+/// plain exec and `su` were refused then — every service exec on a server),
+/// `nobody`'s, root's and a set-id program's as `nobody` (`su`) plain
+/// execs run; root's staging preload, which the first pass could not read,
+/// is killed at the post-commit check (the kernel's copy, read into a
+/// per-CPU buffer the flood cannot take) before its first instruction.
+/// Emptied, the exec policy judges as before. The agent signs a
+/// degradation (`execpol_capacity`) meanwhile.
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn the_exec_guards_past_their_capacity_keep_protected_targets_closed() {
+    use std::os::unix::process::CommandExt;
+    let _eni = EniIptablesGuard::install();
+    // the server profile, made the same in every tier the test may run in:
+    // root's staging preloads refused, a memfd refused
+    let fx = Fixture::setup_opts(
+        None,
+        Some("profile server\npreload * deny-root\nexec memfd * deny\n"),
+    );
+    let armed = common::wait_until(Duration::from_secs(30), || {
+        std::fs::read_to_string(&fx.agent_log).ok().and_then(|l| {
+            l.lines()
+                .find(|l| l.contains("exec policy armed in the kernel") && l.contains("env=true"))
+                .map(str::to_string)
+        })
+    });
+    assert!(
+        armed.is_some_and(|a| a.contains("enforce")),
+        "the exec policy did not arm; agent.log tail:\n{}",
+        tail(&fx.agent_log)
+    );
+    let work = tempfile::Builder::new()
+        .prefix("nn-e2e-325c-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod the work directory");
+    let lib = compile_marker_preload(work.path());
+    let dir = fx
+        .admin_socket
+        .parent()
+        .expect("the socket's directory")
+        .to_path_buf();
+    let trigger = |name: &str, text: &str, log: &str| {
+        let t = dir.join(name);
+        let before = std::fs::read_to_string(&fx.agent_log)
+            .map(|l| l.matches(log).count())
+            .unwrap_or(0);
+        std::fs::write(&t, text).expect("write the trigger");
+        let taken = common::wait_until(Duration::from_secs(15), || {
+            std::fs::read_to_string(&fx.agent_log)
+                .ok()
+                .filter(|l| !t.exists() && l.matches(log).count() > before)
+                .map(|_| ())
+        });
+        assert!(taken.is_some(), "the agent did not take {name}");
+    };
+    // 0: ran, 13: refused (EACCES), other: the error
+    let exec = |path: &str, args: &[&str], uid: Option<u32>, env: &[(&str, String)]| -> i32 {
+        let mut c = Command::new(path);
+        c.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        if let Some(u) = uid {
+            c.uid(u).gid(u);
+        }
+        match c.spawn() {
+            Ok(mut ch) => {
+                let _ = ch.wait();
+                0
+            }
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        }
+    };
+    let staging = vec![("LD_PRELOAD", lib.display().to_string())];
+    let memfd_true = || -> i32 {
+        // /usr/bin/true copied into a memfd and run from it, as root
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import os,sys\nfd=os.memfd_create('nn325')\nos.write(fd,open('/usr/bin/true','rb').read())\n\
+                 try:\n    os.execve(fd,['true'],{})\nexcept PermissionError:\n    sys.exit(77)\n",
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("spawn python3");
+        out.code().unwrap_or(-1)
+    };
+    let mut fails: Vec<String> = Vec::new();
+    fn want(fails: &mut Vec<String>, what: &str, got: i32, want: i32) {
+        if got != want {
+            fails.push(format!("{what}: {got}, wanted {want}"));
+        }
+    }
+    // the policy before the flood: a staging preload as root is refused
+    want(
+        &mut fails,
+        "before: root, staging preload",
+        exec("/usr/bin/true", &[], None, &staging),
+        13,
+    );
+    want(
+        &mut fails,
+        "before: root, plain",
+        exec("/usr/bin/true", &[], None, &[]),
+        0,
+    );
+
+    // the walk's map full
+    trigger(
+        "debug-execpol-fill",
+        "walk",
+        "the exec guards' per-task maps filled",
+    );
+    want(
+        &mut fails,
+        "walk full: root, plain",
+        exec("/usr/bin/true", &[], None, &[]),
+        0,
+    );
+    want(
+        &mut fails,
+        "walk full: nobody, plain",
+        exec("/usr/bin/true", &[], Some(NOBODY), &[]),
+        0,
+    );
+    want(
+        &mut fails,
+        "walk full: root, staging preload",
+        exec("/usr/bin/true", &[], None, &staging),
+        13,
+    );
+    want(&mut fails, "walk full: root, a memfd", memfd_true(), 77);
+    // a burst, bounded: 16 threads x 16 plain execs, every one runs
+    let refused: usize = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..16)
+            .map(|_| {
+                sc.spawn(|| {
+                    (0..16)
+                        .filter(|_| exec("/usr/bin/true", &[], None, &[]) != 0)
+                        .count()
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("burst thread"))
+            .sum()
+    });
+    want(
+        &mut fails,
+        "walk full: a burst of 256 plain execs, refused",
+        refused as i32,
+        0,
+    );
+
+    // the environment's map full too
+    trigger(
+        "debug-execpol-empty",
+        "",
+        "the exec guards' per-task maps emptied",
+    );
+    trigger(
+        "debug-execpol-fill",
+        "walk env",
+        "the exec guards' per-task maps filled",
+    );
+    want(
+        &mut fails,
+        "both full: nobody, plain",
+        exec("/usr/bin/true", &[], Some(NOBODY), &[]),
+        0,
+    );
+    want(
+        &mut fails,
+        "both full: root, plain (protected)",
+        exec("/usr/bin/true", &[], None, &[]),
+        0,
+    );
+    if Path::new("/usr/bin/su").exists() {
+        want(
+            &mut fails,
+            "both full: nobody, su (set-id)",
+            exec("/usr/bin/su", &["--version"], Some(NOBODY), &[]),
+            0,
+        );
+    }
+    // root's staging preload: let through unread, killed after the commit
+    let killed_mark = work.path().join("mark.both-full");
+    let st = Command::new("/usr/bin/true")
+        .env("LD_PRELOAD", lib.display().to_string())
+        .env("NN_E2E_PRELOAD_MARK", killed_mark.display().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match st {
+        Ok(st) if st.signal() == Some(9) && !killed_mark.exists() => {}
+        other => fails.push(format!(
+            "both full: root, staging preload: {other:?}, the preload ran: {}",
+            killed_mark.exists()
+        )),
+    }
+
+    // emptied: as before
+    trigger(
+        "debug-execpol-empty",
+        "",
+        "the exec guards' per-task maps emptied",
+    );
+    want(
+        &mut fails,
+        "after: root, plain",
+        exec("/usr/bin/true", &[], None, &[]),
+        0,
+    );
+    want(
+        &mut fails,
+        "after: root, staging preload",
+        exec("/usr/bin/true", &[], None, &staging),
+        13,
+    );
+    // the capacity episode is signed
+    let degraded = common::wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&fx.agent_log)
+            .ok()
+            .filter(|l| l.contains("execpol_capacity"))
+            .map(|_| ())
+    });
+    if degraded.is_none() {
+        fails.push("no execpol_capacity degradation in the agent's log".into());
+    }
+    assert!(
+        fails.is_empty(),
+        "{fails:#?}\nagent.log tail:\n{}",
+        tail(&fx.agent_log)
+    );
+}
+
+/// Lot 325 (TOCTOU; the review of #546, F2): the first pass reads the
+/// caller's memory after the kernel copied it. A child of this test execs
+/// `/usr/bin/true` with `LD_PRELOAD` from a staging path while a thread of
+/// its own flips the variable's first byte (`L` / `X`) as fast as it can:
+/// the kernel's copy and the first pass's read can disagree. Whatever each
+/// read saw, the preload never runs: refused at the first pass (`EACCES`),
+/// or killed before its first instruction by the post-commit check (the
+/// kernel's own copy), or the copy held `XD_PRELOAD` and nothing loaded.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_preload_written_after_the_kernel_s_copy_never_runs() {
+    const N: usize = 300;
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup_opts(None, Some("preload * deny\n"));
+    let armed = common::wait_until(Duration::from_secs(30), || {
+        std::fs::read_to_string(&fx.agent_log).ok().and_then(|l| {
+            l.lines()
+                .find(|l| l.contains("exec policy armed in the kernel") && l.contains("env=true"))
+                .map(str::to_string)
+        })
+    });
+    assert!(
+        armed.is_some(),
+        "not armed; agent.log tail:\n{}",
+        tail(&fx.agent_log)
+    );
+    let work = tempfile::Builder::new()
+        .prefix("nn-e2e-325t-")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod the work directory");
+    let lib = compile_marker_preload(work.path());
+    let racer = compile_flip_exec(work.path());
+    let (mut refused, mut killed, mut clean, mut ran) = (0, 0, 0, Vec::new());
+    for i in 0..N {
+        let mark = work.path().join(format!("mark.{i}"));
+        let st = Command::new(&racer)
+            .arg(&lib)
+            .arg(&mark)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn flip_exec");
+        match (st.code(), st.signal()) {
+            (Some(77), _) => refused += 1,
+            (None, Some(9)) => killed += 1,
+            _ => clean += 1,
+        }
+        if mark.exists() {
+            ran.push(i);
+        }
+    }
+    eprintln!(
+        "flip race, {N} execs: refused at the first pass {refused}, killed past the point of no \
+         return {killed}, ran without the preload {clean}, ran with it {}",
+        ran.len()
+    );
+    assert!(
+        ran.is_empty(),
+        "the preload ran in {} of {N} execs ({ran:?}); refused {refused}, killed {killed}\n\
+         agent.log tail:\n{}",
+        ran.len(),
+        tail(&fx.agent_log)
+    );
+}
+
+/// The race of [`a_preload_written_after_the_kernel_s_copy_never_runs`]: a
+/// thread flips the first byte of `LD_PRELOAD=<lib>` while the main thread
+/// execs `/usr/bin/true` with it; exit 77 when the exec is refused.
+fn compile_flip_exec(dir: &Path) -> PathBuf {
+    let src = dir.join("flip_exec.c");
+    std::fs::write(
+        &src,
+        r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static char pre[512];
+static volatile int go;
+static void *flip(void *a) {
+  (void)a;
+  go = 1;
+  for (;;) { pre[0] = 'X'; __sync_synchronize(); pre[0] = 'L'; __sync_synchronize(); }
+  return NULL;
+}
+int main(int argc, char **argv) {
+  if (argc < 3) return 2;
+  snprintf(pre, sizeof pre, "LD_PRELOAD=%s", argv[1]);
+  static char mk[512];
+  snprintf(mk, sizeof mk, "NN_E2E_PRELOAD_MARK=%s", argv[2]);
+  char *envv[] = {pre, mk, NULL};
+  char *args[] = {"true", NULL};
+  pthread_t t;
+  if (pthread_create(&t, NULL, flip, NULL)) return 3;
+  while (!go) {}
+  execve("/usr/bin/true", args, envv);
+  return errno == EACCES ? 77 : 1;
+}
+"#,
+    )
+    .expect("write flip_exec.c");
+    let bin = dir.join("flip_exec");
+    let st = Command::new("cc")
+        .args(["-O2", "-pthread", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(st.success(), "cc failed");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    bin
 }

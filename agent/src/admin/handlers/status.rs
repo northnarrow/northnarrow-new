@@ -128,6 +128,10 @@ fn telemetry_status(
         execpol_map_recorded_total: Some(execpol.map_recorded),
         execpol_env_unread_total: Some(execpol.env_unread),
         execpol_lost_total: Some(execpol.lost),
+        execpol_env_truncated_total: Some(execpol.env_truncated),
+        execpol_env_changed_total: Some(execpol.env_changed),
+        execpol_lost_open_total: Some(execpol.lost_open),
+        open_sensor_per_call_total: Some(nn_linux::sensors::open_sensor::per_call_total()),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

@@ -91,6 +91,12 @@ const KNOWN: &[(&str, Why)] = &[
     ("UDP_FLOWS", Why::RateState),
     // classic tracepoint `sched:sched_process_exec`
     ("STDIO_SCRATCH", Why::PreemptOff),
+    // the review of #547 (F2, F5): the post-commit check's entry, classic
+    // tracepoint `sched:sched_process_exec` (`execpol_env_commit`) only
+    ("COMMIT_ENV", Why::PreemptOff),
+    // the review of #547 (F6): the FIM sensor's opens without the task's
+    // buffer
+    ("OPEN_TASK_COUNTERS", Why::Counter),
     // `tp_btf/cgroup_attach_task`
     ("CGROUP_JOIN_PATH", Why::PreemptOff),
     // `iter/bpf_prog`, read by the agent's census only
@@ -243,7 +249,7 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             &lsm,
             "static EXEC_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =",
         ),
-        (&pol, "static EXECPOL_ENV: HashMap<TaskKey, EnvStashRaw> ="),
+        (&pol, "static EXECPOL_ENV: HashMap<TaskKey, EnvScan> ="),
         (
             &pol,
             "static EXECMAP_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =",
@@ -256,7 +262,6 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             &bpf,
             "static OBJ_GET_PATH_SCRATCH: HashMap<TaskKey, [u8; PATH_BUF_LEN]> =",
         ),
-        (&open, "static OPEN_TASK: HashMap<u64, OpenTask> ="),
         (&open, "static RENAME_TASK: HashMap<u64, RenameTask> ="),
     ] {
         let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -266,6 +271,13 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             "{decl}"
         );
     }
+    // Lot 325 (cost): the FIM sensor's entry lives as long as its task — a
+    // plain hash still, allocated as tasks come, removed at `task_free`
+    let flat = open.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains(
+        "static OPEN_TASK: HashMap<u64, OpenTask> = HashMap::with_max_entries(OPEN_TASK_CAP, \
+         crate::task_scratch::BPF_F_NO_PREALLOC);"
+    ));
     let ts = code("agent-ebpf/src/task_scratch.rs");
     assert!(
         !ts.contains("LruHashMap"),
@@ -286,8 +298,63 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         &[
             "crate::task_scratch::make(&EXECQ_CAND_SCRATCH, &ck)",
             "crate::execpol::count_lost();",
-            "EXECQ_CAND.insert(&task, &*cand, 0)",
+            "let _ = nn_execq_cand_put(task, u64::from(ck.tid), ck.start_ns);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&q, "nn_execq_cand_put"),
+        &[
+            "EXECQ_CAND_SCRATCH.get_ptr_mut(&ck)",
+            "cand_put(task, cand);",
             "let _ = EXECQ_CAND_SCRATCH.remove(&ck);",
+        ],
+    )
+    .unwrap();
+    // copied into the candidates' map within the login's share (the review
+    // of #547, F4; the re-check, G5), the share given back when it goes;
+    // the map full, the oldest candidate goes for it (counted)
+    in_order(
+        body(&q, "cand_put"),
+        &[
+            "cand_take(task);",
+            "crate::task_scratch::share_take(",
+            "&EXECQ_CAND_UIDS,",
+            "&EXECQ_CAND_OVERFLOW,",
+            "crate::task_scratch::share_key(),",
+            "EXECQ_CAND_PER_SHARE,",
+            "bump(counter::CAND_DROPPED);",
+            "(*cand).uid = row;",
+            "(*cand).at = now;",
+            "if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {",
+            "if !(evict_oldest(now) && EXECQ_CAND.insert(&task, &*cand, 0).is_ok()) {",
+            "crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, row);",
+            "bump(counter::CAND_DROPPED);",
+            "bump(counter::CAND_EVICTED);",
+            "ring_note(task, now);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&q, "evict_oldest"),
+        &[
+            "while k < EVICT_PROBES {",
+            "EXECQ_CAND_RING.get(i)",
+            "Some(c) => c.at == at,",
+            "if live && now > at && now - at >= EVICT_MIN_AGE_NS {",
+            "cand_take(t);",
+            "return true;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&q, "cand_remove").contains("let _ = nn_execq_cand_remove(task);"));
+    assert!(body(&q, "nn_execq_cand_remove").contains("cand_take(task);"));
+    assert!(body(&q, "forget_freed").contains("cand_take(task);"));
+    in_order(
+        body(&q, "cand_take"),
+        &[
+            "EXECQ_CAND.remove(&task).is_ok()",
+            "crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, uid);",
         ],
     )
     .unwrap();
@@ -297,8 +364,10 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         &[
             "let key = crate::task_scratch::key_of(task);",
             "crate::task_scratch::make(&EXEC_SCRATCH, &key)",
-            // the map full: counted, refused in enforce mode
-            "None => return crate::execpol::walk_lost(),",
+            // the map full: judged without the walk (lot 325, R5: the
+            // protected targets refused, the rest let through, counted)
+            "crate::execpol::nn_exec_unwalked(",
+            "return if refuse != 0 { -13 } else { 0 };",
             "nn_exe_walk(",
             "crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);",
             "let _ = EXEC_SCRATCH.remove(&key);",
@@ -313,11 +382,13 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     assert!(body(&q, "nn_execq_classify")
         .contains("None => u64::from(class::TMP | class::VAR_TMP | class::HOME),"));
     in_order(
-        body(&pol, "walk_lost"),
+        body(&pol, "exec_unwalked"),
         &[
+            "let refuse = m == mode::ENFORCE && deny_c != 0;",
+            "if refuse {",
             "bump(counter::LOST);",
-            "if conf(conf_slot::MODE) == mode::ENFORCE {",
-            "-EACCES",
+            "} else {",
+            "bump(counter::LOST_OPEN);",
         ],
     )
     .unwrap();
@@ -376,16 +447,30 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     in_order(
         body(&open, "on_open"),
         &[
-            "crate::task_scratch::make(&OPEN_TASK, &task)",
+            "match task_buffer(task) {",
             "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);",
             "crate::fim_watch::observe_open_plain(file);",
             "on_open_in(file, t);",
-            "let _ = OPEN_TASK.remove(&task);",
+            // lot 325: kept for the task's life when `task_free` removes
+            // it; the review of #547 (F6): else the run's own, removed
+            "if !live {",
+            "let _ = OPEN_TASK_RUN.remove(&task);",
         ],
     )
     .unwrap();
     assert!(body(&open, "on_open_in").contains("observe(") && !open.contains("OPEN_WIN"));
-    assert!(body(&open, "walk").contains("crate::task_scratch::get_or_make(&OPEN_TASK, &task)"));
+    assert!(body(&open, "walk").contains("match task_buffer(task) {"));
+    let tb = body(&open, "task_buffer");
+    assert!(tb.contains("if nn_open_task_make(task) != 0 {"));
+    assert!(
+        body(&open, "nn_open_task_make").contains("crate::task_scratch::make(&OPEN_TASK, &task)")
+    );
+    assert!(tb.contains("crate::task_scratch::make(&OPEN_TASK_RUN, &task)"));
+    let flat_open = open.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat_open.contains(
+        "static OPEN_TASK_RUN: HashMap<u64, OpenTask> = \
+         HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);"
+    ));
     in_order(
         body(&open, "nn_rename_burst"),
         &["rename_burst(", "let _ = RENAME_TASK.remove(&task);"],
@@ -424,28 +509,40 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
 #[test]
 fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     let pol = code("agent-ebpf/src/execpol.rs");
+    // Lot 325: one tracepoint program, the post-commit check, on
+    // `sched_process_exec` — a tracepoint that is no syscall's, which runs
+    // on every CPU; nothing of execpol.rs on a syscall tracepoint.
+    assert_eq!(
+        pol.matches("#[tracepoint]").count(),
+        1,
+        "tracepoint programs in execpol.rs"
+    );
+    assert!(pol.contains("#[tracepoint]\npub fn execpol_env_commit("));
+    let m = code("agent/src/execpol/mod.rs");
+    assert!(m.contains("prog.attach(\"sched\", \"sched_process_exec\")"));
     assert!(
-        !pol.contains("#[tracepoint]"),
-        "a tracepoint program in execpol.rs"
+        !m.contains("\"syscalls\""),
+        "an execpol program on a syscall tracepoint"
     );
     assert!(!pol.contains("EXECPOL_ENV_SCRATCH"));
     assert!(!pol.contains("TP_SYS_ENTER_EXECVE"));
-    let p = body(&pol, "on_pass");
+    // the re-check of #547 (G6): by the environment's own LSM program on
+    // the exec sensor's hook (`exec_env_lsm`), its first pass
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
-            "let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {",
-            "nn_exec_env(task, u64::from(wk.tid), wk.start_ns)",
+            "let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);",
+            "if ef == 0 {",
             "let stashed = er & ENV_STASHED != 0;",
-            "if classes == 0 && ef == 0 {",
-            "if ef != 0 {",
-            "if ef & env_flags::DENYABLE != 0 {",
-            "report_exec(",
+            "if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {",
+            "nn_env_report(",
             "if stashed {",
-            "let _ = EXECPOL_ENV.remove(wk);",
+            "let _ = EXECPOL_ENV.remove(&wk);",
         ],
     )
     .unwrap();
+    assert!(!body(&pol, "on_pass").contains("nn_exec_env("));
     in_order(
         body(&pol, "exec_envp"),
         &[
@@ -453,12 +550,13 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
             "TASK_STRUCT_MM_OFFSET",
             "regs_are_the_writes(tflags)",
             "bpf_task_pt_regs(generated::bpf_get_current_task_btf())",
-            "let (reg, compat) = match exec_envp_reg(nr) {",
+            "let (reg, abi) = match exec_envp_reg(nr) {",
             "None => return ENVP_UNREAD,",
             "EnvpReg::Dx => off_opt!(PT_REGS_DX_OFFSET),",
             "EnvpReg::R10 => off_opt!(PT_REGS_R10_OFFSET),",
             "EnvpReg::Si => off_opt!(PT_REGS_SI_OFFSET),",
-            "envp_value(peek_u64((regs + off as u64) as *const u8), compat)",
+            "envp_value(peek_u64((regs + off as u64) as *const u8), abi)",
+            "if abi.compat_pointers() {",
             "v | ENVP_COMPAT",
         ],
     )
@@ -467,20 +565,29 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     // pointers is read; an entry or a string the scan cannot read is a
     // finding (never skipped), counted and recorded, never refused
     in_order(
-        body(&pol, "env_scan"),
+        body(&pol, "nn_env_step"),
         &[
             "let stride = envp_stride(compat);",
             "stride as u32,",
-            "(envp + (i as u64) * stride)",
-            "(*e).flags |= env_flags::UNREADABLE;",
+            "(envp + (idx + i as u64) * stride)",
+            "return i as u64 | UNREAD;",
             ") < 0",
-            "(*e).flags |= env_flags::UNREADABLE;",
+            "unread = UNREAD;",
         ],
     )
     .unwrap();
+    in_order(
+        body(&pol, "env_scan"),
+        &[
+            "if r & UNREAD != 0 {",
+            "(*e).stash.flags |= env_flags::UNREADABLE;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&pol, "nn_env_var").contains("(*e).stash.flags |= env_flags::UNREADABLE;"));
     let so = body(&pol, "scan_one");
     assert_eq!(
-        so.matches("(*e).flags |= env_flags::UNREADABLE;").count(),
+        so.matches("st.flags |= env_flags::UNREADABLE;").count(),
         5,
         "each captured value's read failure is flagged:\n{so}"
     );
@@ -490,20 +597,26 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
             "if raw == ENVP_UNREAD {",
             "return u64::from(env_flags::UNREADABLE);",
             "let compat = raw >> 63;",
-            "nn_env_scan(envp, u64::from(key.tid), key.start_ns, compat)",
+            "env_scan(envp, u64::from(key.tid), key.start_ns, compat)",
             "if r & SCAN_LOST != 0 {",
             "return u64::from(env_flags::UNREADABLE);",
             "u64::from(ef) | ENV_STASHED",
         ],
     )
     .unwrap();
-    let p = body(&pol, "on_pass");
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
             "if ef & env_flags::UNREADABLE != 0 {",
             "bump(counter::ENV_UNREAD);",
-            "| env_flags::UNREADABLE)",
+            "| env_flags::UNREADABLE",
+            // lot 325 (R2): and one the scan could not finish
+            "| env_flags::UNFINISHED",
+            // the review of #547 (F1): and a relative loader path
+            "| env_flags::PRELOAD_RELATIVE",
+            // the re-check of #547 (G1–G4): and an irregular loader value
+            "| env_flags::LOADER_IRREGULAR)",
         ],
     )
     .unwrap();
@@ -519,17 +632,35 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         body(&pol, "env_scan"),
         &[
             "crate::task_scratch::make(&EXECPOL_ENV, &key)",
-            "bpf_probe_read_user(",
-            "nn_list_staging(0, tid, start)",
+            "nn_env_round(",
             "if f == 0 {",
             "EXECPOL_ENV.remove(&key)",
         ],
     )
     .unwrap();
-    // a stash gone before the staging check counts as staging
+    // The review of #547 (F1): each loader value judged whole in the task's
+    // entry. An entry gone under the judgment (lot 322: it counted as
+    // staging) stops the scan unfinished — `TRUNCATED`, refused at a
+    // protected or set-id target — never a clean environment.
+    assert!(body(&pol, "nn_env_pending")
+        .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);"));
     in_order(
-        body(&pol, "nn_list_staging"),
-        &["EXECPOL_ENV.get_ptr(&key)", "None => return 1,"],
+        body(&pol, "nn_env_pending"),
+        &[
+            "None => return STOP,",
+            "nn_env_judge(",
+            "if env_entry(0, tid, start).is_none() {",
+            "return STOP;",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&pol, "env_scan"),
+        &[
+            "if nn_env_pending(tid, start) & STOP != 0 {",
+            "(*e).stash.flags |= env_flags::TRUNCATED;",
+            "let f = nn_env_resolve(0, tid, start) as u32;",
+        ],
     )
     .unwrap();
     // the record carries the findings the judgment rested on
@@ -538,7 +669,9 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     // it arms the check when the four registers' offsets resolved
     let m = code("agent/src/execpol/mod.rs");
     assert!(!m.contains("sys_enter_execve"), "agent/src/execpol/mod.rs");
-    assert!(m.contains("if offsets_resolved(&ENV_OFFSETS) {"));
+    // (the re-check of #547, G6: and attaches the environment's program)
+    assert!(m.contains("if !offsets_resolved(&ENV_OFFSETS) {"));
+    assert!(m.contains("} else if let Err(e) = attach_env_lsm(ebpf) {"));
     let flat = m.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains(
         "pub const ENV_OFFSETS: [u32; 4] = [ common::btf_offsets::slot::PT_REGS_ORIG_AX_OFFSET, \
