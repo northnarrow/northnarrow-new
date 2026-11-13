@@ -593,7 +593,15 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
   `bpf_prog_opt_out`, the loader and the type, Low, no posture change (one
   record a second per loader and type). A refused load is NN-L-AT-001
   `bpf_prog_type`, High, and raises the posture to ENGAGED (an
-  administrator's bpftrace meets it too: never the decisive tamper).
+  administrator's bpftrace meets it too: never the decisive tamper). Lot
+  341: the same under the observe-only `alpha` profile — a foreign tracing
+  load is the agent's self-protection (`bpf_send_signal` kills it past the
+  `task_kill` hook), not a response ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)
+  §1.1). `install.sh --allow-bpf-tools` (this host's bpftrace and the
+  interpreter of BCC's tools) and `--allow-bpf-loader <path>` write these
+  lines at a fresh install, signed with the install's key and applied
+  through the started agent; a line already in the policy is kept
+  (ALPHA_PROFILE.md §1.2).
 - It names an executable, not a user: while it is in force any root process
   that runs that executable may load those types. bpftrace runs what it is
   given — opt out a tool only where its use outside a window is routine.

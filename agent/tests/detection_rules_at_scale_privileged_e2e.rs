@@ -834,15 +834,16 @@ fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
     assert_eq!(rec["severity"], "Low", "record: {rec}");
     // The verdict is the evidence: a record, not a kill. The fixture's
     // agent is detect-only, where a Log decision's report is "would
-    // execute" too (`Executor::log_report` under `dry_run`), so `response`
-    // reads as a kill's would (lot 279's lab: this asserted "none" and
-    // failed on both guests with the verdict Log).
+    // execute" too (`Executor::log_report` under `dry_run`); since lot 341
+    // the record says what would have run — nothing, for a Log decision
+    // (lot 279's lab saw "suppressed (detect-only)" here, which named no
+    // action).
     assert_eq!(
         rec["verdict"],
         serde_json::json!({"Rule": "Log"}),
         "record: {rec}"
     );
-    assert_eq!(rec["response"], "suppressed (detect-only)", "record: {rec}");
+    assert_eq!(rec["response"], "none", "record: {rec}");
     let _ = Command::new("rmmod")
         .arg("dummy")
         .stderr(Stdio::null())
@@ -870,7 +871,8 @@ fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
         serde_json::json!({"Rule": "KillProcess"}),
         "record: {rec}"
     );
-    assert_eq!(rec["response"], "suppressed (detect-only)", "record: {rec}");
+    // lot 341: the suppressed response names its action
+    assert_eq!(rec["response"], "would have: KillProcess", "record: {rec}");
 }
 
 /// Lot 279: `depmod -a` again once the module copied into the running

@@ -759,10 +759,14 @@ pub enum OverlayKind {
     /// its JSONL file sink, its syslog-over-TLS receiver and the CA it
     /// pins). Off without it: a signed file turns the export on.
     Export = 17,
+    /// Lot 341 (alpha 2/4): `profile.local` — the response profile
+    /// (`profile = alpha|enforcing`). The only way to switch an installed
+    /// agent between observe-only and enforcing; applies at its next start.
+    Profile = 18,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 17] = [
+    pub const ALL: [OverlayKind; 18] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -780,6 +784,7 @@ impl OverlayKind {
         OverlayKind::RulePolicy,
         OverlayKind::NoDnsAllow,
         OverlayKind::Export,
+        OverlayKind::Profile,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -802,6 +807,7 @@ impl OverlayKind {
             OverlayKind::RulePolicy => "rule-policy",
             OverlayKind::NoDnsAllow => "nodns-allow",
             OverlayKind::Export => "export",
+            OverlayKind::Profile => "profile",
         }
     }
 
@@ -855,6 +861,7 @@ impl TryFrom<u8> for OverlayKind {
             15 => Ok(Self::RulePolicy),
             16 => Ok(Self::NoDnsAllow),
             17 => Ok(Self::Export),
+            18 => Ok(Self::Profile),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -2020,6 +2027,7 @@ mod tests {
             (OverlayKind::RulePolicy, 15, "rule-policy"),
             (OverlayKind::NoDnsAllow, 16, "nodns-allow"),
             (OverlayKind::Export, 17, "export"),
+            (OverlayKind::Profile, 18, "profile"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);
@@ -2028,7 +2036,7 @@ mod tests {
             assert_eq!(OverlayKind::from_keyword(&k.file_name()), Some(k));
         }
         assert!(OverlayKind::try_from(0u8).is_err());
-        assert!(OverlayKind::try_from(18u8).is_err());
+        assert!(OverlayKind::try_from(19u8).is_err());
         assert_eq!(OverlayKind::Export.file_name(), "export.local");
         assert_eq!(OverlayKind::from_keyword("nope"), None);
     }

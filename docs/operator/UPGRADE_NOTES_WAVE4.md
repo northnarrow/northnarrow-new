@@ -1879,3 +1879,56 @@ are judged as before; `CHANGELOG.md` has the detail.
   walking the map (a candidate made at least a second ago), where the
   first 8 slots of a ring could all be gone ones. Kernel 5.13 or later
   (`bpf_for_each_map_elem`), as every kernel the agent supports.
+
+## 37. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
+
+- **A fresh install is observe-only and starts.** `install.sh` on a host
+  without `/etc/northnarrow/install-manifest.json` records the `alpha`
+  profile (no response touches a user program; every verdict recorded with
+  what it would have done — [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)), starts
+  the agent then the watchdog and enables both at boot. Automation that
+  wants the old behaviour passes `--profile enforcing --no-enable` and
+  starts the units itself.
+- **An existing install keeps enforcing.** An upgrade, or a reinstall over a
+  kept `/etc/northnarrow`, keeps the profile its manifest has; a manifest
+  from before this lot has none, and its agent enforces as before.
+  `install.sh --profile` never switches an installed agent: switching is a
+  signed `nn-admin config overlay set profile` (kind 18), applied at the
+  agent's next start.
+- **Records say what would have run.** A response the no-enforcement gate
+  suppressed (`--detect-only`, `NN_DETECT_ONLY`, `alpha`) reads `"response":
+  "would have: KillProcessTree"`; it read `"suppressed (detect-only)"`. A
+  `Log` decision under the gate reads `"none"`. Records already written keep
+  their text; a reader keyed on the old string matches neither.
+- **Detect-only also stops an earlier enforcing run's owed exec-quarantine
+  kills** (the process is resumed). The module-load judge keeps refusing
+  untrusted modules under the gate, as before: the host's integrity.
+- **Under `alpha`, the host's integrity and the agent's self-protection
+  are enforced as under `enforcing`**: a foreign tracing, LSM, extension
+  or `struct_ops` BPF program's load (`bpftrace`, BCC, another EDR), an
+  untrusted module, a kexec image, the sysctl guard and its put-back, a
+  `cgroup/sysctl` program on the root cgroup, the kprobes and lockdown
+  switches, a cgroup v1 move or freeze and a ptrace of PID 1 are refused
+  outside a window, besides the agent's own files, processes, cgroup and
+  BPF objects ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). A tester who
+  runs bpftrace or BCC installs with `--allow-bpf-tools` (or
+  `--allow-bpf-loader <path>`): signed `bpf-loader-allow` lines, applied
+  through the started agent (§1.2). Nothing changes on an `enforcing`
+  install.
+- **An `alpha` start after an enforcing run, with no signed
+  `profile.local`**, writes a signed `integrity_drift` of kind
+  `profile_downgraded`. A reader of the audit chain that alerts on
+  `integrity_drift` sees it; a signed switch to `alpha` raises nothing.
+- **`install.sh` refuses a host it cannot run on** before any change:
+  not x86_64, systemd not the init system, no kernel BTF, a kernel the new
+  agent's `--btf-check` refuses; on a fresh install that starts the units,
+  also the BPF LSM off or bpffs not mounted (`--no-enable` installs anyway).
+- **The bootstrap key** a fresh install writes also has `telemetry-read`
+  (`nn-admin detections`). Keys bootstrapped before keep their line.
+- **`uninstall.sh` exits 3** when the agent is wedged: both units disabled,
+  the removal finished at the next boot by `northnarrow-uninstall.service`.
+  Automation that treated any non-zero exit as a failure should reboot on 3.
+- **`nn-admin status`** prints a summary block first; `--json` gains
+  `profile` and `records_today`. An `nn-admin` of this release needs an
+  agent of this release (the status reply grew two fields, as every
+  appended field before).

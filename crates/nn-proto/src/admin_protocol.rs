@@ -975,6 +975,34 @@ pub struct StatusResponse {
     /// agent.
     #[serde(default)]
     pub open_sensor_per_call_total: Option<u64>,
+    /// Lot 341 (alpha 2/4): the response profile in force and where it came
+    /// from (`alpha (install manifest)`, `enforcing (signed profile.local)`,
+    /// `enforcing (built-in default)`). With the next field, appended after
+    /// `open_sensor_per_call_total`; telemetry (`None` in the unsigned
+    /// reply, as detect-only); `None` from an older agent.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Lot 341: today's records (UTC day) by severity and the responses
+    /// they would have run — the summary at the top of `nn-admin status`.
+    #[serde(default)]
+    pub records_today: Option<RecordsToday>,
+}
+
+/// Lot 341 (alpha 2/4): the detection records of the current UTC day this
+/// agent wrote ([`StatusResponse::records_today`]), counted as they are
+/// recorded (a restart starts the count again: `since` says from when).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordsToday {
+    /// The UTC day counted (`2026-11-13`).
+    pub day: String,
+    /// When the count started: 00:00 UTC, or the agent's start that day
+    /// (RFC 3339).
+    pub since: String,
+    /// `(severity, records)`, highest first; severities with none left out.
+    pub by_severity: Vec<(String, u64)>,
+    /// `(action, records)` of the responses the no-enforcement gate
+    /// suppressed (`would have: <action>`), most first.
+    pub would_have: Vec<(String, u64)>,
 }
 
 /// Lot 276: the export's state ([`StatusResponse::export`];
@@ -1362,6 +1390,8 @@ impl StatusResponse {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: None,
+            records_today: None,
         }
     }
 
@@ -2451,6 +2481,13 @@ mod tests {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: Some("alpha (install manifest)".to_string()),
+            records_today: Some(RecordsToday {
+                day: "2026-11-13".to_string(),
+                since: "2026-11-13T00:00:00Z".to_string(),
+                by_severity: vec![("High".to_string(), 2), ("Low".to_string(), 7)],
+                would_have: vec![("KillProcess".to_string(), 2)],
+            }),
         }));
     }
 
@@ -2531,6 +2568,8 @@ mod tests {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: None,
+            records_today: None,
         }));
     }
 
@@ -2793,6 +2832,8 @@ mod tests {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: None,
+            records_today: None,
         }));
     }
 
@@ -2902,6 +2943,8 @@ mod tests {
             event_bus_decision: None,
             response_dispatch: None,
             export: None,
+            profile: None,
+            records_today: None,
         }
     }
 
@@ -2998,18 +3041,15 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the six appended fields' tags: R12a's bus, R12b's decision
+        // the appended fields' tags: R12a's bus, R12b's decision
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
-        // lot 322's two exec-guard counters
-        // and lot 325's four
+        // lot 322's two exec-guard counters, lot 325's four and lot 341's
+        // two
+        assert!(a.ends_with(&[0; 12]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 12]) && b.len() > a.len());
         assert!(
-            a.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            "the absent fields' tags"
-        );
-        assert!(b.starts_with(&a[..a.len() - 10]) && b.len() > a.len());
-        assert!(
-            b.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            "R12b's, R12c's, lot 276's, lot 322's and lot 325's fields, absent"
+            b.ends_with(&[0; 11]),
+            "R12b's, R12c's, lot 276's, lot 322's, lot 325's and lot 341's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
@@ -3036,9 +3076,10 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last nine: the decision's delay, the dispatch, lot 276's
-        // export, lot 322's two counters, lot 325's four — all absent)
-        assert!(c.starts_with(&b[..b.len() - 9]) && c.len() > b.len());
+        // (b's last eleven: the decision's delay, the dispatch, lot 276's
+        // export, lot 322's two counters, lot 325's four, lot 341's two —
+        // all absent)
+        assert!(c.starts_with(&b[..b.len() - 11]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3098,9 +3139,9 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        // (c's last eight: the dispatch, lot 276's export, lot 322's two
-        // counters and lot 325's four, absent)
-        assert!(d.starts_with(&c[..c.len() - 8]) && d.len() > c.len());
+        // (c's last ten: the dispatch, lot 276's export, lot 322's two
+        // counters, lot 325's four and lot 341's two, absent)
+        assert!(d.starts_with(&c[..c.len() - 10]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3650,8 +3691,8 @@ mod tests {
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
         // `response_dispatch`, lot 276's `export`, lot 322's
         // `execpol_env_unread_total` and `execpol_lost_total`, lot 325's
-        // four.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4;
+        // four, lot 341's `profile` and `records_today`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3677,12 +3718,12 @@ mod tests {
         status.execpol_env_unread_total = Some(300);
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 325's four fields follow them, absent here
-        let before = without.len() - 6;
+        // lot 325's four fields and lot 341's two follow them, absent here
+        let before = without.len() - 8;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
-        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3701,11 +3742,11 @@ mod tests {
         status.execpol_env_changed_total = Some(4);
         status.execpol_lost_open_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        // the review of #547's field follows them, absent here
-        let before = without.len() - 4;
+        // the review of #547's field and lot 341's two follow them, absent
+        let before = without.len() - 6;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 4..], &[1, 1, 1, 2, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02, 0]);
+        assert_eq!(&without[before - 4..], &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3718,11 +3759,45 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.open_sensor_per_call_total = Some(6);
         let with = postcard::to_allocvec(&status).unwrap();
-        let before = without.len() - 1;
+        // lot 341's two fields follow it, absent here
+        let before = without.len() - 3;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0]);
-        assert_eq!(&with[before..], &[1, 6]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 6, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// Lot 341 (alpha 2/4): the response profile and today's records are
+    /// the status's last fields, after the review of #547's: a reply with
+    /// them is the reply without them plus their bytes, so an older
+    /// `nn-admin` reads every field it knows.
+    #[test]
+    fn the_profile_and_today_s_records_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.open_sensor_per_call_total = Some(9);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.profile = Some("alpha (install manifest)".to_string());
+        status.records_today = Some(RecordsToday {
+            day: "2026-11-13".to_string(),
+            since: "2026-11-13T00:00:00Z".to_string(),
+            by_severity: vec![("High".to_string(), 2)],
+            would_have: vec![],
+        });
+        let with = postcard::to_allocvec(&status).unwrap();
+        let before = without.len() - 2;
+        assert_eq!(&with[..before], &without[..before]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0]);
+        assert_eq!(
+            &with[before..before + 2],
+            &[1, 24],
+            "Some, then the profile's length"
+        );
+        assert!(with.len() > without.len() + 24);
+        roundtrip(AdminMessage::StatusResponse(status));
+        assert!(
+            StatusResponse::public(PostureKind::Observing, false, None, None, None)
+                .telemetry_withheld()
+        );
     }
 
     #[test]
@@ -4527,10 +4602,12 @@ mod tests {
         // `execpol_env_truncated_total`, `execpol_env_changed_total` and
         // `execpol_lost_open_total`; every byte before them is lot 322's.
         // The review of #547: one more (0x55), `open_sensor_per_call_total`.
+        // Lot 341: two more (0x57), `profile` and `records_today`; every
+        // byte before them is the review of #547's.
         const STATUS_RESPONSE: &str = concat!(
-            "00000055050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000057050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "000000000000000000",
+            "0000000000000000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

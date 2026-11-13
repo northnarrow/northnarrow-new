@@ -18,9 +18,14 @@ use super::refusal::{self, Refusal};
 /// proof the attach takes.
 pub(crate) struct Integrity {
     pub(crate) exec_cfg: ExecutorConfig,
+    /// Lot 341: the ONE no-enforcement gate, resolved here from its every
+    /// input ([`resolve_gate`]); every response path and deny switch takes
+    /// this value.
     pub(crate) detect_only: bool,
     /// Where detect-only came from (MAIN-008), for `agent_boot`.
     pub(crate) detect_only_source: Option<String>,
+    /// Lot 341 (alpha 2/4): the response profile in force and its source.
+    pub(crate) profile: nn_core::response::profile::ResolvedProfile,
     /// The capabilities missing in enforcement, signed once the audit log
     /// is open.
     pub(crate) caps_degraded: Vec<String>,
@@ -81,15 +86,15 @@ pub(crate) fn check(
     // Lab PR 218: resolved before the attach — the capability gate below
     // depends on it.
     // BUG-033 detect-only: resolve the one no-enforcement gate from the
-    // CLI flag OR-ed with the env inputs (`from_env` reads
-    // `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`). The resolved
-    // value drives BOTH the response Executor (via the config) and the
-    // COMBAT engage-hook below, so there is exactly one switch.
-    let mut exec_cfg = ExecutorConfig::from_env();
-    if cli.detect_only {
-        exec_cfg.dry_run = true;
-    }
-    let detect_only = exec_cfg.dry_run;
+    // CLI flag OR-ed with the env inputs (`NN_DETECT_ONLY` / legacy
+    // `NORTHNARROW_DRY_RUN`) and, since lot 341, the response profile
+    // (`alpha`: observe-only). The resolved value drives the response
+    // Executor (via the config), the COMBAT engage-hook, the capability
+    // gate below, and the kernel's exec quarantine, exec policy, connect
+    // deny and exploit guard (the attach takes it): exactly one switch.
+    let (profile, gate) = resolve_gate(cli, overlay_gate);
+    let detect_only = gate.on;
+    let exec_cfg = executor_config(&gate);
     // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
     // R901..R904 on a file-name suffix any user picks; it starts in
     // enforcement only with NN_ALLOW_DEMO_RULES=1 (a weakening variable,
@@ -112,13 +117,8 @@ pub(crate) fn check(
         }
     }
     // External audit MAIN-008: the signed agent_boot entry says where
-    // detect-only came from.
-    let detect_only_source: Option<String> = if cli.detect_only {
-        Some("--detect-only".to_string())
-    } else {
-        northnarrow_agent::response::config::detect_only_env()
-            .map(|(name, v)| format!("{name}={v}"))
-    };
+    // detect-only came from (lot 341: the profile too).
+    let detect_only_source: Option<String> = gate.source;
     // Capability preflight (before anything attaches since lab PR 218,
     // external review G-09 / Q11-03): the systemd CapabilityBoundingSet is the
     // hard ceiling on what this root process can do. Without CAP_KILL,
@@ -131,9 +131,9 @@ pub(crate) fn check(
     // (below); in detect-only a WARN.
     let caps_degraded: Vec<String> = {
         use northnarrow_agent::response::caps_preflight as caps;
-        // review #466 F3: the check reads the environment's detect-only
-        // itself; the command line's flag is the one input it takes
-        let (reading, gate) = checks::capabilities(boot, cli.detect_only)?;
+        // review #466 F3, lot 341: the gate the response reads, resolved
+        // once above (the flag, the environment, the profile)
+        let (reading, gate) = checks::capabilities(boot, detect_only)?;
         if let caps::CapsReading::Read {
             note: Some(note), ..
         } = &reading
@@ -490,6 +490,7 @@ pub(crate) fn check(
         exec_cfg,
         detect_only,
         detect_only_source,
+        profile,
         caps_degraded,
         integrity,
         host_checks,
@@ -498,4 +499,342 @@ pub(crate) fn check(
         audit: audit_open,
         verified,
     })
+}
+
+/// Lot 341 (alpha 2/4): the response profile and the no-enforcement gate,
+/// resolved once from every input — the signed `profile.local` (through the
+/// overlay gate), the install manifest's profile (for the installed binary
+/// only), `--detect-only` and the detect-only variables. The only reader of
+/// those inputs at the start (`xtask/tests/self_defense.rs` keeps it so).
+pub(crate) fn resolve_gate(
+    cli: &Cli,
+    overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
+) -> (
+    nn_core::response::profile::ResolvedProfile,
+    nn_core::response::profile::DetectOnly,
+) {
+    // the running binary (an unreadable one: no install profile applies)
+    let own_exe = std::env::current_exe().unwrap_or_default();
+    resolve_gate_with(
+        cli,
+        overlay_gate,
+        &own_exe,
+        northnarrow_agent::response::config::detect_only_env(),
+    )
+}
+
+/// [`resolve_gate`] for the running binary `own_exe` and the detect-only
+/// variable `env` (the tests give theirs).
+pub(crate) fn resolve_gate_with(
+    cli: &Cli,
+    overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
+    own_exe: &std::path::Path,
+    env: Option<(&str, String)>,
+) -> (
+    nn_core::response::profile::ResolvedProfile,
+    nn_core::response::profile::DetectOnly,
+) {
+    use nn_core::response::profile::{self as prof, Profile};
+    use nn_proto::admin_signed_payload::OverlayKind;
+    use northnarrow_agent::config::overlay_auth::Verified;
+    use northnarrow_agent::install_manifest::{install_profile, InstallProfile};
+    let overlay = match overlay_gate.verified(OverlayKind::Profile, &cli.profile_local) {
+        Verified::Content { path, text } => match Profile::parse(&text) {
+            Ok(p) => Some(p),
+            // the gate's own check refuses such a file before it signs it;
+            // one that reaches here (the escape hatch) changes nothing
+            Err(why) => {
+                let detail = format!("{}: {why}", path.display());
+                error!(detail = %detail, "profile overlay unreadable — the install's profile applies");
+                northnarrow_agent::boot::degradation::report("profile", &detail);
+                None
+            }
+        },
+        _ => None,
+    };
+    let manifest = match install_profile(&cli.install_manifest, own_exe) {
+        InstallProfile::Named(p) => Some(p),
+        InstallProfile::None => None,
+        InstallProfile::Invalid(why) => {
+            let detail = format!("{}: {why}", cli.install_manifest.display());
+            error!(detail = %detail, "install manifest names no profile — the built-in default applies");
+            northnarrow_agent::boot::degradation::report("profile", &detail);
+            None
+        }
+    };
+    let profile = prof::resolve(overlay, manifest);
+    let gate = prof::detect_only_gate(cli.detect_only, env, &profile);
+    info!(
+        profile = %profile.describe(),
+        detect_only = gate.on,
+        source = gate.source.as_deref().unwrap_or("none"),
+        "response profile"
+    );
+    (profile, gate)
+}
+
+/// The response executor's configuration for the start's gate: its
+/// `dry_run` IS the gate (every action reports `WouldExecute`).
+pub(crate) fn executor_config(gate: &nn_core::response::profile::DetectOnly) -> ExecutorConfig {
+    ExecutorConfig {
+        dry_run: gate.on,
+        ..ExecutorConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use northnarrow_agent::config::overlay_auth::OverlayGate;
+    use northnarrow_agent::config::overlay_floor::RollbackFloor;
+
+    /// An installed binary in `dir` (its manifest naming `profile`) and the
+    /// command line an operator could give, every enforcement asked for.
+    fn installed(dir: &std::path::Path, profile: Option<&str>) -> (Cli, std::path::PathBuf) {
+        let exe = dir.join("northnarrow-agent");
+        std::fs::write(&exe, b"installed").unwrap();
+        let manifest = dir.join("install-manifest.json");
+        let field = profile
+            .map(|p| format!(",\"profile\":\"{p}\""))
+            .unwrap_or_default();
+        std::fs::write(
+            &manifest,
+            format!(
+                "{{\"version\":\"0.0.1\",\"provenance\":\"source-tree\",\"bin_dir\":\"{}\",\"files\":{{}}{field}}}",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        // the flags read the process environment, which
+        // `cli::tests::env_switches_read_1_and_0` sets (gates6: its
+        // `NN_EXEC_POLICY_NO_ENV=maybe` met this parse)
+        let _env = super::super::cli::TEST_ENV.lock();
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent".to_string(),
+            "--install-manifest".to_string(),
+            manifest.display().to_string(),
+            "--profile-local".to_string(),
+            dir.join("profile.local").display().to_string(),
+            "--exec-quarantine".to_string(),
+            "enforce".to_string(),
+            "--exec-policy".to_string(),
+            "enforce".to_string(),
+            "--net-connect-deny".to_string(),
+            "--exploit-guard-response".to_string(),
+            "enforce".to_string(),
+        ])
+        .expect("a test's command line");
+        (cli, exe)
+    }
+
+    fn gate_without_keys(dir: &std::path::Path) -> OverlayGate {
+        OverlayGate::new(&dir.join("admin.pub"), [3; 16], RollbackFloor::default())
+    }
+
+    /// A `profile.local` with `body` in `dir`, signed by a `config-manage`
+    /// key for agent `[3; 16]`, and the gate that trusts that key.
+    fn signed_profile(dir: &std::path::Path, body: &str) -> OverlayGate {
+        use ed25519_dalek::SigningKey;
+        use nn_proto::admin_signed_payload::{sign, OverlayKind, SignedPayload};
+        use northnarrow_agent::config::overlay_auth::{content_sha256, sig_path, OverlaySignature};
+        let key = SigningKey::generate(&mut northnarrow_agent::os_rng::OsRng);
+        let admin_pub = dir.join("admin.pub");
+        std::fs::write(
+            &admin_pub,
+            format!(
+                "{} config-manage\n",
+                hex::encode(key.verifying_key().as_bytes())
+            ),
+        )
+        .unwrap();
+        let p = dir.join("profile.local");
+        std::fs::write(&p, body).unwrap();
+        // the request's nonce, drawn from the OS (never a fixed value)
+        let nonce: [u8; 32] = {
+            use rand::RngExt;
+            northnarrow_agent::os_rng::OsRng.random()
+        };
+        let payload = SignedPayload::new_config_overlay_set(
+            nonce,
+            100,
+            [3; 16],
+            OverlayKind::Profile,
+            content_sha256(body.as_bytes()),
+            body.len() as u32,
+        );
+        let s = sign(&payload, &key).unwrap();
+        std::fs::write(
+            sig_path(&p),
+            OverlaySignature::new(payload, &[s])
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        OverlayGate::new(&admin_pub, [3; 16], RollbackFloor::default())
+    }
+
+    /// Named (lot 341): a signed `profile.local` is the switch of an
+    /// installed agent — `enforcing` over the install's `alpha`, `alpha`
+    /// over an enforcing install — and its source is said.
+    #[test]
+    fn a_signed_profile_local_switches_the_installed_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(dir.path(), Some("alpha"));
+        let gate = signed_profile(dir.path(), "# the operator's switch\nprofile = enforcing\n");
+        let (profile, g) = resolve_gate_with(&cli, &gate, &exe, None);
+        assert_eq!(profile.describe(), "enforcing (signed profile.local)");
+        assert!(!g.on, "{g:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(dir.path(), Some("enforcing"));
+        let gate = signed_profile(dir.path(), "profile = alpha\n");
+        let (profile, g) = resolve_gate_with(&cli, &gate, &exe, None);
+        assert_eq!(profile.describe(), "alpha (signed profile.local)");
+        assert_eq!(
+            g.source.as_deref(),
+            Some("profile alpha (signed profile.local)")
+        );
+    }
+
+    /// Named (lot 341, alpha 2/4): no response executes under `alpha`. The
+    /// install's `alpha` profile switches the start's one gate on, and every
+    /// response path and deny switch the start feeds from it stands down —
+    /// even with every enforcement asked for on the command line: the
+    /// executor (kill, tree kill, quarantine, egress block, throttle),
+    /// the exec quarantine's holds, the exec policy's denies, the kernel
+    /// connect deny, the exploit guard, the module-load judge's refusals.
+    #[test]
+    fn no_response_executes_under_alpha() {
+        use nn_model::ResponseAction;
+        use northnarrow_agent::response::journal::{ActionIntent, ActionJournal};
+        use northnarrow_agent::response::{ExecutionOutcome, Executor};
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(dir.path(), Some("alpha"));
+        let (profile, gate) = resolve_gate_with(&cli, &gate_without_keys(dir.path()), &exe, None);
+        assert_eq!(profile.describe(), "alpha (install manifest)");
+        assert!(gate.on, "{gate:?}");
+        assert_eq!(
+            gate.source.as_deref(),
+            Some("profile alpha (install manifest)")
+        );
+        // the executor: every action reports what it would have done
+        let exec = Executor::with_config(executor_config(&gate));
+        let journal = ActionJournal::memory();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        for action in [
+            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
+            ResponseAction::BlockOutbound,
+            ResponseAction::Quarantine,
+            ResponseAction::ThrottleProcess,
+        ] {
+            let ticket = journal.intent(ActionIntent::named("alpha", "test", 0));
+            let report = exec.execute(action.clone(), pid, &ticket);
+            assert_eq!(
+                report.primary,
+                ExecutionOutcome::WouldExecute { pid },
+                "{action:?} ran under alpha"
+            );
+            assert_eq!(
+                northnarrow_agent::detection_store::describe_response(&report),
+                format!("would have: {action:?}")
+            );
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the target died under alpha"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        // the kernel's switches the start writes from the same gate
+        assert_eq!(
+            cli.execq_config(gate.on).mode,
+            northnarrow_agent::execq::Mode::Observe,
+            "exec quarantine holds under alpha"
+        );
+        assert_eq!(
+            super::super::attach::execpol_mode(cli.exec_policy, gate.on),
+            northnarrow_agent::execpol::Mode::Audit,
+            "exec policy denies under alpha"
+        );
+        assert_eq!(
+            nn_linux::sensors::connect_deny::arming(cli.net_connect_deny, gate.on),
+            nn_linux::sensors::connect_deny::Arming::DetectOnly,
+            "connect deny armed under alpha"
+        );
+        assert_eq!(
+            northnarrow_agent::sensors::epg::effective_response(
+                cli.exploit_guard_response.response(),
+                gate.on
+            ),
+            northnarrow_agent::sensors::epg::Response::Detect,
+            "exploit guard kills under alpha"
+        );
+        // the review of #550 (F2): the host's integrity and the agent's
+        // self-protection hold under alpha — an untrusted module refused
+        assert_eq!(
+            northnarrow_agent::module_trust::kernel_mode(
+                northnarrow_agent::module_trust::DEFAULT_MODE,
+                true
+            ),
+            common::module_judge::mode::DENY,
+            "an untrusted module loads under alpha"
+        );
+    }
+
+    /// The same command line on an `enforcing` install enforces: the test
+    /// above would catch a gate that never opens, this one a gate stuck on.
+    #[test]
+    fn the_enforcing_install_enforces_and_a_signed_overlay_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(dir.path(), Some("enforcing"));
+        let (profile, gate) = resolve_gate_with(&cli, &gate_without_keys(dir.path()), &exe, None);
+        assert_eq!(profile.describe(), "enforcing (install manifest)");
+        assert!(!gate.on);
+        assert_eq!(
+            cli.execq_config(gate.on).mode,
+            northnarrow_agent::execq::Mode::Enforce
+        );
+        // an install older than the profile: enforcing, as before
+        let old = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(old.path(), None);
+        let (profile, gate) = resolve_gate_with(&cli, &gate_without_keys(old.path()), &exe, None);
+        assert_eq!(profile.describe(), "enforcing (built-in default)");
+        assert!(!gate.on);
+        // an unsigned profile.local is refused: the install's alpha stays
+        let alpha = tempfile::tempdir().unwrap();
+        let (cli, exe) = installed(alpha.path(), Some("alpha"));
+        std::fs::write(alpha.path().join("profile.local"), "profile = enforcing\n").unwrap();
+        let (profile, gate) = resolve_gate_with(&cli, &gate_without_keys(alpha.path()), &exe, None);
+        assert_eq!(profile.describe(), "alpha (install manifest)");
+        assert!(gate.on, "an unsigned file switched alpha to enforcing");
+        // the mini-hunt: an unsigned `alpha` dropped on an enforcing install
+        // (root's file, no key) switches nothing off
+        let enforcing = tempfile::tempdir().unwrap();
+        let (cli_e, exe_e) = installed(enforcing.path(), Some("enforcing"));
+        std::fs::write(enforcing.path().join("profile.local"), "profile = alpha\n").unwrap();
+        let (profile, gate) =
+            resolve_gate_with(&cli_e, &gate_without_keys(enforcing.path()), &exe_e, None);
+        assert_eq!(profile.describe(), "enforcing (install manifest)");
+        assert!(!gate.on, "an unsigned alpha disarmed an enforcing install");
+        // a copy of the agent (the e2e fixtures') is no installed binary
+        let copy = alpha.path().join("northnarrow-agent-e2etest-1");
+        std::fs::write(&copy, b"fixture").unwrap();
+        let (cli, _) = installed(alpha.path(), Some("alpha"));
+        let (profile, _) = resolve_gate_with(&cli, &gate_without_keys(alpha.path()), &copy, None);
+        assert_eq!(profile.describe(), "enforcing (built-in default)");
+        // the flag and the variable keep their meaning on an enforcing install
+        let (_, gate) = resolve_gate_with(
+            &cli,
+            &gate_without_keys(alpha.path()),
+            &copy,
+            Some(("NN_DETECT_ONLY", "1".to_string())),
+        );
+        assert_eq!(gate.source.as_deref(), Some("NN_DETECT_ONLY=1"));
+    }
 }

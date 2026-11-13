@@ -407,11 +407,7 @@ impl Controller {
         let changed = self.mirror != next;
         self.mirror = next;
         // the mode, once the map is filled
-        let m = if want.mode == mode::DENY && !self.deny_ok {
-            mode::RECORD
-        } else {
-            want.mode
-        };
+        let m = kernel_mode(want.mode, self.deny_ok);
         let first = self.armed.is_none();
         if self.armed != Some(m) {
             match self.kernel.set_mode(m) {
@@ -450,6 +446,21 @@ impl Controller {
             }
         }
         set_state(summary);
+    }
+}
+
+/// The mode written to the kernel for the policy's `want`: the deny mode
+/// only when the kernel's offsets let the judge trust a file (`deny_ok`).
+/// Lot 341 (the review of #550, F2/F7): no profile and no detect-only
+/// input — an untrusted module can do anything to the agent (blind its
+/// hooks, kill it), so the judge refuses one under `alpha` and
+/// `--detect-only` as under `enforcing`; only the signed policy (R018 in a
+/// mode other than `enforce`, a `module-allow` line) relaxes it.
+pub fn kernel_mode(want: u64, deny_ok: bool) -> u64 {
+    if want == mode::DENY && !deny_ok {
+        mode::RECORD
+    } else {
+        want
     }
 }
 
@@ -505,6 +516,18 @@ pub fn start(kernel: Option<kernel::Kernel>) -> Result<std::thread::JoinHandle<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named (lot 341, the review of #550 F2/F7): the module-load judge
+    /// takes no gate — the deny mode the policy (or the default) asks for
+    /// is written as asked under every profile; only offsets the judge
+    /// cannot trust record instead.
+    #[test]
+    fn the_module_judge_denies_under_every_profile() {
+        assert_eq!(DEFAULT_MODE, mode::DENY);
+        assert_eq!(kernel_mode(mode::DENY, true), mode::DENY);
+        assert_eq!(kernel_mode(mode::DENY, false), mode::RECORD);
+        assert_eq!(kernel_mode(mode::RECORD, true), mode::RECORD);
+    }
     use crate::decision::rule_policy::parse;
 
     /// The policy's mode for R018 is the judge's: `enforce` deny, any other

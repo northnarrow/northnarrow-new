@@ -79,6 +79,7 @@ pub(crate) async fn load(
     bpf_lsm: &northnarrow_agent::boot::lsm::BpfLsm,
     image: std::io::Result<nn_linux::worker::SelfImage>,
     export_on: bool,
+    detect_only: bool,
 ) -> Result<Attached> {
     // R14b (plan §3.1, §3.5): the workers first — the parse worker ready
     // when the DNS pump's first records come; its pid registered once the
@@ -130,23 +131,16 @@ pub(crate) async fn load(
         ..Default::default()
     };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the
-    // multiplexer writes it into the kernel (the same detect-only inputs
-    // the executor reads further down: a detect-only agent observes).
-    let execq_cfg = cli.execq_config(
-        cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some(),
-    );
+    // multiplexer writes it into the kernel (lot 341: the start's one gate,
+    // the executor's: a detect-only or `alpha` agent observes).
+    let execq_cfg = cli.execq_config(detect_only);
     let execq_mode = execq_cfg.mode;
     // Lab PR 226 (EXPERIMENTAL): the exec policy, its signed table read
     // now (the kernel configuration is written and frozen when the
     // multiplexer starts); a detect-only agent audits.
     let execpol_cfg = {
         use northnarrow_agent::execpol::{self as ep, Mode};
-        let detect_only =
-            cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some();
-        let mode = match cli.exec_policy {
-            Mode::Enforce if detect_only => Mode::Audit,
-            m => m,
-        };
+        let mode = execpol_mode(cli.exec_policy, detect_only);
         let boot = if mode == Mode::Off {
             ep::boot_table(None, cli.exec_policy_profile)
         } else {
@@ -535,6 +529,20 @@ fn spawn_lineage_sweep(
             "lineage: the sweep's thread did not start — exited processes' entries are not \
              released, forks not entered"
         );
+    }
+}
+
+/// Lab PR 226: the exec policy's mode for the one asked for: under the
+/// no-enforcement gate (lot 341: `--detect-only`, a detect-only variable,
+/// the `alpha` profile) an enforcing policy audits.
+pub(crate) fn execpol_mode(
+    requested: northnarrow_agent::execpol::Mode,
+    detect_only: bool,
+) -> northnarrow_agent::execpol::Mode {
+    use northnarrow_agent::execpol::Mode;
+    match requested {
+        Mode::Enforce if detect_only => Mode::Audit,
+        m => m,
     }
 }
 

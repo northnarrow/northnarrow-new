@@ -165,9 +165,11 @@ pub(crate) fn build(
     }
     if detect_only {
         warn!(
-            "DETECT-ONLY mode active (--detect-only / NN_DETECT_ONLY / NORTHNARROW_DRY_RUN): \
+            "DETECT-ONLY mode active (the alpha profile, --detect-only, NN_DETECT_ONLY or \
+             NORTHNARROW_DRY_RUN: the `response profile` line names which): \
              detection + posture run normally, but NO response action or COMBAT network \
-             isolation will touch the system — verdicts are logged as \"would execute\" only"
+             isolation will touch the system — each verdict is recorded with what it would have \
+             done (\"would have: <action>\")"
         );
     }
     // Lab follow-up (lab PR 165): without `nft` the per-process outbound

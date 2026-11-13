@@ -40,6 +40,16 @@
 #               stopped the agent; a pin root that is still protected is
 #               reported instead of failing the package operation
 #
+# Lot 341 (alpha 2/4): a WEDGED agent — its unit active but its admin socket
+# not answering, or an agent that does not come up for the window — cannot
+# open the trusted-installer window, and its hooks refuse the stop until the
+# next boot (bpffs does not survive one). The script then disables both
+# units (their enablement links are not protected), schedules the rest of
+# the removal for the next boot (northnarrow-uninstall.service, a one-shot
+# that runs a copy of this script with the same options, --at-boot, and
+# then removes itself) and exits 3: reboot to finish. No key is needed for
+# that path.
+#
 # A unit that does not stop (no window on a protected host) stops the
 # script before anything is disabled or removed.
 #
@@ -66,14 +76,24 @@ OWN_IDS_FILE=${OWN_IDS_FILE:-$RUN_DIR/bpf-own-ids}
 PURGE=0
 YES=0
 PACKAGE=0
+AT_BOOT=0
 GRANT_KEY=
 expect_key=0
+# Lot 341: where a wedged agent's removal waits for the next boot (outside
+# the agent's own directories, which its hooks keep protected until then).
+FINISH_DIR=${FINISH_DIR:-/var/lib/northnarrow-uninstall}
+FINISH_UNIT=northnarrow-uninstall.service
+# How long the agent has to answer on its socket before it counts as wedged.
+ANSWER_TIMEOUT=${ANSWER_TIMEOUT:-10}
+# This script, copied for the boot-time run.
+SELF_SCRIPT=${SELF_SCRIPT:-$(readlink -f "$0")}
 for arg in "$@"; do
     if (( expect_key )); then GRANT_KEY=$arg; expect_key=0; continue; fi
     case "$arg" in
         --purge) PURGE=1 ;;
         --yes|-y) YES=1 ;;
         --package) PACKAGE=1 ;;
+        --at-boot) AT_BOOT=1 ;;
         --grant-key) expect_key=1 ;;
         -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) echo "uninstall.sh: unknown argument: $arg" >&2; exit 2 ;;
@@ -167,6 +187,62 @@ if (( ! YES )); then
     [[ "$ans" == y || "$ans" == Y ]] || { echo "aborted"; exit 1; }
 fi
 
+# >>> finish_at_boot (run by xtask/tests/install_scripts.rs)
+# Lot 341 (alpha 2/4): the agent answers on its admin socket within
+# ANSWER_TIMEOUT seconds (each try bounded: a wedged socket never hangs the
+# script).
+agent_answers() {
+    timeout "$ANSWER_TIMEOUT" "$BIN_DIR/nn-admin" status --socket "$ADMIN_SOCKET" --json >/dev/null 2>&1
+}
+# A wedged agent: both units disabled now, the removal finished at the next
+# boot by a one-shot unit running a copy of this script (--at-boot, the same
+# options), which then removes itself. Exit 3: reboot to finish.
+finish_at_boot() {   # <why>
+    local u args=(--yes --at-boot)
+    (( PURGE )) && args+=(--purge)
+    echo "uninstall.sh: the agent is WEDGED ($1): its trusted-installer window cannot open, and its hooks" >&2
+    echo "uninstall.sh: refuse its stop until the next boot. Disabling both units and finishing at the next boot." >&2
+    for u in northnarrow-watchdog northnarrow-agent; do
+        systemctl disable "$u.service" 2>/dev/null || true
+        if systemctl is-enabled --quiet "$u.service" 2>/dev/null; then
+            echo "uninstall.sh: $u.service could not be disabled. Reboot with systemd.mask=$u.service on the kernel" >&2
+            echo "uninstall.sh: command line (both units), then run this script again. Nothing else was changed." >&2
+            exit 1
+        fi
+    done
+    install -d -m 0700 "$FINISH_DIR"
+    install -m 0700 "$SELF_SCRIPT" "$FINISH_DIR/uninstall.sh"
+    cat > "$UNIT_DIR/$FINISH_UNIT" <<EOT
+[Unit]
+Description=Finish the NorthNarrow uninstall (its agent was wedged)
+After=local-fs.target
+Before=northnarrow-agent.service northnarrow-watchdog.service
+ConditionPathExists=$FINISH_DIR/uninstall.sh
+
+[Service]
+Type=oneshot
+Environment=BIN_DIR=$BIN_DIR UNIT_DIR=$UNIT_DIR DROPIN_ROOT=$DROPIN_ROOT ETC_DIR=$ETC_DIR STATE_DIR=$STATE_DIR RUN_DIR=$RUN_DIR BPFFS_ROOT=$BPFFS_ROOT FINISH_DIR=$FINISH_DIR
+ExecStart=/bin/bash $FINISH_DIR/uninstall.sh ${args[*]}
+
+[Install]
+WantedBy=multi-user.target
+EOT
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable "$FINISH_UNIT" 2>/dev/null || true
+    echo "uninstall.sh: both units disabled; the removal finishes at the next boot ($FINISH_UNIT)."
+    echo "uninstall.sh: REBOOT NOW to finish: sudo systemctl reboot"
+    echo "uninstall.sh: afterwards: journalctl -b -u $FINISH_UNIT shows what was removed."
+    exit 3
+}
+# The one-shot's own removal, at the end of a run at boot.
+finish_done() {
+    systemctl disable "$FINISH_UNIT" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$FINISH_UNIT"
+    rm -rf "$FINISH_DIR"
+    systemctl daemon-reload 2>/dev/null || true
+}
+# <<< finish_at_boot
+
 # External audit DEP-006: the drain gate used to wait for "no LSM program on
 # the host", a count that includes every other product's BPF-LSM programs:
 # on such a host it never reached 0 and the uninstall stopped halfway. It
@@ -235,7 +311,8 @@ if (( ! PACKAGE )) && pins_present && units_inactive; then
             exit 1
         fi
         [[ -r "$GRANT_KEY" ]] || { echo "uninstall.sh: --grant-key $GRANT_KEY is not readable" >&2; exit 1; }
-        start_agent_for_window || exit 1
+        # lot 341: an agent that does not come up for the window is wedged
+        start_agent_for_window || finish_at_boot "the installed agent did not come up for the window"
         STARTED_FOR_WINDOW=1
     fi
 fi
@@ -243,6 +320,13 @@ fi
 own_ids=$(read_own_prog_ids)
 
 # ── 1. units ──────────────────────────────────────────────────────────
+# Lot 341: an active agent that does not answer cannot open a window: the
+# removal is finished at the next boot (finish_at_boot), with or without a
+# key. Not for --package (the package manager already stopped it) nor at
+# boot (the units are disabled then: nothing runs).
+if (( ! PACKAGE && ! AT_BOOT )) && systemctl is-active --quiet northnarrow-agent.service && ! agent_answers; then
+    finish_at_boot "northnarrow-agent.service is active but does not answer nn-admin status within ${ANSWER_TIMEOUT}s"
+fi
 # The pin root is protected by the running agent (review entry 39): open the
 # trusted-installer window first, while the agent still answers.
 if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
@@ -256,7 +340,7 @@ if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.servic
     if [[ $local_help == *--for-installer* ]]; then
         for_installer=(--for-installer)
     fi
-    if ! "$BIN_DIR/nn-admin" trusted-installer-grant ${for_installer[@]+"${for_installer[@]}"} --key "$GRANT_KEY" --window-secs 300; then
+    if ! timeout 60 "$BIN_DIR/nn-admin" trusted-installer-grant ${for_installer[@]+"${for_installer[@]}"} --key "$GRANT_KEY" --window-secs 300; then
         echo "uninstall.sh: trusted-installer grant REFUSED (key without the trusted-installer role?)" >&2
         (( STARTED_FOR_WINDOW )) &&
             echo "uninstall.sh: the agent started for the window keeps running (its stop needs the window)" >&2
@@ -340,6 +424,11 @@ elif [[ -n "$own_ids" ]]; then
         echo "uninstall.sh: (ps aux | grep northnarrow). Stop it and re-run." >&2
         (( PACKAGE )) || exit 1
     fi
+elif (( AT_BOOT )); then
+    # Lot 341: the boot-time run of a wedged agent's removal — its units
+    # were disabled before this boot and bpffs is new: no NorthNarrow program
+    # can be loaded (other products' LSM programs are not ours to wait for).
+    log "at boot, the units disabled since before it: no NorthNarrow BPF program is loaded"
 else
     # An agent older than the list (or none ever ran): every LSM program on
     # the host, as before, naming what is left.
@@ -472,6 +561,11 @@ if (( PURGE )); then
     done
 else
     kept_report
+fi
+
+# Lot 341: the boot-time run of a wedged agent's removal removes itself.
+if (( AT_BOOT )); then
+    finish_done
 fi
 
 echo ""
