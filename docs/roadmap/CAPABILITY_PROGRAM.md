@@ -9442,7 +9442,15 @@ number in parentheses is a lab PR.
     A bracket class now ends as glibc ends it (N2:
     `[a[:]uditd.servic[:e:]` stops auditd). Checked against glibc 2.39's
     `fnmatch`: 60,560 cases, plus 40,000 around `[:`, `[=` and `[.`; every
-    name glibc matches is matched. @MUT2@ @LAB@ Left to lot 330, with F5, F6, F7 and F13: a
+    name glibc matches is matched. 39 mutations of the round's code: 37
+    caught by named tests (2 after a test each), 2 argued equivalent.
+    Ubuntu 24.04 (`6.8.0-149-generic`, systemd 255, fdba3a6f, the agent
+    uninstalled and the guest clean and off after): logrotate forced on
+    rsyslog's own configuration, run as a transient unit as the timer runs
+    it, ran the real postrotate (`rsyslog-rotate`) four times: each a Low
+    NN-L-EVA-001 (rsyslogd's `SigCgt` `0000000100314001`, alone in its
+    cgroup) and no other record. With `POSIXLY_CORRECT=1`, rsyslogd got
+    SIGTERM and the record was High. Left to lot 330, with F5, F6, F7 and F13: a
     listed unit's file and drop-ins (an empty `ExecStart=` in a
     `.service.d` drop-in, `daemon-reload`, `restart`: no record).
   - Level unchanged (C14 2): fixes inside the capability at its level.
