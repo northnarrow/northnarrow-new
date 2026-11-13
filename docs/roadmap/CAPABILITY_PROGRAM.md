@@ -10514,6 +10514,11 @@ number in parentheses is a lab PR.
       `wire::execq` (`root_s_subuid_ranges_are_not_root_s_row`), the
       updated `exec_env_complete.rs`; 7 mutants of the new branches, each
       caught by a named test.
+    - Lab, as measured (our guest, lease k332): `verifier-check` 0 failing
+      on 7.0.0-43 (112 programs, 107 OK, 5 not counted);
+      `fim_file_open_sensor` 263,427 instructions processed, as before the
+      re-check (6,271 instructions loaded, 3 more), its deepest chain still
+      480 of 512 bytes; no probe instance or kprobe event left.
   - Level unchanged: the gate is the lab's and the nightly's; C23's
     provisional waits on the nightly on the five guests, now with the
     verifier step.
