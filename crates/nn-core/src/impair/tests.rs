@@ -1815,6 +1815,16 @@ mod lot316_variants {
             .run(7501, 200, SYSTEMCTL, &["systemctl", "stop", "northnarrow*"])
             .expect("a finding");
         assert!(f.sanctioned.is_some(), "{f:?}");
+        // the review of #548: `condstop` is a stop
+        let f = h
+            .run(
+                7502,
+                200,
+                SYSTEMCTL,
+                &["systemctl", "condstop", "northnarrow-agent"],
+            )
+            .expect("a finding");
+        assert!(f.sanctioned.is_some(), "{f:?}");
         // a mask or a freeze of the agent's own unit: no restart
         for (k, argv) in [
             &["systemctl", "mask", "northnarrow-agent"][..],
@@ -2176,6 +2186,13 @@ mod rev548 {
             (SC, &["systemctl", "kill", "-s", "HUP", "falco"]),
             ("/usr/bin/kill", &["kill", "-HUP", "9401"]),
             ("/usr/bin/kill", &["kill", "-TERM", "9400"]),
+            // procps: the last `-s` is the signal
+            (
+                "/usr/bin/kill",
+                &["kill", "-s", "HUP", "-s", "KILL", "9400"],
+            ),
+            // a stop that names a signal is a stop
+            (SC, &["systemctl", "stop", "-s", "HUP", "rsyslog"]),
         ]
         .into_iter()
         .enumerate()
@@ -2188,5 +2205,6 @@ mod rev548 {
             low(9440, SC, &["systemctl", "kill", "-s", "HUP", "rsyslog"]),
             None
         );
+        assert_eq!(low(9441, "/usr/bin/kill", &["kill", "-HUP", "9400"]), None);
     }
 }

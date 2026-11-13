@@ -315,6 +315,15 @@ mod tests {
             ("a\\*", "a\\x", true),
             ("*", "auditd.service", true),
             ("[a", "[a", true),
+            // an unclosed `[` is itself, no wildcard
+            ("[a", "xa", false),
+            // a range's upper bound; a class holds its own characters only;
+            // a collating symbol is its character
+            ("[a-c]x", "dx", false),
+            ("[[:alpha:]]x", "1x", false),
+            ("[[:upper:]]x", "ax", false),
+            ("[[.a.]]x", "bx", false),
+            ("[[=a=]]x", "bx", false),
             ("auditd.service?", "auditd.service", false),
             ("a*b*c*d*e*f*g", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
         ] {
