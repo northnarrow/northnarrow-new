@@ -10234,5 +10234,33 @@ number in parentheses is a lab PR.
     protected target (`TRUNCATED`); 100,000 judged names refused at the
     first pass in 42 µs (the 64-name cap). A failed exec's candidate goes with its file: 1,500 processes each failing an exec (no loader) and staying alive left no candidate (6.8; the uid's share back to 0, its row removed at the next recount); the FIM buffers' shares equal their entries, uid by uid. 40 targeted mutants,
     each caught by a named test.
+  - The re-check of #547 (MERGE AFTER FIXES; new commits). G1–G4: a loader
+    value holding a control byte (a tab inside an `LD_PRELOAD` entry, which
+    glibc keeps; musl's newline), an empty `LD_LIBRARY_PATH` element (the
+    caller's directory) or a `$` token (`$LIB`, `$ORIGIN`, `$PLATFORM`) is
+    `irregular_loader_value`: refused at a protected or set-id target,
+    recorded elsewhere. G5: the shares of the quarantine's candidates and of
+    the FIM buffers are the login's (`task->loginuid`, kept by a session's
+    container subuids), the uid's without one; an overflow row bounds the
+    shares the count map cannot track; the candidates' map full, the oldest
+    candidate stuck at least a second goes for the new one (`CAND_EVICTED`,
+    counted and signed). G6: measured with a kprobe on the verifier's
+    `check_max_stack_depth` during `verifier-check` (5.15 has no
+    `verified_insns`; the loader keeps no log of a successful load), the
+    re-check's first object counted 930,372 of 1,000,000 for
+    `exec_check_lsm` on 5.15 — above the coordinator's 900k line — so the
+    environment's check became a second LSM program on
+    `bprm_check_security`, `exec_env_lsm` (its record a global function:
+    inline, its path walk was verified once per state, 921,358 alone).
+    Final object, processed: 5.15.0-202 `exec_check_lsm` 141,595,
+    `exec_env_lsm` 292,123 (`fim_file_open_sensor` 821,228, pre-existing);
+    6.12.116 96,410 and 269,131; 7.0.0-43 87,234 and 330,221; 6.8.0-149
+    87,890 and 268,903; 0 failing on each, the deepest call chains 384 and 352 of 512.
+    Lab, 7.0: the R2 e2e passes with the four forms (tab, `:`, trailing
+    `:`, `$LIB`, newline: refused as root and as `nobody`); with the split
+    object, the capacity and TOCTOU e2e pass too; five subuids of login 1000
+    holding open files added 200 FIM buffers to login 1000's row and none
+    to a subuid's. 26 more mutants (21 of the re-check's fixes, 5 of the
+    split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.

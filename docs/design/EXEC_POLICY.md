@@ -657,8 +657,12 @@ The rules are outside the frozen V2 validation denominator, like
   in `nn_value_end` / `nn_value_slash`), the rounds and steps calling
   nothing below them — inline, the judgment multiplied the loops' states
   past the verifier's million instructions (7.0 and 5.15 refused
-  `exec_check_lsm`); the deepest call chain under `exec_check_lsm` 448 of
-  512 bytes of stack,
+  `exec_check_lsm`); the re-check of #547 (G6): the environment in its own
+  program, `exec_env_lsm` (processed on 5.15: 292,123, `exec_check_lsm`
+  141,595; 6.8: 268,903 and 87,890; 6.12: 269,131 and 96,410; 7.0: 330,221
+  and 87,234); the deepest
+  call chains 384 (`exec_check_lsm`) and 352 (`exec_env_lsm`) of 512 bytes
+  of stack,
   `nn_execpol_tier` 8 hops,
   `nn_map_classify` the 64-level walk); findings are kept in map memory, not
   registers, so the loop states do not multiply; helper reads only
