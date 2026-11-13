@@ -267,6 +267,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     (
+        "crates/nn-core/src/impair/mod.rs",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
+        PROC,
+    ),
+    (
         "crates/nn-core/src/posture/exempt.rs",
         "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
