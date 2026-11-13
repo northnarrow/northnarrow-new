@@ -443,7 +443,10 @@ fn a_helper_that_reads_the_gate_from_the_self_protection_is_caught() {
         "task_kill.rs",
         "try_task_kill",
         "\n    if relaxed_outer() {\n        return 0;\n    }\n",
-        "\nfn relaxed_outer() -> bool {\n    crate::execpol::relaxed_inner()\n}\n",
+        // and a harmless function of the same name in the site's own file:
+        // the path names which one runs
+        "\nfn relaxed_outer() -> bool {\n    crate::execpol::relaxed_inner()\n}\n\
+         \nfn relaxed_inner() -> bool {\n    false\n}\n",
     );
     deep.get_mut("execpol.rs").unwrap().push_str(
         "\npub(crate) fn relaxed_inner() -> bool {\n    EXECPOL_CONF.get(0).is_none()\n}\n",

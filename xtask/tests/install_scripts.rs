@@ -4302,6 +4302,21 @@ fn allow_bpf_tools_adds_lines_to_the_policy_in_force() {
          bpf-loader-allow /usr/bin/python3.12 kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n\
          allowed=/usr/bin/bpftrace (already in the policy) /usr/bin/python3.12\n"
     );
+    // no key to sign with: nothing applied, nothing claimed, the lines
+    // and the command said
+    let (status, out, err) = bpf_loader_allow(
+        &dir,
+        &format!(
+            "ETC_DIR='{}'; BIN_DIR=/nonexistent; ALLOW_BPF_TOOLS=0; ALLOW_BPF_LOADERS=(/bin/sh)",
+            dir.display()
+        ),
+        "apply_bpf_loader_allow ''\necho \"allowed=${BPF_ALLOWED[*]-}\"",
+    );
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("no config-manage key"), "{err}");
+    assert!(err.contains("bpf-loader-allow /bin/sh kprobe,"), "{err}");
+    assert!(err.contains("sudo nn-admin policy set --file"), "{err}");
+    assert!(out.ends_with("allowed=\n"), "{out}");
     // no policy in force: the lines alone
     let (_, out, _) = bpf_loader_allow(
         &dir,
