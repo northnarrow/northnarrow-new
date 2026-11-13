@@ -10444,5 +10444,50 @@ number in parentheses is a lab PR.
     two argued equivalent (a self-parent fork record
     yields nothing at the depth cap; npm's link without the node check is
     gated by `is_npm_cli_writer`'s own).
+  - **The review of #552 (F1–F7): no attacker obtains an exemption.**
+    logrotate's needs root's packaged invocation (`logrotate
+    /etc/logrotate.conf`, the exec's uid 0; the lineage keeps a keyed
+    digest of each exec's argv) and PID 1's fork or cron's daily run
+    (`/etc/cron.daily/logrotate` under `run-parts`, a short root chain up to
+    a cron daemon PID 1 forked); npm's writer runs npm's script alone (no
+    `ENV_LOADS`) from a root-owned tree; CoreDNS's id is the leaf of a
+    `kubepods` cgroup and the sender shares the container init's PID and
+    mount namespaces; a resolver is the system's service (its unit's cgroup
+    under `system.slice`, PID 1's fork or NetworkManager's for dnsmasq,
+    system uids, no loader variable); the BPF probe's loader is its exec's
+    image as of the load (after the bus barrier), `lsm` PID 1's alone; the
+    drain notes a created child's size under its own inode. The lab found
+    the timer's real `logrotate.service` still High: it runs in a mount
+    namespace of its own, where the exec record kept no image — the lineage
+    now keeps the LSM identity of the executed file for a packaged-file
+    comparison (`exec_file`; networkd's probes run in one too).
+    Lab, ubuntu2404 (6.8, systemd 255), as measured: the timer's
+    `logrotate.service` with every log due (rsyslog's logs by `copytruncate`
+    for the round, so each rotation is a judged in-place write): FIM-005
+    Low ×3 and ×2 by logrotate, no High from it (before the mount-namespace
+    fix: High ×2 and ×1 on syslog); controls — `systemd-run logrotate -f
+    /etc/logrotate.conf` FIM-005 High by logrotate (and FIM-019 High on wtmp
+    in another round), the packaged invocation by hand FIM-005 High; the
+    review's anacron-by-hand probe and PID 1's fork, each with a
+    configuration of the caller's (syslog and wtmp by `copytruncate`):
+    FIM-005 High on syslog and FIM-019 High (the kill) on wtmp, by
+    logrotate, each;
+    `npm ci` from a unit and from the session: ConfirmedIntrusion 0 and no
+    record; the review's postinstall probe (`NODE_OPTIONS=--require` an
+    encryptor into `npm -v`), a package-shipped `npm-cli.js` and `node
+    enc.js`: ConfirmedIntrusion 1 and NN-L-IMP-001 Critical each;
+    systemd-resolved relaying 12 hash-shaped names under one zone: no
+    record, not restarted. Not measured in the lab: CoreDNS (no cluster on
+    the guests; unit tests), the BPF probes (systemd 255 makes none).
+    Seen, not changed: with `copytruncate` (not Ubuntu's default) rsyslogd's
+    first write after the truncation is FIM-005 High; the default rename
+    and create races the drain's enrollment of the new file (no FIM record
+    at all for some runs).
+  - Mutations of the review's round: 37 mutants of the new guards, 37
+    caught by named tests (one after a test added: cron.daily's script
+    without `run-parts`); 9 argued equivalent (an argv count before
+    length-prefixed elements, an empty argv's digest, `ppid == 1` and the
+    last hop, `..` and a relative path already outside `in_system_tree`, a
+    nested unit name, NetworkManager only in dnsmasq's units, four uids).
   - Level unchanged: the change removes false positives; no capability gains
     evidence it lacked.
