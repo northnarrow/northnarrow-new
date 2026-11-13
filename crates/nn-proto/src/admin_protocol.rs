@@ -968,6 +968,13 @@ pub struct StatusResponse {
     /// guards' per-task buffers full; no protected target), each recorded.
     #[serde(default)]
     pub execpol_lost_open_total: Option<u64>,
+    /// Lot 325 (the review of #547, F6): file opens the file-open sensor
+    /// judged in a run's own buffer because the task's could not be kept
+    /// (its map full, or its uid's share taken) — correct, slower. Appended
+    /// after `execpol_lost_open_total`; telemetry; `None` from an older
+    /// agent.
+    #[serde(default)]
+    pub open_sensor_per_call_total: Option<u64>,
 }
 
 /// Lot 276: the export's state ([`StatusResponse::export`];
@@ -1349,6 +1356,7 @@ impl StatusResponse {
             execpol_env_truncated_total: None,
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2437,6 +2445,7 @@ mod tests {
             execpol_env_truncated_total: None,
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2516,6 +2525,7 @@ mod tests {
             execpol_env_truncated_total: None,
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2777,6 +2787,7 @@ mod tests {
             execpol_env_truncated_total: None,
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2885,6 +2896,7 @@ mod tests {
             execpol_env_truncated_total: None,
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
+            open_sensor_per_call_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2989,14 +3001,14 @@ mod tests {
         // the six appended fields' tags: R12a's bus, R12b's decision
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
         // lot 322's two exec-guard counters
-        // and lot 325's three
+        // and lot 325's four
         assert!(
-            a.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            a.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             "the absent fields' tags"
         );
-        assert!(b.starts_with(&a[..a.len() - 9]) && b.len() > a.len());
+        assert!(b.starts_with(&a[..a.len() - 10]) && b.len() > a.len());
         assert!(
-            b.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0]),
+            b.ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0]),
             "R12b's, R12c's, lot 276's, lot 322's and lot 325's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
@@ -3024,9 +3036,9 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last eight: the decision's delay, the dispatch, lot 276's
-        // export, lot 322's two counters, lot 325's three — all absent)
-        assert!(c.starts_with(&b[..b.len() - 8]) && c.len() > b.len());
+        // (b's last nine: the decision's delay, the dispatch, lot 276's
+        // export, lot 322's two counters, lot 325's four — all absent)
+        assert!(c.starts_with(&b[..b.len() - 9]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3086,9 +3098,9 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        // (c's last seven: the dispatch, lot 276's export, lot 322's two
-        // counters and lot 325's three, absent)
-        assert!(d.starts_with(&c[..c.len() - 7]) && d.len() > c.len());
+        // (c's last eight: the dispatch, lot 276's export, lot 322's two
+        // counters and lot 325's four, absent)
+        assert!(d.starts_with(&c[..c.len() - 8]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3638,8 +3650,8 @@ mod tests {
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
         // `response_dispatch`, lot 276's `export`, lot 322's
         // `execpol_env_unread_total` and `execpol_lost_total`, lot 325's
-        // three.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 3;
+        // four.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3665,12 +3677,12 @@ mod tests {
         status.execpol_env_unread_total = Some(300);
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 325's three fields follow them, absent here
-        let before = without.len() - 5;
+        // lot 325's four fields follow them, absent here
+        let before = without.len() - 6;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before..], &[0, 0, 0, 0, 0]);
+        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
-        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3689,10 +3701,27 @@ mod tests {
         status.execpol_env_changed_total = Some(4);
         status.execpol_lost_open_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        let before = without.len() - 3;
+        // the review of #547's field follows them, absent here
+        let before = without.len() - 4;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 4..], &[1, 1, 1, 2, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02]);
+        assert_eq!(&without[before - 4..], &[1, 1, 1, 2, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02, 0]);
+        roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// The review of #547 (F6): the file-open sensor's per-call opens are
+    /// the status's last field, after lot 325's three.
+    #[test]
+    fn the_open_sensor_s_per_call_opens_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.execpol_lost_open_total = Some(9);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.open_sensor_per_call_total = Some(6);
+        let with = postcard::to_allocvec(&status).unwrap();
+        let before = without.len() - 1;
+        assert_eq!(&with[..before], &without[..before]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0]);
+        assert_eq!(&with[before..], &[1, 6]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -4497,10 +4526,11 @@ mod tests {
         // Lot 325: three bytes longer (0x51 -> 0x54) — the absent tags of
         // `execpol_env_truncated_total`, `execpol_env_changed_total` and
         // `execpol_lost_open_total`; every byte before them is lot 322's.
+        // The review of #547: one more (0x55), `open_sensor_per_call_total`.
         const STATUS_RESPONSE: &str = concat!(
-            "00000054050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000055050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000",
+            "000000000000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

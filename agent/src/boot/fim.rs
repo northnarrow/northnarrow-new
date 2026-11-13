@@ -179,6 +179,18 @@ fn start_open_sensor(
         loop {
             tick.tick().await;
             depth_cap.sample(&maps);
+            // the review of #547 (F6): the uids' shares of the tasks'
+            // buffers recounted when opens lost their task's buffer
+            if let Some(r) = maps.recount_shares(std::time::Instant::now()) {
+                if r.corrected + r.removed + r.failed > 0 {
+                    info!(
+                        corrected = r.corrected,
+                        removed = r.removed,
+                        failed = r.failed,
+                        "file-open sensor: uids' shares of the tasks' buffers recounted"
+                    );
+                }
+            }
             if let Some(applied) = refresh(&mut maps, &current, &extras) {
                 report_open_rules(&mut health, &applied, audit_log.as_ref(), false);
                 current = applied.in_maps;

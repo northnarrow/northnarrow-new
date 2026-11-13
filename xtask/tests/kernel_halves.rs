@@ -261,9 +261,10 @@ fn a_set_id_target_does_not_escape_the_environment_deny() {
             "let root = tv & tier_sig::ROOT != 0;",
             "let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0",
             "|| (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);",
-            // lot 325 (R2): the bits make an unfinished environment fail
-            // closed — stricter, never an exemption
-            "let unfinished = ef & env_flags::UNFINISHED != 0 && (env_deny_rule || setid);",
+            // lot 325 (R2; the review of #547, F1): the bits make an
+            // environment the first pass cannot clear fail closed —
+            // stricter, never an exemption
+            "let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);",
             "if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {",
             "env_act |= action::DENY;",
             "|| (setid && ef & env_flags::GLIBC_TUNABLES != 0);",

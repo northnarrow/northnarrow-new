@@ -228,9 +228,24 @@ pub mod env_flags {
     /// ([`Self::TRUNCATED`]): refused at a protected or set-id target,
     /// recorded, counted with it.
     pub const LOADER_CUT: u32 = 1 << 16;
-    /// Lot 325: what the scan could not judge to its end — refused at a
-    /// protected or set-id target.
+    /// Lot 325: what the scan could not judge to its end.
     pub const UNFINISHED: u32 = TRUNCATED | LOADER_CUT;
+    /// The review of #547 (F1): an `LD_PRELOAD` or `LD_AUDIT` entry that is a
+    /// path relative to the caller's directory (it holds a `/` and does not
+    /// start with one: `./x.so`, `lib/x.so`), or a bare name searched in a
+    /// staging or relative `LD_LIBRARY_PATH`. Where it resolves is not in
+    /// the string: refused at a protected or set-id target, recorded.
+    pub const PRELOAD_RELATIVE: u32 = 1 << 17;
+    /// What the first pass refuses at a protected or set-id target: an
+    /// array past the cap (or more judged names than the scan reads), a
+    /// relative loader path. A loader value longer than the scan reads
+    /// (`LOADER_CUT`) is not refused there — the review of #547 (F7): a
+    /// clean long value is legitimate — and is judged in the kernel's copy
+    /// at the commit.
+    pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE;
+    /// What the post-commit check cannot clear in the kernel's copy, which
+    /// kills a protected or set-id target (the review of #547, F2).
+    pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE;
     /// Loader variables that can load code.
     pub const LOADER: u32 = LD_PRELOAD | LD_AUDIT;
     /// Findings a deny can rest on.
@@ -535,6 +550,7 @@ pub fn env_names(bits: u32) -> alloc::vec::Vec<&'static str> {
         (env_flags::VALUE_CUT, "value_cut"),
         (env_flags::CHANGED, "changed_after_the_kernel_s_copy"),
         (env_flags::LOADER_CUT, "loader_value_cut"),
+        (env_flags::PRELOAD_RELATIVE, "relative_loader_path"),
     ] {
         if bits & bit != 0 {
             out.push(name);
@@ -612,10 +628,14 @@ impl EnvpAbi {
 /// `kernel_execve`, whose task has no user registers: the caller does not
 /// ask): 11 and 358 are no native exec (`munmap`, none), 59 and 322 no
 /// 32-bit one. `None`: not read (counted and recorded as
-/// [`counter::ENV_UNREAD`]).
+/// [`counter::ENV_UNREAD`]). The review of #547 (F3): the call is
+/// `orig_ax`'s low 32 bits, as the kernel takes it — `entry_SYSCALL_64`
+/// saves the whole `rax` as `orig_ax` and runs `(int)eax`, so an `execve`
+/// entered with garbage in `rax`'s high half is an `execve` (it was "an
+/// unknown call": not read, never refused).
 #[inline(always)]
 pub const fn exec_envp_reg(orig_ax: u64) -> Option<(EnvpReg, EnvpAbi)> {
-    match orig_ax {
+    match orig_ax & 0xffff_ffff {
         NR_EXECVE => Some((EnvpReg::Dx, EnvpAbi::Native)),
         NR_EXECVEAT => Some((EnvpReg::R10, EnvpAbi::Native)),
         IA32_NR_EXECVE => Some((EnvpReg::Dx, EnvpAbi::Ia32)),
@@ -653,7 +673,10 @@ pub const ENV_REGION_READ: usize = 256;
 
 /// Lot 325: the bytes of a task's `EXECPOL_ENV` entry (the findings, then
 /// the post-commit check's read buffer).
-pub const ENV_ENTRY_BYTES: usize = core::mem::size_of::<EnvStashRaw>() + ENV_REGION_READ;
+pub const ENV_ENTRY_BYTES: usize = core::mem::size_of::<EnvStashRaw>()
+    + ENV_REGION_READ
+    + core::mem::size_of::<value_parse::ValueParse>()
+    + 16;
 
 /// Lot 325 (the re-check of #546, R2): the most variables an exec the
 /// kernel accepts can carry. Its strings and its pointers share at most
@@ -671,6 +694,235 @@ pub const ENV_STEP: usize = 64;
 pub const ENV_STEPS_MID: usize = 128;
 pub const ENV_ROUNDS: usize = 128;
 pub const ENV_SCAN_CAP: usize = ENV_STEP * ENV_STEPS_MID * ENV_ROUNDS;
+
+/// The review of #547 (F1): a loader variable's value judged entry by entry
+/// as the loader parses it, one byte at a time (the kernel feeds it the
+/// value in [`ENV_REGION_READ`]-byte reads, the state in the task's entry).
+/// The staging check is lexical over the normalised path: `//` and `/./`
+/// collapse, `..` removes the component before it, so `//tmp/x.so`,
+/// `/./tmp/x.so` and `/var/../tmp/x.so` are `/tmp/x.so`; every entry is
+/// judged wherever it starts in the value (it compared an entry's first
+/// nine bytes, and only when they fitted in the 128-byte capture: 120
+/// spaces then `/tmp/x` passed). Separators are the loader's: for
+/// `LD_PRELOAD` the space, the colon and every other `isspace` byte (musl
+/// splits on `isspace`); for `LD_AUDIT` the colon; for `LD_LIBRARY_PATH` the
+/// colon and the semicolon. A symlink is not in the string: the mapping
+/// check judges the file the loader maps.
+pub mod value_parse {
+    /// [`ValueParse::found`]: an entry under a staging directory.
+    pub const STAGING: u32 = 1 << 0;
+    /// An entry relative to the caller's directory (a `/` inside, not at
+    /// its start); for `LD_LIBRARY_PATH`, any entry that is not absolute.
+    pub const RELATIVE: u32 = 1 << 1;
+    /// A bare name (no `/`): searched in the library path.
+    pub const BARE: u32 = 1 << 2;
+
+    /// The variable a value belongs to.
+    pub const KIND_PRELOAD: u32 = 0;
+    pub const KIND_AUDIT: u32 = 1;
+    pub const KIND_LIBPATH: u32 = 2;
+
+    /// [`ValueParse::st`]: inside an entry, the entry absolute, a `/` seen.
+    const IN: u32 = 1 << 0;
+    const ABS: u32 = 1 << 1;
+    const SLASH: u32 = 1 << 2;
+
+    /// The parse of one value: the first two components of the normalised
+    /// path so far (their first eight bytes and length), the current one,
+    /// the depth, the entry's state and what the value's entries showed.
+    /// 48 bytes, no implicit padding.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+    pub struct ValueParse {
+        pub c0: u64,
+        pub c1: u64,
+        pub cw: u64,
+        pub c0len: u32,
+        pub c1len: u32,
+        pub clen: u32,
+        pub depth: u32,
+        pub st: u32,
+        pub found: u32,
+    }
+
+    impl ValueParse {
+        pub const fn zeroed() -> Self {
+            Self {
+                c0: 0,
+                c1: 0,
+                cw: 0,
+                c0len: 0,
+                c1len: 0,
+                clen: 0,
+                depth: 0,
+                st: 0,
+                found: 0,
+            }
+        }
+    }
+
+    const W_TMP: u64 = 0x70_6d74; // "tmp"
+    const W_PROC: u64 = 0x636f_7270; // "proc"
+    const W_VAR: u64 = 0x72_6176; // "var"
+    const W_DEV: u64 = 0x76_6564; // "dev"
+    const W_SHM: u64 = 0x6d_6873; // "shm"
+    const W_FD: u64 = 0x6466; // "fd"
+    const W_DOT: u64 = 0x2e; // "."
+    const W_DOTDOT: u64 = 0x2e2e; // ".."
+
+    /// Whether `b` ends an entry of a value of `kind`.
+    #[inline(always)]
+    pub const fn is_sep(kind: u32, b: u8) -> bool {
+        match kind {
+            KIND_PRELOAD => b == b':' || b == b' ' || (b >= 9 && b <= 13),
+            KIND_AUDIT => b == b':',
+            _ => b == b':' || b == b';',
+        }
+    }
+
+    #[inline(always)]
+    fn end_component(p: &mut ValueParse) {
+        let w = p.cw;
+        let l = p.clen;
+        p.cw = 0;
+        p.clen = 0;
+        if l == 0 || (l == 1 && w == W_DOT) {
+            return;
+        }
+        if l == 2 && w == W_DOTDOT {
+            if p.depth > 0 {
+                p.depth -= 1;
+            }
+            return;
+        }
+        if p.depth == 0 {
+            p.c0 = w;
+            p.c0len = l;
+        } else if p.depth == 1 {
+            p.c1 = w;
+            p.c1len = l;
+        }
+        if p.depth < 255 {
+            p.depth += 1;
+        }
+    }
+
+    /// Whether the normalised absolute path of `p` is under a staging
+    /// directory: `/tmp`, `/proc`, `/var/tmp`, `/dev/shm`, `/dev/fd` — for
+    /// a file (a preload) something below them, for a directory (a library
+    /// path) the directory itself too.
+    #[inline(always)]
+    fn staging(p: &ValueParse, kind: u32) -> bool {
+        let d = if kind == KIND_LIBPATH {
+            p.depth + 1
+        } else {
+            p.depth
+        };
+        let one = |w: u64, l: u32, want: u64, wl: u32| w == want && l == wl;
+        (d >= 2 && (one(p.c0, p.c0len, W_TMP, 3) || one(p.c0, p.c0len, W_PROC, 4)))
+            || (d >= 3
+                && ((one(p.c0, p.c0len, W_VAR, 3) && one(p.c1, p.c1len, W_TMP, 3))
+                    || (one(p.c0, p.c0len, W_DEV, 3)
+                        && (one(p.c1, p.c1len, W_SHM, 3) || one(p.c1, p.c1len, W_FD, 2)))))
+    }
+
+    /// The end of an entry (a separator, or the value's end).
+    #[inline(always)]
+    pub fn end_entry(p: &mut ValueParse, kind: u32) {
+        if p.st & IN == 0 {
+            return;
+        }
+        end_component(p);
+        if p.st & ABS != 0 {
+            if staging(p, kind) {
+                p.found |= STAGING;
+            }
+        } else if kind == KIND_LIBPATH || p.st & SLASH != 0 {
+            p.found |= RELATIVE;
+        } else {
+            p.found |= BARE;
+        }
+        p.st = 0;
+        p.c0 = 0;
+        p.c1 = 0;
+        p.c0len = 0;
+        p.c1len = 0;
+        p.depth = 0;
+    }
+
+    /// A byte `b` that is no separator: the start of an entry, if one is
+    /// not open (absolute when it is a `/`).
+    #[inline(always)]
+    pub fn begin(p: &mut ValueParse, b: u8) {
+        if p.st & IN == 0 {
+            p.st = IN | if b == b'/' { ABS } else { 0 };
+        }
+    }
+
+    /// A `/` inside an entry: the component before it ends.
+    #[inline(always)]
+    pub fn slash(p: &mut ValueParse) {
+        p.st |= SLASH;
+        end_component(p);
+    }
+
+    /// Any other byte of a component.
+    #[inline(always)]
+    pub fn push(p: &mut ValueParse, b: u8) {
+        if p.clen < 8 {
+            p.cw |= (b as u64) << (8 * p.clen);
+        }
+        if p.clen < 255 {
+            p.clen += 1;
+        }
+    }
+
+    /// One byte of a value of `kind` (not its NUL: the value's end is
+    /// [`end_entry`]). The eBPF program runs the same steps, its separator
+    /// and `/` ones in global functions (`agent-ebpf/src/execpol.rs`,
+    /// `nn_env_chunk`).
+    #[inline(always)]
+    pub fn byte(p: &mut ValueParse, kind: u32, b: u8) {
+        if is_sep(kind, b) {
+            end_entry(p, kind);
+            return;
+        }
+        begin(p, b);
+        if b == b'/' {
+            slash(p);
+            return;
+        }
+        push(p, b);
+    }
+
+    /// A whole value (host side: tests, the userland re-check).
+    pub fn judge(kind: u32, value: &[u8]) -> u32 {
+        let mut p = ValueParse::zeroed();
+        for &b in value {
+            if b == 0 {
+                break;
+            }
+            byte(&mut p, kind, b);
+        }
+        end_entry(&mut p, kind);
+        p.found
+    }
+}
+
+/// The review of #547 (F7): a loader variable's value is judged whole, read
+/// [`ENV_REGION_READ`] bytes at a time, up to this many reads (about 4 KiB);
+/// past it, `LOADER_CUT`.
+pub const ENV_VALUE_READS: usize = 16;
+/// The review of #547 (F8): the judged names (`LD_*`, `GLIBC_TUNABLES`, the
+/// history ones) read whole per exec; past it the scan is not finished
+/// (`TRUNCATED`). No legitimate environment carries that many.
+pub const ENV_JUDGED_MAX: u32 = 64;
+/// The review of #547 (F8): the post-commit check reads at most this many
+/// rounds, each of at most `ENV_STEPS_MID + ENV_JUDGED_MAX` steps of
+/// [`ENV_STEP`] reads (98,304 reads of the strings at most, with
+/// preemption off), and the judged names' values; past them, `TRUNCATED`.
+pub const ENV_COMMIT_ROUNDS: usize = 8;
 
 /// Lot 325 (R2): whether the first eight bytes of a variable (`w0`, little
 /// endian) start one of the names the scan reads whole — the loader
@@ -794,6 +1046,33 @@ mod tests {
         assert_eq!(envp_stride(0), 8);
         assert_eq!(envp_stride(1), 4);
         assert_eq!(envp_stride(3), 4);
+    }
+
+    /// The review of #547 (F3): the kernel takes the call from `orig_ax`'s
+    /// low 32 bits (`entry_SYSCALL_64` saves `rax` whole and runs
+    /// `(int)eax`): an `execve` entered with garbage in `rax`'s high half
+    /// is an `execve`, and its environment is read. It was "an unknown
+    /// call": not read, never refused (the reviewer's probe).
+    #[test]
+    fn an_exec_entered_with_garbage_in_rax_s_high_half_is_read() {
+        assert_eq!(
+            exec_envp_reg((1u64 << 32) | 59),
+            Some((EnvpReg::Dx, EnvpAbi::Native))
+        );
+        assert_eq!(
+            exec_envp_reg(0xdead_0000_0000_0142),
+            Some((EnvpReg::R10, EnvpAbi::Native))
+        );
+        assert_eq!(
+            exec_envp_reg(0xdead_0000_4000_0208),
+            Some((EnvpReg::Dx, EnvpAbi::X32))
+        );
+        assert_eq!(
+            exec_envp_reg(0xffff_ffff_0000_000b),
+            Some((EnvpReg::Dx, EnvpAbi::Ia32))
+        );
+        // still nothing for what is no exec in its low half
+        assert_eq!(exec_envp_reg((1u64 << 32) | 9), None);
     }
 
     /// Lot 325 (the re-check of #546, R1): the kernel reads an ia32 exec's

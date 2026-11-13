@@ -7,7 +7,9 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
-use common::wire::execq::{conf_slot, counter, root_kind, ExecqKey, ExecqKnown, ExecqStopped};
+use common::wire::execq::{
+    conf_slot, counter, root_kind, ExecqCandRaw, ExecqKey, ExecqKnown, ExecqStopped,
+};
 
 /// `ExecqKey` for aya (its own `Pod` marker; the orphan rule forbids
 /// implementing it on the `common` type).
@@ -29,6 +31,14 @@ pub struct AyaStopped(pub ExecqStopped);
 // SAFETY: `#[repr(C)]` over two u64.
 unsafe impl aya::Pod for AyaStopped {}
 
+/// `ExecqCandRaw` for aya: the agent reads a candidate's uid only (the
+/// review of #547, F4: each uid's share recounted).
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug)]
+pub struct AyaCand(pub ExecqCandRaw);
+// SAFETY: `#[repr(C)]`, `bytemuck::Pod` in `common` (no padding).
+unsafe impl aya::Pod for AyaCand {}
+
 /// What the controller holds.
 pub struct Kernel {
     pub ring: RingBuf<MapData>,
@@ -37,6 +47,11 @@ pub struct Kernel {
     pub alive: Array<MapData, u64>,
     pub roots: HashMap<MapData, AyaKey, u32>,
     pub counters: PerCpuArray<MapData, u64>,
+    /// The review of #547 (F4): the candidates (`EXECQ_CAND`) and each
+    /// uid's share of them (`EXECQ_CAND_UIDS`), recounted
+    /// ([`Kernel::recount_shares`]).
+    pub cand: HashMap<MapData, u64, AyaCand>,
+    pub cand_uids: HashMap<MapData, u32, u64>,
     pub(crate) reject: crate::sensors::reject::RejectThrottle,
 }
 
@@ -109,8 +124,31 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
         alive: Array::try_from(take("EXECQ_ALIVE")?).context("EXECQ_ALIVE")?,
         roots: HashMap::try_from(take("EXECQ_ROOTS")?).context("EXECQ_ROOTS")?,
         counters: PerCpuArray::try_from(take("EXECQ_COUNTERS")?).context("EXECQ_COUNTERS")?,
+        cand: HashMap::try_from(take("EXECQ_CAND")?).context("EXECQ_CAND")?,
+        cand_uids: HashMap::try_from(take("EXECQ_CAND_UIDS")?).context("EXECQ_CAND_UIDS")?,
         reject: crate::sensors::reject::RejectThrottle::new(),
     })
+}
+
+/// `EXECQ_CAND`'s room (`EXECQ_CAND_CAP`): a recount reads no more.
+const CAND_ENTRIES_MAX: usize = 4096;
+
+impl Kernel {
+    /// The review of #547 (F4): each uid's share of the candidates
+    /// recounted from the entries
+    /// ([`nn_linux::sensors::task_free::rewrite_shares`]): a share that
+    /// drifted up (a lost update) would drop the uid's candidates early —
+    /// its execs run unheld.
+    pub fn recount_shares(&mut self) -> Result<nn_linux::sensors::task_free::Rewritten> {
+        let uids = self
+            .cand
+            .iter()
+            .take(CAND_ENTRIES_MAX)
+            .filter_map(|r| r.ok())
+            .map(|(_, c)| c.0.uid);
+        let want = nn_linux::sensors::task_free::uid_shares(uids);
+        nn_linux::sensors::task_free::rewrite_shares(&mut self.cand_uids, &want)
+    }
 }
 
 /// `CLOCK_MONOTONIC` now, in ns — `bpf_ktime_get_ns`'s clock.

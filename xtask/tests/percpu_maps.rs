@@ -91,6 +91,12 @@ const KNOWN: &[(&str, Why)] = &[
     ("UDP_FLOWS", Why::RateState),
     // classic tracepoint `sched:sched_process_exec`
     ("STDIO_SCRATCH", Why::PreemptOff),
+    // the review of #547 (F2, F5): the post-commit check's entry, classic
+    // tracepoint `sched:sched_process_exec` (`execpol_env_commit`) only
+    ("COMMIT_ENV", Why::PreemptOff),
+    // the review of #547 (F6): the FIM sensor's opens without the task's
+    // buffer
+    ("OPEN_TASK_COUNTERS", Why::Counter),
     // `tp_btf/cgroup_attach_task`
     ("CGROUP_JOIN_PATH", Why::PreemptOff),
     // `iter/bpf_prog`, read by the agent's census only
@@ -292,8 +298,41 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         &[
             "crate::task_scratch::make(&EXECQ_CAND_SCRATCH, &ck)",
             "crate::execpol::count_lost();",
-            "EXECQ_CAND.insert(&task, &*cand, 0)",
+            "let _ = nn_execq_cand_put(task, u64::from(ck.tid), ck.start_ns);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&q, "nn_execq_cand_put"),
+        &[
+            "EXECQ_CAND_SCRATCH.get_ptr(&ck)",
+            "cand_put(task, cand);",
             "let _ = EXECQ_CAND_SCRATCH.remove(&ck);",
+        ],
+    )
+    .unwrap();
+    // copied into the candidates' map within the uid's share (the review
+    // of #547, F4), the share given back when it goes
+    in_order(
+        body(&q, "cand_put"),
+        &[
+            "cand_remove(task);",
+            "crate::task_scratch::uid_admits(&EXECQ_CAND_UIDS, uid, EXECQ_CAND_PER_UID)",
+            "bump(counter::CAND_DROPPED);",
+            "EXECQ_CAND.insert(&task, &*cand, 0)",
+            "bump(counter::CAND_DROPPED);",
+            "crate::task_scratch::uid_took(&EXECQ_CAND_UIDS, uid);",
+        ],
+    )
+    .unwrap();
+    assert!(body(&q, "cand_remove").contains("let _ = nn_execq_cand_remove(task);"));
+    assert!(body(&q, "nn_execq_cand_remove").contains("cand_take(task);"));
+    assert!(body(&q, "forget_freed").contains("cand_take(task);"));
+    in_order(
+        body(&q, "cand_take"),
+        &[
+            "EXECQ_CAND.remove(&task).is_ok()",
+            "crate::task_scratch::uid_gave(&EXECQ_CAND_UIDS, uid);",
         ],
     )
     .unwrap();
@@ -386,18 +425,27 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     in_order(
         body(&open, "on_open"),
         &[
-            "crate::task_scratch::get_or_make(&OPEN_TASK, &task)",
+            "match task_buffer(task) {",
             "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);",
             "crate::fim_watch::observe_open_plain(file);",
             "on_open_in(file, t);",
-            // lot 325: kept for the task's life when `task_free` removes it
-            "if !crate::task_scratch::task_free_armed() {",
-            "let _ = OPEN_TASK.remove(&task);",
+            // lot 325: kept for the task's life when `task_free` removes
+            // it; the review of #547 (F6): else the run's own, removed
+            "if !live {",
+            "let _ = OPEN_TASK_RUN.remove(&task);",
         ],
     )
     .unwrap();
     assert!(body(&open, "on_open_in").contains("observe(") && !open.contains("OPEN_WIN"));
-    assert!(body(&open, "walk").contains("crate::task_scratch::get_or_make(&OPEN_TASK, &task)"));
+    assert!(body(&open, "walk").contains("match task_buffer(task) {"));
+    let tb = body(&open, "task_buffer");
+    assert!(tb.contains("crate::task_scratch::make(&OPEN_TASK, &task)"));
+    assert!(tb.contains("crate::task_scratch::make(&OPEN_TASK_RUN, &task)"));
+    let flat_open = open.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat_open.contains(
+        "static OPEN_TASK_RUN: HashMap<u64, OpenTask> = \
+         HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);"
+    ));
     in_order(
         body(&open, "nn_rename_burst"),
         &["rename_burst(", "let _ = RENAME_TASK.remove(&task);"],
@@ -495,7 +543,7 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         &[
             "let stride = envp_stride(compat);",
             "stride as u32,",
-            "(envp + (base + i as u64) * stride)",
+            "(envp + (idx + i as u64) * stride)",
             "return i as u64 | UNREAD;",
             ") < 0",
             "unread = UNREAD;",
@@ -504,7 +552,10 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     .unwrap();
     in_order(
         body(&pol, "env_scan"),
-        &["if unread {", "(*e).stash.flags |= env_flags::UNREADABLE;"],
+        &[
+            "if r & UNREAD != 0 {",
+            "(*e).stash.flags |= env_flags::UNREADABLE;",
+        ],
     )
     .unwrap();
     assert!(body(&pol, "nn_env_var").contains("(*e).stash.flags |= env_flags::UNREADABLE;"));
@@ -535,7 +586,9 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
             "bump(counter::ENV_UNREAD);",
             "| env_flags::UNREADABLE",
             // lot 325 (R2): and one the scan could not finish
-            "| env_flags::UNFINISHED)",
+            "| env_flags::UNFINISHED",
+            // the review of #547 (F1): and a relative loader path
+            "| env_flags::PRELOAD_RELATIVE)",
         ],
     )
     .unwrap();
@@ -557,11 +610,29 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         ],
     )
     .unwrap();
-    assert!(body(&pol, "env_var_judged").contains("nn_list_staging(which, tid, start)"));
-    // a stash gone before the staging check counts as staging
+    // The review of #547 (F1): each loader value judged whole in the task's
+    // entry. An entry gone under the judgment (lot 322: it counted as
+    // staging) stops the scan unfinished — `TRUNCATED`, refused at a
+    // protected or set-id target — never a clean environment.
+    assert!(body(&pol, "nn_env_pending")
+        .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);"));
     in_order(
-        body(&pol, "nn_list_staging"),
-        &["EXECPOL_ENV.get_ptr(&key)", "None => return 1,"],
+        body(&pol, "nn_env_pending"),
+        &[
+            "None => return STOP,",
+            "nn_env_judge(",
+            "if env_entry(0, tid, start).is_none() {",
+            "return STOP;",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&pol, "env_scan"),
+        &[
+            "if nn_env_pending(tid, start) & STOP != 0 {",
+            "(*e).stash.flags |= env_flags::TRUNCATED;",
+            "let f = nn_env_resolve(0, tid, start) as u32;",
+        ],
     )
     .unwrap();
     // the record carries the findings the judgment rested on

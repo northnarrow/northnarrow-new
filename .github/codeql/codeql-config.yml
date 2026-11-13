@@ -10,6 +10,7 @@ name: NorthNarrow CodeQL
 paths-ignore:
   - agent/tests
   - cli/tests
+  - common/tests
   - crates/nn-export/tests
   - scan/tests
   - watchdog/tests

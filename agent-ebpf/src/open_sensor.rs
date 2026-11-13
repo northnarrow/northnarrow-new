@@ -176,7 +176,18 @@ const INODE_WIN: usize = 128;
 pub(crate) struct OpenTask {
     win: [u8; FILE_WIN + INODE_WIN],
     names: [u8; 128],
+    /// The review of #547 (F6): the uid whose share ([`OPEN_TASK_PER_UID`])
+    /// the entry takes, given back when the task is freed.
+    uid: u32,
+    _pad: u32,
 }
+// The agent reads the uid of each entry to recount the shares
+// (`northnarrow_common::wire::open_sensor::OpenTaskRaw`).
+const _: () = assert!(
+    core::mem::offset_of!(OpenTask, uid) == northnarrow_common::wire::open_sensor::OPEN_TASK_BUFFERS
+        && core::mem::size_of::<OpenTask>()
+            == core::mem::size_of::<northnarrow_common::wire::open_sensor::OpenTaskRaw>()
+);
 /// Lot 322 (the review of #546, F3): [`OpenTask`] is the running task's own
 /// entry, keyed by its `task_struct` (`crate::task_scratch`), made by
 /// [`on_open`] (or by the walk, from `inode_unlink` / `inode_rename`).
@@ -203,6 +214,66 @@ static OPEN_TASK: HashMap<u64, OpenTask> =
 /// Tasks with an [`OPEN_TASK`] entry at once: the live tasks that opened a
 /// file (a busy host runs a few thousand).
 pub(crate) const OPEN_TASK_CAP: u32 = 65536;
+/// The review of #547 (F6): one uid's share of [`OPEN_TASK`] — one user's
+/// idle threads cannot take every other task's.
+pub(crate) const OPEN_TASK_PER_UID: u64 = 16384;
+/// The tasks' entries each uid holds.
+#[map]
+static OPEN_TASK_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// The review of #547 (F6): a run's own entry when [`OPEN_TASK`] has no room
+/// for the task (full, its uid's share taken) or `task_free` does not run —
+/// made and removed in the run, as lot 322's: the open is judged whole,
+/// at an insert and a delete's cost. Never blind.
+#[map]
+static OPEN_TASK_RUN: HashMap<u64, OpenTask> =
+    HashMap::with_max_entries(crate::task_scratch::TASK_SCRATCH_CAP, 0);
+/// The review of #547 (F6): per-CPU counts — [`OPEN_TASK_PER_CALL`] opens
+/// judged in a run's own entry while `task_free` runs, [`OPEN_TASK_LOST`]
+/// opens with no entry at all (the plain observer). The agent reports them.
+#[map]
+pub static OPEN_TASK_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+pub(crate) const OPEN_TASK_PER_CALL: u32 = 0;
+pub(crate) const OPEN_TASK_LOST: u32 = 1;
+
+#[inline(always)]
+fn open_task_bump(slot: u32) {
+    if let Some(c) = OPEN_TASK_COUNTERS.get_ptr_mut(slot) {
+        // SAFETY: per-CPU slot, bounded by the map size.
+        unsafe { *c = (*c).wrapping_add(1) };
+    }
+}
+
+/// The running task's buffers (`task`: its `task_struct`), and whether they
+/// live as long as the task: its [`OPEN_TASK`] entry — made at its first
+/// open while `task_free` runs, within its uid's share — or this run's own
+/// ([`OPEN_TASK_RUN`]). `None`: neither has room (counted).
+#[inline(always)]
+unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
+    if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
+        return Some((p, true));
+    }
+    if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {
+        return Some((p, false));
+    }
+    if crate::task_scratch::task_free_armed() {
+        let uid = crate::task_scratch::current_uid();
+        if crate::task_scratch::uid_admits(&OPEN_TASK_UIDS, uid, OPEN_TASK_PER_UID) {
+            if let Some(p) = crate::task_scratch::make(&OPEN_TASK, &task) {
+                (*p).uid = uid;
+                crate::task_scratch::uid_took(&OPEN_TASK_UIDS, uid);
+                return Some((p, true));
+            }
+        }
+        open_task_bump(OPEN_TASK_PER_CALL);
+    }
+    match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {
+        Some(p) => Some((p, false)),
+        None => {
+            open_task_bump(OPEN_TASK_LOST);
+            None
+        }
+    }
+}
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -460,8 +531,8 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
     // The running task's buffers: [`on_open`]'s, or made here for an
     // unlink or a rename (`forget_task` removes them).
     let task = bpf_get_current_task();
-    let scratch = match crate::task_scratch::get_or_make(&OPEN_TASK, &task) {
-        Some(p) => (*p).names.as_mut_ptr(),
+    let scratch = match task_buffer(task) {
+        Some((p, _)) => (*p).names.as_mut_ptr(),
         None => {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
             // Lot 325 (R3): lost, never cached ([`dir_class`]).
@@ -792,26 +863,26 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 /// The whole `file_open` work of the sensor variant of the FIM observer
 /// (`fim_watch::fim_file_open_sensor`): the FIM watch and the sensor, from
 /// one read of `struct file` and one of the inode, in the running task's
-/// own buffers ([`OPEN_TASK`]), removed at the end.
+/// own buffers ([`task_buffer`]: kept for the task's life, or this run's).
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
     let task = bpf_get_current_task();
-    let t = match crate::task_scratch::get_or_make(&OPEN_TASK, &task) {
-        Some(p) => p,
+    let (t, live) = match task_buffer(task) {
+        Some(x) => x,
         None => {
-            // The map full: FIM still sees the open (the plain observer,
-            // field by field, no shared buffer); the sensor's look is
-            // lost, counted.
+            // No room anywhere: FIM still sees the open (the plain observer,
+            // field by field, no shared buffer); the sensor's look is lost,
+            // counted.
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
             crate::fim_watch::observe_open_plain(file);
             return;
         }
     };
     on_open_in(file, t);
-    // Lot 325: the entry stays for the task's next open, removed at
-    // `task_free`; without that program, at the end of the run.
-    if !crate::task_scratch::task_free_armed() {
-        let _ = OPEN_TASK.remove(&task);
+    // Lot 325: a task's entry stays for its next open, removed at
+    // `task_free`; a run's own, at the end of the run.
+    if !live {
+        let _ = OPEN_TASK_RUN.remove(&task);
     }
 }
 
@@ -1564,19 +1635,24 @@ unsafe fn try_file_cap(ctx: &LsmContext) {
 /// Lot 322 (the review of #546, F3): the walk's buffers an unlink or a
 /// rename made ([`nn_open_walk`] from [`nn_unlink_burst`]), removed at the
 /// end of `fim_watch::fim_unlink_observe` / `fim_rename_observe` — lot 325:
-/// unless they live as long as the task (`task_free` removes them).
+/// a run's own entry; a task's lives until `task_free`.
 #[inline(always)]
 pub(crate) fn forget_task() {
-    if crate::task_scratch::task_free_armed() {
-        return;
-    }
     // SAFETY: a helper call with no argument.
     let task = unsafe { bpf_get_current_task() };
-    let _ = OPEN_TASK.remove(&task);
+    let _ = OPEN_TASK_RUN.remove(&task);
 }
 
-/// Lot 325: the task `task` (its `task_struct`) is being freed.
+/// Lot 325: the task `task` (its `task_struct`) is being freed: its entry
+/// goes, its uid's share given back.
 #[inline(always)]
 pub(crate) fn forget_freed(task: u64) {
-    let _ = OPEN_TASK.remove(&task);
+    // SAFETY: lookups and a delete in this module's maps.
+    let uid = match unsafe { OPEN_TASK.get(&task) } {
+        Some(t) => t.uid,
+        None => return,
+    };
+    if OPEN_TASK.remove(&task).is_ok() {
+        crate::task_scratch::uid_gave(&OPEN_TASK_UIDS, uid);
+    }
 }

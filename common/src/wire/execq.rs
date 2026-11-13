@@ -226,7 +226,13 @@ pub struct ExecqCandRaw {
     pub ctime_nsec: u32,
     pub class: u32,
     pub flags: u32,
-    pub _pad: u32,
+    /// The review of #547 (F4): the caller's real uid, whose share of the
+    /// candidates' map this one takes (`EXECQ_CAND_UIDS`).
+    pub uid: u32,
+    /// The review of #547 (F4): the pass's inode (its address), by which a
+    /// failed exec's candidate is found and removed when the kernel frees
+    /// the exec's file.
+    pub inode: u64,
     pub exe: ExeIdentityRaw,
 }
 
@@ -238,7 +244,8 @@ impl ExecqCandRaw {
             ctime_nsec: 0,
             class: 0,
             flags: 0,
-            _pad: 0,
+            uid: 0,
+            inode: 0,
             exe: ExeIdentityRaw::zeroed(),
         }
     }
@@ -345,7 +352,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<ExecqKey>(), 16);
         assert_eq!(core::mem::size_of::<ExecqKnown>(), 24);
         assert_eq!(core::mem::size_of::<ExecqStopped>(), 16);
-        assert_eq!(core::mem::size_of::<ExecqCandRaw>(), 32 + 552);
+        // the review of #547 (F4): the inode's address added (kernel only)
+        assert_eq!(core::mem::size_of::<ExecqCandRaw>(), 40 + 552);
         assert_eq!(core::mem::size_of::<ExecqStopRaw>(), 640);
         assert_eq!(core::mem::offset_of!(ExecqStopRaw, exe), 88);
         assert_eq!(core::mem::align_of::<ExecqStopRaw>(), 8);

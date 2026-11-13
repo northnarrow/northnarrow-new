@@ -40,11 +40,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     Past 2048 execs preempted in the middle of the exec sensor, lot 322
     refused all of them in enforce mode. They are judged without the walk:
     a protected target (a deny the tier, memfd, deleted, tmpfs, a
-    world-writable directory or the environment support; an unreadable
-    environment at a protected or set-id target) is refused, every other
-    exec runs, counted ("execs let through without their walk",
+    world-writable directory or the environment support) is refused, every
+    other exec runs, counted ("execs let through without their walk",
     `lost_open`) and recorded (`NN-L-EXECPOL-001`, Low); the agent signs
-    `execpol_capacity` while it lasts.
+    `execpol_capacity` while it lasts. An environment the flood left unread
+    is judged on the kernel's copy after the commit (the review of #547,
+    below).
   - **`EXECQ_CAND` is a plain hash** (R6), its entries removed when the
     kernel frees the task (a new LSM `task_free` program, `nn_task_free`).
   - **A FIM walk that could not run is not cached** (R3): it was the
@@ -58,6 +59,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     common environment, `nn_task_free` about 1.5 µs per task freed; an
     environment of 100,000 variables costs the two exec programs about
     1.6 ms (the exec itself about 48 ms).
+  - The independent review of #547:
+    - **Each loader entry is judged as the loader reads it** (F1): the
+      value read whole (up to about 4 KiB), split as glibc and musl split
+      it (colons and white space for `LD_PRELOAD`), each entry's path
+      normalised (`//`, `/./`, `..`). 120 spaces then `/tmp/x.so`,
+      `//tmp/`, `/./tmp/` and a tab passed the 9-byte compare of a 128-byte
+      capture. A relative loader path (`relative_loader_path`) is refused at
+      a protected or set-id target; a bare name searched through a staging
+      `LD_LIBRARY_PATH` is a staging preload.
+    - **No false refusal on a long clean value** (F7): a clean `LD_PRELOAD`
+      longer than 128 bytes (or exactly 127: an off-by-one) was refused as
+      not finished; a value longer than the first pass reads is judged on
+      the kernel's copy after the commit.
+    - **The post-commit check is never silent** (F2) and bounded (F8): what
+      it cannot clear (a value longer than its reads, past 98,304 reads,
+      a relative path, an unreadable string) kills a protected or set-id
+      target and is recorded elsewhere; it read into the task's entry, which
+      a flood could take — a per-CPU buffer now (the tracepoint runs with
+      preemption off). `killed` only when the signal went (F9).
+    - **A flood no longer refuses root's and the services' execs** (F5):
+      with both per-task maps full, an unread environment was refused at
+      every protected target; it is let through to the post-commit check,
+      which kills a staging preload before its first instruction.
+    - **`execve` with garbage in `rax`'s high half** (F3): the kernel runs
+      the low half, the scan did not recognise the call and read no
+      environment; it matches the low 32 bits.
+    - **A failed exec's quarantine candidate goes with its file** (F4), and
+      each uid holds at most 1,024 candidates; a candidate dropped is an
+      exec that ran unheld — counted in `not_held`, signed.
+    - **The FIM sensor's per-task buffers** (F6): at most 16,384 per uid;
+      past it, or the map full, the open is judged in a buffer of its own
+      run, counted (`nn-admin status --json`: `open_sensor_per_call_total`,
+      a new field appended last), never blind. The kernel's per-uid counts
+      are recounted by the agent from the entries.
+    - `task_free` is tracked as attached, not loaded (F9).
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision

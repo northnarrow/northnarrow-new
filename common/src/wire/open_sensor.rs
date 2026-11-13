@@ -121,6 +121,23 @@ pub mod open_class {
     pub const DIRECT: u32 = SUBTREE | CHILDREN_PROBE | LEAVES_CRED | CHILD_FILES | DIR_HAS_FILES;
 }
 
+/// The review of #547 (F6): the bytes of an `OPEN_TASK` entry before its
+/// uid — the task's windows and names (`agent-ebpf/src/open_sensor.rs`,
+/// `OpenTask`, which asserts the layout).
+pub const OPEN_TASK_BUFFERS: usize = 512;
+
+/// The review of #547 (F6): an `OPEN_TASK` entry as the agent reads it to
+/// recount each uid's share of the map (`OPEN_TASK_UIDS`): only `uid` is
+/// read.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct OpenTaskRaw {
+    pub buffers: [u8; OPEN_TASK_BUFFERS],
+    pub uid: u32,
+    pub _pad: u32,
+}
+
 /// Lot 325 (R3): whether a computed directory class may go into the
 /// cache (`DIR_CLASS`): not one whose walk could not run.
 #[inline(always)]

@@ -48,6 +48,7 @@ use aya_ebpf::{
 use northnarrow_common::wire::exe::{exe_flags, ExeIdentityRaw};
 use northnarrow_common::wire::execpol::{
     action, conf_slot, counter, env_flags, env_name_wanted, envp_stride, envp_value,
+    value_parse::{self, ValueParse}, ENV_COMMIT_ROUNDS, ENV_JUDGED_MAX, ENV_VALUE_READS,
     exec_envp_reg, flags, image_role, kind, mode, slice_slot, tier, tier_sig, EnvStashRaw,
     EnvpReg, ExecPolRaw, MapSeen, TaskKey, ENV_AUDIT_LEN, ENV_HIST_LEN, ENV_LIBPATH_LEN,
     ENV_PREFIX_LEN, ENV_PRELOAD_LEN, ENV_ROUNDS, ENV_SCAN_CAP, ENV_STEP, ENV_STEPS_MID,
@@ -116,7 +117,30 @@ static EXECPOL_ENV: HashMap<TaskKey, EnvScan> =
 pub(crate) struct EnvScan {
     pub(crate) stash: EnvStashRaw,
     region: [u8; REGION_READ],
+    /// The review of #547 (F1, F7): the value being judged, entry by entry.
+    parse: ValueParse,
+    /// The judged names read whole so far (F8: at most [`ENV_JUDGED_MAX`]).
+    judged: u32,
+    /// What only the scan uses ([`INTERNAL_*`](INTERNAL_BARE_PRELOAD)).
+    internal: u32,
+    /// The judged name a step stopped at (its string), for its round.
+    pending: u64,
 }
+/// [`EnvScan::internal`]: a bare name in `LD_PRELOAD` / `LD_AUDIT`, a staging
+/// or a relative directory in `LD_LIBRARY_PATH`, an `LD_LIBRARY_PATH` longer
+/// than the scan reads — resolved together at the scan's end
+/// ([`resolve_bare`]).
+const INTERNAL_BARE_PRELOAD: u32 = 1 << 0;
+const INTERNAL_BARE_AUDIT: u32 = 1 << 1;
+const INTERNAL_LIBPATH_STAGING: u32 = 1 << 2;
+const INTERNAL_LIBPATH_RELATIVE: u32 = 1 << 3;
+const INTERNAL_LIBPATH_CUT: u32 = 1 << 4;
+/// The review of #547 (F2, F5): the post-commit check's entry, one per CPU —
+/// sound there: `execpol_env_commit` is a classic tracepoint program, which
+/// runs with preemption off, so no other task's run can rewrite it — and
+/// one the first pass, however many execs are in flight, cannot take.
+#[map]
+static COMMIT_ENV: PerCpuArray<EnvScan> = PerCpuArray::with_max_entries(1, 0);
 /// Bytes of the new image's environment read at once by the post-commit
 /// check ([`nn_env_region_step`]): a string shorter than this is one read.
 const REGION_READ: usize = northnarrow_common::wire::execpol::ENV_REGION_READ;
@@ -489,9 +513,10 @@ pub(crate) unsafe fn on_pass(
         // recorded elsewhere. No legitimate environment reaches the cap
         // (the largest measured, a CI runner's or a Kubernetes pod's, holds
         // thousands of variables, the cap a million).
-        // The mini-hunt: a loader variable's value longer than its capture
-        // is the same — a staging entry past the cut was not judged.
-        let unfinished = ef & env_flags::UNFINISHED != 0 && (env_deny_rule || setid);
+        // The review of #547: a relative loader path is the same (F1); a
+        // loader value longer than the scan reads is not refused here (F7)
+        // — the post-commit check judges the kernel's copy of it.
+        let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);
         if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {
             if m == mode::ENFORCE {
                 env_act |= action::DENY;
@@ -512,7 +537,8 @@ pub(crate) unsafe fn on_pass(
                 | env_flags::LIBPATH_STAGING
                 | env_flags::HISTORY
                 | env_flags::UNREADABLE
-                | env_flags::UNFINISHED)
+                | env_flags::UNFINISHED
+                | env_flags::PRELOAD_RELATIVE)
             != 0
             || (setid && ef & env_flags::GLIBC_TUNABLES != 0);
         if conf(conf_slot::ENV_RECORD) & tb != 0 && reportable {
@@ -534,9 +560,10 @@ pub(crate) unsafe fn on_pass(
     if stashed {
         let _ = EXECPOL_ENV.remove(wk);
     }
-    // Lot 325 (TOCTOU): a staging loader entry judged here and let through
-    // (a tier that records it) is not news to the post-commit check.
-    if ef & env_flags::DENYABLE != 0 && env_act & action::DENY == 0 {
+    // Lot 325 (TOCTOU): what was judged here and let through (a tier that
+    // records it) is no news to the post-commit check — its record is
+    // made; it still kills a protected target on what it cannot clear.
+    if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
         let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
     }
     if (act | env_act) & action::DENY != 0 {
@@ -783,6 +810,23 @@ const M7: u64 = 0x00ff_ffff_ffff_ffff;
 const COUNT_MASK: u64 = 0xffff_ffff;
 const MORE: u64 = 1 << 63;
 const UNREAD: u64 = 1 << 62;
+/// A step stopped at a judged name (its string in [`EnvScan::pending`]):
+/// the scan reads it whole ([`nn_env_pending`]); at the post-commit check,
+/// the region's round. Steps never call down (the review of #547: the call
+/// chain under `exec_check_lsm` stays under 512 bytes of stack).
+const JUDGE: u64 = 1 << 61;
+/// The scan stops before the array's end, not finished (`TRUNCATED`): the
+/// judged names' cap was reached, or the task's entry went while a judged
+/// name was read (it cannot: the task alone makes and removes it; were it
+/// to, never a clean environment).
+const STOP: u64 = 1 << 60;
+/// The step calls of the post-commit check's round: its [`ENV_STEPS_MID`]
+/// full steps and the stops at judged names.
+const ROUND_CALLS: usize = ENV_STEPS_MID + ENV_JUDGED_MAX as usize;
+// The first pass's rounds cover the cap: each full one reads
+// ENV_STEPS_MID * ENV_STEP entries, and the scan runs ENV_ROUNDS of them
+// beside its ENV_JUDGED_MAX stops at judged names.
+const _: () = assert!(ENV_ROUNDS * ENV_STEPS_MID * ENV_STEP == ENV_SCAN_CAP);
 
 /// Read the environment array `envp` (user memory of the caller, its old
 /// image) into the task's own entry of [`EXECPOL_ENV`] (`tid`, `start`:
@@ -811,28 +855,31 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
     let stride = envp_stride(compat);
     let mut read = 0u64;
     let mut more = true;
-    let mut unread = false;
     let mut round = 0usize;
-    while round < ENV_ROUNDS {
-        let r = nn_env_round(
-            envp,
-            (round * ENV_STEP * ENV_STEPS_MID) as u64,
-            tid,
-            start,
-            compat,
-        );
+    // What a round found goes into the entry at once, not into locals: each
+    // way out of the loop is then one state for the verifier (5.15 refused
+    // `exec_check_lsm` past a million instructions with two more). A round
+    // reads ENV_STEPS_MID * ENV_STEP entries, unless the array ends or a
+    // step stops at a judged name, which is read whole here
+    // ([`nn_env_pending`]: past the judged names' cap, `STOP`); the rounds
+    // and the judged names' stops cover the cap.
+    while round < ENV_ROUNDS + ENV_JUDGED_MAX as usize {
+        let r = nn_env_round(envp, read, tid, start, compat);
         read += r & COUNT_MASK;
         if r & UNREAD != 0 {
-            unread = true;
+            (*e).stash.flags |= env_flags::UNREADABLE;
         }
-        if r & MORE == 0 {
+        if r & JUDGE != 0 {
+            if nn_env_pending(tid, start) & STOP != 0 {
+                (*e).stash.flags |= env_flags::TRUNCATED;
+                more = false;
+                break;
+            }
+        } else if r & MORE == 0 {
             more = false;
             break;
         }
         round += 1;
-    }
-    if unread {
-        (*e).stash.flags |= env_flags::UNREADABLE;
     }
     if more {
         // Every round full: an array past the cap, longer than any the
@@ -842,32 +889,107 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
         let rc = generated::bpf_probe_read_user(
             &mut ptr as *mut u64 as *mut c_void,
             stride as u32,
-            (envp + (ENV_SCAN_CAP as u64) * stride) as *const c_void,
+            (envp + read * stride) as *const c_void,
         );
         if rc != 0 || ptr != 0 {
             (*e).stash.flags |= env_flags::TRUNCATED;
         }
     }
     (*e).stash.count = read as u32;
-    let f = (*e).stash.flags;
+    let f = nn_env_resolve(0, tid, start) as u32;
     if f == 0 {
         let _ = EXECPOL_ENV.remove(&key);
     }
     u64::from(f)
 }
 
-/// One round of [`env_scan`]: [`ENV_STEPS_MID`] steps of [`nn_env_step`]
-/// from entry `base`. A global function: checked once.
+/// The review of #547 (F1): a bare name in `LD_PRELOAD` / `LD_AUDIT` is
+/// searched in `LD_LIBRARY_PATH` first: under a staging directory there it
+/// is a staging preload; under a relative one, a relative path; with a
+/// library path longer than the scan reads, not judged to its end
+/// (`LOADER_CUT`). The entry's findings then ([`env_entry`]: `sel`, `tid`,
+/// `start`; [`env_flags::UNREADABLE`] without it). A global function: its
+/// branches are checked once, not on every way out of a scan's loop.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_round(envp: u64, base: u64, tid: u64, start: u64, compat: u64) -> u64 {
+pub extern "C" fn nn_env_resolve(sel: u64, tid: u64, start: u64) -> u64 {
+    unsafe {
+        match env_entry(sel, tid, start) {
+            Some(e) => {
+                resolve_bare(e);
+                u64::from((*e).stash.flags)
+            }
+            None => u64::from(env_flags::UNREADABLE),
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn resolve_bare(e: *mut EnvScan) {
+    let i = (*e).internal;
+    if i & INTERNAL_BARE_PRELOAD != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
+        (*e).stash.flags |= env_flags::PRELOAD_STAGING;
+    }
+    if i & INTERNAL_BARE_AUDIT != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
+        (*e).stash.flags |= env_flags::AUDIT_STAGING;
+    }
+    if i & (INTERNAL_BARE_PRELOAD | INTERNAL_BARE_AUDIT) != 0 {
+        if i & INTERNAL_LIBPATH_RELATIVE != 0 {
+            (*e).stash.flags |= env_flags::PRELOAD_RELATIVE;
+        }
+        if i & INTERNAL_LIBPATH_CUT != 0 {
+            (*e).stash.flags |= env_flags::LOADER_CUT;
+        }
+    }
+}
+
+/// The entry a judged name's functions work in: the exec'ing task's own
+/// ([`EXECPOL_ENV`], `tid`, `start`) at the first pass (`sel` 0), the CPU's
+/// ([`COMMIT_ENV`]) at the post-commit check (`sel` 1).
+#[inline(always)]
+unsafe fn env_entry(sel: u64, tid: u64, start: u64) -> Option<*mut EnvScan> {
+    if sel != 0 {
+        COMMIT_ENV.get_ptr_mut(0)
+    } else {
+        EXECPOL_ENV.get_ptr_mut(&crate::task_scratch::key(tid, start))
+    }
+}
+
+/// The review of #547 (F8): one more judged name, or past the cap (the scan
+/// is then not finished: `TRUNCATED`).
+#[inline(always)]
+unsafe fn judged_one_more(sel: u64, tid: u64, start: u64) -> bool {
+    match env_entry(sel, tid, start) {
+        Some(e) => {
+            if (*e).judged >= ENV_JUDGED_MAX {
+                (*e).stash.flags |= env_flags::TRUNCATED;
+                false
+            } else {
+                (*e).judged += 1;
+                true
+            }
+        }
+        None => false,
+    }
+}
+
+/// One round of [`env_scan`] from entry `idx`: up to [`ENV_STEPS_MID`] steps
+/// ([`nn_env_step`]), until the array ends or a step stops at a judged name
+/// (`JUDGE`, its string in [`EnvScan::pending`], for [`nn_env_pending`]).
+/// Returns the entries read and the flags. A global function: checked once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_env_round(envp: u64, idx: u64, tid: u64, start: u64, compat: u64) -> u64 {
     let mut n = 0u64;
     let mut unread = 0u64;
     let mut j = 0usize;
     while j < ENV_STEPS_MID {
-        let r = nn_env_step(envp, base + (j * ENV_STEP) as u64, tid, start, compat);
+        let r = nn_env_step(envp, idx + n, tid, start, compat);
         n += r & COUNT_MASK;
         unread |= r & UNREAD;
+        if r & JUDGE != 0 {
+            return n | unread | JUDGE;
+        }
         if r & MORE == 0 {
             return n | unread;
         }
@@ -876,41 +998,75 @@ pub extern "C" fn nn_env_round(envp: u64, base: u64, tid: u64, start: u64, compa
     n | unread | MORE
 }
 
-/// One step of [`env_scan`]: entries `base..base + ENV_STEP` of `envp`,
-/// each its pointer and the first eight bytes of its string; a name the
-/// scan judges ([`env_name_wanted`]) is read whole by [`nn_env_var`]. A
-/// global function: its loop is checked once, and a step costs its
-/// callers one call.
+/// The judged name a step stopped at (the task's entry: `tid`, `start`),
+/// read whole ([`nn_env_var`]) and, a loader variable, its value judged
+/// ([`nn_env_judge`]) — at most [`ENV_JUDGED_MAX`] per exec
+/// ([`judged_one_more`]: past it, `STOP`, the scan not finished). Called by
+/// the scan itself, not by its round: the call chain under
+/// `exec_check_lsm` stays under 512 bytes of stack, and the round's loop
+/// stays small for the verifier. A global function: checked once.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_step(envp: u64, base: u64, tid: u64, start: u64, compat: u64) -> u64 {
+pub extern "C" fn nn_env_pending(tid: u64, start: u64) -> u64 {
     unsafe {
+        if !judged_one_more(0, tid, start) {
+            return STOP;
+        }
+        let ptr = match env_entry(0, tid, start) {
+            Some(e) => (*e).pending,
+            None => return STOP,
+        };
+        nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);
+        if env_entry(0, tid, start).is_none() {
+            return STOP;
+        }
+        0
+    }
+}
+
+/// One step of [`env_scan`]: entries `idx..idx + ENV_STEP` of `envp`, each
+/// its pointer and the first eight bytes of its string, read into the
+/// task's entry (not the stack); it stops after a name the scan judges
+/// ([`env_name_wanted`]), its string in [`EnvScan::pending`] (`JUDGE`), for
+/// its round to read whole. A global function that calls nothing: its loop
+/// is checked once, and the call chain stays short.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_env_step(envp: u64, idx: u64, tid: u64, start: u64, compat: u64) -> u64 {
+    unsafe {
+        let e = match env_entry(0, tid, start) {
+            Some(x) => x,
+            None => return UNREAD,
+        };
+        let w = (*e).region.as_mut_ptr() as *mut u64;
         let stride = envp_stride(compat);
         let mut unread = 0u64;
         let mut i = 0usize;
         while i < ENV_STEP {
-            let mut ptr = 0u64;
+            // the entry, into the buffer's third word (zeroed: a compat
+            // entry fills its low half)
+            core::ptr::write_volatile(w.add(2), 0);
             if generated::bpf_probe_read_user(
-                &mut ptr as *mut u64 as *mut c_void,
+                w.add(2) as *mut c_void,
                 stride as u32,
-                (envp + (base + i as u64) * stride) as *const c_void,
+                (envp + (idx + i as u64) * stride) as *const c_void,
             ) != 0
             {
                 return i as u64 | UNREAD;
             }
+            let ptr = core::ptr::read_volatile(w.add(2));
             if ptr == 0 {
                 return i as u64 | unread;
             }
             // The name's first eight bytes; the string read stops at its
             // NUL (a shorter name leaves zeroes, which no judged name has).
-            let mut w = core::mem::MaybeUninit::<[u64; 2]>::uninit();
-            let wp = w.as_mut_ptr() as *mut u64;
-            core::ptr::write_volatile(wp, 0);
-            core::ptr::write_volatile(wp.add(1), 0);
-            if generated::bpf_probe_read_user_str(wp as *mut c_void, 9, ptr as *const c_void) < 0 {
+            core::ptr::write_volatile(w, 0);
+            core::ptr::write_volatile(w.add(1), 0);
+            if generated::bpf_probe_read_user_str(w as *mut c_void, 9, ptr as *const c_void) < 0 {
                 unread = UNREAD;
-            } else if env_name_wanted(core::ptr::read_volatile(wp)) {
-                env_var_judged(nn_env_var(ptr, tid, start), tid, start);
+            } else if env_name_wanted(core::ptr::read_volatile(w)) {
+                (*e).pending = ptr;
+                return (i + 1) as u64 | unread | JUDGE;
             }
             i += 1;
         }
@@ -918,16 +1074,17 @@ pub extern "C" fn nn_env_step(envp: u64, base: u64, tid: u64, start: u64, compat
     }
 }
 
-/// One variable at `ptr` whose name the scan judges, read whole into the
-/// task's entry (`tid`, `start`): its first 24 bytes compared, a loader
-/// variable's value captured and judged at once ([`scan_one`]). A global
-/// function: checked once, called for the few variables it judges.
+/// One variable at `ptr` whose name the scan judges, read into the entry
+/// ([`env_entry`]: `sel`, `tid`, `start`): its first 24 bytes compared, a
+/// loader variable's value captured for the record ([`scan_one`]); returns
+/// which loader variable it is (`VAR_*`: [`nn_env_judge`] judges its value
+/// whole). A global function: checked once, called for the few variables
+/// it judges.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_var(ptr: u64, tid: u64, start: u64) -> u64 {
+pub extern "C" fn nn_env_var(ptr: u64, tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
-        let key = crate::task_scratch::key(tid, start);
-        let e = match EXECPOL_ENV.get_ptr_mut(&key) {
+        let e = match env_entry(sel, tid, start) {
             Some(p) => p,
             None => return VAR_NONE,
         };
@@ -956,37 +1113,232 @@ pub extern "C" fn nn_env_var(ptr: u64, tid: u64, start: u64) -> u64 {
 }
 
 /// [`nn_env_var`]'s result: the loader variable it captured (`VAR_*`), whose
-/// value [`env_var_judged`] then judges.
+/// value [`nn_env_judge`] then judges.
 const VAR_NONE: u64 = 0;
 const VAR_PRELOAD: u64 = 1;
 const VAR_AUDIT: u64 = 2;
 const VAR_LIBPATH: u64 = 3;
 
-/// Lot 325 (the mini-hunt): the loader variable [`nn_env_var`] just
-/// captured (`var`), judged at once — a staging entry in any occurrence is a
-/// finding. It judged the last occurrence only: glibc's loader takes the
-/// last `LD_PRELOAD`, but musl's (and any `getenv`) the first, so a staging
-/// preload first and a clean one last passed into a musl target. Called by
-/// the step, beside [`nn_env_var`] rather than inside it: the verifier sums
-/// the frames of a call chain (512 bytes).
-#[inline(always)]
-unsafe fn env_var_judged(var: u64, tid: u64, start: u64) {
-    let (which, bit) = match var {
-        VAR_PRELOAD => (0, env_flags::PRELOAD_STAGING),
-        VAR_AUDIT => (1, env_flags::AUDIT_STAGING),
-        VAR_LIBPATH => (2, env_flags::LIBPATH_STAGING),
-        _ => return,
+/// The loader variable [`nn_env_var`] just read (`var`, the variable at
+/// `ptr`), its value judged whole — each occurrence, so a staging entry in
+/// any of them is a finding (the mini-hunt: musl's loader takes the first
+/// `LD_PRELOAD`, glibc's the last). The review of #547 (F1, F7): read
+/// [`REGION_READ`] bytes at a time ([`nn_env_chunk`]), each entry parsed as
+/// the loader parses the list and judged on its normalised path, up to
+/// [`ENV_VALUE_READS`] reads (about 4 KiB) — past them, `LOADER_CUT`. It
+/// compared the first nine bytes of each entry of a 128-byte capture: an
+/// entry that started after its 119th byte, a `//tmp/`, a `/./tmp/`, a tab
+/// (musl) passed; a clean value longer than the capture was refused.
+/// A global function, beside [`nn_env_var`] rather than under it (the
+/// verifier sums the frames of a call chain, 512 bytes): its reads are
+/// checked once — inline in the round, its 16 reads multiplied the round's
+/// states past the verifier's million instructions (7.0 refused
+/// `exec_check_lsm`).
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_env_judge(var: u64, ptr: u64, tid: u64, start: u64, sel: u64) -> u64 {
+    let (kind, off) = match var {
+        VAR_PRELOAD => (u64::from(value_parse::KIND_PRELOAD), 11u64),
+        VAR_AUDIT => (u64::from(value_parse::KIND_AUDIT), 9),
+        VAR_LIBPATH => (u64::from(value_parse::KIND_LIBPATH), 16),
+        _ => return 0,
     };
-    if nn_list_staging(which, tid, start) != 0 {
-        if let Some(e) = EXECPOL_ENV.get_ptr_mut(&crate::task_scratch::key(tid, start)) {
-            (*e).stash.flags |= bit;
+    let mut q = ptr + off;
+    let mut r = 0usize;
+    let mut cut = CHUNK_CUT;
+    while r < ENV_VALUE_READS {
+        let n = nn_env_chunk(q, kind | if r == 0 { CHUNK_FIRST } else { 0 }, tid, start, sel);
+        if n < REGION_READ as u64 {
+            // the value's end (0: unreadable, flagged)
+            cut = 0;
+            break;
+        }
+        q += (REGION_READ - 1) as u64;
+        r += 1;
+    }
+    let _ = nn_env_chunk(0, kind | CHUNK_FINISH | cut, tid, start, sel);
+    0
+}
+
+/// [`nn_env_chunk`]'s second argument, above the value's kind: the value's
+/// first read (its parse starts afresh), the value's end (no read: its last
+/// entry judged, what it showed into the findings), and with it, the value
+/// went on past the reads.
+const CHUNK_FIRST: u64 = 1 << 8;
+const CHUNK_FINISH: u64 = 1 << 9;
+const CHUNK_CUT: u64 = 1 << 10;
+
+/// One read of a loader variable's value at `p` into the entry
+/// ([`env_entry`]: `sel`, `tid`, `start`), up to [`REGION_READ`] bytes, its
+/// bytes through the value's parser ([`value_parse::byte`]); returns the
+/// bytes read with the NUL (0: unreadable, flagged). With [`CHUNK_FINISH`]
+/// in `kind_flags`: no read — the value's end. A global function: its byte
+/// loop is checked once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_env_chunk(p: u64, kind_flags: u64, tid: u64, start: u64, sel: u64) -> u64 {
+    unsafe {
+        let e = match env_entry(sel, tid, start) {
+            Some(x) => x,
+            None => return 0,
+        };
+        let kind = (kind_flags & 0xff) as u32;
+        if kind_flags & CHUNK_FINISH != 0 {
+            value_found(e, kind, kind_flags & CHUNK_CUT != 0);
+            return 0;
+        }
+        if kind_flags & CHUNK_FIRST != 0 {
+            zero_parse(&mut (*e).parse);
+        }
+        let n = generated::bpf_probe_read_user_str(
+            (*e).region.as_mut_ptr() as *mut c_void,
+            REGION_READ as u32,
+            p as *const c_void,
+        );
+        if n <= 0 {
+            (*e).stash.flags |= env_flags::UNREADABLE;
+            return 0;
+        }
+        // the bytes before the NUL (a full read: 255 and its NUL)
+        let len = (n - 1) as usize;
+        let buf = (*e).region.as_ptr();
+        let mut i = 0usize;
+        while i < REGION_READ - 1 {
+            if i >= len {
+                break;
+            }
+            // `value_parse::byte`, its separator and `/` steps in global
+            // functions: inline, their branches multiplied the loop's
+            // states past the verifier's million instructions
+            let b = *buf.add(i);
+            if value_parse::is_sep(kind, b) {
+                let _ = nn_value_end(u64::from(kind), tid, start, sel);
+            } else {
+                value_parse::begin(&mut (*e).parse, b);
+                if b == b'/' {
+                    let _ = nn_value_slash(tid, start, sel);
+                } else {
+                    value_parse::push(&mut (*e).parse, b);
+                }
+            }
+            i += 1;
+        }
+        n as u64
+    }
+}
+
+/// The end of a value's entry ([`value_parse::end_entry`]) in the entry
+/// ([`env_entry`]: `sel`, `tid`, `start`). A global function: checked once,
+/// called from [`nn_env_chunk`]'s byte loop at each separator.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_value_end(kind: u64, tid: u64, start: u64, sel: u64) -> u64 {
+    unsafe {
+        if let Some(e) = env_entry(sel, tid, start) {
+            value_parse::end_entry(&mut (*e).parse, kind as u32);
+        }
+    }
+    0
+}
+
+/// A `/` of a value's entry ([`value_parse::slash`]), as [`nn_value_end`].
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_value_slash(tid: u64, start: u64, sel: u64) -> u64 {
+    unsafe {
+        if let Some(e) = env_entry(sel, tid, start) {
+            value_parse::slash(&mut (*e).parse);
+        }
+    }
+    0
+}
+
+
+/// Zero a [`ValueParse`] with volatile stores (a struct assignment compiled
+/// to a `memset` call: rule 9).
+#[inline(always)]
+unsafe fn zero_parse(p: *mut ValueParse) {
+    let w = p as *mut u64;
+    let mut i = 0;
+    while i < core::mem::size_of::<ValueParse>() / 8 {
+        core::ptr::write_volatile(w.add(i), 0);
+        i += 1;
+    }
+}
+
+/// The end of a value: its last entry judged, what its entries showed into
+/// the entry's findings; `cut`: the value went on past the reads.
+#[inline(always)]
+unsafe fn value_found(e: *mut EnvScan, kind: u32, cut: bool) {
+    value_parse::end_entry(&mut (*e).parse, kind);
+    let found = (*e).parse.found;
+    let staging = found & value_parse::STAGING != 0;
+    let relative = found & value_parse::RELATIVE != 0;
+    let bare = found & value_parse::BARE != 0;
+    let st = &mut (*e).stash;
+    if kind == value_parse::KIND_PRELOAD {
+        if staging {
+            st.flags |= env_flags::PRELOAD_STAGING;
+        }
+        if relative {
+            st.flags |= env_flags::PRELOAD_RELATIVE;
+        }
+        if bare {
+            (*e).internal |= INTERNAL_BARE_PRELOAD;
+        }
+        if cut {
+            st.flags |= env_flags::LOADER_CUT;
+        }
+    } else if kind == value_parse::KIND_AUDIT {
+        if staging {
+            st.flags |= env_flags::AUDIT_STAGING;
+        }
+        if relative {
+            st.flags |= env_flags::PRELOAD_RELATIVE;
+        }
+        if bare {
+            (*e).internal |= INTERNAL_BARE_AUDIT;
+        }
+        if cut {
+            st.flags |= env_flags::LOADER_CUT;
+        }
+    } else {
+        if staging {
+            st.flags |= env_flags::LIBPATH_STAGING;
+            (*e).internal |= INTERNAL_LIBPATH_STAGING;
+        }
+        if relative {
+            st.flags |= env_flags::LIBPATH_STAGING;
+            (*e).internal |= INTERNAL_LIBPATH_RELATIVE;
+        }
+        if cut {
+            (*e).internal |= INTERNAL_LIBPATH_CUT;
         }
     }
 }
 
+
+/// Whether a captured value (`len` from the string read into `cap` bytes,
+/// the value at `value`) was cut: a full read is `cap - 1` bytes and its NUL,
+/// cut only when the value has a byte at `cap - 1` (the review of #547, F7:
+/// a value of exactly 127 bytes, or 63, was flagged).
+#[inline(always)]
+unsafe fn value_cut(len: i64, cap: usize, value: u64) -> bool {
+    if len < cap as i64 {
+        return false;
+    }
+    let mut b = 0u8;
+    let _ = generated::bpf_probe_read_user(
+        &mut b as *mut u8 as *mut c_void,
+        1,
+        (value + cap as u64 - 1) as *const c_void,
+    );
+    b != 0
+}
+
 /// One variable (`ptr`, its first 24 bytes in `w0..w2`): a finding into the
 /// task's entry `e`, and the value of a loader variable captured; returns
-/// which (`VAR_*`: [`env_var_judged`] judges each occurrence).
+/// which (`VAR_*`: [`nn_env_judge`] judges each occurrence).
 #[inline(always)]
 unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 {
     let st = &mut (*e).stash;
@@ -1000,8 +1352,8 @@ unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 
         if len < 0 {
             st.flags |= env_flags::UNREADABLE;
         }
-        if len >= ENV_PRELOAD_LEN as i64 {
-            st.flags |= env_flags::VALUE_CUT | env_flags::LOADER_CUT;
+        if value_cut(len, ENV_PRELOAD_LEN, ptr + 11) {
+            st.flags |= env_flags::VALUE_CUT;
         }
         return VAR_PRELOAD;
     } else if w0 == W_LD_AUDIT && w1 & M1 == u64::from(b'=') {
@@ -1014,8 +1366,8 @@ unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 
         if len < 0 {
             st.flags |= env_flags::UNREADABLE;
         }
-        if len >= ENV_AUDIT_LEN as i64 {
-            st.flags |= env_flags::VALUE_CUT | env_flags::LOADER_CUT;
+        if value_cut(len, ENV_AUDIT_LEN, ptr + 9) {
+            st.flags |= env_flags::VALUE_CUT;
         }
         return VAR_AUDIT;
     } else if w0 == W_LD_LIBRA && w1 == W_RY_PATH {
@@ -1028,7 +1380,7 @@ unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 
         if len < 0 {
             st.flags |= env_flags::UNREADABLE;
         }
-        if len >= ENV_LIBPATH_LEN as i64 {
+        if value_cut(len, ENV_LIBPATH_LEN, ptr + 16) {
             st.flags |= env_flags::VALUE_CUT;
         }
         return VAR_LIBPATH;
@@ -1177,8 +1529,13 @@ unsafe fn exec_unwalked(
     let ef = er as u32;
     let stashed = er & ENV_STASHED != 0;
     let protected = env_deny_rule || setid;
+    // The review of #547 (F5): an environment this pass could not read (its
+    // own map full, a page gone) is not refused here — the post-commit
+    // check reads the kernel's copy in a buffer this flood cannot take, and
+    // kills what it must; refusing it refused every service exec once both
+    // maps were full.
     let env_refused = (ef & env_flags::DENYABLE != 0 && env_deny_rule)
-        || (protected && ef & (env_flags::UNREADABLE | env_flags::UNFINISHED) != 0);
+        || (protected && ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0);
     let mut act = action::UNWALKED | action::RECORD;
     let mut env_act = 0u32;
     let refuse = m == mode::ENFORCE && (deny_c != 0 || env_refused);
@@ -1221,13 +1578,15 @@ unsafe fn exec_unwalked(
     if stashed {
         let _ = EXECPOL_ENV.remove(&wk);
     }
-    if ef & env_flags::DENYABLE != 0 && env_act & action::DENY == 0 {
+    if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
         let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
     }
+    // The review of #547 (F4): an earlier, failed exec's candidate is not this
+    // exec's (no candidate is made here: the quarantine needs the walk).
+    if pass == 0 {
+        crate::execq::forget(task);
+    }
     if refuse {
-        if pass == 0 {
-            crate::execq::forget(task);
-        }
         return 1;
     }
     0
@@ -1339,12 +1698,6 @@ unsafe fn env_commit() {
     };
     let start = peek_u64(mm.add(os));
     let end = peek_u64(mm.add(oe));
-    let key = crate::task_scratch::key_of(task);
-    let r = if end > start {
-        nn_env_region(start, end, u64::from(key.tid), key.start_ns)
-    } else {
-        0
-    };
     let seen = match EXECPOL_ENV_SEEN.get(&tk) {
         Some(v) => *v,
         None => 0,
@@ -1352,41 +1705,91 @@ unsafe fn env_commit() {
     if seen != 0 {
         let _ = EXECPOL_ENV_SEEN.remove(&tk);
     }
-    if r & SCAN_LOST != 0 {
-        return;
-    }
-    let f = r as u32;
-    if f & env_flags::DENYABLE & !seen == 0 {
-        if f != 0 {
-            let _ = EXECPOL_ENV.remove(&key);
+    // The CPU's entry (preemption is off here), zeroed.
+    let e = match COMMIT_ENV.get_ptr_mut(0) {
+        Some(p) => p,
+        None => {
+            bump(counter::ENV_UNREAD);
+            return;
         }
+    };
+    if let Some(z) = crate::task_scratch::TASK_SCRATCH_ZERO.get_ptr(0) {
+        let _ = generated::bpf_probe_read_kernel(
+            e as *mut c_void,
+            core::mem::size_of::<EnvScan>() as u32,
+            z as *const c_void,
+        );
+    }
+    let f = if end > start {
+        nn_env_region(start, end) as u32
+    } else {
+        0
+    };
+    // The review of #547 (F2): a staging entry the first pass did not see
+    // (the environment changed after the kernel's copy), and what this read
+    // of the kernel's own copy cannot clear — a value longer than the scan
+    // reads, past the bound of this read, a relative path, an unreadable
+    // string — are never silent: a protected target (the tier's rule
+    // refuses a staging preload) or a set-id one is killed, anything else
+    // recorded and counted. It acted on new staging entries only.
+    let staging_new = f & env_flags::DENYABLE & !seen;
+    let unjudged = f & env_flags::UNJUDGED;
+    if staging_new == 0 && unjudged == 0 {
         return;
     }
-    bump(counter::ENV_CHANGED);
     let tv = nn_execpol_tier(tk) as u32;
     let t = tv & 3;
     let tb = 1u64 << t;
     let root = tv & tier_sig::ROOT != 0;
-    let mut env_act = 0u32;
-    if conf(conf_slot::ENV_DENY) & tb != 0 || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0) {
+    let rule = conf(conf_slot::ENV_DENY) & tb != 0
+        || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
+    let setid = exe_mode(mm) & 0o6000 != 0;
+    let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));
+    // what the first pass judged and recorded, let through: no news, unless
+    // it is to be killed now
+    if !kill && staging_new == 0 && unjudged & !seen == 0 {
+        return;
+    }
+    if staging_new != 0 {
+        bump(counter::ENV_CHANGED);
+    }
+    if unjudged & env_flags::UNFINISHED != 0 {
+        bump(counter::ENV_TRUNCATED);
+    }
+    if unjudged & env_flags::UNREADABLE != 0 {
+        bump(counter::ENV_UNREAD);
+    }
+    let mut env_act = action::RECORD;
+    if kill {
         if conf(conf_slot::MODE) == mode::ENFORCE {
-            let _ = generated::bpf_send_signal(SIGKILL);
-            env_act |= action::DENY | action::KILLED;
-            bump(counter::ENV_DENIED);
+            // the review of #547 (F9): killed only when the signal is sent
+            if generated::bpf_send_signal(SIGKILL) == 0 {
+                env_act |= action::DENY | action::KILLED;
+                bump(counter::ENV_DENIED);
+            } else {
+                env_act |= action::WOULD_DENY;
+            }
         } else {
             env_act |= action::WOULD_DENY;
         }
     }
-    if conf(conf_slot::ENV_RECORD) & tb != 0 {
-        env_act |= action::RECORD;
+    bump(counter::ENV_RECORDED);
+    let changed = if staging_new != 0 { env_flags::CHANGED } else { 0 };
+    report_commit(task, mm, tv, f | changed, env_act, &(*e).stash);
+}
+
+/// The mode bits of `mm`'s executable (0 when unreadable).
+#[inline(always)]
+unsafe fn exe_mode(mm: *const u8) -> u32 {
+    let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+    if file.is_null() {
+        return 0;
     }
-    if env_act != 0 {
-        bump(counter::ENV_RECORDED);
-        if let Some(e) = EXECPOL_ENV.get_ptr(&key) {
-            report_commit(task, mm, tv, f | env_flags::CHANGED, env_act, &(*e).stash);
-        }
+    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+    if inode.is_null() {
+        return 0;
     }
-    let _ = EXECPOL_ENV.remove(&key);
+    u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))))
 }
 
 /// The report of [`execpol_env_commit`]: the new image's file, its path
@@ -1444,47 +1847,44 @@ unsafe fn report_commit(
 }
 
 /// The new image's environment `[start, end)`, string after string, into
-/// the task's own entry (`tid`, `kstart`), made here: [`ENV_ROUNDS`] rounds
-/// of [`nn_env_region_round`], each string's first eight bytes compared
-/// and the names the scan judges read whole ([`nn_env_var`], as the first
-/// pass does). Returns the findings, or [`SCAN_LOST`]. A global function:
-/// checked once.
+/// the CPU's entry ([`COMMIT_ENV`]): at most [`ENV_COMMIT_ROUNDS`] rounds of
+/// [`nn_env_region_round`] (the review of #547, F8: with preemption off, at
+/// most 98,304 reads of the strings, and the judged names' values; past
+/// them, `TRUNCATED`), each string's first eight
+/// bytes compared and the judged names read whole, their values judged as
+/// the first pass judges them ([`nn_env_var`], [`nn_env_judge`]). Returns
+/// the findings. A global function: checked once.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_region(start: u64, end: u64, tid: u64, kstart: u64) -> u64 {
+pub extern "C" fn nn_env_region(start: u64, end: u64) -> u64 {
     unsafe {
-        let key = crate::task_scratch::key(tid, kstart);
-        let e = match crate::task_scratch::make(&EXECPOL_ENV, &key) {
+        let e = match COMMIT_ENV.get_ptr_mut(0) {
             Some(p) => p,
-            None => return SCAN_LOST,
+            None => return u64::from(env_flags::UNREADABLE),
         };
         let mut pos = start;
         let mut at = 1u64;
         let mut done = false;
         let mut round = 0usize;
-        while round < ENV_ROUNDS {
-            let r = nn_env_region_round(pos, end, tid, kstart, at);
+        while round < ENV_COMMIT_ROUNDS {
+            let r = nn_env_region_round(pos, end, at);
             if r & UNREAD != 0 {
                 (*e).stash.flags |= env_flags::UNREADABLE;
                 done = true;
                 break;
             }
-            if r & MORE == 0 {
+            if r & (MORE | STOP) != MORE {
                 done = true;
                 break;
             }
             pos = r & POS_MASK;
-            at = (r >> AT_SHIFT) & 1;
+            at = (r >> AT_SHIFT) & AT_MASK;
             round += 1;
         }
         if !done {
             (*e).stash.flags |= env_flags::TRUNCATED;
         }
-        let f = (*e).stash.flags;
-        if f == 0 {
-            let _ = EXECPOL_ENV.remove(&key);
-        }
-        u64::from(f)
+        nn_env_resolve(1, 0, 0)
     }
 }
 
@@ -1492,48 +1892,69 @@ pub extern "C" fn nn_env_region(start: u64, end: u64, tid: u64, kstart: u64) -> 
 /// address, below 2^48), and whether it is at a string's start.
 const POS_MASK: u64 = (1 << 48) - 1;
 const AT_SHIFT: u64 = 48;
+/// The position's bits above it: at a string's start; and that string is
+/// the judged one just read whole (its name is not compared again).
+const AT_START: u64 = 1;
+const AT_SKIP: u64 = 2;
+const AT_MASK: u64 = AT_START | AT_SKIP;
 
-/// One round of [`nn_env_region`]: [`ENV_STEPS_MID`] steps.
+/// One round of [`nn_env_region`]: steps ([`nn_env_region_step`]); each
+/// judged name a step stops at is read whole here, its value judged, then
+/// its string skipped by the next step.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_region_round(pos: u64, end: u64, tid: u64, kstart: u64, at: u64) -> u64 {
-    let mut p = pos;
-    let mut a = at & 1;
-    let mut j = 0usize;
-    while j < ENV_STEPS_MID {
-        let r = nn_env_region_step(p, end, tid, kstart, a);
-        if r & MORE == 0 {
-            return r;
+pub extern "C" fn nn_env_region_round(pos: u64, end: u64, at: u64) -> u64 {
+    unsafe {
+        let mut p = pos;
+        let mut a = at & AT_MASK;
+        let mut j = 0usize;
+        while j < ROUND_CALLS {
+            let r = nn_env_region_step(p, end, a);
+            if r & UNREAD != 0 {
+                return r;
+            }
+            p = r & POS_MASK;
+            a = (r >> AT_SHIFT) & AT_MASK;
+            if r & JUDGE != 0 {
+                if !judged_one_more(1, 0, 0) {
+                    return p | STOP;
+                }
+                nn_env_judge(nn_env_var(p, 0, 0, 1), p, 0, 0, 1);
+                // the string at `p` again, its name not compared
+                a = AT_START | AT_SKIP;
+            } else if r & MORE == 0 {
+                return r;
+            }
+            j += 1;
         }
-        p = r & POS_MASK;
-        a = (r >> AT_SHIFT) & 1;
-        j += 1;
+        p | (a << AT_SHIFT) | MORE
     }
-    p | (a << AT_SHIFT) | MORE
 }
 
 /// One step of [`nn_env_region`]: [`ENV_STEP`] reads of up to
 /// [`REGION_READ`] bytes; a read that starts a string compares its first
-/// eight bytes, and a string longer than a read takes the next one.
+/// eight bytes — a judged name stops the step at that string (`JUDGE`) for
+/// its round, which reads it whole and has the next step skip it
+/// ([`AT_SKIP`]) — and a string longer than a read takes the next one. A
+/// global function that calls nothing.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_env_region_step(pos: u64, end: u64, tid: u64, kstart: u64, at: u64) -> u64 {
+pub extern "C" fn nn_env_region_step(pos: u64, end: u64, at: u64) -> u64 {
     unsafe {
-        let key = crate::task_scratch::key(tid, kstart);
-        let e = match EXECPOL_ENV.get_ptr_mut(&key) {
+        let e = match COMMIT_ENV.get_ptr_mut(0) {
             Some(p) => p,
             None => return pos | UNREAD,
         };
-        let buf = (*e).region.as_mut_ptr();
         let mut p = pos;
-        let mut a = at & 1;
+        let mut a = at & AT_START;
+        let mut skip = at & AT_SKIP != 0;
         let mut i = 0usize;
         while i < ENV_STEP {
             if p >= end {
                 return p | (a << AT_SHIFT);
             }
             let n = generated::bpf_probe_read_user_str(
-                buf as *mut c_void,
+                (*e).region.as_mut_ptr() as *mut c_void,
                 REGION_READ as u32,
                 p as *const c_void,
             );
@@ -1541,16 +1962,21 @@ pub extern "C" fn nn_env_region_step(pos: u64, end: u64, tid: u64, kstart: u64, 
                 return p | UNREAD;
             }
             if a != 0 {
-                (*e).stash.count = (*e).stash.count.wrapping_add(1);
-                // Bytes past the NUL are an earlier read's: a judged name
-                // has no NUL in its first eight bytes.
-                if env_name_wanted(core::ptr::read_volatile(buf as *const u64)) {
-                    env_var_judged(nn_env_var(p, tid, kstart), tid, kstart);
+                if !skip {
+                    (*e).stash.count = (*e).stash.count.wrapping_add(1);
+                    // Bytes past the NUL are an earlier read's: a judged
+                    // name has no NUL in its first eight bytes.
+                    if env_name_wanted(core::ptr::read_volatile(
+                        (*e).region.as_ptr() as *const u64,
+                    )) {
+                        return p | (AT_START << AT_SHIFT) | JUDGE;
+                    }
                 }
+                skip = false;
             }
             if n < REGION_READ as i64 {
                 p += n as u64;
-                a = 1;
+                a = AT_START;
             } else {
                 p += (REGION_READ - 1) as u64;
                 a = 0;
@@ -1561,83 +1987,8 @@ pub extern "C" fn nn_env_region_step(pos: u64, end: u64, tid: u64, kstart: u64, 
     }
 }
 
-/// "/tmp/", "/var/tmp/", "/dev/shm/", "/proc/", "/dev/fd/" — as eight
-/// little-endian bytes and the mask of their length (the last three are
-/// longer than eight: their ninth byte is checked apart).
-const P_TMP: u64 = u64::from_le_bytes(*b"/tmp/\0\0\0");
-const P_VAR_TMP: u64 = u64::from_le_bytes(*b"/var/tmp");
-const P_DEV_SHM: u64 = u64::from_le_bytes(*b"/dev/shm");
-const P_PROC: u64 = u64::from_le_bytes(*b"/proc/\0\0");
-const P_DEV_FD: u64 = u64::from_le_bytes(*b"/dev/fd/");
-const M6: u64 = 0xffff_ffff_ffff;
 
-/// Whether an entry of the colon- (or, for `LD_PRELOAD`, space-) separated
-/// list captured in the task's stash (`tid`, `start`; `which`: 0 preload,
-/// 1 audit, 2 library path) starts with a staging prefix
-/// ([`STAGING_PREFIXES`](northnarrow_common::wire::execpol::STAGING_PREFIXES)).
-/// A stash gone between the scan and this read (evicted) counts as one:
-/// the variable was there, its value can no longer be cleared. A global
-/// function: its byte loop is checked once.
-#[no_mangle]
-#[inline(never)]
-pub extern "C" fn nn_list_staging(which: u64, tid: u64, start: u64) -> u64 {
-    unsafe {
-        let key = crate::task_scratch::key(tid, start);
-        let e = match EXECPOL_ENV.get_ptr(&key) {
-            Some(p) => p,
-            None => return 1,
-        };
-        let (base, len) = match which {
-            0 => ((*e).stash.preload.as_ptr(), ENV_PRELOAD_LEN),
-            1 => ((*e).stash.audit.as_ptr(), ENV_AUDIT_LEN),
-            _ => ((*e).stash.libpath.as_ptr(), ENV_LIBPATH_LEN),
-        };
-        u64::from(list_staging(base, len))
-    }
-}
 
-#[inline(always)]
-unsafe fn list_staging(base: *const u8, len: usize) -> bool {
-    let mut start = true;
-    let mut i = 0usize;
-    while i < ENV_PRELOAD_LEN {
-        if i >= len {
-            break;
-        }
-        let b = *base.add(i);
-        if b == 0 {
-            break;
-        }
-        if b == b':' || b == b' ' {
-            start = true;
-        } else {
-            if start && b == b'/' && i + 9 <= len {
-                let mut w = 0u64;
-                let mut nine = 0u8;
-                let _ = generated::bpf_probe_read_kernel(
-                    &mut w as *mut u64 as *mut c_void,
-                    8,
-                    base.add(i) as *const c_void,
-                );
-                let _ = generated::bpf_probe_read_kernel(
-                    &mut nine as *mut u8 as *mut c_void,
-                    1,
-                    base.add(i + 8) as *const c_void,
-                );
-                if w & M5 == P_TMP
-                    || w & M6 == P_PROC
-                    || w == P_DEV_FD
-                    || ((w == P_VAR_TMP || w == P_DEV_SHM) && nine == b'/')
-                {
-                    return true;
-                }
-            }
-            start = false;
-        }
-        i += 1;
-    }
-    false
-}
 
 // ── executable mappings ─────────────────────────────────────────────
 

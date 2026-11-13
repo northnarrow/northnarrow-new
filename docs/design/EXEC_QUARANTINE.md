@@ -171,9 +171,14 @@ caller's old image. The LSM hook only classifies; the candidate travels in
 tracepoint. Lot 325 (the re-check of #546, R6): a plain hash of 4096
 entries, never an LRU (an LRU insert could evict an entry a preemptible
 program holds and give its memory to another task's candidate); a failed
-exec's candidate goes when the kernel frees its task (the LSM `task_free`
-program, `nn_task_free`), and past 4096 in flight a candidate is dropped
-(`CAND_DROPPED`: the exec runs, unheld).
+exec's candidate goes when the kernel frees the exec's file (the review of
+#547, F4: the LSM `file_free_security` program `execq_exec_failed`; it
+stayed until the task's next exec or its end, the LSM `task_free` program
+`nn_task_free`), each uid holds at most 1024 candidates (`EXECQ_CAND_UIDS`,
+recounted by the agent every 30 s), and past 4096 in flight, or the uid's
+share taken, a candidate is dropped (`CAND_DROPPED`: the exec runs, unheld
+— counted in `not_held` and signed, with the ring's and the stop signal's
+fail-opens, as `exec quarantine fail-open`).
 
 **Fail-open by construction.** A stop needs the agent's heartbeat
 (`EXECQ_ALIVE`, written every 250 ms) younger than 1.5 s, a free entry on

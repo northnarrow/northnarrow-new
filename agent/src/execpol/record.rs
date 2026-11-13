@@ -530,13 +530,7 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
     if ef & env_flags::UNFINISHED != 0
         && ea & (action::RECORD | action::DENY | action::WOULD_DENY) != 0
     {
-        let resp = if ea & action::DENY != 0 {
-            "denied at exec (EACCES): a protected or set-id target"
-        } else if ea & action::WOULD_DENY != 0 {
-            "would deny (audit): the exec ran"
-        } else {
-            "recorded: the exec ran"
-        };
+        let resp = env_response(ea, "a protected or set-id target");
         out.push(record(
             event,
             &path,
@@ -551,17 +545,49 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
                     common::wire::execpol::ENV_SCAN_CAP
                 )
             } else {
-                // Lot 325 (the mini-hunt of R2)
+                // Lot 325 (the mini-hunt of R2; the review of #547, F7: the
+                // value is judged whole up to about 4 KiB, a longer one
+                // judged in the kernel's copy at the commit)
                 format!(
                     "a loader variable's value at exec is longer than the check reads \
-                     ({tname} caller; {} bytes of LD_PRELOAD, {} of LD_AUDIT): its entries \
-                     past them were not judged",
-                    common::wire::execpol::ENV_PRELOAD_LEN,
-                    common::wire::execpol::ENV_AUDIT_LEN
+                     ({tname} caller; {} bytes): its entries past them were not judged",
+                    common::wire::execpol::ENV_VALUE_READS
+                        * (common::wire::execpol::ENV_REGION_READ - 1)
                 )
             },
-            resp.to_string(),
+            resp,
             vec![pick(ATTACK_ENV, Tactic::Stealth, "T1574.006")],
+            evidence(raw, decision_of(ea), policy),
+        ));
+    }
+    // The review of #547 (F1): a relative loader path, or a bare name in a
+    // staging or relative library path — where it resolves is not in the
+    // string. Refused at a protected or set-id target, recorded elsewhere.
+    if ef & env_flags::PRELOAD_RELATIVE != 0
+        && ea & (action::RECORD | action::DENY | action::WOULD_DENY) != 0
+    {
+        let refused = ea & action::DENY != 0;
+        out.push(record(
+            event,
+            &path,
+            (RULE_PRELOAD, RULE_PRELOAD_NAME),
+            if refused {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            format!(
+                "a loader variable at exec names a path relative to the caller's directory, \
+                 or a bare name in a staging or relative library path ({}), for a {tname} \
+                 caller: where it resolves is not in the string",
+                values(raw)
+                    .into_iter()
+                    .filter(|v| v.starts_with("LD_"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            env_response(ea, "a protected or set-id target"),
+            ATTACK_PRELOAD.to_vec(),
             evidence(raw, decision_of(ea), policy),
         ));
     }
@@ -569,11 +595,11 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
         && ef & env_flags::UNFINISHED == 0
         && ea & (action::RECORD | action::DENY) != 0
     {
-        // Lot 325 (R5): refused on it only judged without its walk, at a
-        // protected target (the exec guards past their capacity).
-        let refused_on_it = ea & action::DENY != 0
-            && raw.action & action::UNWALKED != 0
-            && ef & env_flags::DENYABLE == 0;
+        // The review of #547 (F5): an unreadable environment is not refused
+        // at the first pass (the post-commit check reads the kernel's copy);
+        // killed there on it only at a protected or set-id target.
+        let refused_on_it =
+            ea & action::DENY != 0 && ef & (env_flags::DENYABLE | env_flags::PRELOAD_RELATIVE) == 0;
         out.push(record(
             event,
             &path,
@@ -585,18 +611,34 @@ pub fn records_of(raw: &ExecPolRaw, event: &Event, policy: &str) -> Vec<ExecPolR
                  not know; a loader variable in it was not judged"
             ),
             if refused_on_it {
-                "denied at exec (EACCES): judged without its walk, a protected or set-id target"
+                env_response(ea, "a protected or set-id target")
             } else if ea & action::DENY != 0 {
-                "the exec was refused on another finding of its environment"
+                "the exec was refused on another finding of its environment".to_string()
             } else {
-                "recorded: the exec ran"
-            }
-            .to_string(),
+                "recorded: the exec ran".to_string()
+            },
             vec![pick(ATTACK_ENV, Tactic::Stealth, "T1574.006")],
             evidence(raw, if refused_on_it { "deny" } else { "record" }, policy),
         ));
     }
     out
+}
+
+/// What was done about an environment finding (`ea`, the report's
+/// `env_action`); `why` names the target a refusal rests on.
+fn env_response(ea: u32, why: &str) -> String {
+    if ea & action::KILLED != 0 {
+        format!(
+            "killed (SIGKILL) before its first instruction: the kernel's own copy of the \
+             environment, past the exec's point of no return ({why})"
+        )
+    } else if ea & action::DENY != 0 {
+        format!("denied at exec (EACCES): {why}")
+    } else if ea & action::WOULD_DENY != 0 {
+        "would deny (audit): the exec ran".to_string()
+    } else {
+        "recorded: the exec ran".to_string()
+    }
 }
 
 /// Lot 325 (R5): what a record of an exec judged without its walk adds.
@@ -1004,6 +1046,63 @@ mod tests {
             rs[0].response
         );
         assert_eq!(rs[0].evidence.decision, "deny");
+    }
+
+    /// The review of #547 (F1, F2): a relative loader path is one record
+    /// under the preload rule (High when refused); what the post-commit
+    /// check could not clear in the kernel's copy, killed at a protected or
+    /// set-id target, says so.
+    #[test]
+    fn a_relative_loader_path_and_a_kill_on_an_unjudged_copy_are_recorded() {
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::LD_PRELOAD | env_flags::PRELOAD_RELATIVE;
+        raw.env_action = action::RECORD | action::DENY;
+        put(&mut raw.preload, "./x.so");
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_PRELOAD);
+        assert_eq!(rs[0].verdict.severity, Severity::High);
+        assert!(rs[0]
+            .verdict
+            .reasoning
+            .contains("relative to the caller's directory"));
+        assert!(
+            rs[0].response.starts_with("denied at exec"),
+            "{}",
+            rs[0].response
+        );
+        assert!(rs[0]
+            .evidence
+            .environment
+            .contains(&"relative_loader_path".to_string()));
+        raw.env_action = action::RECORD;
+        assert_eq!(
+            records_of(&raw, &ev("/usr/bin/true"), "p")[0]
+                .verdict
+                .severity,
+            Severity::Medium
+        );
+        // a value past the scan's reads, killed at the commit
+        let mut raw = raw_exec(0, 0, tier::SERVICE);
+        raw.env_flags = env_flags::LD_PRELOAD | env_flags::LOADER_CUT;
+        raw.env_action = action::RECORD | action::DENY | action::KILLED;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
+        assert!(
+            rs[0].response.starts_with("killed (SIGKILL)"),
+            "{}",
+            rs[0].response
+        );
+        // an unreadable copy, killed
+        raw.env_flags = env_flags::UNREADABLE;
+        let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert!(
+            rs[0].response.starts_with("killed (SIGKILL)"),
+            "{}",
+            rs[0].response
+        );
     }
 
     #[test]

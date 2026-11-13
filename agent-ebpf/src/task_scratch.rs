@@ -94,15 +94,6 @@ pub(crate) unsafe fn make<K, T>(map: &HashMap<K, T>, key: &K) -> Option<*mut T> 
     map.get_ptr_mut(key)
 }
 
-/// The task's entry in `map`, made if this run has none yet.
-#[inline(always)]
-pub(crate) unsafe fn get_or_make<K, T>(map: &HashMap<K, T>, key: &K) -> Option<*mut T> {
-    match map.get_ptr_mut(key) {
-        Some(p) => Some(p),
-        None => make(map, key),
-    }
-}
-
 /// `BPF_F_NO_PREALLOC`: a hash whose entries are allocated as they are
 /// made (the entries that live as long as their task).
 pub(crate) const BPF_F_NO_PREALLOC: u32 = 1;
@@ -134,8 +125,58 @@ pub fn nn_task_free(ctx: LsmContext) -> i32 {
     let task: u64 = ctx.arg(0);
     if task != 0 {
         crate::open_sensor::forget_freed(task);
-        unsafe { crate::execq::forget(task) };
+        crate::execq::forget_freed(task);
         crate::execpol::forget_freed(task);
     }
     0
+}
+
+/// The review of #547 (F4, F6): one uid's share of a map whose entries
+/// outlive a run (the exec quarantine's candidates, the FIM sensor's task
+/// buffers), counted in `counts` (uid → entries). Whether `uid` may take
+/// one more (fewer than `cap`): one user's idle threads cannot fill the map
+/// for every other user. The counts are plain read-modify-writes (no
+/// atomics in this crate: the re-review of #494, R1) — two runs updating one
+/// uid's count at the same instant can lose an update; the agent recounts
+/// both maps from their entries every 30 s (`agent/src/execq/controller.rs`,
+/// `crates/nn-linux/src/sensors/open_sensor.rs`), so a drift lasts no
+/// longer.
+#[inline(always)]
+pub(crate) fn uid_admits(counts: &HashMap<u32, u64>, uid: u32, cap: u64) -> bool {
+    // SAFETY: a lookup in a map of plain integers.
+    match unsafe { counts.get(&uid) } {
+        Some(n) => *n < cap,
+        None => true,
+    }
+}
+
+/// `uid` took one more entry.
+#[inline(always)]
+pub(crate) fn uid_took(counts: &HashMap<u32, u64>, uid: u32) {
+    match counts.get_ptr_mut(&uid) {
+        // SAFETY: a map value's address.
+        Some(n) => unsafe { *n = (*n).wrapping_add(1) },
+        None => {
+            let _ = counts.insert(&uid, &1u64, 0);
+        }
+    }
+}
+
+/// `uid` gave one back (an entry it took is removed).
+#[inline(always)]
+pub(crate) fn uid_gave(counts: &HashMap<u32, u64>, uid: u32) {
+    if let Some(n) = counts.get_ptr_mut(&uid) {
+        // SAFETY: as above; never below zero.
+        unsafe {
+            if *n > 0 {
+                *n -= 1;
+            }
+        }
+    }
+}
+
+/// The real uid of the running task.
+#[inline(always)]
+pub(crate) fn current_uid() -> u32 {
+    aya_ebpf::helpers::bpf_get_current_uid_gid() as u32
 }

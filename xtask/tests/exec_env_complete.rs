@@ -69,38 +69,91 @@ fn the_environment_is_read_to_its_end() {
         body(&pol, "env_scan"),
         &[
             "crate::task_scratch::make(&EXECPOL_ENV, &key)",
-            "while round < ENV_ROUNDS {",
-            "nn_env_round(",
-            "(round * ENV_STEP * ENV_STEPS_MID) as u64",
-            "if r & MORE == 0 {",
+            "while round < ENV_ROUNDS + ENV_JUDGED_MAX as usize {",
+            "nn_env_round(envp, read, tid, start, compat)",
+            "read += r & COUNT_MASK;",
+            "if r & JUDGE != 0 {",
+            "if nn_env_pending(tid, start) & STOP != 0 {",
+            "(*e).stash.flags |= env_flags::TRUNCATED;",
+            "} else if r & MORE == 0 {",
             "if more {",
-            "(envp + (ENV_SCAN_CAP as u64) * stride)",
+            "(envp + read * stride)",
             "(*e).stash.flags |= env_flags::TRUNCATED;",
             "(*e).stash.count = read as u32;",
         ],
     );
+    // the rounds cover the cap, whatever the judged names took of them
+    assert!(flat(&pol)
+        .contains("const _: () = assert!(ENV_ROUNDS * ENV_STEPS_MID * ENV_STEP == ENV_SCAN_CAP);"));
+    assert!(
+        flat(&pol).contains("const ROUND_CALLS: usize = ENV_STEPS_MID + ENV_JUDGED_MAX as usize;")
+    );
+    let round = body(&pol, "nn_env_round");
     in_order(
-        body(&pol, "nn_env_round"),
+        round,
         &[
             "while j < ENV_STEPS_MID {",
-            "nn_env_step(envp, base + (j * ENV_STEP) as u64, tid, start, compat)",
+            "nn_env_step(envp, idx + n, tid, start, compat)",
+            "if r & JUDGE != 0 {",
+            "return n | unread | JUDGE;",
             "if r & MORE == 0 {",
+            "return n | unread;",
             "n | unread | MORE",
         ],
     );
+    // a judged name is read whole by the scan (the call chain's stack, the
+    // round's verifier states), at most ENV_JUDGED_MAX per exec
+    assert!(
+        !round.contains("nn_env_var("),
+        "the round reads a name:\n{round}"
+    );
     in_order(
-        body(&pol, "nn_env_step"),
+        body(&pol, "nn_env_pending"),
+        &[
+            "if !judged_one_more(0, tid, start) {",
+            "return STOP;",
+            "nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);",
+            "if env_entry(0, tid, start).is_none() {",
+            "return STOP;",
+        ],
+    );
+    let step = body(&pol, "nn_env_step");
+    in_order(
+        step,
         &[
             "while i < ENV_STEP {",
             "if ptr == 0 {",
-            "bpf_probe_read_user_str(wp as *mut c_void, 9, ptr as *const c_void)",
-            "env_name_wanted(core::ptr::read_volatile(wp))",
-            "env_var_judged(nn_env_var(ptr, tid, start), tid, start);",
+            "bpf_probe_read_user_str(w as *mut c_void, 9, ptr as *const c_void)",
+            "env_name_wanted(core::ptr::read_volatile(w))",
+            "(*e).pending = ptr;",
+            "return (i + 1) as u64 | unread | JUDGE;",
             "ENV_STEP as u64 | unread | MORE",
         ],
     );
+    // a step calls nothing: the call chain under `exec_check_lsm` stays
+    // under the verifier's 512 bytes
+    assert!(!step.contains("nn_env_var("), "a step calls down:\n{step}");
+    // the judged names' cap (the review of #547, F8): past it, not finished
+    in_order(
+        body(&pol, "judged_one_more"),
+        &[
+            "if (*e).judged >= ENV_JUDGED_MAX {",
+            "(*e).stash.flags |= env_flags::TRUNCATED;",
+            "false",
+        ],
+    );
     // each a global function: verified once, a call for its callers
-    for f in ["nn_env_round", "nn_env_step", "nn_env_var"] {
+    for f in [
+        "nn_env_round",
+        "nn_env_step",
+        "nn_env_pending",
+        "nn_env_var",
+        "nn_env_judge",
+        "nn_env_chunk",
+        "nn_value_end",
+        "nn_value_slash",
+        "nn_env_resolve",
+    ] {
         assert!(
             flat(&pol).contains(&format!(
                 "#[no_mangle] #[inline(never)] pub extern \"C\" fn {f}("
@@ -120,14 +173,24 @@ fn the_environment_is_read_to_its_end() {
         p,
         &[
             "let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0",
-            "let unfinished = ef & env_flags::UNFINISHED != 0 && (env_deny_rule || setid);",
+            "let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);",
             "if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {",
             "env_act |= action::DENY;",
         ],
     );
     assert!(
-        p.contains("| env_flags::UNFINISHED)"),
+        p.contains("| env_flags::UNFINISHED"),
         "a truncated environment is reported"
+    );
+    // the review of #547 (F1, F7): what the first pass refuses unread — an
+    // array past the cap, a relative loader path; a loader value longer
+    // than the scan reads goes to the post-commit check
+    let wire_flat = flat(&wire);
+    assert!(
+        wire_flat.contains("pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE;")
+    );
+    assert!(
+        wire_flat.contains("pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE;")
     );
     assert!(p.contains("bump(counter::ENV_TRUNCATED);"));
     // the agent reads the count and shows it
@@ -158,30 +221,114 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
     );
     // never cleared once set (an `=` would let a later clean one undo it)
     assert!(!so.contains("flags = "), "a finding cleared:\n{so}");
-    // a loader value longer than its capture: not judged to its end
+    // The review of #547 (F7): a value longer than its capture (the record's
+    // quote) is cut for the record only — the value is judged whole below;
+    // a clean `LD_PRELOAD` of 128 bytes or more was refused.
     assert_eq!(
-        so.matches("st.flags |= env_flags::VALUE_CUT | env_flags::LOADER_CUT;")
-            .count(),
-        2,
-        "LD_PRELOAD's and LD_AUDIT's cut:\n{so}"
+        so.matches("st.flags |= env_flags::VALUE_CUT;").count(),
+        3,
+        "the captures' cut:\n{so}"
+    );
+    assert!(!so.contains("LOADER_CUT"), "a capture's cut refused:\n{so}");
+    // a full capture is `cap - 1` bytes and its NUL: cut only when the value
+    // has a byte at `cap - 1` (a value of exactly 127 bytes was flagged)
+    in_order(
+        body(&pol, "value_cut"),
+        &[
+            "if len < cap as i64 {",
+            "return false;",
+            "(value + cap as u64 - 1) as *const c_void,",
+            "b != 0",
+        ],
     );
     let wire = flat(&code("common/src/wire/execpol.rs"));
     assert!(wire.contains("pub const UNFINISHED: u32 = TRUNCATED | LOADER_CUT;"));
+    // The review of #547 (F1): each value read whole, a chunk at a time,
+    // every entry parsed as the loader parses the list
+    // (`value_parse::byte`) and judged on its normalised path; past the
+    // reads, `LOADER_CUT`. It compared the first nine bytes of each entry
+    // of a 128-byte capture.
+    assert!(
+        !pol.contains("nn_list_staging"),
+        "the 9-byte entry compare is back"
+    );
     in_order(
-        body(&pol, "env_var_judged"),
+        body(&pol, "nn_env_judge"),
         &[
-            "VAR_PRELOAD => (0, env_flags::PRELOAD_STAGING),",
-            "VAR_AUDIT => (1, env_flags::AUDIT_STAGING),",
-            "VAR_LIBPATH => (2, env_flags::LIBPATH_STAGING),",
-            "if nn_list_staging(which, tid, start) != 0 {",
-            "(*e).stash.flags |= bit;",
+            "VAR_PRELOAD => (u64::from(value_parse::KIND_PRELOAD), 11u64),",
+            "VAR_AUDIT => (u64::from(value_parse::KIND_AUDIT), 9),",
+            "VAR_LIBPATH => (u64::from(value_parse::KIND_LIBPATH), 16),",
+            "while r < ENV_VALUE_READS {",
+            "nn_env_chunk(q, kind | if r == 0 { CHUNK_FIRST } else { 0 }, tid, start, sel)",
+            "cut = 0;",
+            "q += (REGION_READ - 1) as u64;",
+            "nn_env_chunk(0, kind | CHUNK_FINISH | cut, tid, start, sel)",
+        ],
+    );
+    in_order(
+        body(&pol, "nn_env_chunk"),
+        &[
+            "value_found(e, kind, kind_flags & CHUNK_CUT != 0);",
+            "zero_parse(&mut (*e).parse);",
+            "(*e).stash.flags |= env_flags::UNREADABLE;",
+            "if value_parse::is_sep(kind, b) {",
+            "let _ = nn_value_end(u64::from(kind), tid, start, sel);",
+            "value_parse::begin(&mut (*e).parse, b);",
+            "if b == b'/' {",
+            "let _ = nn_value_slash(tid, start, sel);",
+            "value_parse::push(&mut (*e).parse, b);",
+        ],
+    );
+    // the steps of `value_parse::byte`, which the host tests run
+    assert!(body(&pol, "nn_value_end")
+        .contains("value_parse::end_entry(&mut (*e).parse, kind as u32);"));
+    assert!(body(&pol, "nn_value_slash").contains("value_parse::slash(&mut (*e).parse);"));
+    in_order(
+        body(&wire, "byte"),
+        &[
+            "if is_sep(kind, b) {",
+            "end_entry(p, kind);",
+            "begin(p, b);",
+            "if b == b'/' {",
+            "slash(p);",
+            "push(p, b);",
+        ],
+    );
+    in_order(
+        body(&pol, "value_found"),
+        &[
+            "value_parse::end_entry(&mut (*e).parse, kind);",
+            "if kind == value_parse::KIND_PRELOAD {",
+            "st.flags |= env_flags::PRELOAD_STAGING;",
+            "st.flags |= env_flags::PRELOAD_RELATIVE;",
+            "st.flags |= env_flags::LOADER_CUT;",
+            "} else if kind == value_parse::KIND_AUDIT {",
+            "st.flags |= env_flags::AUDIT_STAGING;",
+            "st.flags |= env_flags::PRELOAD_RELATIVE;",
+            "st.flags |= env_flags::LOADER_CUT;",
+            "(*e).internal |= INTERNAL_LIBPATH_STAGING;",
+            "(*e).internal |= INTERNAL_LIBPATH_RELATIVE;",
+            "(*e).internal |= INTERNAL_LIBPATH_CUT;",
+        ],
+    );
+    // a bare name is searched in the library path first
+    in_order(
+        body(&pol, "resolve_bare"),
+        &[
+            "(*e).stash.flags |= env_flags::PRELOAD_STAGING;",
+            "(*e).stash.flags |= env_flags::AUDIT_STAGING;",
+            "(*e).stash.flags |= env_flags::PRELOAD_RELATIVE;",
+            "(*e).stash.flags |= env_flags::LOADER_CUT;",
         ],
     );
     // judged after each variable, by the first pass and the post-commit one
-    assert!(body(&pol, "nn_env_step")
-        .contains("env_var_judged(nn_env_var(ptr, tid, start), tid, start);"));
-    assert!(body(&pol, "nn_env_region_step")
-        .contains("env_var_judged(nn_env_var(p, tid, kstart), tid, kstart);"));
+    assert!(body(&pol, "nn_env_pending")
+        .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);"));
+    assert!(body(&pol, "nn_env_region_round")
+        .contains("nn_env_judge(nn_env_var(p, 0, 0, 1), p, 0, 0, 1);"));
+    assert!(body(&pol, "env_scan").contains("let f = nn_env_resolve(0, tid, start) as u32;"));
+    assert!(body(&pol, "nn_env_region").contains("nn_env_resolve(1, 0, 0)"));
+    assert!(body(&pol, "nn_env_resolve").contains("resolve_bare(e);"));
 }
 
 /// R1: an x32 exec's `envp` is read from the register whole, an ia32
@@ -226,7 +373,7 @@ fn a_flood_of_execs_keeps_protected_targets_closed() {
             "let ex = exemptions(t_ptr, inode, &mut sig);",
             "let setid = mode_bits & 0o6000 != 0;",
             "let protected = env_deny_rule || setid;",
-            "(protected && ef & (env_flags::UNREADABLE | env_flags::UNFINISHED) != 0);",
+            "(protected && ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0);",
             "let refuse = m == mode::ENFORCE && (deny_c != 0 || env_refused);",
             "bump(counter::LOST);",
             "bump(counter::LOST_OPEN);",
@@ -251,6 +398,24 @@ fn a_flood_of_execs_keeps_protected_targets_closed() {
         "the scan under the ladder's frame"
     );
     assert!(u.contains("let mut act = action::UNWALKED | action::RECORD;"));
+    // The review of #547 (F5): an environment the flood left unread is not
+    // refused here (both maps full, every service exec was refused): it is
+    // noted for the post-commit check, which reads the kernel's copy in a
+    // per-CPU buffer the flood cannot take and kills a protected or set-id
+    // target on what it cannot clear.
+    in_order(
+        u,
+        &[
+            "if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {",
+            "EXECPOL_ENV_SEEN.insert(&task, &ef, 0);",
+            "crate::execq::forget(task);",
+        ],
+    );
+    assert!(flat(&pol).contains(
+        "static COMMIT_ENV: PerCpuArray<EnvScan> = PerCpuArray::with_max_entries(1, 0);"
+    ));
+    assert!(body(&pol, "env_commit")
+        .contains("let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));"));
     // the agent: counted, a signed degradation while the counts move
     let c = code("agent/src/execpol/controller.rs");
     in_order(
@@ -280,11 +445,43 @@ fn the_quarantine_s_candidate_is_never_evicted() {
         body(&ts, "nn_task_free"),
         &[
             "crate::open_sensor::forget_freed(task);",
-            "crate::execq::forget(task)",
+            "crate::execq::forget_freed(task);",
             "crate::execpol::forget_freed(task);",
         ],
     );
     assert!(ts.contains("#[lsm(hook = \"task_free\")]\npub fn nn_task_free("));
+    // The review of #547 (F4): a failed exec's candidate goes when the
+    // kernel frees the exec's file (it stayed until the task's next exec or
+    // its end: one user's idle threads filled the map), attached with the
+    // quarantine
+    let qc = code("agent-ebpf/src/execq.rs");
+    assert!(qc.contains("#[lsm(hook = \"file_free_security\")]\npub fn execq_exec_failed("));
+    in_order(
+        body(&qc, "execq_exec_failed"),
+        &[
+            "let inode = match EXECQ_CAND.get(&task) {",
+            "Some(c) => c.inode,",
+            "peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) == inode",
+            "cand_remove(task);",
+        ],
+    );
+    assert!(body(&qc, "note_pass").contains("(*cand).inode = inode as u64;"));
+    let em = code("agent/src/execq/mod.rs");
+    assert!(em.contains("pub const FAILED_EXEC_PROGRAM: &str = \"execq_exec_failed\";"));
+    assert!(body(&em, "install").contains(
+        "antitamper_bpf::attach_transient(ebpf, FAILED_EXEC_PROGRAM, \"file_free_security\", &btf)"
+    ));
+    // a dropped candidate ran unheld: counted with the not-held, signed
+    let ctl = code("agent/src/execq/controller.rs");
+    in_order(
+        body(&ctl, "step"),
+        &[
+            "+ c[counter::CAND_DROPPED as usize],",
+            "self.report_fail_open(",
+            "c[counter::CAND_DROPPED as usize],",
+            "self.k.recount_shares();",
+        ],
+    );
     // attached by the exec guards when the quarantine or the policy runs
     let g = code("agent/src/exec_guards.rs");
     in_order(
@@ -304,7 +501,7 @@ fn a_lost_fim_walk_is_never_cached() {
     in_order(
         body(&open, "walk"),
         &[
-            "crate::task_scratch::get_or_make(&OPEN_TASK, &task)",
+            "match task_buffer(task) {",
             "return (u64::from(u32::MAX) << 32) | u64::from(WALK_LOST);",
         ],
     );
@@ -337,17 +534,57 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
     in_order(
         o,
         &[
-            "crate::task_scratch::get_or_make(&OPEN_TASK, &task)",
+            "match task_buffer(task) {",
+            "crate::fim_watch::observe_open_plain(file);",
             "on_open_in(file, t);",
-            "if !crate::task_scratch::task_free_armed() {",
-            "let _ = OPEN_TASK.remove(&task);",
+            "if !live {",
+            "let _ = OPEN_TASK_RUN.remove(&task);",
         ],
     );
-    in_order(
-        body(&open, "forget_task"),
-        &["if crate::task_scratch::task_free_armed() {", "return;"],
+    assert!(
+        !o.contains("OPEN_TASK.remove("),
+        "the task's entry removed per open:\n{o}"
     );
-    assert!(body(&open, "forget_freed").contains("OPEN_TASK.remove(&task)"));
+    // The task's entry while `task_free` runs, within its uid's share (the
+    // review of #547, F6); else the run's own, removed at its end — the open
+    // still judged whole, counted; with no room anywhere, the plain
+    // observer, counted.
+    in_order(
+        body(&open, "task_buffer"),
+        &[
+            "if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {",
+            "return Some((p, true));",
+            "if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {",
+            "return Some((p, false));",
+            "if crate::task_scratch::task_free_armed() {",
+            "crate::task_scratch::uid_admits(&OPEN_TASK_UIDS, uid, OPEN_TASK_PER_UID)",
+            "crate::task_scratch::make(&OPEN_TASK, &task)",
+            "crate::task_scratch::uid_took(&OPEN_TASK_UIDS, uid);",
+            "return Some((p, true));",
+            "open_task_bump(OPEN_TASK_PER_CALL);",
+            "match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {",
+            "Some(p) => Some((p, false)),",
+            "open_task_bump(OPEN_TASK_LOST);",
+        ],
+    );
+    assert!(body(&open, "forget_task").contains("let _ = OPEN_TASK_RUN.remove(&task);"));
+    in_order(
+        body(&open, "forget_freed"),
+        &[
+            "OPEN_TASK.remove(&task).is_ok()",
+            "crate::task_scratch::uid_gave(&OPEN_TASK_UIDS, uid);",
+        ],
+    );
+    // the opens judged in a run's own buffer reach `nn-admin status`, and
+    // the uids' shares are recounted from the entries
+    let os = code("crates/nn-linux/src/sensors/open_sensor.rs");
+    assert!(os.contains("take(ebpf, \"OPEN_TASK_COUNTERS\")"));
+    assert!(body(&os, "recount_shares").contains("rewrite_shares(&mut self.task_uids, &want)"));
+    let st = code("agent/src/admin/handlers/status.rs");
+    assert!(st.contains(
+        "open_sensor_per_call_total: Some(nn_linux::sensors::open_sensor::per_call_total()),"
+    ));
+    assert!(body(&os, "sample").contains("let _ = maps.per_call_total();"));
     // the agent attaches `task_free` with the sensor, then arms it
     let a = code("crates/nn-linux/src/fim/attach.rs");
     in_order(
@@ -358,11 +595,18 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         ],
     );
     let tf = code("crates/nn-linux/src/sensors/task_free.rs");
+    // the review of #547 (F9): "attached", not "loaded" — a load whose
+    // attach failed is attached again by the next caller
     in_order(
         body(&tf, "ensure"),
         &[
+            "if attached() {",
+            "return Ok(false);",
+            "let loaded = ebpf.program(PROGRAM).is_some_and(|p| p.fd().is_ok());",
+            "prog.attach().context(\"attaching task_free\")?;",
             "antitamper_bpf::attach_transient(ebpf, PROGRAM, HOOK, btf)?;",
             "arr.set(0, 1, 0)",
+            "ATTACHED.store(true, std::sync::atomic::Ordering::Release);",
         ],
     );
 }
@@ -375,20 +619,37 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
 #[test]
 fn the_kernel_s_own_copy_is_read_past_the_point_of_no_return() {
     let pol = code("agent-ebpf/src/execpol.rs");
+    // The review of #547 (F2): what the kernel's copy shows that the first
+    // pass did not see, and what this read cannot clear (a value longer
+    // than the scan reads, past this read's bound, a relative path, an
+    // unreadable string), is never silent: a protected or set-id target is
+    // killed (only when the signal went: F9), anything else recorded and
+    // counted. It acted on new staging entries only.
     in_order(
         body(&pol, "env_commit"),
         &[
             "off_opt!(MM_STRUCT_ENV_START_OFFSET)",
             "off_opt!(MM_STRUCT_ENV_END_OFFSET)",
-            "nn_env_region(start, end, u64::from(key.tid), key.start_ns)",
             "EXECPOL_ENV_SEEN.get(&tk)",
-            "if f & env_flags::DENYABLE & !seen == 0 {",
-            "bump(counter::ENV_CHANGED);",
+            "COMMIT_ENV.get_ptr_mut(0)",
+            "bump(counter::ENV_UNREAD);",
+            "nn_env_region(start, end) as u32",
+            "let staging_new = f & env_flags::DENYABLE & !seen;",
+            "let unjudged = f & env_flags::UNJUDGED;",
+            "if staging_new == 0 && unjudged == 0 {",
             "let tv = nn_execpol_tier(tk) as u32;",
+            "let setid = exe_mode(mm) & 0o6000 != 0;",
+            "let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));",
+            "if !kill && staging_new == 0 && unjudged & !seen == 0 {",
+            "bump(counter::ENV_CHANGED);",
+            "bump(counter::ENV_TRUNCATED);",
+            "bump(counter::ENV_UNREAD);",
+            "let mut env_act = action::RECORD;",
             "if conf(conf_slot::MODE) == mode::ENFORCE {",
-            "generated::bpf_send_signal(SIGKILL);",
+            "if generated::bpf_send_signal(SIGKILL) == 0 {",
             "env_act |= action::DENY | action::KILLED;",
-            "report_commit(task, mm, tv, f | env_flags::CHANGED, env_act, &(*e).stash);",
+            "env_act |= action::WOULD_DENY;",
+            "report_commit(task, mm, tv, f | changed, env_act, &(*e).stash);",
         ],
     );
     // the first pass notes what it let through, and forgets a failed
@@ -399,20 +660,46 @@ fn the_kernel_s_own_copy_is_read_past_the_point_of_no_return() {
         &[
             "let _ = EXECPOL_ENV_SEEN.remove(&task);",
             "nn_exec_env(task, u64::from(wk.tid), wk.start_ns)",
-            "if ef & env_flags::DENYABLE != 0 && env_act & action::DENY == 0 {",
+            "if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {",
             "EXECPOL_ENV_SEEN.insert(&task, &ef, 0);",
         ],
     );
-    // the region is read string after string, the judged names whole
+    // The region is read string after string in the CPU's entry, at most
+    // `ENV_COMMIT_ROUNDS` rounds (the review of #547, F8: with preemption
+    // off); past them, not finished. The judged names read whole.
     in_order(
-        body(&pol, "nn_env_region_step"),
+        body(&pol, "nn_env_region"),
+        &[
+            "while round < ENV_COMMIT_ROUNDS {",
+            "nn_env_region_round(pos, end, at)",
+            "(*e).stash.flags |= env_flags::UNREADABLE;",
+            "if !done {",
+            "(*e).stash.flags |= env_flags::TRUNCATED;",
+        ],
+    );
+    in_order(
+        body(&pol, "nn_env_region_round"),
+        &[
+            "while j < ROUND_CALLS {",
+            "nn_env_region_step(p, end, a)",
+            "if !judged_one_more(1, 0, 0) {",
+            "nn_env_judge(nn_env_var(p, 0, 0, 1), p, 0, 0, 1);",
+        ],
+    );
+    let rs = body(&pol, "nn_env_region_step");
+    in_order(
+        rs,
         &[
             "bpf_probe_read_user_str(",
             "REGION_READ as u32,",
             "if a != 0 {",
             "env_name_wanted(",
-            "env_var_judged(nn_env_var(p, tid, kstart), tid, kstart);",
+            "return p | (AT_START << AT_SHIFT) | JUDGE;",
         ],
+    );
+    assert!(
+        !rs.contains("nn_env_var("),
+        "a region step calls down:\n{rs}"
     );
     // the agent attaches it where the offsets resolve, else a degradation
     let m = code("agent/src/execpol/mod.rs");

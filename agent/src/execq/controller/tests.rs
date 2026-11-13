@@ -38,6 +38,8 @@ struct KState {
     /// Lot 317 (BUG-118): the heartbeat cleared, the programs waited for,
     /// the stopped map read — in the order the controller did them.
     log: Vec<&'static str>,
+    /// The review of #547 (F4): the uids' shares recounted, how often.
+    recounts: usize,
 }
 
 #[derive(Clone, Default)]
@@ -99,6 +101,9 @@ impl KernelIo for FakeKernel {
     }
     fn counters(&self) -> [u64; counter::SLOTS as usize] {
         self.0.lock().counters
+    }
+    fn recount_shares(&mut self) {
+        self.0.lock().recounts += 1;
     }
     fn quiesce(&mut self) {
         self.0.lock().log.push("quiesce");
@@ -1729,6 +1734,35 @@ fn an_exec_the_map_could_not_name_is_not_held_and_is_signed() {
             .any(|d| d.contains("the map of stopped processes was full for 2")),
         "{d:?}"
     );
+}
+
+/// The review of #547 (F4): a candidate the kernel dropped — its map full,
+/// or its uid's share taken — is an exec that ran unheld: a signed
+/// fail-open degradation with its count (nobody read the counter). The
+/// uids' shares are recounted from the entries every `SHARES_EVERY`.
+#[test]
+fn a_dropped_candidate_is_signed_and_the_shares_are_recounted() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, true);
+    let t0 = Instant::now();
+    w.ctl.step(t0);
+    assert_eq!(w.k.0.lock().recounts, 1, "recounted at the first pass");
+    assert!(w.rec.degraded.lock().is_empty());
+    w.k.0.lock().counters[counter::CAND_DROPPED as usize] = 4;
+    let t1 = t0 + HEARTBEAT_EVERY + Duration::from_millis(1);
+    w.ctl.step(t1);
+    {
+        let d = w.rec.degraded.lock();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].contains("4 exec(s) ran without being held")
+                && d[0].contains("the candidates' map (or a uid's share of it) was full for 4"),
+            "{}",
+            d[0]
+        );
+    }
+    assert_eq!(w.k.0.lock().recounts, 1, "not before SHARES_EVERY");
+    w.ctl.step(t0 + super::SHARES_EVERY);
+    assert_eq!(w.k.0.lock().recounts, 2);
 }
 
 /// A held process the scanner judged block-listed, its decision still

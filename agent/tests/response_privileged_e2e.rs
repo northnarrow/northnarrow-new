@@ -1070,7 +1070,10 @@ fn compile_env_exec(dir: &Path) -> PathBuf {
 #include <unistd.h>
 int main(int argc, char **argv) {
   if (argc < 3) return 2;
-  long pad = atol(argv[2]);
+  /* "hi": no padding, execve entered with garbage in rax's high half (the
+     kernel runs the low half; pt_regs->orig_ax keeps all 64 bits) */
+  int hi = strcmp(argv[2], "hi") == 0;
+  long pad = hi ? 0 : atol(argv[2]);
   int extra = argc - 3;
   char **envv = calloc(pad + extra + 1, sizeof(char *));
   if (!envv) return 3;
@@ -1082,6 +1085,18 @@ int main(int argc, char **argv) {
   for (int j = 0; j < extra; j++) envv[pad + j] = argv[3 + j];
   envv[pad + extra] = NULL;
   char *args[] = {argv[1], NULL};
+#if defined(__x86_64__)
+  if (hi) {
+    long r;
+    register long rdx __asm__("rdx") = (long)envv;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "0"((1UL << 32) | 59), "D"(argv[1]), "S"(args), "r"(rdx)
+                     : "rcx", "r11", "memory");
+    errno = (int)-r;
+    return errno == EACCES ? 77 : 1;
+  }
+#endif
   execve(argv[1], args, envv);
   return errno == EACCES ? 77 : 1;
 }
@@ -1108,8 +1123,14 @@ int main(int argc, char **argv) {
 /// refused, as root and as `nobody`, and the preload never runs; so are a
 /// staging entry past the first 128 bytes of a clean list and (as root) a
 /// staging `LD_PRELOAD` followed by a clean one (musl's loader takes the
-/// first) — the mini-hunt. The controls (the padding without the preload)
-/// run.
+/// first) — the mini-hunt. The review of #547: the forms each passed —
+/// 120 spaces before the entry, `//tmp/`, `/./tmp/` (F1), a relative path
+/// (refused where a staging preload is: where it resolves is not in the
+/// string), an `execve` entered with garbage in `rax`'s high half (F3);
+/// an entry past the first pass's reads is killed at the post-commit check
+/// (F7). The controls run: the padding without the preload, and long clean
+/// values — a 2,880-byte `LD_PRELOAD`, a 2,880-byte `LD_LIBRARY_PATH` (F7:
+/// a clean value past 128 bytes was refused).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn a_staging_preload_behind_many_variables_is_refused() {
@@ -1141,7 +1162,12 @@ fn a_staging_preload_behind_many_variables_is_refused() {
     // (exec'd by this test: a helper of the test's own under /tmp is the
     // agent's `R001_ExecFromTmp` for `nobody`, killed); Err(errno) when the
     // exec is refused
-    let run = |pad: usize, vars: &[(String, String)], uid: Option<u32>| -> Result<i32, i32> {
+    // (Ok: its exit code, 128 + the signal that killed it)
+    let run_at = |cwd: Option<&Path>,
+                  pad: usize,
+                  vars: &[(String, String)],
+                  uid: Option<u32>|
+     -> Result<i32, i32> {
         let mut c = Command::new("/usr/bin/true");
         c.env_clear()
             .envs((0..pad).map(|i| (format!("NN_PAD_{i}"), "x".to_string())))
@@ -1149,14 +1175,19 @@ fn a_staging_preload_behind_many_variables_is_refused() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
         if let Some(u) = uid {
             c.uid(u).gid(u);
         }
         match c.status() {
-            Ok(st) => Ok(st.code().unwrap_or(-1)),
+            Ok(st) => Ok(st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))),
             Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
         }
     };
+    let run =
+        |pad: usize, vars: &[(String, String)], uid: Option<u32>| run_at(None, pad, vars, uid);
     let preload = |case: &str, value: String| {
         vec![
             ("LD_PRELOAD".to_string(), value),
@@ -1201,6 +1232,60 @@ fn a_staging_preload_behind_many_variables_is_refused() {
                 "{who}: a staging preload past 128 bytes of clean ones: {rc:?}"
             ));
         }
+        // the review of #547 (F1): the forms the 9-byte compare missed
+        let l = lib.display().to_string();
+        for (tag, value) in [
+            ("spaces", format!("{}{l}", " ".repeat(120))),
+            ("slashes", format!("/{l}")),
+            ("dot", format!("/.{l}")),
+        ] {
+            let case = format!("{who}-{tag}");
+            let rc = run(0, &preload(&case, value), uid);
+            if rc != Err(13) || mark(&case).exists() {
+                failures.push(format!(
+                    "{who}: a staging preload written {tag}: {rc:?}, the preload ran: {}",
+                    mark(&case).exists()
+                ));
+            }
+        }
+        // a relative path (here, the staging directory's): refused where a
+        // staging preload is
+        let case = format!("{who}-relative");
+        let rc = run_at(
+            Some(work.path()),
+            0,
+            &preload(&case, "./libmark.so".to_string()),
+            uid,
+        );
+        if rc != Err(13) || mark(&case).exists() {
+            failures.push(format!("{who}: a relative preload: {rc:?}"));
+        }
+        // F7: past the first pass's reads (about 4 KiB), the entry is
+        // judged on the kernel's copy after the commit: killed
+        let case = format!("{who}-past-reads");
+        let far = format!(
+            "{}:{l}",
+            ["/usr/lib/x86_64-linux-gnu/libc.so.6"; 120].join(":")
+        );
+        let rc = run(0, &preload(&case, far), uid);
+        if rc != Ok(128 + 9) || mark(&case).exists() {
+            failures.push(format!(
+                "{who}: a staging preload past the first pass's reads: {rc:?}, the preload \
+                 ran: {}",
+                mark(&case).exists()
+            ));
+        }
+        // the controls: long clean values run
+        let clean = ["/usr/lib/x86_64-linux-gnu/libc.so.6"; 80].join(":");
+        for (name, value) in [("LD_PRELOAD", &clean), ("LD_LIBRARY_PATH", &clean)] {
+            let rc = run(0, &[(name.to_string(), value.clone())], uid);
+            if rc != Ok(0) {
+                failures.push(format!(
+                    "{who}: a clean {name} of {} bytes: {rc:?}",
+                    value.len()
+                ));
+            }
+        }
     }
     // the mini-hunt: a staging preload first, a clean one last (two
     // `LD_PRELOAD` entries, which only a raw `envp` can carry: the helper,
@@ -1222,6 +1307,28 @@ fn a_staging_preload_behind_many_variables_is_refused() {
             "root: a staging preload followed by a clean one: {st:?}"
         ));
     }
+    // the review of #547 (F3): `execve` entered with garbage in `rax`'s
+    // high half — the kernel runs it; the scan read no environment
+    #[cfg(target_arch = "x86_64")]
+    {
+        let st = Command::new(&exe)
+            .arg("/usr/bin/true")
+            .arg("hi")
+            .arg(format!("LD_PRELOAD={}", lib.display()))
+            .arg(format!("NN_E2E_PRELOAD_MARK={}", mark("hi").display()))
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn env_exec");
+        if st.code() != Some(77) || mark("hi").exists() {
+            failures.push(format!(
+                "root: an execve with rax's high half set: {st:?}, the preload ran: {}",
+                mark("hi").exists()
+            ));
+        }
+    }
     assert!(
         failures.is_empty(),
         "{failures:#?}\nagent.log tail:\n{}",
@@ -1237,11 +1344,14 @@ fn a_staging_preload_behind_many_variables_is_refused() {
 /// walk's map full, a plain exec runs as root and as `nobody`, and a burst
 /// of 256 of them from 16 threads runs whole; a staging preload as root
 /// and a memfd as root (a deny cell without a walk) are still refused.
-/// With the environment's map full too, `nobody`'s plain exec runs, root's
-/// (a protected target: the session's rule refuses root's preloads, and
-/// its environment cannot be read) and a set-id program's as `nobody`
-/// (`su`) are refused. Emptied, the exec policy judges as before. The
-/// agent signs a degradation (`execpol_capacity`) meanwhile.
+/// With the environment's map full too (the review of #547, F5: root's
+/// plain exec and `su` were refused then — every service exec on a server),
+/// `nobody`'s, root's and a set-id program's as `nobody` (`su`) plain
+/// execs run; root's staging preload, which the first pass could not read,
+/// is killed at the post-commit check (the kernel's copy, read into a
+/// per-CPU buffer the flood cannot take) before its first instruction.
+/// Emptied, the exec policy judges as before. The agent signs a
+/// degradation (`execpol_capacity`) meanwhile.
 #[cfg(feature = "debug-trigger")]
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
@@ -1416,15 +1526,31 @@ fn the_exec_guards_past_their_capacity_keep_protected_targets_closed() {
         &mut fails,
         "both full: root, plain (protected)",
         exec("/usr/bin/true", &[], None, &[]),
-        13,
+        0,
     );
     if Path::new("/usr/bin/su").exists() {
         want(
             &mut fails,
             "both full: nobody, su (set-id)",
             exec("/usr/bin/su", &["--version"], Some(NOBODY), &[]),
-            13,
+            0,
         );
+    }
+    // root's staging preload: let through unread, killed after the commit
+    let killed_mark = work.path().join("mark.both-full");
+    let st = Command::new("/usr/bin/true")
+        .env("LD_PRELOAD", lib.display().to_string())
+        .env("NN_E2E_PRELOAD_MARK", killed_mark.display().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match st {
+        Ok(st) if st.signal() == Some(9) && !killed_mark.exists() => {}
+        other => fails.push(format!(
+            "both full: root, staging preload: {other:?}, the preload ran: {}",
+            killed_mark.exists()
+        )),
     }
 
     // emptied: as before
