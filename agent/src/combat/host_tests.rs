@@ -484,6 +484,7 @@ fn denial(pid: u32, ts: u64) -> Event {
         target_ino: 2,
         operation: nn_model::FsProtectOperation::Unlink,
         timestamp_ns: ts,
+        would_deny: false,
     }
 }
 

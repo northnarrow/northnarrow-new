@@ -46,6 +46,7 @@ impl Rule for NnLAt001AntiTamperDenial {
             target_dev,
             target_ino,
             operation,
+            would_deny,
             ..
         } = event
         else {
@@ -379,10 +380,19 @@ impl Rule for NnLAt001AntiTamperDenial {
             }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
-        let reasoning = format!(
-            "`{comm}` attempted {what}; the kernel refused it. An attempt on the sensor itself is \
-             the clearest intent signal there is."
-        );
+        // Lot 341: a host-wide deny the start's observe-only gate let through
+        let reasoning = if *would_deny {
+            format!(
+                "`{comm}` attempted {what}. Would deny: NOT refused — the start's observe-only \
+                 gate (the `alpha` profile) leaves this host-wide guard in observe; the enforcing \
+                 profile refuses it."
+            )
+        } else {
+            format!(
+                "`{comm}` attempted {what}; the kernel refused it. An attempt on the sensor itself \
+                 is the clearest intent signal there is."
+            )
+        };
         Some(build_verdict(
             self,
             event,
@@ -670,6 +680,7 @@ mod tests {
             target_ino: 709,
             operation: op,
             timestamp_ns: 1,
+            would_deny: false,
         }
     }
 
@@ -687,6 +698,41 @@ mod tests {
             FsProtectOperation::from_wire(200),
             FsProtectOperation::Unknown(200)
         );
+    }
+
+    #[test]
+    fn would_deny_is_said_not_refused() {
+        // Lot 341: a host-wide deny the observe-only gate let through
+        for op in [
+            FsProtectOperation::BpfProgType,
+            FsProtectOperation::Kexec,
+            FsProtectOperation::SysctlValue,
+            FsProtectOperation::CgroupV1,
+        ] {
+            let mut e = denial(op);
+            if let Event::FsProtectDenial { would_deny, .. } = &mut e {
+                *would_deny = true;
+            }
+            let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("a verdict");
+            assert!(
+                v.reasoning.contains("Would deny: NOT refused"),
+                "{}",
+                v.reasoning
+            );
+            assert!(
+                !v.reasoning.contains("the kernel refused it"),
+                "{}",
+                v.reasoning
+            );
+            let refused = NnLAt001AntiTamperDenial
+                .evaluate(&denial(op))
+                .expect("a verdict");
+            assert!(refused.reasoning.contains("the kernel refused it"));
+            assert_eq!(
+                v.severity, refused.severity,
+                "what the enforcing profile records"
+            );
+        }
     }
 
     #[test]
@@ -796,6 +842,7 @@ mod tests {
             target_ino: ino,
             operation: op,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let r = NnLAt001AntiTamperDenial
             .evaluate(&ev(
@@ -968,6 +1015,7 @@ mod tests {
             target_ino: mask,
             operation: FsProtectOperation::KernelTaint,
             timestamp_ns: 1,
+            would_deny: false,
         };
         for (new, sev) in [
             (TAINT_UNSIGNED_MODULE, Severity::Critical),
@@ -1028,6 +1076,7 @@ mod tests {
             target_ino: 709,
             operation: FsProtectOperation::ExemptInjection,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let attach = common::cgroup_join::inject_detail(0x12, Some(101));
         let v = exempt_injection(&ev(0, attach), "exe /usr/bin/x sha256 aa", Some(true))
@@ -1107,6 +1156,7 @@ mod tests {
             target_ino: 35,
             operation: FsProtectOperation::SysctlRootProg,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let v = NnLAt001AntiTamperDenial
             .evaluate(&ev(
@@ -1176,6 +1226,7 @@ mod tests {
             target_ino: ino,
             operation: op,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let rfs = object_comm("restrict_filesy", "bpf_lsm_file_open");
         let known = crossview_ino(false, false, 29, 21) | CROSSVIEW_KNOWN_BIT;
@@ -1280,6 +1331,7 @@ mod tests {
             target_ino: ino,
             operation: op,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
         let h = v(ev(FsProtectOperation::BpfHandle, "bpftool", 1, 31));

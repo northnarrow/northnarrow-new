@@ -2483,6 +2483,7 @@ pub mod testutil {
             target_ino: 2,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: ts,
+            would_deny: false,
         }
     }
 
@@ -2765,6 +2766,7 @@ mod tests {
             target_ino: 12345,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let hits = det.detect(&focal, &[]);
         assert!(
@@ -2816,6 +2818,7 @@ mod tests {
                 target_ino: 12345,
                 operation: op,
                 timestamp_ns: ts,
+                would_deny: false,
             };
         use nn_model::FsProtectOperation as Op;
         for op in [
@@ -2893,6 +2896,7 @@ mod tests {
             target_ino: 12345,
             operation: op,
             timestamp_ns: 4 * S,
+            would_deny: false,
         };
         let mut minor = 0;
         for byte in 1..=common::wire::FS_OP_LAST {
@@ -2974,6 +2978,7 @@ mod tests {
             target_ino: 12345,
             operation: op,
             timestamp_ns: 4 * S,
+            would_deny: false,
         };
         use nn_model::FsProtectOperation as Op;
         for op in [
@@ -3031,6 +3036,7 @@ mod tests {
                 target_ino: 4242,
                 operation: nn_model::FsProtectOperation::CgroupJoin,
                 timestamp_ns: 1,
+                would_deny: false,
             };
             let hits = det.detect(&focal, &[]);
             assert!(
@@ -3055,6 +3061,7 @@ mod tests {
             target_ino: u64::MAX,
             operation,
             timestamp_ns: 1,
+            would_deny: false,
         };
         assert!(det
             .detect(&ev(nn_model::FsProtectOperation::SysctlOptOut), &[])
@@ -3079,6 +3086,7 @@ mod tests {
             target_ino: 8,
             operation,
             timestamp_ns: 1,
+            would_deny: false,
         };
         for op in [
             nn_model::FsProtectOperation::KernelTaint,
@@ -3118,6 +3126,7 @@ mod tests {
             target_ino: 77,
             operation,
             timestamp_ns: 1,
+            would_deny: false,
         };
         for op in [
             nn_model::FsProtectOperation::BpfProgType,
@@ -3164,6 +3173,7 @@ mod tests {
             target_ino: 77,
             operation,
             timestamp_ns: 1,
+            would_deny: false,
         };
         for pid in [1, 4242] {
             assert_eq!(
@@ -3294,6 +3304,7 @@ mod tests {
             target_ino: 12345,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
+            would_deny: false,
         };
         assert_eq!(
             det.detect(&denial(WATCHDOG), &[]),
@@ -3330,6 +3341,7 @@ mod tests {
             target_ino: 12345,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
+            would_deny: false,
         };
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::AntiTamperDenial), "{hits:?}");
@@ -4882,6 +4894,7 @@ mod tests {
             target_ino: 12345,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 3,
+            would_deny: false,
         };
         let hits = det.detect(&focal, &[]);
         // BUG-032: the denial now raises the Decisive AntiTamperDenial,

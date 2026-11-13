@@ -173,4 +173,23 @@ mod tests {
         assert_eq!(would_have_action("KillProcess"), None);
         assert_eq!(would_have_action("none"), None);
     }
+
+    /// Named (lot 341): a host-wide deny the gate let through is counted
+    /// by its operation, beside the suppressed responses.
+    #[test]
+    fn a_would_deny_is_counted_by_its_operation() {
+        let mut c = TodayCounts::new(at(9, 30));
+        let text = nn_core::response::profile::would_deny("bpf_prog_type");
+        c.note(at(9, 31), Severity::High, &text);
+        c.note(at(9, 32), Severity::High, &text);
+        c.note(
+            at(9, 33),
+            Severity::High,
+            "denied in kernel (anti-tamper LSM hook)",
+        );
+        assert_eq!(
+            c.snapshot(at(9, 34)).would_have,
+            vec![("deny:bpf_prog_type".to_string(), 2)]
+        );
+    }
 }

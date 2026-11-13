@@ -1258,6 +1258,76 @@ pub const fn sigio_signal(sig: i32) -> i32 {
 /// Lot 280b: the last denial code (the tests' loops).
 pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 
+/// Lot 341 (the alpha profile; the coordinator's decision of 13/11): the
+/// bit a record's `operation` carries when a HOST-WIDE deny let the action
+/// through — the observe-only gate (`alpha`, `--detect-only`) leaves the
+/// guards that refuse a third-party tool something on the host (not
+/// something on the agent) in observe, each attempt signed "would deny".
+/// Above every denial code ([`FS_OP_LAST`] is far below it).
+pub const FS_OP_WOULD_DENY: u8 = 0x80;
+
+const _: () = assert!(FS_OP_LAST < FS_OP_WOULD_DENY);
+
+/// Lot 341: the denial code of a record's `operation` byte (the
+/// [`FS_OP_WOULD_DENY`] bit cleared).
+pub const fn fs_op_of(byte: u8) -> u8 {
+    byte & !FS_OP_WOULD_DENY
+}
+
+/// Lot 341: whether a record's `operation` byte says the action was let
+/// through by the observe-only gate (a host-wide deny's "would deny").
+pub const fn is_would_deny(byte: u8) -> bool {
+    byte & FS_OP_WOULD_DENY != 0
+}
+
+/// Lot 341: `HOST_DENY_MODE[0]` (`agent-ebpf/src/host_deny.rs`) of an
+/// enforcing start — every host-wide deny refuses. The map's zero: an
+/// agent that could not write it enforces (fail closed).
+pub const HOST_DENY_ENFORCE: u32 = 0;
+/// Lot 341: `HOST_DENY_MODE[0]` under the observe-only gate — a host-wide
+/// deny lets the action through and signs it "would deny"
+/// ([`FS_OP_WOULD_DENY`]).
+pub const HOST_DENY_OBSERVE: u32 = 1;
+
+/// Lot 341: the host-wide denies, by their record's code — the guards
+/// that refuse a THIRD-PARTY tool an action on the host: a foreign
+/// tracing / LSM / extension BPF program's load (`bpftrace`, BCC, another
+/// EDR), a `cgroup/sysctl` program on the root cgroup, the kprobes and
+/// lockdown switches, a kexec image, the sysctl guard (its write deny and
+/// its `cgroup/sysctl` judge) and a cgroup v1 write. With
+/// [`host_wide_refusal`]'s ptrace of PID 1, the ones the observe-only gate
+/// leaves in observe; every other refusal protects the agent itself and
+/// holds under every profile (`xtask/tests/host_deny.rs` keeps the eBPF to
+/// this split).
+pub const HOST_WIDE_OPS: [u8; 8] = [
+    FS_OP_BPF_PROG_TYPE,
+    FS_OP_SYSCTL_ROOT_ATTACH,
+    FS_OP_KPROBES,
+    FS_OP_LOCKDOWN,
+    FS_OP_KEXEC,
+    FS_OP_SYSCTL,
+    FS_OP_SYSCTL_VALUE,
+    FS_OP_CGROUP_V1,
+];
+
+/// Lot 341: whether a refusal of `operation` (a denial code) whose record
+/// names `target_ino` is a host-wide one — one of [`HOST_WIDE_OPS`], or a
+/// ptrace attach of PID 1 (`target_ino` the target tgid); a ptrace of the
+/// agent, its watchdog or a worker protects the agent.
+pub const fn host_wide_refusal(operation: u8, target_ino: u64) -> bool {
+    if operation == FS_OP_PTRACE {
+        return target_ino == 1;
+    }
+    let mut i = 0;
+    while i < HOST_WIDE_OPS.len() {
+        if HOST_WIDE_OPS[i] == operation {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
 /// the posture does not take as `AntiTamperDenial`: its
@@ -1279,9 +1349,12 @@ pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 /// count is its own `RING_DROPS` slot (`minor_denial_rate`), not a security
 /// loss. `nn_core`'s posture test pins the equivalence both ways: minor
 /// here exactly when not `AntiTamperDenial` there.
+///
+/// Lot 341: a host-wide deny's "would deny" ([`FS_OP_WOULD_DENY`]) takes
+/// its operation's budget.
 pub const fn is_minor_denial(operation: u8) -> bool {
     matches!(
-        operation,
+        fs_op_of(operation),
         FS_OP_READ
             | FS_OP_BPF_HANDLE
             | FS_OP_BPF_PROG_TYPE
@@ -2127,6 +2200,41 @@ mod tests {
         assert_eq!(restored.trunc_flags, spawn_trunc::ARGV);
         assert_eq!(restored.stdio, original.stdio);
         assert_eq!(restored.parent_stdio, StdioRaw::zeroed());
+    }
+
+    /// Lot 341: the "would deny" bit leaves the code it marks whole, takes
+    /// its budget, and the host-wide set is the decision's list (a ptrace
+    /// of PID 1 is one, a ptrace of the agent is not).
+    #[test]
+    fn a_would_deny_keeps_its_operation_and_its_budget() {
+        for op in 1..=FS_OP_LAST {
+            let marked = op | FS_OP_WOULD_DENY;
+            assert_eq!(fs_op_of(marked), op);
+            assert!(is_would_deny(marked));
+            assert!(!is_would_deny(op));
+            assert_eq!(is_minor_denial(marked), is_minor_denial(op));
+        }
+        for op in HOST_WIDE_OPS {
+            assert!(host_wide_refusal(op, 0));
+        }
+        assert!(host_wide_refusal(FS_OP_PTRACE, 1));
+        assert!(!host_wide_refusal(FS_OP_PTRACE, 709));
+        for op in [
+            FS_OP_UNLINK,
+            FS_OP_RENAME,
+            FS_OP_WRITE,
+            FS_OP_BPF_MAP,
+            FS_OP_BPF_LINK,
+            FS_OP_BPF_HANDLE,
+            FS_OP_SIGNAL,
+            FS_OP_CGROUP_MOVE,
+            FS_OP_CGROUP_LIMIT,
+            FS_OP_OOM_ADJ,
+            FS_OP_SIGIO,
+        ] {
+            assert!(!host_wide_refusal(op, 1), "op {op} protects the agent");
+        }
+        assert_eq!(HOST_DENY_ENFORCE, 0, "the map's zero enforces");
     }
 
     #[test]

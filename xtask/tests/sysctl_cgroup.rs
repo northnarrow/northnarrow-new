@@ -94,7 +94,10 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
             "if caller_may {\n        return SysctlVerdict::Allow;\n    }",
             "let (read, v) = new_value(ctx);",
             "let verdict = verdict_of(kind, false, read, v, opt_out(kind));",
-            "SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),",
+            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`): signed,
+            // and let through under the observe-only gate
+            "SysctlVerdict::Refuse => {",
+            "let (refuse, op) = crate::host_deny::judge_no_task(FS_OP_SYSCTL_VALUE);\n            record(op, kind, read, v, task, tgid, true);\n            if !refuse {\n                return SysctlVerdict::Allow;\n            }\n        }",
             "SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),",
             "verdict",
         ],
@@ -204,7 +207,12 @@ fn the_write_deny_honours_the_opt_out_and_records_it_once() {
             "FS_OP_SYSCTL_OPT_OUT,",
             "return false;",
             "SysctlVerdict::Refuse => {}",
-            "sign(phase, FS_OP_SYSCTL, key);",
+            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`) — its
+            // "would deny" signed once too: by the cgroup/sysctl program
+            // when this boot attached it, else here
+            "let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL);",
+            "if !refuse && crate::sysctl_guard::kernel_judge_attached() {\n        return false;\n    }",
+            "sign(phase, op, key);",
         ],
     )
     .unwrap();

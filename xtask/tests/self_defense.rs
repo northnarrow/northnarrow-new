@@ -403,7 +403,10 @@ fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
         [
             "fn caller_is_self_test",
             "fn emit_attempt",
-            "fn emit_limited"
+            "fn emit_limited",
+            // lot 341: the profile's switch refuses the self-test's child
+            // under every profile (it proves the hook judges)
+            "fn judge"
         ],
         "the self-test's mark read outside the two emitters"
     );

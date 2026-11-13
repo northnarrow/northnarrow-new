@@ -8,7 +8,10 @@
 //!   isolation, no quarantine, no exec-queue hold, no enforce deny): every
 //!   verdict is recorded with what it *would have* done. The agent's own
 //!   self-protection (the anti-tamper deny hooks on its files, processes,
-//!   maps and cgroup) is not a response and stays on.
+//!   maps and cgroup) is not a response and stays on; the host-wide denies
+//!   (a third-party tool's tracing BPF program, a kexec, a sysctl, …) are
+//!   only observed, each recorded "would deny" ([`would_deny`]; the
+//!   kernel's switch, `agent-ebpf/src/host_deny.rs`).
 //! - **`enforcing`** — the responses run.
 //!
 //! Where the profile comes from, strongest first ([`resolve`]):
@@ -172,7 +175,9 @@ pub fn resolve(overlay: Option<Profile>, manifest: Option<Profile>) -> ResolvedP
 /// The agent-wide no-enforcement gate, resolved once at the start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetectOnly {
-    /// No response action and no enforce deny of a user program.
+    /// No response action and no enforce deny of a user program — lot 341:
+    /// the host-wide denies included (the start writes it into the kernel's
+    /// `HOST_DENY_MODE`; the agent's self-protection reads no such switch).
     pub on: bool,
     /// What switched it on (MAIN-008: the signed `agent_boot` names it):
     /// `--detect-only`, `NN_DETECT_ONLY=1`, `profile alpha (…)`.
@@ -213,6 +218,18 @@ pub fn would_have(action: &str) -> String {
 
 /// The prefix of [`would_have`].
 pub const WOULD_HAVE_PREFIX: &str = "would have: ";
+
+/// Lot 341: the text a record carries for a HOST-WIDE deny the gate let
+/// through (a foreign tracing BPF program's load, a kexec image, a sysctl
+/// or cgroup v1 write, the kprobes or lockdown switch, a ptrace of PID 1):
+/// `would have: deny:kexec (would deny: …)` — counted with the suppressed
+/// responses (`deny:kexec`), and saying "would deny".
+pub fn would_deny(operation: &str) -> String {
+    would_have(&format!(
+        "deny:{operation} (would deny: not refused — the observe-only gate leaves the \
+         host-wide guards in observe)"
+    ))
+}
 
 #[cfg(test)]
 mod tests {
@@ -286,5 +303,22 @@ mod tests {
     fn a_suppressed_response_reads_would_have() {
         assert_eq!(would_have("KillProcess"), "would have: KillProcess");
         assert!(would_have("Quarantine").starts_with(WOULD_HAVE_PREFIX));
+    }
+
+    /// Named (lot 341): under alpha the host-wide denies observe, under
+    /// enforcing they refuse; a let-through deny's record says "would
+    /// deny" and is counted with the suppressed responses by its operation.
+    #[test]
+    fn the_host_wide_denies_observe_under_alpha_only() {
+        let alpha = detect_only_gate(false, None, &resolve(None, Some(Profile::Alpha)));
+        assert!(alpha.on, "the start's host_deny_observe");
+        let enforcing = detect_only_gate(false, None, &resolve(None, Some(Profile::Enforcing)));
+        assert!(!enforcing.on);
+        let text = would_deny("bpf_prog_type");
+        assert!(
+            text.starts_with("would have: deny:bpf_prog_type "),
+            "{text}"
+        );
+        assert!(text.contains("would deny"), "{text}");
     }
 }

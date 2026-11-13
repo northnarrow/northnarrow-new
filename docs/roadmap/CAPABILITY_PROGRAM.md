@@ -10399,8 +10399,7 @@ number in parentheses is a lab PR.
     `profile.local`, overlay kind 18, else the install manifest's, else
     enforcing), resolved once (`boot::integrity::resolve_gate`, ratchet
     `xtask/tests/alpha_profile.rs`); both ignoring paths gated; `would have:
-    <action>`; the agent's self-protection and its host-wide anti-blinding
-    guards unchanged. `install.sh`: alpha on a fresh install, `enable --now`
+    <action>`; the agent's self-protection unchanged. `install.sh`: alpha on a fresh install, `enable --now`
     with the upgrade's health check (`--no-enable`), a host support check
     before any change, a short summary; `uninstall.sh`: a wedged agent's
     removal finished at the next boot (exit 3); `nn-admin status`: a human
@@ -10430,5 +10429,39 @@ number in parentheses is a lab PR.
     enabled; after the reboot the one-shot removed everything (`uninstall
     complete`, itself gone) and the diff against the host before the
     install was empty.
+  - Round 2 (the coordinator's decision of 13/11: the alpha never breaks
+    anything on a tester's machine): under the gate the host-wide denies —
+    a foreign tracing, LSM, extension or struct_ops BPF program's load, a
+    root cgroup/sysctl attach, the kprobes and lockdown switches, kexec, the
+    sysctl guard, cgroup v1 writes, a ptrace of PID 1 — observe, each
+    recorded "would deny" (a bit of the record's operation, `would have:
+    deny:<op>`); the denies that protect the agent (its processes, files,
+    units, pins, cgroup and BPF objects) hold under every profile. One
+    kernel switch (`HOST_DENY_MODE`, written from the resolved gate before
+    any attach, frozen); a ratchet (`xtask/tests/host_deny.rs`) classifies
+    every deny site of the eBPF object (routed through the switch, or the
+    agent's self-protection with its reason, or a response path the gate
+    already sets). Lab, as measured
+    (lease k341, the BPF guard enforcing — `NN_BPF_DEFENSE_ENFORCE=1`, the
+    production default — and `nn-lab.sh host-deny-check`): Ubuntu 24.04
+    (6.8), an alpha install: a tracepoint and a kprobe program loaded by a
+    foreign root process, `bpftrace -e 'tracepoint:syscalls:sys_enter_openat
+    …'` ran (1379 opens counted), `opensnoop-bpfcc` (BCC) ran, each recorded
+    `would have: deny:bpf_prog_type (would deny: …)` (status: `would have :
+    deny:bpf_prog_type x5`); a handle on `PROTECTED_PIDS` (read-write and
+    read-only), on one of the agent's programs by id, `bpftool map delete`
+    on it, a handle on and `bpftool link detach` of a link pin, a handle by
+    id on each of its 82 links: all EPERM, the 33 link pins kept, the agent
+    the same pid. An enforcing install, the same check: both loads EPERM,
+    bpftrace and `opensnoop-bpfcc` refused (`Operation not permitted`), each
+    signed `bpf_prog_type` "denied in kernel"; the agent's objects refused as
+    under alpha. Debian 13 (6.12), alpha: the same (bpftrace 732 opens; no
+    BCC tool there, the raw_tracepoint loader instead; 84 link handles
+    refused). Both alpha installs uninstalled to the host before them (the
+    check's own apt packages aside); the enforcing one's `uninstall.sh`, run
+    from the lab user's tree 30 s after the agent's start, was killed (rc
+    137; most likely R009's root exec from a user path, the lab's known
+    flake after a start — the purge took the journal) and the install was
+    removed by a later round.
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).

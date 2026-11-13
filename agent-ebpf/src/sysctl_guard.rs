@@ -17,6 +17,10 @@
 //! carries, and a value it cannot read; the signed opt-out
 //! ([`SYSCTL_OPTOUT`]) lets its range through, every such write recorded.
 //!
+//! Lot 341: a host-wide deny ([`crate::host_deny`]): under the start's
+//! observe-only gate (the `alpha` profile) a refused value goes through,
+//! signed "would deny".
+//!
 //! A program in a child cgroup cannot get around it: the agent attaches it
 //! by a link, which the kernel attaches `BPF_F_ALLOW_MULTI`
 //! (`cgroup_bpf_link_attach`), so the root's program is in every
@@ -101,7 +105,15 @@ unsafe fn try_sysctl_guard(ctx: &SysctlContext) -> SysctlVerdict {
     let (read, v) = new_value(ctx);
     let verdict = verdict_of(kind, false, read, v, opt_out(kind));
     match verdict {
-        SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),
+        SysctlVerdict::Refuse => {
+            // Lot 341: a host-wide deny (`crate::host_deny`) — under the
+            // observe-only gate the write goes through, signed "would deny"
+            let (refuse, op) = crate::host_deny::judge_no_task(FS_OP_SYSCTL_VALUE);
+            record(op, kind, read, v, task, tgid, true);
+            if !refuse {
+                return SysctlVerdict::Allow;
+            }
+        }
         SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),
         SysctlVerdict::Allow => {}
     }

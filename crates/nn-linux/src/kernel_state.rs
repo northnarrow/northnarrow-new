@@ -250,6 +250,7 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
         target_ino,
         operation,
         timestamp_ns,
+        would_deny: false,
     }
 }
 
@@ -607,6 +608,7 @@ mod tests {
                     target_ino: 35,
                     operation: FsProtectOperation::SysctlRootProg,
                     timestamp_ns: 7,
+                    would_deny: false,
                 } if comm == "systemd-network"
                     && *target_dev == common::bpf_prog_class::root_prog_known_dev(0, false, 3)
             ),
@@ -647,6 +649,7 @@ mod tests {
             target_ino,
             operation,
             timestamp_ns,
+            would_deny: _,
         } = e
         else {
             panic!("{e:?}")

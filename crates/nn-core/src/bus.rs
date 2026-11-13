@@ -1637,6 +1637,7 @@ mod tests {
             target_ino: 0,
             operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 0,
+            would_deny: false,
         };
         assert_eq!(class_of(&denial), EventClass::Tamper);
         assert_eq!(when_full(&denial), WhenFull::Wait { max_ns: P0_WAIT_NS });
@@ -1768,6 +1769,7 @@ mod tests {
             target_ino: 2,
             operation: nn_model::FsProtectOperation::Setattr,
             timestamp_ns: 9,
+            would_deny: false,
         }
     }
 
@@ -2030,6 +2032,7 @@ mod tests {
                 target_ino: ino,
                 operation: nn_model::FsProtectOperation::Setattr,
                 timestamp_ns: 1,
+                would_deny: false,
             })
             .unwrap()
         };

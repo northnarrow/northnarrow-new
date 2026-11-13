@@ -1759,9 +1759,22 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   their text; a reader keyed on the old string matches neither.
 - **Detect-only also stops the module-load judge's refusals** (R018's deny
   mode: record mode under the gate) and an earlier enforcing run's owed
-  exec-quarantine kills (resumed). The agent's self-protection, and the
-  host-wide guards that keep it able to see (foreign tracing BPF programs,
-  `kexec_load`, the sysctl guard), are unchanged under the gate.
+  exec-quarantine kills (resumed). The agent's self-protection is unchanged
+  under the gate.
+- **The host-wide denies observe under the gate** (`alpha`, and
+  `--detect-only` / `NN_DETECT_ONLY` too): a foreign tracing, LSM,
+  extension or `struct_ops` BPF program's load (`bpftrace`, BCC, another
+  EDR), a `cgroup/sysctl` program on the root cgroup, the kprobes and
+  lockdown switches, a kexec image, the sysctl guard (and the integrity
+  round's put-back of a harmful value: `sysctl_would_restore`, nothing
+  written), a cgroup v1 write and a ptrace of PID 1 go through, each
+  recorded "would deny" (`"response":
+  "would have: deny:<operation> (would deny: …)"`, the reasoning "Would
+  deny: NOT refused"). A lab or a script that ran a detect-only agent and
+  expected those refusals now sees them only under `enforcing` without
+  the flag. The agent's own files, processes, cgroup and BPF objects stay
+  refused under every profile ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)
+  §1.1).
 - **`install.sh` refuses a host it cannot run on** before any change:
   not x86_64, systemd not the init system, no kernel BTF, a kernel the new
   agent's `--btf-check` refuses; on a fresh install that starts the units,

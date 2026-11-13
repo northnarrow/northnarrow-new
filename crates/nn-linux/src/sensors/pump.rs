@@ -387,6 +387,7 @@ mod tests {
             target_ino: u64::from(pid),
             operation: nn_model::FsProtectOperation::Setattr,
             timestamp_ns: ts,
+            would_deny: false,
         }
     }
 

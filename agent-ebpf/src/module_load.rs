@@ -304,14 +304,21 @@ unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
 /// (AlmaLinux 9: `kexec -l` succeeded with the agent running). The refusal
 /// is an anti-tamper denial (NN-L-AT-001). kdump's crash kernel is loaded
 /// at boot, before the agent starts (its unit is ordered after
-/// `kdump.service`); a later reload needs the window.
+/// `kdump.service`); a later reload needs the window. Lot 341: a host-wide
+/// deny ([`crate::host_deny`]) — under the start's observe-only gate (the
+/// `alpha` profile) the image loads, signed "would deny".
 #[inline(always)]
 unsafe fn deny_kexec(id: c_int) -> i32 {
     if crate::inode_protect::override_active() {
         return 0;
     }
-    crate::inode_protect::emit_task_denial(northnarrow_common::wire::FS_OP_KEXEC, id as u64, 0);
-    -EPERM
+    let (refuse, op) = crate::host_deny::judge(northnarrow_common::wire::FS_OP_KEXEC);
+    crate::inode_protect::emit_task_denial(op, id as u64, 0);
+    if refuse {
+        -EPERM
+    } else {
+        0
+    }
 }
 
 /// Best-effort record of the load and its verdict. Dropped (and counted) if

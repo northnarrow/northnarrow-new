@@ -165,7 +165,8 @@ pub fn note_ftrace(root: &Path) -> Ftrace {
 /// One finding of the round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
-    /// `sysctl_restored`, `sysctl_not_restored`, `sysctl_strict`.
+    /// `sysctl_restored`, `sysctl_not_restored`, `sysctl_strict`, (lot
+    /// 341) `sysctl_would_restore`.
     pub kind: &'static str,
     pub detail: String,
 }
@@ -181,19 +182,48 @@ fn threads_default(mem_total: u64) -> String {
 /// Lot 280a: a value the signed per-sysctl opt-out in force allows
 /// (`crate::sysctl_cgroup::opt_out_for`) is left, a `sysctl_opted_out`
 /// finding.
+///
+/// Lot 341: `write` false (a dry run, or the start's observe-only gate:
+/// [`crate::anti_tamper::host_deny::observing`]) writes nothing, and a
+/// harmful value is then `sysctl_would_restore` — what the enforcing
+/// profile would have put back, the tester's value left.
 pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
-    check_with(
-        root,
-        mem_total,
-        &crate::sysctl_cgroup::opt_out_for,
-        |path, text| {
-            if write {
-                std::fs::write(path, text)
-            } else {
-                Ok(())
-            }
-        },
-    )
+    check_writing(root, mem_total, &crate::sysctl_cgroup::opt_out_for, write)
+}
+
+/// [`check`] with the opt-outs `opt_out` (the tests': none).
+fn check_writing(
+    root: &Path,
+    mem_total: u64,
+    opt_out: &dyn Fn(u8) -> Option<(i64, i64)>,
+    write: bool,
+) -> Vec<Seen> {
+    let seen = check_with(root, mem_total, opt_out, |path, text| {
+        if write {
+            std::fs::write(path, text)
+        } else {
+            Ok(())
+        }
+    });
+    if write {
+        return seen;
+    }
+    seen.into_iter().map(would_restore).collect()
+}
+
+/// Lot 341: a `sysctl_restored` of a run that wrote nothing, said as it is.
+fn would_restore(s: Seen) -> Seen {
+    if s.kind != "sysctl_restored" {
+        return s;
+    }
+    Seen {
+        kind: "sysctl_would_restore",
+        detail: format!(
+            "{} (not written: the observe-only gate leaves the host's value)",
+            s.detail
+                .replace(": put back to ", ": would be put back to ")
+        ),
+    }
 }
 
 /// The RT period the round judges the runtime against (`/proc/sys/kernel/
@@ -339,13 +369,7 @@ mod tests {
     /// [`super::check`] without the process's opt-outs (another test may
     /// have some in force: `sysctl_cgroup`'s, run in parallel).
     fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
-        check_with(root, mem_total, &|_| None, |path, text| {
-            if write {
-                std::fs::write(path, text)
-            } else {
-                Ok(())
-            }
-        })
+        super::check_writing(root, mem_total, &|_| None, write)
     }
 
     fn host(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -388,6 +412,27 @@ mod tests {
         assert_eq!(read("proc/sys/kernel/pid_max"), "32768\n");
         assert_eq!(read("proc/sys/vm/max_map_count"), "262144\n");
         assert!(check(d.path(), 16 << 30, true).is_empty());
+    }
+
+    /// Named (lot 341): under the observe-only gate the round writes
+    /// nothing — a harmful value is what the enforcing profile would have
+    /// put back, the host's value left.
+    #[test]
+    fn under_the_gate_a_harmful_value_is_left_and_said_would_restore() {
+        let d = host(&[
+            ("/proc/sys/kernel/pid_max", "300\n"),
+            ("/proc/sys/kernel/ftrace_enabled", "0\n"),
+        ]);
+        let r = check(d.path(), 16 << 30, false);
+        assert!(!r.is_empty(), "{r:?}");
+        for s in &r {
+            assert_eq!(s.kind, "sysctl_would_restore", "{r:?}");
+            assert!(s.detail.contains("would be put back to"), "{}", s.detail);
+            assert!(s.detail.contains("observe-only gate"), "{}", s.detail);
+        }
+        let read = |p: &str| std::fs::read_to_string(d.path().join(p)).unwrap();
+        assert_eq!(read("proc/sys/kernel/pid_max"), "300\n");
+        assert_eq!(read("proc/sys/kernel/ftrace_enabled"), "0\n");
     }
 
     #[test]

@@ -1523,6 +1523,7 @@ fn a_relayed_signal_denial_engages_but_never_reaches_combat() {
         target_ino: 4242,
         operation: nn_model::FsProtectOperation::Signal,
         timestamp_ns: 1,
+        would_deny: false,
     };
     let (state, firing) = m.observe(&relayed, &[]).expect("posture transitioned");
     assert_eq!(state.kind(), PostureKind::Engaged);
@@ -1536,6 +1537,7 @@ fn a_relayed_signal_denial_engages_but_never_reaches_combat() {
             target_ino: 4242,
             operation: nn_model::FsProtectOperation::Signal,
             timestamp_ns: ts,
+            would_deny: false,
         };
         let _ = m.observe(&again, &[]);
     }

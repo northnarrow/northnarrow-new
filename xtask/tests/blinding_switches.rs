@@ -147,7 +147,10 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
             "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
             "Some(off) if !attr.is_null() => {",
             "None => ROOT_UNREADABLE,",
-            "if root != ROOT_NO {\n            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);\n            return -EPERM;\n        }",
+            // lot 341: a host-wide deny, decided by the profile's switch
+            // (`xtask/tests/host_deny.rs`): refused unless the observe-only
+            // gate is on, signed either way
+            "if root != ROOT_NO {\n            let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL_ROOT_ATTACH);\n            emit_denial(op, arg);\n            if refuse {\n                return -EPERM;\n            }\n        }",
             "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
         ],
     )

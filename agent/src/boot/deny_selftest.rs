@@ -528,6 +528,7 @@ mod tests {
             target_ino: target,
             operation: FsProtectOperation::Signal,
             timestamp_ns: ts,
+            would_deny: false,
         }
     }
 
@@ -549,6 +550,7 @@ mod tests {
             target_ino: target,
             operation: FsProtectOperation::CgroupMove,
             timestamp_ns: ts,
+            would_deny: false,
         };
         for other in [
             mv(5152, 6161, 3_500),
@@ -613,6 +615,7 @@ mod tests {
                 target_ino: 100,
                 operation: FsProtectOperation::Unlink,
                 timestamp_ns: 1_500,
+                would_deny: false,
             },
         ] {
             assert!(!expected.take(&other), "{other:?}");

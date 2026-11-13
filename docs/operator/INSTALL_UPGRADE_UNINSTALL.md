@@ -520,7 +520,9 @@ on.
 kexec kernel image load (`kexec -l`, `kexec -p`, `systemctl kexec`; both
 `kexec_load` and `kexec_file_load`) outside the trusted-installer window,
 and records it as an anti-tamper denial (NN-L-AT-001). A loaded image let
-root reboot at once into a kernel without the agent. kdump is not affected
+root reboot at once into a kernel without the agent. Lot 341: under the
+observe-only `alpha` profile the load goes through, recorded "would deny"
+([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). kdump is not affected
 at boot: the agent's unit starts after `kdump.service`, so the crash kernel
 is already loaded. To reload it later (`kdumpctl restart`, a crashkernel
 change), open the window first:

@@ -417,6 +417,12 @@ const STATICS: &[Kept] = &[
         "lot 281 (#494's N1): the directory the one tracker's pins went to (the plan's, or a later generation's past a plant), read by the pins' protection and registration",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/host_deny.rs",
+        "OBSERVE",
+        Kernel,
+        "lot 341: the host-wide denies' mode the start wrote into the one eBPF object's frozen HOST_DENY_MODE (the resolved gate, once a boot), read by the integrity round's and a window close's put-back of the guarded sysctls so they follow the kernel's switch",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "JUDGE",
         Kernel,

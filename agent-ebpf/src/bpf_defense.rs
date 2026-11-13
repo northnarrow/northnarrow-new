@@ -46,7 +46,11 @@
 //!   pin directories (`/sys/fs/bpf/northnarrow*`). The two attach and load
 //!   refusals (this one and lot 280b's root `cgroup/sysctl` attach) hold in
 //!   every mode — the observe mode relaxes only the guard of the agent's
-//!   own objects, which the lab's fixtures reach with `bpftool`. A load the
+//!   own objects, which the lab's fixtures reach with `bpftool`. Lot 341:
+//!   both are HOST-WIDE denies ([`crate::host_deny`]): under the start's
+//!   observe-only gate (the `alpha` profile) the load or the attach goes
+//!   through, signed "would deny"; every guard of the agent's own maps,
+//!   programs and links below holds under every profile. A load the
 //!   hook lets through marks its thread ([`crate::bpf_census`]) so the
 //!   `bpf_prog` hook records the new program's id: the cross-view's "seen".
 //! * `bpf_prog(struct bpf_prog *prog)` (lot 290) — every program handle
@@ -816,6 +820,9 @@ const LOADER_OPTED_OUT: u64 = 1;
 /// Lot 290: the dedup key's command of an opt-out's record (one a second
 /// per loader and type, the type in its low byte).
 const OPT_OUT_REPORT: u32 = 0xFFFF_0100;
+/// Lot 341: the dedup key's command of a "would deny" load's record (one a
+/// second per loader and type, the type in its low byte).
+const WOULD_DENY_REPORT: u32 = 0xFFFF_0200;
 
 /// Lot 290: whether the signed per-loader opt-out ([`BPF_LOADER_OPTOUT`])
 /// names the caller's executable, by device and inode, with
@@ -901,16 +908,27 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // fresh agent or watchdog before it is a protected pid loads its own.
     // A load let through marks its thread: the `bpf_prog` hook records the
     // program it makes as seen (the cross-view).
+    //
+    // Lot 341: a host-wide deny — under the observe-only gate (alpha) the
+    // load goes through, signed "would deny" once a second per loader and
+    // type. A program that would act on the agent's programs or maps still
+    // needs a descriptor of one, which the handle guards below and the
+    // `bpf_map` / `bpf_prog` hooks refuse under every profile.
     if cmd == BPF_PROG_LOAD {
         if denied_by_default(arg)
             && !crate::inode_protect::override_active()
             && !fresh_instance_may_load()
         {
             if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {
-                emit_denial(FS_OP_BPF_PROG_TYPE, arg);
-                return -EPERM;
-            }
-            if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {
+                let (refuse, op) = crate::host_deny::judge(FS_OP_BPF_PROG_TYPE);
+                if refuse {
+                    emit_denial(op, arg);
+                    return -EPERM;
+                }
+                if should_report(pid, WOULD_DENY_REPORT | (arg & 0xff)) {
+                    emit_denial(op, arg);
+                }
+            } else if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {
                 emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);
             }
         }
@@ -991,7 +1009,10 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // a window (the family returned above; a fresh agent before it is a
     // protected pid may attach its judge) — refused, signed. `arg` is the
     // attach type for both commands; the target is read only for them.
-    // Lot 290: in every mode (it held in enforce mode only).
+    // Lot 290: in every mode (it held in enforce mode only). Lot 341: a
+    // host-wide deny (the sysctl guard's own guard; that guard observes
+    // under the observe-only gate too) — let through and signed "would
+    // deny" there.
     if judges_attach_target(cmd, arg)
         && !crate::inode_protect::override_active()
         && !fresh_instance_may_load()
@@ -1007,8 +1028,11 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             None => ROOT_UNREADABLE,
         };
         if root != ROOT_NO {
-            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);
-            return -EPERM;
+            let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL_ROOT_ATTACH);
+            emit_denial(op, arg);
+            if refuse {
+                return -EPERM;
+            }
         }
     }
     let foreign_handle =

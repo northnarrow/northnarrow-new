@@ -128,6 +128,10 @@ pub(crate) async fn load(
         lsm_absent: matches!(bpf_lsm, northnarrow_agent::boot::lsm::BpfLsm::Absent { .. }),
         // R14b: the DNS pump's names go to the parse worker
         parse: Some(workers.clone()),
+        // Lot 341: the start's one gate — under it (the `alpha` profile,
+        // `--detect-only`) the host-wide denies observe ("would deny"); the
+        // agent's self-protection reads no such switch
+        host_deny_observe: detect_only,
         ..Default::default()
     };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the

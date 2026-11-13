@@ -593,7 +593,11 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
   `bpf_prog_opt_out`, the loader and the type, Low, no posture change (one
   record a second per loader and type). A refused load is NN-L-AT-001
   `bpf_prog_type`, High, and raises the posture to ENGAGED (an
-  administrator's bpftrace meets it too: never the decisive tamper).
+  administrator's bpftrace meets it too: never the decisive tamper). Lot
+  341: under the observe-only `alpha` profile (and `--detect-only`) the
+  load is not refused — the same record, marked "would deny"
+  ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1); the opt-out matters only
+  under `enforcing`.
 - It names an executable, not a user: while it is in force any root process
   that runs that executable may load those types. bpftrace runs what it is
   given — opt out a tool only where its use outside a window is routine.

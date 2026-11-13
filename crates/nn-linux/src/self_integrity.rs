@@ -1946,7 +1946,8 @@ impl Checker {
             crate::sysctl_guard::check(
                 Path::new("/"),
                 antitamper_bpf::cgroup_floors::Host::read().mem_total,
-                true,
+                // lot 341: under the observe-only gate, nothing put back
+                !crate::anti_tamper::host_deny::observing(),
             )
             .into_iter()
             .map(|s| Finding {

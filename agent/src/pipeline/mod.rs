@@ -259,6 +259,7 @@ mod tests {
             target_ino: 4242,
             operation: nn_model::FsProtectOperation::Signal,
             timestamp_ns: ts,
+            would_deny: false,
         }
     }
 

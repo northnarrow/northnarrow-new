@@ -622,7 +622,8 @@ fn sysctls_at_close() -> Vec<String> {
     crate::sysctl_guard::check(
         std::path::Path::new("/"),
         antitamper_bpf::cgroup_floors::Host::read().mem_total,
-        true,
+        // lot 341: under the observe-only gate, nothing put back
+        !crate::anti_tamper::host_deny::observing(),
     )
     .into_iter()
     .filter(|s| s.kind != "sysctl_strict" && s.kind != "sysctl_opted_out")
