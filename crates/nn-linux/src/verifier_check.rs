@@ -562,9 +562,13 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
         );
     }
     // Lot 345: the return override's calibration program, on a kernel built
-    // without CONFIG_BPF_KPROBE_OVERRIDE (no such helper: nothing to judge)
+    // without CONFIG_BPF_KPROBE_OVERRIDE (no such helper: nothing to judge).
+    // The lab's Debian 13 (6.12 cloud): "program of this type cannot use
+    // helper bpf_override_return#58"; a kernel without the id: "unknown func"
     if name == crate::anti_tamper::bpf_defense::CALIB_OVERRIDE_PROGRAM
-        && matches!(outcome, Outcome::Refused { log, .. } if log.contains("unknown func"))
+        && matches!(outcome, Outcome::Refused { log, .. }
+            if log.contains("bpf_override_return#58")
+                && (log.contains("unknown func") || log.contains("cannot use helper")))
     {
         return Some(
             "optional: this kernel has no bpf_override_return (CONFIG_BPF_KPROBE_OVERRIDE off): \
@@ -1341,6 +1345,17 @@ mod tests {
             log: "0: R1=ctx() R10=fp0\n; unknown func bpf_override_return#58\n".into(),
         };
         assert!(optional_reason("nn_calib_override", "kprobe", &no_override).is_some());
+        let not_built = Outcome::Refused {
+            errno: Some(libc::EINVAL),
+            log: "0: R1=ctx() R10=fp0\nprogram of this type cannot use helper bpf_override_return#58\n"
+                .into(),
+        };
+        assert!(optional_reason("nn_calib_override", "kprobe", &not_built).is_some());
+        let other = Outcome::Refused {
+            errno: Some(libc::EACCES),
+            log: "unknown func bpf_send_signal#109\n".into(),
+        };
+        assert!(optional_reason("nn_calib_override", "kprobe", &other).is_none());
         assert!(optional_reason("nn_calib_override", "kprobe", &refused).is_none());
         assert!(optional_reason("nn_calib_signals", "kprobe", &no_override).is_none());
     }

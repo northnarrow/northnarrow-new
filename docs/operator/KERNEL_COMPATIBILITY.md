@@ -1120,6 +1120,64 @@ refusals do not depend on it.
   `name` 528 (resolved at boot). No HID-BPF program; systemd 249 loads its
   cgroup programs unnamed.
 
+## The BPF content judge (lot 345)
+
+A loader the signed per-loader opt-out names (`install.sh
+--allow-bpf-tools`) is still refused an fmod_ret and a program that calls
+`bpf_send_signal`, `bpf_send_signal_thread`, `bpf_probe_write_user`,
+`bpf_override_return` or the `bpf_send_signal_task` kfunc
+([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.2). Where each kernel judges it:
+
+- **fmod_ret**, on every kernel: the `bpf` hook reads `expected_attach_type`
+  from the kernel's copy of the attr.
+- **6.9 and later** (`bpf_lsm_bpf_prog_load` in the BTF): the
+  `bpf_prog_load_guard` program reads the kernel's copy of the
+  instructions before the verifier runs. It compares helper ids, and the
+  kfunc by its vmlinux BTF id where the kernel has it (6.13+).
+- **5.15 to 6.8**: the `bpf_prog` hook judges every foreign handle once the
+  program is verified.
+  - The targets are calibrated at the agent's start: two programs of its
+    own, `nn_calib_signals` and `nn_calib_override` (kprobes, never
+    attached, then unloaded). `kallsyms` is not used: the unit has no
+    `CAP_SYSLOG`.
+  - `bpf_probe_write_user` is refused instead by the `bpf_write_user_guard`
+    program on `locked_down`, using this kernel's `LOCKDOWN_BPF_WRITE_USER`
+    from its BTF.
+- Two optional BTF offsets: `bpf_prog.len` and `.insnsi`. Without them the
+  judge refuses every program it would read.
+- A kernel built without `CONFIG_BPF_KPROBE_OVERRIDE` refuses
+  `nn_calib_override` (Debian's cloud 6.12: "program of this type cannot
+  use helper bpf_override_return#58"). `verifier-check` does not count it:
+  there is no such helper to refuse.
+- A start that could not calibrate the signals reports `bpf content judge`
+  (an observe failure, signed).
+
+**As measured** (our lab guests, lease k345). Each kernel was installed with
+`--allow-bpf-tools` (python3 and bpftrace named) and then cold-booted. On
+all three, `nn-lab.sh bpf-content-check` found the plain kprobe, the
+fentry, bpftrace and BCC's `opensnoop-bpfcc` still loading, and each
+refusal signed with the helper named:
+
+| Kernel | Stage | Refused | `bpf_prog_guard` processed | `verifier-check` | LSM programs after cold boot |
+|---|---|---|---|---|---|
+| Ubuntu 24.04 (`6.8.0-149`) | at the handle, calibrated | three helpers `EPERM`, `bpf_probe_write_user` `EINVAL` (lockdown), fmod_ret `EPERM`, bpftrace `signal()` | 87,605 | 116 programs, 0 failing | 49 |
+| Debian 13 (`6.12.116`) | at the load | four helpers and fmod_ret `EPERM`, bpftrace `signal()` | 268,913 (`bpf_prog_load_guard` 31,157) | `nn_calib_override` refused by the kernel, now not counted | 50 |
+| Ubuntu 26.04 (`7.0.0-43`) | at the load | four helpers and fmod_ret `EPERM`, bpftrace `signal()` | 198,913 (`bpf_prog_load_guard` 31,086) | 0 failing | 50 |
+
+- **Every kernel's verifier headroom is within the 900,000 gate.** The
+  highest program on each: `execpol_env_commit` 273,029 (6.8),
+  `execmap_check` 304,715 (6.12), `fim_rename_observe` 360,991 (7.0).
+- **6.8's calibration**: `override_return`, `send_signal` and
+  `send_signal_thread` found, and the same targets again after the cold
+  boot.
+- **Debian 13**: BCC cannot compile there (no kheaders).
+- **7.0**: bpftrace's syscall-tracepoint count can stay empty (lot 322);
+  its probes attached.
+- **The first 6.8 round found** the `bpf_prog` guard refused by its
+  verifier. A hook's `struct bpf_prog *` is a BTF pointer, which a global
+  function does not take ("R1 is not a scalar"). Its address is now passed
+  as a plain number.
+
 ## A signal through a file's owner (lot 293)
 
 **What it needs.** The `file_send_sigiotask` LSM hook (in the BPF LSM since

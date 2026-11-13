@@ -10892,3 +10892,55 @@ number in parentheses is a lab PR.
     before the round was empty on both (the check's own apt packages aside).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
+
+- **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases
+  (before the alpha tag; the re-check of #550, N1–N5 and point 1; C27, C28;
+  no level changes).**
+  - **What was open.**
+    - A loader `install.sh --allow-bpf-tools` names was let through the five
+      tracing types whole: python3, and with it any root Python script, and
+      bpftrace. It could load an fmod_ret on any `security_*` function, or a
+      program calling `bpf_send_signal` (it kills the agent past
+      `task_kill`), `bpf_probe_write_user` or `bpf_override_return`.
+    - `--help` and the summary did not say what the flag opens.
+    - F8 compared `detect_only`: one observing boot in between laundered the
+      alarm, and the alarm was only an audit row.
+    - install.sh glued its lines to a policy without a final newline, kept a
+      narrower existing line while saying "allowed", and signed over a
+      policy whose signature did not verify.
+    - The `deny_routes` ratchet missed a re-export, a macro and a function
+      pointer of a gate switch.
+  - **Done.**
+    - The content judge: fmod_ret refused at the `bpf` hook; the helpers and
+      the kfunc at `bpf_prog_load` (6.9+) or at `bpf_prog` once verified
+      (5.15–6.8), with targets calibrated from the agent's own programs and
+      `bpf_probe_write_user` refused at the verifier's `locked_down`
+      question. The signed record names the helper.
+    - F8 compares profile to profile, and the alarm is a degradation in
+      `nn-admin status`.
+    - The install edges are fixed, and `--help` and the summary say the risk.
+    - The ratchet follows macros, paths, bare names, `use … as` aliases and
+      function-pointer statics.
+    - Mini-hunt: two opt-out lines of one executable merge their types; the
+      degradation registry's unlocked test writers take its lock (a gate
+      flake).
+    - 44 targeted mutants: 43 caught by a named test; 1 redundant clause
+      removed.
+  - **Lab, as measured** (our guests, lease k345, `nn-lab.sh
+    bpf-content-check` after `install.sh --allow-bpf-tools`, then a cold
+    boot): Ubuntu 24.04 (6.8.0-149), Debian 13 (6.12.116) and Ubuntu 26.04
+    (7.0.0-43).
+    - **Still loads**: a plain kprobe, an fentry, bpftrace and (except on
+      Debian, which has no kheaders) `opensnoop-bpfcc`.
+    - **Refused on all three, each signed with the helper named**: an fmod_ret
+      on `security_file_open`, a program calling `bpf_send_signal`,
+      `_thread`, `bpf_override_return` or `bpf_probe_write_user`, and
+      bpftrace's `signal()`. All `EPERM`, except `bpf_probe_write_user` on
+      6.8, which is `EINVAL` (the lockdown question).
+    - **`verifier-check`**: every program within the 900,000 gate.
+      `bpf_prog_guard` processed 87,605 / 268,913 / 198,913.
+    - **After the cold boot**: agent and watchdog active, 77 pins, 49/50/50
+      LSM programs, the judge armed again, `bpf_send_signal` refused again.
+    - `uninstall.sh --purge` left nothing.
+  - **Levels unchanged**: the opt-out still lets an allowed loader read
+    memory (declared); what it no longer opens is the kill and the blinding.
