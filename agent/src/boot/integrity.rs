@@ -646,12 +646,11 @@ mod tests {
         .unwrap();
         let p = dir.join("profile.local");
         std::fs::write(&p, body).unwrap();
-        // the request's nonce, from the OS (never a fixed value)
-        let mut nonce = [0u8; 32];
-        {
-            use rand::Rng;
-            northnarrow_agent::os_rng::OsRng.fill_bytes(&mut nonce);
-        }
+        // the request's nonce, drawn from the OS (never a fixed value)
+        let nonce: [u8; 32] = {
+            use rand::RngExt;
+            northnarrow_agent::os_rng::OsRng.random()
+        };
         let payload = SignedPayload::new_config_overlay_set(
             nonce,
             100,
