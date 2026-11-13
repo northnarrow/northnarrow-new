@@ -10449,8 +10449,10 @@ number in parentheses is a lab PR.
     /etc/logrotate.conf`, the exec's uid 0; the lineage keeps a keyed
     digest of each exec's argv) and PID 1's fork or cron's daily run
     (`/etc/cron.daily/logrotate` under `run-parts`, a short root chain up to
-    a cron daemon PID 1 forked); npm's writer runs npm's script alone (no
-    `ENV_LOADS`) from a root-owned tree; CoreDNS's id is the leaf of a
+    a cron daemon PID 1 forked); npm's writer has no code-loading environment
+    (`ENV_LOADS`) and npm's CLI under a system path prefix (a prefix, not a
+    proof of root ownership; `~/.npm-init.js` and user-owned or namespaced
+    prefixes remain a declared residual, follow-up lot); CoreDNS's id is the leaf of a
     `kubepods` cgroup and the sender shares the container init's PID and
     mount namespaces; a resolver is the system's service (its unit's cgroup
     under `system.slice`, PID 1's fork or NetworkManager's for dnsmasq,

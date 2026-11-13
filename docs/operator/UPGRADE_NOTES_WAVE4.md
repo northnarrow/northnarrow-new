@@ -1773,8 +1773,11 @@ are judged as before; `CHANGELOG.md` has the detail.
   open sensor's ring record grew to 632 bytes (an agent and its eBPF object are
   one build; nothing to do).
 - **`npm ci` / `go test`** do not raise ENGAGED any more: npm's CLI run
-  through `/usr/bin/npm` (the package's link) or npm's CLI in a system
-  tree, with no `NODE_OPTIONS`/`NODE_PATH` loading code, and the packaged `go`
+  through `/usr/bin/npm` (the package's link) or npm's CLI under a system
+  path prefix, with no `NODE_OPTIONS`/`NODE_PATH` loading code (known limit:
+  the prefix is not a proof of root ownership, and npm loads
+  `~/.npm-init.js` itself; a follow-up narrows the exemption to npm's own
+  write paths), and the packaged `go`
   command writing in its work directory (`$TMPDIR/go-build<digits>/`), its
   build cache or its module cache. A `go` in a home (`GOTOOLCHAIN`), what
   `go` runs, and node running any other script still count.

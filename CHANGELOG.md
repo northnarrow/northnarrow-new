@@ -698,9 +698,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     npm's CLI in one is now npm's CLI. The review of #552 (F2): only when
     node runs npm's script alone — no `NODE_OPTIONS=--require`/`--import`
     or `NODE_PATH` read by the exec pump (`ENV_LOADS`) — and npm's CLI by
-    its suffix (`…/npm/bin/npm-cli.js`) only in a root-owned system tree:
+    its suffix (`…/npm/bin/npm-cli.js`) only under a system path prefix
+    (`/usr`, `/opt`, `/usr/local`; a prefix, not a proof of root ownership):
     a package's own copy, one in a home (a user prefix the postinstall can
     write) or a path through `..` is the caller's code under npm's name
+    Residual (the re-check of #552, N1): npm still loads `~/.npm-init.js`
+    into its own process on `npm init`, and the prefix test does not prove
+    root ownership (`/nix/store`, a user-owned `/usr/local` or `/opt`, a
+    `unshare -Urm` or rootless mount namespace) — the exemption is not yet
+    attacker-proof; a follow-up limits it to npm's own write paths.
     and keeps the arm. The packaged `go` command rewriting
     its archives in its work directory (`$TMPDIR/go-build<digits>/`), its
     build cache or its module cache (`go test` stamping build ids) is
