@@ -266,15 +266,19 @@ set-id target and recorded elsewhere; a bare name searched through a
 staging `LD_LIBRARY_PATH` directory is a staging preload. The re-check of
 #547 (G1–G4): a loader value holding a control byte (glibc keeps a tab
 inside an `LD_PRELOAD` entry, which the musl split read as two entries;
-musl splits its library path on a newline), an empty `LD_LIBRARY_PATH`
-element (`:`, `a::b`, a trailing `:`: glibc searches the caller's directory
-there) or a `$` (glibc expands `$LIB`, `$ORIGIN`, `$PLATFORM` — `$LIB` is
-two components on Ubuntu, so `/tmp/$LIB/../../x.so` is `/tmp/x.so`) is
-`irregular_loader_value` (`LOADER_IRREGULAR`), whichever variable: refused
-at a protected or set-id target, recorded elsewhere — legitimate set-id
-execs carry none of them; the known false refusal is a sloppy
-`LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/x` with the variable unset (an empty
-first element) at a protected target. It compared the
+musl splits its library path on a newline) or a `$` (glibc expands `$LIB`,
+`$ORIGIN`, `$PLATFORM` — `$LIB` is two components on Ubuntu, so
+`/tmp/$LIB/../../x.so` is `/tmp/x.so`) is `irregular_loader_value`
+(`LOADER_IRREGULAR`), whichever variable: refused at a protected or set-id
+target, recorded elsewhere — legitimate set-id execs carry none of them.
+An empty `LD_LIBRARY_PATH` element (`:`, `a::b`, a trailing `:`: glibc
+searches the caller's directory there) is a relative directory (the
+re-check 2 of #547): alone it is recorded (`library_path_staging`), never
+refused — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the variable
+unset is its commonest shape, and it was refused in containers, root shells
+and `sudo`; a bare `LD_PRELOAD` / `LD_AUDIT` name searched in it, the
+combination that loads from the caller's directory, is `relative_loader_path`,
+refused where a staging preload is. It compared the
 first nine bytes of each entry of a 128-byte capture: 120 spaces then
 `/tmp/x.so`, `//tmp/`, `/./tmp/`, a tab (musl) passed, and a clean value
 longer than 128 bytes was refused as not finished. A value longer than the
@@ -375,9 +379,9 @@ attempt is one whatever the caller).
 
 Limits, by design: the string check normalises the path's text (`//`,
 `/./`, `..`; the review of #547) but resolves no link (a symlink to a
-staging file); a relative path, a control byte, an empty library-path
-element or a `$` token is refused at a protected or set-id target whatever
-it names; about 4 KiB of each loader value at the first pass (a
+staging file); a relative path (a bare name in an empty library-path
+element included), a control byte or a `$` token is refused at a protected
+or set-id target whatever it names; about 4 KiB of each loader value at the first pass (a
 longer value is judged on the kernel's copy after the commit: killed at a
 protected or set-id target, recorded elsewhere); an array longer than any
 the kernel accepts (`TRUNCATED`, refused at a protected or set-id target,

@@ -96,11 +96,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     - `task_free` is tracked as attached, not loaded (F9).
   - The re-check of #547:
     - **Irregular loader values are refused at protected and set-id
-      targets** (G1–G4): a control byte (a tab inside an `LD_PRELOAD`
-      entry, which glibc keeps; a newline, musl's library-path separator),
-      an empty `LD_LIBRARY_PATH` element (the caller's directory) or a `$`
-      token (`$LIB`, `$ORIGIN`, `$PLATFORM`) in `LD_PRELOAD`, `LD_AUDIT` or
-      `LD_LIBRARY_PATH` (`irregular_loader_value`); recorded elsewhere.
+      targets** (G1, G3, G4): a control byte (a tab inside an `LD_PRELOAD`
+      entry, which glibc keeps; a newline, musl's library-path separator)
+      or a `$` token (`$LIB`, `$ORIGIN`, `$PLATFORM`) in `LD_PRELOAD`,
+      `LD_AUDIT` or `LD_LIBRARY_PATH` (`irregular_loader_value`); recorded
+      elsewhere. An empty `LD_LIBRARY_PATH` element (G2, the caller's
+      directory) is a relative directory: refused only with a bare preload
+      name searched in it, recorded alone (the re-check 2: alone it was
+      refused, and `$LD_LIBRARY_PATH:/opt/lib` with the variable unset is
+      the variable's commonest shape).
     - **The shares are the login's** (G5): the quarantine's candidates and
       the FIM buffers are counted per login uid (a session's container
       subuids included), per uid for a service; an overflow row bounds the

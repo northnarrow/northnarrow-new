@@ -80,8 +80,8 @@ fn every_loader_entry_is_judged_as_the_loader_reads_it() {
     assert_eq!(preload(&long), 0);
     assert_eq!(judge(KIND_LIBPATH, &long[..long.len() - 1]), 0);
     // (with its trailing `:`, a library path ends with an empty element:
-    // the caller's directory — the re-check of #547, G2)
-    assert_eq!(judge(KIND_LIBPATH, &long), IRREGULAR);
+    // the caller's directory, a relative one — the re-check 2 of #547)
+    assert_eq!(judge(KIND_LIBPATH, &long), RELATIVE);
     // and a staging entry at its end is still seen
     long.extend_from_slice(b"/tmp/x.so");
     assert_ne!(preload(&long) & STAGING, 0);
@@ -100,11 +100,12 @@ fn every_loader_entry_is_judged_as_the_loader_reads_it() {
     }
 }
 
-/// The re-check of #547 (G1–G4, the reviewer's probe
+/// The re-check of #547 (G1, G3, G4, the reviewer's probe
 /// `rev547-recheck-value-parse-probe.rs`): what the loader does with a
-/// control byte, an empty library-path element or a `$` token is not in
-/// the string as the parser reads it — each is `IRREGULAR` (refused at a
-/// protected or set-id target). glibc 2.39 loaded the marker in G1–G3.
+/// control byte or a `$` token is not in the string as the parser reads
+/// it — each is `IRREGULAR` (refused at a protected or set-id target).
+/// glibc 2.39 loaded the marker in G1 and G3. (G2, an empty library-path
+/// element: [`an_empty_library_path_element_is_a_relative_directory`].)
 #[test]
 fn an_irregular_loader_value_is_never_clean() {
     let irregular = |kind: u32, v: &[u8]| judge(kind, v) & IRREGULAR != 0;
@@ -120,20 +121,6 @@ fn an_irregular_loader_value_is_never_clean() {
             KIND_AUDIT,
             b"/usr/lib/a.so\x0b/x.so",
             "a vertical tab in LD_AUDIT",
-        ),
-        // G2: an empty element is the caller's directory
-        (KIND_LIBPATH, b":", "a lone separator"),
-        (KIND_LIBPATH, b":/usr/lib", "a leading empty element"),
-        (KIND_LIBPATH, b"/usr/lib:", "a trailing empty element"),
-        (
-            KIND_LIBPATH,
-            b"/usr/lib::/opt/x",
-            "an empty element between two",
-        ),
-        (
-            KIND_LIBPATH,
-            b"/usr/lib;;/opt/x",
-            "an empty element, semicolons",
         ),
         // G3: dynamic string tokens
         (KIND_PRELOAD, b"/tmp/$LIB/../../x.so", "$LIB"),
@@ -177,6 +164,29 @@ fn an_irregular_loader_value_is_never_clean() {
         judge(KIND_PRELOAD, b"/usr/lib/a.so::/usr/lib/b.so") & IRREGULAR,
         0
     );
+}
+
+/// The re-check 2 of #547 (G2, a false refusal): an empty `LD_LIBRARY_PATH`
+/// element is the caller's directory — a relative directory, not an
+/// irregular value. Alone it is recorded (`LIBPATH_STAGING`), never
+/// refused; only a bare `LD_PRELOAD` / `LD_AUDIT` name searched in it is
+/// (`PRELOAD_RELATIVE`: the eBPF program's `resolve_bare`). The commonest
+/// shape of the variable — `$LD_LIBRARY_PATH:/opt/lib` with it unset,
+/// `:/opt/lib` — was refused at every protected or set-id target.
+#[test]
+fn an_empty_library_path_element_is_a_relative_directory() {
+    for v in [
+        &b":"[..],
+        b":/opt/lib",
+        b"/opt/lib:",
+        b"/usr/lib::/opt/x",
+        b"/usr/lib;;/opt/x",
+    ] {
+        let f = judge(KIND_LIBPATH, v);
+        assert_ne!(f & RELATIVE, 0, "{}", String::from_utf8_lossy(v));
+        assert_eq!(f & IRREGULAR, 0, "{}", String::from_utf8_lossy(v));
+    }
+    assert_eq!(judge(KIND_LIBPATH, b"/usr/lib:/opt/lib"), 0);
     // fed in pieces, the same (the state carried across the kernel's reads)
     let v = b"/usr/lib:";
     let mut p = ValueParse::zeroed();
@@ -184,5 +194,6 @@ fn an_irregular_loader_value_is_never_clean() {
         byte(&mut p, KIND_LIBPATH, b);
     }
     end_value(&mut p, KIND_LIBPATH);
-    assert_ne!(p.found & IRREGULAR, 0);
+    assert_ne!(p.found & RELATIVE, 0);
+    assert_eq!(p.found & IRREGULAR, 0);
 }

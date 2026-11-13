@@ -314,7 +314,7 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
         body(&wire, "sep"),
         &[
             "if kind == KIND_LIBPATH && p.st & IN == 0 {",
-            "p.found |= IRREGULAR;",
+            "p.found |= RELATIVE;",
             "end_entry(p, kind);",
         ],
     );
@@ -322,10 +322,31 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
         body(&wire, "end_value"),
         &[
             "if kind == KIND_LIBPATH && p.st & SEP != 0 {",
-            "p.found |= IRREGULAR;",
+            "p.found |= RELATIVE;",
             "end_entry(p, kind);",
         ],
     );
+    // The re-check 2 of #547 (G2): an empty library-path element is a
+    // relative directory — recorded alone (`LIBPATH_STAGING`), refused only
+    // with a bare `LD_PRELOAD` / `LD_AUDIT` name searched in it
+    // (`resolve_bare`: `PRELOAD_RELATIVE`), never `LOADER_IRREGULAR`
+    in_order(
+        body(&pol, "value_found"),
+        &[
+            "st.flags |= env_flags::LIBPATH_STAGING;",
+            "(*e).internal |= INTERNAL_LIBPATH_RELATIVE;",
+        ],
+    );
+    in_order(
+        body(&pol, "resolve_bare"),
+        &[
+            "if i & (INTERNAL_BARE_PRELOAD | INTERNAL_BARE_AUDIT) != 0 {",
+            "if i & INTERNAL_LIBPATH_RELATIVE != 0 {",
+            "(*e).stash.flags |= env_flags::PRELOAD_RELATIVE;",
+        ],
+    );
+    assert!(!flat(&code("common/src/wire/execpol.rs"))
+        .contains("pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE | LOADER_IRREGULAR | LIBPATH_STAGING"));
     assert!(body(&pol, "nn_value_slash").contains("value_parse::slash(&mut (*e).parse);"));
     in_order(
         body(&wire, "byte"),

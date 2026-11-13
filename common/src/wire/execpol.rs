@@ -236,14 +236,15 @@ pub mod env_flags {
     /// staging or relative `LD_LIBRARY_PATH`. Where it resolves is not in
     /// the string: refused at a protected or set-id target, recorded.
     pub const PRELOAD_RELATIVE: u32 = 1 << 17;
-    /// The re-check of #547 (G1–G4): a loader variable's value (`LD_PRELOAD`,
-    /// `LD_AUDIT`, `LD_LIBRARY_PATH`) holding a control byte (glibc keeps a
-    /// tab inside an `LD_PRELOAD` entry; musl splits its library path on a
-    /// newline), an empty `LD_LIBRARY_PATH` element (the caller's directory)
-    /// or a `$` (glibc expands `$LIB`, `$ORIGIN`, `$PLATFORM`): what the loader
-    /// does with it is not in the string as the check reads it. Refused at a
-    /// protected or set-id target, recorded elsewhere. Legitimate set-id
-    /// execs carry none of them.
+    /// The re-check of #547 (G1, G3, G4): a loader variable's value
+    /// (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`) holding a control byte
+    /// (glibc keeps a tab inside an `LD_PRELOAD` entry; musl splits its
+    /// library path on a newline) or a `$` (glibc expands `$LIB`, `$ORIGIN`,
+    /// `$PLATFORM`): what the loader does with it is not in the string as the
+    /// check reads it. Refused at a protected or set-id target, recorded
+    /// elsewhere. Legitimate set-id execs carry none of them. (An empty
+    /// `LD_LIBRARY_PATH` element (G2) is a relative directory: it matters with
+    /// a bare `LD_PRELOAD` / `LD_AUDIT` name only, `PRELOAD_RELATIVE`.)
     pub const LOADER_IRREGULAR: u32 = 1 << 18;
     /// What the first pass refuses at a protected or set-id target: an
     /// array past the cap (or more judged names than the scan reads), a
@@ -726,8 +727,8 @@ pub mod value_parse {
     pub const RELATIVE: u32 = 1 << 1;
     /// A bare name (no `/`): searched in the library path.
     pub const BARE: u32 = 1 << 2;
-    /// The re-check of #547 (G1–G4): a control byte or a `$` in the value,
-    /// or an empty `LD_LIBRARY_PATH` element ([`env_flags::LOADER_IRREGULAR`]).
+    /// The re-check of #547 (G1, G3, G4): a control byte or a `$` in the
+    /// value ([`env_flags::LOADER_IRREGULAR`]).
     ///
     /// [`env_flags::LOADER_IRREGULAR`]: super::env_flags::LOADER_IRREGULAR
     pub const IRREGULAR: u32 = 1 << 3;
@@ -881,11 +882,15 @@ pub mod value_parse {
 
     /// A separator of a value of `kind`: the entry before it ends; in an
     /// `LD_LIBRARY_PATH`, a separator with no entry before it is an empty
-    /// element — the caller's directory (glibc's `fillin_rpath`).
+    /// element — the caller's directory (glibc's `fillin_rpath`): a relative
+    /// directory ([`RELATIVE`]), which matters only to a bare name searched
+    /// in it (the re-check 2 of #547: it was irregular, and
+    /// `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the variable unset —
+    /// the commonest shape of the variable — was refused everywhere).
     #[inline(always)]
     pub fn sep(p: &mut ValueParse, kind: u32) {
         if kind == KIND_LIBPATH && p.st & IN == 0 {
-            p.found |= IRREGULAR;
+            p.found |= RELATIVE;
         }
         end_entry(p, kind);
         p.st |= SEP;
@@ -902,11 +907,12 @@ pub mod value_parse {
     }
 
     /// The value's end (its NUL): the last entry judged; an `LD_LIBRARY_PATH`
-    /// that ends with a separator ends with an empty element.
+    /// that ends with a separator ends with an empty element (relative, as
+    /// [`sep`]).
     #[inline(always)]
     pub fn end_value(p: &mut ValueParse, kind: u32) {
         if kind == KIND_LIBPATH && p.st & SEP != 0 {
-            p.found |= IRREGULAR;
+            p.found |= RELATIVE;
         }
         end_entry(p, kind);
     }

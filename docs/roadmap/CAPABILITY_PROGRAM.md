@@ -10236,10 +10236,12 @@ number in parentheses is a lab PR.
     each caught by a named test.
   - The re-check of #547 (MERGE AFTER FIXES; new commits). G1–G4: a loader
     value holding a control byte (a tab inside an `LD_PRELOAD` entry, which
-    glibc keeps; musl's newline), an empty `LD_LIBRARY_PATH` element (the
-    caller's directory) or a `$` token (`$LIB`, `$ORIGIN`, `$PLATFORM`) is
-    `irregular_loader_value`: refused at a protected or set-id target,
-    recorded elsewhere. G5: the shares of the quarantine's candidates and of
+    glibc keeps; musl's newline) or a `$` token (`$LIB`, `$ORIGIN`,
+    `$PLATFORM`) is `irregular_loader_value`: refused at a protected or
+    set-id target, recorded elsewhere; an empty `LD_LIBRARY_PATH` element
+    (the caller's directory) is a relative directory — refused only with a
+    bare preload name searched in it, recorded alone (re-check 2: alone it
+    was refused, a false refusal of the variable's commonest shape). G5: the shares of the quarantine's candidates and of
     the FIM buffers are the login's (`task->loginuid`, kept by a session's
     container subuids), the uid's without one; an overflow row bounds the
     shares the count map cannot track; the candidates' map full, the oldest

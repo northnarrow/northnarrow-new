@@ -1574,11 +1574,11 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   rule refuses one, a set-id target) and recorded elsewhere
   (`relative_loader_path`). **A clean value longer than 128 bytes is no
   longer refused** (it was, as "not finished"). **A loader value with a
-  control byte, an empty `LD_LIBRARY_PATH` element or a `$` token is
-  refused where a staging preload is** (`irregular_loader_value`): check
-  scripts that build `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/x` with the variable
-  unset (an empty first element, the caller's directory) before they run a
-  set-id program or a protected service.
+  control byte or a `$` token is refused where a staging preload is**
+  (`irregular_loader_value`), and so is a bare `LD_PRELOAD` / `LD_AUDIT`
+  name with an empty `LD_LIBRARY_PATH` element (the caller's directory). An
+  empty element alone — `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/lib` with the
+  variable unset — is only recorded.
 - **New status counts** on the exec policy's line of `nn-admin status`, when
   not zero: "environments not finished", "changed after the kernel's copy",
   "execs let through without their walk" (`--json`: `env_truncated`,
