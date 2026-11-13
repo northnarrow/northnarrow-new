@@ -177,21 +177,15 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
 /// environment of the process `dir` (`/proc/<pid>`), the exec's process
 /// that started at `start_ns` — an entry named so, as glibc's `getenv`
 /// finds it. `None` when it cannot be told: its start unknown or not the
-/// exec's (the pid reused), its memory gone before or after the read (it
-/// exited: an empty environment), the read failed, or the environment is
-/// larger than [`MAX_ENVIRON`].
+/// exec's (the pid reused), its memory gone (it exited: a process past its
+/// exit reads an empty environment), the read failed, or the environment
+/// is larger than [`MAX_ENVIRON`]. Checked after the read: a pid is not
+/// reused before its process is reaped, so the exec's process with its
+/// memory then is the one whose environment was read, whole.
 fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
     use crate::response::proc_ref::{started_at, stat_start_ticks};
     use std::io::Read;
     if start_ns == 0 {
-        return None;
-    }
-    let running = || {
-        let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
-        let ticks = stat_start_ticks(&stat)?;
-        Some(started_at(ticks, start_ns) && super::kmod_exec::has_memory(&stat))
-    };
-    if running() != Some(true) {
         return None;
     }
     let mut env = Vec::new();
@@ -199,7 +193,12 @@ fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env))
         .ok()?;
     // after the read: still the exec's process, still with its memory
-    if running() != Some(true) || env.len() as u64 > MAX_ENVIRON {
+    let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
+    let ticks = stat_start_ticks(&stat)?;
+    if !started_at(ticks, start_ns)
+        || !super::kmod_exec::has_memory(&stat)
+        || env.len() as u64 > MAX_ENVIRON
+    {
         return None;
     }
     Some(
@@ -789,8 +788,9 @@ mod tests {
         assert_eq!(read(97, sc, &rotate, p, ("Z", ticks, 4096)), 0);
         assert_eq!(read(98, sc, &rotate, p, ("S", ticks, 0)), 0);
         assert_eq!(read(99, sc, &rotate, p, ("S", ticks + 360_000, 4096)), 0);
+        // (a process of the boot's first tick: its start would pass for 0)
+        read(100, sc, &rotate, p, ("S", 1, 4096));
         let mut e = spawn(100, Default::default(), sc, &rotate);
-        proc_with(proc.path(), 100, Path::new("/usr/bin/env"), p, None);
         if let Event::ProcessSpawn { start_ns, .. } = &mut e {
             *start_ns = 0;
         }
