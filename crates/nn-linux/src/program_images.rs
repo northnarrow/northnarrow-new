@@ -61,11 +61,14 @@ const WHOLE_LEN: u64 = 4 << 20;
 const EDGE: u64 = 1 << 20;
 const BLOCK: u64 = 64 << 10;
 const BLOCKS: u64 = 8;
-/// The bytes the compares may read in a second (both files counted).
+/// The bytes one uid's compares may read in a second (both files counted).
 const BUDGET_PER_SECOND: u64 = 64 << 20;
+/// … and every uid's together (the re-check 2 of #549, N1: a user with
+/// many host uids — the subuids rootless podman maps — reads no more).
+const GLOBAL_BUDGET_PER_SECOND: u64 = 128 << 20;
 /// The answers remembered, by file, at most (the oldest out).
 const MEMO_CAP: usize = 1024;
-/// The uids whose budgets are kept at once.
+/// The uids whose budgets are kept at once (the least recently used out).
 const UIDS_CAP: usize = 256;
 
 /// Lot 313 (the re-check of #549, R2): where the distributions install the
@@ -94,21 +97,32 @@ type Memo = (HashMap<FileKey, Option<ProgramKind>>, VecDeque<FileKey>);
 /// for `status`.
 pub struct Bounds {
     memo: Mutex<Memo>,
-    /// The bytes each uid's compares read in its current second (the
-    /// re-check of #549, R1: one user's flood spends only that user's).
-    spent: Mutex<HashMap<u32, (Instant, u64)>>,
+    spent: Mutex<Spent>,
     budget: u64,
+    global_budget: u64,
     compared: AtomicU64,
     skipped: AtomicU64,
     remembered: AtomicU64,
 }
 
+/// The bytes the compares read in the current second: each uid's (the
+/// re-check of #549, R1: one user's flood spends only that user's) and all
+/// of them (its re-check 2, N1).
+#[derive(Default)]
+struct Spent {
+    /// uid → (its second's start, the bytes it read in it, its last take).
+    uids: HashMap<u32, (Instant, u64, Instant)>,
+    /// every uid's: (the second's start, the bytes read in it).
+    all: Option<(Instant, u64)>,
+}
+
 impl Bounds {
-    fn new(budget: u64) -> Self {
+    fn new(budget: u64, global_budget: u64) -> Self {
         Self {
             memo: Mutex::new((HashMap::new(), VecDeque::new())),
-            spent: Mutex::new(HashMap::new()),
+            spent: Mutex::new(Spent::default()),
             budget,
+            global_budget,
             compared: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             remembered: AtomicU64::new(0),
@@ -131,31 +145,53 @@ impl Bounds {
         }
     }
 
-    /// `bytes` taken from `uid`'s budget for this second; `false` when they
-    /// do not fit.
+    /// `bytes` taken from `uid`'s budget and from every uid's for this
+    /// second; `false` when they do not fit in either (nothing is taken).
     fn take(&self, uid: u32, bytes: u64, now: Instant) -> bool {
+        let second = Duration::from_secs(1);
         let mut s = self.spent.lock();
-        if s.len() >= UIDS_CAP && !s.contains_key(&uid) {
-            s.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(1));
-            if s.len() >= UIDS_CAP {
-                // a host with that many users busy at once: start over
-                s.clear();
+        let all = match s.all {
+            Some((t, n)) if now.duration_since(t) < second => (t, n),
+            _ => (now, 0),
+        };
+        if all.1.saturating_add(bytes) > self.global_budget {
+            s.all = Some(all);
+            return false;
+        }
+        if s.uids.len() >= UIDS_CAP && !s.uids.contains_key(&uid) {
+            s.uids
+                .retain(|_, (t, _, _)| now.duration_since(*t) < second);
+            // never all of them at once (the re-check 2 of #549, N1: that
+            // gave each uid its budget again): the least recently used out
+            while s.uids.len() >= UIDS_CAP {
+                let Some(oldest) = s
+                    .uids
+                    .iter()
+                    .min_by_key(|(_, (_, _, last))| *last)
+                    .map(|(uid, _)| *uid)
+                else {
+                    break;
+                };
+                s.uids.remove(&oldest);
             }
         }
-        let e = s.entry(uid).or_insert((now, 0));
-        if now.duration_since(e.0) >= Duration::from_secs(1) {
-            *e = (now, 0);
+        let e = s.uids.entry(uid).or_insert((now, 0, now));
+        if now.duration_since(e.0) >= second {
+            (e.0, e.1) = (now, 0);
         }
-        if e.1 + bytes > self.budget {
+        e.2 = now;
+        if e.1.saturating_add(bytes) > self.budget {
             return false;
         }
         e.1 += bytes;
+        s.all = Some((all.0, all.1 + bytes));
         true
     }
 }
 
 /// The content check's bounds: one exec pump, one host.
-static BOUNDS: LazyLock<Bounds> = LazyLock::new(|| Bounds::new(BUDGET_PER_SECOND));
+static BOUNDS: LazyLock<Bounds> =
+    LazyLock::new(|| Bounds::new(BUDGET_PER_SECOND, GLOBAL_BUDGET_PER_SECOND));
 
 /// Lot 313 (F1): the content check since the agent's start — running images
 /// compared, execs not compared because the second's budget was spent, and
@@ -618,7 +654,7 @@ mod tests {
         std::fs::create_dir_all(proc_root.join("31390")).unwrap();
         symlink(&x, proc_root.join("31390/exe")).unwrap();
         let e = exec(31390, 1, outbound());
-        let bounds = Bounds::new(BUDGET_PER_SECOND);
+        let bounds = Bounds::new(BUDGET_PER_SECOND, GLOBAL_BUDGET_PER_SECOND);
         let t0 = Instant::now();
         read_and_keep_with(&e, &proc_root, &bounds);
         let first = t0.elapsed();
@@ -650,7 +686,7 @@ mod tests {
         put(r, "/usr/bin/python3.12", &content);
         refresh_under(r);
         let proc_root = r.join("proc");
-        let bounds = Bounds::new(3 * compare_cost(n as u64));
+        let bounds = Bounds::new(3 * compare_cost(n as u64), u64::MAX);
         for i in 0..10u32 {
             let mut near = content.clone();
             near[n - 1] = i as u8 ^ 0xff;
@@ -740,7 +776,7 @@ mod tests {
         put(r, "/usr/bin/perl5.40", &content);
         refresh_under(r);
         let proc_root = r.join("proc");
-        let bounds = Bounds::new(compare_cost(n as u64));
+        let bounds = Bounds::new(compare_cost(n as u64), u64::MAX);
         let as_uid = |pid: u32, uid: u32, tail: u8| {
             let mut near = content.clone();
             near[n - 1] = tail;
@@ -769,6 +805,89 @@ mod tests {
         let gone = exec(31_503, 1, outbound());
         read_and_keep_with(&gone, &proc_root, &bounds);
         assert!(program_identity::unverified(&gone));
+    }
+
+    /// The re-check 2 of #549 (N1), the reviewer's probe: 300 uids (the
+    /// subuids rootless podman maps) each asking for a whole budget, twice
+    /// in one second, are granted the global budget in all — never 64 MiB
+    /// each (the full uid table was cleared: 38,400 MiB in one second).
+    #[test]
+    fn many_uids_share_one_global_budget() {
+        let b = Bounds::new(BUDGET_PER_SECOND, GLOBAL_BUDGET_PER_SECOND);
+        let now = Instant::now();
+        let take_all = |at: Instant| {
+            (0..300u32)
+                .filter(|uid| b.take(100_000 + uid, BUDGET_PER_SECOND, at))
+                .count() as u64
+        };
+        let granted = take_all(now);
+        let again = take_all(now + Duration::from_millis(500));
+        assert!(
+            (granted + again) * BUDGET_PER_SECOND <= GLOBAL_BUDGET_PER_SECOND,
+            "{granted} then {again} uids granted 64 MiB in one second"
+        );
+        assert_eq!(granted, GLOBAL_BUDGET_PER_SECOND / BUDGET_PER_SECOND);
+        assert_eq!(again, 0);
+        // the next second: the global budget again, no more
+        let next = take_all(now + Duration::from_millis(1500));
+        assert_eq!(next, GLOBAL_BUDGET_PER_SECOND / BUDGET_PER_SECOND);
+    }
+
+    /// The re-check 2 of #549 (N1): a full uid table loses its least
+    /// recently used uid, never every uid's spent budget.
+    #[test]
+    fn a_full_uid_table_evicts_one_never_clears() {
+        let b = Bounds::new(1000, u64::MAX);
+        let now = Instant::now();
+        let at = |us: u64| now + Duration::from_micros(us);
+        for uid in 0..UIDS_CAP as u32 {
+            assert!(b.take(uid, 1000, at(uid.into())), "uid {uid}");
+        }
+        // uid 0 asks again (refused): uid 1 is now the least recently used
+        assert!(!b.take(0, 1, at(299)));
+        assert!(b.take(70_000, 1000, at(300)), "a new uid, the table full");
+        assert_eq!(b.spent.lock().uids.len(), UIDS_CAP);
+        assert!(
+            !b.spent.lock().uids.contains_key(&1),
+            "the least recent out"
+        );
+        for uid in (0..UIDS_CAP as u32).filter(|uid| *uid != 1) {
+            assert!(!b.take(uid, 1, at(400)), "uid {uid}'s budget kept spent");
+        }
+    }
+
+    /// The re-check 2 of #549 (N1): past the global budget an exec of
+    /// another uid is not compared — counted, and unverified, as past its
+    /// own budget.
+    #[test]
+    fn past_the_global_budget_an_exec_is_unverified() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let n = (6usize << 20) + 241;
+        let content: Vec<u8> = (0..n).map(|i| (i % 241) as u8).collect();
+        put(r, "/usr/bin/perl5.42", &content);
+        refresh_under(r);
+        let proc_root = r.join("proc");
+        let bounds = Bounds::new(u64::MAX, compare_cost(n as u64));
+        let as_uid = |pid: u32, uid: u32, tail: u8| {
+            let mut near = content.clone();
+            near[n - 1] = tail;
+            let x = put(r, &format!("/home/u{uid}/x{pid}"), &near);
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            symlink(&x, proc_root.join(format!("{pid}/exe"))).unwrap();
+            let mut e = exec(pid, 1, outbound());
+            if let Event::ProcessSpawn { uid: u, .. } = &mut e {
+                *u = uid;
+            }
+            read_and_keep_with(&e, &proc_root, &bounds);
+            e
+        };
+        let a = as_uid(31_600, 165_536, 1);
+        let b = as_uid(31_601, 165_537, 2);
+        assert!(!program_identity::unverified(&a), "the first, compared");
+        assert!(program_identity::unverified(&b), "the global budget spent");
+        assert_eq!(bounds.compared.load(Ordering::Relaxed), 1);
+        assert_eq!(bounds.skipped.load(Ordering::Relaxed), 1);
     }
 
     /// The re-check of #549 (R2): the installed dynamic loader is recorded,

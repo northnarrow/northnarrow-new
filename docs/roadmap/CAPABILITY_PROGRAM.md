@@ -9395,6 +9395,10 @@ number in parentheses is a lab PR.
     is the loader (recorded with the shells). Residuals listed: a `#!`
     script socat starts (lot 329), socat's `\` inside single quotes, `/opt`
     counted as a system tree.
+    The re-check 2 (N1): the per-user budget has a global ceiling (128 MiB
+    a second in all) and a full uid table loses its least recently used
+    uid, never every budget (300 uids twice in one second were granted
+    38,400 MiB).
     **Open (lot 331)**: the LOTL shape encryption tool + `rm` is decisive in
     the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
     r4: one inline and one interactive session — the files encrypted and

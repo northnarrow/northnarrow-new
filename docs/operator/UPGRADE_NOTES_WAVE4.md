@@ -1568,8 +1568,11 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   an answer is remembered by the file's device, inode, size and change
   time; a file is compared whole up to 4 MiB, by samples above (its first
   and last MiB and eight blocks between); each user's compares share 64
-  MiB a second (one user's flood spends only that user's), past which an
-  exec is not compared — judged by its name, and, for an image a user can
+  MiB a second (one user's flood spends only that user's) and all users'
+  128 MiB (a user with many host uids, the subuids rootless podman maps,
+  reads no more; the least recently used of 256 uids kept makes room),
+  past either of which an exec is not compared — judged by its name,
+  and, for an image a user can
   write with its stdin or stdout on a socket or a parent whose stdio is
   one connected out (the pty-wrapped shape), recorded High, "identity
   unverified"; an image the pump cannot open (a user's FUSE mount without
