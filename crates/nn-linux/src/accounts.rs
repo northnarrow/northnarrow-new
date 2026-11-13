@@ -28,7 +28,7 @@ const PASSWD: &str = "/etc/passwd";
 const READ_MAX: u64 = 16 << 20;
 
 /// A file's identity and version: device, inode, mtime (s, ns), size.
-type Stamp = Option<(u64, u64, i64, i64, u64)>;
+pub(crate) type Stamp = Option<(u64, u64, i64, i64, u64)>;
 
 #[derive(Default)]
 struct Table {
@@ -41,7 +41,7 @@ struct Table {
 /// when it changes.
 static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
 
-fn stamp(path: &str) -> Stamp {
+pub(crate) fn stamp(path: &str) -> Stamp {
     crate::response::on_host_path(Path::new(path), |p| std::fs::metadata(p))
         .ok()
         .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.len()))

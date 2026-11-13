@@ -29,17 +29,32 @@
 //! the stack depth of every subprogram — a few lines), the second, for the
 //! refused programs only, with the full trace.
 //!
-//! Exit 0 when every program the agent needs loads, 1 when one is refused
-//! (or its attach target is missing where the agent requires it), 2 when the
-//! run could not start (not root, no object, BTF unusable). Programs that do
-//! not count: the sensor-feasibility probes (`probe_*`, lab only), and an
-//! optional deny hook (`anti_tamper::OPTIONAL_DENY_HOOKS`) this kernel does
-//! not have.
+//! Lot 332: the headroom. Every program the agent needs is measured — the
+//! instructions the verifier processed to accept it — and the run fails
+//! when one is above the budget (900,000 of the verifier's million,
+//! [`HEADROOM_BUDGET`](crate::verifier_headroom::HEADROOM_BUDGET)) or could
+//! not be measured (`crate::verifier_headroom`). The count
+//! is the kernel's `bpf_prog_info.verified_insns` where it hands it out
+//! (5.16 and later); on older kernels (5.15) the loader keeps no verifier
+//! log of an accepted program, so the same counter is read by a kprobe
+//! event (`InsnProbe`) on `check_max_stack_depth`, the verifier's last
+//! pass over an accepted program, in a tracing instance of this run's own.
+//! Where both exist the two are compared (the report's cross-check line).
+//! The report ends with the ten highest and the verdict line
+//! (`== verifier headroom <kernel>: OK|FAIL — …`).
+//!
+//! Exit 0 when every program the agent needs loads within the budget, 1
+//! when one is refused (or its attach target is missing where the agent
+//! requires it), over the budget or unmeasured, 2 when the run could not
+//! start (not root, no object, BTF unusable). Programs that do not count:
+//! the sensor-feasibility probes (`probe_*`, lab only), and an optional deny
+//! hook (`anti_tamper::OPTIONAL_DENY_HOOKS`) this kernel does not have.
 //!
 //! Lab knobs (environment): `NN_VERIFIER_CHECK_OBJECT=<file>` loads that
 //! object instead of the embedded one (to iterate on the eBPF half without
 //! rebuilding the agent); `NN_VERIFIER_CHECK_ONLY=<name,…>` loads only the
-//! programs named.
+//! programs named; `NN_VERIFIER_CHECK_BUDGET=<n>` lowers the budget (never
+//! raises it).
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
@@ -58,6 +73,7 @@ use sha2::{Digest, Sha256};
 use crate::anti_tamper::btf_revalidate::{self, RefuseReason, ResolveOutcome};
 use crate::anti_tamper::OPTIONAL_DENY_HOOKS;
 use crate::sensors::ebpf_object::EBPF_BYTES;
+use crate::verifier_headroom::{self, Measured, ProbeOffsets, BUDGET_ENV};
 
 /// Maps the object pins by name land here, away from the agent's pin root.
 const PIN_DIR: &str = "/sys/fs/bpf/nn-verifier-check";
@@ -96,6 +112,12 @@ enum Outcome {
     Loaded {
         insns: Option<u32>,
         verified: Option<u32>,
+        /// Lot 332: the kprobe's count of this load ([`InsnProbe`]).
+        kprobe: Option<u32>,
+        /// The review of #551 (F3): its tag (the program info's), by which
+        /// the kprobe's line of this load is told from another program's
+        /// with the same 15-byte name.
+        tag: Option<u64>,
         stack: Option<Stack>,
     },
     /// The attach target is not in this kernel's BTF (aya refuses before
@@ -193,6 +215,30 @@ fn execute() -> Result<bool> {
     }
     let btf = Btf::from_sys_fs().context("loading the vmlinux BTF")?;
 
+    // Lot 332: the budget, and the kprobe for kernels whose program info
+    // has no count.
+    let (budget, budget_note) =
+        verifier_headroom::budget_from(std::env::var(BUDGET_ENV).ok().as_deref());
+    if let Some(n) = budget_note {
+        println!("budget: {n}");
+    }
+    let probe = match InsnProbe::arm() {
+        Ok(p) => {
+            println!(
+                "processed: the program info's count where the kernel gives one; kprobe on \
+                 {KPROBE_FUNC} armed ({})",
+                p.fetch
+            );
+            Some(p)
+        }
+        Err(e) => {
+            println!(
+                "processed: the program info's count only; kprobe on {KPROBE_FUNC} unavailable ({e})"
+            );
+            None
+        }
+    };
+
     // Pass 1: every program, statistics-only logs.
     let mut rows = Vec::new();
     {
@@ -203,10 +249,16 @@ fn execute() -> Result<bool> {
                 continue;
             }
             let section = sections.get(&name).cloned().unwrap_or_default();
-            let outcome = match ebpf.program_mut(&name) {
+            if let Some(p) = &probe {
+                p.clear();
+            }
+            let mut outcome = match ebpf.program_mut(&name) {
                 Some(p) => load_one(p, &section, &btf),
                 None => Outcome::Error("not in the loaded object".into()),
             };
+            if let (Some(p), Outcome::Loaded { kprobe, tag, .. }) = (&probe, &mut outcome) {
+                *kprobe = tag.and_then(|t| p.count(&name, t));
+            }
             let optional = optional_reason(&name, &section, &outcome);
             rows.push(Row {
                 name,
@@ -292,6 +344,8 @@ fn execute() -> Result<bool> {
         println!("verifier logs: {}", dir.display());
     }
 
+    drop(probe);
+
     let failures: Vec<&Row> = rows.iter().filter(|r| r.counts_as_failure()).collect();
     println!();
     println!(
@@ -317,7 +371,28 @@ fn execute() -> Result<bool> {
             )
         }
     );
-    Ok(failures.is_empty())
+
+    // Lot 332: the headroom of every loaded program the agent needs.
+    let measured: Vec<Measured> = rows
+        .iter()
+        .filter(|r| r.optional.is_none())
+        .filter_map(|r| match &r.outcome {
+            Outcome::Loaded {
+                verified, kprobe, ..
+            } => Some(Measured {
+                name: r.name.clone(),
+                info: *verified,
+                kprobe: *kprobe,
+            }),
+            _ => None,
+        })
+        .collect();
+    let verdict = verifier_headroom::judge(&measured, budget);
+    println!();
+    for l in verifier_headroom::report(&kernel, &verdict) {
+        println!("{l}");
+    }
+    Ok(failures.is_empty() && verdict.passes())
 }
 
 /// The object to check: the embedded one, or [`OBJECT_ENV`]'s file (copied
@@ -432,6 +507,8 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
                     .and_then(|i| i.size_translated())
                     .map(|b| b / 8),
                 verified: info.as_ref().and_then(|i| i.verified_instruction_count()),
+                kprobe: None,
+                tag: info.as_ref().map(|i| i.tag()),
                 stack,
             }
         }
@@ -488,17 +565,24 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
 
 fn print_table(rows: &[Row]) {
     println!();
-    println!("| program | section | result | insns | verified | stack frame / chain | note |");
+    println!("| program | section | result | insns | processed | stack frame / chain | note |");
     println!("|---|---|---|---:|---:|---|---|");
     for r in rows {
         let (insns, verified, stack, note) = match &r.outcome {
             Outcome::Loaded {
                 insns,
                 verified,
+                kprobe,
                 stack,
+                ..
             } => (
                 opt(*insns),
-                opt(*verified),
+                // lot 332: the kprobe's count where the program info has none
+                match (verified, kprobe) {
+                    (Some(n), _) => n.to_string(),
+                    (None, Some(k)) => format!("{k} (kprobe)"),
+                    (None, None) => "n/a".into(),
+                },
                 stack.as_ref().map_or_else(
                     || "n/a".to_string(),
                     |s| format!("{} / {} of {MAX_BPF_STACK}", s.frame, s.chain),
@@ -598,6 +682,168 @@ fn chain(e: &dyn std::error::Error) -> String {
         cur = c.source();
     }
     s
+}
+
+// ───────────────────── lot 332: the count on 5.15 ──────────────────────
+
+/// Where tracefs is mounted (systemd mounts it at the first; older setups
+/// reach it through debugfs).
+const TRACEFS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+/// The kprobe event's group, its event, and this run's tracing instance
+/// (named after the group).
+const KPROBE_GROUP: &str = "nn_verifier_check";
+const KPROBE_EVENT: &str = "insn_processed";
+/// The verifier's last pass over a program it accepted (every kernel from
+/// 5.2 to 7.0 calls it once per load, after the instructions are all
+/// processed): its first argument is the verifier's state.
+const KPROBE_FUNC: &str = "check_max_stack_depth";
+const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
+
+/// The verifier's own count of each load (`bpf_verifier_env.insn_processed`)
+/// read by a kprobe event — the count 5.15's program info does not carry,
+/// and the loader keeps no verifier log of an accepted program to read it
+/// from. The event is created for this run and enabled only in a tracing
+/// instance of its own (the system's trace buffer is never touched), with
+/// its pid filter on this process; the buffer is cleared before each load
+/// and read after it. Everything is removed when it is dropped, and a
+/// leftover of a killed run is removed first.
+struct InsnProbe {
+    tracing: PathBuf,
+    instance: PathBuf,
+    /// How the first argument is fetched (`$arg1`, or the register).
+    fetch: &'static str,
+}
+
+impl InsnProbe {
+    fn arm() -> std::result::Result<Self, String> {
+        let tracing = TRACEFS
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.join("kprobe_events").exists())
+            .ok_or_else(|| {
+                "no tracefs with kprobe_events (CONFIG_KPROBE_EVENTS, tracefs mounted)".to_string()
+            })?;
+        let q: [(&str, &[&str]); 5] = [
+            ("bpf_verifier_env", &["insn_processed"]),
+            ("bpf_verifier_env", &["prog"]),
+            ("bpf_prog", &["aux"]),
+            ("bpf_prog_aux", &["name"]),
+            ("bpf_prog", &["tag"]),
+        ];
+        let found = btf_revalidate::resolve_fields_from(Path::new(VMLINUX_BTF), &q)?;
+        let mut offs = [0usize; 5];
+        for (i, r) in found.into_iter().enumerate() {
+            offs[i] = r.map_err(|e| format!("{}.{}: {e}", q[i].0, q[i].1.join(".")))?;
+        }
+        let o = ProbeOffsets {
+            insn_processed: offs[0],
+            prog: offs[1],
+            aux: offs[2],
+            name: offs[3],
+            tag: offs[4],
+        };
+        let mut probe = Self {
+            instance: tracing.join("instances").join(KPROBE_GROUP),
+            tracing,
+            fetch: "",
+        };
+        probe.teardown();
+        fs::create_dir(&probe.instance)
+            .map_err(|e| format!("creating {}: {e}", probe.instance.display()))?;
+        // `$arg1` where the kernel has argument access; the register of the
+        // first argument otherwise
+        let mut fetches = vec!["$arg1"];
+        if cfg!(target_arch = "x86_64") {
+            fetches.push("%di");
+        } else if cfg!(target_arch = "aarch64") {
+            fetches.push("%x0");
+        }
+        let mut last = String::new();
+        for f in fetches {
+            let def =
+                verifier_headroom::kprobe_definition(KPROBE_GROUP, KPROBE_EVENT, KPROBE_FUNC, f, o);
+            match append_line(&probe.tracing.join("kprobe_events"), &def) {
+                Ok(()) => {
+                    probe.fetch = f;
+                    break;
+                }
+                Err(e) => last = format!("{def}: {e}"),
+            }
+        }
+        if probe.fetch.is_empty() {
+            return Err(format!("the kprobe event was refused ({last})"));
+        }
+        let event = probe
+            .instance
+            .join("events")
+            .join(KPROBE_GROUP)
+            .join(KPROBE_EVENT);
+        // this process's loads only. The review of #551 (F3): or no probe —
+        // a foreign loader's line could be taken for one of ours (on 5.15
+        // every program is then unmeasured, and the gate fails)
+        write_file(
+            &probe.instance.join("set_event_pid"),
+            &std::process::id().to_string(),
+        )
+        .map_err(|e| format!("the probe's pid filter: {e}"))?;
+        write_file(&event.join("enable"), "1")?;
+        Ok(probe)
+    }
+
+    /// Empty the instance's buffer (before a load).
+    fn clear(&self) {
+        let _ = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(self.instance.join("trace"));
+    }
+
+    /// The count of `prog`'s load (its program info's `tag`), from the
+    /// buffer (after it).
+    fn count(&self, prog: &str, tag: u64) -> Option<u32> {
+        match fs::read_to_string(self.instance.join("trace")) {
+            Ok(t) => verifier_headroom::count_in_trace(&t, prog, tag),
+            Err(_) => None,
+        }
+    }
+
+    /// Disable the event, remove the instance, then the event (each step
+    /// tolerates what is already gone).
+    fn teardown(&self) {
+        let event = self
+            .instance
+            .join("events")
+            .join(KPROBE_GROUP)
+            .join(KPROBE_EVENT);
+        let _ = write_file(&event.join("enable"), "0");
+        let _ = fs::remove_dir(&self.instance);
+        let _ = append_line(
+            &self.tracing.join("kprobe_events"),
+            &format!("-:{KPROBE_GROUP}/{KPROBE_EVENT}"),
+        );
+    }
+}
+
+impl Drop for InsnProbe {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+/// One line appended to a tracefs control file. Never truncating:
+/// `kprobe_events` opened with `O_TRUNC` would remove every kprobe event of
+/// the system, not only ours.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().append(true).open(path)?;
+    f.write_all(format!("{line}\n").as_bytes())
+}
+
+fn write_file(path: &Path, text: &str) -> std::result::Result<(), String> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 // ───────────────────────── the object's sections ─────────────────────────

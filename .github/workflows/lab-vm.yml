@@ -323,6 +323,39 @@ jobs:
         timeout-minutes: 100
         run: deploy/lab/nn-lab.sh build
 
+      # Lot 332: every program of the eBPF object through this kernel's
+      # verifier, and its headroom — the instructions the verifier processed
+      # to accept each program the agent needs, at most 900,000 of its
+      # million per load (5.15's count read by a kprobe event). An alpha
+      # tester's kernel can refuse a program the lab's kernels take near the
+      # limit. Before the install, so no agent is stopped for it. A failure
+      # is this step's, with the report's verdict line as the error; the
+      # suites still run, and the summary step fails the job on its outcome.
+      - name: nn-lab.sh verifier-check (every program loads, within 900,000 processed instructions)
+        if: steps.kvm.outputs.available == 'true'
+        id: verifier
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set +e
+          deploy/lab/nn-lab.sh verifier-check 2>&1 | tee "$GATE_OUT/verifier-check.md"
+          rc=${PIPESTATUS[0]}
+          loads=$(grep -E '^== verifier-check ' "$GATE_OUT/verifier-check.md" | tail -1)
+          headroom=$(grep -E '^== verifier headroom ' "$GATE_OUT/verifier-check.md" | tail -1)
+          {
+            echo "### Verifier check on \`$NN_LAB_DISTRO\`"
+            echo
+            echo "${loads:-no verifier-check summary line}"
+            echo
+            echo "${headroom:-no verifier headroom line}"
+            echo
+            sed -n '/^top 10 by instructions processed:/,/^$/p;/^| # | program |/,/^$/p' "$GATE_OUT/verifier-check.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" != 0 ]; then
+            echo "::error title=verifier headroom ($NN_LAB_DISTRO)::${headroom:-no headroom verdict} | ${loads:-verifier-check exited $rc without a summary}"
+            exit 1
+          fi
+
       - name: nn-lab.sh install (install.sh, both units started)
         if: steps.kvm.outputs.available == 'true'
         id: install
@@ -356,6 +389,7 @@ jobs:
             up=${{ steps.up.outcome }}
             sync=${{ steps.sync.outcome }}
             build=${{ steps.build.outcome }}
+            verifier-check=${{ steps.verifier.outcome }}
             install=${{ steps.install.outcome }}
             test-ignored=${{ steps.ignored.outcome }}
           GUEST_DIR: ${{ steps.image.outputs.lab_dir }}

@@ -1812,8 +1812,75 @@ are judged as before; `CHANGELOG.md` has the detail.
   resolver's legs that cannot be traced to the process that asked stay one
   Medium record each and are no longer a High "tunnel" of the resolver. The
   `DnsQuery` event gained `known_resolver` (absent when false).
+## 35. The verifier's headroom, and shares an account's (lot 332)
 
-## 35. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
+- **`deploy/lab/nn-lab.sh verifier-check` fails above 900,000** processed
+  instructions for any program the agent needs, or when it cannot measure
+  one (lab builds only; the agent itself is unchanged by it). It measures
+  5.15 too, with a kprobe event on `check_max_stack_depth` created for the
+  run in a tracing instance of its own (`instances/nn_verifier_check`),
+  filtered on its own pid (a filter that cannot be set is no probe), each
+  load's line found by its program's tag; `nn-lab.sh` removes the instance
+  and the event before and after every run, a killed one included. A lab
+  that runs it on a kernel without kprobe events or tracefs and without
+  `verified_insns` (before 5.16) gets a failure, "unmeasured". `NN_VERIFIER_CHECK_BUDGET` lowers the budget, never raises
+  it. The nightly `lab-vm.yml` runs it on every guest
+  ([kernel compatibility, "Verifier headroom"](https://github.com/northnarrow/northnarrow-new/blob/main/docs/operator/KERNEL_COMPATIBILITY.md)).
+- **The file-open sensor runs as global functions** (`nn_open_class`,
+  `nn_open_count_write`, `nn_open_observe`): the same reads, judgments and
+  records in the same order; a tool that dumps the program sees them as
+  its subprograms. `fim_file_open_sensor` processes 144,600 instructions
+  on 5.15 where it processed 821,228.
+- **The FIM buffers' and the exec quarantine's shares are an account's**:
+  the uid in the initial user namespace; in a user namespace, the account
+  that made the outermost one, or that namespace when root made it (one
+  share per system container). They were the login uid's, which a
+  service's children set to any value. A root session (`sudo -i`) now
+  counts in root's share, not the login's. Three optional BTF offsets
+  (`user_namespace.parent`, `.level`, `.owner`; the slots after them move
+  by three, an agent and its object are one build): without them a task's
+  share is its uid's.
+- **A user's subordinate uids count as the user's** (the review of #551,
+  F1): the agent publishes `/etc/subuid` into an LPM trie (`SHARE_SUBUID`,
+  16,384 entries, 16,383 used — one kept free for an in-place rewrite on
+  kernels before the upstream fix for full LPM tries —, about 1,300 users'
+  ranges; read again within 2 s of a
+  change to `/etc/subuid` or `/etc/passwd`, a thread `nn-subuid`), and a
+  uid of a range, taken as a real uid in the initial namespace or the
+  creator of a namespace, is its owner's share. A uid of the ranges' span
+  no single owner is known for — an owner name `/etc/passwd` does not
+  resolve (an LDAP account's range is not resolved through NSS), two
+  users' ranges overlapping, a gap between ranges, a range past the trie's
+  room — counts in the overflow row (one share, the same cap), never in a
+  share of its own; an `/etc/subuid` that cannot be read puts every uid
+  from 65,536 up there (logged). An account whose uid lies inside another
+  account's range counts as that account's — except in a range root owns
+  (LXD, Incus: `root:1000000:1000000000`), which is a reserved row of its
+  own (`ROOT_SUBID_SHARE`, the per-share cap), never root's: a domain
+  account (sssd, FreeIPA) with a uid there cannot fill root's row (the
+  re-check of #551, G1). An account whose uid lies in a gap between
+  ranges, or in a range whose owner is not known, counts in the overflow
+  row. A range's start and count are read in decimal, as `useradd` writes
+  them: a line `newuidmap` would read in hex is skipped, one with a
+  leading `0` is read as decimal. `/etc/subgid` is not read (the key is a
+  uid). What a task still chooses: a namespace root made is one
+  share per namespace, so a setuid-root helper that makes one per run
+  (firejail, a setuid bwrap) gives its caller one share per run; ranges
+  served by NSS (`subid:` in `nsswitch.conf`) are not published.
+- **A global cap on each shares' map**: past the map's room less one
+  share's (3,072 of the quarantine's 4,096 candidates, 49,152 of the FIM
+  sensor's 65,536 buffers), a share holding a 64th of a share or more takes
+  no more — the FIM open is then judged in its run's own buffer, as past a
+  share's cap; a candidate is dropped (`CAND_DROPPED`, signed with the
+  quarantine's fail-opens). The cap holds back greedy shares; 64 more
+  shares still take their floor, so the map's room stays the bound on how
+  many shares fit.
+- **A full candidates' map evicts its oldest held candidate**, found by
+  walking the map (a candidate made at least a second ago), where the
+  first 8 slots of a ring could all be gone ones. Kernel 5.13 or later
+  (`bpf_for_each_map_elem`), as every kernel the agent supports.
+
+## 37. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
 
 - **A fresh install is observe-only and starts.** `install.sh` on a host
   without `/etc/northnarrow/install-manifest.json` records the `alpha`

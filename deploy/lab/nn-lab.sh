@@ -1490,6 +1490,21 @@ cmd_release_check() {
     return "$rc"
 }
 
+# >>> verifier-check-teardown
+# Lot 332 (the review of #551, F2): what `verifier-check` arms in the guest
+# — its tracing instance and its kprobe event on check_max_stack_depth
+# (crates/nn-linux/src/verifier_check.rs, `InsnProbe`) — removed whatever
+# became of the run. The agent removes them itself, but not when it dies
+# on a panic (release builds abort) or a signal (the step's timeout, a lost
+# ssh session): then the event stayed enabled in the instance, and the
+# install and the suites ran with it. Run as root in the guest before and
+# after every run. POSIX sh on one line, each step tolerating what is
+# already gone, `kprobe_events` only appended to (never truncated: that
+# would remove every kprobe event of the system); $@: tracefs mount points.
+VC_TEARDOWN='for t in "$@"; do [ -e "$t/kprobe_events" ] || continue; i="$t/instances/nn_verifier_check"; e="$i/events/nn_verifier_check/insn_processed/enable"; if [ -e "$e" ]; then echo 0 > "$e"; fi; if [ -d "$i" ]; then rmdir "$i"; fi; if grep -q "^p:nn_verifier_check/insn_processed " "$t/kprobe_events"; then echo "-:nn_verifier_check/insn_processed" >> "$t/kprobe_events"; fi; done 2>/dev/null; exit 0'
+VC_TRACEFS='/sys/kernel/tracing /sys/kernel/debug/tracing'
+# <<< verifier-check-teardown
+
 cmd_verifier_check() {
     # Every program of the eBPF object through this guest's verifier, with
     # the agent's own loader setup (northnarrow-agent --verifier-check, from
@@ -1499,6 +1514,10 @@ cmd_verifier_check() {
     # `synced` checks the object `sync` copied (agent-ebpf/target/…) instead
     # of the embedded one: an eBPF change without rebuilding the agent.
     # Report and the refused programs' full verifier logs: $LAB_DIR/reports.
+    # Lot 332: the run also fails when a program the agent needs processed
+    # more than 900,000 instructions (its verifier headroom; the kprobe gives
+    # 5.15's count) — NN_VERIFIER_CHECK_BUDGET lowers that budget, never
+    # raises it.
     vm_running || die "guest is not running"
     local stamp out logs remote was_active=0 rc=0 obj_env=""
     stamp=$(date -u +%Y%m%d-%H%M%S)
@@ -1510,12 +1529,21 @@ cmd_verifier_check() {
         synced) obj_env='NN_VERIFIER_CHECK_OBJECT=$HOME/northnarrow/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf ' ;;
         *) die "verifier-check: unknown argument ${1} (expected: synced)" ;;
     esac
-    local only=${NN_VERIFIER_CHECK_ONLY:-}
+    local only=${NN_VERIFIER_CHECK_ONLY:-} budget=${NN_VERIFIER_CHECK_BUDGET:-}
     if vssh 'systemctl is-active --quiet northnarrow-agent'; then
         was_active=1
         lab_purge_pins >/dev/null
     fi
-    vssh "sudo ${obj_env}${only:+NN_VERIFIER_CHECK_ONLY=$(printf %q "$only") }\$HOME/northnarrow/target/release/northnarrow-agent --verifier-check" | tee "$out" || rc=$?
+    # the review of #551 (F2): a leftover of a run that died is removed
+    # first; this run's in the same ssh session as soon as the agent
+    # returns, however it ended, then again from here (the session itself
+    # may have been lost)
+    local teardown
+    teardown="sudo sh -c $(printf %q "$VC_TEARDOWN") sh $VC_TRACEFS"
+    vssh "$teardown" </dev/null >/dev/null 2>&1 || true
+    vssh "sudo ${obj_env}${only:+NN_VERIFIER_CHECK_ONLY=$(printf %q "$only") }${budget:+NN_VERIFIER_CHECK_BUDGET=$(printf %q "$budget") }\$HOME/northnarrow/target/release/northnarrow-agent --verifier-check; vc_rc=\$?; $teardown </dev/null >/dev/null 2>&1; exit \$vc_rc" | tee "$out" || rc=$?
+    vssh "$teardown" </dev/null >/dev/null 2>&1 \
+        || log "verifier-check: the guest's tracing instance was not checked after the run (ssh)"
     remote=$(sed -n 's|^verifier logs: \(/var/tmp/nn-verifier-check\.[A-Za-z0-9]*\)$|\1|p' "$out" | tail -1)
     if [[ -n $remote ]]; then
         mkdir -p "$logs"

@@ -323,6 +323,8 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             "&EXECQ_CAND_OVERFLOW,",
             "crate::task_scratch::share_key(),",
             "EXECQ_CAND_PER_SHARE,",
+            "EXECQ_CAND_GLOBAL,",
+            "EXECQ_CAND_FLOOR,",
             "bump(counter::CAND_DROPPED);",
             "(*cand).uid = row;",
             "(*cand).at = now;",
@@ -331,22 +333,47 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             "crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, row);",
             "bump(counter::CAND_DROPPED);",
             "bump(counter::CAND_EVICTED);",
-            "ring_note(task, now);",
+        ],
+    )
+    .unwrap();
+    // lot 332 (the re-check 2 of #547, G5): the oldest found by walking
+    // the map itself, every entry — no ring that failed execs could fill
+    // with gone candidates
+    in_order(
+        body(&q, "evict_oldest"),
+        &[
+            "generated::bpf_for_each_map_elem(",
+            "&EXECQ_CAND as *const HashMap<u64, ExecqCandRaw> as *mut c_void,",
+            "oldest_candidate as *const () as *mut c_void,",
+            "&mut o as *mut Oldest as *mut c_void,",
+            "if o.task == 0 {",
+            "return false;",
+            "Some(c) => c.at == o.at,",
+            "if same {",
+            "cand_take(o.task);",
+            "true",
         ],
     )
     .unwrap();
     in_order(
-        body(&q, "evict_oldest"),
+        body(&q, "oldest_candidate"),
         &[
-            "while k < EVICT_PROBES {",
-            "EXECQ_CAND_RING.get(i)",
-            "Some(c) => c.at == at,",
-            "if live && now > at && now - at >= EVICT_MIN_AGE_NS {",
-            "cand_take(t);",
-            "return true;",
+            "let at = (*value).at;",
+            "if now > at && now - at >= EVICT_MIN_AGE_NS && ((*ctx).task == 0 || at < (*ctx).at) {",
+            "(*ctx).task = *key;",
+            "(*ctx).at = at;",
+            "0",
         ],
     )
     .unwrap();
+    for gone in [
+        "EXECQ_CAND_RING",
+        "EXECQ_CAND_HEAD",
+        "EVICT_PROBES",
+        "ring_note",
+    ] {
+        assert!(!q.contains(gone), "{gone}: the eviction walks the map");
+    }
     assert!(body(&q, "cand_remove").contains("let _ = nn_execq_cand_remove(task);"));
     assert!(body(&q, "nn_execq_cand_remove").contains("cand_take(task);"));
     assert!(body(&q, "forget_freed").contains("cand_take(task);"));
@@ -450,7 +477,7 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
             "match task_buffer(task) {",
             "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);",
             "crate::fim_watch::observe_open_plain(file);",
-            "on_open_in(file, t);",
+            "on_open_in(file, t, task, live);",
             // lot 325: kept for the task's life when `task_free` removes
             // it; the review of #547 (F6): else the run's own, removed
             "if !live {",
@@ -458,7 +485,18 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         ],
     )
     .unwrap();
-    assert!(body(&open, "on_open_in").contains("observe(") && !open.contains("OPEN_WIN"));
+    assert!(body(&open, "on_open_in").contains("nn_open_observe(") && !open.contains("OPEN_WIN"));
+    // lot 332: the global functions past the watch find the task's buffer
+    // again by its key, in the map `on_open` found it in
+    in_order(
+        body(&open, "buffer_of"),
+        &[
+            "if dev_bits >> OBS_LIVE & 1 != 0 {",
+            "OPEN_TASK.get_ptr_mut(&task)",
+            "OPEN_TASK_RUN.get_ptr_mut(&task)",
+        ],
+    )
+    .unwrap();
     assert!(body(&open, "walk").contains("match task_buffer(task) {"));
     let tb = body(&open, "task_buffer");
     assert!(tb.contains("if nn_open_task_make(task) != 0 {"));
