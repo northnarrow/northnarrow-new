@@ -28,7 +28,8 @@
 #
 #   tool <name> class=<audit|mac|firewall|log|ids|edr|cloud> [unit=<u>[,<u>…]]
 #        [proc=<p>[,<p>…]] [config=<c>[,<c>…]]
-#     unit    systemd unit or SysV service name (`.service` may be left out)
+#     unit    systemd unit or SysV service name (`.service` may be left out),
+#             its aliases too (`Alias=`: rsyslog's `syslog.service`)
 #     proc    the tool's executable (or the script an interpreter runs), an
 #             absolute path; a path ending in `/` is a tree: any program in it
 #     config  an absolute path; a path ending in `/` is a directory, whose
@@ -44,10 +45,10 @@ tool auditd      class=audit    unit=auditd proc=/usr/sbin/auditd,/sbin/auditd c
 tool apparmor    class=mac      unit=apparmor config=/etc/apparmor/,/etc/apparmor.d/
 tool selinux     class=mac      config=/etc/selinux/config
 tool ufw         class=firewall unit=ufw config=/etc/ufw/,/etc/default/ufw
-tool firewalld   class=firewall unit=firewalld proc=/usr/sbin/firewalld config=/etc/firewalld/
+tool firewalld   class=firewall unit=firewalld,dbus-org.fedoraproject.FirewallD1 proc=/usr/sbin/firewalld config=/etc/firewalld/
 tool nftables    class=firewall unit=nftables config=/etc/nftables.conf,/etc/sysconfig/nftables.conf
 tool iptables    class=firewall unit=netfilter-persistent,iptables,ip6tables config=/etc/iptables/,/etc/sysconfig/iptables,/etc/sysconfig/ip6tables
-tool rsyslog     class=log      unit=rsyslog proc=/usr/sbin/rsyslogd config=/etc/rsyslog.conf,/etc/rsyslog.d/
+tool rsyslog     class=log      unit=rsyslog,syslog proc=/usr/sbin/rsyslogd config=/etc/rsyslog.conf,/etc/rsyslog.d/
 tool journald    class=log      unit=systemd-journald,systemd-journald.socket config=/etc/systemd/journald.conf,/etc/systemd/journald.conf.d/
 tool fail2ban    class=ids      unit=fail2ban proc=/usr/bin/fail2ban-server config=/etc/fail2ban/
 # Host sensors and EDR agents

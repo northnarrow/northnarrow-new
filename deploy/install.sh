@@ -2137,7 +2137,7 @@ declare -A SHIPPED_V1_EARLIER=(
     [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24 3549750f6c1530fc139f9853d173bccb72612b58086392517fa9fe1f3a815870"
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
     [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
-    [security-tools.v1]=""
+    [security-tools.v1]="38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335"
     [daemon-data.v1]=""
 )
 install_shipped_v1() {

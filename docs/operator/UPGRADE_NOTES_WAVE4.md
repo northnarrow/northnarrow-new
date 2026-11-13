@@ -1547,3 +1547,112 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
   refused: a signed degradation) no unit's shell vouches and only PID 1's
   executor copies are exempt.
+
+## 32. The system tools' options, read by their tables (lot 316)
+
+- **systemctl, kill, pkill, killall, iptables, nft and firewall-cmd are read
+  by the interpreters' reader, through a table each**
+  (`crates/nn-core/src/impair/tool_options.rs`, the external bug hunt's
+  edition 1.4: BUG-106, BUG-89, N4). NN-L-EVA-001..003 used to compare their
+  argv with hand-written lists: an unlisted valued option before the verb
+  (`systemctl -P Id stop auditd`, `--check-inhibitors no`, `--kill-who
+  main`), a getopt_long prefix (`--si KILL`), a cluster (`-qs KILL`), a
+  long or separate form (`iptables --policy INPUT ACCEPT`, `firewall-cmd
+  --set-default-zone trusted`) switched a tool off unrecorded, and `pkill
+  -n auditd` or `killall -g auditd` lost the name. The tables come from the
+  tools' sources (systemd 249–262, procps-ng 4.0.4, psmisc 23.7, iptables
+  1.8.11, nftables 1.0.6/1.1.3, firewalld 2.3.1).
+- **An option after the verb is read both ways.** GNU getopt reads it as an
+  option, and with `POSIXLY_CORRECT` in the tool's environment (which the
+  exec event does not carry) as an operand: `systemctl stop auditd --user`
+  stops the system's auditd then, and is NN-L-EVA-001. The manager is the
+  last of `--system`, `--user`, `--global`, `--capsule`.
+- **An option a table does not hold errs toward a detection.** The record
+  says "(options not understood)": any operand may be systemctl's verb and
+  every later one a unit, any spelling of iptables' `-F` or `-P` counts,
+  pkill's name is matched every way. Expect it for an iptables extension's
+  option the table does not list, or a newer systemctl's — report it, it
+  joins the table.
+- **Every listed unit of a command is judged** (BUG-96). `systemctl stop
+  northnarrow-agent auditd` is auditd's High record (`unit auditd stop
+  (with northnarrow-agent)`), inside a trusted-installer window too: the
+  window sanctions a command only when every listed unit it stops is the
+  agent's own. A glob is matched as systemd matches it — `fnmatch` with
+  `FNM_NOESCAPE` (`\` is itself) on the unit's full name, a listed unit
+  with no type suffix a `.service` (`snap.amazon-ssm-agent.amazon-ssm-agent`):
+  `*uditd*`, `audit?.service`, `[[:alpha:]]uditd.service`,
+  `snap.*.service` — in time linear in the pattern and the name (the
+  review of #548: the first matcher backtracked, and a 21-byte glob of
+  stars held the decision thread for hours). A bracket class ends as glibc
+  ends it (the re-check, N2): a `[:` whose name meets a byte outside
+  `a`–`y` before `:]` is no class, and a `[=` holds exactly one character,
+  so `[a[:]uditd.servic[:e:]` names auditd. Checked on 60,560 cases against
+  glibc: every name glibc matches is matched. The manager matches the
+  patterns itself, in the C locale. systemctl matches them on its own side
+  only when the manager refuses the listing (an old manager). There, its
+  locale's ranges and `POSIXLY_CORRECT`'s literal `^` are not modelled
+  (residual).
+- **systemd's verbs that reach a unit** (the review of #548). `stop`,
+  `condstop`, `kill`, `freeze`, `clean`, `disable`, `mask`, `preset`,
+  `revert`, `edit`, `link` (the unit file's name), `set-property`,
+  `service-log-level`, `service-log-target`, `bind`, `mount-image` (their
+  first operand), `isolate` of a target other than `default`, `multi-user`
+  or `graphical`, `rescue`, `emergency` and `preset-all` (every listed
+  unit). Not judged: the restart and reload family (`restart`,
+  `try-restart`, `condrestart`, …: the unit runs again), `start`,
+  `enable`, `unmask`. A unit's aliases are listed with it (rsyslog's
+  `syslog.service`, firewalld's `dbus-org.fedoraproject.FirewallD1`).
+- **A reload signal the processes catch is Low** (the review of #548, the
+  coordinator's decision, as its re-check left it). A SIGHUP sent by
+  `systemctl kill` or `kill` is a Low record ("a reload, no stop") when:
+  - the tool documents SIGHUP as its reload: auditd (reconfigure), rsyslog
+    (reopen its files), firewalld (reload), falco (hot reload). No other
+    signal is a reload: auditd's SIGUSR1 rotates its logs, and five in a
+    row delete the older ones (`num_logs`), so it is High;
+  - every process it reaches catches it (`SigCgt` in `/proc/<pid>/status`).
+    For `kill`, each tool's process it names, still the one registered.
+    For `systemctl kill` (`--kill-whom=all`), every process of the unit's
+    cgroup (`cgroup.procs` of the cgroup a registered process runs in). A
+    cgroup with cgroups below it, a unit no registered process runs in (an
+    alias's name) or a list that cannot be read: High;
+  - the reading of the argv the process makes sends SIGHUP. Under
+    `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid for
+    procps' `kill`, is an operand and the signal SIGTERM: logrotate's own
+    `systemctl kill -s HUP rsyslog.service` then kills `-s.service`,
+    `HUP.service` and rsyslog.service with SIGTERM (measured with systemd
+    255). The exec pump reads the environment of an exec of systemctl or
+    `kill` while it runs (its start the exec's, its memory still there
+    after the read): without `POSIXLY_CORRECT` GNU's reading alone names
+    the signal (logrotate's rotation is Low), with it the
+    `POSIXLY_CORRECT` reading alone (High). When it could not be read (the
+    process gone, its memory gone, its pid another's, a read that failed),
+    every reading must send SIGHUP: `systemctl kill rsyslog -s HUP` and
+    `kill <pid> -s HUP` are then High, `systemctl -s HUP kill
+    rsyslog.service` (the option before the verb), `kill -HUP <pid>` and
+    `kill -s HUP <pid>` Low. Residual: a process that rewrites its own
+    environment before the pump reads it (code injected into systemctl,
+    which could send any signal itself).
+- **Names.** iptables by any of its names (`iptables-nft`,
+  `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
+  command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part
+  of the process name at least half of it, unless `-x` (`pkill audit` ends
+  auditd; `pkill -f agent` names no listed agent), `-f` the full
+  command line, `-i` (killall `-I`) any case; killall's name with a `/` the
+  executable, its path folded as stat() walks it (`killall
+  //usr/sbin/auditd`, `/usr/bin/../sbin/auditd`); procps' pgrep binary run
+  as `pkill` or `lt-pkill` is pkill. procps' `kill`: the last `-s` over the
+  first `-SIGNAL` (`kill -s KILL -0 <pid>` kills), a pid with leading blanks
+  or a `+`.
+- **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
+  /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
+  as the agent's own process starting.
+- Residual, declared: a renamed copy of the tool (`cp /usr/bin/systemctl
+  /tmp/x`), a command read from a file or standard input (`nft -f`,
+  `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
+  regular expression beyond a part of the name, or a part less than half of
+  it, a symbolic link to a tool given to killall. The kernel's `task_kill`
+  reports to NN-L-EVA-003 only SIGINT, QUIT, ABRT, KILL, TERM, STOP and
+  TSTP to a registered tool's process, and never one from PID 1 or from
+  another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
+  signal that ends a tool, sent by a command line this reader does not
+  name, is not recorded (lot 330 is to report every default-fatal signal).
