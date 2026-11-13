@@ -2459,5 +2459,16 @@ mod rev548_recheck {
             None
         );
         assert!(sanction(&h, 9773, KILL, &["kill", "-HUP", "9710", "1"]).is_some());
+        // `kill` of rsyslogd and of a tool's process whose entry is gone:
+        // still the tool's (the finding), no longer one whose catch is known
+        a_process(&h, 9778, 4778, "0000000000000001");
+        assert!(h
+            .run(9778, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        std::fs::remove_dir_all(h._proc.path().join("9778")).unwrap();
+        assert_eq!(
+            sanction(&h, 9779, KILL, &["kill", "-HUP", "9710", "9778"]),
+            None
+        );
     }
 }
