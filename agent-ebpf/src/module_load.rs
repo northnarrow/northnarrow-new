@@ -305,7 +305,7 @@ unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
 /// is an anti-tamper denial (NN-L-AT-001). kdump's crash kernel is loaded
 /// at boot, before the agent starts (its unit is ordered after
 /// `kdump.service`); a later reload needs the window. Lot 341: a host-wide
-/// deny ([`crate::host_deny`]) — under the start's observe-only gate (the
+/// deny ([`crate::host_deny`]) — under the start's `alpha` profile (the
 /// `alpha` profile) the image loads, signed "would deny".
 #[inline(always)]
 unsafe fn deny_kexec(id: c_int) -> i32 {

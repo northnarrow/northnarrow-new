@@ -95,7 +95,7 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
             "let (read, v) = new_value(ctx);",
             "let verdict = verdict_of(kind, false, read, v, opt_out(kind));",
             // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`): signed,
-            // and let through under the observe-only gate
+            // and let through under the alpha profile
             "SysctlVerdict::Refuse => {",
             "let (refuse, op) = crate::host_deny::judge_no_task(FS_OP_SYSCTL_VALUE);\n            record(op, kind, read, v, task, tgid, true);\n            if !refuse {\n                return SysctlVerdict::Allow;\n            }\n        }",
             "SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),",

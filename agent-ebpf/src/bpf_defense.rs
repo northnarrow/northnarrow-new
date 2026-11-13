@@ -48,7 +48,7 @@
 //!   every mode — the observe mode relaxes only the guard of the agent's
 //!   own objects, which the lab's fixtures reach with `bpftool`. Lot 341:
 //!   both are HOST-WIDE denies ([`crate::host_deny`]): under the start's
-//!   observe-only gate (the `alpha` profile) the load or the attach goes
+//!   `alpha` profile the load or the attach goes
 //!   through, signed "would deny"; every guard of the agent's own maps,
 //!   programs and links below holds under every profile. A load the
 //!   hook lets through marks its thread ([`crate::bpf_census`]) so the
@@ -909,7 +909,7 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // A load let through marks its thread: the `bpf_prog` hook records the
     // program it makes as seen (the cross-view).
     //
-    // Lot 341: a host-wide deny — under the observe-only gate (alpha) the
+    // Lot 341: a host-wide deny — under the `alpha` profile the
     // load goes through, signed "would deny" once a second per loader and
     // type. A program that would act on the agent's programs or maps still
     // needs a descriptor of one, which the handle guards below and the
@@ -1011,7 +1011,7 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // attach type for both commands; the target is read only for them.
     // Lot 290: in every mode (it held in enforce mode only). Lot 341: a
     // host-wide deny (the sysctl guard's own guard; that guard observes
-    // under the observe-only gate too) — let through and signed "would
+    // under the alpha profile too) — let through and signed "would
     // deny" there.
     if judges_attach_target(cmd, arg)
         && !crate::inode_protect::override_active()

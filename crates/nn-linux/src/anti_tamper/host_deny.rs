@@ -2,13 +2,14 @@
 //! userland half of the host-wide denies' switch (`agent-ebpf/src/
 //! host_deny.rs`).
 //!
-//! The start's resolved no-enforcement gate (`nn_core::response::profile::
-//! DetectOnly`: the `alpha` profile, `--detect-only`, `NN_DETECT_ONLY`;
-//! `LoadPlan::host_deny_observe`) is written into `HOST_DENY_MODE`
-//! right after the object loads, before any of its programs attaches, and
+//! The start's resolved profile (`nn_core::response::profile::
+//! ResolvedProfile::host_wide_denies_observe`: the `alpha` profile only —
+//! `--detect-only` and `NN_DETECT_ONLY` keep their meaning, no response,
+//! and leave these denies on; `LoadPlan::host_deny_observe`) is written
+//! into `HOST_DENY_MODE` right after the object loads, before any of its programs attaches, and
 //! the map is frozen: no descriptor writes it again, the agent's included.
 //! A write that fails leaves the map's zero — every host-wide deny refuses
-//! (fail closed), and under the gate that is a signed degradation: the
+//! (fail closed), and under `alpha` that is a signed degradation: the
 //! tester's tools are refused although the profile observes.
 
 use anyhow::{anyhow, Context, Result};
@@ -19,20 +20,20 @@ use common::wire::{HOST_DENY_ENFORCE, HOST_DENY_OBSERVE};
 /// The kernel's switch, by name in the object.
 pub const MODE_MAP: &str = "HOST_DENY_MODE";
 
-/// The gate's answer for the userland half of the host-wide guards — the
+/// The profile's answer for the userland half of the host-wide guards — the
 /// integrity round's and a window's close's put-back of the guarded
-/// sysctls (`crate::sysctl_guard::check`): under the gate they write
+/// sysctls (`crate::sysctl_guard::check`): under `alpha` they write
 /// nothing. Set by [`arm`] at the start; `false` (enforce) before it, as
 /// every caller outside the agent's start (the tests) expects.
 static OBSERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether this start's gate leaves the host-wide guards in observe (the
+/// Whether this start's profile leaves the host-wide guards in observe (the
 /// kernel's and the round's alike).
 pub fn observing() -> bool {
     OBSERVE.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// The value of [`MODE_MAP`] for the gate's answer.
+/// The value of [`MODE_MAP`] for the profile's answer.
 pub const fn mode_value(observe: bool) -> u32 {
     if observe {
         HOST_DENY_OBSERVE
@@ -41,10 +42,10 @@ pub const fn mode_value(observe: bool) -> u32 {
     }
 }
 
-/// Write the gate's answer into [`MODE_MAP`] and freeze it.
+/// Write the profile's answer into [`MODE_MAP`] and freeze it.
 pub fn arm(ebpf: &mut Ebpf, observe: bool) -> Result<()> {
-    // the round's half first: it follows the gate whatever the kernel's
-    // write does (a tester's sysctl is never put back under the gate)
+    // the round's half first: it follows the profile whatever the kernel's
+    // write does (a tester's sysctl is never put back under `alpha`)
     OBSERVE.store(observe, std::sync::atomic::Ordering::Release);
     {
         let map = ebpf
@@ -62,7 +63,7 @@ pub fn arm(ebpf: &mut Ebpf, observe: bool) -> Result<()> {
 /// The boot line's words for the switch in force.
 pub fn describe(observe: bool) -> &'static str {
     if observe {
-        "OBSERVED (the observe-only gate): a foreign tracing BPF program's load, a cgroup/sysctl \
+        "OBSERVED (the alpha profile): a foreign tracing BPF program's load, a cgroup/sysctl \
          program on the root cgroup, the kprobes and lockdown switches, a kexec image, the sysctl \
          guard, a cgroup v1 write and a ptrace of PID 1 go through, each signed \"would deny\" \
          (the round puts no guarded sysctl back); the agent's self-protection is enforced"
@@ -77,10 +78,10 @@ pub fn describe(observe: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    /// Named (lot 341): the gate's answer is the kernel's value; enforcing
+    /// Named (lot 341): the profile's answer is the kernel's value; enforcing
     /// is the map's zero (an agent that could not write it enforces).
     #[test]
-    fn the_gate_s_answer_is_the_kernel_s_mode() {
+    fn the_profile_s_answer_is_the_kernel_s_mode() {
         assert_eq!(mode_value(true), HOST_DENY_OBSERVE);
         assert_eq!(mode_value(false), HOST_DENY_ENFORCE);
         assert_eq!(mode_value(false), 0);

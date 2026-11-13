@@ -18,7 +18,7 @@
 //! ([`SYSCTL_OPTOUT`]) lets its range through, every such write recorded.
 //!
 //! Lot 341: a host-wide deny ([`crate::host_deny`]): under the start's
-//! observe-only gate (the `alpha` profile) a refused value goes through,
+//! `alpha` profile a refused value goes through,
 //! signed "would deny".
 //!
 //! A program in a child cgroup cannot get around it: the agent attaches it
@@ -107,7 +107,7 @@ unsafe fn try_sysctl_guard(ctx: &SysctlContext) -> SysctlVerdict {
     match verdict {
         SysctlVerdict::Refuse => {
             // Lot 341: a host-wide deny (`crate::host_deny`) — under the
-            // observe-only gate the write goes through, signed "would deny"
+            // `alpha` profile the write goes through, signed "would deny"
             let (refuse, op) = crate::host_deny::judge_no_task(FS_OP_SYSCTL_VALUE);
             record(op, kind, read, v, task, tgid, true);
             if !refuse {

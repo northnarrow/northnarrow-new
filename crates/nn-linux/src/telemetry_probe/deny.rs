@@ -29,7 +29,7 @@
 //! - the **BPF guard**: a load of a two-instruction kprobe program (a type
 //!   refused outside the family in every mode: the `bpf` hook; lot 341: a
 //!   host-wide deny a third party meets only as "would deny" under the
-//!   observe-only gate, the self-test's child refused under every profile —
+//!   `alpha` profile, the self-test's child refused under every profile —
 //!   `agent-ebpf/src/host_deny.rs`), and, where
 //!   the guard enforces, a read-only handle on one of the agent's maps and
 //!   one on one of its programs through relative paths (the `bpf_map` and

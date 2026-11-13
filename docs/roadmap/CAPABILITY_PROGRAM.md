@@ -10430,15 +10430,15 @@ number in parentheses is a lab PR.
     complete`, itself gone) and the diff against the host before the
     install was empty.
   - Round 2 (the coordinator's decision of 13/11: the alpha never breaks
-    anything on a tester's machine): under the gate the host-wide denies —
+    anything on a tester's machine): under `alpha` the host-wide denies —
     a foreign tracing, LSM, extension or struct_ops BPF program's load, a
     root cgroup/sysctl attach, the kprobes and lockdown switches, kexec, the
     sysctl guard, cgroup v1 writes, a ptrace of PID 1 — observe, each
     recorded "would deny" (a bit of the record's operation, `would have:
     deny:<op>`); the denies that protect the agent (its processes, files,
     units, pins, cgroup and BPF objects) hold under every profile. One
-    kernel switch (`HOST_DENY_MODE`, written from the resolved gate before
-    any attach, frozen); a ratchet (`xtask/tests/host_deny.rs`) classifies
+    kernel switch (`HOST_DENY_MODE`, written from the resolved profile
+    before any attach, frozen; `--detect-only` leaves the denies on); a ratchet (`xtask/tests/host_deny.rs`) classifies
     every deny site of the eBPF object (routed through the switch, or the
     agent's self-protection with its reason, or a response path the gate
     already sets). Lab, as measured

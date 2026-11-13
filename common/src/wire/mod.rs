@@ -1260,7 +1260,7 @@ pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
 
 /// Lot 341 (the alpha profile; the coordinator's decision of 13/11): the
 /// bit a record's `operation` carries when a HOST-WIDE deny let the action
-/// through — the observe-only gate (`alpha`, `--detect-only`) leaves the
+/// through — the `alpha` profile leaves the
 /// guards that refuse a third-party tool something on the host (not
 /// something on the agent) in observe, each attempt signed "would deny".
 /// Above every denial code ([`FS_OP_LAST`] is far below it).
@@ -1275,7 +1275,7 @@ pub const fn fs_op_of(byte: u8) -> u8 {
 }
 
 /// Lot 341: whether a record's `operation` byte says the action was let
-/// through by the observe-only gate (a host-wide deny's "would deny").
+/// through by the alpha profile (a host-wide deny's "would deny").
 pub const fn is_would_deny(byte: u8) -> bool {
     byte & FS_OP_WOULD_DENY != 0
 }
@@ -1284,7 +1284,7 @@ pub const fn is_would_deny(byte: u8) -> bool {
 /// enforcing start — every host-wide deny refuses. The map's zero: an
 /// agent that could not write it enforces (fail closed).
 pub const HOST_DENY_ENFORCE: u32 = 0;
-/// Lot 341: `HOST_DENY_MODE[0]` under the observe-only gate — a host-wide
+/// Lot 341: `HOST_DENY_MODE[0]` under the alpha profile — a host-wide
 /// deny lets the action through and signs it "would deny"
 /// ([`FS_OP_WOULD_DENY`]).
 pub const HOST_DENY_OBSERVE: u32 = 1;
@@ -1295,7 +1295,7 @@ pub const HOST_DENY_OBSERVE: u32 = 1;
 /// EDR), a `cgroup/sysctl` program on the root cgroup, the kprobes and
 /// lockdown switches, a kexec image, the sysctl guard (its write deny and
 /// its `cgroup/sysctl` judge) and a cgroup v1 write. With
-/// [`host_wide_refusal`]'s ptrace of PID 1, the ones the observe-only gate
+/// [`host_wide_refusal`]'s ptrace of PID 1, the ones the alpha profile
 /// leaves in observe; every other refusal protects the agent itself and
 /// holds under every profile (`xtask/tests/host_deny.rs` keeps the eBPF to
 /// this split).

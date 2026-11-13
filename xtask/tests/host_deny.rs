@@ -1,20 +1,20 @@
 //! Lot 341 (the alpha profile; the coordinator's decision of 13/11): the
 //! alpha promises a tester it never breaks anything on the machine. Under
-//! the start's ONE no-enforcement gate (`alpha`, `--detect-only`,
-//! `NN_DETECT_ONLY`) the HOST-WIDE denies — the guards that refuse a
+//! the `alpha` profile the HOST-WIDE denies — the guards that refuse a
 //! third-party tool something on the host — go to observe, each attempt
-//! signed "would deny"; the denies that protect the AGENT itself hold under
-//! every profile.
+//! signed "would deny" (`--detect-only` and `NN_DETECT_ONLY`, the gate's
+//! other inputs, keep their meaning: no response, these denies on); the
+//! denies that protect the AGENT itself hold under every profile.
 //!
-//! The eBPF programs run only in a kernel (the privileged
-//! `agent/tests/host_deny_privileged_e2e.rs` and the lab load a foreign
-//! tracing program and try a handle on the agent's map). Here the code is
-//! read: every deny site of the object is either routed through the
-//! profile's switch (`agent-ebpf/src/host_deny.rs`) or listed below as the
-//! agent's self-protection with its reason (or as a response path whose
+//! The eBPF programs run only in a kernel (the lab's `nn-lab.sh
+//! host-deny-check` loads foreign tracing programs, bpftrace and a BCC tool
+//! and tries the agent's map, programs and links under both profiles). Here
+//! the code is read: every deny site of the object is either routed through
+//! the profile's switch (`agent-ebpf/src/host_deny.rs`) or listed below as
+//! the agent's self-protection with its reason (or as a response path whose
 //! own mode the gate sets) — a new deny site fails until it is classified —
-//! and the agent writes the switch from the resolved gate before anything
-//! attaches.
+//! and the agent writes the switch from the resolved profile before
+//! anything attaches.
 
 mod support;
 
@@ -26,7 +26,7 @@ use support::{matching_brace, product_code, repo_root};
 #[derive(Clone, Copy, Debug)]
 enum Route {
     /// A host-wide deny: decided by `crate::host_deny::judge` (one call a
-    /// site in the function), observed under the gate.
+    /// site in the function), observed under the `alpha` profile.
     Profile,
     /// The agent's self-protection: enforced under every profile — the
     /// function never reads the profile's switch. The reason.
@@ -432,20 +432,33 @@ fn blank_uses(text: &str) -> String {
     out
 }
 
-/// Named: the switch is the start's resolved gate's, written into the
-/// object right after it loads and before any program attaches, then
-/// frozen; per load, never pinned; its zero enforces.
+/// Named: the switch is the start's resolved profile's (`alpha`), written
+/// into the object right after it loads and before any program attaches,
+/// then frozen; per load, never pinned; its zero enforces.
 #[test]
-fn the_switch_is_written_from_the_resolved_gate_before_any_attach() {
+fn the_switch_is_written_from_the_resolved_profile_before_any_attach() {
     let all = product_code(&repo_root());
     let at = |rel: &str| {
         all.get(rel)
             .unwrap_or_else(|| panic!("{rel} not found"))
             .as_str()
     };
+    // the profile's (`alpha`), resolved once: `--detect-only` keeps its
+    // meaning (no response) and leaves these denies on
+    let profile = at("crates/nn-core/src/response/profile.rs");
+    let f = &profile[profile
+        .find("pub fn host_wide_denies_observe(&self) -> bool {")
+        .expect("ResolvedProfile::host_wide_denies_observe")..];
+    assert!(f[..f.find('}').expect("its body")].contains("self.profile.observe_only()"));
+    let boot = at("agent/src/boot/mod.rs");
+    assert!(boot.contains(
+        "detect_only,\n        profile.host_wide_denies_observe(),\n    )\n    .await?;"
+    ));
     let attach = at("agent/src/boot/attach.rs");
     let load = &attach[attach.find("fn load(").expect("attach::load")..];
-    assert!(load.contains("host_deny_observe: detect_only,"));
+    assert!(load
+        .contains("    detect_only: bool,\n    host_deny_observe: bool,\n) -> Result<Attached> {"));
+    assert!(load.contains("        host_deny_observe,\n        ..Default::default()\n    };"));
     let mux = at("crates/nn-linux/src/sensors/multiplexer.rs");
     let start = &mux[mux.find("async fn do_start(").expect("do_start")..];
     let loaded = start.find(".load(EBPF_BYTES)").expect("the load");

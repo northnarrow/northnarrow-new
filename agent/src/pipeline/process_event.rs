@@ -570,13 +570,12 @@ pub(crate) fn process_event(
                         "KERNEL STATE: found by the kernel-state round (not refused)"
                     );
                 } else if *would_deny {
-                    // Lot 341: a host-wide deny the observe-only gate let through
+                    // Lot 341: a host-wide deny the alpha profile let through
                     warn!(
                         pid, uid, comm = %Escaped(comm),
                         op = %operation,
                         target_dev, target_ino,
-                        "WOULD DENY: a host-wide guard let it through (observe-only gate: the \
-                         alpha profile); the enforcing profile refuses it"
+                        "WOULD DENY: a host-wide guard let it through (the alpha profile); the enforcing profile refuses it"
                     );
                 } else {
                     warn!(
@@ -1028,8 +1027,8 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     }
 }
 
-/// Lot 341: the record's outcome of a host-wide deny the start's
-/// observe-only gate let through — `would have: deny:<operation> (would
+/// Lot 341: the record's outcome of a host-wide deny the start's `alpha`
+/// profile let through — `would have: deny:<operation> (would
 /// deny: …)`, counted with the suppressed responses; `None` for any other
 /// event (a refusal says how the kernel refused it).
 pub(crate) fn would_deny_outcome(event: &Event) -> Option<String> {
@@ -1055,7 +1054,7 @@ mod tests {
 
     use super::*;
 
-    /// Named (lot 341): a host-wide deny the observe-only gate let through
+    /// Named (lot 341): a host-wide deny the alpha profile let through
     /// is recorded "would deny", by its operation; a refusal is not.
     #[test]
     fn a_let_through_host_wide_deny_is_recorded_would_deny() {

@@ -36,11 +36,11 @@ isolation), every record is signed in its chain.
 ### 1.1 The kernel's denies: what stays enforced, what is only observed
 
 The alpha promises a tester it never breaks anything on the machine. The
-deny hooks therefore split in two (the coordinator's decision of
+deny hooks therefore split in two under `alpha` (the coordinator's decision of
 13/11/2026, lot 341's second round):
 
 - the denies that refuse a **third-party tool something on the host** are
-  only **observed** under the gate: the action goes through, and the
+  only **observed** under `alpha`: the action goes through, and the
   attempt is recorded as a **"would deny"** — what the enforcing profile
   would have refused;
 - the denies that **protect the agent itself** stay **enforced** under
@@ -83,16 +83,18 @@ An operator still needs a trusted-installer window to stop, upgrade or
 remove the agent ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md)
 §3.7).
 
-How it holds: the start writes its resolved gate into the kernel's
+How it holds: the start writes its resolved profile into the kernel's
 `HOST_DENY_MODE` right after the eBPF object loads, before any program
 attaches, and freezes it (no descriptor writes it again, the agent's
 included; a write that fails leaves every deny enforcing, a signed
 `host_deny` degradation). The start's log says which: `host-wide denies
-OBSERVED (the observe-only gate) …` or `host-wide denies ENFORCED …`. A
+OBSERVED (the alpha profile) …` or `host-wide denies ENFORCED …`. A
 ratchet (`xtask/tests/host_deny.rs`) keeps every deny site of the eBPF
 object either routed through that switch or listed as the agent's
-self-protection with its reason. `--detect-only` and `NN_DETECT_ONLY`, the
-gate's other inputs, observe these denies too.
+self-protection with its reason. The switch follows the **profile** alone:
+`--detect-only` and `NN_DETECT_ONLY`, the gate's other inputs, keep their
+meaning (no response) and leave these denies on — the lab and the
+privileged suites measure them that way.
 
 ### 1.2 A "would deny" record
 
@@ -100,7 +102,7 @@ gate's other inputs, observe these denies too.
 (`NN-L-AT-001_AntiTamperDenial`, the same operation and severity), with
 
 ```
-"response": "would have: deny:bpf_prog_type (would deny: not refused — the observe-only gate leaves the host-wide guards in observe)"
+"response": "would have: deny:bpf_prog_type (would deny: not refused — the alpha profile leaves the host-wide guards in observe)"
 "reasoning": "`bpftrace` attempted to load a `tracepoint` BPF program … Would deny: NOT refused — …"
 ```
 
@@ -159,7 +161,7 @@ would have        : KillProcessTree x2
 - `records today` counts the records this agent appended to its detection
   chain in the current UTC day (since its start, if it started that day).
 - `would have` counts the responses the gate suppressed, by action, and the
-  host-wide denies it let through, by operation (`deny:bpf_prog_type`,
+  host-wide denies `alpha` let through, by operation (`deny:bpf_prog_type`,
   §1.2).
 
 Without `--key` the agent shows the posture only (external audit ASK-009).

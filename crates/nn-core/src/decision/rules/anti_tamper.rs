@@ -380,7 +380,7 @@ impl Rule for NnLAt001AntiTamperDenial {
             }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
-        // Lot 341: a host-wide deny the start's observe-only gate let through
+        // Lot 341: a host-wide deny the start's `alpha` profile let through
         let reasoning = if *would_deny {
             format!(
                 "`{comm}` attempted {what}. Would deny: NOT refused — the start's observe-only \
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn would_deny_is_said_not_refused() {
-        // Lot 341: a host-wide deny the observe-only gate let through
+        // Lot 341: a host-wide deny the alpha profile let through
         for op in [
             FsProtectOperation::BpfProgType,
             FsProtectOperation::Kexec,

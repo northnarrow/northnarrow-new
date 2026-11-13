@@ -137,7 +137,7 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // debugger attach.
     //
     // Lot 341: PID 1's is a host-wide deny ([`crate::host_deny`]): under the
-    // start's observe-only gate (the `alpha` profile) the access goes
+    // start's `alpha` profile (the `alpha` profile) the access goes
     // through, signed "would deny"; one of the agent's, its watchdog's or a
     // worker's is refused under every profile.
     let mode: u32 = ctx.arg(1);

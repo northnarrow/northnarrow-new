@@ -884,7 +884,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&ti, "sysctls_at_close"),
         &[
             "crate::sysctl_guard::check(",
-            // lot 341: written unless the start's observe-only gate is on
+            // lot 341: written unless the start's `alpha` profile is on
             // (`xtask/tests/host_deny.rs`; a `sysctl_would_restore` then)
             "!crate::anti_tamper::host_deny::observing(),",
             ".filter(|s| s.kind != \"sysctl_strict\" && s.kind != \"sysctl_opted_out\")",
@@ -1029,7 +1029,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
     in_order(
         body(&si, "collect_round"),
-        // lot 341: written unless the start's observe-only gate is on
+        // lot 341: written unless the start's `alpha` profile is on
         &[
             "crate::sysctl_guard::check(",
             "!crate::anti_tamper::host_deny::observing(),",

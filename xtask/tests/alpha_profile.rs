@@ -115,7 +115,10 @@ fn every_enforcing_switch_takes_the_resolved_gate() {
     assert!(body(attach, "execpol_mode").contains("Mode::Enforce if detect_only => Mode::Audit"));
     let boot = at("agent/src/boot/mod.rs");
     assert!(
-        boot.contains("export_loaded.on().is_some(),\n        detect_only,\n    )"),
+        // lot 341 round 2: and the profile's host-wide switch after it
+        boot.contains(
+            "export_loaded.on().is_some(),\n        detect_only,\n        profile.host_wide_denies_observe(),\n    )"
+        ),
         "the start hands attach::load the resolved gate"
     );
     let policy = at("agent/src/boot/policy.rs");

@@ -183,7 +183,7 @@ fn threads_default(mem_total: u64) -> String {
 /// (`crate::sysctl_cgroup::opt_out_for`) is left, a `sysctl_opted_out`
 /// finding.
 ///
-/// Lot 341: `write` false (a dry run, or the start's observe-only gate:
+/// Lot 341: `write` false (a dry run, or the start's `alpha` profile:
 /// [`crate::anti_tamper::host_deny::observing`]) writes nothing, and a
 /// harmful value is then `sysctl_would_restore` — what the enforcing
 /// profile would have put back, the tester's value left.
@@ -219,7 +219,7 @@ fn would_restore(s: Seen) -> Seen {
     Seen {
         kind: "sysctl_would_restore",
         detail: format!(
-            "{} (not written: the observe-only gate leaves the host's value)",
+            "{} (not written: the alpha profile leaves the host's value)",
             s.detail
                 .replace(": put back to ", ": would be put back to ")
         ),
@@ -414,7 +414,7 @@ mod tests {
         assert!(check(d.path(), 16 << 30, true).is_empty());
     }
 
-    /// Named (lot 341): under the observe-only gate the round writes
+    /// Named (lot 341): under the alpha profile the round writes
     /// nothing — a harmful value is what the enforcing profile would have
     /// put back, the host's value left.
     #[test]
@@ -428,7 +428,7 @@ mod tests {
         for s in &r {
             assert_eq!(s.kind, "sysctl_would_restore", "{r:?}");
             assert!(s.detail.contains("would be put back to"), "{}", s.detail);
-            assert!(s.detail.contains("observe-only gate"), "{}", s.detail);
+            assert!(s.detail.contains("alpha profile"), "{}", s.detail);
         }
         let read = |p: &str| std::fs::read_to_string(d.path().join(p)).unwrap();
         assert_eq!(read("proc/sys/kernel/pid_max"), "300\n");

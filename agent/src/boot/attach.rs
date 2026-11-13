@@ -80,6 +80,7 @@ pub(crate) async fn load(
     image: std::io::Result<nn_linux::worker::SelfImage>,
     export_on: bool,
     detect_only: bool,
+    host_deny_observe: bool,
 ) -> Result<Attached> {
     // R14b (plan §3.1, §3.5): the workers first — the parse worker ready
     // when the DNS pump's first records come; its pid registered once the
@@ -128,10 +129,10 @@ pub(crate) async fn load(
         lsm_absent: matches!(bpf_lsm, northnarrow_agent::boot::lsm::BpfLsm::Absent { .. }),
         // R14b: the DNS pump's names go to the parse worker
         parse: Some(workers.clone()),
-        // Lot 341: the start's one gate — under it (the `alpha` profile,
-        // `--detect-only`) the host-wide denies observe ("would deny"); the
+        // Lot 341: the resolved profile's — under `alpha` the host-wide
+        // denies observe ("would deny"); `--detect-only` leaves them on; the
         // agent's self-protection reads no such switch
-        host_deny_observe: detect_only,
+        host_deny_observe,
         ..Default::default()
     };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the

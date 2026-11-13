@@ -580,7 +580,7 @@ unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, ph
         SysctlVerdict::Refuse => {}
     }
     // Lot 341: a host-wide deny (`crate::host_deny`). Let through under the
-    // observe-only gate, its "would deny" signed once: by the cgroup/sysctl
+    // `alpha` profile, its "would deny" signed once: by the cgroup/sysctl
     // program, on the kernel's copy, when this boot attached it (as an
     // opt-out's write); else here.
     let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL);

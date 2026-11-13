@@ -353,8 +353,7 @@ pub enum Event {
         target_ino: u64,
         operation: FsProtectOperation,
         timestamp_ns: u64,
-        /// Lot 341: a host-wide deny the start's observe-only gate (the
-        /// `alpha` profile) let through — the kernel did NOT refuse it; the
+        /// Lot 341: a host-wide deny the start's `alpha` profile let through — the kernel did NOT refuse it; the
         /// enforcing profile would have (`FS_OP_WOULD_DENY` on the wire).
         #[serde(default)]
         would_deny: bool,
@@ -1873,7 +1872,7 @@ pub struct Verdict {
 mod tests {
     use super::*;
 
-    /// Named (lot 341): a host-wide deny the observe-only gate let through
+    /// Named (lot 341): a host-wide deny the alpha profile let through
     /// decodes to its own operation, marked "would deny"; a refusal is not.
     #[test]
     fn a_would_deny_record_decodes_to_its_operation() {

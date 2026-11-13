@@ -148,6 +148,21 @@ impl ResolvedProfile {
     }
 }
 
+impl ResolvedProfile {
+    /// Lot 341 (the coordinator's decision of 13/11): the host-wide denies
+    /// — the guards that refuse a third-party tool something on the host
+    /// (a foreign tracing BPF program, a kexec, a sysctl, …), not something
+    /// on the agent — observe under the `alpha` profile, each recorded
+    /// "would deny": what the start writes into the kernel's
+    /// `HOST_DENY_MODE`. `--detect-only` and `NN_DETECT_ONLY` keep their
+    /// meaning (no response) and leave them on — the lab and the privileged
+    /// suites measure them so. The agent's self-protection reads no such
+    /// switch.
+    pub fn host_wide_denies_observe(&self) -> bool {
+        self.profile.observe_only()
+    }
+}
+
 /// The built-in default: an agent with no profile from its install is the
 /// agent it was before this lot.
 pub const DEFAULT_PROFILE: Profile = Profile::Enforcing;
@@ -175,9 +190,9 @@ pub fn resolve(overlay: Option<Profile>, manifest: Option<Profile>) -> ResolvedP
 /// The agent-wide no-enforcement gate, resolved once at the start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetectOnly {
-    /// No response action and no enforce deny of a user program — lot 341:
-    /// the host-wide denies included (the start writes it into the kernel's
-    /// `HOST_DENY_MODE`; the agent's self-protection reads no such switch).
+    /// No response action and no enforce deny of a user program (lot 341:
+    /// the host-wide denies follow the profile alone,
+    /// [`ResolvedProfile::host_wide_denies_observe`]).
     pub on: bool,
     /// What switched it on (MAIN-008: the signed `agent_boot` names it):
     /// `--detect-only`, `NN_DETECT_ONLY=1`, `profile alpha (…)`.
@@ -226,7 +241,7 @@ pub const WOULD_HAVE_PREFIX: &str = "would have: ";
 /// responses (`deny:kexec`), and saying "would deny".
 pub fn would_deny(operation: &str) -> String {
     would_have(&format!(
-        "deny:{operation} (would deny: not refused — the observe-only gate leaves the \
+        "deny:{operation} (would deny: not refused — the alpha profile leaves the \
          host-wide guards in observe)"
     ))
 }
@@ -310,10 +325,14 @@ mod tests {
     /// deny" and is counted with the suppressed responses by its operation.
     #[test]
     fn the_host_wide_denies_observe_under_alpha_only() {
-        let alpha = detect_only_gate(false, None, &resolve(None, Some(Profile::Alpha)));
-        assert!(alpha.on, "the start's host_deny_observe");
-        let enforcing = detect_only_gate(false, None, &resolve(None, Some(Profile::Enforcing)));
-        assert!(!enforcing.on);
+        assert!(resolve(None, Some(Profile::Alpha)).host_wide_denies_observe());
+        assert!(resolve(Some(Profile::Alpha), Some(Profile::Enforcing)).host_wide_denies_observe());
+        let enforcing = resolve(None, Some(Profile::Enforcing));
+        assert!(!enforcing.host_wide_denies_observe());
+        assert!(!resolve(None, None).host_wide_denies_observe());
+        // --detect-only switches the responses off, not these denies
+        assert!(detect_only_gate(true, None, &enforcing).on);
+        assert!(!enforcing.host_wide_denies_observe());
         let text = would_deny("bpf_prog_type");
         assert!(
             text.starts_with("would have: deny:bpf_prog_type "),

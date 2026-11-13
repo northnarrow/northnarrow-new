@@ -26,21 +26,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     themselves, so an input added in one place would have left the others
     enforcing. A ratchet (`xtask/tests/alpha_profile.rs`) keeps every reader
     in the resolver and every switch on its value.
-  - **The host-wide denies observe under the gate** (the coordinator's
+  - **The host-wide denies observe under `alpha`** (the coordinator's
     decision of 13/11: the alpha never breaks anything on a tester's
     machine). A foreign tracing, LSM, extension or `struct_ops` BPF
     program's load (`bpftrace`, BCC, another EDR), a `cgroup/sysctl`
     program on the root cgroup, the kprobes and lockdown switches, a kexec
     image, the sysctl guard (write deny and `cgroup/sysctl` judge; the
     integrity round puts no guarded value back, `sysctl_would_restore`), a cgroup
-    v1 write and a ptrace of PID 1 go through under `alpha` (and
-    `--detect-only`), each recorded "would deny" (`would have:
+    v1 write and a ptrace of PID 1 go through under `alpha`
+    (`--detect-only` keeps its meaning and leaves them on), each recorded
+    "would deny" (`would have:
     deny:<operation> (would deny: …)`, counted in the status summary). The
     denies that protect the agent — a signal, ptrace or limit change aimed
     at it or its watchdog; a write, rename or unlink of its files, units and
     pins; a handle on, a write of, a detach or replacement of its BPF maps,
     programs and links — hold under every profile. The start writes the
-    gate into the kernel's `HOST_DENY_MODE` before anything attaches and
+    profile's answer into the kernel's `HOST_DENY_MODE` before anything attaches and
     freezes it; a ratchet (`xtask/tests/host_deny.rs`) keeps every deny site
     of the eBPF object routed through it or listed as self-protection with
     its reason; `deploy/lab/malsim/host-deny-check.sh` (`nn-lab.sh

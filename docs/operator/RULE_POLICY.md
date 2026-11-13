@@ -594,7 +594,7 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
   record a second per loader and type). A refused load is NN-L-AT-001
   `bpf_prog_type`, High, and raises the posture to ENGAGED (an
   administrator's bpftrace meets it too: never the decisive tamper). Lot
-  341: under the observe-only `alpha` profile (and `--detect-only`) the
+  341: under the observe-only `alpha` profile the
   load is not refused — the same record, marked "would deny"
   ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1); the opt-out matters only
   under `enforcing`.

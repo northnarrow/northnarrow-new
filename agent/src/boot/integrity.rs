@@ -606,6 +606,10 @@ mod tests {
             ),
         )
         .unwrap();
+        // the flags read the process environment, which
+        // `cli::tests::env_switches_read_1_and_0` sets (gates6: its
+        // `NN_EXEC_POLICY_NO_ENV=maybe` met this parse)
+        let _env = super::super::cli::TEST_ENV.lock();
         let cli = Cli::try_parse_from([
             "northnarrow-agent".to_string(),
             "--install-manifest".to_string(),
