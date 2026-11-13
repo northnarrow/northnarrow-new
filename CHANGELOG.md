@@ -812,6 +812,80 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 346 (alpha, false positives round 2B): a developer's and a
+  self-hoster's normal work, each benign case told apart by identity —
+  never by name alone (`docs/operator/UPGRADE_NOTES_WAVE4.md` §39).
+  - **`go test`'s binaries and `go run`'s program are no staging exec.** A
+    program the packaged `go` (`is_go_toolchain`, its exec seen) built in its
+    work directory (`<tmp>/go-build<digits>/b<digits>/<name>` or
+    `…/exe/<name>`) and forked itself — the one hop above the exec, run
+    before the fork — raises no `StagingExec` without a second factor (an
+    unlinked image, a mass write). On `main` every developer's `go test`
+    held the posture in ENGAGED (lot 340's corpus). The pre-exec check
+    (`ExecCheck`, the LSM's `bprm_check_security`) is judged on its kernel
+    `ppid` running the packaged `go` (`execs_go_build_output`): the lab's
+    first after-round found `go test` still ENGAGED by it — the fork's
+    `/proc` image was the test binary by the time the posture read it.
+    R001's record stays (lot 283b). Named test:
+    `go_test_binaries_and_go_run_programs_are_no_staging_exec`. The
+    mini-hunt: `go test` rewriting its archives in its work directory was
+    also NN-L-IMP-001 **Critical** (the ransomware tracker judged the
+    packaged `go` under a session's shell); the tracker now trusts the
+    packaged `go` in its own directories (`Trusted::GoToolchainOwnWork`, lot
+    340's `is_go_toolchain_own_write`). Named test:
+    `the_go_toolchain_rewriting_its_own_archives_is_trusted`.
+  - **JavaScript package managers in their own directories only** (the
+    re-check of #552, N1; item 2). npm's mass-write exemption covered every
+    write of node running npm's CLI — `npm init` loads `~/.npm-init.js` in
+    that process, and npm's CLI was npm's under a path prefix a user may
+    fill (`/nix/store`, `/opt`). It is now `js_pm_own_write`: a package
+    manager (npm, yarn, pnpm through node; bun's binary running an install
+    command) whose exec has its image — executed from a root-only directory
+    in PID 1's mount namespace (`ROOT_DIR`) — and a crossing file in its own
+    directories (a `node_modules` segment, its cache or store, a manifest
+    or lockfile). yarn (`yarn/bin/yarn.js`, `/usr/bin/yarnpkg`,
+    `/usr/local/bin/yarn`, corepack's links), pnpm (`pnpm/bin/pnpm.cjs`,
+    `/usr/local/bin/pnpm`) and bun (`…/node_modules/bun/bin/bun.exe`,
+    `/usr/bin/bun`, `/usr/local/bin/bun`; `install`, `add`, `remove`,
+    `update`) were not exempt at all. The CLI by its suffix only under
+    `/usr`. Residual, said: the arm judges the file that crossed (the
+    kernel reports a window once), so code inside the package manager that
+    keeps its crossings in a package tree is not counted by the arm — the
+    ransomware tracker (NN-L-IMP-001) still judges every crossing; a
+    package manager from a user prefix (nvm, `~/.bun`) is judged as any
+    process. Named tests:
+    `npm_outside_its_own_directories_or_identity_raises_the_posture`,
+    `yarn_pnpm_and_bun_installs_do_not_raise_the_posture`,
+    `a_package_manager_outside_its_identity_or_directories_keeps_the_arm`,
+    `npm_is_npm_only_from_usr_and_a_rooted_node`,
+    `npm_s_own_writes_are_its_directories_only`,
+    `yarn_pnpm_and_bun_are_known_by_their_identity_and_own_directories`.
+  - **`initdb` making a cluster** (item 6). The packaged `initdb` and the
+    bootstrap `postgres` it starts (forked by it or by its `popen`'s
+    `sh -c`, the same version's directory), as a service account, writing
+    only that account's own data (the kernel's `SERVICE` summary), no longer
+    raise ConfirmedIntrusion from a session (`pg_createcluster` by hand: lot
+    340's db corpus). Lot 283c's decision 1 stands for every other program
+    of the account; its test's session writer is now a shell. Named test:
+    `initdb_making_a_cluster_raises_nothing_from_a_session_too`.
+  - **The exec record's argv keeps empty arguments** (the re-check of
+    #552, N2). `parse_argv_blob` dropped every empty segment:
+    `execve("/usr/sbin/logrotate", ["", "logrotate", "/etc/logrotate.conf"])`
+    digested as the packaged invocation (lot 340's Low) while logrotate also
+    read `./logrotate` as a configuration. Only the last argument's NUL is
+    dropped now, as `/proc/<pid>/cmdline` is read. Named test:
+    `parse_argv_blob_keeps_empty_arguments`.
+  - **Cluster DNS services and self-forking resolvers** (item 5, N3).
+    NodeLocal DNSCache (`node-cache`) and kube-dns (`kubedns`, its
+    `dnsmasq`) are proven by their container runtime's record as CoreDNS
+    is (`CLUSTER_DNS`); a resolver whose recorded forker ran the same
+    packaged file (a daemon's own fork, at most two) is its unit's service
+    when the chain starts at PID 1. Named tests:
+    `node_local_dns_and_kube_dns_are_proven_by_their_container_runtime_s_record`,
+    `a_resolver_that_forked_itself_is_its_unit_s_service`.
+  - **The lab's dev corpus** installs the npm project with yarn, pnpm and
+    bun too (`wl_js`), and keeps npm's cache at its default name under the
+    corpus' tree.
 - Lot 340 (alpha 1/4): the daily false positives of a benign host, each
   removed where the kernel proves the benign case; every attack variant is
   still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §34).

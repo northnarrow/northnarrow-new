@@ -75,7 +75,11 @@ and `cargo test` (three registry dependencies, pinned); `cargo fmt` over 120
 small unformatted modules; `go test ./...`, `go run .` and `go build` (the
 test binary and `go run`'s program run from `/tmp/go-build…`); `npm install`
 (writes the lockfile), `npm ci`, `npm run build` (tsc), `prettier --write`
-over the 300 sources; `python3 -m venv` and `pip install` of two packages;
+over the 300 sources; lot 346: the same project installed by `yarnpkg`
+(the distribution's yarn 1), pnpm 9 and bun 1.1 (`npm i -g`, under
+`/usr/local`; Node 18 or later), each once and once more with `--force`,
+their caches at their default places in a home under the corpus' tree
+(`$W/lab-home`), npm's cache at `$W/lab-home/.npm`; `python3 -m venv` and `pip install` of two packages;
 `git checkout` between the two branches (2,400 of the 3,000 files differ)
 and back; `rsync -a --inplace` of 1,000 changed small files onto their
 copies; the AppImage: its squashfs image mounted by `squashfuse` on

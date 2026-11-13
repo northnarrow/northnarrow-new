@@ -1532,6 +1532,13 @@ enum StagedExec {
 /// - the mass-write arm fired for the same process within a mass-write
 ///   window (its lineage gates applied).
 ///
+/// Lot 346 (item 1): not raised at all, without a second factor, for a
+/// program the packaged `go` built in its own work directory and runs
+/// itself (`go test`'s test binaries, `go run`'s program:
+/// [`AuthSessionTracker::runs_go_build_output`]) — every developer's `go
+/// test` held the posture in ENGAGED. R001's record of the exec is the
+/// rule's (a person's exec from `/tmp`, lot 283b).
+///
 /// Never promoted within a package transaction: maintainer scripts and
 /// scriptlets run helpers they unpack in `/tmp`. Lab PR 175: the
 /// transaction of the rules' carve-outs
@@ -1548,21 +1555,24 @@ fn staging_exec<H: PostureAgent>(
     auth: &AuthSessionTracker<H>,
     mass_writers: &MassWriters,
 ) -> Option<StagedExec> {
-    let (pid, filename, exe, ts) = match focal {
+    // lot 346 (the lab of item 1): the pre-exec check's process is still
+    // the fork it was — its parent, the kernel's `ppid`, is asked
+    let (pid, filename, exe, ts, pre_exec) = match focal {
         Event::ProcessSpawn {
             pid,
             filename,
             exe,
             timestamp_ns,
             ..
-        }
-        | Event::ExecCheck {
+        } => (*pid, filename, exe, *timestamp_ns, None),
+        Event::ExecCheck {
             pid,
+            ppid,
             filename,
             exe,
             timestamp_ns,
             ..
-        } => (*pid, filename, exe, *timestamp_ns),
+        } => (*pid, filename, exe, *timestamp_ns, Some(*ppid)),
         _ => return None,
     };
     let image = exe.path_or(filename);
@@ -1575,6 +1585,16 @@ fn staging_exec<H: PostureAgent>(
     let unlinked = exe.has(exe_flags::DELETED) || exe.has(exe_flags::MEMFD);
     let mass_wrote = mass_writers.wrote_near(pid, ts);
     if !unlinked && !mass_wrote {
+        // lot 346 (item 1): `go test`'s test binary and `go run`'s program,
+        // built by the packaged `go` in its work directory and run by it
+        let as_of = AsOf::judged(ts);
+        let go_built = match pre_exec {
+            None => auth.runs_go_build_output(pid, as_of, image),
+            Some(ppid) => auth.execs_go_build_output(ppid, as_of, image),
+        };
+        if go_built {
+            return None;
+        }
         return Some(StagedExec::Plain);
     }
     tracing::warn!(
@@ -1671,7 +1691,7 @@ fn confirmed_intrusion<H: DecisionHost>(
             cgroup_id,
             own_data,
         } => {
-            let mut own = own_data_exempt(auth, daemons, *pid, *uid, *own_data);
+            let mut own = own_data_exempt(auth, daemons, (*pid, *uid, *timestamp_ns), *own_data);
             let shape = if *overwrites && *small_files {
                 Shape::SmallRewrites
             } else if *overwrites {
@@ -1717,7 +1737,7 @@ fn confirmed_intrusion<H: DecisionHost>(
             own_data,
             ..
         } => {
-            let own = own_data_exempt(auth, daemons, *pid, *uid, *own_data);
+            let own = own_data_exempt(auth, daemons, (*pid, *uid, *timestamp_ns), *own_data);
             let Some(all_own) = replacements.record(
                 *pid,
                 pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
@@ -2027,7 +2047,11 @@ fn tracepoint_arm<H: PostureHost>(
 ///   a service account ([`AccountKind::System`]: below `UID_MIN` or a shell
 ///   that refuses a login) and the writer runs in a system service's cgroup
 ///   (`/system.slice/…/<unit>.service`, never a session's scope) —
-///   PostgreSQL, MySQL, Redis writing their own data;
+///   PostgreSQL, MySQL, Redis writing their own data; lot 346 (item 6): or
+///   the writer is the packaged `initdb` making a cluster, or its bootstrap
+///   `postgres` ([`AuthSessionTracker::runs_postgres_initdb`]) — from a
+///   session too (`pg_createcluster` by hand, `sudo -u postgres initdb`);
+///   any other program of the account in a session still counts;
 /// - `CACHE` (every file in its owner's `~/.cache`, written by that owner):
 ///   the uid is a person's ([`AccountKind::Human`]);
 /// - a daemon directory's code (every file in one directory of
@@ -2041,15 +2065,16 @@ fn tracepoint_arm<H: PostureHost>(
 fn own_data_exempt<H: DecisionHost>(
     auth: &AuthSessionTracker<H>,
     daemons: Option<&DaemonData>,
-    pid: u32,
-    uid: u32,
+    (pid, uid, ts_ns): (u32, u32, u64),
     own: u8,
 ) -> Option<&'static str> {
     match own {
         own_data::NONE => None,
+        // lot 346 (item 6): or by the packaged `initdb` making its cluster
         own_data::SERVICE => (H::account_kind(uid) == AccountKind::System
-            && auth.system_service(pid).is_some())
-        .then_some("a service account's own data, written by its service"),
+            && (auth.system_service(pid).is_some()
+                || auth.runs_postgres_initdb(pid, AsOf::judged(ts_ns))))
+        .then_some("a service account's own data, written by its service or its initdb"),
         own_data::CACHE => (H::account_kind(uid) == AccountKind::Human)
             .then_some("a person's own cache, written by that person"),
         code => {
@@ -2066,7 +2091,9 @@ fn own_data_exempt<H: DecisionHost>(
 /// transaction's ([`AuthSessionTracker::in_package_transaction`]), mandb's
 /// own as a system account (its cache rebuild,
 /// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own
-/// (lot 340: also run through `/usr/bin/npm`), the Go toolchain's in its own
+/// (lot 340: also run through `/usr/bin/npm`; lot 346: yarn's, pnpm's and
+/// bun's too, in their own directories only,
+/// [`AuthSessionTracker::js_pm_own_write`]), the Go toolchain's in its own
 /// directories (lot 340, [`AuthSessionTracker::is_go_toolchain_own_write`]),
 /// and a user's package manager in that user's container storage —
 /// `Some` with which, `None` for any other writer.
@@ -2101,8 +2128,10 @@ fn mass_write_exempt<H: PostureHost>(
         Some("package transaction")
     } else if auth.is_system_man_cache_writer(pid, as_of) {
         Some("man-db cache rebuild")
-    } else if auth.is_npm_cli_writer(pid, as_of) {
-        Some("npm CLI")
+    } else if let Some(pm) = auth.js_pm_own_write(pid, as_of, path) {
+        // lot 346 (the re-check of #552, N1): npm, yarn, pnpm, bun — in
+        // their own directories only
+        Some(pm.exempt_reason())
     } else if auth.is_go_toolchain_own_write(pid, as_of, path) {
         // lot 340: `go test` stamping its archives' build ids in place
         Some("the Go toolchain in its own work, build-cache or module-cache directory")
@@ -2675,6 +2704,104 @@ mod tests {
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
         assert_eq!(hits, vec![TriggerType::StagingExec]);
+    }
+
+    /// Named test (lot 346, item 1): `go test` runs each package's test
+    /// binary from its work directory in `/tmp`, `go run` its program — the
+    /// packaged `go` forked both. On `main` each was a staging exec and the
+    /// developer's posture sat in ENGAGED (lot 340's dev corpus). The same
+    /// file run by a shell, by the test binary itself, by a `go` in a home,
+    /// a file outside the work directory's layout, and the test binary
+    /// with a second factor (its image unlinked) are judged as before.
+    #[test]
+    fn go_test_binaries_and_go_run_programs_are_no_staging_exec() {
+        let det = detector_with_empty_proc();
+        let go = "/usr/lib/go-1.22/bin/go";
+        let _ = det.detect(&spawn_with_exe(300, 1, "/usr/bin/bash", 1), &[]);
+        let _ = det.detect(&rooted(spawn_with_exe(8000, 300, go, 2)), &[]);
+        for (pid, image) in [
+            (8001, "/tmp/go-build2618259110/b001/calc.test"),
+            (8002, "/tmp/go-build4098838642/b001/exe/nncorpus"),
+            (8003, "/var/tmp/go-build77/b012/x.test"),
+        ] {
+            let hits = det.detect(&spawn(pid, 8000, "calc.test", image, 5), &[]);
+            assert!(
+                !hits.contains(&TriggerType::StagingExec),
+                "{image}: {hits:?}"
+            );
+        }
+        let _ = det.detect(
+            &rooted(spawn_with_exe(8010, 300, "/home/u/sdk/go1.23.0/bin/go", 2)),
+            &[],
+        );
+        for (pid, ppid, image) in [
+            (8020, 300, "/tmp/go-build2618259110/b001/calc.test"),
+            (8021, 8001, "/tmp/go-build2618259110/b001/exe/helper"),
+            (8022, 8010, "/tmp/go-build1/b001/calc.test"),
+            (8023, 8000, "/tmp/go-build1/calc.test"),
+            (8024, 8000, "/tmp/go-build1/b001/x/calc.test"),
+            (8025, 8000, "/tmp/go-buildx/b001/calc.test"),
+            (8026, 8000, "/tmp/go-build1/b001/../../evil"),
+            (8027, 8000, "/tmp/evil"),
+            // (mutation r1) no `b<digits>` directory; `..` before the work dir
+            (8028, 8000, "/tmp/go-build1/evil/calc.test"),
+            (8029, 8000, "/tmp/x/../go-build1/b001/calc.test"),
+        ] {
+            let hits = det.detect(&spawn(pid, ppid, "x", image, 6), &[]);
+            assert_eq!(hits, vec![TriggerType::StagingExec], "{ppid} {image}");
+        }
+        // (mutation r1) never an ancestor further up: `go` forks 8040, which
+        // forks 8041 and only then executes a shell; 8041 runs a file of a
+        // work directory — its forker ran no `go` when it forked it
+        let _ = det.detect(&rooted(spawn_with_exe(8040, 8000, go, 2)), &[]);
+        let mut late = spawn_with_exe(8040, 8000, "/usr/bin/bash", 5);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut late {
+            *start_ns = 3;
+        }
+        let _ = det.detect(&late, &[]);
+        let mut child = spawn(8041, 8040, "x.test", "/tmp/go-build1/b001/x.test", 6);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut child {
+            *start_ns = 4;
+        }
+        assert_eq!(det.detect(&child, &[]), vec![TriggerType::StagingExec]);
+        // the pre-exec check (LSM `bprm_check_security`): the process is go's
+        // fork, its parent the kernel's `ppid` — the lab's after-round found
+        // `go test` still ENGAGED by it (the fork's `/proc` image is the test
+        // binary by the time the posture reads it)
+        let check = |pid: u32, ppid: u32, image: &str| Event::ExecCheck {
+            pid,
+            ppid,
+            uid: 1000,
+            comm: "go".into(),
+            filename: image.into(),
+            timestamp_ns: 6,
+            exe: nn_model::ExeIdentity {
+                path: image.into(),
+                flags: exe_flags::KNOWN,
+                ..Default::default()
+            },
+        };
+        let built = "/tmp/go-build2618259110/b001/calc.test";
+        let hits = det.detect(&check(8050, 8000, built), &[]);
+        assert!(!hits.contains(&TriggerType::StagingExec), "{hits:?}");
+        for (pid, ppid, image) in [
+            (8051, 300, built),
+            (8052, 8010, built),
+            (8053, 8001, built),
+            (8054, 8000, "/tmp/go-build1/evil/calc.test"),
+            (8055, 8000, "/tmp/evil"),
+        ] {
+            let hits = det.detect(&check(pid, ppid, image), &[]);
+            assert_eq!(hits, vec![TriggerType::StagingExec], "{ppid} {image}");
+        }
+        let mut gone = spawn(8030, 8000, "calc.test", "/tmp/go-build1/b001/calc.test", 7);
+        if let Event::ProcessSpawn { exe, .. } = &mut gone {
+            exe.path = "/tmp/go-build1/b001/calc.test".into();
+            exe.flags |= exe_flags::KNOWN | exe_flags::DELETED;
+        }
+        assert!(det
+            .detect(&gone, &[])
+            .contains(&TriggerType::ConfirmedIntrusion));
     }
 
     /// External audit NETR-008: the shared staging set, /var/tmp included;
@@ -4528,7 +4655,7 @@ mod tests {
         let det = detector_with_empty_proc();
         // node interpreter running npm's CLI, ingested via the argv path.
         let _ = det.detect(
-            &spawn_with_argv(
+            &rooted(spawn_with_argv(
                 7000,
                 1,
                 "/usr/bin/node",
@@ -4540,7 +4667,7 @@ mod tests {
                     "left-pad",
                 ],
                 1,
-            ),
+            )),
             &[],
         );
         // Unpack burst into the global node_modules.
@@ -4637,6 +4764,30 @@ mod tests {
         detector_with_empty_proc()
     }
 
+    /// Lot 346 (the re-check of #552, N1): `e` with the image the kernel
+    /// gives an exec from a root-only directory in PID 1's mount namespace
+    /// (`KNOWN | ROOT_DIR`), as every packaged package manager's.
+    fn rooted(mut e: Event) -> Event {
+        if let Event::ProcessSpawn {
+            pid, filename, exe, ..
+        } = &mut e
+        {
+            exe.path = filename.clone();
+            (exe.dev, exe.ino) = (2049, u64::from(*pid));
+            exe.flags |= exe_flags::KNOWN | exe_flags::ROOT_DIR;
+        }
+        e
+    }
+
+    /// Lot 346: [`destroyed`] whose crossing file is `path`.
+    fn destroyed_at(pid: u32, path: &str, ts: u64) -> Event {
+        let mut e = destroyed(pid, ts);
+        if let Event::FileBurst { filename, .. } = &mut e {
+            *filename = path.into();
+        }
+        e
+    }
+
     /// A kernel crossing of `pid` whose crossing file is `path`.
     fn mass_write_at(pid: u32, path: &str, overwrites: bool, small: bool, ts: u64) -> Event {
         let mut e = mass_write_in(pid, 0, overwrites, small, ts);
@@ -4658,12 +4809,19 @@ mod tests {
         for script in ["/usr/bin/npm", "/usr/local/bin/npm", "/bin/npm"] {
             let det = detector_with_npm_links();
             let _ = det.detect(
-                &spawn_with_argv(7300, 1, "/usr/bin/node", &["node", script, "ci"], 1),
+                &rooted(spawn_with_argv(
+                    7300,
+                    1,
+                    "/usr/bin/node",
+                    &["node", script, "ci"],
+                    1,
+                )),
                 &[],
             );
             let w = "/srv/ci/web/node_modules/@types/lodash/assign.d.ts";
             let _ = det.detect(&mass_write_at(7300, w, false, false, 10), &[]);
-            let hits = det.detect(&destroyed(7300, 11), &[]);
+            let gone = "/srv/ci/web/node_modules/@types/lodash/index.d.ts";
+            let hits = det.detect(&destroyed_at(7300, gone, 11), &[]);
             assert!(
                 !hits.contains(&TriggerType::ConfirmedIntrusion),
                 "{script}: npm ci's replacement must not raise the posture: {hits:?}"
@@ -4713,18 +4871,27 @@ mod tests {
     #[test]
     fn npm_running_the_caller_s_code_keeps_the_mass_write_arm() {
         use common::wire::exe::exe_flags::ENV_LOADS;
-        let run = |pid: u32, script: &str, flags: u32| {
+        // lot 346 (N1): with the image of a packaged node, and npm's
+        // exemption its own directories — the raised cases write a
+        // document, the exempt ones a package tree
+        let run_at = |pid: u32, script: &str, flags: u32, path: &str| {
             let det = detector_with_npm_links();
-            let mut e = spawn_with_argv(pid, 1, "/usr/bin/node", &["node", script, "ci"], 1);
+            let mut e = rooted(spawn_with_argv(
+                pid,
+                1,
+                "/usr/bin/node",
+                &["node", script, "ci"],
+                1,
+            ));
             if let Event::ProcessSpawn { exe, .. } = &mut e {
-                exe.flags = flags;
+                exe.flags |= flags;
             }
             let _ = det.detect(&e, &[]);
-            let _ = det.detect(
-                &mass_write_at(pid, "/home/u/Documents/a.pdf", false, false, 10),
-                &[],
-            );
-            det.detect(&destroyed(pid, 11), &[])
+            let _ = det.detect(&mass_write_at(pid, path, false, false, 10), &[]);
+            det.detect(&destroyed_at(pid, path, 11), &[])
+        };
+        let run = |pid: u32, script: &str, flags: u32| {
+            run_at(pid, script, flags, "/home/u/Documents/a.pdf")
         };
         for (pid, script, flags) in [
             (7600, "/home/u/p/node_modules/evil/npm/bin/npm-cli.js", 0),
@@ -4749,15 +4916,208 @@ mod tests {
                 "{script} {flags:#x}: {hits:?}"
             );
         }
+        // (mutation r1) the caller's code loaded into npm keeps the arm in a
+        // package tree too
+        for (pid, script) in [
+            (7607, "/usr/bin/npm"),
+            (7608, "/usr/share/nodejs/npm/bin/npm-cli.js"),
+        ] {
+            let hits = run_at(
+                pid,
+                script,
+                ENV_LOADS,
+                "/home/u/p/node_modules/lodash/lodash.js",
+            );
+            assert!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{script}: {hits:?}"
+            );
+        }
         for (pid, script) in [
             (7610, "/usr/bin/npm"),
             (7611, "/usr/share/nodejs/npm/bin/npm-cli.js"),
             (7612, "/usr/local/lib/node_modules/npm/bin/npm-cli.js"),
         ] {
-            let hits = run(pid, script, 0);
+            let hits = run_at(pid, script, 0, "/home/u/p/node_modules/lodash/lodash.js");
             assert!(
                 !hits.contains(&TriggerType::ConfirmedIntrusion),
                 "{script}: {hits:?}"
+            );
+        }
+    }
+
+    /// Named test (lot 346, the re-check of #552, N1): the packaged npm,
+    /// run clean, that writes a user's documents — the encryptor npm loads
+    /// in its own process (`npm init` runs `~/.npm-init.js`) — raises the
+    /// posture; so does npm in a package tree when its node has no image of
+    /// a root-only directory in PID 1's mount namespace (a user's namespace
+    /// that binds an encryptor over npm's CLI), and npm's CLI from a Nix
+    /// store path or `/opt`. On `main` all were "npm CLI", exempt.
+    #[test]
+    fn npm_outside_its_own_directories_or_identity_raises_the_posture() {
+        let ci = TriggerType::ConfirmedIntrusion;
+        let modules = "/home/u/p/node_modules/lodash/lodash.js";
+        let run = |pid: u32, script: &str, rooted_exec: bool, path: &str| {
+            let det = detector_with_npm_links();
+            let e = spawn_with_argv(pid, 1, "/usr/bin/node", &["node", script, "init", "-y"], 1);
+            let e = if rooted_exec {
+                rooted(e)
+            } else {
+                let mut e = rooted(e);
+                if let Event::ProcessSpawn { exe, .. } = &mut e {
+                    exe.flags &= !exe_flags::ROOT_DIR;
+                }
+                e
+            };
+            let _ = det.detect(&e, &[]);
+            let _ = det.detect(&mass_write_at(pid, path, false, false, 10), &[]);
+            det.detect(&destroyed_at(pid, path, 11), &[])
+        };
+        for (pid, script, rooted_exec, path) in [
+            (7700, "/usr/bin/npm", true, "/home/u/Documents/thesis.odt"),
+            (
+                7701,
+                "/usr/share/nodejs/npm/bin/npm-cli.js",
+                true,
+                "/home/u/.npm-init.js",
+            ),
+            (7702, "/usr/bin/npm", false, modules),
+            (
+                7703,
+                "/nix/store/0abc-nodejs-20/lib/node_modules/npm/bin/npm-cli.js",
+                true,
+                modules,
+            ),
+            (
+                7704,
+                "/opt/dev/lib/node_modules/npm/bin/npm-cli.js",
+                true,
+                modules,
+            ),
+        ] {
+            let hits = run(pid, script, rooted_exec, path);
+            assert!(
+                hits.contains(&ci),
+                "{script} {rooted_exec} {path}: {hits:?}"
+            );
+        }
+        // the control: the packaged npm in its package tree
+        let hits = run(7705, "/usr/bin/npm", true, modules);
+        assert!(!hits.contains(&ci), "{hits:?}");
+        // in-place rewrites too (the arm's other shape)
+        let det = detector_with_npm_links();
+        let _ = det.detect(
+            &rooted(spawn_with_argv(
+                7706,
+                1,
+                "/usr/bin/node",
+                &["node", "/usr/bin/npm", "ci"],
+                1,
+            )),
+            &[],
+        );
+        let docs = "/home/u/Documents/a.pdf";
+        assert!(det
+            .detect(&mass_write_at(7706, docs, true, false, 10), &[])
+            .contains(&ci));
+    }
+
+    /// Named test (lot 346, item 2): yarn, pnpm and bun installing a
+    /// project — a replacement crossing in its package tree, a cache or
+    /// store filled beside it — raise nothing, as npm (lot 340); on `main`
+    /// only npm was known, and each raised ConfirmedIntrusion → ENGAGED.
+    #[test]
+    fn yarn_pnpm_and_bun_installs_do_not_raise_the_posture() {
+        for (pid, exe, args, created, gone) in [
+            (
+                7800,
+                "/usr/bin/node",
+                &["node", "/usr/bin/yarnpkg", "install", "--frozen-lockfile"][..],
+                "/home/u/.cache/yarn/v6/npm-lodash-4.17.21/node_modules/lodash/a.js",
+                "/home/u/p/node_modules/lodash/a.js",
+            ),
+            (
+                7801,
+                "/usr/bin/node",
+                &["node", "/usr/local/bin/pnpm", "install"][..],
+                "/home/u/.local/share/pnpm/store/v3/files/0a/bcdef",
+                "/home/u/p/node_modules/.pnpm/lodash@4.17.21/node_modules/lodash/a.js",
+            ),
+            (
+                7802,
+                "/usr/local/lib/node_modules/bun/bin/bun.exe",
+                &["bun", "install"][..],
+                "/home/u/.bun/install/cache/lodash@4.17.21@@@1/a.js",
+                "/home/u/p/node_modules/lodash/a.js",
+            ),
+        ] {
+            let det = detector_with_npm_links();
+            let _ = det.detect(&rooted(spawn_with_argv(pid, 1, exe, args, 1)), &[]);
+            let _ = det.detect(&mass_write_at(pid, created, false, false, 10), &[]);
+            let hits = det.detect(&destroyed_at(pid, gone, 11), &[]);
+            assert!(
+                !hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{args:?}: {hits:?}"
+            );
+        }
+    }
+
+    /// Named test (lot 346, item 2): what is not a packaged package
+    /// manager's install, or writes outside its own directories, keeps the
+    /// arm — `bun run` (the caller's code in bun), bun from the upstream
+    /// installer's `~/.bun/bin`, pnpm's standalone binary in a home, yarn's
+    /// berry release run from a project, yarn writing a document — and a
+    /// package's install script (a child of the package manager) in a
+    /// package tree.
+    #[test]
+    fn a_package_manager_outside_its_identity_or_directories_keeps_the_arm() {
+        let modules = "/home/u/p/node_modules/lodash/a.js";
+        let docs = "/home/u/Documents/a.pdf";
+        for (pid, exe, args, path) in [
+            (
+                7900,
+                "/usr/local/bin/bun",
+                &["bun", "run", "enc.ts"][..],
+                modules,
+            ),
+            (
+                7901,
+                "/home/u/.bun/bin/bun",
+                &["bun", "install"][..],
+                modules,
+            ),
+            (
+                7902,
+                "/home/u/.local/share/pnpm/pnpm",
+                &["pnpm", "install"][..],
+                modules,
+            ),
+            (
+                7903,
+                "/usr/bin/node",
+                &["node", "/home/u/p/.yarn/releases/yarn-4.5.0.cjs", "install"][..],
+                modules,
+            ),
+            (
+                7904,
+                "/usr/bin/node",
+                &["node", "/usr/bin/yarnpkg", "install"][..],
+                docs,
+            ),
+            (
+                7905,
+                "/usr/bin/node",
+                &["node", "/home/u/p/node_modules/x/install.js"][..],
+                modules,
+            ),
+        ] {
+            let det = detector_with_npm_links();
+            let _ = det.detect(&rooted(spawn_with_argv(pid, 1, exe, args, 1)), &[]);
+            let _ = det.detect(&mass_write_at(pid, path, false, false, 10), &[]);
+            let hits = det.detect(&destroyed_at(pid, path, 11), &[]);
+            assert!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{args:?} {path}: {hits:?}"
             );
         }
     }
@@ -6038,8 +6398,11 @@ mod tests {
         // the session: sshd → bash → the client run as postgres
         let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
         let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        // lot 346: a program of the account in the session (its shell), not
+        // the packaged initdb making a cluster
+        // (`initdb_making_a_cluster_raises_nothing_from_a_session_too`)
         let _ = det.detect(
-            &spawn_with_exe_by(113, PG_SESSION, 300, "/usr/lib/postgresql/16/bin/initdb", 3),
+            &spawn_with_exe_by(113, PG_SESSION, 300, "/usr/bin/bash", 3),
             &[],
         );
         let _ = det.detect(&spawn_with_exe_by(1000, ALICE, 300, "/usr/bin/go", 4), &[]);
@@ -6107,9 +6470,13 @@ mod tests {
             .contains(&TriggerType::ConfirmedIntrusion));
     }
 
-    /// Lot 283c, decision 1: the same burst from a login session — `initdb`
-    /// run from `sudo -u postgres` in an SSH shell — counts: the writer is
-    /// no system service.
+    /// Lot 283c, decision 1: the same burst from a login session — a
+    /// program of the account run from `sudo -u postgres -i` in an SSH shell
+    /// — counts: the writer is no system service. Lot 346 (item 6): the
+    /// session's writer was `initdb`; the packaged `initdb` making a cluster
+    /// is now told apart by its identity
+    /// ([`initdb_making_a_cluster_raises_nothing_from_a_session_too`]), and
+    /// the decision stands for every other program of the account.
     #[test]
     fn the_same_service_burst_from_a_session_counts() {
         let h = own_host();
@@ -6118,6 +6485,142 @@ mod tests {
             .det
             .detect(&own_burst(PG_SESSION, 113, pg, own_data::SERVICE, 10), &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    /// Named test (lot 346, item 6): `pg_createcluster` by hand runs the
+    /// packaged `initdb` as the service account from a session, and
+    /// `initdb`'s bootstrap `postgres` (through its `popen`'s `sh -c`,
+    /// which execs it or forks it) rewrites the new cluster's relation
+    /// files: every file the service account's own data (the kernel's
+    /// `SERVICE` summary). On `main`: ConfirmedIntrusion → ENGAGED for both
+    /// (lot 340's db corpus). They raise nothing now; the same burst with a
+    /// file outside the account's own data, by a person, by a copy of
+    /// `initdb` in a home, by an `initdb` with no image of a root-only
+    /// directory (another mount namespace), by the packaged `postgres` run
+    /// from the session or under another version's `initdb`, still counts.
+    #[test]
+    fn initdb_making_a_cluster_raises_nothing_from_a_session_too() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let pg = "/var/lib/postgresql/16/nncorpus/base/1/2678";
+        let bin = "/usr/lib/postgresql/16/bin";
+        let run = |e: Event| {
+            let _ = h.det.detect(&e, &[]);
+        };
+        run(rooted(spawn_with_exe_by(
+            113,
+            520,
+            300,
+            &format!("{bin}/initdb"),
+            5,
+        )));
+        // popen's shell execs the backend (dash), or forks it (bash)
+        run(rooted(spawn_with_exe_by(113, 521, 520, "/usr/bin/dash", 6)));
+        run(rooted(spawn_with_exe_by(
+            113,
+            521,
+            520,
+            &format!("{bin}/postgres"),
+            7,
+        )));
+        run(rooted(spawn_with_exe_by(113, 522, 520, "/usr/bin/bash", 6)));
+        run(rooted(spawn_with_exe_by(
+            113,
+            523,
+            522,
+            &format!("{bin}/postgres"),
+            7,
+        )));
+        for (i, pid) in [520, 521, 523].into_iter().enumerate() {
+            let hits = h.det.detect(
+                &own_burst(pid, 113, pg, own_data::SERVICE, 10 + i as u64),
+                &[],
+            );
+            assert!(!hits.contains(&ci), "pid {pid}: {hits:?}");
+        }
+        // the same writers outside the account's own data, or as a person
+        let docs = "/home/alice/Documents/report.docx";
+        assert!(h
+            .det
+            .detect(&own_burst(520, 113, docs, own_data::NONE, 20), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(521, 1000, pg, own_data::SERVICE, 21), &[])
+            .contains(&ci));
+        // a copy in a home, no image, a postgres the session runs, another
+        // version's postgres under initdb 16
+        run(rooted(spawn_with_exe_by(
+            113,
+            530,
+            300,
+            "/home/u/pg/bin/initdb",
+            30,
+        )));
+        let mut unrooted = spawn_with_exe_by(113, 531, 300, &format!("{bin}/initdb"), 30);
+        if let Event::ProcessSpawn { exe, .. } = &mut unrooted {
+            exe.path = format!("{bin}/initdb");
+            (exe.dev, exe.ino, exe.flags) = (2049, 531, exe_flags::KNOWN);
+        }
+        run(unrooted);
+        run(rooted(spawn_with_exe_by(
+            113,
+            532,
+            300,
+            &format!("{bin}/postgres"),
+            30,
+        )));
+        run(rooted(spawn_with_exe_by(
+            113,
+            533,
+            520,
+            "/usr/lib/postgresql/15/bin/postgres",
+            30,
+        )));
+        // (mutation r1) an initdb of another tree, and a postgres three
+        // hops below the packaged initdb (a shell's shell: not its popen)
+        run(rooted(spawn_with_exe_by(
+            113,
+            534,
+            300,
+            "/opt/pg/bin/initdb",
+            30,
+        )));
+        run(rooted(spawn_with_exe_by(
+            113,
+            535,
+            300,
+            "/usr/local/bin/initdb",
+            30,
+        )));
+        run(rooted(spawn_with_exe_by(
+            113,
+            536,
+            520,
+            "/usr/bin/dash",
+            31,
+        )));
+        run(rooted(spawn_with_exe_by(
+            113,
+            537,
+            536,
+            "/usr/bin/dash",
+            32,
+        )));
+        run(rooted(spawn_with_exe_by(
+            113,
+            538,
+            537,
+            &format!("{bin}/postgres"),
+            33,
+        )));
+        for (i, pid) in [530, 531, 532, 533, 534, 535, 538].into_iter().enumerate() {
+            let hits = h.det.detect(
+                &own_burst(pid, 113, pg, own_data::SERVICE, 40 + i as u64),
+                &[],
+            );
+            assert!(hits.contains(&ci), "pid {pid}: {hits:?}");
+        }
     }
 
     /// Lot 283c, decision 1: the same burst with one file of its window

@@ -2035,3 +2035,47 @@ are judged as before; `CHANGELOG.md` has the detail.
   `profile` and `records_today`. An `nn-admin` of this release needs an
   agent of this release (the status reply grew two fields, as every
   appended field before).
+
+## 39. Developer tools and services, round 2 (lot 346)
+
+What a developer's or a self-hoster's normal work produced, and what an
+operator who reads the records after the upgrade will see instead. The
+attack variants beside each are judged as before; `CHANGELOG.md` has the
+detail.
+
+- **`go test` and `go run`** no longer raise ENGAGED (`StagingExec`): a
+  program the packaged `go` built in its work directory
+  (`<tmp>/go-build<digits>/b<digits>/…`) and runs itself, with no second
+  factor. R001's record of that exec stays High (a person's exec from
+  `/tmp`, lot 283b). `go test`'s rewrite of its own archives is no longer
+  NN-L-IMP-001 Critical: the ransomware tracker trusts the packaged `go`
+  in its work, build-cache and module-cache directories. The same file run by a shell, by a test binary, by a
+  `go` in a home, and anything else run from `/tmp` raise as before.
+- **npm, yarn, pnpm and bun** are exempt from the mass-write arm only in
+  their own directories: a `node_modules` tree, their cache or store
+  (`~/.npm`, `~/.cache/yarn`, a `.yarn` directory, pnpm's store and
+  `~/.cache/pnpm`, `~/.bun/install/cache`), a manifest or lockfile. npm was
+  exempt wherever it wrote; yarn, pnpm and bun were not exempt at all. The
+  package manager must be the packaged one: node (`/usr/bin/node`,
+  `/usr/local/bin/node`) running the CLI from `/usr` or a link a package
+  installed (`/usr/bin/npm`, `/usr/bin/yarnpkg`, `/usr/local/bin/pnpm`, …),
+  or bun's binary in a system tree running an install command, executed
+  from a root-only directory in PID 1's mount namespace, with no
+  `NODE_OPTIONS`/`NODE_PATH` loading code. **What to check after the
+  upgrade**: a package manager from a user prefix (nvm, volta, `~/.bun`,
+  pnpm's standalone binary, a yarn release a project ships) is judged as any
+  process; `npm ci` from such a node in a CI runner raises ENGAGED as
+  before. A cache moved out of its default place (`npm_config_cache`,
+  `--cache-folder`, `store-dir`) is no longer the package manager's own.
+- **`initdb`** making a cluster (`pg_createcluster` by hand, `sudo -u
+  postgres initdb`) no longer raises ENGAGED: the packaged `initdb`
+  (`/usr/lib/postgresql/<N>/bin`, `/usr/pgsql-<N>/bin`, `/usr/bin`) and
+  the bootstrap `postgres` it starts, as a service account, writing only
+  that account's own data. Any other program of the account in a session
+  still counts.
+- **Kubernetes' NodeLocal DNSCache and kube-dns** are known resolvers, as
+  CoreDNS: their legs are recorded, never their own tunnel, never killed.
+- **A resolver daemon that forked itself** (`Type=forking`) is its unit's
+  service when its lineage records the fork.
+- **The exec record's argv** keeps empty arguments (`""`): an exec's
+  `argv` in a record may now hold `""` where it read as missing.

@@ -816,7 +816,14 @@ answered): a package transaction (it replaces the files it upgrades), the
 man-db cache rebuild as a system account (it replaces each locale's
 `index.db` by a rename), npm's CLI (`npm ci` deletes `node_modules` and
 extracts it again) and a user's package manager in that user's container
-storage. None is by name or path alone.
+storage. None is by name or path alone. Lot 346: npm's, yarn's, pnpm's and
+bun's own writes, each in its own directories only (a package tree, its
+cache or store, a manifest or lockfile), and only for a package manager
+the kernel executed from a root-only directory in PID 1's mount namespace;
+the exemption is judged on the crossing's file, which the kernel reports
+once a window — code inside the package manager that keeps its crossings
+in a package tree is not counted by the arm, and the ransomware tracker
+still reads every crossing.
 
 The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`):
 its (a) rewrites are distinct files of 4 KiB or more (a small-file crossing

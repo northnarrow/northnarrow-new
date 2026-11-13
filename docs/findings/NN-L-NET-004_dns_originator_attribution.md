@@ -210,3 +210,29 @@ The review of #552 tightened both proofs, so that no user obtains them:
   CoreDNS's id passed — and the sender must share its PID and mount
   namespaces with the container's init, whose pid the runtime recorded in
   the bundle (containerd's `init.pid`, CRI-O's `userdata/pidfile`, root's).
+
+## Lot 346: the other cluster DNS services, and a daemon that forked itself
+
+- **NodeLocal DNSCache and kube-dns** are proven as CoreDNS is, by their
+  runtime's record of the container (`crates/nn-linux/src/net/known_resolver.rs`,
+  `CLUSTER_DNS`): in `kube-system`, NodeLocal DNSCache's container
+  `node-cache` from a `k8s-dns-node-cache` image running `/node-cache`
+  (its sender), kube-dns's `kubedns` from `k8s-dns-kube-dns` running
+  `/kube-dns`, and its `dnsmasq` container from `k8s-dns-dnsmasq-nanny`
+  running `/dnsmasq-nanny`, whose child `/usr/sbin/dnsmasq` sends. An
+  image's name is its repository's last part, a mirror's
+  `<prefix>-<name>`, with an architecture's suffix or not
+  (`k8s-dns-kube-dns-amd64`). Each record proves only its own sender: a
+  `/kube-dns` in a NodeLocal DNSCache container is not one.
+  `KNOWN_RESOLVER_PROGRAMS` gained `node-cache` and `kube-dns` (a candidate
+  by name; the proof decides).
+- **A resolver daemon that forked itself** (the re-check of #552, N3):
+  when the lineage records the resolver's forker as a process that ran the
+  same packaged file (a daemon's own fork, `Type=forking`), the proof walks
+  up to two such forks and asks the first one's forker to be PID 1 (or,
+  for dnsmasq, the packaged NetworkManager). A fork the daemon made after
+  its exec has no exec record, and `/proc`'s parent (PID 1 after the
+  reparenting) answered already; the walk covers the lineage that names
+  the pre-fork process. A chain started by a shell, or a forker that ran
+  another file, is not proven.
+

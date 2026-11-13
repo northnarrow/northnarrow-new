@@ -312,10 +312,79 @@ const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
 
 /// Lot 340: the links to npm's CLI a package installs in a root-owned
 /// system tree — the path a shell runs `npm` by, which the kernel hands
-/// node as `argv[1]` ([`AuthSessionTracker::names_npm_cli`]): the Debian
-/// and Ubuntu `npm` package's and NodeSource's `/usr/bin/npm` (`/bin/npm`
-/// with a merged `/usr`), an upstream archive's `/usr/local/bin/npm`.
+/// node as `argv[1]` ([`js_pm_of`]): the Debian and Ubuntu `npm` package's
+/// and NodeSource's `/usr/bin/npm` (`/bin/npm` with a merged `/usr`), an
+/// upstream archive's `/usr/local/bin/npm`.
 const NPM_CLI_LINKS: &[&str] = &["/usr/bin/npm", "/bin/npm", "/usr/local/bin/npm"];
+
+/// Lot 346 (the alpha's false positives, round 2): the JavaScript package
+/// managers whose own writes the mass-write arm leaves out
+/// ([`AuthSessionTracker::js_pm_own_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsPm {
+    Npm,
+    Yarn,
+    Pnpm,
+    Bun,
+}
+
+impl JsPm {
+    /// The exemption's name in the arm's INFO record.
+    pub fn exempt_reason(self) -> &'static str {
+        match self {
+            JsPm::Npm => "npm's CLI in its own directories (node_modules, its cache)",
+            JsPm::Yarn => "yarn's CLI in its own directories (node_modules, its cache)",
+            JsPm::Pnpm => "pnpm's CLI in its own directories (node_modules, its store)",
+            JsPm::Bun => "bun's install in its own directories (node_modules, its cache)",
+        }
+    }
+}
+
+/// Lot 346: the package managers node runs as a script — each by its CLI's
+/// suffix under `/usr` (a distribution's or an upstream archive's global
+/// tree: `/usr/lib/node_modules`, `/usr/share/nodejs`,
+/// `/usr/local/lib/node_modules`) or by the link a package installs for it
+/// in a root-owned system tree, which the kernel hands node as `argv[1]`:
+/// npm ([`NPM_CLI_SUFFIX`], [`NPM_CLI_LINKS`]); yarn (`yarn/bin/yarn.js`:
+/// Debian's and Ubuntu's `yarnpkg`, `npm i -g yarn`; corepack's shims are
+/// links of the same names); pnpm (`pnpm/bin/pnpm.cjs`: `npm i -g pnpm`).
+const NODE_PM_CLIS: &[(JsPm, &str, &[&str])] = &[
+    (JsPm::Npm, NPM_CLI_SUFFIX, NPM_CLI_LINKS),
+    (
+        JsPm::Yarn,
+        "/yarn/bin/yarn.js",
+        &[
+            "/usr/bin/yarn",
+            "/bin/yarn",
+            "/usr/local/bin/yarn",
+            "/usr/bin/yarnpkg",
+            "/bin/yarnpkg",
+            "/usr/local/bin/yarnpkg",
+        ],
+    ),
+    (
+        JsPm::Pnpm,
+        "/pnpm/bin/pnpm.cjs",
+        &["/usr/bin/pnpm", "/bin/pnpm", "/usr/local/bin/pnpm"],
+    ),
+];
+
+/// Lot 346: bun's binary where a package puts it in a root-owned system
+/// tree — `npm i -g bun` (`…/node_modules/bun/bin/bun.exe`, which the
+/// kernel resolves `/usr/local/bin/bun` to), or a distribution's
+/// `/usr/bin/bun`. The upstream installer's `~/.bun/bin/bun` is the user's
+/// own file: not one.
+const BUN_EXES: &[&str] = &[
+    "/usr/bin/bun",
+    "/usr/local/bin/bun",
+    "/usr/lib/node_modules/bun/bin/bun.exe",
+    "/usr/local/lib/node_modules/bun/bin/bun.exe",
+];
+
+/// Lot 346: bun's commands that install packages (`argv[1]`). `bun run`,
+/// `bun test`, `bun x`, `bun <file>` run the caller's code in the process:
+/// never exempt.
+const BUN_INSTALLS: &[&str] = &["install", "i", "add", "a", "remove", "rm", "update"];
 
 /// The pid→Entry map's size past which the entries of processes that
 /// have exited (and whose [`EXIT_GRACE`] has passed) are dropped, oldest
@@ -421,16 +490,17 @@ struct Entry {
     /// keeps it), same clock. Without one (older records, the plain
     /// ingest calls) its exec time stands in: the latest it can be.
     start_ns: u64,
-    /// FP-2: `true` iff this spawn's `argv[1]` is npm's CLI entrypoint
-    /// ([`NPM_CLI_SUFFIX`]). Precomputed at ingest so the mass-write
-    /// exemption is a single cheap field read AND the variable-length
-    /// argv is never retained in the bounded cache. Meaningful only
-    /// when `exe` ∈ [`NODE_EXES`] — that exe gate is applied at read
-    /// time in [`AuthSessionTracker::is_npm_cli_writer`].
-    argv_npm_cli: bool,
+    /// FP-2: this spawn's `argv[1]` is npm's CLI entrypoint
+    /// ([`NPM_CLI_SUFFIX`]); lot 346: or yarn's, pnpm's ([`NODE_PM_CLIS`]),
+    /// or bun's install command ([`BUN_INSTALLS`]) — [`js_pm_of`].
+    /// Precomputed at ingest so the mass-write exemption is a single cheap
+    /// field read AND the variable-length argv is never retained in the
+    /// bounded cache. Meaningful only with the exe's gate, applied at read
+    /// time in [`AuthSessionTracker::js_pm_writer`].
+    js_pm: Option<JsPm>,
     /// Lot 313 (BUG-49's residue): the exec's argv asks an encryption tool
     /// to encrypt ([`crate::posture::script_args::encrypts`]), precomputed
-    /// at ingest as [`Self::argv_npm_cli`] is (the argv is not kept).
+    /// at ingest as [`Self::js_pm`] is (the argv is not kept).
     encrypts: bool,
     /// Lot 340 (the review of #552, F1): the exec's whole argv as a digest
     /// ([`AuthSessionTracker::argv_digest`]: `argv[0]`'s basename, then
@@ -1170,7 +1240,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (false, false, None),
+            (None, false, None),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1235,7 +1305,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .then_some((exe.dev, exe.ino))
             .or(image);
         let path = exe.path_or(filename);
-        let argv_npm_cli = self.names_npm_cli(Path::new(path), argv);
+        let js_pm = js_pm_of(Path::new(path), argv);
         // lot 313 (BUG-49's residue): an encryption tool asked to encrypt
         let encrypts = crate::posture::script_args::encrypts(Path::new(path), argv);
         // the review of #552 (F1): an argv the sensor cut is not the whole
@@ -1257,7 +1327,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *pid,
             *ppid,
             path,
-            (argv_npm_cli, encrypts, digest),
+            (js_pm, encrypts, digest),
             runs,
             *timestamp_ns,
             (*start_ns, None),
@@ -1283,14 +1353,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         start_ns: u64,
         uid: u32,
     ) {
-        let argv_npm_cli = self.names_npm_cli(Path::new(exe), argv);
+        let js_pm = js_pm_of(Path::new(exe), argv);
         let encrypts = crate::posture::script_args::encrypts(Path::new(exe), argv);
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
             pid,
             ppid,
             exe,
-            (argv_npm_cli, encrypts, self.argv_digest(argv)),
+            (js_pm, encrypts, self.argv_digest(argv)),
             runs,
             spawn_ns,
             (start_ns, None),
@@ -1374,7 +1444,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: k.start_ns,
             start_ns: k.start_ns,
             // npm's own CLI is the process its exec named, never a fork of it
-            argv_npm_cli: false,
+            js_pm: None,
             // lot 313 (BUG-49's residue): a forked copy runs its forker's
             // exec, an encryption it was asked for included (as `fork_entry`)
             encrypts: parent.encrypts,
@@ -1385,34 +1455,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image: parent.image,
             exec_file: parent.exec_file,
             fork_parent: k.parent,
-        })
-    }
-
-    /// FP-2: `argv[1]` names npm's CLI ([`NPM_CLI_SUFFIX`]). Lot 340 (the
-    /// alpha's daily false positives): or, for a node of [`NODE_EXES`]
-    /// (`exe`), the link a package installs for it ([`NPM_CLI_LINKS`]). A
-    /// shell runs `npm` as `/usr/bin/npm`, a link to
-    /// `../share/nodejs/npm/bin/npm-cli.js` (Ubuntu, Debian; NodeSource's to
-    /// `../lib/node_modules/npm/bin/npm-cli.js`); the kernel hands the
-    /// shebang's interpreter the path it was asked to execute, so node's
-    /// `argv[1]` is `/usr/bin/npm`, and `npm ci` was never npm's CLI to the
-    /// mass-write arm (lot 313's ci corpus: ConfirmedIntrusion → ENGAGED).
-    /// The link's path, root's, is judged as the suffix is — what node runs
-    /// is the file there — with no read on the decision path.
-    ///
-    /// The review of #552 (F2): npm's CLI by its suffix only in a root-owned
-    /// system tree, named by an absolute path ([`in_system_tree`], no `..`)
-    /// — the installed npm, as the links are. A package's own copy
-    /// (`node_modules/evil/npm/bin/npm-cli.js`), or one in a home, is the
-    /// caller's code under npm's name: the very postinstall the mass-write
-    /// arm guards against can write it.
-    fn names_npm_cli(&self, exe: &Path, argv: &[String]) -> bool {
-        argv.get(1).is_some_and(|script| {
-            (script.ends_with(NPM_CLI_SUFFIX)
-                && script.starts_with('/')
-                && !script.split('/').any(|s| s == "..")
-                && in_system_tree(script))
-                || (is_node_exe(exe) && NPM_CLI_LINKS.contains(&script.as_str()))
         })
     }
 
@@ -1494,7 +1536,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 pid,
                 ppid,
                 &exe,
-                (false, false, None),
+                (None, false, None),
                 runs,
                 0,
                 (start_ns, Some(ticks)),
@@ -1551,7 +1593,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
-        (argv_npm_cli, encrypts, argv): (bool, bool, Option<u64>),
+        (js_pm, encrypts, argv): (Option<JsPm>, bool, Option<u64>),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
@@ -1566,7 +1608,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             exe: PathBuf::from(exe),
             spawn_ns,
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
-            argv_npm_cli,
+            js_pm,
             encrypts,
             argv,
             runs,
@@ -1854,7 +1896,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     e.ppid,
                     &e.exe.to_string_lossy(),
-                    (e.argv_npm_cli, e.encrypts, e.argv),
+                    (e.js_pm, e.encrypts, e.argv),
                     e.runs,
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
@@ -1912,11 +1954,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .filter(|e| e.spawn_ns <= latest && e.start_ns <= latest)
             .collect();
         let first = *could.first()?;
-        if could.iter().any(|e| {
-            e.runs != first.runs
-                || e.argv_npm_cli != first.argv_npm_cli
-                || e.encrypts != first.encrypts
-        }) {
+        if could
+            .iter()
+            .any(|e| e.runs != first.runs || e.js_pm != first.js_pm || e.encrypts != first.encrypts)
+        {
             return None;
         }
         if ppid != 1 && !could.iter().any(|e| self.is_cached_ancestor(ppid, e.ppid)) {
@@ -1944,7 +1985,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             // ran and let exit) never covers the events before it
             spawn_ns: H::monotonic_ns().max(start_ns),
             start_ns,
-            argv_npm_cli: first.argv_npm_cli,
+            js_pm: first.js_pm,
             encrypts: first.encrypts,
             // the review of #552 (F1): its own argv is not known
             argv: None,
@@ -2044,7 +2085,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 // readers) before that exec reached the cache would take
                 // the identity, and nothing tells the two apart
                 if e.runs != Runs::Inline
-                    || e.argv_npm_cli
+                    || e.js_pm.is_some()
                     || is_interpreter(&e.exe)
                     || !is_auth_binary(&e.exe)
                 {
@@ -2072,7 +2113,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             exe: parent.exe,
             spawn_ns: start_ns,
             start_ns,
-            argv_npm_cli: parent.argv_npm_cli,
+            js_pm: parent.js_pm,
             encrypts: parent.encrypts,
             // the review of #552 (F1): an exec's argv is its own process's
             argv: None,
@@ -2103,7 +2144,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 Some(f)
                     if f.exe != e.exe
                         || f.runs != e.runs
-                        || f.argv_npm_cli != e.argv_npm_cli
+                        || f.js_pm != e.js_pm
                         || f.encrypts != e.encrypts =>
                 {
                     return None
@@ -2763,7 +2804,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
     /// (non-lineage) check that the focal writer's `exe` ∈ [`NODE_EXES`]
-    /// AND its precomputed [`Entry::argv_npm_cli`] flag is set (argv[1]
+    /// AND its precomputed [`Entry::js_pm`] flag is set (argv[1]
     /// = npm's CLI entrypoint). Unlike [`Self::in_package_transaction`]
     /// this does NOT walk ancestors — only the npm-cli.js node process
     /// itself is exempted from the mass-write arm; any child it spawns
@@ -2791,16 +2832,52 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// [`with_pump_facts`]; what it runs is then [`Runs::Unknown`]). A
     /// postinstall's `NODE_OPTIONS=--require=./p.js npm -v` runs the
     /// package's code in a process named npm: judged as any node.
-    pub fn is_npm_cli_writer(&self, pid: u32, as_of: AsOf) -> bool {
+    ///
+    /// Lot 346 (the re-check of #552, N1): and node's exec has its image
+    /// ([`Entry::image`]: the kernel's or the pump's identity, `ROOT_DIR` —
+    /// executed from a root-only directory, in PID 1's mount namespace): a
+    /// node a user's namespace binds over its own, a container's, a node in
+    /// a directory a user owns is not npm's. Yarn's and pnpm's CLIs the
+    /// same way; bun's install commands run by bun's own binary
+    /// ([`BUN_EXES`], no interpreter). What this names is the process, not
+    /// what it may write: [`Self::js_pm_own_write`] is the exemption.
+    pub fn js_pm_writer(&self, pid: u32, as_of: AsOf) -> Option<JsPm> {
         if pid == 0 || pid == 1 {
-            return false;
+            return None;
         }
-        match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => {
-                e.argv_npm_cli && is_node_exe(&e.exe) && matches!(e.runs, Runs::Script(_))
-            }
-            CachedAt::LaterOnly | CachedAt::Absent => false,
-        }
+        let e = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::LaterOnly | CachedAt::Absent => return None,
+        };
+        let pm = e.js_pm?;
+        e.image?;
+        let runs = match pm {
+            JsPm::Bun => e.runs == Runs::Inline && is_bun_exe(&e.exe),
+            _ => is_node_exe(&e.exe) && matches!(e.runs, Runs::Script(_)),
+        };
+        runs.then_some(pm)
+    }
+
+    /// FP-2: [`Self::js_pm_writer`] for npm.
+    pub fn is_npm_cli_writer(&self, pid: u32, as_of: AsOf) -> bool {
+        self.js_pm_writer(pid, as_of) == Some(JsPm::Npm)
+    }
+
+    /// Lot 346 (the re-check of #552, N1): `pid` is a JavaScript package
+    /// manager ([`Self::js_pm_writer`]) and `path` one of its own
+    /// directories or files ([`in_js_pm_own_dir`]): a package tree, its
+    /// cache or store, a manifest or lockfile. npm loads the caller's code
+    /// in its own process by design (`npm init` runs `~/.npm-init.js`;
+    /// corepack's yarn and pnpm are downloads into the home), and a node
+    /// prefix under `/usr/local` may be a user's (npm's old `EACCES`
+    /// advice): whatever runs there, a user's document is never npm's to
+    /// write. The arm judges the file that crossed its threshold (the
+    /// kernel reports a window's crossing once): code inside npm that
+    /// keeps its crossings in a package tree is not counted by the arm —
+    /// the ransomware tracker (NN-L-IMP-001) still judges every crossing.
+    pub fn js_pm_own_write(&self, pid: u32, as_of: AsOf, path: &str) -> Option<JsPm> {
+        self.js_pm_writer(pid, as_of)
+            .filter(|pm| in_js_pm_own_dir(*pm, path))
     }
 
     /// Lot 340 (the review of #552, F1): the real uid `pid` executed its
@@ -2850,6 +2927,95 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 e.runs == Runs::Inline && is_go_toolchain(&e.exe)
             }
             CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
+    /// Lot 346 (item 1): `pid` runs a program the Go toolchain built in its
+    /// own work directory — `image`, the file the kernel executed, is
+    /// `<tmp>/go-build<digits>/b<digits>/<name>` (`go test`'s test binary)
+    /// or `…/b<digits>/exe/<name>` (`go run`'s program) ([`in_go_work_dir`])
+    /// — and the process that forked it ran the packaged `go` command
+    /// ([`is_go_toolchain`], its exec seen, run as itself) before the fork:
+    /// the one hop above `pid` (external audit POS-003's order), never an
+    /// ancestor further up. A test binary run through `go test -exec`'s
+    /// wrapper, a program a test binary runs, a file a user drops in a
+    /// `go-build` directory and runs from a shell, a `go` downloaded into a
+    /// home: not. What `go` builds is the user's code — as `go build` and
+    /// `./prog` from a home, which no staging rule judges. As of `as_of`.
+    pub fn runs_go_build_output(&self, pid: u32, as_of: AsOf, image: &str) -> bool {
+        if pid <= 1 || !in_go_work_dir(image) {
+            return false;
+        }
+        matches!(
+            self.lineage_walk(pid, as_of, |hop| hop.pid != pid, 1),
+            Some(Some(hop)) if hop.cached && hop.runs == Runs::Inline && is_go_toolchain(&hop.exe)
+        )
+    }
+
+    /// Lot 346 (the lab of item 1): [`Self::runs_go_build_output`] for the
+    /// pre-exec check (`Event::ExecCheck`, LSM `bprm_check_security`): the
+    /// process is still the fork it was, its parent the kernel's `ppid` —
+    /// that parent runs the packaged `go` as of the check (its exec seen,
+    /// run as itself), and `image` lies in a work directory's layout. The
+    /// exec event that follows is judged on the order of the fork
+    /// ([`Self::runs_go_build_output`]): a parent that executed `go` only
+    /// after the fork raises there.
+    pub fn execs_go_build_output(&self, ppid: u32, as_of: AsOf, image: &str) -> bool {
+        if ppid <= 1 || !in_go_work_dir(image) {
+            return false;
+        }
+        match self.cached_live(ppid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.runs == Runs::Inline && is_go_toolchain(&e.exe)
+            }
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
+    /// Lot 346 (item 6): `pid` is PostgreSQL's `initdb` making a cluster —
+    /// the packaged `initdb` ([`is_postgres_bin`]: a distribution's
+    /// `/usr/lib/postgresql/<N>/bin/initdb`, PGDG's `/usr/pgsql-<N>/bin/`,
+    /// `/usr/bin/initdb`; its exec seen with its image, run as itself), or
+    /// the packaged `postgres` of the same directory that such an `initdb`
+    /// started for the bootstrap (forked by it, or by the `sh -c` its
+    /// `popen` runs: at most two hops up, each ran before the fork below).
+    /// `initdb` creates a cluster in an empty directory and its bootstrap
+    /// backends write the new cluster's relation files, rewriting each as
+    /// they fill it (lot 340's db corpus: ConfirmedIntrusion → ENGAGED for
+    /// both, `pg_createcluster` by hand). Whose files and which account the
+    /// arm still decides ([`super::triggers`]: a service account's own
+    /// data, the kernel's summary). As of `as_of`, from the spawn cache.
+    pub fn runs_postgres_initdb(&self, pid: u32, as_of: AsOf) -> bool {
+        if pid <= 1 {
+            return false;
+        }
+        let e = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::LaterOnly | CachedAt::Absent => return false,
+        };
+        if e.image.is_none() || e.runs != Runs::Inline {
+            return false;
+        }
+        let Some((dir, prog)) = is_postgres_bin(&e.exe) else {
+            return false;
+        };
+        match prog {
+            "initdb" => true,
+            _ => {
+                let initdb = format!("{dir}/initdb");
+                matches!(
+                    self.lineage_walk(
+                        pid,
+                        as_of,
+                        |hop| hop.pid != pid
+                            && hop.cached
+                            && hop.runs == Runs::Inline
+                            && hop.exe == Path::new(&initdb),
+                        2,
+                    ),
+                    Some(Some(_))
+                )
+            }
         }
     }
 
@@ -3807,9 +3973,133 @@ fn in_go_own_dir(path: &str) -> bool {
     })
 }
 
+/// Lot 346: `path` is a program the Go toolchain built in a build's work
+/// directory and runs from there: `…/go-build<digits>/b<digits>/<name>`
+/// (`go test`'s test binary) or `…/go-build<digits>/b<digits>/exe/<name>`
+/// (`go run`'s). Absolute, every segment judged, no `.` or `..`.
+fn in_go_work_dir(path: &str) -> bool {
+    if !path.starts_with('/') || path.split('/').any(|s| s == ".." || s == ".") {
+        return false;
+    }
+    let digits = |s: &str, p: &str| {
+        s.strip_prefix(p)
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segs.iter().enumerate().any(|(i, s)| {
+        digits(s, "go-build")
+            && segs.get(i + 1).is_some_and(|b| digits(b, "b"))
+            && matches!(&segs[(i + 2).min(segs.len())..], [_] | ["exe", _])
+    })
+}
+
+/// Lot 346: `exe` is a packaged PostgreSQL server program — its directory
+/// (a distribution's `/usr/lib/postgresql/<version>/bin`, PGDG's
+/// `/usr/pgsql-<version>/bin`, or `/usr/bin`: each exactly, a version of
+/// digits and dots, so no `..` and no other tree) and its name, `initdb` or
+/// `postgres`.
+fn is_postgres_bin(exe: &Path) -> Option<(&str, &str)> {
+    let e = exe.to_str()?;
+    let (dir, prog) = e.rsplit_once('/')?;
+    if !matches!(prog, "initdb" | "postgres") {
+        return None;
+    }
+    let version = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    let packaged = dir == "/usr/bin"
+        || dir
+            .strip_prefix("/usr/lib/postgresql/")
+            .and_then(|r| r.strip_suffix("/bin"))
+            .is_some_and(version)
+        || dir
+            .strip_prefix("/usr/pgsql-")
+            .and_then(|r| r.strip_suffix("/bin"))
+            .is_some_and(version);
+    packaged.then_some((dir, prog))
+}
+
 fn is_node_exe(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     NODE_EXES.iter().any(|p| s == *p)
+}
+
+fn is_bun_exe(exe: &Path) -> bool {
+    let s = exe.to_string_lossy();
+    BUN_EXES.iter().any(|p| s == *p)
+}
+
+/// The package manager an exec of `exe` with `argv` runs, if any.
+///
+/// FP-2: node's `argv[1]` names npm's CLI ([`NPM_CLI_SUFFIX`]). Lot 340 (the
+/// alpha's daily false positives): or, for a node of [`NODE_EXES`] (`exe`),
+/// the link a package installs for it ([`NPM_CLI_LINKS`]). A shell runs
+/// `npm` as `/usr/bin/npm`, a link to `../share/nodejs/npm/bin/npm-cli.js`
+/// (Ubuntu, Debian; NodeSource's to `../lib/node_modules/npm/bin/npm-cli.js`);
+/// the kernel hands the shebang's interpreter the path it was asked to
+/// execute, so node's `argv[1]` is `/usr/bin/npm`. The review of #552 (F2):
+/// the CLI by its suffix only in a root-owned system tree, named by an
+/// absolute path ([`in_system_tree`], no `..`) — a package's own copy
+/// (`node_modules/evil/npm/bin/npm-cli.js`), or one in a home, is the
+/// caller's code under npm's name. The re-check of #552 (N1), lot 346: and
+/// under `/usr` only — a Nix store path or a directory under `/opt` is any
+/// user's to fill; yarn's and pnpm's CLIs the same way ([`NODE_PM_CLIS`]);
+/// bun's install commands run by bun's binary in a system tree
+/// ([`BUN_EXES`], [`BUN_INSTALLS`]).
+fn js_pm_of(exe: &Path, argv: &[String]) -> Option<JsPm> {
+    let first = argv.get(1)?;
+    if is_bun_exe(exe) {
+        return BUN_INSTALLS.contains(&first.as_str()).then_some(JsPm::Bun);
+    }
+    // `in_system_tree` refuses a `..` segment (mutation r1: a second check
+    // of it was equivalent)
+    let installed = first.starts_with("/usr/") && in_system_tree(first);
+    NODE_PM_CLIS
+        .iter()
+        .find(|(_, suffix, links)| {
+            (installed && first.ends_with(suffix))
+                || (is_node_exe(exe) && links.contains(&first.as_str()))
+        })
+        .map(|(pm, _, _)| *pm)
+}
+
+/// Lot 346 (the re-check of #552, N1): `path` (absolute, no `..`) is one
+/// `pm` writes as its own work — a package tree (a directory segment
+/// `node_modules`: a project's, a global prefix's, pnpm's
+/// `node_modules/.pnpm`), its cache or store in the user's home, or a
+/// project's manifest or lockfile — and never a user's document, whatever
+/// code runs in the package manager's process:
+///
+/// - npm: `~/.npm/` (`_cacache`, `_logs`, `_npx`); `package.json`,
+///   `package-lock.json`, `npm-shrinkwrap.json`;
+/// - yarn: `~/.cache/yarn/`, a `.yarn/` directory (berry's cache, its
+///   install state; `~/.yarn/berry/`); `yarn.lock`, `.pnp.cjs`,
+///   `.pnp.loader.mjs`, `package.json`;
+/// - pnpm: its store (`…/pnpm/store/`, a `.pnpm-store/` at a volume's
+///   root), `~/.cache/pnpm/`; `pnpm-lock.yaml`, `package.json`;
+/// - bun: `~/.bun/install/cache/`; `bun.lock`, `bun.lockb`,
+///   `package.json`.
+fn in_js_pm_own_dir(pm: JsPm, path: &str) -> bool {
+    if !path.starts_with('/') || path.split('/').any(|s| s == ".." || s == ".") {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some((leaf, dirs)) = segs.split_last() else {
+        return false;
+    };
+    let under = |a: &str, b: &str| dirs.windows(2).any(|w| w[0] == a && w[1] == b);
+    let dir = |d: &str| dirs.contains(&d);
+    let leaves: &[&str] = match pm {
+        JsPm::Npm => &["package.json", "package-lock.json", "npm-shrinkwrap.json"],
+        JsPm::Yarn => &["package.json", "yarn.lock", ".pnp.cjs", ".pnp.loader.mjs"],
+        JsPm::Pnpm => &["package.json", "pnpm-lock.yaml"],
+        JsPm::Bun => &["package.json", "bun.lock", "bun.lockb"],
+    };
+    let own = match pm {
+        JsPm::Npm => dir(".npm"),
+        JsPm::Yarn => under(".cache", "yarn") || dir(".yarn"),
+        JsPm::Pnpm => under("pnpm", "store") || dir(".pnpm-store") || under(".cache", "pnpm"),
+        JsPm::Bun => dirs.windows(3).any(|w| w == [".bun", "install", "cache"]),
+    };
+    dir("node_modules") || own || leaves.contains(leaf)
 }
 
 /// Lot 310 (the review of #539, findings 2 and 7): what an exec pump's
@@ -4936,16 +5226,49 @@ mod tests {
         v
     }
 
+    /// Lot 346 (the re-check of #552, N1): an exec of `exe` with `argv`,
+    /// with the image the kernel or the pump gave it (`ROOT_DIR`: executed
+    /// from a root-only directory, in PID 1's mount namespace) when
+    /// `rooted`, else the LSM identity alone (another mount namespace).
+    fn ingest_exec_of(t: &AuthSessionTracker, pid: u32, exe: &str, argv: &[String], rooted: bool) {
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let _ = t.ingest_spawn_event(&Event::ProcessSpawn {
+            pid,
+            ppid: 50,
+            uid: 1000,
+            gid: 1000,
+            comm: "node".into(),
+            filename: exe.into(),
+            timestamp_ns: 1,
+            argv: argv.to_vec(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 1,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: exe.into(),
+                dev: 2049,
+                ino: u64::from(pid),
+                flags: if rooted { KNOWN | ROOT_DIR } else { KNOWN },
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        });
+    }
+
     #[test]
     fn node_running_npm_cli_is_npm_cli_writer() {
         let t = AuthSessionTracker::new("/proc");
-        // node interpreter running npm's CLI entrypoint.
-        t.ingest_spawn_with_argv(
+        // node interpreter running npm's CLI entrypoint (lot 346: its
+        // image recorded, as every exec the kernel reports).
+        ingest_exec_of(
+            &t,
             7000,
-            50,
             "/usr/bin/node",
             &npm_argv(&["install", "-g", "x"]),
-            1,
+            true,
         );
         assert!(t.is_npm_cli_writer(7000, AsOf::Now));
         // It is NOT auth- or system-daemon-mediated (disjoint signals).
@@ -4969,6 +5292,10 @@ mod tests {
         // (the non-forgeable half) → not exempt.
         t.ingest_spawn_with_argv(7002, 50, "/tmp/evil", &npm_argv(&["install"]), 1);
         assert!(!t.is_npm_cli_writer(7002, AsOf::Now));
+        // lot 346 (mutation r1): with an image too — another interpreter
+        // in a system tree naming npm's CLI by its suffix
+        ingest_exec_of(&t, 7006, "/usr/bin/python3", &npm_argv(&["install"]), true);
+        assert!(!t.is_npm_cli_writer(7006, AsOf::Now));
     }
 
     #[test]
@@ -4995,7 +5322,7 @@ mod tests {
             (7008, "/usr/share/nodejs/npm/bin/npm-cli.js"),
         ] {
             let argv = vec!["node".to_string(), path.to_string()];
-            t.ingest_spawn_with_argv(pid, 50, "/usr/bin/node", &argv, 1);
+            ingest_exec_of(&t, pid, "/usr/bin/node", &argv, true);
             assert!(t.is_npm_cli_writer(pid, AsOf::Now), "{path}");
         }
     }
@@ -5020,6 +5347,190 @@ mod tests {
             let argv = vec!["node".to_string(), path.to_string()];
             t.ingest_spawn_with_argv(pid, 50, "/usr/bin/node", &argv, 1);
             assert!(!t.is_npm_cli_writer(pid, AsOf::Now), "{path}");
+        }
+    }
+
+    /// Named test (lot 346, the re-check of #552, N1): npm's CLI is npm's
+    /// only from `/usr` and from a node executed in PID 1's mount namespace
+    /// out of a root-only directory — not a Nix store path or a directory
+    /// under `/opt` any user may fill, not a node a user's namespace binds
+    /// a file over (no `ROOT_DIR`), not an exec the agent has no image of.
+    #[test]
+    fn npm_is_npm_only_from_usr_and_a_rooted_node() {
+        let t = AuthSessionTracker::new("/proc");
+        for (pid, path, rooted) in [
+            (
+                7030,
+                "/nix/store/0abc-nodejs-20/lib/node_modules/npm/bin/npm-cli.js",
+                true,
+            ),
+            (7031, "/opt/dev/lib/node_modules/npm/bin/npm-cli.js", true),
+            (7032, "/usr/share/nodejs/npm/bin/npm-cli.js", false),
+            (7033, "/usr/bin/npm", false),
+        ] {
+            let argv = vec!["node".to_string(), path.to_string(), "init".to_string()];
+            ingest_exec_of(&t, pid, "/usr/bin/node", &argv, rooted);
+            assert!(!t.is_npm_cli_writer(pid, AsOf::Now), "{path} {rooted}");
+        }
+        // the plain ingest (no identity at all) names no package manager
+        t.ingest_spawn_with_argv(7034, 50, "/usr/bin/node", &npm_argv(&["ci"]), 1);
+        assert!(!t.is_npm_cli_writer(7034, AsOf::Now));
+        ingest_exec_of(&t, 7035, "/usr/bin/node", &npm_argv(&["ci"]), true);
+        assert!(t.is_npm_cli_writer(7035, AsOf::Now));
+    }
+
+    /// Named test (lot 346, the re-check of #552, N1): npm's exemption is
+    /// its own directories — a package tree, `~/.npm`, a manifest or
+    /// lockfile — and never a user's document, whatever runs in npm
+    /// (`~/.npm-init.js`); the other package managers' own places are not
+    /// npm's.
+    #[test]
+    fn npm_s_own_writes_are_its_directories_only() {
+        let t = AuthSessionTracker::new("/proc");
+        ingest_exec_of(&t, 7040, "/usr/bin/node", &npm_argv(&["init", "-y"]), true);
+        let now = AsOf::Now;
+        for own in [
+            "/home/u/p/node_modules/lodash/lodash.js",
+            "/home/u/p/node_modules/.package-lock.json",
+            "/usr/local/lib/node_modules/typescript/lib/tsc.js",
+            "/home/u/.npm/_cacache/content-v2/sha512/ab/cd/ef",
+            "/home/u/.npm/_logs/2026-11-13T21_00_00_000Z-debug-0.log",
+            "/home/u/p/package-lock.json",
+            "/home/u/p/package.json",
+            "/root/.npm/_cacache/index-v5/aa/bb",
+        ] {
+            assert_eq!(t.js_pm_own_write(7040, now, own), Some(JsPm::Npm), "{own}");
+        }
+        for not_own in [
+            "/home/u/Documents/thesis.odt",
+            "/home/u/.npm-init.js",
+            "/home/u/p/src/index.js",
+            "/home/u/.cache/yarn/v6/npm-x/index.js",
+            "/home/u/.local/share/pnpm/store/v3/files/00/aa",
+            "/home/u/p/node_modules/../../Documents/a.pdf",
+            "/home/u/p/./node_modules/a",
+            "node_modules/a/index.js",
+            "/home/u/p/node_modules",
+            "/home/u/p/yarn.lock",
+        ] {
+            assert_eq!(t.js_pm_own_write(7040, now, not_own), None, "{not_own}");
+        }
+    }
+
+    /// Named test (lot 346, item 2): yarn, pnpm and bun are known by the
+    /// same identity as npm — node running their CLI from `/usr` or a
+    /// packaged link, bun's binary in a system tree running an install
+    /// command — each in its own directories; bun running the caller's
+    /// code (`bun run`, `bun x`, a file), the upstream installer's
+    /// `~/.bun/bin/bun`, pnpm's standalone binary in a home and yarn's
+    /// berry release in a project are not.
+    #[test]
+    fn yarn_pnpm_and_bun_are_known_by_their_identity_and_own_directories() {
+        let t = AuthSessionTracker::new("/proc");
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let now = AsOf::Now;
+        for (pid, exe, args, pm, own) in [
+            (
+                7050,
+                "/usr/bin/node",
+                &["node", "/usr/bin/yarnpkg", "install"][..],
+                JsPm::Yarn,
+                "/home/u/.cache/yarn/v6/npm-lodash-4.17.21/package.json",
+            ),
+            (
+                7051,
+                "/usr/bin/node",
+                &["node", "/usr/local/bin/yarn"][..],
+                JsPm::Yarn,
+                "/home/u/p/.yarn/cache/lodash-npm-4.17.21.zip",
+            ),
+            (
+                7057,
+                "/usr/bin/node",
+                &["node", "/usr/bin/yarnpkg"][..],
+                JsPm::Yarn,
+                "/home/u/.cache/yarn/v6/.tmp/0a1b2c/lodash.js",
+            ),
+            (
+                7052,
+                "/usr/local/bin/node",
+                &[
+                    "node",
+                    "/usr/local/lib/node_modules/yarn/bin/yarn.js",
+                    "add",
+                    "x",
+                ][..],
+                JsPm::Yarn,
+                "/home/u/p/node_modules/x/index.js",
+            ),
+            (
+                7053,
+                "/usr/bin/node",
+                &["node", "/usr/local/bin/pnpm", "install"][..],
+                JsPm::Pnpm,
+                "/home/u/.local/share/pnpm/store/v3/files/00/abcdef",
+            ),
+            (
+                7054,
+                "/usr/bin/node",
+                &["node", "/usr/lib/node_modules/pnpm/bin/pnpm.cjs", "i"][..],
+                JsPm::Pnpm,
+                "/home/u/p/node_modules/.pnpm/lodash@4.17.21/node_modules/lodash/a.js",
+            ),
+            (
+                7055,
+                "/usr/local/lib/node_modules/bun/bin/bun.exe",
+                &["bun", "install"][..],
+                JsPm::Bun,
+                "/home/u/.bun/install/cache/lodash@4.17.21/a.js",
+            ),
+            (
+                7056,
+                "/usr/local/bin/bun",
+                &["bun", "add", "x"][..],
+                JsPm::Bun,
+                "/home/u/p/bun.lock",
+            ),
+        ] {
+            ingest_exec_of(&t, pid, exe, &argv(args), true);
+            assert_eq!(t.js_pm_writer(pid, now), Some(pm), "{args:?}");
+            assert_eq!(t.js_pm_own_write(pid, now, own), Some(pm), "{own}");
+            for other in [
+                "/home/u/Documents/a.pdf",
+                "/home/u/yarn/.cache/a.js",
+                "/home/u/store/pnpm/a.js",
+            ] {
+                assert_eq!(t.js_pm_own_write(pid, now, other), None, "{args:?} {other}");
+            }
+        }
+        for (pid, exe, args) in [
+            (
+                7060,
+                "/usr/local/lib/node_modules/bun/bin/bun.exe",
+                &["bun", "run", "x.ts"][..],
+            ),
+            (7061, "/usr/local/bin/bun", &["bun", "x", "cowsay"][..]),
+            (7062, "/usr/local/bin/bun", &["bun", "/home/u/enc.js"][..]),
+            (7063, "/home/u/.bun/bin/bun", &["bun", "install"][..]),
+            (
+                7064,
+                "/home/u/.local/share/pnpm/pnpm",
+                &["pnpm", "install"][..],
+            ),
+            (
+                7065,
+                "/usr/bin/node",
+                &["node", "/home/u/p/.yarn/releases/yarn-4.5.0.cjs", "install"][..],
+            ),
+            (
+                7066,
+                "/usr/bin/node",
+                &["node", "/home/u/p/node_modules/pnpm/bin/pnpm.cjs"][..],
+            ),
+            (7067, "/usr/bin/python3", &["python3", "/usr/bin/yarn"][..]),
+        ] {
+            ingest_exec_of(&t, pid, exe, &argv(args), true);
+            assert_eq!(t.js_pm_writer(pid, now), None, "{args:?}");
         }
     }
 
@@ -7803,7 +8314,7 @@ mod tests {
             exe: PathBuf::from("/usr/bin/bash"),
             spawn_ns: 0,
             start_ns,
-            argv_npm_cli: false,
+            js_pm: None,
             encrypts: false,
             argv: None,
             runs: Runs::Inline,

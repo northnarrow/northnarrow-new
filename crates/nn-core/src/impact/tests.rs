@@ -962,3 +962,54 @@ fn an_inline_session_s_gpg_then_rm_is_decisive() {
     assert_eq!(b.key, a.key, "the encryptor's window");
     assert_eq!(b.actor, 560, "the session that started it");
 }
+
+/// Named test (lot 346, the mini-hunt of item 1): `go test` rewrites its
+/// packages' archives in place in its work directory to stamp their build
+/// ids, high-entropy files — NN-L-IMP-001 Critical on every developer's run
+/// on `main` (lot 340's dev corpus). The packaged `go` in its own work,
+/// build-cache or module-cache directory is trusted now; the same `go`
+/// rewriting a document, a `go` in a home, and the test binary it runs are
+/// judged as before.
+#[test]
+fn the_go_toolchain_rewriting_its_own_archives_is_trusted() {
+    let h = Host::new();
+    h.exec(
+        300,
+        200,
+        "/usr/lib/go-1.22/bin/go",
+        &["go", "test", "./..."],
+    );
+    h.exec(
+        301,
+        200,
+        "/home/u/sdk/go1.23.0/bin/go",
+        &["go", "test", "./..."],
+    );
+    h.exec(302, 300, "/tmp/go-build1/b001/calc.test", &["calc.test"]);
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    let t = h.tracker(Fixed::high("/"));
+    for (i, file) in [
+        "/tmp/go-build2618259110/b073/_pkg_.a",
+        "/home/u/.cache/go-build/0a/0a1b-d",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = t.assess(&rewrites(300, T0 + i as u64, file)).unwrap();
+        assert!(a.trusted.is_some() && !a.decisive, "{file}: {a:?}");
+        assert!(a.signals.is_empty(), "{file}: {a:?}");
+    }
+    for (i, (pid, file)) in [
+        (300, format!("{d}/report.docx")),
+        (301, "/tmp/go-build2618259110/b073/_pkg_.a".to_string()),
+        (302, "/tmp/go-build2618259110/b073/_pkg_.a".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = t.assess(&rewrites(pid, T0 + 10 + i as u64, &file)).unwrap();
+        assert!(a.trusted.is_none(), "{pid} {file}: {a:?}");
+        assert!(!a.signals.is_empty(), "{pid} {file}: {a:?}");
+    }
+}

@@ -10892,3 +10892,54 @@ number in parentheses is a lab PR.
     before the round was empty on both (the check's own apt packages aside).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
+- **Lot 346 — developer tools and services, the alpha's false positives
+  round 2B (C10, C14, C17; no level changes).**
+  - What was open: `go test` held a developer's posture in ENGAGED
+    (`StagingExec` of its test binaries, also NN-L-IMP-001 Critical for its
+    archive rewrites); yarn, pnpm and bun were not known; npm's exemption
+    covered every write of a process named npm (the re-check of #552, N1:
+    `~/.npm-init.js` loaded by `npm init`, `/nix/store`, `/opt`, a user's
+    mount namespace); the exec record dropped empty arguments (N2); a
+    self-forking resolver and NodeLocal DNSCache/kube-dns were not proven
+    resolvers (N3, item 5); `pg_createcluster` by hand raised
+    ConfirmedIntrusion for `initdb` and its bootstrap `postgres`.
+  - Done, by identity: the packaged `go`'s own build outputs run by it (the
+    exec's forker, or the pre-exec check's kernel `ppid`) raise no
+    `StagingExec`, and the ransomware tracker trusts the packaged `go` in
+    its own directories; npm, yarn, pnpm (node running the CLI from `/usr`
+    or a packaged link) and bun (its binary in a system tree, install
+    commands) are exempt from the mass-write arm only in their own
+    directories and only when the exec has its image (`ROOT_DIR`: a
+    root-only directory in PID 1's mount namespace); `parse_argv_blob`
+    keeps empty arguments; a resolver whose recorded forkers ran the same
+    packaged file (≤ 2) from PID 1 is its unit's service; NodeLocal
+    DNSCache and kube-dns proven by their runtime's record as CoreDNS; the
+    packaged `initdb` (and the bootstrap `postgres` it starts) writing only
+    the service account's own data is that account's service.
+  - Lab (as measured; ubuntu2404 6.8.0-149 and debian13 6.12, `main`
+    1d8f427d before, the lot after — ubuntu2404's after-round on 49ecceca,
+    before the pre-exec fix and the tracker's go trust; debian13's on
+    be075d5b): **db corpus** `pg_createcluster` + start: ConfirmedIntrusion
+    for `initdb` and `postgres` and ENGAGED → no raise, both guests.
+    **dev corpus** `go test`: `StagingExec` ENGAGED + NN-L-IMP-001
+    Critical → on debian13 (final code) posture still OBSERVING at the go
+    steps, no IMP-001; on ubuntu2404 (49ecceca) still both — the pre-exec
+    check, found there and fixed since. R001 High for the test binary on
+    both, before and after (lot 283b). **Package managers as a CI runner**
+    (units): `npm ci`, `pnpm install --force`, `bun install --force` 0
+    raises before and after (the corpus project crosses no threshold:
+    pnpm and bun link from their stores); `yarnpkg install` fails on
+    debian13 (its yarnpkg is berry, `--force` unknown). **N1 control**: the
+    packaged npm's `npm init -y` loading an encryptor from
+    `~/.npm-init.js` (80 documents): **0 raises and no record on `main`**
+    → ConfirmedIntrusion, both guests (still no NN-L-IMP-001: the tracker
+    trusts the packaged npm). **npm from an nvm prefix** (measured, kept
+    strict): `npm ci` in the session 0, in a unit ConfirmedIntrusion 1,
+    before and after. **Attack controls** after, both guests: a package's
+    postinstall encryptor, `NODE_OPTIONS=--require` into yarn, `bun run`
+    of an encryptor, a bun project's postinstall encryptor, node alone —
+    ConfirmedIntrusion and NN-L-IMP-001 Critical each; a program in a
+    go-build-shaped directory run by a shell — R001 High.
+  - Level unchanged: the false-positive work of the alpha; C17's
+    provisional waits on the nightly.
+
