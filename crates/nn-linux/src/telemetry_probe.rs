@@ -2589,6 +2589,7 @@ pub fn round_events_for_tests(
                 family: 2,
                 timestamp_ns: ts,
                 qname_partial: false,
+                known_resolver: false,
             },
         ),
         (

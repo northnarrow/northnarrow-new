@@ -705,6 +705,117 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 340 (alpha 1/4): the daily false positives of a benign host, each
+  removed where the kernel proves the benign case; every attack variant is
+  still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §34).
+  - **A scheduled log rotation is Low.** NN-L-FIM-005 (a log modified) and
+    NN-L-FIM-019 (wtmp/btmp written by a non-login process, a kill) were
+    High for logrotate's daily run. A write by the packaged `logrotate`
+    (its path, and the device and inode of the file there), run as root
+    with exactly the packaged invocation (`logrotate /etc/logrotate.conf`:
+    its unit's `ExecStart=`, `/etc/cron.daily/logrotate`'s command), that
+    PID 1 forked (its timer's `logrotate.service`, the kernel's fork record)
+    or that cron's daily run started (`/etc/cron.daily/logrotate` under
+    `run-parts`, a short root chain up to a cron daemon PID 1 forked) is
+    recorded Low, not acted on. Anything else — another writer truncating
+    btmp, a copy of logrotate, logrotate run by hand or with any other
+    argument (`-f`, `-s`, a configuration of the caller's), by a non-root
+    user, under anacron or cron run by hand (`anacron -t /tmp/t`) or below a
+    cron `@reboot` entry — keeps its verdict (the review of #552, F1). The
+    packaged file is told by the LSM program's identity of the executed
+    file whatever the unit's mount namespace: the timer's
+    `logrotate.service` runs in one of its own (`ProtectSystem=`), where the
+    exec record kept no image, and the review's lab round found its run
+    still NN-L-FIM-005 High on syslog.
+  - **rsyslogd's appends after a rotation, and at the start, are appends.**
+    The FIM drain measured a write against the start's baseline of the
+    path: after a rotation the path holds a new, smaller file, and every
+    append rsyslogd made was a "truncation" (NN-L-FIM-005 High) until the
+    file outgrew the one rotated away; at the agent's start the first append
+    raced the baseline (none yet: High). A write is now measured against the
+    size the drain last read in that same file, else the size it had when it
+    was watched (`FimEvent::baseline_size`); a truncation in place still
+    shrinks it. The review of #552 (F6): the size read at a child's
+    creation in a watched directory is the child's, not the directory's.
+  - **A credential store's directory listed is no verdict** (the
+    mini-hunt). A `find /` (the lab's harness; plocate's daily `updatedb`
+    makes the same walk) opened `~/.gnupg/private-keys-v1.d` and its
+    siblings: NN-L-FIM-017 High, a kill, each time. A directory of a store
+    opened (`O_DIRECTORY`) names its files and reads none; a file of it
+    opened is judged as before.
+  - **A backup's receiver keeps its lineage.** A writer that never executes
+    (rsync's receiver, a fork of rsync) was read from `/proc` only: once it
+    exited, a burst judged after it had no lineage and was judged (lot
+    310's lab: 4 of 5 unit backups). The open sensor's record carries the
+    writer's fork record from the kernel (`fork_parent_record`, lot 310:
+    the forker, and the start, while the writer executed nothing since) and
+    its forker's when that one has not executed either (rsync's receiver is
+    a fork of its generator, a fork of rsync); the open pump teaches them
+    to the lineage before the record's events are sent, and the walk reads
+    the writer as its forker's copy as of its start (`OpenRecordRaw` 608 →
+    632 bytes).
+  - **npm's CLI run from `PATH`, and the Go toolchain in its own
+    directories, no longer raise ENGAGED.** npm run as `npm` is node with
+    `argv[1]` = `/usr/bin/npm`, the link the package installed (the kernel
+    hands the shebang's interpreter the path it executed): FP-2's
+    exemption never matched it, and `npm ci` from a CI runner raised
+    ConfirmedIntrusion. The link in a system tree whose target (folded) is
+    npm's CLI in one is now npm's CLI. The review of #552 (F2): only when
+    node runs npm's script alone — no `NODE_OPTIONS=--require`/`--import`
+    or `NODE_PATH` read by the exec pump (`ENV_LOADS`) — and npm's CLI by
+    its suffix (`…/npm/bin/npm-cli.js`) only under a system path prefix
+    (`/usr`, `/opt`, `/usr/local`; a prefix, not a proof of root ownership):
+    a package's own copy, one in a home (a user prefix the postinstall can
+    write) or a path through `..` is the caller's code under npm's name
+    Residual (the re-check of #552, N1): npm still loads `~/.npm-init.js`
+    into its own process on `npm init`, and the prefix test does not prove
+    root ownership (`/nix/store`, a user-owned `/usr/local` or `/opt`, a
+    `unshare -Urm` or rootless mount namespace) — the exemption is not yet
+    attacker-proof; a follow-up limits it to npm's own write paths.
+    and keeps the arm. The packaged `go` command rewriting
+    its archives in its work directory (`$TMPDIR/go-build<digits>/`), its
+    build cache or its module cache (`go test` stamping build ids) is
+    exempt from the mass-write arm; what it runs is judged as before.
+  - **R011: a clean system `modprobe` that exited at once is Medium.** The
+    system's tool by module name, run by root, whose process exited before
+    its environment could be read (a module already loaded or built in)
+    was High; it is Medium. Root with a clean environment read stays Low,
+    a non-root exec High, every kill a kill.
+  - **systemd's own BPF loads on Ubuntu 26.04 are Low and never
+    corroborate.** The user manager's `tracepoint` probe at the first login
+    and networkd's probes at its start were refused and signed High
+    (NN-L-AT-001, `bpf_prog_type`), raising ENGAGED at every boot — and
+    (lot 332's lab, on `main` too) corroborating an unrelated mass write
+    into COMBAT, where the ladder killed a shell. A refused load of a type
+    systemd's programs use (`tracepoint`, `kprobe`; PID 1's `lsm` at a
+    `daemon-reexec`) whose loader the agent proves the packaged
+    `/usr/lib/systemd/systemd` or `systemd-networkd` is still refused,
+    recorded Low, and raises no posture trigger, so it corroborates
+    nothing. The review of #552 (F5): the proof is the image the loader's
+    exec recorded (device and inode) as of the load, read from the lineage
+    once the bus taught it the execs that came first — never
+    `/proc/<pid>/exe` at the record's decode, which a root process that
+    loads and then executes systemd showed as systemd's; and `lsm` is PID
+    1's alone. Any other loader keeps High and its trigger.
+  - **Resolvers by identity; CoreDNS one of them.** NN-L-NET-004/-005/-014
+    treated a query as a resolver's forwarded leg by the basename of its
+    sender's image (a tunnel run as `/tmp/x/dnsmasq` was never killed), and
+    CoreDNS was not one (its pods' names were its own). The DNS pump now
+    proves it: the host's packaged resolver (its image the host's file at
+    that path) running as the system's service — the review of #552 (F4):
+    in its own unit's cgroup under `system.slice`, forked by PID 1 (or, for
+    dnsmasq, the packaged NetworkManager), as system users, with no dynamic
+    loader variable (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`); the same
+    image run by a user or a webshell is judged as any process — or the
+    cluster's CoreDNS as its container runtime's bundle records it
+    (`kube-system`, a `coredns` image, `/coredns`), its container's id the
+    leaf of the sender's `kubepods` cgroup and the sender in the PID and
+    mount namespaces of the container's init the runtime recorded (F3: a
+    user's delegated cgroup named with CoreDNS's id passed). A known
+    resolver's legs with no attributable originator stay one Medium record
+    each and no longer add up to a "tunnel" of the resolver (they are many
+    processes' names: hash-shaped lookups under one zone); the originator's
+    own query, and a leg traced back to it, still count against it.
 - The exec quarantine's stop resumes every process the kernel holds (lot
   317, third bug hunt BUG-118; `docs/design/EXEC_QUARANTINE.md` §3). It
   resumed the processes whose report it had read from the ring: one the

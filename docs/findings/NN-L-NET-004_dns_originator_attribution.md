@@ -172,3 +172,41 @@ Add the known-resolver **exes** to the kill-protection set (and/or downgrade -00
 5. Unit tests: direct (A) still kills sender; stub (B) attributes to originator + suppresses the resolver verdict; Varlink (C) → `Log`, never kills the resolver; LAN-resolver → `Log`; loopback range + `::1`; stale-window non-correlation.
 
 All of the above is **detect-only / attribution-quality** — no change to true-positive *behaviour* (a real originator is still killed), only to *who* is named. No COMBAT/ladder/enforcement changes.
+
+## Lot 340: the forwarder proven, not named
+
+The forwarder set (`KNOWN_RESOLVER_PROGRAMS`) was matched on the basename of
+the sender's image: a tunnel run as `/tmp/x/dnsmasq` got the forwarder's
+treatment (never killed), and CoreDNS, absent from the list, had its pods'
+names counted as its own. The DNS pump now proves the sender
+(`known_resolver` on `Event::DnsQuery`, `crates/nn-linux/src/net/known_resolver.rs`):
+a name of the list in a root-owned system tree whose image is the host's
+file at that path (device and inode, whatever its mount namespace), or
+`/coredns` in a container its runtime records as the cluster's CoreDNS (the
+OCI bundle's annotations: namespace `kube-system`, container `coredns`, a
+`coredns` image; `process.args[0]` `/coredns`; the bundle root's and
+writable by no one else). NN-L-NET-004/-005/-014 read that proof. A proven
+resolver's leg with no attributable originator is one Medium record and is
+not counted as the resolver's own tunnel (NETR-002's corroboration is one
+process's labels; the resolver relays every process's names), as
+NN-L-NET-005 already counted none of its legs. Pods reach CoreDNS on the
+cluster's DNS address, not a loopback stub: their own queries are judged on
+the pod's process, and CoreDNS's upstream legs are recorded, not acted on.
+
+The review of #552 tightened both proofs, so that no user obtains them:
+
+- **F4, a resolver is the system's service**, not its packaged image: the
+  sender runs in its own unit's cgroup right under `system.slice` (only
+  root places a process there; a webshell runs in its web server's unit),
+  PID 1 forked it (the kernel's record of its exec; else its parent now)
+  or, for dnsmasq, the packaged NetworkManager did, every uid it runs as is
+  a system user's, and its environment holds no dynamic loader variable
+  (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`). A user's
+  `LD_PRELOAD=/tmp/t.so /usr/lib/systemd/systemd-resolved` and a user's
+  `dnsmasq -p 5353` relay are judged as any process.
+- **F3, CoreDNS by its container**: the container's id must be the last
+  segment of a cgroup path whose first is the kubelet's
+  (`kubepods`/`kubepods.slice`) — a user's delegated cgroup named with
+  CoreDNS's id passed — and the sender must share its PID and mount
+  namespaces with the container's init, whose pid the runtime recorded in
+  the bundle (containerd's `init.pid`, CRI-O's `userdata/pidfile`, root's).

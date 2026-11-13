@@ -340,6 +340,17 @@ pub enum Event {
         /// `--dns-sensor sendmsg` mode.
         #[serde(default)]
         qname_partial: bool,
+        /// Lot 340 (the alpha's daily false positives): the sender is a
+        /// known resolver proven by its identity, not by its name — the
+        /// host's packaged resolver (`exe`'s basename one of
+        /// `KNOWN_RESOLVER_PROGRAMS`, its image the host's file at that path:
+        /// device and inode), or the cluster's CoreDNS as its container
+        /// runtime records it (namespace `kube-system`, a `coredns` image,
+        /// `/coredns`). NN-L-NET-004/-005/-014 treat its queries as forwarded
+        /// legs; a process that only bears a resolver's name is judged as
+        /// any sender. Set by the DNS pump; `false` in older records.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        known_resolver: bool,
     },
     /// Tappa 7 inode-protection LSM hook denied a modification of a
     /// protected filesystem object. By construction this means
