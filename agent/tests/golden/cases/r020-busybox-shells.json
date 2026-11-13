@@ -1,0 +1,545 @@
+{
+ "about": "Lot 313 (external bug hunt, edition 1.4: BUG-85; the mini-hunt's variants): busybox runs the program its argv names, read as busybox reads it \u2014 `busybox sh -i`, `/bin/busybox sh`, the login shells `-sh` and `-ash`, a link named for its shell (`ln -s /bin/busybox ~/sh`), a name starting with `busybox` (`busybox.static sh`), busybox through busybox, a path after busybox \u2014 each with its stdin and stdout on a socket a web server's process connected out: R020 (Critical, its kill held); busybox sh on a pty whose parent holds that socket: R020's third shape. Controls: busybox's nc and cat, its --help, a link whose name is no program: nothing. On main only `sh`/`ash` in argv[0] was read: `busybox sh`, `-sh`, `-ash` had no shape. The renamed copy of an installed shell (N1) needs the exec pump's content check, which a replay has not: its unit tests and the lab cover it.",
+ "fires": [
+  "R020_ShellWithSocketStdio"
+ ],
+ "held": [
+  "R020_ShellWithSocketStdio"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131001,
+     "ppid": 1,
+     "uid": 33,
+     "gid": 33,
+     "comm": "apache2",
+     "filename": "/usr/sbin/apache2",
+     "timestamp_ns": 500000000000,
+     "argv": [
+      "/usr/sbin/apache2",
+      "-k",
+      "start"
+     ],
+     "parent_comm": "",
+     "start_ns": 499999000000,
+     "exe": {
+      "path": "/usr/sbin/apache2",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131010,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3600000000000,
+     "argv": [
+      "busybox",
+      "sh",
+      "-i"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3599999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131011,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3601000000000,
+     "argv": [
+      "/bin/busybox",
+      "sh"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3600999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131012,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3602000000000,
+     "argv": [
+      "-sh"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3601999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131013,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3603000000000,
+     "argv": [
+      "-ash"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3602999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131014,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3604000000000,
+     "argv": [
+      "/home/u/sh",
+      "-i"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3603999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131015,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3605000000000,
+     "argv": [
+      "busybox.static",
+      "sh"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3604999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131016,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3606000000000,
+     "argv": [
+      "busybox",
+      "busybox",
+      "hush"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3605999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131017,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3607000000000,
+     "argv": [
+      "busybox",
+      "/bin/ash"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3606999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131018,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3608000000000,
+     "argv": [
+      "busybox",
+      "sh"
+     ],
+     "parent_comm": "python3",
+     "start_ns": 3607999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131019,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3609000000000,
+     "argv": [
+      "busybox",
+      "nc",
+      "203.0.113.7",
+      "4444"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3608999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131020,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "busybox",
+      "cat"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3609999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131021,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3611000000000,
+     "argv": [
+      "busybox",
+      "--help",
+      "sh"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3610999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6131022,
+     "ppid": 6131001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "busybox",
+     "filename": "/bin/busybox",
+     "timestamp_ns": 3612000000000,
+     "argv": [
+      "x",
+      "sh"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3611999000000,
+     "exe": {
+      "path": "/bin/busybox",
+      "flags": 1
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  }
+ ]
+}

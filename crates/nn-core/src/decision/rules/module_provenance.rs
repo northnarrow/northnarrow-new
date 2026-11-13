@@ -10,8 +10,14 @@
 //! [`ModuleOwners::of`] answers from the package database: on Debian and
 //! its family the `.list` files of `/var/lib/dpkg/info` (the module paths
 //! read once, again when `/var/lib/dpkg/status` changes); on the RPM family
-//! `rpm -qf`; DKMS by its registry (`/var/lib/dkms/<module>`) for a file
-//! under an `updates/dkms` or `extra` directory. A host with neither
+//! `rpm -qf`; DKMS by its registry for a file under an `updates/dkms` or
+//! `extra` directory — lot 313 (external bug hunt, edition 1.4: BUG-87): by
+//! the content DKMS built, never by a name ([`dkms_registered`], the kernel
+//! judge's own test, `agent/src/module_trust/scan.rs`). It asked whether
+//! `/var/lib/dkms/<name>` was a directory, with the name cut at the file's
+//! first `.ko`: `..ko` named the registry's parent, `nvidia.kox-rootkit.ko`
+//! a registered `nvidia`, and `mkdir /var/lib/dkms/rk` registered anything
+//! called `rk`. A host with neither
 //! database is [`Provenance::Unknown`], judged as before. Paths are compared
 //! with `/usr` dropped: a merged-`/usr` host reports `/usr/lib/modules`
 //! while packages list `/lib/modules`.
@@ -112,7 +118,7 @@ impl<H: DecisionHost> ModuleOwners<H> {
 
     fn lookup(&self, path: &str) -> Provenance {
         let key = without_usr(path);
-        if self.dkms_built(&key) {
+        if self.dkms_built(path) {
             return Provenance::Dkms;
         }
         let info = self.root.join("var/lib/dpkg/info");
@@ -173,18 +179,108 @@ impl<H: DecisionHost> ModuleOwners<H> {
         set
     }
 
-    /// A file in a DKMS install directory whose module DKMS has registered.
-    fn dkms_built(&self, key: &str) -> bool {
-        if !(key.contains("/updates/dkms/") || key.contains("/extra/")) {
-            return false;
-        }
-        let Some(name) = module_name(key) else {
+    /// Lot 313 (BUG-87): a file in a DKMS install directory of its kernel's
+    /// tree (`/lib/modules/<release>/updates/dkms/`, `…/extra/`) holding the
+    /// content DKMS built for a module of that name and that release
+    /// ([`dkms_registered`]) — never a name alone.
+    fn dkms_built(&self, path: &str) -> bool {
+        let key = without_usr(path);
+        let Some(rest) = key.strip_prefix("/lib/modules/") else {
             return false;
         };
-        let registry = self.root.join("var/lib/dkms");
-        // DKMS registers `<name>` or, for a package of several modules,
-        // the package's name: the file must sit in one of its trees.
-        registry.join(&name).is_dir() || dkms_tree_has(&registry, &name)
+        let Some((release, in_tree)) = rest.split_once('/') else {
+            return false;
+        };
+        if !(in_tree.starts_with("updates/dkms/") || in_tree.starts_with("extra/")) {
+            return false;
+        }
+        let Some(module) = Path::new(in_tree)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(common::module_judge::module_name_of)
+        else {
+            return false;
+        };
+        dkms_registered(
+            &self.root.join("var/lib/dkms"),
+            release,
+            &module,
+            &self.root.join(path.trim_start_matches('/')),
+        )
+    }
+}
+
+/// DKMS registered module `module` (kmod's spelling) for `release`, built
+/// as the file `file` holds it: a
+/// `<registry>/<package>/<version>/<release>/<arch>/module/` directory
+/// holds a file of that module with the same content (DKMS installs its
+/// own copy, compressed and signed there). Lot 313 (BUG-87): the one test,
+/// the kernel judge's (`agent/src/module_trust/scan.rs`) and R018's.
+pub fn dkms_registered(registry: &Path, release: &str, module: &str, file: &Path) -> bool {
+    let Ok(want) = std::fs::metadata(file) else {
+        return false;
+    };
+    let dirs = |p: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(p)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .take(256)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for package in dirs(registry) {
+        for version in dirs(&package) {
+            for arch in dirs(&version.join(release)) {
+                let Ok(rd) = std::fs::read_dir(arch.join("module")) else {
+                    continue;
+                };
+                if rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(common::module_judge::module_name_of)
+                        .is_some_and(|m| m == module)
+                        && same_content(&e.path(), file, want.len())
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `a` (a regular file, symbolic links not followed) holds the bytes `b`
+/// holds; `len` is `b`'s length, as its metadata gave it (a cheap first
+/// check). Lot 313: the one comparison of a file's content with another's
+/// — DKMS's copy of a module ([`dkms_registered`]), an installed shell's
+/// image (`nn_linux::program_images`).
+pub fn same_content(a: &Path, b: &Path, len: u64) -> bool {
+    use std::io::Read;
+    let Ok(m) = std::fs::symlink_metadata(a) else {
+        return false;
+    };
+    if !m.is_file() || m.len() != len {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        let Ok(n) = fa.read(&mut ba) else {
+            return false;
+        };
+        if n == 0 {
+            // b ends here too
+            return matches!(fb.read(&mut bb[..1]), Ok(0));
+        }
+        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
+        }
     }
 }
 
@@ -204,44 +300,9 @@ fn rpm_owns<H: DecisionHost>(path: &str) -> Option<bool> {
     }
 }
 
-/// A registered DKMS package holds a built module of this name.
-fn dkms_tree_has(registry: &Path, name: &str) -> bool {
-    let Ok(pkgs) = std::fs::read_dir(registry) else {
-        return false;
-    };
-    pkgs.flatten()
-        .any(|pkg| walk_finds(&pkg.path(), &format!("{name}.ko"), 6))
-}
-
-fn walk_finds(dir: &Path, prefix: &str, depth: usize) -> bool {
-    if depth == 0 {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        let p = e.path();
-        if e.file_type().is_ok_and(|t| t.is_dir()) {
-            walk_finds(&p, prefix, depth - 1)
-        } else {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix))
-        }
-    })
-}
-
 /// `/usr/lib/modules/…` → `/lib/modules/…`.
 fn without_usr(path: &str) -> String {
     path.strip_prefix("/usr").unwrap_or(path).to_string()
-}
-
-/// `…/name.ko[.xz|.zst|.gz]` → `name`.
-fn module_name(path: &str) -> Option<String> {
-    let file = path.rsplit('/').next()?;
-    let stem = file.split(".ko").next()?;
-    (!stem.is_empty()).then(|| stem.to_string())
 }
 
 #[cfg(test)]
@@ -288,24 +349,46 @@ mod tests {
         );
     }
 
+    /// `content` at `path` under the host's root `t`.
+    fn put(t: &TempDir, path: &str, content: &[u8]) {
+        let f = t.path().join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, content).unwrap();
+    }
+
+    /// Lot 313 (BUG-87): DKMS's build is the content its registry holds for
+    /// the module and the kernel — the registry's directory of that name is
+    /// not (it was: `mkdir /var/lib/dkms/zfs` registered any `zfs.ko`).
     #[test]
     fn a_dkms_module_is_dkms_built_only_when_registered() {
         let t = dpkg_host();
         let o = ModuleOwners::new(t.path());
         let p = "/lib/modules/6.8.0-1-generic/updates/dkms/zfs.ko.zst";
+        put(&t, p, b"zfs 2.2.2");
         assert_eq!(o.of(p), Provenance::Unowned, "not registered");
         std::fs::create_dir_all(t.path().join("var/lib/dkms/zfs/2.2.2")).unwrap();
+        assert_eq!(
+            o.of(p),
+            Provenance::Unowned,
+            "a directory named so builds nothing"
+        );
+        // DKMS's own copy, for this kernel: the same content
+        let built = "/var/lib/dkms/zfs/2.2.2/6.8.0-1-generic/x86_64/module/zfs.ko.zst";
+        put(&t, built, b"zfs 2.2.2");
         assert_eq!(o.of(p), Provenance::Dkms);
         // a package of several modules: found in its tree
-        let built = t
-            .path()
-            .join("var/lib/dkms/nvidia/550/6.8.0-1-generic/x86_64/module");
-        std::fs::create_dir_all(&built).unwrap();
-        std::fs::write(built.join("nvidia-uvm.ko.zst"), b"").unwrap();
-        assert_eq!(
-            o.of("/lib/modules/6.8.0-1-generic/updates/dkms/nvidia-uvm.ko.zst"),
-            Provenance::Dkms
-        );
+        let built = "/var/lib/dkms/nvidia/550/6.8.0-1-generic/x86_64/module/nvidia-uvm.ko.zst";
+        put(&t, built, b"uvm");
+        let p = "/lib/modules/6.8.0-1-generic/updates/dkms/nvidia-uvm.ko.zst";
+        put(&t, p, b"uvm");
+        assert_eq!(o.of(p), Provenance::Dkms);
+        // another content under the registered name, another kernel's build
+        let p = "/lib/modules/6.8.0-1-generic/extra/nvidia-uvm.ko.zst";
+        put(&t, p, b"rootkit");
+        assert_eq!(o.of(p), Provenance::Unowned, "not the content DKMS built");
+        let p = "/lib/modules/6.9.0-1-generic/updates/dkms/nvidia-uvm.ko.zst";
+        put(&t, p, b"uvm");
+        assert_eq!(o.of(p), Provenance::Unowned, "built for another kernel");
     }
 
     /// R12b: the answer the pump asked for is the one the rule reads —
@@ -385,5 +468,117 @@ mod tests {
         assert!(owners
             .read_dpkg_module_paths()
             .contains("/lib/modules/6.8.0/kernel/drivers/x.ko.zst"));
+    }
+}
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-87): `module_name` kept
+/// what preceded the FIRST `.ko` (or the whole name when there was none)
+/// and accepted `.` and `..`, which `dkms_built` joined to the registry:
+/// `registry/.` and `registry/..` are directories on every host with
+/// `/var/lib/dkms`. Now a DKMS build is the content the registry holds.
+#[cfg(test)]
+mod bug87 {
+    use super::*;
+    use crate::posture::host::testing::TestHost as H;
+    use tempfile::TempDir;
+
+    fn dpkg_host() -> TempDir {
+        let t = TempDir::new().unwrap();
+        std::fs::create_dir_all(t.path().join("var/lib/dpkg/info")).unwrap();
+        std::fs::write(t.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
+        t
+    }
+
+    fn put(t: &TempDir, path: &str, content: &[u8]) {
+        let f = t.path().join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, content).unwrap();
+    }
+
+    #[test]
+    fn bug87_a_dot_name_in_an_empty_dkms_registry_is_unowned() {
+        let t = dpkg_host();
+        std::fs::create_dir_all(t.path().join("var/lib/dkms")).unwrap();
+        let o = ModuleOwners::<H>::new(t.path());
+        let wrong: Vec<(&str, Provenance)> = [
+            "/lib/modules/6.8.0-1-generic/extra/..ko",
+            "/lib/modules/6.8.0-1-generic/extra/...ko",
+            "/usr/lib/modules/6.8.0-1-generic/updates/dkms/..ko.zst",
+        ]
+        .into_iter()
+        .map(|p| (p, o.of(p)))
+        .filter(|(_, v)| *v != Provenance::Unowned)
+        .collect();
+        assert!(
+            wrong.is_empty(),
+            "nothing is registered in /var/lib/dkms, yet: {wrong:?}"
+        );
+    }
+
+    #[test]
+    fn bug87_a_name_past_the_first_ko_is_not_the_registered_module() {
+        let t = dpkg_host();
+        std::fs::create_dir_all(t.path().join("var/lib/dkms/nvidia/550")).unwrap();
+        let o = ModuleOwners::<H>::new(t.path());
+        let wrong: Vec<(&str, Provenance)> = [
+            "/lib/modules/6.8.0-1-generic/extra/nvidia.kox-rootkit.ko",
+            "/lib/modules/6.8.0-1-generic/extra/nvidia.komodo.ko.zst",
+            "/lib/modules/6.8.0-1-generic/extra/nvidia",
+        ]
+        .into_iter()
+        .map(|p| (p, o.of(p)))
+        .filter(|(_, v)| *v != Provenance::Unowned)
+        .collect();
+        assert!(
+            wrong.is_empty(),
+            "only `nvidia` is registered, yet: {wrong:?}"
+        );
+    }
+
+    /// Beyond the card (the triage: the wider hole): a directory of the
+    /// registry, made by whoever is root, vouched for any file of its name —
+    /// the registered module's own name included.
+    #[test]
+    fn bug87_a_registry_directory_without_the_build_vouches_for_nothing() {
+        let t = dpkg_host();
+        std::fs::create_dir_all(t.path().join("var/lib/dkms/rk/1.0")).unwrap();
+        let p = "/lib/modules/6.8.0-1-generic/updates/dkms/rk.ko";
+        put(&t, p, b"rootkit");
+        assert_eq!(ModuleOwners::<H>::new(t.path()).of(p), Provenance::Unowned);
+    }
+
+    /// Guard: the registered module itself stays DKMS's — its build, the
+    /// same content, in the registry for that kernel (the triage's guard
+    /// asked for the directory only: what BUG-87's wider hole was).
+    #[test]
+    fn bug87_guard_the_registered_module_stays_dkms() {
+        let t = dpkg_host();
+        put(
+            &t,
+            "/var/lib/dkms/nvidia/550/6.8.0-1-generic/x86_64/module/nvidia.ko.zst",
+            b"nvidia 550",
+        );
+        put(
+            &t,
+            "/var/lib/dkms/nvidia/550/6.8.0-1-generic/x86_64/module/nvidia.ko",
+            b"nvidia 550 plain",
+        );
+        put(
+            &t,
+            "/lib/modules/6.8.0-1-generic/updates/dkms/nvidia.ko.zst",
+            b"nvidia 550",
+        );
+        put(
+            &t,
+            "/lib/modules/6.8.0-1-generic/extra/nvidia.ko",
+            b"nvidia 550 plain",
+        );
+        let o = ModuleOwners::<H>::new(t.path());
+        for p in [
+            "/lib/modules/6.8.0-1-generic/updates/dkms/nvidia.ko.zst",
+            "/lib/modules/6.8.0-1-generic/extra/nvidia.ko",
+        ] {
+            assert_eq!(o.of(p), Provenance::Dkms, "{p}");
+        }
     }
 }

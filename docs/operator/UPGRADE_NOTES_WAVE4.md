@@ -1880,6 +1880,109 @@ are judged as before; `CHANGELOG.md` has the detail.
   first 8 slots of a ring could all be gone ones. Kernel 5.13 or later
   (`bpf_for_each_map_elem`), as every kernel the agent supports.
 
+## 36. Shells and tools by what the kernel executed (lot 313)
+
+- **R020 knows a shell by its file** (the external bug hunt's edition 1.4:
+  BUG-85, N1). A copy of an installed shell or interpreter under any name
+  (`cp /bin/bash ~/x`), an installed one under another name (a hard link, a
+  bind mount), busybox running a shell (`busybox sh`, `/bin/busybox sh`, the
+  login shells `-sh`, `-ash`, a link named `sh`) and a shell the dynamic
+  loader runs (`/lib64/ld-linux-x86-64.so.2 /bin/bash -i`, `ld.so ~/x`) with
+  its stdin or stdout on a socket is a reverse shell: Critical, the
+  posture's `ConfirmedIntrusion` (the kill stays held by the per-rule
+  policy). The agent records the host's shells, interpreters and busybox by
+  device and inode at its start and every minute ("R020: the installed
+  shells and interpreters known by their identity" in the journal):
+  `/etc/shells`, and the files of `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`,
+  `/usr/local/bin`, each resolved, whose resolved file is named as one.
+  Only an exec with its stdio on an inet socket has its running image (or
+  the loader's operand) compared, on the exec pump's thread and bounded:
+  an answer is remembered by the file's device, inode, size and change
+  time; a file is compared whole up to 4 MiB, by samples above (its first
+  and last MiB and eight blocks between); each user's compares share 64
+  MiB a second (one user's flood spends only that user's) and all users'
+  128 MiB (a user with many host uids, the subuids rootless podman maps,
+  reads no more; the least recently used of 256 uids kept makes room),
+  past either of which an exec is not compared — judged by its name,
+  and, for an image a user can
+  write with its stdin or stdout on a socket or a parent whose stdio is
+  one connected out (the pty-wrapped shape), recorded High, "identity
+  unverified"; an image the pump cannot open (a user's FUSE mount without
+  `allow_other`) is recorded so too: a flood followed by a renamed shell is
+  never silence — `nn-admin status` shows "shell copies: N running images
+  compared, M execs not compared". The dynamic loader is recorded with the
+  shells: a renamed copy of `ld-linux-x86-64.so.2` running bash is the
+  loader, its operand the program. Residuals: a copy that differs from the installed
+  file by one byte (an appended byte changes its length) or is patched in
+  a sample, a shell rebuilt or downloaded, under another name; a
+  container's own shells (only the host's are recorded; on overlayfs the
+  hook's identity is not `stat`'s, so a container's copy is not compared).
+  A behaviour-based check, independent of identity, is the next lot's.
+- **R006 reads socat's addresses as socat does** (BUG-112). The
+  distribution's socat whose address runs a shell is killed in more
+  spellings: each address read by socat's lexer (`\` and quotes dropped
+  anywhere: `EXEC:/bin/s\h`, `EX"EC":/bin/sh`), each half of a dual
+  address (`a!!b`) and each link of a chain (`a|b`); `SYSTEM:` and
+  `SHELL:` always (socat runs `/bin/sh -c`: a `SYSTEM:` relay that runs a
+  plain command is now killed too — allowlist socat in
+  `process-comm-allowlist` if a harness needs one); `EXEC:` past `env`
+  (`-S` too), `setsid`, `nohup`, `stdbuf`, `timeout`, `nice`, `ionice`,
+  `chrt`, `taskset`, `sudo` (`-i`, `-s`: a shell), `doas`, `su`,
+  `runuser`, `chroot`/`nsenter`/`unshare` with no command, the dynamic
+  loader, busybox; a shell, `script`, or an interpreter running inline
+  code, its standard input or a REPL. And whatever the address's spelling,
+  **a shell or an interpreter socat starts** (by identity, directly or
+  through a launcher that forks, `sudo -i`, `su -`) **is killed**:
+  `EXEC:python3 /srv/app.py` is killed now too. A link to `/usr/bin/socat`
+  under another name is socat, and so is socat 1.8's own file,
+  `/usr/bin/socat1` (a tool's name takes a version suffix). The record
+  names the address that runs the shell, as socat read it.
+- **System-tree exemptions read the kernel's executed file** (BUG-119):
+  the trusted actor's record (R011, R012, R013, R017), R011's package
+  transaction and initramfs build, and R006's distribution socat. An exec
+  whose kernel path is not known (a mount root the agent cannot place, an
+  argv string cut at 255 bytes with `/proc/<pid>/exe` unreadable) is in no
+  system tree: killed, as a copy would be. A path with an empty, `.` or
+  `..` segment is in none either (the lineage's fallback to a caller's
+  string costs trust, never grants it).
+- **A module file's name, and a DKMS build, have one reader** (BUG-87,
+  BUG-111). `common::module_judge::module_stem` takes the last `.ko`,
+  `.ko.xz`, `.ko.zst` or `.ko.gz` that ends the name and refuses `.`, `..`
+  and empty: `acme.kontrol.ko` is `acme.kontrol` (the kernel judge vouched
+  for no such DKMS module), `..ko` nothing. R018 takes a file of
+  `updates/dkms/` or `extra/` for DKMS's build when DKMS's registry holds a
+  file of that module, for that kernel, with the same content — as the
+  kernel judge does — not when `/var/lib/dkms/<name>` is a directory.
+- **An encryption tool asked to encrypt is never trusted for (b) and (c)**
+  (BUG-49's residue, the decision of 11/11/2026). `openssl enc` (or a
+  cipher command) without `-d`, `openssl smime|cms|pkeyutl|rsautl
+  -encrypt`, `gpg`/`gpgtar` `-c`/`-e`/`--symmetric`/`--encrypt`/
+  `--encrypt-files` (abbreviations, clusters), `age`/`rage` without `-d`,
+  `7z a|u -p`, `rar a -p`/`-hp`, `zip -e`/`-P`, `zipcloak`, `ccrypt`,
+  `ccencrypt`, `mcrypt`, `aescrypt -e`, `scrypt enc` — each argv read with
+  the tool's own option table (a value is never an option; the last mode
+  wins where the tool's does) — whoever started them:
+  - their outputs count as ciphertext (b) whatever their header: OpenPGP,
+    age, 7-Zip, zip and rar wrap their ciphertext in a container that the
+    entropy sampler otherwise sets aside;
+  - their renames to a new extension (`ccrypt -r`), and the encrypted
+    copies beside originals deleted (c), count — the originals deleted by
+    another process of the session that started the tool (`gpg
+    --encrypt-files *; rm *`, whether that session is trusted or not) count
+    for that tool;
+  - two make the assessment decisive (NN-L-IMP-001; the kill held by
+    default, aimed at the process that started the tool); their rewrites
+    (a) and deletions (d) keep the trust their lineage gives.
+
+  Expect an assessment of a backup job that encrypts with a packaged tool
+  in bulk and deletes the originals. **Open (lot 331)**: the LOTL shape of
+  an encryption tool then `rm` (`gpg --encrypt-files *; rm *`) is decisive
+  in the unit tests but was NOT reproduced live on Ubuntu 24.04 (lab r3,
+  r4: no NN-L-IMP-001, in one inline and one interactive session); `ccrypt
+  -r` (renames) was, on Debian 13. Residual: an encryptor that forks a
+  process per file and a deletion by a process of another session; a tool
+  no table names.
+
 ## 37. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
 
 - **A fresh install is observe-only and starts.** `install.sh` on a host

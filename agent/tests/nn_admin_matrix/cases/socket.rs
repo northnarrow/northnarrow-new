@@ -355,6 +355,9 @@ pub fn full_status() -> StatusResponse {
     }
     v["response_dispatch"] = dispatch;
     v["export"] = export;
+    // lot 313 (the review of #549, F1): the exec pump's content check
+    v["program_copy_compared_total"] = json!(3);
+    v["program_copy_skipped_total"] = json!(1);
     serde_json::from_value(v).unwrap()
 }
 

@@ -262,6 +262,10 @@ pub struct StatusOutcome {
     /// Lot 325 (the review of #547, F6): file opens judged in a run's own
     /// buffer.
     pub open_sensor_per_call_total: Option<u64>,
+    /// Lot 313: the exec pump's content check — images compared, execs not
+    /// compared (the second's budget spent).
+    pub program_copy_compared_total: Option<u64>,
+    pub program_copy_skipped_total: Option<u64>,
     pub execq_script_refused_total: Option<u64>,
     /// Lab PR 267 (R12a): the priority event bus and the loss counters by
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
@@ -545,6 +549,8 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execpol_env_changed_total: resp.execpol_env_changed_total,
         execpol_lost_open_total: resp.execpol_lost_open_total,
         open_sensor_per_call_total: resp.open_sensor_per_call_total,
+        program_copy_compared_total: resp.program_copy_compared_total,
+        program_copy_skipped_total: resp.program_copy_skipped_total,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,
@@ -3969,6 +3975,8 @@ mod tests {
                     execpol_env_changed_total: Some(23),
                     execpol_lost_open_total: Some(24),
                     open_sensor_per_call_total: Some(25),
+                    program_copy_compared_total: Some(26),
+                    program_copy_skipped_total: Some(27),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
@@ -3997,6 +4005,8 @@ mod tests {
         assert_eq!(out.execpol_env_changed_total, Some(23));
         assert_eq!(out.execpol_lost_open_total, Some(24));
         assert_eq!(out.open_sensor_per_call_total, Some(25));
+        assert_eq!(out.program_copy_compared_total, Some(26));
+        assert_eq!(out.program_copy_skipped_total, Some(27));
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

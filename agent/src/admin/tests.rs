@@ -1007,6 +1007,8 @@ fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
         execpol_env_changed_total: None,
         execpol_lost_open_total: None,
         open_sensor_per_call_total: None,
+        program_copy_compared_total: None,
+        program_copy_skipped_total: None,
         execq_script_refused_total: None,
         event_bus: None,
         event_bus_decision: None,

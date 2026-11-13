@@ -151,26 +151,41 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
-        observes: "An exec named like offensive tooling (`socat`, `msfvenom`, `meterpreter`, \
-                   `sliver`, `havoc`). The distribution's `socat` is recorded unless one of \
-                   its addresses runs a shell (`EXEC:`, `SYSTEM:`, `SHELL:`), and recorded at \
-                   Critical when the kernel cut its argv.",
+        observes: "An exec of offensive tooling (`socat`, `msfvenom`, `meterpreter`, \
+                   `sliver`, `havoc`), by its `comm` or the kernel's executed file (a link \
+                   under another name). The distribution's `socat` — placed by the kernel's \
+                   executed file, never the caller's string — is recorded unless one of its \
+                   addresses runs a shell (lot 313: each address of a dual `a!!b` or a chain, \
+                   read as socat's lexer reads it — `\\` and quotes dropped; `SYSTEM:` and \
+                   `SHELL:` always; `EXEC:` past `env` (`-S` too), `setsid`, `nohup`, \
+                   `stdbuf`, `timeout`, `sudo -i`, `su`, `chroot`, the dynamic loader and the \
+                   like, a shell, `script`, or an interpreter running inline code), and \
+                   recorded at Critical when the kernel cut its argv. A shell or an \
+                   interpreter (by identity) that socat starts, directly or through a launcher \
+                   that forks, is killed too: what an address ran, whatever its spelling.",
         false_positives: "A `socat` from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` used as a \
                           relay is recorded (Log, High), not killed; a build of it elsewhere is \
                           killed unless allowlisted in `process-comm-allowlist`, which is \
-                          judged on what the kernel executed.",
+                          judged on what the kernel executed. Lot 313: a `SYSTEM:` address \
+                          runs `/bin/sh -c` and is killed whatever its command (a test \
+                          harness's `SYSTEM:'echo …'` server too), and so is a shell or an \
+                          interpreter socat starts (`EXEC:python3 /srv/app.py`): allowlist \
+                          socat by identity where a harness needs one.",
         how_to_test: "`cp /bin/sleep /tmp/sliver && /tmp/sliver 5` (killed); `socat -V` \
-                      (the distribution's socat, recorded).",
+                      (the distribution's socat, recorded); `socat TCP:127.0.0.1:9 \
+                      STDIO!!EXEC:/bin/sh` (killed).",
         tests: &[
             "crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool",
             "crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::\
              r006_system_socat_is_recorded_a_copy_is_killed",
             "crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::\
              r006_system_socat_running_a_shell_is_killed",
+            "crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::\
+             bug112_dual_address_running_a_shell_is_killed",
         ],
         attack_note: "The tools are C2 frameworks and a relay: T1095 for the raw TCP channel, \
                       T1059.004 for the shell `socat EXEC:` runs. The rule sees the name and \
-                      argv, not the traffic; a renamed tool evades it.",
+                      argv, not the traffic; a renamed copy of a tool evades it.",
     },
     RuleDoc {
         id: "R007_CryptoMiner",
@@ -564,18 +579,25 @@ pub(super) const DOCS: &[RuleDoc] = &[
     // ── a shell on a network socket (lab PR 224, CM-03) ─────────────
     RuleDoc {
         id: "R020_ShellWithSocketStdio",
-        severities: &[Severity::Critical],
+        severities: &[Severity::Critical, Severity::High],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032", "DC0082"],
-        observes: "A shell or interpreter, by exec identity, whose stdin/stdout is an outbound \
+        observes: "A shell or interpreter, by exec identity (lot 313: a copy of an installed \
+                   shell or interpreter under any name, found by the exec pump's bounded \
+                   content check; an installed one by its device and inode; else the executed \
+                   file's name; busybox by the program its argv names, `busybox sh`, `-sh`; \
+                   the program the dynamic loader runs, `ld.so /bin/bash`), whose \
+                   stdin/stdout is an outbound \
                    inet socket (the reverse shell), or an accepted one not handed over by an \
                    inetd-style launcher (the bind shell), or whose parent's stdio is an \
                    outbound socket (the pty-wrapped reverse shell): `sched_process_exec` \
                    reads the new image's fds 0..2 and its parent's. Critical, recorded, \
                    posture ConfirmedIntrusion; the kill of the tree (`KillProcessTree`) is \
                    held behind the per-rule response policy, off by default (a new rule of \
-                   lab PR 224).",
+                   lab PR 224). Lot 313: an exec of a user-writable image on such a socket \
+                   whose content check the exec pump's budget skipped is recorded High, \
+                   \"identity unverified\".",
         false_positives: "inetd-style services (PID 1 socket activation, inetd, xinetd, \
                           tcpserver), exempt by the launcher's identity; the process allowlist \
                           by identity. Without the optional BTF offsets the stdio is not read \
@@ -587,6 +609,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              a_shell_on_an_outbound_socket_is_a_critical_reverse_shell",
             "crates/nn-core/src/decision/rules/r020_shell_with_socket_stdio.rs::\
              a_pty_wrapped_reverse_shell_fires_on_the_shell",
+            "crates/nn-core/src/decision/rules/r020_shell_with_socket_stdio.rs::\
+             n1_a_renamed_copy_of_a_shell_is_a_shell",
             "deploy/lab/malsim/net-check.sh::MS06",
         ],
         attack_note: "The shell (T1059.004) and its raw channel (T1095), as R006 maps the \

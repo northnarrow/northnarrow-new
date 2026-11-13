@@ -152,7 +152,7 @@ impl<H: PostureHost> Rule for R013NamespaceEscapeTooling<H> {
 /// executed it (a copy of `nsenter` renamed `runc` is held too: its record
 /// stays High).
 fn is_runc(filename: &str) -> bool {
-    filename.rsplit('/').next() == Some("runc")
+    super::program_identity::base_of(filename) == "runc"
 }
 
 #[cfg(test)]

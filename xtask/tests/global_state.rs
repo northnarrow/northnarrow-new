@@ -550,6 +550,24 @@ const STATICS: &[Kept] = &[
          oldest out first)",
     ),
     kept(
+        "crates/nn-core/src/decision/rules/program_identity.rs",
+        "KNOWN",
+        HostFact,
+        "lot 313: the host's installed shells, interpreters and busybox by their identity (the \
+         agent records them at its start and every minute; an upgrade's new image added, the \
+         old kept, bounded), and the execs the exec pump found to be a copy of one, which R020 \
+         and the posture's reverse-shell shape judge on (one host; keyed by exec, bounded, the \
+         oldest out first)",
+    ),
+    kept(
+        "crates/nn-linux/src/program_images.rs",
+        "BOUNDS",
+        HostFact,
+        "lot 313 (the review of #549, F1): the exec pump's content check's bounds — its \
+         answers by file (dev, ino, size, ctime; bounded, the oldest out), the bytes read in \
+         the current second, and its counts for `status` (one host, one exec pump)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         "BUILDERS",
         HostFact,

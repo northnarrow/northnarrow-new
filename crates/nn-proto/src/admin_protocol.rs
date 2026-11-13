@@ -986,6 +986,15 @@ pub struct StatusResponse {
     /// they would have run — the summary at the top of `nn-admin status`.
     #[serde(default)]
     pub records_today: Option<RecordsToday>,
+    /// Lot 313 (the review of #549, F1): the exec pump's content check of a
+    /// running image against the installed shells and interpreters (R020)
+    /// — images compared, and execs not compared because the second's
+    /// budget was spent (judged by their name); `None` from an agent older
+    /// than the fields. Appended after lot 341's `records_today`.
+    #[serde(default)]
+    pub program_copy_compared_total: Option<u64>,
+    #[serde(default)]
+    pub program_copy_skipped_total: Option<u64>,
 }
 
 /// Lot 341 (alpha 2/4): the detection records of the current UTC day this
@@ -1385,6 +1394,8 @@ impl StatusResponse {
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
             open_sensor_per_call_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2476,6 +2487,8 @@ mod tests {
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
             open_sensor_per_call_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2563,6 +2576,8 @@ mod tests {
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
             open_sensor_per_call_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2827,6 +2842,8 @@ mod tests {
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
             open_sensor_per_call_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2938,6 +2955,8 @@ mod tests {
             execpol_env_changed_total: None,
             execpol_lost_open_total: None,
             open_sensor_per_call_total: None,
+            program_copy_compared_total: None,
+            program_copy_skipped_total: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -3041,15 +3060,15 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the appended fields' tags: R12a's bus, R12b's decision
+        // the fourteen appended fields' tags: R12a's bus, R12b's decision
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
-        // lot 322's two exec-guard counters, lot 325's four and lot 341's
-        // two
-        assert!(a.ends_with(&[0; 12]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 12]) && b.len() > a.len());
+        // lot 322's two exec-guard counters, lot 325's four, lot 341's two
+        // and lot 313's two content-check counters
+        assert!(a.ends_with(&[0; 14]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 14]) && b.len() > a.len());
         assert!(
-            b.ends_with(&[0; 11]),
-            "R12b's, R12c's, lot 276's, lot 322's, lot 325's and lot 341's fields, absent"
+            b.ends_with(&[0; 13]),
+            "R12b's, R12c's, lot 276's, lot 322's, lot 325's, lot 341's and lot 313's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
@@ -3076,10 +3095,11 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last eleven: the decision's delay, the dispatch, lot 276's
-        // export, lot 322's two counters, lot 325's four, lot 341's two —
+        // (b's last thirteen: the decision's delay, the dispatch, lot 276's
+        // export, lot 322's two counters, lot 325's four, lot 341's two,
+        // lot 313's two —
         // all absent)
-        assert!(c.starts_with(&b[..b.len() - 11]) && c.len() > b.len());
+        assert!(c.starts_with(&b[..b.len() - 13]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3139,9 +3159,9 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        // (c's last ten: the dispatch, lot 276's export, lot 322's two
-        // counters, lot 325's four and lot 341's two, absent)
-        assert!(d.starts_with(&c[..c.len() - 10]) && d.len() > c.len());
+        // (c's last twelve: the dispatch, lot 276's export, lot 322's two
+        // counters, lot 325's four, lot 341's two and lot 313's two, absent)
+        assert!(d.starts_with(&c[..c.len() - 12]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3691,8 +3711,9 @@ mod tests {
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
         // `response_dispatch`, lot 276's `export`, lot 322's
         // `execpol_env_unread_total` and `execpol_lost_total`, lot 325's
-        // four, lot 341's `profile` and `records_today`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2;
+        // four, lot 341's `profile` and `records_today`, lot 313's
+        // `program_copy_compared_total` and `program_copy_skipped_total`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2 + 2;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3718,12 +3739,16 @@ mod tests {
         status.execpol_env_unread_total = Some(300);
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 325's four fields and lot 341's two follow them, absent here
-        let before = without.len() - 8;
+        // lot 325's four fields, lot 341's two and lot 313's two follow
+        // them, absent here
+        let before = without.len() - 10;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
-        assert_eq!(&with[before..], &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &with[before..],
+            &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3742,11 +3767,15 @@ mod tests {
         status.execpol_env_changed_total = Some(4);
         status.execpol_lost_open_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        // the review of #547's field and lot 341's two follow them, absent
-        let before = without.len() - 6;
+        // the review of #547's field, lot 341's two and lot 313's two
+        // follow them, absent here
+        let before = without.len() - 8;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 4..], &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0]);
+        assert_eq!(
+            &without[before - 4..],
+            &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(&with[before..], &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3759,11 +3788,32 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.open_sensor_per_call_total = Some(6);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 341's two fields follow it, absent here
-        let before = without.len() - 3;
+        // lot 341's two fields and lot 313's two counters follow it, absent
+        // here
+        let before = without.len() - 5;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 6, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 6, 0, 0, 0, 0]);
+        roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// Lot 313 (the review of #549, F1): the content check's two counters
+    /// are the status's last fields, after lot 341's
+    /// `records_today` — an older `nn-admin` reads every field
+    /// it knows.
+    #[test]
+    fn the_content_check_counters_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.open_sensor_per_call_total = Some(5);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.program_copy_compared_total = Some(3);
+        status.program_copy_skipped_total = Some(300);
+        let with = postcard::to_allocvec(&status).unwrap();
+        let before = without.len() - 2;
+        assert_eq!(&with[..before], &without[..before]);
+        // lot 341's two fields, absent, between them
+        assert_eq!(&without[before - 4..], &[1, 5, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3784,9 +3834,10 @@ mod tests {
             would_have: vec![],
         });
         let with = postcard::to_allocvec(&status).unwrap();
-        let before = without.len() - 2;
+        // lot 313's two counters follow them, absent here
+        let before = without.len() - 4;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0]);
         assert_eq!(
             &with[before..before + 2],
             &[1, 24],
@@ -4604,10 +4655,13 @@ mod tests {
         // The review of #547: one more (0x55), `open_sensor_per_call_total`.
         // Lot 341: two more (0x57), `profile` and `records_today`; every
         // byte before them is the review of #547's.
+        // Lot 313: two more (0x59), the absent tags of
+        // `program_copy_compared_total` and `program_copy_skipped_total`,
+        // appended last; every byte before them is lot 341's pin.
         const STATUS_RESPONSE: &str = concat!(
-            "00000057050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000059050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000",
+            "00000000000000000000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

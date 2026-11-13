@@ -801,7 +801,8 @@ mod tests {
             .expect("the copied binary runs");
         let pid = child.id();
         // the exec has replaced the image before NEUTRALIZE reads it
-        for _ in 0..100 {
+        let mut seen = false;
+        for _ in 0..500 {
             if binary_of(pid)
                 .ok()
                 .flatten()
@@ -809,10 +810,21 @@ mod tests {
                 .as_deref()
                 == Some(mal.as_path())
             {
+                seen = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // #549's CI: NEUTRALIZE once found no binary to open. Say what the
+        // child was before NEUTRALIZE runs, not after.
+        assert!(
+            seen,
+            "the child never ran {}: exe {:?}, stat {:?}, wait {:?}",
+            mal.display(),
+            binary_of(pid).map(|h| h.and_then(|h| h.current_path())),
+            std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            child.try_wait()
+        );
         // for_test is detect-only; this test enforces, on its own child,
         // with every path under the temp dir.
         let cfg = ExecutorConfig {

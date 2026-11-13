@@ -386,16 +386,32 @@ pub fn module_file_name(tail: &[u8; NAME_TAIL]) -> bool {
     false
 }
 
-/// The module name a file name carries: the part before `.ko`, with `-`
-/// read as `_` (the kernel's and kmod's spelling of the same module).
+/// The endings of a module file's name that [`module_stem`] takes off: the
+/// module itself, and the compressed forms kmod loads.
+pub const MODULE_SUFFIXES: [&str; 4] = [".ko", ".ko.xz", ".ko.zst", ".ko.gz"];
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-87, BUG-111): the stem of a
+/// module file's name — what precedes the `.ko`, `.ko.xz`, `.ko.zst` or
+/// `.ko.gz` that ENDS the name (`acme.kontrol.ko` is `acme.kontrol`); `None`
+/// for any other name (`x.ko;65a1b2c3`, `zfs.ko.zst.dpkg-new`, `x.kobj`) and
+/// for a stem that names no file of its own (empty, `.`, `..`). The one
+/// reader of a module's name from its file's: the kernel judge's trust map
+/// (`agent/src/module_trust`) and R018's provenance read it here. It cut at
+/// the FIRST `.ko` before: `nvidia.kox-rootkit.ko` was DKMS's `nvidia`,
+/// `..ko` the registry's own directory.
+#[cfg(feature = "std")]
+pub fn module_stem(file_name: &str) -> Option<&str> {
+    let stem = MODULE_SUFFIXES
+        .iter()
+        .find_map(|s| file_name.strip_suffix(s))?;
+    (!matches!(stem, "" | "." | "..")).then_some(stem)
+}
+
+/// The module name a file name carries: its [`module_stem`], with `-` read
+/// as `_` (the kernel's and kmod's spelling of the same module).
 #[cfg(feature = "std")]
 pub fn module_name_of(file_name: &str) -> Option<alloc::string::String> {
-    let at = file_name.find(".ko")?;
-    let rest = &file_name[at + 3..];
-    if at == 0 || !(rest.is_empty() || rest.starts_with('.')) {
-        return None;
-    }
-    Some(file_name[..at].replace('-', "_"))
+    module_stem(file_name).map(|s| s.replace('-', "_"))
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -768,5 +784,72 @@ mod tests {
         ];
         let names: std::collections::BTreeSet<_> = all.iter().map(|v| verdict_name(*v)).collect();
         assert_eq!(names.len(), all.len());
+    }
+}
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-111): `module_name_of`
+/// stopped at the FIRST `.ko` whatever followed it, while `module_file_name`
+/// recognises the same names as module files by a `.ko` at the end or
+/// followed by a dot: a DKMS module named `acme.kontrol.ko` had no name, and
+/// its build was never vouched for.
+#[cfg(all(test, feature = "std"))]
+mod bug111 {
+    use super::*;
+
+    fn tail(name: &str) -> [u8; NAME_TAIL] {
+        let mut t = [0u8; NAME_TAIL];
+        let b = name.as_bytes();
+        let from = b.len().saturating_sub(NAME_TAIL);
+        t[..b.len() - from].copy_from_slice(&b[from..]);
+        t
+    }
+
+    #[test]
+    fn bug111_a_module_file_with_dot_ko_in_its_name_has_a_module_name() {
+        for (file, name) in [
+            ("acme.kontrol.ko", "acme.kontrol"),
+            ("snd.kobj-bridge.ko.zst", "snd.kobj_bridge"),
+        ] {
+            assert!(module_file_name(&tail(file)), "{file} is a module file");
+            assert_eq!(module_name_of(file).as_deref(), Some(name), "{file}");
+        }
+    }
+
+    /// Guard: a dot not followed by `ko` already gave the part before the
+    /// suffix; a name that is no module file has none.
+    #[test]
+    fn bug111_guards() {
+        assert_eq!(module_name_of("acme.bar.ko").as_deref(), Some("acme.bar"));
+        assert_eq!(module_name_of("x.ko;65a1b2c3"), None);
+        assert_eq!(module_name_of(".ko.zst"), None);
+    }
+
+    /// Lot 313: the stem is what precedes the suffix ending the name, the
+    /// last one; a stem naming no file of its own (empty, `.`, `..`) is
+    /// none, nor is a name another ending follows (a package manager's
+    /// temporary name is no module to name).
+    #[test]
+    fn module_stem_takes_the_suffix_that_ends_the_name() {
+        for (file, stem) in [
+            ("e1000.ko", Some("e1000")),
+            ("nvidia-drm.ko.zst", Some("nvidia-drm")),
+            ("zfs.ko.xz", Some("zfs")),
+            ("zfs.ko.gz", Some("zfs")),
+            ("nvidia.kox-rootkit.ko", Some("nvidia.kox-rootkit")),
+            ("nvidia.komodo.ko.zst", Some("nvidia.komodo")),
+            ("a.ko.ko", Some("a.ko")),
+            (".x.ko", Some(".x")),
+            ("..ko", None),
+            ("...ko", None),
+            ("..ko.zst", None),
+            (".ko", None),
+            ("nvidia", None),
+            ("x.ko.bz2", None),
+            ("zfs.ko.zst.dpkg-new", None),
+            ("x.ko;65a1b2c3", None),
+            ("", None),
+        ] {
+            assert_eq!(module_stem(file), stem, "{file}");
+        }
     }
 }

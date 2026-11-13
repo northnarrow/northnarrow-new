@@ -32,6 +32,9 @@ pub mod net;
 pub mod net_fanout;
 /// Lot 275: NN-L-NET-028, "no DNS, no connect".
 pub mod net_nodns;
+/// Lot 313: shells, interpreters and busybox by what the kernel executed;
+/// the rules' one place for their names.
+pub mod program_identity;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
 mod r003_exec_from_var_tmp;
@@ -400,17 +403,12 @@ pub(crate) fn judge_actor<H: PostureHost>(
     if verdict.action == ResponseAction::Log {
         return verdict;
     }
-    let Event::ProcessSpawn {
-        pid,
-        uid,
-        filename,
-        exe,
-        ..
-    } = event
-    else {
+    let Event::ProcessSpawn { pid, uid, .. } = event else {
         return verdict;
     };
-    if *uid != 0 || !crate::posture::lineage::in_system_tree(exe.path_or(filename)) {
+    // Lot 313 (BUG-119): the kernel's executed file, never the caller's
+    // string (a cut one named `/usr/bin/./././…`)
+    if *uid != 0 || !program_identity::exec_in_system_tree(event) {
         return verdict;
     }
     let Some(actor) = allowlist.actor_of(*pid, crate::posture::lineage::AsOf::of_event(event))
@@ -456,6 +454,8 @@ fn spawn_rules<H: DecisionHost>(
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let r011_lineage = lineage.clone();
+    // lot 313 (the review of #549, F2): the shell socat starts
+    let r006_lineage = lineage.clone();
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -474,7 +474,7 @@ fn spawn_rules<H: DecisionHost>(
         // the tool and staging rules a shell copied to /tmp also meets.
         Box::new(r020),
         Box::new(R007CryptoMiner::new(al())),
-        Box::new(R006ReverseShellTooling::new(al())),
+        Box::new(R006ReverseShellTooling::new(al()).with_lineage(r006_lineage)),
         Box::new(r009),
         Box::new(R010BinaryInWebroot),
         Box::new(R011KernelModuleTooling::new(al()).with_lineage(r011_lineage)),
@@ -673,6 +673,17 @@ pub mod testutil {
             filename_truncated: false,
             stdio: Default::default(),
         }
+    }
+
+    /// Lot 313 (BUG-119): `e` as the LSM hook reports a file executed where
+    /// the caller named it — the kernel's path is the caller's string. The
+    /// rules' system-tree exemptions read that path only.
+    pub fn kernel_exe(mut e: Event) -> Event {
+        if let Event::ProcessSpawn { filename, exe, .. } = &mut e {
+            exe.path = filename.clone();
+            exe.flags |= common::wire::exe::exe_flags::KNOWN;
+        }
+        e
     }
 
     /// External audit EBPF-021: `e` as the kernel reports an argv it cut

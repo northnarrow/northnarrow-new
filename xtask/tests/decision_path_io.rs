@@ -227,10 +227,15 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/decision/rules/module_provenance.rs",
-        7,
+        // lot 313 (BUG-87): 7 → 11, DKMS's build told by its content
+        // (`dkms_registered`, `same_content`: the registry walked, the two
+        // files compared), in the same lookup; the kernel judge's trust map
+        // and the exec pump's copy check call them on their own threads
+        11,
         "R018's package ownership: asked by the module-load pump on its thread \
          (`ModuleOwners::refresh`, R12b); the decision reads its answer, and asks itself \
-         only for a file no pump asked about (the replay, the tests)",
+         only for a file no pump asked about (the replay, the tests); lot 313: DKMS's build \
+         by its content, in that lookup",
     ),
     // lot 310: R004 matches no `/proc` path itself any more (the posture's
     // one reader of a `/proc` link, `posture/proc_link.rs`, does: no read)
@@ -655,15 +660,27 @@ fn the_exec_pump_reads_a_module_tool_s_exec() {
         .find("kmod_exec::note_exec(&e)")
         .expect("every exec noted for the initramfs builds");
     assert!(resolve < note, "noted before its path was resolved: {step}");
-    // the core keeps the facts; it reads nothing itself
-    let core = strip_comments(
-        &std::fs::read_to_string(
-            repo_root().join("crates/nn-core/src/decision/rules/kmod_exec_facts.rs"),
-        )
-        .unwrap(),
+    // lot 313: an exec with its stdio on a socket has its running image
+    // compared with the installed shells, while it runs, first too
+    let copy = step
+        .find("program_images::read_and_keep(&e)")
+        .expect("the running image compared with the installed programs");
+    assert!(
+        copy < resolve,
+        "compared after its path was resolved: {step}"
     );
-    let core = production(&core);
-    for m in MARKERS {
-        assert!(!core.contains(m), "kmod_exec_facts.rs holds {m}");
+    // the core keeps the facts; it reads nothing itself (lot 313: nor
+    // the programs' identities)
+    for file in ["kmod_exec_facts.rs", "program_identity.rs"] {
+        let core = strip_comments(
+            &std::fs::read_to_string(
+                repo_root().join(format!("crates/nn-core/src/decision/rules/{file}")),
+            )
+            .unwrap(),
+        );
+        let core = production(&core);
+        for m in MARKERS {
+            assert!(!core.contains(m), "{file} holds {m}");
+        }
     }
 }

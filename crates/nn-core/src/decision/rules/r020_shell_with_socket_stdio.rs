@@ -17,7 +17,7 @@
 //!
 //! The rule fires, Critical, on an exec whose image
 //! (by what the kernel executed, never `comm`) is a shell or an
-//! interpreter ([`SHELLS`], [`INTERPRETERS`]) and:
+//! interpreter and:
 //!
 //! 1. its stdin or stdout is an inet socket connected out — the reverse
 //!    shell, whatever its parent;
@@ -42,7 +42,23 @@
 //! The operator's `process-comm-allowlist` exempts a program, judged on
 //! exec identity, as for R006/R007.
 //!
-//! Not covered (said so): an interpreter that `dup2`s a socket onto its
+//! Lot 313 (external bug hunt, edition 1.4: BUG-85, N1): the shell is
+//! recognised by identity ([`program_identity::shell_or_interpreter`]): a
+//! copy of an installed shell or interpreter under any name (`cp /bin/bash
+//! ~/x`: the exec pump compares the running image with the installed
+//! programs, byte for byte), an installed one by its device and inode (a
+//! hard link, a bind mount), else by the executed file's name as before;
+//! and busybox by the program its `argv` names, as busybox reads it
+//! (`busybox sh`, `/bin/busybox sh`, the login shells `-sh` and `-ash`).
+//! An exec of a user-writable image with its stdio on a socket — or a
+//! parent's connected out, the pty-wrapped shape — whose content check the
+//! exec pump skipped (its user's budget spent, or the image unreadable to
+//! it) is recorded High, "identity unverified" — never silence (the review
+//! of #549 and its re-check).
+//!
+//! Not covered (said so): a shell that is not byte-identical to an
+//! installed program (rebuilt, patched, downloaded) and named otherwise; an
+//! interpreter that `dup2`s a socket onto its
 //! own stdio and runs no new image (a Python REPL over the socket); a
 //! bind shell re-parented to PID 1 before its exec (double fork) — its
 //! listener is still NN-L-NET-006/019's; a socket that is not on fds 0..2
@@ -57,23 +73,13 @@ use nn_model::{Event, ResponseAction, Severity, StdioSocket, Verdict};
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::response_policy::{self, PolicySwitch};
-use crate::decision::rules::transfer_tools::program_is;
+use crate::decision::rules::program_identity;
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
 
-/// Shells, by the basename of the executed file (a version suffix
-/// allowed: `ksh93`).
-pub const SHELLS: &[&str] = &[
-    "sh", "bash", "rbash", "dash", "ash", "zsh", "ksh", "mksh", "pdksh", "yash", "csh", "tcsh",
-    "fish",
-];
-
-/// Interpreters a reverse shell is written in.
-pub const INTERPRETERS: &[&str] = &[
-    "python", "python2", "python3", "pypy", "pypy3", "perl", "ruby", "irb", "php", "lua", "luajit",
-    "node", "nodejs", "deno", "tclsh", "wish", "expect", "pwsh",
-];
+/// Shells and interpreters: the rules' one list ([`program_identity`]).
+pub use crate::decision::rules::program_identity::{INTERPRETERS, SHELLS};
 
 /// Programs that hand an accepted connection to a service on its stdio
 /// (inetd style). PID 1 counts as systemd without a lookup.
@@ -89,32 +95,6 @@ pub const LAUNCHERS: &[&str] = &[
     "in.rshd",
     "in.rexecd",
 ];
-
-/// Applets busybox runs as a shell (`argv[0]`).
-const BUSYBOX_SHELLS: &[&str] = &["sh", "ash", "hush", "bash"];
-
-fn base_of(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-/// What the kernel executed is a shell (`true`) or an interpreter
-/// (`false`); `None` for anything else.
-fn shell_or_interpreter(image: &str, argv: &[String]) -> Option<bool> {
-    let base = base_of(image);
-    if SHELLS.iter().any(|s| program_is(base, s)) {
-        return Some(true);
-    }
-    if base == "busybox" {
-        let applet = argv.first().map(|a| base_of(a)).unwrap_or("");
-        if BUSYBOX_SHELLS.contains(&applet) {
-            return Some(true);
-        }
-    }
-    INTERPRETERS
-        .iter()
-        .any(|s| program_is(base, s))
-        .then_some(false)
-}
 
 /// Which of the three shapes (module docs) an exec has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,21 +126,14 @@ pub fn shape<H: PostureHost>(
     event: &Event,
     lineage: Option<&AuthSessionTracker<H>>,
 ) -> Option<StdioShellShape> {
-    let Event::ProcessSpawn {
-        ppid,
-        filename,
-        exe,
-        argv,
-        stdio,
-        ..
-    } = event
-    else {
+    let Event::ProcessSpawn { ppid, stdio, .. } = event else {
         return None;
     };
     if !stdio.own.stdin_or_stdout_inet() && !stdio.parent.stdin_or_stdout_inet() {
         return None;
     }
-    let is_shell = shell_or_interpreter(exe.path_or(filename), argv)?;
+    // lot 313 (BUG-85, N1): by identity, busybox by the program it runs
+    let is_shell = program_identity::shell_or_interpreter(event)?;
     if stdio.own.stdin_or_stdout_inet() {
         if stdio.own.outbound {
             return Some(StdioShellShape::Outbound);
@@ -188,10 +161,11 @@ fn parent_is_launcher<H: PostureHost>(
     let Some(id) = lineage.and_then(|l| l.exec_identity(ppid, as_of)) else {
         return false;
     };
-    crate::posture::lineage::in_system_tree(&id.exe.to_string_lossy())
+    let exe = id.exe.to_string_lossy();
+    crate::posture::lineage::in_system_tree(&exe)
         && LAUNCHERS
             .iter()
-            .any(|l| program_is(base_of(&id.exe.to_string_lossy()), l))
+            .any(|l| program_identity::program_is(program_identity::base_of(&exe), l))
 }
 
 /// `stdio tcp 127.0.0.1:44401 outbound`, for the detection record and the
@@ -226,6 +200,65 @@ pub struct R020ShellWithSocketStdio<H: PostureHost> {
 }
 
 impl<H: PostureHost> R020ShellWithSocketStdio<H> {
+    /// Lot 313 (the coordinator's fail-safe for the content check's
+    /// budget): an exec of a user-writable image (not in a system tree, by
+    /// the kernel's path) with its stdin or stdout on an inet socket, whose
+    /// running image the exec pump did not compare — a flood spent the
+    /// second's budget ([`program_identity::unverified`]) — is recorded
+    /// High, "identity unverified": a flood followed by a renamed shell is
+    /// never silence.
+    fn unverified(&self, event: &Event) -> Option<Verdict> {
+        let Event::ProcessSpawn {
+            filename,
+            exe,
+            stdio,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        // the socket where a reverse shell puts it: its own stdio, or (the
+        // re-check of #549, R1) its parent's, connected out — the pty
+        // master's holder of case 3
+        let own = stdio.own.stdin_or_stdout_inet();
+        let parent = stdio.parent.stdin_or_stdout_inet() && stdio.parent.outbound;
+        if !(own || parent)
+            || !program_identity::unverified(event)
+            || program_identity::exec_in_system_tree(event)
+        {
+            return None;
+        }
+        if super::judge_spawn(&self.allowlist, event) == Judgement::Allowed {
+            return None;
+        }
+        let image = exe.path_or(filename);
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            Severity::High,
+            &format!(
+                "{image} (a file a user can write) started with {} — its identity \
+                 unverified: the exec pump did not compare it with the installed shells (its \
+                 budget spent by a flood of execs, or the image unreadable to it: lot 313); \
+                 recorded",
+                if own {
+                    format!(
+                        "stdin/stdout on a {} socket (peer {})",
+                        stdio.own.proto_name(),
+                        peer_text(stdio.own.peer)
+                    )
+                } else {
+                    format!(
+                        "a parent whose stdin/stdout is a {} socket connected out to {}",
+                        stdio.parent.proto_name(),
+                        peer_text(stdio.parent.peer)
+                    )
+                }
+            ),
+        ))
+    }
+
     pub fn new(allowlist: Arc<CommAllowlist<H>>, lineage: Option<AuthSessionTracker<H>>) -> Self {
         Self {
             allowlist,
@@ -262,7 +295,9 @@ impl<H: PostureHost> Rule for R020ShellWithSocketStdio<H> {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let shape = shape(event, self.lineage.as_ref())?;
+        let Some(shape) = shape(event, self.lineage.as_ref()) else {
+            return self.unverified(event);
+        };
         if super::judge_spawn(&self.allowlist, event) == Judgement::Allowed {
             return None;
         }
@@ -531,5 +566,385 @@ mod tests {
             4000,
         );
         assert!(r.evaluate(&e).is_none());
+    }
+}
+
+/// Lot 313 (external bug hunt, edition 1.4: BUG-85): busybox picks its applet from `argv[0]`
+/// less a leading `-` (a login shell), and, run under its own name, from
+/// the next argument (`busybox sh`). R020 reads `argv[0]` only.
+#[cfg(test)]
+mod bug85 {
+    use super::*;
+    use crate::decision::rules::program_identity;
+    use crate::decision::rules::testutil::spawn_exe;
+    use crate::posture::host::testing::TestHost as H;
+    use nn_model::{StdioSocket, StdioSockets};
+
+    fn sock(outbound: bool, fds: u8, peer: &str) -> StdioSocket {
+        StdioSocket {
+            read: true,
+            inet_fds: fds,
+            outbound,
+            proto: 6,
+            peer: Some(peer.parse().unwrap()),
+        }
+    }
+
+    fn busybox(argv: &[&str], own: StdioSocket, parent: StdioSocket) -> Event {
+        let mut e = spawn_exe("busybox", "/bin/busybox", "/bin/busybox", 0);
+        if let Event::ProcessSpawn {
+            stdio,
+            ppid,
+            argv: a,
+            ..
+        } = &mut e
+        {
+            *stdio = StdioSockets { own, parent };
+            *ppid = 4000;
+            *a = argv.iter().map(|s| s.to_string()).collect();
+        }
+        e
+    }
+
+    fn rule() -> R020ShellWithSocketStdio<H> {
+        R020ShellWithSocketStdio::new(Arc::new(CommAllowlist::<H>::default()), None)
+    }
+
+    #[test]
+    fn bug85_busybox_sh_on_an_outbound_socket_is_a_reverse_shell() {
+        let out = sock(true, 0b011, "127.0.0.1:44401");
+        let mut missed = Vec::new();
+        for argv in [
+            &["busybox", "sh", "-i"][..],
+            &["/bin/busybox", "sh"][..],
+            &["-sh"][..],
+            &["-ash"][..],
+            // lot 313: a link named for its shell, busybox's own spellings
+            &["/home/u/sh", "-i"][..],
+            &["busybox.static", "sh"][..],
+            &["busybox", "busybox", "sh"][..],
+        ] {
+            let e = busybox(argv, out, StdioSocket::default());
+            if shape::<H>(&e, None) != Some(StdioShellShape::Outbound)
+                || rule().evaluate(&e).is_none()
+            {
+                missed.push(argv.join(" "));
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "busybox running a shell on an outbound socket: no R020 verdict for {missed:?}"
+        );
+    }
+
+    #[test]
+    fn bug85_busybox_sh_wrapped_in_a_pty_is_case_3() {
+        let own = StdioSocket {
+            read: true,
+            ..Default::default()
+        };
+        let e = busybox(
+            &["busybox", "sh"],
+            own,
+            sock(true, 0b111, "127.0.0.1:44402"),
+        );
+        assert_eq!(
+            shape::<H>(&e, None),
+            Some(StdioShellShape::ParentOutbound),
+            "busybox sh under a pty whose parent holds the outbound socket"
+        );
+    }
+
+    /// N1 (the triage, beyond the card; same root: the shell told by the
+    /// image's basename): a copy of a shell under another name, in a
+    /// directory the user writes, was no shell to R020 (`cp /bin/bash
+    /// ~/x`). The exec pump found the running image to be a copy of the
+    /// installed bash (`nn_linux::program_images`, its own test) and kept
+    /// it for the exec; R020 reads that.
+    #[test]
+    fn n1_a_renamed_copy_of_a_shell_is_a_shell() {
+        let out = sock(true, 0b011, "127.0.0.1:44401");
+        let mut e = spawn_exe("x", "/home/u/x", "/home/u/x", 0);
+        if let Event::ProcessSpawn {
+            stdio,
+            ppid,
+            argv,
+            pid,
+            timestamp_ns,
+            ..
+        } = &mut e
+        {
+            *stdio = StdioSockets {
+                own: out,
+                parent: StdioSocket::default(),
+            };
+            *ppid = 4000;
+            *pid = 313_085;
+            *timestamp_ns = 313_085;
+            *argv = vec!["x".into(), "-i".into()];
+        }
+        program_identity::keep_copy(&e, program_identity::ProgramKind::Shell);
+        assert_eq!(
+            shape::<H>(&e, None),
+            Some(StdioShellShape::Outbound),
+            "a copy of bash named x, stdio on an outbound socket"
+        );
+        let v = rule().evaluate(&e).expect("a reverse shell");
+        assert_eq!(v.severity, Severity::Critical);
+    }
+
+    /// Lot 313: an installed shell by its identity — a hard link or a bind
+    /// mount of bash under another name, and busybox's file (Alpine's
+    /// `/bin/sh` is a link to it: the kernel runs `/bin/busybox`) whatever
+    /// it is named, running the shell its `argv` names.
+    #[test]
+    fn an_installed_shell_under_another_name_is_a_shell() {
+        let out = sock(true, 0b011, "127.0.0.1:44401");
+        let bash = (0x0fd0_0313, 85_001);
+        let bb = (0x0fd0_0313, 85_002);
+        for (id, kind, len) in [
+            (bash, program_identity::ProgramKind::Shell, 1_446_024),
+            (bb, program_identity::ProgramKind::Busybox, 1_000_000),
+        ] {
+            program_identity::record_installed(program_identity::InstalledImage {
+                id,
+                len,
+                path: "/usr/bin/x".into(),
+                kind,
+            });
+        }
+        let at = |path: &str, id: (u64, u64), argv: &[&str]| {
+            let mut e = spawn_exe("x", path, path, 0);
+            if let Event::ProcessSpawn {
+                stdio,
+                ppid,
+                argv: a,
+                exe,
+                ..
+            } = &mut e
+            {
+                *stdio = StdioSockets {
+                    own: out,
+                    parent: StdioSocket::default(),
+                };
+                *ppid = 4000;
+                *a = argv.iter().map(|s| s.to_string()).collect();
+                (exe.dev, exe.ino) = id;
+            }
+            shape::<H>(&e, None)
+        };
+        assert_eq!(
+            at("/home/u/.cache/x", bash, &["x", "-i"]),
+            Some(StdioShellShape::Outbound)
+        );
+        // busybox through a link named for its shell (`ln -s /bin/busybox
+        // ~/sh`: the kernel runs busybox, `argv[0]` names `sh`)
+        assert_eq!(
+            at("/home/u/x", bb, &["/home/u/sh", "-i"]),
+            Some(StdioShellShape::Outbound)
+        );
+        assert_eq!(
+            at("/home/u/x", bb, &["x", "sh"]),
+            None,
+            "busybox runs `x`: no such program"
+        );
+    }
+
+    /// Guards: busybox started through its `sh` link is a shell already;
+    /// a busybox applet that is no shell stays no shape.
+    #[test]
+    fn bug85_guards() {
+        let out = sock(true, 0b011, "127.0.0.1:44401");
+        let e = busybox(&["sh", "-i"], out, StdioSocket::default());
+        assert_eq!(shape::<H>(&e, None), Some(StdioShellShape::Outbound));
+        for argv in [&["busybox", "nc", "h", "1"][..], &["busybox", "cat"][..]] {
+            let e = busybox(argv, out, StdioSocket::default());
+            assert_eq!(shape::<H>(&e, None), None, "{argv:?}");
+        }
+    }
+}
+
+/// Lot 313 (the review of #549, F4): a shell run through the dynamic
+/// loader (`/lib64/ld-linux-x86-64.so.2 /bin/bash -i`): the kernel executed
+/// the loader (comm `ld-linux-x86-64`), which runs its operand — that
+/// program is what R020 judges.
+#[cfg(test)]
+mod review549 {
+    use super::*;
+    use crate::decision::rules::testutil::spawn_exe;
+    use crate::posture::host::testing::TestHost as H;
+    use nn_model::{StdioSocket, StdioSockets};
+
+    fn through_loader(loader: &str, argv: &[&str]) -> Event {
+        let mut e = spawn_exe("ld-linux-x86-64", loader, loader, 0);
+        if let Event::ProcessSpawn {
+            stdio,
+            ppid,
+            argv: a,
+            ..
+        } = &mut e
+        {
+            *stdio = StdioSockets {
+                own: StdioSocket {
+                    read: true,
+                    inet_fds: 0b011,
+                    outbound: true,
+                    proto: 6,
+                    peer: Some("127.0.0.1:44401".parse().unwrap()),
+                },
+                parent: StdioSocket::default(),
+            };
+            *ppid = 4000;
+            *a = argv.iter().map(|s| s.to_string()).collect();
+        }
+        e
+    }
+
+    #[test]
+    fn review549_a_shell_through_the_dynamic_loader_is_a_shell() {
+        let rule =
+            R020ShellWithSocketStdio::<H>::new(Arc::new(CommAllowlist::<H>::default()), None);
+        for (loader, argv) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["/lib64/ld-linux-x86-64.so.2", "/bin/bash", "-i"][..],
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["ld.so", "--library-path", "/x", "--argv0", "y", "/bin/sh"],
+            ),
+            (
+                "/lib/ld-musl-x86_64.so.1",
+                &["ld-musl-x86_64.so.1", "/bin/busybox", "sh"],
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                &["ld.so", "--", "/usr/bin/python3"],
+            ),
+        ] {
+            let e = through_loader(loader, argv);
+            assert_eq!(
+                shape::<H>(&e, None),
+                Some(StdioShellShape::Outbound),
+                "{argv:?}"
+            );
+            assert!(rule.evaluate(&e).is_some(), "{argv:?}");
+        }
+        // guards: a program that is no shell; the loader's own query
+        for argv in [
+            &["ld.so", "/usr/bin/id"][..],
+            &["ld.so", "--list", "/usr/bin/id"],
+            &["ld.so", "--help"],
+            &["ld.so"],
+        ] {
+            let e = through_loader("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", argv);
+            assert_eq!(shape::<H>(&e, None), None, "{argv:?}");
+        }
+    }
+}
+
+/// Lot 313 (the coordinator's fail-safe): when the exec pump skips the
+/// content check (its budget spent by a flood), a user-writable image with
+/// its stdio on a socket is recorded High, "identity unverified" — never
+/// silence; an image of a system tree, a compared one and one without a
+/// socket are not.
+#[cfg(test)]
+mod unverified_identity {
+    use super::*;
+    use crate::decision::rules::testutil::spawn_exe;
+    use crate::posture::host::testing::TestHost as H;
+    use nn_model::{StdioSocket, StdioSockets};
+
+    fn exec(pid: u32, path: &str, socket: bool) -> Event {
+        let mut e = spawn_exe("x", path, path, 0);
+        if let Event::ProcessSpawn {
+            pid: p,
+            timestamp_ns,
+            stdio,
+            argv,
+            ..
+        } = &mut e
+        {
+            (*p, *timestamp_ns) = (pid, u64::from(pid));
+            *argv = vec!["x".into(), "-i".into()];
+            if socket {
+                *stdio = StdioSockets {
+                    own: StdioSocket {
+                        read: true,
+                        inet_fds: 0b011,
+                        outbound: true,
+                        proto: 6,
+                        peer: Some("127.0.0.1:44401".parse().unwrap()),
+                    },
+                    parent: StdioSocket::default(),
+                };
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn a_skipped_compare_is_recorded_never_silent() {
+        let rule =
+            R020ShellWithSocketStdio::<H>::new(Arc::new(CommAllowlist::<H>::default()), None);
+        let flood = exec(313_601, "/home/u/x", true);
+        assert!(
+            rule.evaluate(&flood).is_none(),
+            "compared (or no budget asked): nothing"
+        );
+        program_identity::keep_unverified(&flood);
+        let v = rule.evaluate(&flood).expect("identity unverified");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("identity unverified"),
+            "{}",
+            v.reasoning
+        );
+        // guards: no socket; a system tree's image
+        let quiet = exec(313_602, "/home/u/x", false);
+        program_identity::keep_unverified(&quiet);
+        assert!(rule.evaluate(&quiet).is_none());
+        let system = exec(313_603, "/usr/lib/x/tool", true);
+        program_identity::keep_unverified(&system);
+        assert!(rule.evaluate(&system).is_none());
+        // the re-check of #549 (R1 b): the pty-wrapped case — its own stdio
+        // a pty, its parent's the socket connected out
+        let mut pty = exec(313_605, "/home/u/x", false);
+        if let Event::ProcessSpawn { stdio, .. } = &mut pty {
+            stdio.own = StdioSocket {
+                read: true,
+                ..Default::default()
+            };
+            stdio.parent = StdioSocket {
+                read: true,
+                inet_fds: 0b111,
+                outbound: true,
+                proto: 6,
+                peer: Some("127.0.0.1:44402".parse().unwrap()),
+            };
+        }
+        assert!(rule.evaluate(&pty).is_none(), "not asked: nothing");
+        program_identity::keep_unverified(&pty);
+        let v = rule
+            .evaluate(&pty)
+            .expect("the pty-wrapped copy, unverified");
+        assert_eq!(v.severity, Severity::High);
+        assert!(
+            v.reasoning.contains("a parent whose stdin/stdout"),
+            "{}",
+            v.reasoning
+        );
+        // a compared copy is verified: a copy of busybox running its `cat`
+        // is no shell, and no unverified identity either
+        let mut cat = exec(313_604, "/home/u/bb", true);
+        if let Event::ProcessSpawn { argv, .. } = &mut cat {
+            *argv = vec!["cat".into()];
+        }
+        program_identity::keep_copy(&cat, program_identity::ProgramKind::Busybox);
+        assert!(!program_identity::unverified(&cat));
+        assert!(rule.evaluate(&cat).is_none());
     }
 }

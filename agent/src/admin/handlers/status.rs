@@ -132,6 +132,9 @@ fn telemetry_status(
         execpol_env_changed_total: Some(execpol.env_changed),
         execpol_lost_open_total: Some(execpol.lost_open),
         open_sensor_per_call_total: Some(nn_linux::sensors::open_sensor::per_call_total()),
+        // lot 313 (the review of #549, F1): the exec pump's content check
+        program_copy_compared_total: Some(nn_linux::program_images::counts().0),
+        program_copy_skipped_total: Some(nn_linux::program_images::counts().1),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

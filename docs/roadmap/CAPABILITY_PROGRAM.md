@@ -9338,6 +9338,142 @@ number in parentheses is a lab PR.
     this lot). Uninstalled each round, nothing left.
   - Levels unchanged (C06 2, C14 2, C19 1): fixes inside capabilities at
     their level.
+- **Lot 313 — shells and tools by what the kernel executed (C06, C14,
+  C19; the third bug hunt's lot 3: BUG-85 P1, N1 P1, BUG-112, BUG-119,
+  BUG-87, BUG-111; the decision of 11/11/2026 on BUG-49's residue).**
+  - What was open: R020 took a shell from the executed file's basename —
+    `cp /bin/bash ~/x` with its stdio on a socket connected out, `busybox
+    sh`, `/bin/busybox sh`, the login shells `-sh` and `-ash` were no
+    reverse shell (no Critical, no `ConfirmedIntrusion`; an unprivileged
+    user's evasion); R006 read socat's shell as the first word of an
+    argument that starts with `EXEC:`/`SYSTEM:`/`SHELL:` (`STDIO!!EXEC:/bin/sh`,
+    `EXEC:/usr/bin/env sh`, `SYSTEM:exec bash -i` were relays); the
+    system-tree exemptions (the trusted actor's record, R011's package
+    transaction, R006's distribution socat) took a caller's string cut at
+    255 bytes (`/usr/bin/./././…`) for `/usr/bin`; a module's name was cut
+    at its first `.ko` and DKMS's build was a directory of that name
+    (`..ko`, `nvidia.kox-rootkit.ko`, `mkdir /var/lib/dkms/rk`); a packaged
+    encryption tool started from a trusted lineage (`ccrypt -r` by a unit,
+    `gpg -c` from an interactive session) never counted for the ransomware
+    signal.
+  - What changed: one identity helper for the rules
+    (`rules/program_identity.rs`: the exec pump's byte comparison of a
+    running image with the installed shells and interpreters, their
+    `(dev, ino)` recorded by the agent at its start and every minute
+    (`nn_linux::program_images`), then the name; busybox read as busybox
+    reads its argv; a command line's program past its launchers; a tool by
+    its `comm` or the kernel's executed file, a version suffix allowed);
+    R020 and R006 ask it; the exemptions read the kernel's executed file
+    only, and `in_system_tree` refuses a non-canonical path; one
+    `common::module_stem`, DKMS's build by its content (the kernel judge's
+    `dkms_registered`, now shared); `script_args::encrypts` and the
+    lineage's flag: an encryption tool asked to encrypt counts (b) and (c)
+    whoever started it; a ratchet (`xtask/tests/program_names.rs`).
+  - The independent review of #549 (MERGE AFTER FIXES), fixed here: the
+    content check ran unbounded on the exec ring's thread (a 64 MiB
+    near-copy cost 10 ms an exec, with no memory of the file) — now an
+    answer is remembered by `(dev, ino, size, ctime)`, a file above 4 MiB is
+    compared by samples, the compares share 64 MiB a second and the execs
+    past it are counted in `status`; socat's lexer was not read (`EXEC:/bin/s\h`,
+    `EX"EC":` were relays) — now it is, and the shell or interpreter socat
+    starts is killed by its identity whatever the spelling (`sudo -i`, `su
+    -`, `chroot /`, `env -S`, busybox's `hush`, `python3 /tmp/x.py`); a
+    shell run by the dynamic loader (`ld.so /bin/bash -i`) was no shell —
+    the loader is read with the interpreters' reader and its operand is the
+    program, for R020, R006 and every rule that judges the program; BUG-49's
+    residue counted only `ccrypt` and `mcrypt -u` in practice (the other
+    tools' outputs are containers to the sampler, and they never rename) —
+    now an encryption tool's outputs count as ciphertext whatever their
+    header, and the deletions beside them by the same session's other
+    processes count for the tool, trusted or not (`gpg --encrypt-files`
+    then `rm`: decisive); `encrypts` read option values as options
+    (`ccrypt -K -d`); a content check the budget skipped records the exec
+    of a user-writable image on a socket ("identity unverified", High).
+    The re-check (R1, R2): an image the pump cannot open, and a pty-wrapped
+    exec whose parent holds the socket, are recorded "identity unverified"
+    too, and the budget is per user; a renamed copy of the dynamic loader
+    is the loader (recorded with the shells). Residuals listed: a `#!`
+    script socat starts (lot 329), socat's `\` inside single quotes, `/opt`
+    counted as a system tree.
+    The re-check 2 (N1): the per-user budget has a global ceiling (128 MiB
+    a second in all) and a full uid table loses its least recently used
+    uid, never every budget (300 uids twice in one second were granted
+    38,400 MiB).
+    **Open (lot 331)**: the LOTL shape encryption tool + `rm` is decisive in
+    the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
+    r4: one inline and one interactive session — the files encrypted and
+    deleted, no NN-L-IMP-001); not claimed closed.
+    Residuals stated: one appended byte or a patched sample defeats the
+    copy check; a container's own shells (and overlayfs' identities) are not
+    compared — lot 329's behaviour-based check is the answer to both.
+  - The lab, as measured (our own guests under lease k313; the agent
+    uninstalled, the guests clean and off at the end):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255; r1 at
+      c7888ee5): the agent recorded 6 installed programs at its start. As
+      the lab user, with stdin and stdout on a socket the shell connected
+      out to a loopback listener: `-sh` (busybox run as a login shell) and
+      `busybox.x sh` (busybox's prefix rule): R020 Critical, recorded (the
+      kill held by default). socat 1.8.0.0, the distribution's:
+      `STDIO!!EXEC:/bin/sh`, `EXEC:/usr/bin/env sh`, `EXEC:/usr/bin/setsid
+      bash -i`, `SYSTEM:exec bash -i`, `EXEC:python3 -c 'import
+      pty;pty.spawn(…)'`: R006 KillProcessTree, rc 137 each; a relay
+      (`STDIO!!OPEN:/dev/null`): R006 High, recorded, ran. Found and fixed:
+      a link `~/relay` to `/usr/bin/socat` running `EXEC:/bin/sh` ran with
+      no record — socat 1.8 installs `/usr/bin/socat1`, `socat` a link to it,
+      and the kernel's executed file is `socat1` (94666f71: a tool's name
+      takes a version suffix). The round's other R020 cases ran through a
+      shell function under `timeout` (rc 127, the probe's fault) and the
+      round stopped at the relay case (socat read the rest of the probe
+      from its standard input): rerun in r2 below. Benign corpus: `dev` (24
+      steps) one kill, the `www-data` control's R001 (by design), R001 High
+      records (`go test`, `go run`, the AppImage runs, the user's control),
+      NN-L-IMP-001 (held) in `go test`, `ConfirmedIntrusion` (mass write)
+      on `rsync --inplace` — as lot 310's baseline; `ci` (15 steps) no kill,
+      R001 High (`go test`, `go run`), NN-L-AT-001 ×24 of
+      `deb-systemd-helper` in the purge (known), `ConfirmedIntrusion` (mass
+      write) raised on `go test` and on `npm ci` (an io_uring worker): the
+      posture's mass-write arm, which this lot does not touch. No R020,
+      R006 or ransomware record in either corpus.
+    - **Debian 13** (`6.12.115+deb13.1-cloud-amd64`, systemd 257; at
+      c7888ee5): 4 installed programs recorded; `-sh` and `busybox.x sh`:
+      R020 Critical; socat 1.8.0.3: the five shell spellings killed (rc
+      137), the relay recorded, the link to socat with no record (the same
+      `socat1`, fixed). BUG-49's residue: `ccrypt -e -r` run by a transient
+      unit (PID 1 → ccrypt: a lineage of installed programs, trusted on
+      main) over 30 text files: 30 renamed `.cpt`, NN-L-IMP-001 Critical
+      (its kill held by default).
+    - **Debian 13, round r2** (`6.12.115+deb13.1-cloud-amd64`, systemd
+      257; at 12809c64 with the encryption flag on the bus's ingest), the
+      cases r1 left invalid or missing, the probe's cases reading
+      `/dev/null`: as the lab user, with stdin and stdout on a socket the
+      shell connected out — a copy of bash `~/x`, a hard link of bash under
+      another name (root made it), `busybox sh`, a link `~/sh` to busybox:
+      R020 Critical, recorded, each; the copy without a socket and `busybox
+      cat` on the socket: nothing. A link `~/relay` to `/usr/bin/socat`
+      (`→ socat1`, 1.8.0.3) running `EXEC:/bin/sh`: R006 KillProcessTree, rc
+      137; the same link as a relay: R006 High, recorded, ran. No leftovers.
+    - **Ubuntu 24.04, the review's fixes** (`6.8.0-147-generic`; r3 at
+      17392143, r4 at 5b3951de): socat 1.8.0.0 with `EXEC:/bin/s\h`,
+      `EX"EC":/bin/sh`, `SY\STEM:id`, `EXEC:env -S/bin/sh`, `EXEC:<ld.so>
+      /bin/sh`: R006 Critical, killed (rc 137); `EXEC:python3 x.py`: R006
+      Critical on the python child; a relay recorded. `ld.so /bin/bash -c`
+      and `ld.so ~/x` (a copy of bash) on a socket: R020 Critical; `ld.so
+      /usr/bin/id`: nothing. The pump with a 64 MiB "installed" interpreter
+      (bash padded): 300 execs of one near-copy on a socket in 2.8 s (one
+      compare, the rest remembered), 40 execs each changing the file in
+      0.5 s; status before → after: compared 1 → 14, skipped 0 → 28, ring
+      drops 0 → 0; a renamed bash right after: R020 Critical. During a 20 s
+      flood spending the budget, a renamed bash run by root on a socket:
+      R020 Critical ×3 (never silence). The LOTL `gpg --encrypt-files` then
+      `rm` (r3: two units; r4: one inline session, one interactive
+      session): the 30 files encrypted and deleted, **no NN-L-IMP-001** —
+      open, lot 331.
+  - Level unchanged (C06, C14, C19): the evasions are closed and measured
+    on two kernels; nothing new is proved beyond them. Residual, said so:
+    a shell that is not byte-identical to an installed one under another
+    name; a renamed copy of a shell with no socket on its stdio is R017's
+    only by its name; in tracepoint mode a path is the exec pump's lexical
+    normalisation of the caller's string (PROC-002/003).
 - **Lot 316 — the system tools' argv, read by the one reader (C14; the
   third bug hunt's lot 7: BUG-106, BUG-86, N4 P2; BUG-89, BUG-96 P3; all
   need root).**

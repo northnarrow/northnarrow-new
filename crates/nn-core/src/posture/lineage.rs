@@ -428,6 +428,10 @@ struct Entry {
     /// when `exe` ∈ [`NODE_EXES`] — that exe gate is applied at read
     /// time in [`AuthSessionTracker::is_npm_cli_writer`].
     argv_npm_cli: bool,
+    /// Lot 313 (BUG-49's residue): the exec's argv asks an encryption tool
+    /// to encrypt ([`crate::posture::script_args::encrypts`]), precomputed
+    /// at ingest as [`Self::argv_npm_cli`] is (the argv is not kept).
+    encrypts: bool,
     /// Lot 340 (the review of #552, F1): the exec's whole argv as a digest
     /// ([`AuthSessionTracker::argv_digest`]: `argv[0]`'s basename, then
     /// every argument), so a rule can ask for one exact invocation
@@ -658,7 +662,11 @@ const COMM_LEN_MAX: usize = 15;
 
 /// Review 85: `path` lies in a root-owned system tree, which a process
 /// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
-/// memfd, and not a binary deleted or replaced while it runs.
+/// memfd, and not a binary deleted or replaced while it runs. Lot 313
+/// (BUG-119's family): and a canonical path — the kernel's, the exec
+/// pump's normalisation, `/proc/<pid>/exe` — never one with an empty, `.` or
+/// `..` segment: such a string is a caller's (`/usr/bin/./././…` cut at 255
+/// bytes named no file under `/usr/bin`), whoever passes it on.
 pub fn in_system_tree(path: &str) -> bool {
     const TREES: &[&str] = &[
         "/usr/",
@@ -673,6 +681,10 @@ pub fn in_system_tree(path: &str) -> bool {
     ];
     TREES.iter().any(|t| path.starts_with(t))
         && !path.contains("/../")
+        && !path.contains("/./")
+        && !path.contains("//")
+        && !path.ends_with("/.")
+        && !path.ends_with("/..")
         && !path.ends_with(" (deleted)")
 }
 
@@ -1158,7 +1170,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (false, None),
+            (false, false, None),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1224,6 +1236,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .or(image);
         let path = exe.path_or(filename);
         let argv_npm_cli = self.names_npm_cli(Path::new(path), argv);
+        // lot 313 (BUG-49's residue): an encryption tool asked to encrypt
+        let encrypts = crate::posture::script_args::encrypts(Path::new(path), argv);
         // the review of #552 (F1): an argv the sensor cut is not the whole
         let digest = if *argv_truncated {
             None
@@ -1243,7 +1257,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *pid,
             *ppid,
             path,
-            (argv_npm_cli, digest),
+            (argv_npm_cli, encrypts, digest),
             runs,
             *timestamp_ns,
             (*start_ns, None),
@@ -1270,12 +1284,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         uid: u32,
     ) {
         let argv_npm_cli = self.names_npm_cli(Path::new(exe), argv);
+        let encrypts = crate::posture::script_args::encrypts(Path::new(exe), argv);
         let runs = runs_of(Path::new(exe), argv);
         self.ingest_inner(
             pid,
             ppid,
             exe,
-            (argv_npm_cli, self.argv_digest(argv)),
+            (argv_npm_cli, encrypts, self.argv_digest(argv)),
             runs,
             spawn_ns,
             (start_ns, None),
@@ -1360,6 +1375,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             start_ns: k.start_ns,
             // npm's own CLI is the process its exec named, never a fork of it
             argv_npm_cli: false,
+            // lot 313 (BUG-49's residue): a forked copy runs its forker's
+            // exec, an encryption it was asked for included (as `fork_entry`)
+            encrypts: parent.encrypts,
             argv: None,
             runs: parent.runs,
             start_ticks: None,
@@ -1476,7 +1494,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 pid,
                 ppid,
                 &exe,
-                (false, None),
+                (false, false, None),
                 runs,
                 0,
                 (start_ns, Some(ticks)),
@@ -1533,7 +1551,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
-        (argv_npm_cli, argv): (bool, Option<u64>),
+        (argv_npm_cli, encrypts, argv): (bool, bool, Option<u64>),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
@@ -1549,6 +1567,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
+            encrypts,
             argv,
             runs,
             start_ticks,
@@ -1835,7 +1854,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     e.ppid,
                     &e.exe.to_string_lossy(),
-                    (e.argv_npm_cli, e.argv),
+                    (e.argv_npm_cli, e.encrypts, e.argv),
                     e.runs,
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
@@ -1893,10 +1912,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .filter(|e| e.spawn_ns <= latest && e.start_ns <= latest)
             .collect();
         let first = *could.first()?;
-        if could
-            .iter()
-            .any(|e| e.runs != first.runs || e.argv_npm_cli != first.argv_npm_cli)
-        {
+        if could.iter().any(|e| {
+            e.runs != first.runs
+                || e.argv_npm_cli != first.argv_npm_cli
+                || e.encrypts != first.encrypts
+        }) {
             return None;
         }
         if ppid != 1 && !could.iter().any(|e| self.is_cached_ancestor(ppid, e.ppid)) {
@@ -1925,6 +1945,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: H::monotonic_ns().max(start_ns),
             start_ns,
             argv_npm_cli: first.argv_npm_cli,
+            encrypts: first.encrypts,
             // the review of #552 (F1): its own argv is not known
             argv: None,
             runs: first.runs.clone(),
@@ -2052,6 +2073,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns: start_ns,
             start_ns,
             argv_npm_cli: parent.argv_npm_cli,
+            encrypts: parent.encrypts,
             // the review of #552 (F1): an exec's argv is its own process's
             argv: None,
             runs: parent.runs,
@@ -2079,7 +2101,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             match found {
                 None => found = Some(e),
                 Some(f)
-                    if f.exe != e.exe || f.runs != e.runs || f.argv_npm_cli != e.argv_npm_cli =>
+                    if f.exe != e.exe
+                        || f.runs != e.runs
+                        || f.argv_npm_cli != e.argv_npm_cli
+                        || f.encrypts != e.encrypts =>
                 {
                     return None
                 }
@@ -2715,6 +2740,25 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .and_then(|(_, rest)| rest.split_whitespace().nth(4))
             .and_then(|tty| tty.parse::<i64>().ok())
             .is_some_and(|tty| tty != 0)
+    }
+
+    /// Lot 313 (BUG-49's residue): `pid`, as of `as_of`, runs an
+    /// encryption tool asked to encrypt ([`Entry::encrypts`]) — its own
+    /// exec, or the exec its forked copy runs. Cache-only, as
+    /// [`Self::is_npm_cli_writer`]: a miss is no encryption (the writer is
+    /// judged by its trust as before).
+    pub fn runs_encryption(&self, pid: u32, as_of: AsOf) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.encrypts,
+            CachedAt::LaterOnly => false,
+            CachedAt::Absent if as_of.is_judged() => self
+                .fork_entry(pid, as_of.time(), 0)
+                .is_some_and(|e| e.encrypts),
+            CachedAt::Absent => false,
+        }
     }
 
     /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
@@ -7760,6 +7804,7 @@ mod tests {
             spawn_ns: 0,
             start_ns,
             argv_npm_cli: false,
+            encrypts: false,
             argv: None,
             runs: Runs::Inline,
             start_ticks,

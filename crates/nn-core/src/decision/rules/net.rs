@@ -823,8 +823,8 @@ const DNS_ORIGINATOR_WINDOW_NS: u64 = 2 * 1_000_000_000;
 /// resolver's DNS-over-TLS rows from the other processes' with it.
 pub fn sender_is_forwarder(exe: Option<&str>) -> bool {
     let Some(path) = exe else { return false };
-    let base = path.rsplit('/').next().unwrap_or(path);
-    KNOWN_RESOLVER_PROGRAMS.contains(&base)
+    // lot 313: a program's name read by the rules' one helper
+    KNOWN_RESOLVER_PROGRAMS.contains(&super::program_identity::base_of(path))
 }
 
 /// Where a tripped DnsQuery predicate (NN-L-NET-004/-014) should be

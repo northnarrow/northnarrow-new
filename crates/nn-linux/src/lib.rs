@@ -437,6 +437,9 @@ pub mod module_writes;
 /// Lot 273d: our units' own drop-ins made inside a window, judged at its
 /// close.
 pub mod own_dropins;
+/// Lot 313: the host's shells, interpreters and busybox by their
+/// identity, and a copy of one found at an exec, for R020.
+pub mod program_images;
 /// Lot 280a: the same, judged on the kernel's copy of the write
 /// (`cgroup/sysctl` on the root cgroup), and the signed per-sysctl opt-out.
 pub mod sysctl_cgroup;

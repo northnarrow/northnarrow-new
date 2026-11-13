@@ -896,7 +896,8 @@ fn a_log_rule_never_shadows_a_staging_kill() {
 
 /// External audit PROC-010: in the engine, a name that only contains a
 /// miner's is recorded where nothing else kills, and the distribution's
-/// socat is recorded.
+/// socat is recorded. Lot 313 (BUG-119): the distribution's socat is placed
+/// by the kernel's executed file — the exec as the LSM hook reports it.
 #[test]
 fn name_fragments_and_system_socat_are_recorded() {
     let engine = RuleEngine::with_default_rules();
@@ -908,7 +909,11 @@ fn name_fragments_and_system_socat_are_recorded() {
         ),
         ("socat", "/usr/bin/socat", "R006_ReverseShellTooling"),
     ] {
-        let v = engine.evaluate(&spawn(comm, path)).expect(path);
+        let v = engine
+            .evaluate(&crate::decision::rules::testutil::kernel_exe(spawn(
+                comm, path,
+            )))
+            .expect(path);
         assert_eq!(v.rule_id, rule, "{path}");
         assert_eq!(v.action, ResponseAction::Log, "{path}");
         assert_eq!(v.severity, Severity::High, "{path}");
