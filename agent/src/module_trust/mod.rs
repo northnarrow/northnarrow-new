@@ -208,10 +208,6 @@ struct Controller {
     release: String,
     tree: PathBuf,
     deny_ok: bool,
-    /// Lot 341 (alpha 2/4): the start's no-enforcement gate (`--detect-only`,
-    /// a detect-only variable, the `alpha` profile): the judge records and
-    /// never refuses.
-    observe_only: bool,
     /// What the trust map holds (the kernel's copy).
     mirror: HashMap<InodeKey, ModuleTrust>,
     pkg_images: Vec<InodeKey>,
@@ -411,7 +407,7 @@ impl Controller {
         let changed = self.mirror != next;
         self.mirror = next;
         // the mode, once the map is filled
-        let m = kernel_mode(want.mode, self.deny_ok, self.observe_only);
+        let m = kernel_mode(want.mode, self.deny_ok);
         let first = self.armed.is_none();
         if self.armed != Some(m) {
             match self.kernel.set_mode(m) {
@@ -454,12 +450,14 @@ impl Controller {
 }
 
 /// The mode written to the kernel for the policy's `want`: the deny mode
-/// only when the kernel's offsets let the judge trust a file (`deny_ok`)
-/// and the agent enforces — lot 341: under the no-enforcement gate
-/// (`observe_only`: `--detect-only`, a detect-only variable, the `alpha`
-/// profile) a load the deny mode would refuse is let through and recorded.
-pub fn kernel_mode(want: u64, deny_ok: bool, observe_only: bool) -> u64 {
-    if want == mode::DENY && (!deny_ok || observe_only) {
+/// only when the kernel's offsets let the judge trust a file (`deny_ok`).
+/// Lot 341 (the review of #550, F2/F7): no profile and no detect-only
+/// input — an untrusted module can do anything to the agent (blind its
+/// hooks, kill it), so the judge refuses one under `alpha` and
+/// `--detect-only` as under `enforcing`; only the signed policy (R018 in a
+/// mode other than `enforce`, a `module-allow` line) relaxes it.
+pub fn kernel_mode(want: u64, deny_ok: bool) -> u64 {
+    if want == mode::DENY && !deny_ok {
         mode::RECORD
     } else {
         want
@@ -469,11 +467,7 @@ pub fn kernel_mode(want: u64, deny_ok: bool, observe_only: bool) -> u64 {
 /// Start the controller on its own thread with the maps the load took.
 /// `Err`: the judge cannot be fed (the start signs the degradation; the
 /// kernel's mode stays "not armed": nothing judged, nothing refused).
-/// `observe_only`: the start's no-enforcement gate ([`kernel_mode`]).
-pub fn start(
-    kernel: Option<kernel::Kernel>,
-    observe_only: bool,
-) -> Result<std::thread::JoinHandle<()>, String> {
+pub fn start(kernel: Option<kernel::Kernel>) -> Result<std::thread::JoinHandle<()>, String> {
     let mut kernel =
         kernel.ok_or_else(|| "the judge's maps were not taken from the eBPF object".to_string())?;
     let release = release().ok_or_else(|| "the running kernel's release unreadable".to_string())?;
@@ -496,7 +490,6 @@ pub fn start(
         release,
         tree,
         deny_ok,
-        observe_only,
         mirror: HashMap::new(),
         pkg_images: Vec::new(),
         cache: scan::PackagedCache::default(),
@@ -523,20 +516,19 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rule_policy::parse;
 
-    /// Named (lot 341): under the no-enforcement gate the judge never
-    /// refuses a load — the deny mode the policy (or the default) asks for
-    /// is written as the record mode; enforcing keeps it.
+    /// Named (lot 341, the review of #550 F2/F7): the module-load judge
+    /// takes no gate — the deny mode the policy (or the default) asks for
+    /// is written as asked under every profile; only offsets the judge
+    /// cannot trust record instead.
     #[test]
-    fn the_module_judge_only_records_under_the_no_enforcement_gate() {
+    fn the_module_judge_denies_under_every_profile() {
         assert_eq!(DEFAULT_MODE, mode::DENY);
-        assert_eq!(kernel_mode(mode::DENY, true, false), mode::DENY);
-        assert_eq!(kernel_mode(mode::DENY, true, true), mode::RECORD);
-        assert_eq!(kernel_mode(mode::DENY, false, false), mode::RECORD);
-        assert_eq!(kernel_mode(mode::RECORD, true, true), mode::RECORD);
-        assert_eq!(kernel_mode(mode::RECORD, true, false), mode::RECORD);
+        assert_eq!(kernel_mode(mode::DENY, true), mode::DENY);
+        assert_eq!(kernel_mode(mode::DENY, false), mode::RECORD);
+        assert_eq!(kernel_mode(mode::RECORD, true), mode::RECORD);
     }
+    use crate::decision::rule_policy::parse;
 
     /// The policy's mode for R018 is the judge's: `enforce` deny, any other
     /// mode record, no line the default; the `module-allow` lines only

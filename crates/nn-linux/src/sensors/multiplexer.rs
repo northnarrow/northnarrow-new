@@ -167,11 +167,6 @@ pub struct LoadPlan {
     /// R14b (plan §3.1): the parse worker the DNS pump hands its names to
     /// (`None`: none in this run — every name left without a decode).
     pub parse: Option<crate::worker::Workers>,
-    /// Lot 341: the start's resolved profile (`alpha`) leaves the host-wide
-    /// denies in observe (`anti_tamper::host_deny`), written into the object
-    /// before any program attaches. `false` (enforce) unless the start says
-    /// otherwise.
-    pub host_deny_observe: bool,
 }
 
 impl Default for LoadPlan {
@@ -183,7 +178,6 @@ impl Default for LoadPlan {
             epg_task_maps: crate::sensors::epg::TaskMaps::default(),
             lsm_absent: false,
             parse: None,
-            host_deny_observe: false,
         }
     }
 }
@@ -406,32 +400,6 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 "BTF_OFFSETS NOT frozen — a root process could rewrite the kernel offsets the \
                  hooks read while the BPF guard only observes"
             );
-        }
-
-        // Lot 341: the host-wide denies' mode, the start's resolved profile's,
-        // before any program of the object attaches; frozen. A failure
-        // leaves them enforcing (the map's zero): under `alpha`, a signed
-        // degradation.
-        match crate::anti_tamper::host_deny::arm(&mut ebpf, plan.host_deny_observe) {
-            Ok(()) => info!(
-                "host-wide denies {}",
-                crate::anti_tamper::host_deny::describe(plan.host_deny_observe)
-            ),
-            Err(e) => {
-                let detail = format!(
-                    "the host-wide denies' mode not written ({e:#}): they refuse{}",
-                    if plan.host_deny_observe {
-                        " although the alpha profile is on — a foreign tracing BPF \
-                         program, a kexec image, a guarded sysctl's write are refused"
-                    } else {
-                        ""
-                    }
-                );
-                error!("{detail}");
-                if plan.host_deny_observe {
-                    crate::boot::degradation::report("host_deny", &detail);
-                }
-            }
         }
 
         let ring_drops = crate::sensors::ring_drops::install(&mut ebpf);

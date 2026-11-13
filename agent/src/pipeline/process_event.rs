@@ -455,7 +455,6 @@ pub(crate) fn process_event(
             target_dev,
             target_ino,
             operation,
-            would_deny,
             ..
         } => {
             // Short-circuit: a kernel deny is not something the
@@ -569,14 +568,6 @@ pub(crate) fn process_event(
                         target_dev, target_ino,
                         "KERNEL STATE: found by the kernel-state round (not refused)"
                     );
-                } else if *would_deny {
-                    // Lot 341: a host-wide deny the alpha profile let through
-                    warn!(
-                        pid, uid, comm = %Escaped(comm),
-                        op = %operation,
-                        target_dev, target_ino,
-                        "WOULD DENY: a host-wide guard let it through (the alpha profile); the enforcing profile refuses it"
-                    );
                 } else {
                     warn!(
                         pid, uid, comm = %Escaped(comm),
@@ -596,9 +587,7 @@ pub(crate) fn process_event(
                     );
                     if let Some(sink) = detection_sink {
                         // Lot 273: who, by executable too.
-                        let outcome = if let Some(text) = would_deny_outcome(&event) {
-                            text
-                        } else if let Some(exemption) = &covered {
+                        let outcome = if let Some(exemption) = &covered {
                             format!(
                                 "not refused: the exemption ({exemption}) and every other no \
                                  longer hold for pid {target_ino} or what it forks \
@@ -1027,23 +1016,6 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     }
 }
 
-/// Lot 341: the record's outcome of a host-wide deny the start's `alpha`
-/// profile let through — `would have: deny:<operation> (would
-/// deny: …)`, counted with the suppressed responses; `None` for any other
-/// event (a refusal says how the kernel refused it).
-pub(crate) fn would_deny_outcome(event: &Event) -> Option<String> {
-    match event {
-        Event::FsProtectDenial {
-            operation,
-            would_deny: true,
-            ..
-        } => Some(nn_core::response::profile::would_deny(
-            &operation.to_string(),
-        )),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1053,29 +1025,6 @@ mod tests {
     use northnarrow_agent::response::{Executor, ExecutorConfig};
 
     use super::*;
-
-    /// Named (lot 341): a host-wide deny the alpha profile let through
-    /// is recorded "would deny", by its operation; a refusal is not.
-    #[test]
-    fn a_let_through_host_wide_deny_is_recorded_would_deny() {
-        let ev = |would_deny| Event::FsProtectDenial {
-            pid: 4242,
-            uid: 0,
-            comm: "bpftrace".into(),
-            target_dev: 0,
-            target_ino: 5,
-            operation: nn_model::FsProtectOperation::BpfProgType,
-            timestamp_ns: 1,
-            would_deny,
-        };
-        let text = would_deny_outcome(&ev(true)).expect("a would-deny outcome");
-        assert!(
-            text.starts_with("would have: deny:bpf_prog_type "),
-            "{text}"
-        );
-        assert!(text.contains("would deny"), "{text}");
-        assert_eq!(would_deny_outcome(&ev(false)), None);
-    }
     use crate::pipeline::dispatch::{Dispatcher, Followups};
 
     fn exec_from_tmp(pid: u32, uid: u32) -> Event {

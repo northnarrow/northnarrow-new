@@ -94,8 +94,8 @@ fn the_no_enforcement_gate_is_resolved_in_one_place() {
 
 /// Named: every response path and deny switch the start arms takes the one
 /// gate — the exec quarantine's holds, the exec policy's denies, the kernel
-/// connect deny, the exploit guard, the module-load judge, the COMBAT
-/// ladder — and the attach no longer recomputes it.
+/// connect deny, the exploit guard, the COMBAT ladder — and the attach no
+/// longer recomputes it; the module-load judge takes none.
 #[test]
 fn every_enforcing_switch_takes_the_resolved_gate() {
     let code = product_code(&repo_root());
@@ -115,24 +115,21 @@ fn every_enforcing_switch_takes_the_resolved_gate() {
     assert!(body(attach, "execpol_mode").contains("Mode::Enforce if detect_only => Mode::Audit"));
     let boot = at("agent/src/boot/mod.rs");
     assert!(
-        // lot 341 round 2: and the profile's host-wide switch after it
-        boot.contains(
-            "export_loaded.on().is_some(),\n        detect_only,\n        profile.host_wide_denies_observe(),\n    )"
-        ),
+        boot.contains("export_loaded.on().is_some(),\n        detect_only,\n    )"),
         "the start hands attach::load the resolved gate"
     );
     let policy = at("agent/src/boot/policy.rs");
     assert!(policy.contains("arming(cli.net_connect_deny, detect_only)"));
     let response = at("agent/src/boot/response.rs");
     assert!(response.contains("effective_response(requested, detect_only)"));
+    // the module-load judge takes NO gate (the review of #550, F2/F7): an
+    // untrusted module is refused under every profile, as kexec is
     let tasks = at("agent/src/boot/tasks.rs");
-    assert!(tasks.contains("let observe_only = execq_exec_cfg.dry_run;"));
-    assert!(tasks.contains("module_trust::start(module_kernel, observe_only)"));
+    assert!(tasks.contains("module_trust::start(module_kernel)"));
+    assert!(!tasks.contains("observe_only"));
     let module = at("agent/src/module_trust/mod.rs");
-    assert!(body(module, "kernel_mode").contains("(!deny_ok || observe_only)"));
-    assert!(
-        body(module, "look").contains("kernel_mode(want.mode, self.deny_ok, self.observe_only)")
-    );
+    assert!(signature(module, "kernel_mode").contains("(want: u64, deny_ok: bool)"));
+    assert!(body(module, "look").contains("kernel_mode(want.mode, self.deny_ok)"));
     // the COMBAT ladder and the response build take the start's value
     assert!(boot.contains("&isolator,\n        detect_only,\n        &audit_log,"));
     // the exec quarantine's controller kills only when it enforces — a kill

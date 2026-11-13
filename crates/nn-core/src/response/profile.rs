@@ -6,12 +6,13 @@
 //! - **`alpha`** — observe-only. Detection, posture and the evidence chains
 //!   run as always; no response action touches a user program (no kill, no
 //!   isolation, no quarantine, no exec-queue hold, no enforce deny): every
-//!   verdict is recorded with what it *would have* done. The agent's own
-//!   self-protection (the anti-tamper deny hooks on its files, processes,
-//!   maps and cgroup) is not a response and stays on; the host-wide denies
-//!   (a third-party tool's tracing BPF program, a kexec, a sysctl, …) are
-//!   only observed, each recorded "would deny" ([`would_deny`]; the
-//!   kernel's switch, `agent-ebpf/src/host_deny.rs`).
+//!   verdict is recorded with what it *would have* done. The host's
+//!   integrity and the agent's self-protection are not responses and stay
+//!   enforced: the deny hooks on its files, processes, maps and cgroup, and
+//!   (the review of #550) the host-wide denies that would blind, freeze or
+//!   kill it — a foreign tracing BPF load, the kprobes and lockdown
+//!   switches, the sysctl guard, a cgroup v1 write, a ptrace of PID 1, a
+//!   kexec image, an untrusted module.
 //! - **`enforcing`** — the responses run.
 //!
 //! Where the profile comes from, strongest first ([`resolve`]):
@@ -148,21 +149,6 @@ impl ResolvedProfile {
     }
 }
 
-impl ResolvedProfile {
-    /// Lot 341 (the coordinator's decision of 13/11): the host-wide denies
-    /// — the guards that refuse a third-party tool something on the host
-    /// (a foreign tracing BPF program, a kexec, a sysctl, …), not something
-    /// on the agent — observe under the `alpha` profile, each recorded
-    /// "would deny": what the start writes into the kernel's
-    /// `HOST_DENY_MODE`. `--detect-only` and `NN_DETECT_ONLY` keep their
-    /// meaning (no response) and leave them on — the lab and the privileged
-    /// suites measure them so. The agent's self-protection reads no such
-    /// switch.
-    pub fn host_wide_denies_observe(&self) -> bool {
-        self.profile.observe_only()
-    }
-}
-
 /// The built-in default: an agent with no profile from its install is the
 /// agent it was before this lot.
 pub const DEFAULT_PROFILE: Profile = Profile::Enforcing;
@@ -187,12 +173,35 @@ pub fn resolve(overlay: Option<Profile>, manifest: Option<Profile>) -> ResolvedP
     }
 }
 
+/// Lot 341 (the review of #550, F8): the alarm of an observe-only start
+/// after a run that enforced (`previous_enforced`: the chain's last
+/// `agent_boot` said `detect_only: false`) when nothing signed asked for it
+/// — the profile is `alpha` and not from a verified `profile.local` (a
+/// deleted overlay, a manifest edited while the agent was stopped). A
+/// signed `profile = alpha` is the operator's switch: no alarm. The text
+/// the start signs, `None` when there is nothing to say.
+pub fn unsigned_downgrade(
+    previous_enforced: Option<bool>,
+    now: &ResolvedProfile,
+) -> Option<String> {
+    (previous_enforced == Some(true)
+        && now.profile.observe_only()
+        && now.source != ProfileSource::Overlay)
+        .then(|| {
+            format!(
+                "the response profile is {} after a run that enforced, and no signed \
+                 profile.local asked for it: a switch to alpha is a signed `nn-admin config \
+                 overlay set profile` — check who removed the overlay or edited the install \
+                 manifest",
+                now.describe()
+            )
+        })
+}
+
 /// The agent-wide no-enforcement gate, resolved once at the start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetectOnly {
-    /// No response action and no enforce deny of a user program (lot 341:
-    /// the host-wide denies follow the profile alone,
-    /// [`ResolvedProfile::host_wide_denies_observe`]).
+    /// No response action and no enforce deny of a user program.
     pub on: bool,
     /// What switched it on (MAIN-008: the signed `agent_boot` names it):
     /// `--detect-only`, `NN_DETECT_ONLY=1`, `profile alpha (…)`.
@@ -234,21 +243,25 @@ pub fn would_have(action: &str) -> String {
 /// The prefix of [`would_have`].
 pub const WOULD_HAVE_PREFIX: &str = "would have: ";
 
-/// Lot 341: the text a record carries for a HOST-WIDE deny the gate let
-/// through (a foreign tracing BPF program's load, a kexec image, a sysctl
-/// or cgroup v1 write, the kprobes or lockdown switch, a ptrace of PID 1):
-/// `would have: deny:kexec (would deny: …)` — counted with the suppressed
-/// responses (`deny:kexec`), and saying "would deny".
-pub fn would_deny(operation: &str) -> String {
-    would_have(&format!(
-        "deny:{operation} (would deny: not refused — the alpha profile leaves the \
-         host-wide guards in observe)"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named (lot 341, the review of #550 F8): an `alpha` start after an
+    /// enforcing run is an alarm unless a signed `profile.local` asked for
+    /// it; a first boot, an alpha run before, an enforcing start are none.
+    #[test]
+    fn an_unsigned_downgrade_to_alpha_is_an_alarm() {
+        let manifest_alpha = resolve(None, Some(Profile::Alpha));
+        let overlay_alpha = resolve(Some(Profile::Alpha), Some(Profile::Enforcing));
+        let enforcing = resolve(None, Some(Profile::Enforcing));
+        let text = unsigned_downgrade(Some(true), &manifest_alpha).expect("an alarm");
+        assert!(text.contains("alpha (install manifest)"), "{text}");
+        assert_eq!(unsigned_downgrade(Some(true), &overlay_alpha), None);
+        assert_eq!(unsigned_downgrade(Some(false), &manifest_alpha), None);
+        assert_eq!(unsigned_downgrade(None, &manifest_alpha), None);
+        assert_eq!(unsigned_downgrade(Some(true), &enforcing), None);
+    }
 
     #[test]
     fn a_profile_file_names_exactly_one_profile() {
@@ -318,26 +331,5 @@ mod tests {
     fn a_suppressed_response_reads_would_have() {
         assert_eq!(would_have("KillProcess"), "would have: KillProcess");
         assert!(would_have("Quarantine").starts_with(WOULD_HAVE_PREFIX));
-    }
-
-    /// Named (lot 341): under alpha the host-wide denies observe, under
-    /// enforcing they refuse; a let-through deny's record says "would
-    /// deny" and is counted with the suppressed responses by its operation.
-    #[test]
-    fn the_host_wide_denies_observe_under_alpha_only() {
-        assert!(resolve(None, Some(Profile::Alpha)).host_wide_denies_observe());
-        assert!(resolve(Some(Profile::Alpha), Some(Profile::Enforcing)).host_wide_denies_observe());
-        let enforcing = resolve(None, Some(Profile::Enforcing));
-        assert!(!enforcing.host_wide_denies_observe());
-        assert!(!resolve(None, None).host_wide_denies_observe());
-        // --detect-only switches the responses off, not these denies
-        assert!(detect_only_gate(true, None, &enforcing).on);
-        assert!(!enforcing.host_wide_denies_observe());
-        let text = would_deny("bpf_prog_type");
-        assert!(
-            text.starts_with("would have: deny:bpf_prog_type "),
-            "{text}"
-        );
-        assert!(text.contains("would deny"), "{text}");
     }
 }

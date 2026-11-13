@@ -176,8 +176,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "if op == 0 {\n        return false;\n    }",
             "if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {\n        return false;\n    }",
             "read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });",
-            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`)
-            "let (refuse, op) = crate::host_deny::judge(op);\n    sign(phase, op, key);\n    refuse",
+            "sign(phase, op, key);\n    true",
         ],
     )
     .unwrap();
@@ -214,10 +213,8 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "|| written_value(),",
             "SysctlVerdict::Allow => return false,",
             "SysctlVerdict::Refuse => {}",
-            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`)
-            "let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL);",
-            "sign(phase, op, key);",
-            "refuse",
+            "sign(phase, FS_OP_SYSCTL, key);",
+            "true",
         ],
     )
     .unwrap();
@@ -303,8 +300,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "Some(p) if *p & CGROUP_POLICY_V1_REFUSE != 0 => {}",
             "if caller_may(caller) {\n        return false;\n    }",
-            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`)
-            "let (refuse, op) = crate::host_deny::judge(FS_OP_CGROUP_V1);\n    sign(phase, op, key);\n    refuse",
+            "sign(phase, FS_OP_CGROUP_V1, key);",
         ],
     )
     .unwrap();
@@ -603,9 +599,7 @@ fn the_task_settings_denies_refuse_another_processs_change() {
         body(&p, "try_ptrace_access_check"),
         &[
             "let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;",
-            // lot 341: PID 1's is a host-wide deny, the agent's targets refused
-            // under every profile (`xtask/tests/host_deny.rs`)
-            "let own_target = crate::task_kill::is_protected_pid(target_tgid)\n        || crate::bpf_defense::task_runs_own_binary(target as *const u8);\n    if !init_attach && !own_target {\n        return 0;\n    }",
+            "if !init_attach\n        && !crate::task_kill::is_protected_pid(target_tgid)",
             "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return 0;\n    }",
             "if init_attach && crate::inode_protect::override_active() {\n        return 0;\n    }",
             "-EPERM",
@@ -633,8 +627,7 @@ fn the_task_settings_denies_refuse_another_processs_change() {
             "if caller_may(caller) {\n        return false;\n    }",
             "if v1_binds_a_controller(inode) == Some(false) {\n        return false;\n    }",
             "if v1_moves_or_freezes(inode) == Some(false) {\n        return false;\n    }",
-            // lot 341: a host-wide deny (`xtask/tests/host_deny.rs`)
-            "let (refuse, op) = crate::host_deny::judge(FS_OP_CGROUP_V1);\n    sign(phase, op, key);\n    refuse",
+            "sign(phase, FS_OP_CGROUP_V1, key);",
         ],
     )
     .unwrap();
@@ -884,9 +877,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&ti, "sysctls_at_close"),
         &[
             "crate::sysctl_guard::check(",
-            // lot 341: written unless the start's `alpha` profile is on
-            // (`xtask/tests/host_deny.rs`; a `sysctl_would_restore` then)
-            "!crate::anti_tamper::host_deny::observing(),",
+            "true,",
             ".filter(|s| s.kind != \"sysctl_strict\" && s.kind != \"sysctl_opted_out\")",
         ],
     )
@@ -1029,11 +1020,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
     in_order(
         body(&si, "collect_round"),
-        // lot 341: written unless the start's `alpha` profile is on
-        &[
-            "crate::sysctl_guard::check(",
-            "!crate::anti_tamper::host_deny::observing(),",
-        ],
+        &["crate::sysctl_guard::check(", "true,"],
     )
     .unwrap();
     // R1: ftrace_enabled read at every build of the capability manifest

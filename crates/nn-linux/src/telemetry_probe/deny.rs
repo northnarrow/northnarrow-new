@@ -27,10 +27,7 @@
 //!   write of 0 bytes through a descriptor the agent opened before and
 //!   handed to the child ([`WRITE_FD`]);
 //! - the **BPF guard**: a load of a two-instruction kprobe program (a type
-//!   refused outside the family in every mode: the `bpf` hook; lot 341: a
-//!   host-wide deny a third party meets only as "would deny" under the
-//!   `alpha` profile, the self-test's child refused under every profile —
-//!   `agent-ebpf/src/host_deny.rs`), and, where
+//!   refused outside the family in every mode: the `bpf` hook), and, where
 //!   the guard enforces, a read-only handle on one of the agent's maps and
 //!   one on one of its programs through relative paths (the `bpf_map` and
 //!   `bpf_prog` hooks: the `bpf` hook judges the absolute ones first).

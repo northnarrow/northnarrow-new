@@ -40,7 +40,6 @@ mod fail_open;
 mod file_open;
 mod fim_watch;
 mod fork_parent;
-mod host_deny;
 mod inbound;
 mod inet_csk_listen;
 mod inode_dev;

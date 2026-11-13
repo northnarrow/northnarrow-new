@@ -154,10 +154,8 @@ unsafe fn refuse_switch(file: *const c_void, inode: *const c_void, fs: SpecialFs
         return false;
     }
     let key = crate::inode_protect::read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });
-    // Lot 341: a host-wide deny (`crate::host_deny`)
-    let (refuse, op) = crate::host_deny::judge(op);
     sign(phase, op, key);
-    refuse
+    true
 }
 
 /// The dentry of `file` (`file->f_path.dentry`).
@@ -506,10 +504,8 @@ unsafe fn refuse_v1(inode: *const c_void, hook: u32, phase: Phase) -> bool {
         crate::fail_open::bump(hook);
         return false;
     };
-    // Lot 341: a host-wide deny (`crate::host_deny`)
-    let (refuse, op) = crate::host_deny::judge(FS_OP_CGROUP_V1);
-    sign(phase, op, key);
-    refuse
+    sign(phase, FS_OP_CGROUP_V1, key);
+    true
 }
 
 /// Lot 273d (the review of #492): a write of a guarded global sysctl
@@ -579,20 +575,12 @@ unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, ph
         }
         SysctlVerdict::Refuse => {}
     }
-    // Lot 341: a host-wide deny (`crate::host_deny`). Let through under the
-    // `alpha` profile, its "would deny" signed once: by the cgroup/sysctl
-    // program, on the kernel's copy, when this boot attached it (as an
-    // opt-out's write); else here.
-    let (refuse, op) = crate::host_deny::judge(FS_OP_SYSCTL);
-    if !refuse && crate::sysctl_guard::kernel_judge_attached() {
-        return false;
-    }
     let Some(key) = crate::inode_protect::read_inode_key(inode) else {
         crate::fail_open::bump(hook);
         return false;
     };
-    sign(phase, op, key);
-    refuse
+    sign(phase, FS_OP_SYSCTL, key);
+    true
 }
 
 /// `oom_score_adj` / `oom_adj` of a protected process: [`refuse_write`]'s
@@ -663,11 +651,6 @@ unsafe fn proc_file_tgid(inode: *const c_void) -> Option<u32> {
 #[inline(always)]
 fn sign(phase: Phase, operation: u8, key: InodeKey) {
     match phase {
-        // Lot 341: a "would deny" refuses nothing — its open and its writes
-        // go on: one record a caller and operation a second (the dedup)
-        Phase::Open if northnarrow_common::wire::is_would_deny(operation) => {
-            crate::inode_protect::emit_limited(operation, key)
-        }
         // Lot 293 (BUG37): behind the attempt budget.
         Phase::Open => crate::inode_protect::emit_attempt(operation, key),
         Phase::Write => crate::inode_protect::emit_limited(operation, key),
