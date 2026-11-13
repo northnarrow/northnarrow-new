@@ -66,7 +66,10 @@ pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
 pub const BUILTIN_SECURITY_TOOLS_V1: &str =
     include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/security-tools.v1"));
 /// SHA-256 of every `security-tools.v1` an earlier release shipped.
-pub const EARLIER_SECURITY_TOOLS_V1_SHA256: &[&str] = &[];
+pub const EARLIER_SECURITY_TOOLS_V1_SHA256: &[&str] = &[
+    // lab PR 225 to lot 316 (before the units' aliases)
+    "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
+];
 /// The shipped `security-tools.v1` (built-in copy, earlier ones).
 pub const SECURITY_TOOLS_SHIPPED: Shipped<'static> =
     Shipped::new(BUILTIN_SECURITY_TOOLS_V1, EARLIER_SECURITY_TOOLS_V1_SHA256);
