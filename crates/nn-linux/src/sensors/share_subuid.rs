@@ -553,7 +553,7 @@ mod tests {
         // every subuid of each resolved range is its owner's
         for (lo, owner) in [(100_000u32, 1000u32), (165_536, 1001), (231_072, 1002)] {
             for i in (0..65_536u32).step_by(97).chain([0, 65_535]) {
-                assert_eq!(key_of(&t, lo + i, 0, 0, 0), owner, "{}", lo + i);
+                assert_eq!(key_of(&t, lo + i, 0, 0, 0), owner, "offset {i} of a range");
                 assert_eq!(key_of(&t, 1, 2, lo + i, 7), owner);
             }
         }
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(
             (small.unplaced, small.entries.len()),
             (4, cover),
-            "{small:?}"
+            "the span's cover only"
         );
         for uid in [100_000 + 4242, 170_000, 240_000, 1_000_123] {
             assert_eq!(key_of(&small, uid, 0, 0, 0), OVERFLOW_SHARE);
@@ -670,7 +670,10 @@ mod tests {
         let mut overflow = 0;
         for i in 0..1500u32 {
             let k = key_of(&t, 100_000 + i * 65_536 + 7, 0, 0, 0);
-            assert!(k == 2000 + i || k == OVERFLOW_SHARE, "u{i}: {k}");
+            assert!(
+                k == 2000 + i || k == OVERFLOW_SHARE,
+                "range {i}: not its owner's"
+            );
             // a range is placed whole or not at all
             assert_eq!(
                 key_of(&t, 100_000 + i * 65_536 + 65_535, 0, 0, 0),
@@ -739,7 +742,7 @@ mod tests {
             s
         };
         let mut s = attack(&host());
-        assert!(s.rows.len() <= 1, "{:?}", s.rows.keys());
+        assert!(s.rows.len() <= 1, "{} rows", s.rows.len());
         assert_eq!(s.rows.get(&1000), Some(&PER));
         assert_eq!(s.overflow, PER);
         assert_eq!(s.total, 2 * PER);
