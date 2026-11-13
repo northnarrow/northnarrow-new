@@ -10198,5 +10198,41 @@ number in parentheses is a lab PR.
     Kubernetes pod carries about 7 per service of its namespace
     (documented). Against a cap of 1,048,576 (the kernel's own
     limit 699,050): fail-closed at protected and set-id targets.
+  - The independent review of #547 (MERGE AFTER FIXES; new commits): F1
+    each loader entry judged as the loader reads it (the value read whole,
+    about 4 KiB, split on colons and white space, the path normalised; a
+    relative loader path fails closed at a protected or set-id target); F2
+    the post-commit check kills a protected or set-id target on what it
+    cannot clear, in a per-CPU buffer; F3 `orig_ax`'s low 32 bits; F4 a
+    failed exec's quarantine candidate goes with its file (LSM
+    `file_free_security`), 1,024 candidates per uid, a dropped one counted
+    and signed; F5 an unread environment goes to the post-commit check
+    instead of refusing every protected exec; F6 the FIM buffers 16,384 per
+    uid, a per-run buffer past it, counted (`open_sensor_per_call_total`);
+    F7 no refusal of a long clean value, the capture's off-by-one; F8 64
+    judged names per exec, the commit bounded at 98,304 reads; F9 the docs,
+    `task_free` tracked as attached, `KILLED` only when the signal went. The
+    per-uid shares are plain read-modify-writes (no atomics in the eBPF
+    crate), recounted by the agent. The first object of the round was
+    refused on 7.0 and on 5.15 (past a million instructions: the value's
+    judgment inline in the scan's loops); the judgment moved into global
+    functions (`nn_env_pending`, `nn_env_judge`, `nn_value_end`,
+    `nn_value_slash`, `nn_env_resolve`, `nn_execq_cand_put` /
+    `_remove`). Lab (the object of this code, our guests, lease k325): verifier-check 0 failing on 5.15.0-202,
+    6.8.0-149 (487,281), 6.12.116 and 7.0.0-43 (`exec_check_lsm` processed 816,949
+    on 7.0 and 803,595 on 6.12, 627,971 / 668,228 before the review; stack
+    448 of 512); the four e2e pass on 7.0 with the reviewer's forms (120
+    spaces, `//tmp/`, `/./tmp/`, a relative path, `rax`'s high half set:
+    refused; past the first pass's reads: killed; 2,880-byte clean
+    `LD_PRELOAD` and `LD_LIBRARY_PATH`: run; both per-task maps full: root,
+    `su` and `nobody` run, root's staging preload killed). Cost, 7.0
+    (bpf_stats): `exec_check_lsm` 33 µs per exec with no variable, 35 with
+    60, 44 with 1,000, 154 with 10,000; the commit 1.9 / 2.5 / 9.1 / 70.8
+    µs; 64 clean 4 KiB `LD_PRELOAD` values 361 + 231 µs; the commit's worst
+    case is bounded — 600,000 empty strings 509 µs (3,274 before),
+    100,000 variables 602 µs, past its 98,304 reads, and killed at a
+    protected target (`TRUNCATED`); 100,000 judged names refused at the
+    first pass in 42 µs (the 64-name cap). A failed exec's candidate goes with its file: 1,500 processes each failing an exec (no loader) and staying alive left no candidate (6.8; the uid's share back to 0, its row removed at the next recount); the FIM buffers' shares equal their entries, uid by uid. 40 targeted mutants,
+    each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
