@@ -231,36 +231,164 @@ pub struct ExecqCandRaw {
     pub flags: u32,
     /// The review of #547 (F4; the re-check, G5): the share of the
     /// candidates' map this one takes (`EXECQ_CAND_UIDS`) — the caller's
-    /// login uid, or its uid without one ([`share_key`]); [`OVERFLOW_SHARE`]
-    /// when the shares' map could not hold a row for it.
+    /// [`share_key`] (lot 332: its uid, or its user namespace's creator or
+    /// container); [`OVERFLOW_SHARE`] when the shares' map could not hold a
+    /// row for it.
     pub uid: u32,
     /// The review of #547 (F4): the pass's inode (its address), by which a
     /// failed exec's candidate is found and removed when the kernel frees
     /// the exec's file.
     pub inode: u64,
     /// The re-check of #547 (G5): when it was made (`bpf_ktime_get_ns`), by
-    /// which the oldest goes first when the map is full.
+    /// which the oldest goes first when the map is full (lot 332: found by
+    /// walking the map).
     pub at: u64,
     pub exe: ExeIdentityRaw,
 }
 
-/// The re-check of #547 (G5): the key of a task's share of the maps whose
-/// entries outlive a run (the quarantine's candidates, the FIM sensor's task
-/// buffers) — its login uid (`task->loginuid`, set at login and kept by
-/// every process of the session, the container subuids of a rootless
-/// runtime included: they cannot change it), or its uid when it has none
-/// (`u32::MAX`: a service).
-pub const fn share_key(loginuid: u32, uid: u32) -> u32 {
-    if loginuid == u32::MAX {
-        uid
+/// The key of a task's share of the maps whose entries outlive a run (the
+/// quarantine's candidates, the FIM sensor's task buffers): the account the
+/// task's work is held to.
+///
+/// - `level` 0, the initial user namespace: its real uid `uid` (the
+///   kernel's, in that namespace). Lot 332 (the re-check 2 of #547, G5): it
+///   was the login uid there, and a task whose login uid is unset — a
+///   service, a container under a root daemon, where a foothold lands —
+///   sets it to any value without a privilege (`audit_set_loginuid_perm`),
+///   so each child of one service took a share of its own.
+/// - In a user namespace, keyed by its outermost ancestor below the initial
+///   one (the one a container runtime or `unshare -U` made): `owner`, the
+///   account that created it, when that is not root — a rootless
+///   container's nested namespaces are its user's; `inum`, that
+///   namespace's inode number, when root made it (a system container:
+///   LXD, a remapping docker), one share per container, whatever uid in its
+///   range a process takes. The creator is set by the kernel when the
+///   namespace is made, and nesting cannot reach past it.
+/// - Lot 332 (the review of #551, F1): the uid or the creator
+///   ([`share_account`]) is first looked up in the host's subordinate uid
+///   ranges (`/etc/subuid`, published by the agent: `SHARE_SUBUID`), and
+///   `sub` is that answer. A user with a range can make a binary owned by
+///   any uid of it setuid (`chown` inside a namespace it made), run it in
+///   the initial namespace and take that uid as its real one
+///   (`setresuid`), or make a namespace whose creator it is: 65,536 keys
+///   of its own. `Some(o)`: the uid is in `o`'s range, the key is `o`'s;
+///   `Some(OVERFLOW_SHARE)`: it is in the ranges' span but the agent knows
+///   no single owner for it (a range the trie had no room for, an owner it
+///   could not resolve, two users' ranges overlapping, a gap between
+///   ranges), the key is the overflow row's, one row under the same cap,
+///   never a row of its own; `Some(ROOT_SUBID_SHARE)`: it is in a range
+///   root owns (the re-check of #551, G1: [`subuid_row`]), the key is that
+///   row's, never root's own; `None`: no one's subordinate uid, the key is
+///   the account's own.
+///
+/// What a task cannot choose, then: a key other than its account's, its
+/// account's ranges' owner's, the overflow row, root's ranges' row, or — a
+/// namespace root made — that namespace's (one per namespace: a
+/// setuid-root helper that makes one per run gives its caller one per
+/// run).
+///
+/// [`OVERFLOW_SHARE`] only for `sub == Some(OVERFLOW_SHARE)`, and
+/// [`ROOT_SUBID_SHARE`] only for `sub == Some(ROOT_SUBID_SHARE)`: an
+/// account or a namespace whose number is one of them is keyed below them.
+pub const fn share_key(uid: u32, level: u32, owner: u32, inum: u32, sub: Option<u32>) -> u32 {
+    let k = match share_account(uid, level, owner) {
+        Some(account) => match sub {
+            Some(OVERFLOW_SHARE) => return OVERFLOW_SHARE,
+            Some(ROOT_SUBID_SHARE) => return ROOT_SUBID_SHARE,
+            Some(o) => o,
+            None => account,
+        },
+        None => inum,
+    };
+    if k >= ROOT_SUBID_SHARE {
+        ROOT_SUBID_SHARE - 1
     } else {
-        loginuid
+        k
     }
 }
+
+/// Lot 332 (the review of #551, F1): the account [`share_key`] looks up in
+/// the host's subordinate uid ranges — the uid in the initial user
+/// namespace, the creator of the outermost namespace a user made — or
+/// `None` in a namespace root made (keyed by its inode number, which is no
+/// uid).
+pub const fn share_account(uid: u32, level: u32, owner: u32) -> Option<u32> {
+    if level == 0 {
+        Some(uid)
+    } else if owner != 0 {
+        Some(owner)
+    } else {
+        None
+    }
+}
+
+/// Lot 332 (the review of #551, F1): the entries of the subordinate uids'
+/// LPM trie (`SHARE_SUBUID`: the uid big-endian → [`subuid_row`] of the
+/// owner, or [`OVERFLOW_SHARE`]). About 1,300 users' useradd ranges (a range of
+/// 65,536 not aligned on its size takes 12 entries); the ranges past them
+/// are the overflow row's.
+pub const SUBUID_TRIE_MAX: u32 = 16_384;
+
+/// The deepest user namespace below the initial one (the kernel refuses a
+/// 33rd level, `create_user_ns`): the share key's walk to the outermost
+/// ancestor takes at most this many steps.
+pub const USERNS_MAX_LEVEL: u32 = 33;
 
 /// The re-check of #547 (G5): the share of the keys the shares' map has no
 /// row for (it is full): one row, under the same cap, held apart.
 pub const OVERFLOW_SHARE: u32 = u32::MAX;
+
+/// Lot 332 (the re-check of #551, G1): the share of the uids of the ranges
+/// root owns in `/etc/subuid` (LXD, Incus: `root:1000000:1000000000`) —
+/// one row of the shares' map under the per-share cap, apart from root's
+/// own (0) and from the overflow row. An account whose uid lies in such a
+/// range (a domain account: sssd, FreeIPA and LDAP ids run to 2·10⁹), and
+/// a namespace it makes, count there: they can neither fill root's row
+/// nor hold back root's execs.
+pub const ROOT_SUBID_SHARE: u32 = u32::MAX - 1;
+
+/// Lot 332 (the re-check of #551, G1): the row `SHARE_SUBUID` holds for a
+/// range owned by the account `owner` — its uid; [`ROOT_SUBID_SHARE`] for
+/// root's ranges, never root's own row; [`OVERFLOW_SHARE`] for an owner
+/// whose uid is a reserved key (`nfsnobody`, 4294967294).
+pub const fn subuid_row(owner: u32) -> u32 {
+    if owner == 0 {
+        ROOT_SUBID_SHARE
+    } else if owner >= ROOT_SUBID_SHARE {
+        OVERFLOW_SHARE
+    } else {
+        owner
+    }
+}
+
+/// Lot 332: the rows of a shares map's array (`EXECQ_CAND_OVERFLOW`,
+/// `OPEN_TASK_OVERFLOW`): the [`OVERFLOW_SHARE`] row, and the total of every
+/// share's entries (the global cap, [`share_admits`]).
+pub const OVERFLOW_ROW: u32 = 0;
+pub const TOTAL_ROW: u32 = 1;
+pub const SHARE_ROWS: u32 = 2;
+
+/// Lot 332 (the re-check 2 of #547, G5): the global cap of a map of
+/// `capacity` entries shared in shares of `per_share` — one share's room is
+/// kept back: past the cap, only a share holding fewer than
+/// [`share_floor`] entries takes one more, so the shares that fill the
+/// rest (four of 1024 candidates filled 4096) leave room for 64 others.
+pub const fn global_cap(capacity: u64, per_share: u64) -> u64 {
+    capacity - per_share
+}
+
+/// The entries a share takes past the global cap ([`global_cap`]): a 64th
+/// of a share.
+pub const fn share_floor(per_share: u64) -> u64 {
+    per_share / 64
+}
+
+/// Whether a share holding `own` entries takes one more while every share
+/// together holds `total`: below its own cap, and below the global cap or
+/// below the floor.
+pub const fn share_admits(own: u64, total: u64, per_share: u64, global: u64, floor: u64) -> bool {
+    own < per_share && (total < global || own < floor)
+}
 
 impl ExecqCandRaw {
     pub const fn zeroed() -> Self {
@@ -375,22 +503,179 @@ mod tests {
     use super::*;
 
     /// The re-check of #547 (G5): a login's processes share one row, the
-    /// container subuids of a rootless runtime (`/etc/subuid`) included —
-    /// they keep the login uid; a service (no login uid) is its uid's.
+    /// container subuids of a rootless runtime (`/etc/subuid`) included;
+    /// a service is its uid's. Lot 332: the inputs are the kernel's — the
+    /// uid, the user namespace's depth, the creator and inode of its
+    /// outermost ancestor — no longer the login uid, which an unset task
+    /// sets to anything.
     #[test]
     fn a_login_s_subuids_share_one_row() {
         let login = 1000;
+        // the login's own processes (initial namespace), its rootless
+        // container's subuids (a namespace it made), their nested
+        // namespaces (the outermost is still its)
         let rows: Vec<u32> = (0..6)
-            .map(|i| share_key(login, 100_000 + i * 65_536))
-            .chain([share_key(login, 1000), share_key(login, 0)])
+            .map(|i| share_key(100_000 + i * 65_536, 1, login, 0xF000_0010, None))
+            .chain([
+                share_key(login, 0, 0, 0, None),
+                share_key(100_000, 3, login, 0xF000_0010, None),
+            ])
             .collect();
         assert!(rows.iter().all(|r| *r == login), "{rows:?}");
         // services: their own uid each
-        assert_eq!(share_key(u32::MAX, 33), 33);
-        assert_eq!(share_key(u32::MAX, 0), 0);
-        assert_ne!(share_key(u32::MAX, 33), share_key(u32::MAX, 108));
+        assert_eq!(share_key(33, 0, 0, 0, None), 33);
+        assert_eq!(share_key(0, 0, 0, 0, None), 0);
+        assert_ne!(share_key(33, 0, 0, 0, None), share_key(108, 0, 0, 0, None));
         // no key is the overflow row's
-        assert_ne!(share_key(u32::MAX, 65_534), OVERFLOW_SHARE);
+        assert_ne!(share_key(65_534, 0, 0, 0, None), OVERFLOW_SHARE);
+        assert_ne!(share_key(u32::MAX, 0, 0, 0, None), OVERFLOW_SHARE);
+        assert_ne!(share_key(5, 1, 0, u32::MAX, None), OVERFLOW_SHARE);
+    }
+
+    /// Lot 332 (the re-check 2 of #547, G5): a service's children cannot
+    /// spread over shares. The login uid is not an input any more: a task
+    /// with none set it to anything without a privilege, one value per
+    /// child. What a task can change is its uid only with a privilege, and
+    /// a namespace it makes is held to it (its creator); a system
+    /// container is one share whatever uid in its range a process takes.
+    #[test]
+    fn a_service_s_children_cannot_choose_their_share() {
+        // www-data's children, whatever login uid each wrote, and the
+        // namespaces they make (`unshare -U`: their creator is www-data)
+        let children: Vec<u32> = (0..64)
+            .map(|_| share_key(33, 0, 0, 0, None))
+            .chain((1..=32).map(|lvl| share_key(33, lvl, 33, 0xF000_1000 + lvl, None)))
+            .collect();
+        assert!(children.iter().all(|k| *k == 33), "{children:?}");
+        // a system container: every uid in its range is one share, the
+        // container's (its namespace's inode); another container another
+        let c1: Vec<u32> = (0..65_536u32)
+            .step_by(4096)
+            .map(|u| share_key(1_000_000 + u, 1, 0, 0xF000_0042, None))
+            .collect();
+        assert!(c1.iter().all(|k| *k == 0xF000_0042), "{c1:?}");
+        assert_ne!(
+            share_key(1_000_000, 1, 0, 0xF000_0042, None),
+            share_key(1_065_536, 1, 0, 0xF000_0043, None)
+        );
+    }
+
+    /// Lot 332 (the review of #551, F1): a user with a subordinate uid
+    /// range makes a binary owned by subuid N setuid (inside a namespace it
+    /// made, where it holds `CAP_CHOWN` and N is mapped), runs it in the
+    /// initial namespace and calls `setresuid(N, N, N)`: its real uid is N.
+    /// Before the fix that was a row of its own, one per subuid (65,536
+    /// keys); with the agent's answer for N (`SHARE_SUBUID`: N is in the
+    /// user's range) it is the user's row. So is a namespace whose creator
+    /// is N. A uid the agent knows no single owner for is the overflow
+    /// row's; a namespace root made is keyed by its inode, never looked up.
+    #[test]
+    fn a_subuid_taken_as_the_real_uid_is_its_user_s_share() {
+        let (login, n) = (1000u32, 100_000 + 4242);
+        // the answer of the trie for N: the user's
+        assert_eq!(share_account(n, 0, 0), Some(n));
+        assert_eq!(share_key(n, 0, 0, 0, Some(login)), login);
+        // without it (the bug): a row of its own per subuid
+        assert_eq!(share_key(n, 0, 0, 0, None), n);
+        // a namespace made by the process that took N
+        assert_eq!(share_account(7, 1, n), Some(n));
+        assert_eq!(share_key(7, 1, n, 0xF000_0011, Some(login)), login);
+        assert_eq!(share_key(7, 4, n, 0xF000_0011, Some(login)), login);
+        // every subuid of the range, both ways: one row
+        let keys: Vec<u32> = (0..65_536u32)
+            .step_by(257)
+            .flat_map(|i| {
+                [
+                    share_key(100_000 + i, 0, 0, 0, Some(login)),
+                    share_key(0, 2, 100_000 + i, 0xF000_0100 + i, Some(login)),
+                ]
+            })
+            .collect();
+        assert!(keys.iter().all(|k| *k == login));
+        // in the span, no single owner known: the overflow row, never fresh
+        assert_eq!(share_key(n, 0, 0, 0, Some(OVERFLOW_SHARE)), OVERFLOW_SHARE);
+        assert_eq!(
+            share_key(3, 1, n, 0xF000_0011, Some(OVERFLOW_SHARE)),
+            OVERFLOW_SHARE
+        );
+        // root's namespace: its inode, the uid is not looked up
+        assert_eq!(share_account(n, 1, 0), None);
+        assert_eq!(share_key(n, 1, 0, 0xF000_0042, None), 0xF000_0042);
+    }
+
+    /// Lot 332 (the re-check of #551, G1): root's subordinate uid ranges
+    /// (LXD, Incus) are a row of their own, never root's. A domain account
+    /// whose uid lies in one (sssd), and a namespace it makes, take the
+    /// trie's answer for it: that row; root itself keeps its own. No
+    /// account or namespace is keyed in a reserved row without the trie's
+    /// answer, and an owner whose uid is a reserved key owns no row.
+    #[test]
+    fn root_s_subuid_ranges_are_not_root_s_row() {
+        assert_eq!(subuid_row(0), ROOT_SUBID_SHARE);
+        assert_eq!(subuid_row(1000), 1000);
+        assert_eq!(subuid_row(ROOT_SUBID_SHARE - 1), ROOT_SUBID_SHARE - 1);
+        assert_eq!(subuid_row(ROOT_SUBID_SHARE), OVERFLOW_SHARE);
+        assert_eq!(subuid_row(OVERFLOW_SHARE), OVERFLOW_SHARE);
+        let (domain, root_s) = (400_000_000u32, Some(subuid_row(0)));
+        assert_eq!(share_key(domain, 0, 0, 0, root_s), ROOT_SUBID_SHARE);
+        assert_eq!(
+            share_key(3, 1, domain, 0xF000_0001, root_s),
+            ROOT_SUBID_SHARE
+        );
+        assert_ne!(share_key(domain, 0, 0, 0, root_s), 0, "root's own row");
+        assert_eq!(share_key(0, 0, 0, 0, None), 0);
+        for k in [ROOT_SUBID_SHARE, OVERFLOW_SHARE] {
+            assert_eq!(share_key(k, 0, 0, 0, None), ROOT_SUBID_SHARE - 1);
+            assert_eq!(share_key(5, 1, 0, k, None), ROOT_SUBID_SHARE - 1);
+            assert_eq!(share_key(5, 1, k, 9, None), ROOT_SUBID_SHARE - 1);
+        }
+    }
+
+    /// Lot 332 (the re-check 2 of #547, G5): the global cap — one share's
+    /// room kept back. Four greedy shares no longer fill the map: past the
+    /// cap they take nothing more, and 64 others still take their floor.
+    #[test]
+    fn greedy_shares_leave_room_for_others() {
+        let (cap, per) = (4096u64, 1024u64);
+        let (global, floor) = (global_cap(cap, per), share_floor(per));
+        assert_eq!((global, floor), (3072, 16));
+        // each share alone: up to its cap
+        assert!(share_admits(per - 1, 0, per, global, floor));
+        assert!(!share_admits(per, 0, per, global, floor));
+        // greedy shares take until the global cap
+        let mut total = 0u64;
+        let mut greedy = [0u64; 8];
+        for g in greedy.iter_mut() {
+            while share_admits(*g, total, per, global, floor) {
+                *g += 1;
+                total += 1;
+            }
+        }
+        // three reach their cap, the global cap with them; the others take
+        // only their floor
+        assert_eq!(greedy[..3], [per, per, per]);
+        assert_eq!(greedy[3..], [floor; 5], "{greedy:?}");
+        assert_eq!(total, global + 5 * floor);
+        // past it, a share holding its floor or more takes nothing, and
+        // each fresh one takes its floor: 64 shares in all fit in the room
+        // kept back
+        assert!(!share_admits(floor, total, per, global, floor));
+        assert!(!share_admits(per - 1, total, per, global, floor));
+        let mut fresh = 0u64;
+        while total < cap {
+            let mut own = 0u64;
+            while share_admits(own, total, per, global, floor) {
+                own += 1;
+                total += 1;
+            }
+            assert_eq!(own, floor);
+            fresh += 1;
+        }
+        assert_eq!(fresh + 5, 64);
+        assert_eq!(total, cap, "the map's room exactly");
+        // the FIM buffers' map
+        assert_eq!(global_cap(65_536, 16_384), 49_152);
+        assert_eq!(share_floor(16_384), 256);
     }
 
     #[test]

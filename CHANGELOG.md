@@ -6,6 +6,76 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 332: verifier headroom on every kernel, for alpha testers' kernels the
+  lab has not seen.
+  - **`verifier-check` measures every program and gates it.** The count
+    the verifier processed to accept each program the agent needs:
+    `bpf_prog_info.verified_insns` from 5.16, on 5.15 the same counter
+    read by a kprobe event (`check_max_stack_depth`) in a tracing instance
+    of its own. Above 900,000 of the million, or unmeasured, the kernel
+    fails; the report lists the ten highest. The nightly lab runs it on
+    its five guests, a failing step with the verdict line as its error
+    (`lab-vm.yml`, the gate summary's `verifier-check` step).
+  - **The file-open sensor is three global functions.**
+    `fim_file_open_sensor` was at 821,228 on 5.15, 765k in its own body
+    (the sensor inline, verified again for every state the FIM watch
+    left): `nn_open_class`, `nn_open_count_write`, `nn_open_observe`,
+    called in turn, the same work in the same order (the write count
+    before the leaf's names, which have no effect of their own) — 144,600
+    on 5.15. A ratchet keeps every global function to `u64` arguments and
+    the sensor's work past the watch in them.
+  - **The shares' key is no longer the login uid** (the re-check 2 of
+    #547, G5). The quarantine's candidates and the FIM buffers were
+    counted per login uid, which a task without one — a service, a
+    container under a root daemon — sets to any value without a
+    privilege, one share per child. The key is now the uid in the initial
+    user namespace, and in a user namespace the account that made its
+    outermost ancestor, or that namespace when root made it (one share
+    per system container).
+  - **A user's subordinate uids are its share** (the review of #551, F1).
+    A user with an `/etc/subuid` range can take any uid of it as its real
+    uid in the initial namespace (a binary owned by that subuid, made
+    setuid inside a namespace the user made, then `setresuid`), or make a
+    namespace that subuid owns: 65,536 keys, and about 67 fill the
+    candidates' map. The agent publishes the ranges into an LPM trie
+    (`SHARE_SUBUID`, read again within 2 s of a change to `/etc/subuid` or
+    `/etc/passwd`); the uid or the namespace's creator is its range's
+    owner's share. Fail closed: a uid of the ranges' span no single owner
+    is known for (an owner `/etc/passwd` does not resolve, two users'
+    ranges overlapping, a gap, a range past the trie's 16,384 entries,
+    about 1,300 users, one node kept free so that a kernel before the
+    in-place fix for full LPM tries can rewrite it) is the overflow row's,
+    one row under the same cap; an unreadable `/etc/subuid` puts every uid
+    from 65,536 up there. A range root owns (LXD, Incus) is a reserved row
+    of its own (`ROOT_SUBID_SHARE`), never root's: a domain account whose
+    uid lies in it (sssd, FreeIPA) cannot fill root's row and hold back
+    root's execs (the re-check of #551, G1). Residual: an account whose
+    uid lies in a gap between ranges, or in a range of no known owner,
+    counts in the overflow row; a range's start and count are read in
+    decimal only (`newuidmap` also reads hex and octal); a namespace root
+    made is one share per namespace, so a
+    setuid-root helper that makes one per run (firejail, a setuid bwrap)
+    gives its caller one share per run; subordinate ids served by NSS
+    (`subid:` in `nsswitch.conf`) are not read.
+  - **A global cap**: every share's entries are counted together; past
+    the map's room less one share's, a share holding a 64th of a share or
+    more takes no more — four shares at their cap filled the 4,096
+    candidates. It holds back greedy shares; 64 more shares still take
+    their floor, so the map's room stays the bound on the number of
+    shares.
+  - **`verifier-check` leaves nothing behind and counts the right
+    program** (the review of #551, F2, F3): `nn-lab.sh verifier-check`
+    removes the probe's tracing instance and kprobe event before the run,
+    in its ssh session as soon as the agent returns, and after it — a
+    killed or panicked agent (release builds abort, no destructor) left
+    them enabled. On 5.15 a load's count is the probe line with its
+    program's tag (the program info's), not only its 15-byte name, which
+    several of the agent's programs share; a pid filter that cannot be
+    set fails the probe (every program unmeasured, the gate fails).
+  - **The oldest candidate is found by walking the map**
+    (`bpf_for_each_map_elem`), every entry, when the map is full: it was
+    the first 8 slots of a ring, which failed execs filled with gone
+    candidates.
 - Lot 325: the exec environment's check complete and cheap (the re-check
   of #546).
   - **Every variable is read** (R2). The check read the first 64: 64
