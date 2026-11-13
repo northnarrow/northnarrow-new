@@ -9389,6 +9389,12 @@ number in parentheses is a lab PR.
     then `rm`: decisive); `encrypts` read option values as options
     (`ccrypt -K -d`); a content check the budget skipped records the exec
     of a user-writable image on a socket ("identity unverified", High).
+    The re-check (R1, R2): an image the pump cannot open, and a pty-wrapped
+    exec whose parent holds the socket, are recorded "identity unverified"
+    too, and the budget is per user; a renamed copy of the dynamic loader
+    is the loader (recorded with the shells). Residuals listed: a `#!`
+    script socat starts (lot 329), socat's `\` inside single quotes, `/opt`
+    counted as a system tree.
     **Open (lot 331)**: the LOTL shape encryption tool + `rm` is decisive in
     the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
     r4: one inline and one interactive session — the files encrypted and

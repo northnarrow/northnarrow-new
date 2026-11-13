@@ -50,9 +50,11 @@
 //! hard link, a bind mount), else by the executed file's name as before;
 //! and busybox by the program its `argv` names, as busybox reads it
 //! (`busybox sh`, `/bin/busybox sh`, the login shells `-sh` and `-ash`).
-//! An exec of a user-writable image with its stdio on a socket whose
-//! content check the exec pump's budget skipped is recorded High,
-//! "identity unverified" — never silence (the review of #549).
+//! An exec of a user-writable image with its stdio on a socket — or a
+//! parent's connected out, the pty-wrapped shape — whose content check the
+//! exec pump skipped (its user's budget spent, or the image unreadable to
+//! it) is recorded High, "identity unverified" — never silence (the review
+//! of #549 and its re-check).
 //!
 //! Not covered (said so): a shell that is not byte-identical to an
 //! installed program (rebuilt, patched, downloaded) and named otherwise; an
@@ -215,7 +217,12 @@ impl<H: PostureHost> R020ShellWithSocketStdio<H> {
         else {
             return None;
         };
-        if !stdio.own.stdin_or_stdout_inet()
+        // the socket where a reverse shell puts it: its own stdio, or (the
+        // re-check of #549, R1) its parent's, connected out — the pty
+        // master's holder of case 3
+        let own = stdio.own.stdin_or_stdout_inet();
+        let parent = stdio.parent.stdin_or_stdout_inet() && stdio.parent.outbound;
+        if !(own || parent)
             || !program_identity::unverified(event)
             || program_identity::exec_in_system_tree(event)
         {
@@ -231,11 +238,23 @@ impl<H: PostureHost> R020ShellWithSocketStdio<H> {
             ResponseAction::Log,
             Severity::High,
             &format!(
-                "{image} (a file a user can write) started with stdin/stdout on a {} socket \
-                 (peer {}) — its identity unverified: the exec pump did not compare it with the \
-                 installed shells, its budget spent by a flood of execs (lot 313); recorded",
-                stdio.own.proto_name(),
-                peer_text(stdio.own.peer)
+                "{image} (a file a user can write) started with {} — its identity \
+                 unverified: the exec pump did not compare it with the installed shells (its \
+                 budget spent by a flood of execs, or the image unreadable to it: lot 313); \
+                 recorded",
+                if own {
+                    format!(
+                        "stdin/stdout on a {} socket (peer {})",
+                        stdio.own.proto_name(),
+                        peer_text(stdio.own.peer)
+                    )
+                } else {
+                    format!(
+                        "a parent whose stdin/stdout is a {} socket connected out to {}",
+                        stdio.parent.proto_name(),
+                        peer_text(stdio.parent.peer)
+                    )
+                }
             ),
         ))
     }
@@ -891,6 +910,33 @@ mod unverified_identity {
         let system = exec(313_603, "/usr/lib/x/tool", true);
         program_identity::keep_unverified(&system);
         assert!(rule.evaluate(&system).is_none());
+        // the re-check of #549 (R1 b): the pty-wrapped case — its own stdio
+        // a pty, its parent's the socket connected out
+        let mut pty = exec(313_605, "/home/u/x", false);
+        if let Event::ProcessSpawn { stdio, .. } = &mut pty {
+            stdio.own = StdioSocket {
+                read: true,
+                ..Default::default()
+            };
+            stdio.parent = StdioSocket {
+                read: true,
+                inet_fds: 0b111,
+                outbound: true,
+                proto: 6,
+                peer: Some("127.0.0.1:44402".parse().unwrap()),
+            };
+        }
+        assert!(rule.evaluate(&pty).is_none(), "not asked: nothing");
+        program_identity::keep_unverified(&pty);
+        let v = rule
+            .evaluate(&pty)
+            .expect("the pty-wrapped copy, unverified");
+        assert_eq!(v.severity, Severity::High);
+        assert!(
+            v.reasoning.contains("a parent whose stdin/stdout"),
+            "{}",
+            v.reasoning
+        );
         // a compared copy is verified: a copy of busybox running its `cat`
         // is no shell, and no unverified identity either
         let mut cat = exec(313_604, "/home/u/bb", true);

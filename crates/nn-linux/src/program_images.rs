@@ -65,6 +65,23 @@ const BLOCKS: u64 = 8;
 const BUDGET_PER_SECOND: u64 = 64 << 20;
 /// The answers remembered, by file, at most (the oldest out).
 const MEMO_CAP: usize = 1024;
+/// The uids whose budgets are kept at once.
+const UIDS_CAP: usize = 256;
+
+/// Lot 313 (the re-check of #549, R2): where the distributions install the
+/// dynamic loader — recorded with the shells, so a renamed copy of it is
+/// the loader too.
+const LOADER_PATHS: &[&str] = &[
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-armhf.so.3",
+    "/lib/ld-linux.so.2",
+    "/lib64/ld64.so.2",
+    "/lib/ld64.so.1",
+    "/lib/ld-musl-x86_64.so.1",
+    "/lib/ld-musl-aarch64.so.1",
+    "/usr/lib64/ld-linux-x86-64.so.2",
+];
 
 /// A file by what changes when its content can: `(dev, ino, size, ctime)`.
 type FileKey = (u64, u64, u64, i64, i64);
@@ -77,7 +94,9 @@ type Memo = (HashMap<FileKey, Option<ProgramKind>>, VecDeque<FileKey>);
 /// for `status`.
 pub struct Bounds {
     memo: Mutex<Memo>,
-    spent: Mutex<(Option<Instant>, u64)>,
+    /// The bytes each uid's compares read in its current second (the
+    /// re-check of #549, R1: one user's flood spends only that user's).
+    spent: Mutex<HashMap<u32, (Instant, u64)>>,
     budget: u64,
     compared: AtomicU64,
     skipped: AtomicU64,
@@ -88,7 +107,7 @@ impl Bounds {
     fn new(budget: u64) -> Self {
         Self {
             memo: Mutex::new((HashMap::new(), VecDeque::new())),
-            spent: Mutex::new((None, 0)),
+            spent: Mutex::new(HashMap::new()),
             budget,
             compared: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -112,18 +131,25 @@ impl Bounds {
         }
     }
 
-    /// `bytes` taken from this second's budget; `false` when they do not fit.
-    fn take(&self, bytes: u64, now: Instant) -> bool {
+    /// `bytes` taken from `uid`'s budget for this second; `false` when they
+    /// do not fit.
+    fn take(&self, uid: u32, bytes: u64, now: Instant) -> bool {
         let mut s = self.spent.lock();
-        if s.0
-            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
-        {
-            *s = (Some(now), 0);
+        if s.len() >= UIDS_CAP && !s.contains_key(&uid) {
+            s.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(1));
+            if s.len() >= UIDS_CAP {
+                // a host with that many users busy at once: start over
+                s.clear();
+            }
         }
-        if s.1 + bytes > self.budget {
+        let e = s.entry(uid).or_insert((now, 0));
+        if now.duration_since(e.0) >= Duration::from_secs(1) {
+            *e = (now, 0);
+        }
+        if e.1 + bytes > self.budget {
             return false;
         }
-        s.1 += bytes;
+        e.1 += bytes;
         true
     }
 }
@@ -228,6 +254,12 @@ pub fn installed_under(root: &Path) -> Vec<InstalledImage> {
             }
         }
     }
+    // the dynamic loader (the re-check of #549, R2)
+    paths.extend(
+        LOADER_PATHS
+            .iter()
+            .map(|p| root.join(p.trim_start_matches('/'))),
+    );
     for dir in BIN_DIRS {
         let Ok(rd) = std::fs::read_dir(root.join(dir.trim_start_matches('/'))) else {
             continue;
@@ -276,75 +308,42 @@ fn read_and_keep_at(event: &Event, proc_root: &Path) {
     read_and_keep_with(event, proc_root, &BOUNDS);
 }
 
-/// The file the exec runs: its running image, or under the dynamic loader
-/// the loader's operand (relative to the process's working directory).
-fn running_file(event: &Event, proc_root: &Path) -> Option<(PathBuf, bool)> {
-    let Event::ProcessSpawn {
-        pid,
-        filename,
-        exe,
-        argv,
-        ..
-    } = event
-    else {
-        return None;
-    };
-    let dir = proc_root.join(pid.to_string());
-    if let Some(program) =
-        nn_core::posture::script_args::loader_operand(exe.path_or(filename), argv)
-    {
-        let path = match program.strip_prefix('/') {
-            Some(abs) => dir.join("root").join(abs),
-            None => dir.join("cwd").join(program),
-        };
-        return Some((path, true));
-    }
-    Some((dir.join("exe"), false))
+/// Why a file could not be identified: the exec is then unverified.
+#[derive(Debug, PartialEq, Eq)]
+enum Unverified {
+    /// It could not be opened or stat'ed (a user's FUSE mount without
+    /// `allow_other`, a file gone).
+    Unreadable,
+    /// The file open is not the one the hook named (a later exec).
+    Another,
+    /// The uid's budget for this second is spent.
+    Budget,
 }
 
-/// [`read_and_keep`] with `/proc` at `proc_root` and `bounds` (tests).
-fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
-    let Event::ProcessSpawn { exe, stdio, .. } = event else {
-        return;
-    };
-    if !stdio.own.stdin_or_stdout_inet() && !stdio.parent.stdin_or_stdout_inet() {
-        return;
-    }
-    let Some((path, operand)) = running_file(event, proc_root) else {
-        return;
-    };
-    let known = exe.has(common::wire::exe::exe_flags::KNOWN) && !operand;
-    if known && program_identity::installed_kind((exe.dev, exe.ino)).is_some() {
-        return;
-    }
-    let Ok(file) = std::fs::File::open(&path) else {
-        return;
-    };
-    let Ok(m) = file.metadata() else {
-        return;
-    };
+/// What the file at `path` is (`None`: no installed program's copy),
+/// bounded by `bounds` for `uid`; `expect`: the identity the hook gave.
+fn identify(
+    path: &Path,
+    expect: Option<(u64, u64)>,
+    uid: u32,
+    bounds: &Bounds,
+) -> Result<Option<ProgramKind>, Unverified> {
+    let file = std::fs::File::open(path).map_err(|_| Unverified::Unreadable)?;
+    let m = file.metadata().map_err(|_| Unverified::Unreadable)?;
     let id = (
         crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
         m.ino(),
     );
-    // the exec's own file, when the hook said which (a later exec of the
-    // pid runs another)
-    if known && id != (exe.dev, exe.ino) {
-        return;
+    if expect.is_some_and(|e| e != id) {
+        return Err(Unverified::Another);
     }
-    if operand {
-        if let Some(kind) = program_identity::installed_kind(id) {
-            program_identity::keep_copy(event, kind);
-            return;
-        }
+    if let Some(kind) = program_identity::installed_kind_sized(id, m.len()) {
+        return Ok(Some(kind));
     }
     let key = (id.0, id.1, m.len(), m.ctime(), m.ctime_nsec());
     if let Some(answer) = bounds.recall(&key) {
         bounds.remembered.fetch_add(1, Ordering::Relaxed);
-        if let Some(kind) = answer {
-            program_identity::keep_copy(event, kind);
-        }
-        return;
+        return Ok(answer);
     }
     let candidates: Vec<InstalledImage> = program_identity::installed_of_len(m.len())
         .into_iter()
@@ -352,14 +351,12 @@ fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
         .collect();
     if candidates.is_empty() {
         bounds.remember(key, None);
-        return;
+        return Ok(None);
     }
     let cost = compare_cost(m.len()) * candidates.len() as u64;
-    if !bounds.take(cost, Instant::now()) {
+    if !bounds.take(uid, cost, Instant::now()) {
         bounds.skipped.fetch_add(1, Ordering::Relaxed);
-        // never silence: R020 records the exec, its identity unverified
-        program_identity::keep_unverified(event);
-        return;
+        return Err(Unverified::Budget);
     }
     bounds.compared.fetch_add(1, Ordering::Relaxed);
     let kind = candidates
@@ -367,8 +364,82 @@ fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
         .find(|i| same_sampled(&file, Path::new(&i.path), m.len()))
         .map(|i| i.kind);
     bounds.remember(key, kind);
-    if let Some(kind) = kind {
-        program_identity::keep_copy(event, kind);
+    Ok(kind)
+}
+
+/// [`read_and_keep`] with `/proc` at `proc_root` and `bounds` (tests).
+fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
+    let Event::ProcessSpawn {
+        pid,
+        uid,
+        filename,
+        exe,
+        argv,
+        stdio,
+        ..
+    } = event
+    else {
+        return;
+    };
+    if !stdio.own.stdin_or_stdout_inet() && !stdio.parent.stdin_or_stdout_inet() {
+        return;
+    }
+    let dir = proc_root.join(pid.to_string());
+    let known = exe.has(common::wire::exe::exe_flags::KNOWN);
+    let installed = if known {
+        program_identity::installed_kind((exe.dev, exe.ino))
+    } else {
+        None
+    };
+    let named_loader = ProgramKind::of_name(exe.path_or(filename)) == Some(ProgramKind::Loader);
+    // the exec's own image: installed (the core knows it), the loader by its
+    // name (its operand is what is compared), else compared
+    let image = match installed {
+        Some(kind) => Some(kind),
+        None if named_loader => Some(ProgramKind::Loader),
+        None => match identify(
+            &dir.join("exe"),
+            known.then_some((exe.dev, exe.ino)),
+            *uid,
+            bounds,
+        ) {
+            Ok(kind) => kind,
+            // never silence (the re-check of #549, R1): R020 records it
+            Err(_) => {
+                program_identity::keep_unverified(event);
+                return;
+            }
+        },
+    };
+    let loader = image == Some(ProgramKind::Loader);
+    if !loader {
+        if installed.is_none() {
+            if let Some(kind) = image {
+                program_identity::keep_copy(event, kind);
+            }
+        }
+        return;
+    }
+    // the dynamic loader (by name, identity or content): its operand is the
+    // program (the review of #549, F4; the re-check's R2), by the process's
+    // root, or its working directory for a relative one
+    let Some((program, _)) = nn_core::posture::script_args::loader_program(argv) else {
+        return;
+    };
+    let path = match program.strip_prefix('/') {
+        Some(abs) => dir.join("root").join(abs),
+        None => dir.join("cwd").join(program),
+    };
+    match identify(&path, None, *uid, bounds) {
+        Ok(Some(kind)) if kind != ProgramKind::Loader => program_identity::keep_copy(event, kind),
+        // no copy: a loader known by its content is said so, the operand then
+        // judged by its name
+        Ok(_) => {
+            if installed.is_none() && !named_loader {
+                program_identity::keep_copy(event, ProgramKind::Loader);
+            }
+        }
+        Err(_) => program_identity::keep_unverified(event),
     }
 }
 
@@ -574,7 +645,7 @@ mod tests {
     fn past_the_budget_an_exec_is_counted_not_compared() {
         let t = tempfile::tempdir().unwrap();
         let r = t.path();
-        let n = 6usize << 20;
+        let n = (6usize << 20) + 251;
         let content: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         put(r, "/usr/bin/python3.12", &content);
         refresh_under(r);
@@ -624,7 +695,7 @@ mod tests {
         let proc_root = r.join("proc");
         put(&proc_root, "/31395/root/home/u/x", &content);
         put(&proc_root, "/31396/cwd/y", &content);
-        for (pid, operand) in [(31395u32, "/home/u/x"), (31396, "y")] {
+        let under_loader = |pid: u32, operand: &str| {
             let mut e = exec(pid, 1, outbound());
             if let Event::ProcessSpawn {
                 exe,
@@ -638,11 +709,111 @@ mod tests {
                 *argv = vec!["ld.so".into(), operand.into(), "-i".into()];
             }
             read_and_keep_at(&e, &proc_root);
+            e
+        };
+        for (pid, operand) in [(31395u32, "/home/u/x"), (31396, "y")] {
+            let e = under_loader(pid, operand);
             assert_eq!(
                 program_identity::copy_of(&e),
                 Some(ProgramKind::Shell),
                 "{operand}"
             );
+            assert!(!program_identity::unverified(&e), "{operand}");
         }
+        // an operand the pump cannot open (a user's FUSE mount, a file gone):
+        // unverified, never silently passed (the re-check of #549, R1/R2)
+        let gone = under_loader(31397, "/home/u/gone");
+        assert!(program_identity::unverified(&gone));
+        assert_eq!(program_identity::copy_of(&gone), None);
+    }
+
+    /// The re-check of #549 (R1): one user's flood spends only that user's
+    /// budget — another uid is still compared; and an exec whose image the
+    /// pump cannot open (a user's FUSE mount without `allow_other`, a file
+    /// gone) is unverified, never silently passed.
+    #[test]
+    fn the_budget_is_per_uid_and_an_unreadable_image_is_unverified() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let n = (6usize << 20) + 249;
+        let content: Vec<u8> = (0..n).map(|i| (i % 249) as u8).collect();
+        put(r, "/usr/bin/perl5.40", &content);
+        refresh_under(r);
+        let proc_root = r.join("proc");
+        let bounds = Bounds::new(compare_cost(n as u64));
+        let as_uid = |pid: u32, uid: u32, tail: u8| {
+            let mut near = content.clone();
+            near[n - 1] = tail;
+            let x = put(r, &format!("/home/u{uid}/x{pid}"), &near);
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            symlink(&x, proc_root.join(format!("{pid}/exe"))).unwrap();
+            let mut e = exec(pid, 1, outbound());
+            if let Event::ProcessSpawn { uid: u, .. } = &mut e {
+                *u = uid;
+            }
+            read_and_keep_with(&e, &proc_root, &bounds);
+            e
+        };
+        let a1 = as_uid(31_500, 1001, 1);
+        let a2 = as_uid(31_501, 1001, 2);
+        let b1 = as_uid(31_502, 1002, 3);
+        assert!(!program_identity::unverified(&a1), "the first, compared");
+        assert!(
+            program_identity::unverified(&a2),
+            "the same user's budget spent"
+        );
+        assert!(!program_identity::unverified(&b1), "another user: compared");
+        assert_eq!(bounds.compared.load(Ordering::Relaxed), 2);
+        assert_eq!(bounds.skipped.load(Ordering::Relaxed), 1);
+        // no `exe` to open: unverified
+        let gone = exec(31_503, 1, outbound());
+        read_and_keep_with(&gone, &proc_root, &bounds);
+        assert!(program_identity::unverified(&gone));
+    }
+
+    /// The re-check of #549 (R2): the installed dynamic loader is recorded,
+    /// and a renamed copy of it running bash is the loader — its operand
+    /// (an installed bash, or a copy of bash) is what the exec runs.
+    #[test]
+    fn a_renamed_copy_of_the_loader_runs_its_operand() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let loader = b"ld.so image of lot 313, r2".repeat(500);
+        let bash = b"bash image of lot 313, r2".repeat(700);
+        put(r, "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", &loader);
+        std::fs::create_dir_all(r.join("lib64")).unwrap();
+        symlink(
+            r.join("usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+            r.join("lib64/ld-linux-x86-64.so.2"),
+        )
+        .unwrap();
+        put(r, "/usr/bin/bash", &bash);
+        assert!(installed_under(r)
+            .iter()
+            .any(|i| i.kind == ProgramKind::Loader));
+        refresh_under(r);
+        let proc_root = r.join("proc");
+        let x = put(r, "/home/u/x", &loader);
+        let y = put(&proc_root, "/31510/cwd/y", &bash);
+        for (pid, operand) in [(31_510u32, "y"), (31_511, "/usr/bin/bash")] {
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            symlink(&x, proc_root.join(format!("{pid}/exe"))).unwrap();
+            if operand.starts_with('/') {
+                put(&proc_root, &format!("/{pid}/root{operand}"), &bash);
+            }
+            let mut e = exec(pid, 1, outbound());
+            if let Event::ProcessSpawn { argv, filename, .. } = &mut e {
+                *filename = "/home/u/x".into();
+                *argv = vec!["x".into(), operand.into(), "-i".into()];
+            }
+            read_and_keep_at(&e, &proc_root);
+            assert_eq!(
+                program_identity::copy_of(&e),
+                Some(ProgramKind::Shell),
+                "{operand}"
+            );
+            assert_eq!(program_identity::shell_or_interpreter(&e), Some(true));
+        }
+        let _ = y;
     }
 }

@@ -77,6 +77,10 @@ pub enum ProgramKind {
     Interpreter,
     /// busybox: the program its `argv` names.
     Busybox,
+    /// Lot 313 (the re-check of #549, R2): the dynamic loader — the program
+    /// is its operand (a renamed copy of `ld-linux-x86-64.so.2` runs bash as
+    /// the loader does).
+    Loader,
 }
 
 impl ProgramKind {
@@ -88,6 +92,9 @@ impl ProgramKind {
         let base = base_of(name);
         if base.starts_with(BUSYBOX) {
             return Some(Self::Busybox);
+        }
+        if crate::posture::script_args::is_loader_name(base) {
+            return Some(Self::Loader);
         }
         if SHELLS.iter().any(|s| program_is(base, s)) {
             return Some(Self::Shell);
@@ -442,6 +449,21 @@ pub fn installed_of_len(len: u64) -> Vec<InstalledImage> {
         .collect()
 }
 
+/// The installed program whose identity is `id` and whose length is `len`
+/// (the exec pump's `fstat`: an inode number a removed program had, now a
+/// user's file of another length, is not that program).
+pub fn installed_kind_sized(id: (u64, u64), len: u64) -> Option<ProgramKind> {
+    if id == (0, 0) {
+        return None;
+    }
+    KNOWN
+        .read()
+        .installed
+        .iter()
+        .find(|i| i.id == id && i.len == len)
+        .map(|i| i.kind)
+}
+
 /// The installed program whose identity is `id`.
 pub fn installed_kind(id: (u64, u64)) -> Option<ProgramKind> {
     if id == (0, 0) {
@@ -497,9 +519,10 @@ pub fn copy_of(event: &Event) -> Option<ProgramKind> {
 /// What the kernel executed for `event` (an exec), by identity: the pump's
 /// content check, else the installed programs' device and inode (the LSM
 /// hook's: a tracepoint exec carries none), else the executed file's name
-/// (module docs). Lot 313 (the review of #549, F4): the dynamic loader run
-/// as a program runs its operand — that program's name (the pump compares
-/// the operand's file: a copy is known by its content).
+/// (module docs) — and, for the dynamic loader (by any of those: a renamed
+/// copy of it too, the re-check of #549's R2), the program it runs: its
+/// operand's kind, as the pump found it (a copy by its content) or by its
+/// name (the review of #549, F4).
 pub fn image_kind(event: &Event) -> Option<ProgramKind> {
     let Event::ProcessSpawn {
         filename,
@@ -510,25 +533,23 @@ pub fn image_kind(event: &Event) -> Option<ProgramKind> {
     else {
         return None;
     };
-    if let Some(kind) = copy_of(event) {
+    let kind = copy_of(event)
+        .or_else(|| {
+            exe.has(common::wire::exe::exe_flags::KNOWN)
+                .then(|| installed_kind((exe.dev, exe.ino)))
+                .flatten()
+        })
+        .or_else(|| ProgramKind::of_name(exe.path_or(filename)))?;
+    if kind != ProgramKind::Loader {
         return Some(kind);
     }
-    if exe.has(common::wire::exe::exe_flags::KNOWN) {
-        if let Some(kind) = installed_kind((exe.dev, exe.ino)) {
-            return Some(kind);
-        }
-    }
-    let image = exe.path_or(filename);
-    if crate::posture::script_args::is_loader_name(base_of(image)) {
-        let (program, _) = crate::posture::script_args::loader_program(argv)?;
-        return ProgramKind::of_name(program);
-    }
-    ProgramKind::of_name(image)
+    let (program, _) = crate::posture::script_args::loader_program(argv)?;
+    ProgramKind::of_name(program).filter(|k| *k != ProgramKind::Loader)
 }
 
-/// The arguments the program an exec runs reads: the exec's own, or under
-/// the dynamic loader its operand's (its `argv[0]` the operand).
-fn program_argv(event: &Event) -> &[String] {
+/// The exec runs the dynamic loader (by identity or name): its operand's
+/// index in its argv.
+fn loader_operand_at(event: &Event) -> Option<usize> {
     let Event::ProcessSpawn {
         filename,
         exe,
@@ -536,14 +557,28 @@ fn program_argv(event: &Event) -> &[String] {
         ..
     } = event
     else {
+        return None;
+    };
+    let loader = matches!(copy_of(event), Some(ProgramKind::Loader))
+        || (exe.has(common::wire::exe::exe_flags::KNOWN)
+            && installed_kind((exe.dev, exe.ino)) == Some(ProgramKind::Loader))
+        || ProgramKind::of_name(exe.path_or(filename)) == Some(ProgramKind::Loader);
+    loader
+        .then(|| crate::posture::script_args::loader_program(argv))
+        .flatten()
+        .map(|(_, at)| at)
+}
+
+/// The arguments the program an exec runs reads: the exec's own, or under
+/// the dynamic loader its operand's (its `argv[0]` the operand).
+fn program_argv(event: &Event) -> &[String] {
+    let Event::ProcessSpawn { argv, .. } = event else {
         return &[];
     };
-    if crate::posture::script_args::is_loader_name(base_of(exe.path_or(filename))) {
-        if let Some((_, at)) = crate::posture::script_args::loader_program(argv) {
-            return &argv[at..];
-        }
+    match loader_operand_at(event) {
+        Some(at) => &argv[at..],
+        None => argv,
     }
-    argv
 }
 
 /// The program an exec runs is a shell (`Some(true)`) or an interpreter
@@ -553,6 +588,7 @@ pub fn shell_or_interpreter(event: &Event) -> Option<bool> {
     match image_kind(event)? {
         ProgramKind::Shell => Some(true),
         ProgramKind::Interpreter => Some(false),
+        ProgramKind::Loader => None,
         ProgramKind::Busybox => {
             let (program, _) = crate::posture::script_args::busybox_program(program_argv(event))?;
             crate::posture::script_args::BUSYBOX_SHELLS
@@ -625,6 +661,7 @@ mod tests {
             ("/usr/bin/perl", Some(ProgramKind::Interpreter)),
             ("/bin/busybox", Some(ProgramKind::Busybox)),
             ("busybox.static", Some(ProgramKind::Busybox)),
+            ("/lib64/ld-linux-x86-64.so.2", Some(ProgramKind::Loader)),
             ("shellcheck", None),
             ("bashbug", None),
             ("x", None),
@@ -865,5 +902,47 @@ mod tests {
         let caller_only = spawn("kmod", "/usr/bin/kmod");
         assert_eq!(kernel_image(&caller_only), None);
         assert!(!exec_in_system_tree(&caller_only));
+    }
+
+    /// The re-check of #549 (R2): a renamed copy of the dynamic loader —
+    /// by its installed identity, or found by the pump to be the loader —
+    /// runs its operand: that program's kind (by name here; the pump
+    /// compares the operand's file too).
+    #[test]
+    fn a_renamed_loader_s_operand_is_the_program() {
+        let ld = (0x0fd0_0313, 4_001);
+        record_installed(InstalledImage {
+            id: ld,
+            len: 232_000,
+            path: "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into(),
+            kind: ProgramKind::Loader,
+        });
+        let by_id = with_argv(
+            with_id(spawn_exe("x", "/home/u/x", "/home/u/x", 0), 313_701, 1, ld),
+            &["x", "--argv0", "sh", "/bin/bash", "-i"],
+        );
+        assert_eq!(image_kind(&by_id), Some(ProgramKind::Shell));
+        assert_eq!(shell_or_interpreter(&by_id), Some(true));
+        let copy = with_argv(
+            with_id(
+                spawn_exe("x", "/home/u/x", "/home/u/x", 0),
+                313_702,
+                1,
+                (9, 13),
+            ),
+            &["x", "/bin/busybox", "sh"],
+        );
+        keep_copy(&copy, ProgramKind::Loader);
+        assert_eq!(image_kind(&copy), Some(ProgramKind::Busybox));
+        assert_eq!(
+            shell_or_interpreter(&copy),
+            Some(true),
+            "busybox's sh, read past the loader"
+        );
+        let id = with_argv(
+            with_id(spawn_exe("x", "/home/u/x", "/home/u/x", 0), 313_703, 1, ld),
+            &["x", "/usr/bin/id"],
+        );
+        assert_eq!(image_kind(&id), None);
     }
 }

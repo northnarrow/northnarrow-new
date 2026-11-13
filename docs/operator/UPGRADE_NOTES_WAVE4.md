@@ -1567,12 +1567,17 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   the loader's operand) compared, on the exec pump's thread and bounded:
   an answer is remembered by the file's device, inode, size and change
   time; a file is compared whole up to 4 MiB, by samples above (its first
-  and last MiB and eight blocks between); the compares share 64 MiB a
-  second, past which an exec is not compared — judged by its name, and,
-  for an image a user can write with its stdin or stdout on a socket,
-  recorded High, "identity unverified" (a flood followed by a renamed shell
-  is never silence) — `nn-admin status` shows "shell copies: N running
-  images compared, M execs not compared". Residuals: a copy that differs from the installed
+  and last MiB and eight blocks between); each user's compares share 64
+  MiB a second (one user's flood spends only that user's), past which an
+  exec is not compared — judged by its name, and, for an image a user can
+  write with its stdin or stdout on a socket or a parent whose stdio is
+  one connected out (the pty-wrapped shape), recorded High, "identity
+  unverified"; an image the pump cannot open (a user's FUSE mount without
+  `allow_other`) is recorded so too: a flood followed by a renamed shell is
+  never silence — `nn-admin status` shows "shell copies: N running images
+  compared, M execs not compared". The dynamic loader is recorded with the
+  shells: a renamed copy of `ld-linux-x86-64.so.2` running bash is the
+  loader, its operand the program. Residuals: a copy that differs from the installed
   file by one byte (an appended byte changes its length) or is patched in
   a sample, a shell rebuilt or downloaded, under another name; a
   container's own shells (only the host's are recorded; on overlayfs the

@@ -1055,7 +1055,7 @@ const LOADER: Table = Table {
 /// operand past the loader's options, read with [`LOADER`]'s arities), and
 /// where its own arguments start (its `argv[0]` is the loader's operand).
 /// `None`: no program, or an option the table does not hold.
-pub(crate) fn loader_program(argv: &[String]) -> Option<(&str, usize)> {
+pub fn loader_program(argv: &[String]) -> Option<(&str, usize)> {
     let mut i = 1;
     while let Some(a) = argv.get(i) {
         if a == "--" {
@@ -1074,16 +1074,6 @@ pub(crate) fn loader_program(argv: &[String]) -> Option<(&str, usize)> {
         }
     }
     None
-}
-
-/// Lot 313 (F4): the program the dynamic loader `exe` (a path) runs for
-/// `argv`; `None` when `exe` is no loader or runs no program.
-pub fn loader_operand<'a>(exe: &str, argv: &'a [String]) -> Option<&'a str> {
-    let base = exe.rsplit('/').next().unwrap_or(exe);
-    if !is_loader_name(base) {
-        return None;
-    }
-    loader_program(argv).map(|(p, _)| p)
 }
 
 /// busybox's shells.
