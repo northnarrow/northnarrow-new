@@ -10422,10 +10422,13 @@ number in parentheses is a lab PR.
     13's first round). Ubuntu 24.04 (6.8), the full round: the same —
     active and enabled after the cold boot (77 pins, 48 LSM programs), the
     corpus without a kill (the control as www-data ran its 20 s; would have
-    `KillProcessTree` ×1), the probe not killed, the diff empty. The
-    wedged-agent round (the agent and its watchdog stopped by SIGSTOP inside
-    a window that then closed, `uninstall.sh --purge` without a key, the
-    reboot): queued when this note was written, both guest slots taken by
-    other lots; added here when measured.
+    `KillProcessTree` ×1), the probe not killed, the diff empty. A wedged
+    agent, Debian 13: the agent and its watchdog frozen (`systemctl freeze`
+    inside a window that then closed; a SIGSTOP is refused by the task_kill
+    hook even inside one), `nn-admin status` silent; `uninstall.sh --purge`
+    without a key: exit 3, both units disabled, `northnarrow-uninstall`
+    enabled; after the reboot the one-shot removed everything (`uninstall
+    complete`, itself gone) and the diff against the host before the
+    install was empty.
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
