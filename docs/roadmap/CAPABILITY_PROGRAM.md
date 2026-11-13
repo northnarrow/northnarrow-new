@@ -10510,7 +10510,8 @@ number in parentheses is a lab PR.
   - Done: the `alpha` profile, one more input of the single gate (a signed
     `profile.local`, overlay kind 18, else the install manifest's, else
     enforcing), resolved once (`boot::integrity::resolve_gate`, ratchet
-    `xtask/tests/alpha_profile.rs`); both ignoring paths gated; `would have:
+    `xtask/tests/alpha_profile.rs`); the exec quarantine's owed kill gated
+    (the module-load judge too in round 1, undone in round 3); `would have:
     <action>`; the agent's self-protection unchanged. `install.sh`: alpha on a fresh install, `enable --now`
     with the upgrade's health check (`--no-enable`), a host support check
     before any change, a short summary; `uninstall.sh`: a wedged agent's
@@ -10542,7 +10543,7 @@ number in parentheses is a lab PR.
     complete`, itself gone) and the diff against the host before the
     install was empty.
   - Round 2 (the coordinator's decision of 13/11: the alpha never breaks
-    anything on a tester's machine): under `alpha` the host-wide denies —
+    anything on a tester's machine; SUPERSEDED by round 3): under `alpha` the host-wide denies —
     a foreign tracing, LSM, extension or struct_ops BPF program's load, a
     root cgroup/sysctl attach, the kprobes and lockdown switches, kexec, the
     sysctl guard, cgroup v1 writes, a ptrace of PID 1 — observe, each
@@ -10575,5 +10576,25 @@ number in parentheses is a lab PR.
     137; most likely R009's root exec from a user path, the lab's known
     flake after a start — the purge took the journal) and the install was
     removed by a later round.
+  - Round 3 (the review of #550; the coordinator's corrected decision of
+    13/11): round 2's host-wide denies were self-protection in disguise —
+    `kernel.ftrace_enabled=0`, `kprobes/enabled=0` and lockdown blind the
+    deny hooks, a foreign tracing program's `bpf_send_signal` kills the
+    agent past `task_kill` (`SEND_SIG_PRIV`), a v1 freezer freezes it, a
+    ptrace of PID 1 races the trusted writes the hooks let PID 1 make, an
+    untrusted module or a kexec image runs code no hook sees. They are
+    enforced under every profile again: `HOST_DENY_MODE`, the "would deny"
+    bit and record are removed (no switch left to race, the review's F5),
+    the module-load judge takes no gate (F2, F7). The ratchet
+    (`xtask/tests/deny_routes.rs`) lists every deny site as self-protection
+    with its reason or as a gated response path, and walks every function a
+    self-protection site calls: a gate's switch named anywhere in that
+    closure, or outside its own file, fails it — the review's planted
+    helper (F6) and three variants (two calls deep, an alias, the old
+    switch back) are its cases. Testers' tracing tools: `install.sh
+    --allow-bpf-tools` / `--allow-bpf-loader <path>` sign `bpf-loader-allow`
+    lines with the install's key through the started agent. An `alpha`
+    start after an enforcing run with no signed `profile.local` signs an
+    `integrity_drift` `profile_downgraded` (F8).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).

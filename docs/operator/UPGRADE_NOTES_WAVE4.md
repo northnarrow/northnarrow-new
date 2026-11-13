@@ -1833,23 +1833,25 @@ are judged as before; `CHANGELOG.md` has the detail.
   "would have: KillProcessTree"`; it read `"suppressed (detect-only)"`. A
   `Log` decision under the gate reads `"none"`. Records already written keep
   their text; a reader keyed on the old string matches neither.
-- **Detect-only also stops the module-load judge's refusals** (R018's deny
-  mode: record mode under the gate) and an earlier enforcing run's owed
-  exec-quarantine kills (resumed). The agent's self-protection is unchanged
-  under the gate.
-- **The host-wide denies observe under `alpha`**: a foreign tracing, LSM,
-  extension or `struct_ops` BPF program's load (`bpftrace`, BCC, another
-  EDR), a `cgroup/sysctl` program on the root cgroup, the kprobes and
-  lockdown switches, a kexec image, the sysctl guard (and the integrity
-  round's put-back of a harmful value: `sysctl_would_restore`, nothing
-  written), a cgroup v1 write and a ptrace of PID 1 go through, each
-  recorded "would deny" (`"response":
-  "would have: deny:<operation> (would deny: …)"`, the reasoning "Would
-  deny: NOT refused"). Under `enforcing` they are refused as before,
-  `--detect-only` and `NN_DETECT_ONLY` included (no response, the denies
-  on). The agent's own files, processes, cgroup and BPF objects stay
-  refused under every profile ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md)
-  §1.1).
+- **Detect-only also stops an earlier enforcing run's owed exec-quarantine
+  kills** (the process is resumed). The module-load judge keeps refusing
+  untrusted modules under the gate, as before: the host's integrity.
+- **Under `alpha`, the host's integrity and the agent's self-protection
+  are enforced as under `enforcing`**: a foreign tracing, LSM, extension
+  or `struct_ops` BPF program's load (`bpftrace`, BCC, another EDR), an
+  untrusted module, a kexec image, the sysctl guard and its put-back, a
+  `cgroup/sysctl` program on the root cgroup, the kprobes and lockdown
+  switches, a cgroup v1 move or freeze and a ptrace of PID 1 are refused
+  outside a window, besides the agent's own files, processes, cgroup and
+  BPF objects ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1.1). A tester who
+  runs bpftrace or BCC installs with `--allow-bpf-tools` (or
+  `--allow-bpf-loader <path>`): signed `bpf-loader-allow` lines, applied
+  through the started agent (§1.2). Nothing changes on an `enforcing`
+  install.
+- **An `alpha` start after an enforcing run, with no signed
+  `profile.local`**, writes a signed `integrity_drift` of kind
+  `profile_downgraded`. A reader of the audit chain that alerts on
+  `integrity_drift` sees it; a signed switch to `alpha` raises nothing.
 - **`install.sh` refuses a host it cannot run on** before any change:
   not x86_64, systemd not the init system, no kernel BTF, a kernel the new
   agent's `--btf-check` refuses; on a fresh install that starts the units,
