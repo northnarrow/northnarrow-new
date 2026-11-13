@@ -1767,7 +1767,9 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   share is its uid's.
 - **A user's subordinate uids count as the user's** (the review of #551,
   F1): the agent publishes `/etc/subuid` into an LPM trie (`SHARE_SUBUID`,
-  16,384 entries, about 1,300 users' ranges; read again within 2 s of a
+  16,384 entries, 16,383 used — one kept free for an in-place rewrite on
+  kernels before the upstream fix for full LPM tries —, about 1,300 users'
+  ranges; read again within 2 s of a
   change to `/etc/subuid` or `/etc/passwd`, a thread `nn-subuid`), and a
   uid of a range, taken as a real uid in the initial namespace or the
   creator of a namespace, is its owner's share. A uid of the ranges' span
@@ -1777,8 +1779,16 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   room — counts in the overflow row (one share, the same cap), never in a
   share of its own; an `/etc/subuid` that cannot be read puts every uid
   from 65,536 up there (logged). An account whose uid lies inside another
-  account's range counts as that account's. `/etc/subgid` is not read (the
-  key is a uid). What a task still chooses: a namespace root made is one
+  account's range counts as that account's — except in a range root owns
+  (LXD, Incus: `root:1000000:1000000000`), which is a reserved row of its
+  own (`ROOT_SUBID_SHARE`, the per-share cap), never root's: a domain
+  account (sssd, FreeIPA) with a uid there cannot fill root's row (the
+  re-check of #551, G1). An account whose uid lies in a gap between
+  ranges, or in a range whose owner is not known, counts in the overflow
+  row. A range's start and count are read in decimal, as `useradd` writes
+  them: a line `newuidmap` would read in hex is skipped, one with a
+  leading `0` is read as decimal. `/etc/subgid` is not read (the key is a
+  uid). What a task still chooses: a namespace root made is one
   share per namespace, so a setuid-root helper that makes one per run
   (firejail, a setuid bwrap) gives its caller one share per run; ranges
   served by NSS (`subid:` in `nsswitch.conf`) are not published.

@@ -181,8 +181,9 @@ or that namespace when root made it; never the login uid, which a
 service's children set to any value; the review of #551, F1: a uid of a
 user's `/etc/subuid` range — taken as a real uid, or the creator of a
 namespace — is that user's, as the agent publishes the ranges
-(`SHARE_SUBUID`), and one of their span no single owner is known for is the
-overflow row's; a namespace root made remains one share each, a
+(`SHARE_SUBUID`), one of a range root owns a reserved row's
+(`ROOT_SUBID_SHARE`, never root's: the re-check of #551, G1), and one of
+their span no single owner is known for is the overflow row's; a namespace root made remains one share each, a
 setuid-root helper's per-run namespaces included — docs/design/EXEC_POLICY.md;
 `EXECQ_CAND_UIDS`, recounted by the agent every 30 s, an overflow row for
 the shares it has no room for), past 3072 candidates in all a share

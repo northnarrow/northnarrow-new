@@ -19,7 +19,15 @@
 //!   is the overflow row's — one row under the same cap — never a row of
 //!   its own. A `/etc/subuid` that cannot be read (other than missing)
 //!   puts every uid from 65,536 up there.
-//! - Bounded: [`SUBUID_TRIE_MAX`] entries (about 1,300 users' useradd ranges);
+//! - Root's ranges are not root's row (the re-check of #551, G1): a range
+//!   root owns (LXD, Incus: `root:1000000:1000000000`) is published as
+//!   [`ROOT_SUBID_SHARE`](common::wire::execq::ROOT_SUBID_SHARE), a row of
+//!   its own under the per-share cap ([`subuid_row`]). Real accounts can have uids inside the span (sssd,
+//!   FreeIPA and LDAP ids run to 2·10⁹): in root's range they count in
+//!   that row, in another user's range as that user's, in a gap or a range
+//!   of no known owner in the overflow row — never root's own.
+//! - Bounded: [`TABLE_MAX`] entries, one node of the trie's
+//!   [`SUBUID_TRIE_MAX`] kept free (about 1,300 users' useradd ranges);
 //!   past them the ranges are the overflow row's, counted in the log.
 //! - Refreshed: both files' stamps (device, inode, modification time,
 //!   size) are checked every [`REFRESH`], and the trie is rewritten when
@@ -27,7 +35,11 @@
 //!   until then.
 //!
 //! `/etc/subgid` is not read: the key is a uid (the real uid, a
-//! namespace's creator), never a gid.
+//! namespace's creator), never a gid. A range's start and count are read
+//! in decimal, as `useradd` writes them; `newuidmap` reads them with
+//! `strtoul(…, 0)`, so a line in hex (`0x…`) or with leading blanks is
+//! skipped here (its uids keyed by themselves) and one with a leading `0`
+//! (octal there) is read as decimal. Only root writes the file.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -39,7 +51,7 @@ use anyhow::{anyhow, Context, Result};
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::MapData;
 use aya::Ebpf;
-use common::wire::execq::{OVERFLOW_SHARE, SUBUID_TRIE_MAX};
+use common::wire::execq::{subuid_row, OVERFLOW_SHARE, SUBUID_TRIE_MAX};
 use tracing::{info, warn};
 
 /// The trie (`agent-ebpf/src/task_scratch.rs`).
@@ -49,6 +61,12 @@ pub const SUBUID: &str = "/etc/subuid";
 const PASSWD: &str = "/etc/passwd";
 /// How often the files' stamps are checked.
 pub const REFRESH: Duration = Duration::from_secs(2);
+/// The most entries published (the re-check of #551, G2): one node of the
+/// trie kept free. Before the upstream fix "bpf: Handle in-place update for
+/// full LPM trie correctly" a kernel refuses every update of a trie holding
+/// `max_entries` — an existing key's too — so a full trie could never be
+/// rewritten in place (a retry every [`REFRESH`], stale owners kept).
+pub const TABLE_MAX: usize = SUBUID_TRIE_MAX as usize - 1;
 /// The most of either file read; a longer `/etc/subuid` is unreadable
 /// (fail closed: the ranges past it would be unknown).
 const READ_MAX: u64 = 16 << 20;
@@ -131,8 +149,8 @@ pub fn prefixes(start: u64, end: u64) -> Vec<(u32, u32)> {
     out
 }
 
-/// What the trie holds: `(prefix length, base) → value` (an owner's uid,
-/// or [`OVERFLOW_SHARE`]).
+/// What the trie holds: `(prefix length, base) → value` (an owner's row,
+/// [`subuid_row`], or [`OVERFLOW_SHARE`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Table {
     pub entries: BTreeMap<(u32, u32), u32>,
@@ -148,7 +166,8 @@ pub struct Table {
 
 /// The trie for `ranges`, at most `cap` entries: the span's own entries
 /// (the overflow row's) first, then each part of it one resolved owner
-/// holds alone.
+/// holds alone, as that owner's row ([`subuid_row`]: root's ranges are
+/// [`ROOT_SUBID_SHARE`](common::wire::execq::ROOT_SUBID_SHARE)'s).
 pub fn table(ranges: &[Range], cap: usize) -> Table {
     let mut t = Table {
         ranges: ranges.len(),
@@ -171,7 +190,7 @@ pub fn table(ranges: &[Range], cap: usize) -> Table {
             continue;
         }
         for p in ps {
-            t.entries.insert(p, owner);
+            t.entries.insert(p, subuid_row(owner));
         }
     }
     t
@@ -296,7 +315,7 @@ fn read_table() -> Table {
 fn table_of(subuid: std::io::Result<String>, passwd: std::io::Result<String>) -> Table {
     let passwd = passwd.unwrap_or_default();
     match subuid {
-        Ok(text) => table(&ranges(&text, &passwd), SUBUID_TRIE_MAX as usize),
+        Ok(text) => table(&ranges(&text, &passwd), TABLE_MAX),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Table::default(),
         Err(e) => {
             warn!(
@@ -434,7 +453,7 @@ pub fn ensure(ebpf: &mut Ebpf) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::execq::{global_cap, share_admits, share_floor, share_key};
+    use common::wire::execq::{global_cap, share_admits, share_floor, share_key, ROOT_SUBID_SHARE};
 
     const PASSWD_TEXT: &str = "root:x:0:0:root:/root:/bin/bash\n\
         www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
@@ -455,7 +474,7 @@ mod tests {
         root:1000000:1000000000\n";
 
     fn host() -> Table {
-        table(&ranges(SUBUID_TEXT, PASSWD_TEXT), SUBUID_TRIE_MAX as usize)
+        table(&ranges(SUBUID_TEXT, PASSWD_TEXT), TABLE_MAX)
     }
 
     /// The kernel's key for a task: its uid at `level` 0, or the creator
@@ -565,8 +584,52 @@ mod tests {
         assert_eq!(key_of(&t, 100_000, 1, 1000, 0xF000_0002), 1000);
         // root's range (LXD): a system container is keyed by its namespace
         assert_eq!(key_of(&t, 1_000_123, 1, 0, 0xF000_0042), 0xF000_0042);
-        // ... and a uid of it in the initial namespace (root's doing) root's
-        assert_eq!(key_of(&t, 1_000_123, 0, 0, 0), 0);
+        // ... and a uid of it in the initial namespace: the row of root's
+        // ranges, never root's own (the re-check of #551, G1)
+        assert_eq!(key_of(&t, 1_000_123, 0, 0, 0), ROOT_SUBID_SHARE);
+    }
+
+    /// The re-check of #551 (G1), the reviewer's probe: a domain-joined
+    /// host (sssd, FreeIPA, LDAP: ids up to 2·10⁹) with useradd's ranges,
+    /// LXD's or Incus's root range and podman's auto-userns range. A real
+    /// account whose uid lies in root's range, and a namespace it makes,
+    /// count in the row of root's ranges, never in root's own (they did: a
+    /// domain user's held execs filled root's row); in a gap, or in a range
+    /// whose owner is not known, in the overflow row (a residual, as
+    /// before); past the span, in its own.
+    #[test]
+    fn real_accounts_inside_the_span_never_take_root_s_row() {
+        let sub = "alice:100000:65536\nbob:165536:65536\nroot:1000000:1000000000\n\
+                   containers:2147483647:2147483648\n";
+        let t = table_of(Ok(sub.to_string()), Ok(PASSWD_TEXT.to_string()));
+        let in_root_s = 400_000_000u32;
+        assert_eq!(key_of(&t, in_root_s, 0, 0, 0), ROOT_SUBID_SHARE);
+        assert_eq!(key_of(&t, 0, 1, in_root_s, 0xF000_0001), ROOT_SUBID_SHARE);
+        assert_eq!(key_of(&t, 5, 3, in_root_s, 0xF000_0001), ROOT_SUBID_SHARE);
+        // the range's first and last uid
+        assert_eq!(key_of(&t, 1_000_000, 0, 0, 0), ROOT_SUBID_SHARE);
+        assert_eq!(key_of(&t, 1_000_999_999, 0, 0, 0), ROOT_SUBID_SHARE);
+        // the gaps (below root's range, between it and podman's), and
+        // podman's range (`containers` is not in /etc/passwd)
+        for uid in [600_000u32, 1_001_000_000, 1_500_000_000, u32::MAX - 10] {
+            assert_eq!(key_of(&t, uid, 0, 0, 0), OVERFLOW_SHARE);
+            assert_eq!(key_of(&t, 0, 1, uid, 0xF000_0001), OVERFLOW_SHARE);
+        }
+        // root, its system containers, the users: their own rows
+        assert_eq!(key_of(&t, 0, 0, 0, 0), 0);
+        assert_eq!(key_of(&t, 1_000_123, 1, 0, 0xF000_0042), 0xF000_0042);
+        assert_eq!(key_of(&t, 100_007, 0, 0, 0), 1000);
+        assert_eq!(key_of(&t, 1001, 0, 0, 0), 1001);
+        // no entry of the trie is root's own row, a numeric owner neither
+        assert!(t.entries.values().all(|v| *v != 0));
+        let numeric = table_of(Ok("0:1000000:65536\n".into()), Ok(String::new()));
+        assert_eq!(key_of(&numeric, 1_000_007, 0, 0, 0), ROOT_SUBID_SHARE);
+        // a range of an owner whose uid is a reserved key: no row of its own
+        let nfs = table_of(
+            Ok("nfsnobody:300000:65536\n".into()),
+            Ok("nfsnobody:x:4294967294:4294967294::/var/lib/nfs:/sbin/nologin\n".into()),
+        );
+        assert_eq!(key_of(&nfs, 300_007, 0, 0, 0), OVERFLOW_SHARE);
     }
 
     /// Fail closed: a uid of the span no single owner is known for is the
@@ -663,7 +726,7 @@ mod tests {
             passwd.push_str(&format!("u{i}:x:{}:100::/home/u{i}:/bin/sh\n", 2000 + i));
             subuid.push_str(&format!("u{i}:{}:65536\n", 100_000 + i * 65_536));
         }
-        let t = table(&ranges(&subuid, &passwd), SUBUID_TRIE_MAX as usize);
+        let t = table(&ranges(&subuid, &passwd), TABLE_MAX);
         assert!(t.entries.len() <= SUBUID_TRIE_MAX as usize);
         assert!(t.unplaced > 0, "{}", t.unplaced);
         assert!(1500 - t.unplaced >= 1300, "{}", t.unplaced);
@@ -761,6 +824,38 @@ mod tests {
         assert!(!before.take(1001), "the map was full");
     }
 
+    /// The re-check of #551 (G1): domain accounts whose uids lie in root's
+    /// range (LXD, Incus), as real uids or as the creators of namespaces,
+    /// fill one row, that range's — and root's own execs (its services,
+    /// package managers, cron) are still held: root's row takes its whole
+    /// share. They were root's row: full, root's next candidate was dropped
+    /// (`CAND_DROPPED`, an exec run unheld).
+    #[test]
+    fn root_s_execs_are_held_when_root_s_ranges_row_is_full() {
+        let t = host();
+        let mut s = Shares {
+            rows: BTreeMap::new(),
+            overflow: 0,
+            total: 0,
+        };
+        for i in 0..100u32 {
+            let uid = 1_000_000 + i * 9_999_991;
+            let k = if i % 2 == 0 {
+                key_of(&t, uid, 0, 0, 0)
+            } else {
+                key_of(&t, 0, 1, uid, 0xF000_0000 + i)
+            };
+            while s.take(k) {}
+        }
+        assert_eq!(s.rows.get(&ROOT_SUBID_SHARE), Some(&PER), "one row, full");
+        assert_eq!((s.rows.len(), s.overflow), (1, 0));
+        let mut root = 0;
+        while s.take(key_of(&t, 0, 0, 0, 0)) {
+            root += 1;
+        }
+        assert_eq!(root, PER, "root's whole share");
+    }
+
     /// The publisher rewrites the trie: keys of the old table it no longer
     /// holds are removed, the rest written; a failed write is tried again
     /// at the next tick.
@@ -768,6 +863,9 @@ mod tests {
     struct Fake {
         m: BTreeMap<(u32, u32), u32>,
         fail: bool,
+        /// A kernel before the in-place fix (the re-check of #551, G2): a
+        /// trie holding this many entries refuses every update.
+        full_at: Option<usize>,
     }
     impl SubuidTrie for Fake {
         fn keys(&self) -> Result<Vec<(u32, u32)>> {
@@ -778,7 +876,7 @@ mod tests {
             Ok(())
         }
         fn insert(&mut self, key: (u32, u32), value: u32) -> Result<()> {
-            if self.fail {
+            if self.fail || self.full_at.is_some_and(|n| self.m.len() >= n) {
                 return Err(anyhow!("full"));
             }
             self.m.insert(key, value);
@@ -882,5 +980,48 @@ mod tests {
             "the same table, not said again"
         );
         assert!(p.tick_with(s1, || b.clone(), &mut f), "a new one is said");
+    }
+
+    /// The re-check of #551 (G2): a kernel before the upstream in-place fix
+    /// refuses every update of a full LPM trie, an existing key's too. The
+    /// table published keeps one node free: ranges that would fill the
+    /// trie exactly (20,000 users' aligned ranges, one entry each) publish
+    /// 16,383 entries, and such a kernel's trie is rewritten in place, the
+    /// same table again or a changed one.
+    #[test]
+    fn a_full_table_keeps_one_node_free_for_an_in_place_rewrite() {
+        let users = |from: u32| {
+            let (mut passwd, mut subuid) = (String::new(), String::new());
+            for i in from..from + 20_000 {
+                passwd.push_str(&format!("u{i}:x:{}:100::/home/u{i}:/bin/sh\n", 2000 + i));
+                subuid.push_str(&format!("u{i}:{}:65536\n", (2 + i) * 65_536));
+            }
+            table_of(Ok(subuid), Ok(passwd))
+        };
+        let (a, b) = (users(0), users(10));
+        for t in [&a, &b] {
+            assert_eq!(t.entries.len(), SUBUID_TRIE_MAX as usize - 1);
+            assert!(t.unplaced > 0, "{}", t.unplaced);
+        }
+        assert_ne!(a.entries, b.entries);
+        let mut f = Fake {
+            full_at: Some(SUBUID_TRIE_MAX as usize),
+            ..Fake::default()
+        };
+        write_trie(&mut f, &a).unwrap();
+        write_trie(&mut f, &a).expect("the same table, in place");
+        write_trie(&mut f, &b).expect("a changed table, in place");
+        assert_eq!(f.m, b.entries);
+        // the bug: a table filling the trie is never rewritten there
+        let mut full = Fake {
+            full_at: Some(SUBUID_TRIE_MAX as usize),
+            ..Fake::default()
+        };
+        let exact = Table {
+            entries: (0..SUBUID_TRIE_MAX).map(|i| ((32, i), 1000)).collect(),
+            ..Table::default()
+        };
+        write_trie(&mut full, &exact).unwrap();
+        assert!(write_trie(&mut full, &exact).is_err());
     }
 }

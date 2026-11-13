@@ -56,9 +56,12 @@ impl ExecGuards for AgentExecGuards {
             ),
         }
         // Lot 332 (the review of #551, F1): the subordinate uid ranges the
-        // shares' key resolves a user's subuids through, published before
-        // the quarantine's candidates are taken. Not fatal: without them a
-        // subuid is a share of its own (each still capped).
+        // shares' key resolves a user's subuids through. Their publisher is
+        // started here, before the quarantine is installed, but its first
+        // publish lands moments later on a thread of its own, so the first
+        // candidates can come before it (the re-check of #551); until then,
+        // and if this fails (not fatal), a subuid is a share of its own
+        // (each still capped).
         if let Err(e) = nn_linux::sensors::share_subuid::ensure(ebpf) {
             error!(
                 error = format!("{e:#}"),

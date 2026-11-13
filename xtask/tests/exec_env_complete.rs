@@ -776,11 +776,27 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
     assert!(cg.contains("uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32, loginuid: 0,"));
     assert!(!cg.contains("loginuid()"), "{cg}");
     let wq = flat(&code("common/src/wire/execq.rs"));
+    // the re-check of #551 (G1): root's ranges are a reserved row of their
+    // own, never root's (0); no account or namespace is keyed in a
+    // reserved row without the trie's answer
     assert!(wq.contains(
         "let k = match share_account(uid, level, owner) { Some(account) => match sub { \
-         Some(OVERFLOW_SHARE) => return OVERFLOW_SHARE, Some(o) => o, None => account, }, \
-         None => inum, };"
+         Some(OVERFLOW_SHARE) => return OVERFLOW_SHARE, \
+         Some(ROOT_SUBID_SHARE) => return ROOT_SUBID_SHARE, Some(o) => o, None => account, }, \
+         None => inum, }; if k >= ROOT_SUBID_SHARE { ROOT_SUBID_SHARE - 1 } else { k }"
     ));
+    assert!(wq.contains(
+        "if owner == 0 { ROOT_SUBID_SHARE } else if owner >= ROOT_SUBID_SHARE { OVERFLOW_SHARE } \
+         else { owner }"
+    ));
+    let table = flat(body(&pubr, "table"));
+    assert!(
+        table.contains("t.entries.insert(p, subuid_row(owner));"),
+        "{table}"
+    );
+    // the re-check of #551 (G2): one node of the trie kept free
+    assert!(flat_pubr.contains("pub const TABLE_MAX: usize = SUBUID_TRIE_MAX as usize - 1;"));
+    assert!(flat(body(&pubr, "table_of")).contains("table(&ranges(&text, &passwd), TABLE_MAX)"));
     assert!(
         wq.contains("if level == 0 { Some(uid) } else if owner != 0 { Some(owner) } else { None }")
     );

@@ -276,26 +276,32 @@ pub struct ExecqCandRaw {
 ///   no single owner for it (a range the trie had no room for, an owner it
 ///   could not resolve, two users' ranges overlapping, a gap between
 ///   ranges), the key is the overflow row's, one row under the same cap,
-///   never a row of its own; `None`: no one's subordinate uid, the key is
+///   never a row of its own; `Some(ROOT_SUBID_SHARE)`: it is in a range
+///   root owns (the re-check of #551, G1: [`subuid_row`]), the key is that
+///   row's, never root's own; `None`: no one's subordinate uid, the key is
 ///   the account's own.
 ///
 /// What a task cannot choose, then: a key other than its account's, its
-/// account's ranges' owner's, the overflow row, or — a namespace root made
-/// — that namespace's (one per namespace: a setuid-root helper that makes
-/// one per run gives its caller one per run).
+/// account's ranges' owner's, the overflow row, root's ranges' row, or — a
+/// namespace root made — that namespace's (one per namespace: a
+/// setuid-root helper that makes one per run gives its caller one per
+/// run).
 ///
-/// [`OVERFLOW_SHARE`] only for `sub == Some(OVERFLOW_SHARE)`.
+/// [`OVERFLOW_SHARE`] only for `sub == Some(OVERFLOW_SHARE)`, and
+/// [`ROOT_SUBID_SHARE`] only for `sub == Some(ROOT_SUBID_SHARE)`: an
+/// account or a namespace whose number is one of them is keyed below them.
 pub const fn share_key(uid: u32, level: u32, owner: u32, inum: u32, sub: Option<u32>) -> u32 {
     let k = match share_account(uid, level, owner) {
         Some(account) => match sub {
             Some(OVERFLOW_SHARE) => return OVERFLOW_SHARE,
+            Some(ROOT_SUBID_SHARE) => return ROOT_SUBID_SHARE,
             Some(o) => o,
             None => account,
         },
         None => inum,
     };
-    if k == OVERFLOW_SHARE {
-        OVERFLOW_SHARE - 1
+    if k >= ROOT_SUBID_SHARE {
+        ROOT_SUBID_SHARE - 1
     } else {
         k
     }
@@ -317,8 +323,8 @@ pub const fn share_account(uid: u32, level: u32, owner: u32) -> Option<u32> {
 }
 
 /// Lot 332 (the review of #551, F1): the entries of the subordinate uids'
-/// LPM trie (`SHARE_SUBUID`: the uid big-endian → the owner's uid, or
-/// [`OVERFLOW_SHARE`]). About 1,300 users' useradd ranges (a range of
+/// LPM trie (`SHARE_SUBUID`: the uid big-endian → [`subuid_row`] of the
+/// owner, or [`OVERFLOW_SHARE`]). About 1,300 users' useradd ranges (a range of
 /// 65,536 not aligned on its size takes 12 entries); the ranges past them
 /// are the overflow row's.
 pub const SUBUID_TRIE_MAX: u32 = 16_384;
@@ -331,6 +337,29 @@ pub const USERNS_MAX_LEVEL: u32 = 33;
 /// The re-check of #547 (G5): the share of the keys the shares' map has no
 /// row for (it is full): one row, under the same cap, held apart.
 pub const OVERFLOW_SHARE: u32 = u32::MAX;
+
+/// Lot 332 (the re-check of #551, G1): the share of the uids of the ranges
+/// root owns in `/etc/subuid` (LXD, Incus: `root:1000000:1000000000`) —
+/// one row of the shares' map under the per-share cap, apart from root's
+/// own (0) and from the overflow row. An account whose uid lies in such a
+/// range (a domain account: sssd, FreeIPA and LDAP ids run to 2·10⁹), and
+/// a namespace it makes, count there: they can neither fill root's row
+/// nor hold back root's execs.
+pub const ROOT_SUBID_SHARE: u32 = u32::MAX - 1;
+
+/// Lot 332 (the re-check of #551, G1): the row `SHARE_SUBUID` holds for a
+/// range owned by the account `owner` — its uid; [`ROOT_SUBID_SHARE`] for
+/// root's ranges, never root's own row; [`OVERFLOW_SHARE`] for an owner
+/// whose uid is a reserved key (`nfsnobody`, 4294967294).
+pub const fn subuid_row(owner: u32) -> u32 {
+    if owner == 0 {
+        ROOT_SUBID_SHARE
+    } else if owner >= ROOT_SUBID_SHARE {
+        OVERFLOW_SHARE
+    } else {
+        owner
+    }
+}
 
 /// Lot 332: the rows of a shares map's array (`EXECQ_CAND_OVERFLOW`,
 /// `OPEN_TASK_OVERFLOW`): the [`OVERFLOW_SHARE`] row, and the total of every
@@ -572,6 +601,34 @@ mod tests {
         // root's namespace: its inode, the uid is not looked up
         assert_eq!(share_account(n, 1, 0), None);
         assert_eq!(share_key(n, 1, 0, 0xF000_0042, None), 0xF000_0042);
+    }
+
+    /// Lot 332 (the re-check of #551, G1): root's subordinate uid ranges
+    /// (LXD, Incus) are a row of their own, never root's. A domain account
+    /// whose uid lies in one (sssd), and a namespace it makes, take the
+    /// trie's answer for it: that row; root itself keeps its own. No
+    /// account or namespace is keyed in a reserved row without the trie's
+    /// answer, and an owner whose uid is a reserved key owns no row.
+    #[test]
+    fn root_s_subuid_ranges_are_not_root_s_row() {
+        assert_eq!(subuid_row(0), ROOT_SUBID_SHARE);
+        assert_eq!(subuid_row(1000), 1000);
+        assert_eq!(subuid_row(ROOT_SUBID_SHARE - 1), ROOT_SUBID_SHARE - 1);
+        assert_eq!(subuid_row(ROOT_SUBID_SHARE), OVERFLOW_SHARE);
+        assert_eq!(subuid_row(OVERFLOW_SHARE), OVERFLOW_SHARE);
+        let (domain, root_s) = (400_000_000u32, Some(subuid_row(0)));
+        assert_eq!(share_key(domain, 0, 0, 0, root_s), ROOT_SUBID_SHARE);
+        assert_eq!(
+            share_key(3, 1, domain, 0xF000_0001, root_s),
+            ROOT_SUBID_SHARE
+        );
+        assert_ne!(share_key(domain, 0, 0, 0, root_s), 0, "root's own row");
+        assert_eq!(share_key(0, 0, 0, 0, None), 0);
+        for k in [ROOT_SUBID_SHARE, OVERFLOW_SHARE] {
+            assert_eq!(share_key(k, 0, 0, 0, None), ROOT_SUBID_SHARE - 1);
+            assert_eq!(share_key(5, 1, 0, k, None), ROOT_SUBID_SHARE - 1);
+            assert_eq!(share_key(5, 1, k, 9, None), ROOT_SUBID_SHARE - 1);
+        }
     }
 
     /// Lot 332 (the re-check 2 of #547, G5): the global cap — one share's

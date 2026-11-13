@@ -10487,6 +10487,33 @@ number in parentheses is a lab PR.
       the trie follows `/etc/subuid` (12 → 29 → 12 entries). F2: an agent
       SIGKILLed once its probe was armed left the instance (and on 7.0 the
       event); the same kill under `nn-lab.sh verifier-check` left nothing.
+  - The re-check 1 of #551 (MERGE AFTER FIXES; G1, G2, P3):
+    - G1: a range root owns in `/etc/subuid` (LXD, Incus:
+      `root:1000000:1000000000`) was published as root's row (0), so a
+      real account whose uid lies in it (a domain account: sssd, FreeIPA,
+      LDAP ids run to 2·10⁹) and its namespaces counted in root's row, and
+      one such user's held execs could fill it (root's next candidate
+      `CAND_DROPPED`). Root's ranges are now a reserved row of their own,
+      `ROOT_SUBID_SHARE`, under the per-share cap (`wire::execq::
+      subuid_row`; `share_key` keys no account or namespace there without
+      the trie's answer). Accounts whose uid lies in a gap between ranges,
+      or in a range whose owner is not known, still count in the overflow
+      row (a residual, documented).
+    - G2: the table published keeps one node of the trie free (16,383 of
+      16,384 entries): before the upstream in-place fix for full LPM tries
+      a kernel refuses every update of a full trie, an existing key's too,
+      so a table landing exactly on the cap was never rewritten.
+    - The comment that the ranges are published "before the quarantine's
+      candidates are taken" is corrected (the first publish lands moments
+      later, on its own thread). The ranges' start and count stay read in
+      decimal (documented: `newuidmap` also reads hex and octal).
+    - Host: `share_subuid` (the reviewer's probe as
+      `real_accounts_inside_the_span_never_take_root_s_row`;
+      `root_s_execs_are_held_when_root_s_ranges_row_is_full`;
+      `a_full_table_keeps_one_node_free_for_an_in_place_rewrite`),
+      `wire::execq` (`root_s_subuid_ranges_are_not_root_s_row`), the
+      updated `exec_env_complete.rs`; 7 mutants of the new branches, each
+      caught by a named test.
   - Level unchanged: the gate is the lab's and the nightly's; C23's
     provisional waits on the nightly on the five guests, now with the
     verifier step.

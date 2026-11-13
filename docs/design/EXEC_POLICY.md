@@ -633,13 +633,18 @@ The rules are outside the frozen V2 validation denominator, like
   made, run outside it, then `setresuid`) or as the creator of a new
   namespace — 65,536 keys, about 67 of which filled the map. The uid or
   the creator is first looked up in the host's ranges, which the agent
-  publishes (`SHARE_SUBUID`, an LPM trie of 16,384 entries,
-  `nn_linux::sensors::share_subuid`, read again within 2 s of a change to
-  `/etc/subuid` or `/etc/passwd`): a uid of a range is its owner's share;
-  one of the ranges' span no single owner is known for (an owner
-  `/etc/passwd` does not resolve, two users' ranges overlapping, a gap, a
-  range past the trie's room) is the overflow row's, never a share of its
-  own; an unreadable `/etc/subuid` puts every uid from 65,536 up there.
+  publishes (`SHARE_SUBUID`, an LPM trie of 16,384 entries, one kept free
+  for an in-place rewrite on kernels before the upstream fix for full LPM
+  tries; `nn_linux::sensors::share_subuid`, read again within 2 s of a
+  change to `/etc/subuid` or `/etc/passwd`): a uid of a range is its
+  owner's share, and of a range root owns (LXD, Incus) the reserved row
+  `ROOT_SUBID_SHARE`, never root's own (the re-check of #551, G1: a domain
+  account with a uid there filled root's row); one of the ranges' span no
+  single owner is known for (an owner `/etc/passwd` does not resolve, two
+  users' ranges overlapping, a gap, a range past the trie's room) is the
+  overflow row's, never a share of its own — real accounts whose uid lies
+  there included; an unreadable `/etc/subuid` puts every uid from 65,536
+  up there.
   What a task can still choose: a namespace root made is one share each,
   so a setuid-root helper that makes one per run gives its caller one
   share per run, and ranges served by NSS (`subid:`) are not published.

@@ -43,9 +43,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     owner's share. Fail closed: a uid of the ranges' span no single owner
     is known for (an owner `/etc/passwd` does not resolve, two users'
     ranges overlapping, a gap, a range past the trie's 16,384 entries,
-    about 1,300 users) is the overflow row's, one row under the same cap;
-    an unreadable `/etc/subuid` puts every uid from 65,536 up there.
-    Residual: a namespace root made is one share per namespace, so a
+    about 1,300 users, one node kept free so that a kernel before the
+    in-place fix for full LPM tries can rewrite it) is the overflow row's,
+    one row under the same cap; an unreadable `/etc/subuid` puts every uid
+    from 65,536 up there. A range root owns (LXD, Incus) is a reserved row
+    of its own (`ROOT_SUBID_SHARE`), never root's: a domain account whose
+    uid lies in it (sssd, FreeIPA) cannot fill root's row and hold back
+    root's execs (the re-check of #551, G1). Residual: an account whose
+    uid lies in a gap between ranges, or in a range of no known owner,
+    counts in the overflow row; a range's start and count are read in
+    decimal only (`newuidmap` also reads hex and octal); a namespace root
+    made is one share per namespace, so a
     setuid-root helper that makes one per run (firejail, a setuid bwrap)
     gives its caller one share per run; subordinate ids served by NSS
     (`subid:` in `nsswitch.conf`) are not read.
