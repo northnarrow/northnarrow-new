@@ -9428,6 +9428,23 @@ number in parentheses is a lab PR.
     code, all caught by named tests (8 after a test each). The kernel's
     `task_kill` reports only SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP
     (lot 330 is to report every default-fatal signal).
+  - The re-check of #548 (round 3). A reload is Low only when:
+    - every reading of the argv sends SIGHUP (N1). Under `POSIXLY_CORRECT`
+      an option after systemctl's verb, or after a pid for `kill`, is an
+      operand and the signal TERM. So logrotate's own `rsyslog-rotate`
+      argv is High again: a known false positive, left to lot 330;
+    - the tool documents SIGHUP as its reload (N3): auditd, rsyslog,
+      firewalld, falco. auditd's SIGUSR1 rotates its logs: High;
+    - every process of the unit's cgroup catches it (N4).
+    A bracket class now ends as glibc ends it (N2:
+    `[a[:]uditd.servic[:e:]` stops auditd). Checked against glibc 2.39's
+    `fnmatch`: 60,560 cases, plus 40,000 around `[:`, `[=` and `[.`; every
+    name glibc matches is matched. 25 mutations of the round's code: 23
+    caught by named tests (2 after a test each), 2 argued equivalent. No
+    lab round: the fixture tests cover the
+    readings and the cgroup. Left to lot 330, with F5, F6, F7 and F13: a
+    listed unit's file and drop-ins (an empty `ExecStart=` in a
+    `.service.d` drop-in, `daemon-reload`, `restart`: no record).
   - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
