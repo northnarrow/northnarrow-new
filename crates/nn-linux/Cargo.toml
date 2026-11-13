@@ -126,7 +126,7 @@ nn-core = { workspace = true, features = ["test-util"] }
 # R09b (lab PR 254; was the agent's): parse the embedded eBPF object in
 # unit tests, with the parser aya 0.14.0 itself runs (lab PR 219: every map
 # of a type aya loads; the exploit guard's maps and programs).
-aya-obj = "=0.3.0"
+aya-obj = "=0.6.0"
 
 [lints]
 workspace = true
