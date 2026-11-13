@@ -52,6 +52,8 @@ pub struct Kernel {
     /// ([`Kernel::recount_shares`]).
     pub cand: HashMap<MapData, u64, AyaCand>,
     pub cand_uids: HashMap<MapData, u32, u64>,
+    /// The re-check of #547 (G5): the overflow row's count.
+    pub cand_overflow: Array<MapData, u64>,
     pub(crate) reject: crate::sensors::reject::RejectThrottle,
 }
 
@@ -126,6 +128,8 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
         counters: PerCpuArray::try_from(take("EXECQ_COUNTERS")?).context("EXECQ_COUNTERS")?,
         cand: HashMap::try_from(take("EXECQ_CAND")?).context("EXECQ_CAND")?,
         cand_uids: HashMap::try_from(take("EXECQ_CAND_UIDS")?).context("EXECQ_CAND_UIDS")?,
+        cand_overflow: Array::try_from(take("EXECQ_CAND_OVERFLOW")?)
+            .context("EXECQ_CAND_OVERFLOW")?,
         reject: crate::sensors::reject::RejectThrottle::new(),
     })
 }
@@ -146,8 +150,13 @@ impl Kernel {
             .take(CAND_ENTRIES_MAX)
             .filter_map(|r| r.ok())
             .map(|(_, c)| c.0.uid);
-        let want = nn_linux::sensors::task_free::uid_shares(uids);
-        nn_linux::sensors::task_free::rewrite_shares(&mut self.cand_uids, &want)
+        let mut want = nn_linux::sensors::task_free::uid_shares(uids);
+        let overflow = nn_linux::sensors::task_free::take_overflow(&mut want);
+        let mut r = nn_linux::sensors::task_free::rewrite_shares(&mut self.cand_uids, &want)?;
+        if self.cand_overflow.set(0, overflow, 0).is_err() {
+            r.failed += 1;
+        }
+        Ok(r)
     }
 }
 

@@ -305,23 +305,45 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     in_order(
         body(&q, "nn_execq_cand_put"),
         &[
-            "EXECQ_CAND_SCRATCH.get_ptr(&ck)",
+            "EXECQ_CAND_SCRATCH.get_ptr_mut(&ck)",
             "cand_put(task, cand);",
             "let _ = EXECQ_CAND_SCRATCH.remove(&ck);",
         ],
     )
     .unwrap();
-    // copied into the candidates' map within the uid's share (the review
-    // of #547, F4), the share given back when it goes
+    // copied into the candidates' map within the login's share (the review
+    // of #547, F4; the re-check, G5), the share given back when it goes;
+    // the map full, the oldest candidate goes for it (counted)
     in_order(
         body(&q, "cand_put"),
         &[
-            "cand_remove(task);",
-            "crate::task_scratch::uid_admits(&EXECQ_CAND_UIDS, uid, EXECQ_CAND_PER_UID)",
+            "cand_take(task);",
+            "crate::task_scratch::share_take(",
+            "&EXECQ_CAND_UIDS,",
+            "&EXECQ_CAND_OVERFLOW,",
+            "crate::task_scratch::share_key(),",
+            "EXECQ_CAND_PER_SHARE,",
             "bump(counter::CAND_DROPPED);",
-            "EXECQ_CAND.insert(&task, &*cand, 0)",
+            "(*cand).uid = row;",
+            "(*cand).at = now;",
+            "if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {",
+            "if !(evict_oldest(now) && EXECQ_CAND.insert(&task, &*cand, 0).is_ok()) {",
+            "crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, row);",
             "bump(counter::CAND_DROPPED);",
-            "crate::task_scratch::uid_took(&EXECQ_CAND_UIDS, uid);",
+            "bump(counter::CAND_EVICTED);",
+            "ring_note(task, now);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&q, "evict_oldest"),
+        &[
+            "while k < EVICT_PROBES {",
+            "EXECQ_CAND_RING.get(i)",
+            "Some(c) => c.at == at,",
+            "if live && now > at && now - at >= EVICT_MIN_AGE_NS {",
+            "cand_take(t);",
+            "return true;",
         ],
     )
     .unwrap();
@@ -332,7 +354,7 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         body(&q, "cand_take"),
         &[
             "EXECQ_CAND.remove(&task).is_ok()",
-            "crate::task_scratch::uid_gave(&EXECQ_CAND_UIDS, uid);",
+            "crate::task_scratch::share_give(&EXECQ_CAND_UIDS, &EXECQ_CAND_OVERFLOW, uid);",
         ],
     )
     .unwrap();
@@ -362,7 +384,7 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     in_order(
         body(&pol, "exec_unwalked"),
         &[
-            "let refuse = m == mode::ENFORCE && (deny_c != 0 || env_refused);",
+            "let refuse = m == mode::ENFORCE && deny_c != 0;",
             "if refuse {",
             "bump(counter::LOST);",
             "} else {",
@@ -439,7 +461,10 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
     assert!(body(&open, "on_open_in").contains("observe(") && !open.contains("OPEN_WIN"));
     assert!(body(&open, "walk").contains("match task_buffer(task) {"));
     let tb = body(&open, "task_buffer");
-    assert!(tb.contains("crate::task_scratch::make(&OPEN_TASK, &task)"));
+    assert!(tb.contains("if nn_open_task_make(task) != 0 {"));
+    assert!(
+        body(&open, "nn_open_task_make").contains("crate::task_scratch::make(&OPEN_TASK, &task)")
+    );
     assert!(tb.contains("crate::task_scratch::make(&OPEN_TASK_RUN, &task)"));
     let flat_open = open.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat_open.contains(
@@ -501,22 +526,23 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     );
     assert!(!pol.contains("EXECPOL_ENV_SCRATCH"));
     assert!(!pol.contains("TP_SYS_ENTER_EXECVE"));
-    let p = body(&pol, "on_pass");
+    // the re-check of #547 (G6): by the environment's own LSM program on
+    // the exec sensor's hook (`exec_env_lsm`), its first pass
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
-            "let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {",
-            "nn_exec_env(task, u64::from(wk.tid), wk.start_ns)",
+            "let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);",
+            "if ef == 0 {",
             "let stashed = er & ENV_STASHED != 0;",
-            "if classes == 0 && ef == 0 {",
-            "if ef != 0 {",
             "if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {",
-            "report_exec(",
+            "nn_env_report(",
             "if stashed {",
-            "let _ = EXECPOL_ENV.remove(wk);",
+            "let _ = EXECPOL_ENV.remove(&wk);",
         ],
     )
     .unwrap();
+    assert!(!body(&pol, "on_pass").contains("nn_exec_env("));
     in_order(
         body(&pol, "exec_envp"),
         &[
@@ -578,7 +604,7 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
         ],
     )
     .unwrap();
-    let p = body(&pol, "on_pass");
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
@@ -588,7 +614,9 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
             // lot 325 (R2): and one the scan could not finish
             "| env_flags::UNFINISHED",
             // the review of #547 (F1): and a relative loader path
-            "| env_flags::PRELOAD_RELATIVE)",
+            "| env_flags::PRELOAD_RELATIVE",
+            // the re-check of #547 (G1–G4): and an irregular loader value
+            "| env_flags::LOADER_IRREGULAR)",
         ],
     )
     .unwrap();
@@ -641,7 +669,9 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     // it arms the check when the four registers' offsets resolved
     let m = code("agent/src/execpol/mod.rs");
     assert!(!m.contains("sys_enter_execve"), "agent/src/execpol/mod.rs");
-    assert!(m.contains("if offsets_resolved(&ENV_OFFSETS) {"));
+    // (the re-check of #547, G6: and attaches the environment's program)
+    assert!(m.contains("if !offsets_resolved(&ENV_OFFSETS) {"));
+    assert!(m.contains("} else if let Err(e) = attach_env_lsm(ebpf) {"));
     let flat = m.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains(
         "pub const ENV_OFFSETS: [u32; 4] = [ common::btf_offsets::slot::PT_REGS_ORIG_AX_OFFSET, \

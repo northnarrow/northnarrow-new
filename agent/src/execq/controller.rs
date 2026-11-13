@@ -332,7 +332,7 @@ pub struct Controller<K: KernelIo, B: Backend> {
     /// The kernel's fail-open counts already reported (the events ring
     /// full, the stop signal refused) and when: one signed degradation per
     /// [`DEGRADED_EVERY`] at most, with the counts since the previous one.
-    fail_open_seen: (u64, u64, u64, u64),
+    fail_open_seen: (u64, u64, u64, u64, u64),
     fail_open_at: Option<Instant>,
     /// Lot 317 (BUG-124): how a held process is captured.
     capture: Capture,
@@ -385,7 +385,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             busy_since: None,
             last_degraded: None,
             degraded_held: 0,
-            fail_open_seen: (0, 0, 0, 0),
+            fail_open_seen: (0, 0, 0, 0, 0),
             fail_open_at: None,
             capture: Box::new(ProcRef::open_started_at),
             owed: Vec::new(),
@@ -452,7 +452,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     + c[counter::RING_FULL as usize]
                     + c[counter::SIGNAL_FAILED as usize]
                     + c[counter::MAP_FULL as usize]
-                    + c[counter::CAND_DROPPED as usize],
+                    + c[counter::CAND_DROPPED as usize]
+                    + c[counter::CAND_EVICTED as usize],
                 Ordering::Relaxed,
             );
             self.report_fail_open(
@@ -461,6 +462,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     c[counter::SIGNAL_FAILED as usize],
                     c[counter::MAP_FULL as usize],
                     c[counter::CAND_DROPPED as usize],
+                    c[counter::CAND_EVICTED as usize],
                 ],
                 now,
             );
@@ -767,10 +769,15 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// [`DEGRADED_EVERY`], with the counts since the previous one. Lot 317
     /// (review F3): and one the map of stopped processes could not name
     /// (`MAP_FULL`: the kernel stops only a process the map names).
-    fn report_fail_open(&mut self, counts: [u64; 4], now: Instant) {
-        let [ring_full, signal_failed, map_full, dropped] = counts;
-        let (ring0, sig0, map0, drop0) = self.fail_open_seen;
-        if ring_full <= ring0 && signal_failed <= sig0 && map_full <= map0 && dropped <= drop0 {
+    fn report_fail_open(&mut self, counts: [u64; 5], now: Instant) {
+        let [ring_full, signal_failed, map_full, dropped, evicted] = counts;
+        let (ring0, sig0, map0, drop0, ev0) = self.fail_open_seen;
+        if ring_full <= ring0
+            && signal_failed <= sig0
+            && map_full <= map0
+            && dropped <= drop0
+            && evicted <= ev0
+        {
             return;
         }
         if self
@@ -783,21 +790,25 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let sig = signal_failed.saturating_sub(sig0);
         let map = map_full.saturating_sub(map0);
         let cand = dropped.saturating_sub(drop0);
+        let ev = evicted.saturating_sub(ev0);
         warn!(
             ring_full = ring,
             signal_failed = sig,
             map_full = map,
             candidates_dropped = cand,
+            candidates_evicted = ev,
             "exec quarantine fail-open: execs ran without being held"
         );
         self.r.degraded(&format!(
             "exec quarantine fail-open: {} exec(s) ran without being held or scanned since the \
              previous record — the events ring was full for {ring} (ring-drop slot execq), the \
              stop signal was refused for {sig}, the map of stopped processes was full for {map}, \
-             the candidates' map (or a uid's share of it) was full for {cand}",
-            ring + sig + map + cand
+             a login's share of the candidates' map was taken (or the map was full with no \
+             candidate old enough to go) for {cand}, the oldest candidate went for a newer one, \
+             the map full, for {ev}",
+            ring + sig + map + cand + ev
         ));
-        self.fail_open_seen = (ring_full, signal_failed, map_full, dropped);
+        self.fail_open_seen = (ring_full, signal_failed, map_full, dropped, evicted);
         self.fail_open_at = Some(now);
     }
 

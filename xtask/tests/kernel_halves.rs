@@ -253,7 +253,8 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
 #[test]
 fn a_set_id_target_does_not_escape_the_environment_deny() {
     let e = code("agent-ebpf/src/execpol.rs");
-    let p = body(&e, "on_pass");
+    // the re-check of #547 (G6): the environment's own program
+    let p = body(&e, "try_exec_env_lsm");
     in_order(
         p,
         &[

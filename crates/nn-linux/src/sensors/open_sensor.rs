@@ -704,6 +704,8 @@ pub struct OpenSensorMaps {
     /// ([`Self::recount_shares`]).
     tasks: BpfHashMap<MapData, u64, AyaOpenTask>,
     task_uids: BpfHashMap<MapData, u32, u64>,
+    /// The re-check of #547 (G5): the overflow row's count.
+    task_overflow: Array<MapData, u64>,
     /// [`Self::per_call_total`] at the last recount, and when.
     recounted: (u64, Option<Instant>),
 }
@@ -793,6 +795,7 @@ impl OpenSensorMaps {
             task_counters: PerCpuArray::try_from(take(ebpf, "OPEN_TASK_COUNTERS")?)?,
             tasks: BpfHashMap::try_from(take(ebpf, "OPEN_TASK")?)?,
             task_uids: BpfHashMap::try_from(take(ebpf, "OPEN_TASK_UIDS")?)?,
+            task_overflow: Array::try_from(take(ebpf, "OPEN_TASK_OVERFLOW")?)?,
             recounted: (0, None),
         })
     }
@@ -839,8 +842,13 @@ impl OpenSensorMaps {
             .take(OPEN_TASK_ENTRIES_MAX)
             .filter_map(|r| r.ok())
             .map(|(_, t)| t.0.uid);
-        let want = crate::sensors::task_free::uid_shares(uids);
-        crate::sensors::task_free::rewrite_shares(&mut self.task_uids, &want).ok()
+        let mut want = crate::sensors::task_free::uid_shares(uids);
+        let overflow = crate::sensors::task_free::take_overflow(&mut want);
+        let mut r = crate::sensors::task_free::rewrite_shares(&mut self.task_uids, &want).ok()?;
+        if self.task_overflow.set(0, overflow, 0).is_err() {
+            r.failed += 1;
+        }
+        Some(r)
     }
 
     /// Invalidate every cached directory class ([`bump_generation_in`]).

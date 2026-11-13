@@ -78,7 +78,10 @@ fn every_loader_entry_is_judged_as_the_loader_reads_it() {
     }
     assert!(long.len() > 3000);
     assert_eq!(preload(&long), 0);
-    assert_eq!(judge(KIND_LIBPATH, &long), 0);
+    assert_eq!(judge(KIND_LIBPATH, &long[..long.len() - 1]), 0);
+    // (with its trailing `:`, a library path ends with an empty element:
+    // the caller's directory — the re-check of #547, G2)
+    assert_eq!(judge(KIND_LIBPATH, &long), IRREGULAR);
     // and a staging entry at its end is still seen
     long.extend_from_slice(b"/tmp/x.so");
     assert_ne!(preload(&long) & STAGING, 0);
@@ -92,7 +95,94 @@ fn every_loader_entry_is_judged_as_the_loader_reads_it() {
         for &b in &v[cut..] {
             byte(&mut p, KIND_PRELOAD, b);
         }
-        end_entry(&mut p, KIND_PRELOAD);
+        end_value(&mut p, KIND_PRELOAD);
         assert_ne!(p.found & STAGING, 0, "cut at {cut}");
     }
+}
+
+/// The re-check of #547 (G1–G4, the reviewer's probe
+/// `rev547-recheck-value-parse-probe.rs`): what the loader does with a
+/// control byte, an empty library-path element or a `$` token is not in
+/// the string as the parser reads it — each is `IRREGULAR` (refused at a
+/// protected or set-id target). glibc 2.39 loaded the marker in G1–G3.
+#[test]
+fn an_irregular_loader_value_is_never_clean() {
+    let irregular = |kind: u32, v: &[u8]| judge(kind, v) & IRREGULAR != 0;
+    for (kind, v, what) in [
+        // G1: glibc splits LD_PRELOAD on " :" only — one entry, relative
+        (
+            KIND_PRELOAD,
+            &b"lib\t/x.so"[..],
+            "a tab inside an LD_PRELOAD entry",
+        ),
+        (KIND_PRELOAD, b"/usr/lib/a.so\n/tmp/x.so", "a newline"),
+        (
+            KIND_AUDIT,
+            b"/usr/lib/a.so\x0b/x.so",
+            "a vertical tab in LD_AUDIT",
+        ),
+        // G2: an empty element is the caller's directory
+        (KIND_LIBPATH, b":", "a lone separator"),
+        (KIND_LIBPATH, b":/usr/lib", "a leading empty element"),
+        (KIND_LIBPATH, b"/usr/lib:", "a trailing empty element"),
+        (
+            KIND_LIBPATH,
+            b"/usr/lib::/opt/x",
+            "an empty element between two",
+        ),
+        (
+            KIND_LIBPATH,
+            b"/usr/lib;;/opt/x",
+            "an empty element, semicolons",
+        ),
+        // G3: dynamic string tokens
+        (KIND_PRELOAD, b"/tmp/$LIB/../../x.so", "$LIB"),
+        (KIND_PRELOAD, b"$ORIGIN/../../tmp/x.so", "$ORIGIN"),
+        (KIND_PRELOAD, b"/opt/${PLATFORM}/x.so", "${PLATFORM}"),
+        (KIND_AUDIT, b"/opt/$LIB/audit.so", "$LIB in LD_AUDIT"),
+        (KIND_LIBPATH, b"/tmp/$LIB/../..", "$LIB in LD_LIBRARY_PATH"),
+        // G4: musl splits its library path on a newline
+        (
+            KIND_LIBPATH,
+            b"/usr/lib\n/tmp",
+            "a newline in LD_LIBRARY_PATH",
+        ),
+        (KIND_LIBPATH, b"/usr/lib\x7f", "DEL"),
+    ] {
+        assert!(irregular(kind, v), "{what}: {}", String::from_utf8_lossy(v));
+    }
+    // and the newline still splits musl's path: its staging entry is seen
+    assert_ne!(judge(KIND_LIBPATH, b"/usr/lib\n/tmp") & STAGING, 0);
+    // the controls: regular values stay clean
+    for (kind, v) in [
+        (
+            KIND_PRELOAD,
+            &b"/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"[..],
+        ),
+        (KIND_PRELOAD, b"/usr/lib/a.so /usr/lib/b.so:/usr/lib/c.so"),
+        (KIND_AUDIT, b"/usr/lib/a.so:/usr/lib/b.so"),
+        (KIND_LIBPATH, b"/usr/lib:/opt/x/lib;/usr/local/lib"),
+        (KIND_LIBPATH, b""),
+        (KIND_PRELOAD, b""),
+    ] {
+        assert_eq!(
+            judge(kind, v) & IRREGULAR,
+            0,
+            "{}",
+            String::from_utf8_lossy(v)
+        );
+    }
+    // an empty element of LD_PRELOAD or LD_AUDIT is skipped by the loader
+    assert_eq!(
+        judge(KIND_PRELOAD, b"/usr/lib/a.so::/usr/lib/b.so") & IRREGULAR,
+        0
+    );
+    // fed in pieces, the same (the state carried across the kernel's reads)
+    let v = b"/usr/lib:";
+    let mut p = ValueParse::zeroed();
+    for &b in v {
+        byte(&mut p, KIND_LIBPATH, b);
+    }
+    end_value(&mut p, KIND_LIBPATH);
+    assert_ne!(p.found & IRREGULAR, 0);
 }

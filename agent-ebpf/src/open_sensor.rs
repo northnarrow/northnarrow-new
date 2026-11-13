@@ -176,7 +176,8 @@ const INODE_WIN: usize = 128;
 pub(crate) struct OpenTask {
     win: [u8; FILE_WIN + INODE_WIN],
     names: [u8; 128],
-    /// The review of #547 (F6): the uid whose share ([`OPEN_TASK_PER_UID`])
+    /// The review of #547 (F6; the re-check, G5): the share's row
+    /// ([`OPEN_TASK_PER_SHARE`]: the login's, or the uid's)
     /// the entry takes, given back when the task is freed.
     uid: u32,
     _pad: u32,
@@ -214,12 +215,18 @@ static OPEN_TASK: HashMap<u64, OpenTask> =
 /// Tasks with an [`OPEN_TASK`] entry at once: the live tasks that opened a
 /// file (a busy host runs a few thousand).
 pub(crate) const OPEN_TASK_CAP: u32 = 65536;
-/// The review of #547 (F6): one uid's share of [`OPEN_TASK`] — one user's
-/// idle threads cannot take every other task's.
-pub(crate) const OPEN_TASK_PER_UID: u64 = 16384;
-/// The tasks' entries each uid holds.
+/// The review of #547 (F6; the re-check, G5): one share of [`OPEN_TASK`] —
+/// a login's (its container subuids included), or a service's uid
+/// (`crate::task_scratch::share_key`): one user's idle threads cannot take
+/// every other task's.
+pub(crate) const OPEN_TASK_PER_SHARE: u64 = 16384;
+/// The tasks' entries each share holds.
 #[map]
 static OPEN_TASK_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// The entries of the shares [`OPEN_TASK_UIDS`] has no row for (it is
+/// full), under the same cap (`OVERFLOW_SHARE`).
+#[map]
+static OPEN_TASK_OVERFLOW: Array<u64> = Array::with_max_entries(1, 0);
 /// The review of #547 (F6): a run's own entry when [`OPEN_TASK`] has no room
 /// for the task (full, its uid's share taken) or `task_free` does not run —
 /// made and removed in the run, as lot 322's: the open is judged whole,
@@ -256,11 +263,8 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
         return Some((p, false));
     }
     if crate::task_scratch::task_free_armed() {
-        let uid = crate::task_scratch::current_uid();
-        if crate::task_scratch::uid_admits(&OPEN_TASK_UIDS, uid, OPEN_TASK_PER_UID) {
-            if let Some(p) = crate::task_scratch::make(&OPEN_TASK, &task) {
-                (*p).uid = uid;
-                crate::task_scratch::uid_took(&OPEN_TASK_UIDS, uid);
+        if nn_open_task_make(task) != 0 {
+            if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
                 return Some((p, true));
             }
         }
@@ -274,6 +278,36 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
         }
     }
 }
+/// The re-check of #547 (G5): the running task's [`OPEN_TASK`] entry made
+/// (zeroed), within its share ([`OPEN_TASK_PER_SHARE`]; the row it is
+/// counted in kept in the entry). 1: made; 0: the share taken or the map
+/// full. A global function: checked once, its share's branches not in the
+/// sensor's states.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_open_task_make(task: u64) -> u64 {
+    let row = match crate::task_scratch::share_take(
+        &OPEN_TASK_UIDS,
+        &OPEN_TASK_OVERFLOW,
+        crate::task_scratch::share_key(),
+        OPEN_TASK_PER_SHARE,
+    ) {
+        Some(r) => r,
+        None => return 0,
+    };
+    // SAFETY: the running task's own entry of this module's map.
+    match unsafe { crate::task_scratch::make(&OPEN_TASK, &task) } {
+        Some(p) => {
+            unsafe { (*p).uid = row };
+            1
+        }
+        None => {
+            crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, row);
+            0
+        }
+    }
+}
+
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -1653,6 +1687,6 @@ pub(crate) fn forget_freed(task: u64) {
         None => return,
     };
     if OPEN_TASK.remove(&task).is_ok() {
-        crate::task_scratch::uid_gave(&OPEN_TASK_UIDS, uid);
+        crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, uid);
     }
 }

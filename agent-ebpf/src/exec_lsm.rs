@@ -155,13 +155,11 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
         // scalar the verifier cannot range: 6.12+ checks an LSM program's
         // return value).
         None => {
-            let er = crate::execpol::env_for_unwalked(task as u64, pass);
             let refuse = crate::execpol::nn_exec_unwalked(
                 inode as u64,
                 dentry as u64,
                 task as u64,
                 u64::from(flags) | (u64::from(pass) << 32),
-                er,
             );
             return if refuse != 0 { -13 } else { 0 };
         }

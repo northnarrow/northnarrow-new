@@ -168,7 +168,8 @@ fn the_environment_is_read_to_its_end() {
     // an environment the scan could not finish: refused at a protected
     // target (the tier's rule refuses a staging preload) or a set-id one,
     // counted, recorded
-    let p = body(&pol, "on_pass");
+    // the re-check of #547 (G6): judged by the environment's own program
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
@@ -186,12 +187,12 @@ fn the_environment_is_read_to_its_end() {
     // array past the cap, a relative loader path; a loader value longer
     // than the scan reads goes to the post-commit check
     let wire_flat = flat(&wire);
-    assert!(
-        wire_flat.contains("pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE;")
-    );
-    assert!(
-        wire_flat.contains("pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE;")
-    );
+    assert!(wire_flat.contains(
+        "pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE | LOADER_IRREGULAR;"
+    ));
+    assert!(wire_flat.contains(
+        "pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE | LOADER_IRREGULAR;"
+    ));
     assert!(p.contains("bump(counter::ENV_TRUNCATED);"));
     // the agent reads the count and shows it
     let m = code("agent/src/execpol/mod.rs");
@@ -280,14 +281,58 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
         ],
     );
     // the steps of `value_parse::byte`, which the host tests run
-    assert!(body(&pol, "nn_value_end")
-        .contains("value_parse::end_entry(&mut (*e).parse, kind as u32);"));
+    assert!(body(&pol, "nn_value_end").contains("value_parse::sep(&mut (*e).parse, kind as u32);"));
+    // The re-check of #547 (G1–G4): every byte through `value_parse::odd`
+    // (a control byte, a `$`), the value's end through `end_value` (a
+    // library path ending with an empty element); whichever variable, the
+    // finding is `LOADER_IRREGULAR`, refused at a protected or set-id
+    // target with the first pass's fail-closed set
+    in_order(
+        body(&pol, "nn_env_chunk"),
+        &[
+            "let b = *buf.add(i);",
+            "value_parse::odd(&mut (*e).parse, b);",
+            "if value_parse::is_sep(kind, b) {",
+        ],
+    );
+    in_order(
+        body(&pol, "value_found"),
+        &[
+            "value_parse::end_value(&mut (*e).parse, kind);",
+            "if found & value_parse::IRREGULAR != 0 {",
+            "(*e).stash.flags |= env_flags::LOADER_IRREGULAR;",
+        ],
+    );
+    in_order(
+        body(&wire, "odd"),
+        &[
+            "if b < 0x20 || b == 0x7f || b == b'$' {",
+            "p.found |= IRREGULAR;",
+        ],
+    );
+    in_order(
+        body(&wire, "sep"),
+        &[
+            "if kind == KIND_LIBPATH && p.st & IN == 0 {",
+            "p.found |= IRREGULAR;",
+            "end_entry(p, kind);",
+        ],
+    );
+    in_order(
+        body(&wire, "end_value"),
+        &[
+            "if kind == KIND_LIBPATH && p.st & SEP != 0 {",
+            "p.found |= IRREGULAR;",
+            "end_entry(p, kind);",
+        ],
+    );
     assert!(body(&pol, "nn_value_slash").contains("value_parse::slash(&mut (*e).parse);"));
     in_order(
         body(&wire, "byte"),
         &[
+            "odd(p, b);",
             "if is_sep(kind, b) {",
-            "end_entry(p, kind);",
+            "sep(p, kind);",
             "begin(p, b);",
             "if b == b'/' {",
             "slash(p);",
@@ -297,7 +342,7 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
     in_order(
         body(&pol, "value_found"),
         &[
-            "value_parse::end_entry(&mut (*e).parse, kind);",
+            "value_parse::end_value(&mut (*e).parse, kind);",
             "if kind == value_parse::KIND_PRELOAD {",
             "st.flags |= env_flags::PRELOAD_STAGING;",
             "st.flags |= env_flags::PRELOAD_RELATIVE;",
@@ -371,46 +416,52 @@ fn a_flood_of_execs_keeps_protected_targets_closed() {
             "classes |= class::TMPFS;",
             "classes |= class::WORLD_WRITABLE_DIR;",
             "let ex = exemptions(t_ptr, inode, &mut sig);",
-            "let setid = mode_bits & 0o6000 != 0;",
-            "let protected = env_deny_rule || setid;",
-            "(protected && ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0);",
-            "let refuse = m == mode::ENFORCE && (deny_c != 0 || env_refused);",
+            "let refuse = m == mode::ENFORCE && deny_c != 0;",
             "bump(counter::LOST);",
             "bump(counter::LOST_OPEN);",
             "report_unwalked(",
-        ],
-    );
-    assert!(body(&pol, "report_unwalked").contains("(*raw).action = act;"));
-    // the environment read by `exec_check_lsm` itself, then handed over (a
-    // frame of the ladder under the scan's three passed the verifier's 512
-    // bytes for a call chain: 7.0 refused the program)
-    let lsm = code("agent-ebpf/src/exec_lsm.rs");
-    in_order(
-        body(&lsm, "try_exec_check_lsm"),
-        &[
-            "let er = crate::execpol::env_for_unwalked(task as u64, pass);",
-            "crate::execpol::nn_exec_unwalked(",
-            "er,",
-        ],
-    );
-    assert!(
-        !u.contains("nn_exec_env("),
-        "the scan under the ladder's frame"
-    );
-    assert!(u.contains("let mut act = action::UNWALKED | action::RECORD;"));
-    // The review of #547 (F5): an environment the flood left unread is not
-    // refused here (both maps full, every service exec was refused): it is
-    // noted for the post-commit check, which reads the kernel's copy in a
-    // per-CPU buffer the flood cannot take and kills a protected or set-id
-    // target on what it cannot clear.
-    in_order(
-        u,
-        &[
-            "if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {",
-            "EXECPOL_ENV_SEEN.insert(&task, &ef, 0);",
             "crate::execq::forget(task);",
         ],
     );
+    assert!(body(&pol, "report_unwalked").contains("(*raw).action = act;"));
+    // The re-check of #547 (G6): the environment is judged by its own LSM
+    // program on the same hook, into its own entry whether or not this walk
+    // could be made — not by the ladder, nor read by `exec_check_lsm` for it
+    let lsm = code("agent-ebpf/src/exec_lsm.rs");
+    assert!(
+        !lsm.contains("env_for_unwalked"),
+        "the ladder's environment is back"
+    );
+    assert!(!pol.contains("fn env_for_unwalked("));
+    in_order(
+        body(&lsm, "try_exec_check_lsm"),
+        &[
+            "crate::execpol::nn_exec_unwalked(",
+            "u64::from(flags) | (u64::from(pass) << 32),",
+            ");",
+        ],
+    );
+    for not in ["nn_exec_env(", "env_flags::", "EXECPOL_ENV_SEEN"] {
+        assert!(!u.contains(not), "the ladder judges the environment: {not}");
+    }
+    assert!(u.contains("let mut act = action::UNWALKED | action::RECORD;"));
+    // The review of #547 (F5): an environment the flood left unread is not
+    // refused at the first pass (both maps full, every service exec was
+    // refused): it is noted for the post-commit check, which reads the
+    // kernel's copy in a per-CPU buffer the flood cannot take and kills a
+    // protected or set-id target on what it cannot clear.
+    in_order(
+        body(&pol, "try_exec_env_lsm"),
+        &[
+            "let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);",
+            "let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);",
+            "if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {",
+            "EXECPOL_ENV_SEEN.insert(&task, &ef, 0);",
+            "crate::execq::forget(task);",
+            "return -EACCES;",
+        ],
+    );
+    assert!(body(&pol, "exec_env").contains("return u64::from(env_flags::UNREADABLE);"));
     assert!(flat(&pol).contains(
         "static COMMIT_ENV: PerCpuArray<EnvScan> = PerCpuArray::with_max_entries(1, 0);"
     ));
@@ -476,9 +527,11 @@ fn the_quarantine_s_candidate_is_never_evicted() {
     in_order(
         body(&ctl, "step"),
         &[
-            "+ c[counter::CAND_DROPPED as usize],",
+            "+ c[counter::CAND_DROPPED as usize]",
+            "+ c[counter::CAND_EVICTED as usize],",
             "self.report_fail_open(",
             "c[counter::CAND_DROPPED as usize],",
+            "c[counter::CAND_EVICTED as usize],",
             "self.k.recount_shares();",
         ],
     );
@@ -557,9 +610,8 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
             "if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {",
             "return Some((p, false));",
             "if crate::task_scratch::task_free_armed() {",
-            "crate::task_scratch::uid_admits(&OPEN_TASK_UIDS, uid, OPEN_TASK_PER_UID)",
-            "crate::task_scratch::make(&OPEN_TASK, &task)",
-            "crate::task_scratch::uid_took(&OPEN_TASK_UIDS, uid);",
+            "if nn_open_task_make(task) != 0 {",
+            "if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {",
             "return Some((p, true));",
             "open_task_bump(OPEN_TASK_PER_CALL);",
             "match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {",
@@ -572,9 +624,44 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         body(&open, "forget_freed"),
         &[
             "OPEN_TASK.remove(&task).is_ok()",
-            "crate::task_scratch::uid_gave(&OPEN_TASK_UIDS, uid);",
+            "crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, uid);",
         ],
     );
+    // The re-check of #547 (G5): the share is the login's (its subuids
+    // keep the login uid), the uid's without one; a share the rows' map
+    // has no room for is the overflow row's, under the same cap
+    in_order(
+        body(&open, "nn_open_task_make"),
+        &[
+            "crate::task_scratch::share_take(",
+            "&OPEN_TASK_UIDS,",
+            "&OPEN_TASK_OVERFLOW,",
+            "crate::task_scratch::share_key(),",
+            "OPEN_TASK_PER_SHARE,",
+            "None => return 0,",
+            "crate::task_scratch::make(&OPEN_TASK, &task)",
+            "(*p).uid = row",
+            "crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, row);",
+        ],
+    );
+    let ts = code("agent-ebpf/src/task_scratch.rs");
+    assert!(body(&ts, "share_key")
+        .contains("northnarrow_common::wire::execq::share_key(current_loginuid(), current_uid())"));
+    assert!(body(&ts, "current_loginuid").contains("off_opt!(TASK_STRUCT_LOGINUID_OFFSET)"));
+    in_order(
+        body(&ts, "share_take"),
+        &[
+            "if *n >= cap {",
+            "return None;",
+            "return Some(key);",
+            "rows.insert(&key, &1u64, BPF_NOEXIST).is_ok()",
+            "let n = overflow.get_ptr_mut(0)?;",
+            "if *n >= cap {",
+            "Some(OVERFLOW_SHARE)",
+        ],
+    );
+    let wq = flat(&code("common/src/wire/execq.rs"));
+    assert!(wq.contains("if loginuid == u32::MAX { uid } else { loginuid }"));
     // the opens judged in a run's own buffer reach `nn-admin status`, and
     // the uids' shares are recounted from the entries
     let os = code("crates/nn-linux/src/sensors/open_sensor.rs");
@@ -654,7 +741,7 @@ fn the_kernel_s_own_copy_is_read_past_the_point_of_no_return() {
     );
     // the first pass notes what it let through, and forgets a failed
     // exec's note at the next exec
-    let p = body(&pol, "on_pass");
+    let p = body(&pol, "try_exec_env_lsm");
     in_order(
         p,
         &[
@@ -715,4 +802,58 @@ fn the_kernel_s_own_copy_is_read_past_the_point_of_no_return() {
     let off = flat(&code("common/src/btf_offsets.rs"));
     assert!(off.contains("pub const MM_STRUCT_ENV_START_OFFSET: u32 = 130;"));
     assert!(off.contains("pub const MM_STRUCT_ENV_END_OFFSET: u32 = 131;"));
+}
+
+/// The re-check of #547 (G6): the environment's check is a program of its
+/// own on `bprm_check_security` (`exec_env_lsm`), with its own verifier
+/// budget — with the scan inside `exec_check_lsm`, 5.15 counted 930,372 of
+/// its 1,000,000 instructions. `exec_check_lsm` no longer reads the
+/// environment; the policy attaches the program after the exec sensor's
+/// (BPF-LSM runs a hook's programs in turn; the first refusal refuses).
+#[test]
+fn the_environment_has_its_own_program() {
+    let pol = code("agent-ebpf/src/execpol.rs");
+    assert!(pol.contains("#[lsm(hook = \"bprm_check_security\")]\npub fn exec_env_lsm("));
+    in_order(
+        body(&pol, "try_exec_env_lsm"),
+        &[
+            "if m == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {",
+            // pass 0 only: the file the caller named
+            "if peek_u64(bprm.add(o_interp)) != peek_u64(bprm.add(o_filename)) {",
+            "let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);",
+            "nn_env_report(",
+            "(u64::from(env_act) << 32) | u64::from(mode_bits),",
+            "return -EACCES;",
+        ],
+    );
+    // recorded whenever the judgment acts (refuses, would, records)
+    assert!(flat(body(&pol, "try_exec_env_lsm")).contains("if env_act != 0 { nn_env_report("));
+    // the record, its path walked, checked once (a global function)
+    assert!(flat(&pol).contains("#[no_mangle] #[inline(never)] pub extern \"C\" fn nn_env_report("));
+    assert!(body(&pol, "nn_env_report").contains("report_env_pass("));
+    let op = body(&pol, "on_pass");
+    for not in ["nn_exec_env(", "env_deny_rule", "EXECPOL_ENV_SEEN"] {
+        assert!(
+            !op.contains(not),
+            "exec_check_lsm judges the environment again: {not}"
+        );
+    }
+    assert!(
+        op.contains("report_exec(s, inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits);")
+    );
+    let m = code("agent/src/execpol/mod.rs");
+    assert!(m.contains("pub const ENV_PROGRAM: &str = \"exec_env_lsm\";"));
+    in_order(
+        body(&m, "attach_env_lsm"),
+        &["prog.load(\"bprm_check_security\", &btf)", "prog.attach()"],
+    );
+    in_order(
+        body(&m, "install"),
+        &[
+            "if !offsets_resolved(&ENV_OFFSETS) {",
+            "} else if let Err(e) = attach_env_lsm(ebpf) {",
+            "env_ok = true;",
+            "attach_commit(ebpf)",
+        ],
+    );
 }

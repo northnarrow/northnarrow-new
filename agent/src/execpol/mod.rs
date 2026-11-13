@@ -67,6 +67,11 @@ pub const MAP_PROGRAM: &str = "execmap_check";
 /// first instruction when it holds a staging loader entry the first pass
 /// did not see ([`COMMIT_OFFSETS`]).
 pub const COMMIT_PROGRAM: &str = "execpol_env_commit";
+/// The re-check of #547 (G6): the environment's check at the exec's first
+/// pass, its own LSM program on `bprm_check_security` (beside the exec
+/// sensor's `exec_check_lsm`, attached before it: each has its own
+/// verifier budget).
+pub const ENV_PROGRAM: &str = "exec_env_lsm";
 
 /// Lot 325: the `mm_struct` offsets [`COMMIT_PROGRAM`] reads the new image's
 /// environment with (`env_start`, `env_end`).
@@ -204,6 +209,21 @@ fn attach_commit(ebpf: &mut Ebpf) -> Result<()> {
     Ok(())
 }
 
+/// The re-check of #547 (G6): [`ENV_PROGRAM`] on `bprm_check_security`.
+fn attach_env_lsm(ebpf: &mut Ebpf) -> Result<()> {
+    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the environment check")?;
+    let prog: &mut Lsm = ebpf
+        .program_mut(ENV_PROGRAM)
+        .ok_or_else(|| anyhow!("program {ENV_PROGRAM} missing from the eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {ENV_PROGRAM} is not LSM"))?;
+    prog.load("bprm_check_security", &btf)
+        .with_context(|| format!("verifier rejected `{ENV_PROGRAM}`"))?;
+    prog.attach()
+        .with_context(|| format!("attaching `{ENV_PROGRAM}`"))?;
+    Ok(())
+}
+
 fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
     let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the mapping check")?;
     let prog: &mut Lsm = ebpf
@@ -245,9 +265,23 @@ pub fn install(
     let mut map_ok = false;
     if m != Mode::Off {
         if cfg.env && cfg.table.has_env_rules() {
-            // Lot 322: read by the exec sensor's program itself, from the
-            // exec's registers — nothing to attach.
-            if offsets_resolved(&ENV_OFFSETS) {
+            // Lot 322: read from the exec's registers at its first pass —
+            // the re-check of #547 (G6): by a program of its own on the
+            // exec sensor's hook.
+            if !offsets_resolved(&ENV_OFFSETS) {
+                note(
+                    "exec policy: the exec's registers cannot be read on this kernel \
+                     (pt_regs.orig_ax, dx, r10 or si not resolved: not x86-64?): LD_PRELOAD, \
+                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec"
+                        .into(),
+                );
+            } else if let Err(e) = attach_env_lsm(ebpf) {
+                note(format!(
+                    "exec policy: the environment check is not attached ({}): LD_PRELOAD, \
+                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec",
+                    crate::sensors::exe_identity::verifier_tail(&e)
+                ));
+            } else {
                 env_ok = true;
                 // Lot 325 (TOCTOU): the kernel's own copy, read again past
                 // the point of no return.
@@ -267,13 +301,6 @@ pub fn install(
                         crate::sensors::exe_identity::verifier_tail(&e)
                     ));
                 }
-            } else {
-                note(
-                    "exec policy: the exec's registers cannot be read on this kernel \
-                     (pt_regs.orig_ax, dx, r10 or si not resolved: not x86-64?): LD_PRELOAD, \
-                     LD_AUDIT, GLIBC_TUNABLES and the history tricks are not judged at exec"
-                        .into(),
-                );
             }
         }
         if cfg.map && cfg.table.has_map_rules() {

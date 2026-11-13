@@ -263,7 +263,18 @@ on colons and semicolons; each entry's path is normalised (`//`, `/./`,
 `LD_LIBRARY_PATH` directory, says nothing of where it resolves:
 `relative_loader_path` (`PRELOAD_RELATIVE`), refused at a protected or
 set-id target and recorded elsewhere; a bare name searched through a
-staging `LD_LIBRARY_PATH` directory is a staging preload. It compared the
+staging `LD_LIBRARY_PATH` directory is a staging preload. The re-check of
+#547 (G1–G4): a loader value holding a control byte (glibc keeps a tab
+inside an `LD_PRELOAD` entry, which the musl split read as two entries;
+musl splits its library path on a newline), an empty `LD_LIBRARY_PATH`
+element (`:`, `a::b`, a trailing `:`: glibc searches the caller's directory
+there) or a `$` (glibc expands `$LIB`, `$ORIGIN`, `$PLATFORM` — `$LIB` is
+two components on Ubuntu, so `/tmp/$LIB/../../x.so` is `/tmp/x.so`) is
+`irregular_loader_value` (`LOADER_IRREGULAR`), whichever variable: refused
+at a protected or set-id target, recorded elsewhere — legitimate set-id
+execs carry none of them; the known false refusal is a sloppy
+`LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/x` with the variable unset (an empty
+first element) at a protected target. It compared the
 first nine bytes of each entry of a 128-byte capture: 120 spaces then
 `/tmp/x.so`, `//tmp/`, `/./tmp/`, a tab (musl) passed, and a clean value
 longer than 128 bytes was refused as not finished. A value longer than the
@@ -321,7 +332,20 @@ where `GLIBC_TUNABLES` is reported.
 
 Lot 322 moved the read from the `sys_enter_execve{,at}` tracepoints (on
 Ubuntu 26.04's 7.0 they ran for CPU 0's execs only) into the exec's own
-`bprm_check_security` run.
+`bprm_check_security` run. The re-check of #547 (G6): that run is a second
+LSM program on the hook, `exec_env_lsm`, beside the exec sensor's
+`exec_check_lsm` — the scan, the judgment, the record of the first pass and
+the note for the post-commit check, at the exec's first pass. The verifier
+gives each program its own million instructions: with the scan inside it,
+`exec_check_lsm` counted 930,372 on 5.15 (measured by a kprobe on the
+verifier's `check_max_stack_depth` while `verifier-check` loaded it: 5.15
+has no `verified_insns`, and the loader keeps the verifier's log only for a
+refusal). BPF-LSM runs a hook's programs in turn and the first refusal
+refuses the exec; the policy attaches `exec_env_lsm` after the exec sensor's
+program, so an exec refused on its classes is recorded on them, not also on
+its environment. Without the program (refused by the verifier, not
+attached), the start signs an `exec_policy` degradation and the environment
+is not judged at exec.
 
 Lot 325 (the re-check of #546, R1): an **x32** exec's `envp` is the
 register whole, as the kernel's x32 stub passes it (`SC_X86_64_REGS_TO_ARGS`,
@@ -351,8 +375,9 @@ attempt is one whatever the caller).
 
 Limits, by design: the string check normalises the path's text (`//`,
 `/./`, `..`; the review of #547) but resolves no link (a symlink to a
-staging file); a relative path is refused at a protected or set-id target
-whatever it names; about 4 KiB of each loader value at the first pass (a
+staging file); a relative path, a control byte, an empty library-path
+element or a `$` token is refused at a protected or set-id target whatever
+it names; about 4 KiB of each loader value at the first pass (a
 longer value is judged on the kernel's copy after the commit: killed at a
 protected or set-id target, recorded elsewhere); an array longer than any
 the kernel accepts (`TRUNCATED`, refused at a protected or set-id target,
@@ -555,14 +580,15 @@ The rules are outside the frozen V2 validation denominator, like
   middle of `exec_check_lsm`: a fork bomb's flood) lot 322 refused every
   exec in enforce mode — the administrator's shell's too. An exec whose walk
   cannot be made is now judged on what needs none (`nn_exec_unwalked`): the
-  caller's tier, the file's set-id bits, memfd, deleted, tmpfs, a
-  world-writable directory, and the environment (its own entry). It is
-  refused (counted in `LOST`) when those classes meet a deny cell, a staging
-  loader entry meets the tier's rule, or the environment is past the cap or
-  names a relative loader path at a **protected target** (the tier's rule
-  refuses a staging preload, or the file is set-id). The review of #547
-  (F5): an environment the flood left unread (its own map full too) is no
-  longer refused — that refused every root and service exec of a server
+  caller's tier, memfd, deleted, tmpfs, a world-writable directory. It is
+  refused (counted in `LOST`) when those classes meet a deny cell. The
+  environment is judged by its own program (`exec_env_lsm`, the re-check of
+  #547), into its own entry whether or not the walk could be made: a staging
+  loader entry where the tier's rule refuses it, an environment past the cap,
+  a relative or irregular loader value at a **protected target** (the
+  tier's rule refuses a staging preload, or the file is set-id) are refused
+  there. The review of #547 (F5): an environment the flood left unread (its
+  own map full too) is no longer refused — that refused every root and service exec of a server
   once both maps were full: it is noted for the post-commit check, which
   reads the kernel's copy in its per-CPU buffer and kills a protected or
   set-id target on a staging entry or on what it cannot clear (§5); the e2e
@@ -587,15 +613,25 @@ The rules are outside the frozen V2 validation denominator, like
   task's next exec or its end, and one user's idle threads (each failing an
   exec) filled the map for everyone: it goes when the kernel frees the
   exec's file (the LSM `file_free_security` program `execq_exec_failed`,
-  which removes the task's candidate naming that inode); each uid holds at
-  most 1024 candidates (`EXECQ_CAND_UIDS`); a candidate dropped (the map
-  full, the uid's share taken: `CAND_DROPPED`) is an exec that ran unheld —
-  counted in `not_held` and in the signed `exec quarantine fail-open`
-  degradation (one per ten minutes while it moves). `task_free` is attached
+  which removes the task's candidate naming that inode); each share holds
+  at most 1024 candidates (`EXECQ_CAND_UIDS`) — the re-check of #547 (G5):
+  a login's share (`task->loginuid`, which every process of the session
+  keeps, the subuids of a rootless container included, and none can change
+  in a user namespace), a service's uid without one; it was the uid's, and
+  four subuids of one login filled the map. The shares the rows' map has no
+  room for share one overflow row under the same cap. The map full, the
+  oldest candidate still in it — made at least a second ago (its exec is
+  stuck: no program of its task holds it), found in a ring of the
+  candidates in the order they were made — goes for the new one
+  (`CAND_EVICTED`); none old enough, the new one is dropped
+  (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
+  `not_held` and in the signed `exec quarantine fail-open` degradation (one
+  per ten minutes while they move). `task_free` is attached
   once per object and the agent tracks "attached", not "loaded" (F9: a load
   whose attach failed made the next caller skip it, silently).
 - The review of #547 (F6): the FIM sensor's buffers (`OPEN_TASK`, 65,536
-  tasks) — each uid holds at most 16,384 (`OPEN_TASK_UIDS`); past it, or the
+  tasks) — each share (the login's, the re-check's G5, as above) holds at
+  most 16,384 (`OPEN_TASK_UIDS`); past it, or the
   map full, the open is judged in a buffer made and removed in the run
   (`OPEN_TASK_RUN`, the cost before lot 325: an insert and a delete), and
   counted (`nn-admin status`: `open_sensor_per_call_total`); only with no

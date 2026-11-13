@@ -60,7 +60,8 @@ use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_INODE_OFFSET,
     FILE_F_PATH_OFFSET, MM_STRUCT_ENV_END_OFFSET, MM_STRUCT_ENV_START_OFFSET,
     INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
-    INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
+    INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, LINUX_BINPRM_FILENAME_OFFSET,
+    LINUX_BINPRM_FILE_OFFSET, LINUX_BINPRM_INTERP_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
     PATH_DENTRY_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_R10_OFFSET,
     PT_REGS_SI_OFFSET,
     QSTR_NAME_OFFSET, SIGNAL_STRUCT_TTY_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
@@ -406,22 +407,9 @@ pub(crate) unsafe fn on_pass(
         // Lab PR 223 alone: every class the guard holds.
         return crate::execq::note_pass(s, inode, task, pass, classes);
     }
-    // Lot 322: the new environment, read now into the task's own entry
-    // (`ef` its findings, `stashed` whether the task's entry holds them:
-    // removed once judged). Plain integers, no `Option<TaskKey>`: its
-    // `None` left a stack slot unwritten that the move read, which 5.15's
-    // verifier refuses ("invalid read from stack").
-    let er = if pass == 0 && conf(conf_slot::FLAGS) & flags::ENV_SCAN != 0 {
-        // Lot 325: what an earlier, failed exec of this task left for the
-        // post-commit check is not this exec's.
-        let _ = EXECPOL_ENV_SEEN.remove(&task);
-        nn_exec_env(task, u64::from(wk.tid), wk.start_ns)
-    } else {
-        0
-    };
-    let ef = er as u32;
-    let stashed = er & ENV_STASHED != 0;
-    if classes == 0 && ef == 0 {
+    // The re-check of #547 (G6): the new environment is judged by its own
+    // program on this hook ([`exec_env_lsm`]), not here.
+    if classes == 0 {
         if q {
             return crate::execq::note_pass(s, inode, task, pass, 0);
         }
@@ -474,21 +462,93 @@ pub(crate) unsafe fn on_pass(
             bump(counter::WOULD_DENY);
         }
     }
-    let mut env_act = 0u32;
-    let mut mode_bits = 0u32;
-    // The values the record quotes, from the entry (the judgment rests on
-    // `ef`, a copy the scan returned).
-    let env = if stashed {
-        match EXECPOL_ENV.get_ptr(wk) {
-            Some(e) => Some(&(*e).stash as *const EnvStashRaw),
-            None => None,
+    if act & (action::DENY | action::WOULD_DENY) != 0 {
+        let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        report_exec(s, inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits);
+    }
+    if act & action::DENY != 0 {
+        if pass == 0 {
+            crate::execq::forget(task);
         }
-    } else {
-        None
+        return -EACCES;
+    }
+    if q {
+        return crate::execq::note_pass(s, inode, task, pass, cand);
+    }
+    0
+}
+
+// ── the environment's check: a program of its own (the re-check of #547) ──
+
+/// The re-check of #547 (G6): the new environment judged at the exec's
+/// first pass by a second LSM program on `bprm_check_security`, beside the
+/// exec sensor's `exec_check_lsm`. The verifier gives each program its own
+/// million instructions: with the scan inside it, 5.15 counted 930,372 for
+/// `exec_check_lsm`. BPF-LSM runs the programs of a hook in turn and the
+/// first refusal refuses the exec; `exec_check_lsm` is attached first (the
+/// exec sensor, then the policy), so an exec refused on its classes is
+/// recorded on them and not judged on its environment. Not a tail call:
+/// under a tail call each frame is capped at 256 bytes, and the verdict
+/// would cross a map. The judgment is lot 322's and lot 325's, moved:
+/// refused where the tier's rule refuses a staging loader entry, or what
+/// the scan cannot clear (`FIRST_PASS_FAIL_CLOSED`) at a protected or set-id
+/// target; recorded; what it let through noted for the post-commit check.
+#[lsm(hook = "bprm_check_security")]
+pub fn exec_env_lsm(ctx: LsmContext) -> i32 {
+    unsafe { try_exec_env_lsm(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_exec_env_lsm(ctx: &LsmContext) -> i32 {
+    let m = conf(conf_slot::MODE);
+    if m == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {
+        return 0;
+    }
+    // Kernel signature: (bprm).
+    let bprm: *const u8 = ctx.arg(0);
+    if bprm.is_null() {
+        return 0;
+    }
+    let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return 0,
     };
-    if ef != 0 {
+    let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return 0,
+    };
+    let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return 0,
+    };
+    // Pass 0 only: the file the caller named (an interpreter's pass runs
+    // with the same environment).
+    if peek_u64(bprm.add(o_interp)) != peek_u64(bprm.add(o_filename)) {
+        return 0;
+    }
+    let file = peek_u64(bprm.add(o_file)) as *const u8;
+    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+    let dentry = peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+    let task = bpf_get_current_task();
+    let wk = crate::task_scratch::current_key();
+    // Lot 325: what an earlier, failed exec of this task left for the
+    // post-commit check is not this exec's.
+    let _ = EXECPOL_ENV_SEEN.remove(&task);
+    // Lot 322: the new environment, read now into the task's own entry
+    // (`ef` its findings, `stashed` whether the task's entry holds them:
+    // removed once judged).
+    let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);
+    let ef = er as u32;
+    if ef == 0 {
+        return 0;
+    }
+    let stashed = er & ENV_STASHED != 0;
+    let tv = nn_execpol_tier(task) as u32;
+    let t = tv & 3;
+    let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+    let mut env_act = 0u32;
+    {
         let tb = 1u64 << t;
-        mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
         // The target's set-id bits: what `GLIBC_TUNABLES` is reported at.
         let setid = mode_bits & 0o6000 != 0;
         // Lot 318 (external bug hunt BUG101): a set-id target is judged as
@@ -538,7 +598,8 @@ pub(crate) unsafe fn on_pass(
                 | env_flags::HISTORY
                 | env_flags::UNREADABLE
                 | env_flags::UNFINISHED
-                | env_flags::PRELOAD_RELATIVE)
+                | env_flags::PRELOAD_RELATIVE
+                | env_flags::LOADER_IRREGULAR)
             != 0
             || (setid && ef & env_flags::GLIBC_TUNABLES != 0);
         if conf(conf_slot::ENV_RECORD) & tb != 0 && reportable {
@@ -551,14 +612,19 @@ pub(crate) unsafe fn on_pass(
             bump(counter::ENV_TRUNCATED);
         }
     }
-    if act & (action::DENY | action::WOULD_DENY) != 0 || env_act != 0 {
-        if mode_bits == 0 {
-            mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-        }
-        report_exec(s, inode, t_ptr, t | sig, classes, act, env_act, ef, env, mode_bits);
+    if env_act != 0 {
+        // one call: the record (its path walked) is checked once, not for
+        // every state the judgment leaves
+        nn_env_report(
+            task,
+            inode as u64,
+            dentry as u64,
+            (u64::from(tv) << 32) | u64::from(ef),
+            (u64::from(env_act) << 32) | u64::from(mode_bits),
+        );
     }
     if stashed {
-        let _ = EXECPOL_ENV.remove(wk);
+        let _ = EXECPOL_ENV.remove(&wk);
     }
     // Lot 325 (TOCTOU): what was judged here and let through (a tier that
     // records it) is no news to the post-commit check — its record is
@@ -566,16 +632,94 @@ pub(crate) unsafe fn on_pass(
     if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
         let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
     }
-    if (act | env_act) & action::DENY != 0 {
-        if pass == 0 {
-            crate::execq::forget(task);
-        }
+    if env_act & action::DENY != 0 {
+        // the exec quarantine's candidate of this pass, if `exec_check_lsm`
+        // made one: the exec fails
+        crate::execq::forget(task);
         return -EACCES;
     }
-    if q {
-        return crate::execq::note_pass(s, inode, task, pass, cand);
+    0
+}
+
+/// The report of [`exec_env_lsm`]: the file by its identity and its path,
+/// walked into the ring entry itself, and the environment's findings — the
+/// values the record quotes from the task's entry ([`EXECPOL_ENV`], when
+/// the scan stashed them). `tv_ef`: the tier above the findings;
+/// `act_mode`: the action above the file's mode bits. A global function:
+/// inline, its path walk was checked again for every state the judgment
+/// left, past the verifier's budget on 5.15.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_env_report(task: u64, inode: u64, dentry: u64, tv_ef: u64, act_mode: u64) -> u64 {
+    // SAFETY: the task's own entry, kernel reads of the exec's file.
+    unsafe {
+        let wk = crate::task_scratch::current_key();
+        let env = match EXECPOL_ENV.get_ptr(&wk) {
+            Some(e) => Some(&(*e).stash as *const EnvStashRaw),
+            None => None,
+        };
+        report_env_pass(
+            task as *const u8,
+            inode as *const u8,
+            dentry as *const u8,
+            (tv_ef >> 32) as u32,
+            tv_ef as u32,
+            (act_mode >> 32) as u32,
+            env,
+            act_mode as u32,
+        );
     }
     0
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn report_env_pass(
+    task: *const u8,
+    inode: *const u8,
+    dentry: *const u8,
+    tv: u32,
+    ef: u32,
+    env_act: u32,
+    env: Option<*const EnvStashRaw>,
+    mode_bits: u32,
+) {
+    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+        Some(e) => e,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+            bump(counter::RING_FULL);
+            return;
+        }
+    };
+    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+    crate::zero::zero(raw);
+    fill_head(raw, task);
+    (*raw).kind = kind::EXEC;
+    (*raw).tier = tv;
+    (*raw).env_action = env_act;
+    (*raw).env_flags = ef;
+    if let Some(e) = env {
+        (*raw).env_count = (*e).count;
+        (*raw).tunables_len = (*e).tunables_len;
+        let _ = generated::bpf_probe_read_kernel(
+            (*raw).preload.as_mut_ptr() as *mut c_void,
+            (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
+                as u32,
+            (*e).preload.as_ptr() as *const c_void,
+        );
+    }
+    (*raw).file_mode = mode_bits;
+    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+        (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+    }
+    let k = inode_key(inode);
+    let task_root = crate::exec_lsm::task_root_of(task);
+    let wf = crate::exec_lsm::exe_walk(&mut (*raw).exe, dentry, task_root) as u32;
+    (*raw).exe.dev = k.dev;
+    (*raw).exe.ino = k.ino;
+    (*raw).exe.flags = exe_flags::KNOWN | wf;
+    entry.submit(0);
 }
 
 /// The common fields of a report.
@@ -1211,6 +1355,8 @@ pub extern "C" fn nn_env_chunk(p: u64, kind_flags: u64, tid: u64, start: u64, se
             // functions: inline, their branches multiplied the loop's
             // states past the verifier's million instructions
             let b = *buf.add(i);
+            // the re-check of #547 (G1–G4): a control byte, a `$`
+            value_parse::odd(&mut (*e).parse, b);
             if value_parse::is_sep(kind, b) {
                 let _ = nn_value_end(u64::from(kind), tid, start, sel);
             } else {
@@ -1227,15 +1373,16 @@ pub extern "C" fn nn_env_chunk(p: u64, kind_flags: u64, tid: u64, start: u64, se
     }
 }
 
-/// The end of a value's entry ([`value_parse::end_entry`]) in the entry
-/// ([`env_entry`]: `sel`, `tid`, `start`). A global function: checked once,
-/// called from [`nn_env_chunk`]'s byte loop at each separator.
+/// A separator of a value ([`value_parse::sep`]: its entry's end, an empty
+/// `LD_LIBRARY_PATH` element) in the entry ([`env_entry`]: `sel`, `tid`,
+/// `start`). A global function: checked once, called from
+/// [`nn_env_chunk`]'s byte loop at each separator.
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_value_end(kind: u64, tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
         if let Some(e) = env_entry(sel, tid, start) {
-            value_parse::end_entry(&mut (*e).parse, kind as u32);
+            value_parse::sep(&mut (*e).parse, kind as u32);
         }
     }
     0
@@ -1270,8 +1417,12 @@ unsafe fn zero_parse(p: *mut ValueParse) {
 /// the entry's findings; `cut`: the value went on past the reads.
 #[inline(always)]
 unsafe fn value_found(e: *mut EnvScan, kind: u32, cut: bool) {
-    value_parse::end_entry(&mut (*e).parse, kind);
+    value_parse::end_value(&mut (*e).parse, kind);
     let found = (*e).parse.found;
+    // the re-check of #547 (G1–G4): whichever loader variable
+    if found & value_parse::IRREGULAR != 0 {
+        (*e).stash.flags |= env_flags::LOADER_IRREGULAR;
+    }
     let staging = found & value_parse::STAGING != 0;
     let relative = found & value_parse::RELATIVE != 0;
     let bare = found & value_parse::BARE != 0;
@@ -1444,13 +1595,7 @@ unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 
 /// [`TASK_SCRATCH_CAP`]: crate::task_scratch::TASK_SCRATCH_CAP
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_exec_unwalked(
-    inode: u64,
-    dentry: u64,
-    task: u64,
-    flags_pass: u64,
-    er: u64,
-) -> u64 {
+pub extern "C" fn nn_exec_unwalked(inode: u64, dentry: u64, task: u64, flags_pass: u64) -> u64 {
     unsafe {
         exec_unwalked(
             inode as *const u8,
@@ -1458,26 +1603,8 @@ pub extern "C" fn nn_exec_unwalked(
             task,
             flags_pass as u32,
             (flags_pass >> 32) as u8,
-            er,
         )
     }
-}
-
-/// The environment of an exec judged without its walk, read by
-/// `exec_check_lsm` itself (`er`: [`nn_exec_env`]'s result) — not from
-/// [`nn_exec_unwalked`], whose frame would sit under the scan's three
-/// (the verifier sums a call chain's frames: 512 bytes).
-#[inline(always)]
-pub(crate) unsafe fn env_for_unwalked(task: u64, pass: u8) -> u64 {
-    if pass != 0
-        || conf(conf_slot::MODE) == mode::OFF
-        || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0
-    {
-        return 0;
-    }
-    let _ = EXECPOL_ENV_SEEN.remove(&task);
-    let wk = crate::task_scratch::current_key();
-    nn_exec_env(task, u64::from(wk.tid), wk.start_ns)
 }
 
 #[inline(always)]
@@ -1487,7 +1614,6 @@ unsafe fn exec_unwalked(
     task: u64,
     fl: u32,
     pass: u8,
-    er: u64,
 ) -> u64 {
     let m = conf(conf_slot::MODE);
     if m == mode::OFF {
@@ -1496,11 +1622,9 @@ unsafe fn exec_unwalked(
         return 0;
     }
     let t_ptr = task as *const u8;
-    let wk = crate::task_scratch::current_key();
     let tv = nn_execpol_tier(task) as u32;
     let t = tv & 3;
     let mut sig = tv & !tier::MASK;
-    let tb = 1u64 << t;
     // The classes that need no walk.
     let mut classes = 0u32;
     if fl & exe_flags::MEMFD != 0 {
@@ -1522,65 +1646,21 @@ unsafe fn exec_unwalked(
     let ex = exemptions(t_ptr, inode, &mut sig);
     let deny_c = classes & conf(conf_slot::DENY + t) as u32 & !ex & !(conf(conf_slot::CLASS_AUDIT) as u32);
     let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-    let setid = mode_bits & 0o6000 != 0;
-    let root = tv & tier_sig::ROOT != 0;
-    let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0
-        || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
-    let ef = er as u32;
-    let stashed = er & ENV_STASHED != 0;
-    let protected = env_deny_rule || setid;
-    // The review of #547 (F5): an environment this pass could not read (its
-    // own map full, a page gone) is not refused here — the post-commit
-    // check reads the kernel's copy in a buffer this flood cannot take, and
-    // kills what it must; refusing it refused every service exec once both
-    // maps were full.
-    let env_refused = (ef & env_flags::DENYABLE != 0 && env_deny_rule)
-        || (protected && ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0);
+    // The re-check of #547 (G6): the environment is judged by its own
+    // program ([`exec_env_lsm`]), which reads it into its own entry whether
+    // or not this walk could be made.
     let mut act = action::UNWALKED | action::RECORD;
-    let mut env_act = 0u32;
-    let refuse = m == mode::ENFORCE && (deny_c != 0 || env_refused);
+    let refuse = m == mode::ENFORCE && deny_c != 0;
     if refuse {
         bump(counter::LOST);
-        if deny_c != 0 {
-            act |= action::DENY;
-        }
-        if env_refused {
-            env_act |= action::DENY;
-            bump(counter::ENV_DENIED);
-        }
+        act |= action::DENY;
     } else {
         bump(counter::LOST_OPEN);
         if deny_c != 0 {
             act |= action::WOULD_DENY;
         }
-        if env_refused {
-            env_act |= action::WOULD_DENY;
-        }
     }
-    if ef != 0 && conf(conf_slot::ENV_RECORD) & tb != 0 {
-        env_act |= action::RECORD;
-    }
-    if ef & env_flags::UNREADABLE != 0 {
-        bump(counter::ENV_UNREAD);
-    }
-    if ef & env_flags::UNFINISHED != 0 {
-        bump(counter::ENV_TRUNCATED);
-    }
-    let env = if stashed {
-        match EXECPOL_ENV.get_ptr(&wk) {
-            Some(e) => Some(&(*e).stash as *const EnvStashRaw),
-            None => None,
-        }
-    } else {
-        None
-    };
-    report_unwalked(inode, t_ptr, t | sig, classes, act, env_act, ef, env, mode_bits, fl, pass);
-    if stashed {
-        let _ = EXECPOL_ENV.remove(&wk);
-    }
-    if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
-        let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
-    }
+    report_unwalked(inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits, fl, pass);
     // The review of #547 (F4): an earlier, failed exec's candidate is not this
     // exec's (no candidate is made here: the quarantine needs the walk).
     if pass == 0 {

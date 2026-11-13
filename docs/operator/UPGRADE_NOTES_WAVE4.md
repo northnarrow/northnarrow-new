@@ -1573,7 +1573,12 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   `LD_LIBRARY_PATH`) **is refused where a staging preload is** (a tier whose
   rule refuses one, a set-id target) and recorded elsewhere
   (`relative_loader_path`). **A clean value longer than 128 bytes is no
-  longer refused** (it was, as "not finished").
+  longer refused** (it was, as "not finished"). **A loader value with a
+  control byte, an empty `LD_LIBRARY_PATH` element or a `$` token is
+  refused where a staging preload is** (`irregular_loader_value`): check
+  scripts that build `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/x` with the variable
+  unset (an empty first element, the caller's directory) before they run a
+  set-id program or a protected service.
 - **New status counts** on the exec policy's line of `nn-admin status`, when
   not zero: "environments not finished", "changed after the kernel's copy",
   "execs let through without their walk" (`--json`: `env_truncated`,
@@ -1598,9 +1603,16 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   policy's note for the post-commit check. **A new LSM program,
   `execq_exec_failed`** (`file_free_security`), attached with the exec
   quarantine, removes a failed exec's candidate when its file is freed;
-  each uid holds at most 1,024 candidates, and a dropped one is counted in
-  `not_held` and signed (`exec quarantine fail-open`).
-- **The file-open sensor's per-task buffers** are capped per uid (16,384);
+  each login holds at most 1,024 candidates (a session's container
+  subuids count as the login), and a dropped one is counted in `not_held`
+  and signed (`exec quarantine fail-open`); the map full, the oldest
+  stuck candidate goes for the new one, counted and signed the same way.
+- **A new LSM program, `exec_env_lsm`** (`bprm_check_security`), attached by
+  the exec policy when it judges the environment: the environment's check,
+  moved out of the exec sensor's `exec_check_lsm` (each program has its own
+  verifier budget). A tool that lists the agent's programs sees one more on
+  the hook; without it the start signs an `exec_policy` degradation.
+- **The file-open sensor's per-task buffers** are capped per login (16,384);
   past it the open is judged in a buffer of its own run (correct, at the
   cost before lot 325), counted in `nn-admin status --json`
   (`open_sensor_per_call_total`, appended last: a reader that requires the

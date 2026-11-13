@@ -236,16 +236,25 @@ pub mod env_flags {
     /// staging or relative `LD_LIBRARY_PATH`. Where it resolves is not in
     /// the string: refused at a protected or set-id target, recorded.
     pub const PRELOAD_RELATIVE: u32 = 1 << 17;
+    /// The re-check of #547 (G1–G4): a loader variable's value (`LD_PRELOAD`,
+    /// `LD_AUDIT`, `LD_LIBRARY_PATH`) holding a control byte (glibc keeps a
+    /// tab inside an `LD_PRELOAD` entry; musl splits its library path on a
+    /// newline), an empty `LD_LIBRARY_PATH` element (the caller's directory)
+    /// or a `$` (glibc expands `$LIB`, `$ORIGIN`, `$PLATFORM`): what the loader
+    /// does with it is not in the string as the check reads it. Refused at a
+    /// protected or set-id target, recorded elsewhere. Legitimate set-id
+    /// execs carry none of them.
+    pub const LOADER_IRREGULAR: u32 = 1 << 18;
     /// What the first pass refuses at a protected or set-id target: an
     /// array past the cap (or more judged names than the scan reads), a
-    /// relative loader path. A loader value longer than the scan reads
+    /// relative loader path, an irregular loader value. A loader value longer than the scan reads
     /// (`LOADER_CUT`) is not refused there — the review of #547 (F7): a
     /// clean long value is legitimate — and is judged in the kernel's copy
     /// at the commit.
-    pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE;
+    pub const FIRST_PASS_FAIL_CLOSED: u32 = TRUNCATED | PRELOAD_RELATIVE | LOADER_IRREGULAR;
     /// What the post-commit check cannot clear in the kernel's copy, which
     /// kills a protected or set-id target (the review of #547, F2).
-    pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE;
+    pub const UNJUDGED: u32 = UNFINISHED | UNREADABLE | PRELOAD_RELATIVE | LOADER_IRREGULAR;
     /// Loader variables that can load code.
     pub const LOADER: u32 = LD_PRELOAD | LD_AUDIT;
     /// Findings a deny can rest on.
@@ -551,6 +560,7 @@ pub fn env_names(bits: u32) -> alloc::vec::Vec<&'static str> {
         (env_flags::CHANGED, "changed_after_the_kernel_s_copy"),
         (env_flags::LOADER_CUT, "loader_value_cut"),
         (env_flags::PRELOAD_RELATIVE, "relative_loader_path"),
+        (env_flags::LOADER_IRREGULAR, "irregular_loader_value"),
     ] {
         if bits & bit != 0 {
             out.push(name);
@@ -716,16 +726,24 @@ pub mod value_parse {
     pub const RELATIVE: u32 = 1 << 1;
     /// A bare name (no `/`): searched in the library path.
     pub const BARE: u32 = 1 << 2;
+    /// The re-check of #547 (G1–G4): a control byte or a `$` in the value,
+    /// or an empty `LD_LIBRARY_PATH` element ([`env_flags::LOADER_IRREGULAR`]).
+    ///
+    /// [`env_flags::LOADER_IRREGULAR`]: super::env_flags::LOADER_IRREGULAR
+    pub const IRREGULAR: u32 = 1 << 3;
 
     /// The variable a value belongs to.
     pub const KIND_PRELOAD: u32 = 0;
     pub const KIND_AUDIT: u32 = 1;
     pub const KIND_LIBPATH: u32 = 2;
 
-    /// [`ValueParse::st`]: inside an entry, the entry absolute, a `/` seen.
+    /// [`ValueParse::st`]: inside an entry, the entry absolute, a `/` seen;
+    /// and the last byte a separator (an empty `LD_LIBRARY_PATH` element at
+    /// the value's end).
     const IN: u32 = 1 << 0;
     const ABS: u32 = 1 << 1;
     const SLASH: u32 = 1 << 2;
+    const SEP: u32 = 1 << 3;
 
     /// The parse of one value: the first two components of the normalised
     /// path so far (their first eight bytes and length), the current one,
@@ -777,7 +795,8 @@ pub mod value_parse {
         match kind {
             KIND_PRELOAD => b == b':' || b == b' ' || (b >= 9 && b <= 13),
             KIND_AUDIT => b == b':',
-            _ => b == b':' || b == b';',
+            // glibc `":;"`, musl `":\n"`
+            _ => b == b':' || b == b';' || b == b'\n',
         }
     }
 
@@ -851,13 +870,45 @@ pub mod value_parse {
         p.depth = 0;
     }
 
+    /// The re-check of #547 (G1–G4): any byte of a value — a control byte
+    /// or a `$` makes it [`IRREGULAR`].
+    #[inline(always)]
+    pub fn odd(p: &mut ValueParse, b: u8) {
+        if b < 0x20 || b == 0x7f || b == b'$' {
+            p.found |= IRREGULAR;
+        }
+    }
+
+    /// A separator of a value of `kind`: the entry before it ends; in an
+    /// `LD_LIBRARY_PATH`, a separator with no entry before it is an empty
+    /// element — the caller's directory (glibc's `fillin_rpath`).
+    #[inline(always)]
+    pub fn sep(p: &mut ValueParse, kind: u32) {
+        if kind == KIND_LIBPATH && p.st & IN == 0 {
+            p.found |= IRREGULAR;
+        }
+        end_entry(p, kind);
+        p.st |= SEP;
+    }
+
     /// A byte `b` that is no separator: the start of an entry, if one is
     /// not open (absolute when it is a `/`).
     #[inline(always)]
     pub fn begin(p: &mut ValueParse, b: u8) {
+        p.st &= !SEP;
         if p.st & IN == 0 {
-            p.st = IN | if b == b'/' { ABS } else { 0 };
+            p.st |= IN | if b == b'/' { ABS } else { 0 };
         }
+    }
+
+    /// The value's end (its NUL): the last entry judged; an `LD_LIBRARY_PATH`
+    /// that ends with a separator ends with an empty element.
+    #[inline(always)]
+    pub fn end_value(p: &mut ValueParse, kind: u32) {
+        if kind == KIND_LIBPATH && p.st & SEP != 0 {
+            p.found |= IRREGULAR;
+        }
+        end_entry(p, kind);
     }
 
     /// A `/` inside an entry: the component before it ends.
@@ -879,13 +930,14 @@ pub mod value_parse {
     }
 
     /// One byte of a value of `kind` (not its NUL: the value's end is
-    /// [`end_entry`]). The eBPF program runs the same steps, its separator
+    /// [`end_value`]). The eBPF program runs the same steps, its separator
     /// and `/` ones in global functions (`agent-ebpf/src/execpol.rs`,
     /// `nn_env_chunk`).
     #[inline(always)]
     pub fn byte(p: &mut ValueParse, kind: u32, b: u8) {
+        odd(p, b);
         if is_sep(kind, b) {
-            end_entry(p, kind);
+            sep(p, kind);
             return;
         }
         begin(p, b);
@@ -905,7 +957,7 @@ pub mod value_parse {
             }
             byte(&mut p, kind, b);
         }
-        end_entry(&mut p, kind);
+        end_value(&mut p, kind);
         p.found
     }
 }
