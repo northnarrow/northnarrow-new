@@ -575,7 +575,11 @@ adds:
 Implemented in lab PR 52:
 
 - **Kernel** (`agent-ebpf/src/open_sensor.rs`). `observe()` runs inside
-  `fim_file_open_sensor` and is armed by userland. Directory renames
+  `fim_file_open_sensor` and is armed by userland (lot 332: past the FIM
+  watch, the sensor is three global functions called in turn —
+  `nn_open_class`, `nn_open_count_write`, `nn_open_observe` — each
+  verified once: inline, 5.15 processed 821,228 instructions for the
+  program, 765k in its own body; KERNEL_COMPATIBILITY, 5.15 rule 12). Directory renames
   invalidate the cache; `open_sensor_rmdir` drops the removed directory's
   entry. The ancestor walk of a cache miss is a global BPF function
   (`nn_open_walk`), which the verifier checks once on its own. Inlined,

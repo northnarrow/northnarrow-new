@@ -619,23 +619,35 @@ The rules are outside the frozen V2 validation denominator, like
   exec's file (the LSM `file_free_security` program `execq_exec_failed`,
   which removes the task's candidate naming that inode); each share holds
   at most 1024 candidates (`EXECQ_CAND_UIDS`) — the re-check of #547 (G5):
-  a login's share (`task->loginuid`, which every process of the session
-  keeps, the subuids of a rootless container included, and none can change
-  in a user namespace), a service's uid without one; it was the uid's, and
-  four subuids of one login filled the map. The shares the rows' map has no
-  room for share one overflow row under the same cap. The map full, the
-  oldest candidate still in it — made at least a second ago (its exec is
-  stuck: no program of its task holds it), found in a ring of the
-  candidates in the order they were made — goes for the new one
-  (`CAND_EVICTED`); none old enough, the new one is dropped
-  (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
+  it was the uid's, and four subuids of one login filled the map. Lot 332
+  (the re-check 2, G5): an account's share, a key the task cannot choose
+  (`task_scratch::nn_share_key`, `wire::execq::share_key`) — its uid in
+  the initial user namespace; in a user namespace, the account that made
+  the outermost one (a rootless container's subuids, nested namespaces
+  included, are its user's), or that namespace's inode number when root
+  made it (one share per system container). The login uid it was keyed by
+  is set to any value, without a privilege, by a task that has none (a
+  service, a container under a root daemon): one share per child. The
+  shares the rows' map has no room for share one overflow row under the
+  same cap, and every share's entries are counted together (lot 332, the
+  global cap): past the map's room less one share's (3072), a share
+  holding 16 candidates or more takes no more, so the shares at their cap
+  leave room for 64 others. The map full, the oldest candidate still in it
+  — made at least a second ago (its exec is stuck: no program of its task
+  holds it) — goes for the new one (`CAND_EVICTED`); lot 332: found by
+  walking the map (`bpf_for_each_map_elem`, every entry, on the full map's
+  path only), where it was the first 8 slots of a ring of the candidates
+  in the order they were made, which failed execs (a candidate made, then
+  removed with its file) filled with gone ones. None old enough, the new
+  one is dropped (`CAND_DROPPED`). Either is an exec that ran unheld — counted in
   `not_held` and in the signed `exec quarantine fail-open` degradation (one
   per ten minutes while they move). `task_free` is attached
   once per object and the agent tracks "attached", not "loaded" (F9: a load
   whose attach failed made the next caller skip it, silently).
 - The review of #547 (F6): the FIM sensor's buffers (`OPEN_TASK`, 65,536
-  tasks) — each share (the login's, the re-check's G5, as above) holds at
-  most 16,384 (`OPEN_TASK_UIDS`); past it, or the
+  tasks) — each share (the account's, the re-check's G5 and lot 332, as
+  above) holds at most 16,384 (`OPEN_TASK_UIDS`), and past 49,152 entries
+  in all no more than 256 (the global cap); past it, or the
   map full, the open is judged in a buffer made and removed in the run
   (`OPEN_TASK_RUN`, the cost before lot 325: an insert and a delete), and
   counted (`nn-admin status`: `open_sensor_per_call_total`); only with no

@@ -1736,3 +1736,40 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   (`NN-L-EXECPOL-001`, Low, "judged without its walk"). The agent signs
   the degradation `execpol_capacity` while it lasts.
 
+
+## 34. The verifier's headroom, and shares no task can choose (lot 332)
+
+- **`deploy/lab/nn-lab.sh verifier-check` fails above 900,000** processed
+  instructions for any program the agent needs, or when it cannot measure
+  one (lab builds only; the agent itself is unchanged by it). It measures
+  5.15 too, with a kprobe event on `check_max_stack_depth` created for the
+  run in a tracing instance of its own (`instances/nn_verifier_check`) and
+  removed at its end; a lab that runs it on a kernel without kprobe events
+  or tracefs and without `verified_insns` (before 5.16) gets a failure,
+  "unmeasured". `NN_VERIFIER_CHECK_BUDGET` lowers the budget, never raises
+  it. The nightly `lab-vm.yml` runs it on every guest
+  ([kernel compatibility, "Verifier headroom"](https://github.com/northnarrow/northnarrow-new/blob/main/docs/operator/KERNEL_COMPATIBILITY.md)).
+- **The file-open sensor runs as global functions** (`nn_open_class`,
+  `nn_open_count_write`, `nn_open_observe`): the same reads, judgments and
+  records in the same order; a tool that dumps the program sees them as
+  its subprograms. `fim_file_open_sensor` processes 144,600 instructions
+  on 5.15 where it processed 821,228.
+- **The FIM buffers' and the exec quarantine's shares are an account's**:
+  the uid in the initial user namespace; in a user namespace, the account
+  that made the outermost one (a rootless container's subuids count as
+  their user's), or that namespace when root made it (one share per system
+  container). They were the login uid's, which a service's children set to
+  any value. A root session (`sudo -i`) now counts in root's share, not the
+  login's. Three optional BTF offsets (`user_namespace.parent`, `.level`,
+  `.owner`; the slots after them move by three, an agent and its object
+  are one build): without them a task's share is its uid's.
+- **A global cap on each shares' map**: past the map's room less one
+  share's (3,072 of the quarantine's 4,096 candidates, 49,152 of the FIM
+  sensor's 65,536 buffers), a share holding a 64th of a share or more takes
+  no more — the FIM open is then judged in its run's own buffer, as past a
+  share's cap; a candidate is dropped (`CAND_DROPPED`, signed with the
+  quarantine's fail-opens).
+- **A full candidates' map evicts its oldest held candidate**, found by
+  walking the map (a candidate made at least a second ago), where the
+  first 8 slots of a ring could all be gone ones. Kernel 5.13 or later
+  (`bpf_for_each_map_elem`), as every kernel the agent supports.

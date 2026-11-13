@@ -10382,3 +10382,66 @@ number in parentheses is a lab PR.
     split), each caught by a named test.
   - Level unchanged: C23's provisional waits on the nightly on the five
     guests; this lot adds three e2e to the privileged suites.
+- **Lot 332 — verifier headroom on every kernel, and the shares no task
+  can choose (C23, C14; no level changes).**
+  - What was open: `verifier-check` printed the verifier's count from 5.16
+    only (5.15: `n/a`, aya keeps no log of a program it loaded), and
+    nothing failed near the limit; `fim_file_open_sensor` was at 821,228 of
+    1,000,000 on 5.15, and two of lot 325's rounds hit the limit on one
+    kernel first. The re-check 2 of #547 (G5, P3): the shares' key was the
+    login uid, which a task without one sets to any value without a
+    privilege; the overflow row bounded only the keys the rows' map could
+    not hold (four shares at their cap filled the 4,096 candidates); a full
+    candidates' map looked for its oldest in the first 8 slots of a ring
+    that failed execs could fill with gone ones.
+  - Done: `verifier-check` measures every program — the program info's
+    count, or on 5.15 the verifier's own counter read by a kprobe event on
+    `check_max_stack_depth` in a tracing instance of its own — and fails a
+    kernel above 900,000 for a program the agent needs, or with one it
+    could not measure; it prints the ten highest; the nightly `lab-vm.yml`
+    runs it on its five guests (a step of its own, its outcome in the gate
+    summary). `fim_file_open_sensor`'s sensor past the FIM watch is three
+    global functions called in turn (`nn_open_class`,
+    `nn_open_count_write`, `nn_open_observe`), the same work in the same
+    order. G5: the key is the uid in the initial user namespace, in a user
+    namespace the creator of the outermost one (its inode when root made
+    it), never the login uid (`nn_share_key`, three optional BTF slots
+    132–134); a total row and a global cap (the map's room less one
+    share's; past it a share of a 64th or more takes no more); the oldest
+    candidate found by walking the map (`bpf_for_each_map_elem`). The
+    mini-hunt: the mass-write window of a writer in the root cgroup was
+    keyed by its uid and login uid (one window per child of a service that
+    sets it): its uid alone now.
+  - Host: `verifier_headroom` (6 tests), `wire::execq` (the key's two
+    tests, the global cap), `task_free` (the total), `btf_offsets` (the
+    slots, the layout); `xtask/tests/verifier_headroom.rs` (3, new),
+    `lab_ci.rs` (the nightly step), the updated `exec_env_complete.rs` and
+    `percpu_maps.rs`; 40 mutants, each caught by a named test; gates green
+    once (114 suites, 5,004 passed).
+  - Lab, as measured (our guests, lease k332): every program loads within
+    the budget on 5.15.0-202, 6.8.0-149, 6.12.116 and 7.0.0-43, before and
+    after; `fim_file_open_sensor` 821,228 → 144,600 (5.15), 149,234 →
+    135,781 (6.8), 171,964 → 155,416 (6.12), 275,019 → 263,368 (7.0), its
+    deepest call chain 480 of 512 bytes; the highest program on any of them
+    after the lot is `module_read_file_observe`, 551,900 on 5.15. 5.15's counts came from the kprobe, equal to
+    `bpftrace`'s on the same counter for five programs; on 7.0 the kprobe
+    and the program info agreed for 100 of 100 programs. With the budget
+    lowered to 500,000 the 5.15 run failed, naming
+    `module_read_file_observe` 551,900. The FIM sensor's behaviour:
+    `open-sensor-check` 24 of 24 on 5.15 before and after,
+    `fim_privileged_e2e` 6 of 6 after; on 6.12 `open-sensor-check` 24 of 24 and
+    `fim_privileged_e2e` 6 of 6; on 7.0 `fim_privileged_e2e` 6 of 6, and
+    `open-sensor-check` stopped at its eighth case for `main` and the lot
+    alike, the same boot: the agent's COMBAT killed the check's own shell
+    (its mass write, corroborated by a High `NN-L-AT-001` on systemd loading
+    a tracepoint BPF program as the check starts) — a follow-up on 7.0,
+    not this lot's. Its cost on 5.15 (bpf_stats, 300,000
+    opens, best of three, the same boot): 406.4 ns per open on `main`,
+    358.7 ns after. G5 on 5.15 (the same boot): a service's ten children,
+    each writing its own login uid (5001–5010) before its first open, took
+    ten rows on `main` and none after (all counted in the service's uid's
+    row, 33); the lab user's processes in user namespaces it made, one and
+    two deep, counted in its own row (1000); after the lot the same on 6.12.
+  - Level unchanged: the gate is the lab's and the nightly's; C23's
+    provisional waits on the nightly on the five guests, now with the
+    verifier step.

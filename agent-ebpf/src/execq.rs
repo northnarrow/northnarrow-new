@@ -33,8 +33,8 @@ use northnarrow_common::wire::exe::{
     exe_flags, exe_path_slot, ExeIdentityRaw, TaskKey, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
 };
 use northnarrow_common::wire::execq::{
-    class, conf_slot, counter, mode, root_kind, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown,
-    ExecqStopRaw, ExecqStopped,
+    class, conf_slot, counter, global_cap, mode, root_kind, share_floor, stop_flags, ExecqCandRaw,
+    ExecqKey, ExecqKnown, ExecqStopRaw, ExecqStopped, SHARE_ROWS,
 };
 
 use crate::btf_offsets::{
@@ -93,38 +93,28 @@ static EXECQ_CAND: HashMap<u64, ExecqCandRaw> = HashMap::with_max_entries(EXECQ_
 /// `sched_process_exec`.
 pub(crate) const EXECQ_CAND_CAP: u32 = 4096;
 /// The review of #547 (F4; the re-check, G5): one share of [`EXECQ_CAND`] —
-/// a login's (its container subuids included: they keep the login uid), or
-/// a service's uid (`crate::task_scratch::share_key`): one user's threads,
-/// each held in an exec (a FUSE-backed binary it never answers), cannot
-/// take the room every other user's execs need. It was the uid's: four
-/// subuids of one login filled the map.
+/// an account's (`crate::task_scratch::nn_share_key`: its uid, or the
+/// creator of its user namespaces — a rootless container's subuids are its
+/// user's), so one user's threads, each held in an exec (a FUSE-backed
+/// binary it never answers), cannot take the room every other user's execs
+/// need. It was the uid's: four subuids of one login filled the map.
 pub(crate) const EXECQ_CAND_PER_SHARE: u64 = 1024;
+/// Lot 332 (the re-check 2 of #547, G5): the global cap of the shares —
+/// the map's room less one share's; past it a share takes no more than
+/// [`EXECQ_CAND_FLOOR`] (`wire::execq::share_admits`).
+pub(crate) const EXECQ_CAND_GLOBAL: u64 = global_cap(EXECQ_CAND_CAP as u64, EXECQ_CAND_PER_SHARE);
+pub(crate) const EXECQ_CAND_FLOOR: u64 = share_floor(EXECQ_CAND_PER_SHARE);
 /// The candidates each share holds ([`EXECQ_CAND_PER_SHARE`]).
 #[map]
 static EXECQ_CAND_UIDS: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// The candidates of the shares [`EXECQ_CAND_UIDS`] has no row for (it is
-/// full), under the same cap (`OVERFLOW_SHARE`).
+/// full), under the same cap (`OVERFLOW_ROW`: `OVERFLOW_SHARE`), and lot
+/// 332's total of every share's (`TOTAL_ROW`: the global cap).
 #[map]
-static EXECQ_CAND_OVERFLOW: Array<u64> = Array::with_max_entries(1, 0);
-/// The re-check of #547 (G5): the candidates in the order they were made
-/// (task, time), a ring over [`EXECQ_CAND_CAP`] slots from
-/// [`EXECQ_CAND_HEAD`]: with the map full, the oldest goes for the newest
-/// ([`evict_oldest`]).
-#[map]
-static EXECQ_CAND_RING: Array<CandSlot> = Array::with_max_entries(EXECQ_CAND_CAP, 0);
-#[map]
-static EXECQ_CAND_HEAD: Array<u64> = Array::with_max_entries(1, 0);
-/// One slot of [`EXECQ_CAND_RING`].
-#[repr(C)]
-pub(crate) struct CandSlot {
-    task: u64,
-    at: u64,
-}
+static EXECQ_CAND_OVERFLOW: Array<u64> = Array::with_max_entries(SHARE_ROWS, 0);
 /// A candidate younger than this is never evicted: its exec is in flight,
 /// and its own program may hold it.
 const EVICT_MIN_AGE_NS: u64 = 1_000_000_000;
-/// The ring slots looked at, oldest first, for one to evict.
-const EVICT_PROBES: u64 = 8;
 /// Where a candidate is built (584 bytes: never on the stack): the running
 /// task's own entry, made, copied into [`EXECQ_CAND`] and removed in one
 /// run. Lot 322: it was a per-CPU buffer in a program that runs
@@ -637,6 +627,8 @@ unsafe fn cand_put(task: u64, cand: *mut ExecqCandRaw) {
         &EXECQ_CAND_OVERFLOW,
         crate::task_scratch::share_key(),
         EXECQ_CAND_PER_SHARE,
+        EXECQ_CAND_GLOBAL,
+        EXECQ_CAND_FLOOR,
     ) {
         Some(r) => r,
         None => {
@@ -655,56 +647,74 @@ unsafe fn cand_put(task: u64, cand: *mut ExecqCandRaw) {
         }
         bump(counter::CAND_EVICTED);
     }
-    ring_note(task, now);
 }
 
-/// The re-check of #547 (G5): the candidate made at `at` for `task`, noted
-/// in the ring ([`EXECQ_CAND_RING`]) over its oldest slot. The head is a
-/// plain read-modify-write (no atomics here): two candidates made at the
-/// same instant can share a slot — the one lost from the ring is still
-/// removed by its exec's end, its file or its task.
-#[inline(always)]
-unsafe fn ring_note(task: u64, at: u64) {
-    if let Some(h) = EXECQ_CAND_HEAD.get_ptr_mut(0) {
-        let i = (*h % EXECQ_CAND_CAP as u64) as u32;
-        if let Some(slot) = EXECQ_CAND_RING.get_ptr_mut(i) {
-            (*slot).task = task;
-            (*slot).at = at;
+/// Lot 332 (the re-check 2 of #547, G5): what the walk of [`evict_oldest`]
+/// carries, on its caller's stack: the time, and the oldest candidate old
+/// enough so far (its task, when it was made).
+#[repr(C)]
+struct Oldest {
+    now: u64,
+    task: u64,
+    at: u64,
+}
+
+/// [`evict_oldest`]'s step, called by the kernel for each entry of
+/// [`EXECQ_CAND`] (`bpf_for_each_map_elem`; a static function, as the
+/// verifier wants a callback): a candidate made at least
+/// [`EVICT_MIN_AGE_NS`] before `now`, older than the oldest so far, is the
+/// one. 0: go on.
+#[inline(never)]
+extern "C" fn oldest_candidate(_map: *mut c_void, key: *const u64, value: *const ExecqCandRaw, ctx: *mut Oldest) -> u64 {
+    // SAFETY: the kernel passes the entry's key and value, and the
+    // caller's `Oldest`.
+    unsafe {
+        let at = (*value).at;
+        let now = (*ctx).now;
+        if now > at && now - at >= EVICT_MIN_AGE_NS && ((*ctx).task == 0 || at < (*ctx).at) {
+            (*ctx).task = *key;
+            (*ctx).at = at;
         }
-        *h = (*h).wrapping_add(1);
     }
+    0
 }
 
-/// The re-check of #547 (G5): with the map full, the oldest candidate still
-/// in it (the ring's slots from its head, [`EVICT_PROBES`] of them) is
-/// removed — one made at least [`EVICT_MIN_AGE_NS`] ago, whose exec is
-/// stuck (a binary served by a FUSE file system that never answers): no
-/// program of its task holds it then. `false`: none of them.
+/// The re-check of #547 (G5): with the map full, the oldest candidate in it
+/// made at least [`EVICT_MIN_AGE_NS`] ago — whose exec is stuck (a binary
+/// served by a FUSE file system that never answers): no program of its task
+/// holds it then — is removed. Lot 332 (the re-check 2): found by walking
+/// the map itself (`bpf_for_each_map_elem`, 5.13+), every entry; it was the
+/// first 8 slots of a ring of the candidates in the order they were made,
+/// which failed execs (each a candidate made, then removed with its file)
+/// filled with gone candidates — the map full of held ones, nothing was
+/// found and every later candidate was dropped. Only on the full map's
+/// path. `false`: none old enough.
 #[inline(always)]
 unsafe fn evict_oldest(now: u64) -> bool {
-    let head = match EXECQ_CAND_HEAD.get(0) {
-        Some(h) => *h,
-        None => return false,
+    let mut o = Oldest {
+        now,
+        task: 0,
+        at: 0,
     };
-    let mut k = 0u64;
-    while k < EVICT_PROBES {
-        let i = ((head + k) % EXECQ_CAND_CAP as u64) as u32;
-        if let Some(slot) = EXECQ_CAND_RING.get(i) {
-            let (t, at) = (slot.task, slot.at);
-            if t != 0 {
-                let live = match EXECQ_CAND.get(&t) {
-                    Some(c) => c.at == at,
-                    None => false,
-                };
-                if live && now > at && now - at >= EVICT_MIN_AGE_NS {
-                    cand_take(t);
-                    return true;
-                }
-            }
-        }
-        k += 1;
+    let _ = generated::bpf_for_each_map_elem(
+        &EXECQ_CAND as *const HashMap<u64, ExecqCandRaw> as *mut c_void,
+        oldest_candidate as *const () as *mut c_void,
+        &mut o as *mut Oldest as *mut c_void,
+        0,
+    );
+    if o.task == 0 {
+        return false;
     }
-    false
+    // still the one the walk found (its exec did not end meanwhile: gone,
+    // it made the room itself)
+    let same = match EXECQ_CAND.get(&o.task) {
+        Some(c) => c.at == o.at,
+        None => false,
+    };
+    if same {
+        cand_take(o.task);
+    }
+    true
 }
 
 /// `task`'s candidate removed, its uid's share given back

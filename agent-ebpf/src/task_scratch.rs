@@ -32,9 +32,12 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::exe::TaskKey;
 
-use northnarrow_common::wire::execq::OVERFLOW_SHARE;
+use northnarrow_common::wire::execq::{share_admits, OVERFLOW_ROW, OVERFLOW_SHARE, TOTAL_ROW, USERNS_MAX_LEVEL};
 
-use crate::btf_offsets::{TASK_STRUCT_LOGINUID_OFFSET, TASK_STRUCT_START_TIME_OFFSET};
+use crate::btf_offsets::{
+    CRED_USER_NS_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_START_TIME_OFFSET, USER_NAMESPACE_INUM_OFFSET,
+    USER_NAMESPACE_LEVEL_OFFSET, USER_NAMESPACE_OWNER_OFFSET, USER_NAMESPACE_PARENT_OFFSET,
+};
 
 /// Entries of each per-task map: the runs in flight at once, which is the
 /// tasks preempted in the middle of one of these programs. Far above any
@@ -136,54 +139,64 @@ pub fn nn_task_free(ctx: LsmContext) -> i32 {
 /// The review of #547 (F4, F6; the re-check, G5): one share of a map whose
 /// entries outlive a run (the exec quarantine's candidates, the FIM sensor's
 /// task buffers), counted in `rows` (share → entries): the running task's
-/// login's ([`share_key`]: its subuids, a rootless container's, are the
-/// login's), so that one login cannot take the room every other one needs.
-/// Takes one more entry of `key`'s share, below `cap`, and returns the row
-/// it was counted in — `key`'s, or, when `rows` has no room for a new row,
-/// the overflow row ([`OVERFLOW_SHARE`], `overflow[0]`, the same cap: the
-/// keys the map cannot track share one, they are not let through
-/// uncounted). `None`: the share is taken. The counts are plain
-/// read-modify-writes (no atomics in this crate: the re-review of #494, R1)
-/// — two runs updating one row at the same instant can lose an update; the
-/// agent recounts both maps from their entries (the candidates' every 30 s,
-/// the task buffers' when opens lost their buffer), so a drift lasts no
-/// longer.
+/// account's ([`nn_share_key`]), so that one account cannot take the room
+/// every other one needs. Takes one more entry of `key`'s share and returns
+/// the row it was counted in — `key`'s, or, when `rows` has no room for a
+/// new row, the overflow row ([`OVERFLOW_SHARE`], `overflow[OVERFLOW_ROW]`,
+/// the same cap: the keys the map cannot track share one, they are not let
+/// through uncounted). `None`: the share is taken.
+///
+/// Lot 332 (the re-check 2 of #547, G5): and a global cap.
+/// `overflow[TOTAL_ROW]` counts every share's entries; past `global` (the
+/// map's room less one share's), only a share holding fewer than `floor`
+/// takes one more (`wire::execq::share_admits`): four shares at their cap
+/// filled the map, and every later candidate was dropped. A row made here
+/// for a new key is made empty and counted only when the take is admitted;
+/// one another run made at the same instant is found again, not counted in
+/// the overflow row.
+///
+/// The counts are plain read-modify-writes (no atomics in this crate: the
+/// re-review of #494, R1) — two runs updating one row at the same instant
+/// can lose an update; the agent recounts both maps from their entries
+/// (the candidates' every 30 s, the task buffers' when opens lost their
+/// buffer), the total with them, so a drift lasts no longer.
 #[inline(always)]
 pub(crate) fn share_take(
     rows: &HashMap<u32, u64>,
     overflow: &Array<u64>,
     key: u32,
     cap: u64,
+    global: u64,
+    floor: u64,
 ) -> Option<u32> {
-    if let Some(n) = rows.get_ptr_mut(&key) {
-        // SAFETY: a map value's address.
-        unsafe {
-            if *n >= cap {
-                return None;
+    let total = overflow.get_ptr_mut(TOTAL_ROW)?;
+    let (n, row) = match rows.get_ptr_mut(&key) {
+        Some(n) => (n, key),
+        None => {
+            let _ = rows.insert(&key, &0u64, BPF_NOEXIST);
+            match rows.get_ptr_mut(&key) {
+                Some(n) => (n, key),
+                None => (overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE),
             }
-            *n += 1;
         }
-        return Some(key);
-    }
-    if rows.insert(&key, &1u64, BPF_NOEXIST).is_ok() {
-        return Some(key);
-    }
-    let n = overflow.get_ptr_mut(0)?;
-    // SAFETY: as above.
+    };
+    // SAFETY: map values' addresses.
     unsafe {
-        if *n >= cap {
+        if !share_admits(*n, *total, cap, global, floor) {
             return None;
         }
         *n += 1;
+        *total += 1;
     }
-    Some(OVERFLOW_SHARE)
+    Some(row)
 }
 
-/// The row `row` ([`share_take`]'s) gave one entry back; never below zero.
+/// The row `row` ([`share_take`]'s) gave one entry back, and the total;
+/// never below zero.
 #[inline(always)]
 pub(crate) fn share_give(rows: &HashMap<u32, u64>, overflow: &Array<u64>, row: u32) {
     let n = if row == OVERFLOW_SHARE {
-        overflow.get_ptr_mut(0)
+        overflow.get_ptr_mut(OVERFLOW_ROW)
     } else {
         rows.get_ptr_mut(&row)
     };
@@ -195,35 +208,109 @@ pub(crate) fn share_give(rows: &HashMap<u32, u64>, overflow: &Array<u64>, row: u
             }
         }
     }
+    if let Some(t) = overflow.get_ptr_mut(TOTAL_ROW) {
+        // SAFETY: as above.
+        unsafe {
+            if *t > 0 {
+                *t -= 1;
+            }
+        }
+    }
 }
 
 /// `BPF_NOEXIST`: an insert that makes a new entry only.
 const BPF_NOEXIST: u64 = 1;
 
-/// The running task's share key: its login uid, or its uid without one
-/// (`northnarrow_common::wire::execq::share_key`).
-#[inline(always)]
-pub(crate) fn share_key() -> u32 {
-    northnarrow_common::wire::execq::share_key(current_loginuid(), current_uid())
+/// The running task's share key (`northnarrow_common::wire::execq::share_key`):
+/// its real uid in the initial user namespace; in a user namespace, the
+/// creator of the outermost one below the initial namespace, or that
+/// namespace's inode number when root made it (a system container). Lot 332
+/// (the re-check 2 of #547, G5): it was the login uid, which a task whose
+/// login uid is unset (a service, a container under a root daemon) sets to
+/// any value without a privilege.
+///
+/// A global function (no argument): the walk up the namespaces is checked
+/// once, not on every way into its callers.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_share_key() -> u64 {
+    let uid = current_uid();
+    // SAFETY: reads of the running task's credentials and namespaces, each
+    // through `bpf_probe_read_kernel` (0 when unreadable).
+    let (level, owner, inum) = unsafe { outer_user_ns() };
+    u64::from(northnarrow_common::wire::execq::share_key(uid, level, owner, inum))
 }
 
-/// The running task's login uid (`task->loginuid`), or `u32::MAX` when it
-/// has none or the kernel keeps none (no audit).
+/// The running task's share key ([`nn_share_key`]).
 #[inline(always)]
-pub(crate) fn current_loginuid() -> u32 {
-    // SAFETY: a helper call, then a read of the running task.
-    unsafe {
-        let task = aya_ebpf::helpers::bpf_get_current_task() as *const u8;
-        match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
-            Some(o) if !task.is_null() => {
-                match aya_ebpf::helpers::bpf_probe_read_kernel::<u32>(task.add(o) as *const u32) {
-                    Ok(u) => u,
-                    Err(_) => u32::MAX,
-                }
-            }
-            _ => u32::MAX,
-        }
+pub(crate) fn share_key() -> u32 {
+    nn_share_key() as u32
+}
+
+/// The running task's user namespace depth, and the creator (`owner`) and
+/// inode number of its outermost ancestor below the initial namespace; all
+/// 0 (the initial namespace: keyed by the uid) when a field is not known on
+/// this kernel or cannot be read. Each offset is read where it is used, and
+/// every read goes through one scratch word: this runs at the end of the
+/// FIM sensor's deepest call chain (the sensor, the directory walk, the
+/// buffer's share), whose stack the verifier holds to 512 bytes.
+#[inline(always)]
+unsafe fn outer_user_ns() -> (u32, u32, u32) {
+    let Some(o_cred) = off_opt!(TASK_STRUCT_CRED_OFFSET) else {
+        return (0, 0, 0);
+    };
+    let Some(o_ns) = off_opt!(CRED_USER_NS_OFFSET) else {
+        return (0, 0, 0);
+    };
+    let Some(o_level) = off_opt!(USER_NAMESPACE_LEVEL_OFFSET) else {
+        return (0, 0, 0);
+    };
+    let task = bpf_get_current_task() as *const u8;
+    let cred = peek_u64(task.add(o_cred)) as *const u8;
+    let mut ns = peek_u64(cred.add(o_ns)) as *const u8;
+    let level = peek_u32(ns.add(o_level));
+    if level == 0 {
+        return (0, 0, 0);
     }
+    let Some(o_parent) = off_opt!(USER_NAMESPACE_PARENT_OFFSET) else {
+        return (0, 0, 0);
+    };
+    let mut l = level;
+    let mut i = 0u32;
+    while i < USERNS_MAX_LEVEL && l > 1 {
+        ns = peek_u64(ns.add(o_parent)) as *const u8;
+        l = peek_u32(ns.add(o_level));
+        i += 1;
+    }
+    if l != 1 {
+        return (0, 0, 0);
+    }
+    let Some(o_owner) = off_opt!(USER_NAMESPACE_OWNER_OFFSET) else {
+        return (0, 0, 0);
+    };
+    let Some(o_inum) = off_opt!(USER_NAMESPACE_INUM_OFFSET) else {
+        return (0, 0, 0);
+    };
+    (level, peek_u32(ns.add(o_owner)), peek_u32(ns.add(o_inum)))
+}
+
+/// A kernel `u64`, 0 when unreadable, without a branch on the result: the
+/// helper always writes its destination (zeros on a fault). A branch per
+/// read in the namespaces' walk multiplied the states the 5.15 verifier
+/// explores past its million instructions (lot 332's lab).
+#[inline(always)]
+unsafe fn peek_u64(src: *const u8) -> u64 {
+    let mut v = core::mem::MaybeUninit::<u64>::uninit();
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    v.assume_init()
+}
+
+/// A kernel `u32`, as [`peek_u64`].
+#[inline(always)]
+unsafe fn peek_u32(src: *const u8) -> u32 {
+    let mut v = core::mem::MaybeUninit::<u32>::uninit();
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    v.assume_init()
 }
 
 /// The real uid of the running task.

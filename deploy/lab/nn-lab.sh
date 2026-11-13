@@ -1488,6 +1488,10 @@ cmd_verifier_check() {
     # `synced` checks the object `sync` copied (agent-ebpf/target/…) instead
     # of the embedded one: an eBPF change without rebuilding the agent.
     # Report and the refused programs' full verifier logs: $LAB_DIR/reports.
+    # Lot 332: the run also fails when a program the agent needs processed
+    # more than 900,000 instructions (its verifier headroom; the kprobe gives
+    # 5.15's count) — NN_VERIFIER_CHECK_BUDGET lowers that budget, never
+    # raises it.
     vm_running || die "guest is not running"
     local stamp out logs remote was_active=0 rc=0 obj_env=""
     stamp=$(date -u +%Y%m%d-%H%M%S)
@@ -1499,12 +1503,12 @@ cmd_verifier_check() {
         synced) obj_env='NN_VERIFIER_CHECK_OBJECT=$HOME/northnarrow/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf ' ;;
         *) die "verifier-check: unknown argument ${1} (expected: synced)" ;;
     esac
-    local only=${NN_VERIFIER_CHECK_ONLY:-}
+    local only=${NN_VERIFIER_CHECK_ONLY:-} budget=${NN_VERIFIER_CHECK_BUDGET:-}
     if vssh 'systemctl is-active --quiet northnarrow-agent'; then
         was_active=1
         lab_purge_pins >/dev/null
     fi
-    vssh "sudo ${obj_env}${only:+NN_VERIFIER_CHECK_ONLY=$(printf %q "$only") }\$HOME/northnarrow/target/release/northnarrow-agent --verifier-check" | tee "$out" || rc=$?
+    vssh "sudo ${obj_env}${only:+NN_VERIFIER_CHECK_ONLY=$(printf %q "$only") }${budget:+NN_VERIFIER_CHECK_BUDGET=$(printf %q "$budget") }\$HOME/northnarrow/target/release/northnarrow-agent --verifier-check" | tee "$out" || rc=$?
     remote=$(sed -n 's|^verifier logs: \(/var/tmp/nn-verifier-check\.[A-Za-z0-9]*\)$|\1|p' "$out" | tail -1)
     if [[ -n $remote ]]; then
         mkdir -p "$logs"

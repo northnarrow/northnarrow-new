@@ -837,6 +837,80 @@ fn lab_vm_runs_the_gate_in_order_and_keeps_its_evidence() {
     }
 }
 
+/// Lot 332: the verifier's headroom is gated on every guest the workflow
+/// boots (the nightly's five kernels, 5.15 included): `nn-lab.sh
+/// verifier-check` runs after the build and before the install, its report
+/// kept with the evidence, its verdict line in the job summary and as the
+/// error of a failing step; the step does not stop the suites
+/// (`continue-on-error`), and its outcome reaches the gate summary, which
+/// fails the job on it. The check itself fails above 900,000 processed
+/// instructions or on a program it could not measure.
+#[test]
+fn lab_vm_gates_the_verifier_headroom_of_every_program() {
+    let steps = steps();
+    let vc = step_running(&steps, "deploy/lab/nn-lab.sh verifier-check");
+    let build = step_running(&steps, "deploy/lab/nn-lab.sh build");
+    let install = step_running(&steps, "deploy/lab/nn-lab.sh install");
+    assert!(build < vc && vc < install, "{build} {vc} {install}");
+    let s = &steps[vc];
+    assert_eq!(str_of(s, "id"), Some("verifier"));
+    assert_eq!(
+        str_of(s, "if"),
+        Some("steps.kvm.outputs.available == 'true'")
+    );
+    assert_eq!(
+        s.get("continue-on-error").and_then(|v| v.as_bool()),
+        Some(true),
+        "the suites still run after a failed headroom"
+    );
+    let run = run_of(s);
+    for want in [
+        "tee \"$GATE_OUT/verifier-check.md\"",
+        "PIPESTATUS[0]",
+        "'^== verifier headroom '",
+        "'^== verifier-check '",
+        "$GITHUB_STEP_SUMMARY",
+        "::error title=verifier headroom",
+        "exit 1",
+    ] {
+        assert!(run.contains(want), "the verifier step lacks `{want}`");
+    }
+    let summary = step_running(&steps, "xtask gate-summary");
+    let outcomes = str_of(steps[summary].get("env").unwrap(), "OUTCOMES").unwrap();
+    assert!(outcomes.contains("verifier-check=${{ steps.verifier.outcome }}"));
+    // what the step reads is what the check prints, and the budget is the
+    // lot's
+    let vc_src = read("crates/nn-linux/src/verifier_headroom.rs");
+    assert!(vc_src.contains("pub const HEADROOM_BUDGET: u32 = 900_000;"));
+    assert!(vc_src.contains("\"== verifier headroom {kernel}: FAIL — {}\""));
+    assert!(vc_src
+        .contains("\"== verifier headroom {kernel}: OK — every program within {} ({highest})\""));
+    let check = read("crates/nn-linux/src/verifier_check.rs");
+    assert!(check.contains("Ok(failures.is_empty() && verdict.passes())"));
+    // the gate judges every loaded program the agent needs (the probes and
+    // the optional programs aside), with the kprobe's count where the
+    // program info has none
+    let flat_check = check.split_whitespace().collect::<Vec<_>>().join(" ");
+    for want in [
+        ".filter(|r| r.optional.is_none())",
+        "info: *verified, kprobe: *kprobe,",
+        "let verdict = verifier_headroom::judge(&measured, budget);",
+        "*kprobe = p.count(&name);",
+        "p.clear();",
+    ] {
+        assert!(
+            flat_check.contains(want),
+            "verifier_check.rs lacks `{want}`"
+        );
+    }
+    assert!(check.contains(
+        "\"== verifier-check {kernel}: {} programs, {} OK, {} not counted, {} failing{}\""
+    ));
+    assert!(vc_src.contains("pub const TOP: usize = 10;"));
+    assert!(vc_src.contains("out.push(format!(\"top {TOP} by instructions processed:\"));"));
+    assert!(run.contains("top 10 by instructions processed:"));
+}
+
 // ── the scripts parse ─────────────────────────────────────────────────────
 
 fn sh_files(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -610,7 +610,7 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         &[
             "match task_buffer(task) {",
             "crate::fim_watch::observe_open_plain(file);",
-            "on_open_in(file, t);",
+            "on_open_in(file, t, task, live);",
             "if !live {",
             "let _ = OPEN_TASK_RUN.remove(&task);",
         ],
@@ -648,9 +648,10 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
             "crate::task_scratch::share_give(&OPEN_TASK_UIDS, &OPEN_TASK_OVERFLOW, uid);",
         ],
     );
-    // The re-check of #547 (G5): the share is the login's (its subuids
-    // keep the login uid), the uid's without one; a share the rows' map
-    // has no room for is the overflow row's, under the same cap
+    // The re-check of #547 (G5): the share is the account's (lot 332: its
+    // uid, or its user namespaces' creator — a rootless container's subuids
+    // are its user's); a share the rows' map has no room for is the
+    // overflow row's, under the same cap; lot 332: under the global cap
     in_order(
         body(&open, "nn_open_task_make"),
         &[
@@ -659,6 +660,8 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
             "&OPEN_TASK_OVERFLOW,",
             "crate::task_scratch::share_key(),",
             "OPEN_TASK_PER_SHARE,",
+            "OPEN_TASK_GLOBAL,",
+            "OPEN_TASK_FLOOR,",
             "None => return 0,",
             "crate::task_scratch::make(&OPEN_TASK, &task)",
             "(*p).uid = row",
@@ -666,28 +669,105 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
         ],
     );
     let ts = code("agent-ebpf/src/task_scratch.rs");
-    assert!(body(&ts, "share_key")
-        .contains("northnarrow_common::wire::execq::share_key(current_loginuid(), current_uid())"));
-    assert!(body(&ts, "current_loginuid").contains("off_opt!(TASK_STRUCT_LOGINUID_OFFSET)"));
+    // Lot 332 (the re-check 2 of #547, G5): the key is the kernel's — the
+    // uid, or the creator of the outermost user namespace (its inode when
+    // root made it) — never the login uid, which a task without one sets
+    // to anything; one global function walks the namespaces
+    assert!(body(&ts, "share_key").contains("nn_share_key() as u32"));
+    in_order(
+        body(&ts, "nn_share_key"),
+        &[
+            "let uid = current_uid();",
+            "outer_user_ns()",
+            "northnarrow_common::wire::execq::share_key(uid, level, owner, inum)",
+        ],
+    );
+    in_order(
+        body(&ts, "outer_user_ns"),
+        &[
+            "off_opt!(TASK_STRUCT_CRED_OFFSET)",
+            "off_opt!(CRED_USER_NS_OFFSET)",
+            "off_opt!(USER_NAMESPACE_LEVEL_OFFSET)",
+            "let cred = peek_u64(task.add(o_cred)) as *const u8;",
+            "let mut ns = peek_u64(cred.add(o_ns)) as *const u8;",
+            "let level = peek_u32(ns.add(o_level));",
+            "if level == 0 {",
+            "return (0, 0, 0);",
+            "off_opt!(USER_NAMESPACE_PARENT_OFFSET)",
+            "while i < USERNS_MAX_LEVEL && l > 1 {",
+            "ns = peek_u64(ns.add(o_parent)) as *const u8;",
+            "l = peek_u32(ns.add(o_level));",
+            "if l != 1 {",
+            "return (0, 0, 0);",
+            "off_opt!(USER_NAMESPACE_OWNER_OFFSET)",
+            "off_opt!(USER_NAMESPACE_INUM_OFFSET)",
+            "(level, peek_u32(ns.add(o_owner)), peek_u32(ns.add(o_inum)))",
+        ],
+    );
+    assert!(
+        !ts.contains("LOGINUID"),
+        "the login uid keys no share (a task without one sets it to anything)"
+    );
     in_order(
         body(&ts, "share_take"),
         &[
-            "if *n >= cap {",
+            "let total = overflow.get_ptr_mut(TOTAL_ROW)?;",
+            "Some(n) => (n, key),",
+            "let _ = rows.insert(&key, &0u64, BPF_NOEXIST);",
+            "match rows.get_ptr_mut(&key) {",
+            "Some(n) => (n, key),",
+            "None => (overflow.get_ptr_mut(OVERFLOW_ROW)?, OVERFLOW_SHARE),",
+            "if !share_admits(*n, *total, cap, global, floor) {",
             "return None;",
-            "return Some(key);",
-            "rows.insert(&key, &1u64, BPF_NOEXIST).is_ok()",
-            "let n = overflow.get_ptr_mut(0)?;",
-            "if *n >= cap {",
-            "Some(OVERFLOW_SHARE)",
+            "*n += 1;",
+            "*total += 1;",
+            "Some(row)",
         ],
     );
+    in_order(
+        body(&ts, "share_give"),
+        &[
+            "overflow.get_ptr_mut(OVERFLOW_ROW)",
+            "rows.get_ptr_mut(&row)",
+            "if *n > 0 {",
+            "*n -= 1;",
+            "overflow.get_ptr_mut(TOTAL_ROW)",
+            "if *t > 0 {",
+            "*t -= 1;",
+        ],
+    );
+    // the mini-hunt: the mass-write window of a writer in the root cgroup
+    // is its uid's, not its login uid's either
+    let cg = flat(body(&open, "count_cgroup"));
+    assert!(cg.contains("uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32, loginuid: 0,"));
+    assert!(!cg.contains("loginuid()"), "{cg}");
     let wq = flat(&code("common/src/wire/execq.rs"));
-    assert!(wq.contains("if loginuid == u32::MAX { uid } else { loginuid }"));
+    assert!(
+        wq.contains("let k = if level == 0 { uid } else if owner != 0 { owner } else { inum };")
+    );
+    assert!(wq.contains("own < per_share && (total < global || own < floor)"));
+    assert!(wq.contains("capacity - per_share"));
+    assert!(wq.contains("per_share / 64"));
     // the opens judged in a run's own buffer reach `nn-admin status`, and
     // the uids' shares are recounted from the entries
     let os = code("crates/nn-linux/src/sensors/open_sensor.rs");
     assert!(os.contains("take(ebpf, \"OPEN_TASK_COUNTERS\")"));
     assert!(body(&os, "recount_shares").contains("rewrite_shares(&mut self.task_uids, &want)"));
+    // lot 332: the recount rewrites the global cap's total with the rows,
+    // both maps
+    let kq = code("agent/src/execq/kernel.rs");
+    for b in [body(&os, "recount_shares"), body(&kq, "recount_shares")] {
+        in_order(
+            b,
+            &[
+                "let total = ",
+                "total_of(&want);",
+                "(common::wire::execq::OVERFLOW_ROW, overflow),",
+                "(common::wire::execq::TOTAL_ROW, total),",
+                ".set(row, n, 0).is_err()",
+            ],
+        );
+    }
     let st = code("agent/src/admin/handlers/status.rs");
     assert!(st.contains(
         "open_sensor_per_call_total: Some(nn_linux::sensors::open_sensor::per_call_total()),"

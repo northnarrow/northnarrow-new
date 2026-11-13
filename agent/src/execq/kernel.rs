@@ -151,10 +151,17 @@ impl Kernel {
             .filter_map(|r| r.ok())
             .map(|(_, c)| c.0.uid);
         let mut want = nn_linux::sensors::task_free::uid_shares(uids);
+        let total = nn_linux::sensors::task_free::total_of(&want);
         let overflow = nn_linux::sensors::task_free::take_overflow(&mut want);
         let mut r = nn_linux::sensors::task_free::rewrite_shares(&mut self.cand_uids, &want)?;
-        if self.cand_overflow.set(0, overflow, 0).is_err() {
-            r.failed += 1;
+        // lot 332: the overflow row and the total (the global cap's)
+        for (row, n) in [
+            (common::wire::execq::OVERFLOW_ROW, overflow),
+            (common::wire::execq::TOTAL_ROW, total),
+        ] {
+            if self.cand_overflow.set(row, n, 0).is_err() {
+                r.failed += 1;
+            }
         }
         Ok(r)
     }

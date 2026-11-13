@@ -6,6 +6,40 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- Lot 332: verifier headroom on every kernel, for alpha testers' kernels the
+  lab has not seen.
+  - **`verifier-check` measures every program and gates it.** The count
+    the verifier processed to accept each program the agent needs:
+    `bpf_prog_info.verified_insns` from 5.16, on 5.15 the same counter
+    read by a kprobe event (`check_max_stack_depth`) in a tracing instance
+    of its own. Above 900,000 of the million, or unmeasured, the kernel
+    fails; the report lists the ten highest. The nightly lab runs it on
+    its five guests, a failing step with the verdict line as its error
+    (`lab-vm.yml`, the gate summary's `verifier-check` step).
+  - **The file-open sensor is three global functions.**
+    `fim_file_open_sensor` was at 821,228 on 5.15, 765k in its own body
+    (the sensor inline, verified again for every state the FIM watch
+    left): `nn_open_class`, `nn_open_count_write`, `nn_open_observe`,
+    called in turn, the same work in the same order (the write count
+    before the leaf's names, which have no effect of their own) — 144,600
+    on 5.15. A ratchet keeps every global function to `u64` arguments and
+    the sensor's work past the watch in them.
+  - **The shares' key cannot be chosen** (the re-check 2 of #547, G5).
+    The quarantine's candidates and the FIM buffers were counted per
+    login uid, which a task without one — a service, a container under a
+    root daemon — sets to any value without a privilege, one share per
+    child. The key is now the uid in the initial user namespace, and in a
+    user namespace the account that made its outermost ancestor (a
+    rootless container's subuids are its user's), or that namespace when
+    root made it (one share per system container).
+  - **A real global cap**: every share's entries are counted together;
+    past the map's room less one share's, a share holding a 64th of a
+    share or more takes no more — four shares at their cap filled the
+    4,096 candidates.
+  - **The oldest candidate is found by walking the map**
+    (`bpf_for_each_map_elem`), every entry, when the map is full: it was
+    the first 8 slots of a ring, which failed execs filled with gone
+    candidates.
 - Lot 325: the exec environment's check complete and cheap (the re-check
   of #546).
   - **Every variable is read** (R2). The check read the first 64: 64

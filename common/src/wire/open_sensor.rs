@@ -667,13 +667,16 @@ pub fn destroys_an_original(size: u64, had: Option<u64>, now: u64) -> bool {
 }
 
 /// `OPEN_CG_WRITES` key: a cgroup (v2 id), or, where the writer sits in
-/// the root cgroup (no cgroup v2 hierarchy in use), its uid and login uid.
+/// the root cgroup (no cgroup v2 hierarchy in use), its uid.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct OpenCgKey {
     pub cgroup: u64,
     pub uid: u32,
+    /// Always 0. Lot 332 (the mini-hunt of G5): it was the writer's login
+    /// uid, which a task without one sets to any value (one window per
+    /// child, each under the threshold). Kept for the layout.
     pub loginuid: u32,
 }
 

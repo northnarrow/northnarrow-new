@@ -843,10 +843,17 @@ impl OpenSensorMaps {
             .filter_map(|r| r.ok())
             .map(|(_, t)| t.0.uid);
         let mut want = crate::sensors::task_free::uid_shares(uids);
+        let total = crate::sensors::task_free::total_of(&want);
         let overflow = crate::sensors::task_free::take_overflow(&mut want);
         let mut r = crate::sensors::task_free::rewrite_shares(&mut self.task_uids, &want).ok()?;
-        if self.task_overflow.set(0, overflow, 0).is_err() {
-            r.failed += 1;
+        // lot 332: the overflow row and the total (the global cap's)
+        for (row, n) in [
+            (common::wire::execq::OVERFLOW_ROW, overflow),
+            (common::wire::execq::TOTAL_ROW, total),
+        ] {
+            if self.task_overflow.set(row, n, 0).is_err() {
+                r.failed += 1;
+            }
         }
         Some(r)
     }

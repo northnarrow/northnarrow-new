@@ -770,10 +770,9 @@ same rules or the 22.04 guest will refuse to load it:
    unknown folded into it (a global function's result) keeps alive the
    paths that would have returned at `reason == 0`. Count such values
    elsewhere (a map, a separate record) or store them only. The budget is
-   cumulative across the program and its global functions; measure it on
-   the 22.04 guest with `bpftrace` on `do_check_common`
-   (`((struct bpf_verifier_env *)arg0)->insn_processed` at return) —
-   aya's own log stops at 16 MB, before the verdict.
+   cumulative across the program and its global functions; `verifier-check`
+   measures it on every kernel, 5.15 included (lot 332, "Verifier
+   headroom" below) — aya's own log stops at 16 MB, before the verdict.
 8. **Bound any offset added to or subtracted from a hook argument** (all
    kernels, 6.8 included). An LSM hook's `struct inode *` argument is a
    BTF-typed pointer. `inode - off` with `off` read from `BTF_OFFSETS` (a
@@ -818,9 +817,9 @@ same rules or the 22.04 guest will refuse to load it:
     verifier walked one by one. Measure with `deploy/lab/nn-lab.sh
     verifier-check` (every program through the guest's verifier with the
     agent's own loader setup: OK or REFUSED, instructions processed on
-    6.1 and later, stack per frame and per call chain); keep every
-    program well under the limit on 6.1, which reports the count (5.15
-    does not; there, rule 7's `bpftrace` measure).
+    every kernel — 5.15's through a kprobe, lot 332 —, stack per frame
+    and per call chain); keep every program under 900,000 on every
+    kernel (the gate, "Verifier headroom" below).
 11. **A loop whose state is data, in a global function of its own, its
     result in map memory.** The ransomware rename counter (lab PR 225)
     scanned both names' last 16 bytes for an extension and compared their
@@ -832,6 +831,29 @@ same rules or the 22.04 guest will refuse to load it:
     whose results the caller reads from a per-CPU array: values loaded
     from map memory carry no precision back. The decision itself stays
     the shared `common::wire::open_sensor::rename_shape_with`.
+
+12. **What a hook does past its first test is a global function** (lot
+    332). A program's own body is verified again for every state that
+    reaches each of its instructions; a global function once, on its own.
+    `fim_file_open_sensor` read the file and its inode, judged the FIM
+    watch, then ran the file-open sensor inline: 5.15 processed 821,228
+    instructions for it, 765k in the program's body. The sensor is now
+    three global functions called in turn from `on_open_in` —
+    `nn_open_class` (the directory's class, the walk under it),
+    `nn_open_count_write` (the mass-write windows), `nn_open_observe`
+    (the names, the reason, the record) —, the class, the parent dentry
+    and its inode number passed through the task's own buffer: 144,600
+    on 5.15. They are called in turn, never one inside another, because
+    the verifier also holds the deepest call chain's stack to 512 bytes
+    (the sensor's is 480: the program, `nn_open_class`, the walk, the
+    buffer's share, the share's key). Every global function takes and
+    returns `u64`s only (`xtask/tests/verifier_headroom.rs`): 5.15
+    refuses a BTF pointer argument, and a pointer argument is memory
+    there, not a map key. A bounded walk reads branch-free
+    (`bpf_probe_read_kernel` zeroes its destination on a fault): the
+    shares' walk up a task's user namespaces, first written with a
+    branch on each read's result, took its global function past the
+    million on 5.15 by itself.
 
 Lab notes for 22.04-era userland:
 
@@ -849,6 +871,60 @@ Lab notes for 22.04-era userland:
 - RHEL-family sudo sets `HOME=/root` (`always_set_home`), so the root `cargo test`
   of the lab's privileged suites resolves root's own rustup and downloads a
   second toolchain on first use; harmless, just slow once.
+
+## Verifier headroom (lot 332)
+
+The kernel's verifier processes at most a million instructions to accept
+one program (`BPF_COMPLEXITY_LIMIT_INSNS`, the same from 5.2 to 7.0). A
+program near it on the lab's kernels can be refused on a kernel the lab has
+not seen — RHEL and Alma 5.14, Fedora, Arch, an older 5.15 build — and the
+agent then runs without it. `deploy/lab/nn-lab.sh verifier-check`
+(`northnarrow-agent --verifier-check`, lab builds) measures every program
+the agent needs and fails the kernel when one processed more than 900,000
+(90%), or could not be measured:
+
+- the count is the kernel's own, `bpf_prog_info.verified_insns`, from 5.16;
+- on 5.15 the program info has no count and aya keeps no verifier log of a
+  program it loaded, so the same counter (`bpf_verifier_env.insn_processed`)
+  is read by a kprobe event on `check_max_stack_depth`, the verifier's last
+  pass over an accepted program: created for the run, enabled only in a
+  tracing instance of its own (`instances/nn_verifier_check`, the system's
+  trace buffer untouched, `kprobe_events` only appended to), the offsets
+  from the running kernel's BTF, removed at the end. Where the program info
+  has a count too, the report compares the two (the "kprobe cross-check"
+  line); a kernel where neither is available fails the gate, unmeasured;
+- the report ends with the ten programs with the highest count and the
+  verdict line, `== verifier headroom <kernel>: OK|FAIL — …`;
+  `NN_VERIFIER_CHECK_BUDGET=<n>` lowers the budget for a run, never raises
+  it.
+
+The nightly `lab-vm.yml` runs it on its five guests (5.15, 6.1, 6.8, 6.12,
+7.0) after the build, before the install: a failure is that step's, with
+the verdict line as its error and the ten highest in the job summary; the
+privileged suites still run, and the gate summary fails the job.
+
+Measured by lot 332 (our guests; the program info's count, 5.15's by the
+kprobe — equal there to `bpftrace`'s on the same counter for the five
+programs compared), the programs above 200,000 on one kernel at least,
+before (`main` fd22fe5f) and after the lot:
+
+| program | 5.15 before | 5.15 after | 6.8 before | 6.8 after | 6.12 before | 6.12 after | 7.0 before | 7.0 after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `fim_file_open_sensor` | 821,228 | 144,600 | 149,234 | 135,781 | 171,964 | 155,416 | 275,019 | 263,368 |
+| `module_read_file_observe` | 551,900 | 551,900 | 83,784 | 83,784 | 84,080 | 84,080 | 68,066 | 68,066 |
+| `fim_rename_observe` | 109,649 | 110,703 | 215,948 | 217,002 | 250,663 | 251,703 | 359,636 | 360,701 |
+| `execpol_env_commit` | 323,155 | 323,155 | 273,029 | 273,029 | 274,217 | 274,217 | 335,293 | 335,293 |
+| `exec_env_lsm` | 292,123 | 292,170 | 268,903 | 268,931 | 269,131 | 269,159 | 330,221 | 330,261 |
+| `execmap_check` | 326,070 | 326,070 | 262,103 | 262,103 | 304,715 | 304,715 | 277,483 | 277,483 |
+| `fim_unlink_observe` | 53,110 | 54,164 | 104,192 | 105,246 | 138,326 | 139,366 | 244,065 | 245,130 |
+| `cgroup_join_mark` | 207,446 | 207,446 | 40,778 | 40,778 | 25,555 | 25,555 | 49,426 | 49,426 |
+
+`fim_file_open_sensor` was 82% of the limit on 5.15; it is 26.3% (263,368 on 7.0)
+at most on these four kernels (5.15 rule 12 above). The highest after the
+lot is `module_read_file_observe`, 551,900 on 5.15 (55.2%; 68,066 to 84,080 elsewhere). The kprobe's method is checked against the kernel's
+own field where both exist: on 7.0 the two agreed for 100 of 100 programs
+(`kprobe cross-check`); on 6.8 and 6.12 `check_max_stack_depth` is not a
+kprobe target (the program info counts there, so nothing is unmeasured).
 
 ## Kernel fix level (lot 277)
 
