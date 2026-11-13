@@ -6,6 +6,38 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security
+- The system tools a security tool is switched off with are read by the
+  same reader as the interpreters, through a table each (lot 316; the
+  external bug hunt's edition 1.4: BUG-106, BUG-89, BUG-96, BUG-86, N4;
+  `docs/operator/UPGRADE_NOTES_WAVE4.md` §32). `systemctl -P Id stop auditd`,
+  `--si KILL kill auditd`, `-qs KILL kill auditd` (a valued option the
+  hand-written list did not hold, a getopt_long prefix, a cluster) moved the
+  verb onto a value: no NN-L-EVA-001, no DefenseImpairment;
+  `iptables --policy INPUT ACCEPT` and `firewall-cmd --set-default-zone
+  trusted` were compared as exact words: no NN-L-EVA-002; `pkill -n`,
+  `-o`, `-c` and `killall -g` were read as taking a value, so the name after
+  them was lost; `systemctl stop northnarrow-agent auditd` inside a
+  trusted-installer window was judged on its first unit alone and
+  sanctioned; a cloud agent's uninstaller run by a shell was registered as
+  that agent's process. Now `posture/script_args.rs` reads getopt_long's
+  prefixes, getopt_long_only's one-hyphen long options (killall), GNU's
+  permutation and, as a second reading, `POSIXLY_CORRECT`'s, a long option
+  as its letter, the kill family's `-SIGNAL`, iptables' optional chain and
+  two-argument `-P`; the tables (`impair/tool_options.rs`: systemctl, kill,
+  pkill, killall, iptables, nft, firewall-cmd) come from the tools' sources.
+  An option a table does not hold gives an over-approximating reading, never
+  `None` ("(options not understood)" in the record). Every listed unit of a
+  command is judged (the window sanctions only the agent's own units, all of
+  them); a unit glob is matched as systemctl's `fnmatch`; iptables is known
+  by all its names (`iptables-nft`, `iptables-legacy`, the multi-call
+  binaries' `main4`); nft's operands are one command line; pkill's pattern
+  matches a part of the name at least half of it (unless `-x`), `-f`
+  the full command line,
+  `-i`/`-I` any case, killall's `/path` the executable. Lot 310's ratchet
+  (`xtask/tests/interpreter_options.rs`: every option literal and argv read
+  in the product crates) pins `impair/mod.rs` at 4 sites, none an option read (it held 72), and
+  plants these tools' shapes; an `#[ignore]` differential test runs the
+  tables against the real pkill, killall, iptables, nft and systemctl.
 - An interpreter's options are read by one reader, and a fileless exec is
   judged on the executed file (lot 310; the external bug hunt's edition 1.4:
   BUG-97, BUG-88 (P0), BUG-99, BUG-100, BUG-103, BUG-104, N3, the decision

@@ -1,0 +1,778 @@
+{
+  "about": "Lot 316 (external bug hunt, edition 1.4: BUG-106, BUG-89, BUG-96, BUG-86, N4): a security tool switched off by its system tools' other spellings, each from a cron job's own shell (no administrator's session, no coalescing) — systemctl's valued option before the verb (`-P Id`), a cluster ending in one (`-qs KILL`), an option after the verb (`--user`: a unit under POSIXLY_CORRECT), the agent's unit and auditd in one command (auditd named), an option no table holds (the reader's over-approximation, said in the record); iptables' long `--policy`, the multi-call binary's `main4 -F`, nft's command line in one argument, firewall-cmd's separate `--set-default-zone trusted`; pkill's `-n` and killall's `-g` (no value); a cloud agent's uninstaller run by a shell (NN-L-EVA-002, not its tool's process starting). Then an administrator's benign `systemctl status`, an iptables LOG rule whose prefix starts with `-F`, `nft list ruleset`, firewall-cmd's default zone `public`: nothing.",
+  "fires": [
+    "NN-L-EVA-001_SecurityServiceStopped",
+    "NN-L-EVA-002_SecurityToolSwitchedOff",
+    "NN-L-EVA-003_SecurityToolKilled"
+  ],
+  "items": [
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460001,
+          "ppid": 1,
+          "uid": 0,
+          "gid": 0,
+          "comm": "cron",
+          "filename": "/usr/sbin/cron",
+          "timestamp_ns": 3000000000000,
+          "argv": [
+            "/usr/sbin/cron",
+            "-f"
+          ],
+          "parent_comm": "",
+          "start_ns": 2999999000000,
+          "exe": {
+            "path": "/usr/sbin/cron"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460100,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3020000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl -P Id stop auditd"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3019999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460101,
+          "ppid": 5460100,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3021000000000,
+          "argv": [
+            "systemctl",
+            "-P",
+            "Id",
+            "stop",
+            "auditd"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3020999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460102,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3040000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl -qs KILL kill auditd.service"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3039999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460103,
+          "ppid": 5460102,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3041000000000,
+          "argv": [
+            "systemctl",
+            "-qs",
+            "KILL",
+            "kill",
+            "auditd.service"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3040999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460104,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3060000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl stop auditd --user"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3059999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460105,
+          "ppid": 5460104,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3061000000000,
+          "argv": [
+            "systemctl",
+            "stop",
+            "auditd",
+            "--user"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3060999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460106,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3080000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl stop northnarrow-agent auditd"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3079999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460107,
+          "ppid": 5460106,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3081000000000,
+          "argv": [
+            "systemctl",
+            "stop",
+            "northnarrow-agent",
+            "auditd"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3080999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460108,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3100000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl --frobnicate stop rsyslog"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3099999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460109,
+          "ppid": 5460108,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3101000000000,
+          "argv": [
+            "systemctl",
+            "--frobnicate",
+            "stop",
+            "rsyslog"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3100999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460110,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3120000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "iptables --policy INPUT ACCEPT"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3119999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460111,
+          "ppid": 5460110,
+          "uid": 0,
+          "gid": 0,
+          "comm": "xtables-nft-mul",
+          "filename": "/usr/sbin/xtables-nft-multi",
+          "timestamp_ns": 3121000000000,
+          "argv": [
+            "iptables",
+            "--policy",
+            "INPUT",
+            "ACCEPT"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3120999000000,
+          "exe": {
+            "path": "/usr/sbin/xtables-nft-multi"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460112,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3140000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "xtables-nft-multi main4 -F"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3139999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460113,
+          "ppid": 5460112,
+          "uid": 0,
+          "gid": 0,
+          "comm": "xtables-nft-mul",
+          "filename": "/usr/sbin/xtables-nft-multi",
+          "timestamp_ns": 3141000000000,
+          "argv": [
+            "xtables-nft-multi",
+            "main4",
+            "-F"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3140999000000,
+          "exe": {
+            "path": "/usr/sbin/xtables-nft-multi"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460114,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3160000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "nft add table inet x; flush ruleset"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3159999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460115,
+          "ppid": 5460114,
+          "uid": 0,
+          "gid": 0,
+          "comm": "nft",
+          "filename": "/usr/sbin/nft",
+          "timestamp_ns": 3161000000000,
+          "argv": [
+            "nft",
+            "add table inet x; flush ruleset"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3160999000000,
+          "exe": {
+            "path": "/usr/sbin/nft"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460116,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3180000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "firewall-cmd --set-default-zone trusted"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3179999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460117,
+          "ppid": 5460116,
+          "uid": 0,
+          "gid": 0,
+          "comm": "firewall-cmd",
+          "filename": "/usr/bin/firewall-cmd",
+          "timestamp_ns": 3181000000000,
+          "argv": [
+            "firewall-cmd",
+            "--set-default-zone",
+            "trusted"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3180999000000,
+          "exe": {
+            "path": "/usr/bin/firewall-cmd"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460118,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3200000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "pkill -n rsyslogd"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3199999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460119,
+          "ppid": 5460118,
+          "uid": 0,
+          "gid": 0,
+          "comm": "pkill",
+          "filename": "/usr/bin/pkill",
+          "timestamp_ns": 3201000000000,
+          "argv": [
+            "pkill",
+            "-n",
+            "rsyslogd"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3200999000000,
+          "exe": {
+            "path": "/usr/bin/pkill"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460120,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3220000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "killall -g auditd"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3219999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460121,
+          "ppid": 5460120,
+          "uid": 0,
+          "gid": 0,
+          "comm": "killall",
+          "filename": "/usr/bin/killall",
+          "timestamp_ns": 3221000000000,
+          "argv": [
+            "killall",
+            "-g",
+            "auditd"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3220999000000,
+          "exe": {
+            "path": "/usr/bin/killall"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460122,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3240000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "sh /usr/local/qcloud/YunJing/uninst.sh"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3239999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460123,
+          "ppid": 5460122,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3241000000000,
+          "argv": [
+            "sh",
+            "/usr/local/qcloud/YunJing/uninst.sh"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3240999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460124,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3260000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "systemctl status auditd --no-pager"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3259999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460125,
+          "ppid": 5460124,
+          "uid": 0,
+          "gid": 0,
+          "comm": "systemctl",
+          "filename": "/usr/bin/systemctl",
+          "timestamp_ns": 3261000000000,
+          "argv": [
+            "systemctl",
+            "status",
+            "auditd",
+            "--no-pager"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3260999000000,
+          "exe": {
+            "path": "/usr/bin/systemctl"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460126,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3280000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "iptables -A INPUT -j LOG --log-prefix -FW- "
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3279999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460127,
+          "ppid": 5460126,
+          "uid": 0,
+          "gid": 0,
+          "comm": "xtables-nft-mul",
+          "filename": "/usr/sbin/xtables-nft-multi",
+          "timestamp_ns": 3281000000000,
+          "argv": [
+            "iptables",
+            "-A",
+            "INPUT",
+            "-j",
+            "LOG",
+            "--log-prefix",
+            "-FW- "
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3280999000000,
+          "exe": {
+            "path": "/usr/sbin/xtables-nft-multi"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460128,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3300000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "nft list ruleset"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3299999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460129,
+          "ppid": 5460128,
+          "uid": 0,
+          "gid": 0,
+          "comm": "nft",
+          "filename": "/usr/sbin/nft",
+          "timestamp_ns": 3301000000000,
+          "argv": [
+            "nft",
+            "list",
+            "ruleset"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3300999000000,
+          "exe": {
+            "path": "/usr/sbin/nft"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460130,
+          "ppid": 5460001,
+          "uid": 0,
+          "gid": 0,
+          "comm": "sh",
+          "filename": "/usr/bin/dash",
+          "timestamp_ns": 3320000000000,
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "firewall-cmd --set-default-zone=public"
+          ],
+          "parent_comm": "cron",
+          "start_ns": 3319999000000,
+          "exe": {
+            "path": "/usr/bin/dash"
+          }
+        }
+      }
+    },
+    {
+      "event": {
+        "ProcessSpawn": {
+          "pid": 5460131,
+          "ppid": 5460130,
+          "uid": 0,
+          "gid": 0,
+          "comm": "firewall-cmd",
+          "filename": "/usr/bin/firewall-cmd",
+          "timestamp_ns": 3321000000000,
+          "argv": [
+            "firewall-cmd",
+            "--set-default-zone=public"
+          ],
+          "parent_comm": "sh",
+          "start_ns": 3320999000000,
+          "exe": {
+            "path": "/usr/bin/firewall-cmd"
+          }
+        }
+      }
+    }
+  ]
+}

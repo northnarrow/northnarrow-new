@@ -142,79 +142,79 @@ exit: 0
 |   34  NN-L-EPG-002_NamespaceRootPostcondition KillProcess Critical pid 5920002
 |   35  -
 |   36  -
-|   37  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5450003
+|   37  NN-L-EVA-001_SecurityServiceStopped Log High pid 5460101
 |   38  -
-|   39  -
-|   40  NN-L-EVA-003_SecurityToolKilled Log High pid 5450002
-|   41  NN-L-EVA-004_SecurityToolConfigChanged Log High pid 5450002
+|   39  NN-L-EVA-001_SecurityServiceStopped Log High pid 5460103
+|   40  -
+|   41  NN-L-EVA-001_SecurityServiceStopped Log High pid 5460105
 |   42  -
-|   43  -
+|   43  NN-L-EVA-001_SecurityServiceStopped Log High pid 5460107
 |   44  -
-|   45  NN-L-EVA-001_SecurityServiceStopped Log Low pid 5400004
+|   45  NN-L-EVA-001_SecurityServiceStopped Log High pid 5460109
 |   46  -
-|   47  -
-|   48  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400013
-|   49  R009_RootExecFromUserPath Log High pid 5400021  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
-|   50  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400021  (held)
-|   51  NN-L-FIM-010_RansomwareExtensionRename KillProcessTree Critical pid 5100101
+|   47  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5460111
+|   48  -
+|   49  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5460113
+|   50  -
+|   51  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5460115
 |   52  -
-|   53  NN-L-FIM-010_RansomwareExtensionRename Log Critical pid 5100101  (held)
+|   53  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5460117
 |   54  -
-|   55  -
+|   55  NN-L-EVA-003_SecurityToolKilled Log High pid 5460119
 |   56  -
-|   57  -
+|   57  NN-L-EVA-003_SecurityToolKilled Log High pid 5460121
 |   58  -
-|   59  -
+|   59  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5460123
 |   60  -
 |   61  -
 |   62  -
 |   63  -
 |   64  -
-|   65  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200011
-|   66  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200012
-|   67  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200013
-|   68  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200014
-|   69  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200015
-|   70  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200016
-|   71  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200017
-|   72  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200018
-|   73  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200019
-|   74  -
+|   65  -
+|   66  -
+|   67  -
+|   68  -
+|   69  -
+|   70  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5450003
+|   71  -
+|   72  -
+|   73  NN-L-EVA-003_SecurityToolKilled Log High pid 5450002
+|   74  NN-L-EVA-004_SecurityToolConfigChanged Log High pid 5450002
 |   75  -
 |   76  -
 |   77  -
-|   78  -
+|   78  NN-L-EVA-001_SecurityServiceStopped Log Low pid 5400004
 |   79  -
 |   80  -
-|   81  -
-|   82  -
-|   83  -
-|   84  -
+|   81  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400013
+|   82  R009_RootExecFromUserPath Log High pid 5400021  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
+|   83  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400021  (held)
+|   84  NN-L-FIM-010_RansomwareExtensionRename KillProcessTree Critical pid 5100101
 |   85  -
-|   86  -
+|   86  NN-L-FIM-010_RansomwareExtensionRename Log Critical pid 5100101  (held)
 |   87  -
 |   88  -
-|   89  NN-L-IMP-002_RenameExtensionBurst Log High pid 5350003
+|   89  -
 |   90  -
-|   91  NN-L-IOU-002_IoUringFileAndNetwork Log High pid 5314001
+|   91  -
 |   92  -
 |   93  -
 |   94  -
 |   95  -
 |   96  -
-|   97  NN-L-IOU-002_IoUringFileAndNetwork Log High pid 5314002
-|   98  -
-|   99  -
-|  100  -
-|  101  -
-|  102  -
-|  103  -
-|  104  -
-|  105  -
-|  106  -
+|   97  -
+|   98  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200011
+|   99  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200012
+|  100  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200013
+|  101  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200014
+|  102  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200015
+|  103  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200016
+|  104  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200017
+|  105  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200018
+|  106  NN-L-FIM-011_AwsCredsRead KillProcess High pid 6200019
 |  107  -
 |  108  -
-|  109  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
+|  109  -
 |  110  -
 |  111  -
 |  112  -
@@ -223,95 +223,95 @@ exit: 0
 |  115  -
 |  116  -
 |  117  -
-|  118  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
-|  119  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
-|  120  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|  118  -
+|  119  -
+|  120  -
 |  121  -
-|  122  -
+|  122  NN-L-IMP-002_RenameExtensionBurst Log High pid 5350003
 |  123  -
-|  124  R020_ShellWithSocketStdio Log Critical pid 5700103  (held)
+|  124  NN-L-IOU-002_IoUringFileAndNetwork Log High pid 5314001
 |  125  -
 |  126  -
-|  127  R001_ExecFromTmp Log High pid 5910002  (held)
-|  128  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
-|  129  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
-|  130  NN-L-NET-001_OutboundToBlockedIp KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
-|  131  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|  127  -
+|  128  -
+|  129  -
+|  130  NN-L-IOU-002_IoUringFileAndNetwork Log High pid 5314002
+|  131  -
 |  132  -
-|  133  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100011
-|  134  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100012
-|  135  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100013
-|  136  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100014
-|  137  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100015
-|  138  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100016
-|  139  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100017
-|  140  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100018
-|  141  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100019  [R004_ExecFromProcSelfFd builtin KillProcessTree; R008_HiddenHomeBinary builtin Log]
-|  142  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100020
-|  143  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100021
-|  144  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100031
-|  145  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100032
-|  146  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100041
-|  147  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100042
-|  148  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100043
-|  149  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100051
+|  133  -
+|  134  -
+|  135  -
+|  136  -
+|  137  -
+|  138  -
+|  139  -
+|  140  -
+|  141  -
+|  142  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
+|  143  -
+|  144  -
+|  145  -
+|  146  -
+|  147  -
+|  148  -
+|  149  -
 |  150  -
-|  151  -
-|  152  -
-|  153  -
-|  154  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
-|  155  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
-|  156  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
-|  157  -
-|  158  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6400001
-|  159  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6400001  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
-|  160  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
-|  161  -
-|  162  -
-|  163  -
-|  164  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
-|  165  R009_RootExecFromUserPath Log High pid 6100001  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
-|  166  NN-L-FIM-023_SystemdTimerCreated KillProcess High pid 6100001  [NN-L-FIM-009_SystemdUnitDropped builtin Log (held); NN-L-FIM-023_SystemdTimerCreated builtin KillProcess]
-|  167  -
-|  168  -
-|  169  -
-|  170  NN-L-NET-009_ByteAnomaly Log High pid 6300003  [NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
-|  171  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
-|  172  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
-|  173  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
-|  174  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  175  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  176  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  177  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  178  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  179  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  180  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  181  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  182  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  183  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  184  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  185  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  186  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  187  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  188  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  189  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  190  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  191  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  192  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  193  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  194  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  195  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  196  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  197  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  198  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  199  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  200  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  201  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  202  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  203  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  204  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  205  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  206  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  151  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
+|  152  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
+|  153  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|  154  -
+|  155  -
+|  156  -
+|  157  R020_ShellWithSocketStdio Log Critical pid 5700103  (held)
+|  158  -
+|  159  -
+|  160  R001_ExecFromTmp Log High pid 5910002  (held)
+|  161  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|  162  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|  163  NN-L-NET-001_OutboundToBlockedIp KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|  164  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|  165  -
+|  166  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100011
+|  167  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100012
+|  168  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100013
+|  169  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100014
+|  170  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100015
+|  171  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100016
+|  172  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100017
+|  173  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100018
+|  174  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100019  [R004_ExecFromProcSelfFd builtin KillProcessTree; R008_HiddenHomeBinary builtin Log]
+|  175  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100020
+|  176  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100021
+|  177  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100031
+|  178  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100032
+|  179  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100041
+|  180  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100042
+|  181  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100043
+|  182  R004_ExecFromProcSelfFd KillProcessTree Critical pid 6100051
+|  183  -
+|  184  -
+|  185  -
+|  186  -
+|  187  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
+|  188  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
+|  189  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|  190  -
+|  191  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6400001
+|  192  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6400001  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|  193  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
+|  194  -
+|  195  -
+|  196  -
+|  197  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
+|  198  R009_RootExecFromUserPath Log High pid 6100001  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
+|  199  NN-L-FIM-023_SystemdTimerCreated KillProcess High pid 6100001  [NN-L-FIM-009_SystemdUnitDropped builtin Log (held); NN-L-FIM-023_SystemdTimerCreated builtin KillProcess]
+|  200  -
+|  201  -
+|  202  -
+|  203  NN-L-NET-009_ByteAnomaly Log High pid 6300003  [NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
+|  204  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
+|  205  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
+|  206  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
 |  207  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
 |  208  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
 |  209  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
@@ -376,7 +376,40 @@ exit: 0
 |  268  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
 |  269  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
 |  270  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
-|  271  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
+|  271  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  272  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  273  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  274  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  275  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  276  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  277  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  278  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  279  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  280  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  281  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  282  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  283  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  284  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  285  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  286  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  287  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  288  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  289  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  290  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  291  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  292  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  293  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  294  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  295  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  296  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  297  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  298  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  299  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  300  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  301  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  302  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  303  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  304  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
 --- stderr
 (empty)
 

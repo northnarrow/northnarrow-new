@@ -933,3 +933,939 @@ fn an_edited_list_is_never_applied_even_under_the_escape_hatch() {
         "{source:?}"
     );
 }
+
+// ── Lot 316 (external bug hunt, edition 1.4): BUG-86, 89, 96, 106, N4 ─────
+
+mod bug86 {
+    //! BUG-86: the three cloud-agent uninstallers the list names as `cmd`
+    //! lie in their own tool's `proc=` tree, so their exec is taken for the
+    //! tool's process starting (registered, `assess` = None) and
+    //! NN-L-EVA-002 never fires for them.
+    use super::*;
+
+    #[test]
+    fn bug86_a_listed_uninstaller_run_by_a_shell_is_a_switch_off() {
+        let h = host();
+        let f = h.run(
+            360,
+            200,
+            "/bin/sh",
+            &["/bin/sh", "/usr/local/qcloud/YunJing/uninst.sh"],
+        );
+        let c = h.det.counts();
+        let f = f.unwrap_or_else(|| {
+            panic!(
+                "BUG-86: `sh /usr/local/qcloud/YunJing/uninst.sh`: assess() = None, NN-L-EVA-002 \
+                 expected (registered as the tool's process instead: {c:?})"
+            )
+        });
+        assert_eq!(
+            (f.rule, f.tool.as_str()),
+            (EvaRule::SwitchedOff, "tencent-yunjing")
+        );
+        assert_eq!(h.det.counts().defenders, 0, "no tool process registered");
+    }
+
+    #[test]
+    fn bug86_every_listed_uninstaller_in_every_form() {
+        let h = host();
+        let mut missed = Vec::new();
+        let mut pid = 370;
+        for script in [
+            "/usr/local/qcloud/YunJing/uninst.sh",
+            "/usr/local/qcloud/stargate/admin/uninstall.sh",
+            "/usr/local/qcloud/monitor/barad/admin/uninstall.sh",
+        ] {
+            for (exe, argv) in [
+                ("/usr/bin/bash", vec!["bash", script]),
+                ("/usr/bin/sh", vec!["sh", "-e", script]),
+                (script, vec!["/bin/sh", script]),
+            ] {
+                pid += 1;
+                if h.run(pid, 200, exe, &argv).map(|f| f.rule) != Some(EvaRule::SwitchedOff) {
+                    missed.push(format!("{exe} {argv:?}"));
+                }
+            }
+        }
+        assert!(missed.is_empty(), "BUG-86: no NN-L-EVA-002 for {missed:#?}");
+    }
+
+    /// Guard: any other program of the tree is still the tool's process.
+    #[test]
+    fn bug86_guard_the_tools_own_process_is_registered() {
+        let h = host();
+        assert!(h
+            .run(
+                380,
+                1,
+                "/usr/local/qcloud/YunJing/YDEyes/YDService",
+                &["YDService"]
+            )
+            .is_none());
+        assert_eq!(h.det.counts().defenders, 1);
+    }
+}
+
+mod bug89 {
+    //! BUG-89: `pattern_args` takes `-n`, `-o`, `-c` (pkill: --newest,
+    //! --oldest, --count) and `-g` (killall: --process-group) as options with
+    //! a value (procps-ng 4.0.4 and psmisc 23.7 `--help`, read in the lab:
+    //! none takes one), so the process name after them is dropped.
+    use super::*;
+    use crate::impair::tool_options::SystemTool;
+
+    #[test]
+    fn bug89_pkill_and_killall_flags_without_value_keep_the_name() {
+        let h = host();
+        let mut missed = Vec::new();
+        let mut pid = 400;
+        for (exe, argv, tool) in [
+            ("/usr/bin/pkill", vec!["pkill", "-n", "auditd"], "auditd"),
+            ("/usr/bin/pkill", vec!["pkill", "-o", "rsyslogd"], "rsyslog"),
+            ("/usr/bin/pkill", vec!["pkill", "-c", "auditd"], "auditd"),
+            (
+                "/usr/bin/pkill",
+                vec!["pkill", "-9", "-n", "auditd"],
+                "auditd",
+            ),
+            (
+                "/usr/bin/killall",
+                vec!["killall", "-g", "auditd"],
+                "auditd",
+            ),
+        ] {
+            pid += 1;
+            let got = h.run(pid, 200, exe, &argv);
+            if got.as_ref().map(|f| (f.rule, f.tool.as_str())) != Some((EvaRule::Killed, tool)) {
+                missed.push(format!("{argv:?} -> {got:?}"));
+            }
+        }
+        assert!(missed.is_empty(), "BUG-89: no NN-L-EVA-003 for {missed:#?}");
+    }
+
+    /// The names `argv` gives `tool`, as its table reads them (lot 316:
+    /// the hand-written `pattern_args` this guard called is the table now).
+    fn pattern_args(tool: SystemTool, argv: &[&str]) -> Vec<String> {
+        let a: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        tool.read(&a, 1)[0]
+            .operands
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Guard: options that do take a value keep it (`pkill -g <pgid>`,
+    /// `killall -o <time>`, `killall -n <pid>`, `-u root`).
+    #[test]
+    fn bug89_guard_valued_options_keep_their_value() {
+        let pkill = SystemTool::Pkill;
+        assert_eq!(
+            pattern_args(pkill, &["pkill", "-g", "auditd", "x"]),
+            vec!["x"]
+        );
+        assert_eq!(
+            pattern_args(pkill, &["pkill", "-u", "root", "auditd"]),
+            vec!["auditd"]
+        );
+        let killall = SystemTool::Killall;
+        assert_eq!(
+            pattern_args(killall, &["killall", "-o", "auditd", "x"]),
+            vec!["x"]
+        );
+        assert_eq!(
+            pattern_args(killall, &["killall", "-n", "auditd", "x"]),
+            vec!["x"]
+        );
+        assert_eq!(
+            pattern_args(killall, &["killall", "-u", "root", "auditd"]),
+            vec!["auditd"]
+        );
+    }
+}
+
+mod bug96 {
+    //! BUG-96: inside a valid trusted-installer window, `systemctl stop
+    //! northnarrow-agent auditd` is one finding naming the first listed
+    //! unit (the agent's), which the window sanctions; auditd, stopped by
+    //! the same command, is never High ("The window sanctions nothing of
+    //! another tool", the module doc).
+    use super::*;
+    use crate::anti_tamper::trusted_installer::WindowGrant;
+    use crate::posture::host::testing::TestWindow;
+
+    fn open_window(h: &Host) {
+        h.det.set_installer_window(Arc::new(TestWindow {
+            open: true,
+            grant: Some(WindowGrant {
+                key_id: "c2e8f3da".to_string(),
+                expires_at: "2026-11-11T18:00:00Z".to_string(),
+                grantee: None,
+            }),
+        }));
+    }
+
+    #[test]
+    fn bug96_window_never_sanctions_auditd_stopped_with_the_agent() {
+        let h = host();
+        open_window(&h);
+        let argv = ["systemctl", "stop", "northnarrow-agent", "auditd"];
+        let f = h
+            .run(630, 200, "/usr/bin/systemctl", &argv)
+            .expect("a finding");
+        assert_eq!(f.rule, EvaRule::ServiceStopped);
+        assert!(
+            f.sanctioned.is_none(),
+            "BUG-96: {argv:?} stops auditd inside the window — High as anywhere — but the \
+             finding is sanctioned (Low, no DefenseImpairment): {f:?}"
+        );
+    }
+
+    /// Guard: the reverse order is High on main; the agent's unit alone is
+    /// sanctioned by the window.
+    #[test]
+    fn bug96_guard_reverse_order_and_agent_alone() {
+        let h = host();
+        open_window(&h);
+        let f = h
+            .run(
+                631,
+                200,
+                "/usr/bin/systemctl",
+                &["systemctl", "stop", "auditd", "northnarrow-agent"],
+            )
+            .expect("a finding");
+        assert!(f.sanctioned.is_none(), "{f:?}");
+        let f = h
+            .run(
+                632,
+                200,
+                "/usr/bin/systemctl",
+                &["systemctl", "stop", "northnarrow-agent"],
+            )
+            .expect("a finding");
+        assert!(f.sanctioned.is_some(), "{f:?}");
+    }
+}
+
+mod bug106 {
+    //! BUG-106: `service_targets` reads systemctl's options with a value from
+    //! an incomplete exact-match list: an unlisted one (`-P`,
+    //! `--preset-mode`, `--check-inhibitors`, `--kill-who`, `--message`), an
+    //! abbreviated long one (`--si`, getopt_long) or a short cluster ending
+    //! in one (`-qs KILL`) before the verb moves the verb onto its value.
+    use super::*;
+
+    #[test]
+    fn bug106_valued_options_before_the_verb_keep_the_verb() {
+        let h = host();
+        let mut missed = Vec::new();
+        let mut pid = 640;
+        for (argv, tool) in [
+            (vec!["systemctl", "-P", "Id", "stop", "auditd"], "auditd"),
+            (
+                vec!["systemctl", "--preset-mode", "full", "stop", "auditd"],
+                "auditd",
+            ),
+            (
+                vec!["systemctl", "--check-inhibitors", "no", "stop", "auditd"],
+                "auditd",
+            ),
+            (
+                vec!["systemctl", "--kill-who", "main", "kill", "auditd"],
+                "auditd",
+            ),
+            (
+                vec!["systemctl", "--message", "x", "mask", "northnarrow-agent"],
+                "northnarrow",
+            ),
+            (
+                vec!["systemctl", "--si", "KILL", "kill", "auditd"],
+                "auditd",
+            ),
+            (vec!["systemctl", "-qs", "KILL", "kill", "auditd"], "auditd"),
+        ] {
+            pid += 1;
+            let got = h.run(pid, 200, "/usr/bin/systemctl", &argv);
+            if got.as_ref().map(|f| (f.rule, f.tool.as_str()))
+                != Some((EvaRule::ServiceStopped, tool))
+            {
+                missed.push(format!("{argv:?} -> {got:?}"));
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "BUG-106: no NN-L-EVA-001 for {missed:#?}"
+        );
+    }
+
+    /// N4 (new in the triage, same family): the switch-off commands were
+    /// matched as exact consecutive words, so the long or separate form of a
+    /// listed option was no NN-L-EVA-002 (`iptables --policy` is `-P`;
+    /// firewall-cmd's argparse reads `--set-default-zone trusted`).
+    #[test]
+    fn n4_switch_off_long_forms() {
+        let h = host();
+        let mut missed = Vec::new();
+        for (pid, exe, argv) in [
+            (
+                670,
+                "/usr/sbin/iptables",
+                vec!["iptables", "--policy", "INPUT", "ACCEPT"],
+            ),
+            (
+                671,
+                "/usr/bin/firewall-cmd",
+                vec!["firewall-cmd", "--set-default-zone", "trusted"],
+            ),
+        ] {
+            if h.run(pid, 200, exe, &argv).map(|f| f.rule) != Some(EvaRule::SwitchedOff) {
+                missed.push(format!("{argv:?}"));
+            }
+        }
+        assert!(missed.is_empty(), "no NN-L-EVA-002 for {missed:#?}");
+    }
+
+    /// Guard: the listed forms (existing test, `-s KILL kill falcon-sensor`).
+    #[test]
+    fn bug106_guard_listed_valued_option() {
+        let h = host();
+        let f = h
+            .run(
+                660,
+                200,
+                "/usr/bin/systemctl",
+                &["systemctl", "-s", "KILL", "kill", "falcon-sensor"],
+            )
+            .expect("a finding");
+        assert_eq!(f.tool, "crowdstrike");
+    }
+}
+
+// ── Lot 316: the mini-hunt — the variants of each fixed bug ─────────────
+
+mod lot316_variants {
+    //! Lot 316's mini-hunt (external bug hunt, edition 1.4): other
+    //! spellings of BUG-106, BUG-89, BUG-96, BUG-86 and N4, and the benign
+    //! commands of an administrator that stay quiet.
+    use super::*;
+    use crate::anti_tamper::trusted_installer::WindowGrant;
+    use crate::posture::host::testing::TestWindow;
+
+    /// `(rule, tool)` of what `argv` run as `exe` is, from pid `pid`.
+    fn got(h: &Host, pid: u32, exe: &str, argv: &[&str]) -> Option<(EvaRule, String)> {
+        h.run(pid, 200, exe, argv).map(|f| (f.rule, f.tool))
+    }
+
+    /// The cases that must be `(rule, tool)`: the ones that are not.
+    fn missed(h: &Host, from: u32, cases: &[(&str, &[&str], EvaRule, &str)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (k, (exe, argv, rule, tool)) in cases.iter().enumerate() {
+            let g = got(h, from + k as u32, exe, argv);
+            if g != Some((*rule, tool.to_string())) {
+                out.push(format!("{exe} {argv:?} -> {g:?}"));
+            }
+        }
+        out
+    }
+
+    const SYSTEMCTL: &str = "/usr/bin/systemctl";
+
+    /// BUG-106's variants: GNU getopt reads an option after the verb as an
+    /// option, and with `POSIXLY_CORRECT` (an environment the exec event
+    /// does not carry) as a unit — `stop auditd --user` stops the system's
+    /// auditd then; the last of `--user`, `--system` is the manager; a
+    /// glob systemctl matches against the units in memory.
+    #[test]
+    fn systemctl_scope_order_and_globs() {
+        let h = host();
+        let stop = EvaRule::ServiceStopped;
+        let m = missed(
+            &h,
+            7000,
+            &[
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "stop", "auditd", "--user"],
+                    stop,
+                    "auditd",
+                ),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "stop", "-p", "auditd"],
+                    stop,
+                    "auditd",
+                ),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "--user", "--system", "stop", "auditd"],
+                    stop,
+                    "auditd",
+                ),
+                (SYSTEMCTL, &["systemctl", "stop", "*uditd*"], stop, "auditd"),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "stop", "audit?.service"],
+                    stop,
+                    "auditd",
+                ),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "kill", "[a]uditd.service"],
+                    stop,
+                    "auditd",
+                ),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "freeze", "auditd.servic?"],
+                    stop,
+                    "auditd",
+                ),
+                (
+                    SYSTEMCTL,
+                    &["systemctl", "--no-block", "--", "stop", "rsyslog"],
+                    stop,
+                    "rsyslog",
+                ),
+                (
+                    SYSTEMCTL,
+                    &[
+                        "systemctl",
+                        "--kill-whom=main",
+                        "-sSIGKILL",
+                        "kill",
+                        "falco",
+                    ],
+                    stop,
+                    "falco",
+                ),
+            ],
+        );
+        assert!(m.is_empty(), "{m:#?}");
+        for (k, argv) in [
+            &["systemctl", "--user", "stop", "auditd"][..],
+            &["systemctl", "--system", "--user", "stop", "auditd"],
+            &["systemctl", "--global", "disable", "auditd"],
+            &["systemctl", "stop", "ngin*"],
+            &["systemctl", "stop", "audit?"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(got(&h, 7020 + k as u32, SYSTEMCTL, argv), None, "{argv:?}");
+        }
+    }
+
+    /// N4's variants: iptables by any of its names (`iptables-nft`,
+    /// `iptables-legacy`, the multi-call binaries' `main4`, read from
+    /// `argv[1]`), `--flush` by a prefix, nft's command line in one
+    /// argument or several, after `--`, among other commands; firewall-cmd's
+    /// prefix.
+    #[test]
+    fn firewall_switch_offs_by_every_name_and_spelling() {
+        let h = host();
+        let off = EvaRule::SwitchedOff;
+        let multi = "/usr/sbin/xtables-nft-multi";
+        let m = missed(
+            &h,
+            7100,
+            &[
+                (
+                    multi,
+                    &["xtables-nft-multi", "main4", "-F"],
+                    off,
+                    "iptables",
+                ),
+                (
+                    multi,
+                    &["xtables-nft-multi", "iptables", "--flush"],
+                    off,
+                    "iptables",
+                ),
+                (multi, &["iptables-nft", "--fl", "INPUT"], off, "iptables"),
+                (
+                    multi,
+                    &["/usr/sbin/iptables", "-PINPUT", "ACCEPT"],
+                    off,
+                    "iptables",
+                ),
+                (multi, &["ip6tables-nft", "-w", "-F"], off, "iptables"),
+                (
+                    multi,
+                    &["xtables-nft-multi", "main6", "--flush"],
+                    off,
+                    "iptables",
+                ),
+                (
+                    "/usr/sbin/xtables-legacy-multi",
+                    &["iptables-legacy", "--policy", "INPUT", "ACCEPT"],
+                    off,
+                    "iptables",
+                ),
+                (
+                    "/usr/sbin/xtables-legacy-multi",
+                    &["x", "main4", "-F"],
+                    off,
+                    "iptables",
+                ),
+                ("/usr/sbin/nft", &["nft", "flush ruleset"], off, "nftables"),
+                (
+                    "/usr/sbin/nft",
+                    &["nft", "--", "flush", "ruleset"],
+                    off,
+                    "nftables",
+                ),
+                (
+                    "/usr/sbin/nft",
+                    &["nft", "add table inet x; flush ruleset"],
+                    off,
+                    "nftables",
+                ),
+                (
+                    "/usr/sbin/nft",
+                    &["nft", "list tables\nflush\truleset"],
+                    off,
+                    "nftables",
+                ),
+                (
+                    "/usr/bin/firewall-cmd",
+                    &["firewall-cmd", "--set-def", "trusted"],
+                    off,
+                    "firewalld",
+                ),
+                (
+                    "/usr/bin/firewall-cmd",
+                    &["firewall-cmd", "-q", "--set-default-zone=trusted"],
+                    off,
+                    "firewalld",
+                ),
+            ],
+        );
+        assert!(m.is_empty(), "{m:#?}");
+        for (k, (exe, argv)) in [
+            (multi, &["iptables-save"][..]),
+            (multi, &["xtables-nft-multi", "iptables-translate", "-F"]),
+            (multi, &["iptables", "-L", "-n"]),
+            ("/usr/sbin/nft", &["nft", "list", "ruleset"]),
+            ("/usr/sbin/nft", &["nft", "-f", "/etc/nftables.conf"]),
+            ("/usr/sbin/nft", &["nft", "flush", "table", "inet", "x"]),
+            (
+                "/usr/bin/firewall-cmd",
+                &["firewall-cmd", "--set-default-zone=public"],
+            ),
+            ("/usr/bin/sudo", &["sudo", "iptables", "-F"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(got(&h, 7130 + k as u32, exe, argv), None, "{exe} {argv:?}");
+        }
+    }
+
+    /// BUG-89's variants: pkill's pattern is searched in the name (`pkill
+    /// audit` ends auditd: a part at least half of it), `-i` and killall's
+    /// `-I` in any case, pkill's
+    /// `-f` in the full command line, killall's name with a `/` the
+    /// executable; killall's `-signal` with one hyphen.
+    #[test]
+    fn kill_family_names_as_the_tools_match_them() {
+        let h = host();
+        let killed = EvaRule::Killed;
+        let pkill = "/usr/bin/pkill";
+        let killall = "/usr/bin/killall";
+        let m = missed(
+            &h,
+            7200,
+            &[
+                (pkill, &["pkill", "audit"], killed, "auditd"),
+                (pkill, &["pkill", "-i", "AUDITD"], killed, "auditd"),
+                (
+                    pkill,
+                    &["pkill", "-f", "/usr/sbin/auditd"],
+                    killed,
+                    "auditd",
+                ),
+                (
+                    pkill,
+                    &["pkill", "-9", "-f", "sbin/rsyslog"],
+                    killed,
+                    "rsyslog",
+                ),
+                (
+                    pkill,
+                    &["pkill", "--signal=KILL", "-x", "auditd"],
+                    killed,
+                    "auditd",
+                ),
+                (killall, &["killall", "/usr/sbin/auditd"], killed, "auditd"),
+                (killall, &["killall", "-I", "AUDITD"], killed, "auditd"),
+                (
+                    killall,
+                    &["killall", "-signal", "KILL", "auditd"],
+                    killed,
+                    "auditd",
+                ),
+                (killall, &["killall", "-r", "uditd"], killed, "auditd"),
+                (
+                    killall,
+                    &["killall", "/opt/CrowdStrike/falcond"],
+                    killed,
+                    "crowdstrike",
+                ),
+                // half of the name, exactly
+                (pkill, &["pkill", "dit"], killed, "auditd"),
+                // a unit's name, as a process's (as before)
+                (pkill, &["pkill", "-x", "aegis"], killed, "aliyun-aegis"),
+            ],
+        );
+        assert!(m.is_empty(), "{m:#?}");
+        for (k, (exe, argv)) in [
+            (pkill, &["pkill", "-x", "audit"][..]),
+            (pkill, &["pkill", "-f", "gunicorn"]),
+            (pkill, &["pkill", "/usr/sbin/auditd"]),
+            // a part that is less than half of a listed name: anyone's
+            (pkill, &["pkill", "-f", "agent"]),
+            (pkill, &["pkill", "-f", "server"]),
+            (pkill, &["pkill", "log"]),
+            (killall, &["killall", "audit"]),
+            (killall, &["killall", "nginx"]),
+            (killall, &["killall", "-HUP", "nginx"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(got(&h, 7230 + k as u32, exe, argv), None, "{exe} {argv:?}");
+        }
+    }
+
+    /// `kill`'s probes and listings (procps: `-l` prints and exits, `-0` and
+    /// `SIGCONT` stop nothing), and an argv whose signal is not known or
+    /// that kills in one of its readings;
+    /// systemctl's capsule (a user's manager); a 15-byte `comm`.
+    #[test]
+    fn kill_probes_capsules_and_comm() {
+        let h = host();
+        assert!(h
+            .run(7600, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none());
+        for (k, argv) in [
+            &["kill", "-l", "9", "7600"][..],
+            &["kill", "-CONT", "7600"],
+            &["kill", "-s", "SIGCONT", "7600"],
+            &["kill", "--signal=0", "7600"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                got(&h, 7610 + k as u32, "/usr/bin/kill", argv),
+                None,
+                "{argv:?}"
+            );
+        }
+        for (k, argv) in [
+            &["kill", "-9", "7600"][..],
+            &["kill", "--nosuch", "-0", "7600"],
+            // GNU getopt reads the `-l` after the pid as a listing; under
+            // POSIXLY_CORRECT it is a pid procps refuses — after it killed
+            // the one before
+            &["kill", "-9", "7600", "-l"],
+            &["kill", "-s", "KILL", "7600"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                got(&h, 7620 + k as u32, "/usr/bin/kill", argv),
+                Some((EvaRule::Killed, "auditd".to_string())),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            got(
+                &h,
+                7630,
+                SYSTEMCTL,
+                &["systemctl", "-C", "x", "stop", "auditd"]
+            ),
+            None
+        );
+        assert_eq!(
+            got(
+                &h,
+                7631,
+                "/usr/bin/killall",
+                &["killall", "amazon-ssm-agen"]
+            ),
+            Some((EvaRule::Killed, "amazon-ssm".to_string()))
+        );
+        assert_eq!(
+            got(&h, 7632, "/usr/bin/pkill", &["pkill", "-x", "AUDITD"]),
+            None,
+            "the case of the name, without -i"
+        );
+    }
+
+    /// The brief's rule: an option the table does not hold gives the
+    /// reader's over-approximation, never `None` — the record says the
+    /// options were not understood. What names no listed tool stays quiet.
+    #[test]
+    fn an_option_no_table_holds_errs_toward_a_detection() {
+        let h = host();
+        for (k, (exe, argv)) in [
+            (
+                SYSTEMCTL,
+                &["systemctl", "--frobnicate", "x", "stop", "auditd"][..],
+            ),
+            (SYSTEMCTL, &["systemctl", "-Z", "stop", "auditd"]),
+            (
+                "/usr/sbin/xtables-nft-multi",
+                &["iptables", "-m", "foo", "--foo-bar", "1", "-F"],
+            ),
+            // an unknown letter, then the flush in the same cluster
+            ("/usr/sbin/xtables-nft-multi", &["iptables", "-yF"]),
+            // not understood: the name matched every way (a part of it)
+            ("/usr/bin/pkill", &["pkill", "--nosuch", "-x", "audit"]),
+            ("/usr/bin/pkill", &["pkill", "--nosuch", "auditd"]),
+            ("/usr/bin/killall", &["killall", "-Q", "auditd"]),
+            (
+                "/usr/bin/firewall-cmd",
+                &["firewall-cmd", "--nosuch", "--set-default-zone", "trusted"],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let f = h
+                .run(7300 + k as u32, 200, exe, argv)
+                .unwrap_or_else(|| panic!("{argv:?}: None"));
+            assert!(f.what.contains("options not understood"), "{argv:?}: {f:?}");
+        }
+        for (k, (exe, argv)) in [
+            (
+                SYSTEMCTL,
+                &["systemctl", "--frobnicate", "status", "auditd"][..],
+            ),
+            (
+                "/usr/sbin/xtables-nft-multi",
+                &[
+                    "iptables",
+                    "-A",
+                    "INPUT",
+                    "-m",
+                    "foo",
+                    "--foo-bar",
+                    "1",
+                    "-j",
+                    "ACCEPT",
+                ],
+            ),
+            ("/usr/bin/pkill", &["pkill", "--nosuch", "nginx"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(h.run(7320 + k as u32, 200, exe, argv), None, "{argv:?}");
+        }
+    }
+
+    /// An administrator's everyday commands of these tools stay quiet.
+    #[test]
+    fn benign_admin_commands_stay_quiet() {
+        let h = host();
+        let ipt = "/usr/sbin/xtables-nft-multi";
+        for (k, (exe, argv)) in [
+            (
+                SYSTEMCTL,
+                &["systemctl", "status", "auditd", "--no-pager"][..],
+            ),
+            (
+                SYSTEMCTL,
+                &["systemctl", "--no-pager", "-l", "status", "auditd"],
+            ),
+            (SYSTEMCTL, &["systemctl", "restart", "auditd"]),
+            (SYSTEMCTL, &["systemctl", "reload", "rsyslog"]),
+            (SYSTEMCTL, &["systemctl", "is-active", "--quiet", "auditd"]),
+            (SYSTEMCTL, &["systemctl", "--user", "stop", "pipewire"]),
+            (SYSTEMCTL, &["systemctl", "enable", "--now", "auditd"]),
+            (SYSTEMCTL, &["systemctl", "list-units", "--state=failed"]),
+            (
+                SYSTEMCTL,
+                &["systemctl", "show", "-p", "ActiveState", "auditd"],
+            ),
+            (
+                ipt,
+                &[
+                    "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT",
+                ],
+            ),
+            (ipt, &["iptables", "-L", "-n", "-v", "--line-numbers"]),
+            (ipt, &["iptables", "-S"]),
+            (
+                ipt,
+                &[
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-o",
+                    "eth0",
+                    "-j",
+                    "MASQUERADE",
+                ],
+            ),
+            (
+                ipt,
+                &[
+                    "iptables",
+                    "-I",
+                    "INPUT",
+                    "1",
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "ESTABLISHED,RELATED",
+                    "-j",
+                    "ACCEPT",
+                ],
+            ),
+            (
+                ipt,
+                &[
+                    "iptables",
+                    "-A",
+                    "INPUT",
+                    "-j",
+                    "LOG",
+                    "--log-prefix",
+                    "-FW- ",
+                ],
+            ),
+            (ipt, &["iptables", "-P", "INPUT", "DROP"]),
+            (ipt, &["ip6tables", "-P", "FORWARD", "DROP"]),
+            (
+                ipt,
+                &[
+                    "iptables", "-m", "policy", "--dir", "in", "--pol", "ipsec", "-j", "ACCEPT",
+                ],
+            ),
+            ("/usr/sbin/nft", &["nft", "list", "ruleset"]),
+            ("/usr/sbin/nft", &["nft", "-a", "list", "ruleset"]),
+            (
+                "/usr/sbin/nft",
+                &[
+                    "nft", "add", "rule", "inet", "filter", "input", "tcp", "dport", "22", "accept",
+                ],
+            ),
+            (
+                "/usr/bin/firewall-cmd",
+                &["firewall-cmd", "--get-default-zone"],
+            ),
+            (
+                "/usr/bin/firewall-cmd",
+                &["firewall-cmd", "--permanent", "--add-service=http"],
+            ),
+            ("/usr/bin/firewall-cmd", &["firewall-cmd", "--reload"]),
+            ("/usr/bin/pkill", &["pkill", "-f", "gunicorn"]),
+            ("/usr/bin/pkill", &["pkill", "-HUP", "nginx"]),
+            ("/usr/bin/kill", &["kill", "-0", "77"]),
+            ("/usr/bin/kill", &["kill", "-s", "0", "77"]),
+            ("/usr/bin/kill", &["kill", "-l"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                h.run(7400 + k as u32, 200, exe, argv),
+                None,
+                "{exe} {argv:?}"
+            );
+        }
+    }
+
+    /// BUG-96's variants: a window sanctions a stop of the agent's two units
+    /// together, nothing that stops another tool's with them — by name, by
+    /// glob, by `kill`; and BUG-86's: an uninstaller run as itself.
+    #[test]
+    fn a_window_sanctions_the_agents_units_only() {
+        let h = host();
+        h.det.set_installer_window(Arc::new(TestWindow {
+            open: true,
+            grant: Some(WindowGrant {
+                key_id: "c2e8f3da".to_string(),
+                expires_at: "2026-11-11T18:00:00Z".to_string(),
+                grantee: None,
+            }),
+        }));
+        let f = h
+            .run(
+                7500,
+                200,
+                SYSTEMCTL,
+                &[
+                    "systemctl",
+                    "stop",
+                    "northnarrow-agent",
+                    "northnarrow-watchdog",
+                ],
+            )
+            .expect("a finding");
+        assert!(f.sanctioned.is_some(), "{f:?}");
+        let f = h
+            .run(7501, 200, SYSTEMCTL, &["systemctl", "stop", "northnarrow*"])
+            .expect("a finding");
+        assert!(f.sanctioned.is_some(), "{f:?}");
+        // a mask or a freeze of the agent's own unit: no restart
+        for (k, argv) in [
+            &["systemctl", "mask", "northnarrow-agent"][..],
+            &["systemctl", "freeze", "northnarrow-agent"],
+            &["systemctl", "disable", "northnarrow-*"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let f = h
+                .run(7505 + k as u32, 200, SYSTEMCTL, argv)
+                .unwrap_or_else(|| panic!("{argv:?}"));
+            assert!(f.sanctioned.is_none(), "{argv:?}: {f:?}");
+        }
+        for (k, argv) in [
+            &["systemctl", "stop", "northnarrow-agent", "rsyslog"][..],
+            &["systemctl", "kill", "northnarrow-agent", "auditd.service"],
+            &["systemctl", "stop", "[an]*"],
+            &["systemctl", "stop", "northnarrow-agent", "*uditd*"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let f = h
+                .run(7510 + k as u32, 200, SYSTEMCTL, argv)
+                .unwrap_or_else(|| panic!("{argv:?}"));
+            assert!(f.sanctioned.is_none(), "{argv:?}: {f:?}");
+            assert_ne!(f.tool, AGENT_TOOL, "{argv:?}: {f:?}");
+            assert!(f.what.contains("with"), "{argv:?}: {f:?}");
+        }
+    }
+
+    /// `fnmatch` as systemctl's: `*`, `?`, classes, ranges, negation, `\`.
+    #[test]
+    fn unit_globs_match_as_fnmatch() {
+        for (p, n, want) in [
+            ("*uditd*", "auditd.service", true),
+            ("audit?.service", "auditd.service", true),
+            ("[a]uditd.service", "auditd.service", true),
+            ("[!b]uditd.service", "auditd.service", true),
+            ("[^a]uditd.service", "auditd.service", false),
+            ("[a-c]uditd.*", "auditd.service", true),
+            ("[]a]uditd.service", "auditd.service", true),
+            ("\\auditd.service", "auditd.service", true),
+            ("audit?", "auditd.service", false),
+            ("*", "auditd.service", true),
+            ("[a", "[a", true),
+            ("auditd.service?", "auditd.service", false),
+            ("a*b*c*d*e*f*g", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+        ] {
+            assert_eq!(fnmatch(p, n), want, "{p} {n}");
+        }
+    }
+}

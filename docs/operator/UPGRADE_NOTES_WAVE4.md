@@ -1547,3 +1547,51 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
   Without the fork-parent record (`sched_process_fork`'s BTF tracepoint
   refused: a signed degradation) no unit's shell vouches and only PID 1's
   executor copies are exempt.
+
+## 32. The system tools' options, read by their tables (lot 316)
+
+- **systemctl, kill, pkill, killall, iptables, nft and firewall-cmd are read
+  by the interpreters' reader, through a table each**
+  (`crates/nn-core/src/impair/tool_options.rs`, the external bug hunt's
+  edition 1.4: BUG-106, BUG-89, N4). NN-L-EVA-001..003 used to compare their
+  argv with hand-written lists: an unlisted valued option before the verb
+  (`systemctl -P Id stop auditd`, `--check-inhibitors no`, `--kill-who
+  main`), a getopt_long prefix (`--si KILL`), a cluster (`-qs KILL`), a
+  long or separate form (`iptables --policy INPUT ACCEPT`, `firewall-cmd
+  --set-default-zone trusted`) switched a tool off unrecorded, and `pkill
+  -n auditd` or `killall -g auditd` lost the name. The tables come from the
+  tools' sources (systemd 249–262, procps-ng 4.0.4, psmisc 23.7, iptables
+  1.8.11, nftables 1.0.6/1.1.3, firewalld 2.3.1).
+- **An option after the verb is read both ways.** GNU getopt reads it as an
+  option, and with `POSIXLY_CORRECT` in the tool's environment (which the
+  exec event does not carry) as an operand: `systemctl stop auditd --user`
+  stops the system's auditd then, and is NN-L-EVA-001. The manager is the
+  last of `--system`, `--user`, `--global`, `--capsule`.
+- **An option a table does not hold errs toward a detection.** The record
+  says "(options not understood)": any operand may be systemctl's verb and
+  every later one a unit, any spelling of iptables' `-F` or `-P` counts,
+  pkill's name is matched every way. Expect it for an iptables extension's
+  option the table does not list, or a newer systemctl's — report it, it
+  joins the table.
+- **Every listed unit of a command is judged** (BUG-96). `systemctl stop
+  northnarrow-agent auditd` is auditd's High record (`unit auditd stop
+  (with northnarrow-agent)`), inside a trusted-installer window too: the
+  window sanctions a command only when every listed unit it stops is the
+  agent's own. A glob is matched as systemctl matches it (`fnmatch` on the
+  unit's full name: `*uditd*`, `audit?.service`).
+- **Names.** iptables by any of its names (`iptables-nft`,
+  `iptables-legacy`, `xtables-nft-multi main4`); nft's operands as one
+  command line (`nft 'add table x; flush ruleset'`); pkill's pattern a part
+  of the process name at least half of it, unless `-x` (`pkill audit` ends
+  auditd; `pkill -f agent` names no listed agent), `-f` the full
+  command line, `-i` (killall `-I`) any case; killall's name with a `/` the
+  executable (`killall /usr/sbin/auditd`).
+- **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
+  /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
+  as the agent's own process starting.
+- Residual, declared: a renamed copy of the tool (`cp /usr/bin/systemctl
+  /tmp/x`), a command read from a file or standard input (`nft -f`,
+  `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
+  regular expression beyond a part of the name, or a part less than half of
+  it (the signal itself is NN-L-EVA-003 on `task_kill`, unless PID 1 sends
+  it).

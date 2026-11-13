@@ -56,6 +56,8 @@ use crate::content_host::ContentHost;
 use crate::decision::host::DecisionHost;
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::{AsOf, AuthSessionTracker, ExecIdentity};
+use crate::posture::script_args::Parsed;
+use tool_options::{read_listed, Program, SystemTool};
 
 /// Deploy location of the list.
 pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
@@ -267,23 +269,34 @@ impl SecurityTools {
     }
 
     /// The tool a unit argument names (`auditd`, `auditd.service`, a
-    /// glob `falcon*`).
+    /// glob `falcon*`): the first of [`Self::tools_of_unit`].
     pub fn tool_of_unit(&self, arg: &str) -> Option<(&Tool, String)> {
+        self.tools_of_unit(arg).into_iter().next()
+    }
+
+    /// Every listed unit a unit argument names, with its tool: one for a
+    /// name (`auditd`, `auditd.service`); for a glob (`falcon*`), lot 316,
+    /// every one systemctl's `fnmatch` matches among the units in memory —
+    /// on the unit's full name (`falcon*`, `*uditd*`, `audit?.service`,
+    /// `[a]uditd.service`).
+    pub fn tools_of_unit(&self, arg: &str) -> Vec<(&Tool, String)> {
         let key = unit_key(arg);
-        if let Some(prefix) = key
-            .strip_suffix('*')
-            .filter(|p| !p.is_empty() && !p.contains('*'))
-        {
-            return self.tools.iter().find_map(|t| {
-                t.units
-                    .iter()
-                    .find(|u| u.starts_with(prefix))
-                    .map(|u| (t, u.clone()))
-            });
+        let glob = arg.contains(['*', '?', '[']);
+        let mut out = Vec::new();
+        for t in &self.tools {
+            for u in &t.units {
+                let full = if u.contains('.') {
+                    u.to_string()
+                } else {
+                    format!("{u}.service")
+                };
+                let named = if glob { fnmatch(arg, &full) } else { *u == key };
+                if named {
+                    out.push((t, u.clone()));
+                }
+            }
         }
-        self.tools
-            .iter()
-            .find_map(|t| t.units.iter().find(|u| *u == key).map(|u| (t, u.clone())))
+        out
     }
 
     /// The tool whose process `id` is (its executable, or the script an
@@ -295,6 +308,16 @@ impl SecurityTools {
             // run — a tool is registered to be watched, which trusts nothing
             .chain(id.runs.mentioned().filter(|s| s.starts_with('/')))
             .collect();
+        // Lot 316 (BUG-86): the program of a listed switch-off command (a
+        // cloud agent's uninstaller, in its own tool's tree) is that command
+        // run, never the tool's process starting
+        if self
+            .cmds
+            .iter()
+            .any(|c| c.program.starts_with('/') && paths.contains(&c.program.as_str()))
+        {
+            return None;
+        }
         self.tools.iter().find(|t| {
             t.procs.iter().any(|p| {
                 paths.iter().any(|x| {
@@ -312,16 +335,59 @@ impl SecurityTools {
     /// basename of a listed executable (or its first 15 bytes, the kernel's
     /// `comm`), or a listed unit.
     pub fn tool_of_name(&self, name: &str) -> Option<&Tool> {
+        self.tool_of_pattern(name, NameMatch::default())
+    }
+
+    /// Lot 316: the tool a name given to `pkill` or `killall` names, as
+    /// the tool matches it ([`NameMatch`]): a part of the name (pkill's
+    /// pattern, unless `-x`) at least half of it, in any case (`-i`,
+    /// killall's `-I`), the full
+    /// path of a listed program or tree (pkill's `-f`; killall's name with a
+    /// `/`, which it matches against the executable).
+    fn tool_of_pattern(&self, name: &str, m: NameMatch) -> Option<&Tool> {
         let name = name.trim_start_matches('^').trim_end_matches('$');
         if name.is_empty() || name.len() < 3 {
             return None;
         }
+        let fold = |s: &str| {
+            if m.ignore_case {
+                s.to_lowercase()
+            } else {
+                s.to_string()
+            }
+        };
+        let want = fold(name);
+        // a part names a program when it is at least half of its name: `pkill
+        // audit` ends auditd, `pkill -f agent` is no listed agent's (it may
+        // be anyone's; what it ends is seen on `task_kill`)
+        let hit = |have: &str| {
+            let have = fold(have);
+            if m.part {
+                have.contains(&want) && 2 * want.chars().count() >= have.chars().count()
+            } else {
+                have == want
+            }
+        };
         self.tools.iter().find(|t| {
-            t.units.iter().any(|u| u == name)
+            let by_path = || {
+                t.procs.iter().any(|p| {
+                    if m.full {
+                        hit(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
+                    } else if m.path && name.contains('/') {
+                        // killall: the executable itself, or one of a tree
+                        want == fold(p) || (p.ends_with('/') && want.starts_with(&fold(p)))
+                    } else {
+                        false
+                    }
+                })
+            };
+            // a unit's name, as a process's, in full
+            t.units.iter().any(|u| fold(u) == want)
                 || t.procs.iter().filter(|p| !p.ends_with('/')).any(|p| {
                     let base = p.rsplit('/').next().unwrap_or(p);
-                    base == name || (name.len() == 15 && base.starts_with(name))
+                    hit(base) || (want.len() == 15 && fold(base).starts_with(&want))
                 })
+                || by_path()
         })
     }
 
@@ -817,6 +883,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
     fn assess_once(&self, event: &Event) -> Option<Finding> {
         // R12b (R-F): the lineage as of the event's own time
         let as_of = AsOf::of_event(event);
+        // NN-L-EVA-001: the verb and every listed unit the command names
+        let mut stopped: Option<UnitsStopped> = None;
         let (rule, tool, what, pid, filename, ts) = match event {
             Event::ProcessSpawn {
                 pid,
@@ -836,8 +904,16 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let (rule, tool, what) = self.spawn_finding(*pid, &id, argv, as_of)?;
-                (rule, tool, what, *pid, image, *timestamp_ns)
+                let asked = self.spawn_finding(*pid, &id, argv, as_of)?;
+                stopped = asked.stopped;
+                (
+                    asked.rule,
+                    asked.tool,
+                    asked.what,
+                    *pid,
+                    image,
+                    *timestamp_ns,
+                )
             }
             Event::DefenderSignal {
                 pid,
@@ -884,7 +960,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             .unwrap_or(ToolClass::Edr);
         let sanctioned = self
             .sanctioned(event, pid, ts)
-            .or_else(|| self.own_units_in_window(rule, &tool, &what));
+            .or_else(|| self.own_units_in_window(stopped.as_ref()));
         let suspicious = if sanctioned.is_none() {
             self.suspicious(pid, as_of)
         } else {
@@ -977,64 +1053,137 @@ impl<H: DecisionHost> DefenseDetector<H> {
         id: &ExecIdentity,
         argv: &[String],
         as_of: AsOf,
-    ) -> Option<(EvaRule, String, String)> {
-        let prog = program_name(id, argv);
-        let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    ) -> Option<Asked> {
+        // lot 316: the program by its names (the xtables multi-call
+        // binary's included), and where its own arguments start
+        let prog = Program::of(&id.exe, argv);
+        let args: Vec<&str> = argv
+            .iter()
+            .skip(prog.args_from)
+            .map(String::as_str)
+            .collect();
         // NN-L-EVA-002: a listed switch-off command.
-        if let Some(c) = self.tools.cmds.iter().find(|c| {
+        for c in &self.tools.cmds {
             let named = if c.program.starts_with('/') {
                 id.exe.to_string_lossy() == c.program.as_str()
                     || id.runs.mentioned() == Some(c.program.as_str())
                     || argv.iter().any(|a| a == &c.program)
             } else {
-                prog.iter().any(|p| *p == c.program)
+                prog.is(&c.program)
             };
-            named && switches_off(&args, &c.args, || self.flushed_by_its_runtime(pid, as_of))
-        }) {
+            if !named {
+                continue;
+            }
+            // lot 316 (N4): a tool with a table is read by it — the
+            // listed command's options by name, whatever their spelling
+            let understood = match SystemTool::named(&c.program) {
+                Some(tool) => {
+                    let listed = read_listed(tool, &c.args);
+                    let by_its_runtime = || self.flushed_by_its_runtime(pid, as_of);
+                    tool.read(argv, prog.args_from)
+                        .iter()
+                        .find(|r| holds(tool, r, &listed, &by_its_runtime))
+                        .map(|r| r.understood)
+                }
+                None => switches_off(&args, &c.args).then_some(true),
+            };
+            let Some(understood) = understood else {
+                continue;
+            };
             let shown = if c.args.is_empty() {
                 format!("`{}`", c.program)
             } else {
                 format!("`{} {}`", c.program, c.args.join(" "))
             };
-            return Some((EvaRule::SwitchedOff, c.tool.clone(), shown));
+            return Some(Asked::of(
+                EvaRule::SwitchedOff,
+                c.tool.clone(),
+                with_reading(shown, understood),
+            ));
         }
-        // NN-L-EVA-001: a listed unit stopped, disabled, masked or killed.
-        for (verb, unit) in service_targets(&prog, argv) {
-            if let Some((t, u)) = self.tools.tool_of_unit(&unit) {
-                return Some((
-                    EvaRule::ServiceStopped,
-                    t.name.clone(),
-                    format!("unit {u} {verb}"),
-                ));
+        // NN-L-EVA-001: a listed unit stopped, disabled, masked or killed;
+        // lot 316 (BUG-96): every unit of the command, the finding named by
+        // another tool's before the agent's own
+        let mut units: Vec<(String, String, String)> = Vec::new();
+        let mut understood = true;
+        for t in service_targets(&prog, argv) {
+            for (tool, u) in self.tools.tools_of_unit(&t.unit) {
+                if !units.iter().any(|(n, x, _)| *n == tool.name && *x == u) {
+                    units.push((tool.name.clone(), u, t.verb.clone()));
+                }
+                understood &= t.understood;
             }
+        }
+        if !units.is_empty() {
+            let first = units
+                .iter()
+                .position(|(n, _, _)| n != AGENT_TOOL)
+                .unwrap_or(0);
+            let (tool, unit, unit_verb) = units[first].clone();
+            let others: Vec<&str> = units
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != first)
+                .map(|(_, (_, u, _))| u.as_str())
+                .collect();
+            let mut what = format!("unit {unit} {unit_verb}");
+            if !others.is_empty() {
+                what.push_str(&format!(" (with {})", others.join(", ")));
+            }
+            return Some(Asked {
+                rule: EvaRule::ServiceStopped,
+                tool,
+                what: with_reading(what, understood),
+                stopped: Some(UnitsStopped {
+                    verbs: units.iter().map(|(_, _, v)| v.clone()).collect(),
+                    units: units.into_iter().map(|(n, u, _)| (n, u)).collect(),
+                }),
+            });
         }
         // NN-L-EVA-003: kill, pkill, killall naming a tool's process.
-        if prog.contains(&"kill") {
-            if kill_signal_is_probe(&args) {
-                return None;
-            }
-            for a in args.iter().filter(|a| !a.starts_with('-')) {
-                if let Ok(target) = a.parse::<u32>() {
-                    if let Some(tool) = self.defender(target, as_of) {
-                        return Some((
-                            EvaRule::Killed,
-                            tool.clone(),
-                            format!("`kill` of {tool}'s process {target}"),
-                        ));
+        match prog.tool() {
+            Some(SystemTool::Kill) => {
+                for r in SystemTool::Kill.read(argv, prog.args_from) {
+                    if kill_is_probe(&r) {
+                        continue;
+                    }
+                    for a in &r.operands {
+                        let Ok(target) = a.parse::<u32>() else {
+                            continue;
+                        };
+                        if let Some(tool) = self.defender(target, as_of) {
+                            return Some(Asked::of(
+                                EvaRule::Killed,
+                                tool.clone(),
+                                with_reading(
+                                    format!("`kill` of {tool}'s process {target}"),
+                                    r.understood,
+                                ),
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if prog.iter().any(|p| *p == "pkill" || *p == "killall") {
-            for a in pattern_args(&args) {
-                if let Some(t) = self.tools.tool_of_name(a) {
-                    return Some((
-                        EvaRule::Killed,
-                        t.name.clone(),
-                        format!("`{} {a}`", prog[0]),
-                    ));
+            Some(tool @ (SystemTool::Pkill | SystemTool::Killall)) => {
+                for r in tool.read(argv, prog.args_from) {
+                    let m = NameMatch::of(tool, &r);
+                    for a in &r.operands {
+                        if let Some(t) = self.tools.tool_of_pattern(a, m) {
+                            let name = if tool == SystemTool::Pkill {
+                                "pkill"
+                            } else {
+                                "killall"
+                            };
+                            return Some(Asked::of(
+                                EvaRule::Killed,
+                                t.name.clone(),
+                                with_reading(format!("`{name} {a}`"), r.understood),
+                            ));
+                        }
+                    }
                 }
             }
+            _ => {}
         }
         None
     }
@@ -1043,18 +1192,19 @@ impl<H: DecisionHost> DefenseDetector<H> {
     /// [`AGENT_UNITS`]: `stop`, `force-stop`, `kill` — `systemctl kill` is
     /// how a window restarts it) inside a valid signed trusted-installer
     /// window: the window's grant, named. A disable, mask or freeze, another
-    /// tool, no window or an expired one: `None`.
-    fn own_units_in_window(&self, rule: EvaRule, tool: &str, what: &str) -> Option<String> {
-        if rule != EvaRule::ServiceStopped || tool != AGENT_TOOL {
-            return None;
-        }
-        // `what` is "unit <name> <verb>" for NN-L-EVA-001.
-        let mut w = what.split(' ');
-        let (Some("unit"), Some(unit), Some(verb), None) = (w.next(), w.next(), w.next(), w.next())
-        else {
-            return None;
+    /// tool, no window or an expired one: `None`. Lot 316 (BUG-96): every
+    /// listed unit the command stops must be the agent's own — auditd
+    /// stopped with the agent is High as anywhere.
+    fn own_units_in_window(&self, stopped: Option<&UnitsStopped>) -> Option<String> {
+        let stopped = stopped?;
+        let own = |(tool, unit): &(String, String)| {
+            tool == AGENT_TOOL && AGENT_UNITS.contains(&unit.as_str())
         };
-        if !AGENT_UNITS.contains(&unit) || !matches!(verb, "stop" | "force-stop" | "kill") {
+        let restart = |verb: &String| matches!(verb.as_str(), "stop" | "force-stop" | "kill");
+        if stopped.units.is_empty()
+            || !stopped.units.iter().all(own)
+            || !stopped.verbs.iter().all(restart)
+        {
             return None;
         }
         let g = H::installer_grant(self.installer.get()?)?;
@@ -1135,184 +1285,297 @@ fn start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
         .ok()
 }
 
-/// The names a program goes by: its executable's basename and its
-/// `argv[0]`'s (`iptables` is `xtables-nft-multi`; a tool named by its
-/// `argv[0]` gains nothing from it but a detection).
-fn program_name<'a>(id: &'a ExecIdentity, argv: &'a [String]) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    if let Some(b) = id.exe.file_name().and_then(|b| b.to_str()) {
-        out.push(b);
-    }
-    if let Some(a0) = argv.first() {
-        let b = a0.rsplit('/').next().unwrap_or(a0);
-        if !out.contains(&b) {
-            out.push(b);
+/// Lot 316: what an exec asked, before it is judged.
+struct Asked {
+    rule: EvaRule,
+    tool: String,
+    what: String,
+    /// NN-L-EVA-001: what the command stops.
+    stopped: Option<UnitsStopped>,
+}
+
+impl Asked {
+    fn of(rule: EvaRule, tool: String, what: String) -> Self {
+        Self {
+            rule,
+            tool,
+            what,
+            stopped: None,
         }
     }
-    out
+}
+
+/// Lot 316 (BUG-96): every listed unit a service-manager command names —
+/// its tool and unit — and the verb each is named with.
+struct UnitsStopped {
+    units: Vec<(String, String)>,
+    verbs: Vec<String>,
+}
+
+/// `what`, said as read from an argv not understood (an option its table
+/// does not hold: the over-approximation of the reader).
+fn with_reading(what: String, understood: bool) -> String {
+    if understood {
+        what
+    } else {
+        format!("{what} (options not understood)")
+    }
 }
 
 /// `args` holds the switch-off command `run` as consecutive arguments (an
-/// empty run: always). Lot 282 (Tappa Prove P0): except a listed flush
-/// (`iptables -F`, `--flush`) of a container runtime's own chain
-/// ([`is_runtime_chain`]) that the runtime itself runs
-/// (`by_its_runtime`, asked only then). Podman's CNI plugin flushes its NAT
-/// chain (`iptables -t nat -F CNI-…`) at a container's removal: NN-L-EVA-002
-/// recorded "`iptables -F`", and the posture's DefenseImpairment, recorded in
-/// the administrator's scope, corroborated podman's own mass write — COMBAT,
-/// locked, and the ladder killed podman (lab 04/11, on main). The same chain
-/// flushed by any other process, and any other chain — the host firewall's
-/// (ufw, fail2ban, firewalld), a built-in one, every chain of a table (no
-/// chain named) — is still the firewall switched off.
-fn switches_off(args: &[&str], run: &[String], by_its_runtime: impl Fn() -> bool) -> bool {
-    if run.is_empty() {
+/// empty run: always) — for a program with no table of its own
+/// ([`tool_options`]: `auditctl`, `ufw`, `setenforce`, the uninstallers).
+fn switches_off(args: &[&str], run: &[String]) -> bool {
+    run.is_empty()
+        || args
+            .windows(run.len())
+            .any(|w| w.iter().zip(run).all(|(a, b)| *a == b.as_str()))
+}
+
+/// Lot 316 (N4): the reading `r` of a tool's argv holds the listed command
+/// `listed`, read by the same table: each of its options, by name, with its
+/// arguments when the list gives them (`iptables -F` is a flush of any
+/// chain, `-P INPUT ACCEPT` that policy), and its operands next to each
+/// other (`nft flush ruleset`, nft's words). Lot 282 (Tappa Prove P0):
+/// except a flush of a container runtime's own chain ([`is_runtime_chain`])
+/// that the runtime itself runs (`by_its_runtime`, asked only then).
+/// Podman's CNI plugin flushes its NAT chain (`iptables -t nat -F CNI-…`)
+/// at a container's removal: NN-L-EVA-002 recorded "`iptables -F`", and the
+/// posture's DefenseImpairment, recorded in the administrator's scope,
+/// corroborated podman's own mass write — COMBAT, locked, and the ladder
+/// killed podman (lab 04/11, on main). The same chain flushed by any other
+/// process, and any other chain — the host firewall's (ufw, fail2ban,
+/// firewalld), a built-in one, every chain of a table (no chain named) — is
+/// still the firewall switched off.
+fn holds(
+    tool: SystemTool,
+    r: &Parsed<'_>,
+    listed: &Parsed<'_>,
+    by_its_runtime: &dyn Fn() -> bool,
+) -> bool {
+    let flush = |name: &str| tool == SystemTool::Iptables && name == tool_options::IPTABLES_FLUSH;
+    let options = listed.options.iter().all(|(name, values)| {
+        r.option(name).any(|v| {
+            (values.is_empty() || v == values.as_slice())
+                && !(flush(name)
+                    && values.is_empty()
+                    && v.first().is_some_and(|chain| is_runtime_chain(chain))
+                    && by_its_runtime())
+        })
+    });
+    let operands = listed.operands.is_empty()
+        || r.operands
+            .windows(listed.operands.len())
+            .any(|w| w == listed.operands.as_slice());
+    options && operands
+}
+
+/// Lot 316: `kill`'s reading `r` sends no signal that stops — an existence
+/// probe (`-0`, `-s 0`, `-SIG0`), `SIGCONT`, or a listing (`-l`, `-L`,
+/// help, version: procps' kill prints and exits). Never for an argv not
+/// understood, whose signal is not known.
+fn kill_is_probe(r: &Parsed<'_>) -> bool {
+    if !r.understood {
+        return false;
+    }
+    if ["l", "L", "h", "V"].iter().any(|o| r.has(o)) {
         return true;
     }
-    let flush = run.last().is_some_and(|a| a == "-F" || a == "--flush");
-    args.windows(run.len()).enumerate().any(|(i, w)| {
-        w.iter().zip(run).all(|(a, b)| *a == b.as_str())
-            && !(flush
-                && args
-                    .get(i + run.len())
-                    .is_some_and(|chain| is_runtime_chain(chain))
-                && by_its_runtime())
+    // the last signal named: `-SIGNAL` first, then `-s` (procps)
+    let signal = r
+        .options
+        .iter()
+        .filter(|(n, _)| *n == crate::posture::script_args::SIGNAL || *n == "s")
+        .filter_map(|(_, v)| v.first())
+        .next_back();
+    signal.is_some_and(|s| {
+        let up = s.to_ascii_uppercase();
+        let name = up.strip_prefix("SIG").unwrap_or(&up);
+        matches!(name, "0" | "CONT" | "18")
     })
 }
 
-/// `kill -0 …` (an existence probe), `kill -l` (a listing).
-fn kill_signal_is_probe(args: &[&str]) -> bool {
-    args.iter().any(|a| {
-        matches!(
-            *a,
-            "-0" | "-l"
-                | "-L"
-                | "--list"
-                | "--table"
-                | "-s0"
-                | "-SIG0"
-                | "-CONT"
-                | "-SIGCONT"
-                | "-18"
-        )
-    }) || args
-        .windows(2)
-        .any(|w| matches!(w[0], "-s" | "-n" | "--signal") && w[1] == "0")
+/// Lot 316: how `pkill` or `killall` matches a name to a process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NameMatch {
+    /// A part of the name is enough (pkill's pattern, a regular expression
+    /// searched in the name, unless `-x`; killall's `-r`).
+    part: bool,
+    /// Against the full command line (pkill's `-f`).
+    full: bool,
+    /// In any case (pkill's `-i`, killall's `-I`).
+    ignore_case: bool,
+    /// A name with a `/` is the executable (killall).
+    path: bool,
 }
 
-/// The pattern arguments of `pkill`/`killall`: what is not an option or
-/// an option's value.
-fn pattern_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    const WITH_VALUE: &[&str] = &[
-        "-s",
-        "--signal",
-        "-u",
-        "--euid",
-        "-U",
-        "--uid",
-        "-g",
-        "--pgroup",
-        "-G",
-        "--group",
-        "-P",
-        "--parent",
-        "-t",
-        "--terminal",
-        "--ns",
-        "--nslist",
-        "-o",
-        "--older-than",
-        "-y",
-        "--younger-than",
-        "-n",
-        "--session",
-        "-c",
-        "--cgroup",
-        "-F",
-        "--pidfile",
-    ];
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if WITH_VALUE.contains(a) {
-            it.next();
-        } else if !a.starts_with('-') {
-            out.push(*a);
+impl NameMatch {
+    /// As `tool`'s reading `r` asks; for an argv not understood, every
+    /// way at once.
+    fn of(tool: SystemTool, r: &Parsed<'_>) -> Self {
+        if !r.understood {
+            return Self {
+                part: true,
+                full: true,
+                ignore_case: true,
+                path: true,
+            };
+        }
+        match tool {
+            SystemTool::Pkill => Self {
+                part: !r.has("x"),
+                full: r.has("f"),
+                ignore_case: r.has("i"),
+                path: false,
+            },
+            _ => Self {
+                part: r.has("r"),
+                full: false,
+                ignore_case: r.has("I"),
+                path: true,
+            },
         }
     }
-    out
 }
 
-/// `(verb, unit)` pairs a service-manager command stops, disables, masks
-/// or kills. `prog`: the program's names.
-fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
-    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-    let is = |n: &str| prog.contains(&n);
-    let free: Vec<&str> = args
-        .iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    let mut out = Vec::new();
-    if is("systemctl") {
-        if args.iter().any(|a| matches!(*a, "--user" | "--global")) {
-            return out;
+/// `fnmatch(3)` without flags: `*`, `?`, a bracket expression (`!` or `^`
+/// negates, `a-z` ranges), `\` quotes the next character — how systemctl
+/// matches a pattern against the units in memory.
+fn fnmatch(pattern: &str, name: &str) -> bool {
+    fn class(p: &[char], c: char) -> Option<(bool, usize)> {
+        // p starts after `[`; the class and its length up to `]`
+        let mut i = 0;
+        let negate = matches!(p.first(), Some('!' | '^'));
+        if negate {
+            i += 1;
         }
-        const WITH_VALUE: &[&str] = &[
-            "-H",
-            "--host",
-            "-M",
-            "--machine",
-            "-t",
-            "--type",
-            "-s",
-            "--signal",
-            "-p",
-            "--property",
-            "-n",
-            "--lines",
-            "-o",
-            "--output",
-            "--kill-whom",
-            "--kill-value",
-            "--root",
-            "--image",
-            "--what",
-            "--job-mode",
-            "--state",
-            "--timestamp",
-            "--when",
-            "--drop-in",
-            "--boot-loader-entry",
-            "--reboot-argument",
-        ];
-        let mut words = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if WITH_VALUE.contains(a) {
-                it.next();
-            } else if !a.starts_with('-') {
-                words.push(*a);
+        let mut hit = false;
+        let mut first = true;
+        while i < p.len() {
+            if p[i] == ']' && !first {
+                return Some((hit != negate, i + 1));
+            }
+            first = false;
+            let lo = p[i];
+            if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+                hit |= lo <= c && c <= p[i + 2];
+                i += 3;
+            } else {
+                hit |= lo == c;
+                i += 1;
             }
         }
-        if let Some((verb, units)) = words.split_first() {
-            if matches!(*verb, "stop" | "disable" | "mask" | "kill" | "freeze") {
-                out.extend(units.iter().map(|u| (verb.to_string(), u.to_string())));
+        None
+    }
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
+            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
+            Some('[') => match (n.first(), class(&p[1..], *n.first().unwrap_or(&'\0'))) {
+                (Some(_), Some((true, len))) => go(&p[1 + len..], &n[1..]),
+                (Some(_), Some((false, _))) | (None, _) => false,
+                // no closing `]`: a `[` as itself
+                (Some(c), None) => *c == '[' && go(&p[1..], &n[1..]),
+            },
+            Some('\\') if p.len() > 1 => n.first() == Some(&p[1]) && go(&p[2..], &n[1..]),
+            Some(c) => n.first() == Some(c) && go(&p[1..], &n[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // a bounded pattern: systemctl's unit names are short
+    p.len() <= 256 && n.len() <= 256 && go(&p, &n)
+}
+
+/// One unit a service-manager command stops, disables, masks or kills.
+struct ServiceTarget {
+    verb: String,
+    unit: String,
+    /// Read from an argv its table understood (systemctl's).
+    understood: bool,
+}
+
+/// The verbs of systemctl that stop a unit or keep it from starting.
+const SYSTEMCTL_STOPS: &[&str] = &["stop", "disable", "mask", "kill", "freeze"];
+
+/// Lot 316 (BUG-106, BUG-96): the units systemctl's reading `r` stops —
+/// every unit after the verb, on the system's manager (the last of
+/// `--system`, `--user`, `--global`, `--capsule`). For an argv not
+/// understood, any operand may be the verb and every later one a unit, and
+/// the manager is the system's.
+fn systemctl_targets<'a>(r: &Parsed<'a>) -> Vec<(&'a str, &'a str)> {
+    if !r.understood {
+        let mut out = Vec::new();
+        for (i, verb) in r.operands.iter().enumerate() {
+            if SYSTEMCTL_STOPS.contains(verb) {
+                out.extend(r.operands[i + 1..].iter().map(|u| (*verb, *u)));
             }
         }
         return out;
     }
-    let pair = |name: usize, action: usize, stops: &[&str]| -> Option<(String, String)> {
-        let (n, a) = (free.get(name)?, free.get(action)?);
-        stops.contains(a).then(|| (a.to_string(), n.to_string()))
+    let system = r
+        .options
+        .iter()
+        .rev()
+        .find_map(|(n, _)| match *n {
+            "system" => Some(true),
+            "user" | "global" | "C" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true);
+    match r.operands.split_first() {
+        Some((verb, units)) if system && SYSTEMCTL_STOPS.contains(verb) => {
+            units.iter().map(|u| (*verb, *u)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The units a service-manager command stops, disables, masks or kills.
+/// Lot 316: systemctl's argv read by its table, every way it may be read
+/// (BUG-106: an option the old exact-match list did not hold moved the verb
+/// onto its value; `POSIXLY_CORRECT` makes an option after the verb a
+/// unit).
+fn service_targets(prog: &Program, argv: &[String]) -> Vec<ServiceTarget> {
+    let mut out: Vec<ServiceTarget> = Vec::new();
+    if prog.is("systemctl") {
+        for r in SystemTool::Systemctl.read(argv, prog.args_from) {
+            out.extend(
+                systemctl_targets(&r)
+                    .into_iter()
+                    .map(|(verb, unit)| ServiceTarget {
+                        verb: verb.to_string(),
+                        unit: unit.to_string(),
+                        understood: r.understood,
+                    }),
+            );
+        }
+        return out;
+    }
+    let target = |verb: &str, unit: &str| ServiceTarget {
+        verb: verb.to_string(),
+        unit: unit.to_string(),
+        understood: true,
     };
-    if is("service") || is("invoke-rc.d") || is("rc-service") {
+    let free: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let pair = |name: usize, action: usize, stops: &[&str]| -> Option<ServiceTarget> {
+        let (n, a) = (free.get(name)?, free.get(action)?);
+        stops.contains(a).then(|| target(a, n))
+    };
+    if prog.is("service") || prog.is("invoke-rc.d") || prog.is("rc-service") {
         out.extend(pair(0, 1, &["stop", "force-stop"]));
-    } else if is("update-rc.d") {
+    } else if prog.is("update-rc.d") {
         out.extend(pair(0, 1, &["disable", "remove"]));
-    } else if is("chkconfig") {
+    } else if prog.is("chkconfig") {
         out.extend(pair(0, 1, &["off"]));
-    } else if is("rc-update") && free.first() == Some(&"del") {
-        out.extend(free.get(1).map(|n| ("del".to_string(), n.to_string())));
+    } else if prog.is("rc-update") && free.first() == Some(&"del") {
+        out.extend(free.get(1).map(|n| target("del", n)));
     }
     // `/etc/init.d/<name> stop`: the script is an argument of its
     // interpreter's exec.
@@ -1322,7 +1585,7 @@ fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
                 .get(i + 1)
                 .is_some_and(|x| matches!(x.as_str(), "stop" | "force-stop"))
             {
-                out.push(("stop".to_string(), name.to_string()));
+                out.push(target("stop", name));
             }
         }
     }
@@ -1331,3 +1594,4 @@ fn service_targets(prog: &[&str], argv: &[String]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests;
+mod tool_options;
