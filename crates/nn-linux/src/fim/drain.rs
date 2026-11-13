@@ -3977,6 +3977,25 @@ mod tests {
             writer_exe_of(&raw, Some(&own)).as_deref(),
             Some("/usr/bin/dd")
         );
+        // a writer gone that executed nothing since its fork: its forker's
+        // exec, through the kernel's fork record at the writer's start
+        let forks = AuthSessionTracker::new(dir.path().join("no-proc"));
+        let t = start + 120_000_000_000;
+        forks.ingest_spawn(4_000_005, 1, "/usr/bin/rsync", t - 3_000);
+        let mut gone = fake_raw(1, 2, FimOp::Modified as u8);
+        gone.timestamp_ns = t;
+        gone.modifier_pid = 4_000_007;
+        gone.fork_ppid = 4_000_005;
+        gone.fork_start = t - 1_000;
+        gone.modifier_start = t - 1_000;
+        teach_fork(&gone, Some(&forks));
+        assert_eq!(
+            writer_exe_of(&gone, Some(&forks)).as_deref(),
+            Some("/usr/bin/rsync")
+        );
+        // the fork record of another process at that pid: not the writer's
+        gone.modifier_start = t - 500;
+        assert_eq!(writer_exe_of(&gone, Some(&forks)), None);
         // a record without a start (left at the writer's own call): /proc
         raw.modifier_start = 0;
         assert_eq!(writer_exe_of(&raw, None).as_deref(), Some(exe.as_str()));
