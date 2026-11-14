@@ -11311,21 +11311,36 @@ number in parentheses is a lab PR.
     no record, no degradation; the window's and the pre-agent `bpf_send_signal`
     kprobes' handles by id and pin refused (EPERM, `bpf_prog_type` High ×4:
     the calibrated judge); a copy of `/etc` over `/etc` signed
-    `mount_over_protected` within 45 s. After: @AFTER2404@ **ubuntu2204**
+    `mount_over_protected` within 45 s. After: After: the cpuset controller enabled at the root, no record; the partition
+    `cpu_confined` High naming `/nn-cpu-check` and `own_cpus` in the status
+    within 15 s (44 threads on CPU 0), gone from the status once undone; CPU
+    3 offline and back, no record; systemd's `AllowedCPUs=0-2` on the slice,
+    no record — its reset left the threads on 0–2 (the kernel keeps the masks
+    when the cpuset controller leaves the slice), signed `cpu_confined`
+    (true); `bpf-content-check` every case PASS, B9 the window's kprobe
+    refused by id and pin after the window, signed; the pre-agent kprobe
+    refused by id and pin (baseline High); `/etc` signed as before. **ubuntu2204**
     (5.15.0-202), after: the cpuset controller enabled at the root, no
     record; the partition `cpu_confined` High naming `/nn-cpu-check` and
     `own_cpus` in the status within 15 s, gone once undone; CPU 3 offline
     and back, no record; the window's kprobe refused by id and pin, the
     pre-agent one too (baseline High); `/etc` signed as on 6.8;
     `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing, the
-    highest 551,900 of 900,000 (`bpf_prog_guard` 18,479). The first
-    after-round's content checks ran inside the CPU check's window (the
-    check now waits for its end) and are not counted. **ubuntu2604** (7.0):
+    highest 551,900 of 900,000 (`bpf_prog_guard` 18,479); a second round
+    (the CPU check's window, still open in the first, had let
+    `bpf-content-check`'s loads through: the check now waits for its end)
+    every case PASS, the reset's record true as on 6.8. **ubuntu2604** (7.0):
     before, the window's kprobe and `syscall` program (calling
     `bpf_send_signal_task`, SIGWINCH to the agent) and the pre-agent kprobe
     were taken by id and pin and the syscall program run, no record (the
     pre-agent one signed High at the start, the cross-view's baseline); a
-    copy of `/etc` signed `mount_over_protected`. After: @AFTER2604@
+    copy of `/etc` signed `mount_over_protected`. After: After: R001 as on 6.8 (C0–C3 PASS, the reset's record true);
+    `bpf-content-check` every case PASS — B9: the window's kprobe and the
+    window's `syscall` program calling `bpf_send_signal_task` refused by id
+    and through the pin after the window, each signed `bpf_prog_type`
+    naming the call; B7 unchanged; the pre-agent kprobe: High at the start,
+    its handles by id and pin still given (named); `/etc` signed
+    `mount_over_protected`.
   - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
     the host for all (no record); the kernel leaves the threads' masks
     narrowed when systemd drops the cpuset controller after an
