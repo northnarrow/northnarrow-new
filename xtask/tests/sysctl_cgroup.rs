@@ -265,7 +265,7 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
             "crate::cgroup_join::install(tracker);",
             "match crate::sysctl_cgroup::attach(ebpf, pin_root) {",
             "bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root)",
-            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root)",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
             "filesystem::register_bpffs_pins(ebpf, &crate::sysctl_cgroup::pin_dir(root))",
             "filesystem::prune_stale_inodes(ebpf)",
         ],

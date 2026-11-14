@@ -1087,10 +1087,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         &mut self,
         verified: &crate::boot::IntegrityVerified,
         pids: &[u32],
-        keep: &[crate::anti_tamper::ExeIdentity],
+        own: &crate::anti_tamper::OwnExes,
     ) -> Result<crate::anti_tamper::AttachReport> {
         let report =
-            crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)?;
+            crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, own)?;
         // R13 (lab PR 271): the deny hooks and the two observe sensors of
         // the anti-tamper attach, in the manifest's attach points
         if let Some(deny) = &report.deny {

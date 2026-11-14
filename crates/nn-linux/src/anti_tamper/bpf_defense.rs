@@ -513,6 +513,7 @@ pub(crate) fn register_own_objects(
     guard: &BpfGuard,
     ebpf: &mut Ebpf,
     pin_root: Option<&Path>,
+    own_exes: &crate::anti_tamper::OwnExes,
 ) -> Result<OwnObjects> {
     // External audit ATP-013: the maps taken out of the object before this
     // point, as recorded at load; then those still in it. An id that cannot
@@ -646,31 +647,16 @@ pub(crate) fn register_own_objects(
         }
     }
     // The agent's own binaries, by role: this executable (the agent) and
-    // its sibling watchdog. External audit EBPF-002: a process running one
-    // of them may take write handles before it is a protected pid only
+    // the watchdog it verifies. External audit EBPF-002: a process running
+    // one of them may take write handles before it is a protected pid only
     // while that role has no live process, in its first minute
     // (`fresh_instance_may_load`); `nn-admin` is not one of them — it talks
     // to the agent through its socket. A copy elsewhere has another inode.
-    let mut exe_keys: Vec<(common::wire::InodeKey, u8)> = Vec::new();
-    if let Ok(own) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-        let dir = own.parent().map(Path::to_path_buf);
-        let mut paths = vec![(own, ROLE_AGENT)];
-        if let Some(d) = dir {
-            paths.push((d.join("northnarrow-watchdog"), ROLE_WATCHDOG));
-        }
-        for (path, role) in paths {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                use std::os::unix::fs::MetadataExt;
-                exe_keys.push((
-                    common::wire::InodeKey {
-                        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
-                        ino: meta.ino(),
-                    },
-                    role,
-                ));
-            }
-        }
-    }
+    // Lot 344 (#554's KVM suites): the watchdog is the one the agent
+    // registers (`--watchdog-exe`, else its sibling), never a path guessed
+    // here — a watchdog the hook did not know was a foreign handle at every
+    // start.
+    let exe_keys = own_exe_keys(own_exes);
     {
         let exe_map = ebpf
             .map_mut(OWN_EXE_MAP)
@@ -737,6 +723,25 @@ pub(crate) fn register_own_objects(
         pin_names: pin_names.len(),
         enforce,
     })
+}
+
+/// `OWN_EXE_INODES`' entries: each executable of `own` under its role (the
+/// device in the kernel's encoding, as the hook reads it). Nothing else: no binary is added by its name or its directory.
+fn own_exe_keys(own: &crate::anti_tamper::OwnExes) -> Vec<(common::wire::InodeKey, u8)> {
+    [(own.agent, ROLE_AGENT), (own.watchdog, ROLE_WATCHDOG)]
+        .into_iter()
+        .filter_map(|(id, role)| {
+            id.map(|id| {
+                (
+                    common::wire::InodeKey {
+                        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+                        ino: id.ino,
+                    },
+                    role,
+                )
+            })
+        })
+        .collect()
 }
 
 /// Lot 290 (item 3): the configuration maps this module writes once, at
@@ -1911,6 +1916,43 @@ mod tests {
         assert_ne!(ROLE_WATCHDOG, ROLE_AGENT);
         assert_ne!(ROLE_WATCHDOG, 0, "0 is \"not one of ours\" in the guard");
         assert_ne!(ROLE_AGENT, 0, "0 is \"not one of ours\" in the guard");
+    }
+
+    /// Lot 344 (#554's KVM suites): the hook's roles are the executables
+    /// the agent gives it, each under its own role, and nothing else — no
+    /// `northnarrow-watchdog` guessed next to the agent (a watchdog the
+    /// agent verifies elsewhere was a foreign handle at every start).
+    #[test]
+    fn the_hook_s_roles_are_the_executables_it_is_given() {
+        use crate::anti_tamper::{ExeIdentity, OwnExes};
+        let agent = ExeIdentity {
+            dev: 0x802,
+            ino: 41,
+        };
+        let watchdog = ExeIdentity {
+            dev: 0x10101,
+            ino: 42,
+        };
+        let key = |id: ExeIdentity| common::wire::InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+            ino: id.ino,
+        };
+        let both = own_exe_keys(&OwnExes {
+            agent: Some(agent),
+            watchdog: Some(watchdog),
+        });
+        assert_eq!(
+            both,
+            [(key(agent), ROLE_AGENT), (key(watchdog), ROLE_WATCHDOG)]
+        );
+        // the device in the kernel's encoding, as the hook reads it
+        assert_eq!(both[0].0.dev, (8 << 20) | 2);
+        let wd_only = own_exe_keys(&OwnExes {
+            agent: None,
+            watchdog: Some(watchdog),
+        });
+        assert_eq!(wd_only, [(key(watchdog), ROLE_WATCHDOG)]);
+        assert!(own_exe_keys(&OwnExes::default()).is_empty());
     }
 
     #[test]

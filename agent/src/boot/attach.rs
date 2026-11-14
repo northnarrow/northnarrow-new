@@ -265,16 +265,10 @@ pub(crate) async fn load(
     // External audit ATP-002: entries a previous agent left in the pinned
     // map are kept only while they run the agent's or the watchdog's
     // executable, no longer while they merely call themselves so.
+    // Lot 344 (#554's KVM suites): the same two executables are the `bpf`
+    // hook's agent and watchdog roles (its fresh-instance window).
     let agent_pid = std::process::id();
-    let keep: Vec<northnarrow_agent::anti_tamper::ExeIdentity> = [
-        northnarrow_agent::anti_tamper::ExeIdentity::of_file(std::path::Path::new(
-            "/proc/self/exe",
-        )),
-        northnarrow_agent::anti_tamper::ExeIdentity::of_file(&cli.resolved_watchdog_exe()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let own = cli.own_exes();
     let pids = vec![agent_pid];
     // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
     // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside
@@ -282,7 +276,7 @@ pub(crate) async fn load(
     // refused by the preflight above (lab PR 218), or runs under that same
     // opt-in; hooks that attach and never run are the self-test's below.
     let anti_tamper = match sensor
-        .attach_anti_tamper(verified, &pids, &keep)
+        .attach_anti_tamper(verified, &pids, &own)
         .with_context(|| {
             format!(
                 "anti-tamper setup failed (agent_pid={agent_pid}) — \

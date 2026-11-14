@@ -930,7 +930,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     device and inode through `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` while
     the role is vacant takes the same path). A second instance beside the
     live one, one past its first minute, any handle on a link of the
-    agent's: reported High (and refused) as before.
+    agent's: reported High (and refused) as before. The hook's watchdog is
+    the one the agent verifies (`--watchdog-exe`, else its sibling): it
+    named the sibling on its own, so a watchdog given by `--watchdog-exe`
+    (the privileged e2e's) still took the High record at every start.
   - **A reboot is not an attempt on the agent.** systemd's SIGTERM to the
     watchdog and the agent during a shutdown is refused until
     `systemd-shutdown` and, when systemd says it is stopping the host, not

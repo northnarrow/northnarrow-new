@@ -551,3 +551,55 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
     )
     .unwrap();
 }
+
+/// Lot 344 (#554's KVM suites): the `bpf` hook's watchdog role is the
+/// watchdog the agent verifies (`--watchdog-exe`, else its sibling) — the
+/// one value the stale-pid scan takes too. It named the agent's sibling
+/// `northnarrow-watchdog` on its own, so a watchdog the agent was told of
+/// elsewhere took the agent's pins at its start as a foreign process
+/// (NN-L-BPF-002 High). No binary is guessed in the guard's registration.
+#[test]
+fn the_hook_s_watchdog_is_the_watchdog_the_agent_verifies() {
+    let c = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let prod = &c[..c.find("#[cfg(test)]").expect("the tests")];
+    assert!(
+        !prod.contains("\"northnarrow-watchdog\""),
+        "the guard names a watchdog binary of its own"
+    );
+    let reg = body(prod, "register_own_objects");
+    assert!(reg.contains("let exe_keys = own_exe_keys(own_exes);"));
+    assert!(
+        !reg.contains("current_exe"),
+        "the guard reads an executable of its own"
+    );
+    in_order(
+        body(prod, "own_exe_keys"),
+        &["[(own.agent, ROLE_AGENT), (own.watchdog, ROLE_WATCHDOG)]"],
+    )
+    .unwrap();
+    let at = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&at, "attach_reporting"),
+        &[
+            "match evict_stale_pids(ebpf, &own.keep()) {",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        &code("agent/src/boot/attach.rs"),
+        &[
+            "let own = cli.own_exes();",
+            ".attach_anti_tamper(verified, &pids, &own)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&code("agent/src/boot/cli.rs"), "own_exes"),
+        &[
+            "agent: ExeIdentity::of_process(std::process::id()),",
+            "watchdog: ExeIdentity::of_file(&self.resolved_watchdog_exe()),",
+        ],
+    )
+    .unwrap();
+}

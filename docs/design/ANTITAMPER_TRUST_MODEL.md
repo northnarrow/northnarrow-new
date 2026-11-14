@@ -356,7 +356,12 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
 
 - **Principal:** the process that runs the agent's or the watchdog's binary
   (`OWN_EXE_INODES`, now valued by role: 1 watchdog, 2 agent; `nn-admin` is
-  not registered — it talks to the agent over its socket).
+  not registered — it talks to the agent over its socket). The watchdog's
+  binary is the one the agent verifies before it registers a watchdog pid
+  (`--watchdog-exe`, else the `northnarrow-watchdog` next to the agent):
+  lot 344 (#554's KVM suites) — the guard named that sibling on its own,
+  so a watchdog the agent was told of elsewhere was a foreign handle at
+  every start. One value (`OwnExes`) feeds both.
 - **Mechanism:** the role is vacant. `ROLE_TGIDS` (pinned, two slots) holds
   the tgid of the live watchdog and agent; each records itself once it is a
   protected pid (the agent also records the watchdog it verifies), and

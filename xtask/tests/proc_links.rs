@@ -99,7 +99,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "agent/src/boot/attach.rs",
-        3,
+        2,
         "the agent's own image (`/proc/self/exe`): read, no match",
     ),
     (
