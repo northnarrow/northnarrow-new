@@ -3935,7 +3935,9 @@ mod tests {
     /// `rsyslogd` started at the pid lent its image to a log's shrink. The
     /// writer's executable is read from `/proc` only while it shows that
     /// start, else from the lineage's records of that process: a later
-    /// holder of the pid (its `/proc`, its exec record) lends nothing.
+    /// holder of the pid (its `/proc`, its exec record) lends nothing,
+    /// unless it started within the start's 2-tick tolerance (re-check of
+    /// #554, N1: a residual).
     #[test]
     fn a_writer_s_pid_held_by_another_process_lends_it_no_image() {
         let mut child = std::process::Command::new("sleep")

@@ -863,8 +863,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     The marker holds the writer's start, and the record carries it
     (`FimDriftRaw::modifier_start`): a pid reused by the time the drain
     reads it lends no image (`/proc` read for that start only, the lineage
-    for that process only). Residual: code running inside rsyslogd itself
-    writes as rsyslogd.
+    for that process only), except within the start's 2-tick tolerance: a
+    pid reused within about 15 ms of the writer's exit can still lend its
+    image (re-check of #554, N1). Residual: code running inside rsyslogd
+    itself writes as rsyslogd.
   - **A drift's writer that executed nothing since its fork is known.** The
     FIM drift record (`FimDriftRaw`, 144 → 176 bytes) carries the writer's
     unexecuted fork record and its forker's, as the open sensor's has since
