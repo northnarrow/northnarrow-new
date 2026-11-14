@@ -10,15 +10,16 @@
 #       (never attached: the load itself is what the agent judges)
 #   bpf-probe.py load-tracing [--type kprobe|tracepoint|perf_event|raw_tracepoint]
 #       [--call none|write_user|send_signal|send_signal_thread|override_return]
-#       [--name NAME]
+#       [--name NAME] [--pin PATH]
 #       (lot 345) BPF_PROG_LOAD of a tracing program that calls one helper
-#       (none: `r0 = 0; exit`) — what the content judge reads
+#       (none: `r0 = 0; exit`) — what the content judge reads; (lot 349)
+#       with --pin, pinned at PATH and its id printed ("OK fd N id I …")
 #   bpf-probe.py load-fmod-ret --func FUNC [--fentry] [--name NAME]
 #       (lot 345) BPF_PROG_LOAD of a `tracing` program on kernel function
 #       FUNC (its BTF id read from /sys/kernel/btf/vmlinux) as fmod_ret
 #       (BPF_MODIFY_RETURN), or fentry with --fentry; `r0 = 0; exit`
 #   bpf-probe.py load-kfunc-signal --type syscall|xdp|tc|cgroup_skb --pid PID
-#       [--sig N] [--no-signal] [--run] [--name NAME]
+#       [--sig N] [--no-signal] [--run] [--name NAME] [--pin PATH]
 #       (the review of #553, F1) BPF_PROG_LOAD of a program of a type any
 #       root loads with no opt-out that does t = bpf_task_from_pid(PID);
 #       bpf_send_signal_task(t, N, PIDTYPE_TGID, 0); bpf_task_release(t)
@@ -28,7 +29,12 @@
 #   bpf-probe.py load-socket-filter [--pin PATH] [--name NAME]
 #       BPF_PROG_LOAD of a socket filter (a type the agent lets through)
 #   bpf-probe.py map-fd-by-id ID [--rdonly]
-#   bpf-probe.py prog-fd-by-id ID
+#   bpf-probe.py prog-fd-by-id ID [--run]
+#       (lot 349) with --run, BPF_PROG_RUN on the handle given (a syscall
+#       program: "OK fd N run OK retval R")
+#   bpf-probe.py prog-ids | map-ids
+#       (lot 349) every program / map id on the host (*_GET_NEXT_ID: no
+#       handle)
 #   bpf-probe.py obj-get PATH [--rdonly]
 #   bpf-probe.py link-ids
 #       (lot 301) every link id on the host (BPF_LINK_GET_NEXT_ID: no handle)
@@ -52,6 +58,8 @@ BPF_OBJ_PIN = 6
 BPF_OBJ_GET = 7
 BPF_PROG_GET_FD_BY_ID = 13
 BPF_OBJ_GET_INFO_BY_FD = 15
+BPF_PROG_GET_NEXT_ID = 11
+BPF_MAP_GET_NEXT_ID = 12
 BPF_LINK_GET_FD_BY_ID = 30
 BPF_LINK_GET_NEXT_ID = 31
 BPF_LINK_DETACH = 34
@@ -176,6 +184,47 @@ def pin(fd, path):
     return bpf(BPF_OBJ_PIN, struct.pack("<QII", ctypes.addressof(p), fd, 0))
 
 
+def prog_id(fd):
+    """(lot 349) the id of program `fd` (struct bpf_prog_info: type, id)."""
+    info = ctypes.create_string_buffer(64)
+    _, ie = bpf(BPF_OBJ_GET_INFO_BY_FD, struct.pack("<IIQ", fd, 64, ctypes.addressof(info)))
+    return struct.unpack_from("<I", info.raw, 4)[0] if ie == 0 else f"? (info errno {ie})"
+
+
+def test_run(fd):
+    """BPF_PROG_RUN of program `fd` (no input): " run OK retval R" or " run ERR E"."""
+    attr = struct.pack("<IIIIQQIIIIQQIII", fd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    buf = ctypes.create_string_buffer(attr, 128)
+    r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_PROG_TEST_RUN), buf, ctypes.c_long(128))
+    re = ctypes.get_errno() if r < 0 else 0
+    retval = struct.unpack_from("<I", buf.raw, 4)[0]
+    return f" run {'OK retval ' + str(retval) if r >= 0 else 'ERR ' + errno.errorcode.get(re, '?')}"
+
+
+def pinned(fd, args):
+    """(lot 349) `--pin PATH`: pin `fd` there; the id and the pin, or ""."""
+    path = opt(args, "--pin")
+    if fd is None or not path:
+        return ""
+    _, pe = pin(fd, path)
+    return f" id {prog_id(fd)}" + (f" pinned {path}" if pe == 0 else f" PIN-ERR {pe}")
+
+
+def enum_ids(cmd):
+    """(lot 349) every id `cmd` (a *_GET_NEXT_ID) enumerates."""
+    out, cur = [], 0
+    while True:
+        buf = ctypes.create_string_buffer(struct.pack("<II", cur, 0), 128)
+        r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(cmd), buf, ctypes.c_long(128))
+        if r < 0:
+            e = ctypes.get_errno()
+            if e == errno.ENOENT:
+                return out, 0
+            return out, e
+        cur = struct.unpack_from("<I", buf.raw, 4)[0]
+        out.append(cur)
+
+
 def report(fd, e, extra=""):
     if fd is None:
         print(f"ERR {errno.errorcode.get(e, '?')} {e}")
@@ -245,7 +294,7 @@ def main(argv):
             body = [insn(0xB7, dst=1, imm=0), insn(0x85, imm=CALLS[call])]
         insns = body + [insn(0xB7, dst=0, imm=0), insn(0x95)]
         fd, e = prog_load(WRITE_USER_TYPES[kind], insns, opt(args, "--name", "k345_tr"))
-        return report(fd, e)
+        return report(fd, e, pinned(fd, args))
     if cmd == "load-kfunc-signal":
         kind = opt(args, "--type", "syscall")
         pid = opt(args, "--pid")
@@ -278,14 +327,9 @@ def main(argv):
         if fd is None:
             print(f"ERR {errno.errorcode.get(e, '?')} {e}" + (f" verifier: {last[:160]}" if last else ""))
             return 1
-        extra = ""
+        extra = pinned(fd, args)
         if "--run" in args and kind == "syscall":
-            attr = struct.pack("<IIIIQQIIIIQQIII", fd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-            buf = ctypes.create_string_buffer(attr, 128)
-            r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_PROG_TEST_RUN), buf, ctypes.c_long(128))
-            re = ctypes.get_errno() if r < 0 else 0
-            retval = struct.unpack_from("<I", buf.raw, 4)[0]
-            extra = f" run {'OK retval ' + str(retval) if r >= 0 else 'ERR ' + errno.errorcode.get(re, '?')}"
+            extra += test_run(fd)
         os.close(fd)
         print(f"OK fd {fd}{extra}")
         return 0
@@ -303,7 +347,15 @@ def main(argv):
         flags = BPF_F_RDONLY if "--rdonly" in args else 0
         return report(*bpf(BPF_MAP_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, flags)))
     if cmd == "prog-fd-by-id":
-        return report(*bpf(BPF_PROG_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0)))
+        fd, e = bpf(BPF_PROG_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0))
+        return report(fd, e, test_run(fd) if fd is not None and "--run" in args else "")
+    if cmd in ("prog-ids", "map-ids"):
+        found, e = enum_ids(BPF_PROG_GET_NEXT_ID if cmd == "prog-ids" else BPF_MAP_GET_NEXT_ID)
+        if e:
+            print(f"ERR {errno.errorcode.get(e, '?')} {e}")
+            return 1
+        print("OK " + " ".join(str(i) for i in found))
+        return 0
     if cmd == "obj-get":
         flags = BPF_F_RDONLY if "--rdonly" in args else 0
         p = ctypes.create_string_buffer(args[0].encode() + b"\0")

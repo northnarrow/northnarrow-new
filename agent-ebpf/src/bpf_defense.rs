@@ -216,6 +216,29 @@ pub static PROG_CONTENT_SEEN: Array<u32> = Array::with_max_entries(CALIB_MAX_INS
 #[map]
 pub static PROG_CONTENT_KEYS: HashMap<u64, u32> = HashMap::with_max_entries(CALL_TARGETS as u32, 0);
 
+/// Lot 349 (pre-alpha R002): from 6.9 the judge reads a load's content at
+/// `bpf_prog_load` only, and a load inside a trusted-installer window is let
+/// through whatever it calls — so a program calling a forbidden helper or
+/// kfunc, loaded in a window, could be taken later by id or through its pin
+/// by any root process and attached or run (the lab on 7.0: a syscall
+/// program calling `bpf_send_signal_task`, run by id after the window). Its
+/// id and the judge's verdict (`why << 32 | type`) are kept here at the
+/// load; a later handle on it outside a window, by a caller outside the
+/// family, is refused and signed ([`try_bpf_prog_guard`]), as the `bpf_prog`
+/// hook refuses every such handle before 6.9. Full: the id is not kept
+/// (a fail-open, counted).
+#[map]
+pub static PROG_CONTENT_HELD: HashMap<u32, u64> = HashMap::with_max_entries(PROG_CONTENT_HELD_MAX, 0);
+
+/// Lot 349: the verdict of a window's load between its `bpf_prog_load` hook
+/// and the `bpf_prog` hook that hands its descriptor out (thread id →
+/// `why << 32 | type`). Overwritten or cleared at the thread's next load.
+#[map]
+static PROG_CONTENT_HELD_INFLIGHT: LruHashMap<u32, u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// Lot 349: how many window loads with a forbidden call are kept.
+const PROG_CONTENT_HELD_MAX: u32 = 1024;
+
 /// `(dev, ino)` of the agent's own binaries, registered by userland at
 /// boot, valued by role ([`ROLE_WATCHDOG`], [`ROLE_AGENT`]). External audit
 /// EBPF-002: running one of them is no longer an exemption by itself —
@@ -840,6 +863,28 @@ unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
             return -EPERM;
         }
     }
+    // Lot 349 (pre-alpha R002): from 6.9, a load inside a window that the
+    // judge would refuse outside one — kept at its load ([`PROG_CONTENT_HELD`])
+    // — and, on any later handle by id or path outside a window, refused to a
+    // caller outside the family, signed as at the load.
+    if content_stage() == CONTENT_STAGE_LOAD {
+        if loading {
+            let tid = bpf_get_current_pid_tgid() as u32;
+            if let Some(v) = PROG_CONTENT_HELD_INFLIGHT.get_ptr(&tid) {
+                let v = *v;
+                let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
+                if PROG_CONTENT_HELD.insert(&id, &v, 0).is_err() {
+                    crate::fail_open::bump(fail_open_hook::BPF);
+                }
+            }
+        } else if let Some(v) = PROG_CONTENT_HELD.get_ptr(&id) {
+            let v = *v;
+            if !caller_is_exempt() && !crate::inode_protect::override_active() && !fresh_instance_may_load() {
+                emit_denial_kind(FS_OP_BPF_PROG_TYPE, (v >> 32) as u8, v as u32);
+                return -EPERM;
+            }
+        }
+    }
     // Lot 345: one of the agent's calibration programs, loaded while it
     // asks for a calibration (before 6.9)
     if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {
@@ -888,9 +933,18 @@ unsafe fn try_bpf_prog_load_guard(ctx: &LsmContext) -> i32 {
     if prog.is_null() {
         return 0;
     }
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
     if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {
         emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
         return -EPERM;
+    }
+    // Lot 349 (pre-alpha R002): a window lets the load through; what it
+    // would refuse outside one is kept for the program's later handles
+    if crate::inode_protect::override_active() && !caller_is_exempt() && !fresh_instance_may_load() {
+        if let Some((why, ty)) = content_scan(prog, every_type_armed()) {
+            let _ = PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &((u64::from(why) << 32) | u64::from(ty)), 0);
+        }
     }
     0
 }
@@ -1036,6 +1090,27 @@ unsafe fn content_refusal(prog: *const c_void, every_type: bool) -> Option<(u8, 
     {
         return None;
     }
+    content_verdict(prog, ty, kfuncs_only)
+}
+
+/// Lot 349 (pre-alpha R002): [`content_refusal`]'s verdict on `prog`'s
+/// content alone, whoever the caller — a window's load, let through, whose
+/// verdict is kept for the program's later handles.
+#[inline(always)]
+unsafe fn content_scan(prog: *const c_void, every_type: bool) -> Option<(u8, u32)> {
+    let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
+        .ok()?;
+    let kfuncs_only = !denied_by_default(ty);
+    if kfuncs_only && !every_type {
+        return None;
+    }
+    content_verdict(prog, ty, kfuncs_only)
+}
+
+/// Lot 345: the scan of `prog` (of type `ty`) for a forbidden call (with
+/// `kfuncs_only`, a kfunc target's only).
+#[inline(always)]
+unsafe fn content_verdict(prog: *const c_void, ty: u32, kfuncs_only: bool) -> Option<(u8, u32)> {
     // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
     // BTF pointer to the verifier, which a global function does not take
     // ("R1 is not a scalar") — its address is passed as a plain number

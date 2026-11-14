@@ -514,12 +514,14 @@ pub(crate) fn process_event(
             // Lot 280b: what the kernel-state round found — the kernel's own
             // record, not a refusal.
             // Lot 290: and its BPF cross-view.
+            // Lot 349: and the agent's own CPU watch.
             let found = matches!(
                 operation,
                 nn_model::FsProtectOperation::KernelTaint
                     | nn_model::FsProtectOperation::SysctlRootProg
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
+                    | nn_model::FsProtectOperation::CpuConfined
             );
             // Lot 290: a load the signed per-loader opt-out let through.
             let loader_opted_out = *operation == nn_model::FsProtectOperation::BpfProgOptOut;
@@ -606,6 +608,10 @@ pub(crate) fn process_event(
                         } else if *operation == nn_model::FsProtectOperation::KernelTaint {
                             "not refused: a taint flag of code entering the kernel, read by the \
                              kernel-state round"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::CpuConfined {
+                            "not refused: the agent runs on fewer CPUs than it should, read by \
+                             the kernel-state round's CPU watch"
                                 .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
                             "not refused: found on the root cgroup's cgroup/sysctl slot by the \

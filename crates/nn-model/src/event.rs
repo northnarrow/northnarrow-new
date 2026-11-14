@@ -1196,6 +1196,12 @@ pub enum FsProtectOperation {
     /// pid is the process whose I/O raised it, not necessarily the one
     /// that armed it.
     Sigio,
+    /// Lot 349 (pre-alpha R001): NOT a refusal — the agent runs on fewer
+    /// CPUs than it should, found by its kernel-state round
+    /// (`nn_linux::own_cpus`): `target_dev` the cause and the counts
+    /// (`own_cpus::of_target_dev`), `target_ino` the CPUs left (a mask of
+    /// those below 64), `comm` the partition, cgroup or thread named.
+    CpuConfined,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1248,6 +1254,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_BPF_UNSEEN => Self::BpfUnseen,
             crate::wire::FS_OP_BPF_BASELINE => Self::BpfBaseline,
             crate::wire::FS_OP_SIGIO => Self::Sigio,
+            crate::wire::FS_OP_CPU_CONFINED => Self::CpuConfined,
             other => Self::Unknown(other),
         }
     }
@@ -1298,6 +1305,7 @@ impl FsProtectOperation {
             Self::BpfUnseen => "bpf_unseen",
             Self::BpfBaseline => "bpf_baseline",
             Self::Sigio => "sigio",
+            Self::CpuConfined => "cpu_confined",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2066,6 +2074,12 @@ mod tests {
             ),
             // Lot 293
             (crate::wire::FS_OP_SIGIO, FsProtectOperation::Sigio, "sigio"),
+            // Lot 349
+            (
+                crate::wire::FS_OP_CPU_CONFINED,
+                FsProtectOperation::CpuConfined,
+                "cpu_confined",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
