@@ -448,7 +448,20 @@ impl<H: DecisionHost> RansomTracker<H> {
         };
         let own = hops.get(top).map_or(pid, |(p, _)| *p);
         let starter = hops.get(top + 1).map_or(own, |(p, _)| *p);
-        let judged = trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned);
+        // lot 346 (the mini-hunt): the packaged `go` in its own directories
+        // (lot 340's posture exemption): `go test` rewrote its archives in
+        // place and NN-L-IMP-001 was Critical on every developer's run
+        let go_own = match event {
+            Event::MassWrite { filename, .. } | Event::FileBurst { filename, .. } => {
+                self.lineage.is_go_toolchain_own_write(pid, as_of, filename)
+            }
+            _ => false,
+        };
+        let judged = if go_own {
+            trust::Judged::Trusted(trust::Trusted::GoToolchainOwnWork)
+        } else {
+            trust::judge_with(pid, lineage.as_deref(), &facts, package_tx, &owned)
+        };
         if let Some((key, encryptor_starter, program)) = beside {
             // lot 313 (the review of #549, F3, and the lab of 13/11): the
             // originals another process of the encryption tool's session
@@ -488,6 +501,7 @@ impl<H: DecisionHost> RansomTracker<H> {
                     a.program = match t {
                         trust::Trusted::PackagedProgram(p) => p,
                         trust::Trusted::PackageTransaction => String::new(),
+                        trust::Trusted::GoToolchainOwnWork => "go".to_string(),
                     };
                     return a;
                 }

@@ -48,6 +48,50 @@ use crate::posture::lineage::{in_system_tree, AsOf, AuthSessionTracker};
 /// The image CoreDNS runs in its container.
 pub const COREDNS_IMAGE_PATH: &str = "/coredns";
 
+/// Lot 346 (item 5): a cluster DNS service's container, as its runtime
+/// records it — the container's name in `kube-system`, its image's
+/// repository (the last part, or a mirror's `<prefix>-<name>`), the program
+/// the container runs (`process.args[0]`) — and the image that sends its
+/// upstream queries, in the container's view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterDns {
+    pub container: &'static str,
+    pub image: &'static str,
+    pub program: &'static str,
+    pub sender: &'static str,
+}
+
+/// Lot 346 (item 5): the cluster DNS services: CoreDNS; NodeLocal DNSCache
+/// (`node-local-dns`, a DaemonSet whose `node-cache` forwards the pods'
+/// names); the legacy kube-dns — its `kubedns` and the `dnsmasq` its nanny
+/// starts at `/usr/sbin/dnsmasq` in the same container.
+pub const CLUSTER_DNS: &[ClusterDns] = &[
+    ClusterDns {
+        container: "coredns",
+        image: "coredns",
+        program: COREDNS_IMAGE_PATH,
+        sender: COREDNS_IMAGE_PATH,
+    },
+    ClusterDns {
+        container: "node-cache",
+        image: "k8s-dns-node-cache",
+        program: "/node-cache",
+        sender: "/node-cache",
+    },
+    ClusterDns {
+        container: "kubedns",
+        image: "k8s-dns-kube-dns",
+        program: "/kube-dns",
+        sender: "/kube-dns",
+    },
+    ClusterDns {
+        container: "dnsmasq",
+        image: "k8s-dns-dnsmasq-nanny",
+        program: "/dnsmasq-nanny",
+        sender: "/usr/sbin/dnsmasq",
+    },
+];
+
 /// The runtimes' bundle files of a container `<id>`, under the host's root:
 /// containerd's and k3s' containerd's (`k8s.io` namespace), CRI-O's — the
 /// directory, then the OCI spec, then the file the runtime records the
@@ -107,6 +151,10 @@ const RESOLVER_UNITS: &[(&str, &[&str])] = &[
     ("connmand", &["connman"]),
 ];
 
+/// The re-check of #552 (N3), lot 346: the forks a resolver daemon makes of
+/// itself between its exec and the process that serves (a double fork).
+const SELF_FORKS: usize = 2;
+
 /// The review of #552 (F4): the packaged program that may start dnsmasq
 /// itself (its forker, not PID 1): NetworkManager's `dns=dnsmasq`.
 const DNSMASQ_PARENT: &str = "/usr/sbin/NetworkManager";
@@ -143,22 +191,22 @@ pub fn is_known_resolver(lineage: &AuthSessionTracker, pid: u32, exe: Option<&st
         pid,
         exe,
         &|exe| proven_on_host(pid, exe, || system_service_in(proc, lineage, pid, exe)),
-        &|| {
-            proven_on_host(pid, COREDNS_IMAGE_PATH, || {
-                coredns_in(proc, Path::new("/"), pid)
+        &|exe| {
+            proven_on_host(pid, &format!("cluster:{exe}"), || {
+                cluster_dns_in(proc, Path::new("/"), pid, exe)
             })
         },
     )
 }
 
 /// [`is_known_resolver`], the service's proof by `service` (for the image)
-/// and CoreDNS's by `coredns`.
+/// and a cluster DNS service's by `cluster` (for the image, lot 346).
 fn known_resolver(
     lineage: &AuthSessionTracker,
     pid: u32,
     exe: Option<&str>,
     service: &dyn Fn(&str) -> bool,
-    coredns: &dyn Fn() -> bool,
+    cluster: &dyn Fn(&str) -> bool,
 ) -> bool {
     let Some(exe) = exe else {
         return false;
@@ -166,10 +214,8 @@ fn known_resolver(
     if !sender_is_forwarder(Some(exe)) {
         return false;
     }
-    if exe == COREDNS_IMAGE_PATH {
-        return coredns();
-    }
-    in_system_tree(exe) && lineage.runs_host_file(pid, exe) && service(exe)
+    let on_host = in_system_tree(exe) && lineage.runs_host_file(pid, exe) && service(exe);
+    on_host || (CLUSTER_DNS.iter().any(|d| d.sender == exe) && cluster(exe))
 }
 
 /// `prove` for the process `pid` running `exe` on this host, kept
@@ -228,7 +274,12 @@ fn stat_field(stat: &str, n: usize) -> Option<u64> {
 ///   saw it ([`AuthSessionTracker::fork_parent`]), else its parent now (a
 ///   daemon older than the agent, or one that forked itself away from the
 ///   exec: in its unit's cgroup either way) — or, for dnsmasq, the
-///   packaged NetworkManager ([`DNSMASQ_PARENT`], by its image);
+///   packaged NetworkManager ([`DNSMASQ_PARENT`], by its image). The
+///   re-check of #552 (N3): or it is a fork the daemon made of itself, up
+///   to [`SELF_FORKS`] of them, each forker having executed the same
+///   packaged file ([`AuthSessionTracker::ran_host_file`]) and the first
+///   forked as above — Debian's `dnsmasq.service` (`Type=forking`) when the
+///   cache holds the kernel's record of the daemon's fork;
 /// * every uid it runs as (real, effective, saved, filesystem) is a system
 ///   user's (below [`UID_MIN`], or `nobody`);
 /// * its environment holds none of the dynamic loader's variables
@@ -251,7 +302,7 @@ pub fn system_service_in(proc: &Path, lineage: &AuthSessionTracker, pid: u32, ex
     if !units.contains(&unit.as_str()) {
         return false;
     }
-    let parent = match lineage.fork_parent(pid, AsOf::Now) {
+    let mut parent = match lineage.fork_parent(pid, AsOf::Now) {
         Some(p) => p,
         None => match crate::state_read::read_state(dir.join("stat"))
             .ok()
@@ -262,11 +313,25 @@ pub fn system_service_in(proc: &Path, lineage: &AuthSessionTracker, pid: u32, ex
             None => return false,
         },
     };
-    let by_its_manager = base == "dnsmasq" && lineage.runs_host_file(parent, DNSMASQ_PARENT);
-    if parent != 1 && !by_its_manager {
-        return false;
+    // the re-check of #552 (N3), lot 346: a daemon that forked itself away
+    // from its exec (`Type=forking`: Debian's dnsmasq double-forks, named
+    // on RHEL forks once) — each forker ran the same packaged file, as the
+    // spawn cache recorded its exec, and the first one's forker is PID 1
+    // (or dnsmasq's network manager)
+    for _ in 0..=SELF_FORKS {
+        let by_its_manager = base == "dnsmasq" && lineage.runs_host_file(parent, DNSMASQ_PARENT);
+        if parent == 1 || by_its_manager {
+            return system_user(&dir) && loader_free(&dir);
+        }
+        if parent <= 1 || !lineage.ran_host_file(parent, AsOf::Now, exe) {
+            return false;
+        }
+        match lineage.fork_parent(parent, AsOf::Now) {
+            Some(p) => parent = p,
+            None => return false,
+        }
     }
-    system_user(&dir) && loader_free(&dir)
+    false
 }
 
 /// The system unit (`<name>.service`, its template's name for an instance)
@@ -324,6 +389,17 @@ fn loader_free(dir: &Path) -> bool {
 /// ([`container_id`]), its bundle records CoreDNS, and the sender shares
 /// its namespaces with the container's init ([`ns_of_container`]).
 pub fn coredns_in(proc: &Path, root: &Path, pid: u32) -> bool {
+    cluster_dns_in(proc, root, pid, COREDNS_IMAGE_PATH)
+}
+
+/// Lot 346 (item 5): [`coredns_in`] for any cluster DNS service of
+/// [`CLUSTER_DNS`] whose sending image is `sender`: the bundle records that
+/// service's container ([`spec_is_cluster_dns`]).
+pub fn cluster_dns_in(proc: &Path, root: &Path, pid: u32, sender: &str) -> bool {
+    let services: Vec<&ClusterDns> = CLUSTER_DNS.iter().filter(|d| d.sender == sender).collect();
+    if services.is_empty() {
+        return false;
+    }
     let Ok(cgroup) = crate::state_read::read_state(proc.join(pid.to_string()).join("cgroup"))
     else {
         return false;
@@ -335,7 +411,10 @@ pub fn coredns_in(proc: &Path, root: &Path, pid: u32) -> bool {
         let dir = root.join(format!("{dir}{id}"));
         let spec = PathBuf::from(format!("{}{spec}", dir.display()));
         let init = PathBuf::from(format!("{}{init}", dir.display()));
-        spec.exists() && bundle_is_coredns(&spec) && ns_of_container(proc, pid, &init)
+        spec.exists()
+            && bundle_spec(&spec)
+                .is_some_and(|b| services.iter().any(|d| spec_is_cluster_dns(&b, d)))
+            && ns_of_container(proc, pid, &init)
     })
 }
 
@@ -415,23 +494,20 @@ fn owned_small_file(path: &Path) -> Option<String> {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// The bundle at `path` is root's, writable by no one else, and records the
-/// cluster's CoreDNS ([`spec_is_coredns`]).
-fn bundle_is_coredns(path: &Path) -> bool {
-    let Ok(m) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
+/// The bundle at `path`, when it is root's and writable by no one else: its
+/// OCI spec.
+fn bundle_spec(path: &Path) -> Option<serde_json::Value> {
+    let m = std::fs::symlink_metadata(path).ok()?;
     if !m.is_file()
         || m.uid() != bundle_owner()
         || m.permissions().mode() & 0o022 != 0
         || m.len() > BUNDLE_MAX_BYTES
     {
-        return false;
+        return None;
     }
     std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|spec| spec_is_coredns(&spec))
 }
 
 /// The owner a runtime's bundle must have: root (tests: the user running
@@ -455,6 +531,13 @@ fn bundle_owner() -> u32 {
 /// (`io.kubernetes.container.name`, `io.kubernetes.pod.namespace`,
 /// `io.kubernetes.cri-o.ImageName`).
 pub fn spec_is_coredns(spec: &serde_json::Value) -> bool {
+    spec_is_cluster_dns(spec, &CLUSTER_DNS[0])
+}
+
+/// Lot 346 (item 5): [`spec_is_coredns`] for the cluster DNS service `dns`:
+/// the container `dns.container` of `kube-system`, from a `dns.image`
+/// image, running `dns.program`.
+pub fn spec_is_cluster_dns(spec: &serde_json::Value, dns: &ClusterDns) -> bool {
     let a = &spec["annotations"];
     let first = |keys: &[&str]| keys.iter().find_map(|k| a[*k].as_str());
     let namespace = first(&[
@@ -471,20 +554,37 @@ pub fn spec_is_coredns(spec: &serde_json::Value) -> bool {
     ]);
     let program = spec["process"]["args"][0].as_str();
     namespace == Some("kube-system")
-        && name == Some("coredns")
-        && image.is_some_and(is_coredns_image)
-        && program == Some(COREDNS_IMAGE_PATH)
+        && name == Some(dns.container)
+        && image.is_some_and(|i| image_is(i, dns.image))
+        && program == Some(dns.program)
 }
 
-/// An image reference whose repository's last part is CoreDNS's
+/// The architectures an older image's name may end with
+/// (`k8s-dns-kube-dns-amd64`).
+const IMAGE_ARCHES: &[&str] = &["amd64", "arm64", "arm", "ppc64le", "s390x"];
+
+/// An image reference whose repository's last part is `want`, or a
+/// mirror's `<prefix>-<want>`, with an architecture's suffix or not
 /// (`registry.k8s.io/coredns/coredns:v1.11.1`,
-/// `docker.io/rancher/mirrored-coredns-coredns:1.10.1`, `…@sha256:…`).
-fn is_coredns_image(image: &str) -> bool {
+/// `docker.io/rancher/mirrored-coredns-coredns:1.10.1`, `…@sha256:…`,
+/// `registry.k8s.io/dns/k8s-dns-node-cache:1.23.1`).
+fn image_is(image: &str, want: &str) -> bool {
     let repo = image.split('@').next().unwrap_or(image);
     let last = repo.rsplit('/').next().unwrap_or(repo);
     let name = last.split(':').next().unwrap_or(last);
-    // `coredns`, or a mirror's `<prefix>-coredns`
-    name.rsplit('-').next() == Some("coredns")
+    let name = IMAGE_ARCHES
+        .iter()
+        .find_map(|a| name.strip_suffix(a)?.strip_suffix('-'))
+        .unwrap_or(name);
+    name == want
+        || name
+            .strip_suffix(want)
+            .is_some_and(|prefix| prefix.ends_with('-') && prefix.len() > 1)
+}
+
+#[cfg(test)]
+fn is_coredns_image(image: &str) -> bool {
+    image_is(image, "coredns")
 }
 
 #[cfg(test)]
@@ -751,7 +851,7 @@ mod tests {
                 pid,
                 Some(exe),
                 &|exe| system_service_in(&svc, &lineage, pid, exe),
-                &|| false,
+                &|_| false,
             )
         };
         let proven = is("/usr/sbin/dnsmasq");
@@ -770,7 +870,9 @@ mod tests {
             pid,
             Some("/usr/sbin/dnsmasq"),
             &|exe| system_service_in(&user, &lineage, pid, exe),
-            &|| true,
+            // lot 346: kube-dns's `dnsmasq` container sends from this path
+            // too, so the cluster's proof is asked for it: none here
+            &|_| false,
         );
         let outside = is("/srv/x/dnsmasq");
         let not_a_resolver = is("/usr/bin/curl");
@@ -949,6 +1051,202 @@ mod tests {
             argv_truncated: false,
             filename_truncated: false,
             stdio: Default::default(),
+        }
+    }
+
+    /// Named test (lot 346, item 5): NodeLocal DNSCache's `node-cache` and
+    /// kube-dns's `kubedns` and `dnsmasq` are proven by their runtime's
+    /// record of the container, as CoreDNS is; each only for its own
+    /// sending image, in `kube-system`, from its image, running its
+    /// program. On `main` only `/coredns` could be one.
+    #[test]
+    fn node_local_dns_and_kube_dns_are_proven_by_their_container_runtime_s_record() {
+        let systemd = format!(
+            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{ID}.scope\n"
+        );
+        let proven = |body: &str, sender: &str| {
+            let t = tempfile::tempdir().unwrap();
+            fixture(t.path(), 41, &systemd, BUNDLES[0].0, body, 0o644);
+            cluster_dns_in(&t.path().join("proc"), t.path(), 41, sender)
+        };
+        let node_cache = spec(
+            "kube-system",
+            "node-cache",
+            "registry.k8s.io/dns/k8s-dns-node-cache:1.23.1",
+            "/node-cache",
+        );
+        let kubedns = spec(
+            "kube-system",
+            "kubedns",
+            "registry.k8s.io/dns/k8s-dns-kube-dns-amd64:1.14.13",
+            "/kube-dns",
+        );
+        let nanny = spec(
+            "kube-system",
+            "dnsmasq",
+            "registry.k8s.io/dns/k8s-dns-dnsmasq-nanny:1.23.1",
+            "/dnsmasq-nanny",
+        );
+        assert!(proven(&node_cache, "/node-cache"));
+        assert!(proven(&kubedns, "/kube-dns"));
+        assert!(proven(&nanny, "/usr/sbin/dnsmasq"));
+        for (body, sender) in [
+            // another service's sender, CoreDNS's record for another image
+            (&node_cache, "/kube-dns"),
+            (&nanny, "/dnsmasq-nanny"),
+            (&kubedns, "/coredns"),
+            (
+                &spec(
+                    "kube-system",
+                    "coredns",
+                    "coredns/coredns:1.11.1",
+                    "/coredns",
+                ),
+                "/node-cache",
+            ),
+            // outside kube-system, another image, another program, a name
+            (
+                &spec(
+                    "default",
+                    "node-cache",
+                    "registry.k8s.io/dns/k8s-dns-node-cache:1",
+                    "/node-cache",
+                ),
+                "/node-cache",
+            ),
+            (
+                &spec(
+                    "kube-system",
+                    "node-cache",
+                    "evil/k8s-dns-node-cache-x:1",
+                    "/node-cache",
+                ),
+                "/node-cache",
+            ),
+            (
+                &spec(
+                    "kube-system",
+                    "node-cache",
+                    "registry.k8s.io/dns/k8s-dns-node-cache:1",
+                    "/bin/sh",
+                ),
+                "/node-cache",
+            ),
+            (
+                &spec("kube-system", "dnsmasq", "evil/dnsmasq:1", "/dnsmasq-nanny"),
+                "/usr/sbin/dnsmasq",
+            ),
+            (
+                &spec(
+                    "kube-system",
+                    "kubedns",
+                    "registry.k8s.io/dns/k8s-dns-kube-dns:1",
+                    "/kube-dns",
+                ),
+                "/tmp/kube-dns",
+            ),
+        ] {
+            assert!(!proven(body, sender), "{body} {sender}");
+        }
+        // a sender that names no service is never asked for
+        let lineage = AuthSessionTracker::new(Path::new("/nonexistent"));
+        for exe in ["/node-cache", "/kube-dns"] {
+            assert!(known_resolver(&lineage, 41, Some(exe), &|_| true, &|e| e == exe));
+            assert!(!known_resolver(&lineage, 41, Some(exe), &|_| true, &|_| {
+                false
+            }));
+        }
+        assert!(!known_resolver(
+            &lineage,
+            41,
+            Some("/sidecar"),
+            &|_| true,
+            &|_| true
+        ));
+        // (mutation r1) a mirror's prefix is a name, not a bare hyphen
+        assert!(image_is(
+            "docker.io/rancher/mirrored-k8s-dns-node-cache:1",
+            "k8s-dns-node-cache"
+        ));
+        assert!(!image_is(
+            "docker.io/x/-k8s-dns-node-cache:1",
+            "k8s-dns-node-cache"
+        ));
+        // (mutation r1) a resolver's name no cluster service sends from is
+        // never asked for the cluster's proof
+        assert!(!known_resolver(
+            &lineage,
+            41,
+            Some("/usr/sbin/unbound"),
+            &|_| false,
+            &|_| true
+        ));
+    }
+
+    /// Named test (lot 346, the re-check of #552, N3): a resolver whose
+    /// recorded forker is its own daemon — the spawn cache holds the
+    /// kernel's record that another process running the same packaged file
+    /// forked it — is its unit's service when that chain (at most two such
+    /// forks) starts at PID 1; on `main` its parent had to be PID 1. A chain
+    /// whose first exec a shell forked, a forker that ran another file, and
+    /// a longer chain are not.
+    #[test]
+    fn a_resolver_that_forked_itself_is_its_unit_s_service() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        let exe = root.join("usr/sbin/dnsmasq");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"dnsmasq").unwrap();
+        let other = root.join("usr/sbin/other");
+        std::fs::write(&other, b"other").unwrap();
+        let proc = t.path().join("proc");
+        let lineage = AuthSessionTracker::new(&proc).with_host_root(&root);
+        const DNSMASQ: &str = "/usr/sbin/dnsmasq";
+        let unit = "/system.slice/dnsmasq.service";
+        // an exec of `file` whose fork the kernel recorded `forker`'s
+        let exec = |pid: u32, forker: u32, file: &Path| {
+            let m = std::fs::metadata(file).unwrap();
+            let mut e = exec_forked_by(pid, DNSMASQ, forker);
+            if let nn_model::Event::ProcessSpawn { exe, .. } = &mut e {
+                (exe.dev, exe.ino) = (common::wire::exe::kernel_dev(m.dev()), m.ino());
+                exe.flags =
+                    common::wire::exe::exe_flags::KNOWN | common::wire::exe::exe_flags::ROOT_DIR;
+            }
+            lineage.ingest_spawn_event(&e);
+        };
+        for (pid, forker, file) in [
+            (100, 1, &exe),
+            (101, 100, &exe),
+            (102, 101, &exe),
+            (110, 600, &exe),
+            (111, 110, &exe),
+            (120, 1, &other),
+            (121, 120, &exe),
+            (130, 1, &exe),
+            (131, 130, &exe),
+            (132, 131, &exe),
+            (133, 132, &exe),
+            (140, 0, &exe),
+            (141, 140, &exe),
+        ] {
+            exec(pid, forker, file);
+        }
+        for pid in [101, 102, 111, 121, 133, 141] {
+            service(&proc, pid, unit, 1, NOBODY, b"\0");
+        }
+        assert!(system_service_in(&proc, &lineage, 101, DNSMASQ), "one fork");
+        assert!(
+            system_service_in(&proc, &lineage, 102, DNSMASQ),
+            "a double fork"
+        );
+        for (pid, why) in [
+            (111, "a shell forked its exec"),
+            (121, "its forker ran another file"),
+            (133, "three forks"),
+            (141, "its forker's own forker not known"),
+        ] {
+            assert!(!system_service_in(&proc, &lineage, pid, DNSMASQ), "{why}");
         }
     }
 

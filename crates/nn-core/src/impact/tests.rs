@@ -137,6 +137,31 @@ impl Host {
         );
     }
 
+    /// The review of #555 (F1): [`Self::exec`] as the agent ingests an exec
+    /// event, with the image the kernel gives an exec from a root-only
+    /// directory in PID 1's mount namespace (`KNOWN | ROOT_DIR`) — a
+    /// packaged program's.
+    fn exec_rooted(&self, pid: u32, ppid: u32, exe: &str, argv: &[&str]) {
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let mut e = crate::decision::rules::testutil::spawn_full("x", exe, 1000, argv, "bash");
+        if let Event::ProcessSpawn {
+            pid: p,
+            ppid: pp,
+            timestamp_ns,
+            start_ns,
+            exe: id,
+            ..
+        } = &mut e
+        {
+            (*p, *pp) = (pid, ppid);
+            (*timestamp_ns, *start_ns) = (10 * S + pid as u64, 10 * S + pid as u64);
+            id.path = exe.into();
+            (id.dev, id.ino) = (2049, u64::from(pid));
+            id.flags |= KNOWN | ROOT_DIR;
+        }
+        assert!(self.lineage.ingest_spawn_event(&e));
+    }
+
     fn tracker(&self, sampler: Arc<Fixed>) -> RansomTracker {
         RansomTracker::with(
             self.lineage.clone(),
@@ -961,4 +986,98 @@ fn an_inline_session_s_gpg_then_rm_is_decisive() {
     assert!(b.encrypting && b.decisive, "{b:?}");
     assert_eq!(b.key, a.key, "the encryptor's window");
     assert_eq!(b.actor, 560, "the session that started it");
+}
+
+/// Named test (lot 346, the mini-hunt of item 1): `go test` rewrites its
+/// packages' archives in place in its work directory to stamp their build
+/// ids, high-entropy files — NN-L-IMP-001 Critical on every developer's run
+/// on `main` (lot 340's dev corpus). The packaged `go` in its own work,
+/// build-cache or module-cache directory is trusted now; the same `go`
+/// rewriting a document, a `go` in a home, and the test binary it runs are
+/// judged as before.
+#[test]
+fn the_go_toolchain_rewriting_its_own_archives_is_trusted() {
+    let h = Host::new();
+    // the review of #555 (F1): the packaged `go`'s exec has its image
+    h.exec_rooted(
+        300,
+        200,
+        "/usr/lib/go-1.22/bin/go",
+        &["go", "test", "./..."],
+    );
+    h.exec_rooted(
+        301,
+        200,
+        "/home/u/sdk/go1.23.0/bin/go",
+        &["go", "test", "./..."],
+    );
+    h.exec(302, 300, "/tmp/go-build1/b001/calc.test", &["calc.test"]);
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    let t = h.tracker(Fixed::high("/"));
+    for (i, file) in [
+        "/tmp/go-build2618259110/b073/_pkg_.a",
+        "/home/u/.cache/go-build/0a/0a1b-d",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = t.assess(&rewrites(300, T0 + i as u64, file)).unwrap();
+        assert!(a.trusted.is_some() && !a.decisive, "{file}: {a:?}");
+        assert!(a.signals.is_empty(), "{file}: {a:?}");
+    }
+    for (i, (pid, file)) in [
+        (300, format!("{d}/report.docx")),
+        (301, "/tmp/go-build2618259110/b073/_pkg_.a".to_string()),
+        (302, "/tmp/go-build2618259110/b073/_pkg_.a".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = t.assess(&rewrites(pid, T0 + 10 + i as u64, &file)).unwrap();
+        assert!(a.trusted.is_none(), "{pid} {file}: {a:?}");
+        assert!(!a.signals.is_empty(), "{pid} {file}: {a:?}");
+    }
+}
+
+/// Named test (the review of #555, F1): a `go` at the toolchain's path whose
+/// exec has no image — a rootless container's `/usr/local/go/bin/go` (a
+/// golang image's), a user namespace's bind over the packaged one — writing
+/// a home it bound at `…/go/pkg/mod/` or under a `go-build` work directory
+/// there. The path names a file only in the namespace that resolved it: on
+/// 61e15d9a NN-L-IMP-001 trusted it (`GoToolchainOwnWork`) and nothing was
+/// Critical. It is judged as any writer; the same `go` with its image is
+/// trusted.
+#[test]
+fn a_go_without_its_image_is_not_trusted_by_the_ransomware_tracker() {
+    let h = Host::new();
+    for (pid, exe) in [
+        (310, "/usr/local/go/bin/go"),
+        (311, "/usr/lib/go-1.22/bin/go"),
+        (312, "/usr/lib/go/bin/go"),
+    ] {
+        h.exec(pid, 200, exe, &["go", "test", "./..."]);
+    }
+    h.exec_rooted(313, 200, "/usr/local/go/bin/go", &["go", "test", "./..."]);
+    let t = h.tracker(Fixed::high("/"));
+    for (i, (pid, file)) in [
+        (310, "/root/go/pkg/mod/h/Documents/report.pdf"),
+        (311, "/tmp/go-build1/b1/Documents/report.pdf"),
+        (312, "/home/u/.cache/go-build/Documents/report.pdf"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = t.assess(&rewrites(pid, T0 + i as u64, file)).unwrap();
+        assert!(a.trusted.is_none(), "{pid} {file}: {a:?}");
+        assert!(!a.signals.is_empty(), "{pid} {file}: {a:?}");
+    }
+    let a = t
+        .assess(&rewrites(
+            313,
+            T0 + 10,
+            "/root/go/pkg/mod/h/Documents/report.pdf",
+        ))
+        .unwrap();
+    assert!(a.trusted.is_some(), "{a:?}");
 }
