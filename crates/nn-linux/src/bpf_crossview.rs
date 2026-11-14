@@ -530,7 +530,10 @@ impl CrossView {
         let gone = stale_held(&held, &en.progs);
         if !gone.is_empty() {
             let n = self.parts.release_held(&gone);
-            tracing::debug!(released = n, "BPF self-defence: held programs no longer loaded released");
+            tracing::debug!(
+                released = n,
+                "BPF self-defence: held programs no longer loaded released"
+            );
         }
         let mut own = (self.own)();
         // the agent's own loads not registered yet (a sensor attached after
@@ -565,7 +568,10 @@ impl CrossView {
 /// id held after the enumeration is not in `held` and stays.
 pub fn stale_held(held: &[u32], progs: &[ProgRecord]) -> Vec<u32> {
     let live: BTreeSet<u32> = progs.iter().map(|p| p.id).collect();
-    held.iter().copied().filter(|id| !live.contains(id)).collect()
+    held.iter()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect()
 }
 
 /// The status file's path for an agent whose pid file is `pid_file`.
@@ -603,9 +609,16 @@ mod tests {
     fn held_programs_no_longer_loaded_are_released_each_round() {
         let live = [prog(7, 2, "a"), prog(9, 26, "b")];
         assert_eq!(stale_held(&[7, 8, 9, 1024], &live), vec![8, 1024]);
-        assert!(stale_held(&[7, 9], &live).is_empty(), "loaded ones stay held");
+        assert!(
+            stale_held(&[7, 9], &live).is_empty(),
+            "loaded ones stay held"
+        );
         assert!(stale_held(&[], &live).is_empty());
-        assert_eq!(stale_held(&[3], &[]), vec![3], "nothing loaded: all released");
+        assert_eq!(
+            stale_held(&[3], &[]),
+            vec![3],
+            "nothing loaded: all released"
+        );
     }
 
     fn with_attach(mut p: ProgRecord, a: &str) -> ProgRecord {

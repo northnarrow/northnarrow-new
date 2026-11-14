@@ -513,11 +513,15 @@ impl Watch {
             return Step::Skipped;
         };
         let settled = r.online == last && r.online == online_again;
-        let online = intersect(&intersect(&r.online, online_again), &last);
+        let mut online = intersect(&r.online, online_again);
+        if !last.is_empty() {
+            // a last round that read none narrows nothing
+            online = intersect(&online, &last);
+        }
         let why = r.unjudged.clone().or_else(|| {
             online
                 .is_empty()
-                .then(|| "no online CPU could be read".to_string())
+                .then(|| "no CPU online at every read".to_string())
         });
         if let Some(why) = why {
             self.unsettled = self.unsettled.saturating_add(1);
@@ -781,8 +785,8 @@ pub fn agent_unit_files(root: &Path, installed: Option<std::time::SystemTime>) -
 
 /// The file at `p` for [`unit_affinity`]; `None` when there is none.
 fn unit_file(p: &Path, installed: Option<std::time::SystemTime>, ours: bool) -> Option<UnitFile> {
-    use std::os::unix::fs::MetadataExt;
     use crate::state_read::Config;
+    use std::os::unix::fs::MetadataExt;
     let text = match crate::state_read::read_config(p) {
         Config::Absent => return None,
         Config::Text(t) => Some(t),
@@ -798,9 +802,8 @@ fn unit_file(p: &Path, installed: Option<std::time::SystemTime>, ours: bool) -> 
             ct < installed
         })
     };
-    let signed = ours
-        && crate::own_dropins::regular_with_one_name(p)
-        && installed.is_some_and(predates);
+    let signed =
+        ours && crate::own_dropins::regular_with_one_name(p) && installed.is_some_and(predates);
     Some(UnitFile { text, signed })
 }
 
@@ -840,6 +843,10 @@ pub fn host_now() -> Host {
             .map(|t| isolated_by_cmdline(&t))
             .unwrap_or_default(),
         manager: manager_affinity(&system_conf_files(Path::new("/"))),
+        unit: unit_affinity(&agent_unit_files(
+            Path::new("/"),
+            crate::own_dropins::install_time(),
+        )),
     }
 }
 
@@ -852,22 +859,278 @@ pub fn own_cgroup(proc_self_cgroup: &str) -> Option<String> {
         .filter(|p| p.starts_with('/'))
 }
 
-/// Every read of the watch: the file as text (`state_read::read_state`),
-/// `None` when it cannot be read — which narrows nothing the agent should run
-/// on (the wider set is expected: a record, the stricter side) and names no
-/// partition; an unreadable online list leaves the other source.
+/// The reads of the agent's start (the command line, systemd's
+/// `system.conf`): the file as text (`state_read::read_state`: bounded, a
+/// regular file only), `None` when it cannot be read — which narrows
+/// nothing the agent should run on (the wider set is expected: a record,
+/// the stricter side).
 fn read_text(p: &Path) -> Option<String> {
     crate::state_read::read_state(p).ok()
 }
 
-fn read_cpus(p: &Path) -> Option<Vec<u32>> {
-    let t = read_text(p)?;
-    Some(cpu_list(t.trim()))
+/// The review of #558 (F2, F3, F7): `path` opened once — a regular file,
+/// or a directory when `dir`, `O_NONBLOCK` — on the filesystem `magic`
+/// (`fstatfs`): a file bound over the path later changes nothing the
+/// descriptor reads, and one there at the start on another filesystem (a
+/// FUSE file, a tmpfs one, a FIFO) is refused (`Err`: why).
+pub fn open_source(path: &Path, magic: u64, dir: bool) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = libc::O_NONBLOCK
+        | libc::O_NOCTTY
+        | libc::O_CLOEXEC
+        | if dir { libc::O_DIRECTORY } else { 0 };
+    let at = |e: std::io::Error| format!("{}: {e}", path.display());
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .map_err(at)?;
+    let t = f.metadata().map_err(at)?.file_type();
+    if (dir && !t.is_dir()) || (!dir && !t.is_file()) {
+        return Err(format!(
+            "{}: not a {} — refused",
+            path.display(),
+            if dir { "directory" } else { "regular file" }
+        ));
+    }
+    match crate::fs_type::magic_of_file(&f) {
+        Some(m) if m == magic => Ok(f),
+        m => Err(format!(
+            "{}: on a filesystem of type {:#x}, not {magic:#x} — refused",
+            path.display(),
+            m.unwrap_or(0)
+        )),
+    }
 }
 
-/// The cgroup directory of `cgroup` (`/a/b`) under `root`.
-fn dir_of(root: &Path, cgroup: &str) -> PathBuf {
-    root.join(cgroup.trim_start_matches('/'))
+/// The text of a source opened at the start, made afresh: `pread` from
+/// offset 0 (procfs, sysfs and cgroupfs generate the file anew at offset
+/// 0), at most [`SOURCE_MAX`] — more is an error, never a cut answer.
+fn reread(f: &File) -> std::io::Result<String> {
+    use std::os::unix::fs::FileExt;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = match f.read_at(&mut buf, out.len() as u64) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        out.extend_from_slice(&buf[..n]);
+        if out.len() as u64 > SOURCE_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("more than {SOURCE_MAX} bytes: not read"),
+            ));
+        }
+    }
+    Ok(nn_core::posture::host::state_text(out))
+}
+
+/// The entries of the directory `dir` (name, a directory), read through a
+/// descriptor of its own (`openat(dir, ".")`: no path resolved again, no
+/// mount crossed).
+fn list_dir(dir: &File) -> std::io::Result<Vec<(Vec<u8>, bool)>> {
+    // SAFETY: `c"."` is NUL-terminated; the descriptor returned is ours.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is an open directory descriptor; `fdopendir` takes it.
+    let d = unsafe { libc::fdopendir(fd) };
+    if d.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, the descriptor is still ours.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let mut out = Vec::new();
+    let end = loop {
+        // SAFETY: errno is this thread's; cleared to tell the end from an
+        // error.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `d` is the open stream above.
+        let e = unsafe { libc::readdir(d) };
+        if e.is_null() {
+            let err = std::io::Error::last_os_error();
+            break if err.raw_os_error().unwrap_or(0) == 0 {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        // SAFETY: `e` points at the stream's entry, valid until the next
+        // `readdir`; `d_name` is NUL-terminated.
+        let (name, kind) = unsafe {
+            (
+                std::ffi::CStr::from_ptr((*e).d_name.as_ptr())
+                    .to_bytes()
+                    .to_vec(),
+                (*e).d_type,
+            )
+        };
+        if name != b"." && name != b".." {
+            out.push((name, matches!(kind, libc::DT_DIR | libc::DT_UNKNOWN)));
+        }
+    };
+    // SAFETY: `d` is the open stream; it closes `fd`.
+    unsafe { libc::closedir(d) };
+    end.map(|()| out)
+}
+
+/// The review of #558 (F2, F3): what the watch reads through, opened once
+/// at its first round — the online list (sysfs), `/proc/stat` and the
+/// agent's own `cgroup` and `task` entries (procfs), the cgroup2 root. A
+/// source refused or that could not be opened is `Err(why)`, and reads as
+/// nothing: the online list's other source stays, no cgroup file narrows
+/// what the agent should run on (the threads' affinity tells a
+/// confinement).
+#[derive(Debug)]
+pub struct Sources {
+    pub online: Result<File, String>,
+    pub stat: Result<File, String>,
+    pub cgroup: Result<File, String>,
+    pub task: Result<File, String>,
+    pub tree: Result<Tree, String>,
+}
+
+impl Sources {
+    /// This host's.
+    pub fn open() -> Sources {
+        let s = Sources {
+            online: open_source(Path::new(ONLINE), SYSFS_MAGIC, false),
+            stat: open_source(Path::new(PROC_STAT), PROC_SUPER_MAGIC, false),
+            cgroup: open_source(Path::new("/proc/self/cgroup"), PROC_SUPER_MAGIC, false),
+            task: open_source(Path::new("/proc/self/task"), PROC_SUPER_MAGIC, true),
+            tree: Tree::open(Path::new(CGROUP_ROOT)),
+        };
+        for why in [
+            s.online.as_ref().err(),
+            s.stat.as_ref().err(),
+            s.cgroup.as_ref().err(),
+            s.task.as_ref().err(),
+            s.tree.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tracing::warn!(source = %why, "own CPUs: a source of the watch is not read");
+        }
+        s
+    }
+}
+
+/// The review of #558 (F3): the cgroup2 hierarchy, through a descriptor of
+/// its root opened at the watch's start. Every file of it is opened beneath
+/// that descriptor with `openat2` — `RESOLVE_NO_XDEV` (no mount crossed: a
+/// file bound over a `cpuset.cpus`, a directory over a cgroup), no symbolic
+/// or magic link, `O_NONBLOCK` — and read bounded, a regular file only.
+#[derive(Debug)]
+pub struct Tree {
+    root: File,
+}
+
+impl Tree {
+    /// The tree at `path`, which must be a cgroup2 root (`fstatfs`).
+    pub fn open(path: &Path) -> Result<Tree, String> {
+        open_source(path, CGROUP2_SUPER_MAGIC, true).map(|root| Tree { root })
+    }
+
+    /// A tree at any directory (a test's).
+    #[cfg(test)]
+    fn unchecked(path: &Path) -> Tree {
+        Tree {
+            root: File::open(path).unwrap(),
+        }
+    }
+
+    /// `rel` (`a/b/cpuset.cpus`; empty: `dir` itself) opened beneath `dir`
+    /// with `flags`, crossing no mount (`EXDEV`) and no link (`ELOOP`). A
+    /// kernel without `openat2` (before 5.6): `openat`, and a file on
+    /// another device than `dir` is a mount crossed.
+    fn open_beneath(dir: &File, rel: &[u8], flags: i32) -> std::io::Result<File> {
+        use std::os::unix::fs::MetadataExt;
+        let c = std::ffi::CString::new(if rel.is_empty() { &b"."[..] } else { rel })
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let flags = flags | libc::O_CLOEXEC | libc::O_NOCTTY;
+        // SAFETY: `open_how` is plain old data, valid when zeroed.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = flags as u64;
+        how.resolve = libc::RESOLVE_BENEATH
+            | libc::RESOLVE_NO_XDEV
+            | libc::RESOLVE_NO_SYMLINKS
+            | libc::RESOLVE_NO_MAGICLINKS;
+        // SAFETY: `c` is NUL-terminated and `how` outlives the call, its
+        // size given.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: a new descriptor the kernel gave this call alone.
+            return Ok(unsafe { File::from_raw_fd(fd as i32) });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(e);
+        }
+        // SAFETY: `c` is NUL-terminated.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a new descriptor the kernel gave this call alone.
+        let f = unsafe { File::from_raw_fd(fd) };
+        if f.metadata()?.dev() != dir.metadata()?.dev() {
+            return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        Ok(f)
+    }
+
+    /// The text of `rel` beneath `dir`: `Ok(None)` when there is none or it
+    /// cannot be read (it narrows nothing: the wider set is expected),
+    /// `Err(why)` when its path crosses a mount or a link — never nothing.
+    fn read_in(dir: &File, rel: &[u8]) -> Result<Option<String>, String> {
+        match Self::open_beneath(dir, rel, libc::O_RDONLY | libc::O_NONBLOCK) {
+            Ok(f) => Ok(crate::state_read::read_file_bounded(&f, SOURCE_MAX)
+                .ok()
+                .map(nn_core::posture::host::state_text)),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::EXDEV) => Err(format!(
+                    "a mount over /{} or a directory above it",
+                    String::from_utf8_lossy(rel)
+                )),
+                Some(libc::ELOOP) => Err(format!(
+                    "a link on the path of /{}",
+                    String::from_utf8_lossy(rel)
+                )),
+                _ => Ok(None),
+            },
+        }
+    }
+}
+
+/// The file `file` of the cgroup `cgroup` (`/a/b`; empty: the root),
+/// relative to the root.
+fn rel_of(cgroup: &str, file: &str) -> Vec<u8> {
+    let cg = cgroup.trim_matches('/');
+    if cg.is_empty() {
+        file.as_bytes().to_vec()
+    } else {
+        format!("{cg}/{file}").into_bytes()
+    }
 }
 
 /// `cgroup` and each ancestor up to (not including) the root, the cgroup
@@ -885,21 +1148,30 @@ fn chain(cgroup: &str) -> Vec<String> {
     out
 }
 
-/// One read under `root` (`/sys/fs/cgroup`) with `online` and the threads'
-/// affinities given.
+/// One read of the cgroup `tree` with `online` and the threads' affinities
+/// given. The review of #558 (F3): a read whose path crosses a mount makes
+/// the reading [`Reading::unjudged`] — never a narrower expectation.
 pub fn read_under(
-    root: &Path,
+    tree: &Tree,
     online: Vec<u32>,
     cgroup: Option<String>,
     start_cgroup: Option<&str>,
     threads: Vec<(u32, Vec<u32>)>,
 ) -> Reading {
+    let mut unjudged: Option<String> = None;
+    let mut read = |cg: &str, file: &str| match Tree::read_in(&tree.root, &rel_of(cg, file)) {
+        Ok(t) => t.map(|t| cpu_list(t.trim())),
+        Err(why) => {
+            unjudged.get_or_insert(why);
+            None
+        }
+    };
     let effective = cgroup.as_deref().and_then(|cg| {
         chain(cg)
             .iter()
-            .map(|c| dir_of(root, c))
-            .chain(std::iter::once(root.to_path_buf()))
-            .find_map(|d| read_cpus(&d.join("cpuset.cpus.effective")).filter(|v| !v.is_empty()))
+            .map(String::as_str)
+            .chain(std::iter::once(""))
+            .find_map(|c| read(c, "cpuset.cpus.effective").filter(|v| !v.is_empty()))
     });
     let configured = start_cgroup
         .or(cgroup.as_deref())
@@ -907,7 +1179,7 @@ pub fn read_under(
             chain(start)
                 .into_iter()
                 .filter_map(|c| {
-                    let cpus = read_cpus(&dir_of(root, &c).join("cpuset.cpus"))?;
+                    let cpus = read(&c, "cpuset.cpus")?;
                     (!cpus.is_empty()).then_some((c, cpus))
                 })
                 .collect()
@@ -919,38 +1191,50 @@ pub fn read_under(
         effective,
         configured,
         threads,
+        unjudged,
     }
 }
 
-/// The cgroups under `root` in a partition (`cpuset.cpus.partition` `root`
-/// or `isolated`, valid or not), as `path state cpus`, breadth first, at
-/// most [`PARTITION_SCAN_MAX`] cgroups read, [`NAMED_MAX`] named.
-pub fn partitions_under(root: &Path) -> Vec<String> {
+/// The cgroups of `tree` in a partition (`cpuset.cpus.partition` `root` or
+/// `isolated`, valid or not), as `path state cpus`, breadth first, at most
+/// [`PARTITION_SCAN_MAX`] cgroups read, [`NAMED_MAX`] named. The review of
+/// #558 (F3, F7): each directory opened beneath the root's descriptor — one
+/// beneath a mount is not walked (a FUSE directory would stall the walk) —
+/// and its files read bounded.
+pub fn partitions_under(tree: &Tree) -> Vec<String> {
     let mut out = Vec::new();
-    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut queue = std::collections::VecDeque::from([Vec::<u8>::new()]);
     let mut read = 0usize;
-    while let Some(dir) = queue.pop_front() {
+    while let Some(rel) = queue.pop_front() {
         read += 1;
         if read > PARTITION_SCAN_MAX || out.len() >= NAMED_MAX {
             break;
         }
-        if dir != root {
-            if let Some(state) = read_text(&dir.join("cpuset.cpus.partition")) {
+        let Ok(dir) = Tree::open_beneath(&tree.root, &rel, libc::O_RDONLY | libc::O_DIRECTORY)
+        else {
+            continue;
+        };
+        if !rel.is_empty() {
+            if let Ok(Some(state)) = Tree::read_in(&dir, b"cpuset.cpus.partition") {
                 let state = state.trim();
                 if state.starts_with("root") || state.starts_with("isolated") {
-                    let cpus = read_text(&dir.join("cpuset.cpus.effective"))
+                    let cpus = Tree::read_in(&dir, b"cpuset.cpus.effective")
+                        .ok()
+                        .flatten()
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    let rel = dir.strip_prefix(root).unwrap_or(&dir);
-                    out.push(format!("/{} {state} {cpus}", rel.display()));
+                    out.push(format!("/{} {state} {cpus}", String::from_utf8_lossy(&rel)));
                 }
             }
         }
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    queue.push_back(e.path());
+        for (name, is_dir) in list_dir(&dir).unwrap_or_default() {
+            if is_dir {
+                let mut sub = rel.clone();
+                if !sub.is_empty() {
+                    sub.push(b'/');
                 }
+                sub.extend_from_slice(&name);
+                queue.push_back(sub);
             }
         }
     }
@@ -981,37 +1265,43 @@ pub fn affinity(tid: u32) -> Option<Vec<u32>> {
     )
 }
 
-/// Each thread of this process and its affinity (a thread gone between the
+/// Each thread of this process (the entries of its `task` directory,
+/// opened at the start) and its affinity (a thread gone between the
 /// listing and its read is left out).
-pub fn own_threads() -> Vec<(u32, Vec<u32>)> {
-    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+pub fn own_threads(task: &File) -> Vec<(u32, Vec<u32>)> {
+    list_dir(task)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, _)| std::str::from_utf8(&name).ok()?.parse::<u32>().ok())
         .filter_map(|tid| Some((tid, affinity(tid)?)))
         .collect()
 }
 
-/// One read of the host: the online CPUs (read twice: before and after the
-/// rest) and the reading.
-pub fn read_host(start_cgroup: Option<&str>) -> (Reading, Vec<u32>) {
-    let online = || {
-        online_of(
-            read_cpus(Path::new(ONLINE)).unwrap_or_default(),
-            read_text(Path::new(PROC_STAT)).as_deref().unwrap_or(""),
-        )
+/// One read of the host through `s`: the online CPUs (read twice: before
+/// and after the rest; the online list's and `/proc/stat`'s together) and
+/// the reading. Without the cgroup2 root (a cgroup v1 host, or one refused
+/// at the start) no cgroup file is read: nothing narrows what the agent
+/// should run on, and the threads' affinity tells a confinement.
+pub fn read_host(s: &Sources, start_cgroup: Option<&str>) -> (Reading, Vec<u32>) {
+    let text = |f: &Result<File, String>| {
+        f.as_ref()
+            .ok()
+            .and_then(|f| reread(f).ok())
+            .unwrap_or_default()
     };
+    let online = || online_of(cpu_list(text(&s.online).trim()), &text(&s.stat));
     let first = online();
-    let cgroup = read_text(Path::new("/proc/self/cgroup")).and_then(|t| own_cgroup(&t));
-    let r = read_under(
-        Path::new(CGROUP_ROOT),
-        first,
-        cgroup,
-        start_cgroup,
-        own_threads(),
-    );
+    let cgroup = own_cgroup(&text(&s.cgroup));
+    let threads = s.task.as_ref().map(own_threads).unwrap_or_default();
+    let r = match &s.tree {
+        Ok(t) => read_under(t, first, cgroup, start_cgroup, threads),
+        Err(_) => Reading {
+            online: first,
+            cgroup,
+            threads,
+            ..Reading::default()
+        },
+    };
     (r, online())
 }
 
@@ -1021,13 +1311,23 @@ pub fn round(w: &mut Watch) -> Option<Confinement> {
     if w.start_cgroup.is_none() {
         w.host = host_now();
     }
-    let (r, again) = read_host(w.start_cgroup.as_deref());
-    let partitions = || partitions_under(Path::new(CGROUP_ROOT));
-    match w.step(&r, &again, &partitions) {
+    let sources = w.sources.take().unwrap_or_else(Sources::open);
+    let (r, again) = read_host(&sources, w.start_cgroup.as_deref());
+    let partitions = || match &sources.tree {
+        Ok(t) => partitions_under(t),
+        Err(_) => Vec::new(),
+    };
+    let step = w.step(&r, &again, &partitions);
+    w.sources = Some(sources);
+    match step {
         Step::Same | Step::Skipped => None,
         Step::Confined(c) => {
             let line = c.line();
-            tracing::warn!(detail = %line, "own CPUs: the agent runs on fewer CPUs than it should");
+            if c.cause.is_unjudged() {
+                tracing::warn!(detail = %line, "own CPUs: the watch could not judge the agent's CPUs");
+            } else {
+                tracing::warn!(detail = %line, "own CPUs: the agent runs on fewer CPUs than it should");
+            }
             crate::boot::degradation::withdraw(DEGRADATION, &[]);
             if crate::boot::degradation::report(DEGRADATION, &line) {
                 crate::boot::degradation::flush();
@@ -1067,6 +1367,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, c)| (100 + i as u32, c.to_vec()))
                 .collect(),
+            unjudged: None,
         }
     }
 
@@ -1196,9 +1497,13 @@ mod tests {
     }
 
     /// The round: once per confinement, again when it changes, cleared
-    /// when it ends; a round whose online CPUs moved is skipped.
+    /// when it ends. The review of #558 (F2): a round whose online CPUs
+    /// moved is no longer skipped — judged against the CPUs every read saw
+    /// online, a real hotplug makes no record (this test's hotplug was a
+    /// confinement as well, which the old round skipped: its input is now
+    /// a hotplug alone, the cpusets lagging behind it).
     #[test]
-    fn the_round_signs_each_confinement_once_and_skips_a_hotplug() {
+    fn the_round_signs_each_confinement_once_and_a_hotplug_makes_no_record() {
         let mut w = Watch::default();
         let free = reading(&all(), &[&all()]);
         let pinned = reading(&[0], &[&[0]]);
@@ -1221,21 +1526,37 @@ mod tests {
         );
         assert!(matches!(w.step(&free, &all(), &none), Step::Cleared(_)));
         assert_eq!(w.current, None);
-        // a hotplug: the online set moved since the last round — skipped,
-        // whatever the cpusets say
-        let mut off = reading(&[0], &[&[0]]);
+        // a hotplug: CPU 3 offline, the cgroup's effective CPUs not yet
+        // updated (the affinities are the kernel's, its active CPUs only):
+        // judged on CPUs 0-2, no record
+        let mut off = reading(&all(), &[&[0, 1, 2]]);
         off.online = vec![0, 1, 2];
-        assert_eq!(w.step(&off, &[0, 1, 2], &none), Step::Skipped);
-        assert!(matches!(w.step(&off, &[0, 1, 2], &none), Step::Confined(_)));
+        assert_eq!(w.step(&off, &[0, 1, 2], &none), Step::Same);
+        // CPU 3 back, the cpusets and the affinities not yet given it: the
+        // last round did not see it online — no record either
+        let back = reading(&[0, 1, 2], &[&[0, 1, 2]]);
+        assert_eq!(w.step(&back, &all(), &none), Step::Same);
+        assert_eq!(w.step(&free, &all(), &none), Step::Same);
+        assert_eq!(w.current, None);
+        // a confinement in a round whose online CPUs moved: signed at once
+        let mut pinned_off = reading(&[0], &[&[0]]);
+        pinned_off.online = vec![0, 1, 2];
+        let Step::Confined(c) = w.step(&pinned_off, &[0, 1, 2], &none) else {
+            panic!("not signed")
+        };
+        assert_eq!((c.left, c.expected), (vec![0], vec![0, 1, 2]));
         let mut w = Watch::default();
         assert_eq!(w.step(&free, &all(), &none), Step::Skipped);
         let Step::Confined(_) = w.step(&pinned, &all(), &none) else {
             panic!("not signed")
         };
-        // … or between the round's two reads: skipped, the confinement kept
-        assert_eq!(w.step(&pinned, &[0, 1, 2], &none), Step::Skipped);
+        // … or between the round's two reads: judged, the confinement kept
+        // (an unsettled round changes none)
+        assert_eq!(w.step(&pinned, &[0, 1, 2], &none), Step::Same);
         assert!(w.current.is_some());
         assert_eq!(w.step(&pinned, &all(), &none), Step::Same);
+        assert_eq!(w.step(&pinned, &all(), &none), Step::Same);
+        assert_eq!(w.current.as_ref().map(|c| c.expected.clone()), Some(all()));
     }
 
     /// The partitions are named in the record, but a read that lists them
@@ -1298,6 +1619,7 @@ mod tests {
         let host = Host {
             isolated: vec![2, 3],
             manager: Some(vec![0, 1]),
+            unit: None,
         };
         let r = reading(&all(), &[&[0, 1], &[0, 1]]);
         assert_eq!(expected(START, &host, &r), vec![0, 1]);
@@ -1308,12 +1630,14 @@ mod tests {
         let isolated = Host {
             isolated: vec![2, 3],
             manager: None,
+            unit: None,
         };
         assert_eq!(expected(START, &isolated, &r), vec![0, 1]);
         assert_eq!(judge(START, &isolated, &r, &none), None);
         let manager = Host {
             isolated: Vec::new(),
             manager: Some(vec![0, 1]),
+            unit: None,
         };
         assert_eq!(judge(START, &manager, &r, &none), None);
         assert!(judge(START, &Host::default(), &r, &none).is_some());
@@ -1321,36 +1645,41 @@ mod tests {
         let stale = Host {
             isolated: Vec::new(),
             manager: Some(vec![9]),
+            unit: None,
         };
         assert_eq!(expected(START, &stale, &r), all());
         assert!(judge(START, &stale, &pinned, &none).is_some());
-        // the files in systemd's order
+        // the files in systemd's order. The review of #558 (F6): the
+        // assignments are merged (this input pinned the last one before:
+        // `0-3` then `0-1` gave `0-1`, where systemd runs on `0-3`); each
+        // file now moves the answer if it were read out of order — the
+        // hidden `usr/lib` one resets, the `.txt` one resets
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("etc/systemd/system.conf.d")).unwrap();
         std::fs::create_dir_all(t.path().join("usr/lib/systemd/system.conf.d")).unwrap();
         std::fs::write(
             t.path().join("etc/systemd/system.conf"),
-            "[Manager]\nCPUAffinity=0-3\n",
-        )
-        .unwrap();
-        std::fs::write(
-            t.path().join("usr/lib/systemd/system.conf.d/10-a.conf"),
-            "[Manager]\nCPUAffinity=0\n",
-        )
-        .unwrap();
-        std::fs::write(
-            t.path().join("etc/systemd/system.conf.d/10-a.conf"),
             "[Manager]\nCPUAffinity=0-1\n",
         )
         .unwrap();
         std::fs::write(
+            t.path().join("usr/lib/systemd/system.conf.d/10-a.conf"),
+            "[Manager]\nCPUAffinity=\nCPUAffinity=3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("etc/systemd/system.conf.d/10-a.conf"),
+            "[Manager]\nCPUAffinity=2\n",
+        )
+        .unwrap();
+        std::fs::write(
             t.path().join("etc/systemd/system.conf.d/20-b.txt"),
-            "[Manager]\nCPUAffinity=3\n",
+            "[Manager]\nCPUAffinity=\n",
         )
         .unwrap();
         assert_eq!(
             manager_affinity(&system_conf_files(t.path())),
-            Some(vec![0, 1])
+            Some(vec![0, 1, 2])
         );
     }
 
@@ -1417,7 +1746,9 @@ mod tests {
         .unwrap();
         // an empty effective list is no answer: the nearest ancestor's is read
         std::fs::write(agent.join("cpuset.cpus.effective"), "\n").unwrap();
-        let r = read_under(root, all(), Some(START.into()), None, vec![(1, vec![0])]);
+        let tree = Tree::unchecked(root);
+        let r = read_under(&tree, all(), Some(START.into()), None, vec![(1, vec![0])]);
+        assert_eq!(r.unjudged, None);
         assert_eq!(
             r.effective,
             Some(vec![0]),
@@ -1425,16 +1756,22 @@ mod tests {
         );
         assert_eq!(r.configured, vec![(SLICE.to_string(), vec![0, 1])]);
         assert_eq!(
-            partitions_under(root),
+            partitions_under(&tree),
             vec![
                 "/k349part root 1-3".to_string(),
                 "/rt.slice/iso isolated invalid (cpus not exclusive) ".to_string()
             ]
         );
-        let c = judge(START, &Host::default(), &r, &|| partitions_under(root)).expect("confined");
+        let c = judge(START, &Host::default(), &r, &|| partitions_under(&tree)).expect("confined");
         assert_eq!((c.left, c.expected), (vec![0], vec![0, 1]));
         std::fs::write(agent.join("cpuset.cpus.effective"), "0-1\n").unwrap();
-        let r = read_under(root, all(), Some(START.into()), None, vec![(1, vec![0, 1])]);
+        let r = read_under(
+            &tree,
+            all(),
+            Some(START.into()),
+            None,
+            vec![(1, vec![0, 1])],
+        );
         assert_eq!(r.effective, Some(vec![0, 1]));
         assert_eq!(judge(START, &Host::default(), &r, &none), None);
     }
@@ -1443,9 +1780,10 @@ mod tests {
     /// a subset of the online CPUs).
     #[test]
     fn this_process_s_threads_are_read() {
-        let threads = own_threads();
+        let task = open_source(Path::new("/proc/self/task"), PROC_SUPER_MAGIC, true).unwrap();
+        let threads = own_threads(&task);
         assert!(!threads.is_empty());
-        let online = read_cpus(Path::new(ONLINE)).unwrap_or_default();
+        let online = cpu_list(read_text(Path::new(ONLINE)).unwrap_or_default().trim());
         for (_, cpus) in &threads {
             assert!(!cpus.is_empty());
             assert!(
@@ -1453,5 +1791,339 @@ mod tests {
                 "{cpus:?} {online:?}"
             );
         }
+    }
+
+    /// The review of #558 (F2; its probe): a CPU toggled off and on
+    /// between rounds while a partition confines the agent kept every
+    /// round skipped — nothing signed. Each round is now judged against
+    /// the CPUs every read saw online: the confinement is signed at the
+    /// first round, once.
+    #[test]
+    fn hotplug_churn_blinds_the_watch() {
+        let mut w = Watch::default();
+        let free = reading(&all(), &[&all()]);
+        assert_eq!(w.step(&free, &all(), &none), Step::Skipped);
+        assert_eq!(w.step(&free, &all(), &none), Step::Same);
+        // partition 1-3 confines the agent to CPU 0; root toggles CPU 3
+        for i in 0..20 {
+            let mut r = reading(&[0], &[&[0], &[0]]);
+            if i % 2 == 0 {
+                r.online = vec![0, 1, 2];
+            }
+            let again = r.online.clone();
+            let step = w.step(&r, &again, &none);
+            if i == 0 {
+                let Step::Confined(c) = step else {
+                    panic!("round {i}: {step:?}")
+                };
+                assert_eq!(c.cause, Cause::Partition(Vec::new()));
+                assert_eq!((c.left, c.expected), (vec![0], vec![0, 1, 2]));
+            } else {
+                assert_eq!(step, Step::Same, "round {i}: signed once");
+            }
+        }
+        assert!(w.current.is_some(), "signed, in force");
+    }
+
+    /// The review of #558 (F2): rounds the watch cannot judge — a mount
+    /// crossed in the cgroup tree, no online CPU read, online CPUs moving
+    /// in every round with nothing found (CPUs taken offline at each of
+    /// its reads would hide a partition on them) — are no longer skipped
+    /// without end: the third in a row is signed, once; a judged round
+    /// signs what it finds, a settled one clears it.
+    #[test]
+    fn a_watch_that_cannot_judge_three_rounds_in_a_row_signs_it() {
+        let mut w = Watch::default();
+        let free = reading(&all(), &[&all()]);
+        assert_eq!(w.step(&free, &all(), &none), Step::Skipped);
+        assert_eq!(w.step(&free, &all(), &none), Step::Same);
+        let mut bound = reading(&[0], &[&[0], &[0]]);
+        let why = "a mount over /northnarrow.slice/cpuset.cpus or a directory above it";
+        bound.unjudged = Some(why.to_string());
+        assert_eq!(w.step(&bound, &all(), &none), Step::Skipped);
+        assert_eq!(w.step(&bound, &all(), &none), Step::Skipped);
+        let Step::Confined(c) = w.step(&bound, &all(), &none) else {
+            panic!("not signed")
+        };
+        assert_eq!(
+            c.cause,
+            Cause::Unjudged {
+                rounds: 3,
+                why: why.to_string()
+            }
+        );
+        assert_eq!(of_target_dev(c.target_dev()), (CAUSE_UNJUDGED, 1, 4, 3));
+        assert_eq!(c.target_ino(), 1, "the CPUs every thread may run on");
+        assert!(c
+            .cause
+            .subject()
+            .starts_with("a mount over /northnarrow.slice"));
+        assert!(
+            c.line()
+                .contains("could not judge them for 3 rounds in a row"),
+            "{}",
+            c.line()
+        );
+        assert_eq!(w.step(&bound, &all(), &none), Step::Skipped, "signed once");
+        // judged again: the partition the mount hid is signed
+        let pinned = reading(&[0], &[&[0]]);
+        let Step::Confined(c) = w.step(&pinned, &all(), &none) else {
+            panic!("not signed")
+        };
+        assert_eq!(c.cause.code(), CAUSE_PARTITION);
+        assert!(matches!(w.step(&free, &all(), &none), Step::Cleared(_)));
+        // no online CPU read
+        let mut blind = free.clone();
+        blind.online = Vec::new();
+        assert_eq!(w.step(&blind, &[], &none), Step::Skipped);
+        assert_eq!(w.step(&blind, &[], &none), Step::Skipped);
+        let Step::Confined(c) = w.step(&blind, &[], &none) else {
+            panic!("not signed")
+        };
+        assert!(
+            matches!(&c.cause, Cause::Unjudged { why, .. } if why == "no CPU online at every read"),
+            "{:?}",
+            c.cause
+        );
+        // the online CPUs read again: unsettled (the last round read none),
+        // then settled — cleared
+        assert_eq!(w.step(&free, &all(), &none), Step::Same);
+        assert!(matches!(w.step(&free, &all(), &none), Step::Cleared(_)));
+        // CPUs 1-3 offline at every second read: nothing found, signed at
+        // the third such round
+        let mut w = Watch::default();
+        assert_eq!(w.step(&free, &all(), &none), Step::Skipped);
+        assert_eq!(w.step(&free, &all(), &none), Step::Same);
+        assert_eq!(w.step(&pinned, &[0], &none), Step::Same);
+        assert_eq!(w.step(&pinned, &[0], &none), Step::Same);
+        let Step::Confined(c) = w.step(&pinned, &[0], &none) else {
+            panic!("not signed")
+        };
+        assert!(
+            matches!(&c.cause, Cause::Unjudged { rounds: 3, why } if why.contains("online CPUs moved")),
+            "{:?}",
+            c.cause
+        );
+    }
+
+    /// The review of #558 (F3; its probe): a file bound over the slice's
+    /// `cpuset.cpus` (or a directory bound over the slice) narrowed what
+    /// the agent should run on, and the partition was no confinement. The
+    /// cgroup files are now opened beneath the root's descriptor crossing
+    /// no mount: such a read is not judged — never a narrower expectation
+    /// — and three in a row are signed. The mount here is a real one:
+    /// `/proc` under a tree rooted at `/`, as the bind is.
+    #[test]
+    fn bound_slice_cpuset_hides_a_partition() {
+        let tree = Tree::unchecked(Path::new("/"));
+        let start = "/proc/northnarrow.slice/northnarrow-agent.service";
+        let r = read_under(&tree, all(), Some(start.into()), None, vec![(100, vec![0])]);
+        assert_eq!(r.configured, Vec::new(), "nothing read through the mount");
+        let why = r.unjudged.clone().expect("a mount crossed");
+        assert!(why.starts_with("a mount over /proc/"), "{why}");
+        let mut w = Watch::default();
+        assert_eq!(w.step(&r, &all(), &none), Step::Skipped);
+        assert_eq!(w.step(&r, &all(), &none), Step::Skipped);
+        let Step::Confined(c) = w.step(&r, &all(), &none) else {
+            panic!("not signed")
+        };
+        assert_eq!(c.cause.code(), CAUSE_UNJUDGED);
+        // a symbolic link in the tree (cgroupfs has none) is refused alike
+        let t = tempfile::tempdir().unwrap();
+        let other = t.path().join("other");
+        std::fs::create_dir_all(other.join("northnarrow-agent.service")).unwrap();
+        std::fs::write(other.join("cpuset.cpus"), "0\n").unwrap();
+        std::os::unix::fs::symlink(&other, t.path().join("northnarrow.slice")).unwrap();
+        let r = read_under(
+            &Tree::unchecked(t.path()),
+            all(),
+            Some(START.into()),
+            None,
+            vec![(100, vec![0])],
+        );
+        assert_eq!(r.configured, Vec::new());
+        assert!(
+            r.unjudged
+                .as_deref()
+                .is_some_and(|w| w.starts_with("a link on the path of /northnarrow.slice")),
+            "{:?}",
+            r.unjudged
+        );
+    }
+
+    /// The review of #558 (F2, F3, F7): the watch's sources are opened once
+    /// and read afresh at each round through the same descriptor (`pread`
+    /// at offset 0: `/proc/stat`'s counters move between two reads); one
+    /// on another filesystem than its own — a file a FUSE or tmpfs mount
+    /// put there before the start — or not a regular file (a FIFO) is
+    /// refused; a FIFO in the cgroup tree is no stall, and narrows nothing.
+    #[test]
+    fn the_watch_s_sources_are_opened_once_and_read_afresh() {
+        let s = Sources::open();
+        let stat = s.stat.as_ref().expect("/proc/stat");
+        let ctxt = |t: String| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("ctxt "))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .expect("a ctxt line")
+        };
+        let a = ctxt(reread(stat).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = ctxt(reread(stat).unwrap());
+        assert!(b > a, "{a} {b}");
+        assert!(s.online.is_ok(), "{:?}", s.online);
+        let (r, again) = read_host(&s, None);
+        assert!(!r.online.is_empty() && !again.is_empty());
+        assert!(r.cgroup.is_some());
+        assert!(!r.threads.is_empty());
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("online");
+        std::fs::write(&file, "0\n").unwrap();
+        let e = open_source(&file, SYSFS_MAGIC, false).unwrap_err();
+        assert!(e.contains("not 0x62656572 — refused"), "{e}");
+        let fifo = d.path().join("cpuset.cpus");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = open_source(&fifo, SYSFS_MAGIC, false).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        assert!(open_source(Path::new("/proc"), PROC_SUPER_MAGIC, false).is_err());
+        assert!(Tree::open(d.path()).is_err(), "not a cgroup2 root");
+        // the FIFO as the slice's `cpuset.cpus` of a tree: read at once, as
+        // nothing
+        let slice = d.path().join("northnarrow.slice");
+        std::fs::create_dir_all(slice.join("northnarrow-agent.service")).unwrap();
+        std::fs::rename(&fifo, slice.join("cpuset.cpus")).unwrap();
+        let r = read_under(
+            &Tree::unchecked(d.path()),
+            all(),
+            Some(START.into()),
+            None,
+            Vec::new(),
+        );
+        assert_eq!((r.configured, r.unjudged), (Vec::new(), None));
+    }
+
+    /// The review of #558 (F6): systemd merges repeated `CPUAffinity=`
+    /// assignments (an empty one resets the mask), in a file and across
+    /// files — the last one alone was a narrower expectation than the CPUs
+    /// systemd runs on, and a confinement inside the merged set was missed.
+    #[test]
+    fn repeated_cpu_affinity_assignments_are_merged_as_systemd_does() {
+        let conf = |t: &str| t.to_string();
+        assert_eq!(
+            manager_affinity(&[conf("[Manager]\nCPUAffinity=0-1\nCPUAffinity=3\n")]),
+            Some(vec![0, 1, 3])
+        );
+        let two = [
+            conf("[Manager]\nCPUAffinity=0-3\n"),
+            conf("[Manager]\nCPUAffinity=0-1\n"),
+        ];
+        assert_eq!(manager_affinity(&two), Some(all()));
+        assert_eq!(
+            manager_affinity(&[
+                conf("[Manager]\nCPUAffinity=0-3\n"),
+                conf("[Manager]\nCPUAffinity=\nCPUAffinity=1\n")
+            ]),
+            Some(vec![1])
+        );
+        assert_eq!(
+            manager_affinity(&[conf("[Manager]\nCPUAffinity=numa\nCPUAffinity=1\n")]),
+            None,
+            "not a CPU list: not taken"
+        );
+        // the merged set is what the agent should run on: a thread on 0-1
+        // alone is confined
+        let host = Host {
+            manager: manager_affinity(&two),
+            ..Host::default()
+        };
+        assert!(judge(START, &host, &reading(&all(), &[&[0, 1]]), &none).is_some());
+    }
+
+    /// The review of #558 (F6): the agent's unit's own `CPUAffinity=` (an
+    /// operator pinning the EDR to housekeeping CPUs) was a High at every
+    /// start and a degradation for ever. It is what the agent should run on
+    /// when every file assigning it is signed — it predates the install, in
+    /// our units' directories; one changed since, or the host's type-wide
+    /// drop-in, stays a confinement.
+    #[test]
+    fn the_agent_unit_s_signed_cpu_affinity_is_what_it_should_run_on() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let t = tempfile::tempdir().unwrap();
+        let etc = t.path().join("etc/systemd/system");
+        std::fs::create_dir_all(etc.join("northnarrow-agent.service.d")).unwrap();
+        std::fs::create_dir_all(etc.join("service.d")).unwrap();
+        std::fs::write(
+            etc.join(AGENT_UNIT),
+            "[Unit]\nDescription=x\n[Service]\nExecStart=/x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("northnarrow-agent.service.d/10-pin.conf"),
+            "[Service]\nCPUAffinity=0\nCPUAffinity=1\n",
+        )
+        .unwrap();
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        let files = agent_unit_files(t.path(), Some(later));
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.signed), "{files:?}");
+        let unit = unit_affinity(&files);
+        assert_eq!(unit, Some(vec![0, 1]));
+        let host = Host {
+            unit,
+            manager: Some(all()),
+            ..Host::default()
+        };
+        let pinned = reading(&all(), &[&[0, 1], &[0, 1]]);
+        assert_eq!(expected(START, &host, &pinned), vec![0, 1]);
+        assert_eq!(
+            judge(START, &host, &pinned, &none),
+            None,
+            "no record at each start"
+        );
+        assert!(judge(START, &host, &reading(&[0], &[&[0]]), &none).is_some());
+        // changed since the install, or no install known: not taken
+        let files = agent_unit_files(t.path(), Some(UNIX_EPOCH));
+        assert!(files.iter().all(|f| !f.signed));
+        let host = Host {
+            unit: unit_affinity(&files),
+            ..Host::default()
+        };
+        assert_eq!(host.unit, None);
+        assert!(
+            judge(START, &host, &pinned, &none).is_some(),
+            "a confinement"
+        );
+        assert_eq!(unit_affinity(&agent_unit_files(t.path(), None)), None);
+        // the host's type-wide drop-in is never signed
+        std::fs::write(
+            etc.join("service.d/20-all.conf"),
+            "[Service]\nCPUAffinity=0-3\n",
+        )
+        .unwrap();
+        let files = agent_unit_files(t.path(), Some(later));
+        assert_eq!(files.iter().filter(|f| !f.signed).count(), 1);
+        assert_eq!(unit_affinity(&files), None);
+        // a file assigning none needs no signature; a reset clears; what
+        // cannot be read takes none
+        let file = |text: Option<&str>, signed: bool| UnitFile {
+            text: text.map(str::to_string),
+            signed,
+        };
+        let pin = file(Some("[Service]\nCPUAffinity=0-1\n"), true);
+        assert_eq!(
+            unit_affinity(&[pin.clone(), file(Some("[Service]\nNice=0\n"), false)]),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            unit_affinity(&[pin.clone(), file(Some("[Service]\nCPUAffinity=\n"), true)]),
+            None
+        );
+        assert_eq!(unit_affinity(&[pin.clone(), file(None, true)]), None);
+        assert_eq!(
+            unit_affinity(&[file(Some("[Unit]\nCPUAffinity=0\n"), false)]),
+            None
+        );
     }
 }

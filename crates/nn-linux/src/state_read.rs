@@ -405,9 +405,13 @@ mod tests {
         assert_eq!(read_state(&big).unwrap().len() as u64, STATE_MAX_BYTES);
         assert!(read_bounded(&big, 10).is_err(), "a caller's own bound");
         let stat = read_state("/proc/self/stat").unwrap();
-        assert!(stat.starts_with(&format!("{} (", std::process::id())), "{stat}");
-        assert!(read_state("/proc/nonexistent-f7")
-            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound));
+        assert!(
+            stat.starts_with(&format!("{} (", std::process::id())),
+            "{stat}"
+        );
+        assert!(
+            read_state("/proc/nonexistent-f7").is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        );
     }
 
     /// Lot 311 (F4): a failed read is one degradation of its source while

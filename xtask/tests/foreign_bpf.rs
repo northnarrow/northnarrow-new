@@ -989,7 +989,10 @@ fn a_held_program_is_refused_at_every_run_and_attach() {
         ],
     )
     .unwrap();
-    assert!(!use_.contains("enforce()"), "refused in every mode, as the load would be");
+    assert!(
+        !use_.contains("enforce()"),
+        "refused in every mode, as the load would be"
+    );
     in_order(
         body(&c, "nn_held_slot"),
         &[
@@ -1063,7 +1066,11 @@ fn a_window_s_forbidden_load_is_signed_at_its_load() {
     .unwrap();
     in_order(
         body(&c, "emit_held"),
-        &["crate::inode_protect::emit_attempt(", "dev: bpf_held_dev(how, verdict),", "ino: id as u64,"],
+        &[
+            "crate::inode_protect::emit_attempt(",
+            "dev: bpf_held_dev(how, verdict),",
+            "ino: id as u64,",
+        ],
     )
     .unwrap();
 }
@@ -1081,7 +1088,10 @@ fn a_full_held_set_refuses_the_window_s_load_and_the_round_empties_it() {
         !g.contains("PROG_CONTENT_HELD.insert"),
         "every insert goes through hold(), which fails closed"
     );
-    assert!(!body(&c, "hold").contains("fail_open"), "full is no fail-open");
+    assert!(
+        !body(&c, "hold").contains("fail_open"),
+        "full is no fail-open"
+    );
     let x = code("crates/nn-linux/src/bpf_crossview.rs");
     in_order(
         body(&x, "round"),

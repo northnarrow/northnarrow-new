@@ -2663,11 +2663,17 @@ mod tests {
         // come back; a use never collides with a bpf command
         let dev = bpf_held_dev(BPF_HELD_SET_BPF, (9u64 << 32) | 2);
         assert_eq!(bpf_held_of(dev), (BPF_HELD_SET_BPF, 9, 2));
-        assert_eq!(bpf_held_of(bpf_held_dev(10, (8u64 << 32) | 28)), (10, 8, 28));
-        assert!(BPF_HELD_SET_BPF > 0xff && BPF_HELD_FULL > 0xff);
-        assert_ne!(BPF_HELD_SET_BPF, BPF_HELD_FULL);
+        assert_eq!(
+            bpf_held_of(bpf_held_dev(10, (8u64 << 32) | 28)),
+            (10, 8, 28)
+        );
+        const { assert!(BPF_HELD_SET_BPF > 0xff && BPF_HELD_FULL > 0xff) };
+        const { assert!(BPF_HELD_SET_BPF != BPF_HELD_FULL) };
         assert_eq!(bpf_held_use_name(10), "BPF_PROG_RUN");
-        assert_eq!(bpf_held_use_name(BPF_HELD_SET_BPF), "PERF_EVENT_IOC_SET_BPF");
+        assert_eq!(
+            bpf_held_use_name(BPF_HELD_SET_BPF),
+            "PERF_EVENT_IOC_SET_BPF"
+        );
         // lot 349: a CPU confinement's fields go and come back
         let dev = cpu_confined_dev(CPU_CAUSE_AFFINITY, 1, 4, 70_000);
         assert_eq!(cpu_confined_of(dev), (CPU_CAUSE_AFFINITY, 1, 4, 0xffff));
