@@ -400,6 +400,27 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::CpuConfined => {
                 return Some(cpu_confined_verdict(self, event, comm, *target_dev, *target_ino));
             }
+            // Lot 349 (the review of #558, F1): a window's load of a program
+            // the content judge refuses outside one — let through, held.
+            FsProtectOperation::BpfHeldLoad => {
+                let reasoning = format!(
+                    "`{comm}` loaded, inside a trusted-installer window, {} (program id \
+                     {target_ino}) — let through, as the window promises, and held: every run, \
+                     attach or handle of it outside a window, by any caller outside the agent's \
+                     family and through any descriptor, is refused and signed. A link attached \
+                     inside the window keeps running it: check `bpftool link` for program id \
+                     {target_ino}.",
+                    held_program_text(*target_dev)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
+            FsProtectOperation::BpfHeldUse => held_use_text(*target_dev, *target_ino),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -470,6 +491,68 @@ fn cpu_confined_verdict(
 /// load the content refused (`target_dev` a `bpf_prog_class::CONTENT_*`
 /// code, `target_ino` the program type — 0 when the verifier's lockdown
 /// question refused it, before the type is known).
+/// Lot 349 (the review of #558, F1): a held program as a record names it —
+/// its type and what its content does (`common::wire::bpf_held_of`).
+fn held_program_text(target_dev: u64) -> String {
+    use common::bpf_prog_class::{call_target_name, content_refusal, prog_type_name, ContentRefusal};
+    let (_, why, ty) = common::wire::bpf_held_of(target_dev);
+    let program = if ty != 0 {
+        format!("a `{}` BPF program", prog_type_name(ty))
+    } else {
+        "a BPF program".to_string()
+    };
+    match content_refusal(u64::from(why)) {
+        Some(ContentRefusal::Call(n)) => format!(
+            "{program} that calls {} (it kills the agent past its task_kill hook, rewrites a \
+             process's memory or overrides a kernel function's return)",
+            call_target_name(n)
+        ),
+        _ => format!(
+            "{program} whose instructions the judge could not read whole (refused outside a \
+             window as if it called a helper that kills or blinds the agent)"
+        ),
+    }
+}
+
+/// Lot 349 (the review of #558, F1): a refused use of a held program, or a
+/// window's load that the held set had no room for.
+fn held_use_text(target_dev: u64, target_ino: u64) -> String {
+    let (how, _, _) = common::wire::bpf_held_of(target_dev);
+    let program = held_program_text(target_dev);
+    if how == common::wire::BPF_HELD_FULL {
+        return format!(
+            "to load, inside a trusted-installer window, {program} (program id {target_ino}) \
+             while the agent's held set is full — refused (fail closed: a load the agent cannot \
+             hold could be run after the window unrefused)"
+        );
+    }
+    let using = match how {
+        common::wire::BPF_HELD_SET_BPF => {
+            "attach it to a perf event (ioctl PERF_EVENT_IOC_SET_BPF: a kprobe, a tracepoint)"
+                .to_string()
+        }
+        c => format!(
+            "{} it",
+            match c {
+                common::bpf_cmd::BPF_PROG_TEST_RUN => "run (BPF_PROG_RUN)",
+                common::bpf_cmd::BPF_PROG_ATTACH => "attach (BPF_PROG_ATTACH)",
+                common::bpf_cmd::BPF_RAW_TRACEPOINT_OPEN => "attach (BPF_RAW_TRACEPOINT_OPEN)",
+                common::bpf_cmd::BPF_LINK_CREATE => "attach (BPF_LINK_CREATE)",
+                common::bpf_cmd::BPF_LINK_UPDATE => "swap a link onto (BPF_LINK_UPDATE)",
+                common::bpf_cmd::BPF_MAP_UPDATE_ELEM => {
+                    "put in a tail call's slot (a prog array's BPF_MAP_UPDATE_ELEM)"
+                }
+                _ => "use",
+            }
+        ),
+    };
+    format!(
+        "to {using}: {program}, program id {target_ino}, loaded inside a trusted-installer \
+         window and held since — refused outside a window to every caller outside the agent's \
+         family, through any descriptor (the loader's own, one passed or taken with pidfd_getfd)"
+    )
+}
+
 fn content_refusal_text(target_dev: u64, target_ino: u64) -> String {
     use common::bpf_prog_class::{
         call_target_name, content_refusal, prog_type_name, ContentRefusal,
@@ -1591,6 +1674,48 @@ mod tests {
             "{}",
             t.reasoning
         );
+    }
+
+    /// Lot 349 (the review of #558, F1): a window's held load is High and
+    /// not refused, naming the call and the id; each refused use names
+    /// itself (the run, the perf attach, the tail-call slot) and the call;
+    /// a load the full held set refuses says so.
+    #[test]
+    fn a_held_program_s_load_and_uses_are_named_and_high() {
+        use common::bpf_prog_class::CONTENT_CALL;
+        use common::wire::{bpf_held_dev, BPF_HELD_FULL, BPF_HELD_SET_BPF};
+        let ev = |op, dev, ino| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "loader".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1,
+        };
+        let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        // slot 2: bpf_send_signal; type 2: kprobe
+        let verdict = (u64::from(CONTENT_CALL + 2) << 32) | 2;
+        let l = v(ev(FsProtectOperation::BpfHeldLoad, bpf_held_dev(0, verdict), 77));
+        assert_eq!(l.severity, Severity::High);
+        for n in ["inside a trusted-installer window", "program id 77", "`kprobe`", "bpf_send_signal", "held"] {
+            assert!(l.reasoning.contains(n), "{n}: {}", l.reasoning);
+        }
+        assert!(!l.reasoning.contains("refused it"), "{}", l.reasoning);
+        for (how, named) in [
+            (u32::from(10u8), "run (BPF_PROG_RUN)"),
+            (BPF_HELD_SET_BPF, "PERF_EVENT_IOC_SET_BPF"),
+            (28, "BPF_LINK_CREATE"),
+            (2, "tail call"),
+        ] {
+            let u = v(ev(FsProtectOperation::BpfHeldUse, bpf_held_dev(how, verdict), 77));
+            assert_eq!(u.severity, Severity::High);
+            for n in [named, "program id 77", "bpf_send_signal", "refused it", "pidfd_getfd"] {
+                assert!(u.reasoning.contains(n), "{how} {n}: {}", u.reasoning);
+            }
+        }
+        let f = v(ev(FsProtectOperation::BpfHeldUse, bpf_held_dev(BPF_HELD_FULL, verdict), 78));
+        assert!(f.reasoning.contains("held set is full") && f.reasoning.contains("fail closed"), "{}", f.reasoning);
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load

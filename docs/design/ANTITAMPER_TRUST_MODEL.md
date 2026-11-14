@@ -2674,18 +2674,60 @@ the same handles were refused (measured on 6.8). Now the load hook scans a
 window's foreign load too (the scan alone, `content_scan`: no caller
 exemption) and hands the verdict to the `bpf_prog` hook that gives the
 load its descriptor (`PROG_CONTENT_HELD_INFLIGHT`, by thread), which keeps
-it by program id (`PROG_CONTENT_HELD`, 1024 ids; full, a fail-open
-counted). A later handle on a kept program outside a window, by a caller
-outside the family and not a fresh instance, is refused and signed as the
-load's refusal (`bpf_prog_type`, the call), in every mode.
+it by program id (`PROG_CONTENT_HELD`, 1024 ids). A later handle on a kept
+program outside a window, by a caller outside the family and not a fresh
+instance, is refused and signed as the load's refusal (`bpf_prog_type`,
+the call), in every mode.
 
-**What stays open**: the window's loader keeps the descriptor its load gave
-it (no new handle: not judged again — the window is the operator's); an
-agent restart forgets the kept ids (the program is then its baseline,
-High for a refused type); a program loaded before the agent started is
-signed High at the start but its handles are not judged from 6.9 (its
-verified instructions carry the helpers' addresses, which only the
-pre-6.9 calibration reads).
+**The review of #558 (F1, F5): the point of use.** A handle was not the
+only way back: the window's loader kept its own descriptor (or passed it,
+or another root took it with `pidfd_getfd`, which runs no `bpf_prog`
+hook) and, after the window, ran the program (`BPF_PROG_RUN`, which the
+`bpf` hook's `observed` filter left out) or attached it (a perf event's
+`PERF_EVENT_IOC_SET_BPF`, no `bpf(2)` command at all; `BPF_LINK_CREATE`,
+recorded Medium only), or put it in a prog array's slot for a clean
+program's tail call. Before 6.9 the window's load was not kept at all.
+Now:
+- on every kernel the window's forbidden load is held (before 6.9 at its
+  `bpf_prog` handle, with the calibrated scan; from 6.9 from the load
+  hook's verdict) and signed at once (`bpf_held_load`, High, not refused);
+- every run or attach of a held id outside a window, by a caller outside
+  the family and not a fresh instance, is refused and signed
+  (`bpf_held_use`, the use and the id), in every mode: the `bpf` hook
+  judges `BPF_PROG_RUN`, `BPF_PROG_ATTACH`, `BPF_RAW_TRACEPOINT_OPEN`,
+  `BPF_LINK_CREATE`, `BPF_LINK_UPDATE` (the program descriptor at its
+  uapi offset, `bpf_cmd::prog_fd_offset`) and a prog array's
+  `BPF_MAP_UPDATE_ELEM` before its `observed` filter, the `file_ioctl`
+  hooks judge `PERF_EVENT_IOC_SET_BPF`; one global function
+  (`nn_held_use`) resolves the caller's descriptor to its program id
+  (`task->files->fdt->fd[fd]->private_data->aux->id`), so the descriptor
+  it came through does not matter;
+- the held set is pinned (an agent restart keeps it), each kernel-state
+  round removes the ids its enumeration no longer shows (read before
+  it), and a load it has no room for is refused (`bpf_held_use`, "held
+  set full": fail closed).
+
+**What stays open**:
+- what the window itself attached keeps running after it: a link (pinned
+  or not), a perf event, a prog array filled then, an iterator link read
+  later (`cat` of its pin runs it, no `bpf(2)` command) — the load's
+  `bpf_held_load` names the program id to look for;
+- an XDP or tc program attached over netlink (no `bpf(2)` command, no
+  hook with the descriptor; 6.13+, where such a type can call
+  `bpf_send_signal_task`), and the other maps whose values hold program
+  descriptors (a devmap's or cpumap's XDP program, a `struct_ops` map);
+- a race: another thread's `dup2` between the hook's read of the
+  descriptor and the kernel's, or a rewrite of a prog array's value in
+  that gap (the kernel copies it after the hook) — each lost attempt is
+  refused and signed, and the load was signed;
+- a program loaded before the agent started: signed High at the start
+  (its baseline) but neither its handles (from 6.9) nor its loader's
+  descriptor are judged. Its verified instructions carry the helpers'
+  addresses, which only the pre-6.9 calibration reads, and a dump
+  (`BPF_OBJ_GET_INFO_BY_FD`, `xlated_prog_insns`) has every call's `imm`
+  blanked unless `bpf_dump_raw_ok` — `CAP_SYSLOG` with `kptr_restrict=1`
+  — which the agent's unit does not grant (the review's F4: not cheap
+  without widening the agent's capabilities).
 
 **A copy of `/etc` over `/etc` (pre-alpha R003).** Measured on Ubuntu 24.04
 and 26.04: a bind of a copy over `/etc` after the key load is signed within

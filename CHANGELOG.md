@@ -115,6 +115,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     in every mode. A program loaded before the agent started stays as
     before: signed High at the start (the cross-view's baseline, for a
     refused type), its handles not refused on 6.9 and later (named).
+  - **…nor run or attached after it through any descriptor (the review of
+    #558, F1/F5, every kernel).** The window's loader kept its own
+    descriptor (or passed it, or another root took it with `pidfd_getfd`)
+    and, after the window, ran the program (`BPF_PROG_RUN`, not even
+    observed) or attached it (`PERF_EVENT_IOC_SET_BPF`, silent;
+    `BPF_LINK_CREATE`, Medium only) or put it in a prog array. Every run
+    and attach of a held program outside a window is refused now and
+    signed (`bpf_held_use`, High: `BPF_PROG_RUN`, `BPF_PROG_ATTACH`,
+    `BPF_LINK_CREATE`, `BPF_LINK_UPDATE`, `BPF_RAW_TRACEPOINT_OPEN`, a
+    prog array's update in the `bpf` hook; the perf ioctl in `file_ioctl`),
+    whatever the descriptor; the window's load itself is signed
+    (`bpf_held_load`, High, not refused), before 6.9 too. The held set is
+    pinned, emptied of freed ids each kernel-state round, and full it
+    refuses the window's load (fail closed). Open, named: what the window
+    itself attached, a netlink XDP/tc attach, a `dup2` race (each lost
+    attempt signed), programs loaded before the agent.
   - **A copy of `/etc` mounted over `/etc` (R003): measured, unchanged.**
     The integrity round signs it today (`integrity_drift`
     `mount_over_protected`, naming the mount and every protected path it

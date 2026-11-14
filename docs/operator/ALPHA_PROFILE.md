@@ -163,16 +163,29 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       `CONFIG_BPF_KPROBE_OVERRIDE` has no `bpf_override_return` to refuse.
     - A program longer than 1,048,576 instructions, or one the judge cannot
       read, is refused as if it called one.
-    - **A program loaded inside a window** (lot 349): a window lets any
-      load through, but what the judge would refuse outside one is kept —
-      once the window closes, a handle on that program by id or through its
-      pin, by any process outside the agent's family, is refused (`EPERM`,
-      a signed `bpf_prog_type` naming the call), so a `syscall` program
-      calling `bpf_send_signal_task` cannot be taken and run after the
-      window (measured on 7.0, where it was). Before 6.9 the `bpf_prog`
-      hook judges every such handle anyway. A program loaded before the
-      agent started is signed High at its start (the cross-view's
-      baseline); from 6.9 its later handles are not judged.
+    - **A program loaded inside a window** (lot 349, and its review's
+      fixes): a window lets any load through, but what the judge would
+      refuse outside one is held by id and signed at the load
+      (`bpf_held_load`, High). Once the window closes, by any process
+      outside the agent's family and through ANY descriptor — a new handle
+      by id or through its pin (a signed `bpf_prog_type` naming the call),
+      the loader's own descriptor kept from the window, one passed over a
+      socket or taken with `pidfd_getfd` — every run and attach of it is
+      refused (`EPERM`, a signed `bpf_held_use` naming the use and the
+      program id): `BPF_PROG_RUN`, `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`,
+      `BPF_LINK_UPDATE`, `BPF_RAW_TRACEPOINT_OPEN`, a perf event's
+      `PERF_EVENT_IOC_SET_BPF`, a prog array's update (a tail call's slot).
+      So a `syscall` program calling `bpf_send_signal_task`, or a kprobe
+      calling `bpf_send_signal`, loaded in a window cannot be run or
+      attached after it. What stays open: what was attached INSIDE the
+      window keeps running (a link, pinned or not, a perf event, a prog
+      array filled then, an iterator link read later), and a netlink attach
+      (an XDP or tc program through `ip link` / `tc`, no `bpf(2)` command)
+      — each such program's load is the signed High record above. A
+      program loaded before the agent started is signed High at its start
+      (the cross-view's baseline); from 6.9 its handles, runs and attaches
+      are not judged (the agent cannot read its calls: it has no
+      `CAP_SYSLOG`, so the kernel blanks them in a dump).
   - Each refusal is a signed `bpf_prog_type` record (High) that names the
     helper, the kfunc or the fmod_ret. What stays open: a tracing program
     that reads (the agent's keys in its memory are not protected from it),

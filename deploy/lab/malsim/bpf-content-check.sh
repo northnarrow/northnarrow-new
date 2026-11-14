@@ -39,6 +39,16 @@
 #      its pin is refused to root, signed naming the call (from 6.9 the
 #      verdict is kept at the load; before, the calibrated judge reads it at
 #      the handle). The pins are removed.
+#  B10 (the review of #558, F1) the window's loader KEEPS its descriptor: a
+#      kprobe calling bpf_send_signal(SIGKILL) for the agent's pid, and
+#      (6.13+) a syscall program calling bpf_send_signal_task(agent,
+#      SIGKILL), loaded inside a window by processes that stay alive; after
+#      the window each uses its own descriptor and one taken with
+#      pidfd_getfd — the syscall program by BPF_PROG_RUN, the kprobe by a
+#      perf event's PERF_EVENT_IOC_SET_BPF and by BPF_LINK_CREATE, both as a
+#      prog array's value. Every use refused (EPERM), the load signed
+#      (bpf_held_load) and each kind of use signed (bpf_held_use), the agent
+#      alive with the same pid.
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -220,6 +230,43 @@ if [[ -n $KEY ]]; then
     sudo rm -rf "$PINS" </dev/null
 else
     measure "B9 no admin key on this guest: no window"
+fi
+
+# B10: a window's forbidden load, used after the window through its loader's
+# own descriptor (the review of #558, F1)
+if [[ -n $KEY ]]; then
+    sleep 2
+    n0=$(lines "$DET")
+    sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 20 </dev/null >/dev/null 2>&1
+    until=$(( $(date +%s) + 25 ))
+    OUTS=$(mktemp -d)
+    for ty in kprobe syscall; do
+        sudo timeout 90 $PROBE held-use --type $ty --pid "$APID" --sig 9 --until $until --name "k558_$ty" </dev/null >"$OUTS/$ty" 2>&1 &
+    done
+    wait
+    sleep 2
+    for ty in kprobe syscall; do
+        o=$(tr '\n' ' ' < "$OUTS/$ty")
+        echo "=== CASE B10 $ty kept descriptor after the window: rc=0 $o"
+        if [[ $ty == syscall && $o == *NOFUNC* ]]; then
+            measure "B10 no bpf_send_signal_task in this kernel's BTF (before 6.13)"
+            continue
+        fi
+        id=$(echo "$o" | grep -o 'LOADED id [0-9]*' | awk '{print $3}')
+        [[ -n $id ]] || { bad "B10 the $ty program not loaded in the window: $o"; continue; }
+        uses=$(echo "$o" | grep -o 'USES .*' | cut -c6-)
+        nuse=$(echo "$uses" | wc -w); nref=$(echo "$uses" | grep -o '=ERR EPERM' | wc -l)
+        kinds=$(echo "$uses" | tr ' ' '\n' | grep -o '^[a-z-]*-' | sort -u | wc -l)
+        held=$(recs "$n0" bpf_held_load | grep -c "program id $id ")
+        used=$(recs "$n0" bpf_held_use | grep -c "of program id $id,")
+        echo "    uses $nuse, refused $nref, kinds $kinds; records: bpf_held_load x$held, bpf_held_use x$used"
+        [[ $nuse -gt 0 && $nref -eq $nuse ]] && pass "B10 $ty: every use of the kept descriptor refused ($nref/$nuse)" || bad "B10 $ty: a use let through: $uses"
+        [[ $held -ge 1 ]] && pass "B10 $ty: the window's load signed (bpf_held_load)" || bad "B10 $ty: the window's load not signed"
+        [[ $used -ge $kinds ]] && pass "B10 $ty: each kind of use signed (bpf_held_use x$used, $kinds kinds)" || bad "B10 $ty: uses signed x$used for $kinds kinds"
+    done
+    rm -rf "$OUTS"
+else
+    measure "B10 no admin key on this guest: no window"
 fi
 
 systemctl is-active --quiet northnarrow-agent && [[ $(agent_pid) == "$APID" ]] && pass "B6 the agent active, same pid" || bad "B6 the agent restarted or stopped"

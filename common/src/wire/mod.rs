@@ -1273,6 +1273,11 @@ pub const CPU_CAUSE_PARTITION: u64 = 1;
 pub const CPU_CAUSE_CGROUP_CPUSET: u64 = 2;
 pub const CPU_CAUSE_AFFINITY: u64 = 3;
 pub const CPU_CAUSE_CGROUP_MOVE: u64 = 4;
+/// The review of #558 (F2, F3): the watch could not judge the agent's CPUs
+/// for several rounds in a row (`comm` why; the threads count is the number
+/// of rounds, the CPUs left those every thread may run on, the CPUs
+/// expected the online ones it read).
+pub const CPU_CAUSE_UNJUDGED: u64 = 5;
 
 /// Lot 349: an [`FS_OP_CPU_CONFINED`] record's `target_dev` — the cause,
 /// the CPUs left, the CPUs expected and the threads confined (each count
@@ -1315,8 +1320,73 @@ pub const fn sigio_signal(sig: i32) -> i32 {
     }
 }
 
+/// Lot 349 (the review of #558, F1): NOT a refusal — a program loaded
+/// inside a trusted-installer window, by a caller outside the agent's
+/// family, that the content judge refuses outside one (it calls a helper or
+/// a kfunc that signals a process, overrides a return or writes user
+/// memory, or cannot be read whole): let through, as the window promises,
+/// signed at its load and held by id (`PROG_CONTENT_HELD`), so that every
+/// later run, attach or handle of it outside a window is refused
+/// ([`FS_OP_BPF_HELD_USE`]). `target_dev` = [`bpf_held_dev`] (use 0),
+/// `target_ino` = the program id.
+pub const FS_OP_BPF_HELD_LOAD: u8 = 46;
+
+/// Lot 349 (the review of #558, F1): a run or an attach of a held program
+/// ([`FS_OP_BPF_HELD_LOAD`]) outside a window, by a caller outside the
+/// family, through any descriptor (the loader's own, one passed or taken
+/// with `pidfd_getfd`) — refused by the `bpf` hook (`BPF_PROG_TEST_RUN`,
+/// `BPF_PROG_ATTACH`, `BPF_RAW_TRACEPOINT_OPEN`, `BPF_LINK_CREATE`,
+/// `BPF_LINK_UPDATE`, a prog array's `BPF_MAP_UPDATE_ELEM`) or the
+/// `file_ioctl` hook (a perf event's `PERF_EVENT_IOC_SET_BPF`,
+/// [`BPF_HELD_SET_BPF`]); and a window's such load when the held set is
+/// full ([`BPF_HELD_FULL`]: fail closed). `target_dev` = [`bpf_held_dev`]
+/// (the use: the `bpf` command, or one of those two), `target_ino` = the
+/// program id.
+pub const FS_OP_BPF_HELD_USE: u8 = 47;
+
+/// Lot 349: an [`FS_OP_BPF_HELD_USE`]'s use — `PERF_EVENT_IOC_SET_BPF` on a
+/// perf event (no `bpf` command; the `bpf` commands are their own numbers,
+/// all below 0x100).
+pub const BPF_HELD_SET_BPF: u32 = 0x100;
+/// Lot 349: an [`FS_OP_BPF_HELD_USE`]'s use — a window's load that the held
+/// set has no room for, refused (fail closed: kept nowhere, it could be
+/// run after the window unrefused).
+pub const BPF_HELD_FULL: u32 = 0x101;
+
+/// Lot 349: a held program's record's `target_dev` — the use (low 16
+/// bits), the judge's reason (`bpf_prog_class::CONTENT_*`, bits 16 to 23)
+/// and the program type (the high 32 bits); `verdict` as the kernel keeps
+/// it (`reason << 32 | type`).
+pub const fn bpf_held_dev(how: u32, verdict: u64) -> u64 {
+    (how as u64 & 0xffff) | ((verdict >> 32) & 0xff) << 16 | (verdict & 0xffff_ffff) << 32
+}
+
+/// Lot 349: [`bpf_held_dev`] told back: (use, reason, program type).
+pub const fn bpf_held_of(target_dev: u64) -> (u32, u8, u32) {
+    (
+        (target_dev & 0xffff) as u32,
+        ((target_dev >> 16) & 0xff) as u8,
+        (target_dev >> 32) as u32,
+    )
+}
+
+/// Lot 349: the use a [`bpf_held_dev`] names, as the signed record says it.
+pub const fn bpf_held_use_name(how: u32) -> &'static str {
+    match how {
+        BPF_HELD_SET_BPF => "PERF_EVENT_IOC_SET_BPF",
+        BPF_HELD_FULL => "a window's load with the held set full",
+        crate::bpf_cmd::BPF_PROG_TEST_RUN => "BPF_PROG_RUN",
+        crate::bpf_cmd::BPF_PROG_ATTACH => "BPF_PROG_ATTACH",
+        crate::bpf_cmd::BPF_RAW_TRACEPOINT_OPEN => "BPF_RAW_TRACEPOINT_OPEN",
+        crate::bpf_cmd::BPF_LINK_CREATE => "BPF_LINK_CREATE",
+        crate::bpf_cmd::BPF_LINK_UPDATE => "BPF_LINK_UPDATE",
+        crate::bpf_cmd::BPF_MAP_UPDATE_ELEM => "BPF_MAP_UPDATE_ELEM of a prog array",
+        _ => "a use",
+    }
+}
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_CPU_CONFINED;
+pub const FS_OP_LAST: u8 = FS_OP_BPF_HELD_USE;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1346,6 +1416,10 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_BPF_HANDLE
             | FS_OP_BPF_PROG_TYPE
             | FS_OP_BPF_PROG_OPT_OUT
+            // lot 349: a held program's load (no refusal) and its refused
+            // uses, like a refused program type
+            | FS_OP_BPF_HELD_LOAD
+            | FS_OP_BPF_HELD_USE
             | FS_OP_SYSCTL_ROOT_ATTACH
             // the re-check of #545, R1: refused at the write-open, signed
             // at each attempt (`cgroup_files::sign`, `Phase::Open`)
@@ -2581,8 +2655,19 @@ mod tests {
             FS_OP_BPF_BASELINE,
             FS_OP_SIGIO,
             FS_OP_CPU_CONFINED,
+            FS_OP_BPF_HELD_LOAD,
+            FS_OP_BPF_HELD_USE,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
+        // lot 349 (the review of #558, F1): a held program's fields go and
+        // come back; a use never collides with a bpf command
+        let dev = bpf_held_dev(BPF_HELD_SET_BPF, (9u64 << 32) | 2);
+        assert_eq!(bpf_held_of(dev), (BPF_HELD_SET_BPF, 9, 2));
+        assert_eq!(bpf_held_of(bpf_held_dev(10, (8u64 << 32) | 28)), (10, 8, 28));
+        assert!(BPF_HELD_SET_BPF > 0xff && BPF_HELD_FULL > 0xff);
+        assert_ne!(BPF_HELD_SET_BPF, BPF_HELD_FULL);
+        assert_eq!(bpf_held_use_name(10), "BPF_PROG_RUN");
+        assert_eq!(bpf_held_use_name(BPF_HELD_SET_BPF), "PERF_EVENT_IOC_SET_BPF");
         // lot 349: a CPU confinement's fields go and come back
         let dev = cpu_confined_dev(CPU_CAUSE_AFFINITY, 1, 4, 70_000);
         assert_eq!(cpu_confined_of(dev), (CPU_CAUSE_AFFINITY, 1, 4, 0xffff));

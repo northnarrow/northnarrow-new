@@ -856,7 +856,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 290: nor a load the signed per-loader opt-out let through,
             // nor the cross-view's findings (a program the hook never saw,
             // the start's baseline): signed, no refusal.
-            // Lot 349: nor the agent's own CPU watch (a confinement found).
+            // Lot 349: nor the agent's own CPU watch (a confinement found),
+            // nor a window's load of a program the judge refuses outside
+            // one (let through, held: the review of #558, F1).
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -870,6 +872,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
                     | nn_model::FsProtectOperation::CpuConfined
+                    | nn_model::FsProtectOperation::BpfHeldLoad
             ) {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
                     // Lot 293 (external bug hunt BUG14): a refused signal
@@ -927,6 +930,10 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         // bpftrace or `bpftool prog list` meets them too
                         | nn_model::FsProtectOperation::BpfProgType
                         | nn_model::FsProtectOperation::BpfHandle
+                        // lot 349 (the review of #558, F1): a run or an
+                        // attach of a program held at a window's load,
+                        // refused like the load would be
+                        | nn_model::FsProtectOperation::BpfHeldUse
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a
@@ -3133,8 +3140,9 @@ mod tests {
                 );
             }
         }
-        // lot 349: the agent's own CPU watch's record, one more
-        assert_eq!(minor, 21);
+        // lot 349: the agent's own CPU watch's record, one more; the review
+        // of #558 (F1): a held program's load and its refused uses, two more
+        assert_eq!(minor, 23);
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3168,6 +3176,8 @@ mod tests {
             w::FS_OP_SYSCTL,
             w::FS_OP_CGROUP_JOIN,
             w::FS_OP_CPU_CONFINED,
+            w::FS_OP_BPF_HELD_LOAD,
+            w::FS_OP_BPF_HELD_USE,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }
@@ -3367,6 +3377,8 @@ mod tests {
             nn_model::FsProtectOperation::BpfProgOptOut,
             nn_model::FsProtectOperation::BpfUnseen,
             nn_model::FsProtectOperation::BpfBaseline,
+            // lot 349 (the review of #558, F1): a window's held load
+            nn_model::FsProtectOperation::BpfHeldLoad,
         ] {
             assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }

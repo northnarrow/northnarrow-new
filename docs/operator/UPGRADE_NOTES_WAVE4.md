@@ -2411,16 +2411,48 @@ detail.
   once the window closed — and to attach or run (a `syscall` program
   signalled the agent past its `task_kill` hook). Its handles after the
   window are refused now (`EPERM`, signed `bpf_prog_type`, the call named),
-  as before 6.9. The loader's own descriptor, kept from inside the window,
-  is not judged again (the window is the operator's). An agent restart
-  forgets the programs it kept: they are then the new start's baseline.
+  as before 6.9.
+  - **Nor run or attached after it, through any descriptor (every
+    kernel; the review of #558).** The loader's own descriptor, kept from
+    inside the window (or passed over a socket, or taken by another root
+    process with `pidfd_getfd`), ran or attached the program after the
+    window with no refusal and no record: `BPF_PROG_RUN` of a `syscall`
+    program calling `bpf_send_signal_task` (6.13+), a kprobe calling
+    `bpf_send_signal` attached by a perf event's `PERF_EVENT_IOC_SET_BPF`
+    (silent) or by `BPF_LINK_CREATE` (Medium only), on every kernel. The
+    program, not the descriptor, is judged now: every `BPF_PROG_RUN`,
+    `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`, `BPF_LINK_UPDATE`,
+    `BPF_RAW_TRACEPOINT_OPEN`, `PERF_EVENT_IOC_SET_BPF` and prog-array
+    update (a tail call's slot) of a held program outside a window, by a
+    process outside the agent's family, is refused (`EPERM`) and signed
+    (`bpf_held_use`, High, naming the use and the program id).
+  - **The window's load itself is signed** (`bpf_held_load`, High, not
+    refused, naming the call and the program id), on every kernel, so it
+    is never silent — even where it is used in a way no hook sees.
+  - **What stays open:** what was attached INSIDE the window keeps running
+    after it (a link, pinned or not; a perf event; a prog array filled
+    then; an iterator link read later with `cat`), and an XDP or tc program
+    attached over netlink (`ip link`, `tc`: no `bpf(2)` command; 6.13+
+    only, where such a program can call `bpf_send_signal_task`). A
+    descriptor swapped by another thread (`dup2`) between the hook's read
+    and the kernel's, or a prog array's value rewritten in that gap, can
+    win a race: each lost attempt is refused and signed. Check
+    `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
+  - **Held across an agent restart, emptied as programs go.** The held set
+    (`PROG_CONTENT_HELD`, 1024 ids) is pinned now: a restart keeps it. Each
+    kernel-state round removes the ids no longer loaded. When it is full,
+    a window's forbidden load is refused (`bpf_held_use`, "held set full":
+    fail closed) instead of being kept nowhere.
   - **A program loaded before the agent started** is signed High at the
     agent's start when its type is one the agent refuses outside a window
     (the cross-view's baseline, `bpf_baseline`, naming its id, name, tag and
     attach point); before 6.9 its handles are judged and refused like any,
-    from 6.9 they are not (its content cannot be read without the
-    calibration the older kernels need): remove such a program, or reboot,
-    before you trust the host.
+    from 6.9 they are not, nor (on any kernel) the runs and attaches of the
+    descriptor its loader kept: its content cannot be read without the
+    calibration the older kernels need, and a dump of it
+    (`BPF_OBJ_GET_INFO_BY_FD`) has its calls blanked for a reader without
+    `CAP_SYSLOG`, which the agent's unit does not grant. Remove such a
+    program, or reboot, before you trust the host.
 - **A copy of `/etc` over `/etc` is signed, as before.** Mounted after the
   agent loaded its key, it is `integrity_drift` `mount_over_protected` in
   the audit chain within one integrity round (30 s), naming the mount and
@@ -2432,5 +2464,7 @@ detail.
   beside the agent's own lab features; a release build prints `none` as
   before, and release.yml refuses any artefact that does not.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes;
-  the eBPF object adds two maps (`PROG_CONTENT_HELD`,
-  `PROG_CONTENT_HELD_INFLIGHT`), unpinned.
+  the eBPF object adds two maps: `PROG_CONTENT_HELD`, pinned under the pin
+  root (an uninstall removes it with the rest), and
+  `PROG_CONTENT_HELD_INFLIGHT`, unpinned. Two new NN-L-AT-001 operations:
+  `bpf_held_load` (not refused) and `bpf_held_use` (refused).

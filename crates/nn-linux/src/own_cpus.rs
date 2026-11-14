@@ -25,12 +25,41 @@
 //! ([`DEGRADATION`], `nn-admin status`) while it holds.
 //!
 //! No record when nothing was taken: a CPU taken offline leaves the online
-//! set, the effective set and the affinities alike (and a round whose
-//! online set changed since the last one, or between its two reads, is
-//! skipped: the kernel updates the cpusets after the hotplug); a container
-//! runtime enabling the cpuset controller above the agent (#557) gives its
-//! cgroup the parent's CPUs, all of them.
+//! set, the effective set and the affinities alike; a container runtime
+//! enabling the cpuset controller above the agent (#557) gives its cgroup
+//! the parent's CPUs, all of them.
+//!
+//! The review of #558:
+//! - F2: a round whose online CPUs moved (a hotplug, or root toggling a
+//!   CPU every round) is no longer skipped: it is judged against the CPUs
+//!   every read saw online — the round's two reads and the last round's —
+//!   which a real hotplug cannot turn into a record (the kernel ANDs the
+//!   cpusets and the affinities with the active CPUs, and a CPU that came
+//!   back is expected from the next settled round on). Such a round never
+//!   clears nor changes the confinement in force. A round that cannot be
+//!   judged (no online CPU read, a mount crossed in the cgroup tree) is
+//!   skipped, and [`UNJUDGED_ROUNDS`] skipped or unsettled rounds in a row
+//!   with nothing in force are signed ([`Cause::Unjudged`]). The online
+//!   CPUs are read through descriptors opened once at the watch's start
+//!   ([`Sources`], `pread` at offset 0: the kernel makes the text afresh),
+//!   each checked to be sysfs or procfs (`fstatfs`): a file bound over the
+//!   path later changes nothing, a FUSE file there at the start is refused.
+//! - F3: the cgroup files are opened beneath a descriptor of the cgroup2
+//!   root opened at the start ([`Tree`], `openat2` with `RESOLVE_NO_XDEV`
+//!   and no symbolic link): a file bound over the slice's `cpuset.cpus`, or
+//!   a directory over the slice, is a mount crossed — the round is not
+//!   judged, never a narrower expectation.
+//! - F6: repeated `CPUAffinity=` assignments are merged as systemd merges
+//!   them (an empty one resets), and the agent's own unit's `CPUAffinity=`
+//!   is what it should run on when every file assigning it predates the
+//!   agent's install (the installer's check listed it, the integrity round
+//!   signs it: `own_dropins::preinstall_harmful`); one changed since is not
+//!   taken — a confinement.
+//! - F7: every read is bounded and never blocks (a regular file only,
+//!   opened `O_NONBLOCK`, at most [`SOURCE_MAX`]).
 
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 /// The degradation's source while the agent is confined.
@@ -47,11 +76,22 @@ pub const PROC_STAT: &str = "/proc/stat";
 pub const PARTITION_SCAN_MAX: usize = 4096;
 /// How many partitions, and confined threads, a record names at most.
 pub const NAMED_MAX: usize = 4;
+/// The review of #558 (F2): after how many rounds in a row the watch could
+/// not judge (skipped, or its online CPUs moving) it signs it.
+pub const UNJUDGED_ROUNDS: u32 = 3;
+/// The review of #558 (F7): the most a source of the watch is read of —
+/// `/proc/stat` of an 8192-CPU host is about 1 MiB (a `cpuN` line each and
+/// the interrupt counts); a cgroup or online file is a line.
+pub const SOURCE_MAX: u64 = 4 << 20;
+/// `statfs` types a source must be on (the review of #558, F2, F3).
+pub const SYSFS_MAGIC: u64 = 0x6265_6572;
+pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+pub const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 pub use common::wire::{
     cpu_confined_of as of_target_dev, CPU_CAUSE_AFFINITY as CAUSE_AFFINITY,
     CPU_CAUSE_CGROUP_CPUSET as CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE as CAUSE_CGROUP_MOVE,
-    CPU_CAUSE_PARTITION as CAUSE_PARTITION,
+    CPU_CAUSE_PARTITION as CAUSE_PARTITION, CPU_CAUSE_UNJUDGED as CAUSE_UNJUDGED,
 };
 
 /// Why the agent runs on fewer CPUs than it should.
@@ -69,6 +109,9 @@ pub enum Cause {
     Affinity(Vec<(u32, Vec<u32>)>, usize),
     /// The agent is in another cgroup than at its start.
     CgroupMove { from: String, to: String },
+    /// The review of #558 (F2, F3): the watch could not judge for `rounds`
+    /// rounds in a row — why (the last round's reason).
+    Unjudged { rounds: u32, why: String },
 }
 
 impl Cause {
@@ -78,7 +121,12 @@ impl Cause {
             Cause::CgroupCpuset(..) => CAUSE_CGROUP_CPUSET,
             Cause::Affinity(..) => CAUSE_AFFINITY,
             Cause::CgroupMove { .. } => CAUSE_CGROUP_MOVE,
+            Cause::Unjudged { .. } => CAUSE_UNJUDGED,
         }
+    }
+
+    fn is_unjudged(&self) -> bool {
+        matches!(self, Cause::Unjudged { .. })
     }
 
     /// What the record's `comm` names: the partition, the cgroup, the
@@ -95,6 +143,7 @@ impl Cause {
                 .map(|(tid, _)| format!("tid {tid}"))
                 .unwrap_or_default(),
             Cause::CgroupMove { to, .. } => to.clone(),
+            Cause::Unjudged { why, .. } => why.clone(),
         };
         printable(&s, 64)
     }
@@ -133,6 +182,10 @@ impl Cause {
                 printable(from, 96),
                 printable(to, 96)
             ),
+            Cause::Unjudged { rounds, why } => format!(
+                "the watch could not judge them for {rounds} rounds in a row ({})",
+                printable(why, 160)
+            ),
         }
     }
 }
@@ -158,6 +211,15 @@ impl Confinement {
 
     /// The degradation's line (and the journal's).
     pub fn line(&self) -> String {
+        if self.cause.is_unjudged() {
+            return format!(
+                "{} — what the agent may run on is unknown (its threads may run on CPUs {}, of \
+                 the {} online)",
+                self.cause.describe(),
+                cpu_list_text(&self.left),
+                cpu_list_text(&self.expected)
+            );
+        }
         format!(
             "the agent may run on CPUs {} of the {} it should ({}): {} — confined, its sensors \
              and responses keep up with less",
@@ -173,6 +235,7 @@ impl Confinement {
     pub fn target_dev(&self) -> u64 {
         let threads = match &self.cause {
             Cause::Affinity(_, k) => *k,
+            Cause::Unjudged { rounds, .. } => *rounds as usize,
             _ => 0,
         };
         common::wire::cpu_confined_dev(
@@ -280,10 +343,15 @@ pub struct Reading {
     pub configured: Vec<(String, Vec<u32>)>,
     /// Each thread's CPU affinity (the kernel's, its active CPUs only).
     pub threads: Vec<(u32, Vec<u32>)>,
+    /// The review of #558 (F3): why this read cannot be judged — a mount
+    /// crossed in the cgroup tree (a file bound over a `cpuset.cpus`, a
+    /// directory over a cgroup); `None` when it can.
+    pub unjudged: Option<String>,
 }
 
 /// What narrows the CPUs the agent should run on, read once at its start:
-/// the CPUs the kernel's command line isolates, systemd's default affinity.
+/// the CPUs the kernel's command line isolates, systemd's default affinity,
+/// the agent's unit's own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Host {
     /// `isolcpus=` (the domain isolation: plain, or with the `domain` flag).
@@ -291,12 +359,18 @@ pub struct Host {
     /// systemd's `[Manager] CPUAffinity=` (`None`: not set, or a value this
     /// read does not take — `numa`).
     pub manager: Option<Vec<u32>>,
+    /// The review of #558 (F6): the agent's unit's `[Service] CPUAffinity=`
+    /// when every file assigning it predates the agent's install
+    /// ([`unit_affinity`]); `None`: not set, or not taken.
+    pub unit: Option<Vec<u32>>,
 }
 
 /// What the agent should run on: the online CPUs less the isolated ones,
-/// narrowed by systemd's default affinity and by the `cpuset.cpus` a SLICE
-/// above it holds (systemd's `AllowedCPUs=`; never the agent's own
-/// cgroup's, whose floor is its parent's CPUs).
+/// narrowed by its unit's `CPUAffinity=` (signed, [`Host::unit`]) or else
+/// by systemd's default affinity (which the unit's replaces, as systemd
+/// does at the exec), and by the `cpuset.cpus` a SLICE above it holds
+/// (systemd's `AllowedCPUs=`; never the agent's own cgroup's, whose floor
+/// is its parent's CPUs).
 pub fn expected(start_cgroup: &str, host: &Host, r: &Reading) -> Vec<u32> {
     let mut out: Vec<u32> = r
         .online
@@ -304,7 +378,7 @@ pub fn expected(start_cgroup: &str, host: &Host, r: &Reading) -> Vec<u32> {
         .copied()
         .filter(|c| !host.isolated.contains(c))
         .collect();
-    if let Some(m) = &host.manager {
+    if let Some(m) = host.unit.as_ref().or(host.manager.as_ref()) {
         out = intersect(&out, m);
     }
     // a narrowing that leaves no online CPU (a stale list) narrows nothing:
@@ -379,7 +453,8 @@ pub fn judge(
 pub enum Step {
     /// Nothing new.
     Same,
-    /// The round was skipped (the online CPUs moved: a hotplug).
+    /// The round was not judged: the first read (the baseline), or one that
+    /// cannot be ([`Reading::unjudged`], no online CPU read).
     Skipped,
     /// A new confinement, or a different one: sign it, keep it.
     Confined(Confinement),
@@ -394,15 +469,30 @@ pub struct Watch {
     pub start_cgroup: Option<String>,
     /// What narrows the expected CPUs, read at the start.
     pub host: Host,
-    /// The online CPUs as the last round read them.
+    /// The online CPUs as the last round read them (its second read).
     pub online: Option<Vec<u32>>,
     /// The confinement in force (signed).
     pub current: Option<Confinement>,
+    /// The review of #558 (F2): the rounds in a row not judged, or judged
+    /// while the online CPUs moved.
+    pub unsettled: u32,
+    /// The descriptors the round reads through, opened at its first round
+    /// ([`round`]; `None` in a test that steps the watch by hand).
+    pub sources: Option<Sources>,
 }
 
 impl Watch {
     /// One round on `r` (`online_again`: the online CPUs read once more
     /// after the rest).
+    ///
+    /// The review of #558 (F2): judged against the CPUs every read saw
+    /// online — `r`'s, `online_again` and the last round's second read —
+    /// and never skipped for a move of them. A round whose online CPUs
+    /// moved is unsettled: it signs a confinement when none is in force,
+    /// but never clears nor changes the one in force (the next settled
+    /// round does). [`UNJUDGED_ROUNDS`] rounds in a row skipped or
+    /// unsettled, with nothing found and nothing in force, are signed
+    /// ([`Cause::Unjudged`]).
     pub fn step(
         &mut self,
         r: &Reading,
@@ -417,26 +507,93 @@ impl Watch {
             }
             (None, None) => String::new(),
         };
-        let moved = self.online.as_deref() != Some(r.online.as_slice());
-        self.online = Some(r.online.clone());
-        if r.online.is_empty() || r.online != online_again || moved {
+        let Some(last) = self.online.replace(online_again.to_vec()) else {
+            // the first read is the baseline
+            self.unsettled = 1;
             return Step::Skipped;
+        };
+        let settled = r.online == last && r.online == online_again;
+        let online = intersect(&intersect(&r.online, online_again), &last);
+        let why = r.unjudged.clone().or_else(|| {
+            online
+                .is_empty()
+                .then(|| "no online CPU could be read".to_string())
+        });
+        if let Some(why) = why {
+            self.unsettled = self.unsettled.saturating_add(1);
+            return match self.unjudged(why, r) {
+                Some(signed) => signed,
+                None => Step::Skipped,
+            };
         }
+        self.unsettled = if settled {
+            0
+        } else {
+            self.unsettled.saturating_add(1)
+        };
+        let at = Reading {
+            online,
+            ..r.clone()
+        };
         // the partitions are looked for only for a confinement to sign
-        let found = judge(&start, &self.host, r, &Vec::new);
+        let found = judge(&start, &self.host, &at, &Vec::new);
         match (found, self.current.take()) {
-            (None, None) => Step::Same,
-            (None, Some(was)) => Step::Cleared(was),
             (Some(now), Some(was)) if now.key() == was.key() => {
                 self.current = Some(was);
                 Step::Same
             }
+            // unsettled: the confinement in force stands until a settled
+            // round tells it changed
+            (Some(_), Some(was)) if !settled && !was.cause.is_unjudged() => {
+                self.current = Some(was);
+                Step::Same
+            }
             (Some(first), _) => {
-                let now = judge(&start, &self.host, r, partitions).unwrap_or(first);
+                let now = judge(&start, &self.host, &at, partitions).unwrap_or(first);
                 self.current = Some(now.clone());
                 Step::Confined(now)
             }
+            (None, Some(was)) if settled => Step::Cleared(was),
+            (None, Some(was)) => {
+                self.current = Some(was);
+                Step::Same
+            }
+            (None, None) if settled => Step::Same,
+            (None, None) => self
+                .unjudged(
+                    format!(
+                        "the online CPUs moved in each of the last {} rounds",
+                        self.unsettled
+                    ),
+                    r,
+                )
+                .unwrap_or(Step::Same),
         }
+    }
+
+    /// The record of rounds not judged, when [`UNJUDGED_ROUNDS`] of them
+    /// came in a row and nothing is in force (a confinement signed stands:
+    /// the stricter answer).
+    fn unjudged(&mut self, why: String, r: &Reading) -> Option<Step> {
+        if self.unsettled < UNJUDGED_ROUNDS || self.current.is_some() {
+            return None;
+        }
+        let left = r
+            .threads
+            .iter()
+            .map(|(_, c)| c.clone())
+            .reduce(|a, b| intersect(&a, &b))
+            .unwrap_or_default();
+        let c = Confinement {
+            left,
+            expected: r.online.clone(),
+            cause: Cause::Unjudged {
+                rounds: self.unsettled,
+                why,
+            },
+        };
+        self.current = Some(c.clone());
+        Some(Step::Confined(c))
     }
 }
 
@@ -464,39 +621,187 @@ pub fn isolated_by_cmdline(cmdline: &str) -> Vec<u32> {
     cpu_list(&cpus.join(","))
 }
 
+/// What a run of `CPUAffinity=` assignments leaves.
+#[derive(Debug, Default)]
+enum Affinity {
+    #[default]
+    Unset,
+    Cpus(Vec<u32>),
+    /// A value that is not a CPU list (`numa`: the NUMA policy's nodes).
+    Other,
+}
+
+impl Affinity {
+    fn cpus(self) -> Option<Vec<u32>> {
+        match self {
+            Affinity::Cpus(c) if !c.is_empty() => Some(c),
+            _ => None,
+        }
+    }
+}
+
+/// The `CPUAffinity=` assignments of `text`'s `section` (`[Manager]`,
+/// `[Service]`) merged into `acc` as systemd merges them
+/// (systemd-system.conf(5), systemd.exec(5)): each list is added to the
+/// mask, an empty assignment resets it. Whether `text` assigns it at all.
+fn merge_affinity(acc: &mut Affinity, text: &str, section: &str) -> bool {
+    let mut inside = false;
+    let mut assigned = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            inside = l == section;
+            continue;
+        }
+        if !inside || l.starts_with('#') || l.starts_with(';') {
+            continue;
+        }
+        let Some(v) = l.strip_prefix("CPUAffinity=") else {
+            continue;
+        };
+        assigned = true;
+        let v = v.trim();
+        *acc = if v.is_empty() {
+            Affinity::Unset
+        } else if !v
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | ',' | ' ' | '\t'))
+        {
+            Affinity::Other
+        } else {
+            match std::mem::take(acc) {
+                Affinity::Unset => Affinity::Cpus(cpu_list(v)),
+                Affinity::Cpus(mut c) => {
+                    c.extend(cpu_list(v));
+                    c.sort_unstable();
+                    c.dedup();
+                    Affinity::Cpus(c)
+                }
+                Affinity::Other => Affinity::Other,
+            }
+        };
+    }
+    assigned
+}
+
 /// systemd's `[Manager] CPUAffinity=` in the files of `system.conf` given
-/// in systemd's order (the main file, then the drop-ins): the last
-/// assignment holds, an empty one resets it; `None` when unset or a value
-/// that is not a CPU list (`numa`: the NUMA policy's nodes).
+/// in systemd's order (the main file, then the drop-ins). The review of
+/// #558 (F6): the assignments are merged, as systemd merges them — `0-1`
+/// then `3` is `0-1,3` — an empty one resets the mask; `None` when unset or
+/// a value that is not a CPU list (`numa`: the NUMA policy's nodes).
 pub fn manager_affinity(files: &[String]) -> Option<Vec<u32>> {
-    let mut out: Option<Option<Vec<u32>>> = None;
+    let mut acc = Affinity::Unset;
     for text in files {
-        let mut manager = false;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.starts_with('[') {
-                manager = l == "[Manager]";
+        merge_affinity(&mut acc, text, "[Manager]");
+    }
+    acc.cpus()
+}
+
+/// One file of the agent's unit (the unit file or a drop-in), read for its
+/// `CPUAffinity=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitFile {
+    /// Its text; `None` when what systemd reads there cannot be read (a
+    /// FIFO, a device: `state_read::read_config`).
+    pub text: Option<String>,
+    /// It predates the agent's install and lies in our units' own
+    /// directories (the unit file, `northnarrow-agent.service.d`,
+    /// `northnarrow-.service.d`): the installer's check listed it and the
+    /// integrity round signs it (`own_dropins::preinstall_harmful`); after
+    /// the install those directories take a file only inside a window,
+    /// whose close moves a narrower `CPUAffinity=` away.
+    pub signed: bool,
+}
+
+/// The review of #558 (F6): the agent's unit's `[Service] CPUAffinity=`
+/// (its files in systemd's order, merged as systemd merges them) — what the
+/// agent should run on, as the slice's `AllowedCPUs=` of a signed window
+/// is; `None` when unset, when a file assigning it is not signed (a
+/// confinement: a narrower mask is recorded), or when one cannot be read.
+pub fn unit_affinity(files: &[UnitFile]) -> Option<Vec<u32>> {
+    let mut acc = Affinity::Unset;
+    for f in files {
+        let text = f.text.as_deref()?;
+        if merge_affinity(&mut acc, text, "[Service]") && !f.signed {
+            return None;
+        }
+    }
+    acc.cpus()
+}
+
+/// The agent's unit.
+const AGENT_UNIT: &str = "northnarrow-agent.service";
+
+/// The agent's unit files under `root` (`/`), in systemd's order: the unit
+/// file (the first on the unit search path), then the drop-ins of
+/// `northnarrow-agent.service.d`, `northnarrow-.service.d` and the
+/// type-wide `service.d` by name (a name in an earlier directory of the
+/// search path hides the later; the type-wide ones are the host's, never
+/// signed). `installed`: the agent's install
+/// (`own_dropins::install_time`).
+pub fn agent_unit_files(root: &Path, installed: Option<std::time::SystemTime>) -> Vec<UnitFile> {
+    let dirs: Vec<PathBuf> = antitamper_bpf::host_dropins::UNIT_SEARCH_PATH
+        .iter()
+        .map(|d| root.join(d.trim_start_matches('/')))
+        .collect();
+    let mut out = Vec::new();
+    if let Some(p) = dirs
+        .iter()
+        .map(|d| d.join(AGENT_UNIT))
+        .find(|p| std::fs::symlink_metadata(p).is_ok())
+    {
+        out.extend(unit_file(&p, installed, true));
+    }
+    let mut dropins: std::collections::BTreeMap<std::ffi::OsString, (PathBuf, bool)> =
+        std::collections::BTreeMap::new();
+    for d in &dirs {
+        for (sub, ours) in [
+            ("northnarrow-agent.service.d", true),
+            ("northnarrow-.service.d", true),
+            ("service.d", false),
+        ] {
+            let Ok(entries) = std::fs::read_dir(d.join(sub)) else {
                 continue;
-            }
-            if !manager || l.starts_with('#') || l.starts_with(';') {
-                continue;
-            }
-            if let Some(v) = l.strip_prefix("CPUAffinity=") {
-                let v = v.trim();
-                out = Some(if v.is_empty() {
-                    None
-                } else if v
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, '-' | ',' | ' ' | '\t'))
-                {
-                    Some(cpu_list(v)).filter(|c| !c.is_empty())
-                } else {
-                    None
-                });
+            };
+            for e in entries.flatten() {
+                let name = e.file_name();
+                if name.to_string_lossy().ends_with(".conf") {
+                    dropins.entry(name).or_insert((e.path(), ours));
+                }
             }
         }
     }
-    out.flatten()
+    out.extend(
+        dropins
+            .values()
+            .filter_map(|(p, ours)| unit_file(p, installed, *ours)),
+    );
+    out
+}
+
+/// The file at `p` for [`unit_affinity`]; `None` when there is none.
+fn unit_file(p: &Path, installed: Option<std::time::SystemTime>, ours: bool) -> Option<UnitFile> {
+    use std::os::unix::fs::MetadataExt;
+    use crate::state_read::Config;
+    let text = match crate::state_read::read_config(p) {
+        Config::Absent => return None,
+        Config::Text(t) => Some(t),
+        Config::Unjudgeable(_) => None,
+    };
+    let predates = |installed: std::time::SystemTime| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            let ct = std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    m.ctime().max(0) as u64,
+                    m.ctime_nsec().clamp(0, 999_999_999) as u32,
+                );
+            ct < installed
+        })
+    };
+    let signed = ours
+        && crate::own_dropins::regular_with_one_name(p)
+        && installed.is_some_and(predates);
+    Some(UnitFile { text, signed })
 }
 
 /// The `system.conf` files under `root` (`/`), in systemd's order: the
