@@ -154,12 +154,13 @@ pub const CONTENT_CONF_SLOTS: u32 = 2 + CALL_TARGETS as u32;
 pub const CONTENT_LOCKDOWN_SLOT: u32 = 1 + CALL_TARGETS as u32;
 
 /// Lot 345: the calibration the agent asks of the `bpf_prog` hook before
-/// 6.9 (`PROG_CONTENT_CALIB`), while it loads one of its own calibration
-/// programs: the signals' (`bpf_send_signal`, then
-/// `bpf_send_signal_thread`) or the return override's. The hook writes the
-/// verified call's `imm` (the helper's address less `__bpf_call_base`) to
-/// its target's slot: no kernel address is read from `kallsyms`, which the
-/// agent's capabilities hide.
+/// 6.9 (`PROG_CONTENT_CALIB` armed), while it loads one of its own
+/// calibration programs: the signals' (`bpf_send_signal`, then
+/// `bpf_send_signal_thread`) or the return override's. The hook records each
+/// verified helper call's `imm` (the helper's address less
+/// `__bpf_call_base`) by instruction (`PROG_CONTENT_SEEN`); the agent takes
+/// them in order ([`calibration_slot`]): no kernel address is read from
+/// `kallsyms`, which the agent's capabilities hide.
 pub const CALIB_NONE: u32 = 0;
 pub const CALIB_SIGNALS: u32 = 1;
 pub const CALIB_OVERRIDE: u32 = 2;
@@ -230,6 +231,34 @@ pub const fn forbidden_call(insn: u64, targets: &[u32; CALL_TARGETS]) -> u32 {
         return CALL_TARGETS as u32;
     }
     0
+}
+
+/// Lot 345 (the 5.15 verifier's count, the CI of #553): an instruction's
+/// call key — its `code`, `src_reg` and `imm`, the rest masked — looked up
+/// in the content judge's key map: one map lookup and one branch an
+/// instruction for the verifier, where [`forbidden_call`]'s compares were
+/// seven (5.15 processed 950,584 instructions for the hook that ran them).
+pub const CALL_KEY_MASK: u64 = 0xFFFF_FFFF_0000_F0FF;
+
+/// Lot 345: [`CALL_KEY_MASK`] of `insn`.
+#[inline(always)]
+pub const fn call_key(insn: u64) -> u64 {
+    insn & CALL_KEY_MASK
+}
+
+/// Lot 345: the key of a call of slot `slot`'s target `target` (a helper's
+/// call: `src_reg` 0; the kfunc's, the last slot: `src_reg`
+/// [`PSEUDO_KFUNC_CALL`]); `None` for an absent target (0).
+pub const fn target_key(slot: usize, target: u32) -> Option<u64> {
+    if target == 0 || slot >= CALL_TARGETS {
+        return None;
+    }
+    let src: u64 = if slot == CALL_TARGETS - 1 {
+        PSEUDO_KFUNC_CALL as u64
+    } else {
+        0
+    };
+    Some(INSN_CALL as u64 | (src << 12) | ((target as u64) << 32))
 }
 
 /// Lot 345: a `bpf_prog_type` refusal's `target_dev` when the content
@@ -1339,6 +1368,54 @@ mod tests {
         }
         const { assert!(CONTENT_LOCKDOWN_SLOT < CONTENT_CONF_SLOTS) };
         assert_eq!(CONTENT_LOCKDOWN_SLOT, CALL_TARGETS as u32 + 1);
+    }
+
+    /// Lot 345 (named; the CI of #553): the key map's lookup finds exactly
+    /// what [`forbidden_call`] finds — every opcode, every `src_reg`, the
+    /// targets, their neighbours and 0, the other registers' and `off`'s
+    /// bits set or not — and a slot's key is its target's call only.
+    #[test]
+    fn the_call_keys_find_what_the_compares_find() {
+        let targets = [36, 58, 109, 117, 9_001];
+        let keys: Vec<(u64, u32)> = (0..CALL_TARGETS)
+            .filter_map(|s| target_key(s, targets[s]).map(|k| (k, s as u32 + 1)))
+            .collect();
+        assert_eq!(keys.len(), CALL_TARGETS);
+        let lookup = |insn: u64| -> u32 {
+            keys.iter()
+                .find(|(k, _)| *k == call_key(insn))
+                .map_or(0, |(_, s)| *s)
+        };
+        let mut n = 0;
+        for code in [0x85u8, 0x84, 0x95, 0xb7, 0x05, 0x8d, 0x18] {
+            for src in 0u64..16 {
+                for imm in [
+                    0u32,
+                    1,
+                    35,
+                    36,
+                    37,
+                    58,
+                    109,
+                    110,
+                    117,
+                    9_000,
+                    9_001,
+                    u32::MAX,
+                ] {
+                    for rest in [0u64, 0x0f00, 0xffff_0000, 0x7fff_0a00] {
+                        let insn = code as u64 | (src << 12) | rest | ((imm as u64) << 32);
+                        assert_eq!(lookup(insn), forbidden_call(insn, &targets), "{insn:#018x}");
+                        n += 1;
+                    }
+                }
+            }
+        }
+        assert!(n > 5000);
+        assert_eq!(target_key(0, 0), None);
+        assert_eq!(target_key(CALL_TARGETS, 36), None);
+        assert_eq!(target_key(2, 109), Some(0x85 | (109u64 << 32)));
+        assert_eq!(target_key(4, 7), Some(0x85 | (2 << 12) | (7u64 << 32)));
     }
 
     /// Lot 345 (named): a content refusal's record round-trips, and the

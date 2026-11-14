@@ -484,6 +484,21 @@ pub struct ContentJudge {
 }
 
 impl ContentJudge {
+    /// The call keys of the targets, each with its slot plus one
+    /// (`PROG_CONTENT_KEYS`): none when the judge is off.
+    pub fn keys(&self) -> Vec<(u64, u32)> {
+        if self.stage == common::bpf_prog_class::CONTENT_STAGE_OFF {
+            return Vec::new();
+        }
+        self.targets
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, t)| {
+                common::bpf_prog_class::target_key(slot, *t).map(|k| (k, slot as u32 + 1))
+            })
+            .collect()
+    }
+
     /// 6.9 and later, at `bpf_prog_load`: the helpers' uapi ids, and the
     /// kfunc's BTF id where vmlinux has it.
     pub fn at_load(kfunc_btf_id: Option<u32>) -> Self {
@@ -554,30 +569,24 @@ fn arm_content_at_handle(
     use common::bpf_prog_class::{
         CALIB_NONE, CALIB_OVERRIDE, CALIB_SIGNALS, CALL_TARGETS, CONTENT_LOCKDOWN_SLOT,
     };
+    let mut calibrated = [0u32; CALL_TARGETS];
     for (kind, program) in [
         (CALIB_SIGNALS, CALIB_SIGNALS_PROGRAM),
         (CALIB_OVERRIDE, CALIB_OVERRIDE_PROGRAM),
     ] {
+        clear_seen(ebpf)?;
         set_calibration(ebpf, kind)?;
         let loaded = load_calibration(ebpf, program);
         set_calibration(ebpf, CALIB_NONE)?;
         if let Err(e) = loaded {
             // the override's helper is absent from some kernels' builds
             debug!(program, error = %e, "BPF self-defence: calibration program not loaded");
+            continue;
         }
+        place_calibration(kind, &read_seen(ebpf)?, &mut calibrated);
     }
     freeze_named(ebpf, CALIB_MAP)?;
-    let mut calibrated = [0u32; CALL_TARGETS];
-    {
-        let m = ebpf
-            .map(CONTENT_CONF_MAP)
-            .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
-        let conf: Array<&MapData, u32> =
-            Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
-        for (i, t) in calibrated.iter_mut().enumerate() {
-            *t = conf.get(&(i as u32 + 1), 0).unwrap_or(0);
-        }
-    }
+    freeze_named(ebpf, SEEN_MAP)?;
     let judge = ContentJudge::at_handle(calibrated);
     if let Some(why) = &judge.off {
         freeze_named(ebpf, CONTENT_CONF_MAP)?;
@@ -626,6 +635,47 @@ const CALIB_MAP: &str = "PROG_CONTENT_CALIB";
 pub const WRITE_USER_GUARD_PROGRAM: &str = "bpf_write_user_guard";
 pub const WRITE_USER_GUARD_HOOK: &str = "locked_down";
 
+const SEEN_MAP: &str = "PROG_CONTENT_SEEN";
+/// Lot 345: the judge's call keys (`bpf_prog_class::target_key` → slot + 1).
+pub const CONTENT_KEYS_MAP: &str = "PROG_CONTENT_KEYS";
+
+/// Lot 345: the helper calls the hook recorded of calibration `kind`'s
+/// program (`seen`, by instruction, 0 for any other), in order, put in
+/// their targets' slots (`bpf_prog_class::calibration_slot`).
+pub fn place_calibration(
+    kind: u32,
+    seen: &[u32],
+    calibrated: &mut [u32; common::bpf_prog_class::CALL_TARGETS],
+) {
+    for (n, imm) in seen.iter().filter(|v| **v != 0).enumerate() {
+        if let Some(slot) = common::bpf_prog_class::calibration_slot(kind, n as u32) {
+            calibrated[slot as usize - 1] = *imm;
+        }
+    }
+}
+
+fn clear_seen(ebpf: &mut Ebpf) -> std::result::Result<(), String> {
+    let m = ebpf
+        .map_mut(SEEN_MAP)
+        .ok_or_else(|| format!("{SEEN_MAP} missing from the eBPF object"))?;
+    let mut a: Array<&mut MapData, u32> =
+        Array::try_from(m).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
+    for i in 0..common::bpf_prog_class::CALIB_MAX_INSNS {
+        a.set(i, 0, 0).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn read_seen(ebpf: &Ebpf) -> std::result::Result<Vec<u32>, String> {
+    let m = ebpf
+        .map(SEEN_MAP)
+        .ok_or_else(|| format!("{SEEN_MAP} missing from the eBPF object"))?;
+    let a: Array<&MapData, u32> = Array::try_from(m).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
+    (0..common::bpf_prog_class::CALIB_MAX_INSNS)
+        .map(|i| a.get(&i, 0).map_err(|e| format!("{SEEN_MAP}: {e}")))
+        .collect()
+}
+
 fn set_calibration(ebpf: &mut Ebpf, kind: u32) -> std::result::Result<(), String> {
     let m = ebpf
         .map_mut(CALIB_MAP)
@@ -665,7 +715,20 @@ fn write_content_judge(
         conf.set(i as u32 + 1, *t, 0)
             .map_err(|e| format!("{CONTENT_CONF_MAP} slot {}: {e}", i + 1))?;
     }
+    // the keys the hook looks each instruction up in (the CI of #553)
+    {
+        let m = ebpf
+            .map_mut(CONTENT_KEYS_MAP)
+            .ok_or_else(|| format!("{CONTENT_KEYS_MAP} missing from the eBPF object"))?;
+        let mut keys: HashMap<&mut MapData, u64, u32> =
+            HashMap::try_from(m).map_err(|e| format!("{CONTENT_KEYS_MAP}: {e}"))?;
+        for (key, slot) in judge.keys() {
+            keys.insert(key, slot, 0)
+                .map_err(|e| format!("{CONTENT_KEYS_MAP}: {e}"))?;
+        }
+    }
     if freeze {
+        freeze_named(ebpf, CONTENT_KEYS_MAP)?;
         freeze_named(ebpf, CONTENT_CONF_MAP)?;
     }
     Ok(())
@@ -2320,8 +2383,34 @@ mod tests {
         let j = ContentJudge::at_handle([0, 0, 0x20, 0x30, 0]);
         assert_eq!(j.stage, CONTENT_STAGE_HANDLE);
         assert_eq!(j.targets, [0, 0, 0x20, 0x30, 0]);
+        // the keys: one a target, its slot plus one; the kfunc's src_reg 2
+        let j = ContentJudge::at_load(Some(61_234));
+        let keys = j.keys();
+        assert_eq!(keys.len(), 5);
+        assert!(keys.contains(&(0x85 | (109u64 << 32), 3)));
+        assert!(keys.contains(&(0x85 | (2 << 12) | (61_234u64 << 32), 5)));
+        assert_eq!(ContentJudge::at_load(None).keys().len(), 4);
+        // the calibration's records, in order: the signals' two calls into
+        // their slots, the override's one; other instructions are 0
+        let mut cal = [0u32; 5];
+        place_calibration(
+            common::bpf_prog_class::CALIB_SIGNALS,
+            &[0, 0x20, 0, 0x30, 0, 0],
+            &mut cal,
+        );
+        place_calibration(
+            common::bpf_prog_class::CALIB_OVERRIDE,
+            &[0, 0x10, 0, 0],
+            &mut cal,
+        );
+        assert_eq!(cal, [0, 0x10, 0x20, 0x30, 0]);
+        assert_eq!(
+            ContentJudge::at_handle(cal).targets,
+            [0, 0x10, 0x20, 0x30, 0]
+        );
         // no signal calibrated: off, said
         let j = ContentJudge::at_handle([0, 0x10, 0x20, 0, 0]);
+        assert!(j.keys().is_empty());
         assert_eq!(j.stage, CONTENT_STAGE_OFF);
         assert_eq!(j.targets, [0; 5]);
         assert!(

@@ -556,23 +556,26 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "try_bpf_prog_guard"),
         &[
             "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n        if let Some((why, ty)) = content_refusal(prog) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
-            "if loading && (caller_is_exempt() || fresh_instance_may_load()) {\n        calibrate(prog);",
+            "if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {\n        if let Some(addr) = ptr_scalar(prog) {\n            nn_calibrate(addr);",
             "if loading {\n        crate::bpf_census::mark_seen(id, prog);",
         ],
     )
     .unwrap();
-    // the whole program read: CONTENT_MAX_INSNS = 64 blocks x 64 chunks x 256
+    // the whole program read: CONTENT_MAX_INSNS = 32 spans x 32 blocks x
+    // 32 chunks x 32 instructions, each instruction one key lookup
     in_order(
         body(&c, "nn_prog_forbidden_call"),
         &[
             "if len > CONTENT_MAX_INSNS as u64 {\n        return SCAN_UNJUDGED;",
-            "while b < SCAN_BLOCKS {",
-            "let r = nn_scan_block(insns, from, len);",
+            "while k < SCAN_FAN {",
+            "let r = nn_scan_span(insns, from, len);",
         ],
     )
     .unwrap();
+    assert!(body(&c, "nn_scan_span").contains("let r = nn_scan_block(insns, at, len);"));
+    assert!(body(&c, "nn_scan_block").contains("let r = nn_scan_chunk(insns, at, len);"));
     assert_eq!(
-        256 * 64 * 64,
+        32 * 32 * 32 * 32,
         northnarrow_common_max_insns(),
         "the scan covers the most a load may hold"
     );
@@ -580,7 +583,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "nn_scan_chunk"),
         &[
             "Err(_) => return SCAN_UNJUDGED,",
-            "let hit = forbidden_call(insn, &targets);",
+            "if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {\n            return *slot as u64;",
         ],
     )
     .unwrap();
@@ -611,7 +614,8 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&u, "arm_content_at_handle"),
         &[
-            "set_calibration(ebpf, kind)?;\n        let loaded = load_calibration(ebpf, program);\n        set_calibration(ebpf, CALIB_NONE)?;",
+            "clear_seen(ebpf)?;\n        set_calibration(ebpf, kind)?;\n        let loaded = load_calibration(ebpf, program);\n        set_calibration(ebpf, CALIB_NONE)?;",
+            "place_calibration(kind, &read_seen(ebpf)?, &mut calibrated);",
             "freeze_named(ebpf, CALIB_MAP)?;",
             "WRITE_USER_GUARD_PROGRAM,\n            WRITE_USER_GUARD_HOOK,",
             "write_content_judge(ebpf, &judge, true)?;",
@@ -626,8 +630,6 @@ fn northnarrow_common_max_insns() -> u64 {
     let c = code("common/src/bpf_prog_class.rs");
     assert!(c.contains("pub const CONTENT_MAX_INSNS: u32 = 1 << 20;"));
     let e = code("agent-ebpf/src/bpf_defense.rs");
-    assert!(e.contains("const SCAN_CHUNK: u64 = 256;"));
-    assert!(e.contains("const SCAN_BLOCK: u64 = 64;"));
-    assert!(e.contains("const SCAN_BLOCKS: u64 = 64;"));
+    assert!(e.contains("const SCAN_FAN: u64 = 32;"));
     1 << 20
 }

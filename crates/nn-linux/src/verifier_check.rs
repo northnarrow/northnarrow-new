@@ -1299,8 +1299,10 @@ mod tests {
             "nn_loader_opted_out",
             // lot 345: the content judge's scan
             "nn_prog_forbidden_call",
+            "nn_scan_span",
             "nn_scan_block",
             "nn_scan_chunk",
+            "nn_calibrate",
         ] {
             assert!(!s.contains_key(sub), "{sub} is a subprogram");
         }

@@ -82,10 +82,10 @@ use northnarrow_common::bpf_cmd::{
     BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD, BPF_RAW_TRACEPOINT_OPEN,
 };
 use northnarrow_common::bpf_prog_class::{
-    calibration_slot, denied_by_default, forbidden_call, opt_out_refuses_attach, type_bit,
-    CALIB_MAX_INSNS, CALIB_NONE, CALL_TARGETS, CONTENT_CALL, CONTENT_CONF_SLOTS, CONTENT_FMOD_RET,
-    CONTENT_LOCKDOWN_SLOT, CONTENT_MAX_INSNS, CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD,
-    CONTENT_UNJUDGED, INSN_CALL, PROG_LOAD_ATTACH_TYPE_OFFSET,
+    call_key, denied_by_default, opt_out_refuses_attach, type_bit, CALIB_MAX_INSNS, CALIB_NONE,
+    CALL_TARGETS, CONTENT_CALL, CONTENT_CONF_SLOTS, CONTENT_FMOD_RET, CONTENT_LOCKDOWN_SLOT,
+    CONTENT_MAX_INSNS, CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD, CONTENT_UNJUDGED, INSN_CALL,
+    PROG_LOAD_ATTACH_TYPE_OFFSET,
 };
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
@@ -198,6 +198,20 @@ pub static PROG_CONTENT_CONF: Array<u32> = Array::with_max_entries(CONTENT_CONF_
 /// calibration programs (`bpf_prog_class::CALIB_*`; 0 none), before 6.9.
 #[map]
 pub static PROG_CONTENT_CALIB: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Lot 345: what [`nn_calibrate`] read of a calibration program — by
+/// instruction, a helper call's `imm`, 0 for any other instruction. The
+/// agent zeroes it before each calibration and reads it after.
+#[map]
+pub static PROG_CONTENT_SEEN: Array<u32> = Array::with_max_entries(CALIB_MAX_INSNS, 0);
+
+/// Lot 345 (the CI of #553: 5.15 processed 950,584 instructions for the
+/// `bpf_prog` hook with seven compares an instruction): the call keys of
+/// the judge's targets (`bpf_prog_class::target_key`) → their slot plus
+/// one, written by the agent with the configuration and frozen. One lookup
+/// an instruction.
+#[map]
+pub static PROG_CONTENT_KEYS: HashMap<u64, u32> = HashMap::with_max_entries(CALL_TARGETS as u32, 0);
 
 /// `(dev, ino)` of the agent's own binaries, registered by userland at
 /// boot, valued by role ([`ROLE_WATCHDOG`], [`ROLE_AGENT`]). External audit
@@ -824,8 +838,10 @@ unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
     }
     // Lot 345: one of the agent's calibration programs, loaded while it
     // asks for a calibration (before 6.9)
-    if loading && (caller_is_exempt() || fresh_instance_may_load()) {
-        calibrate(prog);
+    if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {
+        if let Some(addr) = ptr_scalar(prog) {
+            nn_calibrate(addr);
+        }
     }
     if loading {
         crate::bpf_census::mark_seen(id, prog);
@@ -868,49 +884,49 @@ unsafe fn try_bpf_prog_load_guard(ctx: &LsmContext) -> i32 {
     0
 }
 
-/// Lot 345 (before 6.9): the verified `imm` of each helper call of the
-/// agent's calibration program `prog` — the helper's address less
-/// `__bpf_call_base`, which the agent cannot read from `kallsyms` — written
-/// to the slot of its target ([`calibration_slot`]). Only while the agent
-/// asks for one ([`PROG_CONTENT_CALIB`]), on its own load.
+/// Lot 345: the agent asks for a calibration ([`PROG_CONTENT_CALIB`]).
 #[inline(always)]
-unsafe fn calibrate(prog: *const c_void) {
-    let kind = match PROG_CONTENT_CALIB.get(0) {
-        Some(k) => *k,
-        None => return,
-    };
-    if kind == CALIB_NONE {
-        return;
+fn calibration_armed() -> bool {
+    match PROG_CONTENT_CALIB.get(0) {
+        Some(k) => *k != CALIB_NONE,
+        None => false,
     }
+}
+
+/// Lot 345 (before 6.9): the verified `imm` of each helper call of the
+/// agent's calibration program at `prog` (its address) — the helper's
+/// address less `__bpf_call_base`, which the agent cannot read from
+/// `kallsyms` — recorded by instruction in [`PROG_CONTENT_SEEN`] (0 for
+/// any other); the agent takes them in order. A global BPF function,
+/// verified once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_calibrate(prog: u64) -> u64 {
     let (Some(len_off), Some(insns_off)) = (off_opt!(BPF_PROG_LEN_OFFSET), off_opt!(BPF_PROG_INSNSI_OFFSET))
     else {
-        return;
+        return 0;
     };
-    let len = match bpf_probe_read_kernel::<u32>((prog as *const u8).add(len_off) as *const u32) {
+    let len = match unsafe { bpf_probe_read_kernel::<u32>((prog + len_off as u64) as *const u32) } {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return 0,
     };
-    let insns = (prog as *const u8).add(insns_off) as *const u64;
-    let mut n: u32 = 0;
+    let insns = prog + insns_off as u64;
     let mut i: u32 = 0;
     while i < CALIB_MAX_INSNS {
         if i >= len {
             break;
         }
-        let insn = match bpf_probe_read_kernel::<u64>(insns.add(i as usize)) {
+        let insn = match unsafe { bpf_probe_read_kernel::<u64>((insns + i as u64 * 8) as *const u64) } {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return 0,
         };
-        if insn as u8 == INSN_CALL && (insn >> 12) & 0xf == 0 {
-            if let Some(slot) = calibration_slot(kind, n) {
-                if let Some(p) = PROG_CONTENT_CONF.get_ptr_mut(slot) {
-                    *p = (insn >> 32) as u32;
-                }
-            }
-            n += 1;
+        let call = insn as u8 == INSN_CALL && (insn >> 12) & 0xf == 0;
+        if let Some(p) = PROG_CONTENT_SEEN.get_ptr_mut(i) {
+            unsafe { *p = if call { (insn >> 32) as u32 } else { 0 } };
         }
         i += 1;
     }
+    1
 }
 
 /// Lot 345: the calibration programs — loaded by the agent, verified, read
@@ -1022,18 +1038,17 @@ unsafe fn ptr_scalar(p: *const c_void) -> Option<u64> {
 const SCAN_CLEAN: u64 = 0;
 /// Lot 345: … could not read the program whole.
 const SCAN_UNJUDGED: u64 = u64::MAX;
-/// Lot 345: the instructions [`nn_scan_chunk`] reads, the chunks
-/// [`nn_scan_block`] scans, and the blocks [`nn_prog_forbidden_call`] scans
-/// — 256 × 64 × 64 = `CONTENT_MAX_INSNS`. Three global functions, each
-/// verified once on its own: the verifier walks 256 + 64 + 64 iterations,
-/// not a million.
-const SCAN_CHUNK: u64 = 256;
-const SCAN_BLOCK: u64 = 64;
-const SCAN_BLOCKS: u64 = 64;
+/// Lot 345: the fan-out of the scan's four levels — 32 instructions a
+/// chunk, 32 chunks a block, 32 blocks a span, 32 spans a program: 32⁴ =
+/// `CONTENT_MAX_INSNS`. Four global functions, each verified once on its own
+/// (the CI of #553: one level of 256 and two of 64 cost 5.15's verifier
+/// 950,584 instructions).
+const SCAN_FAN: u64 = 32;
 
-/// Lot 345: the first forbidden call of `prog` (a `struct bpf_prog *`): its
-/// target's slot plus one, [`SCAN_CLEAN`] or [`SCAN_UNJUDGED`]. A global
-/// BPF function (exported, never inlined, scalar argument).
+/// Lot 345: the first forbidden call of the program at `prog` (a `struct
+/// bpf_prog`'s address): its target's slot plus one, [`SCAN_CLEAN`] or
+/// [`SCAN_UNJUDGED`]. A global BPF function (exported, never inlined,
+/// scalar argument).
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_prog_forbidden_call(prog: u64) -> u64 {
@@ -1049,29 +1064,48 @@ pub extern "C" fn nn_prog_forbidden_call(prog: u64) -> u64 {
         return SCAN_UNJUDGED;
     }
     let insns = prog + insns_off as u64;
-    let mut b: u64 = 0;
-    while b < SCAN_BLOCKS {
-        let from = b * SCAN_BLOCK * SCAN_CHUNK;
+    let mut k: u64 = 0;
+    while k < SCAN_FAN {
+        let from = k * SCAN_FAN * SCAN_FAN * SCAN_FAN;
         if from >= len {
             break;
         }
-        let r = nn_scan_block(insns, from, len);
+        let r = nn_scan_span(insns, from, len);
         if r != SCAN_CLEAN {
             return r;
         }
-        b += 1;
+        k += 1;
     }
     SCAN_CLEAN
 }
 
-/// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_BLOCK`] chunks from
+/// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_FAN`] blocks from
 /// instruction `from`.
 #[no_mangle]
 #[inline(never)]
+pub extern "C" fn nn_scan_span(insns: u64, from: u64, len: u64) -> u64 {
+    let mut k: u64 = 0;
+    while k < SCAN_FAN {
+        let at = from + k * SCAN_FAN * SCAN_FAN;
+        if at >= len {
+            break;
+        }
+        let r = nn_scan_block(insns, at, len);
+        if r != SCAN_CLEAN {
+            return r;
+        }
+        k += 1;
+    }
+    SCAN_CLEAN
+}
+
+/// Lot 345: … over the [`SCAN_FAN`] chunks from instruction `from`.
+#[no_mangle]
+#[inline(never)]
 pub extern "C" fn nn_scan_block(insns: u64, from: u64, len: u64) -> u64 {
-    let mut c: u64 = 0;
-    while c < SCAN_BLOCK {
-        let at = from + c * SCAN_CHUNK;
+    let mut k: u64 = 0;
+    while k < SCAN_FAN {
+        let at = from + k * SCAN_FAN;
         if at >= len {
             break;
         }
@@ -1079,27 +1113,18 @@ pub extern "C" fn nn_scan_block(insns: u64, from: u64, len: u64) -> u64 {
         if r != SCAN_CLEAN {
             return r;
         }
-        c += 1;
+        k += 1;
     }
     SCAN_CLEAN
 }
 
-/// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_CHUNK`]
-/// instructions from `from` (to `len`), against the armed targets.
+/// Lot 345: … over the [`SCAN_FAN`] instructions from `from` (to `len`):
+/// each one's call key looked up in [`PROG_CONTENT_KEYS`].
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64) -> u64 {
-    let mut targets = [0u32; CALL_TARGETS];
-    let mut t = 0;
-    while t < CALL_TARGETS {
-        targets[t] = match PROG_CONTENT_CONF.get(t as u32 + 1) {
-            Some(v) => *v,
-            None => 0,
-        };
-        t += 1;
-    }
     let mut j: u64 = 0;
-    while j < SCAN_CHUNK {
+    while j < SCAN_FAN {
         let i = from + j;
         if i >= len {
             break;
@@ -1108,9 +1133,8 @@ pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64) -> u64 {
             Ok(v) => v,
             Err(_) => return SCAN_UNJUDGED,
         };
-        let hit = forbidden_call(insn, &targets);
-        if hit != 0 {
-            return hit as u64;
+        if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {
+            return *slot as u64;
         }
         j += 1;
     }
