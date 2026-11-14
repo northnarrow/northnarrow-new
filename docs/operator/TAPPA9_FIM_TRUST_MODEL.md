@@ -192,6 +192,24 @@ with other bytes (rewritten in place): High, as before. And the size a file
 had when it was watched is read before the kernel watches its inode (it was
 read after: an append landing in between was measured in it).
 
+Lot 351 (the review of #559, F1): the drain drops a record as a no-op when
+the content it reads matches the start's signed baseline (a `touch`). The
+baseline is the start's, not the last state the drain saw: a log truncated
+back to the exact content of its baseline (`truncate -s <baseline size>`
+after rsyslogd appended a login's lines) matched it, and every line written
+since was erased with no record and no NN-L-FIM-005. A file read smaller
+than the drain last read it (or than its size when it was watched) is now a
+change whatever the baseline says — recorded and judged with the size it
+had (High; logrotate's scheduled `copytruncate` of a log whose baseline is
+empty is Low on logrotate's own record, as any other rotation). A
+same-size return to the baseline (bytes rewritten in place, then back) is
+still dropped: its change was judged when it was read. Not closed: a
+growth the drain never read — no record of the log between the agent's
+start at the baseline and the truncation (rsyslogd keeps its log open; a
+record leaves the kernel at a close) — then a truncation back to the
+baseline: the drain cannot tell it from a `truncate` that changed nothing.
+The kernel's record of the size before the setattr would close it.
+
 Residuals, named: a process that runs rsyslogd's image itself (an rsyslog
 module, `LD_PRELOAD` into rsyslogd) writes as rsyslogd — its growth of a log,
 or its collapse inside the window of another process's truncation, is
@@ -218,6 +236,8 @@ The `ld.so.preload`, `authorized_keys`, bait and credential rules are never rela
 An administrator session's configuration changes still raise the posture to ENGAGED and stay in the signed detection chain. They do not corroborate each other into COMBAT: editing `sshd_config` and then adding a unit is routine work. A signal of another kind in the same login session (an offensive tool, exfiltration, an exec from `/tmp`) still takes the next one to COMBAT.
 
 Whoever holds an administrator's session and sudo password is that administrator to these rules.
+
+Lot 351 (the review of #559, F2): the sudo or su in the writer's lineage vouches only through the process it ran as root after authenticating — its child's process, whose first exec since that fork (the kernel's fork record) ran as root and is no PAM helper. Any user may run sudo, and `sudo -A` forks the user's `SUDO_ASKPASS` program, as the user, before any authentication: a write below it — even by a process that became root there through a local privilege escalation — was "an administrator's session". It is not now; nor is `sudoedit`'s editor or `sudo -u`/`su` to another user. A session older than the agent's start (no exec of it could be seen) is judged on the uid `/proc` showed at the start.
 
 ## A store's own client (review 85)
 

@@ -404,8 +404,9 @@ user-writable path, R009's match. What the running agent does with them:
 - **The script's own exec** comes before any window it can open. Below
   COMBAT, R009 records it (High) and does not kill it (RULE_POLICY.md §1);
   run by an administrator's `sudo` at a terminal, the record is Low (an
-  administrator's session). Lot 350: every time — it was High 3 runs in 7
-  in the pre-alpha's lab. A shell that runs `sudo` as its last command
+  administrator's session). Lot 350: the race below is closed (High 3 runs
+  in 7 in the pre-alpha's lab, 0 in 15 since); an exec record lost to a
+  full ring buffer or an evicted lineage entry can still make one High. A shell that runs `sudo` as its last command
   (`ssh -t host 'cd tree && sudo ./deploy/uninstall.sh'`, `script -c`)
   executes sudo in place of itself, and sudo's monitor, forked in the same
   10 ms clock tick, was not known as sudo's: the session was lost. And
@@ -413,7 +414,17 @@ user-writable path, R009's match. What the running agent does with them:
   `sudo-rs`, `su-rs`) is an elevation binary as sudo is. Without a terminal
   (`ssh host sudo …`, automation) the record stays High; when it does, the
   agent's journal says which part of the session check failed (`not an
-  administrator's sudo/su session at a terminal: …`).
+  administrator's sudo/su session at a terminal: …`). Lot 351: the sudo or
+  su vouches only through the process it ran **as root after
+  authenticating** — the first exec of its child's process, forked by it
+  (the kernel's fork record), as root, no PAM helper (`unix_chkpwd`). What
+  sudo runs as the user (`sudo -A`'s askpass helper, before any
+  authentication; `sudoedit`'s editor), `sudo -u`/`su` to another user, and
+  anything below those — even a process that became root there and
+  executed its payload in place — is no administrator's session: R009
+  High, the journal saying "ran nothing as root after authenticating".
+  `sudo env … ./x` and `sudo bash -c './x'` (an exec in place of the
+  command) stay the administrator's.
 - **What the script executes from its tree afterwards** (the new agent's
   `--version`) runs after it opened its window: asked for an installer
   (`nn-admin trusted-installer-grant --for-installer`, which the scripts
@@ -470,14 +481,33 @@ the agent's own BPF programs to unload (the ids in
 other products' LSM programs are left alone) → `chattr -R -i` on state and
 config → remove
 binaries, units, `journald@northnarrow.conf`, `/run/northnarrow` and the
-ten bait files → `daemon-reload` → stop `northnarrow.slice` (lot 350: its
-file is gone at the reload, and with it its `RefuseManualStop=`; it stayed
-loaded and active, its cgroup there, until the next boot; once stopped,
-`systemctl status northnarrow.slice` reads `loaded`, `inactive (dead)` like
-any slice systemd knows no file of) and remove the
-empty `system.control` directories the agent's unit made the parents of
-(`/etc/systemd/system.control`, `/run/systemd/system.control`: one that
-holds anything stays). Without `--purge` the admin key, the
+ten bait files → `daemon-reload` → the agent's containment cgroups under
+the slice (lot 351: `blocked.scope` and `throttled.scope`, which the agent
+makes itself, no units) removed when empty → stop `northnarrow.slice` (lot
+350: its file is gone at the reload, and with it its `RefuseManualStop=`;
+it stayed loaded and active, its cgroup there, until the next boot; once
+stopped, `systemctl status northnarrow.slice` reads `loaded`, `inactive
+(dead)` like any slice systemd knows no file of) and remove the empty
+`system.control` directories the agent's unit made the parents of: /run's
+(this boot's; systemd makes it again when it needs one), and /etc's only
+when the first install recorded that the host had none
+(`/etc/northnarrow/made-dirs`; an install older than lot 351 recorded
+nothing, and its empty one goes as before) — one that holds anything
+stays. **A process the agent contained** (a profile other than `alpha`)
+still in one of those scopes is neither killed nor released by the
+uninstall — releasing is the operator's decision (`nn-admin`, before the
+uninstall): it hands a process the agent judged back its unit and its
+network, with nothing left to watch it. The uninstall names those
+processes and prints the agent's containment record (where each came
+from), leaves the scope and the slice in place, and the processes stay
+there, outside any unit, until they exit or the next boot: a throttled one
+under the scope's limits, a blocked one no longer blocked (the agent's
+nftables table is gone). To release one by hand: `echo <pid> >
+/sys/fs/cgroup<its origin>/cgroup.procs`. Every directory the uninstall
+removes from systemd's trees (drop-in directories, the journal namespace's
+runtime directory and journals) is never a mount point there — one is left
+and said — and its removal does not cross into another file system
+(lot 351). Without `--purge` the admin key, the
 signed audit chain and the chain logs stay on disk: they are evidence and
 identity, and a later reinstall picks them up (`install.sh` leaves an
 existing `admin.pub` untouched). The summary names every private admin

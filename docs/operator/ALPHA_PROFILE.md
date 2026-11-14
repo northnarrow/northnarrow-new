@@ -332,7 +332,11 @@ did nothing else are told by identity now:
   unit of that phase, forked by the unit's own shell — any other netcat is
   High as before.
 - R009 for `sudo ./deploy/uninstall.sh` (or `install.sh`) at a terminal:
-  Low every time, sudo-rs included
+  Low, sudo-rs included — the race of sudo's monitor forked in the tick of
+  sudo's exec is closed (the lab: 0 High in 15 runs); an exec record lost
+  to a full ring or the lineage cache's eviction can still leave a High.
+  Lot 351: what vouches is the process sudo ran as root after
+  authenticating — never `sudo -A`'s askpass helper or what it runs
   ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §2.1).
 
 `uninstall.sh --purge` leaves nothing of NorthNarrow; what stays until the
