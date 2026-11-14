@@ -402,6 +402,27 @@ impl Rule for NnLAt001AntiTamperDenial {
             }
             // Lot 349 (the review of #558, F1): a window's load of a program
             // the content judge refuses outside one — let through, held.
+            // the re-check of #558 (item 2): still loaded after the window
+            FsProtectOperation::BpfHeldLoad
+                if common::wire::bpf_held_of(*target_dev).0 == common::wire::BPF_HELD_OUTLIVED =>
+            {
+                let reasoning = format!(
+                    "{} (program id {target_ino}), loaded inside a trusted-installer window and \
+                     held, is still loaded after the window closed ({comm}): attached by a link or \
+                     an attach made inside the window, pinned, or kept by a descriptor. Every run, \
+                     attach or handle of it outside a window is refused, but what the window \
+                     attached keeps running it — check `bpftool prog show id {target_ino}` and \
+                     `bpftool link`, and the window's own record of its load.",
+                    held_program_text(*target_dev)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
             FsProtectOperation::BpfHeldLoad => {
                 let reasoning = format!(
                     "`{comm}` loaded, inside a trusted-installer window, {} (program id \
@@ -535,6 +556,17 @@ fn held_program_text(target_dev: u64) -> String {
 fn held_use_text(target_dev: u64, target_ino: u64) -> String {
     let (how, _, _) = common::wire::bpf_held_of(target_dev);
     let program = held_program_text(target_dev);
+    // the re-check of #558 (N1): a tail call's slot whose value the hook
+    // could not read — refused, the prog array named (no program known)
+    if how == common::wire::BPF_HELD_SLOT_UNREAD {
+        return format!(
+            "to put a program in a tail call's slot (a BPF_MAP_UPDATE_ELEM of prog array map id \
+             {target_ino}) with a value the agent's bpf hook could read through neither the user \
+             nor the kernel path (a page not resident, an address that is no value) — refused, \
+             fail closed: the slot could take a program held at a trusted-installer window's \
+             load, which a clean program's tail call would run with no hook at all"
+        );
+    }
     if how == common::wire::BPF_HELD_FULL {
         return format!(
             "to load, inside a trusted-installer window, {program} (program id {target_ino}) \
@@ -1790,6 +1822,65 @@ mod tests {
             "{}",
             f.reasoning
         );
+    }
+
+    /// Lot 349 (the re-check of #558, N1): a tail call's slot whose value
+    /// the hook could not read is refused — the record says so, names the
+    /// prog array, is High, and does not name a program it never read.
+    #[test]
+    fn a_tail_call_slot_whose_value_cannot_be_read_is_a_refusal_named() {
+        use common::wire::{bpf_held_dev, BPF_HELD_SLOT_UNREAD};
+        let e = Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "loader".into(),
+            target_dev: bpf_held_dev(BPF_HELD_SLOT_UNREAD, 0),
+            target_ino: 31,
+            operation: FsProtectOperation::BpfHeldUse,
+            timestamp_ns: 1,
+        };
+        let u = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(u.severity, Severity::High);
+        for n in [
+            "prog array map id 31",
+            "neither the user nor the kernel path",
+            "fail closed",
+            "refused it",
+        ] {
+            assert!(u.reasoning.contains(n), "{n}: {}", u.reasoning);
+        }
+        assert!(!u.reasoning.contains("program id 31"), "{}", u.reasoning);
+    }
+
+    /// Lot 349 (the re-check of #558, item 2): a held program still loaded
+    /// after the window is High, not a refusal, and names the program, its
+    /// call and where to look.
+    #[test]
+    fn a_held_program_that_outlives_its_window_is_high_and_named() {
+        use common::bpf_prog_class::CONTENT_CALL;
+        use common::wire::{bpf_held_dev, BPF_HELD_OUTLIVED};
+        let verdict = (u64::from(CONTENT_CALL + 2) << 32) | 2;
+        let e = Event::FsProtectDenial {
+            pid: 0,
+            uid: 0,
+            comm: "k349_sig on kprobe".into(),
+            target_dev: bpf_held_dev(BPF_HELD_OUTLIVED, verdict),
+            target_ino: 77,
+            operation: FsProtectOperation::BpfHeldLoad,
+            timestamp_ns: 1,
+        };
+        let l = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(l.severity, Severity::High);
+        for n in [
+            "still loaded after the window closed",
+            "program id 77",
+            "bpf_send_signal",
+            "`kprobe`",
+            "k349_sig on kprobe",
+        ] {
+            assert!(l.reasoning.contains(n), "{n}: {}", l.reasoning);
+        }
+        assert!(!l.reasoning.contains("refused it"), "{}", l.reasoning);
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load

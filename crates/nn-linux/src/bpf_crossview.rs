@@ -170,10 +170,11 @@ impl Parts {
         })
     }
 
-    /// Lot 349 (the review of #558, F5): the ids held now.
-    pub fn held(&self) -> Vec<u32> {
+    /// Lot 349 (the review of #558, F5): the ids held now, each with the
+    /// judge's verdict at its load (`why << 32 | type`).
+    pub fn held(&self) -> Vec<(u32, u64)> {
         match &self.held {
-            Some(m) => m.keys().filter_map(Result::ok).collect(),
+            Some(m) => m.iter().filter_map(Result::ok).collect(),
             None => Vec::new(),
         }
     }
@@ -270,6 +271,11 @@ pub enum Finding {
     Baseline(Object),
     /// Appeared later, never seen loading.
     Unseen(Object),
+    /// Lot 349 (the re-check of #558, item 2): a program held at a
+    /// trusted-installer window's load (its verdict, `why << 32 | type`)
+    /// still loaded after the window — attached, pinned or kept by a
+    /// descriptor: signed once.
+    HeldOutlived(Object, u64),
 }
 
 /// What the cross-view keeps between rounds.
@@ -291,6 +297,9 @@ pub struct Watch {
     /// Lot 304: the programs of the last enumeration, by id (the
     /// kernel-state round tells a root `cgroup/sysctl` program by them).
     progs: BTreeMap<u32, ProgRecord>,
+    /// Lot 349 (the re-check of #558, item 2): the held programs signed
+    /// as outliving their window.
+    outlived: BTreeSet<u32>,
 }
 
 /// Lot 304: what the known-program judgement reads of a record — its
@@ -336,7 +345,10 @@ pub fn user_space_start_ns(stat: &str, clk_tck: u64) -> Option<u64> {
 
 /// [`user_space_start_ns`] of this host.
 pub fn host_user_space_start_ns() -> Option<u64> {
-    let stat = crate::state_read::read_state("/proc/1/stat").ok()?;
+    // the re-check of #558 (F7): within the round's deadline
+    let stat = crate::state_read::ROUND_READER
+        .read_state("/proc/1/stat")
+        .ok()?;
     // SAFETY: sysconf has no preconditions.
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     user_space_start_ns(&stat, u64::try_from(tck).ok()?)
@@ -461,6 +473,36 @@ pub fn judge(
     (out, foreign)
 }
 
+/// Lot 349 (the re-check of #558, item 2): the held programs (`held`, read
+/// before the enumeration) that the enumeration still shows (`foreign`)
+/// while no window is open — each signed once ([`Finding::HeldOutlived`]):
+/// a program loaded inside the window that outlives it (attached by a link
+/// made inside it, pinned, kept by a descriptor) is never left unseen, and
+/// a later window's close does not sign it again. Inside a window nothing
+/// is signed (what an installer loads runs there by design).
+pub fn outlived(
+    w: &mut Watch,
+    held: &[(u32, u64)],
+    foreign: &[Object],
+    window_open: bool,
+) -> Vec<Finding> {
+    w.outlived
+        .retain(|id| held.iter().any(|(h, _)| h == id));
+    if window_open {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (id, verdict) in held {
+        let Some(o) = foreign.iter().find(|o| !o.is_link && o.id == *id) else {
+            continue;
+        };
+        if w.outlived.insert(*id) {
+            out.push(Finding::HeldOutlived(o.clone(), *verdict));
+        }
+    }
+    out
+}
+
 /// The status file's body: one line per foreign object.
 pub fn render_status(w: &Watch, foreign: &[Object]) -> String {
     let mut body = format!(
@@ -516,6 +558,9 @@ pub struct CrossView {
     /// Where the status file goes (`None`: not written).
     pub status: Option<PathBuf>,
     pub watch: Watch,
+    /// Lot 349 (the re-check of #558, item 2): a trusted-installer window is
+    /// open now.
+    pub window_open: Box<dyn Fn() -> bool + Send>,
 }
 
 impl CrossView {
@@ -527,7 +572,8 @@ impl CrossView {
         // newer than it, and stays
         let held = self.parts.held();
         let en = self.parts.enumerate()?;
-        let gone = stale_held(&held, &en.progs);
+        let ids: Vec<u32> = held.iter().map(|(id, _)| *id).collect();
+        let gone = stale_held(&ids, &en.progs);
         if !gone.is_empty() {
             let n = self.parts.release_held(&gone);
             tracing::debug!(
@@ -548,7 +594,15 @@ impl CrossView {
                 .filter(|(_, l)| l.tgid == me)
                 .map(|(id, _)| *id),
         );
-        let (found, foreign) = judge(&mut self.watch, seen, &en, &own);
+        let (mut found, foreign) = judge(&mut self.watch, seen, &en, &own);
+        // the window's state read after the enumeration: a held id read
+        // before it was loaded inside a window that has ended by now
+        found.extend(outlived(
+            &mut self.watch,
+            &held,
+            &foreign,
+            (self.window_open)(),
+        ));
         if let Some(path) = &self.status {
             let body = render_status(&self.watch, &foreign);
             if let Err(e) = crate::atomic_file::replace(path, body.as_bytes(), 0o600) {
@@ -621,6 +675,50 @@ mod tests {
         );
     }
 
+    /// Lot 349 (the re-check of #558, item 2): a held program attached by a
+    /// link made inside the window ran unseen after it — only its load was
+    /// signed. Once no window is open, each held program still loaded is
+    /// signed once (not inside a window, not again at a later window's
+    /// close, not when it is no longer loaded).
+    #[test]
+    fn a_held_program_still_loaded_after_its_window_is_signed_once() {
+        let mut w = Watch::default();
+        let en = Enumeration {
+            progs: vec![prog(7, 2, "k349_sig"), prog(9, 26, "b")],
+            links: Some(vec![LinkRecord {
+                id: 40,
+                prog_id: 7,
+                link_type: 2,
+                _pad: 0,
+            }]),
+        };
+        let (_, foreign) = judge(&mut w, Vec::new(), &en, &BTreeSet::new());
+        let held = [(7, 0x0b_0000_0002), (8, 1)];
+        assert!(
+            outlived(&mut w, &held, &foreign, true).is_empty(),
+            "inside the window: nothing"
+        );
+        let found = outlived(&mut w, &held, &foreign, false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let Finding::HeldOutlived(o, verdict) = &found[0] else {
+            panic!("{found:?}");
+        };
+        assert_eq!((o.id, *verdict), (7, 0x0b_0000_0002));
+        assert_eq!(o.attach, link_type_name(2), "its link named");
+        assert!(
+            outlived(&mut w, &held, &foreign, false).is_empty(),
+            "signed once"
+        );
+        assert!(outlived(&mut w, &held, &foreign, true).is_empty());
+        assert!(
+            outlived(&mut w, &held, &foreign, false).is_empty(),
+            "a later window's close: not again"
+        );
+        // released from the held set: forgotten
+        assert!(outlived(&mut w, &[], &foreign, false).is_empty());
+        assert_eq!(w.outlived.len(), 0);
+    }
+
     fn with_attach(mut p: ProgRecord, a: &str) -> ProgRecord {
         p.attach[..a.len()].copy_from_slice(a.as_bytes());
         p.attach_read = 1;
@@ -649,6 +747,7 @@ mod tests {
             .map(|f| match f {
                 Finding::Baseline(o) => ('B', o.is_link, o.id),
                 Finding::Unseen(o) => ('U', o.is_link, o.id),
+                Finding::HeldOutlived(o, _) => ('H', o.is_link, o.id),
             })
             .collect()
     }
@@ -893,7 +992,9 @@ mod tests {
         let early: Vec<(u32, bool)> = f
             .iter()
             .map(|f| match f {
-                Finding::Baseline(o) | Finding::Unseen(o) => (o.id, o.early),
+                Finding::Baseline(o) | Finding::Unseen(o) | Finding::HeldOutlived(o, _) => {
+                    (o.id, o.early)
+                }
             })
             .collect();
         assert_eq!(

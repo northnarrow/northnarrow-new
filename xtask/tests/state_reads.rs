@@ -1607,3 +1607,55 @@ fn print_the_sites() {
         }
     }
 }
+
+/// The body of `fn name` in `code` (to its matching brace).
+fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = code
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name} not found"));
+    let open = start + code[start..].find('{').expect("a body");
+    &code[open..open + support::matching_brace(&code[open..])]
+}
+
+/// The re-check of #558 (F7): a regular FUSE file bound over a file the
+/// kernel-state round reads stalled the whole round (`O_NONBLOCK` does not
+/// reach FUSE's open and read) — the cross-view, the taint read, the CPU
+/// watch, the held set's prune. The round's reads that resolve a path go
+/// through its reader with a deadline (`state_read::ROUND_READER`), and a
+/// stall of any of them makes the CPU watch's round unjudged (the third in
+/// a row signed): the taint mask, the start's `/proc/1/stat`, a loader's
+/// `/proc` files, the CPU watch's start reads and sources.
+#[test]
+fn the_kernel_state_round_reads_within_a_deadline() {
+    let root = repo_root();
+    let read = |rel: &str| {
+        strip_comments(&std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")))
+    };
+    let k = read("crates/nn-linux/src/kernel_state.rs");
+    let t = fn_body(&k, "tainted");
+    assert!(t.contains("crate::state_read::ROUND_READER"), "{t}");
+    assert!(!t.contains("read_to_string") && !t.contains("state_read::read_state("), "{t}");
+    let spawn = fn_body(&k, "spawn");
+    assert!(
+        spawn.contains("crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)"),
+        "{spawn}"
+    );
+    assert_eq!(
+        k.matches("judge_on_host(").count(),
+        1,
+        "the loader's proof only within the deadline (known_within)"
+    );
+    assert!(fn_body(&k, "known_within").contains("ROUND_READER"));
+    let x = read("crates/nn-linux/src/bpf_crossview.rs");
+    assert!(fn_body(&x, "host_user_space_start_ns").contains("ROUND_READER"));
+    let c = read("crates/nn-linux/src/own_cpus.rs");
+    let r = fn_body(&c, "round");
+    for n in [
+        "host_now)",
+        "reader.run(\"the CPU watch's sources\", Sources::open)",
+        "unjudged_by_stall(&mut r, reader.take_stall());",
+    ] {
+        assert!(r.contains(n), "{n}: {r}");
+    }
+    assert!(!r.contains("host_now()") && !r.contains("Sources::open()"), "{r}");
+}

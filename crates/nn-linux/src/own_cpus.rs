@@ -479,6 +479,9 @@ pub struct Watch {
     /// The descriptors the round reads through, opened at its first round
     /// ([`round`]; `None` in a test that steps the watch by hand).
     pub sources: Option<Sources>,
+    /// The re-check of #558 (F7): [`Watch::host`] was read (its reads
+    /// answered in time; until then each round tries again).
+    pub host_read: bool,
 }
 
 impl Watch {
@@ -1305,20 +1308,48 @@ pub fn read_host(s: &Sources, start_cgroup: Option<&str>) -> (Reading, Vec<u32>)
     (r, online())
 }
 
+/// The re-check of #558 (F7): a read of the round that did not answer in
+/// time (`stall`, [`crate::state_read::TimedReader::take_stall`]) makes the
+/// reading one the round cannot judge — never judged on what the other
+/// reads gave; [`UNJUDGED_ROUNDS`] such rounds in a row are signed.
+pub fn unjudged_by_stall(r: &mut Reading, stall: Option<String>) {
+    if let Some(why) = stall {
+        r.unjudged.get_or_insert(why);
+    }
+}
+
 /// One round of the watch on the host: the confinement to sign, if a new
 /// one; the degradation set, changed or cleared.
-pub fn round(w: &mut Watch) -> Option<Confinement> {
-    if w.start_cgroup.is_none() {
-        w.host = host_now();
+///
+/// The re-check of #558 (F7): the reads that resolve a path — the start's
+/// ([`host_now`]: the command line, `system.conf`, the agent's unit) and the
+/// sources' opening — run within `reader`'s deadline, retried at the next
+/// round when they did not answer; a stall of any read of the round (the
+/// taint mask's, a loader's `/proc` files, these) makes it unjudged.
+pub fn round(w: &mut Watch, reader: &crate::state_read::TimedReader) -> Option<Confinement> {
+    if !w.host_read {
+        if let Ok(h) = reader.run("the CPU watch's start reads (the command line, systemd's \
+             system.conf, the agent's unit)", host_now)
+        {
+            w.host = h;
+            w.host_read = true;
+        }
     }
-    let sources = w.sources.take().unwrap_or_else(Sources::open);
-    let (r, again) = read_host(&sources, w.start_cgroup.as_deref());
-    let partitions = || match &sources.tree {
-        Ok(t) => partitions_under(t),
-        Err(_) => Vec::new(),
+    let sources = match w.sources.take() {
+        Some(s) => Some(s),
+        None => reader.run("the CPU watch's sources", Sources::open).ok(),
+    };
+    let (mut r, again) = match &sources {
+        Some(s) => read_host(s, w.start_cgroup.as_deref()),
+        None => (Reading::default(), Vec::new()),
+    };
+    unjudged_by_stall(&mut r, reader.take_stall());
+    let partitions = || match sources.as_ref().map(|s| &s.tree) {
+        Some(Ok(t)) => partitions_under(t),
+        _ => Vec::new(),
     };
     let step = w.step(&r, &again, &partitions);
-    w.sources = Some(sources);
+    w.sources = sources;
     match step {
         Step::Same | Step::Skipped => None,
         Step::Confined(c) => {
@@ -1823,6 +1854,46 @@ mod tests {
             }
         }
         assert!(w.current.is_some(), "signed, in force");
+    }
+
+    /// The re-check of #558 (F7): a FUSE file bound over a file the round
+    /// reads stalled the whole kernel-state round. A read that does not
+    /// answer (a FIFO opened without `O_NONBLOCK` stands for it) fails at
+    /// the reader's deadline; the round is unjudged, and the third such
+    /// round in a row is signed — with the read named.
+    #[test]
+    fn a_round_whose_read_does_not_answer_is_unjudged_and_signed_at_the_third() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("tainted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let reader =
+            crate::state_read::TimedReader::new(std::time::Duration::from_millis(100), 4);
+        let mut w = Watch::default();
+        let mut last = Step::Same;
+        for _ in 0..UNJUDGED_ROUNDS {
+            let at = fifo.clone();
+            assert!(reader.run("/proc/sys/kernel/tainted", move || std::fs::read(&at)).is_err());
+            let mut r = reading(&all(), &[&all()]);
+            unjudged_by_stall(&mut r, reader.take_stall());
+            assert!(r.unjudged.is_some(), "the round is unjudged");
+            last = w.step(&r, &all(), &Vec::new);
+        }
+        let Step::Confined(c) = last else {
+            panic!("the third unjudged round is signed: {last:?}");
+        };
+        assert!(
+            matches!(&c.cause, Cause::Unjudged { rounds: 3, why }
+                if why.contains("/proc/sys/kernel/tainted did not answer")),
+            "{c:?}"
+        );
+        // a round with no stall is judged again
+        let mut r = reading(&all(), &[&all()]);
+        unjudged_by_stall(&mut r, reader.take_stall());
+        assert_eq!(r.unjudged, None);
+        let w2 = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        drop(w2);
     }
 
     /// The review of #558 (F2): rounds the watch cannot judge — a mount

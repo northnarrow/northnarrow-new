@@ -468,8 +468,12 @@ pub(crate) fn wire(
     // through the bus, as the `fs_protect` source's events.
     // Lot 290: and the light cross-view of the host's BPF programs and
     // links (its status file beside the program-id list).
+    // Lot 349 (the re-check of #558, item 2): and, once a trusted-installer
+    // window has ended, each program held at its load still loaded.
+    let window = Arc::clone(installer_override);
     let crossview = sensor.bpf_guard().crossview(
         super::attach::own_prog_ids_file(cli).map(|p| nn_linux::bpf_crossview::status_path(&p)),
+        Box::new(move || window.is_window_open()),
     );
     nn_linux::kernel_state::spawn(sensor.event_tx_for("fs_protect"), crossview);
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.

@@ -60,10 +60,14 @@ pub const LIVEPATCH_DIR: &str = "/sys/kernel/livepatch";
 pub const ROOT_DEGRADATION: &str = "sysctl_judge_root";
 
 /// The taint mask under `root` (`/` on the host, a directory in the
-/// tests).
+/// tests). The re-check of #558 (F7): read within the round's deadline
+/// ([`crate::state_read::ROUND_READER`]) — a FUSE file bound over it no
+/// longer stalls the round.
 pub fn tainted(root: &Path) -> Result<u64, String> {
     let path = root.join(TAINTED.trim_start_matches('/'));
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{TAINTED}: {e}"))?;
+    let text = crate::state_read::ROUND_READER
+        .read_state(&path)
+        .map_err(|e| format!("{TAINTED}: {e}"))?;
     text.trim()
         .parse::<u64>()
         .map_err(|_| format!("{TAINTED} reads {:?}, not an integer", text.trim()))
@@ -237,11 +241,21 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
                 c.target_ino(),
             )
         }
+        // lot 349 (the re-check of #558, item 2): a held program after
+        // its window — the program's id and the verdict of its load
+        Finding::Bpf(crate::bpf_crossview::Finding::HeldOutlived(o, verdict)) => {
+            comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
+            (
+                FsProtectOperation::BpfHeldLoad,
+                common::wire::bpf_held_dev(common::wire::BPF_HELD_OUTLIVED, *verdict),
+                u64::from(o.id),
+            )
+        }
         Finding::Bpf(b) => {
             use crate::bpf_crossview::Finding as B;
             let (op, o) = match b {
                 B::Baseline(o) => (FsProtectOperation::BpfBaseline, o),
-                B::Unseen(o) => (FsProtectOperation::BpfUnseen, o),
+                B::Unseen(o) | B::HeldOutlived(o, _) => (FsProtectOperation::BpfUnseen, o),
             };
             comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
             // lot 304: a known system program's loader, and the bit
@@ -326,13 +340,7 @@ pub fn crossview_round(
             // lot 304: a baseline program a known system program's loader
             // is proven to hold (PID 1's restrict_filesystems)
             mark_known_baselines(&mut found, &|id, link| {
-                crate::known_system_prog::judge_on_host(
-                    id,
-                    link,
-                    cross.watch.program(id).as_ref(),
-                    agent_start,
-                    None,
-                )
+                known_within(id, link, cross.watch.program(id), agent_start, None)
             });
             if failing.take().is_some() {
                 info!("kernel state: the BPF cross-view runs again");
@@ -359,6 +367,30 @@ pub fn crossview_round(
             Vec::new()
         }
     }
+}
+
+/// The re-check of #558 (F7): [`crate::known_system_prog::judge_on_host`]
+/// within the round's deadline — its reads of the loader's `/proc` files
+/// (`stat`, `status`, `comm`, `fdinfo`) are paths a FUSE file can be bound
+/// over; past the deadline the program is not proven (the stricter record).
+fn known_within(
+    id: u32,
+    link: common::bpf_prog_class::KnownLink,
+    prog: Option<crate::known_system_prog::Program>,
+    agent_start: Option<u64>,
+    seen: Option<common::bpf_prog_class::SeenLoad>,
+) -> Result<crate::known_system_prog::Known, String> {
+    crate::state_read::ROUND_READER
+        .run("a loader's /proc files", move || {
+            crate::known_system_prog::judge_on_host(
+                id,
+                link,
+                prog.as_ref(),
+                agent_start,
+                seen.as_ref(),
+            )
+        })
+        .and_then(|r| r)
 }
 
 /// Lot 304: each baseline program of `found` that `known` proves a known
@@ -416,20 +448,24 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
             };
             let mut found = {
                 let known = |id: u32| match cross.as_ref() {
-                    Some(c) => crate::known_system_prog::judge_on_host(
+                    Some(c) => known_within(
                         id,
                         common::bpf_prog_class::KnownLink::RootCgroupSysctl,
-                        c.watch.program(id).as_ref(),
+                        c.watch.program(id),
                         agent_start,
-                        c.watch.seen().get(&id),
+                        c.watch.seen().get(&id).copied(),
                     ),
                     None => Err("no BPF cross-view on this host".to_string()),
                 };
                 round(&mut w, Path::new("/"), &known)
             };
             found.extend(crossed);
-            // lot 349: the agent's own CPUs
-            found.extend(crate::own_cpus::round(&mut cpus).map(Finding::Cpus));
+            // lot 349: the agent's own CPUs — the re-check of #558 (F7): a
+            // read of this round that did not answer makes it unjudged
+            found.extend(
+                crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)
+                    .map(Finding::Cpus),
+            );
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
@@ -705,6 +741,31 @@ mod tests {
                     ..
                 } if comm == "hide@bpf_lsm_file_open"
                     && *target_ino == common::bpf_prog_class::crossview_ino(false, false, 29, 77)
+            ),
+            "{e:?}"
+        );
+        // the re-check of #558 (item 2): a held program after its window,
+        // signed as its held load's record with the use "outlived"
+        let e = event_of(
+            &Finding::Bpf(crate::bpf_crossview::Finding::HeldOutlived(
+                o.clone(),
+                (9u64 << 32) | 2,
+            )),
+            3,
+        );
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial {
+                    pid: 0,
+                    target_ino: 77,
+                    operation: FsProtectOperation::BpfHeldLoad,
+                    comm,
+                    target_dev,
+                    ..
+                } if comm == "hide@bpf_lsm_file_open"
+                    && common::wire::bpf_held_of(*target_dev)
+                        == (common::wire::BPF_HELD_OUTLIVED, 9, 2)
             ),
             "{e:?}"
         );

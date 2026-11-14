@@ -132,6 +132,34 @@ pub const MAP_UPDATE_VALUE_OFFSET: usize = 16;
 /// call's table, whose values are program descriptors.
 pub const MAP_TYPE_PROG_ARRAY: u32 = 3;
 
+/// Lot 349 (the re-check of #558, N1): a prog array's update value (the
+/// program's descriptor) as the `bpf` hook could read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotValue {
+    /// The descriptor, to judge as a run or an attach is.
+    Fd(u32),
+    /// Neither read gave it: the update is refused, signed (fail closed).
+    Unreadable,
+}
+
+/// Lot 349 (the re-check of #558, N1): the value of a prog array's
+/// `BPF_MAP_UPDATE_ELEM` from its two reads — `user` through the user path
+/// (a `bpf(2)` call's pointer), `kernel` through the kernel path, tried
+/// only when the user one failed (`bpf_sys_bpf` from a `syscall` program
+/// passes a kernel pointer, which the user path refuses). The user path is
+/// nofault: a page not resident fails it while the kernel's own copy, after
+/// the hook, may fault it in — so a value neither read gives is
+/// [`SlotValue::Unreadable`], refused, never let through (the slot could
+/// take a program held at a window's load, run by a clean program's tail
+/// call with no hook at all).
+#[inline(always)]
+pub const fn slot_value(user: Option<u32>, kernel: Option<u32>) -> SlotValue {
+    match (user, kernel) {
+        (Some(fd), _) | (None, Some(fd)) => SlotValue::Fd(fd),
+        (None, None) => SlotValue::Unreadable,
+    }
+}
+
 /// Lot 349 (the review of #558, F1): `PERF_EVENT_IOC_SET_BPF`
 /// (`_IOW('$', 8, __u32)`, include/uapi/linux/perf_event.h) — attaches the
 /// program whose descriptor is the `ioctl`'s argument to a perf event (a
@@ -496,6 +524,18 @@ mod tests {
             found.is_empty(),
             "bpf_cmd numbers defined outside common/src/bpf_cmd.rs: {found:?}"
         );
+    }
+
+    /// Lot 349 (the re-check of #558, N1): a prog array's value the user
+    /// path could not read (a page not resident, `bpf_sys_bpf`'s kernel
+    /// pointer) was let through; the kernel path's read is taken then, and
+    /// a value neither gives is refused — never a pass.
+    #[test]
+    fn a_prog_array_value_neither_path_reads_is_refused() {
+        assert_eq!(slot_value(Some(7), None), SlotValue::Fd(7));
+        assert_eq!(slot_value(None, Some(9)), SlotValue::Fd(9), "bpf_sys_bpf");
+        assert_eq!(slot_value(Some(7), Some(9)), SlotValue::Fd(7), "user first");
+        assert_eq!(slot_value(None, None), SlotValue::Unreadable);
     }
 
     /// Lot 349 (the review of #558, F1): every command that runs or

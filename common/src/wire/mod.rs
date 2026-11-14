@@ -1352,6 +1352,17 @@ pub const BPF_HELD_SET_BPF: u32 = 0x100;
 /// set has no room for, refused (fail closed: kept nowhere, it could be
 /// run after the window unrefused).
 pub const BPF_HELD_FULL: u32 = 0x101;
+/// Lot 349 (the re-check of #558, N1): an [`FS_OP_BPF_HELD_USE`]'s use — a
+/// prog array's `BPF_MAP_UPDATE_ELEM` whose value (the program's
+/// descriptor) neither the user nor the kernel path could read: refused
+/// (fail closed), `target_ino` the prog array's map id (the program is not
+/// known).
+pub const BPF_HELD_SLOT_UNREAD: u32 = 0x102;
+/// Lot 349 (the re-check of #558, item 2): an [`FS_OP_BPF_HELD_LOAD`]'s use
+/// — NOT a refusal: a program held at a window's load still loaded after
+/// the window (attached, pinned, or a descriptor kept), signed once by the
+/// kernel-state round's cross-view.
+pub const BPF_HELD_OUTLIVED: u32 = 0x103;
 
 /// Lot 349: a held program's record's `target_dev` — the use (low 16
 /// bits), the judge's reason (`bpf_prog_class::CONTENT_*`, bits 16 to 23)
@@ -1375,6 +1386,8 @@ pub const fn bpf_held_use_name(how: u32) -> &'static str {
     match how {
         BPF_HELD_SET_BPF => "PERF_EVENT_IOC_SET_BPF",
         BPF_HELD_FULL => "a window's load with the held set full",
+        BPF_HELD_SLOT_UNREAD => "BPF_MAP_UPDATE_ELEM of a prog array with a value not read",
+        BPF_HELD_OUTLIVED => "a window's load still loaded after the window",
         crate::bpf_cmd::BPF_PROG_TEST_RUN => "BPF_PROG_RUN",
         crate::bpf_cmd::BPF_PROG_ATTACH => "BPF_PROG_ATTACH",
         crate::bpf_cmd::BPF_RAW_TRACEPOINT_OPEN => "BPF_RAW_TRACEPOINT_OPEN",
@@ -2669,6 +2682,17 @@ mod tests {
         );
         const { assert!(BPF_HELD_SET_BPF > 0xff && BPF_HELD_FULL > 0xff) };
         const { assert!(BPF_HELD_SET_BPF != BPF_HELD_FULL) };
+        // the re-check of #558 (N1, item 2): two more uses, distinct
+        const { assert!(BPF_HELD_SLOT_UNREAD > 0xff && BPF_HELD_OUTLIVED > 0xff) };
+        for (i, a) in [BPF_HELD_SET_BPF, BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, BPF_HELD_OUTLIVED]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(bpf_held_of(bpf_held_dev(*a, 0)).0, *a);
+            for b in &[BPF_HELD_SET_BPF, BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, BPF_HELD_OUTLIVED][i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
         assert_eq!(bpf_held_use_name(10), "BPF_PROG_RUN");
         assert_eq!(
             bpf_held_use_name(BPF_HELD_SET_BPF),
