@@ -1229,6 +1229,51 @@ fn uninstall_help_names_the_grant_key() {
     assert!(!text.contains("set -euo pipefail"), "{text}");
 }
 
+/// The re-check 1 of #560 (I; ratchet): `uninstall.sh --help` lists every
+/// status the script exits with (`exit N` as a command: at a line's start,
+/// after `;`, `||`, `&&`, `{`) in its "Exit codes:" paragraph — exit 4 (a
+/// contained process left) was missing there.
+#[test]
+fn uninstall_help_lists_every_exit_code() {
+    let path = repo_root().join("deploy/uninstall.sh");
+    let out = Command::new("bash")
+        .arg(&path)
+        .arg("--help")
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let start = text.find("Exit codes:").expect("an Exit codes paragraph");
+    let para = &text[start..];
+    let para = &para[..para.find("\n\n").unwrap_or(para.len())];
+    let para = para.split_whitespace().collect::<Vec<_>>().join(" ");
+    let src = fs::read_to_string(&path).unwrap();
+    let mut codes = std::collections::BTreeSet::new();
+    for line in src.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        for (at, _) in line.match_indices("exit ") {
+            let before = line[..at].trim_end();
+            let command = before.is_empty()
+                || ["; ", "||", "&&", "{"]
+                    .iter()
+                    .any(|p| before.ends_with(p.trim_end()));
+            let n: String = line[at + 5..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if command && !n.is_empty() {
+                codes.insert(n);
+            }
+        }
+    }
+    assert!(codes.contains("4") && codes.contains("3"), "{codes:?}");
+    for n in &codes {
+        assert!(
+            para.contains(&format!(": {n} ")) || para.contains(&format!("; {n} ")),
+            "exit {n} not in --help's Exit codes: {para}"
+        );
+    }
+}
+
 // ── FIMR-016: control-surface files dated by their write ─────────────────
 
 /// `install_bait SRC DST` from install.sh, with a stub `install` first on

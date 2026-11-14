@@ -1221,6 +1221,37 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         );
     }
 
+    /// The re-check 1 of #560 (H(b); tests): an exec of `exe` by real uid
+    /// `uid` with its image, as the kernel and the exec pump give the host's
+    /// binary (`KNOWN | ROOT_DIR`: executed from a root-only directory, in
+    /// PID 1's mount namespace and root; an inode of its own per pid) — what
+    /// a sudo or su needs to vouch ([`Self::is_interactive_admin`]).
+    /// `fork_parent`: the process that forked it when this exec is the
+    /// first since (the kernel's fork record), 0 not.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn ingest_host_exec(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        (spawn_ns, start_ns): (u64, u64),
+        uid: u32,
+        fork_parent: u32,
+    ) {
+        let image = Some((8, 1_000_000 + u64::from(pid)));
+        self.ingest_inner(
+            pid,
+            ppid,
+            exe,
+            (None, false, None),
+            Runs::Inline,
+            spawn_ns,
+            (start_ns, None),
+            uid,
+            (image, fork_parent, image),
+        );
+    }
+
     /// Lot 351 (tests and tools): [`Self::ingest_spawn`] of the first exec
     /// of a process since `ppid` forked it — the kernel's fork record
     /// ([`Entry::fork_parent`]: what [`Self::is_interactive_admin`] wants
@@ -2683,7 +2714,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// askpass helper, a PAM helper, a process gone through four execs) is
     /// passed over, and so (the review of #560, A) is one a process already
     /// root ran ([`Self::invoked_by_root`]: root's sudo and su ask for no
-    /// credential — after a local privilege escalation, `sudo ~/payload`).
+    /// credential — after a local privilege escalation, `sudo ~/payload`),
+    /// and (its re-check 1, H(b)) one whose exec was not of the host's
+    /// binary ([`Self::cannot_vouch`]: no image, a chroot's or a mount
+    /// namespace's file at the path).
     /// The first one passed over is said in the answer, and the walk goes
     /// on: a sudo the session ran further up still vouches (an
     /// administrator's `sudo -i`, then root's own `sudo -A` or `su bob`).
@@ -2710,8 +2744,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 if child.as_ref().is_some_and(|c| self.is_monitor_of(c, hop)) {
                     return false;
                 }
-                if self.invoked_by_root(hop, as_of) {
-                    return pass(Passed::RanByRoot(hop.pid));
+                if let Some(refused) = self.cannot_vouch(hop, as_of) {
+                    return pass(refused);
                 }
                 let Some(child) = child else {
                     return true;
@@ -2736,10 +2770,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             && (child.forked || self.own_exec(child).is_some_and(|e| e.spawn_ns == 0))
     }
 
-    /// The review of #560 (A): the sudo or su `elevation` was run by a
-    /// process already root — the real uid its exec of the binary ran as
-    /// (the exec event's, the kernel's credentials: sudo and su are setuid,
-    /// the real uid stays the caller's) is 0. Root runs sudo and su with no
+    /// The review of #560 (A): why the sudo or su `elevation` vouches for
+    /// nothing, if it does not. It was run by a process already root — the
+    /// real uid its exec of the binary ran as (the exec event's, the
+    /// kernel's credentials: sudo and su are setuid, the real uid stays the
+    /// caller's) is 0. Root runs sudo and su with no
     /// credential check, so what they run as root proves no administrator's
     /// authentication: a local privilege escalation that sets every uid to
     /// 0 and runs `sudo ~/payload` (in place or from a fork, with or without
@@ -2755,20 +2790,34 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// held against it: a sudo or su older than the agent (the start's
     /// scan: `/proc` shows sudo's real uid as 0 once it has authenticated,
     /// so its caller is not known) — the residual of a restart, named.
-    fn invoked_by_root(&self, elevation: &Hop, as_of: AsOf) -> bool {
+    ///
+    /// The re-check 1 of #560 (H(b)): and the front-end's exec must be of
+    /// the host's binary — its image ([`Entry::image`]: `ROOT_DIR`, executed
+    /// from a root-only directory, in PID 1's mount namespace and root, as
+    /// the packaged `go` of #555 F1). The path alone names a file only in
+    /// the namespace that resolved it: a fake `/usr/bin/sudo` in a chroot
+    /// or a private mount namespace, executed with the caller's own real
+    /// uid, forks its payload as root exactly as the real one does. No image
+    /// ([`Passed::NotHostImage`]): passed over, whoever ran it.
+    fn cannot_vouch(&self, elevation: &Hop, as_of: AsOf) -> Option<Passed> {
+        let by_root = Some(Passed::RanByRoot(elevation.pid));
         let front = if elevation.forked {
             match self.hop(elevation.ppid, as_of) {
                 Some(up) if up.exe == elevation.exe => up,
-                _ => return true,
+                _ => return by_root,
             }
         } else {
             elevation.clone()
         };
-        match self.own_exec(&front) {
-            Some(e) if e.spawn_ns == 0 => false,
-            Some(e) => e.uid == 0,
-            None => true,
+        let Some(e) = self.own_exec(&front) else {
+            return by_root;
+        };
+        if e.spawn_ns != 0 && e.uid == 0 {
+            return by_root;
         }
+        e.image
+            .is_none()
+            .then_some(Passed::NotHostImage(elevation.pid))
     }
 
     /// Lot 351 (the review of #559, F2): `child`, the hop below the sudo or
@@ -2875,6 +2924,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     "the sudo or su in its lineage (pid {elevation}) was run by a process \
                      already root (real uid 0, or its caller not known): no credential check \
                      stopped it, and no sudo or su above it elevated the session"
+                ))
+            }
+            // the re-check 1 of #560 (H(b))
+            (_, Some(Passed::NotHostImage(elevation))) => {
+                return Some(format!(
+                    "the sudo or su in its lineage (pid {elevation}) was not executed from the \
+                     host's root-only directory in PID 1's mount namespace (a chroot's or a \
+                     namespace's file at that path, or its image not known), and no sudo or su \
+                     above it elevated the session"
                 ))
             }
             (Some(WalkEnd::Root), None) => return Some("no sudo or su in its lineage".to_string()),
@@ -4249,8 +4307,12 @@ enum Passed {
     /// the process it elevated ([`AuthSessionTracker::elevated_child`]).
     NotElevated(u32, u32),
     /// The review of #560 (A): the sudo or su (its pid) a process already
-    /// root ran ([`AuthSessionTracker::invoked_by_root`]).
+    /// root ran ([`AuthSessionTracker::cannot_vouch`]).
     RanByRoot(u32),
+    /// The re-check 1 of #560 (H(b)): the sudo or su (its pid) whose exec
+    /// was not of the host's binary (no image: a chroot's or a mount
+    /// namespace's file at the path, or its directory not root's only).
+    NotHostImage(u32),
 }
 
 /// One hop of a lineage walk.
@@ -7259,7 +7321,7 @@ mod tests {
         write_stat(tmp.path(), 200, 100, tty_nr);
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         t.ingest_first_exec(200, 100, "/usr/sbin/useradd", 3, 0);
         (tmp, t)
     }
@@ -7611,14 +7673,13 @@ mod tests {
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
         // sudo executed at 10.035 s, 35 ms after the fork's tick 1000
-        t.ingest_exec(
+        t.ingest_host_exec(
             710,
             700,
             "/usr/bin/sudo",
-            &[],
-            10_035 * MS,
-            10_001 * MS,
+            (10_035 * MS, 10_001 * MS),
             1000,
+            0,
         );
         write_exe(tmp.path(), 711, "/usr/bin/sudo");
         write_status(tmp.path(), 711, 710);
@@ -7712,14 +7773,13 @@ mod tests {
         let t = AuthSessionTracker::new(tmp.path());
         // the operator's shell (cached), sudo executed at 10.003 s
         t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
-        t.ingest_exec(
+        t.ingest_host_exec(
             710,
             700,
             "/usr/bin/sudo",
-            &[],
-            10_003 * MS,
-            10_001 * MS,
+            (10_003 * MS, 10_001 * MS),
             1000,
+            0,
         );
         // sudo's monitor, forked at 10.008 s: `/proc` shows tick 1000 (10.000 s)
         write_exe(tmp.path(), 711, "/usr/bin/sudo");
@@ -7791,7 +7851,8 @@ mod tests {
             stat(tmp.path(), 700, 1, 34816, 500);
             write_loginuid(tmp.path(), 700, 1000);
             t.ingest_exec(710, 700, "/usr/bin/dash", &[], tfs + 50 * US, tfs, 1000);
-            t.ingest_exec(710, 700, second, &[], te, tfs, 1000);
+            // the re-check 1 of #560 (H(b)): with its image, as the host's
+            t.ingest_host_exec(710, 700, second, (te, tfs), 1000, 0);
             stat(tmp.path(), 710, 700, 34816, tfs / (10 * MS));
             write_exe(tmp.path(), 710, second);
             stat(tmp.path(), 711, 710, 34817, mf / (10 * MS));
@@ -7883,7 +7944,7 @@ mod tests {
         write_stat(tmp.path(), 50, 1, 34816);
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_exec(50, 1, "/usr/bin/bash", &[], 1, 1, 1000);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         let admin = |pid: u32| t.is_interactive_admin(pid, AsOf::Now);
         // the askpass helper, its root payload, the payload it executes in place
         t.ingest_first_exec(200, 100, "/home/alice/askpass", 3, 1000);
@@ -7927,9 +7988,9 @@ mod tests {
         assert!(admin(253));
         // su to another user, then that user's sudo -A: no root after
         // authenticating anywhere
-        t.ingest_first_exec(260, 50, "/usr/bin/su", 20, 1000);
+        t.ingest_host_exec(260, 50, "/usr/bin/su", (20, 0), 1000, 50);
         t.ingest_first_exec(261, 260, "/usr/bin/bash", 21, 1002);
-        t.ingest_first_exec(262, 261, "/usr/bin/sudo", 22, 1002);
+        t.ingest_host_exec(262, 261, "/usr/bin/sudo", (22, 0), 1002, 261);
         t.ingest_first_exec(263, 262, "/home/carol/askpass", 23, 1002);
         t.ingest_first_exec(264, 263, "/home/carol/payload", 24, 0);
         assert!(!admin(264));
@@ -7968,7 +8029,10 @@ mod tests {
         assert!(!admin(281));
         // a sudo session older than the agent, its monitor (a fork of sudo,
         // root's): the monitor's child decides, never the monitor itself
+        // (the image the start's scan read of the host's sudo: the re-check
+        // 1 of #560)
         let seeded = |pid: u32, ppid: u32, exe: &str, uid: u32| {
+            let image = Some((8, u64::from(pid)));
             t.ingest_inner(
                 pid,
                 ppid,
@@ -7978,7 +8042,7 @@ mod tests {
                 0,
                 (3, Some(0)),
                 uid,
-                (None, 0, None),
+                (image, 0, image),
             )
         };
         seeded(300, 50, "/usr/bin/sudo", 1000);
@@ -8008,12 +8072,12 @@ mod tests {
         write_stat(tmp.path(), 50, 1, 34816);
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_exec(50, 1, "/usr/bin/bash", &[], 1, 1, 1000);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         let admin = |pid: u32| t.is_interactive_admin(pid, AsOf::Now);
         let why = |pid: u32| t.not_interactive_admin_because(pid, AsOf::Now).unwrap();
         // the askpass helper, root, executes sudo in place; its command
         t.ingest_first_exec(110, 100, "/home/alice/askpass", 3, 1000);
-        t.ingest_exec(110, 100, "/usr/bin/sudo", &[], 4, 3, 0);
+        t.ingest_host_exec(110, 100, "/usr/bin/sudo", (4, 3), 0, 0);
         t.ingest_first_exec(111, 110, "/home/alice/payload", 5, 0);
         assert!(!admin(111) && !admin(110));
         let w = why(111);
@@ -8030,10 +8094,11 @@ mod tests {
             let base = 200 + 10 * i as u32;
             let at = 10 + 10 * i as u64;
             t.ingest_first_exec(base, 50, "/home/alice/lpe", at, 1000);
-            t.ingest_exec(base, 50, elevation, &[], at + 1, at, 0);
+            // (the host's binaries, their images: the re-check 1 of #560)
+            t.ingest_host_exec(base, 50, elevation, (at + 1, at), 0, 0);
             t.ingest_first_exec(base + 1, base, "/home/alice/payload", at + 2, 0);
             t.ingest_first_exec(base + 2, 50, "/home/alice/lpe", at + 3, 1000);
-            t.ingest_first_exec(base + 3, base + 2, elevation, at + 4, 0);
+            t.ingest_host_exec(base + 3, base + 2, elevation, (at + 4, 0), 0, base + 2);
             t.ingest_first_exec(base + 4, base + 3, "/home/alice/payload", at + 5, 0);
             for pid in [base, base + 1, base + 3, base + 4] {
                 assert!(!admin(pid), "{elevation}: pid {pid}");
@@ -8048,7 +8113,7 @@ mod tests {
             (320, "/usr/bin/bash", 1000, false),
         ] {
             let at = 50 + u64::from(front);
-            t.ingest_exec(front, 50, exe, &[], at, at, uid);
+            t.ingest_host_exec(front, 50, exe, (at, at), uid, 0);
             write_exe(tmp.path(), front + 1, "/usr/bin/sudo");
             write_status_uid(tmp.path(), front + 1, front, 0);
             write_loginuid(tmp.path(), front + 1, 1000);
@@ -8060,7 +8125,7 @@ mod tests {
         assert!(w.contains("(pid 311) was run by"), "{w}");
         // a fork of the monitor that forks the command: no exec of sudo is
         // known for it
-        t.ingest_exec(330, 50, "/usr/bin/sudo", &[], 400, 400, 1000);
+        t.ingest_host_exec(330, 50, "/usr/bin/sudo", (400, 400), 1000, 0);
         for (pid, ppid) in [(331u32, 330u32), (332, 331)] {
             write_exe(tmp.path(), pid, "/usr/bin/sudo");
             write_status_uid(tmp.path(), pid, ppid, 0);
@@ -8080,13 +8145,99 @@ mod tests {
             assert!(admin(base + 2) && admin(base), "{inner}");
         }
         // `su -` at the terminal, then root's own sudo: the su vouches
-        t.ingest_exec(500, 50, "/usr/bin/su", &[], 80, 80, 1000);
+        t.ingest_host_exec(500, 50, "/usr/bin/su", (80, 80), 1000, 0);
         t.ingest_first_exec(501, 500, "/usr/bin/bash", 81, 0);
         t.ingest_first_exec(502, 501, "/usr/bin/sudo", 82, 0);
         t.ingest_first_exec(503, 502, "/home/alice/x.sh", 83, 0);
         assert!(admin(503));
         // and sudo's own process, run by the user
         assert!(admin(100));
+    }
+
+    /// The re-check 1 of #560 (H(b)): a sudo or su whose exec had no image
+    /// — not the host's binary at that path, by `ROOT_DIR` (a fake
+    /// `/usr/bin/sudo` in a chroot or a private mount namespace, executed
+    /// with the caller's own real uid: no uid change is visible, and it
+    /// forks its payload as root as the real one does) — vouches for
+    /// nothing: in place, from a fork, through a "monitor". The host's sudo
+    /// (its image) still does, and so does a `sudo -i` of the host's sudo
+    /// above an unrooted one.
+    #[test]
+    fn a_sudo_or_su_not_of_the_host_s_image_vouches_for_nothing() {
+        let tmp = TempDir::new().unwrap();
+        write_loginuid(tmp.path(), 50, 1001);
+        write_stat(tmp.path(), 50, 1, 34816);
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(50, 1, "/usr/bin/bash", &[], 1, 1, 1001);
+        let admin = |pid: u32| t.is_interactive_admin(pid, AsOf::Now);
+        for (i, elevation) in [
+            "/usr/bin/sudo",
+            "/usr/bin/su",
+            "/usr/bin/sudo-rs",
+            "/usr/bin/su-rs",
+            "/usr/lib/cargo/bin/sudo",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let base = 200 + 10 * i as u32;
+            let at = 10 + 10 * i as u64;
+            // in place: the LPE executes the fake sudo, its own real uid
+            t.ingest_first_exec(base, 50, "/home/alice/lpe", at, 1001);
+            t.ingest_exec(base, 50, elevation, &[], at + 1, at, 1001);
+            t.ingest_first_exec(base + 1, base, "/home/alice/payload", at + 2, 0);
+            // from a fork
+            t.ingest_first_exec(base + 2, 50, elevation, at + 3, 1001);
+            t.ingest_first_exec(base + 3, base + 2, "/home/alice/payload", at + 4, 0);
+            for pid in [base, base + 1, base + 2, base + 3] {
+                assert!(!admin(pid), "{elevation}: pid {pid}");
+            }
+            let w = t
+                .not_interactive_admin_because(base + 3, AsOf::Now)
+                .unwrap();
+            assert!(
+                w.contains(&format!(
+                    "(pid {}) was not executed from the host's",
+                    base + 2
+                )),
+                "{w}"
+            );
+            // the host's binary: the same calls with its image
+            t.ingest_host_exec(base + 4, 50, elevation, (at + 5, at + 5), 1001, 50);
+            t.ingest_first_exec(base + 5, base + 4, "/home/alice/x.sh", at + 6, 0);
+            assert!(admin(base + 5), "{elevation}: the host's");
+        }
+        // a "monitor" of an unrooted sudo: the front-end's exec decides
+        t.ingest_exec(300, 50, "/usr/bin/sudo", &[], 100, 100, 1001);
+        write_exe(tmp.path(), 301, "/usr/bin/sudo");
+        write_status_uid(tmp.path(), 301, 300, 0);
+        write_loginuid(tmp.path(), 301, 1001);
+        write_stat(tmp.path(), 301, 300, 34816);
+        t.ingest_first_exec(302, 301, "/home/alice/payload", 101, 0);
+        assert!(!admin(302));
+        // the host's `sudo -i`, then an unrooted sudo in its root shell:
+        // passed over, the host's sudo above it vouches
+        t.ingest_host_exec(400, 50, "/usr/bin/sudo", (110, 110), 1001, 50);
+        t.ingest_first_exec(401, 400, "/usr/bin/bash", 111, 0);
+        t.ingest_first_exec(402, 401, "/usr/bin/sudo", 112, 0);
+        t.ingest_first_exec(403, 402, "/home/alice/x.sh", 113, 0);
+        assert!(admin(403));
+        // a sudo older than the agent whose image the start's scan did not
+        // read (another root or mount namespace, its directory not root's
+        // only): nothing either
+        t.ingest_inner(
+            500,
+            50,
+            "/usr/bin/sudo",
+            (None, false, None),
+            Runs::Inline,
+            0,
+            (3, Some(0)),
+            1001,
+            (None, 0, None),
+        );
+        t.ingest_first_exec(501, 500, "/home/alice/payload", 120, 0);
+        assert!(!admin(501));
     }
 
     /// The review of #560 (A, the mini-hunt): a sudo read from `/proc` whose
@@ -8178,7 +8329,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         t.ingest_first_exec(200, 100, "/usr/sbin/useradd", 3, 0);
         let why = t.not_interactive_admin_because(200, AsOf::Now).unwrap();
         assert!(why.contains("nothing of its session runs"), "{why}");
@@ -8205,7 +8356,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         t.ingest_first_exec(200, 100, "/usr/bin/tee", 3, 0);
         assert!(!t.is_interactive_admin(200, AsOf::Now), "nothing runs");
         write_loginuid(tmp.path(), 50, 1000);
@@ -8240,7 +8391,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 2, 2, 1000);
+        t.ingest_host_exec(100, 50, "/usr/bin/sudo", (2, 2), 1000, 0);
         // tee (300) ran under sudo's monitor (200), never exec'd, gone.
         t.ingest_spawn(300, 200, "/usr/bin/tee", 3);
         assert_eq!(
@@ -8279,7 +8430,7 @@ mod tests {
         t.ingest_spawn(300, 290, "/usr/bin/sh", 2);
         t.ingest_spawn(390, 1, "/usr/sbin/sshd", 3);
         t.ingest_spawn(400, 390, "/usr/bin/bash", 4);
-        t.ingest_exec(490, 1, "/usr/bin/su", &[], 5, 5, 1000);
+        t.ingest_host_exec(490, 1, "/usr/bin/su", (5, 5), 1000, 0);
         t.ingest_first_exec(500, 490, "/usr/bin/bash", 6, 0);
         assert!(!t.is_interactive_admin(300, AsOf::Now));
         assert!(!t.is_interactive_admin(400, AsOf::Now));

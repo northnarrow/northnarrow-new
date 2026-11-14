@@ -53,6 +53,16 @@
 # A unit that does not stop (no window on a protected host) stops the
 # script before anything is disabled or removed.
 #
+# Lot 351: a removal that leaves processes the agent contained (a held
+# blocked.scope or throttled.scope, a thawed blocked.scope/neutralize-*)
+# names them at the end and exits 4 — the removal is otherwise complete;
+# decide on each (kill it, or release it). With --package it names them
+# and exits 0.
+#
+# Exit codes: 0 done; 1 refused or failed (not root, no confirmation, a
+# key or a unit stop missing); 2 unknown argument; 3 reboot to finish (a
+# WEDGED agent, above); 4 done, contained processes left (above).
+#
 # Same BIN_DIR / UNIT_DIR / ETC_DIR / STATE_DIR overrides as install.sh.
 
 set -euo pipefail

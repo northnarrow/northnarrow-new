@@ -7,7 +7,8 @@ use nn_model::posture_types::{PostureKind, TriggerType};
 use nn_model::Event;
 
 use super::triggers::testutil::{
-    file_open, fs_protect_denial, spawn, spawn_by, spawn_elevated, spawn_exe_flags, tcp_v4,
+    file_open, fs_protect_denial, spawn, spawn_by, spawn_elevated, spawn_exe_flags, spawn_host,
+    tcp_v4,
 };
 use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
 
@@ -1358,11 +1359,12 @@ fn admin_session_machine() -> (tempfile::TempDir, PostureMachine) {
     );
     for (pid, ppid, comm, exe) in [
         (700, 1, "bash", "/usr/bin/bash"),
-        (710, 700, "sudo", "/usr/bin/sudo"),
         (800, 700, "tee", "/usr/bin/tee"),
     ] {
         let _ = m.observe(&spawn(pid, ppid, comm, exe, 1), &[]);
     }
+    // the re-check 1 of #560 (H(b)): the host's sudo, its image
+    let _ = m.observe(&spawn_host(710, 700, "sudo", "/usr/bin/sudo", 1), &[]);
     // lot 351: what sudo ran as root after authenticating (the kernel's
     // fork record of each)
     for pid in [720, 730] {

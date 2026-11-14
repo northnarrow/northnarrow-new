@@ -2549,8 +2549,6 @@ pub mod testutil {
         }
     }
 
-    /// A spawn of `path` as the kernel executed it, with the exe `flags`
-    /// (`exe_flags`; `KNOWN` added: the LSM program filled them).
     /// Lot 351: [`spawn`] of what a sudo or su (`ppid`) ran as root after
     /// authenticating — executed as root, the first exec since `ppid`
     /// forked it (the kernel's fork record): an administrator's session
@@ -2563,6 +2561,24 @@ pub mod testutil {
         e
     }
 
+    /// The re-check 1 of #560 (H(b)): [`spawn`] of the host's binary at
+    /// `filename` — its image as the kernel and the exec pump give it
+    /// (`KNOWN | ROOT_DIR`, a device and an inode of its own per pid:
+    /// executed from a root-only directory, in PID 1's mount namespace and
+    /// root), what a sudo or su needs to vouch for a session
+    /// ([`AuthSessionTracker::is_interactive_admin`](crate::posture::AuthSessionTracker::is_interactive_admin)).
+    pub fn spawn_host(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
+        let mut e = spawn(pid, ppid, comm, filename, ts);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.path = filename.into();
+            (exe.dev, exe.ino) = (8, 1_000_000 + u64::from(pid));
+            exe.flags = exe_flags::KNOWN | exe_flags::ROOT_DIR;
+        }
+        e
+    }
+
+    /// A spawn of `path` as the kernel executed it, with the exe `flags`
+    /// (`exe_flags`; `KNOWN` added: the LSM program filled them).
     pub fn spawn_exe_flags(pid: u32, ppid: u32, path: &str, flags: u32, ts: u64) -> Event {
         let mut e = spawn(pid, ppid, "x", path, ts);
         if let Event::ProcessSpawn { exe, .. } = &mut e {
