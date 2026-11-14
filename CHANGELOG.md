@@ -857,6 +857,69 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 347 (alpha false positives, round 3): a container host's normal work —
+  docker, containerd, podman — and the shutdown record, each told by
+  identity, never by a name or a path alone.
+  - **runc's copy of itself (R004).** runc re-executes itself from a sealed
+    memfd copy of its own image (`runc_cloned:/proc/self/exe`, the
+    CVE-2019-5736 defence) at every container start, exec and build:
+    Critical on Debian 13 (runc 1.1.15, docker.io and podman). The exec pump
+    now compares such a memfd, when the exec's parent runs an installed
+    runtime or its manager (one `stat` of its image), whole and byte for
+    byte with the installed runtimes of its length (`runc`, `crun`: recorded
+    with the shells, and again at the exec at most once a second), sealed
+    against writing, shrinking and growing (`program_images`, a budget of
+    its own); R004 has no verdict when that copy is the file the process
+    that made it runs (runc 1.2's forker, or runc 1.1's `runc init` before
+    its re-exec, by the kernel's exec records, in any mount namespace:
+    rootless Podman's) and an installed manager (`containerd-shim-runc-v2`,
+    `containerd`, `dockerd`, `conmon`, `podman`) started the runtime — by its
+    exec from a root-only directory, or, for conmon's monitor (a fork that
+    never executed), by the installed file the pump saw it run at the exec
+    (`RuntimeClone::seen`). Any other memfd exec stays Critical.
+  - **containerd's and dockerd's module probes (R011).** containerd 1.7's
+    `modprobe aufs` carries the `LD_LIBRARY_PATH` its `opt` plugin sets:
+    R011's kill at every containerd start on Debian 13. The packaged
+    containerd's or dockerd's `modprobe` (the kernel's fork record, the
+    image's identity) of a container runtime's modules, by name, the
+    system's tool, is a Low record; the pump keeps `LD_LIBRARY_PATH`'s value
+    when it is the one refused variable (`ExecFacts::library_path`), and
+    only containerd's `opt` library directories are accepted there. The module's
+    file is still R018's at its load.
+  - **The shutdown record (NN-L-FIM-019).** `systemd-update-utmp` writing
+    wtmp at the host's shutdown, judged before its exec reached the lineage:
+    High, a kill (Ubuntu 24.04). The FIM drain reads, at a write of wtmp or
+    btmp, the writer's image (`/proc/<pid>/exe`'s device and inode against
+    the host's packaged file) and its placing cgroup; the packaged binary in
+    its own unit's cgroup has no verdict (`nn_core::fim::unit_writers`).
+  - **Lab corpus.** The containers corpus also restarts docker (its start:
+    `iptables`/`nft`, module loads), runs a `docker exec` and a build — the
+    NN-L-EVA-002 of `xtables-nft-multi` lot 344 named did not reproduce on
+    Debian 13, Ubuntu 22.04, 24.04 or 26.04. The `docker exec` step removes a
+    leftover `nn-corpus` container first, and its own whatever the exec did.
+  - **The review of #556.** (F1) The seals are read AT THE EXEC: the exec
+    LSM program reads the memfd's shmem inode (`shmem_inode_info.seals`, two
+    new optional BTF offsets, slots 137–138 after lot 345's 135–136; the
+    enum, tracepoint and hook-argument slots move by two more: 153 in all)
+    and sets `exe_flags::MEMFD_SEALED` when it is sealed against writing,
+    shrinking and growing; the pump and R004
+    exempt only such an exec — a copy sealed after the exec (an OCI hook's
+    memfd, rewritten by its holder) is Critical. A ratchet
+    (`kernel_halves.rs`) keeps the flag the LSM program's alone. (F2) The
+    runtime compares' budget: 64 MiB a second per uid, 256 MiB of the
+    512 MiB reserved for root; a memfd past the budget is kept unverified,
+    "not compared (budget)" — root's recorded High, never killed, any other
+    uid's (the re-check, N1: a user spends its own share with decoy hooks,
+    then a sealed payload of runc's length) the Critical kill, as before the
+    lot; root over its own budget is a named residual. (F3) The docs say what R018
+    does with an unpackaged module in `/lib/modules`: High, recorded only.
+    (F4) containerd's library path: exactly its `opt` directories, kept by
+    the pump only when root-only with root-only files (`ctr install` named
+    a residual). (F5) The utmp unit's write is exempt only as an append of
+    whole login records. (F6) The drain reads the writer's image only for a
+    process that started before the record. (F7) A runtime or manager is
+    recorded only when its file and directories are root's and writable by
+    no one else.
 - Lot 346 (alpha, false positives round 2B): a developer's and a
   self-hoster's normal work, each benign case told apart by identity —
   never by name alone (`docs/operator/UPGRADE_NOTES_WAVE4.md` §39).

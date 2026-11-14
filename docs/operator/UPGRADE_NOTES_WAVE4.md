@@ -2257,3 +2257,50 @@ detail.
   inside a trusted-installer window, or expect them. `bpftrace --info`
   under the opt-out: six records, none High (its loads are the opt-out's,
   Low).
+
+## 41. A container runtime's start, the shutdown record (lot 347)
+
+- **runc's copy of itself is no longer Critical.** At every container
+  start, `docker exec`, build and Podman run, runc (1.1 on Debian 13, under
+  containerd's shim, dockerd or conmon) executes itself again from a sealed
+  memfd copy of its own image; R004 recorded each as fileless (Critical,
+  `would have: KillProcessTree` under `alpha`, the kill under `enforcing`).
+  Such an exec now has no verdict when the exec pump finds the memfd sealed
+  and byte for byte an installed runtime (`runc`, `crun` in the binary
+  directories), the process that made it runs that image (the kernel's exec
+  records) and an installed manager started the runtime
+  ([`CONTAINER_HOST_DEPLOY.md`](CONTAINER_HOST_DEPLOY.md)). Any other memfd
+  exec is Critical as before. A runtime the agent does not record (k3s's
+  bundled runc, a snap's) keeps the Critical.
+- **containerd's and dockerd's module probes are Low.** containerd 1.7's
+  `modprobe aufs`, run with the `LD_LIBRARY_PATH` its `opt` plugin sets, was
+  R011's kill at every containerd start on Debian 13 (High). The packaged
+  containerd's or dockerd's `modprobe` of a container runtime's modules
+  (`overlay`, `aufs`, `erofs`, `bridge`, `br_netfilter`, `veth`, the
+  netfilter, nftables, xtables and iptables families), the system's tool by
+  name, is a Low record; R018 still judges the module file at its load. Any
+  other module, a caller's library path, `MODPROBE_OPTIONS`, `LD_PRELOAD`
+  or another parent keeps R011's verdict.
+- **The shutdown record of wtmp.** `systemd-update-utmp` writing the
+  shutdown record while the agent was still stopping was NN-L-FIM-019 High
+  (`would have: KillProcess`) on Ubuntu 24.04 at about one shutdown in two.
+  The FIM drain now reads the writer's image and cgroup at the write; the
+  host's packaged binary in its own unit's cgroup has no verdict. Any other
+  writer of wtmp or btmp keeps the High kill.
+- **The review of #556 narrowed each exemption.** A memfd is exempt only
+  when the kernel executed it already sealed against writing (the exec
+  sensor reads its seals at the exec; an agent in tracepoint mode, or on a
+  kernel whose BTF lacks `shmem_inode_info`, keeps the Critical). The
+  compares' budget is per user (64 MiB a second each) with a reserve for
+  root (256 MiB of 512): a memfd past the budget is "not compared
+  (budget)" — root's recorded High, never killed; any other uid's (a user
+  can spend its own share) killed, Critical, as before. A runtime or
+  manager is recorded only when its file and its directories are root's and
+  writable by no one else. containerd's library
+  path is accepted only as exactly `/var/lib/containerd/opt/lib` or
+  `/opt/containerd/lib`, a root-only directory of root-only files. The utmp
+  unit's write is exempt only as an append of whole login records, by a
+  process that started before the record.
+- **Nothing to configure.** No overlay, allowlist entry or signed policy
+  changes; the container-runtime overlay of `process-comm-allowlist` (R013)
+  is unchanged. Detection records of these three shapes stop appearing.

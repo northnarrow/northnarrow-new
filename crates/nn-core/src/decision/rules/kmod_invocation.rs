@@ -251,7 +251,43 @@ fn names_a_file(arg: &str) -> bool {
 }
 
 fn modprobe(args: &[String]) -> Syntax {
-    let kill = |why: String| Syntax::Kill(format!("modprobe {why}"));
+    let (names, parameters) = match parse_modprobe(args) {
+        Ok(asked) => asked,
+        Err(why) => return Syntax::Kill(format!("modprobe {why}")),
+    };
+    if names.is_empty() {
+        return Syntax::Record("modprobe with no module named (a query or a usage error)".into());
+    }
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    Syntax::Record(format!(
+        "modprobe of {}{}",
+        quoted.join(", "),
+        match parameters {
+            0 => String::new(),
+            1 => " with 1 parameter".to_string(),
+            n => format!(" with {n} parameters"),
+        }
+    ))
+}
+
+/// Lot 347: the modules a `modprobe` invocation R011 records asks for by
+/// name, when it names one at least and passes no module parameter (`None`
+/// for any other tool or invocation, and for every one R011 kills).
+pub fn modules_asked(tool: Tool, argv: &[String]) -> Option<Vec<&str>> {
+    if tool != Tool::Modprobe {
+        return None;
+    }
+    match parse_modprobe(argv.get(1..).unwrap_or_default()) {
+        Ok((names, 0)) if !names.is_empty() => Some(names),
+        _ => None,
+    }
+}
+
+/// modprobe's operands as kmod reads them: the module names and how many
+/// module parameters follow the first; `Err` (why, for "modprobe …") when
+/// R011 kills the invocation.
+fn parse_modprobe(args: &[String]) -> Result<(Vec<&str>, usize), String> {
+    let kill = |why: String| Err(why);
     if let Some(f) = args.iter().find(|a| names_a_file(a)) {
         return kill(format!(
             "given '{f}', which names a file, not a module of the system's tree"
@@ -334,19 +370,7 @@ fn modprobe(args: &[String]) -> Syntax {
         }
         names.push(a);
     }
-    if names.is_empty() {
-        return Syntax::Record("modprobe with no module named (a query or a usage error)".into());
-    }
-    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
-    Syntax::Record(format!(
-        "modprobe of {}{}",
-        quoted.join(", "),
-        match parameters {
-            0 => String::new(),
-            1 => " with 1 parameter".to_string(),
-            n => format!(" with {n} parameters"),
-        }
-    ))
+    Ok((names, parameters))
 }
 
 /// Lot 287: `image` is where the distribution puts a module tool — a file

@@ -560,6 +560,23 @@ const STATICS: &[Kept] = &[
          oldest out first)",
     ),
     kept(
+        "crates/nn-core/src/fim/unit_writers.rs",
+        "KEPT",
+        HostFact,
+        "lot 347: the writes of a login record (wtmp, btmp) the FIM drain found made by the \
+         host's packaged systemd-update-utmp in its unit's own cgroup, read while the writer \
+         ran, which NN-L-FIM-019 judges the write on (one host; keyed by write, bounded, the \
+         oldest out first)",
+    ),
+    kept(
+        "crates/nn-linux/src/program_images.rs",
+        "RUNTIMES",
+        HostFact,
+        "lot 347: the exec pump's compare of a memfd exec with the installed OCI runtimes — \
+         its budget of bytes for the current second, its counts, and the time it last \
+         recorded the runtimes again (one host, one exec pump)",
+    ),
+    kept(
         "crates/nn-linux/src/program_images.rs",
         "BOUNDS",
         HostFact,

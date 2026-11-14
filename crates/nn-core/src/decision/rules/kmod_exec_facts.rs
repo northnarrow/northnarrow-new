@@ -102,6 +102,13 @@ pub struct ExecFacts {
     /// its `prereqs` exits within a millisecond). `None`: the file runs as
     /// itself (a tool, a copy of one), or nothing could be read.
     pub interpreter: Option<String>,
+    /// Lot 347: the value of `LD_LIBRARY_PATH` when it is the one refused
+    /// variable of an environment read whole from the running process
+    /// ([`Environment::Refused`] all the same: R011's kill) — containerd's
+    /// own `opt` plugin puts it in the environment its children inherit
+    /// (`/var/lib/containerd/opt/lib:` on Debian), which R011's runtime
+    /// exemption judges. `None` otherwise.
+    pub library_path: Option<String>,
 }
 
 impl ExecFacts {
@@ -200,6 +207,7 @@ mod tests {
             package_manager: None,
             initramfs_builder: None,
             interpreter: None,
+            library_path: None,
         }
     }
 

@@ -50,6 +50,15 @@ step "containers podman run (rootless)" 300 -- podman run --rm "$IMG" sh -c 'ech
 step "containers podman rmi (rootless)" 120 -- podman rmi -f "$IMG"
 step "containers docker pull" 600 -- sudo docker pull -q "$IMG"
 step "containers docker run" 300 -- sudo docker run --rm "$IMG" sh -c 'echo nn-corpus; ls /'
+# lot 347: docker's own start (its iptables/nftables chains through
+# xtables-nft-multi, its module loads), a docker exec and a build — each a
+# container start through runc
+step "containers docker restart (its start)" 300 -- sudo systemctl restart docker
+# (the review of #556: a leftover nn-corpus from a failed run removed first,
+# and the container removed whatever the exec did — the step's status is
+# the run's and the exec's)
+step "containers docker exec" 300 -- sudo sh -c "docker rm -f nn-corpus >/dev/null 2>&1; docker run -d --name nn-corpus $IMG sleep 60 && docker exec nn-corpus true; rc=\$?; docker rm -f nn-corpus >/dev/null 2>&1; exit \$rc"
+step "containers docker build" 600 -- sudo sh -c "d=\$(mktemp -d) && printf 'FROM $IMG\nRUN true\n' > \$d/Dockerfile && docker build -q -t nn-corpus-img \$d && docker rmi -f nn-corpus-img; rm -rf \$d"
 step "containers docker rmi" 120 -- sudo docker rmi -f "$IMG"
 step "containers k3s install (get.k3s.io)" 900 -- bash -c 'curl -sfL https://get.k3s.io | sudo sh -'
 step "containers k3s node Ready" 300 -- sudo bash -c 'until k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'

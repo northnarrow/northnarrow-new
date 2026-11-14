@@ -132,7 +132,10 @@ fn facts_in(
         return None;
     }
     // the environment first: the process may be short-lived
-    let environment = environment(proc, *pid, *start_ns);
+    let (environment, library_path) = environment_read(proc, *pid, *start_ns);
+    // the review of #556 (F4): kept only when what it names only root can
+    // change
+    let library_path = library_path.filter(|v| root_only_library_path(v, root));
     // lot 283b: and the lineage, while it is alive
     let package_manager = package_manager(proc, *pid);
     // lot 287: and the initramfs build, from its parent up
@@ -143,6 +146,7 @@ fn facts_in(
         package_manager,
         initramfs_builder,
         interpreter: interpreter(root, proc, *pid, *start_ns, exe),
+        library_path,
     })
 }
 
@@ -466,11 +470,24 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
 
 /// What the environment of `pid`, the process that started at `start_ns`
 /// (`CLOCK_MONOTONIC`, as the sensors report it), is to R011; `proc`:
-/// procfs (`/proc`; a copy of an entry in a test).
+/// procfs (`/proc`; a copy of an entry in a test). Lot 347: the pump reads
+/// it with the library path ([`environment_read`]); the tests read this.
+#[cfg(test)]
 fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
+    environment_read(proc, pid, start_ns).0
+}
+
+/// What the environment of `pid` is to R011 (`environment`, the tests'),
+/// and (lot 347) the value of `LD_LIBRARY_PATH` when it is
+/// the one refused variable of the environment, read whole from the running
+/// process ([`library_path_alone`]); `None` in every other case.
+fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Option<String>) {
     if start_ns == 0 {
-        return Environment::Refused(
-            "its start is unknown: its environment cannot be tied to the exec".to_string(),
+        return (
+            Environment::Refused(
+                "its start is unknown: its environment cannot be tied to the exec".to_string(),
+            ),
+            None,
         );
     }
     let fd = match pidfd_open(pid) {
@@ -478,12 +495,18 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
         Ok(raw) => unsafe { OwnedFd::from_raw_fd(raw) },
         // no process has its pid: it had exited, and been reaped
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
-            return Environment::Exited(format!("no process had its pid any more ({e})"))
+            return (
+                Environment::Exited(format!("no process had its pid any more ({e})")),
+                None,
+            )
         }
         Err(e) => {
-            return Environment::Refused(format!(
-                "its pidfd could not be opened ({e}): its environment was not read"
-            ))
+            return (
+                Environment::Refused(format!(
+                    "its pidfd could not be opened ({e}): its environment was not read"
+                )),
+                None,
+            )
         }
     };
     // The pidfd holds the process: `/proc/<pid>` describes it while it runs
@@ -493,14 +516,25 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
         Some(ticks) if started_at(ticks, start_ns) => {}
         // the exec's process was reaped and its pid reused
         Some(_) => {
-            return Environment::Exited(
-                "its pid names another process now (its start is not the exec's)".to_string(),
+            return (
+                Environment::Exited(
+                    "its pid names another process now (its start is not the exec's)".to_string(),
+                ),
+                None,
             )
         }
         None if pidfd_exited(&fd) => {
-            return Environment::Exited("it was reaped before its /proc entry was read".to_string())
+            return (
+                Environment::Exited("it was reaped before its /proc entry was read".to_string()),
+                None,
+            )
         }
-        None => return Environment::Refused("its /proc entry could not be read".to_string()),
+        None => {
+            return (
+                Environment::Refused("its /proc entry could not be read".to_string()),
+                None,
+            )
+        }
     }
     let mut env = Vec::new();
     let read = read_environ(&proc.join(format!("{pid}/environ")), &mut env);
@@ -511,11 +545,15 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
         // its leader's memory gone: the process's exit, or its leader's
         // alone while another of its threads runs on (DC-A)
         if let Some(running) = running_thread(proc, pid, &fd) {
-            return running;
+            return (running, None);
         }
     }
     let gone = pidfd_exited(&fd) || !memory;
-    judged(read, &env, gone)
+    // lot 347: read whole from the running process only
+    let alone = (read.is_ok() && !gone && env.len() as u64 <= MAX_ENVIRON)
+        .then(|| library_path_alone(&env))
+        .flatten();
+    (judged(read, &env, gone), alone)
 }
 
 /// `path` (an `environ`) read into `env`: at most [`MAX_ENVIRON`] + 1
@@ -651,6 +689,66 @@ fn judged(read: std::io::Result<()>, env: &[u8], gone: bool) -> Environment {
         });
     }
     Environment::Clean
+}
+
+/// The review of #556 (F4): the files a library directory may hold for
+/// [`root_only_library_path`] (containerd's `opt` one is empty but for
+/// `ctr install`'s).
+const MAX_LIBRARY_ENTRIES: usize = 256;
+
+/// The review of #556 (F4): each non-empty entry of `value` (an
+/// `LD_LIBRARY_PATH`) is a directory under `root` (`/` on the host) reached
+/// through no link, that directory and every one above it root's and
+/// writable by no one else, and each of its files (followed) too, at most
+/// [`MAX_LIBRARY_ENTRIES`] — a library a user could place or rewrite there
+/// never reaches R011's runtime exemption. `ctr install` (root's, or
+/// containerd's socket) fills containerd's `opt` directory all the same: a
+/// residual R011 names.
+fn root_only_library_path(value: &str, root: &Path) -> bool {
+    use crate::program_images::root_only_path;
+    let Ok(base) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    value.split(':').filter(|e| !e.is_empty()).all(|e| {
+        let rel = e.trim_start_matches('/');
+        let Ok(real) = std::fs::canonicalize(base.join(rel)) else {
+            return false;
+        };
+        if real != base.join(rel) || !real.is_dir() || !root_only_path(&real, &base) {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&real) else {
+            return false;
+        };
+        let mut n = 0;
+        entries.into_iter().all(|entry| {
+            n += 1;
+            n <= MAX_LIBRARY_ENTRIES
+                && entry.is_ok_and(|entry| {
+                    std::fs::canonicalize(entry.path()).is_ok_and(|f| root_only_path(&f, &base))
+                })
+        })
+    })
+}
+
+/// Lot 347: the value of `LD_LIBRARY_PATH` in `env` when it is the one
+/// variable of [`REFUSED_VARS`] there (`None` when another is, or none).
+fn library_path_alone(env: &[u8]) -> Option<String> {
+    let mut path = None;
+    for kv in env.split(|b| *b == 0) {
+        let Some(eq) = kv.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let (name, value) = (&kv[..eq], &kv[eq + 1..]);
+        if !REFUSED_VARS.iter().any(|v| v.as_bytes() == name) {
+            continue;
+        }
+        if name != b"LD_LIBRARY_PATH" || path.is_some() {
+            return None;
+        }
+        path = Some(String::from_utf8(value.to_vec()).ok()?);
+    }
+    path
 }
 
 /// `/proc/<pid>/stat` (`stat`) shows a process with its memory: running
@@ -1255,6 +1353,138 @@ mod tests {
     use crate::response::proc_ref::proc_start_ns;
 
     /// `sleep 30` with exactly `env` as its environment.
+    /// The review of #556 (F4, named): containerd's `opt` library path is
+    /// kept only when its directory — reached through no link, no `.` or
+    /// `..` — and every directory above it, and each file in it, are the
+    /// tree root's owner's (root's on the host) and writable by no one else
+    /// (fails on the lot's first head: any value was kept).
+    #[test]
+    fn an_opt_library_directory_a_user_can_write_is_not_kept() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        let lib = root.join("var/lib/containerd/opt/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        // as root's tree has them, whatever the test's umask
+        for d in lib.ancestors().take_while(|d| d.starts_with(&root)) {
+            mode(d, 0o755);
+        }
+        let opt = "/var/lib/containerd/opt/lib:";
+        assert!(root_only_library_path(opt, &root), "empty, root's");
+        assert!(root_only_library_path("", &root));
+        std::fs::write(lib.join("libkmod.so.2"), b"lib").unwrap();
+        mode(&lib.join("libkmod.so.2"), 0o644);
+        symlink("libkmod.so.2", lib.join("libkmod.so")).unwrap();
+        assert!(root_only_library_path(opt, &root), "root's files");
+        // CONTROLS: a file anyone can write
+        mode(&lib.join("libkmod.so.2"), 0o666);
+        assert!(!root_only_library_path(opt, &root), "a writable file");
+        mode(&lib.join("libkmod.so.2"), 0o644);
+        // a link out to a file in a group-writable directory
+        let staff = root.join("usr/local/lib");
+        std::fs::create_dir_all(&staff).unwrap();
+        std::fs::write(staff.join("liblzma.so.5"), b"lib").unwrap();
+        mode(&staff, 0o775);
+        symlink(staff.join("liblzma.so.5"), lib.join("liblzma.so.5")).unwrap();
+        assert!(
+            !root_only_library_path(opt, &root),
+            "a link to a writable dir"
+        );
+        std::fs::remove_file(lib.join("liblzma.so.5")).unwrap();
+        // the directory, or one above it, writable by its group
+        mode(&lib, 0o775);
+        assert!(!root_only_library_path(opt, &root), "a writable directory");
+        mode(&lib, 0o755);
+        mode(&root.join("var/lib/containerd"), 0o777);
+        assert!(!root_only_library_path(opt, &root), "a writable parent");
+        mode(&root.join("var/lib/containerd"), 0o755);
+        // a link on the way, a `..`, a directory that is not there
+        std::fs::create_dir_all(root.join("opt")).unwrap();
+        mode(&root.join("opt"), 0o755);
+        symlink(
+            root.join("var/lib/containerd/opt"),
+            root.join("opt/containerd"),
+        )
+        .unwrap();
+        assert!(
+            !root_only_library_path("/opt/containerd/lib", &root),
+            "a link"
+        );
+        assert!(!root_only_library_path(
+            "/var/lib/containerd/opt/lib/../lib",
+            &root
+        ));
+        assert!(!root_only_library_path("/nonexistent/lib", &root));
+        assert!(root_only_library_path(opt, &root), "as at first");
+        // through the pump's facts of a `modprobe` whose environment holds it
+        let c = sleeper(&[("LD_LIBRARY_PATH", opt)]);
+        let mut e = exec_of("modprobe", c.id(), 0, 1, 0, ExeIdentity::default());
+        if let Event::ProcessSpawn { start_ns, .. } = &mut e {
+            *start_ns = started(&c);
+        }
+        let facts = |e: &Event| facts_in(&root, Path::new("/proc"), &[], e).expect("facts");
+        assert_eq!(facts(&e).library_path.as_deref(), Some(opt));
+        mode(&lib, 0o775);
+        assert_eq!(facts(&e).library_path, None, "a writable directory");
+        mode(&lib, 0o755);
+        stop(c);
+        // more files than a library directory of containerd's holds
+        for i in 0..MAX_LIBRARY_ENTRIES {
+            std::fs::write(lib.join(format!("lib{i}.so")), b"").unwrap();
+            mode(&lib.join(format!("lib{i}.so")), 0o644);
+        }
+        assert!(!root_only_library_path(opt, &root), "too many files");
+    }
+
+    /// Lot 347: the environment's one refused variable `LD_LIBRARY_PATH`
+    /// (containerd's `opt` plugin's) is kept with its value, read whole from
+    /// the running process — still a refusal (R011's kill unless its
+    /// runtime exemption holds); with another refused variable, alone of
+    /// another one, or none, no value is kept.
+    #[test]
+    fn a_library_path_alone_is_kept_with_its_value() {
+        let p = Path::new("/proc");
+        let opt = "/var/lib/containerd/opt/lib:";
+        let alone = sleeper(&[("PATH", "/usr/bin"), ("LD_LIBRARY_PATH", opt)]);
+        let (env, path) = environment_read(p, alone.id(), started(&alone));
+        assert!(matches!(env, Environment::Refused(_)), "{env:?}");
+        assert_eq!(path.as_deref(), Some(opt));
+        stop(alone);
+        for vars in [
+            &[("LD_LIBRARY_PATH", opt), ("MODPROBE_OPTIONS", "-C /tmp/m")][..],
+            &[("LD_PRELOAD", "/tmp/x.so"), ("LD_LIBRARY_PATH", opt)][..],
+            &[("LD_PRELOAD", "/tmp/x.so")][..],
+            &[("PATH", "/usr/bin")][..],
+        ] {
+            let c = sleeper(vars);
+            let (_, path) = environment_read(p, c.id(), started(&c));
+            assert_eq!(path, None, "{vars:?}");
+            stop(c);
+        }
+        // an environment past the read's bound, cut (`LD_LIBRARY_PATH` in
+        // the part read: the variables are passed sorted): no value kept
+        let big = "x".repeat(120 << 10);
+        let mut vars = vec![("LD_LIBRARY_PATH", opt)];
+        let names: Vec<String> = (0..10).map(|i| format!("ZBIG{i}")).collect();
+        vars.extend(names.iter().map(|n| (n.as_str(), big.as_str())));
+        let c = sleeper(&vars);
+        let (env, path) = environment_read(p, c.id(), started(&c));
+        assert!(
+            matches!(&env, Environment::Refused(w) if w.contains("larger than")),
+            "{env:?}"
+        );
+        assert_eq!(path, None, "cut");
+        stop(c);
+        assert_eq!(
+            library_path_alone(b"LD_LIBRARY_PATH=a\0LD_LIBRARY_PATH=b\0"),
+            None,
+            "twice"
+        );
+    }
+
     fn sleeper(env: &[(&str, &str)]) -> Child {
         let mut c = Command::new("sleep");
         c.arg("30").env_clear().stdout(Stdio::null());
