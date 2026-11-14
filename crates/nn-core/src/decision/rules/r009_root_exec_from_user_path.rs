@@ -264,8 +264,8 @@ mod tests {
         }
         let lineage = AuthSessionTracker::new(tmp.path());
         lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
-        lineage.ingest_spawn(710, 700, "/usr/bin/sudo", 2);
-        lineage.ingest_spawn(720, 710, "/home/alice/deploy.sh", 3);
+        lineage.ingest_host_exec(710, 700, "/usr/bin/sudo", (2, 2), 1000, 0);
+        lineage.ingest_first_exec(720, 710, "/home/alice/deploy.sh", 3, 0);
         lineage.ingest_spawn(800, 700, "/home/alice/deploy.sh", 4);
         let rule = R009RootExecFromUserPath::new(lineage);
 
@@ -281,6 +281,247 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&other).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lot 351 (named, the review of #559, F2): any user may run sudo, and
+    /// `sudo -A` forks the user's `SUDO_ASKPASS` program, as the user,
+    /// before any authentication. A user with no sudo right at a terminal
+    /// ran `SUDO_ASKPASS=~/x sudo -A true`; `~/x` became root through a
+    /// local privilege escalation and ran `/home/alice/payload` as root —
+    /// R009 found sudo in its lineage: Low, no kill. Only the process sudo
+    /// ran as root after authenticating vouches now: the payload below the
+    /// askpass helper, and the payload it executed in its own place, are
+    /// High (the kill); the command sudo ran is still Low.
+    #[test]
+    fn sudo_s_askpass_helper_vouches_for_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (pid, ppid) in [
+            (700u32, 1u32),
+            (710, 700),
+            (715, 710),
+            (716, 710),
+            (720, 715),
+        ] {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("loginuid"), "1000").unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+            )
+            .unwrap();
+        }
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_exec(700, 1, "/usr/bin/bash", &[], 1, 1, 1000);
+        lineage.ingest_host_exec(710, 700, "/usr/bin/sudo", (2, 2), 1000, 0);
+        // the askpass helper sudo forked as the user, and its root payload
+        lineage.ingest_first_exec(715, 710, "/home/alice/askpass", 3, 1000);
+        lineage.ingest_first_exec(720, 715, "/home/alice/payload", 4, 0);
+        // the command sudo ran as root after authenticating
+        lineage.ingest_first_exec(716, 710, "/home/alice/deploy.sh", 5, 0);
+        let rule = R009RootExecFromUserPath::new(lineage.clone());
+        let run = |pid: u32, ppid: u32, path: &str| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p, ppid: pp, ..
+            } = &mut e
+            {
+                (*p, *pp) = (pid, ppid);
+            }
+            e
+        };
+        let v = rule
+            .evaluate(&run(720, 715, "/home/alice/payload"))
+            .expect("fires");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::KillProcessTree),
+            "below the askpass helper"
+        );
+        let v = rule
+            .evaluate(&run(716, 710, "/home/alice/deploy.sh"))
+            .expect("recorded");
+        assert_eq!((v.severity, v.action), (Severity::Low, ResponseAction::Log));
+        // the askpass helper, root now, executes its payload in place: its
+        // process is still the one sudo ran as the user
+        lineage.ingest_exec(715, 710, "/home/alice/payload", &[], 6, 3, 0);
+        let v = rule
+            .evaluate(&run(715, 710, "/home/alice/payload"))
+            .expect("fires");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::KillProcessTree),
+            "the askpass helper's own process"
+        );
+    }
+
+    /// The review of #560 (named, A): root runs sudo with no credential
+    /// check. After a local privilege escalation that set every uid to 0,
+    /// the user's program ran `/usr/bin/sudo /home/alice/payload` — in its
+    /// own place (as sudo -A's askpass helper, and at the user's terminal
+    /// with no askpass at all) or from a fork — and sudo's child was "forked
+    /// by sudo, real uid 0, no PAM helper": Low, no kill. A sudo whose
+    /// caller was already root vouches for nothing now: High, the kill. The
+    /// operator's own `sudo ./deploy/uninstall.sh` (sudo run as the user,
+    /// its monitor's child) stays Low.
+    #[test]
+    fn root_s_own_sudo_vouches_for_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (pid, ppid) in [
+            (700u32, 1u32),
+            (710, 700),
+            (715, 710),
+            (725, 715),
+            (730, 700),
+            (731, 730),
+            (740, 700),
+            (741, 740),
+            (742, 741),
+            (750, 700),
+            (751, 750),
+            (752, 751),
+        ] {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("loginuid"), "1000").unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+            )
+            .unwrap();
+        }
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_exec(700, 1, "/usr/bin/bash", &[], 1, 1, 1000);
+        // (the host's sudo, its images: the re-check 1 of #560)
+        lineage.ingest_host_exec(710, 700, "/usr/bin/sudo", (2, 2), 1000, 0);
+        // (a) sudo -A's askpass helper, root through an LPE, executes sudo
+        // in its own place
+        lineage.ingest_first_exec(715, 710, "/home/alice/askpass", 3, 1000);
+        lineage.ingest_host_exec(715, 710, "/usr/bin/sudo", (4, 3), 0, 0);
+        lineage.ingest_first_exec(725, 715, "/home/alice/payload", 5, 0);
+        // (b) no askpass: the user's LPE at her terminal, sudo in place
+        lineage.ingest_first_exec(730, 700, "/home/alice/lpe", 6, 1000);
+        lineage.ingest_host_exec(730, 700, "/usr/bin/sudo", (7, 6), 0, 0);
+        lineage.ingest_first_exec(731, 730, "/home/alice/payload", 8, 0);
+        // (c) the LPE forks, its child executes sudo as root
+        lineage.ingest_first_exec(740, 700, "/home/alice/lpe", 9, 1000);
+        lineage.ingest_host_exec(741, 740, "/usr/bin/sudo", (10, 0), 0, 740);
+        lineage.ingest_first_exec(742, 741, "/home/alice/payload", 11, 0);
+        // the operator's sudo, its monitor (a fork of it that executed
+        // nothing, root's: the kernel's fork record), the script it forked
+        lineage.ingest_host_exec(750, 700, "/usr/bin/sudo", (12, 12), 1000, 0);
+        lineage.ingest_kernel_fork(751, 13, 750, 0, 42);
+        lineage.ingest_first_exec(752, 751, "/home/alice/nn/deploy/uninstall.sh", 14, 0);
+        let rule = R009RootExecFromUserPath::new(lineage.clone());
+        let run = |pid: u32, ppid: u32, path: &str| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p, ppid: pp, ..
+            } = &mut e
+            {
+                (*p, *pp) = (pid, ppid);
+            }
+            e
+        };
+        for (pid, ppid) in [(725u32, 715u32), (731, 730), (742, 741)] {
+            let v = rule
+                .evaluate(&run(pid, ppid, "/home/alice/payload"))
+                .expect("fires");
+            assert_eq!(
+                (v.severity, v.action),
+                (Severity::High, ResponseAction::KillProcessTree),
+                "pid {pid}"
+            );
+            assert!(!lineage.is_interactive_admin(pid, AsOf::Now), "pid {pid}");
+        }
+        let v = rule
+            .evaluate(&run(752, 751, "/home/alice/nn/deploy/uninstall.sh"))
+            .expect("recorded");
+        assert_eq!((v.severity, v.action), (Severity::Low, ResponseAction::Log));
+    }
+
+    /// The re-check 1 of #560 (named, H(b)): a sudo is recognised by what
+    /// the kernel executed, not by its path alone. After a local privilege
+    /// escalation, a fake `/usr/bin/sudo` in a chroot or a private mount
+    /// namespace (no image: `ROOT_DIR`, PID 1's mount namespace and root),
+    /// executed with the user's own real uid — no uid change to see — forks
+    /// its payload as root exactly as the host's sudo does: it was Low, no
+    /// kill. It is High (the kill), in place and from a fork. The host's
+    /// sudo (its image) still vouches: the operator's `sudo
+    /// ./deploy/uninstall.sh`, and `sudo -i` then `./deploy/uninstall.sh`
+    /// in its root shell, stay Low.
+    #[test]
+    fn a_sudo_not_of_the_host_s_image_vouches_for_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tree = [
+            (700u32, 1u32),
+            (730, 700),
+            (731, 730),
+            (740, 700),
+            (741, 740),
+            (750, 700),
+            (751, 750),
+            (760, 700),
+            (761, 760),
+            (762, 761),
+        ];
+        for (pid, ppid) in tree {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("loginuid"), "1000").unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+            )
+            .unwrap();
+        }
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_exec(700, 1, "/usr/bin/bash", &[], 1, 1, 1000);
+        // the LPE executes the fake sudo in its own place, its real uid
+        lineage.ingest_first_exec(730, 700, "/home/alice/lpe", 2, 1000);
+        lineage.ingest_exec(730, 700, "/usr/bin/sudo", &[], 3, 2, 1000);
+        lineage.ingest_first_exec(731, 730, "/home/alice/payload", 4, 0);
+        // a fork of the shell executes it
+        lineage.ingest_first_exec(740, 700, "/usr/bin/sudo", 5, 1000);
+        lineage.ingest_first_exec(741, 740, "/home/alice/payload", 6, 0);
+        // the operator's `sudo ./deploy/uninstall.sh`, the host's sudo
+        lineage.ingest_host_exec(750, 700, "/usr/bin/sudo", (7, 7), 1000, 700);
+        lineage.ingest_first_exec(751, 750, "/home/alice/nn/deploy/uninstall.sh", 8, 0);
+        // the operator's `sudo -i`, then the script from its root shell
+        lineage.ingest_host_exec(760, 700, "/usr/bin/sudo", (9, 9), 1000, 700);
+        lineage.ingest_first_exec(761, 760, "/usr/bin/bash", 10, 0);
+        lineage.ingest_first_exec(762, 761, "/home/alice/nn/deploy/uninstall.sh", 11, 0);
+        let rule = R009RootExecFromUserPath::new(lineage.clone());
+        let run = |pid: u32, ppid: u32, path: &str| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p, ppid: pp, ..
+            } = &mut e
+            {
+                (*p, *pp) = (pid, ppid);
+            }
+            e
+        };
+        for (pid, ppid) in [(731u32, 730u32), (741, 740)] {
+            let v = rule
+                .evaluate(&run(pid, ppid, "/home/alice/payload"))
+                .expect("fires");
+            assert_eq!(
+                (v.severity, v.action),
+                (Severity::High, ResponseAction::KillProcessTree),
+                "pid {pid}"
+            );
+        }
+        for (pid, ppid) in [(751u32, 750u32), (762, 761)] {
+            let v = rule
+                .evaluate(&run(pid, ppid, "/home/alice/nn/deploy/uninstall.sh"))
+                .expect("recorded");
+            assert_eq!(
+                (v.severity, v.action),
+                (Severity::Low, ResponseAction::Log),
+                "pid {pid}"
+            );
+        }
     }
 
     /// Lot 350 (named, F2-2): Ubuntu 26.04's `sudo` is sudo-rs
@@ -311,8 +552,8 @@ mod tests {
                 }
                 let lineage = AuthSessionTracker::new(tmp.path());
                 lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
-                lineage.ingest_spawn(710, 700, sudo, 2);
-                lineage.ingest_spawn(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3);
+                lineage.ingest_host_exec(710, 700, sudo, (2, 2), 1000, 0);
+                lineage.ingest_first_exec(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3, 0);
                 let rule = R009RootExecFromUserPath::new(lineage);
                 let mut run = spawn_as(0, "uninstall.sh", "/home/alice/nn/deploy/uninstall.sh");
                 if let Event::ProcessSpawn { pid, ppid, .. } = &mut run {

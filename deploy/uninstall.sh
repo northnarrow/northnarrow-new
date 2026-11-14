@@ -53,6 +53,16 @@
 # A unit that does not stop (no window on a protected host) stops the
 # script before anything is disabled or removed.
 #
+# Lot 351: a removal that leaves processes the agent contained (a held
+# blocked.scope or throttled.scope, a thawed blocked.scope/neutralize-*)
+# names them at the end and exits 4 — the removal is otherwise complete;
+# decide on each (kill it, or release it). With --package it names them
+# and exits 0.
+#
+# Exit codes: 0 done; 1 refused or failed (not root, no confirmation, a
+# key or a unit stop missing); 2 unknown argument; 3 reboot to finish (a
+# WEDGED agent, above); 4 done, contained processes left (above).
+#
 # Same BIN_DIR / UNIT_DIR / ETC_DIR / STATE_DIR overrides as install.sh.
 
 set -euo pipefail
@@ -505,30 +515,49 @@ done
 for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
+# >>> rm_tree (run by xtask/tests/install_scripts.rs)
+# Lot 351 (the review of #559, F4): a directory the uninstall removes from
+# systemd's trees (/etc/systemd, /run/systemd, the journals) is never a
+# mount point — `rm -rf` of a bind mount at that path emptied what it showed
+# (only root can make one there): it is left, and said — and nothing below
+# it on another file system is removed (`--one-file-system`).
+rm_tree() {
+    local d
+    for d in "$@"; do
+        [[ -e "$d" || -L "$d" ]] || continue
+        if [[ ! -L "$d" ]] && mountpoint -q -- "$d" 2>/dev/null; then
+            log "$d is a mount point: left in place"
+            continue
+        fi
+        rm -rf --one-file-system -- "$d" 2>/dev/null || log "could not remove $d"
+    done
+    return 0
+}
+# <<< rm_tree
 # Lot 273d: the units' slice and the drop-in directories its units' agent
 # made (empty unless a drop-in was added in a window).
 [[ -e "$UNIT_DIR/northnarrow.slice" ]] && { log "removing $UNIT_DIR/northnarrow.slice"; rm -f "$UNIT_DIR/northnarrow.slice"; }
-rm -rf "$DROPIN_ROOT/northnarrow.slice.d" "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow.slice.d" \
-    /etc/systemd/system.control/northnarrow.slice.d /run/systemd/system.control/northnarrow.slice.d 2>/dev/null || true
-rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d" 2>/dev/null || true
+rm_tree "$DROPIN_ROOT/northnarrow.slice.d" "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow.slice.d" \
+    /etc/systemd/system.control/northnarrow.slice.d /run/systemd/system.control/northnarrow.slice.d
+rm_tree "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d"
 # Lab PR 265: the runtime drop-in directory the unit makes before each start
 # (empty unless a drop-in was added in a window).
-rm -rf "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-agent.service.d" 2>/dev/null || true
+rm_tree "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-agent.service.d"
 # Lot 273b: the units' `set-property` drop-in directories the agent's unit
 # makes before each start (empty unless a property was set in a window).
 for d in /etc/systemd/system.control /run/systemd/system.control; do
-    rm -rf "$d/northnarrow-agent.service.d" "$d/northnarrow-watchdog.service.d" 2>/dev/null || true
+    rm_tree "$d/northnarrow-agent.service.d" "$d/northnarrow-watchdog.service.d"
 done
 # The review of #490 (A): the watchdog's runtime drop-in directory and the
 # `northnarrow-.service.d` prefix ones the agent's unit makes before each
 # start (empty unless a drop-in was added in a window).
-rm -rf "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-watchdog.service.d" \
+rm_tree "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-watchdog.service.d" \
     "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-.service.d" \
-    "$DROPIN_ROOT/northnarrow-.service.d" 2>/dev/null || true
+    "$DROPIN_ROOT/northnarrow-.service.d"
 if [[ -e "$JOURNALD_NS_CONF" ]]; then
     log "removing $JOURNALD_NS_CONF"
     rm -f "$JOURNALD_NS_CONF"
-    rm -rf "${JOURNALD_NS_CONF}.d" 2>/dev/null || true
+    rm_tree "${JOURNALD_NS_CONF}.d"
     systemctl stop systemd-journald@northnarrow.service 2>/dev/null || true
     systemctl stop systemd-journald@northnarrow.socket 2>/dev/null || true
     # Lot 350 (F2-5, the mini-hunt): the namespace's varlink socket too
@@ -539,7 +568,7 @@ fi
 # files are elsewhere (/var/log/journal, /run/log/journal: --purge below).
 if [[ -d "$JOURNALD_NS_RUNTIME" ]]; then
     log "removing $JOURNALD_NS_RUNTIME"
-    rm -rf "$JOURNALD_NS_RUNTIME" 2>/dev/null || true
+    rm_tree "$JOURNALD_NS_RUNTIME"
 fi
 # Tappa 9.5.1 control-surface baits: inert files the install dropped
 # across /etc, /var/lib and /run. Remove them even when config/state
@@ -549,6 +578,10 @@ for f in "$ETC_DIR"/{agent.dev.lock,kill_switch.conf,maintenance.mode,debug_disa
          "$RUN_DIR"/{pause.flag,unload.signal}; do
     [[ -e "$f" ]] && rm -f "$f"
 done
+# Lot 351 (the review of #559, F3): the agent's record of the processes it
+# contained, and where each came from, for stop_slice's word (below) — it
+# goes with $RUN_DIR. Printable characters only (a cgroup's name is any).
+CONTAINMENT_RECORD=$(tr -cd '[:print:]' 2>/dev/null < "$RUN_DIR/containment.json" || true)
 [[ -d "$RUN_DIR" ]] && { log "removing $RUN_DIR"; rm -rf "$RUN_DIR"; }
 # Lot 302: the deny self-test's throwaway cgroup (removed after each round;
 # left by an agent stopped in the middle of one) and the boot's move-guard
@@ -560,30 +593,130 @@ systemctl daemon-reload
 # >>> stop_slice (run by xtask/tests/install_scripts.rs)
 # Lot 350 (F2-5): the units' slice outlived its file until the next boot —
 # loaded, active, its cgroup there. Its file is gone at the reload above, and
-# with it its RefuseManualStop=: stopped now (both units are stopped, nothing
-# else runs in it), then forgotten. The empty `system.control` directories
-# the agent's unit made the parents of (`mkdir -p` before every start, their
-# children removed above) go too: systemd makes them again when it needs one
-# (`systemctl set-property`); one that holds anything stays.
+# with it its RefuseManualStop=: stopped now (both units are stopped), then
+# forgotten. The empty `system.control` directories the agent's unit made
+# the parents of (`mkdir -p` before every start, their children removed
+# above) go too (lot 351: only those `system_control_dirs` names); one that
+# holds anything stays.
+#
+# Lot 351 (the review of #559, F3): the agent's containment is under the
+# slice as well — `blocked.scope` and `throttled.scope`, cgroups the agent
+# makes itself (no units: systemd does not stop them). Each one empty is
+# removed first. One that still holds a process the agent contained stays,
+# named with its processes and the agent's record of where each came from,
+# and the slice is then not stopped: the uninstall kills nothing (it has no
+# verdict on them) and moves nothing (releasing is the operator's decision,
+# `nn-admin` before the uninstall: it hands a process the agent judged back
+# its unit and its network, with nothing left to watch it). Such a process
+# stays in that cgroup, outside any unit, until it exits or the next boot —
+# throttled, under the scope's limits; blocked, its block gone with the
+# agent's nftables table.
+#
+# The review of #560 (D, E): an agent stopped in the middle of a kill left
+# its kill cgroup (`blocked.scope/neutralize-*`), the tree in it frozen (the
+# agent's next start finishes such a kill; no agent starts after this). An
+# empty one is removed; one that holds processes is thawed — nothing would
+# ever thaw it — and said: its processes run again, unwatched. Every process
+# left is named by its pid and its command (`$PROC_ROOT`, /proc), and kept
+# for contained_report at the end: the uninstall then exits 4, not 0.
+CONTAINED_LEFT=()
 stop_slice() {
-    local state
-    state=$(systemctl show -p ActiveState --value northnarrow.slice 2>/dev/null || true)
-    if [[ -n "$state" && "$state" != inactive ]]; then
-        if systemctl stop northnarrow.slice 2>/dev/null; then
-            log "stopped northnarrow.slice"
-        else
-            log "northnarrow.slice did not stop ($state): it goes at the next boot"
+    local state d k scope pids p what held=0
+    local -a said
+    for scope in blocked throttled; do
+        d=$SLICE_CGROUP/$scope.scope
+        [[ -d "$d" ]] || continue
+        for k in "$d"/neutralize-*; do
+            [[ -d "$k" ]] || continue
+            if rmdir "$k" 2>/dev/null; then
+                log "removed the empty $k (a kill an earlier agent did not finish)"
+                continue
+            fi
+            if [[ "$(cat "$k/cgroup.freeze" 2>/dev/null || true)" == 1 ]]; then
+                if echo 0 > "$k/cgroup.freeze" 2>/dev/null; then
+                    log "$k: a kill the agent did not finish had frozen these processes: thawed (they run again, unwatched)"
+                else
+                    log "$k: a kill the agent did not finish froze these processes, and the thaw was refused: still frozen"
+                fi
+            fi
+        done
+        if rmdir "$d" 2>/dev/null; then
+            log "removed the empty $d"
+            continue
         fi
+        pids=""
+        said=()
+        for k in "$d" "$d"/neutralize-*; do
+            [[ -f "$k/cgroup.procs" ]] || continue
+            what=""
+            if [[ "$k" != "$d" ]]; then
+                what=" (a kill the agent did not finish)"
+                if [[ "$(cat "$k/cgroup.freeze" 2>/dev/null || true)" == 1 ]]; then
+                    what=" (a kill the agent did not finish, still FROZEN)"
+                fi
+            fi
+            for p in $(tr -s '\n' ' ' 2>/dev/null < "$k/cgroup.procs" || true); do
+                [[ $p =~ ^[0-9]+$ ]] || continue
+                pids+="$p "
+                said+=("pid $p in $scope.scope$what: $(proc_command "$p")")
+            done
+        done
+        log "$d holds processes the agent contained (pids: ${pids:-?}): left in it, not killed nor released"
+        (( ${#said[@]} )) || said=("$scope.scope holds what the uninstall could not read")
+        for p in "${said[@]}"; do
+            log "  $p"
+        done
+        CONTAINED_LEFT+=("${said[@]}")
+        held=1
+    done
+    if (( held )); then
+        if [[ -n "${CONTAINMENT_RECORD:-}" ]]; then
+            log "where each came from (the agent's containment record): $CONTAINMENT_RECORD"
+        fi
+        log "northnarrow.slice is not stopped while they are in it: it goes at the next boot"
+    else
+        state=$(systemctl show -p ActiveState --value northnarrow.slice 2>/dev/null || true)
+        if [[ -n "$state" && "$state" != inactive ]]; then
+            if systemctl stop northnarrow.slice 2>/dev/null; then
+                log "stopped northnarrow.slice"
+            else
+                log "northnarrow.slice did not stop ($state): it goes at the next boot"
+            fi
+        fi
+        systemctl reset-failed northnarrow.slice 2>/dev/null || true
     fi
-    systemctl reset-failed northnarrow.slice 2>/dev/null || true
-    local d
     for d in "${SYSTEM_CONTROL_DIRS[@]}"; do
         if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed the empty $d"; fi
     done
     return 0
 }
+# A process's command line as /proc shows it: printable characters only (a
+# process writes its own), cut to 120; its comm when it has none (a kernel
+# thread); "exited" when it is gone.
+proc_command() {   # <pid>
+    local proc=${PROC_ROOT:-/proc} c
+    c=$(tr '\0' ' ' 2>/dev/null < "$proc/$1/cmdline" | tr -cd '[:print:]' | cut -c1-120 || true)
+    c=${c%"${c##*[! ]}"}
+    [[ -n "$c" ]] || c=$(tr -cd '[:print:]' 2>/dev/null < "$proc/$1/comm" || true)
+    echo "${c:-exited}"
+}
 # <<< stop_slice
-SYSTEM_CONTROL_DIRS=(/etc/systemd/system.control /run/systemd/system.control)
+# >>> system_control_dirs (run by xtask/tests/install_scripts.rs)
+# Lot 351 (the review of #559, F5): the `system.control` directories
+# stop_slice may remove, empty. /run's is this boot's (tmpfs: systemd makes
+# it again whenever a runtime property needs one). /etc's only when the
+# first install recorded that the host had none (`made-dirs`, install.sh's
+# `record_made_dirs`): one the host had before stays, even empty. An install
+# older than lot 351 recorded nothing: removed when empty, as before.
+system_control_dirs() {   # <made-dirs record> <etc's dir> <run's dir>
+    SYSTEM_CONTROL_DIRS=("$3")
+    if [[ ! -e "$1" ]] || grep -qxF -- "$2" "$1" 2>/dev/null; then
+        SYSTEM_CONTROL_DIRS+=("$2")
+    fi
+}
+# <<< system_control_dirs
+system_control_dirs "$ETC_DIR/made-dirs" /etc/systemd/system.control /run/systemd/system.control
+SLICE_CGROUP=/sys/fs/cgroup/northnarrow.slice
 stop_slice
 
 # ── 5. config + state ─────────────────────────────────────────────────
@@ -633,7 +766,7 @@ if (( PURGE )); then
     # more, and a reinstall bootstraps a new one at the same path.
     [[ -f "$BOOTSTRAP_KEY" ]] && { log "PURGE: removing the bootstrap admin private key $BOOTSTRAP_KEY"; rm -f "$BOOTSTRAP_KEY"; }
     for j in /var/log/journal/*.northnarrow /run/log/journal/*.northnarrow; do
-        [[ -e "$j" ]] && { log "PURGE: removing namespace journal $j"; rm -rf "$j"; }
+        [[ -e "$j" ]] && { log "PURGE: removing namespace journal $j"; rm_tree "$j"; }
     done
 else
     kept_report
@@ -646,3 +779,25 @@ fi
 
 echo ""
 log "uninstall complete."
+# >>> contained_report (run by xtask/tests/install_scripts.rs)
+# The review of #560 (E): processes the agent contained are still in its
+# slice (stop_slice). The uninstall is complete for everything else, but it
+# does not end as a success: they are named once more, and the run exits 4
+# — 0 is no longer "nothing of NorthNarrow's runs". A package's hook
+# (--package) reports them and exits 0: a failure there would fail the
+# package operation.
+contained_report() {
+    (( ${#CONTAINED_LEFT[@]} )) || return 0
+    echo ""
+    echo "WARNING: processes the agent contained are still in northnarrow.slice, outside any unit:"
+    printf '  %s\n' "${CONTAINED_LEFT[@]}"
+    echo "  Nothing confines or watches them any more: a blocked one has its network back (the"
+    echo "  agent's nftables table is gone), a throttled one keeps the scope's limits until it exits,"
+    echo "  and stopping or restarting its original unit no longer reaches it. Decide on each (kill"
+    echo "  it, or move it back: echo <pid> > /sys/fs/cgroup<its origin>/cgroup.procs); the slice"
+    echo "  goes at the next boot. See INSTALL_UPGRADE_UNINSTALL.md, section 3."
+    (( PACKAGE )) && return 0
+    exit 4
+}
+# <<< contained_report
+contained_report

@@ -2593,8 +2593,10 @@ detail.
   with the kernel's record of `O_APPEND` writes by rsyslogd alone, is
   rsyslogd's append now. A truncation by another writer, by rsyslogd itself,
   or a rewrite in place stays High. The drift log is unchanged.
-- **`sudo ./deploy/uninstall.sh` at a terminal is Low every time.** It was
-  High 3 runs in 7: a shell that runs `sudo` as its last command executes
+- **`sudo ./deploy/uninstall.sh` at a terminal is Low** (the race is
+  closed: 0 High in 15 runs; lot 351's wording: an exec record lost to a
+  full ring or the lineage cache's eviction can still leave one High). It
+  was High 3 runs in 7: a shell that runs `sudo` as its last command executes
   sudo in place of itself, and sudo's monitor, forked in the same 10 ms
   clock tick, was not known as sudo's. sudo-rs (`/usr/lib/cargo/bin/sudo`,
   Ubuntu 26.04's `sudo`; `/usr/bin/sudo-rs`, `/usr/bin/su-rs`) counts as
@@ -2617,3 +2619,103 @@ detail.
   programs (systemd's `RestrictFileSystems=`). What remains after a purge
   (kernel modules loaded on demand, the host's own logs) is listed in
   [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.
+
+## 45. A log shrunk back to its baseline, sudo's askpass helper, the uninstall's leftovers (lot 351)
+
+- **A log truncated back to its baseline's exact content is recorded.**
+  The drain dropped a record whose content matched the start's signed
+  baseline as a no-op; a `truncate -s <baseline size>` of a log after
+  rsyslogd's appends matched it, and the lines written since were erased
+  with no drift row and no NN-L-FIM-005. A file read smaller than the drain
+  last read it is a change now, whatever the baseline says: a drift row and
+  NN-L-FIM-005 (High; a scheduled `copytruncate` of a log whose baseline is
+  empty is Low on logrotate's own record). A watched configuration file
+  edited in place and then shrunk back to its baseline is recorded too (it
+  was dropped). Not seen (P3, below): a growth the drain never read, then a
+  truncation back to the baseline's content — after the agent's start, and,
+  for a log whose signed baseline is empty, after every rotation.
+- **`sudo -A`'s askpass helper is no administrator's session.** The session
+  checks (R009, the FIM rules' kill hold, the impair rules' sanction, the
+  posture's admin changes) took any descendant of a sudo or su. sudo forks
+  the user's `SUDO_ASKPASS` program, as the user, before authenticating: a
+  root payload below it (a local privilege escalation) was Low, no kill.
+  Only the process sudo or su ran as root after authenticating vouches now
+  (its child's first exec since the fork, by the kernel's fork record, as
+  root, no PAM helper); what sudo runs as the user, `sudo -u bob` and `su
+  bob` vouch for nothing themselves (a sudo further up still covers what
+  runs below them: P3, below). `sudo env … ./x` and `sudo bash -c …` keep
+  the session (up to three execs in place). A High R009 says in the
+  journal "the sudo or su in its lineage (pid N) ran nothing as root after
+  authenticating above it".
+- **A sudo or su that root ran vouches for nothing** (the review of #560).
+  Root runs sudo and su with no credential check: after a local privilege
+  escalation, `sudo ~/payload` (sudo executed in place or from a fork, with
+  or without an askpass helper) was R009 Low, no kill, and the same pass
+  held the FIM rules' kill and the impair sanction. The real uid sudo's or
+  su's own exec ran as decides (sudo's monitor: the exec of the sudo it is
+  a fork of); the walk goes on to an elevation further up: an
+  administrator's `sudo -i` then root's own `sudo -A`, `sudo su -`, `su -`
+  then `sudo ./x` stay the administrator's. Root logged in directly (no
+  sudo or su above) who runs `sudo ./x` from a home is R009 High now — as
+  root's direct session already was. The journal says "the sudo or su in
+  its lineage (pid N) was run by a process already root". A sudo session
+  older than the agent's start is not held against (its caller cannot be
+  read).
+- **A sudo or su not executed as the host's binary vouches for nothing**
+  (the re-check 1 of #560). The elevation binaries were recognised by
+  their path only: after a local privilege escalation, a fake
+  `/usr/bin/sudo` in a chroot or a private mount namespace, executed with
+  the user's own real uid, forked its payload as root exactly as the host's
+  sudo does, and it was R009 Low. The sudo or su that vouches must have its
+  image now — executed from a root-only directory, in PID 1's mount
+  namespace and with PID 1's root directory (`ROOT_DIR`, as the packaged
+  `go` of #555); otherwise it is passed over and the walk goes on. The
+  journal says "was not executed from the host's root-only directory in
+  PID 1's mount namespace". `ROOT_DIR` itself now also needs PID 1's root:
+  a chrooted process gets none (a plain chroot had none in practice
+  already; one root built to match did). In tracepoint mode the exec pump's
+  read gives sudo its image as before. The operator's `sudo
+  ./deploy/uninstall.sh` and `sudo -i` stay Low.
+- **This does not close every LPE (P2, residual below).** An escalation
+  that keeps real uid 0 and runs sudo is High; one that first sets its real
+  uid to a sudoer's whose sudo asks for nothing — a `NOPASSWD` sudoer (the
+  default user of cloud images), or any sudoer once root forges sudo's
+  timestamp in `/run/sudo/ts` (FIM does not watch it) — and then runs the
+  host's sudo still gets the session's cover (R009 Low, the FIM kill hold,
+  the impair sanction): sudo authorizes by the real uid, and the agent sees
+  an administrator's `sudo payload`.
+- **`uninstall.sh` and the agent's containment cgroups.** `blocked.scope`
+  and `throttled.scope` under `northnarrow.slice` are removed when empty.
+  One holding a process the agent contained is left with it — not killed,
+  not released — the processes (pid and command) and the agent's
+  containment record printed, and the slice is then not stopped (it goes
+  at the next boot). The review of #560: a kill cgroup an agent stopped in
+  the middle of a kill left (`blocked.scope/neutralize-*`) is removed when
+  empty, and thawed when it holds processes (nothing else would ever thaw
+  them; its processes are named, with their real pids, and run again,
+  unwatched). An uninstall that leaves such processes names them again at
+  the end and **exits 4** (`--package`: 0) — not 0: they are outside any
+  unit and no longer confined. Scripts that run `uninstall.sh` and test for
+  0 see 4 there.
+- **`/etc/systemd/system.control` is removed only when the install made
+  it.** A first install records the directories its units are about to
+  make in `/etc/northnarrow/made-dirs`; the uninstall removes /etc's empty
+  `system.control` only when it is listed (or when no record exists: an
+  install older than this one). No action on upgrade: the record is made by
+  a first install only.
+- **The uninstall removes no mount point in systemd's trees.** The
+  directories it removes there (drop-in directories, the journal
+  namespace's runtime directory and journals) are left when they are a
+  mount point, and their removal does not cross into another file system.
+
+Known residuals of lot 351 (P3 unless marked, named for later lots):
+
+| Residual | Where | What would close it |
+|---|---|---|
+| **P2 (the re-check 1 of #560, H(a)).** A local privilege escalation that sets its real uid to a sudoer's whose sudo asks for nothing (`NOPASSWD`: a cloud image's default user; or a timestamp root forges in `/run/sudo/ts`, which FIM does not watch), then executes the host's sudo: sudo authorizes by the real uid, forks the payload as root, and the agent sees an administrator's `sudo payload` — R009 Low, the FIM kill hold, the impair sanction | the session check (`is_interactive_admin`) | the real uid stays the same along the walk, from the sudo or su up to the login or authentication hop (a uid change with no elevation hop between is no session) |
+| **F (the re-check 1 of #560).** Without the kernel's fork record (`FORK_PARENT_DEGRADED`: an eBPF object or kernel that cannot attach it) no sudo session is an administrator's — fail-closed: an administrator's `sudo ./deploy.sh` from a home is R009 High and killed outside `alpha`, and the FIM kill hold is lost — and the degradation's text does not say so; the fork record is not re-checked on 5.15 or Debian since lot 351 | `FORK_PARENT_DEGRADED` (`nn-linux` multiplexer), the lab | the degradation's text names both effects; a lab round on a 5.15 kernel and on Debian |
+| **G (the re-check 1 of #560, hardening).** The start's scan enters a process whose `/proc` shows no uid as real uid 0 (`uid.unwrap_or(0)` in the seed); `ELEVATION_EXES` is `pub`, outside the ratchet that keeps the elevation walk its only reader. No user can cause either, and nothing outside tests reads the constant | `posture::lineage` | a process with no uid read is not entered (or entered as unknown); the constant private to the crate, or named in the ratchet |
+| A growth the drain never read, then a truncation back to the baseline's content: after the agent's start (until the first close of the log), and, **for a log whose signed baseline is empty, after every rotation** (`copytruncate`, `create`: the last read is 0 again, a wipe to 0 matches both) | the FIM drain (`TAPPA9_FIM_TRUST_MODEL.md`) | the kernel's size before the setattr in the record (eBPF + wire) |
+| A sudo or su further up covers what runs below `su bob` / `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session) | the session check | a hop below that ran as another user as a barrier (a decision of its own) |
+| `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
+| A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |

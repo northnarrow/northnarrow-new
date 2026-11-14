@@ -2896,6 +2896,32 @@ done
 # emptiness at attach time. Documented in:
 #   docs/operator/TAPPA9_FIM_TRUST_MODEL.md
 
+# >>> record_made_dirs (run by xtask/tests/install_scripts.rs)
+# Lot 351 (the review of #559, F5): the agent's unit makes
+# /etc/systemd/system.control (the parent of the units' `set-property`
+# drop-in directories) at its first start where the host has none, and
+# uninstall.sh removed it whenever it was empty — one the host had before
+# too. The first install records, before any start, the directories outside
+# NorthNarrow's own its units are about to make (`$ETC_DIR/made-dirs`, one
+# path per line; none: the host had them); uninstall.sh removes one, empty,
+# only when it is listed. An upgrade, and an install over kept
+# configuration, keep the first install's record (an install older than lot
+# 351 has none: uninstall.sh removes the directory when empty, as before).
+record_made_dirs() {   # <record> <dir>...
+    local list=$1 d
+    shift
+    [[ -e "$list" ]] && return 0
+    (( UPGRADE )) && return 0
+    : > "$list.nn-new"
+    for d in "$@"; do
+        [[ -e "$d" ]] || printf '%s\n' "$d" >> "$list.nn-new"
+    done
+    chmod 0644 "$list.nn-new"
+    mv -fT "$list.nn-new" "$list"
+}
+# <<< record_made_dirs
+record_made_dirs "$ETC_DIR/made-dirs" /etc/systemd/system.control
+
 echo "install.sh: reloading systemd unit catalogue"
 write_install_manifest
 systemctl daemon-reload

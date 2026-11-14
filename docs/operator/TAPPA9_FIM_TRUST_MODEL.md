@@ -192,6 +192,42 @@ with other bytes (rewritten in place): High, as before. And the size a file
 had when it was watched is read before the kernel watches its inode (it was
 read after: an append landing in between was measured in it).
 
+Lot 351 (the review of #559, F1): the drain drops a record as a no-op when
+the content it reads matches the start's signed baseline (a `touch`). The
+baseline is the start's, not the last state the drain saw: a log truncated
+back to the exact content of its baseline (`truncate -s <baseline size>`
+after rsyslogd appended a login's lines) matched it, and every line written
+since was erased with no record and no NN-L-FIM-005. A file read smaller
+than the drain last read it (or than its size when it was watched) is now a
+change whatever the baseline says — recorded and judged with the size it
+had (High; logrotate's scheduled `copytruncate` of a log whose baseline is
+empty is Low on logrotate's own record, as any other rotation). A
+same-size return to the baseline (bytes rewritten in place, then back) is
+still dropped: its change was judged when it was read. Not closed (P3,
+the review of #560): a growth the drain never read, then a truncation back
+to the size it last read and the baseline's content. A record leaves the
+kernel only at a close of the file, and rsyslogd keeps its log open: its
+appends leave none, and the drain's last read stays where it was. The drain
+cannot tell such a truncation from a `truncate` that changed nothing, in two
+cases:
+
+- after the agent's start, the last read is the baseline's size until the
+  first close of the log — days, on a quiet host: a truncation back to the
+  baseline's exact content (the install-time lines, routine ones included,
+  byte for byte) erases what was appended since, unseen;
+- **when the signed baseline is empty** (a log installed right after a
+  rotation: plausible on a quiet host) the case **comes back after every
+  rotation**, not only after the agent's start. A judged shrink
+  (`copytruncate`) or a new log (`create`) leaves the last read at 0; the
+  appends after it leave no record; a truncation to 0 matches both the empty
+  baseline and the last read — no record, no NN-L-FIM-005, for the rest of
+  each rotation period (a kernel line `module verification failed:
+  tainting kernel` from a module load, erased).
+
+The kernel's size before the setattr (or the largest size seen while a
+record of the file was pending) in the record would close both: an eBPF and
+wire change, for a later lot.
+
 Residuals, named: a process that runs rsyslogd's image itself (an rsyslog
 module, `LD_PRELOAD` into rsyslogd) writes as rsyslogd — its growth of a log,
 or its collapse inside the window of another process's truncation, is
@@ -218,6 +254,12 @@ The `ld.so.preload`, `authorized_keys`, bait and credential rules are never rela
 An administrator session's configuration changes still raise the posture to ENGAGED and stay in the signed detection chain. They do not corroborate each other into COMBAT: editing `sshd_config` and then adding a unit is routine work. A signal of another kind in the same login session (an offensive tool, exfiltration, an exec from `/tmp`) still takes the next one to COMBAT.
 
 Whoever holds an administrator's session and sudo password is that administrator to these rules.
+
+Lot 351 (the review of #559, F2): the sudo or su in the writer's lineage vouches only through the process it ran as root after authenticating — its child's process, whose first exec since that fork (the kernel's fork record) ran as root and is no PAM helper. Any user may run sudo, and `sudo -A` forks the user's `SUDO_ASKPASS` program, as the user, before any authentication: a write below it — even by a process that became root there through a local privilege escalation — was "an administrator's session". It is not now; nor is `sudoedit`'s editor or `sudo -u`/`su` to another user. A session older than the agent's start (no exec of it could be seen) is judged on the uid `/proc` showed at the start.
+
+The review of #560 (A): a sudo or su that a process already root ran (the real uid its exec of the binary ran as is 0) vouches for nothing — root's sudo and su ask for no credential. After a local privilege escalation, `sudo tee /etc/…` (sudo executed in place or from a fork, with or without an askpass helper) was "forked by sudo, as root": the rules' kill was held. It is not now; the walk goes on to a sudo or su further up (an administrator's `sudo -i`, then root's own `sudo`: still the administrator's). sudo's monitor (a fork of sudo, root's) answers by the exec of the sudo it is a fork of. Residuals (P3): a sudo or su further up covers what runs below a `su bob` or `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session); a sudo older than the agent's start is not held against (its caller cannot be read: `/proc` shows sudo as root once it has authenticated).
+
+The re-check 1 of #560 (H(b)): the sudo or su that vouches must have been executed as the host's binary — its image (`ROOT_DIR`: a root-only directory, in PID 1's mount namespace and with PID 1's root directory). A fake `/usr/bin/sudo` in a chroot or a private mount namespace, executed with the user's own real uid, forked its payload as root as the real one does, and held the rules' kill; it vouches for nothing now. Residual (P2, named in `UPGRADE_NOTES_WAVE4.md` §45): a local privilege escalation that sets its real uid to a sudoer's whose sudo asks for nothing (a `NOPASSWD` sudoer, or a timestamp root forges in `/run/sudo/ts`, which these rules do not watch) and then runs the host's sudo is still an administrator's session here — the kill held.
 
 ## A store's own client (review 85)
 

@@ -15,7 +15,9 @@
 //!   link, in the process's own view of the files (`/proc/<pid>/root`),
 //!   only when that image is still the exec's own and the process runs in
 //!   PID 1's mount namespace (the re-check of #539, N6: a user's namespace
-//!   binds a root directory over its own; a container's process gets none).
+//!   binds a root directory over its own; a container's process gets none)
+//!   and with PID 1's root directory (the re-check 1 of #560, H(b): a
+//!   chroot's view of the executed path's directory is the chroot's choice).
 //! - `ENV_LOADS`: an interpreter naming a script of a root-owned system tree
 //!   (a client's or an installed program's identity), or naming nothing,
 //!   whose environment loads the caller's code beside it (`PYTHONPATH`,
@@ -136,7 +138,10 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     // the re-check of #539 (N6): a process in another mount namespace
     // shows the files it chose (a user's bind mount over its own
     // directory): no `ROOT_DIR` for it
-    let init_mounts = same_mount_namespace(proc_root, &dir);
+    // the re-check 1 of #560 (H(b)): nor for a chrooted one (the same
+    // mount namespace): root builds the tree its view of the executed
+    // path's directory shows (a fake `/usr/bin/sudo`)
+    let init_mounts = same_mount_namespace(proc_root, &dir) && same_root(proc_root, &dir);
     if let Some(path) = link
         .as_deref()
         .filter(|_| own && init_mounts)
@@ -271,6 +276,21 @@ fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
     }
 }
 
+/// The re-check 1 of #560 (H(b)): the process's root directory
+/// (`/proc/<pid>/root`, followed) is PID 1's — the same device and inode:
+/// not a chroot. Not readable: not known, so no.
+fn same_root(proc_root: &Path, dir: &Path) -> bool {
+    let id = |d: &Path| {
+        std::fs::metadata(d.join("root"))
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    };
+    match (id(dir), id(&proc_root.join("1"))) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The process's standard input is a file, a pipe or a socket: not a
 /// terminal, not `/dev/null`, not closed.
 fn stdin_is_a_program(dir: &Path) -> bool {
@@ -334,7 +354,12 @@ mod tests {
         std::fs::create_dir_all(d.join("fd")).unwrap();
         symlink(image, d.join("exe")).unwrap();
         symlink("/", d.join("root")).unwrap();
-        // PID 1's mount namespace, and the process in it
+        // PID 1's mount namespace and root, and the process in them
+        let init_root = root.join("1/root");
+        if init_root.symlink_metadata().is_err() {
+            std::fs::create_dir_all(root.join("1")).unwrap();
+            symlink("/", init_root).unwrap();
+        }
         mount_ns(root, 1, INIT_NS);
         mount_ns(root, pid, INIT_NS);
         let mut env = environ.join("\0").into_bytes();
@@ -613,6 +638,34 @@ mod tests {
         std::fs::remove_file(proc.path().join("1/ns/mnt")).unwrap();
         mount_ns(proc.path(), 60, INIT_NS);
         let mut e = spawn(60, Default::default(), "/usr/bin/env", &["env"]);
+        read_under(proc.path(), &mut e);
+        assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "not known");
+    }
+
+    /// The re-check 1 of #560 (H(b)): a chrooted process (PID 1's mount
+    /// namespace, another root) gets no `ROOT_DIR`, even where its view of
+    /// the executed path's directory is root's only — root builds that tree
+    /// (a fake `/usr/bin/sudo` under a chroot whose `<root>/<path's dir>` is
+    /// root-owned). Here its root is the host's `/usr`, its link's text
+    /// `/bin/sh`: the view `/usr/bin` is root's only. PID 1's root not
+    /// readable: not known, so none.
+    #[test]
+    fn a_chrooted_process_has_no_root_dir() {
+        let proc = tempfile::tempdir().unwrap();
+        proc_with(proc.path(), 70, Path::new("/bin/sh"), &[], None);
+        let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
+        read_under(proc.path(), &mut e);
+        assert!(flags(&e).0 & exe_flags::ROOT_DIR != 0, "PID 1's root");
+        let d = proc.path().join("70");
+        std::fs::remove_file(d.join("root")).unwrap();
+        symlink("/usr", d.join("root")).unwrap();
+        let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
+        read_under(proc.path(), &mut e);
+        assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "a chroot");
+        std::fs::remove_file(d.join("root")).unwrap();
+        symlink("/", d.join("root")).unwrap();
+        std::fs::remove_file(proc.path().join("1/root")).unwrap();
+        let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
         read_under(proc.path(), &mut e);
         assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "not known");
     }

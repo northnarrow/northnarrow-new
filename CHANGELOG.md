@@ -946,6 +946,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
+  - **F1 — a log truncated back to its signed baseline's exact content was
+    dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written
+    since erased without a trace). A file read smaller than the drain last
+    read it (`InodePathMap::last_size`) is drift whatever the baseline says
+    (`process_drift`: `shrank_since_read`).
+  - **F2 — `is_interactive_admin` took any descendant of a sudo or su**,
+    `sudo -A`'s askpass helper included (the user's program, as the user,
+    before authenticating): a root payload below it was R009 Low, no kill.
+    The elevation hop vouches only through the process it ran as root after
+    authenticating — the first exec of its child's process (the spawn
+    cache's history), forked by it (the kernel's fork record), real uid 0,
+    no PAM helper (`elevation_walk`, `elevated_child`); one walk for the
+    check, its status and its journal reason. Ratchet: `ELEVATION_EXES` and
+    the PAM helpers are `AUTH_BINARY_EXES`.
+  - **#559's P3s.** `uninstall.sh` removes the agent's empty containment
+    cgroups (`blocked.scope`, `throttled.scope`) and leaves a held one —
+    neither killed nor released, its processes and the containment record
+    printed, the slice not stopped; removes `/etc/systemd/system.control`
+    only when the first install recorded making it (`made-dirs`,
+    `record_made_dirs`); removes directories in systemd's trees through
+    `rm_tree` (never a mount point, `--one-file-system`; a ratchet forbids a
+    plain `rm -rf` there). "Low every time" in the guides is exact now.
+  - **The review of #560 (A) — a sudo or su that root ran vouched for its
+    child**: only the child's uid was checked, not who ran sudo. After a
+    local privilege escalation, `sudo ~/payload` (in place or from a fork,
+    with or without an askpass helper) was R009 Low, no kill, and held the
+    FIM rules' kill and the impair sanction. A sudo or su whose own exec ran
+    as real uid 0 vouches for nothing now (`invoked_by_root`; sudo's monitor
+    by the front-end's exec), and the walk goes on to an outer elevation;
+    `sudo su -` and `sudo sudo` are judged by the outer sudo
+    (`is_monitor_of` keeps the old pass-over for sudo's monitor only).
+  - **The review of #560 (D, E)** — `uninstall.sh`: a kill cgroup left by an
+    interrupted kill (`blocked.scope/neutralize-*`) is removed when empty,
+    thawed when held; every process left is named by pid and command; a run
+    that leaves any exits 4 (`--package`: 0). The FIM residual of an empty
+    baseline (it recurs after every rotation) and `is_credential_reader`
+    are named P3s (`UPGRADE_NOTES_WAVE4.md` §45).
+  - **The re-check 1 of #560 (H(b)) — a sudo was recognised by its path
+    only**: a fake `/usr/bin/sudo` in a chroot or a private mount namespace,
+    executed with the caller's own real uid, vouched for the root payload it
+    forked (R009 Low, the FIM kill hold, the impair sanction). The sudo or
+    su that vouches must have its image now (`cannot_vouch`: `Entry::image`,
+    `ROOT_DIR` in PID 1's mount namespace, as #555 F1's `go`), and
+    `ROOT_DIR` also needs PID 1's root directory (`exec_facts::same_root`:
+    a chroot's view of the executed path's directory is root's choice).
+    `uninstall.sh --help` lists its exit 4.
+  - **Residual, P2 (H(a), named for a later lot):** a local privilege
+    escalation that sets its real uid to a sudoer's whose sudo asks for
+    nothing (a `NOPASSWD` sudoer — a cloud image's default user — or a
+    timestamp root forges in `/run/sudo/ts`, which FIM does not watch) and
+    then runs the host's sudo still gets the session's cover: sudo
+    authorizes by the real uid. Closing it needs the real uid to stay the
+    same from the sudo up to the login (§45).
 - Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
   raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
   record is told by identity, none by a name.

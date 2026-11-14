@@ -6124,11 +6124,13 @@ mod tests {
     fn admin_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
         let (tmp, t) = pkg_fixture();
         t.ingest_spawn(700, 1, "/usr/bin/bash", 7);
-        t.ingest_spawn(710, 700, "/usr/bin/sudo", 8);
-        t.ingest_spawn(720, 710, "/usr/bin/vim.basic", 9);
-        t.ingest_spawn(730, 710, "/usr/bin/apt-get", 10);
+        t.ingest_host_exec(710, 700, "/usr/bin/sudo", (8, 8), 1000, 0);
+        // lot 351: what sudo ran as root after authenticating (the kernel's
+        // fork record of each, `AuthSessionTracker::is_interactive_admin`)
+        t.ingest_first_exec(720, 710, "/usr/bin/vim.basic", 9, 0);
+        t.ingest_first_exec(730, 710, "/usr/bin/apt-get", 10, 0);
         t.ingest_spawn(740, 730, "/usr/bin/dpkg", 11);
-        t.ingest_spawn(750, 710, "/usr/bin/tee", 12);
+        t.ingest_first_exec(750, 710, "/usr/bin/tee", 12, 0);
         session_proc(tmp.path(), 720, 710, 34816);
         session_proc(tmp.path(), 740, 730, 34816);
         session_proc(tmp.path(), 750, 710, 0);
@@ -6183,6 +6185,44 @@ mod tests {
                 v.reasoning
             );
         }
+    }
+
+    /// The review of #560 (A): a sudo whose caller was already root (a
+    /// local privilege escalation at the user's terminal, then `sudo tee
+    /// /etc/passwd`) holds no kill — root's sudo asks for no credential.
+    /// Nor (the re-check 1 of #560, H(b)) does a sudo whose exec had no
+    /// image. The administrator's sudo (710) still does.
+    #[test]
+    fn root_s_own_sudo_holds_no_fim_kill() {
+        let (tmp, lineage) = admin_fixture();
+        lineage.ingest_first_exec(760, 700, "/home/alice/lpe", 13, 1000);
+        lineage.ingest_host_exec(760, 700, "/usr/bin/sudo", (14, 13), 0, 0);
+        lineage.ingest_first_exec(770, 760, "/usr/bin/tee", 15, 0);
+        session_proc(tmp.path(), 770, 760, 34816);
+        // the re-check 1 of #560 (H(b)): a fake sudo (no image: a chroot's
+        // or a mount namespace's file at the path), the user's real uid
+        lineage.ingest_first_exec(780, 700, "/usr/bin/sudo", 16, 1000);
+        lineage.ingest_first_exec(790, 780, "/usr/bin/tee", 17, 0);
+        session_proc(tmp.path(), 790, 780, 34816);
+        let rules = rules_by_id(&lineage);
+        let rule = &rules["NN-L-FIM-003_SensitiveConfigModified"];
+        for (pid, who) in [
+            (770, "root's own sudo"),
+            (790, "a sudo not of the host's image"),
+        ] {
+            let v = built(
+                rule.as_ref(),
+                &written_by(FimOp::Modified, "/etc/passwd", pid, "tee"),
+            )
+            .expect("fires");
+            assert_ne!(v.action, ResponseAction::Log, "{who}");
+        }
+        let v = built(
+            rule.as_ref(),
+            &written_by(FimOp::Modified, "/etc/passwd", 720, "vim"),
+        )
+        .unwrap();
+        assert_eq!(v.action, ResponseAction::Log, "the administrator's sudo");
     }
 
     /// The package carve-out still applies inside an admin session (`sudo
