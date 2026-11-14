@@ -94,10 +94,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `bpf_prog` once verified, on every foreign handle, against targets the
     hook calibrates from two of the agent's own programs (kallsyms is hidden
     from the agent's unit), and `bpf_probe_write_user` at the verifier's
-    `locked_down` question. The scan is three global BPF functions (256 ×
-    64 × 64 instructions, each verified once); a longer or unreadable
-    program is refused. Each refusal is a signed `bpf_prog_type` naming the
-    helper.
+    `locked_down` question. The scan is four global BPF functions (32 ×
+    32 × 32 × 32 instructions, each verified once), one lookup of the
+    instruction's call key in a frozen map each (5.15's verifier processed
+    950,584 instructions for a first shape, 12,328 for this one); a longer
+    or unreadable program is refused. Each refusal is a signed
+    `bpf_prog_type` naming the helper.
   - **F8 profile to profile.** `agent_boot` signs the profile and its
     source; the `profile_downgraded` alarm compares the previous boot's
     profile (an observing boot in between no longer launders it) and is a

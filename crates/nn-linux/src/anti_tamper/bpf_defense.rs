@@ -485,11 +485,9 @@ pub struct ContentJudge {
 
 impl ContentJudge {
     /// The call keys of the targets, each with its slot plus one
-    /// (`PROG_CONTENT_KEYS`): none when the judge is off.
+    /// (`PROG_CONTENT_KEYS`): none when the judge is off (its targets are
+    /// all 0).
     pub fn keys(&self) -> Vec<(u64, u32)> {
-        if self.stage == common::bpf_prog_class::CONTENT_STAGE_OFF {
-            return Vec::new();
-        }
         self.targets
             .iter()
             .enumerate()
