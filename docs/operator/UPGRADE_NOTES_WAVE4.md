@@ -2430,11 +2430,23 @@ detail.
       non-blocking, takes a regular file only and reads at most a bound
       (16 MiB; the watch's sources 4 MiB): a FIFO or `/dev/zero` bound over
       one no longer stalls the round or exhausts the agent.
+    - **A read that does not answer no longer stalls the round (its
+      re-check, F7).** `O_NONBLOCK` does not reach a FUSE file: a regular
+      FUSE file bound over `/proc/sys/kernel/tainted`, `/proc/1/stat`, a
+      loader's `/proc` files or a file the CPU watch reads at its start
+      stalled the whole kernel-state round (the cross-view, the taint
+      read, the CPU watch, the held set's prune). Those reads now wait at
+      most 2 s for their answer (a helper thread; at most four left
+      blocked, then each such read fails at once): the round goes on, and
+      a round with such a read is one the CPU watch cannot judge — three
+      in a row are the signed `cpu_confined` "could not judge" record,
+      naming the read.
     - Still open: another sysfs or procfs file bound over the online file
       BEFORE the agent starts passes the magic check (the union keeps it
       from narrowing unless both sources are faked); a FUSE regular file
-      can still stall a read; a slice's `cpuset.cpus` written inside a
-      window narrows the expectation; `CPUAffinity=numa` is not read;
+      bound over a file the round reads costs each round its 2 s deadline
+      (reads outside that round are not timed); a slice's `cpuset.cpus`
+      written inside a window narrows the expectation; `CPUAffinity=numa` is not read;
       three rounds of real hotplug in a row give the "could not judge"
       record (true: the watch could not judge).
   - Not watched: the watchdog's CPUs (the agent's own threads only).
@@ -2465,6 +2477,24 @@ detail.
   - **The window's load itself is signed** (`bpf_held_load`, High, not
     refused, naming the call and the program id), on every kernel, so it
     is never silent — even where it is used in a way no hook sees.
+  - **A tail call's slot fails closed (its re-check, N1).** A prog array's
+    update was judged on its value read the way a user pointer is read,
+    and let through when that read failed: a value in a page not yet in
+    memory (the kernel's own copy, after the check, brings it in) or the
+    kernel pointer a `syscall` program's own update passes
+    (`bpf_sys_bpf`). A held program then went into a slot, and a clean
+    program's run jumped into it with no record. The kernel's read is
+    tried next now, and a value neither read gives is refused (`EPERM`,
+    `bpf_held_use` High, "a value not read", the prog array's map id). A
+    tool that updates a prog array from a page it never touched gets
+    `EPERM` once and succeeds when it retries.
+  - **Still loaded after the window: signed (its re-check, item 2).**
+    Once no window is open, the kernel-state round signs each held
+    program still loaded — attached by a link or an attach made inside
+    the window, pinned, or kept by a descriptor — as `bpf_held_load`
+    High, "still loaded after the window closed", naming the program,
+    its call and where it is attached; once per program and per agent
+    start (an agent restart signs it again).
   - **What stays open:** what was attached INSIDE the window keeps running
     after it (a link, pinned or not; a perf event; a prog array filled
     then; an iterator link read later with `cat`), and an XDP or tc program
@@ -2515,3 +2545,29 @@ detail.
   root (an uninstall removes it with the rest), and
   `PROG_CONTENT_HELD_INFLIGHT`, unpinned. Two new NN-L-AT-001 operations:
   `bpf_held_load` (not refused) and `bpf_held_use` (refused).
+- **Residuals, named (the re-check of #558).**
+  - **P1, after the alpha: the trusted-installer window is the host's.**
+    While it lasts, EVERY root process gets what it lifts — an untrusted
+    module, kexec, the protected files, `systemctl stop` of the agent, a
+    forbidden BPF load and what it attaches — not only the process tree
+    of the `nn-admin trusted-installer-grant` that opened it. Scoping the
+    window to the requester's tree is one fix for all of them; until then
+    open a window only on a host you trust for its length, and keep it
+    short (`--window-secs`).
+  - **P2: the `dup2` race.** Another thread's `dup2` of a descriptor
+    between the agent's check and the kernel's own read (a few
+    microseconds), or a prog array's value rewritten in that gap, can
+    win: each lost attempt is refused and signed (`bpf_held_use`), so a
+    tight loop leaves records as it tries, and the load was signed. No
+    hook exists that sees the resolved program for every run and attach.
+  - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
+    attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
+    carry a map's descriptor where the agent reads a program's: on 6.8 a
+    counted fail-open (with a rate-limited `deny_fail_open` record), on
+    7.0 a random id that is never held in practice — noise on hosts with
+    sched_ext or a BPF TCP congestion control, never a false refusal.
+  - **P3: the CPU watch's sources trusted by filesystem type.** A file of
+    the same filesystem bound over the online list and `/proc/stat` (or a
+    cgroup2 subtree over `/sys/fs/cgroup`) BEFORE the agent's first round
+    passes the check and can narrow what it expects; it needs a boot unit
+    or an upgrade, since the agent does not restart outside a window.
