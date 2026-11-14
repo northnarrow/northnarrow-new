@@ -821,7 +821,10 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let bin = t.path().join("usr/sbin/dnsmasq");
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::copy("/bin/sleep", &bin).unwrap();
+        // lot 344: a copy of the shell looping on `sleep 1` — a copy of
+        // `sleep` named `dnsmasq` runs no utility on uutils' multicall
+        // coreutils (Ubuntu 26.04, the hosted runners): it exited at once
+        std::fs::copy("/bin/sh", &bin).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         // the same file at a path outside a system tree, and at a system
         // path whose name is no resolver's
@@ -830,7 +833,10 @@ mod tests {
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             std::fs::hard_link(&bin, &at).unwrap();
         }
-        let mut child = std::process::Command::new(&bin).arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new(&bin)
+            .args(["-c", "while :; do sleep 1; done"])
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let lineage = AuthSessionTracker::with_proc().with_host_root(t.path());
         // the review of #552 (F4): the process runs as dnsmasq's service —

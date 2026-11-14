@@ -55,7 +55,7 @@ use northnarrow_common::wire::open_sensor::{
     OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, OVERWRITE_MIN_BYTES, RENAME_APPENDED,
     RENAME_OTHER, RUNTIME_UIDS_MAX,
 };
-use northnarrow_common::wire::{InodeKey, FIM_OP_OPENED};
+use northnarrow_common::wire::InodeKey;
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_FLAGS_OFFSET,
@@ -965,7 +965,7 @@ unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
         }
         // Review 75: a read-only repeat by the same task is dropped.
         if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
-            crate::fim_watch::emit_drift(FIM_OP_OPENED, key);
+            crate::fim_watch::emit_drift_opened(key);
         }
     }
     if !armed() {

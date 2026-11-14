@@ -131,6 +131,27 @@ pub struct FimEvent {
     /// rename, reported as [`FimOp::Created`]), not created there.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub moved_in: bool,
+    /// Lot 344 (the alpha's false positives): a `Modified` seen at close
+    /// whose kernel record says every write since the file's last record
+    /// went through a file opened with `O_APPEND`, by this event's writer
+    /// alone (`FIM_WRITE_APPEND_ONLY` and `FIM_WRITE_ONE_WRITER`, one
+    /// process: a pid reused is another). Not a proof that nothing shrank
+    /// (the review of #554, F1): `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an
+    /// `O_APPEND` file removes a range through the same write check, with no
+    /// setattr — a shrink is explained only by [`Self::truncated_by_another`].
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub appends_only: bool,
+    /// The review of #554 (F1): a `Modified` seen at close whose kernel
+    /// record says ANOTHER process changed the file's size by a setattr while
+    /// the writes were pending (`FIM_WRITE_TRUNCATED_BY_ANOTHER`), and that
+    /// truncation's own record reached the drain before it, from another
+    /// writer: `logrotate`'s `copytruncate` truncating the log `rsyslogd`
+    /// appends to — `rsyslogd`'s appends emitted at the close of logrotate's
+    /// file were judged a truncation by `rsyslogd` (NN-L-FIM-005 High). The
+    /// size the drain reads smaller is that truncation's, judged on its own
+    /// record with its own writer.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub truncated_by_another: bool,
 }
 
 /// Wave 2 (TST-004): a watched file's permission bits and ownership, as
@@ -737,6 +758,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -841,6 +864,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

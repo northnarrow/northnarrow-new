@@ -1282,6 +1282,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 
@@ -1557,6 +1559,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

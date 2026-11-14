@@ -783,7 +783,15 @@ mod tests {
     #[test]
     fn neutralize_quarantines_the_offenders_binary() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mal = tmp.path().join("mal");
+        // Lot 344 (#549's CI failure, its root cause): the copy keeps the
+        // name `sleep`, in a directory of its own — the hosted runners'
+        // coreutils (Ubuntu 26.04: uutils, one multicall binary) pick the
+        // utility from the name it is run by, and a copy named `mal` printed
+        // "coreutils: unknown program 'mal'" and exited at once: NEUTRALIZE
+        // then found no binary (NO_BINARY) whenever it read the child after
+        // its exit.
+        std::fs::create_dir(tmp.path().join("mal")).unwrap();
+        let mal = tmp.path().join("mal").join("sleep");
         std::fs::copy("/bin/sleep", &mal).unwrap();
         // ETXTBSY: another test thread's fork may still hold the copy's
         // write descriptor for an instant.

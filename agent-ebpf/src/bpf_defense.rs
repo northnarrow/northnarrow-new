@@ -93,7 +93,7 @@ use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
-    BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_HANDLE,
+    BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD, FS_OP_BPF_HANDLE,
     FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
 
@@ -1399,7 +1399,23 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     }
     let foreign_handle =
         own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
-    let report_cmd = if foreign_handle {
+    // Lot 344 (the alpha's false positives): a fresh agent or watchdog —
+    // its binary by device and inode, its role vacant, its main thread, its
+    // first minute — opening the agent's pins before it is a protected pid
+    // is the family's own start (the watchdog registers itself through
+    // `PROTECTED_PIDS`' pin), let through above for that reason: not a
+    // foreign handle (NN-L-BPF-002 High at every start). The review of #554
+    // (F2): recorded on its own (Low), not silenced — a foreign program made
+    // "the watchdog by device and inode" (`PR_SET_MM_EXE_FILE`) while the
+    // role is vacant takes this path too. A second instance beside the live
+    // one, or one past its first minute, is still a foreign handle; a handle
+    // on one of the agent's LINKS (by id, or its pin) is never exempt by
+    // executable (external audit EBPF-002), nor here.
+    let fresh_instance =
+        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();
+    let report_cmd = if fresh_instance {
+        BPF_CMD_FRESH_INSTANCE_GET_FD
+    } else if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
     } else {
         cmd

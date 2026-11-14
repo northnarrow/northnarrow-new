@@ -1009,6 +1009,17 @@ impl Cli {
             northnarrow_agent::posture::sibling_watchdog_exe(own.as_deref())
         })
     }
+
+    /// The agent's executable and the watchdog's ([`Self::resolved_watchdog_exe`]),
+    /// by device and inode: the stale-pid scan of `PROTECTED_PIDS` and the
+    /// `bpf` hook's roles take this one value (lot 344, #554's KVM suites).
+    pub(crate) fn own_exes(&self) -> northnarrow_agent::anti_tamper::OwnExes {
+        use northnarrow_agent::anti_tamper::{ExeIdentity, OwnExes};
+        OwnExes {
+            agent: ExeIdentity::of_process(std::process::id()),
+            watchdog: ExeIdentity::of_file(&self.resolved_watchdog_exe()),
+        }
+    }
 }
 
 /// `--file-open-sensor`.
@@ -1190,6 +1201,37 @@ mod tests {
             .collect();
         dirs.sort();
         assert_eq!(dirs, ["a", "admin", "c", "f", "h", "id", "k", "m", "y"]);
+    }
+
+    /// Lot 344 (#554's KVM suites): the `bpf` hook knew the watchdog as the
+    /// agent's sibling `northnarrow-watchdog` while the agent verified the
+    /// one `--watchdog-exe` names — that watchdog's start took the agent's
+    /// pins as a foreign process (NN-L-BPF-002 High). Both now read the one
+    /// identity: the file `--watchdog-exe` names, and this executable.
+    #[test]
+    fn the_hook_s_watchdog_is_the_watchdog_the_agent_verifies() {
+        use northnarrow_agent::anti_tamper::ExeIdentity;
+        let _env = TEST_ENV.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().join("northnarrow-watchdog-elsewhere");
+        std::fs::write(&wd, b"a watchdog").unwrap();
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent".as_ref(),
+            "--watchdog-exe".as_ref(),
+            wd.as_os_str(),
+        ])
+        .expect("a test's command line");
+        let own = cli.own_exes();
+        assert_eq!(own.watchdog, ExeIdentity::of_file(&wd));
+        assert!(own.watchdog.is_some());
+        assert_eq!(
+            own.agent,
+            ExeIdentity::of_file(&std::env::current_exe().unwrap())
+        );
+        assert!(own.agent.is_some());
+        assert_ne!(own.agent, own.watchdog);
+        // the stale-pid scan keeps exactly these two
+        assert_eq!(own.keep(), [own.agent.unwrap(), own.watchdog.unwrap()]);
     }
 
     /// Wave 4 (lab PR 214): a unit written for an agent with the LLM

@@ -552,6 +552,18 @@ fn is_authorized_keys_path(path: &str) -> bool {
 ///   (c) the file GREW (`new_size > baseline_size`) — an append.
 ///       A shrink/truncation, or unknown sizes, is NOT exempted.
 ///
+/// Lot 344: or (a) and the kernel's record that every write since the
+/// file's last record was an `O_APPEND` write by rsyslogd alone
+/// ([`FimEvent::appends_only`]), whatever its uid (Debian's packaged
+/// rsyslogd runs as root), when the file grew — or, for a size read
+/// smaller, when the kernel also saw ANOTHER process truncate the file by a
+/// setattr while those writes were pending and the drain read that
+/// truncation's own record ([`FimEvent::truncated_by_another`]:
+/// `logrotate`'s `copytruncate`). The review of #554 (F1): an `O_APPEND`
+/// write alone proves no append — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on
+/// an `O_APPEND` file removes a range through the same write check, with no
+/// setattr; a shrink nothing else explains is judged as before.
+///
 /// So a non-rsyslogd writer, a uid mismatch, OR a truncation on a
 /// log path all still raise the verdict. Sizes ride on the
 /// `FimEvent` from the drain's re-hash (`new_size`) and the
@@ -589,7 +601,9 @@ impl NnLFim005LogTruncated {
     }
 
     /// True iff this Modified-on-log-path event is rsyslogd's own
-    /// routine append — the FP-1 carve-out (a) ∧ (b) ∧ (c). Pure;
+    /// routine append — the FP-1 carve-out (a) ∧ (b) ∧ (c), or (a) and
+    /// the kernel's record of its appends (lot 344; the review of #554).
+    /// Pure;
     /// reads only `FimEvent` fields populated upstream by the drain.
     fn is_rsyslogd_append(&self, fe: &FimEvent) -> bool {
         // (a) writer exe is the rsyslog daemon (exact, kernel-resolved).
@@ -607,7 +621,22 @@ impl NnLFim005LogTruncated {
             (fe.new_size, fe.baseline_size),
             (Some(new), Some(base)) if new > base
         );
-        exe_match && uid_match && grew
+        // Lot 344: or the kernel's record says every write since the
+        // file's last record was an `O_APPEND` write by this writer alone
+        // (`FimEvent::appends_only`) — needing no uid: Debian's packaged
+        // rsyslogd runs as root (no `syslog` user), and what rsyslogd
+        // appends any local process can have it append (`logger`). The
+        // review of #554 (F1): that record proves no append —
+        // `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an `O_APPEND` file
+        // shrinks it through the same write check, with no setattr, and a
+        // pid reused lent rsyslogd's image to another writer's record (the
+        // drain now reads `/proc` for the writer's start only). So a growth,
+        // or a size read smaller that ANOTHER process's truncation explains
+        // (`FimEvent::truncated_by_another`: the kernel saw that setattr
+        // while the writes were pending, and the drain read its own record
+        // — `logrotate`'s `copytruncate`, judged there with its writer).
+        let appended = fe.appends_only && (grew || fe.truncated_by_another);
+        exe_match && ((uid_match && grew) || appended)
     }
 }
 
@@ -3232,6 +3261,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 
@@ -3268,6 +3299,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 
@@ -3297,6 +3330,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 
@@ -3740,6 +3775,101 @@ mod tests {
         assert_eq!(v.severity, Severity::High);
     }
 
+    /// Lot 344 (named, the alpha's false positives): `logrotate`'s
+    /// `copytruncate` truncates the log in place; `rsyslogd`'s appends since
+    /// the last record are emitted at the close of logrotate's file, and the
+    /// drain reads the file after the truncation — smaller than before. The
+    /// kernel's record says every write was an `O_APPEND` write by rsyslogd
+    /// alone, and that ANOTHER process truncated the file while they were
+    /// pending — the truncation's own record (logrotate's) read first (the
+    /// review of #554, F1: the input now says it; the appends alone proved
+    /// nothing). Not a truncation by rsyslogd. Another program, or the
+    /// record without the kernel's append proof, still fires.
+    #[test]
+    fn fim005_rsyslogd_appends_read_after_another_s_truncation_are_exempt() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        let shrunk = |exe: Option<&str>, uid: u32, appends_only: bool| {
+            let Event::Fim(mut fe) =
+                fim_log_modify("/var/log/syslog", exe, uid, Some(310), Some(81_920))
+            else {
+                unreachable!()
+            };
+            fe.appends_only = appends_only;
+            fe.truncated_by_another = true;
+            Event::Fim(fe)
+        };
+        assert!(
+            r.evaluate(&shrunk(Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, true))
+                .is_none(),
+            "rsyslogd's O_APPEND writes read after another's truncation"
+        );
+        // the same shrink without the kernel's record: a truncation
+        assert!(r
+            .evaluate(&shrunk(Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, false))
+            .is_some());
+        // the flag proves an append, not who wrote: another program fires
+        assert!(r
+            .evaluate(&shrunk(Some("/usr/bin/tee"), TEST_SYSLOG_UID, true))
+            .is_some());
+        assert!(r.evaluate(&shrunk(None, TEST_SYSLOG_UID, true)).is_some());
+        // Debian's packaged rsyslogd runs as root: the kernel's proof is
+        // enough; without it, root's rsyslogd is judged as before
+        assert!(r.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, true)).is_none());
+        assert!(r.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, false)).is_some());
+        let none = NnLFim005LogTruncated::new(None);
+        assert!(none
+            .evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, true))
+            .is_none());
+        assert!(none
+            .evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, false))
+            .is_some());
+    }
+
+    /// The review of #554 (named, F1): an `O_APPEND` write is no proof that
+    /// nothing shrank — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an
+    /// `O_APPEND` file removes a range through the same write check, with
+    /// no setattr. A log read smaller whose record says only "rsyslogd's
+    /// `O_APPEND` writes" (no other process's truncation seen) is judged as
+    /// on `main`: High, for root's rsyslogd and for the `syslog` user's. A
+    /// growth by rsyslogd's appends stays exempt (Debian's root rsyslogd).
+    #[test]
+    fn fim005_an_append_only_shrink_no_other_truncation_explains_still_fires() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        let ev = |uid: u32, new: u64, base: u64, truncated_by_another: bool| {
+            let Event::Fim(mut fe) = fim_log_modify(
+                "/var/log/auth.log",
+                Some(RSYSLOGD_EXE),
+                uid,
+                Some(new),
+                Some(base),
+            ) else {
+                unreachable!()
+            };
+            fe.appends_only = true;
+            fe.truncated_by_another = truncated_by_another;
+            Event::Fim(fe)
+        };
+        for uid in [0, TEST_SYSLOG_UID] {
+            let v = r
+                .evaluate(&ev(uid, 4_196, 8_292, false))
+                .expect("a collapsed log no truncation explains");
+            assert_eq!(v.severity, Severity::High);
+            // the same size, nothing grew: not an append either
+            assert!(r.evaluate(&ev(uid, 8_292, 8_292, false)).is_some());
+            // explained by another's truncation, or grown: exempt
+            assert!(r.evaluate(&ev(uid, 4_196, 8_292, true)).is_none());
+            assert!(r.evaluate(&ev(uid, 8_400, 8_292, false)).is_none());
+        }
+        // unknown sizes and no truncation seen: judged as before
+        let Event::Fim(mut fe) =
+            fim_log_modify("/var/log/auth.log", Some(RSYSLOGD_EXE), 0, None, None)
+        else {
+            unreachable!()
+        };
+        fe.appends_only = true;
+        assert!(r.evaluate(&Event::Fim(fe)).is_some());
+    }
+
     /// (a) fails — a non-rsyslogd writer growing a log path (e.g. an
     /// attacker appending) is NOT exempt. Fires.
     #[test]
@@ -3981,6 +4111,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 
@@ -4730,6 +4862,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         })
     }
 

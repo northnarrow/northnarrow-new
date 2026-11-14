@@ -837,11 +837,20 @@ pub enum FloodKind {
 impl FloodKind {
     /// The kind of `event`, `None` when it does not flood P0.
     pub fn of(event: &Event) -> Option<(FloodKind, u32)> {
-        use common::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
+        use common::wire::{
+            BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+        };
         match event {
             Event::FsProtectDenial { uid, .. } => Some((FloodKind::Denial, *uid)),
+            // the review of #554 (F2): a fresh instance's handle is one on
+            // the agent's own objects too
             Event::BpfSyscall { uid, cmd, .. }
-                if matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE) =>
+                if matches!(
+                    *cmd,
+                    BPF_CMD_FOREIGN_GET_FD
+                        | BPF_CMD_FOREIGN_MAP_WRITE
+                        | BPF_CMD_FRESH_INSTANCE_GET_FD
+                ) =>
             {
                 Some((FloodKind::BpfOwn, *uid))
             }
@@ -2067,6 +2076,11 @@ mod tests {
         );
         assert_eq!(
             FloodKind::of(&own(BPF_CMD_FOREIGN_MAP_WRITE)),
+            Some((FloodKind::BpfOwn, 0))
+        );
+        // the review of #554 (F2): a fresh instance's handle, recorded now
+        assert_eq!(
+            FloodKind::of(&own(common::wire::BPF_CMD_FRESH_INSTANCE_GET_FD)),
             Some((FloodKind::BpfOwn, 0))
         );
         assert_eq!(FloodKind::of(&own(0)), Some((FloodKind::Bpf, 0)));

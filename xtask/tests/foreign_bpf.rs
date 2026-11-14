@@ -502,6 +502,108 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
     assert!(c.contains("HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);"));
 }
 
+/// Lot 344 (named, the alpha's false positives): a fresh agent or watchdog
+/// opening the agent's pins (maps, programs, the pin directories) before it
+/// is a protected pid is the family's own start — let through by the deny
+/// path above, and no longer reported as a foreign handle (NN-L-BPF-002
+/// High for OUR watchdog at every start). The choice comes after every
+/// refusal (a link handle is never exempt by executable, and is judged
+/// first), names the maps', programs' and directories' handles only, and is
+/// the report's own command — the review of #554 (F2): recorded (Low in
+/// userland), never silenced, so a foreign program made the watchdog's
+/// binary (`PR_SET_MM_EXE_FILE`) while the role is vacant leaves a trace.
+#[test]
+fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let h = body(&c, "try_bpf_syscall_observe");
+    in_order(
+        h,
+        &[
+            "if (own_link_handle || own_link_pin) && enforce() {",
+            "&& !fresh_instance_may_load()\n    {\n        let kind",
+            "if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {",
+            "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
+            "let fresh_instance =\n        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
+            "let report_cmd = if fresh_instance {\n        BPF_CMD_FRESH_INSTANCE_GET_FD\n    } else if foreign_handle {\n        BPF_CMD_FOREIGN_GET_FD",
+            "if should_report(pid, dedup) {\n        emit_syscall(report_cmd, arg);",
+        ],
+    )
+    .unwrap();
+    // the review of #554 (F2): nothing between the choice and the report
+    // returns — the fresh instance's handle is recorded, not silenced
+    let from = h.find("let foreign_handle =").unwrap();
+    let to = h.find("emit_syscall(report_cmd, arg);").unwrap();
+    assert!(
+        !h[from..to].contains("return"),
+        "a handle silenced before its report: {}",
+        &h[from..to]
+    );
+    // the exemption is the deny path's: the binary by device and inode,
+    // the role vacant, the main thread, the first minute
+    in_order(
+        body(&c, "fresh_instance_may_load"),
+        &[
+            "if (pid_tgid >> 32) as u32 != pid_tgid as u32 {\n        return false;\n    }",
+            "let role = caller_role();",
+            "Some(t) => *t == 0,",
+            "< FRESH_INSTANCE_NS",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 344 (#554's KVM suites): the `bpf` hook's watchdog role is the
+/// watchdog the agent verifies (`--watchdog-exe`, else its sibling) — the
+/// one value the stale-pid scan takes too. It named the agent's sibling
+/// `northnarrow-watchdog` on its own, so a watchdog the agent was told of
+/// elsewhere took the agent's pins at its start as a foreign process
+/// (NN-L-BPF-002 High). No binary is guessed in the guard's registration.
+#[test]
+fn the_hook_s_watchdog_is_the_watchdog_the_agent_verifies() {
+    let c = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let prod = &c[..c.find("#[cfg(test)]").expect("the tests")];
+    assert!(
+        !prod.contains("\"northnarrow-watchdog\""),
+        "the guard names a watchdog binary of its own"
+    );
+    let reg = body(prod, "register_own_objects");
+    assert!(reg.contains("let exe_keys = own_exe_keys(own_exes);"));
+    assert!(
+        !reg.contains("current_exe"),
+        "the guard reads an executable of its own"
+    );
+    in_order(
+        body(prod, "own_exe_keys"),
+        &["[(own.agent, ROLE_AGENT), (own.watchdog, ROLE_WATCHDOG)]"],
+    )
+    .unwrap();
+    let at = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&at, "attach_reporting"),
+        &[
+            "match evict_stale_pids(ebpf, &own.keep()) {",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        &code("agent/src/boot/attach.rs"),
+        &[
+            "let own = cli.own_exes();",
+            ".attach_anti_tamper(verified, &pids, &own)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&code("agent/src/boot/cli.rs"), "own_exes"),
+        &[
+            "agent: ExeIdentity::of_process(std::process::id()),",
+            "watchdog: ExeIdentity::of_file(&self.resolved_watchdog_exe()),",
+        ],
+    )
+    .unwrap();
+}
+
 /// Named (lot 345; the re-check of #550, N2 and point 1 (ii)): what an
 /// allowed loader (`install.sh --allow-bpf-tools`, `--allow-bpf-loader`)
 /// still cannot load — read in the code the kernel runs, in the order that

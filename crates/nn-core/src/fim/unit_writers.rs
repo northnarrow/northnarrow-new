@@ -174,6 +174,8 @@ mod tests {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         };
         keep(&fe(34_700), "systemd-update-utmp.service");
         assert_eq!(unit_of(&fe(34_700)), Some("systemd-update-utmp.service"));

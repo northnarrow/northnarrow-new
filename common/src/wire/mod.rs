@@ -1513,6 +1513,14 @@ pub const BPF_CMD_FOREIGN_MAP_WRITE: u32 = 0xFFFF_0001;
 /// A foreign process obtained a handle to one of the agent's own objects
 /// by id (`BPF_*_GET_FD_BY_ID`) — observe-mode counterpart of the deny.
 pub const BPF_CMD_FOREIGN_GET_FD: u32 = 0xFFFF_0002;
+/// The review of #554 (F2): a fresh instance of the agent or the watchdog —
+/// its binary by device and inode, its role vacant, its main thread, its
+/// first minute — took a handle to one of the agent's maps, programs or pin
+/// directories before it is a protected pid: the family's own start, let
+/// through. Recorded (Low), not silent: a foreign program that made itself
+/// "the watchdog by device and inode" (`prctl(PR_SET_MM,
+/// PR_SET_MM_EXE_FILE)`) while the role was vacant takes the same path.
+pub const BPF_CMD_FRESH_INSTANCE_GET_FD: u32 = 0xFFFF_0003;
 
 /// Kernel→userland record of the `bpf()` syscall observer (40 bytes).
 #[repr(C)]
@@ -1555,6 +1563,7 @@ pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
         BPF_LINK_DETACH => "link_detach",
         BPF_CMD_FOREIGN_MAP_WRITE => "foreign_map_write",
         BPF_CMD_FOREIGN_GET_FD => "foreign_get_fd",
+        BPF_CMD_FRESH_INSTANCE_GET_FD => "fresh_instance_get_fd",
         _ => "other",
     }
 }
@@ -1804,8 +1813,8 @@ pub const FIM_RENAME_DEST_LEAF: u8 = 0x02;
 /// these into the richer userland [`FimEvent`].
 ///
 /// Layout: timestamp + (dev,ino) target + (dev,ino) dest +
-/// modifier triple + op byte + pad + child-name tail. **144 bytes**,
-/// 8-byte aligned. Tappa 9 polish #3 (rename dest-path resolution)
+/// modifier triple + op byte + pad + child-name tail + the writer's fork
+/// records. **168 bytes**, 8-byte aligned (lot 344: 144 → 168). Tappa 9 polish #3 (rename dest-path resolution)
 /// grew this from 56 → 72 bytes by appending `dest_dev` + `dest_ino`
 /// for `Renamed` events; BUG-022 (dir child-leaf reconstruction)
 /// grew it 72 → 144 by appending `child_name` + flags. All additions
@@ -1857,7 +1866,59 @@ pub struct FimDriftRaw {
     /// [`FIM_CHILD_TRUNCATED`]. Zero when `child_name` is empty.
     pub child_name_flags: u8,
     pub _pad2: [u8; 7],
+    /// Lot 344 (the alpha's false positives): the writer's fork record when
+    /// it has executed nothing since its fork (`fork_parent::
+    /// unexecuted_forks`, the open sensor's since lot 340) — its forker's
+    /// tgid and its own start; 0 otherwise. A writer that never executes
+    /// has no exec record, and a drift judged after it exited had no
+    /// lineage (`/proc` gone): userland teaches these to the lineage first.
+    /// For a write seen at close, the writer's at its write.
+    pub fork_ppid: u32,
+    /// Lot 344: the forker's own fork record when it has executed nothing
+    /// either (rsync's receiver, a fork of its generator, a fork of rsync):
+    /// its forker's tgid; 0 otherwise.
+    pub fork_pppid: u32,
+    /// Lot 344: the writer's start (`task->start_time`) of its fork record.
+    pub fork_start: u64,
+    /// Lot 344: the forker's start of its own fork record.
+    pub fork_parent_start: u64,
+    /// Lot 344, the review of #554 (F1): for a `Modified` seen at close, the
+    /// writer's start (its thread group leader's `task->start_time`,
+    /// `CLOCK_MONOTONIC` ns) at its last write; 0 otherwise (or unread). The
+    /// record leaves the kernel when the file closes, and its writer may be
+    /// gone by then: userland reads `/proc/<modifier_pid>` only for the
+    /// process that started then, never the next holder of the pid.
+    pub modifier_start: u64,
 }
+
+/// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
+/// every write to the inode since its last record went through a file
+/// opened with `O_APPEND`. Not a proof that nothing shrank (the review of
+/// #554, F1): `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an `O_APPEND` file
+/// removes a range through the same write check, with no setattr — see
+/// [`FIM_WRITE_TRUNCATED_BY_ANOTHER`].
+pub const FIM_WRITE_APPEND_ONLY: u8 = 0x04;
+
+/// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
+/// every write to the inode since its last record the marker saw was by the
+/// record's process (one process: its pid and its start — the marker is
+/// last-writer-wins). Not exact (the review of #554, F3): the marker's
+/// update is not atomic, so a write racing another can be lost from it; a
+/// record read smaller is exempt only with [`FIM_WRITE_TRUNCATED_BY_ANOTHER`].
+pub const FIM_WRITE_ONE_WRITER: u8 = 0x08;
+
+/// [`FimDriftRaw::op_flags`] bit (the review of #554, F1) of a `Modified`
+/// seen at close: while the record's writes were pending, ANOTHER process
+/// (another tgid, or the same pid at another start) changed the file's size
+/// by a setattr (`truncate`, `ftruncate`, an `O_TRUNC` open: `logrotate`'s
+/// `copytruncate`) — a size the drain reads smaller than before is that
+/// truncation's, recorded on its own ([`FIM_SETATTR_SIZE`]) with its own
+/// writer.
+pub const FIM_WRITE_TRUNCATED_BY_ANOTHER: u8 = 0x10;
+
+/// [`FimDriftRaw::op_flags`] bit (the review of #554, F1) of a `Modified`
+/// sent by `inode_setattr`: the setattr changes the size (`ATTR_SIZE`).
+pub const FIM_SETATTR_SIZE: u8 = 0x20;
 
 impl FimDriftRaw {
     pub const fn zeroed() -> Self {
@@ -1876,6 +1937,11 @@ impl FimDriftRaw {
             child_name: [0u8; FIM_CHILD_NAME_LEN],
             child_name_flags: 0,
             _pad2: [0u8; 7],
+            fork_ppid: 0,
+            fork_pppid: 0,
+            fork_start: 0,
+            fork_parent_start: 0,
+            modifier_start: 0,
         }
     }
 }
@@ -2186,7 +2252,8 @@ mod tests {
     // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
 
     /// C1 (+ polish #3) test #1: [`FimDriftRaw`] layout matches
-    /// the kernel↔userland ABI exactly. **144 bytes**, 8-aligned.
+    /// the kernel↔userland ABI exactly. **176 bytes**, 8-aligned (lot 344; the
+    /// review of #554 appended `modifier_start`).
     /// Polish #3 grew this from 56 → 72 bytes by appending
     /// `dest_dev` + `dest_ino` (each `u64`); BUG-022 grew it
     /// 72 → 144 by appending the `child_name` tail so
@@ -2196,8 +2263,12 @@ mod tests {
     #[test]
     fn fim_drift_raw_layout_is_stable() {
         // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 (= 72, polish #3)
-        // + 64 + 1 + 7 (= 144, BUG-022 child-name tail), 8-aligned.
-        assert_eq!(size_of::<FimDriftRaw>(), 144);
+        // + 64 + 1 + 7 (= 144, BUG-022 child-name tail)
+        // + 4 + 4 + 8 + 8 (= 168, lot 344: the writer's fork records), 8-aligned.
+        assert_eq!(size_of::<FimDriftRaw>(), 176);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_ppid), 144);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_parent_start), 160);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, modifier_start), 168);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
         // FsProtectDenialRaw stays at the original 56-byte
         // shape; the FIM drift record is now a SUPERSET (first
@@ -2231,6 +2302,11 @@ mod tests {
             },
             child_name_flags: 0,
             _pad2: [0u8; 7],
+            fork_ppid: 7,
+            fork_pppid: 3,
+            fork_start: 11,
+            fork_parent_start: 5,
+            modifier_start: 13,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
@@ -2243,6 +2319,16 @@ mod tests {
         assert_eq!(restored.op, original.op);
         assert_eq!(restored.dest_dev, original.dest_dev);
         assert_eq!(restored.dest_ino, original.dest_ino);
+        assert_eq!(restored.modifier_start, 13);
+        assert_eq!(
+            (
+                restored.fork_ppid,
+                restored.fork_pppid,
+                restored.fork_start,
+                restored.fork_parent_start
+            ),
+            (7, 3, 11, 5)
+        );
     }
 
     /// C1 test #3: [`FimOp`] discriminants lock in the wire bytes
@@ -2275,6 +2361,10 @@ mod tests {
         assert_eq!(bpf_cmd_name(30), "link_get_fd_by_id");
         assert_eq!(bpf_cmd_name(31), "other");
         assert_eq!(bpf_cmd_name(BPF_CMD_FOREIGN_GET_FD), "foreign_get_fd");
+        assert_eq!(
+            bpf_cmd_name(BPF_CMD_FRESH_INSTANCE_GET_FD),
+            "fresh_instance_get_fd"
+        );
     }
 
     /// External audit EBPF-015: a new entry is refused only in a NOCREATE

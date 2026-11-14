@@ -1087,10 +1087,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         &mut self,
         verified: &crate::boot::IntegrityVerified,
         pids: &[u32],
-        keep: &[crate::anti_tamper::ExeIdentity],
+        own: &crate::anti_tamper::OwnExes,
     ) -> Result<crate::anti_tamper::AttachReport> {
         let report =
-            crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)?;
+            crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, own)?;
         // R13 (lab PR 271): the deny hooks and the two observe sensors of
         // the anti-tamper attach, in the manifest's attach points
         if let Some(deny) = &report.deny {
@@ -2388,7 +2388,15 @@ mod tests {
         let mut start = 0;
         for _ in 0..200 {
             let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
-            if exe.file_name().is_some_and(|n| n == "sleep") {
+            // lot 344 (gates2, under load): the exe link names the new image
+            // at `exec_mmap`, before the new stack holds the environment —
+            // an `environ` read in between was empty ("Clean"). Wait for both.
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            if exe.file_name().is_some_and(|n| n == "sleep")
+                && environ
+                    .split(|b| *b == 0)
+                    .any(|v| v.starts_with(b"MODPROBE_OPTIONS="))
+            {
                 start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
                 break;
             }

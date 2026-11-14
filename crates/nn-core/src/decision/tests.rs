@@ -1277,6 +1277,8 @@ fn a_snapshot_completes_a_chain_while_the_session_is_open() {
         file_key: None,
         is_dir: false,
         moved_in: false,
+        appends_only: false,
+        truncated_by_another: false,
     });
     // The read's own record (the FIM rule) — a late chain completion on
     // the open flow's connect would also do; either way one chain verdict.
@@ -1494,6 +1496,8 @@ fn fim_event(path: &str, op: nn_model::telemetry::FimOp, pid: u32, uid: u32, ts:
         file_key: None,
         is_dir: false,
         moved_in: false,
+        appends_only: false,
+        truncated_by_another: false,
     })
 }
 

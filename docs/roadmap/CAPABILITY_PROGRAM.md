@@ -10959,6 +10959,152 @@ number in parentheses is a lab PR.
     F3) and `initdb -L` (F4).
   - Level unchanged: the false-positive work of the alpha; C17's
     provisional waits on the nightly.
+- **Lot 344 (alpha FP round 2A) — the host's and the agent's own records
+  (C14, C17, C23; no level changes).**
+  - What was open (lab rounds of lots 340/341, the alpha profile on plain
+    hosts): NN-L-BPF-002 High for our own watchdog at every start; NN-L-AT-001
+    High after every reboot (systemd's SIGTERM to the watchdog during the
+    poweroff, judged on systemd's `running` asked just before it);
+    rsyslogd's appends read after logrotate's `copytruncate` (or any
+    `truncate` of a log) judged a truncation by rsyslogd (NN-L-FIM-005 High);
+    a FIM drift's writer forked without an exec unknown once gone; the dev
+    corpus's control not running on Ubuntu 26.04 (a renamed copy of uutils'
+    multicall `sleep`); a CI-only failure of
+    `neutralize_quarantines_the_offenders_binary` (root cause: the same
+    multicall copy, named `mal`, on the hosted runners).
+  - Done: the `bpf` hook's report skips the fresh instance its refusal
+    already exempts (the binary by device and inode, the role vacant, the
+    main thread, the first minute); a relayed signal is judged only on a
+    systemd answer asked after it (the kernel's clock); the FIM write marker
+    carries `FIM_WRITE_APPEND_ONLY`/`FIM_WRITE_ONE_WRITER` (FP-1 accepts the
+    kernel's record of rsyslogd's appends for a growth, and for a shrink
+    another process's truncation explains — the review of #554, below);
+    `FimDriftRaw` (176 bytes)
+    carries the writer's unexecuted fork records, taught to the lineage
+    before the judgement, and a gone writer's image is read from the
+    lineage; the corpus control is a shell copy looping on `sleep 1`; three
+    tests keep the utility's name; ratchet `xtask/tests/multicall_copies.rs`.
+    Mutation: 15 mutants of the userland code, 14 caught by named tests
+    (two found by survivors: a forker's own start, the watch's kernel-clock
+    stamp), one argued equivalent (`>=`/`>` on equal nanoseconds); the eBPF
+    halves are the lab's and the privileged CI's.
+  - Lab, as measured (our guests, lease k344; before = main 1d8f427d, after =
+    this lot; an alpha install, a cold boot, the probe of each item with its
+    control). Debian 13 (6.12.116, systemd 257), before: our watchdog's
+    NN-L-BPF-002 High ×2 (the install's start, the boot's), NN-L-AT-001 High
+    `signal` by PID 1 ×1 (the agent's journal at the previous shutdown: `not
+    a shutdown … systemd_state="running"`); with rsyslog and logrotate added
+    (not on the image), rsyslogd's appends High after each `copytruncate`
+    rotation (×1–2), also under `systemd-run logrotate /etc/logrotate.conf`.
+    After (twice): none of these — the rotation's own records Low; still High:
+    `truncate -s 0` of the new log, `logrotate -f` (the review of #552's F1),
+    `dd` on wtmp, `iptables -F`, and `systemctl kill -s TERM
+    northnarrow-watchdog` (NN-L-AT-001 High, refused). plocate's `updatedb`:
+    no record before or after. 49 LSM programs at the boot both ways. Ubuntu
+    26.04 (7.0), after: the same at boot (no BPF-002, no AT-001 High); the
+    copytruncate rotations Low with no rsyslogd record; the controls High;
+    the dev corpus's control ran (3.0 s as the lab user, recorded; 20.1 s as
+    www-data, `would have: KillProcessTree`) — it exited 1 at once before
+    (lot 341's round). Ubuntu 24.04 (6.8, systemd 255, rsyslogd as
+    `syslog`), before (two rounds): our watchdog's BPF-002 High ×2, AT-001
+    High `signal` by PID 1 in one of the two, rsyslogd's FIM-005 High ×2 at
+    the boot, ×1 at the packaged rename+create rotation, ×1–2 at each
+    `copytruncate` rotation (the timer's and `systemd-run`'s) and beside each
+    `truncate`. After: none of these; the rotations' records Low; `truncate`,
+    `logrotate -f`, a configuration of the caller's under `systemd-run`, the
+    packaged invocation by hand, `dd` on wtmp, `iptables -F`, `systemctl
+    kill` of the watchdog: High, as before. NN-L-EVA-002 for docker: none
+    before or after on either guest — docker.io's install, a restart,
+    `docker run`, `docker build`, a reinstall inside the package transaction.
+  - Residuals: a root process that starts a preloaded watchdog (or agent)
+    binary while that role is vacant — or makes a program of its own the
+    watchdog's binary by device and inode (`prctl(PR_SET_MM,
+    PR_SET_MM_EXE_FILE)`) — gets, in its first minute, handles that are not
+    refused (EBPF-002's window; the watchdog's absence is signed), recorded
+    NN-L-BPF-002 Low since the review of #554; a root that makes systemd `stopping` (`systemctl
+    start shutdown.target`) has its relayed signals judged a shutdown (still
+    refused); a log renamed away and recreated (logrotate's `create`, or
+    `mv` and a new file) is judged by no NN-L-FIM-005/019 verdict — the
+    rename is not a `Modified`, the new file a creation without a writer;
+    an open (`Opened`) carries no fork record; a FIM record's `exe` stays the
+    exec sensors' (the writer's image reaches the rules, not the record); 15
+    lab script sites still run a coreutils copy under another name (listed by
+    the ratchet; 4 of them `cat` copies of `true` in execq-check.sh, seen by
+    its review-of-#554 form); code running inside rsyslogd (a module,
+    `LD_PRELOAD`) writes as rsyslogd — its growth of a log, or a collapse
+    inside another process's truncation window, is exempt (as on `main` for
+    the `syslog` user's rsyslogd). Item 3 (EVA-002 for `xtables-nft-multi` under docker) did not
+    reproduce on a clean guest; lot 340's records came from its corpora on a
+    shared guest — open until a corpus round shows it. Seen, not changed:
+    NN-L-FIM-019 High (`would have: KillProcess`) for `systemd-update-utmp`
+    writing wtmp at a shutdown (Ubuntu 24.04, two rounds of three, before
+    and after); NN-L-R004 Critical for runc's
+    memfd re-exec (`memfd:runc_clon`) at every `docker run`/`build` (Debian
+    13; `would have: KillProcessTree`); R011 High for containerd's `modprobe
+    overlay` at docker's install.
+  - Levels unchanged: no capability's reach changes; the records a benign
+    host made are fewer, every attack variant measured is still recorded.
+  - The review of #554 (fix round). F1 (blocking): an `O_APPEND` write is
+    no proof that nothing shrank — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on
+    an `O_APPEND` file removes a range through the same write check, with no
+    setattr, and the writer's pid may be reused before its record is read
+    (a root log wipe passed for rsyslogd's appends). The marker now says
+    whether ANOTHER process (pid and start) changed the file's size by a
+    setattr while the writes were pending (`FIM_WRITE_TRUNCATED_BY_ANOTHER`,
+    set by `inode_setattr`); a size setattr's own record says so
+    (`FIM_SETATTR_SIZE`); FP-1 exempts a shrink only when both hold, the
+    truncation's record read first from another pid (`FimEvent::
+    truncated_by_another`). The marker holds the writer's start, the record
+    carries it (`FimDriftRaw::modifier_start`, 168 → 176 bytes): `/proc` is
+    read for that start only, the lineage for that process only
+    (`recorded_identity_started`). Tests: `a_log_collapsed_through_an_o_
+    append_fd_is_not_rsyslogd_s_append`, `a_writer_s_pid_held_by_another_
+    process_lends_it_no_image`, `copytruncate_s_truncation_still_explains_
+    rsyslogd_s_appends`, `fim005_an_append_only_shrink_no_other_truncation_
+    explains_still_fires`. F2: the fresh instance's handle is recorded
+    (`BPF_CMD_FRESH_INSTANCE_GET_FD`, NN-L-BPF-002 Low), not silenced
+    (`a_fresh_instance_s_handle_is_recorded_low_not_silenced`; the eBPF
+    ratchet forbids a return before the report). F3: closed by F1 (the
+    over-claim removed). F4: the multicall ratchet asks no longer how a copy
+    is run — every renamed copy, inline destinations, links and renames, and
+    `ln`/`cat`/`command -v` in lab scripts. F5: the watchdog e2e finds the
+    start's own Low record by the same filter (positive control).
+    Mutation: 11 mutants of the round's userland code, 11 caught (the first
+    survivor, the lineage's kernel-fork path, got its case).
+    Lab, as measured (lease k344). Ubuntu 22.04 (5.15.0-202), the round's
+    object through the verifier (`verifier-check synced`): every program OK,
+    the highest `module_read_file_observe` 551,900 (55.2%, as before);
+    processed `fim_write_intent_observe` 4,136 (655 in the 13/11 report),
+    `fim_setattr_observe` 3,561 (1,316), `fim_close_emit_observe` 486 (464),
+    `bpf_syscall_observe` 36,148 (32,058), `fim_file_open_sensor` 145,204
+    (144,651). Ubuntu 24.04 (6.8), an alpha install: our watchdog's start
+    NN-L-BPF-002 Low ×1, no High; two `copytruncate` rotations — logrotate's
+    records Low, no rsyslogd record; `truncate -s 0` of syslog High; the
+    collapse of `/var/log/kern.log`'s first 4 KiB through an `O_APPEND` fd by
+    a fork that exits, its pid then given to `rsyslogd -n -f /dev/null`
+    (`ns_last_pid`; it exits, no action), the fd closed by the fork's child:
+    on #554's head 343e47e4 no record (×2), on this round NN-L-FIM-005 High
+    for the writer (`python3`, its pid) ×2.
+    #554's KVM suites (both red at every head since 343e47e4, the PR job's
+    `continue-on-error` showing the runs green): the watchdog e2e's two
+    NN-L-BPF-002 High records came from the guard's own guess of the
+    watchdog — `OWN_EXE_INODES` named the agent's sibling
+    `northnarrow-watchdog`, while the agent verifies the one
+    `--watchdog-exe` names (the e2e's copy). One value now (`OwnExes`: the
+    agent's image and `resolved_watchdog_exe()`) feeds the stale-pid scan,
+    the unit cgroups and the hook's roles; no binary added, the window's
+    limits unchanged. Behind it, the e2e's positive control looked for the
+    verdict's reasoning, which the signed record does not carry: it reads
+    the record's Low side for the watchdog's pid and name, NN-L-BPF-002's
+    only Low pinned in nn-core (`bpf002_is_low_for_a_fresh_instance_only`).
+    Lab, as measured (lease k344, the watchdog's privileged suite in the
+    guest, `/etc/northnarrow` created first as CI's install does): Ubuntu
+    22.04 (5.15) 10 passed, 0 failed; with the hook fix alone the start
+    left NN-L-BPF-002 Low ×1 and no High, and the control failed (9/1).
+    After the merge of #553 (lot 345), the object through 5.15's verifier
+    (`verifier-check synced`, 5.15.0-202): 116 programs, 109 OK, 7 not
+    counted, 0 failing; highest `module_read_file_observe` 551,900 (55.2%);
+    `bpf_syscall_observe` 38,280, `bpf_prog_guard` 14,527.
 - **Lot 347 — container runtimes and the shutdown record, the alpha's false
   positives round 3 (C06, C11, C14; no level changes).**
   - What was open (lot 344's lab, an r/selfhosted tester's host in records

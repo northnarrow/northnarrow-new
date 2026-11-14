@@ -350,7 +350,7 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
     in_order(
         a,
         &[
-            "evict_stale_pids(ebpf, keep)",
+            "evict_stale_pids(ebpf, &own.keep())",
             // lot 273b (the review's R5): the live watchdog's cgroup too
             "cgroup_guard::cgroup_pids(pids, &live, |pid| {",
             "cgroup_guard::register_unit_cgroups(ebpf, &cgroup_pids)",
@@ -358,7 +358,7 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
             "filesystem::attach(ebpf, &btf, pin_root)",
             "cgroup_guard::attach_move_guard(ebpf, &btf, pin_root)",
             "report.move_guard_attached = mg.present > 0 && mg.failures.is_empty();",
-            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root)",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
             "filesystem::prune_stale_inodes(ebpf)",
             "cgroup_guard::prune_stale_values(ebpf)",
         ],

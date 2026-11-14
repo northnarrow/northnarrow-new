@@ -578,6 +578,8 @@ fn one_event_is_assessed_once() {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         }))
         .is_none());
 }

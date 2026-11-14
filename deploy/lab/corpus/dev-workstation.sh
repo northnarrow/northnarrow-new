@@ -114,9 +114,14 @@ step "dev AppImage: AppRun extracted" 60 -- "$EX/AppRun"
 rm -rf "$EX"
 # the control (lot 283b): one program run from /tmp for a few seconds, by
 # the lab user (a person's account: recorded, not killed) and by www-data
-# (a system account, the web shell's: killed, rc 137)
-install -m 755 /bin/sleep /tmp/nn-corpus-control
-step "dev control: a program from /tmp, as the lab user (3 s)" 60 -- /tmp/nn-corpus-control 3
-step "dev control: the same, as www-data (a system account)" 60 -- sudo -u www-data /tmp/nn-corpus-control 20
+# (a system account, the web shell's: killed, rc 137). Lot 344: a copy of
+# the shell looping on `sleep 1`, not a copy of `sleep` — Ubuntu 26.04's
+# coreutils are uutils' multicall binary, which picks its utility from the
+# name it is run by: the copy printed "unknown program" and exited 1, and the
+# control proved nothing there.
+install -m 755 /bin/sh /tmp/nn-corpus-control
+CONTROL_LOOP='i=0; while [ "$i" -lt "$1" ]; do sleep 1; i=$((i + 1)); done'
+step "dev control: a program from /tmp, as the lab user (3 s)" 60 -- /tmp/nn-corpus-control -c "$CONTROL_LOOP" nn-corpus-control 3
+step "dev control: the same, as www-data (a system account)" 60 -- sudo -u www-data /tmp/nn-corpus-control -c "$CONTROL_LOOP" nn-corpus-control 20
 rm -f /tmp/nn-corpus-control
 corpus_finish

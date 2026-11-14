@@ -218,8 +218,8 @@ pub(crate) const PTRACE_HOOK: &str = "ptrace_access_check";
 /// `pids` is a slice so callers can register multiple PIDs in one
 /// call (Tappa 7 task 6: agent + watchdog). Stale entries from a
 /// prior pinned-map load are evicted first — every entry whose PID
-/// is dead or does not run one of `keep` ([`ExeIdentity`]) is removed
-/// before `pids` is inserted.
+/// is dead or does not run one of `own` ([`OwnExes`]) is removed before
+/// `pids` is inserted.
 ///
 /// Wave 4 restructure, R11b (lab PR 262): `_verified`, the proof that every
 /// integrity check of the start passed ([`crate::boot::IntegrityVerified`]):
@@ -229,10 +229,10 @@ pub fn attach(
     ebpf: &mut Ebpf,
     bpf_guard: &bpf_defense::BpfGuard,
     pids: &[u32],
-    keep: &[ExeIdentity],
+    own: &OwnExes,
 ) -> Result<AttachReport> {
     let mut report = AttachReport::default();
-    attach_reporting(verified, ebpf, bpf_guard, pids, keep, &mut report)?;
+    attach_reporting(verified, ebpf, bpf_guard, pids, own, &mut report)?;
     Ok(report)
 }
 
@@ -243,7 +243,7 @@ fn attach_reporting(
     ebpf: &mut Ebpf,
     bpf_guard: &bpf_defense::BpfGuard,
     pids: &[u32],
-    keep: &[ExeIdentity],
+    own: &OwnExes,
     report: &mut AttachReport,
 ) -> Result<()> {
     // The agent first: the scan below reads `/proc/<pid>/exe` of protected
@@ -252,7 +252,7 @@ fn attach_reporting(
     // would read nothing and evict the live watchdog.
     register_protected_pids(ebpf, &[std::process::id()])
         .context("registering the agent in PROTECTED_PIDS before the stale scan")?;
-    match evict_stale_pids(ebpf, keep) {
+    match evict_stale_pids(ebpf, &own.keep()) {
         Ok(0) => {}
         Ok(n) => info!(
             evicted = n,
@@ -474,6 +474,7 @@ fn attach_reporting(
     let live = ProtectedPidsHandle::from_ebpf(ebpf)
         .and_then(|h| h.pids())
         .unwrap_or_default();
+    let keep = own.keep();
     let cgroup_pids = cgroup_guard::cgroup_pids(pids, &live, |pid| {
         ExeIdentity::of_process(pid).is_some_and(|id| keep.contains(&id))
     });
@@ -617,7 +618,7 @@ fn attach_reporting(
     // Every program is loaded now: register the agent's own object ids
     // and arm the mode. A failure leaves the guard with an empty set
     // (nothing denied) and counts as a deny-hook failure.
-    match bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root) {
+    match bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own) {
         Ok(o) => {
             debug!(
                 maps = o.maps,
@@ -1416,6 +1417,26 @@ impl ExeIdentity {
     /// The program `pid` runs; `None` when it is gone or unreadable.
     pub fn of_process(pid: u32) -> Option<Self> {
         Self::of_file(Path::new(&format!("/proc/{pid}/exe")))
+    }
+}
+
+/// The family's two executables, by role: the agent's own and the watchdog
+/// the agent verifies (`--watchdog-exe`, else its sibling). Lot 344 (#554's
+/// KVM suites): one value for the stale-pid scan of `PROTECTED_PIDS` and the
+/// `bpf` hook's roles (`OWN_EXE_INODES`) — the hook named the agent's
+/// sibling `northnarrow-watchdog` on its own, so a watchdog the agent was
+/// told of elsewhere took the agent's pins at its start as a foreign process
+/// (NN-L-BPF-002 High), the false positive the lot closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnExes {
+    pub agent: Option<ExeIdentity>,
+    pub watchdog: Option<ExeIdentity>,
+}
+
+impl OwnExes {
+    /// Both, those that could be read.
+    pub fn keep(&self) -> Vec<ExeIdentity> {
+        [self.agent, self.watchdog].into_iter().flatten().collect()
     }
 }
 

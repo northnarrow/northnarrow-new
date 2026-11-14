@@ -1534,6 +1534,8 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             // listing of the store, an indexer's walk
             is_dir: r.flags & (libc::O_DIRECTORY as u32) != 0,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         }));
     }
     if r.reason & open_reason::FILE_CAP != 0 {
@@ -1559,6 +1561,8 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             file_key: None,
             is_dir: false,
             moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
         }));
     }
     // External audit POS-002: one event per crossing; an open crossing
