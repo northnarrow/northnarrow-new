@@ -874,15 +874,30 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
         ],
     )
     .unwrap();
-    let held = &guard[guard.find("if content_stage() == CONTENT_STAGE_LOAD {").unwrap()..];
+    let held = &guard[guard
+        .find("if content_stage() == CONTENT_STAGE_LOAD {")
+        .unwrap()..];
     let held = &held[..held.find("crate::bpf_census::mark_seen").unwrap()];
-    assert!(!held.contains("enforce()"), "the held programs' refusal holds in every mode");
+    assert!(
+        !held.contains("enforce()"),
+        "the held programs' refusal holds in every mode"
+    );
     // the window's verdict reads the content alone; the refusal keeps the
     // caller's exemptions
     let scan = body(&c, "content_scan");
-    for exemption in ["caller_is_exempt", "override_active", "fresh_instance_may_load"] {
-        assert!(!scan.contains(exemption), "content_scan judges no caller ({exemption})");
-        assert!(body(&c, "content_refusal").contains(exemption), "{exemption}");
+    for exemption in [
+        "caller_is_exempt",
+        "override_active",
+        "fresh_instance_may_load",
+    ] {
+        assert!(
+            !scan.contains(exemption),
+            "content_scan judges no caller ({exemption})"
+        );
+        assert!(
+            body(&c, "content_refusal").contains(exemption),
+            "{exemption}"
+        );
     }
     in_order(
         scan,
@@ -898,7 +913,8 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
         "pub static PROG_CONTENT_HELD: HashMap<u32, u64> = HashMap::with_max_entries(PROG_CONTENT_HELD_MAX, 0);"
     ));
     // the lab check
-    let lab = fs::read_to_string(repo_root().join("deploy/lab/malsim/bpf-content-check.sh")).unwrap();
+    let lab =
+        fs::read_to_string(repo_root().join("deploy/lab/malsim/bpf-content-check.sh")).unwrap();
     in_order(
         &lab,
         &[

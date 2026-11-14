@@ -3322,22 +3322,23 @@ fn resolved_features(
     std::collections::BTreeSet<String>,
     std::collections::BTreeSet<(String, String)>,
 ) {
-    let out = std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .current_dir(repo_root())
-        .args([
-            "tree",
-            "--workspace",
-            "--locked",
-            "--offline",
-            "-e",
-            edges,
-            "--prefix",
-            "none",
-            "-f",
-            "{p} [{f}]",
-        ])
-        .output()
-        .expect("cargo tree runs");
+    let out =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(repo_root())
+            .args([
+                "tree",
+                "--workspace",
+                "--locked",
+                "--offline",
+                "-e",
+                edges,
+                "--prefix",
+                "none",
+                "-f",
+                "{p} [{f}]",
+            ])
+            .output()
+            .expect("cargo tree runs");
     assert!(
         out.status.success(),
         "cargo tree failed (build the workspace once, or `cargo fetch --locked`):\n{}",
@@ -3388,7 +3389,13 @@ fn the_release_build_enables_no_test_feature() {
         "xtask's userland build is `cargo build --workspace` (the graph resolved here)"
     );
     let (packages, release) = resolved_features("normal,build,features");
-    for krate in ["northnarrow-agent", "northnarrow-watchdog", "nn-core", "nn-linux", "tokio"] {
+    for krate in [
+        "northnarrow-agent",
+        "northnarrow-watchdog",
+        "nn-core",
+        "nn-linux",
+        "tokio",
+    ] {
         assert!(
             packages.contains(krate),
             "cargo tree's release graph does not list {krate} ({} packages read)",
@@ -3410,6 +3417,19 @@ fn the_release_build_enables_no_test_feature() {
         "the release build (cargo build --workspace --release) enables test-only features: {}",
         bad.join(", ")
     );
+    // the mini-hunt: a `--cfg feature="…"` in the release's flags turns a
+    // test door on with no feature at all (cargo tree would not see it)
+    for rel in [".github/workflows/release.yml", ".cargo/config.toml"] {
+        let text = fs::read_to_string(repo_root().join(rel)).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            assert!(
+                code.starts_with('#') || !code.contains("--cfg"),
+                "{rel}:{}: a --cfg in the release's flags: {code}",
+                i + 1
+            );
+        }
+    }
     // the reader sees one where there is one: the tests' graph has them
     let (_, tests) = resolved_features("normal,build,dev,features");
     for want in [("nn-core", "test-util"), ("nn-linux", "test-util")] {
@@ -3435,7 +3455,8 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
     let mut unclassified = Vec::new();
     for m in &members {
         for f in &m.features {
-            if !TEST_ONLY_FEATURES.contains(&f.as_str()) && !RELEASE_FEATURES.contains(&f.as_str()) {
+            if !TEST_ONLY_FEATURES.contains(&f.as_str()) && !RELEASE_FEATURES.contains(&f.as_str())
+            {
                 unclassified.push(format!("{}/{f}", m.name));
             }
         }
@@ -3470,7 +3491,10 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
         "build_info::DEPENDENCY_TEST_FEATURES must name {}",
         unnamed.join(", ")
     );
-    for (entry, krate) in [("nn-core/test-util", "nn_core"), ("nn-linux/test-util", "nn_linux")] {
+    for (entry, krate) in [
+        ("nn-core/test-util", "nn_core"),
+        ("nn-linux/test-util", "nn_linux"),
+    ] {
         assert!(
             info.contains(&format!("(\"{entry}\", {krate}::TEST_UTIL),")),
             "build_info names {entry} with what {krate} was compiled with"

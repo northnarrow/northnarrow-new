@@ -2394,6 +2394,13 @@ detail.
     trusted-installer window, as any change of the slice). A host whose
     real-time workload uses an `isolated` partition gets the record: the
     agent does run on fewer CPUs there.
+  - **Removing that `AllowedCPUs=` is recorded (measured, true).** When
+    systemd then drops the cpuset controller from the slice, the kernel
+    leaves the agent's threads on the CPUs they had (Ubuntu 22.04 and
+    24.04: three of four after `AllowedCPUs=0-2` was reset): the agent
+    does run on fewer CPUs than it should, and says so (`cpu_confined`,
+    cause `affinity`). Restart the agent (inside a window) to give it every
+    CPU back; it does not widen its own threads' masks.
   - Not watched: the watchdog's CPUs (the agent's own threads only).
 - **A program loaded in a window cannot be taken after it (6.9 and
   later).** A program the BPF content judge refuses outside a window (a

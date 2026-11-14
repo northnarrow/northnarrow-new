@@ -243,7 +243,13 @@ pub fn cpu_list_text(cpus: &[u32]) -> String {
 fn printable(s: &str, max: usize) -> String {
     let mut out: String = s
         .chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .collect();
     if out.len() > max {
         out.truncate(max);
@@ -300,6 +306,11 @@ pub fn expected(start_cgroup: &str, host: &Host, r: &Reading) -> Vec<u32> {
         .collect();
     if let Some(m) = &host.manager {
         out = intersect(&out, m);
+    }
+    // a narrowing that leaves no online CPU (a stale list) narrows nothing:
+    // the watch never goes blind for want of an expectation
+    if out.is_empty() {
+        out = r.online.clone();
     }
     for (path, cpus) in &r.configured {
         if path != start_cgroup {
@@ -513,11 +524,7 @@ pub fn system_conf_files(root: &Path) -> Vec<String> {
             }
         }
     }
-    out.extend(
-        dropins
-            .values()
-            .filter_map(|p| read_text(p)),
-    );
+    out.extend(dropins.values().filter_map(|p| read_text(p)));
     out
 }
 
@@ -776,7 +783,11 @@ mod tests {
         assert_eq!(c.cause.subject(), "/k349part");
         assert_eq!(of_target_dev(c.target_dev()), (CAUSE_PARTITION, 1, 4, 0));
         assert_eq!(c.target_ino(), 1);
-        assert!(c.line().contains("CPUs 0 of the 0-3 it should (4)"), "{}", c.line());
+        assert!(
+            c.line().contains("CPUs 0 of the 0-3 it should (4)"),
+            "{}",
+            c.line()
+        );
         assert!(c.line().contains("/k349part root 1-3"), "{}", c.line());
     }
 
@@ -793,7 +804,15 @@ mod tests {
 
     #[test]
     fn all_the_cpus_is_no_confinement() {
-        assert_eq!(judge(START, &Host::default(), &reading(&all(), &[&all(), &all()]), &none), None);
+        assert_eq!(
+            judge(
+                START,
+                &Host::default(),
+                &reading(&all(), &[&all(), &all()]),
+                &none
+            ),
+            None
+        );
     }
 
     /// A CPU taken offline: the online CPUs, the effective ones and the
@@ -878,7 +897,11 @@ mod tests {
         let mut w = Watch::default();
         let free = reading(&all(), &[&all()]);
         let pinned = reading(&[0], &[&[0]]);
-        assert_eq!(w.step(&free, &all(), &none), Step::Skipped, "the first read is the baseline");
+        assert_eq!(
+            w.step(&free, &all(), &none),
+            Step::Skipped,
+            "the first read is the baseline"
+        );
         assert_eq!(w.start_cgroup.as_deref(), Some(START));
         assert_eq!(w.step(&free, &all(), &none), Step::Same);
         let Step::Confined(c) = w.step(&pinned, &all(), &none) else {
@@ -887,7 +910,10 @@ mod tests {
         assert_eq!(c.left, vec![0]);
         assert_eq!(w.step(&pinned, &all(), &none), Step::Same, "signed once");
         let wider = reading(&[0, 1], &[&[0, 1]]);
-        assert!(matches!(w.step(&wider, &all(), &none), Step::Confined(_)), "changed");
+        assert!(
+            matches!(w.step(&wider, &all(), &none), Step::Confined(_)),
+            "changed"
+        );
         assert!(matches!(w.step(&free, &all(), &none), Step::Cleared(_)));
         assert_eq!(w.current, None);
         // a hotplug: the online set moved since the last round — skipped,
@@ -927,9 +953,18 @@ mod tests {
     /// what the agent should run on (no task runs there unless pinned).
     #[test]
     fn isolated_cpus_and_systemd_s_default_affinity_are_not_a_confinement() {
-        assert_eq!(isolated_by_cmdline("ro quiet isolcpus=2-3 nohz_full=2-3"), vec![2, 3]);
-        assert_eq!(isolated_by_cmdline("isolcpus=domain,managed_irq,1,3"), vec![1, 3]);
-        assert_eq!(isolated_by_cmdline("isolcpus=nohz,managed_irq,1-3"), Vec::<u32>::new());
+        assert_eq!(
+            isolated_by_cmdline("ro quiet isolcpus=2-3 nohz_full=2-3"),
+            vec![2, 3]
+        );
+        assert_eq!(
+            isolated_by_cmdline("isolcpus=domain,managed_irq,1,3"),
+            vec![1, 3]
+        );
+        assert_eq!(
+            isolated_by_cmdline("isolcpus=nohz,managed_irq,1-3"),
+            Vec::<u32>::new()
+        );
         assert_eq!(isolated_by_cmdline("isolcpus=1 isolcpus=2"), vec![2]);
         assert_eq!(isolated_by_cmdline("ro quiet"), Vec::<u32>::new());
         let conf = |t: &str| t.to_string();
@@ -945,9 +980,15 @@ mod tests {
             None,
             "an empty assignment resets it"
         );
-        assert_eq!(manager_affinity(&[conf("[Manager]\nCPUAffinity=numa\n")]), None);
+        assert_eq!(
+            manager_affinity(&[conf("[Manager]\nCPUAffinity=numa\n")]),
+            None
+        );
         assert_eq!(manager_affinity(&[conf("[Other]\nCPUAffinity=0\n")]), None);
-        assert_eq!(manager_affinity(&[conf("[Manager]\nCPUAffinity=0 2\n")]), Some(vec![0, 2]));
+        assert_eq!(
+            manager_affinity(&[conf("[Manager]\nCPUAffinity=0 2\n")]),
+            Some(vec![0, 2])
+        );
         // tuned's cpu-partitioning: CPUs 2-3 isolated, systemd on 0-1
         let host = Host {
             isolated: vec![2, 3],
@@ -958,15 +999,54 @@ mod tests {
         assert_eq!(judge(START, &host, &r, &none), None);
         let pinned = reading(&[0], &[&[0]]);
         assert!(judge(START, &host, &pinned, &none).is_some());
+        // each alone: isolcpus without systemd's affinity, and the reverse
+        let isolated = Host {
+            isolated: vec![2, 3],
+            manager: None,
+        };
+        assert_eq!(expected(START, &isolated, &r), vec![0, 1]);
+        assert_eq!(judge(START, &isolated, &r, &none), None);
+        let manager = Host {
+            isolated: Vec::new(),
+            manager: Some(vec![0, 1]),
+        };
+        assert_eq!(judge(START, &manager, &r, &none), None);
+        assert!(judge(START, &Host::default(), &r, &none).is_some());
+        // a narrowing to CPUs that are not online is no expectation of none
+        let stale = Host {
+            isolated: Vec::new(),
+            manager: Some(vec![9]),
+        };
+        assert_eq!(expected(START, &stale, &r), all());
+        assert!(judge(START, &stale, &pinned, &none).is_some());
         // the files in systemd's order
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("etc/systemd/system.conf.d")).unwrap();
         std::fs::create_dir_all(t.path().join("usr/lib/systemd/system.conf.d")).unwrap();
-        std::fs::write(t.path().join("etc/systemd/system.conf"), "[Manager]\nCPUAffinity=0-3\n").unwrap();
-        std::fs::write(t.path().join("usr/lib/systemd/system.conf.d/10-a.conf"), "[Manager]\nCPUAffinity=0\n").unwrap();
-        std::fs::write(t.path().join("etc/systemd/system.conf.d/10-a.conf"), "[Manager]\nCPUAffinity=0-1\n").unwrap();
-        std::fs::write(t.path().join("etc/systemd/system.conf.d/20-b.txt"), "[Manager]\nCPUAffinity=3\n").unwrap();
-        assert_eq!(manager_affinity(&system_conf_files(t.path())), Some(vec![0, 1]));
+        std::fs::write(
+            t.path().join("etc/systemd/system.conf"),
+            "[Manager]\nCPUAffinity=0-3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("usr/lib/systemd/system.conf.d/10-a.conf"),
+            "[Manager]\nCPUAffinity=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("etc/systemd/system.conf.d/10-a.conf"),
+            "[Manager]\nCPUAffinity=0-1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("etc/systemd/system.conf.d/20-b.txt"),
+            "[Manager]\nCPUAffinity=3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manager_affinity(&system_conf_files(t.path())),
+            Some(vec![0, 1])
+        );
     }
 
     /// The online CPUs from two sources: a fake online list (a file bound
@@ -992,6 +1072,14 @@ mod tests {
         assert_eq!(chain(START), vec![START.to_string(), SLICE.to_string()]);
         assert_eq!(chain("/"), Vec::<String>::new());
         assert_eq!(printable("a\nb\u{1b}c", 64), "a?b?c");
+        // a cgroup's name is anyone's: the record's subject is cut, printable
+        let long = Cause::CgroupMove {
+            from: START.into(),
+            to: format!("/{}\u{1b}[31m", "x".repeat(200)),
+        };
+        let subject = long.subject();
+        assert_eq!(subject.len(), 64);
+        assert!(subject.chars().all(|c| c.is_ascii_graphic()), "{subject}");
     }
 
     /// The host's reads, on a cgroup tree in a tempdir: the effective CPUs
@@ -1017,11 +1105,19 @@ mod tests {
         // too (its state as the kernel writes it)
         let iso = root.join("rt.slice/iso");
         std::fs::create_dir_all(&iso).unwrap();
-        std::fs::write(iso.join("cpuset.cpus.partition"), "isolated invalid (cpus not exclusive)\n").unwrap();
+        std::fs::write(
+            iso.join("cpuset.cpus.partition"),
+            "isolated invalid (cpus not exclusive)\n",
+        )
+        .unwrap();
         // an empty effective list is no answer: the nearest ancestor's is read
         std::fs::write(agent.join("cpuset.cpus.effective"), "\n").unwrap();
         let r = read_under(root, all(), Some(START.into()), None, vec![(1, vec![0])]);
-        assert_eq!(r.effective, Some(vec![0]), "the root's, the nearest with the file");
+        assert_eq!(
+            r.effective,
+            Some(vec![0]),
+            "the root's, the nearest with the file"
+        );
         assert_eq!(r.configured, vec![(SLICE.to_string(), vec![0, 1])]);
         assert_eq!(
             partitions_under(root),
@@ -1047,7 +1143,10 @@ mod tests {
         let online = read_cpus(Path::new(ONLINE)).unwrap_or_default();
         for (_, cpus) in &threads {
             assert!(!cpus.is_empty());
-            assert!(online.is_empty() || subset(cpus, &online), "{cpus:?} {online:?}");
+            assert!(
+                online.is_empty() || subset(cpus, &online),
+                "{cpus:?} {online:?}"
+            );
         }
     }
 }

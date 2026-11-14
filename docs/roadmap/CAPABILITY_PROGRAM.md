@@ -11276,6 +11276,69 @@ number in parentheses is a lab PR.
   - Levels unchanged: false-positive work of the alpha; no new capability.
 
 
+- **Lot 349 — pre-alpha self-protection blockers R001–R003 and the release
+  feature ratchet R090 (rc2; C23, C27; no level changes).**
+  - What was open (the pre-alpha Phase 0 list at rc1 a5eb2744): R001, root
+    confined the agent to one CPU through a sibling cgroup in
+    `cpuset.cpus.partition=root` with no hook and no record (the review of
+    #557, F1); R002, from 6.9 a program loaded inside a window, or before the
+    agent, could be taken by id; R003, a copy of `/etc` mounted over `/etc`
+    after the key load; R090, no check that a release build enables no
+    test-only feature.
+  - Done: (R001) the kernel-state round reads every thread's affinity and
+    the agent's cgroup's effective CPUs against the CPUs it should run on
+    (online, less `isolcpus=`, narrowed by systemd's `CPUAffinity=` at the
+    start and a slice's `cpuset.cpus`); a shrink is NN-L-AT-001
+    `cpu_confined` High naming the cause and the degradation `own_cpus`
+    while it holds (`crates/nn-linux/src/own_cpus.rs`, a new
+    `FsProtectOperation`); the online CPUs come from the online list and
+    `/proc/stat` together; a round whose online CPUs moved is skipped.
+    (R002) the load hook scans a window's foreign load too and the
+    `bpf_prog` hook keeps the verdict by program id; a later handle by id
+    or pin outside a window is refused and signed in every mode. (R003)
+    measured, unchanged: the integrity round signs it today. (R090) an xtask
+    ratchet resolves the release graph (`cargo tree --workspace -e
+    normal,build,features`) and fails on any test-only feature, any
+    unclassified feature of a member, a `--cfg` in the release's flags; the
+    agent's `--build-features` names its linked crates' `test-util`, which
+    release.yml's artefact check refuses.
+  - Lab (as measured): our own guests, one at a time, alpha profile with
+    `--allow-bpf-tools`, a fresh install each round (ubuntu2204 had another
+    lot's rc1 install left without `--purge`: recorded and purged before the
+    round, nothing measured on it), uninstalled with `--purge` after. Before
+    = rc1 a5eb2744, after = the lot. **ubuntu2404** (6.8.0-149): before, a
+    sibling partition of CPUs 1–3 left the agent's 43 threads on CPU 0 with
+    no record, no degradation; the window's and the pre-agent `bpf_send_signal`
+    kprobes' handles by id and pin refused (EPERM, `bpf_prog_type` High ×4:
+    the calibrated judge); a copy of `/etc` over `/etc` signed
+    `mount_over_protected` within 45 s. After: @AFTER2404@ **ubuntu2204**
+    (5.15.0-202), after: the cpuset controller enabled at the root, no
+    record; the partition `cpu_confined` High naming `/nn-cpu-check` and
+    `own_cpus` in the status within 15 s, gone once undone; CPU 3 offline
+    and back, no record; the window's kprobe refused by id and pin, the
+    pre-agent one too (baseline High); `/etc` signed as on 6.8;
+    `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing, the
+    highest 551,900 of 900,000 (`bpf_prog_guard` 18,479). The first
+    after-round's content checks ran inside the CPU check's window (the
+    check now waits for its end) and are not counted. **ubuntu2604** (7.0):
+    before, the window's kprobe and `syscall` program (calling
+    `bpf_send_signal_task`, SIGWINCH to the agent) and the pre-agent kprobe
+    were taken by id and pin and the syscall program run, no record (the
+    pre-agent one signed High at the start, the cross-view's baseline); a
+    copy of `/etc` signed `mount_over_protected`. After: @AFTER2604@
+  - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
+    the host for all (no record); the kernel leaves the threads' masks
+    narrowed when systemd drops the cpuset controller after an
+    `AllowedCPUs=` reset (recorded, true; the agent does not widen its own
+    masks); `CPUWeight=` on the slice against a CPU flood (BL:254: root
+    out-weighs it, and a slice unit change needs its own upgrade round);
+    from 6.9 a program loaded before the agent is not judged at its handles
+    (High at the start); the window's loader keeps its own descriptor; an
+    agent restart forgets the kept ids; no `sb_mount` hook (R003 is
+    recorded, not refused).
+  - Levels unchanged: blockers of the pre-alpha closed or measured; no new
+    capability.
+
 - **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases
   (before the alpha tag; the re-check of #550, N1–N5 and point 1; C27, C28;
   no level changes).**

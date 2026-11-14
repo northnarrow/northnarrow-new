@@ -2586,7 +2586,10 @@ mod tests {
         // lot 349: a CPU confinement's fields go and come back
         let dev = cpu_confined_dev(CPU_CAUSE_AFFINITY, 1, 4, 70_000);
         assert_eq!(cpu_confined_of(dev), (CPU_CAUSE_AFFINITY, 1, 4, 0xffff));
-        assert_eq!(cpu_confined_of(cpu_confined_dev(CPU_CAUSE_PARTITION, 0, 2, 0)), (1, 0, 2, 0));
+        assert_eq!(
+            cpu_confined_of(cpu_confined_dev(CPU_CAUSE_PARTITION, 0, 2, 0)),
+            (1, 0, 2, 0)
+        );
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);
             for b in &ops[i + 1..] {

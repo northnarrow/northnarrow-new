@@ -468,11 +468,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_to_string(p.join(f))",
         KNOB,
     ),
-    (
-        "crates/nn-linux/src/own_cpus.rs",
-        "read_state(p)",
-        CPUS,
-    ),
+    ("crates/nn-linux/src/own_cpus.rs", "read_state(p)", CPUS),
     (
         "crates/nn-linux/src/known_system_prog.rs",
         "read_to_string(pdir.join(\"fdinfo\").join(fd.file_name()))",

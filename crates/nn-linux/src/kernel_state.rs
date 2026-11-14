@@ -231,7 +231,11 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
         // lot 349: what the cause names (a partition, a cgroup, a thread)
         Finding::Cpus(c) => {
             comm = c.cause.subject();
-            (FsProtectOperation::CpuConfined, c.target_dev(), c.target_ino())
+            (
+                FsProtectOperation::CpuConfined,
+                c.target_dev(),
+                c.target_ino(),
+            )
         }
         Finding::Bpf(b) => {
             use crate::bpf_crossview::Finding as B;

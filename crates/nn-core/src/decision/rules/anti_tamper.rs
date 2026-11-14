@@ -1106,23 +1106,44 @@ mod tests {
             timestamp_ns: 1,
         };
         for (cause, comm, says) in [
-            (CPU_CAUSE_PARTITION, "/k349part", "cpuset.cpus.partition root or isolated (`/k349part`)"),
-            (CPU_CAUSE_CGROUP_CPUSET, "/northnarrow.slice/northnarrow-agent.service", "own cgroup's cpuset.cpus"),
+            (
+                CPU_CAUSE_PARTITION,
+                "/k349part",
+                "cpuset.cpus.partition root or isolated (`/k349part`)",
+            ),
+            (
+                CPU_CAUSE_CGROUP_CPUSET,
+                "/northnarrow.slice/northnarrow-agent.service",
+                "own cgroup's cpuset.cpus",
+            ),
             (CPU_CAUSE_AFFINITY, "tid 7", "affinity of 2 of its threads"),
-            (CPU_CAUSE_CGROUP_MOVE, "/pen", "moved to another cgroup (`/pen`)"),
+            (
+                CPU_CAUSE_CGROUP_MOVE,
+                "/pen",
+                "moved to another cgroup (`/pen`)",
+            ),
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&confined(cpu_confined_dev(cause, 1, 4, 2), 0b1, comm))
                 .expect("verdict");
             assert_eq!(v.severity, Severity::High, "{cause}");
             assert!(matches!(v.action, ResponseAction::Log));
-            assert!(v.reasoning.contains("may run on 1 of the 4 CPUs it should (CPUs 0)"), "{}", v.reasoning);
+            assert!(
+                v.reasoning
+                    .contains("may run on 1 of the 4 CPUs it should (CPUs 0)"),
+                "{}",
+                v.reasoning
+            );
             assert!(v.reasoning.contains(says), "{}", v.reasoning);
             assert!(v.reasoning.contains("Not refused"), "{}", v.reasoning);
             assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
         }
         let v = NnLAt001AntiTamperDenial
-            .evaluate(&confined(cpu_confined_dev(CPU_CAUSE_PARTITION, 2, 96, 0), 0b1010, "/p"))
+            .evaluate(&confined(
+                cpu_confined_dev(CPU_CAUSE_PARTITION, 2, 96, 0),
+                0b1010,
+                "/p",
+            ))
             .unwrap();
         assert!(v.reasoning.contains("(CPUs 1,3)"), "{}", v.reasoning);
     }

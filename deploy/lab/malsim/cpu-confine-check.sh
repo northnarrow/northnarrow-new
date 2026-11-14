@@ -42,7 +42,7 @@ affinity() { for t in /proc/"$APID"/task/*; do taskset -pc "${t##*/}" </dev/null
 wait_record() { local n=$1 left=$2; while (( left > 0 )); do confined "$n" | grep -q . && return 0; sleep 1; left=$((left - 1)); done; return 1; }
 NCPU=$(nproc --all)
 ONLINE=$(cat /sys/devices/system/cpu/online)
-echo "=== CASE C0 info: rc=0 kernel $(uname -r) cpus $NCPU online $ONLINE agent $APID affinity $(affinity) subtree [$(cat $CG/cgroup.subtree_control)]"
+echo "=== CASE $(date -u +%T) C0 info: rc=0 kernel $(uname -r) cpus $NCPU online $ONLINE agent $APID affinity $(affinity) subtree [$(cat $CG/cgroup.subtree_control)]"
 
 # C0: the cpuset controller enabled at the root
 n0=$(lines "$DET")
@@ -51,7 +51,7 @@ if ! grep -qw cpuset $CG/cgroup.subtree_control; then
     e=$(put +cpuset $CG/cgroup.subtree_control); rc=$?
     ENABLED=1
     sleep 12
-    echo "=== CASE C0 cpuset enabled at the root: rc=$rc $e subtree [$(cat $CG/cgroup.subtree_control)] affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C0 cpuset enabled at the root: rc=$rc $e subtree [$(cat $CG/cgroup.subtree_control)] affinity $(affinity)"
     [[ -z $(confined "$n0") ]] && pass "C0 the cpuset controller enabled above the agent: no cpu_confined" || bad "C0 a cpu_confined record at the controller's enable: $(confined "$n0" | head -1 | cut -c1-200)"
 else
     measure "C0 the cpuset controller was already enabled at the root"
@@ -65,7 +65,7 @@ else
     sudo mkdir -p "$PART" </dev/null
     e1=$(put "1-$((NCPU - 1))" "$PART/cpuset.cpus"); r1=$?
     e2=$(put root "$PART/cpuset.cpus.partition"); r2=$?
-    echo "=== CASE C1 partition root: rc=$r1/$r2 $e1 $e2 state [$(cat $PART/cpuset.cpus.partition 2>&1)] root-effective $(cat $CG/cpuset.cpus.effective) affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C1 partition root: rc=$r1/$r2 $e1 $e2 state [$(cat $PART/cpuset.cpus.partition 2>&1)] root-effective $(cat $CG/cpuset.cpus.effective) affinity $(affinity)"
     if wait_record "$n1" 15; then
         r=$(confined "$n1" | head -1)
         sev=$(echo "$r" | grep -o '"severity":"[A-Za-z]*"' | head -1)
@@ -84,7 +84,7 @@ else
     sudo rmdir "$PART" </dev/null
     sleep 12
     st=$(status)
-    echo "=== CASE C1 partition undone: rc=0 affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C1 partition undone: rc=0 affinity $(affinity)"
     printf '%s\n' "$st" | grep -qE '^  - own_cpus: ' && bad "C1 the confinement still in the status after the partition went" || pass "C1 the partition undone: the degradation left the status"
 fi
 
@@ -94,10 +94,10 @@ if (( NCPU >= 2 )) && [[ -e /sys/devices/system/cpu/cpu$LAST/online ]]; then
     n2=$(lines "$DET")
     e=$(put 0 /sys/devices/system/cpu/cpu$LAST/online); r=$?
     sleep 15
-    echo "=== CASE C2 cpu$LAST offline: rc=$r $e online $(cat /sys/devices/system/cpu/online) affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C2 cpu$LAST offline: rc=$r $e online $(cat /sys/devices/system/cpu/online) affinity $(affinity)"
     put 1 /sys/devices/system/cpu/cpu$LAST/online >/dev/null
     sleep 15
-    echo "=== CASE C2 cpu$LAST online: rc=0 online $(cat /sys/devices/system/cpu/online) affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C2 cpu$LAST online: rc=0 online $(cat /sys/devices/system/cpu/online) affinity $(affinity)"
     [[ -z $(confined "$n2") ]] && pass "C2 a CPU offline and back: no cpu_confined" || bad "C2 a cpu_confined record at a hotplug: $(confined "$n2" | head -1 | cut -c1-200)"
 else
     measure "C2 no CPU hotplug here"
@@ -110,7 +110,7 @@ if [[ -n $KEY ]] && (( NCPU >= 2 )); then
     WEND=$(( $(date +%s) + 120 ))
     o=$(sudo timeout 30 systemctl set-property --runtime northnarrow.slice AllowedCPUs=0-$((NCPU - 2)) </dev/null 2>&1); r=$?
     sleep 15
-    echo "=== CASE C3 slice AllowedCPUs=0-$((NCPU - 2)): rc=$w/$r ${o:0:80} slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $(affinity)"
+    echo "=== CASE $(date -u +%T) C3 slice AllowedCPUs=0-$((NCPU - 2)): rc=$w/$r ${o:0:80} slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $(affinity)"
     [[ -z $(confined "$n3") ]] && pass "C3 systemd's AllowedCPUs= on the slice: no cpu_confined" || bad "C3 a cpu_confined record for the slice's AllowedCPUs=: $(confined "$n3" | head -1 | cut -c1-200)"
     n3=$(lines "$DET")
     sudo timeout 30 systemctl set-property --runtime northnarrow.slice AllowedCPUs= </dev/null >/dev/null 2>&1
@@ -120,7 +120,7 @@ if [[ -n $KEY ]] && (( NCPU >= 2 )); then
     sudo timeout 30 systemctl daemon-reload </dev/null
     sleep 12
     now=$(affinity)
-    echo "=== CASE C3 slice AllowedCPUs reset: rc=0 slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $now"
+    echo "=== CASE $(date -u +%T) C3 slice AllowedCPUs reset: rc=0 slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $now"
     if [[ $now == *" $(cat /sys/devices/system/cpu/online);" && $now != *";"*";"* ]]; then
         [[ -z $(confined "$n3") ]] && pass "C3 the reset gave every CPU back: no cpu_confined" || bad "C3 a cpu_confined record after the reset gave every CPU back: $(confined "$n3" | head -1 | cut -c1-200)"
     else
@@ -138,5 +138,7 @@ if (( ENABLED )); then
     put -cpuset $CG/cgroup.subtree_control >/dev/null || measure "C0 the cpuset controller left enabled at the root (in use)"
 fi
 systemctl is-active --quiet northnarrow-agent && [[ $(agent_pid) == "$APID" ]] && pass "C4 the agent active, same pid" || bad "C4 the agent restarted or stopped"
-echo "=== CASE C-END: rc=$fail"
+# measured, not a verdict: the watch's own journal lines of this run
+sudo journalctl --namespace=northnarrow -b -u northnarrow-agent --no-pager </dev/null 2>/dev/null | grep 'own CPUs' | cut -c1-200 | sed 's/^/    journal: /' | tail -n 12
+echo "=== CASE $(date -u +%T) C-END: rc=$fail"
 exit $fail

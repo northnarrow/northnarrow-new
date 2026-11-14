@@ -2655,7 +2655,12 @@ hotplug.
 from the agent's own process and `/sys/fs/cgroup`), and systemd's
 `system.conf` at the agent's start. Root can still starve the agent by
 other means a record names (a CPU flood: `CPUWeight=` on the slice is not
-set, BL:254, named), and the watchdog's CPUs are not watched.
+set, BL:254, named), and the watchdog's CPUs are not watched. Measured on
+5.15 and 6.8: when systemd drops the cpuset controller from the slice
+(an `AllowedCPUs=` reset), the kernel leaves the tasks' masks as they were
+— the agent stays on fewer CPUs, recorded (cause `affinity`); the agent
+does not widen its own masks (a restart does). Root offlining CPUs
+narrows the host for everyone, the agent with it: no record (a hotplug).
 
 **A window's forbidden load (pre-alpha R002).** From 6.9 the content judge
 runs at `bpf_prog_load` only, on the kernel's copy of the instructions;
