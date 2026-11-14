@@ -359,6 +359,9 @@ pub struct AuditLog<K> {
     /// run that booted ran (its `agent_boot`'s `profile`; for a row written
     /// before the field, `enforcing` when it ran its responses).
     previous_boot_profile: Option<String>,
+    /// The review of #553 (F2): when the chain's unacknowledged
+    /// `profile_downgraded` was signed ([`Self::profile_downgrade_pending`]).
+    profile_downgrade_pending: Option<String>,
     /// External audit ATP-004: the chain holds a successful
     /// `rotate_keys_add` — the one-key bootstrap is over for good. The
     /// log is never rotated (module doc); a rotation must carry this.
@@ -444,6 +447,7 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_run: tail.previous_run,
             previous_boot_enforced: tail.previous_boot_enforced,
             previous_boot_profile: tail.previous_boot_profile,
+            profile_downgrade_pending: tail.profile_downgrade_pending,
             second_key_added: tail.second_key_added,
             rows: tail.seq.rows(),
             numbered: tail.seq.numbered(),
@@ -478,6 +482,7 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_run: PreviousRun::None,
             previous_boot_enforced: None,
             previous_boot_profile: None,
+            profile_downgrade_pending: None,
             second_key_added: false,
             rows: 0,
             numbered: false,
@@ -597,6 +602,18 @@ impl<K: ChainSigner> AuditLog<K> {
     /// earlier boot in this chain.
     pub fn previous_boot_profile(&self) -> Option<&str> {
         self.previous_boot_profile.as_deref()
+    }
+
+    /// The review of #553 (F2): the time of the chain's first
+    /// `profile_downgraded` row that nothing signed answered since — no
+    /// later start ran a profile from a verified `profile.local` (its
+    /// `agent_boot`'s `profile_source` [`PROFILE_SOURCE_SIGNED`]) and no
+    /// signed `config overlay set profile` succeeded
+    /// ([`OVERLAY_SET_OP`] of kind `profile`). The alarm reached
+    /// `nn-admin status` for one boot only: the next start compared to the
+    /// boot that alarmed, which ran alpha, and said nothing.
+    pub fn profile_downgrade_pending(&self) -> Option<&str> {
+        self.profile_downgrade_pending.as_deref()
     }
 
     /// Lot 341 (the review of #550, F8): sign that this boot observes only
@@ -1039,6 +1056,16 @@ pub struct AgentBuild {
 /// `profile.local` asking for it ([`AuditLog::attest_profile_downgrade`]).
 pub const PROFILE_DOWNGRADED_KIND: &str = "profile_downgraded";
 
+/// The review of #553 (F2): an `agent_boot`'s `profile_source` when the
+/// profile came from a verified `profile.local` (`nn_core`'s
+/// `ProfileSource::Overlay` label).
+pub const PROFILE_SOURCE_SIGNED: &str = "signed profile.local";
+
+/// The review of #553 (F2): the op of a signed `nn-admin config overlay
+/// set` (the agent's `overlay_auth::AUDIT_OP_SET`); one of kind `profile`
+/// that succeeded acknowledges a pending downgrade.
+pub const OVERLAY_SET_OP: &str = "config_overlay_set";
+
 /// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
@@ -1186,6 +1213,8 @@ struct TailState {
     previous_boot_enforced: Option<bool>,
     /// Lot 345: the last run's `agent_boot`'s profile.
     previous_boot_profile: Option<String>,
+    /// The review of #553 (F2): [`AuditLog::profile_downgrade_pending`].
+    profile_downgrade_pending: Option<String>,
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -1219,6 +1248,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 last_agent_id: None,
                 previous_boot_enforced: None,
                 previous_boot_profile: None,
+                profile_downgrade_pending: None,
             });
         }
         Err(e) => return Err(refused_open::<H>(e, path, "to read its chain")),
@@ -1236,6 +1266,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     let mut anchoring_started = false;
     let mut last_agent_id = None;
     let mut previous_boot_enforced = None;
+    let mut profile_downgrade_pending: Option<String> = None;
     let mut previous_boot_profile = None;
     for (n, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
@@ -1281,10 +1312,22 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 // observing boot of the enforcing profile (a detect-only
                 // drop-in) is still an enforcing profile's, so it no longer
                 // launders the downgrade that follows it
+                // The review of #553 (F2, its variant): a row without the
+                // field that observed (an agent before it, a binary swapped
+                // back) no longer resets what is known to "unknown" — the
+                // last known profile stands
                 previous_boot_profile = match entry.extra.get("profile").and_then(|v| v.as_str()) {
                     Some(p) => Some(p.to_string()),
-                    None => (previous_boot_enforced == Some(true)).then(|| "enforcing".to_string()),
+                    None if previous_boot_enforced == Some(true) => Some("enforcing".to_string()),
+                    None => previous_boot_profile.take(),
                 };
+                // The review of #553 (F2): a start that ran a profile from a
+                // verified profile.local answers a pending downgrade
+                if entry.extra.get("profile_source").and_then(|v| v.as_str())
+                    == Some(PROFILE_SOURCE_SIGNED)
+                {
+                    profile_downgrade_pending = None;
+                }
                 previous = PreviousRun::Abrupt {
                     booted_at: entry.ts.clone(),
                     last_entry_at: entry.ts.clone(),
@@ -1302,6 +1345,20 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 }
             }
             "rotate_keys_add" if entry.result == "success" => second_key_added = true,
+            // The review of #553 (F2): the unsigned downgrade stays pending
+            // until something signed answers it
+            INTEGRITY_DRIFT_OP
+                if entry.extra.get("kind").and_then(|v| v.as_str())
+                    == Some(PROFILE_DOWNGRADED_KIND) =>
+            {
+                profile_downgrade_pending.get_or_insert_with(|| entry.ts.clone());
+            }
+            OVERLAY_SET_OP
+                if entry.result == "success"
+                    && entry.extra.get("kind").and_then(|v| v.as_str()) == Some("profile") =>
+            {
+                profile_downgrade_pending = None;
+            }
             _ => {}
         }
         if in_run {
@@ -1324,6 +1381,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
         last_agent_id,
         previous_boot_enforced,
         previous_boot_profile,
+        profile_downgrade_pending,
     })
 }
 
@@ -2399,12 +2457,115 @@ mod tests {
         log.boot_probe(None, "verified", "attested", &test_build())
             .unwrap();
         drop(log);
-        let mut log = open();
+        let log = open();
         assert_eq!(log.previous_boot_profile(), Some("enforcing"));
+        drop(log);
+        // an observing row before the field, with nothing known before it
+        // (the review of #553: after a known profile it no longer resets it
+        // — `a_downgrade_stays_pending_through_two_reboots`)
+        let fresh = dir.path().join("fresh.log");
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&fresh, key, [7u8; 16]).unwrap();
         log.boot_probe(Some("--detect-only"), "verified", "attested", &test_build())
             .unwrap();
         drop(log);
-        assert_eq!(open().previous_boot_profile(), None);
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        assert_eq!(
+            AuditLog::open(&fresh, key, [7u8; 16]).unwrap().previous_boot_profile(),
+            None
+        );
+    }
+
+    /// Named (the review of #553, F2): the chain of the review — boot 1
+    /// enforcing, boot 2 alpha from an edited manifest (its
+    /// `profile_downgraded` signed), then two more reboots on alpha — still
+    /// holds the downgrade pending at the fourth open: the alarm no longer
+    /// lives one boot only. A signed `config overlay set profile` answers it,
+    /// and so does a start from a signed profile.local; a refused overlay
+    /// set, another overlay's, an unsigned enforcing start do not. Its
+    /// variant: an observing row without the profile field (a binary swapped
+    /// back) keeps the last known profile instead of "unknown".
+    #[test]
+    fn a_downgrade_stays_pending_through_two_reboots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key_path = dir.path().join("agent.sig.key");
+        let open = || {
+            let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+            AuditLog::open(&path, key, [7u8; 16]).unwrap()
+        };
+        let boot = |log: &mut AuditLog<TestKey>, profile: &str, source: &str| {
+            log.boot_probe_profiled(
+                (profile == "alpha").then_some("profile alpha"),
+                Some((profile, source)),
+                "verified",
+                "attested",
+                &test_build(),
+            )
+            .unwrap();
+        };
+        let overlay_set = |log: &mut AuditLog<TestKey>, kind: &str, result: &str| {
+            let mut d = sample_draft(1);
+            d.op = OVERLAY_SET_OP.to_string();
+            d.extra = serde_json::json!({ "kind": kind });
+            d.result = result.to_string();
+            log.append(d).unwrap();
+        };
+        // boot 1: enforcing
+        let mut log = open();
+        boot(&mut log, "enforcing", "install manifest");
+        drop(log);
+        // boot 2: alpha from the manifest, the alarm signed
+        let mut log = open();
+        assert_eq!(log.profile_downgrade_pending(), None);
+        boot(&mut log, "alpha", "install manifest");
+        log.attest_profile_downgrade("alpha (install manifest) after an enforcing run")
+            .unwrap();
+        drop(log);
+        let at = {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let last: serde_json::Value =
+                serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            last["ts"].as_str().unwrap().to_string()
+        };
+        // boots 3 and 4: alpha again — still pending, since boot 2's row
+        for _ in 0..2 {
+            let mut log = open();
+            assert_eq!(log.previous_boot_profile(), Some("alpha"));
+            assert_eq!(log.profile_downgrade_pending(), Some(at.as_str()));
+            boot(&mut log, "alpha", "install manifest");
+            drop(log);
+        }
+        // neither an unsigned enforcing start, nor a refused or another
+        // overlay's set, answers it
+        let mut log = open();
+        boot(&mut log, "enforcing", "install manifest");
+        overlay_set(&mut log, "profile", "failure: rejected (bad signature)");
+        overlay_set(&mut log, "rule-policy", "success");
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.profile_downgrade_pending(), Some(at.as_str()));
+        // a signed `config overlay set profile` does
+        overlay_set(&mut log, "profile", "success");
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.profile_downgrade_pending(), None);
+        // a new downgrade, answered by a start from a signed profile.local
+        log.attest_profile_downgrade("again").unwrap();
+        drop(log);
+        let mut log = open();
+        assert!(log.profile_downgrade_pending().is_some());
+        boot(&mut log, "alpha", PROFILE_SOURCE_SIGNED);
+        drop(log);
+        let mut log = open();
+        assert_eq!(log.profile_downgrade_pending(), None);
+        // the variant: an observing row of an agent before the field keeps
+        // the last known profile
+        boot(&mut log, "enforcing", "install manifest");
+        log.boot_probe(Some("--detect-only"), "verified", "attested", &test_build())
+            .unwrap();
+        drop(log);
+        assert_eq!(open().previous_boot_profile(), Some("enforcing"));
     }
 
     /// Named (lot 341, the review of #550 F8): the next open knows whether

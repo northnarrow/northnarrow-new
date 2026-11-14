@@ -182,6 +182,15 @@ fn the_start_signs_an_unsigned_downgrade_to_alpha() {
         .expect("and kept for the status");
     assert!(probe < check && check < sign && sign < kept);
     assert!(!attest.contains("previous_boot_enforced"));
+    // the review of #553 (F2): a downgrade the chain holds, unanswered by
+    // anything signed, is kept for the status at every later start too
+    let pending = attest
+        .find("nn_core::response::profile::pending_downgrade(\n                                log.profile_downgrade_pending(),\n                                profile,\n                            )")
+        .expect("the pending downgrade judged from the chain");
+    let kept_again = attest[pending..]
+        .find("northnarrow_agent::boot::degradation::keep(\n                                nn_core::response::profile::DOWNGRADE_SOURCE,\n                                &detail,\n                                true,")
+        .expect("and kept for the status, its row in the chain");
+    assert!(kept < pending && kept_again > 0);
     let boot = at("agent/src/boot/mod.rs");
     assert!(boot.contains("        &detect_only_source,\n        &profile,\n        integrity,"));
 }
