@@ -11101,6 +11101,10 @@ number in parentheses is a lab PR.
     guest, `/etc/northnarrow` created first as CI's install does): Ubuntu
     22.04 (5.15) 10 passed, 0 failed; with the hook fix alone the start
     left NN-L-BPF-002 Low ×1 and no High, and the control failed (9/1).
+    After the merge of #553 (lot 345), the object through 5.15's verifier
+    (`verifier-check synced`, 5.15.0-202): 116 programs, 109 OK, 7 not
+    counted, 0 failing; highest `module_read_file_observe` 551,900 (55.2%);
+    `bpf_syscall_observe` 38,280, `bpf_prog_guard` 14,527.
 
 
 - **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases
