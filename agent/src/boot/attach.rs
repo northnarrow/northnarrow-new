@@ -269,6 +269,8 @@ pub(crate) async fn load(
     // hook's agent and watchdog roles (its fresh-instance window).
     let agent_pid = std::process::id();
     let own = cli.own_exes();
+    // lot 348 (the re-check of #554): never one binary in both roles
+    cli.refuse_one_binary_in_both_roles(&own)?;
     let pids = vec![agent_pid];
     // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
     // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside

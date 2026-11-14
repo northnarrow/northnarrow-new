@@ -191,6 +191,105 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
         self
     }
 
+    /// Lot 348 (the alpha: `apt install podman` on Debian 13, a kernel
+    /// update on Ubuntu 22.04 — their dpkg trigger's `update-initramfs`):
+    /// what an initramfs build run in a package transaction executes under
+    /// a module tool's comm was High (lot 283b and 287 took the kill, not
+    /// the severity) — initramfs-tools' hook `hooks/kmod` (comm `kmod`, a
+    /// shell script that copies kmod into the image) and, where the tools
+    /// do not use `dracut-install`, `manual_add_modules`' hundred `modprobe
+    /// --show-depends --set-version=<kernel>`. `Some(what)` when every fact
+    /// holds, each the kernel's or the exec pump's — root's exec, its
+    /// environment not refused, and one of:
+    ///
+    /// - the system's modprobe ([`ExecFacts::program`]: its device and
+    ///   inode) asked to load nothing ([`kmod_invocation::loads_nothing`]);
+    /// - a `#!` script ([`ExecFacts::interpreter`]: run by an interpreter of
+    ///   a system tree, not the module tool) that is not the module tool, in
+    ///   a system tree outside the tools' places, the executed file (the
+    ///   LSM program's device and inode) the file at its path under the
+    ///   host's root — PID 1's mount namespace — in a directory root's and
+    ///   writable by no one else
+    ///   ([`AuthSessionTracker::is_host_file_in_root_dir`]; the pump gives a
+    ///   script no `ROOT_DIR`: its process's image is the interpreter): not
+    ///   a copy, not a container's or another namespace's file, not
+    ///   replaced since;
+    ///
+    /// — and the exec runs under the packaged initramfs builder, run by
+    /// root ([`ExecFacts::initramfs_builder`]: its device and inode), AND in
+    /// a package transaction run by root ([`ExecFacts::package_manager`]).
+    ///
+    /// An administrator's own `sudo update-initramfs -u` (no package
+    /// manager) keeps lot 287's High record; a hook under a copy of the
+    /// builder, a non-root build, a hook outside a system tree, a copy of
+    /// the hook elsewhere or one another mount namespace sees at the path,
+    /// a module tool, `MODPROBE_OPTIONS` or `LD_*`: R011's verdict as
+    /// before. What this trusts is what the package transaction already
+    /// is: root's packages and the hooks they install.
+    ///
+    /// [`ExecFacts::interpreter`]: kmod_exec_facts::ExecFacts::interpreter
+    /// [`ExecFacts::program`]: kmod_exec_facts::ExecFacts::program
+    /// [`ExecFacts::initramfs_builder`]: kmod_exec_facts::ExecFacts::initramfs_builder
+    /// [`ExecFacts::package_manager`]: kmod_exec_facts::ExecFacts::package_manager
+    /// [`AuthSessionTracker::is_host_file_in_root_dir`]: crate::posture::lineage::AuthSessionTracker::is_host_file_in_root_dir
+    fn package_initramfs_build(&self, event: &Event) -> Option<String> {
+        use common::wire::exe::exe_flags::KNOWN;
+        use kmod_exec_facts::Environment;
+        let Event::ProcessSpawn {
+            uid,
+            exe,
+            argv,
+            argv_truncated,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if *uid != 0 || !exe.has(KNOWN) {
+            return None;
+        }
+        let image = program_identity::kernel_image(event)?;
+        let facts = kmod_exec_facts::of(event)?;
+        if matches!(facts.environment, Environment::Refused(_)) {
+            return None;
+        }
+        let what = match (&facts.program, facts.interpreter.as_deref()) {
+            // the system's modprobe (its device and inode, the pump's)
+            // asked to load nothing: initramfs-tools' `manual_add_modules`
+            // (`--show-depends --set-version=<the new kernel>`, Ubuntu 22.04
+            // and Debian 12: about a hundred per build)
+            (Ok(()), _)
+                if kmod_invocation::tool_of(image, argv) == Ok(kmod_invocation::Tool::Modprobe)
+                    && kmod_invocation::loads_nothing(argv, *argv_truncated) =>
+            {
+                format!("{image}, the system's modprobe asked to load nothing (--show-depends or --dry-run)")
+            }
+            // a hook: a `#!` script, the host's file at its path
+            (Err(_), Some(interpreter))
+                if crate::posture::lineage::in_system_tree(image)
+                    && !kmod_invocation::in_tool_place(image)
+                    && self
+                        .lineage
+                        .as_ref()?
+                        .is_host_file_in_root_dir(image, (exe.dev, exe.ino)) =>
+            {
+                format!(
+                    "{image}, a script of a system tree run by {interpreter} (the host's file at \
+                     that path by its device and inode, in a root-only directory) — no module \
+                     tool: a script loads no module without executing a tool, which R011 judges \
+                     on its own"
+                )
+            }
+            _ => return None,
+        };
+        let builder = facts.initramfs_builder?;
+        let pm = facts.package_manager?;
+        Some(format!(
+            "{what}; run by the initramfs build of the packaged {builder} in a package \
+             transaction ({pm}, run by root, both read in its lineage at the exec)"
+        ))
+    }
+
     /// Lot 347 (the alpha's container hosts: Debian 13's docker.io): the
     /// packaged containerd or dockerd probing a container runtime's modules
     /// — `Some(the manager's installed path)` when every fact holds, each
@@ -501,6 +600,23 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
                      recorded Low (lot 347): what the names load is the kernel's to judge (its \
                      signature policy; R018 judges the file it loads) (T1547.006)"
                 ),
+            ));
+        }
+        // lot 348: an initramfs hook of a dpkg trigger's build, by identity
+        if let Some(what) = self.package_initramfs_build(event) {
+            let mut reasoning = format!(
+                "Kernel-module tooling ({comm}) exec — {what}: what a dpkg trigger's initramfs \
+                 build runs, nothing loaded — recorded Low (lot 348) (T1547.006)"
+            );
+            if !parent_comm.is_empty() {
+                reasoning = format!("{reasoning}; parent={parent_comm}");
+            }
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Low,
+                &reasoning,
             ));
         }
         // Lot 279: judged on the command line's syntax and on what the exec
@@ -1267,6 +1383,238 @@ mod tests {
             ))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// Lot 348 (the alpha: `apt install podman` on Debian 13): the hook
+    /// `kmod` of a dpkg trigger's `update-initramfs` — a script of a system
+    /// tree run by dash, the host's file at its path by its device and inode
+    /// in a root-only directory (checked on the host: the pump gives a
+    /// script no `ROOT_DIR`), under the packaged builder AND in a package
+    /// transaction — is recorded Low (it was Log + High). Each fact missing
+    /// keeps the verdict lot 283b and 287 gave: High (Log), or the kill.
+    #[test]
+    fn a_dpkg_trigger_s_initramfs_hook_is_recorded_low_by_identity() {
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::KNOWN;
+        /// The root filesystem's device as `stat(2)` gives it (253:1), and
+        /// in the kernel's form, as the LSM program records an image.
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        const PACKAGED: (u64, u64) = (KDEV, 348_001);
+        const HOOKS: &str = "/usr/share/initramfs-tools/hooks";
+        IdTestHost::set_file_id(HOOK, Some((STAT_DEV, PACKAGED.1)));
+        IdTestHost::set_dir_root_only(HOOKS, true);
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let bare = super::R011KernelModuleTooling::<IdTestHost>::new(Arc::new(
+            crate::config::comm_allowlist::CommAllowlist::<IdTestHost>::default(),
+        ));
+        let r = super::R011KernelModuleTooling::<IdTestHost>::new(Arc::new(
+            crate::config::comm_allowlist::CommAllowlist::<IdTestHost>::default(),
+        ))
+        .with_lineage(Some(lineage));
+        let hook = |path: &str, id: (u64, u64), flags: u32, uid: u32| {
+            let mut e = exec(path, path, &[path, "prereqs"]);
+            if let Event::ProcessSpawn {
+                exe, uid: u, ppid, ..
+            } = &mut e
+            {
+                (exe.dev, exe.ino) = id;
+                exe.flags = flags;
+                *u = uid;
+                *ppid = 3480;
+            }
+            e
+        };
+        let facts =
+            |pm: Option<&str>, builder: Option<&str>, interpreter: Option<&str>| ExecFacts {
+                program: not_tool(),
+                environment: Environment::Clean,
+                package_manager: pm.map(str::to_string),
+                initramfs_builder: builder.map(str::to_string),
+                interpreter: interpreter.map(str::to_string),
+                library_path: None,
+            };
+        let (dpkg, b, dash) = (
+            Some("/usr/bin/dpkg"),
+            Some(UPDATE_INITRAMFS),
+            Some("/usr/bin/dash"),
+        );
+        // the lab of lot 348: a script's exec has the LSM identity of the
+        // script and no `ROOT_DIR` (its process's image is dash)
+        let rooted = KNOWN;
+        // the dpkg trigger's hook: Low
+        let v = r
+            .evaluate(&read_as(
+                hook(HOOK, PACKAGED, rooted, 0),
+                facts(dpkg, b, dash),
+            ))
+            .expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::Low),
+            "{}",
+            v.reasoning
+        );
+        for part in ["lot 348", "/usr/sbin/update-initramfs", "/usr/bin/dpkg"] {
+            assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+        }
+        // CONTROLS — High recorded as before (lot 283b / 287):
+        let high = |e: Event, f: ExecFacts, why: &str| {
+            let v = r.evaluate(&read_as(e, f)).expect("fires");
+            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+            assert!(!v.reasoning.contains("lot 348"), "{why}: {}", v.reasoning);
+            v
+        };
+        // the admin's own update-initramfs (no package manager)
+        high(
+            hook(HOOK, PACKAGED, rooted, 0),
+            facts(None, b, dash),
+            "admin",
+        );
+        // a package transaction without the packaged builder
+        high(
+            hook(HOOK, PACKAGED, rooted, 0),
+            facts(dpkg, None, dash),
+            "no builder",
+        );
+        // no interpreter read (the file runs as itself)
+        high(
+            hook(HOOK, PACKAGED, rooted, 0),
+            facts(dpkg, b, None),
+            "no #!",
+        );
+        // no LSM identity; a directory another user may write
+        high(hook(HOOK, PACKAGED, 0, 0), facts(dpkg, b, dash), "no LSM");
+        IdTestHost::set_dir_root_only(HOOKS, false);
+        high(hook(HOOK, PACKAGED, rooted, 0), facts(dpkg, b, dash), "dir");
+        IdTestHost::set_dir_root_only(HOOKS, true);
+        // another file at the path than the one executed: a copy, a file
+        // replaced since, another mount namespace's tree
+        high(
+            hook(HOOK, (KDEV, 348_002), rooted, 0),
+            facts(dpkg, b, dash),
+            "inode",
+        );
+        high(
+            hook(HOOK, (KDEV + 1, PACKAGED.1), rooted, 0),
+            facts(dpkg, b, dash),
+            "device",
+        );
+        // no lineage to read the host's file with
+        let v = bare
+            .evaluate(&read_as(
+                hook(HOOK, PACKAGED, rooted, 0),
+                facts(dpkg, b, dash),
+            ))
+            .unwrap();
+        assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        // killed as before: a non-root exec, a copy outside a system tree,
+        // a refused environment
+        let v = r
+            .evaluate(&read_as(
+                hook(HOOK, PACKAGED, rooted, 1000),
+                facts(dpkg, b, dash),
+            ))
+            .unwrap();
+        assert_ne!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        IdTestHost::set_file_id("/tmp/kmod", Some((STAT_DEV, 348_003)));
+        IdTestHost::set_dir_root_only("/tmp", true);
+        let v = r
+            .evaluate(&read_as(
+                hook("/tmp/kmod", (KDEV, 348_003), rooted, 0),
+                facts(dpkg, b, dash),
+            ))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "{}", v.reasoning);
+        let mut f = facts(dpkg, b, dash);
+        f.environment = Environment::Refused("LD_PRELOAD='/tmp/x.so' in its environment".into());
+        let v = r
+            .evaluate(&read_as(hook(HOOK, PACKAGED, rooted, 0), f))
+            .unwrap();
+        assert_ne!(v.severity, Severity::Low, "{}", v.reasoning);
+        // the mini-hunt: `manual_add_modules`' modprobe asked to load
+        // nothing (Ubuntu 22.04's build, a hundred per kernel update) — the
+        // system's tool by the pump's identity: Low under a dpkg trigger's
+        // build
+        let tool = |pm: Option<&str>, builder: Option<&str>| ExecFacts {
+            program: Ok(()),
+            ..facts(pm, builder, None)
+        };
+        let v = r
+            .evaluate(&read_as(
+                exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS),
+                tool(dpkg, b),
+            ))
+            .expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::Low),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("asked to load nothing"),
+            "{}",
+            v.reasoning
+        );
+        // CONTROLS: the admin's build, a build outside a transaction, a
+        // dpkg run without the builder — High as before; a modprobe that
+        // may load (`--set-version` with no dry run) — High; a tool that is
+        // not the system's — High
+        for (f, why) in [
+            (tool(None, b), "admin"),
+            (tool(dpkg, None), "no builder"),
+            (
+                ExecFacts {
+                    program: not_tool(),
+                    ..facts(dpkg, b, None)
+                },
+                "not the system's tool",
+            ),
+        ] {
+            high(
+                exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS),
+                f,
+                why,
+            );
+        }
+        high(
+            exec(
+                "/usr/sbin/modprobe",
+                "/usr/bin/kmod",
+                &["modprobe", "--set-version=6.8.0-1", "ext4"],
+            ),
+            tool(dpkg, b),
+            "may load",
+        );
+        // insmod is no modprobe, whatever its arguments say
+        let v = r
+            .evaluate(&read_as(
+                exec(
+                    "/usr/sbin/insmod",
+                    "/usr/bin/kmod",
+                    &["insmod", "--dry-run", "/tmp/x.ko"],
+                ),
+                tool(dpkg, b),
+            ))
+            .unwrap();
+        assert_ne!(v.severity, Severity::Low, "{}", v.reasoning);
+        // a script in a module tool's place is no hook: as before
+        IdTestHost::set_file_id("/usr/sbin/kmod", Some((STAT_DEV, 348_004)));
+        IdTestHost::set_dir_root_only("/usr/sbin", true);
+        high(
+            hook("/usr/sbin/kmod", (KDEV, 348_004), rooted, 0),
+            facts(dpkg, b, dash),
+            "a tool's place",
+        );
+        IdTestHost::set_file_id("/usr/sbin/kmod", None);
+        IdTestHost::set_dir_root_only("/usr/sbin", false);
+        IdTestHost::set_file_id(HOOK, None);
+        IdTestHost::set_file_id("/tmp/kmod", None);
+        for d in [HOOKS, "/tmp", "/usr/sbin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
     }
 
     /// Lot 287: the same hook under a copy of update-initramfs in `/tmp` —

@@ -857,6 +857,78 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 348 (alpha false positives, round 4): the last records a tester on
+  Ubuntu 22.04/24.04 or Debian 13 with containers saw, each told by identity
+  (the writing thread, the kernel's exec records, the lineage, a file's
+  device and inode), never by a name.
+  - **A controller change above the agent (NN-L-AT-001 `sched`, kernels
+    before 6.5).** Enabling a cgroup v2 controller re-homes every task of
+    the subtree in its own cgroup, and before 6.5 the cpuset controller's
+    `cpuset_can_attach` asks `security_task_setscheduler` of each — the
+    agent's threads among them, whose CPUs and nodes nothing changes. The
+    scheduling deny refused it: on Ubuntu 22.04 `+cpuset` was never
+    enabled at the root, systemd, runc and containerd-shim retried at
+    every container start (three or four High records each) and `docker run
+    --cpuset-cpus` failed. A new fentry on `cgroup_subtree_control_write`
+    (`agent-ebpf/src/controller_change.rs`) marks the writing thread for the
+    write's length — dropped at the end of the write by the move guard's
+    clear (fexit `cgroup_file_write`), 5 s at most — and the scheduling deny
+    lets through only that thread's check. Attached only with the clear;
+    without it the change is refused as before. Another process's
+    `taskset`, `chrt`, `sched_setattr` or `timerslack_ns` write on the agent
+    is refused and signed as before (ratchet
+    `xtask/tests/cgroup_guard.rs::a_controller_change_s_scheduling_check_is_the_writer_thread_s_only`).
+  - **An account tool in a package transaction (NN-L-FIM-003, -018).** A
+    maintainer script's `adduser` (docker.io's dependencies on 22.04 and
+    26.04) runs `useradd`, `usermod`, `chage`, `chfn`: their writes of
+    `/etc/passwd` and `/etc/shadow` were Log + High — the account-tool
+    wrapper turned the kill into a Log at the rule's severity, and the
+    package wrapper outside it passes every Log through, so the catalogue's
+    "a package transaction at Low" never applied to them. `AccountTool` now
+    records an account tool (by the kernel's exe) in a package transaction
+    (the lineage's: a package manager root executed whose run covers the
+    write) at Low; root's account tool outside one stays High, any other
+    writer keeps its verdict (`account_tools_in_a_package_transaction_are_recorded_low`;
+    `systemd-sysusers` and lastlog's NN-L-FIM-018 too).
+  - **A dpkg trigger's initramfs build (R011).** `update-initramfs` run by a
+    dpkg trigger (Podman's `fuse3` on Debian 13; a kernel update on Ubuntu
+    22.04) runs the hook `hooks/kmod` (comm `kmod`, a shell script) and,
+    where initramfs-tools do not use `dracut-install`, a hundred `modprobe
+    --show-depends --set-version=<kernel>`: each was recorded High (lot 283b
+    and 287 took the kill only). R011 records them Low when the exec pump
+    read both the packaged builder (its device and inode, run by root) and a
+    root package manager in the lineage at the exec, the environment not
+    refused, and the exec is the system's modprobe asked to load nothing or
+    a `#!` script of a system tree outside the tools' places, run by a
+    non-tool interpreter, whose image is the host's file at its path
+    (device and inode) in a directory root's and writable by no one else,
+    both checked on the host (`AuthSessionTracker::is_host_file_in_root_dir`:
+    the pump gives a script no `ROOT_DIR`, its process's image being the
+    interpreter — the lab's first after-round found the hook still High)
+    (`a_dpkg_trigger_s_initramfs_hook_is_recorded_low_by_identity`).
+    An administrator's own `update-initramfs` keeps lot 287's High.
+  - **The module tool pump knows a runtime installed a second ago (R011,
+    the mini-hunt).** containerd's first start inside `apt install
+    docker.io` on Debian 13 asked for `aufs` before the minute's census had
+    recorded the new `containerd`: lot 347's runtime exemption, which judges
+    the forker by its installed image, did not apply (High, `would have:
+    KillProcess`). The pump records the installed runtimes and managers
+    again (at most once a second, a few `stat`s) before it keeps a module
+    tool's facts (ratchet `decision_path_io.rs::the_exec_pump_reads_a_module_tool_s_exec`).
+  - **After #554 (its re-checks' residuals).** N2: a size setattr explains
+    a later shrink of a log (NN-L-FIM-005's `truncated_by_another`) only
+    when the drain read the file smaller after it — a same-size `ftruncate`
+    or an extension by another process no longer does
+    (`a_size_setattr_that_shrank_nothing_explains_no_shrink`). Lot 347's F6
+    residual: the utmp unit's writer of a login record is the process at
+    the pid only when it started at the record's writer start
+    (`modifier_start`), read before and after its image and cgroup — a
+    descriptor held open past the writer's exit no longer lets a pid reused
+    before that close pass
+    (`a_login_record_held_open_past_its_writer_s_exit_keeps_no_unit`). The
+    agent refuses to start when `--watchdog-exe` is its own executable
+    (`a_watchdog_exe_that_is_the_agent_s_own_binary_is_refused`); the trust
+    model names `--watchdog-exe` a root-controlled setting.
 - Lot 347 (alpha false positives, round 3): a container host's normal work —
   docker, containerd, podman — and the shutdown record, each told by
   identity, never by a name or a path alone.

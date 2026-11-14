@@ -130,6 +130,28 @@ recorded under `alert`, `audit` or `off R018` or before its maps are armed
 R011's verdict. `containerd.service`'s own `ExecStartPre=modprobe overlay`
 (PID 1's child) was already a Low record.
 
+**The cpuset controller on kernels before 6.5 (NN-L-AT-001 `sched`, lot
+348).** At a container's start systemd, runc and containerd-shim enable the
+cgroup v2 controllers for the new cgroup's ancestors (`+cpuset +cpu +io …`
+written to each `cgroup.subtree_control` from the root down). The kernel
+then re-homes every task of the subtree in its own cgroup, and before 6.5
+the cpuset controller asks the scheduling hook of each — the agent's
+threads among them, whose CPUs and memory nodes nothing changes. The agent
+refused it, so on Ubuntu 22.04 (5.15) `+cpuset` was never enabled at the
+root and each start was recorded three or four times as an attempt on the
+agent (High, "denied in kernel"); `docker run --cpuset-cpus` had no cpuset
+to set. The agent now marks the thread that writes a `cgroup.subtree_control`
+for that write's length (an fentry on `cgroup_subtree_control_write`; the
+mark goes at the write's end, and after five seconds at the latest) and lets
+through only that thread's scheduling check. Any other process changing the
+agent's affinity, policy or priority (`taskset -p`, `chrt`, `sched_setattr`,
+a write of `/proc/<pid>/timerslack_ns`) is refused and signed as before, and
+`cpuset.cpus`/`cpuset.mems` of the agent's unit and slice stay refused
+outside a trusted-installer window (lot 273c). Where the mark cannot be
+attached (a kernel whose BTF lacks the function), the controller change is
+refused as before and the journal says so (`cgroup controller mark is not
+attached`). From 6.5 the kernel no longer asks: nothing changes there.
+
 ## The security tradeoff (read before enabling)
 
 R013 is the detection for the **CVE-2019-5736** class of attack: an

@@ -571,6 +571,14 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(dir.join(\"stat\"))",
         PROC,
     ),
+    // lot 348 (lot 347's F6 residual): the writer's start compared with the
+    // record's `modifier_start`, before and after its image and cgroup;
+    // unreadable, it is not the writer — no unit fact is kept
+    (
+        "crates/nn-linux/src/fim/drain.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
     (
         "crates/nn-linux/src/response/containment.rs",
         "read_state(format!(\"/proc/{pid}/cgroup\"))",

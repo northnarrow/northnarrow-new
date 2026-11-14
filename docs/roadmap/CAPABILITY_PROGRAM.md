@@ -11208,6 +11208,72 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 348 — the alpha's false positives round 4 and lab confirmations
+  before the alpha (C06, C11, C14; no level changes).**
+  - What was open (lot 347's lab, seen and not in its scope): on 5.15
+    NN-L-AT-001 High "denied in kernel" for systemd, containerd-shim and
+    runc at each container start; NN-L-FIM-003 High at docker's install on
+    22.04 and 26.04 (`useradd`, `usermod`, `chage`, `chfn`); R011 High
+    (recorded) of the initramfs hook `kmod` at Podman's install on Debian 13.
+  - Found: (1) operation `sched` on the agent's own pid — enabling a cgroup
+    v2 controller re-homes every task of the subtree in its own cgroup, and
+    before 6.5 `cpuset_can_attach` asks `security_task_setscheduler` of each;
+    the scheduling deny refused the agent's, so `+cpuset` was never enabled
+    at the root (each runtime retried at each start) and `docker run
+    --cpuset-cpus` failed (runc create). (2) the FIM-003 stack
+    `InteractiveAdmin(PackageManaged(AccountTool(rule)))`: the account-tool
+    wrapper's Log passed the package wrapper untouched, so a package
+    transaction's account tool stayed High. (3) lots 283b/287 took the
+    hook's kill, not its severity; on Ubuntu 22.04 the same build's
+    `modprobe --show-depends --set-version` (about a hundred) were High too.
+  - Done: (1) the cause — an fentry on `cgroup_subtree_control_write`
+    (`controller_change.rs`) marks the writing thread for the write's
+    length (dropped by the move guard's clear on `cgroup_file_write`, 5 s
+    at most); `task_setscheduler_deny` lets through only that thread's
+    check; attached with the move guard after its clear, never without it.
+    (2) `AccountTool` gives Low to an account tool in a package transaction
+    (the lineage's). (3) R011 records Low the build's hook (a `#!` script of
+    a system tree, the host's file at its path by device and inode, in a
+    root-only directory) and the system's modprobe asked to load nothing,
+    when the pump read both the packaged builder and a root package manager.
+    Mini-hunt: the module tool pump records the installed runtimes and
+    managers again (rate-limited) — containerd's first start inside `apt
+    install docker.io` on Debian 13 was R011 High (`would have:
+    KillProcess`): the minute's census had not seen the new `containerd`.
+    After #554 merged (item 5): N2 — a size setattr explains a later
+    shrink only when the drain read the file smaller; lot 347's F6 — the
+    utmp unit's writer is the process that started at the record's
+    `modifier_start`; the agent refuses a `--watchdog-exe` that is its own
+    binary, and the trust model names that setting root's.
+  - Lab (as measured): our own guests, `main` e3009072 before, the lot after,
+    one guest at a time, packages purged and the agent uninstalled after each
+    round. **ubuntu2204** (5.15.0-202, runc 1.3.4, docker 29.1.3): AT-001
+    High `sched` at docker's install 7, each `docker run` 3–4, restart 1,
+    Podman's install 12, its run 2 (36 per round) → 0 each; `docker run
+    --cpuset-cpus=0` rc 127 → 0, the root's `subtree_control` gaining
+    `cpuset`; the controls (`taskset -p`, `chrt --idle` of the agent) still
+    refused and High. Item 2: `apt install memcached` FIM-003 High 4 →
+    Low 4, no High. Item 3: `apt install --reinstall fuse3` R011 High 103 → High 2
+    + Low 102 (the first after-round: the hook, a script, carries no
+    `ROOT_DIR` — its process's image is dash — fixed by checking its
+    directory on the host) → Low 103, no High. **debian13** (6.12, systemd 257): no
+    AT-001 at container starts (the kernel asks no more from 6.5); item 2
+    FIM-003 High 3 → Low 3; containerd's first start R011 High 1 → Low; the
+    hook High 2 → Low 3, no High (Podman's install Low 3 too). **ubuntu2404** (6.8.0-149): items 1–3 and the
+    mini-hunt quiet (fuse3's build Low 3, memcached Low 3), item 4a: `go
+    test`/`go run` from the session and from a unit — no StagingExec
+    transition, no ConfirmedIntrusion, no NN-L-IMP-001 (R001 High each, the
+    named residual); item 4b on 2204 and 2404: the content judge calibrated
+    at each cold boot after `install.sh --allow-bpf-tools`, bpftrace and
+    BCC run, `bpf-content-check` all PASS. Controls High/Critical in every
+    round: `insmod` out of the tree (R011 + R018), a root shell rewriting
+    `/etc/passwd` (FIM-003), `kill -9` of the agent (AT-001).
+  - Not done: a `cgroup.type` write's migration and a
+    kernel whose BTF lacks `cgroup_subtree_control_write` keep the refusal
+    (named); docker-ce (Docker's repository) not installed in the lab — its
+    postinst's `groupadd` writes no FIM-003 path; R001 High of go's test
+    binary (lot 283b's decision).
+  - Levels unchanged: false-positive work of the alpha; no new capability.
 
 
 - **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases

@@ -25,6 +25,7 @@ mod cgroup_guard;
 mod cgroup_join;
 mod budget;
 mod comm;
+mod controller_change;
 mod dns_answer;
 mod dns_nss;
 mod dns_query;

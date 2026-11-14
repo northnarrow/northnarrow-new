@@ -248,7 +248,25 @@ pub(crate) mod testing {
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
+    thread_local! {
+        static ROOT_ONLY_DIRS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+
     impl IdTestHost {
+        /// Lot 348: the directory `path` is root's and writable by no one
+        /// else (`true`), or not (this thread's).
+        pub(crate) fn set_dir_root_only(path: impl AsRef<Path>, root_only: bool) {
+            ROOT_ONLY_DIRS.with(|m| {
+                let mut m = m.borrow_mut();
+                if root_only {
+                    m.insert(path.as_ref().to_path_buf());
+                } else {
+                    m.remove(path.as_ref());
+                }
+            });
+        }
+
         /// The file at `path` has the identity `id` (`None`: none).
         pub(crate) fn set_file_id(path: impl AsRef<Path>, id: Option<(u64, u64)>) {
             FILE_IDS.with(|m| {
@@ -284,6 +302,9 @@ pub(crate) mod testing {
         }
         fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
             FILE_IDS.with(|m| m.borrow().get(path.as_ref()).copied())
+        }
+        fn dir_is_root_only<P: AsRef<Path>>(path: P) -> bool {
+            ROOT_ONLY_DIRS.with(|m| m.borrow().contains(path.as_ref()))
         }
         fn suspended_ns() -> u64 {
             TestHost::suspended_ns()

@@ -1991,6 +1991,9 @@ pub fn process_drift(
     if let Some(n) = new_size {
         path_map.note_size(&size_key, n);
     }
+    // the review of #554 (N2, lot 348): a size setattr explains a later
+    // shrink only when it shrank the file
+    note_real_shrink(raw, op, &key, new_size, baseline_size, path_map);
 
     // Wave 2 (TST-004): the kernel reports a chmod or chown as Modified,
     // and an unchanged hash used to drop it as a no-op below — `chmod u+s`
@@ -2196,7 +2199,7 @@ pub fn process_drift(
             truncated_by_another,
         };
         // lot 347: a login record's packaged writer, read while it runs
-        read_login_unit_writer(&fe, Path::new("/proc"), Path::new("/"));
+        read_login_unit_writer(&fe, raw.modifier_start, Path::new("/proc"), Path::new("/"));
         out.push(Event::Fim(fe));
     }
     Ok(true)
@@ -2217,21 +2220,44 @@ fn appends_only(raw: &FimDriftRaw, op: FimOp) -> bool {
 /// read by the drain before it, from another writer's pid — the size the
 /// drain reads smaller is that truncation's, judged on its own record
 /// (`FimEvent::truncated_by_another`). A size setattr's record
-/// ([`FIM_SETATTR_SIZE`]) is noted; every other `Modified` takes the note,
-/// so a truncation answers for the inode's next record only. Not a proof
-/// by itself that the writer appended: NN-L-FIM-005's carve-out also needs
-/// `appends_only`.
+/// ([`FIM_SETATTR_SIZE`]) is noted once the drain has read the file
+/// SMALLER than before it ([`note_real_shrink`]; the review of #554, N2,
+/// lot 348); every other `Modified` takes the note, so a truncation answers
+/// for the inode's next record only. Not a proof by itself that the writer
+/// appended: NN-L-FIM-005's carve-out also needs `appends_only`.
 fn truncation_seen(raw: &FimDriftRaw, op: FimOp, key: &InodeKey, path_map: &InodePathMap) -> bool {
     if op != FimOp::Modified {
         return false;
     }
     if raw.op_flags & FIM_SETATTR_SIZE != 0 {
-        path_map.note_truncation(key, raw.modifier_pid);
         return false;
     }
     let seen = path_map.take_truncation(key);
     raw.op_flags & FIM_WRITE_TRUNCATED_BY_ANOTHER != 0
         && seen.is_some_and(|pid| pid != raw.modifier_pid)
+}
+
+/// The review of #554 (N2, lot 348): a size setattr's record
+/// ([`FIM_SETATTR_SIZE`]) is noted for [`truncation_seen`] only when the
+/// drain read the file smaller (`new_size`) than the size it had before
+/// (`before`: the drain's last read, else the baseline's) — a real shrink.
+/// A same-size `ftruncate` or an extension by another process explains no
+/// later collapse; a size the drain could not read notes nothing (the
+/// record is then judged as a shrink: fail closed).
+fn note_real_shrink(
+    raw: &FimDriftRaw,
+    op: FimOp,
+    key: &InodeKey,
+    new_size: Option<u64>,
+    before: Option<u64>,
+    path_map: &InodePathMap,
+) {
+    if op == FimOp::Modified
+        && raw.op_flags & FIM_SETATTR_SIZE != 0
+        && new_size.zip(before).is_some_and(|(n, b)| n < b)
+    {
+        path_map.note_truncation(key, raw.modifier_pid);
+    }
 }
 
 /// The review of #554 (F1): the executable of the record's writer. A write
@@ -2314,9 +2340,10 @@ pub(crate) fn teach_fork(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>
 /// again (`ns_last_pid` steers the next fork) before the drain read it.
 /// Same-tick reuse (10 ms) is not told apart, and the record's time is its
 /// release's (the last close): a descriptor another process holds open
-/// past the writer's exit lets a pid reused before that close pass. #554
-/// carries the writer's start in the record itself (`modifier_start`),
-/// which closes both; this is the drain's check until it lands.
+/// past the writer's exit lets a pid reused before that close pass. Lot
+/// 348: a record seen at close carries its writer's start
+/// (`modifier_start`, #554), which [`read_login_unit_writer`] compares
+/// instead ([`started_as`]); this check stays for a record without one.
 fn started_by(dir: &Path, at_ns: u64) -> bool {
     use nn_core::posture::host::PostureHost;
     let Ok(stat) = crate::state_read::read_state(dir.join("stat")) else {
@@ -2328,6 +2355,21 @@ fn started_by(dir: &Path, at_ns: u64) -> bool {
         })
 }
 
+/// Lot 348 (lot 347's F6 residual): the process at `dir` (`/proc/<pid>`)
+/// started when the record's writer did (`start_ns`, the kernel's
+/// `task->start_time` of the writer's leader, carried by a record seen at
+/// close: `FimDriftRaw::modifier_start`) — `stat`'s start within two ticks
+/// and the host's suspended time ([`crate::response::proc_ref::started_at`]).
+/// A writer that exited while another process held the file open past its
+/// exit, its pid handed out again before that close, is no longer the
+/// process there.
+fn started_as(dir: &Path, start_ns: u64) -> bool {
+    crate::state_read::read_state(dir.join("stat"))
+        .ok()
+        .and_then(|stat| crate::response::proc_ref::stat_start_ticks(&stat))
+        .is_some_and(|t| crate::response::proc_ref::started_at(t, start_ns))
+}
+
 /// Lot 347 (`nn_core::fim::unit_writers`): at a write of a login record
 /// (wtmp, btmp), whether its writer is the host's packaged
 /// `systemd-update-utmp` — the device and inode of `/proc/<pid>/exe`, the
@@ -2337,7 +2379,12 @@ fn started_by(dir: &Path, at_ns: u64) -> bool {
 /// now, while the writer runs (at the host's shutdown its exec may not be
 /// in the lineage when the write is judged), and kept for NN-L-FIM-019 when
 /// both hold.
-fn read_login_unit_writer(fe: &FimEvent, proc_root: &Path, host_root: &Path) {
+///
+/// Lot 348: `writer_start` is the record's `modifier_start` (0: none) — the
+/// process at the pid must be the one that started then, before and after
+/// its image and cgroup are read ([`started_as`]); without it, one started
+/// no later than the write ([`started_by`]).
+fn read_login_unit_writer(fe: &FimEvent, writer_start: u64, proc_root: &Path, host_root: &Path) {
     use nn_core::fim::unit_writers as uw;
     use std::os::unix::fs::MetadataExt;
     if fe.op != FimOp::Modified
@@ -2347,9 +2394,17 @@ fn read_login_unit_writer(fe: &FimEvent, proc_root: &Path, host_root: &Path) {
         return;
     }
     let dir = proc_root.join(fe.modifier_pid.to_string());
-    // the review of #556 (F6): the process at the pid now is the writer —
-    // it started no later than the write
-    if !started_by(&dir, fe.timestamp_ns) {
+    // the review of #556 (F6), lot 348: the process at the pid now is the
+    // writer — the one that started at the writer's start, else one started
+    // no later than the write
+    let is_writer = || {
+        if writer_start != 0 {
+            started_as(&dir, writer_start)
+        } else {
+            started_by(&dir, fe.timestamp_ns)
+        }
+    };
+    if !is_writer() {
         return;
     }
     let Ok(image) = std::fs::metadata(dir.join("exe")) else {
@@ -2368,6 +2423,11 @@ fn read_login_unit_writer(fe: &FimEvent, proc_root: &Path, host_root: &Path) {
     };
     let service = nn_core::posture::lineage::placing_cgroup(&text)
         .and_then(nn_core::posture::daemon_data::system_service);
+    // lot 348: still the writer after the reads (its pid not reused
+    // meanwhile)
+    if !is_writer() {
+        return;
+    }
     if let Some(unit) = uw::unit_writer(service, packaged) {
         uw::keep(fe, unit);
     }
@@ -3998,6 +4058,54 @@ mod tests {
         let unseen = fx.drift(&fx.raw(rsyslogd, BOTH)).unwrap();
         assert!(!unseen.truncated_by_another);
         assert!(LogFixture::judged_as_rsyslogd(&unseen, 0).is_some());
+    }
+
+    /// The review of #554 (named, N2; lot 348): a size setattr by another
+    /// process that shrank nothing — a same-size `ftruncate`, an extension —
+    /// explains no later collapse of the log: rsyslogd's record with the
+    /// kernel's word "truncated by another" after it is judged as a shrink
+    /// (High). A setattr the drain could not size notes nothing either. A
+    /// real truncation still explains it (the copytruncate test).
+    #[test]
+    fn a_size_setattr_that_shrank_nothing_explains_no_shrink() {
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let (other, rsyslogd) = (4_300, 600);
+        let at_close = |fx: &LogFixture| fx.raw(rsyslogd, BOTH | FIM_WRITE_TRUNCATED_BY_ANOTHER);
+        for (what, len) in [("same size", 81_920u64), ("extended", 90_000)] {
+            let mut fx = LogFixture::new(81_920);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fx.log)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+            let own = fx
+                .drift(&fx.raw(other, FIM_SETATTR_SIZE))
+                .unwrap_or_else(|| panic!("{what}: the setattr's own record"));
+            assert!(!own.truncated_by_another, "{what}");
+            // then the log collapses under rsyslogd's pending appends
+            std::fs::write(&fx.log, b"one line\n").unwrap();
+            let raw = at_close(&fx);
+            let fe = fx.drift(&raw).expect("the collapse is a drift");
+            assert!(!fe.truncated_by_another, "{what}: noted");
+            for uid in [0, 102] {
+                assert!(
+                    LogFixture::judged_as_rsyslogd(&fe, uid).is_some(),
+                    "{what}: exempt"
+                );
+            }
+        }
+        // a truncation the drain could not size (the file gone): nothing
+        // noted; a later record finds none
+        let mut fx = LogFixture::new(81_920);
+        std::fs::remove_file(&fx.log).unwrap();
+        let _ = fx.drift(&fx.raw(other, FIM_SETATTR_SIZE));
+        assert_eq!(fx.path_map.take_truncation(&fx.key), None);
+        // CONTROL: a real shrink is noted, by its writer
+        let mut fx = LogFixture::new(81_920);
+        std::fs::write(&fx.log, b"after\n").unwrap();
+        fx.drift(&fx.raw(other, FIM_SETATTR_SIZE));
+        assert_eq!(fx.path_map.take_truncation(&fx.key), Some(other));
     }
 
     /// The review of #554 (named, F1): a record seen at close carries its
@@ -6317,7 +6425,7 @@ mod tests {
             truncated_by_another: false,
         };
         let read = |fe: &FimEvent| {
-            read_login_unit_writer(fe, &proc, &root);
+            read_login_unit_writer(fe, 0, &proc, &root);
             unit_of(fe)
         };
         process(34_700, &utmp, unit);
@@ -6436,7 +6544,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
             };
-            read_login_unit_writer(&fe, &proc, &root);
+            read_login_unit_writer(&fe, 0, &proc, &root);
             unit_of(&fe)
         };
         process(
@@ -6459,6 +6567,81 @@ mod tests {
         assert_eq!(read(35_602), None, "a pid reused since");
         process(35_603, None);
         assert_eq!(read(35_603), None, "no start read");
+    }
+
+    /// Lot 348 (named; lot 347's F6 residual): a descriptor another process
+    /// held open past the login record writer's exit lets the record leave
+    /// the kernel later than the write, and a pid handed out again before
+    /// that close names a process started BEFORE the record's time — the
+    /// unit's next fork. A record carrying its writer's start
+    /// (`modifier_start`) keeps the unit only for the process that started
+    /// then; a record without one keeps lot 347's check.
+    #[test]
+    fn a_login_record_held_open_past_its_writer_s_exit_keeps_no_unit() {
+        use nn_core::fim::unit_writers::unit_of;
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let utmp = root.join("usr/lib/systemd/systemd-update-utmp");
+        std::fs::create_dir_all(utmp.parent().unwrap()).unwrap();
+        std::fs::write(&utmp, b"utmp image, 348").unwrap();
+        let tick = 1_000_000_000 / crate::known_system_prog::clk_tck();
+        let s = 1_000_000_000u64;
+        let process = |pid: u32, start_ticks: u64| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            symlink(&utmp, d.join("exe")).unwrap();
+            std::fs::write(
+                d.join("cgroup"),
+                "0::/system.slice/systemd-update-utmp.service\n",
+            )
+            .unwrap();
+            std::fs::write(d.join("stat"), stat_started(pid, start_ticks)).unwrap();
+        };
+        // the record leaves at the last close, 100 s after boot
+        let at = 100 * s;
+        let read = |pid: u32, writer_start: u64| {
+            let fe = FimEvent {
+                timestamp_ns: at,
+                path: "/var/log/wtmp".into(),
+                op: FimOp::Modified,
+                new_sha256: None,
+                baseline_sha256: None,
+                new_size: Some(4096),
+                baseline_size: Some(3712),
+                modifier_exe: None,
+                modifier_pid: pid,
+                modifier_uid: 0,
+                modifier_comm: "systemd-update-".into(),
+                dest_path: None,
+                child_truncated: false,
+                wide_coverage: false,
+                owner_uid: None,
+                reader_dac_capable: false,
+                capability: None,
+                attrs: None,
+                file_key: None,
+                is_dir: false,
+                moved_in: false,
+                appends_only: false,
+                truncated_by_another: false,
+            };
+            read_login_unit_writer(&fe, writer_start, &proc, &root);
+            unit_of(&fe)
+        };
+        // the writer started at 50 s; the process at its pid now at 90 s —
+        // before the record's time, after the writer
+        process(34_800, 90 * s / tick);
+        assert_eq!(
+            read(34_800, 50 * s),
+            None,
+            "the pid reused before the close"
+        );
+        // lot 347's check alone let it through
+        assert_eq!(read(34_800, 0), Some("systemd-update-utmp.service"));
+        // CONTROL: the writer itself (its start, within the tick)
+        process(34_801, 50 * s / tick);
+        assert_eq!(read(34_801, 50 * s), Some("systemd-update-utmp.service"));
     }
 
     /// The review of #556 (F5): the record size the unit's append is told

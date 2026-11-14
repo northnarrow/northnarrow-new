@@ -78,6 +78,23 @@ pub const MOVE_CLEAR_HOOK: &str = CGROUP_MOVE_FINISH;
 /// this start, as a prior boot's pins of a hook do.
 pub(crate) const MOVE_CLEAR_LEGACY_HOOK: &str = "cgroup_procs_write_finish";
 
+/// Lot 348: the program that marks a thread inside a cgroup v2
+/// `cgroup.subtree_control` write (fentry), and its kernel function — the
+/// scheduling deny lets that thread's `cpuset_can_attach` check through
+/// (a controller change re-homes the agent in its own cgroup, its CPUs and
+/// nodes unchanged). Not a deny hook: without it the change is refused as
+/// before. Attached only with the program that drops its marks
+/// ([`MOVE_CLEAR_PROGRAM`]).
+pub(crate) const SUBTREE_MARK_PROGRAM: &str = "cgroup_subtree_mark";
+pub const SUBTREE_MARK_HOOK: &str = "cgroup_subtree_control_write";
+
+/// What is lost when the subtree mark is not attached (an FP, never a
+/// protection).
+pub const SUBTREE_MARK_ABSENT_EFFECT: &str =
+    "the cgroup controller mark is not attached: on kernels before 6.5 a write of `+cpuset` to \
+     a cgroup.subtree_control above the agent's unit is refused (the cpuset controller's \
+     scheduling check of the agent, recorded NN-L-AT-001 `sched`)";
+
 /// The three "hooks" of the move guard, as `OPTIONAL_DENY_HOOKS` names them.
 pub const GUARD_HOOKS: [&str; 3] = [MOVE_DENY_HOOK, MOVE_STASH_HOOK, MOVE_CLEAR_HOOK];
 
@@ -125,6 +142,7 @@ pub(crate) fn attach_move_guard(
                 antitamper_bpf::purge_stale_pin(&prog);
             }
         }
+        purge_subtree_mark(pin_root);
         health.absent = Some(why);
         return health;
     }
@@ -142,6 +160,7 @@ pub(crate) fn attach_move_guard(
             MOVE_STASH_PROGRAM,
             "not attached: its refusal half did not attach".into(),
         ));
+        purge_subtree_mark(pin_root);
         return health;
     }
     // Lot 303: an older agent's clear (fentry, pinned under its function's
@@ -167,8 +186,11 @@ pub(crate) fn attach_move_guard(
             MOVE_STASH_PROGRAM,
             "not attached: the program that clears its records did not attach".into(),
         ));
+        purge_subtree_mark(pin_root);
         return health;
     }
+    // Lot 348: the subtree mark, once the program that drops its marks runs.
+    attach_subtree_mark(ebpf, btf, pin_root);
     if let Err(e) = antitamper_bpf::reattach_fresh_fexit(
         ebpf,
         MOVE_STASH_PROGRAM,
@@ -180,6 +202,34 @@ pub(crate) fn attach_move_guard(
         health.failures.push((MOVE_STASH_PROGRAM, format!("{e:#}")));
     }
     health
+}
+
+/// Lot 348: attach [`SUBTREE_MARK_PROGRAM`] (fentry
+/// [`SUBTREE_MARK_HOOK`]); called only once [`MOVE_CLEAR_PROGRAM`] — which
+/// drops its marks — is attached. A failure (the function absent from the
+/// kernel's BTF, a verifier refusal) leaves the controller change refused
+/// as before: a warning, no degradation (no protection is lost).
+fn attach_subtree_mark(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) {
+    if let Err(e) = antitamper_bpf::reattach_fresh_fentry(
+        ebpf,
+        SUBTREE_MARK_PROGRAM,
+        SUBTREE_MARK_HOOK,
+        btf,
+        pin_root,
+    ) {
+        warn!(program = SUBTREE_MARK_PROGRAM, function = SUBTREE_MARK_HOOK, error = %format!("{e:#}"), effect = SUBTREE_MARK_ABSENT_EFFECT, "anti-tamper cgroup: fentry attach FAILED");
+        purge_subtree_mark(pin_root);
+    }
+}
+
+/// Lot 348: a prior boot's subtree mark goes where this boot attaches none
+/// (its marks would be a map no program of this boot reads).
+fn purge_subtree_mark(pin_root: Option<&Path>) {
+    if let Some(root) = pin_root {
+        let (prog, link) = antitamper_bpf::lsm_pin_paths(root, SUBTREE_MARK_HOOK);
+        antitamper_bpf::purge_stale_pin(&link);
+        antitamper_bpf::purge_stale_pin(&prog);
+    }
 }
 
 /// What the registration of the unit cgroups found, for the journal and
