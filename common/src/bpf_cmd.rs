@@ -22,6 +22,9 @@
 
 /// `BPF_MAP_CREATE`.
 pub const BPF_MAP_CREATE: u32 = 0;
+/// Lot 349 (the review of #558, F1): `BPF_MAP_UPDATE_ELEM` — of a prog
+/// array, it puts a program in a tail call's slot.
+pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 /// `BPF_MAP_GET_NEXT_KEY` (the privileged e2e reads `OWN_BPF_IDS` with it).
 pub const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 /// `BPF_PROG_LOAD`.
@@ -34,6 +37,10 @@ pub const BPF_OBJ_GET: u32 = 7;
 pub const BPF_PROG_ATTACH: u32 = 8;
 /// `BPF_PROG_DETACH`.
 pub const BPF_PROG_DETACH: u32 = 9;
+/// Lot 349 (the review of #558, F1): `BPF_PROG_TEST_RUN` (`BPF_PROG_RUN`
+/// is its alias, a later name: the older kernels' BTF has this one) — runs
+/// a program, a `syscall` program's only way to run.
+pub const BPF_PROG_TEST_RUN: u32 = 10;
 /// `BPF_PROG_GET_NEXT_ID`: enumeration, no handle.
 pub const BPF_PROG_GET_NEXT_ID: u32 = 11;
 /// `BPF_MAP_GET_NEXT_ID`: enumeration, no handle.
@@ -97,17 +104,54 @@ pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
     attach_target_offset(cmd).is_some() && attach_type == ATTACH_CGROUP_SYSCTL
 }
 
+/// Lot 349 (the review of #558, F1): where a command that RUNS or ATTACHES
+/// a program carries that program's descriptor in `union bpf_attr` —
+/// `BPF_PROG_RUN`'s `test.prog_fd` (0), `BPF_PROG_ATTACH`'s
+/// `attach_bpf_fd` (4, after `target_fd`), `BPF_RAW_TRACEPOINT_OPEN`'s
+/// `raw_tracepoint.prog_fd` (8, after the name's pointer),
+/// `BPF_LINK_CREATE`'s `link_create.prog_fd` (0) and `BPF_LINK_UPDATE`'s
+/// `new_prog_fd` (4, after `link_fd`); `None` for any other command. A
+/// prog array's `BPF_MAP_UPDATE_ELEM` carries it behind the value's
+/// pointer ([`MAP_UPDATE_VALUE_OFFSET`]). The `bpf` hook refuses each of
+/// them on a program held at a window's load.
+#[inline(always)]
+pub const fn prog_fd_offset(cmd: u32) -> Option<usize> {
+    match cmd {
+        BPF_PROG_TEST_RUN | BPF_LINK_CREATE => Some(0),
+        BPF_PROG_ATTACH | BPF_LINK_UPDATE => Some(4),
+        BPF_RAW_TRACEPOINT_OPEN => Some(8),
+        _ => None,
+    }
+}
+
+/// Lot 349: `BPF_MAP_UPDATE_ELEM`'s `value` pointer in `union bpf_attr`
+/// (after `map_fd` and the key's pointer); its `map_fd` is at 0.
+pub const MAP_UPDATE_VALUE_OFFSET: usize = 16;
+
+/// Lot 349: `enum bpf_map_type`'s `BPF_MAP_TYPE_PROG_ARRAY` — a tail
+/// call's table, whose values are program descriptors.
+pub const MAP_TYPE_PROG_ARRAY: u32 = 3;
+
+/// Lot 349 (the review of #558, F1): `PERF_EVENT_IOC_SET_BPF`
+/// (`_IOW('$', 8, __u32)`, include/uapi/linux/perf_event.h) — attaches the
+/// program whose descriptor is the `ioctl`'s argument to a perf event (a
+/// kprobe, a tracepoint): no `bpf(2)` command at all, so the `file_ioctl`
+/// hook judges it.
+pub const PERF_EVENT_IOC_SET_BPF: u32 = 0x4004_2408;
+
 /// Every number above with its uapi name, for the checks against the
 /// header and the kernel's BTF. A command added above goes here too
 /// (`every_constant_is_listed` checks it).
-pub const UAPI: [(&str, u32); 21] = [
+pub const UAPI: [(&str, u32); 23] = [
     ("BPF_MAP_CREATE", BPF_MAP_CREATE),
+    ("BPF_MAP_UPDATE_ELEM", BPF_MAP_UPDATE_ELEM),
     ("BPF_MAP_GET_NEXT_KEY", BPF_MAP_GET_NEXT_KEY),
     ("BPF_PROG_LOAD", BPF_PROG_LOAD),
     ("BPF_OBJ_PIN", BPF_OBJ_PIN),
     ("BPF_OBJ_GET", BPF_OBJ_GET),
     ("BPF_PROG_ATTACH", BPF_PROG_ATTACH),
     ("BPF_PROG_DETACH", BPF_PROG_DETACH),
+    ("BPF_PROG_TEST_RUN", BPF_PROG_TEST_RUN),
     ("BPF_PROG_GET_NEXT_ID", BPF_PROG_GET_NEXT_ID),
     ("BPF_MAP_GET_NEXT_ID", BPF_MAP_GET_NEXT_ID),
     ("BPF_PROG_GET_FD_BY_ID", BPF_PROG_GET_FD_BY_ID),
@@ -452,6 +496,32 @@ mod tests {
             found.is_empty(),
             "bpf_cmd numbers defined outside common/src/bpf_cmd.rs: {found:?}"
         );
+    }
+
+    /// Lot 349 (the review of #558, F1): every command that runs or
+    /// attaches a program names where its descriptor sits — the uapi
+    /// `union bpf_attr` layout, literal on purpose — and none that only
+    /// reads or detaches does; `PERF_EVENT_IOC_SET_BPF` is `_IOW('$', 8,
+    /// __u32)`.
+    #[test]
+    fn every_run_and_attach_names_its_program_descriptor() {
+        // include/uapi/linux/bpf.h: test.prog_fd, attach_bpf_fd after
+        // target_fd, raw_tracepoint.prog_fd after the u64 name,
+        // link_create.prog_fd, link_update.new_prog_fd after link_fd
+        assert_eq!(prog_fd_offset(10), Some(0), "BPF_PROG_RUN");
+        assert_eq!(prog_fd_offset(8), Some(4), "BPF_PROG_ATTACH");
+        assert_eq!(prog_fd_offset(17), Some(8), "BPF_RAW_TRACEPOINT_OPEN");
+        assert_eq!(prog_fd_offset(28), Some(0), "BPF_LINK_CREATE");
+        assert_eq!(prog_fd_offset(29), Some(4), "BPF_LINK_UPDATE");
+        for cmd in [0, 1, 2, 3, 4, 5, 6, 7, 9, 13, 15, 30, 33, 34] {
+            assert_eq!(prog_fd_offset(cmd), None, "{cmd}");
+        }
+        assert_eq!(MAP_UPDATE_VALUE_OFFSET, 16, "map_fd u32 + pad, key u64");
+        assert_eq!(MAP_TYPE_PROG_ARRAY, 3);
+        const fn iow(ty: u8, nr: u8, size: u32) -> u32 {
+            (1 << 30) | (size << 16) | ((ty as u32) << 8) | nr as u32
+        }
+        assert_eq!(PERF_EVENT_IOC_SET_BPF, iow(b'$', 8, 4));
     }
 
     /// External bug hunt BUG05: `BPF_RAW_TRACEPOINT_OPEN` (uapi 17)

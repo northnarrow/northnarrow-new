@@ -1202,6 +1202,16 @@ pub enum FsProtectOperation {
     /// (`own_cpus::of_target_dev`), `target_ino` the CPUs left (a mask of
     /// those below 64), `comm` the partition, cgroup or thread named.
     CpuConfined,
+    /// Lot 349 (the review of #558, F1): NOT a refusal — a program loaded
+    /// inside a trusted-installer window that the content judge refuses
+    /// outside one, let through and held by id: `target_ino` the program
+    /// id, `target_dev` the reason and type (`common::wire::bpf_held_of`).
+    BpfHeldLoad,
+    /// Lot 349 (the review of #558, F1): a run or an attach of a held
+    /// program outside a window, refused (or a window's load the held set
+    /// has no room for): `target_dev` the use, reason and type
+    /// (`common::wire::bpf_held_of`), `target_ino` the program id.
+    BpfHeldUse,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1255,6 +1265,8 @@ impl FsProtectOperation {
             crate::wire::FS_OP_BPF_BASELINE => Self::BpfBaseline,
             crate::wire::FS_OP_SIGIO => Self::Sigio,
             crate::wire::FS_OP_CPU_CONFINED => Self::CpuConfined,
+            crate::wire::FS_OP_BPF_HELD_LOAD => Self::BpfHeldLoad,
+            crate::wire::FS_OP_BPF_HELD_USE => Self::BpfHeldUse,
             other => Self::Unknown(other),
         }
     }
@@ -1306,6 +1318,8 @@ impl FsProtectOperation {
             Self::BpfBaseline => "bpf_baseline",
             Self::Sigio => "sigio",
             Self::CpuConfined => "cpu_confined",
+            Self::BpfHeldLoad => "bpf_held_load",
+            Self::BpfHeldUse => "bpf_held_use",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2079,6 +2093,17 @@ mod tests {
                 crate::wire::FS_OP_CPU_CONFINED,
                 FsProtectOperation::CpuConfined,
                 "cpu_confined",
+            ),
+            // Lot 349 (the review of #558, F1)
+            (
+                crate::wire::FS_OP_BPF_HELD_LOAD,
+                FsProtectOperation::BpfHeldLoad,
+                "bpf_held_load",
+            ),
+            (
+                crate::wire::FS_OP_BPF_HELD_USE,
+                FsProtectOperation::BpfHeldUse,
+                "bpf_held_use",
             ),
         ];
         for (byte, op, name) in cases {

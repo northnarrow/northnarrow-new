@@ -18,6 +18,14 @@
 #      window (a reservation the drop-in judge keeps), then reset: no
 #      cpu_confined;
 #  C4  the agent still active, same pid.
+#  C5  (the review of #558, F2) a file saying "0" bound over
+#      /sys/devices/system/cpu/online after the agent's start, then the C1
+#      partition: signed cpu_confined naming the partition (the watch reads
+#      the online CPUs through what it opened at its start);
+#  C6  (the review of #558, F3) a file saying "0" bound over
+#      northnarrow.slice/cpuset.cpus, then the partition: a signed
+#      cpu_confined (the partition, or the watch unable to judge through a
+#      mount) within 30 s — never the narrower expectation, silent.
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 DET=/var/lib/northnarrow/detections/detections.jsonl
@@ -133,6 +141,35 @@ if [[ -n $KEY ]] && (( NCPU >= 2 )); then
 else
     measure "C3 no admin key (or one CPU): no window"
 fi
+
+# C5/C6: a mount over what the watch reads, then the partition
+bound_partition() { # $1 label, $2 the path bound over
+    local n=$1 path=$2 fake=/run/nn-cpu-fake
+    # C3's reset can take the cpuset controller off the root again (systemd)
+    grep -qw cpuset $CG/cgroup.subtree_control || { put +cpuset $CG/cgroup.subtree_control >/dev/null; ENABLED=1; sleep 12; }
+    if (( NCPU < 2 )) || [[ ! -e $path ]]; then measure "$n no $path (or one CPU)"; return; fi
+    sudo sh -c 'echo 0 > "$1"' _ "$fake" </dev/null
+    sudo mount --bind "$fake" "$path" </dev/null; local rb=$?
+    sleep 11
+    local m=$(lines "$DET")
+    sudo mkdir -p "$PART" </dev/null
+    put "1-$((NCPU - 1))" "$PART/cpuset.cpus" >/dev/null; put root "$PART/cpuset.cpus.partition" >/dev/null
+    echo "=== CASE $(date -u +%T) $n bound over $path, partition root: rc=$rb reads [$(cat "$path" 2>&1)] state [$(cat $PART/cpuset.cpus.partition 2>&1)] affinity $(affinity)"
+    if wait_record "$m" 30; then
+        local r=$(confined "$m" | head -1)
+        echo "    record: $(echo "$r" | grep -o '"severity":"[A-Za-z]*"' | head -1) $(echo "$r" | grep -oE '"response":"[^"]*' | head -1 | cut -c1-220)"
+        pass "$n a mount over $path hides nothing: signed cpu_confined"
+    else
+        bad "$n no cpu_confined within 30 s with $path bound over"
+    fi
+    put member "$PART/cpuset.cpus.partition" >/dev/null
+    sudo rmdir "$PART" </dev/null
+    sudo umount "$path" </dev/null || sudo umount -l "$path" </dev/null
+    sudo rm -f "$fake" </dev/null
+    sleep 12
+}
+bound_partition C5 /sys/devices/system/cpu/online
+bound_partition C6 $CG/northnarrow.slice/cpuset.cpus
 
 if (( ENABLED )); then
     put -cpuset $CG/cgroup.subtree_control >/dev/null || measure "C0 the cpuset controller left enabled at the root (in use)"

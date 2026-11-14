@@ -22,10 +22,58 @@
 use std::io;
 use std::path::Path;
 
+/// The review of #558 (F7): the most [`read_state`] reads of a file. The
+/// largest state files its callers read stay far below it — `/proc/stat`
+/// of an 8192-CPU host (about 1 MiB), the mount table of some 80 000
+/// mounts, a socket table (`/proc/<pid>/net/tcp`) of some 100 000 sockets
+/// — while a regular file of any size bound over one (a sparse tmpfs file)
+/// no longer exhausts the agent: a file above it is an error, never cut.
+pub const STATE_MAX_BYTES: u64 = 16 << 20;
+
 /// The file at `path` as text, bytes that are not UTF-8 replaced by U+FFFD.
 /// Fails only when the file cannot be read.
+///
+/// The review of #558 (F7): read bounded and without blocking — opened
+/// `O_NONBLOCK` (a FIFO bound over the file no longer waits for a writer),
+/// a regular file only (procfs, sysfs and cgroupfs files are: a FIFO, a
+/// device such as `/dev/zero`, a directory fail as an error), at most
+/// [`STATE_MAX_BYTES`] (more fails as an error). The error is the caller's
+/// error path as before — never an empty answer.
 pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
-    std::fs::read(path).map(nn_core::posture::host::state_text)
+    read_bounded(path.as_ref(), STATE_MAX_BYTES).map(nn_core::posture::host::state_text)
+}
+
+/// The bytes of the regular file at `path`, at most `max` ([`read_state`]'s
+/// rules with a caller's own bound).
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    read_file_bounded(&f, max)
+}
+
+/// The bytes of an open file, read from its offset: a regular file only
+/// (`fstat`), at most `max` — more is an error, never a cut answer.
+pub fn read_file_bounded(f: &std::fs::File, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let t = f.metadata()?.file_type();
+    if !t.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (a FIFO, a device, a directory): not read",
+        ));
+    }
+    let mut bytes = Vec::new();
+    f.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("more than {max} bytes: not read"),
+        ));
+    }
+    Ok(bytes)
 }
 
 pub use antitamper_bpf::config_read::Config;
@@ -322,6 +370,48 @@ mod tests {
         let text = read_state(&status).unwrap();
         assert!(text.lines().any(|l| l.starts_with("PPid:")), "{text}");
         assert!(read_state("/proc/nonexistent-n6").is_err());
+    }
+
+    /// The review of #558 (F7): a state read never blocks and is bounded —
+    /// a FIFO bound over a state file fails at once (it no longer waits
+    /// for a writer), a device is not read (`/dev/null` was an empty
+    /// answer, `/dev/zero` an endless one), a file above the bound fails
+    /// (never cut), the kernel's files read as before.
+    #[test]
+    fn a_state_read_is_bounded_and_never_blocks() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("stat");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_state(&at).map_err(|e| e.kind()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO's read waited for a writer");
+        assert_eq!(got, Err(io::ErrorKind::InvalidInput));
+        let e = read_state("/dev/null").expect_err("a device is no state file");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(read_state(d.path()).is_err(), "a directory");
+        let big = d.path().join("big");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(STATE_MAX_BYTES + 1).unwrap();
+        let e = read_state(&big).expect_err("above the bound");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        f.set_len(STATE_MAX_BYTES).unwrap();
+        assert_eq!(read_state(&big).unwrap().len() as u64, STATE_MAX_BYTES);
+        assert!(read_bounded(&big, 10).is_err(), "a caller's own bound");
+        let stat = read_state("/proc/self/stat").unwrap();
+        assert!(
+            stat.starts_with(&format!("{} (", std::process::id())),
+            "{stat}"
+        );
+        assert!(
+            read_state("/proc/nonexistent-f7").is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        );
     }
 
     /// Lot 311 (F4): a failed read is one degradation of its source while

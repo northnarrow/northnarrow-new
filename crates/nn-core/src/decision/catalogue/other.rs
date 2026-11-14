@@ -403,7 +403,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    into an exempt process High or Critical; lot 349: the agent confined to \
                    fewer CPUs than it should — a cgroup in `cpuset.cpus.partition` root or \
                    isolated, its own cgroup's `cpuset.cpus`, a thread's affinity, a move — \
-                   `cpu_confined` High). Issued by process_event outside the engine.",
+                   `cpu_confined` High; the review of #558: a program the content judge \
+                   refuses outside a window, loaded inside one — `bpf_held_load` High, not \
+                   refused — and its later runs and attaches outside a window, through any \
+                   descriptor, refused — `bpf_held_use` High). Issued by process_event outside \
+                   the engine.",
         false_positives: "An administrator's `systemctl stop` or `kill` of the agent, or an \
                           upgrade, outside a trusted-installer window; a debugger or \
                           `strace -p` on the agent. Lot 283b: `deb-systemd-helper`, when a \
@@ -429,6 +433,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "deploy/lab/adversarial/anti-tamper.sh::case C112",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_held_program_s_load_and_uses_are_named_and_high",
+            "deploy/lab/malsim/bpf-content-check.sh::B10",
             "deploy/lab/malsim/cpu-confine-check.sh::C1",
             "deploy/lab/malsim/foreign-bpf-check.sh::F2",
             "deploy/lab/adversarial/anti-tamper.sh::case C01",

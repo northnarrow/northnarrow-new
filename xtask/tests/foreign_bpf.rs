@@ -848,9 +848,17 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
             "let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);",
             "content_refusal(prog, every_type_armed())",
             "return -EPERM;",
-            "if crate::inode_protect::override_active() && !caller_is_exempt() && !fresh_instance_may_load() {",
-            "content_scan(prog, every_type_armed())",
-            "PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &((u64::from(why) << 32) | u64::from(ty)), 0);",
+            "if let Some(v) = window_verdict(prog, every_type_armed()) {",
+            "PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &v, 0);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "window_verdict"),
+        &[
+            "if !crate::inode_protect::override_active() || caller_is_exempt() || fresh_instance_may_load() {",
+            "return None;",
+            "content_scan(prog, every_type).map(|(why, ty)| (u64::from(why) << 32) | u64::from(ty))",
         ],
     )
     .unwrap();
@@ -863,8 +871,8 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
             "if loading {",
             "PROG_CONTENT_HELD_INFLIGHT.get_ptr(&tid)",
             "let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);",
-            "if PROG_CONTENT_HELD.insert(&id, &v, 0).is_err() {",
-            "crate::fail_open::bump(fail_open_hook::BPF);",
+            "if !hold(id, v) {",
+            "return -EPERM;",
             "} else if let Some(v) = PROG_CONTENT_HELD.get_ptr(&id) {",
             "if !caller_is_exempt() && !crate::inode_protect::override_active() && !fresh_instance_may_load() {",
             "emit_denial_kind(FS_OP_BPF_PROG_TYPE, (v >> 32) as u8, v as u32);",
@@ -909,8 +917,9 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
         ],
     )
     .unwrap();
+    // the review of #558 (F5): pinned — an agent's restart keeps it
     assert!(c.contains(
-        "pub static PROG_CONTENT_HELD: HashMap<u32, u64> = HashMap::with_max_entries(PROG_CONTENT_HELD_MAX, 0);"
+        "pub static PROG_CONTENT_HELD: HashMap<u32, u64> = HashMap::pinned(PROG_CONTENT_HELD_MAX, 0);"
     ));
     // the lab check
     let lab =
@@ -927,4 +936,174 @@ fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
         ],
     )
     .unwrap();
+}
+
+/// The review of #558 (F1, P1): the window's loader kept its own descriptor
+/// (or passed it, or another root took it with `pidfd_getfd`) and, after
+/// the window, ran the held program (`BPF_PROG_RUN` of a `syscall` program
+/// calling `bpf_send_signal_task`, 6.13+: cmd 10 was not even `observed`)
+/// or attached it (a kprobe calling `bpf_send_signal`, every kernel: a perf
+/// event's `PERF_EVENT_IOC_SET_BPF`, silent, or `BPF_LINK_CREATE`, Medium
+/// only), or put it in a prog array's tail-call slot — no `bpf_prog` hook
+/// runs for any of them. Every run and attach of a held id is refused now
+/// outside a window, through any descriptor, signed: the `bpf` hook judges
+/// before its `observed` filter, the `file_ioctl` hooks before their
+/// chattr fast path, both through one global function.
+#[test]
+fn a_held_program_is_refused_at_every_run_and_attach() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "try_bpf_syscall_observe"),
+        &[
+            "if !attr.is_null() && held_use_refused(cmd, attr) {",
+            "return -EPERM;",
+            "if !observed(cmd) {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "held_use_refused"),
+        &[
+            "if cmd == BPF_MAP_UPDATE_ELEM {",
+            "bpf_probe_read_kernel::<u64>(a.add(MAP_UPDATE_VALUE_OFFSET) as *const u64),",
+            "crate::fail_open::bump(fail_open_hook::BPF);",
+            "return nn_held_slot(u64::from(map_fd), value) == HELD_REFUSED;",
+            "let Some(off) = prog_fd_offset(cmd) else {",
+            "Ok(fd) => nn_held_use(u64::from(fd), u64::from(cmd)) == HELD_REFUSED,",
+            "crate::fail_open::bump(fail_open_hook::BPF);",
+        ],
+    )
+    .unwrap();
+    let use_ = body(&c, "nn_held_use");
+    in_order(
+        use_,
+        &[
+            "if caller_is_exempt() || crate::inode_protect::override_active() {",
+            "return HELD_PASS;",
+            "prog_id_of_fd(fd as u32)",
+            "crate::fail_open::bump(fail_open_hook::BPF);",
+            "PROG_CONTENT_HELD.get(&id)",
+            "if fresh_instance_may_load() {",
+            "emit_held(FS_OP_BPF_HELD_USE, how as u32, verdict, id);",
+            "HELD_REFUSED",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !use_.contains("enforce()"),
+        "refused in every mode, as the load would be"
+    );
+    in_order(
+        body(&c, "nn_held_slot"),
+        &[
+            "Ok(Some((_, ty))) if ty == MAP_TYPE_PROG_ARRAY => {}",
+            "Ok(_) => return HELD_PASS,",
+            "bpf_probe_read_user::<u32>(value as *const u32)",
+            "nn_held_use(u64::from(fd), u64::from(BPF_MAP_UPDATE_ELEM))",
+        ],
+    )
+    .unwrap();
+    // the program, not the descriptor: its id through the caller's table
+    in_order(
+        body(&c, "prog_id_of_fd"),
+        &["private_of_fd(fd)?", "prog_id_of(prog as *const c_void)"],
+    )
+    .unwrap();
+    // the perf event's attach, which no bpf command carries
+    let ip = code("agent-ebpf/src/inode_protect.rs");
+    in_order(
+        body(&ip, "try_file_ioctl"),
+        &[
+            "let cmd: c_uint = ctx.arg(1);",
+            "if cmd == PERF_EVENT_IOC_SET_BPF {",
+            "let fd: u64 = ctx.arg(2);",
+            "let held = crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF));",
+            "if core::ptr::read_volatile(&held) == crate::bpf_defense::HELD_REFUSED {",
+            "return -EPERM;",
+            "if cmd != FS_IOC_SETFLAGS",
+        ],
+    )
+    .unwrap();
+    assert!(ip.contains(
+        "const PERF_EVENT_IOC_SET_BPF: c_uint = northnarrow_common::bpf_cmd::PERF_EVENT_IOC_SET_BPF;"
+    ));
+}
+
+/// The review of #558 (F1): the window's forbidden load itself was silent
+/// (`content_refusal` returns None in a window) — on every kernel it is
+/// signed now when it is held, High, so it is never silent even through a
+/// use no hook sees (a link attached inside the window, a netlink XDP
+/// attach). Before 6.9 the `bpf_prog` hook holds it at the load's handle;
+/// from 6.9 the load's verdict, kept by thread, is held there.
+#[test]
+fn a_window_s_forbidden_load_is_signed_at_its_load() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "hold"),
+        &[
+            "if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {",
+            "emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_FULL, verdict, id);",
+            "return false;",
+            "emit_held(FS_OP_BPF_HELD_LOAD, 0, verdict, id);",
+            "true",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "try_bpf_prog_guard"),
+        &[
+            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {",
+            "content_refusal(prog, false)",
+            "return -EPERM;",
+            "if loading {",
+            "if let Some(v) = window_verdict(prog, false) {",
+            "if !hold(id, v) {",
+            "return -EPERM;",
+            "if content_stage() == CONTENT_STAGE_LOAD {",
+            "if !hold(id, v) {",
+            "return -EPERM;",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "emit_held"),
+        &[
+            "crate::inode_protect::emit_attempt(",
+            "dev: bpf_held_dev(how, verdict),",
+            "ino: id as u64,",
+        ],
+    )
+    .unwrap();
+}
+
+/// The review of #558 (F5): the held set (1024 ids) was never emptied and,
+/// full, kept nothing (a fail-open): a window holder's 1024 tiny forbidden
+/// loads left every later window's forbidden load unheld. Full, the load
+/// is refused now (fail closed, signed); each kernel-state round releases
+/// the ids no longer loaded, read before its enumeration.
+#[test]
+fn a_full_held_set_refuses_the_window_s_load_and_the_round_empties_it() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let g = body(&c, "try_bpf_prog_guard");
+    assert!(
+        !g.contains("PROG_CONTENT_HELD.insert"),
+        "every insert goes through hold(), which fails closed"
+    );
+    assert!(
+        !body(&c, "hold").contains("fail_open"),
+        "full is no fail-open"
+    );
+    let x = code("crates/nn-linux/src/bpf_crossview.rs");
+    in_order(
+        body(&x, "round"),
+        &[
+            "let held = self.parts.held();",
+            "let en = self.parts.enumerate()?;",
+            "let gone = stale_held(&held, &en.progs);",
+            "self.parts.release_held(&gone);",
+        ],
+    )
+    .unwrap();
+    assert!(x.contains("pub const HELD_MAP: &str = \"PROG_CONTENT_HELD\";"));
+    assert!(c.contains("pub static PROG_CONTENT_HELD: HashMap<u32, u64> ="));
 }

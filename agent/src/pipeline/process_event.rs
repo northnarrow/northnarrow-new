@@ -525,6 +525,9 @@ pub(crate) fn process_event(
             );
             // Lot 290: a load the signed per-loader opt-out let through.
             let loader_opted_out = *operation == nn_model::FsProtectOperation::BpfProgOptOut;
+            // Lot 349 (the review of #558, F1): a window's load the content
+            // judge refuses outside one — let through, held.
+            let held_load = *operation == nn_model::FsProtectOperation::BpfHeldLoad;
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
@@ -563,6 +566,15 @@ pub(crate) fn process_event(
                         value = ?value,
                         "SYSCTL OPT-OUT: a guarded sysctl's write let through by the signed \
                          per-rule policy's sysctl-allow (recorded, not refused)"
+                    );
+                } else if held_load {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        prog_id = target_ino,
+                        target_dev,
+                        "BPF HELD: a program the content judge refuses outside a window, loaded \
+                         inside one (recorded, not refused; its runs and attaches outside a \
+                         window are refused)"
                     );
                 } else if found {
                     warn!(
@@ -621,6 +633,21 @@ pub(crate) fn process_event(
                             "not refused: let through by the signed per-rule policy's \
                              bpf-loader-allow (the loader's executable and the type)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldLoad {
+                            // lot 349 (the review of #558, F1): the program
+                            // named in the signed record
+                            format!(
+                                "not refused: program id {target_ino} loaded inside a \
+                                 trusted-installer window, held — its runs, attaches and handles \
+                                 outside a window are refused"
+                            )
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldUse {
+                            let (how, _, _) = common::wire::bpf_held_of(*target_dev);
+                            format!(
+                                "denied in kernel (the BPF guard): {} of program id {target_ino}, \
+                                 held at a window's load",
+                                common::wire::bpf_held_use_name(how)
+                            )
                         } else if matches!(
                             operation,
                             nn_model::FsProtectOperation::BpfUnseen

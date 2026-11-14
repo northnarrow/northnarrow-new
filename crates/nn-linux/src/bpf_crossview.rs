@@ -47,6 +47,10 @@ pub const ITER_PROGS: &str = "census_progs";
 pub const ITER_LINKS: &str = "census_links";
 /// The map of the programs the hook saw loading.
 pub const SEEN_MAP: &str = "SEEN_PROGS";
+/// Lot 349 (the review of #558, F5): the map of the programs held at a
+/// window's load (`agent-ebpf`'s `PROG_CONTENT_HELD`, pinned), whose ids no
+/// longer loaded each round removes.
+pub const HELD_MAP: &str = "PROG_CONTENT_HELD";
 /// The status file's name, beside the agent's pid file.
 pub const STATUS_FILE_NAME: &str = "bpf-foreign";
 /// The signed degradation's source while the cross-view does not run.
@@ -104,6 +108,8 @@ pub struct Parts {
     progs: OwnedFd,
     links: Option<OwnedFd>,
     seen: HashMap<MapData, u32, AyaSeen>,
+    /// `None`: an object without it (the eBPF object of an older build).
+    held: Option<HashMap<MapData, u32, u64>>,
 }
 
 /// Load iterator program `name` on `target` (`bpf_prog`, `bpf_link`) and
@@ -151,7 +157,34 @@ impl Parts {
             .ok_or_else(|| format!("{SEEN_MAP} missing from the eBPF object"))?;
         let seen: HashMap<MapData, u32, AyaSeen> =
             HashMap::try_from(seen).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
-        Ok(Parts { progs, links, seen })
+        let held = match ebpf.take_map(HELD_MAP).map(HashMap::try_from) {
+            Some(Ok(m)) => Some(m),
+            Some(Err(e)) => return Err(format!("{HELD_MAP}: {e}")),
+            None => None,
+        };
+        Ok(Parts {
+            progs,
+            links,
+            seen,
+            held,
+        })
+    }
+
+    /// Lot 349 (the review of #558, F5): the ids held now.
+    pub fn held(&self) -> Vec<u32> {
+        match &self.held {
+            Some(m) => m.keys().filter_map(Result::ok).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Lot 349 (the review of #558, F5): remove `ids` from the held map
+    /// (programs freed since); how many went.
+    pub fn release_held(&mut self, ids: &[u32]) -> usize {
+        let Some(m) = &mut self.held else {
+            return 0;
+        };
+        ids.iter().filter(|id| m.remove(id).is_ok()).count()
     }
 
     /// One enumeration: every program, and every link where the kernel has
@@ -490,7 +523,18 @@ impl CrossView {
     /// says it (a signed degradation while it holds).
     pub fn round(&mut self) -> Result<Vec<Finding>, String> {
         let seen = self.parts.seen()?;
+        // the held ids read BEFORE the enumeration: one held after it is
+        // newer than it, and stays
+        let held = self.parts.held();
         let en = self.parts.enumerate()?;
+        let gone = stale_held(&held, &en.progs);
+        if !gone.is_empty() {
+            let n = self.parts.release_held(&gone);
+            tracing::debug!(
+                released = n,
+                "BPF self-defence: held programs no longer loaded released"
+            );
+        }
         let mut own = (self.own)();
         // the agent's own loads not registered yet (a sensor attached after
         // the registration, until the late one: the lab's 22.04 round saw
@@ -513,6 +557,21 @@ impl CrossView {
         }
         Ok(found)
     }
+}
+
+/// Lot 349 (the review of #558, F5): of the ids held before an enumeration
+/// (`held`), those it no longer shows — programs freed since their window's
+/// load, whose entries would otherwise fill the held set (1024 ids, never
+/// emptied: full, a window's forbidden load is refused). Prog ids are
+/// cyclic (`idr_alloc_cyclic`): a freed id comes back only after 2^31
+/// loads, so a stale entry was never a false refusal, only a full set. An
+/// id held after the enumeration is not in `held` and stays.
+pub fn stale_held(held: &[u32], progs: &[ProgRecord]) -> Vec<u32> {
+    let live: BTreeSet<u32> = progs.iter().map(|p| p.id).collect();
+    held.iter()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect()
 }
 
 /// The status file's path for an agent whose pid file is `pid_file`.
@@ -540,6 +599,26 @@ mod tests {
             name: n,
             attach: [0u8; 64],
         }
+    }
+
+    /// Lot 349 (the review of #558, F5): the held set was never emptied — a
+    /// window holder's 1024 tiny forbidden loads, freed at once, filled it
+    /// for the agent's life. The round releases every held id the
+    /// enumeration no longer shows, and only those.
+    #[test]
+    fn held_programs_no_longer_loaded_are_released_each_round() {
+        let live = [prog(7, 2, "a"), prog(9, 26, "b")];
+        assert_eq!(stale_held(&[7, 8, 9, 1024], &live), vec![8, 1024]);
+        assert!(
+            stale_held(&[7, 9], &live).is_empty(),
+            "loaded ones stay held"
+        );
+        assert!(stale_held(&[], &live).is_empty());
+        assert_eq!(
+            stale_held(&[3], &[]),
+            vec![3],
+            "nothing loaded: all released"
+        );
     }
 
     fn with_attach(mut p: ProgRecord, a: &str) -> ProgRecord {

@@ -604,9 +604,9 @@ fn the_agent_asks_the_marks_where_it_decides() {
     // lot 280b: nor the kernel-state round's findings)
     // (lot 281: nor an injection's record)
     // (lot 290: nor a loader opt-out's load, nor the BPF cross-view's findings)
-    // (lot 349: nor the agent's own CPU watch's)
+    // (lot 349: nor the agent's own CPU watch's, nor a window's held load)
     assert!(tr.contains(
-        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n                    | nn_model::FsProtectOperation::ExemptInjection\n                    | nn_model::FsProtectOperation::BpfProgOptOut\n                    | nn_model::FsProtectOperation::BpfUnseen\n                    | nn_model::FsProtectOperation::BpfBaseline\n                    | nn_model::FsProtectOperation::CpuConfined\n            ) {"
+        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n                    | nn_model::FsProtectOperation::ExemptInjection\n                    | nn_model::FsProtectOperation::BpfProgOptOut\n                    | nn_model::FsProtectOperation::BpfUnseen\n                    | nn_model::FsProtectOperation::BpfBaseline\n                    | nn_model::FsProtectOperation::CpuConfined\n                    | nn_model::FsProtectOperation::BpfHeldLoad\n            ) {"
     ));
     let pe = code("agent/src/pipeline/process_event.rs");
     assert!(pe.contains("let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;"));

@@ -400,6 +400,27 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::CpuConfined => {
                 return Some(cpu_confined_verdict(self, event, comm, *target_dev, *target_ino));
             }
+            // Lot 349 (the review of #558, F1): a window's load of a program
+            // the content judge refuses outside one — let through, held.
+            FsProtectOperation::BpfHeldLoad => {
+                let reasoning = format!(
+                    "`{comm}` loaded, inside a trusted-installer window, {} (program id \
+                     {target_ino}) — let through, as the window promises, and held: every run, \
+                     attach or handle of it outside a window, by any caller outside the agent's \
+                     family and through any descriptor, is refused and signed. A link attached \
+                     inside the window keeps running it: check `bpftool link` for program id \
+                     {target_ino}.",
+                    held_program_text(*target_dev)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
+            FsProtectOperation::BpfHeldUse => held_use_text(*target_dev, *target_ino),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -430,9 +451,32 @@ fn cpu_confined_verdict(
 ) -> Verdict {
     use common::wire::{
         cpu_confined_of, CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
-        CPU_CAUSE_PARTITION,
+        CPU_CAUSE_PARTITION, CPU_CAUSE_UNJUDGED,
     };
     let (cause, left, expected, threads) = cpu_confined_of(target_dev);
+    let cpus: Vec<String> = (0..64u32)
+        .filter(|c| target_ino & (1u64 << c) != 0)
+        .map(|c| c.to_string())
+        .collect();
+    let cpus = if cpus.is_empty() {
+        "none below 64".to_string()
+    } else {
+        cpus.join(",")
+    };
+    // the review of #558 (F2, F3): the watch could not judge for
+    // `threads` rounds in a row — what the agent may run on is unknown
+    if cause == CPU_CAUSE_UNJUDGED {
+        let reasoning = format!(
+            "The agent's own CPU watch could not judge the CPUs it may run on for {threads} \
+             rounds in a row (`{comm}`): a mount crossed in the cgroup tree (a file bound over a \
+             cpuset file, a directory over a cgroup), no online CPU read, or online CPUs moving \
+             at every round. Its threads may run on {left} CPUs (CPUs {cpus}{}) of the {expected} \
+             it read online. A partition taking its CPUs would not be told; `nn-admin status` \
+             shows it (degradation `own_cpus`) until a round judges again.",
+            if left > 64 { ", those below 64" } else { "" }
+        );
+        return build_verdict(rule, event, ResponseAction::Log, Severity::High, &reasoning);
+    }
     let why = match cause {
         CPU_CAUSE_PARTITION => format!(
             "a cgroup in cpuset.cpus.partition root or isolated (`{comm}`) took them from every \
@@ -447,20 +491,11 @@ fn cpu_confined_verdict(
         CPU_CAUSE_CGROUP_MOVE => format!("it was moved to another cgroup (`{comm}`)"),
         _ => format!("cause {cause} (`{comm}`)"),
     };
-    let cpus: Vec<String> = (0..64u32)
-        .filter(|c| target_ino & (1u64 << c) != 0)
-        .map(|c| c.to_string())
-        .collect();
     let reasoning = format!(
-        "The agent may run on {left} of the {expected} CPUs it should (CPUs {}{}): {why}. \
+        "The agent may run on {left} of the {expected} CPUs it should (CPUs {cpus}{}): {why}. \
          Confined to one busy CPU its sensors' rings overflow and its responses come late. Not \
          refused — the agent's own CPU watch, read every 5 s; `nn-admin status` shows it \
          (degradation `own_cpus`) while it holds.",
-        if cpus.is_empty() {
-            "none below 64".to_string()
-        } else {
-            cpus.join(",")
-        },
         if left > 64 { ", those below 64" } else { "" }
     );
     build_verdict(rule, event, ResponseAction::Log, Severity::High, &reasoning)
@@ -470,6 +505,70 @@ fn cpu_confined_verdict(
 /// load the content refused (`target_dev` a `bpf_prog_class::CONTENT_*`
 /// code, `target_ino` the program type — 0 when the verifier's lockdown
 /// question refused it, before the type is known).
+/// Lot 349 (the review of #558, F1): a held program as a record names it —
+/// its type and what its content does (`common::wire::bpf_held_of`).
+fn held_program_text(target_dev: u64) -> String {
+    use common::bpf_prog_class::{
+        call_target_name, content_refusal, prog_type_name, ContentRefusal,
+    };
+    let (_, why, ty) = common::wire::bpf_held_of(target_dev);
+    let program = if ty != 0 {
+        format!("a `{}` BPF program", prog_type_name(ty))
+    } else {
+        "a BPF program".to_string()
+    };
+    match content_refusal(u64::from(why)) {
+        Some(ContentRefusal::Call(n)) => format!(
+            "{program} that calls {} (it kills the agent past its task_kill hook, rewrites a \
+             process's memory or overrides a kernel function's return)",
+            call_target_name(n)
+        ),
+        _ => format!(
+            "{program} whose instructions the judge could not read whole (refused outside a \
+             window as if it called a helper that kills or blinds the agent)"
+        ),
+    }
+}
+
+/// Lot 349 (the review of #558, F1): a refused use of a held program, or a
+/// window's load that the held set had no room for.
+fn held_use_text(target_dev: u64, target_ino: u64) -> String {
+    let (how, _, _) = common::wire::bpf_held_of(target_dev);
+    let program = held_program_text(target_dev);
+    if how == common::wire::BPF_HELD_FULL {
+        return format!(
+            "to load, inside a trusted-installer window, {program} (program id {target_ino}) \
+             while the agent's held set is full — refused (fail closed: a load the agent cannot \
+             hold could be run after the window unrefused)"
+        );
+    }
+    let using = match how {
+        common::wire::BPF_HELD_SET_BPF => {
+            "attach it to a perf event (ioctl PERF_EVENT_IOC_SET_BPF: a kprobe, a tracepoint)"
+                .to_string()
+        }
+        c => format!(
+            "{} it",
+            match c {
+                common::bpf_cmd::BPF_PROG_TEST_RUN => "run (BPF_PROG_RUN)",
+                common::bpf_cmd::BPF_PROG_ATTACH => "attach (BPF_PROG_ATTACH)",
+                common::bpf_cmd::BPF_RAW_TRACEPOINT_OPEN => "attach (BPF_RAW_TRACEPOINT_OPEN)",
+                common::bpf_cmd::BPF_LINK_CREATE => "attach (BPF_LINK_CREATE)",
+                common::bpf_cmd::BPF_LINK_UPDATE => "swap a link onto (BPF_LINK_UPDATE)",
+                common::bpf_cmd::BPF_MAP_UPDATE_ELEM => {
+                    "put in a tail call's slot (a prog array's BPF_MAP_UPDATE_ELEM)"
+                }
+                _ => "use",
+            }
+        ),
+    };
+    format!(
+        "to {using}: {program}, program id {target_ino}, loaded inside a trusted-installer \
+         window and held since — refused outside a window to every caller outside the agent's \
+         family, through any descriptor (the loader's own, one passed or taken with pidfd_getfd)"
+    )
+}
+
 fn content_refusal_text(target_dev: u64, target_ino: u64) -> String {
     use common::bpf_prog_class::{
         call_target_name, content_refusal, prog_type_name, ContentRefusal,
@@ -1148,6 +1247,36 @@ mod tests {
         assert!(v.reasoning.contains("(CPUs 1,3)"), "{}", v.reasoning);
     }
 
+    /// The review of #558 (F2, F3): rounds of the CPU watch that could not
+    /// judge, signed — High, the rounds and the reason named, never worded
+    /// as a confinement told nor as a refusal.
+    #[test]
+    fn a_cpu_watch_that_could_not_judge_is_high_and_says_so() {
+        use common::wire::{cpu_confined_dev, CPU_CAUSE_UNJUDGED};
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&Event::FsProtectDenial {
+                pid: 0,
+                uid: 0,
+                comm: "a mount over /northnarrow.slice/cpuset.cpus".into(),
+                target_dev: cpu_confined_dev(CPU_CAUSE_UNJUDGED, 1, 4, 3),
+                target_ino: 0b1,
+                operation: FsProtectOperation::CpuConfined,
+                timestamp_ns: 1,
+            })
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        assert!(matches!(v.action, ResponseAction::Log));
+        for says in [
+            "could not judge the CPUs it may run on for 3 rounds in a row",
+            "(`a mount over /northnarrow.slice/cpuset.cpus`)",
+            "may run on 1 CPUs (CPUs 0) of the 4",
+        ] {
+            assert!(v.reasoning.contains(says), "{says}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("cause 5"), "{}", v.reasoning);
+        assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
+    }
+
     /// Lot 280b (named): a new taint of code entering the kernel is a
     /// signed detection — Critical for an unsigned or forced module, High
     /// for an out-of-tree module or a livepatch — named by its flags, and
@@ -1590,6 +1719,76 @@ mod tests {
             t.reasoning.contains("a type that can rewrite"),
             "{}",
             t.reasoning
+        );
+    }
+
+    /// Lot 349 (the review of #558, F1): a window's held load is High and
+    /// not refused, naming the call and the id; each refused use names
+    /// itself (the run, the perf attach, the tail-call slot) and the call;
+    /// a load the full held set refuses says so.
+    #[test]
+    fn a_held_program_s_load_and_uses_are_named_and_high() {
+        use common::bpf_prog_class::CONTENT_CALL;
+        use common::wire::{bpf_held_dev, BPF_HELD_FULL, BPF_HELD_SET_BPF};
+        let ev = |op, dev, ino| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "loader".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1,
+        };
+        let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        // slot 2: bpf_send_signal; type 2: kprobe
+        let verdict = (u64::from(CONTENT_CALL + 2) << 32) | 2;
+        let l = v(ev(
+            FsProtectOperation::BpfHeldLoad,
+            bpf_held_dev(0, verdict),
+            77,
+        ));
+        assert_eq!(l.severity, Severity::High);
+        for n in [
+            "inside a trusted-installer window",
+            "program id 77",
+            "`kprobe`",
+            "bpf_send_signal",
+            "held",
+        ] {
+            assert!(l.reasoning.contains(n), "{n}: {}", l.reasoning);
+        }
+        assert!(!l.reasoning.contains("refused it"), "{}", l.reasoning);
+        for (how, named) in [
+            (u32::from(10u8), "run (BPF_PROG_RUN)"),
+            (BPF_HELD_SET_BPF, "PERF_EVENT_IOC_SET_BPF"),
+            (28, "BPF_LINK_CREATE"),
+            (2, "tail call"),
+        ] {
+            let u = v(ev(
+                FsProtectOperation::BpfHeldUse,
+                bpf_held_dev(how, verdict),
+                77,
+            ));
+            assert_eq!(u.severity, Severity::High);
+            for n in [
+                named,
+                "program id 77",
+                "bpf_send_signal",
+                "refused it",
+                "pidfd_getfd",
+            ] {
+                assert!(u.reasoning.contains(n), "{how} {n}: {}", u.reasoning);
+            }
+        }
+        let f = v(ev(
+            FsProtectOperation::BpfHeldUse,
+            bpf_held_dev(BPF_HELD_FULL, verdict),
+            78,
+        ));
+        assert!(
+            f.reasoning.contains("held set is full") && f.reasoning.contains("fail closed"),
+            "{}",
+            f.reasoning
         );
     }
 
