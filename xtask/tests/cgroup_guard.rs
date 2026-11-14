@@ -656,6 +656,109 @@ fn the_task_settings_denies_refuse_another_processs_change() {
     .unwrap();
 }
 
+/// Lot 348 (named; fails on `main`, which has no mark): the scheduling
+/// deny lets through only the check of a thread inside its own
+/// `cgroup.subtree_control` write — the cpuset controller's
+/// `cpuset_can_attach` asking `security_task_setscheduler` of every task a
+/// controller change re-homes in its own cgroup (before 6.5; the agent's
+/// threads among them: `+cpuset` was refused at every container start on
+/// 5.15, NN-L-AT-001 `sched` from systemd, runc and containerd-shim). The
+/// mark is the writing thread's, made by an fentry on the write, dropped
+/// at its end with the move guard's stash and bounded in time; attached
+/// only once the program that drops it runs. The three other task-settings
+/// denies (rlimit, nice, ioprio) never read it.
+#[test]
+fn a_controller_change_s_scheduling_check_is_the_writer_thread_s_only() {
+    let m = code("agent-ebpf/src/controller_change.rs");
+    let g = code("agent-ebpf/src/cgroup_guard.rs");
+    assert!(m.contains(
+        "#[fentry(function = \"cgroup_subtree_control_write\")]\npub fn cgroup_subtree_mark("
+    ));
+    in_order(
+        body(&m, "cgroup_subtree_mark"),
+        &[
+            "let pid_tgid = bpf_get_current_pid_tgid();",
+            "SUBTREE_WRITES.insert(&pid_tgid, &now, 0)",
+        ],
+    )
+    .unwrap();
+    // a plain hash map (never an eviction), not pinned
+    assert!(m.contains(
+        "pub(crate) static SUBTREE_WRITES: HashMap<u64, u64> = HashMap::with_max_entries(SUBTREE_WRITE_ENTRIES, 0);"
+    ));
+    // dropped at the end of every cgroup file write, with the move stash
+    in_order(
+        body(&g, "cgroup_move_clear"),
+        &[
+            "let pid_tgid = bpf_get_current_pid_tgid();",
+            "CGROUP_MOVES.remove(&pid_tgid);",
+            "crate::controller_change::SUBTREE_WRITES.remove(&pid_tgid);",
+        ],
+    )
+    .unwrap();
+    // the current thread's own mark, young
+    in_order(
+        body(&m, "in_controller_change"),
+        &[
+            "let pid_tgid = bpf_get_current_pid_tgid();",
+            "SUBTREE_WRITES.get(&pid_tgid)",
+            "< SUBTREE_WRITE_TTL_NS",
+            "None => false,",
+        ],
+    )
+    .unwrap();
+    // the scheduling deny alone reads it, before its refusal
+    let t = code("agent-ebpf/src/task_limits.rs");
+    in_order(
+        body(&t, "task_setscheduler_deny"),
+        &[
+            "if crate::controller_change::in_controller_change() {\n            return 0;\n        }",
+            "refuse_task_change(task, FS_OP_SCHED",
+        ],
+    )
+    .unwrap();
+    assert_eq!(t.matches("in_controller_change").count(), 1);
+    for f in [
+        "task_setrlimit_deny",
+        "task_setnice_deny",
+        "task_setioprio_deny",
+        "refuse_task_change",
+    ] {
+        assert!(!body(&t, f).contains("in_controller_change"), "{f}");
+    }
+    let ebpf_users: Vec<_> = fs::read_dir(repo_root().join("agent-ebpf/src"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            fs::read_to_string(p)
+                .unwrap()
+                .contains("in_controller_change()")
+        })
+        .collect();
+    assert_eq!(ebpf_users.len(), 2, "{ebpf_users:?}"); // its definition's file, the deny's
+                                                       // attached after the program that drops the marks, and its pins purged
+                                                       // wherever it is not attached
+    let u = code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs");
+    let attach = body(&u, "attach_move_guard");
+    in_order(
+        attach,
+        &[
+            "MOVE_CLEAR_PROGRAM,\n        MOVE_CLEAR_HOOK,",
+            "purge_subtree_mark(pin_root);\n        return health;",
+            "attach_subtree_mark(ebpf, btf, pin_root);",
+            "MOVE_STASH_PROGRAM,\n        MOVE_STASH_HOOK,",
+        ],
+    )
+    .unwrap();
+    assert_eq!(attach.matches("attach_subtree_mark(").count(), 1);
+    assert!(u.contains("pub const SUBTREE_MARK_HOOK: &str = \"cgroup_subtree_control_write\";"));
+    in_order(
+        body(&u, "attach_subtree_mark"),
+        &["reattach_fresh_fentry(", "purge_subtree_mark(pin_root);"],
+    )
+    .unwrap();
+}
+
 /// Lot 273c: the reloads the agent asks systemd for — a refused PID 1
 /// write of a resource file or a drop-in (the pipeline), a window's
 /// opening, a quarantine — and the floors at every registration.

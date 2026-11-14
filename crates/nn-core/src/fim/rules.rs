@@ -2845,8 +2845,13 @@ impl<H: PostureHost> Rule for OwnClient<H> {
 /// The tool is told by what the kernel executed ([`ExecIdentity::is_client`](crate::posture::lineage::ExecIdentity::is_client) over
 /// [`ACCOUNT_TOOLS`]), never by `comm`. Its write is recorded: at Low
 /// when a user other than root ran it (a setuid tool changing that user's
-/// own entry), else at the rule's severity — a root process creating an
-/// account stays a detection worth reading.
+/// own entry), or (lot 348) when it runs in a package transaction — a
+/// maintainer script's `adduser` creating the package's system account
+/// ([`AuthSessionTracker::is_package_transaction_write`], the lineage's
+/// identity: [`PackageManaged`] outside this wrapper passes a Log
+/// through, so the transaction's Low is given here) —, else at the rule's
+/// severity: a root process creating an account stays a detection worth
+/// reading.
 pub struct AccountTool<H: PostureHost> {
     inner: Box<dyn Rule>,
     lineage: AuthSessionTracker<H>,
@@ -2888,18 +2893,30 @@ impl<H: PostureHost> Rule for AccountTool<H> {
         if !id.is_client(ACCOUNT_TOOLS) {
             return Some(verdict);
         }
+        // Lot 348: run in a package transaction (a maintainer script's
+        // `adduser`), by the lineage's identity — the package wrapper
+        // outside this one passes a Log through, so its Low is given here.
+        let transaction = self.lineage.is_package_transaction_write(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        );
         Some(Verdict {
             action: ResponseAction::Log,
-            severity: if fe.modifier_uid == 0 {
+            severity: if fe.modifier_uid == 0 && !transaction {
                 verdict.severity
             } else {
                 Severity::Low
             },
             reasoning: format!(
-                "{} [written by the account tool {}: recorded, not killed — killing it \
+                "{} [written by the account tool {}{}: recorded, not killed — killing it \
                  mid-update leaves passwd, shadow and group inconsistent]",
                 verdict.reasoning,
-                id.exe.display()
+                id.exe.display(),
+                if transaction {
+                    " run by the package manager (dpkg/rpm/dnf lineage, a package transaction)"
+                } else {
+                    ""
+                }
             ),
             ..verdict
         })
@@ -5658,6 +5675,86 @@ mod tests {
             "/usr/local/lib/modprobe.d",
         ] {
             assert!(shipped.lines().any(|l| l.trim() == d), "{d} not watched");
+        }
+    }
+
+    /// Lot 348 (the alpha's container hosts: `apt install docker.io` on
+    /// Ubuntu 22.04 and 26.04): a maintainer script's `adduser` runs the
+    /// account tools (`useradd`, `usermod`, `chage`, `chfn`), whose writes
+    /// of `/etc/passwd` and `/etc/shadow` were Log + High — the account-tool
+    /// wrapper turned the kill into a Log at the rule's severity, and the
+    /// package wrapper outside it passes every Log through, so the
+    /// transaction's Low never applied. A package transaction's account
+    /// tool is Low (the catalogue's "a package transaction at Low"); the
+    /// same tools run by root outside one stay High, any other writer keeps
+    /// the kill.
+    #[test]
+    fn account_tools_in_a_package_transaction_are_recorded_low() {
+        let (_tmp, lineage) = pkg_fixture();
+        // dpkg (200) → postinst sh (300) → adduser (310) → the tools
+        lineage.ingest_spawn(310, 300, "/usr/sbin/adduser", 7);
+        let tools = [
+            (311, "/usr/sbin/useradd", "useradd"),
+            (312, "/usr/sbin/usermod", "usermod"),
+            (313, "/usr/bin/chage", "chage"),
+            (314, "/usr/bin/chfn", "chfn"),
+            (315, "/usr/sbin/groupadd", "groupadd"),
+            // the mini-hunt: a postinst's `systemd-sysusers` (debhelper's
+            // dh_installsysusers, Debian 13 and Ubuntu 24.04 on)
+            (316, "/usr/bin/systemd-sysusers", "systemd-sysusers"),
+        ];
+        for (pid, exe, _) in tools {
+            lineage.ingest_spawn(pid, 310, exe, 8);
+        }
+        // the same useradd from the unrelated root shell (500)
+        lineage.ingest_spawn(510, 500, "/usr/sbin/useradd", 9);
+        let rules = rules_by_id(&lineage);
+        let fim003 = &rules["NN-L-FIM-003_SensitiveConfigModified"];
+        let fim018 = &rules["NN-L-FIM-018_LastlogTampered"];
+        for (pid, _, comm) in tools {
+            for (rule, path) in [
+                (fim003, "/etc/passwd"),
+                (fim003, "/etc/shadow"),
+                // the mini-hunt: useradd resets the new uid's lastlog entry
+                (fim018, "/var/log/lastlog"),
+            ] {
+                let v = rule
+                    .evaluate(&written_by(FimOp::Modified, path, pid, comm))
+                    .unwrap_or_else(|| panic!("{comm} {path} recorded"));
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::Low),
+                    "{comm} {path}: {}",
+                    v.reasoning
+                );
+                assert!(v.reasoning.contains("package manager"), "{}", v.reasoning);
+            }
+        }
+        // CONTROLS: root's useradd outside a transaction — Log, High
+        for (rule, path) in [(fim003, "/etc/passwd"), (fim018, "/var/log/lastlog")] {
+            let v = rule
+                .evaluate(&written_by(FimOp::Modified, path, 510, "useradd"))
+                .unwrap();
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::High),
+                "{path}: {}",
+                v.reasoning
+            );
+            assert!(v.reasoning.contains("account tool /usr/sbin/useradd"));
+            assert!(!v.reasoning.contains("package"), "{}", v.reasoning);
+            // a foreign writer: the kill, in a transaction or not
+            for pid in [600, 300] {
+                let v = rule
+                    .evaluate(&written_by(FimOp::Modified, path, pid, "useradd"))
+                    .unwrap();
+                if rule.id() == fim003.id() && pid == 300 {
+                    // the postinst's own shell: the package wrapper's Low
+                    assert_eq!(v.severity, Severity::Low, "{}", v.reasoning);
+                } else {
+                    assert_ne!(v.action, ResponseAction::Log, "{path} {pid}");
+                }
+            }
         }
     }
 

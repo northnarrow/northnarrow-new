@@ -2483,12 +2483,37 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// — the timer's logrotate.service runs in a mount namespace of its own
     /// (`ProtectSystem=`), which kept no image, and its run was High.
     pub fn ran_host_file(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
-        let Some(image) = self.exec_file(pid, as_of) else {
-            return false;
-        };
+        self.exec_file(pid, as_of)
+            .is_some_and(|image| self.is_host_file(path, image))
+    }
+
+    /// Lot 348: `image` (an executed file's device and inode as the LSM
+    /// program gave them, the device in the kernel's form) is the file at
+    /// `path` under the host's root — PID 1's mount namespace, the agent's
+    /// — now ([`Self::ran_host_file`]'s check, for an exec event's own
+    /// identity). A copy, a file replaced at the path since, another mount
+    /// namespace's file at that path: `false`.
+    pub fn is_host_file(&self, path: &str, image: (u64, u64)) -> bool {
         H::file_id(self.inner.host_root.join(path.trim_start_matches('/')))
             .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
             == Some(image)
+    }
+
+    /// Lot 348: [`Self::is_host_file`], and the file's directory under the
+    /// host's root is root's and writable by no one else
+    /// ([`PostureHost::dir_is_root_only`]) — what `ROOT_DIR` says of a
+    /// binary, for an executed SCRIPT, whose process's image (`/proc/<pid>/
+    /// exe`) is its interpreter: the exec pump gives a script no `ROOT_DIR`
+    /// (the lab of lot 348: initramfs-tools' hook `kmod`).
+    pub fn is_host_file_in_root_dir(&self, path: &str, image: (u64, u64)) -> bool {
+        self.is_host_file(path, image)
+            && std::path::Path::new(path).parent().is_some_and(|dir| {
+                H::dir_is_root_only(
+                    self.inner
+                        .host_root
+                        .join(dir.to_string_lossy().trim_start_matches('/')),
+                )
+            })
     }
 
     /// Lab PR 175: `pid` runs in a mount namespace other than init's whose

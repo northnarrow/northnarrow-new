@@ -669,6 +669,27 @@ fn the_exec_pump_reads_a_module_tool_s_exec() {
         copy < resolve,
         "compared after its path was resolved: {step}"
     );
+    // lot 348 (the mini-hunt; Debian 13's `apt install docker.io`): the
+    // pump's read of a module tool's exec records the runtimes and their
+    // managers installed since the minute's refresh, after the facts' read
+    // (the process may be short-lived) and before they are kept — R011's
+    // runtime exemption judges the forker by an installed image
+    let k = strip_comments(
+        &std::fs::read_to_string(repo_root().join("crates/nn-linux/src/sensors/kmod_exec.rs"))
+            .unwrap(),
+    );
+    let facts = &k[k.find("pub fn facts(").expect("kmod_exec::facts")..];
+    let facts = &facts[..facts.find("\n}\n").expect("its end")];
+    let (read, refresh, kept) = (
+        facts.find("facts_in(").expect("the facts read"),
+        facts
+            .find("crate::program_images::refresh_runtimes();")
+            .expect("the runtimes recorded again"),
+        facts.find("Some(facts)").expect("then returned"),
+    );
+    assert!(read < refresh && refresh < kept, "{facts}");
+    let keep = &k[k.find("pub fn read_and_keep(").expect("read_and_keep")..];
+    assert!(keep[..keep.find("\n}\n").unwrap()].contains("facts(Path::new(\"/\"), event)"));
     // the core keeps the facts; it reads nothing itself (lot 313: nor
     // the programs' identities)
     for file in ["kmod_exec_facts.rs", "program_identity.rs"] {

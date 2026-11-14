@@ -1010,6 +1010,27 @@ impl Cli {
         })
     }
 
+    /// Lot 348 (the re-check of #554, P3): `own` ([`Self::own_exes`])
+    /// refused when `--watchdog-exe` names the agent's own executable (the
+    /// same device and inode) — the `bpf` hook's watchdog role, the
+    /// stale-pid scan's second executable and the posture's verified
+    /// watchdog would then be any process running the agent's binary.
+    /// `--watchdog-exe` is root's setting (the unit's command line); this
+    /// keeps a mistyped one from starting an agent whose two roles are one.
+    pub(crate) fn refuse_one_binary_in_both_roles(
+        &self,
+        own: &northnarrow_agent::anti_tamper::OwnExes,
+    ) -> anyhow::Result<()> {
+        if own.agent.is_some() && own.agent == own.watchdog {
+            anyhow::bail!(
+                "--watchdog-exe {} is the agent's own executable: the watchdog must be another \
+                 binary (refusing to start with the agent's and the watchdog's roles one)",
+                self.resolved_watchdog_exe().display()
+            );
+        }
+        Ok(())
+    }
+
     /// The agent's executable and the watchdog's ([`Self::resolved_watchdog_exe`]),
     /// by device and inode: the stale-pid scan of `PROTECTED_PIDS` and the
     /// `bpf` hook's roles take this one value (lot 344, #554's KVM suites).
@@ -1232,6 +1253,51 @@ mod tests {
         assert_ne!(own.agent, own.watchdog);
         // the stale-pid scan keeps exactly these two
         assert_eq!(own.keep(), [own.agent.unwrap(), own.watchdog.unwrap()]);
+    }
+
+    /// Lot 348 (named; the re-check of #554, P3): `--watchdog-exe` naming
+    /// the agent's own executable is refused at the start; another binary
+    /// is not.
+    #[test]
+    fn a_watchdog_exe_that_is_the_agent_s_own_binary_is_refused() {
+        let _env = TEST_ENV.lock();
+        let me = std::env::current_exe().unwrap();
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent".as_ref(),
+            "--watchdog-exe".as_ref(),
+            me.as_os_str(),
+        ])
+        .expect("a test's command line");
+        let err = cli
+            .refuse_one_binary_in_both_roles(&cli.own_exes())
+            .expect_err("the agent's own binary");
+        assert!(
+            err.to_string().contains("the agent's own executable"),
+            "{err}"
+        );
+        // a link to it is the same file
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("northnarrow-watchdog");
+        std::os::unix::fs::symlink(&me, &link).unwrap();
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent".as_ref(),
+            "--watchdog-exe".as_ref(),
+            link.as_os_str(),
+        ])
+        .expect("a test's command line");
+        assert!(cli
+            .refuse_one_binary_in_both_roles(&cli.own_exes())
+            .is_err());
+        // CONTROL: another file
+        let wd = dir.path().join("northnarrow-watchdog-elsewhere");
+        std::fs::write(&wd, b"a watchdog").unwrap();
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent".as_ref(),
+            "--watchdog-exe".as_ref(),
+            wd.as_os_str(),
+        ])
+        .expect("a test's command line");
+        assert!(cli.refuse_one_binary_in_both_roles(&cli.own_exes()).is_ok());
     }
 
     /// Wave 4 (lab PR 214): a unit written for an agent with the LLM

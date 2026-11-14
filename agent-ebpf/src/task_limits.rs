@@ -83,10 +83,18 @@ pub fn task_setrlimit_deny(ctx: LsmContext) -> i32 {
 }
 
 /// `int task_setscheduler(struct task_struct *p)`.
+///
+/// Lot 348: not inside a `cgroup.subtree_control` write of the current
+/// thread — there the check is `cpuset_can_attach`'s, of a task the
+/// controller change re-homes in its own cgroup, whose CPUs and nodes it
+/// does not change (`controller_change::cgroup_subtree_mark`).
 #[lsm(hook = "task_setscheduler")]
 pub fn task_setscheduler_deny(ctx: LsmContext) -> i32 {
     unsafe {
         let task: *const c_void = ctx.arg(0);
+        if crate::controller_change::in_controller_change() {
+            return 0;
+        }
         if refuse_task_change(task, FS_OP_SCHED, 0, hook::TASK_SETSCHEDULER) {
             return -EPERM;
         }

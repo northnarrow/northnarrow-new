@@ -361,7 +361,13 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   (`--watchdog-exe`, else the `northnarrow-watchdog` next to the agent):
   lot 344 (#554's KVM suites) — the guard named that sibling on its own,
   so a watchdog the agent was told of elsewhere was a foreign handle at
-  every start. One value (`OwnExes`) feeds both.
+  every start. One value (`OwnExes`) feeds both. `--watchdog-exe` is a
+  root-controlled setting (the agent unit's command line, under the
+  protected drop-in directories): whoever sets it is root already, and the
+  binary it names is trusted as the watchdog's. Lot 348 (the re-check of
+  #554): an agent whose `--watchdog-exe` is its own executable (the same
+  device and inode, through any link) refuses to start — one binary in both
+  roles would make any process running the agent's binary the watchdog.
 - **Mechanism:** the role is vacant. `ROLE_TGIDS` (pinned, two slots) holds
   the tgid of the live watchdog and agent; each records itself once it is a
   protected pid (the agent also records the watchdog it verifies), and

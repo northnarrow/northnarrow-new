@@ -699,6 +699,17 @@ pub fn installed_runtimes_under(root: &Path) -> Vec<InstalledImage> {
     out
 }
 
+/// Lot 348: the installed container runtimes and their managers recorded
+/// again, at most once a second ([`RuntimeChecks::refresh`]) — the module
+/// tool pump's step (`sensors::kmod_exec::facts`) before it keeps an exec's
+/// facts: containerd's first start, right after `apt install docker.io`,
+/// asks for its modules before the minute's refresh has recorded the
+/// package's `containerd` (R011 kept its kill there, Debian 13: its
+/// `LD_LIBRARY_PATH` judged without the manager's identity).
+pub fn refresh_runtimes() {
+    RUNTIMES.refresh(Path::new("/"), Instant::now());
+}
+
 /// Lot 347: the file `file` is sealed against writing, shrinking and
 /// growing ([`SEALED`]): a memfd whose bytes no one can change any more.
 fn sealed(file: &std::fs::File) -> bool {
@@ -1439,11 +1450,15 @@ mod tests {
         use nn_core::decision::rules::program_identity::{copy_of, record_installed};
         let t = tempfile::tempdir().unwrap();
         let (root, proc) = (t.path().join("root"), t.path().join("proc"));
-        let runc = put(&root, "/usr/sbin/runc", b"runc image, 347, r020");
-        let copy = put(&root, "/home/u/x", b"runc image, 347, r020");
+        // lot 348: a length no other test's file has — this test's record,
+        // its inode reused by the refresh test's 21-byte `ls` once this
+        // tempdir went, named that file a runtime (a flake of the suite)
+        let image: &[u8] = b"runc image of lot 347's r020 test";
+        let runc = put(&root, "/usr/sbin/runc", image);
+        let copy = put(&root, "/home/u/x", image);
         record_installed(InstalledImage {
             id: kernel_id(&std::fs::metadata(&runc).unwrap()),
-            len: 21,
+            len: image.len() as u64,
             path: runc.to_string_lossy().into_owned(),
             kind: ProgramKind::ContainerRuntime,
         });

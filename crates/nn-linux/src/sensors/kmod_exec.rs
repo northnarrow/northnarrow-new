@@ -105,7 +105,11 @@ pub fn read_and_keep(event: &Event) {
 /// in tests) the tools' paths are under.
 pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
     let builders = BUILDERS.lock().running();
-    facts_in(root, Path::new("/proc"), &builders, event)
+    let facts = facts_in(root, Path::new("/proc"), &builders, event)?;
+    // lot 348: a runtime or manager installed since the last minute's
+    // refresh is known to R011's runtime exemption (its parent's identity)
+    crate::program_images::refresh_runtimes();
+    Some(facts)
 }
 
 /// [`facts`] with the processes read from `proc` (a fixture tree in tests)

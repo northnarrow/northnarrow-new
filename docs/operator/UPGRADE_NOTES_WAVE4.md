@@ -2304,3 +2304,52 @@ detail.
 - **Nothing to configure.** No overlay, allowlist entry or signed policy
   changes; the container-runtime overlay of `process-comm-allowlist` (R013)
   is unchanged. Detection records of these three shapes stop appearing.
+
+## 42. A controller change, an account tool, an initramfs build (lot 348)
+
+- **A cgroup controller enabled above the agent is no attempt on it
+  (kernels before 6.5).** systemd, runc and containerd-shim enable the
+  cgroup v2 controllers of a new container's ancestors at its start. Before
+  6.5 the kernel's cpuset controller then asks the scheduling hook of every
+  task it re-homes — the agent's threads among them, whose CPUs nothing
+  changes — and the agent refused it: on Ubuntu 22.04 each container start
+  left three or four NN-L-AT-001 High records ("denied in kernel",
+  operation `sched`) and the cpuset controller was never enabled
+  (`docker run --cpuset-cpus` could not apply). The thread writing a
+  `cgroup.subtree_control` is now let through for that write
+  ([`CONTAINER_HOST_DEPLOY.md`](CONTAINER_HOST_DEPLOY.md)); any other
+  change of the agent's scheduling (`taskset -p`, `chrt`, `sched_setattr`,
+  `timerslack_ns`) is refused and signed as before. A new eBPF program,
+  `cgroup_subtree_mark` (pins `prog_cgroup_subtree_control_write`,
+  `link_cgroup_subtree_control_write`), is attached with the cgroup move
+  guard; an older agent's pins have no such entry, and an upgrade adds them.
+- **A package's system account is a Low record.** A maintainer script that
+  creates its package's account (`adduser` → `useradd`, `usermod`, `chage`,
+  `chfn`; `systemd-sysusers`) wrote `/etc/passwd` and `/etc/shadow` with
+  NN-L-FIM-003 High at Docker's install on Ubuntu 22.04 and 26.04 and
+  Debian 13. An account tool run in a package transaction is now recorded
+  Low, as every other write of the transaction; root's account tool run by
+  hand stays High, and any other writer keeps its verdict.
+- **A dpkg trigger's initramfs build is Low.** A package whose postinst
+  asks for `update-initramfs` (Podman's `fuse3` on Debian 13, any kernel
+  update) had R011 record the hook `kmod` and, on Ubuntu 22.04, about a
+  hundred `modprobe --show-depends` High. They are Low now when the exec
+  pump read the packaged builder and a root package manager in the lineage
+  and the exec is the system's modprobe asked to load nothing, or a script
+  of a system tree that is the host's file at its path. Your own `sudo
+  update-initramfs -u` stays High (lot 287).
+- **containerd's first start right after its install.** On Debian 13 the
+  first `modprobe aufs` of the just-installed containerd was R011 High
+  (`would have: KillProcess`) at `apt install docker.io`; later starts were
+  Low (lot 347). The agent now records a runtime installed since its last
+  minute's census before it judges a module tool's exec: Low at the install
+  too.
+- **Two log and login-record judgements narrowed (after #554).** A size
+  change of a log by another process explains a later shrink only when it
+  made the file smaller; a login record's writer must be the process that
+  started at the writer's start the kernel recorded. Neither changes what
+  a benign host records.
+- **`--watchdog-exe` naming the agent's own binary is refused.** The agent
+  does not start (the journal names the option); point it at the watchdog,
+  or drop it (the `northnarrow-watchdog` next to the agent is the default).
+- **Nothing to configure.** No overlay, allowlist or signed policy changes.

@@ -63,7 +63,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "Account administration writes these files. An account tool (passwd, \
             useradd, chpasswd, systemd-sysusers and the rest, by kernel-resolved exe) is recorded, \
             at Low when a non-root user ran it; a write in an administrator's interactive sudo or \
-            su session is recorded at High; a package transaction at Low. A \
+            su session is recorded at High; a package transaction at Low (lot 348: an account \
+            tool a maintainer script runs too — it was High). A \
             configuration-management run without a terminal is killed.",
         how_to_test: "`sudo systemd-run --wait chmod o+r /etc/shadow`, then `sudo chmod o-r \
             /etc/shadow` (systemd-run: no terminal, so the interactive-admin carve-out does not \
@@ -72,6 +73,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/fim/rules.rs::fim003_fires_on_sensitive_config_modified",
             "crates/nn-core/src/fim/rules.rs::shadow_made_readable_by_others_is_a_sensitive_change",
             "crates/nn-core/src/fim/rules.rs::account_tools_are_recorded_not_killed",
+            "crates/nn-core/src/fim/rules.rs::account_tools_in_a_package_transaction_are_recorded_low",
         ],
         attack_note: "One technique per file: passwd and shadow are T1098 (an account changed) and \
             T1136.001 (a local account added), the two PAM files T1556.003, sudoers T1548.003; \
@@ -408,12 +410,14 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "The login machinery (login, sshd, sshd-session, systemd-logind, \
             systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt \
             by kernel-resolved exe. An account tool (useradd resetting a new uid's entry) is \
-            recorded, at Low when a non-root user ran it.",
+            recorded, at Low when a non-root user ran it or (lot 348) a package transaction \
+            did.",
         how_to_test: "`printf x | sudo dd of=/var/log/lastlog oflag=append conv=notrunc` (a lab \
             guest: it appends a byte); expect High, KillProcess aimed at dd.",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::d3_fim_rules_table",
             "crates/nn-core/src/fim/rules.rs::account_tools_are_recorded_not_killed",
+            "crates/nn-core/src/fim/rules.rs::account_tools_in_a_package_transaction_are_recorded_low",
         ],
         attack_note: "T1685.006: ATT&CK lists the login records among the system logs (T1070.002, \
             revoked in v19). The reasoning text names T1070.",

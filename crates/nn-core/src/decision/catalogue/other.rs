@@ -412,8 +412,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           `northnarrow.slice.d`), the agent's own inodes, refused so a \
                           drop-in cannot be made in a directory the agent does not guard; the \
                           purge completes (the helper ignores the error). No path of another \
-                          package is refused. The kernel refused the action either way; the \
-                          record is Log only.",
+                          package is refused. Lot 348: on kernels before 6.5 the cpuset \
+                          controller's own scheduling check of the agent, when a \
+                          `cgroup.subtree_control` write enables it above the agent's unit \
+                          (systemd, runc and containerd-shim at a container start), is no \
+                          longer refused or recorded — the writing thread's check only. The \
+                          kernel refused the action either way; the record is Log only.",
         how_to_test: "`kill -9` the agent from a root shell (anti-tamper.sh case C01) or read \
                       /proc/<agent>/mem (case C03): the record names the refused operation \
                       (deny=signal, deny=ptrace).",

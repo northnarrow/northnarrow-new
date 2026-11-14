@@ -331,7 +331,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           build (the packaged `update-initramfs`, `mkinitramfs` or `dracut` run \
                           by root, read by the exec pump; lot 287), the hook `kmod` and \
                           modprobe's dry runs (`--show-depends`, `--dry-run`, `-S` beside them) \
-                          are recorded too. Killed still: an administrator's `insmod` of a built \
+                          are recorded too — at Low when the build runs in a package \
+                          transaction (a dpkg trigger's `update-initramfs`; lot 348: the hook the \
+                          host's file at its path by its device and inode in a root-only \
+                          directory, the modprobe the system's tool), High in an \
+                          administrator's own build. Killed still: an administrator's `insmod` of a built \
                           module, a `modprobe -S` that may load, a quiet probe written \
                           `modprobe <name> -q`, a module parameter with a `/`, a `modprobe` run \
                           from a shell whose environment sets `LD_LIBRARY_PATH` (or \
@@ -356,6 +360,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              an_exec_whose_process_exited_before_its_environment_was_read_is_recorded_noting_it",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              kmod_tool_under_apt_is_recorded_not_killed",
+            "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
+             a_dpkg_trigger_s_initramfs_hook_is_recorded_low_by_identity",
             "crates/nn-linux/src/sensors/kmod_exec.rs::\
              the_environment_is_read_from_the_exec_s_process",
             "crates/nn-linux/src/sensors/kmod_exec.rs::\

@@ -166,12 +166,18 @@ unsafe fn try_cgroup_move_stash(ctx: &FExitContext) {
 /// check of the thread to consume. Kernfs calls the function through its
 /// `write` pointer, so it is never inlined (lot 303: 7.0 inlines lot
 /// 273b's `cgroup_procs_write_finish` into its cgroup v2 caller).
+///
+/// Lot 348: and the thread's controller-change mark
+/// ([`crate::controller_change::SUBTREE_WRITES`]: a `cgroup.subtree_control`
+/// write is a write of a cgroup file too).
 #[fexit(function = "cgroup_file_write")]
 pub fn cgroup_move_clear(_ctx: FExitContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let _ = CGROUP_MOVES.remove(&pid_tgid);
+    let _ = crate::controller_change::SUBTREE_WRITES.remove(&pid_tgid);
     0
 }
+
 
 /// Lot 273b: whether `inode` is the file a migration's permission check is
 /// made on — a `cgroup.procs` (or `cgroup.threads`) of a cgroup v2
