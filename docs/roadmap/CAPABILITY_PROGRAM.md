@@ -10906,11 +10906,11 @@ number in parentheses is a lab PR.
   - Done, by identity: the packaged `go`'s own build outputs run by it (the
     exec's forker, or the pre-exec check's kernel `ppid`) raise no
     `StagingExec`, and the ransomware tracker trusts the packaged `go` in
-    its own directories; npm, yarn, pnpm (node running the CLI from `/usr`
-    or a packaged link) and bun (its binary in a system tree, install
-    commands) are exempt from the mass-write arm only in their own
-    directories and only when the exec has its image (`ROOT_DIR`: a
-    root-only directory in PID 1's mount namespace); `parse_argv_blob`
+    its own directories (the packaged `go`: its path with its image, the
+    review of #555); npm (node running the CLI from `/usr` or a packaged
+    link) is exempt from the mass-write arm only in its own directories
+    and only when the exec has its image (`ROOT_DIR`: a root-only
+    directory in PID 1's mount namespace); `parse_argv_blob`
     keeps empty arguments; a resolver whose recorded forkers ran the same
     packaged file (≤ 2) from PID 1 is its unit's service; NodeLocal
     DNSCache and kube-dns proven by their runtime's record as CoreDNS; the
@@ -10940,6 +10940,23 @@ number in parentheses is a lab PR.
     of an encryptor, a bun project's postinstall encryptor, node alone —
     ConfirmedIntrusion and NN-L-IMP-001 Critical each; a program in a
     go-build-shaped directory run by a shell — R001 High.
+  - The review of #555 (no new lab round; unit tests, the PR's CI guests):
+    F1 — `go` is the packaged toolchain only with its image (`ROOT_DIR`):
+    a container's or a user namespace's `go` gets no `StagingExec`
+    exemption, no mass-write exemption (lot 340's too) and no NN-L-IMP-001
+    trust. F2 — yarn, pnpm and bun are no longer exempt (judged as on
+    `main`): they load a project's code in their process on every install
+    and the arm judges only a window's crossing file, which that code can
+    keep in `node_modules`; re-arming the window after an exempt crossing
+    was weighed and not taken (one package-tree write per window, after
+    the documents, still lands the crossing there; no user-space path to
+    the kernel's window exists). Their false positive was never
+    reproduced in the lab (the rows above: 0 → 0). npm keeps N1's
+    narrowing, with the same padding named as its residual. F5 — an argv
+    block of exactly 512 bytes is marked cut (`wire::argv_read`). Named as
+    residuals: a program `go` forks by the user's choice from a
+    work-directory layout (`-exec`, `-toolexec`, `go:generate`, `GOFLAGS`;
+    F3) and `initdb -L` (F4).
   - Level unchanged: the false-positive work of the alpha; C17's
     provisional waits on the nightly.
 

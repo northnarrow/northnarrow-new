@@ -320,18 +320,15 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
                     // Clamp to ARGV_LEN-1, then mask, so the upper bound is
                     // provable to the verifier (ARGV_LEN is a power of two)
                     // and the slice index `[..len]` carries no panic branch.
-                    // Capping at 511 (vs 512) costs at most a trailing byte.
-                    let mut len = arg_end - arg_start;
                     // External audit EBPF-021: a longer block is cut, and
                     // the cut is marked — filler options pushed an argument
-                    // past byte 511 and the argv looked complete. At exec
-                    // the block ends with the last argument's NUL, so a
-                    // block of exactly ARGV_LEN bytes loses that NUL only.
-                    if len > ARGV_LEN {
+                    // past byte 511 and the argv looked complete. The
+                    // review of #555 (F5): a block of exactly ARGV_LEN
+                    // bytes too — it loses its last NUL, a whole argument
+                    // when the last one is empty (`argv_read`).
+                    let (mut len, cut) = northnarrow_common::wire::argv_read(arg_end - arg_start);
+                    if cut {
                         unsafe { (*raw_ptr).trunc_flags |= spawn_trunc::ARGV };
-                    }
-                    if len > ARGV_LEN - 1 {
-                        len = ARGV_LEN - 1;
                     }
                     len &= ARGV_LEN - 1;
                     unsafe {

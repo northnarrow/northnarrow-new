@@ -2091,10 +2091,11 @@ fn own_data_exempt<H: DecisionHost>(
 /// transaction's ([`AuthSessionTracker::in_package_transaction`]), mandb's
 /// own as a system account (its cache rebuild,
 /// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own
-/// (lot 340: also run through `/usr/bin/npm`; lot 346: yarn's, pnpm's and
-/// bun's too, in their own directories only,
-/// [`AuthSessionTracker::js_pm_own_write`]), the Go toolchain's in its own
-/// directories (lot 340, [`AuthSessionTracker::is_go_toolchain_own_write`]),
+/// (lot 340: also run through `/usr/bin/npm`; lot 346: in its own
+/// directories only, [`AuthSessionTracker::js_pm_own_write`] — yarn, pnpm
+/// and bun are not exempt, the review of #555, F2), the packaged Go
+/// toolchain's in its own directories (lot 340,
+/// [`AuthSessionTracker::is_go_toolchain_own_write`]),
 /// and a user's package manager in that user's container storage —
 /// `Some` with which, `None` for any other writer.
 ///
@@ -2129,8 +2130,8 @@ fn mass_write_exempt<H: PostureHost>(
     } else if auth.is_system_man_cache_writer(pid, as_of) {
         Some("man-db cache rebuild")
     } else if let Some(pm) = auth.js_pm_own_write(pid, as_of, path) {
-        // lot 346 (the re-check of #552, N1): npm, yarn, pnpm, bun — in
-        // their own directories only
+        // lot 346 (the re-check of #552, N1): npm in its own directories
+        // only
         Some(pm.exempt_reason())
     } else if auth.is_go_toolchain_own_write(pid, as_of, path) {
         // lot 340: `go test` stamping its archives' build ids in place
@@ -2802,6 +2803,81 @@ mod tests {
         assert!(det
             .detect(&gone, &[])
             .contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Named test (the review of #555, F1): a `go` at the toolchain's path
+    /// whose exec has no image — a rootless container's
+    /// `/usr/local/go/bin/go`, a user namespace's bind over the packaged one
+    /// (`unshare -Urm`) — is not the packaged toolchain: a path names a file
+    /// only in the namespace that resolved it. On 61e15d9a its fork of a
+    /// payload laid out as a work directory's was no staging exec (the
+    /// spawn and the pre-exec check), and its rewrites of a home it bound at
+    /// `…/go/pkg/mod/` or under a `go-build` directory left out of the
+    /// mass-write arm. The same `go` with its image keeps lot 346's and lot
+    /// 340's exemptions.
+    #[test]
+    fn a_go_without_its_image_gets_no_staging_or_mass_write_exemption() {
+        let payload = "/tmp/go-build1/b1/payload";
+        let check = |pid: u32, ppid: u32| Event::ExecCheck {
+            pid,
+            ppid,
+            uid: 1000,
+            comm: "go".into(),
+            filename: payload.into(),
+            timestamp_ns: 6,
+            exe: nn_model::ExeIdentity {
+                path: payload.into(),
+                flags: exe_flags::KNOWN,
+                ..Default::default()
+            },
+        };
+        for go in ["/usr/local/go/bin/go", "/usr/lib/go-1.22/bin/go"] {
+            let det = detector_with_empty_proc();
+            let _ = det.detect(&spawn_with_exe(300, 1, "/usr/bin/bash", 1), &[]);
+            // no image: another mount namespace's file (the LSM identity
+            // known, not from a root-only directory of PID 1's namespace)
+            let mut foreign = spawn_with_exe(8000, 300, go, 2);
+            if let Event::ProcessSpawn { exe, .. } = &mut foreign {
+                exe.path = go.into();
+                (exe.dev, exe.ino) = (51, 8000);
+                exe.flags |= exe_flags::KNOWN;
+            }
+            let _ = det.detect(&foreign, &[]);
+            let hits = det.detect(&spawn(8001, 8000, "payload", payload, 5), &[]);
+            assert_eq!(hits, vec![TriggerType::StagingExec], "{go}");
+            assert_eq!(
+                det.detect(&check(8002, 8000), &[]),
+                vec![TriggerType::StagingExec],
+                "{go}"
+            );
+            for path in [
+                "/root/go/pkg/mod/h/Documents/report.pdf",
+                "/tmp/go-build1/b1/report.pdf",
+                "/home/u/.cache/go-build/report.pdf",
+            ] {
+                let hits = det.detect(&mass_write_at(8000, path, true, false, 10), &[]);
+                assert!(
+                    hits.contains(&TriggerType::ConfirmedIntrusion),
+                    "{go} {path}: {hits:?}"
+                );
+            }
+            // control: the packaged `go`, its image the kernel's
+            let det = detector_with_empty_proc();
+            let _ = det.detect(&spawn_with_exe(300, 1, "/usr/bin/bash", 1), &[]);
+            let _ = det.detect(&rooted(spawn_with_exe(8000, 300, go, 2)), &[]);
+            let hits = det.detect(&spawn(8001, 8000, "payload", payload, 5), &[]);
+            assert!(!hits.contains(&TriggerType::StagingExec), "{go}: {hits:?}");
+            let hits = det.detect(&check(8002, 8000), &[]);
+            assert!(!hits.contains(&TriggerType::StagingExec), "{go}: {hits:?}");
+            let hits = det.detect(
+                &mass_write_at(8000, "/tmp/go-build1/b1/_pkg_.a", true, false, 10),
+                &[],
+            );
+            assert!(
+                !hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{go}: {hits:?}"
+            );
+        }
     }
 
     /// External audit NETR-008: the shared staging set, /var/tmp included;
@@ -5022,12 +5098,19 @@ mod tests {
             .contains(&ci));
     }
 
-    /// Named test (lot 346, item 2): yarn, pnpm and bun installing a
-    /// project — a replacement crossing in its package tree, a cache or
-    /// store filled beside it — raise nothing, as npm (lot 340); on `main`
-    /// only npm was known, and each raised ConfirmedIntrusion → ENGAGED.
+    /// Named test (the review of #555, F2): yarn, pnpm and bun load a
+    /// project's code in their own process (`.pnpmfile.cjs`, yarn berry's
+    /// plugins, corepack's download), and the kernel reports a window's
+    /// crossing once per process: that code first fills `node_modules`
+    /// (the crossing lands there) and then rewrites `~/Documents` in the
+    /// same window, unreported. On 61e15d9a the crossing in their own
+    /// directories was exempt; now each is judged as on `main` — the
+    /// crossing in the package tree or the cache (an overwrite, a
+    /// replacement) raises ConfirmedIntrusion. The lot's false positive
+    /// for their installs was not reproduced in the lab (no project there
+    /// crosses a threshold).
     #[test]
-    fn yarn_pnpm_and_bun_installs_do_not_raise_the_posture() {
+    fn yarn_pnpm_and_bun_padding_their_window_in_node_modules_raise_as_on_main() {
         for (pid, exe, args, created, gone) in [
             (
                 7800,
@@ -5051,14 +5134,27 @@ mod tests {
                 "/home/u/p/node_modules/lodash/a.js",
             ),
         ] {
+            // the install's shape: a cache or store filled, the package
+            // tree replaced
             let det = detector_with_npm_links();
             let _ = det.detect(&rooted(spawn_with_argv(pid, 1, exe, args, 1)), &[]);
             let _ = det.detect(&mass_write_at(pid, created, false, false, 10), &[]);
             let hits = det.detect(&destroyed_at(pid, gone, 11), &[]);
             assert!(
-                !hits.contains(&TriggerType::ConfirmedIntrusion),
-                "{args:?}: {hits:?}"
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                "{args:?} {gone}: {hits:?}"
             );
+            // the padding: the window's overwrite crossing in the package
+            // tree or the cache
+            for pad in [gone, created] {
+                let det = detector_with_npm_links();
+                let _ = det.detect(&rooted(spawn_with_argv(pid, 1, exe, args, 1)), &[]);
+                let hits = det.detect(&mass_write_at(pid, pad, true, false, 10), &[]);
+                assert!(
+                    hits.contains(&TriggerType::ConfirmedIntrusion),
+                    "{args:?} {pad}: {hits:?}"
+                );
+            }
         }
     }
 
@@ -5145,7 +5241,9 @@ mod tests {
         ] {
             for (overwrites, small) in [(true, true), (true, false)] {
                 let det = detector_with_empty_proc();
-                let _ = det.detect(&spawn_with_exe(7500, 1, exe, 1), &[]);
+                // the review of #555 (F1): the packaged `go`'s exec has its
+                // image
+                let _ = det.detect(&rooted(spawn_with_exe(7500, 1, exe, 1)), &[]);
                 let hits = det.detect(&mass_write_at(7500, path, overwrites, small, 10), &[]);
                 assert!(
                     !hits.contains(&TriggerType::ConfirmedIntrusion),

@@ -2049,33 +2049,53 @@ detail.
   factor. R001's record of that exec stays High (a person's exec from
   `/tmp`, lot 283b). `go test`'s rewrite of its own archives is no longer
   NN-L-IMP-001 Critical: the ransomware tracker trusts the packaged `go`
-  in its work, build-cache and module-cache directories. The same file run by a shell, by a test binary, by a
-  `go` in a home, and anything else run from `/tmp` raise as before.
-- **npm, yarn, pnpm and bun** are exempt from the mass-write arm only in
-  their own directories: a `node_modules` tree, their cache or store
-  (`~/.npm`, `~/.cache/yarn`, a `.yarn` directory, pnpm's store and
-  `~/.cache/pnpm`, `~/.bun/install/cache`), a manifest or lockfile. npm was
-  exempt wherever it wrote; yarn, pnpm and bun were not exempt at all. The
-  package manager must be the packaged one: node (`/usr/bin/node`,
-  `/usr/local/bin/node`) running the CLI from `/usr` or a link a package
-  installed (`/usr/bin/npm`, `/usr/bin/yarnpkg`, `/usr/local/bin/pnpm`, …),
-  or bun's binary in a system tree running an install command, executed
-  from a root-only directory in PID 1's mount namespace, with no
+  in its work, build-cache and module-cache directories. The packaged `go`
+  is its path executed from a root-only directory in PID 1's mount
+  namespace (its image): a container's `go` or one a user namespace binds
+  over it is judged as any program — for the staging exec, the mass-write
+  arm (lot 340's exemption too) and the tracker. The same file run by a
+  shell, by a test binary, by a `go` in a home, and anything else run from
+  `/tmp` raise as before. **Residual**: a file in the work directory's
+  layout is not proof that `go` built it — `go run -exec`, `go test -exec`,
+  `-toolexec`, `go vet -vettool`, `//go:generate` or `GOFLAGS` have `go`
+  fork a program the user names; one dropped at `/tmp/go-build<n>/b<n>/`
+  that way raises no `StagingExec` (R001's High stays).
+- **npm** is exempt from the mass-write arm only in its own directories:
+  a `node_modules` tree, `~/.npm`, a manifest or lockfile; it was exempt
+  wherever it wrote. npm must be the packaged one: node (`/usr/bin/node`,
+  `/usr/local/bin/node`) running npm's CLI from `/usr` or a link a package
+  installed (`/usr/bin/npm`, `/usr/local/bin/npm`), executed from a
+  root-only directory in PID 1's mount namespace, with no
   `NODE_OPTIONS`/`NODE_PATH` loading code. **What to check after the
-  upgrade**: a package manager from a user prefix (nvm, volta, `~/.bun`,
-  pnpm's standalone binary, a yarn release a project ships) is judged as any
-  process; `npm ci` from such a node in a CI runner raises ENGAGED as
-  before. A cache moved out of its default place (`npm_config_cache`,
-  `--cache-folder`, `store-dir`) is no longer the package manager's own.
+  upgrade**: npm from a user prefix (nvm, volta) is judged as any process;
+  `npm ci` from such a node in a CI runner raises ENGAGED as before. A
+  cache moved out of its default place (`npm_config_cache`) is no longer
+  npm's own. **Residual**: the arm judges the one file that crossed its
+  threshold (the kernel reports a window's crossing once per process), so
+  code running inside npm (`npm init`'s `~/.npm-init.js`) that puts each
+  window's crossing in `node_modules` pads the window — the documents it
+  rewrites beside it are not counted by the arm.
+- **yarn, pnpm and bun** are judged as any writer, as before: an install
+  that crosses a threshold still raises ENGAGED. They load a project's
+  code in their own process on every install (`.pnpmfile.cjs`, yarn
+  berry's `plugins:`, corepack's downloaded yarn or pnpm), which could pad
+  the window as above; no exemption by directory is safe for them. The
+  lab's dev corpus installs a project with each and crosses no
+  threshold.
 - **`initdb`** making a cluster (`pg_createcluster` by hand, `sudo -u
   postgres initdb`) no longer raises ENGAGED: the packaged `initdb`
   (`/usr/lib/postgresql/<N>/bin`, `/usr/pgsql-<N>/bin`, `/usr/bin`) and
   the bootstrap `postgres` it starts, as a service account, writing only
   that account's own data. Any other program of the account in a session
-  still counts.
+  still counts. **Residual**: `initdb -L <dir>` has the exempt bootstrap
+  run the SQL files of a directory the caller names, as superuser, which
+  can rewrite the account's live cluster unjudged — as `psql` to the
+  running server can, whose writes are exempt by design.
 - **Kubernetes' NodeLocal DNSCache and kube-dns** are known resolvers, as
   CoreDNS: their legs are recorded, never their own tunnel, never killed.
 - **A resolver daemon that forked itself** (`Type=forking`) is its unit's
   service when its lineage records the fork.
 - **The exec record's argv** keeps empty arguments (`""`): an exec's
-  `argv` in a record may now hold `""` where it read as missing.
+  `argv` in a record may now hold `""` where it read as missing. A command
+  line of exactly 512 bytes is now marked cut (`argv_truncated`), as a
+  longer one: the sensor reads 511.
