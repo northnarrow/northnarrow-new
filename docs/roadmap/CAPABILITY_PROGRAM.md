@@ -11085,4 +11085,20 @@ number in parentheses is a lab PR.
     (`ns_last_pid`; it exits, no action), the fd closed by the fork's child:
     on #554's head 343e47e4 no record (×2), on this round NN-L-FIM-005 High
     for the writer (`python3`, its pid) ×2.
+    #554's KVM suites (both red at every head since 343e47e4, the PR job's
+    `continue-on-error` showing the runs green): the watchdog e2e's two
+    NN-L-BPF-002 High records came from the guard's own guess of the
+    watchdog — `OWN_EXE_INODES` named the agent's sibling
+    `northnarrow-watchdog`, while the agent verifies the one
+    `--watchdog-exe` names (the e2e's copy). One value now (`OwnExes`: the
+    agent's image and `resolved_watchdog_exe()`) feeds the stale-pid scan,
+    the unit cgroups and the hook's roles; no binary added, the window's
+    limits unchanged. Behind it, the e2e's positive control looked for the
+    verdict's reasoning, which the signed record does not carry: it reads
+    the record's Low side for the watchdog's pid and name, NN-L-BPF-002's
+    only Low pinned in nn-core (`bpf002_is_low_for_a_fresh_instance_only`).
+    Lab, as measured (lease k344, the watchdog's privileged suite in the
+    guest, `/etc/northnarrow` created first as CI's install does): Ubuntu
+    22.04 (5.15) 10 passed, 0 failed; with the hook fix alone the start
+    left NN-L-BPF-002 Low ×1 and no High, and the control failed (9/1).
 
