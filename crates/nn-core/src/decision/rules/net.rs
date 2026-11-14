@@ -794,7 +794,10 @@ impl Rule for NnLNet003BadJa3 {
 /// host's packaged file, or the cluster's CoreDNS as its container runtime
 /// records it), and the rules read that proof — a program merely named
 /// `dnsmasq` (`/tmp/x/dnsmasq`) is judged as any sender. `coredns`: a
-/// Kubernetes cluster's DNS, which forwards its pods' names.
+/// Kubernetes cluster's DNS, which forwards its pods' names. Lot 346:
+/// `node-cache` (NodeLocal DNSCache) and `kube-dns` (the legacy cluster
+/// DNS, beside its `dnsmasq`), proven by their container runtime's record
+/// as CoreDNS is.
 pub const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
     "systemd-resolved",
     "systemd-resolve",
@@ -807,6 +810,8 @@ pub const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
     "stubby",
     "connmand",
     "coredns",
+    "node-cache",
+    "kube-dns",
 ];
 
 /// DNS originator back-correlation window — deliberately TIGHT (≤2 s)

@@ -816,7 +816,18 @@ answered): a package transaction (it replaces the files it upgrades), the
 man-db cache rebuild as a system account (it replaces each locale's
 `index.db` by a rename), npm's CLI (`npm ci` deletes `node_modules` and
 extracts it again) and a user's package manager in that user's container
-storage. None is by name or path alone.
+storage. None is by name or path alone. Lot 346: npm's own writes, in its
+own directories only (a package tree, `~/.npm`, a manifest or lockfile),
+and only for a node the kernel executed from a root-only directory in PID
+1's mount namespace; the exemption is judged on the crossing's file, which
+the kernel reports once a window per process — code inside npm that puts
+each window's crossing in a package tree pads the window, and the
+documents it rewrites beside it are not counted by the arm (a residual,
+said). Yarn, pnpm and bun load a project's code in their own process on
+every install (the review of #555, F2), so no exemption by directory is
+safe for them: they are judged as any writer. The packaged Go toolchain
+(lot 340) is its path with its image (`ROOT_DIR`, the review of #555, F1):
+a container's or a user namespace's `go` is not.
 
 The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`):
 its (a) rewrites are distinct files of 4 KiB or more (a small-file crossing

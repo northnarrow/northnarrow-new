@@ -212,7 +212,7 @@ step() {
 # as root. Every cache goes under $W (removed by the cleanup).
 runner() { # <session|runner|root>
     local env=(HOME="$HOME" PATH="$PATH" CARGO_HOME="$W/cache/cargo" GOPATH="$W/cache/gopath"
-        GOCACHE="$W/cache/gocache" GOFLAGS=-modcacherw npm_config_cache="$W/cache/npm"
+        GOCACHE="$W/cache/gocache" GOFLAGS=-modcacherw npm_config_cache="$W/lab-home/.npm"
         PIP_CACHE_DIR="$W/cache/pip" GNUTLS_CPUID_OVERRIDE=0x1)
     local sets=() e
     for e in "${env[@]}"; do sets+=(--setenv="$e"); done
@@ -355,6 +355,50 @@ wl_npm() { # <context> <prefix>
     step "$p npm install (the lockfile)" 900 -- "${RUN[@]}" bash -c "cd $W/web && npm install --no-audit --no-fund --loglevel=error"
     step "$p npm ci" 900 -- "${RUN[@]}" bash -c "cd $W/web && npm ci --no-audit --no-fund --loglevel=error"
     step "$p npm run build (tsc)" 600 -- "${RUN[@]}" bash -c "cd $W/web && npm run -s build"
+}
+
+# Lot 346: yarn (the distribution's `yarnpkg`), pnpm and bun (`npm i -g`,
+# under /usr/local) install the npm project's dependencies, each in a copy
+# of its manifest, with their caches and stores at their default places in
+# a home under the corpus' tree (`$W/lab-home`: ~/.cache/yarn,
+# ~/.local/share/pnpm/store, ~/.bun/install/cache). pnpm 9 and bun need
+# Node 18 or later (not 22.04's Node 12): skipped there.
+prep_js() {
+    local m major
+    apt_need yarnpkg
+    major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+    JS_MODERN=0
+    if [[ $major -ge 18 ]]; then
+        if sudo npm i -g --no-audit --no-fund --loglevel=error pnpm@9.15.9 bun@1.1.38 > "$OUT/npm-g.log" 2>&1; then
+            JS_MODERN=1
+        else
+            echo "  npm i -g pnpm bun failed: $(tail -1 "$OUT/npm-g.log" | cut -c1-160)"
+        fi
+    else
+        echo "  Node $major: pnpm and bun skipped"
+    fi
+    mkdir -p "$W/lab-home"
+    for m in yarn pnpm bun; do
+        rm -rf "$W/js-$m" && mkdir -p "$W/js-$m"
+        cp "$W/web/package.json" "$W/js-$m/"
+    done
+}
+
+wl_js() { # <context> <prefix>
+    local p=$2 h="HOME=$W/lab-home"
+    runner "$1"
+    step "$p yarnpkg install" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-yarn && yarnpkg install --non-interactive --silent"
+    step "$p yarnpkg install --force" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-yarn && yarnpkg install --force --non-interactive --silent"
+    [[ ${JS_MODERN:-0} == 1 ]] || return 0
+    step "$p pnpm install" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-pnpm && pnpm install --reporter=silent"
+    step "$p pnpm install --force" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-pnpm && pnpm install --force --reporter=silent"
+    step "$p bun install" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-bun && bun install --silent"
+    step "$p bun install --force" 900 -- "${RUN[@]}" env "$h" bash -c "cd $W/js-bun && bun install --force --silent"
+}
+
+js_purge() {
+    [[ ${JS_MODERN:-0} == 1 ]] && sudo npm rm -g --loglevel=error pnpm bun > /dev/null 2>&1
+    true
 }
 
 wl_pip() { # <context> <prefix>

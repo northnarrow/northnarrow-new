@@ -244,12 +244,30 @@ impl ProcessSpawnRaw {
 /// complete.
 pub mod spawn_trunc {
     /// `argv` is not the whole command line: `arg_end - arg_start` was
-    /// over `ARGV_LEN` (the last argument kept may itself be cut), or the
-    /// user read failed (`argv_len` 0).
+    /// over `ARGV_LEN - 1`, the bytes read ([`super::argv_read`]: the last
+    /// argument kept may itself be cut, or lost its NUL), or the user read
+    /// failed (`argv_len` 0).
     pub const ARGV: u8 = 1 << 0;
     /// `filename` (the caller's string, `bprm->filename`) was longer than
     /// `FILENAME_LEN` bytes with its NUL, and was cut.
     pub const FILENAME: u8 = 1 << 1;
+}
+
+/// External audit EBPF-021, the review of #555 (F5): the bytes the exec
+/// sensor reads of an argv block of `block` bytes (`arg_end - arg_start`),
+/// and whether that cuts it ([`spawn_trunc::ARGV`]). At most
+/// `ARGV_LEN - 1` are read (the verifier's bound on the slice), so a
+/// block of exactly `ARGV_LEN` bytes is cut too: it loses its last NUL,
+/// which is a whole argument when the last one is empty (`""`) — the
+/// parser drops a block's final NUL, and the argv looked complete
+/// without it.
+#[inline(always)]
+pub const fn argv_read(block: usize) -> (usize, bool) {
+    if block > ARGV_LEN - 1 {
+        (ARGV_LEN - 1, true)
+    } else {
+        (block, false)
+    }
 }
 
 /// File open event (LSM `file_open` hook).
@@ -1951,6 +1969,21 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    /// Named test (the review of #555, F5): the exec sensor's argv read —
+    /// a block of exactly `ARGV_LEN` bytes is read as `ARGV_LEN - 1` and
+    /// marked cut. On 61e15d9a the mark was set only past `ARGV_LEN`, and
+    /// a block ending in an empty argument (`…\0\0`) lost that argument
+    /// unmarked.
+    #[test]
+    fn an_argv_block_the_sensor_cannot_read_whole_is_marked_cut() {
+        use super::{argv_read, ARGV_LEN};
+        assert_eq!(argv_read(0), (0, false));
+        assert_eq!(argv_read(1), (1, false));
+        assert_eq!(argv_read(ARGV_LEN - 1), (ARGV_LEN - 1, false));
+        assert_eq!(argv_read(ARGV_LEN), (ARGV_LEN - 1, true));
+        assert_eq!(argv_read(ARGV_LEN + 1), (ARGV_LEN - 1, true));
+        assert_eq!(argv_read(usize::MAX), (ARGV_LEN - 1, true));
+    }
     use super::*;
 
     /// External audit EBPF-001: PID 1 may signal a protected process only
