@@ -11341,6 +11341,56 @@ number in parentheses is a lab PR.
     naming the call; B7 unchanged; the pre-agent kprobe: High at the start,
     its handles by id and pin still given (named); `/etc` signed
     `mount_over_protected`.
+  - **Fix round (the independent review of #558).** F1 (P1): a program
+    loaded in a window stayed usable after it through its loader's own
+    descriptor — `BPF_PROG_RUN` of a `syscall` program calling
+    `bpf_send_signal_task` (cmd 10 was not even observed), a kprobe
+    calling `bpf_send_signal` attached by `PERF_EVENT_IOC_SET_BPF`
+    (silent) or `BPF_LINK_CREATE` (Medium), a prog array's slot,
+    `pidfd_getfd` of the descriptor. Now every run and attach of a held id
+    outside a window is refused and signed (`bpf_held_use`) at the `bpf`
+    hook (before its `observed` filter) and the `file_ioctl` hooks, through
+    one global function that resolves the caller's descriptor to the
+    program id; the window's load is signed on every kernel
+    (`bpf_held_load`, High); F5: the held set is pinned, emptied of freed
+    ids each kernel-state round, and full it refuses the load (fail
+    closed). F2/F3/F6/F7: the CPU watch never skips without bound (three
+    unjudged rounds are signed), reads its sources through files opened at
+    the start and the cgroup tree with `openat2` `RESOLVE_NO_XDEV`, merges
+    systemd's `CPUAffinity=` and takes the agent unit's installed one, and
+    every state read is non-blocking, regular-file only and bounded. F4,
+    F8, F9: named (the agent has no `CAP_SYSLOG`, so a dump's calls are
+    blanked; the R090 ratchet's `--cfg` scan and filter; `content_scan`
+    duplicating `content_refusal`'s body).
+    - Lab, as measured. **ubuntu2604** (7.0.0-43): the first round's
+      agent did not start — the verifier refused `file_ioctl` and
+      `file_ioctl_compat` (LLVM folded the held check into `r0 = -r0`, an
+      unknown return); fixed (a volatile read keeps the two constant
+      returns). Then: B9 as before; **B10: the window's `syscall` program
+      (`bpf_send_signal_task`, SIGKILL to the agent) run after the window
+      through its loader's descriptor and one taken with `pidfd_getfd`:
+      `BPF_PROG_RUN` refused (EPERM) both times, its prog-array slot
+      refused; the kprobe's `PERF_EVENT_IOC_SET_BPF`, `BPF_LINK_CREATE`
+      and prog-array slot refused through both descriptors;
+      `bpf_held_load` ×1 and `bpf_held_use` for each kind of use, per
+      program; the agent alive, same pid.** `verifier-check`: 117
+      programs, 112 OK, 5 not counted, 0 failing; highest 362,329
+      (`fim_rename_observe`); `bpf_prog_load_guard` 6,901 insns
+      processed. A third round (installed with `--allow-bpf-tools`, which
+      the second lacked for B0–B5): every case PASS, B0–B10 and C0–C6 — C5
+      and C6 (a file saying 0 bound over the online list, then over the
+      slice's `cpuset.cpus`, each with the partition) signed `cpu_confined`
+      High; the agent the same pid. **ubuntu2204** (5.15.0-202): every case PASS; **B10: the
+      window's kprobe (`bpf_send_signal`, SIGKILL for the agent's pid)
+      through both descriptors — `PERF_EVENT_IOC_SET_BPF`,
+      `BPF_LINK_CREATE`, the prog-array slot: 6/6 refused, `bpf_held_load`
+      ×1, `bpf_held_use` ×3, the agent alive, same pid**; C5 (a file
+      saying 0 bound over the online list) and C6 (one bound over the
+      slice's `cpuset.cpus`), each with the C1 partition: a signed
+      `cpu_confined` High; `verifier-check` 117 programs, 110 OK, 7 not
+      counted, 0 failing, the highest 551,900 of 900,000 (unchanged;
+      `bpf_prog_guard` 25,410, `bpf_syscall_observe` 42,540,
+      `file_ioctl` 3,705).
   - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
     the host for all (no record); the kernel leaves the threads' masks
     narrowed when systemd drops the cpuset controller after an
@@ -11348,9 +11398,10 @@ number in parentheses is a lab PR.
     masks); `CPUWeight=` on the slice against a CPU flood (R12c-3, open since lab PR 271: root
     out-weighs it, and a slice unit change needs its own upgrade round);
     from 6.9 a program loaded before the agent is not judged at its handles
-    (High at the start); the window's loader keeps its own descriptor; an
-    agent restart forgets the kept ids; no `sb_mount` hook (R003 is
-    recorded, not refused).
+    (High at the start), nor (any kernel) its loader's kept descriptor;
+    what a window itself attached keeps running, a netlink XDP/tc attach,
+    the other program-holding maps, a `dup2` race (each lost attempt
+    signed); no `sb_mount` hook (R003 is recorded, not refused).
   - Levels unchanged: blockers of the pre-alpha closed or measured; no new
     capability.
 
