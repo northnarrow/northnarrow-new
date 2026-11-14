@@ -266,7 +266,10 @@ fn all_functions(code: &BTreeMap<String, String>) -> BTreeMap<String, Vec<(Strin
 /// Lot 345 (the mini-hunt of N1): the other names a function goes by in
 /// `code` — each `use path::name as alias` (`alias`, its body `path::name`),
 /// braces too, and each `static`/`const` of a function-pointer type (its
-/// name, its body the initializer).
+/// name, its body the initializer). The review of #553 (F3): whatever
+/// visibility (`pub(super)`, `pub(in …)`), behind any attributes
+/// (`#[allow(…)] use …`), and a `static`/`const` whose initializer is a
+/// bare path whatever its type (a `type` alias of `fn() -> bool`).
 fn aliases(code: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     // each statement that starts a line, to its `;`
@@ -277,11 +280,7 @@ fn aliases(code: &str) -> Vec<(String, String)> {
         Some(&rest[..end])
     });
     for stmt in stmts {
-        let st = stmt.trim();
-        let st = st
-            .strip_prefix("pub(crate) ")
-            .or_else(|| st.strip_prefix("pub "))
-            .unwrap_or(st);
+        let st = item_head(stmt);
         if let Some(rest) = st.strip_prefix("use ") {
             let (prefix, items) = match rest.split_once('{') {
                 Some((p, i)) => (p.trim_end_matches("::").trim(), i.trim_end_matches('}')),
@@ -308,12 +307,66 @@ fn aliases(code: &str) -> Vec<(String, String)> {
             let Some((name, ty)) = head.split_once(':') else {
                 continue;
             };
-            if ty.contains("fn(") || ty.contains("fn (") {
+            let name = name.trim().strip_prefix("mut ").unwrap_or(name.trim());
+            if ty.contains("fn(") || ty.contains("fn (") || bare_path(init) {
                 out.push((name.trim().to_string(), format!("{};", init.trim())));
             }
         }
     }
     out
+}
+
+/// The review of #553 (F3): an item's text past its attributes (`#[…]`,
+/// any number, nested brackets) and its visibility (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in path)`).
+fn item_head(stmt: &str) -> &str {
+    let mut st = stmt.trim();
+    loop {
+        if let Some(rest) = st.strip_prefix("#[") {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(i) => st = rest[i + 1..].trim_start(),
+                None => return st,
+            }
+        } else if let Some(rest) = st.strip_prefix("pub(") {
+            match rest.find(')') {
+                Some(i) => st = rest[i + 1..].trim_start(),
+                None => return st,
+            }
+        } else if let Some(rest) = st.strip_prefix("pub ") {
+            st = rest.trim_start();
+        } else {
+            return st;
+        }
+    }
+}
+
+/// The review of #553 (F3): whether `init` (a `static`'s or `const`'s
+/// initializer) is a bare path — `crate::execq::is_relaxed_ptr`,
+/// `is_relaxed_ptr`, behind `&` or before `as …` — what names a function
+/// whatever the item's declared type.
+fn bare_path(init: &str) -> bool {
+    let e = init.trim();
+    let e = e.strip_prefix('&').unwrap_or(e).trim();
+    let e = e.split(" as ").next().unwrap_or(e).trim();
+    !e.is_empty()
+        && e.split("::")
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        && e.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 /// The functions `body` calls: `(module, name)` — `module` the path
@@ -801,4 +854,40 @@ fn a_re_export_a_macro_and_a_function_pointer_of_the_gate_are_caught() {
             "{helper}: {r:#?}"
         );
     }
+}
+
+/// Named (the review of #553, F3): the four spellings its probe planted in
+/// `task_kill.rs`, each reaching `EXECQ_CONF` from `try_task_kill` through
+/// `execq::is_relaxed_ptr`, left the ratchet green — a `pub(super) use … as`,
+/// a `use … as` behind an attribute, a `static` whose type is a `type`
+/// alias of a function pointer, a `pub(super) static`. Each is caught, and
+/// a mini-hunt's variants with them (`pub(in crate)`, two attributes, a
+/// `const` through an alias, `&` before the path).
+#[test]
+fn a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught() {
+    let code = ebpf_code();
+    let helper_fn = "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n";
+    let lower = "\n    if relaxed() {\n        return 0;\n    }\n";
+    let upper = "\n    if RELAXED() {\n        return 0;\n    }\n";
+    let cases = [
+        ("pub(super) use", lower, "\npub(super) use crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("attr use", lower, "\n#[allow(unused_imports)] use crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("type alias static", upper, "\ntype RelaxFn = fn() -> bool;\nstatic RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
+        ("pub(super) static", upper, "\npub(super) static RELAXED: fn() -> bool = crate::execq::is_relaxed_ptr;\n"),
+        // the mini-hunt
+        ("pub(in crate) use", lower, "\npub(in crate) use crate::execq::{is_relaxed_ptr as relaxed};\n"),
+        ("two attributes", lower, "\n#[allow(unused_imports)]\n#[cfg(not(test))]\nuse crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("const via alias", upper, "\ntype RelaxFn = fn() -> bool;\npub(crate) const RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
+        ("static of a reference", upper, "\nstatic RELAXED: &RelaxFn = &crate::execq::is_relaxed_ptr;\n"),
+    ];
+    let mut green = Vec::new();
+    for (what, call, helper) in cases {
+        let mut c = planted(&code, "task_kill.rs", "try_task_kill", call, helper);
+        c.get_mut("execq.rs").unwrap().push_str(helper_fn);
+        let r = gate_reads(&c);
+        if !r.iter().any(|l| l.contains("try_task_kill reaches EXECQ_CONF")) {
+            green.push(what);
+        }
+    }
+    assert!(green.is_empty(), "ratchet stays green for: {green:?}");
 }

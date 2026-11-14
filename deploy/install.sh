@@ -1513,6 +1513,19 @@ apply_bpf_loader_allow() {
     fi
     candidate=$(mktemp)
     bpf_loader_policy "$ETC_DIR/rule-policy.local" <<< "$loaders" > "$candidate"
+    # The review of #553 (F5): a line (hand-made: install.sh writes none)
+    # that opens lsm, struct_ops or ext lets its loader blind or starve the
+    # agent — the content judge reads no return value — so install.sh does
+    # not sign it with the rest: the operator signs that policy, knowingly
+    if awk '$1 == "bpf-loader-allow" && $3 ~ /(^|,)(lsm|struct_ops|ext)(,|$)/ { f = 1 } END { exit !f }' "$candidate"; then
+        echo "install.sh: WARNING: the policy in force has bpf-loader-allow line(s) opening lsm, struct_ops or ext:" >&2
+        awk '$1 == "bpf-loader-allow" && $3 ~ /(^|,)(lsm|struct_ops|ext)(,|$)/ { print "  " $0 }' "$candidate" >&2
+        echo "install.sh: a program of those types can blind or starve the agent (its return values are not judged):" >&2
+        echo "install.sh: install.sh signs no such policy. Review it and sign it yourself: docs/operator/RULE_POLICY.md §2.5" >&2
+        BPF_ALLOWED=()
+        rm -f "$candidate"
+        return 0
+    fi
     if [[ -z $key || ! -r $key ]]; then
         echo "install.sh: WARNING: no config-manage key to sign the bpf-loader-allow lines with (--grant-key)." >&2
         echo "install.sh: sign them yourself: sudo nn-admin policy set --file <policy> --key <config-manage key>" >&2
