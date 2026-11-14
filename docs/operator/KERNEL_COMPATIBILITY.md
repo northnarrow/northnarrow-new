@@ -1152,31 +1152,32 @@ A loader the signed per-loader opt-out names (`install.sh
 - A start that could not calibrate the signals reports `bpf content judge`
   (an observe failure, signed).
 
-**As measured** (our lab guests, lease k345). Each kernel was installed with
-`--allow-bpf-tools` (python3 and bpftrace named) and then cold-booted. On
-all three, `nn-lab.sh bpf-content-check` found the plain kprobe, the
-fentry, bpftrace and BCC's `opensnoop-bpfcc` still loading, and each
-refusal signed with the helper named:
+**As measured** (our lab guests, lease k345, the shape of the PR's final
+commits). Each kernel was installed with `--allow-bpf-tools` (python3 and
+bpftrace named), then cold-booted. On every kernel `nn-lab.sh
+bpf-content-check` found the plain kprobe, the fentry, bpftrace and BCC's
+`opensnoop-bpfcc` still loading (except on Debian 13, which has no
+kheaders), and each refusal signed with the helper named:
 
-| Kernel | Stage | Refused | `bpf_prog_guard` processed | `verifier-check` | LSM programs after cold boot |
+| Kernel | Stage | Refused | `bpf_prog_guard` processed | `verifier-check` | After cold boot |
 |---|---|---|---|---|---|
-| Ubuntu 24.04 (`6.8.0-149`) | at the handle, calibrated | three helpers `EPERM`, `bpf_probe_write_user` `EINVAL` (lockdown), fmod_ret `EPERM`, bpftrace `signal()` | 87,605 | 116 programs, 0 failing | 49 |
-| Debian 13 (`6.12.116`) | at the load | four helpers and fmod_ret `EPERM`, bpftrace `signal()` | 268,913 (`bpf_prog_load_guard` 31,157) | `nn_calib_override` refused by the kernel, now not counted | 50 |
-| Ubuntu 26.04 (`7.0.0-43`) | at the load | four helpers and fmod_ret `EPERM`, bpftrace `signal()` | 198,913 (`bpf_prog_load_guard` 31,086) | 0 failing | 50 |
+| Ubuntu 22.04 (`5.15.0-202`) | at the handle, calibrated | three helpers `EPERM`, `bpf_probe_write_user` `EINVAL` (lockdown), fmod_ret `EPERM`, bpftrace `signal()` | 12,328 (kprobe count) | 116 programs, 0 failing; highest `module_read_file_observe` 551,900 | 73 pins, 47 LSM programs |
+| Ubuntu 24.04 (`6.8.0-149`) | at the handle, calibrated | same as 22.04 | 8,461 | 0 failing; highest `execpol_env_commit` 273,029 | 77 pins, 49 LSM programs |
+| Debian 13 (`6.12.116`) | at the load (`bpf_prog_load_guard` 3,444) | four helpers and fmod_ret `EPERM`, bpftrace `signal()` | 8,461 | 0 failing (`nn_calib_override` not counted: no `bpf_override_return` in that build); highest `execmap_check` 304,715 | 77 pins, 50 LSM programs |
+| Ubuntu 26.04 (`7.0.0-43`) | at the load (`bpf_prog_load_guard` 3,373) | same as Debian 13 | 7,642 | 0 failing; highest `fim_rename_observe` 360,991 | 77 pins, 50 LSM programs |
 
-- **Every kernel's verifier headroom is within the 900,000 gate.** The
-  highest program on each: `execpol_env_commit` 273,029 (6.8),
-  `execmap_check` 304,715 (6.12), `fim_rename_observe` 360,991 (7.0).
-- **6.8's calibration**: `override_return`, `send_signal` and
-  `send_signal_thread` found, and the same targets again after the cold
-  boot.
-- **Debian 13**: BCC cannot compile there (no kheaders).
-- **7.0**: bpftrace's syscall-tracepoint count can stay empty (lot 322);
-  its probes attached.
-- **The first 6.8 round found** the `bpf_prog` guard refused by its
-  verifier. A hook's `struct bpf_prog *` is a BTF pointer, which a global
-  function does not take ("R1 is not a scalar"). Its address is now passed
-  as a plain number.
+After the cold boot, every kernel had the agent and watchdog active right
+after and 30 s later, the judge armed again, and `bpf_send_signal`
+refused again.
+
+**What the lab found along the way:**
+- **The verifier refused `bpf_prog_guard` on 6.8** ("R1 is not a scalar"). A
+  hook's `struct bpf_prog *` is a BTF pointer, which a global function does
+  not take. Its address is now passed as a plain number.
+- **5.15's verifier needed 950,584 instructions for `bpf_prog_guard`**
+  (above the 900,000 gate) with a first shape: one level of 256
+  instructions and two of 64, each instruction seven compares. With four
+  levels of 32 and one key-map lookup an instruction, it needs 12,328.
 
 ## A signal through a file's owner (lot 293)
 

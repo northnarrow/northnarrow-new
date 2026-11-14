@@ -10928,19 +10928,20 @@ number in parentheses is a lab PR.
       removed.
   - **Lab, as measured** (our guests, lease k345, `nn-lab.sh
     bpf-content-check` after `install.sh --allow-bpf-tools`, then a cold
-    boot): Ubuntu 24.04 (6.8.0-149), Debian 13 (6.12.116) and Ubuntu 26.04
-    (7.0.0-43).
+    boot): Ubuntu 22.04 (5.15.0-202), Ubuntu 24.04 (6.8.0-149), Debian 13
+    (6.12.116) and Ubuntu 26.04 (7.0.0-43).
     - **Still loads**: a plain kprobe, an fentry, bpftrace and (except on
       Debian, which has no kheaders) `opensnoop-bpfcc`.
-    - **Refused on all three, each signed with the helper named**: an fmod_ret
+    - **Refused on all four, each signed with the helper named**: an fmod_ret
       on `security_file_open`, a program calling `bpf_send_signal`,
       `_thread`, `bpf_override_return` or `bpf_probe_write_user`, and
-      bpftrace's `signal()`. All `EPERM`, except `bpf_probe_write_user` on
-      6.8, which is `EINVAL` (the lockdown question).
-    - **`verifier-check`**: every program within the 900,000 gate.
-      `bpf_prog_guard` processed 87,605 / 268,913 / 198,913.
-    - **After the cold boot**: agent and watchdog active, 77 pins, 49/50/50
-      LSM programs, the judge armed again, `bpf_send_signal` refused again.
+      bpftrace's `signal()`. All `EPERM`, except `bpf_probe_write_user`
+      before 6.9, which is `EINVAL` (the lockdown question).
+    - **`verifier-check`**: 0 failing and every program within the 900,000
+      gate. `bpf_prog_guard` processed 12,328 / 8,461 / 8,461 / 7,642.
+      5.15 needed 950,584 with the first shape, which the PR's CI caught.
+    - **After the cold boot**: agent and watchdog active, the judge armed
+      again, `bpf_send_signal` refused again.
     - `uninstall.sh --purge` left nothing.
   - **Levels unchanged**: the opt-out still lets an allowed loader read
     memory (declared); what it no longer opens is the kill and the blinding.
