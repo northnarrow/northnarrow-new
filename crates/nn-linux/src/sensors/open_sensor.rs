@@ -2662,7 +2662,7 @@ mod tests {
         created.mode = 2 | FMODE_CREATED;
         let ev = events_of(&created, &mut mounts);
         let [Event::Fim(fe)] = &ev[..] else {
-            panic!("{ev:?}");
+            panic!("one FIM event: {} events", ev.len());
         };
         assert_eq!(fe.op, FimOp::Created);
         assert_eq!(fe.path, "/usr/lib/modules/6.8.0-1-generic/nn-test.ko");
@@ -2690,7 +2690,8 @@ mod tests {
         assert!(
             matches!(&ev[..], [Event::Fim(fe)] if fe.op == FimOp::Modified
                 && fe.path == "/lib/modules/6.12.0-1-amd64/kernel/fs/ext4/ext4.ko"),
-            "{ev:?}"
+            "a Modified: {} events",
+            ev.len()
         );
         // FIM's own: the tree's direct child, another critical tree, an
         // unplaced path, a record of another reason
@@ -2727,7 +2728,8 @@ mod tests {
             let ev = events_of(&r, &mut mounts);
             assert!(
                 matches!(&ev[..], [Event::FileOpen { kernel_class, .. }] if *kernel_class == reason),
-                "{comps:?}: {ev:?}"
+                "{comps:?}: {} events",
+                ev.len()
             );
         }
         // a name below the tree longer than a slot (depmod's temporary
@@ -2753,7 +2755,8 @@ mod tests {
                 matches!(&ev[..], [Event::Fim(fe)] if fe.op == FimOp::Created
                     && fe.path.starts_with("/usr/lib/modules/6.12.116+deb13-cloud-amd64/")
                     && !path_is_exact(&fe.path)),
-                "{leaf}: {ev:?}"
+                "{leaf}: {} events",
+                ev.len()
             );
         }
         // the sensor is told about the trees

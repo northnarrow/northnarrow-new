@@ -4941,7 +4941,7 @@ mod tests {
             Some(&mut out),
         )
         .unwrap();
-        assert!(!emitted && out.is_empty(), "{out:?}");
+        assert!(!emitted && out.is_empty(), "no event without the walk");
 
         // the ring: a link record and a drift record told apart by size
         let mut mounts = crate::sensors::open_sensor::MountTable::load();

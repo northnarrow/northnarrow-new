@@ -3785,7 +3785,10 @@ mod tests {
         let v = r.evaluate(&link("/var/tmp/nn-link")).expect("fires");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
-        assert!(v.reasoning.contains("/var/tmp/nn-link"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("/var/tmp/nn-link"),
+            "the link is named"
+        );
         assert!(r
             .evaluate(&link("/backup/daily.0/usr/bin/passwd"))
             .is_none());
@@ -7745,7 +7748,7 @@ mod tests {
                 .into_iter()
                 .filter(|h| h.rule == "NN-L-FIM-008_KernelModuleModified" && h.uid == UID)
                 .collect();
-            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(held.len(), 1, "one held pair");
             assert_eq!(held[0].count, 2);
             assert!(held[0].samples.iter().any(|s| s.ends_with("c.ko.dpkg-new")));
             // the postinst's systemctl, another process of the transaction
@@ -7837,7 +7840,7 @@ mod tests {
                     (ResponseAction::Log, Severity::Low),
                     "{path}"
                 );
-                assert!(v.reasoning.contains("depmod"), "{}", v.reasoning);
+                assert!(v.reasoning.contains("depmod"), "the depmod carve-out");
             }
             for (path, pid) in [
                 ("/lib/modules/6.8.0-1-generic/evil.ko", 900),
