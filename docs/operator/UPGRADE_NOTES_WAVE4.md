@@ -2352,4 +2352,20 @@ detail.
 - **`--watchdog-exe` naming the agent's own binary is refused.** The agent
   does not start (the journal names the option); point it at the watchdog,
   or drop it (the `northnarrow-watchdog` next to the agent is the default).
+- **Residuals named by the review of #557.**
+  - With `+cpuset` now enabled at the root on 5.15 (and, as before, on 6.8
+    and later), root can confine the agent to one CPU through a sibling
+    cgroup in `cpuset.cpus.partition=root`: no hook sees it and no record
+    is written. The agent does not yet watch its own effective CPUs.
+  - The write's mark lives up to 5 s if the clean-up fexit is skipped
+    (full preemption), and stale entries are not reclaimed. A user with a
+    delegated cgroup can fill the 64 entries, and root's containers then
+    get the old record back (High, no change of state).
+  - Inside a package transaction faked by root, `useradd -o -u <uid>`
+    resets that user's lastlog with a Low NN-L-FIM-018, where it was High.
+    The transaction is proven by lineage (a root package manager on the
+    host, still running), so a user or a setuid path cannot fake it.
+  - The initramfs hook directories (`/etc/initramfs-tools/hooks`, …) are
+    not watched by FIM. A hook planted there stays R011 High when it runs,
+    because it is not in a system tree.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes.
