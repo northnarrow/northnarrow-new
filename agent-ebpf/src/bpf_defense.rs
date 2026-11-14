@@ -1090,7 +1090,17 @@ unsafe fn content_refusal(prog: *const c_void, every_type: bool) -> Option<(u8, 
     {
         return None;
     }
-    content_verdict(prog, ty, kfuncs_only)
+    // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
+    // BTF pointer to the verifier, which a global function does not take
+    // ("R1 is not a scalar") — its address is passed as a plain number
+    let Some(addr) = ptr_scalar(prog) else {
+        return Some((CONTENT_UNJUDGED, ty));
+    };
+    match nn_prog_forbidden_call(addr, kfuncs_only as u64) {
+        SCAN_CLEAN => None,
+        hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
+        _ => Some((CONTENT_UNJUDGED, ty)),
+    }
 }
 
 /// Lot 349 (pre-alpha R002): [`content_refusal`]'s verdict on `prog`'s
@@ -1104,13 +1114,6 @@ unsafe fn content_scan(prog: *const c_void, every_type: bool) -> Option<(u8, u32
     if kfuncs_only && !every_type {
         return None;
     }
-    content_verdict(prog, ty, kfuncs_only)
-}
-
-/// Lot 345: the scan of `prog` (of type `ty`) for a forbidden call (with
-/// `kfuncs_only`, a kfunc target's only).
-#[inline(always)]
-unsafe fn content_verdict(prog: *const c_void, ty: u32, kfuncs_only: bool) -> Option<(u8, u32)> {
     // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
     // BTF pointer to the verifier, which a global function does not take
     // ("R1 is not a scalar") — its address is passed as a plain number

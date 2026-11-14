@@ -54,6 +54,15 @@
 //! docs/architecture/module-map.toml, checked by
 //! xtask/tests/workspace_layers.rs.
 
+/// Lot 349 (pre-alpha R090): whether this build of nn-linux has its
+/// `test-util` feature — the test doors (an `UnlockToken` minted for a test,
+/// `ProcRef::for_test`, a test clock) a release must never carry. The agent's
+/// `--build-features` names it (`build_info::DEPENDENCY_TEST_FEATURES`), so
+/// the release workflow's check of every artefact (`none`) refuses a binary
+/// built with it; xtask/tests/supply_chain.rs holds the release build's
+/// resolved features to none of them.
+pub const TEST_UTIL: bool = cfg!(feature = "test-util");
+
 // Lot 283b: whose account a uid is (`login.defs`, `passwd`), for the
 // decision engine's host.
 pub mod accounts;
