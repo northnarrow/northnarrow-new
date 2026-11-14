@@ -2099,3 +2099,36 @@ detail.
   `argv` in a record may now hold `""` where it read as missing. A command
   line of exactly 512 bytes is now marked cut (`argv_truncated`), as a
   longer one: the sensor reads 511.
+
+## 41. A container runtime's start, the shutdown record (lot 347)
+
+- **runc's copy of itself is no longer Critical.** At every container
+  start, `docker exec`, build and Podman run, runc (1.1 on Debian 13, under
+  containerd's shim, dockerd or conmon) executes itself again from a sealed
+  memfd copy of its own image; R004 recorded each as fileless (Critical,
+  `would have: KillProcessTree` under `alpha`, the kill under `enforcing`).
+  Such an exec now has no verdict when the exec pump finds the memfd sealed
+  and byte for byte an installed runtime (`runc`, `crun` in the binary
+  directories), the process that made it runs that image (the kernel's exec
+  records) and an installed manager started the runtime
+  ([`CONTAINER_HOST_DEPLOY.md`](CONTAINER_HOST_DEPLOY.md)). Any other memfd
+  exec is Critical as before. A runtime the agent does not record (k3s's
+  bundled runc, a snap's) keeps the Critical.
+- **containerd's and dockerd's module probes are Low.** containerd 1.7's
+  `modprobe aufs`, run with the `LD_LIBRARY_PATH` its `opt` plugin sets, was
+  R011's kill at every containerd start on Debian 13 (High). The packaged
+  containerd's or dockerd's `modprobe` of a container runtime's modules
+  (`overlay`, `aufs`, `erofs`, `bridge`, `br_netfilter`, `veth`, the
+  netfilter, nftables, xtables and iptables families), the system's tool by
+  name, is a Low record; R018 still judges the module file at its load. Any
+  other module, a caller's library path, `MODPROBE_OPTIONS`, `LD_PRELOAD`
+  or another parent keeps R011's verdict.
+- **The shutdown record of wtmp.** `systemd-update-utmp` writing the
+  shutdown record while the agent was still stopping was NN-L-FIM-019 High
+  (`would have: KillProcess`) on Ubuntu 24.04 at about one shutdown in two.
+  The FIM drain now reads the writer's image and cgroup at the write; the
+  host's packaged binary in its own unit's cgroup has no verdict. Any other
+  writer of wtmp or btmp keeps the High kill.
+- **Nothing to configure.** No overlay, allowlist entry or signed policy
+  changes; the container-runtime overlay of `process-comm-allowlist` (R013)
+  is unchanged. Detection records of these three shapes stop appearing.

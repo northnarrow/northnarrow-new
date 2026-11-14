@@ -1935,6 +1935,11 @@ impl Rule for NnLFim019WtmpBtmpTampered {
         ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        // lot 347: the packaged unit whose work it is (its image and its
+        // unit's cgroup, read by the drain while it wrote)
+        if as_fim(event).is_some_and(|fe| super::unit_writers::unit_of(fe).is_some()) {
+            return None;
+        }
         evaluate_login_record_tamper(
             self,
             event,
@@ -6461,6 +6466,51 @@ mod tests {
                 .evaluate(&write("/var/log/wtmp", 500, "logrotate"))
                 .expect("fires");
             assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        }
+
+        /// Named test (lot 347, the alpha's false positives: Ubuntu 24.04's
+        /// shutdown): `systemd-update-utmp`'s write of the shutdown record
+        /// was judged before its exec was in the lineage — NN-L-FIM-019
+        /// High, a kill of the packaged binary. The drain's facts (the
+        /// packaged image in its unit's own cgroup, kept for that write)
+        /// exempt it; a write the drain kept nothing for keeps the High kill
+        /// (`dd` from a session, the binary run outside its unit, a copy),
+        /// and the fact is the write's, not the pid's.
+        #[test]
+        fn the_packaged_utmp_unit_writing_wtmp_needs_no_exec_record() {
+            let (_tmp, t) = tracker();
+            let [_, fim019] = log_rules(None, &t);
+            let kill = |e: &Event| {
+                let v = fim019.evaluate(e).expect("fires");
+                assert_eq!(
+                    (v.action.clone(), v.severity),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{}",
+                    v.reasoning
+                );
+            };
+            let shutdown = write("/var/log/wtmp", 34_704, "systemd-update-");
+            kill(&shutdown);
+            let Event::Fim(fe) = &shutdown else {
+                unreachable!()
+            };
+            crate::fim::unit_writers::keep(fe, "systemd-update-utmp.service");
+            assert!(fim019.evaluate(&shutdown).is_none(), "its unit's write");
+            // btmp by the unit too (the drain reads both records' writers)
+            let btmp = write("/var/log/btmp", 34_705, "systemd-update-");
+            if let Event::Fim(fe) = &btmp {
+                crate::fim::unit_writers::keep(fe, "systemd-update-utmp-runlevel.service");
+            }
+            assert!(fim019.evaluate(&btmp).is_none());
+            // CONTROLS: no fact kept (a dd, the binary outside its unit, a
+            // copy); the same pid's next write
+            kill(&write("/var/log/wtmp", 34_706, "dd"));
+            kill(&write("/var/log/wtmp", 34_707, "systemd-update-"));
+            let mut later = shutdown.clone();
+            if let Event::Fim(fe) = &mut later {
+                fe.timestamp_ns += 1;
+            }
+            kill(&later);
         }
 
         /// `exec` as uid `uid`, its argv cut by the sensor or not.

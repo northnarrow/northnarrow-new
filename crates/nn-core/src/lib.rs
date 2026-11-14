@@ -174,6 +174,8 @@ pub mod fim {
     // The FIM, credential-read and file-capability rules (Tappa 9; R08b,
     // lab PR 251, with the engine).
     pub mod rules;
+    /// Lot 347: a login record's packaged writer, as the drain read it.
+    pub mod unit_writers;
 }
 
 // The COMBAT ladder (R08c, lab PR 252; was the agent's `combat`): the

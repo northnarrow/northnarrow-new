@@ -59,6 +59,7 @@
 //! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded — not a leader that exited while another thread runs on: that thread's environment is read and judged, refused when not read whole or when no thread is seen while the kernel counts more than one | record, its environment not verified |
 //! | an argv the kernel did not read whole | kill |
 //! | in an initramfs build (lot 287: the packaged `update-initramfs`, `mkinitramfs` or `dracut`, run and still running as root, which the exec pump found from the exec's parent up at the exec), a root exec — the environment not refused — of a `#!` script of a system tree outside the tools' places (the hook `kmod`) or of the system's `modprobe` asked to load nothing (`--show-depends`, `--dry-run`, whatever else: `-S`, an argv cut after the flag) | record |
+//! | lot 347: forked by the installed `containerd` or `dockerd` (the kernel's fork record, the image's identity), root, the system's tool, a container runtime's modules by name ([`RUNTIME_MODULES`], [`RUNTIME_MODULE_FAMILIES`]) and no parameter, its environment clean, exited, or refused only for containerd's `opt` plugin's `LD_LIBRARY_PATH` | record, Low |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
 //!
 //! Whether the names load anything, and what, is the kernel's to judge at
@@ -96,6 +97,8 @@ use std::sync::Arc;
 
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::rules::program_identity::{self, ProgramKind};
+
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
@@ -103,6 +106,60 @@ use crate::decision::rules::kmod_exec_facts::{self, KMOD_TOOLS};
 use crate::decision::rules::kmod_invocation::{self, Syntax};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
+
+/// Lot 347: the modules a container runtime asks for at its start, by
+/// their exact names (kmod reads `-` and `_` alike): its storage drivers
+/// (`overlay`, containerd 1.7's `aufs` probe, `erofs`), the bridge and its
+/// netfilter, `veth`, the IPsec transforms of Docker's overlay networks
+/// and the legacy iptables tables.
+const RUNTIME_MODULES: &[&str] = &[
+    "overlay",
+    "aufs",
+    "erofs",
+    "bridge",
+    "br_netfilter",
+    "veth",
+    "xfrm_user",
+    "xfrm_algo",
+    "ip_tables",
+    "ip6_tables",
+];
+
+/// Lot 347: … and by their family (a prefix): netfilter's, nftables',
+/// xtables' matches and targets, iptables' tables.
+const RUNTIME_MODULE_FAMILIES: &[&str] = &["nf_", "nft_", "xt_", "iptable_", "ip6table_"];
+
+/// Lot 347: the installed managers whose own probes of those modules R011
+/// records Low ([`ProgramKind::RuntimeManager`], by the installed file's
+/// name).
+const MODULE_PROBING_MANAGERS: &[&str] = &["containerd", "dockerd"];
+
+/// Lot 347: where containerd's `opt` plugin roots the `LD_LIBRARY_PATH` it
+/// sets for itself and its children (`<root>/lib`; Debian's
+/// `/var/lib/containerd/opt`, upstream's `/opt/containerd`): root's state
+/// directories.
+const CONTAINERD_OPT_ROOTS: &[&str] = &["/var/lib/containerd/", "/opt/containerd/"];
+
+/// Lot 347: `name` is a container runtime's module ([`RUNTIME_MODULES`],
+/// [`RUNTIME_MODULE_FAMILIES`]).
+fn is_runtime_module(name: &str) -> bool {
+    let name = name.replace('-', "_");
+    RUNTIME_MODULES.contains(&name.as_str())
+        || RUNTIME_MODULE_FAMILIES
+            .iter()
+            .any(|f| name.len() > f.len() && name.starts_with(f))
+}
+
+/// Lot 347: `value` is the `LD_LIBRARY_PATH` containerd's `opt` plugin
+/// sets: each entry under [`CONTAINERD_OPT_ROOTS`] with no `.` or `..`
+/// segment, or empty (its own working directory: `/`, a unit's).
+fn is_containerd_opt_library_path(value: &str) -> bool {
+    value.split(':').all(|e| {
+        e.is_empty()
+            || (CONTAINERD_OPT_ROOTS.iter().any(|r| e.starts_with(r))
+                && !e.split('/').any(|seg| seg == "." || seg == ".."))
+    })
+}
 
 pub struct R011KernelModuleTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
@@ -127,6 +184,72 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
     ) -> Self {
         self.lineage = lineage;
         self
+    }
+
+    /// Lot 347 (the alpha's container hosts: Debian 13's docker.io): the
+    /// packaged containerd or dockerd probing a container runtime's modules
+    /// — `Some(the manager's installed path)` when every fact holds, each
+    /// the kernel's or the exec pump's:
+    ///
+    /// - root runs the system's module tool (the pump's device and inode)
+    ///   by name only, no module parameter, nothing moved or forced, its
+    ///   argv read whole, in the host's mount namespace;
+    /// - every module it asks for is a runtime's ([`is_runtime_module`]);
+    /// - the process that forked it (the kernel's record, its first exec
+    ///   since) runs the installed containerd or dockerd, by the image's
+    ///   identity in a root-only directory (the lineage's exec record);
+    /// - its environment was read clean, or the process had exited before,
+    ///   or its one refused variable is `LD_LIBRARY_PATH` as containerd's
+    ///   `opt` plugin sets it ([`is_containerd_opt_library_path`]):
+    ///   containerd 1.7 probes `aufs` with it (R011's kill at Docker's
+    ///   install).
+    ///
+    /// What the names load is the kernel's to judge: R018 judges the file
+    /// at its load (a module no package installed, or out of the module
+    /// tree, is Critical), the kernel's signature policy refuses an
+    /// unsigned one. Any other module, manager, tool or environment keeps
+    /// R011's verdict.
+    fn runtime_module_probe(&self, event: &Event) -> Option<String> {
+        use kmod_exec_facts::Environment;
+        let Event::ProcessSpawn {
+            uid,
+            filename,
+            exe,
+            argv,
+            argv_truncated,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if *uid != 0 || *argv_truncated || exe.root != (0, 0) || exe.fork_parent == 0 {
+            return None;
+        }
+        let tool = kmod_invocation::tool_of(exe.path_or(filename), argv).ok()?;
+        let names = kmod_invocation::modules_asked(tool, argv)?;
+        if !names.iter().all(|n| is_runtime_module(n)) {
+            return None;
+        }
+        let facts = kmod_exec_facts::of(event)?;
+        if facts.program.is_err() {
+            return None;
+        }
+        if let Environment::Refused(_) = facts.environment {
+            if !facts
+                .library_path
+                .as_deref()
+                .is_some_and(is_containerd_opt_library_path)
+            {
+                return None;
+            }
+        }
+        let lineage = self.lineage.as_ref()?;
+        let as_of = crate::posture::lineage::AsOf::of_event(event);
+        let manager =
+            program_identity::installed_image(lineage.exec_image(exe.fork_parent, as_of)?)?;
+        (manager.kind == ProgramKind::RuntimeManager
+            && MODULE_PROBING_MANAGERS.contains(&program_identity::base_of(&manager.path)))
+        .then_some(manager.path)
     }
 
     /// Lot 285: an exec whose parent is the module tool — the command of a
@@ -354,6 +477,23 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
         );
         if *parent_is_kthread {
             return None;
+        }
+        // lot 347: the packaged containerd's or dockerd's probe of a
+        // container runtime's modules, by identity
+        if let Some(manager) = self.runtime_module_probe(event) {
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Low,
+                &format!(
+                    "Kernel-module tooling ({comm}) exec by module name — a container runtime's \
+                     modules asked for by the packaged {manager} (its image's device and inode, \
+                     the kernel's fork record), the system's tool, nothing moved or forced — \
+                     recorded Low (lot 347): what the names load is the kernel's to judge (its \
+                     signature policy; R018 judges the file it loads) (T1547.006)"
+                ),
+            ));
         }
         // Lot 279: judged on the command line's syntax and on what the exec
         // pump read at the exec — recorded (no kill) by name, killed as
@@ -659,6 +799,172 @@ mod tests {
         exec("/sbin/modprobe", "/usr/bin/kmod", &argv)
     }
 
+    /// Lot 347 (named, the alpha's container hosts: Debian 13's
+    /// `apt-get install docker.io`): containerd 1.7's `modprobe aufs` —
+    /// its snapshotter's probe, with the `LD_LIBRARY_PATH` its `opt` plugin
+    /// sets (`/var/lib/containerd/opt/lib:`) — was R011's kill (High, on
+    /// main); dockerd's `modprobe -va bridge br_netfilter` and
+    /// `nf_conntrack` a Low record. The packaged containerd's and
+    /// dockerd's probes of a runtime's modules are recorded Low, by the
+    /// forker's image and the system's tool. A module of no runtime, a
+    /// library path of the caller's, `MODPROBE_OPTIONS`, a session's shell
+    /// or another manager as the forker, a file, a module parameter, a
+    /// non-root exec, a copy of the tool, no fork record: R011's verdict.
+    #[test]
+    fn a_packaged_container_runtime_s_module_probe_is_recorded_low() {
+        use crate::decision::rules::program_identity::{record_installed, InstalledImage};
+        use common::wire::exe::exe_flags::ROOT_DIR;
+        let (containerd, dockerd, shim, bash) = (
+            (0x0fd0_0347, 347_101),
+            (0x0fd0_0347, 347_102),
+            (0x0fd0_0347, 347_103),
+            (0x0fd0_0347, 347_104),
+        );
+        for (id, path) in [
+            (containerd, "/usr/bin/containerd"),
+            (dockerd, "/usr/sbin/dockerd"),
+            (shim, "/usr/bin/containerd-shim-runc-v2"),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 40_000_000,
+                path: path.into(),
+                kind: ProgramKind::RuntimeManager,
+            });
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for (pid, id, path) in [
+            (34_800, containerd, "/usr/bin/containerd"),
+            (34_801, dockerd, "/usr/sbin/dockerd"),
+            (34_802, shim, "/usr/bin/containerd-shim-runc-v2"),
+            (34_803, bash, "/usr/bin/bash"),
+        ] {
+            let mut e = crate::decision::rules::testutil::spawn_exe("x", path, path, ROOT_DIR);
+            if let Event::ProcessSpawn {
+                pid: p,
+                timestamp_ns,
+                start_ns,
+                exe,
+                ..
+            } = &mut e
+            {
+                (*p, *timestamp_ns, *start_ns) = (pid, 100, 100);
+                (exe.dev, exe.ino) = id;
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = rule().with_lineage(Some(lineage));
+        let facts = |env: Environment, library_path: Option<&str>| ExecFacts {
+            program: Ok(()),
+            environment: env,
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+            library_path: library_path.map(str::to_string),
+        };
+        let opt = "/var/lib/containerd/opt/lib:";
+        let ld = |v: &str| {
+            facts(
+                Environment::Refused(format!("LD_LIBRARY_PATH='{v}' in its environment")),
+                Some(v),
+            )
+        };
+        let judged = |forker: u32, args: &[&str], f: ExecFacts| {
+            let mut e = modprobe(args);
+            if let Event::ProcessSpawn {
+                exe, timestamp_ns, ..
+            } = &mut e
+            {
+                exe.fork_parent = forker;
+                *timestamp_ns += 1_000;
+            }
+            r.evaluate(&read_as(e, f)).expect("a verdict")
+        };
+        let low = |v: Verdict| {
+            assert_eq!(
+                (v.action.clone(), v.severity),
+                (ResponseAction::Log, Severity::Low),
+                "{}",
+                v.reasoning
+            );
+            assert!(v.reasoning.contains("lot 347"), "{}", v.reasoning);
+        };
+        let kill = |v: Verdict| {
+            assert_ne!(v.action, ResponseAction::Log, "{}", v.reasoning);
+            assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        };
+        // the lab's kill: containerd's aufs probe with its opt plugin's path
+        low(judged(34_800, &["aufs"], ld(opt)));
+        low(judged(34_800, &["overlay"], ld("/opt/containerd/lib")));
+        // dockerd's start (its environment clean, or gone at once)
+        low(judged(
+            34_801,
+            &["-va", "bridge", "br_netfilter"],
+            facts(Environment::Clean, None),
+        ));
+        low(judged(
+            34_801,
+            &["nf_conntrack_netlink"],
+            facts(Environment::Exited("reaped".into()), None),
+        ));
+        // CONTROLS: a module of no runtime, under containerd
+        kill(judged(34_800, &["rk"], ld(opt)));
+        kill(judged(34_800, &["-a", "overlay", "rk"], ld(opt)));
+        kill(judged(34_800, &["nf_"], ld(opt)));
+        // a library path of the caller's, or with a `..`
+        kill(judged(34_800, &["aufs"], ld("/tmp/lib:")));
+        kill(judged(
+            34_800,
+            &["aufs"],
+            ld("/var/lib/containerd/../../tmp"),
+        ));
+        // another variable refused (the pump kept no library path)
+        kill(judged(
+            34_800,
+            &["aufs"],
+            facts(
+                Environment::Refused("MODPROBE_OPTIONS='-C /tmp/x'".into()),
+                None,
+            ),
+        ));
+        // a session's shell, or another manager, as the forker; no record
+        kill(judged(34_803, &["aufs"], ld(opt)));
+        kill(judged(34_802, &["aufs"], ld(opt)));
+        kill(judged(34_899, &["aufs"], ld(opt)));
+        kill(judged(0, &["aufs"], ld(opt)));
+        // a file, a module parameter
+        kill(judged(34_800, &["/tmp/overlay.ko"], ld(opt)));
+        kill(judged(34_800, &["overlay", "redirect_dir=on"], ld(opt)));
+        // the mini-hunt: insmod and `kmod insert` under containerd name a
+        // file or a mode R011 never records by module name
+        for argv in [
+            &["insmod", "/var/lib/containerd/overlay.ko"][..],
+            &["kmod", "insert", "overlay"][..],
+        ] {
+            let mut e = exec(&format!("/sbin/{}", argv[0]), "/usr/bin/kmod", argv);
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.fork_parent = 34_800;
+            }
+            let v = r.evaluate(&read_as(e, ld(opt))).expect("a verdict");
+            assert_ne!(v.action, ResponseAction::Log, "{argv:?}: {}", v.reasoning);
+        }
+        // not the system's tool
+        let mut copy = ld(opt);
+        copy.program = Err("a copy".into());
+        kill(judged(34_800, &["aufs"], copy));
+        // a non-root exec
+        let mut user = modprobe(&["aufs"]);
+        if let Event::ProcessSpawn { uid, exe, .. } = &mut user {
+            *uid = 1000;
+            exe.fork_parent = 34_800;
+        }
+        let v = r.evaluate(&read_as(user, ld(opt))).expect("a verdict");
+        assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        assert!(is_runtime_module("br-netfilter") && is_runtime_module("xt_conntrack"));
+        assert!(!is_runtime_module("nft_") && !is_runtime_module("overlayfs"));
+    }
+
     /// `e` run by `uid`.
     fn as_uid(mut e: Event, to: u32) -> Event {
         if let Event::ProcessSpawn { uid, .. } = &mut e {
@@ -684,6 +990,7 @@ mod tests {
             package_manager: None,
             initramfs_builder: None,
             interpreter: None,
+            library_path: None,
         };
         let v = r
             .evaluate(&read_as(modprobe(&["loop"]), exited()))
@@ -755,6 +1062,7 @@ mod tests {
             package_manager: pm.map(str::to_string),
             initramfs_builder: None,
             interpreter: None,
+            library_path: None,
         };
         let v = rule()
             .evaluate(&read_as(
@@ -807,6 +1115,7 @@ mod tests {
             package_manager: None,
             initramfs_builder: builder.map(str::to_string),
             interpreter: interpreter.map(str::to_string),
+            library_path: None,
         }
     }
 
@@ -1082,6 +1391,7 @@ mod tests {
                 package_manager: None,
                 initramfs_builder: None,
                 interpreter: None,
+                library_path: None,
             },
         )
     }
@@ -1319,6 +1629,7 @@ mod tests {
                     package_manager: None,
                     initramfs_builder: None,
                     interpreter: None,
+                    library_path: None,
                 },
                 "not the system's tool's",
             ),
@@ -1331,6 +1642,7 @@ mod tests {
                     package_manager: None,
                     initramfs_builder: None,
                     interpreter: None,
+                    library_path: None,
                 },
                 "MODPROBE_OPTIONS='-d /tmp/x'",
             ),
@@ -1343,6 +1655,7 @@ mod tests {
                     package_manager: None,
                     initramfs_builder: None,
                     interpreter: None,
+                    library_path: None,
                 },
                 "could not be read",
             ),
@@ -1355,6 +1668,7 @@ mod tests {
                     package_manager: None,
                     initramfs_builder: None,
                     interpreter: None,
+                    library_path: None,
                 },
                 "LD_PRELOAD='/tmp/x.so'",
             ),
@@ -1367,6 +1681,7 @@ mod tests {
                     package_manager: None,
                     initramfs_builder: None,
                     interpreter: None,
+                    library_path: None,
                 },
                 "its start is unknown",
             ),
@@ -1402,6 +1717,7 @@ mod tests {
             package_manager: None,
             initramfs_builder: None,
             interpreter: None,
+            library_path: None,
         };
         let v = r
             .evaluate(&read_as(as_uid(modprobe(&["br_netfilter"]), 1000), exited))
@@ -1442,6 +1758,7 @@ mod tests {
             package_manager: None,
             initramfs_builder: None,
             interpreter: None,
+            library_path: None,
         };
         for (e, what) in [
             (modprobe(&["overlay"]), "modprobe of 'overlay'"),
@@ -1884,6 +2201,7 @@ mod bug119 {
                 package_manager: Some("/usr/bin/dpkg".into()),
                 initramfs_builder: None,
                 interpreter: None,
+                library_path: None,
             },
         );
         let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
@@ -1969,6 +2287,7 @@ mod bug119 {
                 package_manager: Some("/usr/bin/dpkg".into()),
                 initramfs_builder: None,
                 interpreter: None,
+                library_path: None,
             },
         );
         let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))

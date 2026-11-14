@@ -555,6 +555,16 @@ const KNOWN: &[(&str, &str, &str)] = &[
         SHELLS,
     ),
     (
+        "crates/nn-linux/src/program_images.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/fim/drain.rs",
+        "read_state(dir.join(\"cgroup\"))",
+        PROC,
+    ),
+    (
         "crates/nn-linux/src/response/containment.rs",
         "read_state(format!(\"/proc/{pid}/cgroup\"))",
         PROC,

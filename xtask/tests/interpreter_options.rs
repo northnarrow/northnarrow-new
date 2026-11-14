@@ -243,10 +243,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/decision/rules/kmod_invocation.rs",
-        14,
+        15,
         "kmod's own options and arguments (`--help`, `--version`, its argv after the tool's \
          name): no interpreter's \
-         — and its options told by their hyphen (`starts_with('-')`)",
+         — and its options told by their hyphen (`starts_with('-')`); lot 347: the module \
+         names R011's container-runtime exemption reads, by the same modprobe parser",
     ),
     (
         "crates/nn-core/src/decision/rules/program_identity.rs",
@@ -446,9 +447,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
-        1,
-        "a module tool's environment split on its NULs (`MODPROBE_OPTIONS`): kmod's, no \
-         interpreter's",
+        2,
+        "a module tool's environment split on its NULs (`MODPROBE_OPTIONS`; lot 347: \
+         `LD_LIBRARY_PATH` when it is the one refused variable): kmod's, no interpreter's",
     ),
     (
         "crates/nn-linux/src/sensors/ring_drops.rs",

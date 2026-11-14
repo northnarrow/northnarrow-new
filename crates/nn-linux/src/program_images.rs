@@ -27,6 +27,16 @@
 //!   Under the dynamic loader (`ld.so /path/x`) the file compared is the
 //!   loader's operand (F4).
 //!
+//! - Lot 347 ([`read_runtime_clone`], the same step): a memfd exec whose
+//!   parent runs an installed OCI runtime or its manager (by the identity of
+//!   its image, one `stat`) has its memfd — sealed against writing,
+//!   shrinking and growing — compared WHOLE, byte for byte, with the
+//!   installed runtimes of its length (`runc` re-executes itself from such a
+//!   copy, the CVE-2019-5736 defence); R004 then judges the lineage. The
+//!   runtimes are recorded with the shells, and again at such an exec (at
+//!   most once a second: a runtime installed this minute), under a budget
+//!   of their own ([`RUNTIME_BUDGET_PER_SECOND`]).
+//!
 //! A name only chooses which installed files are recorded; what an exec
 //! runs is then told by the file, never by its name.
 
@@ -229,15 +239,35 @@ fn compared_ranges(len: u64) -> Vec<(u64, u64)> {
 /// `a` and the file at `b` hold the same bytes over [`compared_ranges`];
 /// `b` is `len` bytes long.
 fn same_sampled(a: &std::fs::File, b: &Path, len: u64) -> bool {
+    same_over(a, b, len, None, &compared_ranges(len))
+}
+
+/// `a` and the file at `b` hold the same bytes over `ranges`; `b` is `len`
+/// bytes long and, with `id`, the file of that identity (the kernel's
+/// device form, its inode: lot 347, the image recorded, not one an upgrade
+/// put at its path since).
+fn same_over(
+    a: &std::fs::File,
+    b: &Path,
+    len: u64,
+    id: Option<(u64, u64)>,
+    ranges: &[(u64, u64)],
+) -> bool {
     let Ok(fb) = std::fs::File::open(b) else {
         return false;
     };
-    if !fb.metadata().is_ok_and(|m| m.is_file() && m.len() == len) {
+    let Ok(mb) = fb.metadata() else {
+        return false;
+    };
+    if !mb.is_file() || mb.len() != len {
+        return false;
+    }
+    if id.is_some_and(|id| id != kernel_id(&mb)) {
         return false;
     }
     let mut ba = vec![0u8; 64 * 1024];
     let mut bb = vec![0u8; 64 * 1024];
-    for (from, n) in compared_ranges(len) {
+    for &(from, n) in ranges {
         let mut at = from;
         while at < from + n {
             let k = (from + n - at).min(ba.len() as u64) as usize;
@@ -253,6 +283,15 @@ fn same_sampled(a: &std::fs::File, b: &Path, len: u64) -> bool {
     true
 }
 
+/// A file's identity as the exec sensor reports an executed file: its
+/// device in the kernel's form (`MKDEV`), its inode.
+fn kernel_id(m: &std::fs::Metadata) -> (u64, u64) {
+    (
+        crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+        m.ino(),
+    )
+}
+
 /// `path` (followed) as an installed program of `kind`.
 fn image_of(path: &Path, kind: ProgramKind) -> Option<InstalledImage> {
     let real = std::fs::canonicalize(path).ok()?;
@@ -261,10 +300,7 @@ fn image_of(path: &Path, kind: ProgramKind) -> Option<InstalledImage> {
         return None;
     }
     Some(InstalledImage {
-        id: (
-            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
-            m.ino(),
-        ),
+        id: kernel_id(&m),
         len: m.len(),
         path: real.to_string_lossy().into_owned(),
         kind,
@@ -272,10 +308,12 @@ fn image_of(path: &Path, kind: ProgramKind) -> Option<InstalledImage> {
 }
 
 /// The kind of an installed file, by the name of the file a path resolves
-/// to (`/usr/bin/sh` → `dash`; `/bin/sh` on Alpine → `busybox`).
+/// to (`/usr/bin/sh` → `dash`; `/bin/sh` on Alpine → `busybox`; lot 347:
+/// `/usr/sbin/runc` an OCI runtime, `/usr/bin/containerd-shim-runc-v2` its
+/// manager).
 fn kind_of(path: &Path) -> Option<ProgramKind> {
     let real = std::fs::canonicalize(path).ok()?;
-    ProgramKind::of_name(&real.to_string_lossy())
+    ProgramKind::of_installed_name(&real.to_string_lossy())
 }
 
 /// The installed programs under `root` (`/` on the host, a test's tree):
@@ -293,6 +331,12 @@ pub fn installed_under(root: &Path) -> Vec<InstalledImage> {
     // the dynamic loader (the re-check of #549, R2)
     paths.extend(
         LOADER_PATHS
+            .iter()
+            .map(|p| root.join(p.trim_start_matches('/'))),
+    );
+    // lot 347: podman's conmon where it is no binary directory's
+    paths.extend(
+        RUNTIME_EXTRA_PATHS
             .iter()
             .map(|p| root.join(p.trim_start_matches('/'))),
     );
@@ -334,9 +378,11 @@ pub fn seed() -> usize {
     refresh()
 }
 
-/// The exec pump's step (module docs).
+/// The exec pump's step (module docs): lot 313's socket-stdio execs, and
+/// (lot 347) a memfd exec's runtime clone ([`read_runtime_clone`]).
 pub fn read_and_keep(event: &Event) {
     read_and_keep_at(event, Path::new("/proc"));
+    read_runtime_clone(event);
 }
 
 /// [`read_and_keep`] with `/proc` at `proc_root` (tests).
@@ -381,8 +427,10 @@ fn identify(
         bounds.remembered.fetch_add(1, Ordering::Relaxed);
         return Ok(answer);
     }
+    // lot 347: no shell runs in a container runtime (R020's programs only)
     let candidates: Vec<InstalledImage> = program_identity::installed_of_len(m.len())
         .into_iter()
+        .filter(|i| !i.kind.is_container_runtime())
         .take(MAX_COMPARED)
         .collect();
     if candidates.is_empty() {
@@ -479,6 +527,226 @@ fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
     }
 }
 
+// ── Lot 347: an OCI runtime's copy of itself in a memfd (R004) ─────────
+
+/// Lot 347: where a distribution installs a runtime's manager outside the
+/// binary directories (podman's conmon on some).
+const RUNTIME_EXTRA_PATHS: &[&str] = &["/usr/libexec/podman/conmon"];
+
+/// Lot 347: the longest memfd compared with the runtimes (`runc` is 10–16
+/// MiB, `crun` under 4).
+const RUNTIME_MAX_LEN: u64 = 64 << 20;
+
+/// Lot 347: the bytes the runtime compares may read in a second, both
+/// files counted — a container start reads its runtime twice (~30 MiB for
+/// runc): about seventeen starts a second; past it a clone is not compared
+/// and R004 keeps its verdict. Only an exec whose parent runs an installed
+/// runtime or its manager reaches a compare.
+const RUNTIME_BUDGET_PER_SECOND: u64 = 512 << 20;
+
+/// Lot 347: the runtimes recorded again at a memfd exec at most this often
+/// (a runtime installed since the minute's refresh: Docker's first
+/// container right after its install).
+const RUNTIME_REFRESH_EVERY: Duration = Duration::from_secs(1);
+
+/// Lot 347: the seals a runtime's copy of itself carries — runc and crun
+/// add these before they execute it: its bytes cannot change since.
+const SEALED: libc::c_int = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+
+/// Lot 347: the runtime compares' bounds and the time of their last
+/// refresh of the runtimes' records.
+pub struct RuntimeChecks {
+    bounds: Bounds,
+    refreshed: Mutex<Option<Instant>>,
+}
+
+impl RuntimeChecks {
+    fn new(budget: u64) -> Self {
+        Self {
+            bounds: Bounds::new(budget, budget),
+            refreshed: Mutex::new(None),
+        }
+    }
+
+    /// The runtimes under `root` recorded, unless done in the last
+    /// [`RUNTIME_REFRESH_EVERY`].
+    fn refresh(&self, root: &Path, now: Instant) {
+        {
+            let mut at = self.refreshed.lock();
+            if at.is_some_and(|t| now.duration_since(t) < RUNTIME_REFRESH_EVERY) {
+                return;
+            }
+            *at = Some(now);
+        }
+        for image in installed_runtimes_under(root) {
+            program_identity::record_installed(image);
+        }
+    }
+}
+
+static RUNTIMES: LazyLock<RuntimeChecks> =
+    LazyLock::new(|| RuntimeChecks::new(RUNTIME_BUDGET_PER_SECOND));
+
+/// Lot 347: the installed OCI runtimes and their managers under `root` —
+/// each of their names in the binary directories (and
+/// [`RUNTIME_EXTRA_PATHS`]), by the name of the file it resolves to: a
+/// few `stat`s, no directory listed.
+pub fn installed_runtimes_under(root: &Path) -> Vec<InstalledImage> {
+    let names = program_identity::CONTAINER_RUNTIMES
+        .iter()
+        .chain(program_identity::RUNTIME_MANAGERS);
+    let mut paths: Vec<PathBuf> = BIN_DIRS
+        .iter()
+        .flat_map(|d| {
+            names
+                .clone()
+                .map(move |n| root.join(d.trim_start_matches('/')).join(n))
+        })
+        .collect();
+    paths.extend(
+        RUNTIME_EXTRA_PATHS
+            .iter()
+            .map(|p| root.join(p.trim_start_matches('/'))),
+    );
+    let mut out: Vec<InstalledImage> = Vec::new();
+    for p in paths {
+        let Some(image) = kind_of(&p)
+            .filter(|k| k.is_container_runtime())
+            .and_then(|k| image_of(&p, k))
+        else {
+            continue;
+        };
+        if !out.iter().any(|i| i.id == image.id) {
+            out.push(image);
+        }
+    }
+    out
+}
+
+/// Lot 347: the file `file` is sealed against writing, shrinking and
+/// growing ([`SEALED`]): a memfd whose bytes no one can change any more.
+fn sealed(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_GET_SEALS reads the seals of an open descriptor this
+    // function borrows; no memory is passed to the kernel.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    seals >= 0 && seals & SEALED == SEALED
+}
+
+/// Lot 347: the exec pump's step for a memfd exec (module docs) — the
+/// running image kept as an installed runtime's clone when its parent runs
+/// an installed runtime or its manager (by its image's identity), and the
+/// memfd, the exec's own file by its device and inode, sealed, is that
+/// runtime's image whole, byte for byte. Anything else keeps nothing: R004
+/// judges a memfd exec fileless without the clone.
+pub fn read_runtime_clone(event: &Event) {
+    read_runtime_clone_with(event, Path::new("/proc"), Path::new("/"), &RUNTIMES);
+}
+
+/// [`read_runtime_clone`] with `/proc` at `proc_root`, the host's root at
+/// `root` and `checks` (tests).
+fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks: &RuntimeChecks) {
+    use common::wire::exe::exe_flags::{KNOWN, MEMFD};
+    let Event::ProcessSpawn {
+        pid,
+        ppid,
+        uid,
+        exe,
+        ..
+    } = event
+    else {
+        return;
+    };
+    if !exe.has(KNOWN) || !exe.has(MEMFD) || *pid == 0 || *ppid == 0 {
+        return;
+    }
+    checks.refresh(root, Instant::now());
+    // first the parent, one `stat` of its image: a runtime's or a manager's
+    let image = |pid: u32| {
+        std::fs::metadata(proc_root.join(pid.to_string()).join("exe"))
+            .ok()
+            .map(|m| kernel_id(&m))
+    };
+    let Some(parent) = image(*ppid).filter(|id| installed_at_its_path(*id).is_some()) else {
+        return;
+    };
+    // the processes above the exec as they run now: the parent, and its
+    // parent when it started no later (the pid not reused since), each an
+    // installed runtime or manager's file at its path — R004's manager when
+    // the lineage holds no exec of it (a fork that never executed: conmon's
+    // monitor)
+    let mut seen = vec![(*ppid, parent)];
+    if let Some((grand, start)) = parent_and_start(proc_root, *ppid) {
+        let older = parent_and_start(proc_root, grand).is_some_and(|(_, g)| g <= start);
+        if let Some(id) =
+            image(grand).filter(|id| older && grand > 1 && installed_at_its_path(*id).is_some())
+        {
+            seen.push((grand, id));
+        }
+    }
+    let Ok(file) = std::fs::File::open(proc_root.join(pid.to_string()).join("exe")) else {
+        return;
+    };
+    let Ok(m) = file.metadata() else {
+        return;
+    };
+    if kernel_id(&m) != (exe.dev, exe.ino)
+        || !m.is_file()
+        || m.len() == 0
+        || m.len() > RUNTIME_MAX_LEN
+        || !sealed(&file)
+    {
+        return;
+    }
+    let candidates: Vec<InstalledImage> = program_identity::runtimes_of_len(m.len())
+        .into_iter()
+        .take(MAX_COMPARED)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let cost = 2 * m.len() * candidates.len() as u64;
+    if !checks.bounds.take(*uid, cost, Instant::now()) {
+        checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    checks.bounds.compared.fetch_add(1, Ordering::Relaxed);
+    let whole = [(0, m.len())];
+    if let Some(found) = candidates
+        .iter()
+        .find(|i| same_over(&file, Path::new(&i.path), m.len(), Some(i.id), &whole))
+    {
+        program_identity::keep_runtime_clone(
+            event,
+            program_identity::RuntimeClone {
+                image: found.id,
+                seen,
+            },
+        );
+    }
+}
+
+/// Lot 347: the installed runtime or manager whose identity `id` is, when
+/// the file at its recorded path is that inode still — an inode number a
+/// removed runtime had, now another file's elsewhere, is not it.
+fn installed_at_its_path(id: (u64, u64)) -> Option<ProgramKind> {
+    let image = program_identity::installed_image(id)?;
+    if !image.kind.is_container_runtime() {
+        return None;
+    }
+    std::fs::metadata(&image.path)
+        .is_ok_and(|m| kernel_id(&m) == id)
+        .then_some(image.kind)
+}
+
+/// Lot 347: `/proc/<pid>/stat`'s parent (field 4) and start (field 22),
+/// read after the `(comm)` field.
+fn parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
+    let stat = crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +829,290 @@ mod tests {
             )
         );
         assert_eq!(image.len, m.len());
+    }
+
+    /// Lot 347: a memfd holding `content`, sealed with `seals`, as runc
+    /// makes its copy.
+    fn memfd(content: &[u8], seals: libc::c_int) -> std::fs::File {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = std::ffi::CString::new("runc_cloned:/proc/self/exe").unwrap();
+        // SAFETY: a name the call reads, no other memory; the descriptor
+        // returned is owned by the File made of it at once.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        assert!(fd >= 0, "memfd_create");
+        // SAFETY: `fd` is a new descriptor no one else owns.
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.write_all(content).unwrap();
+        if seals != 0 {
+            // SAFETY: F_ADD_SEALS on the descriptor `f` owns; no memory.
+            assert_eq!(
+                unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+                0
+            );
+        }
+        f
+    }
+
+    /// Lot 347: a memfd exec of `pid` under `ppid`, its file `f` (its
+    /// identity as the LSM program reports it).
+    fn memfd_exec(pid: u32, ppid: u32, ts: u64, f: &std::fs::File) -> Event {
+        let mut e = nn_core::decision::rules::testutil::spawn("memfd:runc_clon", "/dev/fd/6");
+        let id = kernel_id(&f.metadata().unwrap());
+        if let Event::ProcessSpawn {
+            pid: p,
+            ppid: pp,
+            uid,
+            timestamp_ns,
+            exe,
+            ..
+        } = &mut e
+        {
+            (*p, *pp, *uid, *timestamp_ns) = (pid, ppid, 0, ts);
+            exe.path = "/memfd:runc_cloned:/proc/self/exe".into();
+            (exe.dev, exe.ino) = id;
+            exe.flags = common::wire::exe::exe_flags::KNOWN
+                | common::wire::exe::exe_flags::MEMFD
+                | common::wire::exe::exe_flags::DELETED;
+        }
+        e
+    }
+
+    /// Lot 347 (the alpha's container hosts): a memfd exec whose parent
+    /// runs the installed runc (by its image's identity), sealed and WHOLE
+    /// byte for byte the installed runc, is kept as runc's clone — by
+    /// runc's identity. Unsealed, one byte other (even where lot 313's
+    /// samples would not look), a parent running no runtime, a file that is
+    /// not the exec's, a budget spent, a runtime installed since the last
+    /// refresh (recorded at the exec): kept as nothing, or as the new one.
+    #[test]
+    fn a_sealed_memfd_copy_of_the_installed_runtime_is_its_clone() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        use std::os::fd::AsRawFd;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        // a runtime of 6 MiB: lot 313's samples would read 2.5 of them
+        let mut image: Vec<u8> = (0..(6u32 << 20)).map(|i| (i % 251) as u8).collect();
+        image[..4].copy_from_slice(b"runc");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let shim = put(
+            &root,
+            "/usr/bin/containerd-shim-runc-v2",
+            b"shim image, 347",
+        );
+        let bash = put(&root, "/usr/bin/bash", b"bash image, 347");
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let link = |pid: u32, to: &Path| {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            let _ = std::fs::remove_file(proc.join(pid.to_string()).join("exe"));
+            symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+        };
+        let fd_path = |f: &std::fs::File| PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
+        let checks = RuntimeChecks::new(1 << 30);
+        let run =
+            |pid: u32, ppid: u32, parent: &Path, f: &std::fs::File, checks: &RuntimeChecks| {
+                link(ppid, parent);
+                link(pid, &fd_path(f));
+                let e = memfd_exec(pid, ppid, 347, f);
+                read_runtime_clone_with(&e, &proc, &root, checks);
+                runtime_clone_of(&e).map(|c| c.image)
+            };
+        let all = SEALED | libc::F_SEAL_SEAL;
+        // the runtime recorded at the exec (installed since the minute's
+        // refresh), its clone found under it
+        let clone = memfd(&image, all);
+        assert_eq!(run(34_701, 34_700, &runc, &clone, &checks), Some(runc_id));
+        // what the pump saw above the exec: the parent, and its parent when
+        // it started no later (a pid reused since is younger: not kept)
+        let stat = |pid: u32, ppid: u32, start: u64| {
+            std::fs::write(
+                proc.join(pid.to_string()).join("stat"),
+                format!("{pid} (x y) S {ppid} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n"),
+            )
+            .unwrap();
+        };
+        link(34_715, &shim);
+        stat(34_700, 34_715, 200);
+        stat(34_715, 1, 100);
+        link(34_716, &fd_path(&clone));
+        let e = memfd_exec(34_716, 34_700, 347, &clone);
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        let shim_id = kernel_id(&std::fs::metadata(&shim).unwrap());
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| c.seen),
+            Some(vec![(34_700, runc_id), (34_715, shim_id)])
+        );
+        // the parent's parent running no installed runtime's or manager's
+        // file at its path: not kept
+        link(34_718, &bash);
+        stat(34_700, 34_718, 200);
+        stat(34_718, 1, 100);
+        link(34_719, &fd_path(&clone));
+        let e = memfd_exec(34_719, 34_700, 347, &clone);
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| c.seen),
+            Some(vec![(34_700, runc_id)])
+        );
+        stat(34_700, 34_715, 200);
+        stat(34_715, 1, 300);
+        link(34_717, &fd_path(&clone));
+        let e = memfd_exec(34_717, 34_700, 347, &clone);
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| c.seen),
+            Some(vec![(34_700, runc_id)]),
+            "a younger process at the parent's parent's pid"
+        );
+        std::fs::remove_file(proc.join("34700/stat")).unwrap();
+        // under its manager too (crun's re-exec under conmon's shape)
+        assert_eq!(run(34_702, 34_703, &shim, &clone, &checks), Some(runc_id));
+        // CONTROLS — not sealed against writing
+        let open = memfd(&image, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW);
+        assert_eq!(run(34_704, 34_700, &runc, &open, &checks), None);
+        // one byte other, in the middle (no lot 313 sample there)
+        let mut patched = image.clone();
+        patched[3 << 20] ^= 0x90;
+        assert_eq!(
+            run(34_705, 34_700, &runc, &memfd(&patched, all), &checks),
+            None
+        );
+        // a record of a removed runtime whose inode number the parent's
+        // file has now (its path names no such file): not a runtime
+        let bash_id = kernel_id(&std::fs::metadata(&bash).unwrap());
+        program_identity::record_installed(InstalledImage {
+            id: bash_id,
+            len: 7_777_777,
+            path: root
+                .join("usr/sbin/runc-removed")
+                .to_string_lossy()
+                .into_owned(),
+            kind: ProgramKind::ContainerRuntime,
+        });
+        // the parent runs no runtime
+        assert_eq!(run(34_706, 34_707, &bash, &clone, &checks), None);
+        // the file open is not the exec's (another memfd at the pid now)
+        link(34_700, &runc);
+        link(34_708, &fd_path(&clone));
+        let mut other = memfd_exec(34_708, 34_700, 347, &clone);
+        if let Event::ProcessSpawn { exe, .. } = &mut other {
+            exe.ino ^= 1;
+        }
+        read_runtime_clone_with(&other, &proc, &root, &checks);
+        assert_eq!(runtime_clone_of(&other), None);
+        // no identity from the LSM program (tracepoint mode): not compared
+        let mut tp = memfd_exec(34_709, 34_700, 347, &clone);
+        if let Event::ProcessSpawn { exe, .. } = &mut tp {
+            exe.flags = common::wire::exe::exe_flags::MEMFD;
+        }
+        link(34_709, &fd_path(&clone));
+        read_runtime_clone_with(&tp, &proc, &root, &checks);
+        assert_eq!(runtime_clone_of(&tp), None);
+        // the budget spent: counted, not compared
+        let poor = RuntimeChecks::new(1 << 20);
+        assert_eq!(run(34_710, 34_700, &runc, &clone, &poor), None);
+        assert_eq!(poor.bounds.skipped.load(Ordering::Relaxed), 1);
+        // the runtime upgraded: a new image at the path is the one compared
+        // (the old inode's record names a file no longer there)
+        // (the old image held open, as a process running it does: the new
+        // file cannot take its inode)
+        let _running = std::fs::File::open(&runc).unwrap();
+        std::fs::remove_file(&runc).unwrap();
+        let mut v2 = image.clone();
+        v2[100] ^= 1;
+        let runc2 = put(&root, "/usr/sbin/runc", &v2);
+        let runc2_id = kernel_id(&std::fs::metadata(&runc2).unwrap());
+        // before the new image is recorded (the second not over), the old
+        // record names a file no longer at its path: its bytes are not the
+        // new file's, whatever the new file holds
+        let stale = RuntimeChecks::new(1 << 30);
+        *stale.refreshed.lock() = Some(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(run(34_714, 34_703, &shim, &memfd(&v2, all), &stale), None);
+        let fresh = RuntimeChecks::new(1 << 30);
+        assert_eq!(
+            run(34_711, 34_712, &runc2, &memfd(&v2, all), &fresh),
+            Some(runc2_id)
+        );
+        assert_eq!(
+            run(34_713, 34_712, &runc2, &clone, &fresh),
+            None,
+            "the old bytes"
+        );
+    }
+
+    /// Lot 347: R020's compare looks at the shells, interpreters, busybox
+    /// and the loader only — a copy of an installed runtime with its stdio
+    /// on a socket is compared with none of them (no shell runs in it).
+    #[test]
+    fn r020_compares_no_runtime() {
+        use nn_core::decision::rules::program_identity::{copy_of, record_installed};
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let runc = put(&root, "/usr/sbin/runc", b"runc image, 347, r020");
+        let copy = put(&root, "/home/u/x", b"runc image, 347, r020");
+        record_installed(InstalledImage {
+            id: kernel_id(&std::fs::metadata(&runc).unwrap()),
+            len: 21,
+            path: runc.to_string_lossy().into_owned(),
+            kind: ProgramKind::ContainerRuntime,
+        });
+        std::fs::create_dir_all(proc.join("34720")).unwrap();
+        symlink(&copy, proc.join("34720/exe")).unwrap();
+        let e = exec(34_720, 347, outbound());
+        read_and_keep_with(&e, &proc, &Bounds::new(1 << 20, 1 << 20));
+        assert_eq!(copy_of(&e), None);
+    }
+
+    /// Lot 347: at a memfd exec the runtimes are recorded again (one
+    /// installed since the minute's refresh), at most once a second; only
+    /// the runtimes' and their managers' names, by the file they resolve to
+    /// (a link named `runc` to another program records that program, if it
+    /// is one), and podman's conmon outside the binary directories.
+    #[test]
+    fn the_runtimes_are_recorded_again_at_most_once_a_second() {
+        use nn_core::decision::rules::program_identity::installed_kind_sized;
+        // by identity and length: another test's file, removed, may have
+        // left its inode number to one of these
+        let installed_kind = |(id, len): ((u64, u64), u64)| installed_kind_sized(id, len);
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let id = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (kernel_id(&m), m.len())
+        };
+        let runc = put(r, "/usr/bin/runc", b"runc image, 347 refresh");
+        let checks = RuntimeChecks::new(1 << 20);
+        let now = Instant::now();
+        checks.refresh(r, now);
+        assert_eq!(
+            installed_kind(id(&runc)),
+            Some(ProgramKind::ContainerRuntime)
+        );
+        let crun = put(r, "/usr/bin/crun", b"crun image, 347 refresh");
+        let conmon = put(
+            r,
+            "/usr/libexec/podman/conmon",
+            b"conmon image, 347 refresh",
+        );
+        let ls = put(r, "/usr/bin/ls", b"ls image, 347 refresh");
+        std::fs::create_dir_all(r.join("usr/sbin")).unwrap();
+        symlink(&ls, r.join("usr/sbin/runc")).unwrap();
+        checks.refresh(r, now + Duration::from_millis(900));
+        assert_eq!(installed_kind(id(&crun)), None, "within the second");
+        checks.refresh(r, now + Duration::from_millis(1100));
+        assert_eq!(
+            installed_kind(id(&crun)),
+            Some(ProgramKind::ContainerRuntime)
+        );
+        assert_eq!(
+            installed_kind(id(&conmon)),
+            Some(ProgramKind::RuntimeManager)
+        );
+        assert_eq!(installed_kind(id(&ls)), None, "a link named runc to ls");
+        // the runtimes are no shells for R020's compare
+        assert!(
+            ProgramKind::of_name("runc").is_none() && ProgramKind::of_name("dockerd").is_none()
+        );
     }
 
     fn exec(pid: u32, ts: u64, own: StdioSocket) -> Event {
