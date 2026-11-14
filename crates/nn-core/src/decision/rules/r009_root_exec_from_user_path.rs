@@ -264,7 +264,7 @@ mod tests {
         }
         let lineage = AuthSessionTracker::new(tmp.path());
         lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
-        lineage.ingest_spawn(710, 700, "/usr/bin/sudo", 2);
+        lineage.ingest_exec(710, 700, "/usr/bin/sudo", &[], 2, 2, 1000);
         lineage.ingest_first_exec(720, 710, "/home/alice/deploy.sh", 3, 0);
         lineage.ingest_spawn(800, 700, "/home/alice/deploy.sh", 4);
         let rule = R009RootExecFromUserPath::new(lineage);
@@ -355,6 +355,90 @@ mod tests {
         );
     }
 
+    /// The review of #560 (named, A): root runs sudo with no credential
+    /// check. After a local privilege escalation that set every uid to 0,
+    /// the user's program ran `/usr/bin/sudo /home/alice/payload` — in its
+    /// own place (as sudo -A's askpass helper, and at the user's terminal
+    /// with no askpass at all) or from a fork — and sudo's child was "forked
+    /// by sudo, real uid 0, no PAM helper": Low, no kill. A sudo whose
+    /// caller was already root vouches for nothing now: High, the kill. The
+    /// operator's own `sudo ./deploy/uninstall.sh` (sudo run as the user,
+    /// its monitor's child) stays Low.
+    #[test]
+    fn root_s_own_sudo_vouches_for_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (pid, ppid) in [
+            (700u32, 1u32),
+            (710, 700),
+            (715, 710),
+            (725, 715),
+            (730, 700),
+            (731, 730),
+            (740, 700),
+            (741, 740),
+            (742, 741),
+            (750, 700),
+            (751, 750),
+            (752, 751),
+        ] {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("loginuid"), "1000").unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+            )
+            .unwrap();
+        }
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_exec(700, 1, "/usr/bin/bash", &[], 1, 1, 1000);
+        lineage.ingest_exec(710, 700, "/usr/bin/sudo", &[], 2, 2, 1000);
+        // (a) sudo -A's askpass helper, root through an LPE, executes sudo
+        // in its own place
+        lineage.ingest_first_exec(715, 710, "/home/alice/askpass", 3, 1000);
+        lineage.ingest_exec(715, 710, "/usr/bin/sudo", &[], 4, 3, 0);
+        lineage.ingest_first_exec(725, 715, "/home/alice/payload", 5, 0);
+        // (b) no askpass: the user's LPE at her terminal, sudo in place
+        lineage.ingest_first_exec(730, 700, "/home/alice/lpe", 6, 1000);
+        lineage.ingest_exec(730, 700, "/usr/bin/sudo", &[], 7, 6, 0);
+        lineage.ingest_first_exec(731, 730, "/home/alice/payload", 8, 0);
+        // (c) the LPE forks, its child executes sudo as root
+        lineage.ingest_first_exec(740, 700, "/home/alice/lpe", 9, 1000);
+        lineage.ingest_first_exec(741, 740, "/usr/bin/sudo", 10, 0);
+        lineage.ingest_first_exec(742, 741, "/home/alice/payload", 11, 0);
+        // the operator's sudo, its monitor (a fork of it that executed
+        // nothing, root's: the kernel's fork record), the script it forked
+        lineage.ingest_exec(750, 700, "/usr/bin/sudo", &[], 12, 12, 1000);
+        lineage.ingest_kernel_fork(751, 13, 750, 0, 42);
+        lineage.ingest_first_exec(752, 751, "/home/alice/nn/deploy/uninstall.sh", 14, 0);
+        let rule = R009RootExecFromUserPath::new(lineage.clone());
+        let run = |pid: u32, ppid: u32, path: &str| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p, ppid: pp, ..
+            } = &mut e
+            {
+                (*p, *pp) = (pid, ppid);
+            }
+            e
+        };
+        for (pid, ppid) in [(725u32, 715u32), (731, 730), (742, 741)] {
+            let v = rule
+                .evaluate(&run(pid, ppid, "/home/alice/payload"))
+                .expect("fires");
+            assert_eq!(
+                (v.severity, v.action),
+                (Severity::High, ResponseAction::KillProcessTree),
+                "pid {pid}"
+            );
+            assert!(!lineage.is_interactive_admin(pid, AsOf::Now), "pid {pid}");
+        }
+        let v = rule
+            .evaluate(&run(752, 751, "/home/alice/nn/deploy/uninstall.sh"))
+            .expect("recorded");
+        assert_eq!((v.severity, v.action), (Severity::Low, ResponseAction::Log));
+    }
+
     /// Lot 350 (named, F2-2): Ubuntu 26.04's `sudo` is sudo-rs
     /// (`/usr/lib/cargo/bin/sudo` behind the alternatives; Debian's
     /// `/usr/bin/sudo-rs`). It was no elevation binary: an administrator's
@@ -383,7 +467,7 @@ mod tests {
                 }
                 let lineage = AuthSessionTracker::new(tmp.path());
                 lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
-                lineage.ingest_spawn(710, 700, sudo, 2);
+                lineage.ingest_exec(710, 700, sudo, &[], 2, 2, 1000);
                 lineage.ingest_first_exec(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3, 0);
                 let rule = R009RootExecFromUserPath::new(lineage);
                 let mut run = spawn_as(0, "uninstall.sh", "/home/alice/nn/deploy/uninstall.sh");

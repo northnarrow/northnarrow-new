@@ -595,23 +595,68 @@ systemctl daemon-reload
 # removed first. One that still holds a process the agent contained stays,
 # named with its processes and the agent's record of where each came from,
 # and the slice is then not stopped: the uninstall kills nothing (it has no
-# verdict on them) and releases nothing (that is the operator's decision,
+# verdict on them) and moves nothing (releasing is the operator's decision,
 # `nn-admin` before the uninstall: it hands a process the agent judged back
 # its unit and its network, with nothing left to watch it). Such a process
 # stays in that cgroup, outside any unit, until it exits or the next boot —
 # throttled, under the scope's limits; blocked, its block gone with the
 # agent's nftables table.
+#
+# The review of #560 (D, E): an agent stopped in the middle of a kill left
+# its kill cgroup (`blocked.scope/neutralize-*`), the tree in it frozen (the
+# agent's next start finishes such a kill; no agent starts after this). An
+# empty one is removed; one that holds processes is thawed — nothing would
+# ever thaw it — and said: its processes run again, unwatched. Every process
+# left is named by its pid and its command (`$PROC_ROOT`, /proc), and kept
+# for contained_report at the end: the uninstall then exits 4, not 0.
+CONTAINED_LEFT=()
 stop_slice() {
-    local state d scope pids held=0
+    local state d k scope pids p what held=0
+    local -a said
     for scope in blocked throttled; do
         d=$SLICE_CGROUP/$scope.scope
         [[ -d "$d" ]] || continue
+        for k in "$d"/neutralize-*; do
+            [[ -d "$k" ]] || continue
+            if rmdir "$k" 2>/dev/null; then
+                log "removed the empty $k (a kill an earlier agent did not finish)"
+                continue
+            fi
+            if [[ "$(cat "$k/cgroup.freeze" 2>/dev/null || true)" == 1 ]]; then
+                if echo 0 > "$k/cgroup.freeze" 2>/dev/null; then
+                    log "$k: a kill the agent did not finish had frozen these processes: thawed (they run again, unwatched)"
+                else
+                    log "$k: a kill the agent did not finish froze these processes, and the thaw was refused: still frozen"
+                fi
+            fi
+        done
         if rmdir "$d" 2>/dev/null; then
             log "removed the empty $d"
             continue
         fi
-        pids=$(tr -s '\n' ' ' 2>/dev/null < "$d/cgroup.procs" || true)
+        pids=""
+        said=()
+        for k in "$d" "$d"/neutralize-*; do
+            [[ -f "$k/cgroup.procs" ]] || continue
+            what=""
+            if [[ "$k" != "$d" ]]; then
+                what=" (a kill the agent did not finish)"
+                if [[ "$(cat "$k/cgroup.freeze" 2>/dev/null || true)" == 1 ]]; then
+                    what=" (a kill the agent did not finish, still FROZEN)"
+                fi
+            fi
+            for p in $(tr -s '\n' ' ' 2>/dev/null < "$k/cgroup.procs" || true); do
+                [[ $p =~ ^[0-9]+$ ]] || continue
+                pids+="$p "
+                said+=("pid $p in $scope.scope$what: $(proc_command "$p")")
+            done
+        done
         log "$d holds processes the agent contained (pids: ${pids:-?}): left in it, not killed nor released"
+        (( ${#said[@]} )) || said=("$scope.scope holds what the uninstall could not read")
+        for p in "${said[@]}"; do
+            log "  $p"
+        done
+        CONTAINED_LEFT+=("${said[@]}")
         held=1
     done
     if (( held )); then
@@ -634,6 +679,16 @@ stop_slice() {
         if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed the empty $d"; fi
     done
     return 0
+}
+# A process's command line as /proc shows it: printable characters only (a
+# process writes its own), cut to 120; its comm when it has none (a kernel
+# thread); "exited" when it is gone.
+proc_command() {   # <pid>
+    local proc=${PROC_ROOT:-/proc} c
+    c=$(tr '\0' ' ' 2>/dev/null < "$proc/$1/cmdline" | tr -cd '[:print:]' | cut -c1-120 || true)
+    c=${c%"${c##*[! ]}"}
+    [[ -n "$c" ]] || c=$(tr -cd '[:print:]' 2>/dev/null < "$proc/$1/comm" || true)
+    echo "${c:-exited}"
 }
 # <<< stop_slice
 # >>> system_control_dirs (run by xtask/tests/install_scripts.rs)
@@ -714,3 +769,25 @@ fi
 
 echo ""
 log "uninstall complete."
+# >>> contained_report (run by xtask/tests/install_scripts.rs)
+# The review of #560 (E): processes the agent contained are still in its
+# slice (stop_slice). The uninstall is complete for everything else, but it
+# does not end as a success: they are named once more, and the run exits 4
+# — 0 is no longer "nothing of NorthNarrow's runs". A package's hook
+# (--package) reports them and exits 0: a failure there would fail the
+# package operation.
+contained_report() {
+    (( ${#CONTAINED_LEFT[@]} )) || return 0
+    echo ""
+    echo "WARNING: processes the agent contained are still in northnarrow.slice, outside any unit:"
+    printf '  %s\n' "${CONTAINED_LEFT[@]}"
+    echo "  Nothing confines or watches them any more: a blocked one has its network back (the"
+    echo "  agent's nftables table is gone), a throttled one keeps the scope's limits until it exits,"
+    echo "  and stopping or restarting its original unit no longer reaches it. Decide on each (kill"
+    echo "  it, or move it back: echo <pid> > /sys/fs/cgroup<its origin>/cgroup.procs); the slice"
+    echo "  goes at the next boot. See INSTALL_UPGRADE_UNINSTALL.md, section 3."
+    (( PACKAGE )) && return 0
+    exit 4
+}
+# <<< contained_report
+contained_report

@@ -4690,7 +4690,7 @@ fn stop_slice_with(
         ),
     );
     let script = format!(
-        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nSYSTEM_CONTROL_DIRS=(\"$1/empty\" \"$1/full\" \"$1/absent\")\nSLICE_CGROUP=\"$1/slice\"\nCONTAINMENT_RECORD='[{{\"pid\":4242,\"scope\":\"throttled\",\"origin\":\"/system.slice/app.service\"}}]'\n{}\nstop_slice\necho done\n",
+        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nSYSTEM_CONTROL_DIRS=(\"$1/empty\" \"$1/full\" \"$1/absent\")\nSLICE_CGROUP=\"$1/slice\"\nPROC_ROOT=\"$1/proc\"\nCONTAINMENT_RECORD='[{{\"pid\":4242,\"scope\":\"throttled\",\"origin\":\"/system.slice/app.service\"}}]'\n{}\nstop_slice\necho done\n",
         block("deploy/uninstall.sh", "stop_slice")
     );
     let path = format!(
@@ -4814,17 +4814,31 @@ fn uninstall_removes_the_empty_containment_scopes_and_says_the_held_ones() {
         !dir.join("empty").exists(),
         "the empty system.control still goes"
     );
-    // it moves no process (no write into a cgroup) and signals none
+    // it moves no process and signals none: its one write into a cgroup is
+    // the thaw of a kill cgroup (the review of #560, D)
     let block = block("deploy/uninstall.sh", "stop_slice");
     let code: Vec<&str> = block
         .lines()
         .map(str::trim_start)
         .filter(|l| !l.starts_with('#'))
         .collect();
+    let writes: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.contains("> \"$") || l.contains(">> ") || l.contains("tee "))
+        .collect();
+    assert_eq!(
+        writes,
+        [&"if echo 0 > \"$k/cgroup.freeze\" 2>/dev/null; then"],
+        "{block}"
+    );
     assert!(
-        !code
-            .iter()
-            .any(|l| l.contains("> \"$") || l.contains(">> ")),
+        !block.contains("cgroup.kill") && !block.contains("cgroup.threads"),
+        "{block}"
+    );
+    assert!(
+        !code.iter().any(|l| l.contains("cgroup.procs")
+            && l.contains('>')
+            && !l.contains("< \"$k/cgroup.procs\"")),
         "{block}"
     );
     assert!(
@@ -4840,6 +4854,148 @@ fn uninstall_removes_the_empty_containment_scopes_and_says_the_held_ones() {
         .find("CONTAINMENT_RECORD=$(")
         .expect("the record is read");
     assert!(rec < text.find("rm -rf \"$RUN_DIR\"").unwrap());
+}
+
+/// The review of #560 (named, D): an agent stopped in the middle of a kill
+/// leaves its kill cgroup (`blocked.scope/neutralize-*`), the tree in it
+/// frozen; only the agent's next start finished such a kill. The uninstall
+/// said "holds processes the agent contained (pids: ?)" (the scope's own
+/// `cgroup.procs` is empty) and left them frozen until the next boot. The
+/// empty kill cgroup is removed, the held one thawed, and its processes named
+/// by pid and command — printable characters only (a process writes its own
+/// command line) — with the scope's own.
+#[test]
+fn uninstall_thaws_and_names_an_unfinished_kill_s_processes() {
+    let (calls, out, dir) = stop_slice_with("stop-slice-kill-cgroups", "active", 0, |d| {
+        let k = d.join("slice/blocked.scope/neutralize-7");
+        fs::create_dir_all(&k).unwrap();
+        fs::write(k.join("cgroup.procs"), "5151\n5152\n").unwrap();
+        fs::write(k.join("cgroup.freeze"), "1\n").unwrap();
+        fs::create_dir_all(d.join("slice/blocked.scope/neutralize-8")).unwrap();
+        fs::create_dir_all(d.join("slice/throttled.scope")).unwrap();
+        fs::write(d.join("slice/throttled.scope/cgroup.procs"), "4242\n").unwrap();
+        for (pid, cmdline, comm) in [
+            ("5151", &b"/tmp/x\0--evil\0\x1b]0;owned\x07\0"[..], "x"),
+            ("5152", b"", "kworker"),
+            ("4242", b"/usr/bin/app\0-c\0", "app"),
+        ] {
+            fs::create_dir_all(d.join("proc").join(pid)).unwrap();
+            fs::write(d.join("proc").join(pid).join("cmdline"), cmdline).unwrap();
+            fs::write(d.join("proc").join(pid).join("comm"), format!("{comm}\n")).unwrap();
+        }
+    });
+    assert!(
+        !dir.join("slice/blocked.scope/neutralize-8").exists(),
+        "the empty kill cgroup goes: {out}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("slice/blocked.scope/neutralize-7/cgroup.freeze")).unwrap(),
+        "0\n",
+        "thawed: {out}"
+    );
+    assert!(out.contains("thawed (they run again, unwatched)"), "{out}");
+    assert!(out.contains("(pids: 5151 5152 )"), "the real pids: {out}");
+    assert!(!out.contains("pids: ?"), "{out}");
+    assert!(
+        out.contains(
+            "pid 5151 in blocked.scope (a kill the agent did not finish): /tmp/x --evil ]0;owned\n"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+    assert!(
+        out.contains("pid 5152 in blocked.scope (a kill the agent did not finish): kworker\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("pid 4242 in throttled.scope: /usr/bin/app -c\n"),
+        "{out}"
+    );
+    assert!(!calls.contains("stop northnarrow.slice"), "{calls}");
+    // a pid that has exited since is said so; a thaw refused (its
+    // cgroup.freeze not writable: as a user, not as root) is said, and the
+    // processes said still frozen
+    let (_, out, dir) = stop_slice_with("stop-slice-kill-gone", "active", 0, |d| {
+        let k = d.join("slice/blocked.scope/neutralize-9");
+        fs::create_dir_all(&k).unwrap();
+        fs::write(k.join("cgroup.procs"), "6161\n").unwrap();
+        fs::write(k.join("cgroup.freeze"), "1\n").unwrap();
+        let mut ro = fs::metadata(k.join("cgroup.freeze")).unwrap().permissions();
+        ro.set_readonly(true);
+        fs::set_permissions(k.join("cgroup.freeze"), ro).unwrap();
+    });
+    assert!(out.contains("pid 6161 in blocked.scope"), "{out}");
+    assert!(out.contains(": exited"), "{out}");
+    let freeze = dir.join("slice/blocked.scope/neutralize-9/cgroup.freeze");
+    if fs::read_to_string(&freeze).unwrap() == "1\n" {
+        assert!(out.contains("the thaw was refused: still frozen"), "{out}");
+        assert!(
+            out.contains("did not finish, still FROZEN): exited"),
+            "{out}"
+        );
+    }
+    let mut rw = fs::metadata(&freeze).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    rw.set_readonly(false);
+    fs::set_permissions(&freeze, rw).unwrap();
+}
+
+/// `contained_report` of uninstall.sh with `CONTAINED_LEFT` = `left` and
+/// `PACKAGE` = `package`: its exit status and output.
+fn contained_report(left: &[&str], package: bool) -> (Option<i32>, String) {
+    let items: Vec<String> = left.iter().map(|l| format!("'{l}'")).collect();
+    let script = format!(
+        "set -euo pipefail\nPACKAGE={}\nCONTAINED_LEFT=({})\n{}\ncontained_report\necho done\n",
+        u8::from(package),
+        items.join(" "),
+        block("deploy/uninstall.sh", "contained_report")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+    )
+}
+
+/// The review of #560 (named, E): a containment scope that still held a
+/// process ended the uninstall as any other, exit 0, the one line of the
+/// log its only trace — and the process, outside any unit and no longer
+/// confined, under a slice named northnarrow. The run names them once more
+/// at the end and exits 4 (the guide's §3 documents it); a package's hook
+/// says them and exits 0. Nothing held: nothing said, 0.
+#[test]
+fn a_held_containment_scope_ends_the_uninstall_with_exit_4() {
+    let left = ["pid 4242 in throttled.scope: /usr/bin/app -c"];
+    let (code, out) = contained_report(&left, false);
+    assert_eq!(code, Some(4), "{out}");
+    assert!(
+        out.contains("WARNING: processes the agent contained"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  pid 4242 in throttled.scope: /usr/bin/app -c"),
+        "{out}"
+    );
+    assert!(out.contains("outside any unit"), "{out}");
+    assert!(!out.contains("done"), "{out}");
+    let (code, out) = contained_report(&left, true);
+    assert_eq!(code, Some(0), "--package: {out}");
+    assert!(out.contains("pid 4242") && out.ends_with("done\n"), "{out}");
+    let (code, out) = contained_report(&[], false);
+    assert_eq!((code, out.as_str()), (Some(0), "done\n"));
+    // the last thing the script does, after the summary; stop_slice fills it
+    let text = read("deploy/uninstall.sh");
+    assert!(text.trim_end().ends_with("\ncontained_report"), "the end");
+    let stop = text.find("\nstop_slice\n").unwrap();
+    assert!(text[..stop].contains("CONTAINED_LEFT=()"));
+    assert!(text.find("log \"uninstall complete.\"").unwrap() > stop);
+    // the guide documents the status
+    let guide = read("docs/operator/INSTALL_UPGRADE_UNINSTALL.md");
+    assert!(guide.contains("exits **4**"), "the guide's word for exit 4");
 }
 
 /// `system_control_dirs` of uninstall.sh with the record `record` (`None`:

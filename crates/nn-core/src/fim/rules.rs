@@ -6124,7 +6124,7 @@ mod tests {
     fn admin_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
         let (tmp, t) = pkg_fixture();
         t.ingest_spawn(700, 1, "/usr/bin/bash", 7);
-        t.ingest_spawn(710, 700, "/usr/bin/sudo", 8);
+        t.ingest_exec(710, 700, "/usr/bin/sudo", &[], 8, 8, 1000);
         // lot 351: what sudo ran as root after authenticating (the kernel's
         // fork record of each, `AuthSessionTracker::is_interactive_admin`)
         t.ingest_first_exec(720, 710, "/usr/bin/vim.basic", 9, 0);
@@ -6185,6 +6185,33 @@ mod tests {
                 v.reasoning
             );
         }
+    }
+
+    /// The review of #560 (A): a sudo whose caller was already root (a
+    /// local privilege escalation at the user's terminal, then `sudo tee
+    /// /etc/passwd`) holds no kill — root's sudo asks for no credential.
+    /// The administrator's sudo (710) still does.
+    #[test]
+    fn root_s_own_sudo_holds_no_fim_kill() {
+        let (tmp, lineage) = admin_fixture();
+        lineage.ingest_first_exec(760, 700, "/home/alice/lpe", 13, 1000);
+        lineage.ingest_exec(760, 700, "/usr/bin/sudo", &[], 14, 13, 0);
+        lineage.ingest_first_exec(770, 760, "/usr/bin/tee", 15, 0);
+        session_proc(tmp.path(), 770, 760, 34816);
+        let rules = rules_by_id(&lineage);
+        let rule = &rules["NN-L-FIM-003_SensitiveConfigModified"];
+        let v = built(
+            rule.as_ref(),
+            &written_by(FimOp::Modified, "/etc/passwd", 770, "tee"),
+        )
+        .expect("fires");
+        assert_ne!(v.action, ResponseAction::Log, "root's own sudo");
+        let v = built(
+            rule.as_ref(),
+            &written_by(FimOp::Modified, "/etc/passwd", 720, "vim"),
+        )
+        .unwrap();
+        assert_eq!(v.action, ResponseAction::Log, "the administrator's sudo");
     }
 
     /// The package carve-out still applies inside an admin session (`sudo
