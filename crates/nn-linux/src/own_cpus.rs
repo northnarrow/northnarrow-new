@@ -450,7 +450,7 @@ pub fn isolated_by_cmdline(cmdline: &str) -> Vec<u32> {
     let Some(v) = cmdline
         .split_whitespace()
         .filter_map(|t| t.strip_prefix("isolcpus="))
-        .last()
+        .next_back()
     else {
         return Vec::new();
     };
