@@ -4971,9 +4971,15 @@ fn rm_tree(
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
     setup(&dir);
+    // as mountpoint(1), which follows a symbolic link: `link` (to the
+    // mount point) answers yes too
     write_exec(
         &bin.join("mountpoint"),
-        &format!("[ \"$3\" = '{}' ]", dir.join(mounted).display()),
+        &format!(
+            "[ \"$3\" = '{}' ] || [ \"$3\" = '{}' ]",
+            dir.join(mounted).display(),
+            dir.join("link").display()
+        ),
     );
     let script = format!(
         "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\n{}\nrm_tree {}\necho done\n",
@@ -5010,10 +5016,13 @@ fn rm_tree(
 /// it (the ratchet).
 #[test]
 fn the_uninstall_removes_no_mount_point_in_systemd_s_trees() {
-    let (out, dir) = rm_tree("rm-tree", "mnt", &["tree", "mnt", "absent"], |d| {
+    let (out, dir) = rm_tree("rm-tree", "mnt", &["tree", "mnt", "absent", "link"], |d| {
         fs::create_dir_all(d.join("tree/a/b")).unwrap();
         fs::create_dir_all(d.join("mnt/keep")).unwrap();
+        std::os::unix::fs::symlink(d.join("mnt"), d.join("link")).unwrap();
     });
+    // a symbolic link to a mount point is removed (the link, not its target)
+    assert!(fs::symlink_metadata(dir.join("link")).is_err(), "{out}");
     assert!(!dir.join("tree").exists(), "{out}");
     assert!(
         dir.join("mnt/keep").is_dir(),

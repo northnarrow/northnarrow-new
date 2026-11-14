@@ -7894,6 +7894,26 @@ mod tests {
     /// ([`is_auth_monitor_identity`]): an elevation binary listed in one
     /// list only lost its sessions again — and so are the PAM helpers the
     /// check refuses ([`PAM_HELPER_EXES`]).
+    /// Lot 351 (the review of #559, F2; ratchet): a sudo or su vouches only
+    /// through [`AuthSessionTracker::elevation_walk`] — no other check walks
+    /// to an elevation binary (any descendant of sudo, the askpass helper
+    /// included, was an administrator's session).
+    #[test]
+    fn only_the_elevation_walk_trusts_a_sudo_or_su() {
+        let src = include_str!("lineage.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let walk = code.find("    fn elevation_walk(").unwrap();
+        let walk_end = walk + code[walk..].find("\n    }\n").unwrap();
+        // a call or the function passed to a walk alike
+        for (at, _) in code.match_indices("is_elevation_binary") {
+            let line = code[..at].rsplit('\n').next().unwrap();
+            assert!(
+                (walk..walk_end).contains(&at) || line.starts_with("fn "),
+                "is_elevation_binary outside elevation_walk: {line}"
+            );
+        }
+    }
+
     #[test]
     fn every_elevation_binary_and_pam_helper_is_an_authentication_binary() {
         for exe in ELEVATION_EXES.iter().chain(PAM_HELPER_EXES) {

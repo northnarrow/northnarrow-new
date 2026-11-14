@@ -7,7 +7,7 @@ use nn_model::posture_types::{PostureKind, TriggerType};
 use nn_model::Event;
 
 use super::triggers::testutil::{
-    file_open, fs_protect_denial, spawn, spawn_by, spawn_exe_flags, tcp_v4,
+    file_open, fs_protect_denial, spawn, spawn_by, spawn_elevated, spawn_exe_flags, tcp_v4,
 };
 use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
 
@@ -1359,11 +1359,14 @@ fn admin_session_machine() -> (tempfile::TempDir, PostureMachine) {
     for (pid, ppid, comm, exe) in [
         (700, 1, "bash", "/usr/bin/bash"),
         (710, 700, "sudo", "/usr/bin/sudo"),
-        (720, 710, "tee", "/usr/bin/tee"),
-        (730, 710, "tee", "/usr/bin/tee"),
         (800, 700, "tee", "/usr/bin/tee"),
     ] {
         let _ = m.observe(&spawn(pid, ppid, comm, exe, 1), &[]);
+    }
+    // lot 351: what sudo ran as root after authenticating (the kernel's
+    // fork record of each)
+    for pid in [720, 730] {
+        let _ = m.observe(&spawn_elevated(pid, 710, "tee", "/usr/bin/tee", 1), &[]);
     }
     (tmp, m)
 }
@@ -1432,7 +1435,7 @@ fn exited_admin_writer_is_placed_before_it_corroborates() {
     let (_tmp, m) = admin_session_machine();
     let _ = m.observe(&file_open(740, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
-    let _ = m.observe(&spawn(740, 710, "tee", "/usr/bin/tee", 99), &[]);
+    let _ = m.observe(&spawn_elevated(740, 710, "tee", "/usr/bin/tee", 99), &[]);
     let (ef, er) = exfil_burst(810);
     let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
