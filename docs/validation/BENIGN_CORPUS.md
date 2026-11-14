@@ -98,7 +98,10 @@ units, then `docker build` of a small Dockerfile (alpine, `COPY`, `RUN`), a
 `docker run` of the image and its removal, as root in units too.
 
 **containers** — rootless podman pull, run and rmi of alpine; docker pull,
-run and rmi; k3s from its vendor's install script as an operator runs it
+run, its own restart (lot 347: its start's `iptables`/`nft` chains and
+module loads, which lot 344's NN-L-EVA-002 report named and the labs of lots
+344 and 347 did not reproduce), a `docker exec`, a two-line build and rmi;
+k3s from its vendor's install script as an operator runs it
 (it writes and enables `k3s.service` and starts it), the node Ready, one pod
 run to completion, `kubectl get pods -A`, the pod deleted,
 `k3s-uninstall.sh`.

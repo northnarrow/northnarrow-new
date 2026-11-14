@@ -444,6 +444,20 @@ and once on a btrfs subvolume, and requires NN-L-FIM-011 both times.
 Limit: a btrfs filesystem first mounted after the agent started
 (module loaded later) keeps the old keys until the agent restarts.
 
+## memfd seals at the exec (lot 347, the review of #556)
+
+R004 exempts an OCI runtime's sealed memfd copy of itself (runc's
+`runc_cloned:/proc/self/exe`) only when the memfd was sealed against
+writing, shrinking and growing when the kernel executed it. The exec
+sensor's LSM program (`bprm_check_security`) reads the seals from the
+memfd's shmem inode, `SHMEM_I(inode)->seals`, through two optional offsets,
+`shmem_inode_info.seals` and `shmem_inode_info.vfs_inode` (slots 137 and
+138, after lot 345's `bpf_prog` pair; 6.8: bytes 4 and 152, 6.18: 4 and
+128), and sets `exe_flags::MEMFD_SEALED`. A hugetlbfs memfd carries no flag. Without the
+offsets (no `shmem_inode_info` in the BTF), or in tracepoint mode, no exec
+carries the flag: every memfd exec stays R004's Critical, runc's copies
+included. The verdict of `--btf-check` does not change.
+
 ## overlayfs, FUSE and NFS: inode identity unverified (lab PR 189)
 
 btrfs is the only filesystem whose `stat()` the eBPF side reproduces

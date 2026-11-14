@@ -1935,6 +1935,17 @@ impl Rule for NnLFim019WtmpBtmpTampered {
         ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        // lot 347: the packaged unit whose work it is (its image and its
+        // unit's cgroup, read by the drain while it wrote) — the review of
+        // #556 (F5): an append of whole records only (one dirty mark per
+        // inode credits the last writer with every write since the drain's
+        // last read)
+        if as_fim(event).is_some_and(|fe| {
+            super::unit_writers::unit_of(fe).is_some()
+                && super::unit_writers::appended_whole_records(fe)
+        }) {
+            return None;
+        }
         evaluate_login_record_tamper(
             self,
             event,
@@ -6461,6 +6472,103 @@ mod tests {
                 .evaluate(&write("/var/log/wtmp", 500, "logrotate"))
                 .expect("fires");
             assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        }
+
+        /// Named test (lot 347, the alpha's false positives: Ubuntu 24.04's
+        /// shutdown): `systemd-update-utmp`'s write of the shutdown record
+        /// was judged before its exec was in the lineage — NN-L-FIM-019
+        /// High, a kill of the packaged binary. The drain's facts (the
+        /// packaged image in its unit's own cgroup, kept for that write)
+        /// exempt it; a write the drain kept nothing for keeps the High kill
+        /// (`dd` from a session, the binary run outside its unit, a copy),
+        /// and the fact is the write's, not the pid's.
+        #[test]
+        fn the_packaged_utmp_unit_writing_wtmp_needs_no_exec_record() {
+            let (_tmp, t) = tracker();
+            let [_, fim019] = log_rules(None, &t);
+            let kill = |e: &Event| {
+                let v = fim019.evaluate(e).expect("fires");
+                assert_eq!(
+                    (v.action.clone(), v.severity),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{}",
+                    v.reasoning
+                );
+            };
+            // (the review of #556, F5: the unit's write is an append of a
+            // record, as `systemd-update-utmp` makes; `write` truncates)
+            let shutdown = appended(write("/var/log/wtmp", 34_704, "systemd-update-"), 1);
+            kill(&shutdown);
+            let Event::Fim(fe) = &shutdown else {
+                unreachable!()
+            };
+            crate::fim::unit_writers::keep(fe, "systemd-update-utmp.service");
+            assert!(fim019.evaluate(&shutdown).is_none(), "its unit's write");
+            // btmp by the unit too (the drain reads both records' writers)
+            let btmp = appended(write("/var/log/btmp", 34_705, "systemd-update-"), 1);
+            if let Event::Fim(fe) = &btmp {
+                crate::fim::unit_writers::keep(fe, "systemd-update-utmp-runlevel.service");
+            }
+            assert!(fim019.evaluate(&btmp).is_none());
+            // CONTROLS: no fact kept (a dd, the binary outside its unit, a
+            // copy); the same pid's next write
+            kill(&write("/var/log/wtmp", 34_706, "dd"));
+            kill(&write("/var/log/wtmp", 34_707, "systemd-update-"));
+            let mut later = shutdown.clone();
+            if let Event::Fim(fe) = &mut later {
+                fe.timestamp_ns += 1;
+            }
+            kill(&later);
+        }
+
+        /// `e` (a write) as an append of `records` login records to a file
+        /// of 4096 bytes.
+        fn appended(mut e: Event, records: u64) -> Event {
+            if let Event::Fim(fe) = &mut e {
+                fe.baseline_size = Some(4096);
+                fe.new_size = Some(4096 + records * crate::fim::unit_writers::UTMP_RECORD_LEN);
+            }
+            e
+        }
+
+        /// The review of #556 (F5, named): one dirty mark per inode credits
+        /// the LAST writer with every write since the drain's last read — a
+        /// root shell's truncation or rewrite of wtmp followed by
+        /// `systemctl restart systemd-update-utmp` was the unit's write, no
+        /// verdict. The unit's fact exempts only an append of whole records
+        /// (a boot, shutdown or runlevel record); a shrink, a rewrite of the
+        /// same size, a part of a record, unknown sizes: the High kill (fails
+        /// on the lot's first head: every shape was exempt).
+        #[test]
+        fn the_utmp_unit_s_write_is_exempt_only_as_an_append_of_whole_records() {
+            let (_tmp, t) = tracker();
+            let [_, fim019] = log_rules(None, &t);
+            let by_unit = |pid: u32, before: Option<u64>, after: Option<u64>| {
+                let mut e = write("/var/log/wtmp", pid, "systemd-update-");
+                if let Event::Fim(fe) = &mut e {
+                    (fe.baseline_size, fe.new_size) = (before, after);
+                    crate::fim::unit_writers::keep(fe, "systemd-update-utmp.service");
+                }
+                fim019.evaluate(&e)
+            };
+            let rec = crate::fim::unit_writers::UTMP_RECORD_LEN;
+            assert!(by_unit(35_600, Some(4 * rec), Some(5 * rec)).is_none());
+            assert!(by_unit(35_601, Some(0), Some(2 * rec)).is_none(), "boot");
+            for (pid, before, after) in [
+                (35_610, Some(4 * rec), Some(0)),           // truncated
+                (35_611, Some(4 * rec), Some(3 * rec)),     // a record cut
+                (35_612, Some(4 * rec), Some(4 * rec)),     // rewritten in place
+                (35_613, Some(4 * rec), Some(4 * rec + 7)), // part of a record
+                (35_614, None, Some(5 * rec)),
+                (35_615, Some(4 * rec), None),
+            ] {
+                let v = by_unit(pid, before, after).expect("fires");
+                assert_eq!(
+                    (v.action.clone(), v.severity),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{before:?} -> {after:?}"
+                );
+            }
         }
 
         /// `exec` as uid `uid`, its argv cut by the sensor or not.

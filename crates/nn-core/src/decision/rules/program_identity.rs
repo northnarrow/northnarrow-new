@@ -81,7 +81,34 @@ pub enum ProgramKind {
     /// is its operand (a renamed copy of `ld-linux-x86-64.so.2` runs bash as
     /// the loader does).
     Loader,
+    /// Lot 347: an OCI runtime (`runc`, `crun`), which re-executes itself
+    /// from a sealed memfd copy of its own image (the CVE-2019-5736 defence:
+    /// [`runtime_clone_of`]). Recorded by the installed file's name only
+    /// ([`ProgramKind::of_installed_name`]), never given by a name to an exec.
+    ContainerRuntime,
+    /// Lot 347: what runs an OCI runtime — containerd's shim, containerd,
+    /// dockerd, conmon, podman — by the installed file's name only, as
+    /// [`Self::ContainerRuntime`].
+    RuntimeManager,
 }
+
+/// Lot 347: the OCI runtimes, by the name of an installed file in the
+/// system's binary directories (the name only chooses which files are
+/// recorded: an exec is then told by its identity or its content).
+pub const CONTAINER_RUNTIMES: &[&str] = &["runc", "crun"];
+
+/// Lot 347: what starts an OCI runtime, by the installed file's name as
+/// [`CONTAINER_RUNTIMES`]: containerd's shims (Docker, containerd, nerdctl),
+/// dockerd (its builder's runc), conmon and podman (Podman).
+pub const RUNTIME_MANAGERS: &[&str] = &[
+    "containerd-shim-runc-v2",
+    "containerd-shim-runc-v1",
+    "containerd-shim",
+    "containerd",
+    "dockerd",
+    "conmon",
+    "podman",
+];
 
 impl ProgramKind {
     /// The kind a program's name gives — an executed file's basename, a word
@@ -103,6 +130,29 @@ impl ProgramKind {
             .iter()
             .any(|s| program_is(base, s))
             .then_some(Self::Interpreter)
+    }
+
+    /// Lot 347: the kind an INSTALLED file's name gives (the agent's records
+    /// of the system's binary directories only): [`Self::of_name`]'s, or an
+    /// OCI runtime or its manager by the exact name. An exec is never given
+    /// these kinds by its name ([`Self::of_name`] knows none of them).
+    pub fn of_installed_name(name: &str) -> Option<Self> {
+        Self::of_name(name).or_else(|| {
+            let base = base_of(name);
+            if CONTAINER_RUNTIMES.contains(&base) {
+                Some(Self::ContainerRuntime)
+            } else if RUNTIME_MANAGERS.contains(&base) {
+                Some(Self::RuntimeManager)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Lot 347: a container runtime's kind — the programs R020 does not
+    /// compare a running image with (no shell runs in them).
+    pub fn is_container_runtime(self) -> bool {
+        matches!(self, Self::ContainerRuntime | Self::RuntimeManager)
     }
 }
 
@@ -385,6 +435,10 @@ struct Known {
     /// compare (its budget spent), its identity unverified.
     copies: HashMap<ExecKey, Option<ProgramKind>>,
     order: VecDeque<ExecKey>,
+    /// Lot 347: the memfd execs the pump found to be, byte for byte and
+    /// sealed, an installed OCI runtime's image — that image's identity.
+    clones: HashMap<ExecKey, RuntimeClone>,
+    clone_order: VecDeque<ExecKey>,
 }
 
 /// The installed programs the agent recorded, and the copies the exec pump
@@ -418,6 +472,19 @@ impl Known {
         true
     }
 
+    /// Lot 347: the installed runtime image `id` kept as the content of the
+    /// memfd exec `key`, at most `cap` execs (the oldest out).
+    fn keep_clone(&mut self, key: ExecKey, clone: RuntimeClone, cap: usize) {
+        if self.clones.insert(key, clone).is_none() {
+            self.clone_order.push_back(key);
+        }
+        while self.clone_order.len() > cap {
+            if let Some(old) = self.clone_order.pop_front() {
+                self.clones.remove(&old);
+            }
+        }
+    }
+
     /// `kind` kept for the exec `key`, at most `cap` execs (the oldest out).
     fn keep(&mut self, key: ExecKey, kind: Option<ProgramKind>, cap: usize) {
         if self.copies.insert(key, kind).is_none() {
@@ -449,6 +516,20 @@ pub fn installed_of_len(len: u64) -> Vec<InstalledImage> {
         .collect()
 }
 
+/// Lot 347: the installed OCI runtimes ([`ProgramKind::ContainerRuntime`])
+/// `len` bytes long, the latest recorded first (what the pump compares a
+/// memfd copy with).
+pub fn runtimes_of_len(len: u64) -> Vec<InstalledImage> {
+    KNOWN
+        .read()
+        .installed
+        .iter()
+        .rev()
+        .filter(|i| i.len == len && i.kind == ProgramKind::ContainerRuntime)
+        .cloned()
+        .collect()
+}
+
 /// The installed program whose identity is `id` and whose length is `len`
 /// (the exec pump's `fstat`: an inode number a removed program had, now a
 /// user's file of another length, is not that program).
@@ -462,6 +543,15 @@ pub fn installed_kind_sized(id: (u64, u64), len: u64) -> Option<ProgramKind> {
         .iter()
         .find(|i| i.id == id && i.len == len)
         .map(|i| i.kind)
+}
+
+/// Lot 347: the installed program whose identity is `id` (its path and
+/// kind as recorded).
+pub fn installed_image(id: (u64, u64)) -> Option<InstalledImage> {
+    if id == (0, 0) {
+        return None;
+    }
+    KNOWN.read().installed.iter().find(|i| i.id == id).cloned()
 }
 
 /// The installed program whose identity is `id`.
@@ -508,6 +598,61 @@ pub fn keep_unverified(event: &Event) {
 /// stdio on a socket ("identity unverified"), never lets it pass silently.
 pub fn unverified(event: &Event) -> bool {
     exec_key(event).is_some_and(|key| matches!(KNOWN.read().copies.get(&key), Some(None)))
+}
+
+/// Lot 347: what the exec pump found of a memfd exec that is an installed
+/// OCI runtime's copy of itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeClone {
+    /// The installed runtime whose image the memfd — sealed against
+    /// writing, shrinking and growing when the pump read it — is, byte for
+    /// byte.
+    pub image: (u64, u64),
+    /// The processes the pump saw above the exec at the exec, with the
+    /// image each ran (`/proc/<pid>/exe`'s device, in the kernel's form, and
+    /// inode): its parent, and that parent's parent when it started no
+    /// later. R004 asks it for a forker the lineage holds no exec of — a
+    /// fork that never executed (conmon's monitor, forked as it daemonized).
+    pub seen: Vec<(u32, (u64, u64))>,
+    /// The review of #556 (F2): the bytes were NOT compared — the compare
+    /// budget's share of the exec's uid was spent this second; `image` is
+    /// then the installed runtime of the copy's length, every other fact
+    /// held (sealed at the exec and at the read, the parent a runtime's or a
+    /// manager's file) — any program of that length. R004 records root's,
+    /// never killing it, and kills any other uid's (the re-check of #556,
+    /// N1: a user spends its own share with decoys).
+    pub unverified: bool,
+}
+
+impl RuntimeClone {
+    /// The image the pump saw `pid` run at the exec.
+    pub fn seen_image(&self, pid: u32) -> Option<(u64, u64)> {
+        self.seen
+            .iter()
+            .find(|(p, id)| *p == pid && pid != 0 && *id != (0, 0))
+            .map(|(_, id)| *id)
+    }
+}
+
+/// Lot 347: the exec pump's answer for `event`, a memfd exec: its running
+/// image is an installed OCI runtime's ([`RuntimeClone`]), or (F2) may be,
+/// its bytes not compared (`unverified`).
+pub fn keep_runtime_clone(event: &Event, clone: RuntimeClone) {
+    if clone.image == (0, 0) {
+        return;
+    }
+    if let Some(key) = exec_key(event) {
+        KNOWN.write().keep_clone(key, clone, COPIES_CAP);
+    }
+}
+
+/// Lot 347: what the exec pump found of `event`'s memfd
+/// ([`keep_runtime_clone`]); `None` when it found no installed runtime's
+/// copy, could not compare (the process gone, the budget spent) or the exec
+/// is no memfd's.
+pub fn runtime_clone_of(event: &Event) -> Option<RuntimeClone> {
+    let key = exec_key(event)?;
+    KNOWN.read().clones.get(&key).cloned()
 }
 
 /// What the pump found `event`'s image to be a copy of.
@@ -588,7 +733,7 @@ pub fn shell_or_interpreter(event: &Event) -> Option<bool> {
     match image_kind(event)? {
         ProgramKind::Shell => Some(true),
         ProgramKind::Interpreter => Some(false),
-        ProgramKind::Loader => None,
+        ProgramKind::Loader | ProgramKind::ContainerRuntime | ProgramKind::RuntimeManager => None,
         ProgramKind::Busybox => {
             let (program, _) = crate::posture::script_args::busybox_program(program_argv(event))?;
             crate::posture::script_args::BUSYBOX_SHELLS

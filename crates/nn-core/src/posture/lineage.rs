@@ -850,7 +850,7 @@ fn workload_of_cgroup(path: &str) -> Workload {
 /// process (the caller then reads its parent). On v1 a rootless
 /// container gets no cgroup of its own (the controllers are not delegated
 /// to users): it stays in its user's session.
-fn placing_cgroup(text: &str) -> Option<&str> {
+pub fn placing_cgroup(text: &str) -> Option<&str> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.splitn(3, ':');

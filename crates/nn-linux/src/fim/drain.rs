@@ -2131,7 +2131,7 @@ pub fn process_drift(
         } else {
             None
         };
-        out.push(Event::Fim(FimEvent {
+        let fe = FimEvent {
             timestamp_ns: raw.timestamp_ns,
             path: path.clone(),
             op,
@@ -2157,9 +2157,79 @@ pub fn process_drift(
             file_key: ident.key,
             is_dir: ident.is_dir,
             moved_in: ident.moved_in,
-        }));
+        };
+        // lot 347: a login record's packaged writer, read while it runs
+        read_login_unit_writer(&fe, Path::new("/proc"), Path::new("/"));
+        out.push(Event::Fim(fe));
     }
     Ok(true)
+}
+
+/// The review of #556 (F6): the process at `dir` (`/proc/<pid>`) started no
+/// later than `at_ns` (a record's time, the kernel's monotonic clock) —
+/// `stat`'s start (field 22: boot-clock ticks, the tick's floor) against it
+/// plus the time the host spent suspended. A process that started after the
+/// write cannot have made it: the writer exited and its pid was handed out
+/// again (`ns_last_pid` steers the next fork) before the drain read it.
+/// Same-tick reuse (10 ms) is not told apart, and the record's time is its
+/// release's (the last close): a descriptor another process holds open
+/// past the writer's exit lets a pid reused before that close pass. #554
+/// carries the writer's start in the record itself (`modifier_start`),
+/// which closes both; this is the drain's check until it lands.
+fn started_by(dir: &Path, at_ns: u64) -> bool {
+    use nn_core::posture::host::PostureHost;
+    let Ok(stat) = crate::state_read::read_state(dir.join("stat")) else {
+        return false;
+    };
+    crate::bpf_crossview::user_space_start_ns(&stat, crate::known_system_prog::clk_tck())
+        .is_some_and(|start| {
+            start <= at_ns.saturating_add(crate::chain_host_linux::LinuxHost::suspended_ns())
+        })
+}
+
+/// Lot 347 (`nn_core::fim::unit_writers`): at a write of a login record
+/// (wtmp, btmp), whether its writer is the host's packaged
+/// `systemd-update-utmp` — the device and inode of `/proc/<pid>/exe`, the
+/// kernel's link to the image it runs (no path walked in its mount
+/// namespace), against the packaged file under the host's root — placed in
+/// that unit's own cgroup (`/proc/<pid>/cgroup`'s placing cgroup); read
+/// now, while the writer runs (at the host's shutdown its exec may not be
+/// in the lineage when the write is judged), and kept for NN-L-FIM-019 when
+/// both hold.
+fn read_login_unit_writer(fe: &FimEvent, proc_root: &Path, host_root: &Path) {
+    use nn_core::fim::unit_writers as uw;
+    use std::os::unix::fs::MetadataExt;
+    if fe.op != FimOp::Modified
+        || fe.modifier_pid == 0
+        || !uw::LOGIN_RECORDS.contains(&fe.path.as_str())
+    {
+        return;
+    }
+    let dir = proc_root.join(fe.modifier_pid.to_string());
+    // the review of #556 (F6): the process at the pid now is the writer —
+    // it started no later than the write
+    if !started_by(&dir, fe.timestamp_ns) {
+        return;
+    }
+    let Ok(image) = std::fs::metadata(dir.join("exe")) else {
+        return;
+    };
+    let id = (image.dev(), image.ino());
+    let packaged = uw::UTMP_IMAGES.iter().any(|p| {
+        std::fs::metadata(host_root.join(p.trim_start_matches('/')))
+            .is_ok_and(|m| (m.dev(), m.ino()) == id)
+    });
+    if !packaged {
+        return;
+    }
+    let Ok(text) = crate::state_read::read_state(dir.join("cgroup")) else {
+        return;
+    };
+    let service = nn_core::posture::lineage::placing_cgroup(&text)
+        .and_then(nn_core::posture::daemon_data::system_service);
+    if let Some(unit) = uw::unit_writer(service, packaged) {
+        uw::keep(fe, unit);
+    }
 }
 
 /// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
@@ -5683,5 +5753,212 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(fim010_verdict(&out), Some(nn_model::ResponseAction::Log));
+    }
+
+    /// Lot 347 (named, the alpha's false positives: Ubuntu 24.04's
+    /// shutdown record): a write of wtmp by the host's packaged
+    /// `systemd-update-utmp` (its image's device and inode) placed in its
+    /// unit's own cgroup is kept as that unit's write — whatever the
+    /// lineage holds when it is judged. A copy of the binary, the binary in
+    /// a session's scope or another unit, another file, another operation,
+    /// a writer gone: nothing kept.
+    #[test]
+    fn a_login_record_written_by_the_packaged_utmp_unit_is_kept_as_its_write() {
+        use nn_core::fim::unit_writers::unit_of;
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let put = |path: &str, body: &[u8]| {
+            let f = root.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+            f
+        };
+        let utmp = put("/usr/lib/systemd/systemd-update-utmp", b"utmp image, 347");
+        let copy = put("/tmp/systemd-update-utmp", b"utmp image, 347");
+        let unit = "0::/system.slice/systemd-update-utmp.service\n";
+        // (started at boot: the review of #556, F6 reads the start)
+        let process = |pid: u32, image: &Path, cgroup: &str| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            symlink(image, d.join("exe")).unwrap();
+            std::fs::write(d.join("cgroup"), cgroup).unwrap();
+            std::fs::write(d.join("stat"), stat_started(pid, 0)).unwrap();
+        };
+        let write = |pid: u32, path: &str, op: FimOp| FimEvent {
+            timestamp_ns: 347,
+            path: path.into(),
+            op,
+            new_sha256: None,
+            baseline_sha256: None,
+            new_size: Some(4096),
+            baseline_size: Some(3712),
+            modifier_exe: None,
+            modifier_pid: pid,
+            modifier_uid: 0,
+            modifier_comm: "systemd-update-".into(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
+            capability: None,
+            attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
+        };
+        let read = |fe: &FimEvent| {
+            read_login_unit_writer(fe, &proc, &root);
+            unit_of(fe)
+        };
+        process(34_700, &utmp, unit);
+        assert_eq!(
+            read(&write(34_700, "/var/log/wtmp", FimOp::Modified)),
+            Some("systemd-update-utmp.service")
+        );
+        process(
+            34_701,
+            &utmp,
+            "0::/system.slice/systemd-update-utmp-runlevel.service\n",
+        );
+        assert_eq!(
+            read(&write(34_701, "/var/log/btmp", FimOp::Modified)),
+            Some("systemd-update-utmp-runlevel.service")
+        );
+        // CONTROLS
+        process(34_702, &copy, unit);
+        assert_eq!(
+            read(&write(34_702, "/var/log/wtmp", FimOp::Modified)),
+            None,
+            "a copy"
+        );
+        process(
+            34_703,
+            &utmp,
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+        );
+        assert_eq!(
+            read(&write(34_703, "/var/log/wtmp", FimOp::Modified)),
+            None,
+            "a session's"
+        );
+        process(34_704, &utmp, "0::/system.slice/cron.service\n");
+        assert_eq!(
+            read(&write(34_704, "/var/log/wtmp", FimOp::Modified)),
+            None,
+            "another unit"
+        );
+        assert_eq!(
+            read(&write(34_700, "/var/log/syslog", FimOp::Modified)),
+            None,
+            "another file"
+        );
+        let mut renamed = write(34_700, "/var/log/wtmp", FimOp::Renamed);
+        renamed.timestamp_ns = 348;
+        assert_eq!(read(&renamed), None, "another operation");
+        assert_eq!(
+            read(&write(34_799, "/var/log/wtmp", FimOp::Modified)),
+            None,
+            "gone"
+        );
+    }
+
+    /// `/proc/<pid>/stat` of a process started `ticks` clock ticks after
+    /// boot.
+    fn stat_started(pid: u32, ticks: u64) -> String {
+        format!("{pid} (systemd-update-) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n")
+    }
+
+    /// The review of #556 (F6, named): the writer of a login record exited
+    /// and the utmp unit's next fork took its pid before the drain read
+    /// `/proc/<pid>` — the drain kept the unit's fact for the earlier
+    /// writer's write. The process at the pid must have started no later
+    /// than the write (`stat`'s start against the record's time): one
+    /// started after it, or one whose start cannot be read, keeps nothing
+    /// (fails on the lot's first head: the pid alone was read).
+    #[test]
+    fn a_login_record_writer_s_pid_reused_since_keeps_no_unit() {
+        use nn_core::fim::unit_writers::unit_of;
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let utmp = root.join("usr/lib/systemd/systemd-update-utmp");
+        std::fs::create_dir_all(utmp.parent().unwrap()).unwrap();
+        std::fs::write(&utmp, b"utmp image, 556").unwrap();
+        let tick = 1_000_000_000 / crate::known_system_prog::clk_tck();
+        let process = |pid: u32, stat: Option<String>| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            symlink(&utmp, d.join("exe")).unwrap();
+            std::fs::write(
+                d.join("cgroup"),
+                "0::/system.slice/systemd-update-utmp.service\n",
+            )
+            .unwrap();
+            if let Some(stat) = stat {
+                std::fs::write(d.join("stat"), stat).unwrap();
+            }
+        };
+        // the write at 100 s after boot
+        let at = 100 * 1_000_000_000;
+        let read = |pid: u32| {
+            let fe = FimEvent {
+                timestamp_ns: at,
+                path: "/var/log/wtmp".into(),
+                op: FimOp::Modified,
+                new_sha256: None,
+                baseline_sha256: None,
+                new_size: Some(4096),
+                baseline_size: Some(3712),
+                modifier_exe: None,
+                modifier_pid: pid,
+                modifier_uid: 0,
+                modifier_comm: "systemd-update-".into(),
+                dest_path: None,
+                child_truncated: false,
+                wide_coverage: false,
+                owner_uid: None,
+                reader_dac_capable: false,
+                capability: None,
+                attrs: None,
+                file_key: None,
+                is_dir: false,
+                moved_in: false,
+            };
+            read_login_unit_writer(&fe, &proc, &root);
+            unit_of(&fe)
+        };
+        process(
+            35_600,
+            Some(stat_started(35_600, 50 * 1_000_000_000 / tick)),
+        );
+        assert_eq!(read(35_600), Some("systemd-update-utmp.service"));
+        process(35_601, Some(stat_started(35_601, at / tick)));
+        assert_eq!(
+            read(35_601),
+            Some("systemd-update-utmp.service"),
+            "the same tick"
+        );
+        // CONTROLS: started after the write (its pid reused), no start
+        // (suspended time aside: an hour later)
+        process(
+            35_602,
+            Some(stat_started(35_602, (at + 3_600_000_000_000) / tick)),
+        );
+        assert_eq!(read(35_602), None, "a pid reused since");
+        process(35_603, None);
+        assert_eq!(read(35_603), None, "no start read");
+    }
+
+    /// The review of #556 (F5): the record size the unit's append is told
+    /// by is glibc's `struct utmp` on this architecture.
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn the_utmp_record_len_is_glibc_s() {
+        assert_eq!(
+            nn_core::fim::unit_writers::UTMP_RECORD_LEN,
+            std::mem::size_of::<libc::utmpx>() as u64
+        );
     }
 }

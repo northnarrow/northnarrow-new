@@ -41,7 +41,8 @@ use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_INODE_OFFSET,
     FILE_F_PATH_OFFSET, FS_STRUCT_ROOT_OFFSET, INODE_I_INO_OFFSET, INODE_I_NLINK_OFFSET,
     INODE_I_SB_OFFSET, LINUX_BINPRM_FILENAME_OFFSET, LINUX_BINPRM_FILE_OFFSET,
-    LINUX_BINPRM_INTERP_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    LINUX_BINPRM_INTERP_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET,
+    SHMEM_INODE_INFO_SEALS_OFFSET, SHMEM_INODE_INFO_VFS_INODE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FS_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
     TASK_STRUCT_TGID_OFFSET,
 };
@@ -53,6 +54,11 @@ const RAMFS_MAGIC: u64 = 0x8584_58f6;
 /// "memfd:" as the low six bytes of a little-endian u64.
 const MEMFD_PREFIX: u64 = 0x3a64_666d_656d;
 const MEMFD_MASK: u64 = 0xffff_ffff_ffff;
+/// Lot 347 (the review of #556, F1): `F_SEAL_SHRINK | F_SEAL_GROW |
+/// F_SEAL_WRITE` — the seals after which a memfd's bytes cannot change
+/// (`F_SEAL_FUTURE_WRITE` is not one: a writable mapping made before it
+/// still writes).
+const MEMFD_SEALS: u32 = 0x2 | 0x4 | 0x8;
 
 /// Pass 0's identity, keyed by the exec'ing `task_struct`, until
 /// `sched_process_exec` takes it. A failed exec leaves an entry that the
@@ -137,6 +143,9 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     let name = peek_u64(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) as *const u8;
     if peek_u64(name) & MEMFD_MASK == MEMFD_PREFIX {
         flags |= exe_flags::MEMFD;
+        if magic == TMPFS_MAGIC && memfd_sealed(inode) {
+            flags |= exe_flags::MEMFD_SEALED;
+        }
     }
     if let Some(o) = off_opt!(INODE_I_NLINK_OFFSET) {
         if peek_u32(inode.add(o & 0xffff)) == 0 {
@@ -216,6 +225,30 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     let rc = crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);
     let _ = EXEC_SCRATCH.remove(&key);
     rc
+}
+
+/// Lot 347 (the review of #556, F1): the memfd whose inode is `inode` (a
+/// tmpfs one: a shmem inode, `SHMEM_I()`) is sealed NOW, at the exec,
+/// against writing, shrinking and growing ([`MEMFD_SEALS`]). The kernel
+/// never removes a seal, so its bytes cannot change from here on: the bytes
+/// the exec pump compares later are the ones that run. Read here, before
+/// the exec; the pump's own `F_GET_SEALS` came after it, and any holder of
+/// a writable descriptor could rewrite and seal the copy in between. False
+/// when either optional offset is absent or the read fails (no exemption).
+#[inline(always)]
+unsafe fn memfd_sealed(inode: *const u8) -> bool {
+    // one optional offset at a time (5.15 rule 3)
+    let seals_off = match off_opt!(SHMEM_INODE_INFO_SEALS_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return false,
+    };
+    let vfs_off = match off_opt!(SHMEM_INODE_INFO_VFS_INODE_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return false,
+    };
+    // container_of(inode, struct shmem_inode_info, vfs_inode)
+    let info = (inode as usize).wrapping_sub(vfs_off) as *const u8;
+    peek_u32(info.add(seals_off)) & MEMFD_SEALS == MEMFD_SEALS
 }
 
 /// The dentry of `task`'s root (`task->fs->root.dentry`): where the walk

@@ -10959,6 +10959,109 @@ number in parentheses is a lab PR.
     F3) and `initdb -L` (F4).
   - Level unchanged: the false-positive work of the alpha; C17's
     provisional waits on the nightly.
+- **Lot 347 — container runtimes and the shutdown record, the alpha's false
+  positives round 3 (C06, C11, C14; no level changes).**
+  - What was open (lot 344's lab, an r/selfhosted tester's host in records
+    only): runc's re-exec from a sealed memfd copy of itself
+    (`runc_cloned:/proc/self/exe`, the CVE-2019-5736 defence) was R004
+    Critical at every docker run, exec and build and every Podman run on
+    Debian 13 (runc 1.1.15); containerd 1.7's `modprobe aufs`, with the
+    `LD_LIBRARY_PATH` its `opt` plugin sets, R011's kill at every containerd
+    start there; `systemd-update-utmp`'s shutdown record of wtmp
+    NN-L-FIM-019 High (a kill) on Ubuntu 24.04 when the agent, still
+    stopping, judged it before the exec reached the lineage; lot 344's
+    NN-L-EVA-002 of `xtables-nft-multi` at docker's start, unreproduced.
+  - Done, by identity: the exec pump compares a sealed memfd whose parent
+    runs an installed runtime or manager WHOLE, byte for byte, with the
+    installed `runc`/`crun` (each at its path; recorded with the shells and
+    again at such an exec), keeping the processes it saw above it; R004 has
+    no verdict when that copy is the file the process that made it runs
+    (kernel exec records, any mount namespace) and an installed manager
+    started the runtime (its exec from a root-only directory, or, for
+    conmon's never-executed monitor, the installed file the pump saw it
+    run). R011 records the packaged containerd's or dockerd's `modprobe` of
+    a container runtime's modules Low (the forker's image, the system's
+    tool, names only; containerd's `opt` library path the one refusal
+    accepted, the pump keeping its value). The FIM drain reads a wtmp/btmp
+    writer's image and cgroup at the write: the packaged
+    `systemd-update-utmp` in its own unit's cgroup has no verdict. The
+    containers corpus restarts docker, runs an exec and a build.
+  - Lab (as measured; `main` 1d8f427d before, the lot after; records
+    counted from the signed records, controls in every round):
+    **debian13** (6.12.116, systemd 257, runc 1.1.15, containerd 1.7.24,
+    docker.io 26.1.5, podman 5.4.2): docker run (pulled, cached), run -d +
+    exec, build, run after a first start: R004 Critical 6 → 0 (a1961ad3);
+    containerd's start (install, restart, first start after the modules
+    unloaded): R011 High kill 1 each → Low (`modprobe aufs`), dockerd's
+    `bridge`/`br_netfilter`/`nf_conntrack` Low both; Podman rootful run, run
+    -d + exec: R004 Critical 3 → 3 (a1961ad3: conmon's monitor never
+    executed) → 0 (799d9375); rootless run: Critical 1 → 1 (799d9375: runc in
+    podman's own mount namespace) → 0 (a0037493, the final code: docker and
+    Podman, rootful and rootless, every case 0). **ubuntu2404** (6.8.0-149,
+    systemd 255, runc 1.3.4, containerd 2.2.1, docker 29.1.3): no R004 and
+    no R011 High before either (runc 1.3 makes no memfd copy there); the
+    shutdown record: FIM-019 High at 3 of 6 shutdowns before (the first
+    after the install, and both of a round's three at which the agent still
+    recorded — rsyslogd's FIM-005 seen; at the others it had stopped before
+    `systemd-update-utmp` ran) → 0 of 3 after (a1961ad3), the agent
+    recording at all three. **ubuntu2604** (7.0, runc
+    1.4.0, containerd 2.2.2, docker 29.1.3; the guest's apt left broken
+    before the round, repaired with `apt-get -f install`) and **ubuntu2204**
+    (5.15, runc 1.3.4, docker 29.1.3): docker install, start, restart, run,
+    exec, build — no NN-L-EVA-002, no R004 or R011 High (item 4 not
+    reproduced: the corpus now carries those steps). Controls Critical/High
+    before and after on every guest: a memfd exec of `/usr/bin/id` named
+    `runc_cloned` (R004), the packaged runc's own bytes executed from a
+    memfd by a session's python (R004), `insmod` of a module copied out of
+    the tree (R011 High kill + R018 Critical; refused by the kernel), `dd`
+    appending a record to wtmp (FIM-019 High). Docker and Podman purged
+    from every guest at the end.
+  - Not done: #554's re-check N2 (the "truncated by another" bit on a real
+    shrink only), #554 not merged. Seen, not in scope: on 5.15 NN-L-AT-001
+    High ("denied in kernel") for systemd, containerd-shim and runc at each
+    container start; NN-L-FIM-003 High at docker's install on 22.04 and
+    26.04; R011 High (recorded) of the initramfs hook `kmod` at Podman's
+    install (lot 287's); R005 High of an `nc` at Debian 13's and Ubuntu
+    26.04's boot.
+  - The review of #556 (fix round): F1, the seals read AT THE EXEC — the
+    exec LSM program reads the memfd's shmem inode (`shmem_inode_info.seals`
+    and `.vfs_inode`, optional slots 137–138, after lot 345's) and sets
+    `exe_flags::MEMFD_SEALED`; the pump and R004 exempt only such an exec (a
+    copy rewritten and sealed after the exec — an OCI hook's memfd — stays
+    Critical; ratchet `kernel_halves.rs`). F2, the runtime compares' budget
+    per uid (64 MiB a second) with root's reserve (256 of 512 MiB); a memfd
+    past the budget is "not compared (budget)": root's recorded High, never
+    killed, any other uid's the Critical kill (re-check N1, test
+    `a_users_uncompared_memfd_past_its_own_share_stays_critical`; residual:
+    root over its own budget). F3, R018's behaviour
+    stated (an unpackaged module in `/lib/modules`: High, recorded only).
+    F4, containerd's library path exact, kept only when root-only with
+    root-only files (`ctr install` a named residual). F5, the utmp unit's
+    write exempt only as an append of whole records (`UTMP_RECORD_LEN`,
+    glibc's `struct utmp` on the agent's architecture). F6, the drain's
+    writer read only for a process started before the record. F7, a runtime
+    or manager recorded only when its file and directories are root's and
+    writable by no one else. Lab (as measured, debian13 6.12.116, runc
+    1.1.15, docker.io 26.1.5, podman 5.4.2, the fix round's code): docker run
+    pulled/cached, run -d + exec, build, ctr run, run after a first start:
+    R004 Critical 0 (the kernel's seals read on 6.12: runc's clones still
+    exempt); containerd's starts R011 Low; Podman rootful run R004 0;
+    controls kept (CONTROL1 and 1b R004 Critical, CONTROL2 R011 High + R018
+    Critical, CONTROL3 FIM-019 High). Mutation: 26 mutants of the round's
+    code (two in the eBPF program, caught by the ratchet), 26 caught by a
+    named test. A first run in a user unit (umask 0002) gave false catches —
+    the tests' temporary trees were group-writable, so no runtime was
+    root-only: the tests now make their trees 0755/0644 whatever the umask,
+    and the affected mutants were run again; the owner check is caught where
+    the test's build tree is writable by its owner only (the test skips
+    otherwise, and as root). Guests: what the
+    lot's docker and podman installs left was purged (debian13: gnupg and
+    its libraries, `dbus-user-session`, `fuse3`, `needrestart` — installed by
+    those transactions, a simulated purge removing nothing else); what stays
+    on each is named in the PR.
+  - Levels unchanged: C11 keeps its level (the agent on a container host
+    without the overlay no longer kills its runtime's start; no new
+    container capability).
 
 
 - **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases

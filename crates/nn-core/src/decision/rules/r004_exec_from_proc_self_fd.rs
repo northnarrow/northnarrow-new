@@ -56,6 +56,65 @@
 //!   upgrade is the unlinked old image. No new code runs: the parent ran
 //!   that file, and was judged, when it was linked.
 //!
+//! # Lot 347: an OCI runtime's copy of itself (the alpha's container hosts)
+//!
+//! `runc` (and `crun`) re-execute themselves from a sealed memfd copy of
+//! their own image — `runc_cloned:/proc/self/exe`, the CVE-2019-5736
+//! defence — at every container start, `docker exec` and build: a memfd
+//! exec, Critical, at each. It is no fileless code when every fact holds,
+//! each the kernel's or the file's, never a name or a path:
+//!
+//! - the memfd was sealed against writing, shrinking and growing AT THE
+//!   EXEC — the LSM program read its seals in `bprm_check_security`
+//!   (`exe_flags::MEMFD_SEALED`; the review of #556, F1: sealed only when
+//!   the pump read it, any holder of a writable descriptor could have
+//!   rewritten it after the exec and sealed it then) — and is WHOLE and
+//!   byte for byte an installed runtime's image when the pump reads it
+//!   (`nn_linux::program_images`; [`program_identity::runtime_clone_of`]):
+//!   a seal is never removed, so those are the bytes that ran;
+//! - that image is the one the process that made the copy runs, by the
+//!   kernel's exec records (the LSM program's `(dev, ino)` of the executed
+//!   file, in any mount namespace — rootless Podman runs runc in its own;
+//!   the pump compared the memfd with the installed file still at its path,
+//!   an inode no other file has): runc 1.2's `runc create` (the exec is its
+//!   child's first since the fork, its `fork_parent`), or the process itself
+//!   before this exec (runc 1.1's `runc init` re-executing its own packaged
+//!   image);
+//! - and the runtime was started by an installed manager (containerd's shim,
+//!   dockerd, containerd, conmon, podman), by the image of the process the
+//!   kernel recorded forking it (its exec record in a root-only directory of
+//!   PID 1's mount namespace, [`exec_image`]; for a fork the lineage holds no
+//!   exec of — conmon's monitor, forked as it daemonized — the installed
+//!   file the pump saw it run at the exec, still at its path) — or, for a
+//!   re-exec, the process was forked by one.
+//!
+//! A memfd of anything else, a copy of the runtime not sealed at the exec
+//! (sealed later included), a clone a session's process made (`python3`
+//! executing runc's bytes from a memfd), a runtime outside the binary
+//! directories (k3s's own `runc`, a snap's), a clone the pump could not
+//! compare because the process was gone, every clone in tracepoint mode (no
+//! seals read at the exec) and every clone on a kernel whose BTF lacks
+//! `shmem_inode_info`'s offsets stay Critical. A clone whose every fact
+//! holds but whose bytes were not compared — its uid's share of the
+//! compare budget spent this second (the review of #556, F2: each uid but
+//! root has its own share, root a reserve no user can spend) — is recorded
+//! High, never killed, only for uid 0 (the initial user namespace's root):
+//! any other uid spends its own share (the re-check of #556, N1: three
+//! decoy hooks, then a sealed payload of runc's length) and its uncompared
+//! memfd stays the Critical kill. Either verdict says "not compared
+//! (budget)" — a memfd of the runtime's length, any program's — never a
+//! copy of the runtime. Residual: root spending its own budget, then
+//! executing its own memfd under the runtime, is recorded, not killed —
+//! root, who needs no such route. Residual: the kernel reads the file's first bytes
+//! (the binary's header, `bprm->buf`) just before the LSM hook reads the
+//! seals; a writer racing that window chooses the header of a run whose
+//! every mapped byte is the sealed runtime's (no code of its own: the
+//! program headers, segments and interpreter are read from the sealed
+//! file; a `#!` line names an interpreter, which `/proc/<pid>/exe` then is,
+//! never the copy the pump compares).
+//!
+//! [`exec_image`]: crate::posture::lineage::AuthSessionTracker::exec_image
+//!
 //! Tracepoint mode has no identity: the caller's path is read by the
 //! posture's one reader of a `/proc` link
 //! ([`crate::posture::proc_link::reopens_a_descriptor`]: every per-thread
@@ -65,8 +124,25 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::rules::program_identity::{self, ProgramKind};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
+
+/// Lot 347: what [`R004ExecFromProcSelfFd::runtime_self_clone`] found of a
+/// memfd exec that is an installed runtime's copy of itself by every
+/// identity fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeCopy {
+    /// The pump compared it whole with the runtime's image: no fileless
+    /// code.
+    Compared,
+    /// The review of #556 (F2): not compared (its uid's share of the
+    /// budget spent this second) — a memfd of the runtime's length, any
+    /// program's: root's recorded, never killed; any other uid's the
+    /// Critical kill (the re-check of #556, N1: a user spends its own
+    /// share; [`R004ExecFromProcSelfFd::not_compared`]).
+    NotCompared,
+}
 
 /// R14a (plan §3.5): how the agent starts its own workers — the one
 /// `/proc/self/fd` exec R004 knows to be the agent's. The core runs its
@@ -362,6 +438,112 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 == Some((exe.dev, exe.ino))
     }
 
+    /// The re-check of #556 (N1): the verdict on a memfd exec whose every
+    /// identity fact holds but whose bytes the pump did not compare (the
+    /// budget's share of `uid` spent this second). Only uid 0 — the initial
+    /// user namespace's root, a budget no user can spend — is recorded High
+    /// without a kill; any other uid chooses to spend its own share (decoy
+    /// hooks), so its uncompared memfd stays the Critical kill. Neither text
+    /// calls it a copy of the runtime: nobody compared its bytes.
+    fn not_compared(&self, event: &Event, uid: u32) -> Verdict {
+        if uid == 0 {
+            build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::High,
+                "memfd exec under an installed container runtime and its manager, sealed at \
+                 the exec, of an installed runtime's length — not compared (budget): root's \
+                 compare budget spent this second, its bytes may be any program's (lot 347); \
+                 recorded, not killed",
+            )
+        } else {
+            build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                "memfd-style exec detected — fileless execution, highly suspicious; under an \
+                 installed container runtime, of an installed runtime's length, not compared \
+                 (budget): its uid's share of the compare budget spent this second (lot 347)",
+            )
+        }
+    }
+
+    /// Lot 347 (module docs): `event`, a memfd exec, is an installed OCI
+    /// runtime executing its own image's copy, sealed at the exec, started
+    /// by an installed manager — each by the kernel's records; its bytes
+    /// compared by the pump, or (the review of #556, F2) not compared, its
+    /// uid's share of the budget spent.
+    fn runtime_self_clone(
+        &self,
+        event: &Event,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> Option<RuntimeCopy> {
+        use crate::posture::lineage::AsOf;
+        use common::wire::exe::exe_flags::MEMFD_SEALED;
+        let Event::ProcessSpawn {
+            pid,
+            exe,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        // the review of #556 (F1): sealed when the kernel executed it (the
+        // LSM program's read), not only when the pump read it
+        if !exe.has(MEMFD_SEALED) {
+            return None;
+        }
+        let lineage = self.lineage.as_ref()?;
+        // the pump's compare: the sealed memfd is this installed runtime
+        let clone = program_identity::runtime_clone_of(event)?;
+        let copy = if clone.unverified {
+            RuntimeCopy::NotCompared
+        } else {
+            RuntimeCopy::Compared
+        };
+        let content = clone.image;
+        // a manager: by the lineage's exec record of its image, else — a
+        // fork the lineage holds no exec of (conmon's monitor, forked as it
+        // daemonized) — by the installed file the pump saw it run at the
+        // exec; the forker relation is the kernel's
+        let manager = |pid: Option<u32>| {
+            pid.is_some_and(|p| {
+                let image = match lineage.exec_file(p, as_of) {
+                    Some(_) => lineage.exec_image(p, as_of),
+                    None => clone.seen_image(p),
+                };
+                image.and_then(program_identity::installed_kind)
+                    == Some(ProgramKind::RuntimeManager)
+            })
+        };
+        // a runtime the kernel recorded a manager forking — the runtime's
+        // file by the LSM program's identity in any mount namespace
+        // (rootless Podman runs runc in its own): `content` is an installed
+        // runtime's inode still at its path (the pump's compare), which no
+        // other file can have
+        let managed_runtime = |pid: u32| {
+            lineage.exec_file(pid, as_of) == Some(content)
+                && manager(lineage.fork_parent(pid, as_of))
+        };
+        if exe.fork_parent != 0 {
+            // the first exec since the fork: the forker made the copy of
+            // its own image (runc 1.2's `runc create`)
+            return managed_runtime(exe.fork_parent).then_some(copy);
+        }
+        // a re-exec: the process ran the runtime's image itself just before
+        // (runc 1.1's `runc init`), forked by the runtime under its manager
+        // or by the manager itself
+        let before = AsOf::judged(timestamp_ns.saturating_sub(1));
+        if *timestamp_ns <= 1 || lineage.exec_file(*pid, before) != Some(content) {
+            return None;
+        }
+        let forker = lineage.fork_parent(*pid, before);
+        (manager(forker) || forker.is_some_and(managed_runtime)).then_some(copy)
+    }
+
     /// The re-check of #539 (N2): `fork_parent` (the kernel's record of
     /// who forked the process, for its first exec; 0 not known) is the
     /// host's PID 1, or a `systemd --user` manager told by the image the
@@ -427,10 +609,22 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             // fileless: systemd-executor's fexecve of every unit is one, and
             // the other rules judge any such file on its canonical path
             // (review 61).
-            let fileless = exe.has(MEMFD)
-                || (exe.has(DELETED)
+            // lot 347: a memfd (unlinked too) is fileless unless it is an
+            // installed runtime's sealed copy of itself under its manager
+            // (module docs) — no other exemption reaches one
+            let fileless = if exe.has(MEMFD) {
+                match self.runtime_self_clone(event, as_of) {
+                    Some(RuntimeCopy::Compared) => false,
+                    Some(RuntimeCopy::NotCompared) => {
+                        return Some(self.not_compared(event, *uid));
+                    }
+                    None => true,
+                }
+            } else {
+                exe.has(DELETED)
                     && !self.is_upgraded_executor(exe, as_of)
-                    && !self.reexecs_its_parent_image(*ppid, exe, as_of));
+                    && !self.reexecs_its_parent_image(*ppid, exe, as_of)
+            };
             if !fileless {
                 return None;
             }
@@ -1480,6 +1674,458 @@ mod lot310 {
         assert!(
             r.evaluate(&launch((2049, 1002), 1)).is_none(),
             "PID 1 forked it"
+        );
+    }
+
+    /// Lot 347: an exec in the lineage — `id` its file's identity in a
+    /// root-only directory (`ROOT_DIR`), `fork_parent` the kernel's record.
+    fn lineage_exec(pid: u32, ppid: u32, fork_parent: u32, id: (u64, u64), ts: u64) -> Event {
+        let mut e = exec(0, ppid, "/usr/sbin/runc", "/usr/sbin/runc", ROOT_DIR);
+        if let Event::ProcessSpawn {
+            pid: p,
+            exe,
+            timestamp_ns,
+            start_ns,
+            ..
+        } = &mut e
+        {
+            *p = pid;
+            *timestamp_ns = ts;
+            *start_ns = ts.min(1_000);
+            (exe.dev, exe.ino) = id;
+            exe.fork_parent = fork_parent;
+        }
+        e
+    }
+
+    /// Lot 347: a memfd exec of `pid` (unlinked, as every memfd), as runc's
+    /// `fexecve` reports it — sealed at the exec (the LSM program's read).
+    fn memfd_exec(pid: u32, ppid: u32, fork_parent: u32, ts: u64) -> Event {
+        let mut e = exec(
+            0,
+            ppid,
+            "/dev/fd/6",
+            "/memfd:runc_cloned:/proc/self/exe",
+            MEMFD | DELETED | common::wire::exe::exe_flags::MEMFD_SEALED,
+        );
+        if let Event::ProcessSpawn {
+            pid: p,
+            exe,
+            timestamp_ns,
+            start_ns,
+            ..
+        } = &mut e
+        {
+            *p = pid;
+            *timestamp_ns = ts;
+            *start_ns = 1_000;
+            (exe.dev, exe.ino) = (0x0000_0001, u64::from(pid));
+            exe.fork_parent = fork_parent;
+        }
+        e
+    }
+
+    /// Lot 347 (the alpha's container hosts: Docker on Debian 13): runc's
+    /// sealed copy of itself (`runc_cloned:/proc/self/exe`) is no fileless
+    /// code when the pump found it byte for byte the installed runtime, the
+    /// process that made it runs that image (runc 1.2: the forker; runc 1.1:
+    /// the process itself before the re-exec) and an installed manager
+    /// started the runtime — each by the kernel's records. Every other
+    /// memfd stays Critical (fails on main: every clone was).
+    #[test]
+    fn a_runtimes_sealed_copy_of_itself_under_its_manager_is_not_fileless() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        let copy = |image: (u64, u64)| RuntimeClone {
+            image,
+            seen: Vec::new(),
+            unverified: false,
+        };
+        let (runc, shim, bash, crun) = (
+            (0x0fd0_0347, 347_001),
+            (0x0fd0_0347, 347_002),
+            (0x0fd0_0347, 347_003),
+            (0x0fd0_0347, 347_004),
+        );
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (crun, "/usr/bin/crun", ProgramKind::ContainerRuntime),
+            (
+                shim,
+                "/usr/bin/containerd-shim-runc-v2",
+                ProgramKind::RuntimeManager,
+            ),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for e in [
+            lineage_exec(34_700, 1, 1, shim, 100),           // the shim
+            lineage_exec(34_701, 34_700, 34_700, runc, 200), // runc create
+            lineage_exec(34_710, 1, 1, bash, 100),           // a session's shell
+            lineage_exec(34_711, 34_710, 34_710, runc, 200), // runc run by it
+            lineage_exec(34_720, 34_700, 34_700, crun, 200), // another runtime
+            // runc 1.1: `runc init` runs the packaged runc first, then
+            // re-executes it from the memfd
+            lineage_exec(34_702, 34_701, 34_701, runc, 300),
+            lineage_exec(34_712, 34_711, 34_711, runc, 300),
+            lineage_exec(34_703, 34_701, 34_701, bash, 300),
+            // crun re-executing itself, run by the manager
+            lineage_exec(34_721, 34_700, 34_700, crun, 300),
+        ] {
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = R004::new(lineage.clone());
+        let judged = |e: Event, copy_of: Option<(u64, u64)>| {
+            assert!(lineage.ingest_spawn_event(&e));
+            if let Some(id) = copy_of {
+                keep_runtime_clone(&e, copy(id));
+            }
+            r.evaluate(&e)
+        };
+        // runc 1.2: the child of `runc create`, its first exec
+        assert!(judged(memfd_exec(34_704, 34_701, 34_701, 400), Some(runc)).is_none());
+        // runc 1.1: `runc init` re-executing its own image
+        assert!(judged(memfd_exec(34_702, 34_701, 0, 400), Some(runc)).is_none());
+        // crun re-executing itself under the manager
+        assert!(judged(memfd_exec(34_721, 34_700, 0, 400), Some(crun)).is_none());
+        // the mini-hunt: the path the caller passed is not looked at — Go's
+        // `/proc/self/fd/7`, fexecve's `/dev/fd/6`, the kernel's `/memfd:`
+        for path in ["/proc/self/fd/7", "/proc/thread-self/fd/7", "/memfd:x"] {
+            let mut e = memfd_exec(34_730, 34_701, 34_701, 400);
+            if let Event::ProcessSpawn { filename, .. } = &mut e {
+                *filename = path.into();
+            }
+            assert!(judged(e, Some(runc)).is_none(), "{path}");
+        }
+        // CONTROLS: the pump found no copy (another program, unsealed, not
+        // compared): fileless
+        assert!(kills(judged(memfd_exec(34_705, 34_701, 34_701, 400), None)));
+        // a copy of another installed runtime than the forker's
+        assert!(kills(judged(
+            memfd_exec(34_706, 34_701, 34_701, 400),
+            Some(crun)
+        )));
+        // the runtime started by a session's shell, not a manager
+        assert!(kills(judged(
+            memfd_exec(34_713, 34_711, 34_711, 400),
+            Some(runc)
+        )));
+        assert!(kills(judged(
+            memfd_exec(34_712, 34_711, 0, 400),
+            Some(runc)
+        )));
+        // a re-exec by a process that ran no runtime before
+        assert!(kills(judged(
+            memfd_exec(34_703, 34_701, 0, 400),
+            Some(runc)
+        )));
+        // a session's shell forking a copy of runc (its first exec)
+        assert!(kills(judged(
+            memfd_exec(34_714, 34_710, 34_710, 400),
+            Some(runc)
+        )));
+        // a forker the lineage does not hold
+        assert!(kills(judged(
+            memfd_exec(34_715, 34_799, 34_799, 400),
+            Some(runc)
+        )));
+        // Podman: conmon's monitor, a fork that never executed (it
+        // daemonized), forks `runc create`: its image is the one the pump
+        // saw it run at the exec, for the forker the kernel recorded
+        let conmon = (0x0fd0_0347, 347_005);
+        record_installed(InstalledImage {
+            id: conmon,
+            len: 12_000_000,
+            path: "/usr/bin/conmon".into(),
+            kind: ProgramKind::RuntimeManager,
+        });
+        assert!(lineage.ingest_spawn_event(&lineage_exec(34_741, 34_740, 34_740, runc, 200)));
+        assert!(lineage.ingest_spawn_event(&lineage_exec(34_742, 34_741, 34_741, runc, 300)));
+        let seen = |forker_image: (u64, u64), at: u32| RuntimeClone {
+            image: runc,
+            seen: vec![(34_741, runc), (at, forker_image)],
+            unverified: false,
+        };
+        let podman = |e: Event, clone: RuntimeClone| {
+            assert!(lineage.ingest_spawn_event(&e));
+            keep_runtime_clone(&e, clone);
+            r.evaluate(&e)
+        };
+        assert!(podman(memfd_exec(34_742, 34_741, 0, 400), seen(conmon, 34_740)).is_none());
+        assert!(podman(
+            memfd_exec(34_743, 34_741, 34_741, 400),
+            seen(conmon, 34_740)
+        )
+        .is_none());
+        // a forker the lineage holds an exec of, from no root-only
+        // directory (a user's file whose inode number a removed conmon had):
+        // the pump's sight of it does not count
+        let mut user = lineage_exec(34_746, 34_710, 34_710, conmon, 200);
+        if let Event::ProcessSpawn { exe, .. } = &mut user {
+            exe.flags &= !ROOT_DIR;
+        }
+        assert!(lineage.ingest_spawn_event(&user));
+        assert!(lineage.ingest_spawn_event(&lineage_exec(34_747, 34_746, 34_746, runc, 300)));
+        let by_user = RuntimeClone {
+            image: runc,
+            seen: vec![(34_747, runc), (34_746, conmon)],
+            unverified: false,
+        };
+        assert!(kills(podman(
+            memfd_exec(34_748, 34_747, 34_747, 410),
+            by_user
+        )));
+        // rootless Podman: runc and `runc init` executed in podman's own
+        // mount namespace (no root-only directory of PID 1's: no image in
+        // the lineage, the file's identity all the same)
+        let rootless = |pid: u32, ppid: u32, ts: u64| {
+            let mut e = lineage_exec(pid, ppid, ppid, runc, ts);
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.flags &= !ROOT_DIR;
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+        };
+        rootless(34_751, 34_750, 200);
+        rootless(34_752, 34_751, 300);
+        let under = |at: u32| RuntimeClone {
+            image: runc,
+            seen: vec![(34_751, runc), (at, conmon)],
+            unverified: false,
+        };
+        assert!(podman(memfd_exec(34_752, 34_751, 0, 400), under(34_750)).is_none());
+        assert!(podman(memfd_exec(34_753, 34_751, 34_751, 400), under(34_750)).is_none());
+        // the forker seen running no manager, or another pid seen
+        assert!(kills(podman(
+            memfd_exec(34_744, 34_741, 34_741, 410),
+            seen(bash, 34_740)
+        )));
+        assert!(kills(podman(
+            memfd_exec(34_745, 34_741, 34_741, 410),
+            seen(conmon, 34_749)
+        )));
+        // no lineage (unit tests' rule): fileless
+        let bare = memfd_exec(34_716, 34_701, 34_701, 400);
+        keep_runtime_clone(&bare, copy(runc));
+        assert!(kills(R004::default().evaluate(&bare)));
+    }
+
+    /// The review of #556 (F1, named): the pump's compare proves the memfd
+    /// sealed and runc's bytes when it READS it, after the exec — any holder
+    /// of a writable descriptor (the parent of an OCI hook runc executes
+    /// from `/proc/<pid>/fd/N`) can rewrite and seal it in between. Exempt
+    /// only a copy the LSM program found sealed AT THE EXEC: the same clone,
+    /// the same lineage, without `MEMFD_SEALED`, is fileless (fails on the
+    /// lot's first head: it was exempt).
+    #[test]
+    fn a_runtime_copy_sealed_only_after_the_exec_is_fileless() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        use common::wire::exe::exe_flags::MEMFD_SEALED;
+        let (runc, shim) = ((0x0fd0_0556, 556_001), (0x0fd0_0556, 556_002));
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (
+                shim,
+                "/usr/bin/containerd-shim-runc-v2",
+                ProgramKind::RuntimeManager,
+            ),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        assert!(lineage.ingest_spawn_event(&lineage_exec(35_600, 1, 1, shim, 100)));
+        assert!(lineage.ingest_spawn_event(&lineage_exec(35_601, 35_600, 35_600, runc, 200)));
+        let r = R004::new(lineage.clone());
+        let judged = |e: Event, unverified: bool| {
+            assert!(lineage.ingest_spawn_event(&e));
+            keep_runtime_clone(
+                &e,
+                RuntimeClone {
+                    image: runc,
+                    seen: Vec::new(),
+                    unverified,
+                },
+            );
+            r.evaluate(&e)
+        };
+        let unsealed_at_exec = |pid: u32| {
+            let mut e = memfd_exec(pid, 35_601, 35_601, 400);
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.flags &= !MEMFD_SEALED;
+            }
+            e
+        };
+        assert!(judged(memfd_exec(35_602, 35_601, 35_601, 400), false).is_none());
+        assert!(kills(judged(unsealed_at_exec(35_603), false)));
+        // nor recorded as an unverified copy (F2): the kill
+        assert!(kills(judged(unsealed_at_exec(35_604), true)));
+    }
+
+    /// The review of #556 (F2, named): root's memfd whose every identity
+    /// fact holds but whose bytes the pump did not compare (root's budget
+    /// spent this second) is recorded High, never killed — the alpha's
+    /// Docker starts past a flood. One whose facts fail stays the Critical
+    /// kill (fails on the lot's first head: every uncompared clone was
+    /// killed). Any other uid's: the next test (N1).
+    #[test]
+    fn an_uncompared_runtime_copy_is_recorded_never_killed() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        let (runc, shim, bash) = (
+            (0x0fd0_0556, 556_011),
+            (0x0fd0_0556, 556_012),
+            (0x0fd0_0556, 556_013),
+        );
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (
+                shim,
+                "/usr/bin/containerd-shim-runc-v2",
+                ProgramKind::RuntimeManager,
+            ),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for e in [
+            lineage_exec(35_610, 1, 1, shim, 100),
+            lineage_exec(35_611, 35_610, 35_610, runc, 200),
+            lineage_exec(35_620, 1, 1, bash, 100),
+            lineage_exec(35_621, 35_620, 35_620, runc, 200),
+        ] {
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = R004::new(lineage.clone());
+        let unverified = RuntimeClone {
+            image: runc,
+            seen: Vec::new(),
+            unverified: true,
+        };
+        let under_shim = memfd_exec(35_612, 35_611, 35_611, 400);
+        assert!(lineage.ingest_spawn_event(&under_shim));
+        keep_runtime_clone(&under_shim, unverified.clone());
+        let v = r.evaluate(&under_shim).expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::High),
+            "{}",
+            v.reasoning
+        );
+        // the re-check of #556 (N1): the text vouches for no bytes
+        assert!(
+            v.reasoning.contains("not compared (budget)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        // CONTROL: the runtime run by a session's shell — the kill
+        let under_shell = memfd_exec(35_622, 35_621, 35_621, 400);
+        assert!(lineage.ingest_spawn_event(&under_shell));
+        keep_runtime_clone(&under_shell, unverified);
+        assert!(kills(r.evaluate(&under_shell)));
+    }
+
+    /// The re-check of #556 (N1, named; its probe): a rootless user runs
+    /// three decoy OCI hooks (sealed genuine runc copies, compared) that
+    /// spend its OWN share of the compare budget, then a sealed payload
+    /// padded to runc's length — the pump keeps it unverified. A uid but 0
+    /// chose that downgrade: its uncompared memfd stays the Critical kill,
+    /// as before the lot, and the text says "not compared (budget)", never
+    /// a copy of the runtime (fails on eb16784d: High, recorded only, "the
+    /// runtime's copy of itself").
+    #[test]
+    fn a_users_uncompared_memfd_past_its_own_share_stays_critical() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        let (runc, conmon) = ((0x0fd0_0556, 556_021), (0x0fd0_0556, 556_022));
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (conmon, "/usr/bin/conmon", ProgramKind::RuntimeManager),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for e in [
+            lineage_exec(35_630, 1, 1, conmon, 100),
+            lineage_exec(35_631, 35_630, 35_630, runc, 200),
+        ] {
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = R004::new(lineage.clone());
+        let as_uid = |pid: u32, uid: u32| {
+            let mut e = memfd_exec(pid, 35_631, 35_631, 400);
+            if let Event::ProcessSpawn { uid: u, gid, .. } = &mut e {
+                (*u, *gid) = (uid, uid);
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+            e
+        };
+        let judged = |e: &Event, unverified: bool| {
+            keep_runtime_clone(
+                e,
+                RuntimeClone {
+                    image: runc,
+                    seen: Vec::new(),
+                    unverified,
+                },
+            );
+            r.evaluate(e)
+        };
+        // the user's decoys, compared: exempt
+        assert!(judged(&as_uid(35_632, 1000), false).is_none());
+        // its payload past its own share: the kill, the text vouching for
+        // no bytes
+        let v = judged(&as_uid(35_633, 1000), true).expect("judged");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("not compared (budget)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        // a subordinate uid (a rootless container's root, mapped): the same
+        let sub = judged(&as_uid(35_634, 100_000), true);
+        assert!(kills(sub), "a mapped root is no uid 0");
+        // CONTROL: root's past its own budget — recorded, not killed (the
+        // named residual)
+        let v = judged(&as_uid(35_635, 0), true).expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::High)
         );
     }
 
