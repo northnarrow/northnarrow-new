@@ -612,10 +612,23 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
 - **What no line opens (lot 345).** A loader the opt-out names is still
   refused an fmod_ret (`BPF_MODIFY_RETURN`: it overrides any `security_*`
   function's return) and a program that calls `bpf_send_signal`,
-  `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`
-  or the `bpf_send_signal_task` kfunc — the agent's content judge
-  (ALPHA_PROFILE.md §1.2 says where each kernel judges it). NN-L-AT-001
-  `bpf_prog_type`, High, names the helper or the fmod_ret.
+  `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`,
+  `bpf_send_signal_task` or a `bpf_task_work_schedule_*` kfunc — the
+  agent's content judge (ALPHA_PROFILE.md §1.2 says where each kernel
+  judges it). NN-L-AT-001 `bpf_prog_type`, High, names the helper, the
+  kfunc or the fmod_ret. The kfuncs are refused in a load of every type
+  too, opted out or not (6.13 and later: the review of #553) — the helpers
+  only in the types this section opens. While the judge is not armed (a
+  start that could not calibrate it, before 6.9) no line is honoured.
+- **What a line opening `lsm`, `struct_ops` or `ext` gives away.** The
+  judge reads calls, not return values: an `lsm` program can deny the
+  agent's own file opens and `bpf()` calls, a `struct_ops` one (sched_ext,
+  6.12 and later) can starve it of CPU, an `ext` one takes the place of a
+  function of another loaded program and changes what it decides. A loader
+  such a line names can blind or starve the agent without any refused
+  call. Name those types only for a loader you
+  trust as much as the agent; `install.sh` signs no policy that has such a
+  line (the review of #553: it warns and leaves the signing to you).
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 BPF loader opt-out`).
 - **bpftool needs a window, not an opt-out.** Its `pids` column comes from

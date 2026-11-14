@@ -112,6 +112,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     bare function names, and forbids a gate switch's name outside a function
     of its own file (a re-export, a macro): the three plants of the
     re-check's probe now fail it.
+  - **The review of #553.** F1: the signalling kfuncs
+    (`bpf_send_signal_task`, 6.13+; `bpf_task_work_schedule_signal` /
+    `_resume`, 6.18+) are refused at `bpf_prog_load` in a foreign load of
+    EVERY type — a `syscall` program run with `BPF_PROG_RUN`, XDP, tc: any
+    root process killed the agent and its watchdog this way on 6.13+ (lab:
+    Ubuntu 26.04, 7.0). F2: the `profile_downgraded` alarm is kept at every
+    start until a signed `profile.local` runs or a signed `config overlay
+    set profile` acknowledges it (a second reboot laundered it). F3: the
+    ratchet strips any visibility and attributes, and a `static`/`const`
+    initialized by a bare path is an alias whatever its type. F4: the
+    `locked_down` guard is attached before the calibration, and an unarmed
+    judge suspends every `bpf-loader-allow` line (fail closed). F5: the
+    calibration takes exactly its programs' calls; `install.sh` signs no
+    policy with a line opening `lsm`, `struct_ops` or `ext`.
 - Lot 332: verifier headroom on every kernel, for alpha testers' kernels the
   lab has not seen.
   - **`verifier-check` measures every program and gates it.** The count

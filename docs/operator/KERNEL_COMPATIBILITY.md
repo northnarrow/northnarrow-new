@@ -1132,8 +1132,16 @@ A loader the signed per-loader opt-out names (`install.sh
   from the kernel's copy of the attr.
 - **6.9 and later** (`bpf_lsm_bpf_prog_load` in the BTF): the
   `bpf_prog_load_guard` program reads the kernel's copy of the
-  instructions before the verifier runs. It compares helper ids, and the
-  kfunc by its vmlinux BTF id where the kernel has it (6.13+).
+  instructions before the verifier runs. It compares helper ids, and each
+  kfunc by its vmlinux BTF id where the kernel has it
+  (`bpf_send_signal_task` 6.13+; `bpf_task_work_schedule_signal` /
+  `_resume` 6.18+, `_impl` on 6.18). The review of #553: the kfuncs in a
+  foreign load of EVERY type (`syscall`, XDP, tc, …), the helpers in the
+  types refused by default only; with no such kfunc (6.9 to 6.12) a type
+  let through by default is not read.
+- A judge not armed (a failed calibration, a configuration not written)
+  suspends every `bpf-loader-allow` line until a start arms it; the
+  `locked_down` guard is attached first, whatever the calibration does.
 - **5.15 to 6.8**: the `bpf_prog` hook judges every foreign handle once the
   program is verified.
   - The targets are calibrated at the agent's start: two programs of its
@@ -1149,8 +1157,10 @@ A loader the signed per-loader opt-out names (`install.sh
   `nn_calib_override` (Debian's cloud 6.12: "program of this type cannot
   use helper bpf_override_return#58"). `verifier-check` does not count it:
   there is no such helper to refuse.
-- A start that could not calibrate the signals reports `bpf content judge`
-  (an observe failure, signed).
+- A start that could not calibrate the signals, or whose calibration read
+  other calls than its programs make (exactly two distinct signal calls,
+  one override call), reports `bpf content judge` (an observe failure,
+  signed) and honours no opt-out.
 
 **As measured** (our lab guests, lease k345, the shape of the PR's final
 commits). Each kernel was installed with `--allow-bpf-tools` (python3 and
@@ -1169,6 +1179,15 @@ kheaders), and each refusal signed with the helper named:
 After the cold boot, every kernel had the agent and watchdog active right
 after and 30 s later, the judge armed again, and `bpf_send_signal`
 refused again.
+
+The review of #553, Ubuntu 26.04 (`7.0.0-43`) again: its BTF has all five
+kfunc names (`bpf_send_signal_task`, `bpf_task_work_schedule_signal` /
+`_resume`, and the `_impl` FUNCs of 6.18), so the judge armed five kfunc
+keys. A `syscall`, XDP or tc program calling `bpf_send_signal_task` on the
+agent was refused `EPERM` at the load (from a root process no line names
+and from python3), signed; without the signal it loaded. With no agent the
+same `syscall` program killed a `sleep`. `bpf_prog_load_guard` processed
+5,613 instructions, `bpf_prog_guard` 9,808; 0 failing.
 
 **What the lab found along the way:**
 - **The verifier refused `bpf_prog_guard` on 6.8** ("R1 is not a scalar"). A

@@ -11013,3 +11013,33 @@ number in parentheses is a lab PR.
     - `uninstall.sh --purge` left nothing.
   - **Levels unchanged**: the opt-out still lets an allowed loader read
     memory (declared); what it no longer opens is the kill and the blinding.
+  - **The review of #553 (fix round).** F1 (P1): on 6.13+ any root process
+    killed the agent with a `syscall`, XDP or tc program calling
+    `bpf_task_from_pid` + `bpf_send_signal_task` (`SI_KERNEL`, no
+    `task_kill`), types the judge never read. The `bpf_prog_load` hook now
+    reads a foreign load of every type for the signalling kfuncs this kernel
+    has (`bpf_send_signal_task`; `bpf_task_work_schedule_signal` / `_resume`,
+    6.18+), the helpers still for the refused types only. F2: the
+    `profile_downgraded` alarm is kept at every start until a signed
+    `profile.local` runs or a signed `config overlay set profile` answers it.
+    F3: the ratchet's four spellings. F4: the `locked_down` guard before the
+    calibration; an unarmed judge suspends every opt-out. F5: the
+    calibration takes exactly its programs' calls; `install.sh` signs no
+    line opening `lsm`, `struct_ops` or `ext`. Tests:
+    `the_signal_kfuncs_are_judged_for_every_type`,
+    `a_load_of_every_type_is_read_for_the_signal_kfuncs`,
+    `a_downgrade_stays_pending_through_two_reboots`,
+    `a_pending_downgrade_alarms_at_every_start_until_signed`,
+    `a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught`,
+    `a_failed_calibration_suspends_the_opt_outs_and_keeps_the_lockdown_guard`,
+    `a_calibration_that_read_other_calls_is_refused`,
+    `allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext`.
+    Lab, as measured (Ubuntu 26.04, 7.0, lease k345): with no agent a root `syscall`
+    program killed a `sleep` through `bpf_send_signal_task`; with the agent,
+    `syscall`/XDP/tc programs signalling it were refused `EPERM` at the load
+    (a root process no line names, and python3), signed naming the kfunc,
+    the agent's pid unchanged; without the signal they loaded; bpftrace,
+    BCC, fentry and the earlier B1–B6 cases as before; `verifier-check` 0
+    failing (`bpf_prog_load_guard` 5,613 processed); cold boot 77 pins, 50
+    LSM programs, judge re-armed (5 kfunc keys). `bpftool feature probe`:
+    9 High type refusals (named in the docs). Levels unchanged.

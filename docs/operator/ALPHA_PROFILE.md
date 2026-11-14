@@ -122,10 +122,20 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
     attach type from the kernel's copy of the load's arguments;
   - a program that **calls `bpf_send_signal`, `bpf_send_signal_thread`,
     `bpf_probe_write_user` or `bpf_override_return`** (and, on 6.13 and
-    later, the `bpf_send_signal_task` kfunc): the signal kills the agent
-    past its `task_kill` hook, the write rewrites its memory, the override
-    fakes a kernel function's return. bpftrace's `signal()` (behind
-    `--unsafe`) is refused this way; BCC's tools call none of them.
+    later, the `bpf_send_signal_task` kfunc; on 6.18 and later the
+    `bpf_task_work_schedule_signal` / `_resume` kfuncs, which run a
+    callback in a task's own context): the signal kills the agent past its
+    `task_kill` hook, the write rewrites its memory, the override fakes a
+    kernel function's return. bpftrace's `signal()` (behind `--unsafe`) is
+    refused this way; BCC's tools call none of them.
+    - **The kfuncs, in a load of every type (the review of #553).** The
+      kernel also lets a `syscall` program (run with `BPF_PROG_RUN`), an
+      XDP, tc or `cgroup_skb` one call them — types any root loads with no
+      opt-out. From 6.13 the `bpf_prog_load` hook reads every foreign load
+      for them, whatever its type, and refuses it (`EPERM`, signed, the
+      kfunc named): before this release any root process could kill the
+      agent and its watchdog with such a program. No kernel before 6.13
+      has these kfuncs.
     - **6.9 and later**: judged at the `bpf_prog_load` hook, on the kernel's
       copy of the instructions, before the verifier — a refused program
       never gets an id (`EPERM`).
@@ -145,10 +155,21 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
     - A program longer than 1,048,576 instructions, or one the judge cannot
       read, is refused as if it called one.
   - Each refusal is a signed `bpf_prog_type` record (High) that names the
-    helper or the fmod_ret. What stays open: a tracing program that reads
-    (the agent's keys in its memory are not protected from it), and a
-    kernel without the judge's targets (a start that could not calibrate
-    reports a degradation, `bpf content judge`).
+    helper, the kfunc or the fmod_ret. What stays open: a tracing program
+    that reads (the agent's keys in its memory are not protected from it),
+    and what a hand-signed line opening `lsm`, `struct_ops` or `ext` gives
+    its loader (RULE_POLICY.md §2.5: return values are not judged).
+  - **A start that could not arm the judge suspends the opt-outs** (the
+    review of #553): the calibration failed, or read other calls than its
+    programs make — then no `bpf-loader-allow` line is honoured, their
+    types are refused again, and the degradation `bpf content judge` says
+    so. The `locked_down` guard for `bpf_probe_write_user` is attached
+    whatever the calibration does.
+  - **A feature probe is refused like any load (measured).** `bpftool feature
+    probe kernel` (bpftool named by no line) is refused the nine types
+    refused by default: nine signed records, High (Ubuntu 26.04, 7.0) —
+    run it in a trusted-installer window. `bpftrace --info` under the
+    opt-out makes no High record.
 - The flags go with a fresh install that `install.sh` starts (not
   `--upgrade`, `--no-enable` or a package step: refused before anything
   changes). Every load they let through is recorded (`bpf_prog_opt_out`,
@@ -195,6 +216,16 @@ alarm is in `nn-admin status --key` too: a degradation of source `profile`
 (listed below the summary, `sensors : DEGRADED`, and counted against the
 trust level). A signed `profile = alpha` is the operator's switch and
 raises nothing.
+
+**The alarm stays until something signed answers it** (the review of
+#553). One reboot later the previous boot had run `alpha`, and the alarm
+used to vanish. Now every start keeps the degradation while the chain
+holds a `profile_downgraded` row that nothing signed answered since (the
+journal says `PROFILE DOWNGRADE NOT ACKNOWLEDGED`). It ends when a start
+runs a profile from a signed `profile.local`, or after a signed `nn-admin
+config overlay set profile` (alpha or enforcing: the acknowledgement)
+succeeds. An unsigned return to `enforcing` does not end it: the downgrade
+happened, and no key has seen it.
 
 ## 3. What you see
 
