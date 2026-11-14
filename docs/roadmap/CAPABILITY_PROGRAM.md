@@ -11415,7 +11415,16 @@ number in parentheses is a lab PR.
     judge the content with no new capability; not done for the alpha);
     the window's global scope (P1, after the alpha), N2, N3 (P3) and the
     `dup2` race (P2) named in UPGRADE_NOTES_WAVE4 §43.
-    - Lab, as measured: @VC2204@ @VC2604@
+    - Lab, as measured (the verifier only, the eBPF object
+      `e9140765…`, nothing installed): **ubuntu2204** (5.15.0-202)
+      `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing,
+      the highest 551,900 of 900,000 (`module_read_file_observe`,
+      unchanged; `bpf_syscall_observe` 44,638, `bpf_prog_guard` 25,410,
+      `file_ioctl` 3,705); **ubuntu2604** (7.0.0-43) 117 programs, 112
+      OK, 5 not counted, 0 failing, the highest 362,329
+      (`fim_rename_observe`; `bpf_syscall_observe` 16,513,
+      `bpf_prog_load_guard` 6,901). N1, item 2 and F7 were not run in a
+      guest: their evidence is the host tests named above.
   - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
     the host for all (no record); the kernel leaves the threads' masks
     narrowed when systemd drops the cpuset controller after an

@@ -1656,7 +1656,7 @@ fn the_kernel_state_round_reads_within_a_deadline() {
     let c = read("crates/nn-linux/src/own_cpus.rs");
     let r = fn_body(&c, "round");
     for n in [
-        "host_now)",
+        "host_now,",
         "reader.run(\"the CPU watch's sources\", Sources::open)",
         "unjudged_by_stall(&mut r, reader.take_stall());",
     ] {

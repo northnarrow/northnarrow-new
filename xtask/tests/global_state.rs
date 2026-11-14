@@ -354,6 +354,14 @@ const STATICS: &[Kept] = &[
          per object",
     ),
     kept(
+        "crates/nn-linux/src/state_read.rs",
+        "ROUND_READER",
+        Process,
+        "the kernel-state round's reader with a deadline (the re-check of #558, F7): one round \
+         per agent process, and the helper threads a FUSE file leaves blocked are the process's, \
+         bounded once for it (STALLED_MAX); the tests make their own TimedReader",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/task_free.rs",
         "ATTACHED",
         Kernel,
