@@ -11391,6 +11391,31 @@ number in parentheses is a lab PR.
       counted, 0 failing, the highest 551,900 of 900,000 (unchanged;
       `bpf_prog_guard` 25,410, `bpf_syscall_observe` 42,540,
       `file_ioctl` 3,705).
+  - Its re-check (the second fix round). N1 (P2): a prog array's update
+    was let through when its value could not be read through the user
+    path (a page not resident; `bpf_sys_bpf`'s kernel pointer) — a held
+    program could go into a slot a clean program tail-calls. The kernel
+    path is read next (`bpf_cmd::slot_value`), and a value neither reads
+    is refused and signed (`bpf_held_use`, `BPF_HELD_SLOT_UNREAD`, the
+    prog array's id): `a_prog_array_value_the_hook_cannot_read_is_refused_and_signed`
+    (fails on 08d37e2f), `a_prog_array_value_neither_path_reads_is_refused`,
+    `a_tail_call_slot_whose_value_cannot_be_read_is_a_refusal_named`.
+    Once no window is open, the cross-view signs each held program still
+    loaded (`bpf_held_load`, `BPF_HELD_OUTLIVED`, High, once per program
+    and agent start): `a_held_program_still_loaded_after_its_window_is_signed_once`,
+    `a_held_program_that_outlives_its_window_is_high_and_named`. F7: the
+    kernel-state round's path reads (the taint mask, `/proc/1/stat`, a
+    loader's `/proc` files, the CPU watch's start reads and sources) wait
+    at most 2 s (`state_read::TimedReader`, at most four helpers left
+    blocked), and a read past its deadline makes the CPU watch's round
+    unjudged (three in a row signed): `a_read_that_never_answers_is_bounded_in_time`,
+    `a_round_whose_read_does_not_answer_is_unjudged_and_signed_at_the_third`,
+    the ratchet `the_kernel_state_round_reads_within_a_deadline`. F4's
+    sentence corrected in the trust model (a kernel-side iterator could
+    judge the content with no new capability; not done for the alpha);
+    the window's global scope (P1, after the alpha), N2, N3 (P3) and the
+    `dup2` race (P2) named in UPGRADE_NOTES_WAVE4 §43.
+    - Lab, as measured: @VC2204@ @VC2604@
   - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
     the host for all (no record); the kernel leaves the threads' masks
     narrowed when systemd drops the cpuset controller after an

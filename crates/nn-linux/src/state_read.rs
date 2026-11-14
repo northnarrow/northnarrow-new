@@ -544,7 +544,9 @@ mod tests {
         let at = fifo.clone();
         let t0 = std::time::Instant::now();
         let e = r
-            .run("the taint mask", move || std::fs::read(&at).map(|b| b.len()))
+            .run("the taint mask", move || {
+                std::fs::read(&at).map(|b| b.len())
+            })
             .expect_err("a read that never answers");
         assert!(t0.elapsed() < std::time::Duration::from_secs(3), "bounded");
         assert!(e.contains("did not answer within 200 ms"), "{e}");

@@ -2681,10 +2681,23 @@ root opened at the start, a crossing of a mount making the round
 unjudged; systemd's `CPUAffinity=` merges as systemd merges it; the agent
 unit's own `CPUAffinity=` counts only from the agent's unit directories,
 older than the install; state reads are `O_NONBLOCK`, regular files only,
-bounded. **What stays open**: a sysfs/procfs file of another kind bound
+bounded. **Its re-check (F7)**: `O_NONBLOCK` does not reach a FUSE file
+(`FUSE_OPEN` and `FUSE_READ` wait for the daemon, before any check), so a
+regular FUSE file bound over a file the kernel-state round reads (the
+taint mask, `/proc/1/stat`, a loader's `/proc` files, the CPU watch's
+start reads) stalled the whole round — the cross-view, the taint read,
+the CPU watch, the held set's prune. Those reads now run on a helper
+thread waited for at most 2 s (`state_read::TimedReader`, at most four
+helpers left blocked, then every read fails at once); a read past its
+deadline makes the CPU watch's round unjudged, so three in a row are the
+signed "could not judge" record, and the round's other parts go on.
+**What stays open**: a sysfs/procfs file of another kind bound
 over the online list before the agent starts (the magic check passes it;
-the union keeps one source from narrowing); a FUSE regular file stalls a
-read; the posture host's `LinuxHost::read` is unbounded; a slice's
+the union keeps one source from narrowing); a FUSE regular file stalls
+each round for the 2 s deadline (and a helper thread, up to four) while
+it stays bound — reads outside the kernel-state round (the response's,
+the decision host's) are not timed; the posture host's `LinuxHost::read`
+is unbounded; a slice's
 `cpuset.cpus` written inside a window narrows the expectation after it;
 the unit's setting trusts ctime (root sets the clock back), as the drop-in
 judge does.
@@ -2734,11 +2747,37 @@ Now:
   it), and a load it has no room for is refused (`bpf_held_use`, "held
   set full": fail closed).
 
+**Its re-check (N1, item 2).**
+- A prog array's update was judged on its value read through the user
+  path only, and let through when that read failed: the user path is
+  nofault, so a page not resident failed it (a `MAP_PRIVATE` mapping of a
+  file never touched: the kernel's own copy, after the hook, faults it
+  in), and `bpf_sys_bpf` from a `syscall` program passes a kernel pointer,
+  which the user path refuses. A held program then went into a tail
+  call's slot, and a clean program's `BPF_PROG_RUN` jumped into it with no
+  `bpf_held_use` (on 6.13+ a `syscall` program can tail-call one calling
+  `bpf_send_signal_task`). Now the kernel path is read when the user one
+  fails (`bpf_cmd::slot_value`), and a value neither reads is refused and
+  signed (`bpf_held_use`, "a value not read", the prog array's map id):
+  fail closed, for a caller outside the family, outside a window.
+- Once no window is open, the kernel-state round signs each held program
+  its enumeration still shows (`bpf_held_load`, High, "still loaded after
+  the window", its attach point or links named), once per program and per
+  agent start: what a window loaded and left attached, pinned or held by
+  a descriptor never outlives it unseen, beside the load's own record.
+
 **What stays open**:
 - what the window itself attached keeps running after it: a link (pinned
   or not), a perf event, a prog array filled then, an iterator link read
   later (`cat` of its pin runs it, no `bpf(2)` command) — the load's
-  `bpf_held_load` names the program id to look for;
+  `bpf_held_load` names the program id to look for, and the round after
+  the window signs it again while it is still loaded;
+- the window is the host's, not the installer's: while it lasts, every
+  root process gets the lifted judge (modules, kexec, the protected files,
+  `systemctl stop` of the agent, and this BPF load and attach), not only
+  the process tree of the `nn-admin trusted-installer-grant` that opened
+  it. Scoping it to the requester's tree is one fix for all of them, on
+  the roadmap after the alpha (a P1 row in UPGRADE_NOTES_WAVE4 §43);
 - an XDP or tc program attached over netlink (no `bpf(2)` command, no
   hook with the descriptor; 6.13+, where such a type can call
   `bpf_send_signal_task`), and the other maps whose values hold program
@@ -2750,11 +2789,31 @@ Now:
 - a program loaded before the agent started: signed High at the start
   (its baseline) but neither its handles (from 6.9) nor its loader's
   descriptor are judged. Its verified instructions carry the helpers'
-  addresses, which only the pre-6.9 calibration reads, and a dump
-  (`BPF_OBJ_GET_INFO_BY_FD`, `xlated_prog_insns`) has every call's `imm`
-  blanked unless `bpf_dump_raw_ok` — `CAP_SYSLOG` with `kptr_restrict=1`
-  — which the agent's unit does not grant (the review's F4: not cheap
-  without widening the agent's capabilities).
+  addresses, which only the pre-6.9 calibration reads. A dump from user
+  space does not help: `BPF_OBJ_GET_INFO_BY_FD`'s `xlated_prog_insns` has
+  the `imm` of every `BPF_JMP|BPF_CALL` zeroed (helpers and kfuncs alike)
+  unless `bpf_dump_raw_ok` — `CAP_SYSLOG` with `kptr_restrict=1`, no
+  capability at all with `kptr_restrict=0` and `perf_event_paranoid` ≤ 1,
+  never with `kptr_restrict=2` — and the agent's unit has no
+  `CAP_SYSLOG`; the JIT image and its symbols are withheld under the same
+  test, and `func_info`/`line_info` name only the program's own code. A
+  kernel-side reader needs no new capability, though: the `iter/bpf_prog`
+  census can read `prog->insnsi` unredacted (as `content_scan` reads a
+  load's) and judge it against helper addresses calibrated as before 6.9
+  (the calibration's own `bpf_prog` hook sees verified code from 6.9). It
+  is medium work and not done for the alpha (the review's F4, the
+  re-check's correction: the cost is the work, not a capability);
+- a prog array's slot is the only map value judged: a `struct_ops` map's
+  update registers its programs at once, and a `struct_ops` map's
+  descriptor given to `BPF_LINK_CREATE` (attach type `BPF_STRUCT_OPS`) or
+  `BPF_LINK_UPDATE` is read as a program's — noise only (a fail-open
+  counted on 6.8, a random id on 7.0, never a false refusal in practice;
+  the re-check's N2, P3);
+- the CPU watch's sources are trusted by filesystem type, not identity: a
+  file of the same filesystem bound over the online list and `/proc/stat`
+  (or a cgroup2 subtree over the cgroup root) BEFORE the agent's first
+  round passes the magic check (the re-check's N3, P3: it needs a reboot
+  or an upgrade, the agent does not restart outside a window).
 
 **A copy of `/etc` over `/etc` (pre-alpha R003).** Measured on Ubuntu 24.04
 and 26.04: a bind of a copy over `/etc` after the key load is signed within

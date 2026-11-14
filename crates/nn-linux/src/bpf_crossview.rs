@@ -486,8 +486,7 @@ pub fn outlived(
     foreign: &[Object],
     window_open: bool,
 ) -> Vec<Finding> {
-    w.outlived
-        .retain(|id| held.iter().any(|(h, _)| h == id));
+    w.outlived.retain(|id| held.iter().any(|(h, _)| h == id));
     if window_open {
         return Vec::new();
     }

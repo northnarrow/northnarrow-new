@@ -2684,12 +2684,23 @@ mod tests {
         const { assert!(BPF_HELD_SET_BPF != BPF_HELD_FULL) };
         // the re-check of #558 (N1, item 2): two more uses, distinct
         const { assert!(BPF_HELD_SLOT_UNREAD > 0xff && BPF_HELD_OUTLIVED > 0xff) };
-        for (i, a) in [BPF_HELD_SET_BPF, BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, BPF_HELD_OUTLIVED]
-            .iter()
-            .enumerate()
+        for (i, a) in [
+            BPF_HELD_SET_BPF,
+            BPF_HELD_FULL,
+            BPF_HELD_SLOT_UNREAD,
+            BPF_HELD_OUTLIVED,
+        ]
+        .iter()
+        .enumerate()
         {
             assert_eq!(bpf_held_of(bpf_held_dev(*a, 0)).0, *a);
-            for b in &[BPF_HELD_SET_BPF, BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, BPF_HELD_OUTLIVED][i + 1..] {
+            for b in &[
+                BPF_HELD_SET_BPF,
+                BPF_HELD_FULL,
+                BPF_HELD_SLOT_UNREAD,
+                BPF_HELD_OUTLIVED,
+            ][i + 1..]
+            {
                 assert_ne!(a, b);
             }
         }

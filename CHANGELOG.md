@@ -143,6 +143,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     refuses the window's load (fail closed). Open, named: what the window
     itself attached, a netlink XDP/tc attach, a `dup2` race (each lost
     attempt signed), programs loaded before the agent.
+    Its re-check: a prog array's value the hook cannot read (a page not
+    resident, `bpf_sys_bpf`'s kernel pointer) is read through the kernel
+    path next and, unread, refused and signed (fail closed: it was let
+    through, and a clean program's tail call ran the held one); once no
+    window is open, each held program still loaded is signed High
+    (`bpf_held_load`, "still loaded after the window"); the kernel-state
+    round's path reads wait at most 2 s (a FUSE file bound over one
+    stalled the whole round), a stall making the CPU watch's round
+    unjudged (three in a row signed). Named: the window is the host's,
+    not the installer's (P1 after the alpha), the `dup2` race (P2), a
+    `struct_ops` map read as a program and the CPU watch's sources
+    trusted by filesystem type (P3).
   - **A copy of `/etc` mounted over `/etc` (R003): measured, unchanged.**
     The integrity round signs it today (`integrity_drift`
     `mount_over_protected`, naming the mount and every protected path it

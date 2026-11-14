@@ -1629,12 +1629,17 @@ fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
 fn the_kernel_state_round_reads_within_a_deadline() {
     let root = repo_root();
     let read = |rel: &str| {
-        strip_comments(&std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")))
+        strip_comments(
+            &std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")),
+        )
     };
     let k = read("crates/nn-linux/src/kernel_state.rs");
     let t = fn_body(&k, "tainted");
     assert!(t.contains("crate::state_read::ROUND_READER"), "{t}");
-    assert!(!t.contains("read_to_string") && !t.contains("state_read::read_state("), "{t}");
+    assert!(
+        !t.contains("read_to_string") && !t.contains("state_read::read_state("),
+        "{t}"
+    );
     let spawn = fn_body(&k, "spawn");
     assert!(
         spawn.contains("crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)"),
@@ -1657,5 +1662,8 @@ fn the_kernel_state_round_reads_within_a_deadline() {
     ] {
         assert!(r.contains(n), "{n}: {r}");
     }
-    assert!(!r.contains("host_now()") && !r.contains("Sources::open()"), "{r}");
+    assert!(
+        !r.contains("host_now()") && !r.contains("Sources::open()"),
+        "{r}"
+    );
 }

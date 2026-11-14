@@ -174,14 +174,23 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       refused (`EPERM`, a signed `bpf_held_use` naming the use and the
       program id): `BPF_PROG_RUN`, `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`,
       `BPF_LINK_UPDATE`, `BPF_RAW_TRACEPOINT_OPEN`, a perf event's
-      `PERF_EVENT_IOC_SET_BPF`, a prog array's update (a tail call's slot).
-      So a `syscall` program calling `bpf_send_signal_task`, or a kprobe
-      calling `bpf_send_signal`, loaded in a window cannot be run or
-      attached after it. What stays open: what was attached INSIDE the
-      window keeps running (a link, pinned or not, a perf event, a prog
-      array filled then, an iterator link read later), and a netlink attach
-      (an XDP or tc program through `ip link` / `tc`, no `bpf(2)` command)
-      — each such program's load is the signed High record above. A
+      `PERF_EVENT_IOC_SET_BPF`, a prog array's update (a tail call's slot;
+      a value the agent cannot read — a page not yet in memory, the kernel
+      pointer of a `syscall` program's own update — is refused too, signed
+      `bpf_held_use` naming the prog array: fail closed). So a `syscall`
+      program calling `bpf_send_signal_task`, or a kprobe calling
+      `bpf_send_signal`, loaded in a window cannot be run or attached after
+      it. What stays open: what was attached INSIDE the window keeps
+      running (a link, pinned or not, a perf event, a prog array filled
+      then, an iterator link read later), a netlink attach (an XDP or tc
+      program through `ip link` / `tc`, no `bpf(2)` command), and a race
+      (another thread's `dup2` of the descriptor between the agent's check
+      and the kernel's: each lost attempt is refused and signed) — each
+      such program's load is the signed High record above, and once the
+      window has closed the agent signs each one still loaded (High,
+      `bpf_held_load` "still loaded after the window", with where it is
+      attached). The window itself is the host's: while it lasts every
+      root process, not only the installer, gets what it lifts. A
       program loaded before the agent started is signed High at its start
       (the cross-view's baseline); from 6.9 its handles, runs and attaches
       are not judged (the agent cannot read its calls: it has no

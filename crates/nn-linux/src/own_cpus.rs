@@ -1328,9 +1328,11 @@ pub fn unjudged_by_stall(r: &mut Reading, stall: Option<String>) {
 /// taint mask's, a loader's `/proc` files, these) makes it unjudged.
 pub fn round(w: &mut Watch, reader: &crate::state_read::TimedReader) -> Option<Confinement> {
     if !w.host_read {
-        if let Ok(h) = reader.run("the CPU watch's start reads (the command line, systemd's \
-             system.conf, the agent's unit)", host_now)
-        {
+        if let Ok(h) = reader.run(
+            "the CPU watch's start reads (the command line, systemd's \
+             system.conf, the agent's unit)",
+            host_now,
+        ) {
             w.host = h;
             w.host_read = true;
         }
@@ -1868,13 +1870,14 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: `c` is NUL-terminated.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let reader =
-            crate::state_read::TimedReader::new(std::time::Duration::from_millis(100), 4);
+        let reader = crate::state_read::TimedReader::new(std::time::Duration::from_millis(100), 4);
         let mut w = Watch::default();
         let mut last = Step::Same;
         for _ in 0..UNJUDGED_ROUNDS {
             let at = fifo.clone();
-            assert!(reader.run("/proc/sys/kernel/tainted", move || std::fs::read(&at)).is_err());
+            assert!(reader
+                .run("/proc/sys/kernel/tainted", move || std::fs::read(&at))
+                .is_err());
             let mut r = reading(&all(), &[&all()]);
             unjudged_by_stall(&mut r, reader.take_stall());
             assert!(r.unjudged.is_some(), "the round is unjudged");
