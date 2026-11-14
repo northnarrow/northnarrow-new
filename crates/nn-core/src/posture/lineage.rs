@@ -2743,29 +2743,29 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             && !is_pam_helper(&first.exe)
     }
 
-    /// Lot 351 (the review of #559, F2): the first exec, since its fork, of
-    /// the process the cached `hop` names — of the spawn cache's execs of
-    /// its pid with its start (the latest and [`HISTORY_PER_PID`] before
-    /// it), the earliest up to `hop`'s, when it is known to be the first:
-    /// the one the kernel's fork record marks ([`Entry::fork_parent`]; a
-    /// later exec carries 0), or the start's scan's entry (a process older
-    /// than the agent). `None` otherwise: a hop read from `/proc`, an
-    /// earlier exec the history no longer holds, a fork record lost.
+    /// Lot 351 (the review of #559, F2): the earliest exec the spawn cache
+    /// holds of the process the cached `hop` names — of its pid's execs with
+    /// its start (the latest and [`HISTORY_PER_PID`] before it), up to
+    /// `hop`'s. It is that process's first since its fork when the kernel's
+    /// fork record marks it ([`Entry::fork_parent`]; a later exec carries
+    /// 0), or when it is the start's scan's entry (`spawn_ns` 0: a process
+    /// older than the agent); else the first is not known (an earlier exec
+    /// the history no longer holds, a fork record lost) and
+    /// [`Self::elevated_child`] refuses it. `None` when no exec of the cache
+    /// is `hop` (its time and start): a hop read from `/proc`, one made of a
+    /// fork.
     fn first_exec_of(&self, hop: &Hop) -> Option<Entry> {
-        if !hop.cached {
-            return None;
-        }
         let s = self.inner.state.read();
         let cur = s.map.get(&hop.pid).or_else(|| s.daemons.get(&hop.pid));
         let execs: Vec<&Entry> = s.history.get(&hop.pid).into_iter().flatten().chain(cur).collect();
         let own = execs
             .iter()
             .find(|e| e.spawn_ns == hop.spawn_ns && e.start_ns == hop.start_ns)?;
-        let first = execs
+        execs
             .iter()
             .filter(|e| e.spawn_ns <= own.spawn_ns && self.same_start(e, own))
-            .min_by_key(|e| e.spawn_ns)?;
-        (first.fork_parent != 0 || first.spawn_ns == 0).then(|| (*first).clone())
+            .min_by_key(|e| e.spawn_ns)
+            .map(|e| (*e).clone())
     }
 
     /// Lot 350 (F2-2): why `pid` is not in an administrator's interactive
@@ -7812,6 +7812,8 @@ mod tests {
         t.ingest_first_exec(263, 262, "/home/carol/askpass", 23, 1002);
         t.ingest_first_exec(264, 263, "/home/carol/payload", 24, 0);
         assert!(!admin(264));
+        let why = t.not_interactive_admin_because(264, AsOf::Now).unwrap();
+        assert!(why.contains("(pid 262)") && why.contains("pid 263,"), "the nearest: {why}");
         // a root shell older than the agent (the start's scan: no exec seen)
         t.ingest_inner(
             270,
@@ -7840,6 +7842,28 @@ mod tests {
         );
         t.ingest_first_exec(281, 280, "/home/alice/payload", 26, 0);
         assert!(!admin(281));
+        // a sudo session older than the agent, its monitor (a fork of sudo,
+        // root's): the monitor's child decides, never the monitor itself
+        let seeded = |pid: u32, ppid: u32, exe: &str, uid: u32| {
+            t.ingest_inner(
+                pid,
+                ppid,
+                exe,
+                (None, false, None),
+                Runs::Inline,
+                0,
+                (3, Some(0)),
+                uid,
+                (None, 0, None),
+            )
+        };
+        seeded(300, 50, "/usr/bin/sudo", 1000);
+        seeded(301, 300, "/usr/bin/sudo", 0);
+        t.ingest_first_exec(302, 301, "/home/alice/askpass", 27, 1000);
+        t.ingest_first_exec(303, 302, "/home/alice/payload", 28, 0);
+        assert!(!admin(303));
+        t.ingest_first_exec(304, 301, "/home/alice/x.sh", 29, 0);
+        assert!(admin(304));
         // sudo's own process (sudoedit's copy back)
         assert!(admin(100));
     }
