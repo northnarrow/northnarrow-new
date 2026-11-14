@@ -774,6 +774,10 @@ const START_CALLS: &[(&str, &str)] = &[
         "a degradation signed now, into the run's signed log",
     ),
     (
+        "degradation::keep",
+        "lot 345: the start's unsigned profile downgrade, signed by its own row, kept in the run's degradations for the status",
+    ),
+    (
         "degradation::attach_audit_log",
         "binds the run's signed log to the audit log, once, as the logger is installed",
     ),

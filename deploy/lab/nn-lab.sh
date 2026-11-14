@@ -67,6 +67,7 @@
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh foreign-bpf-check  # lot 290: foreign BPF — the refused program types (a kprobe with bpf_probe_write_user, bpftrace outside/inside a window, the signed per-loader opt-out), the agent's objects off limits (FOREIGN_BPF_ONLY="F2 F4" a subset), the frozen maps, the cross-view (its status file, a program loaded in the agent's gap), systemd's BPF unit features, R011 Low
 #   deploy/lab/nn-lab.sh host-deny-check    # lot 341: the host's integrity and the agent's self-protection under every profile — a foreign tracing program, bpftrace and a BCC/libbpf tool refused unless the signed policy names their loader (install.sh --allow-bpf-tools), the agent's maps, programs and links, kernel.ftrace_enabled=0, kprobes/enabled=0, a SIGSTOP to the agent and a cgroup v1 freezer move refused (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1 in the units' environment)
+#   deploy/lab/nn-lab.sh bpf-content-check  # lot 345: a loader the signed opt-out names (install.sh --allow-bpf-tools, NN_LAB_INSTALL_EXTRA) still cannot load a program calling bpf_send_signal(_thread), bpf_override_return or bpf_probe_write_user, nor an fmod_ret — bpftrace, BCC and a plain tracing program still load
 #   deploy/lab/nn-lab.sh own-pins-check     # lot 301: every BPF object the agent pins is its own to the guard — no link of the agent's (the start-in-cgroup tracker's among them) given to root by id, a handle on and a detach of the tracker's links refused and signed, the tracker still marking (the guard enforcing for the run; KEEP_ENFORCE=1 leaves it so)
 #   deploy/lab/nn-lab.sh deny-selftest-check  # lot 302: every deny hook proves it denies each round — the guard enforcing for the run, ROUNDS rounds with every attempt refused and reported, nothing judged or held back, the budgets spent before 2 rounds, one hook detached on purpose (DETACH=inode_mknod: the degradation, then the alert), the bpf() guard refusing through a restart gap (SKIP_DETACH=1 / SKIP_GAP=1 leave those out; KEEP_ENFORCE=1)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
@@ -109,6 +110,8 @@
 #   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above),
 #   NN_LAB_PROFILE (enforcing; alpha: `install` as an operator's fresh install —
 #   the observe-only profile, the units started by install.sh — lot 341).
+#   NN_LAB_INSTALL_EXTRA: more install.sh flags for that fresh install
+#   (`--allow-bpf-tools`: bpf-content-check — lot 345).
 #   NN_LAB_CI=1: CI mode (.github/workflows/lab-vm.yml, lab PR 227), one KVM guest on a
 #   GitHub-hosted runner. KVM only (whpx and tcg refused), every cargo build --locked (the
 #   host's eBPF build, the guest's builds and test runs), ssh in batch mode with keepalives
@@ -1170,7 +1173,9 @@ cmd_install() {
     # profile, started and enabled by install.sh itself (lot 341's round).
     local flags="--source-tree --no-enable --profile enforcing"
     if [[ ${NN_LAB_PROFILE:-enforcing} == alpha ]]; then
-        flags="--source-tree"
+        # lot 345: NN_LAB_INSTALL_EXTRA (e.g. --allow-bpf-tools) goes with
+        # the operator's fresh install, which install.sh starts itself
+        flags="--source-tree ${NN_LAB_INSTALL_EXTRA:-}"
     fi
     vcargo "sudo ./deploy/install.sh $flags && sudo systemctl daemon-reload" || die "install.sh failed (its output above)"
     lab_start_units
@@ -1766,6 +1771,17 @@ cmd_host_deny_check() {
     # guard enforces (NN_BPF_DEFENSE_ENFORCE=1).
     vm_running || die "guest is not running"
     vssh "cd ~/northnarrow && bash deploy/lab/malsim/host-deny-check.sh"
+}
+
+cmd_bpf_content_check() {
+    # Lot 345 (deploy/lab/malsim/bpf-content-check.sh): what a loader the
+    # signed per-loader opt-out names still cannot load — a program calling
+    # bpf_send_signal(_thread), bpf_override_return or bpf_probe_write_user,
+    # an fmod_ret — while bpftrace, BCC and a plain tracing program still
+    # load. Needs an install with --allow-bpf-tools (NN_LAB_PROFILE=alpha
+    # NN_LAB_INSTALL_EXTRA=--allow-bpf-tools nn-lab.sh install).
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && bash deploy/lab/malsim/bpf-content-check.sh"
 }
 
 cmd_own_pins_check() {
@@ -2586,6 +2602,7 @@ case "${1:-help}" in
     switches-check) cmd_switches_check ;;
     foreign-bpf-check) cmd_foreign_bpf_check ;;
     host-deny-check) cmd_host_deny_check ;;
+    bpf-content-check) cmd_bpf_content_check ;;
     own-pins-check) cmd_own_pins_check ;;
     selftest-check) cmd_selftest_check ;;
     deny-selftest-check) cmd_deny_selftest_check ;;

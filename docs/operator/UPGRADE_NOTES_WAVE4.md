@@ -2154,3 +2154,106 @@ detail.
   `argv` in a record may now hold `""` where it read as missing. A command
   line of exactly 512 bytes is now marked cut (`argv_truncated`), as a
   longer one: the sensor reads 511.
+
+## 40. Allowed BPF loaders, the profile alarm, install's policy edges (lot 345)
+
+- **A loader `bpf-loader-allow` names is still refused what would kill or
+  blind the agent.** In a load of a type refused by default (`kprobe`,
+  `tracepoint`, `perf_event`, `raw_tracepoint`, `raw_tracepoint_writable`,
+  `tracing`, `struct_ops`, `ext`, `lsm` — the types only such a line opens),
+  an fmod_ret (`BPF_MODIFY_RETURN`) program, and a program that calls
+  `bpf_send_signal`, `bpf_send_signal_thread`, `bpf_probe_write_user`,
+  `bpf_override_return` or one of the kfuncs below, are refused to every
+  loader outside the agent's family and a trusted-installer window — the
+  ones `install.sh --allow-bpf-tools` / `--allow-bpf-loader` named
+  included.
+  bpftrace's `signal()` (`--unsafe`) is refused this way; its other probes,
+  BCC's tools and plain tracing programs load as before. Each refusal is a
+  signed `bpf_prog_type` record (High) naming the helper or the fmod_ret
+  (`ALPHA_PROFILE.md` §1.2). Where the kernel judges it: from 6.9 at the
+  `bpf_prog_load` hook (`EPERM`, before the verifier); before 6.9 at the
+  `bpf_prog` hook once verified (`EPERM`), the targets calibrated at the
+  agent's start from its own programs (two programs loaded, read and
+  unloaded: `nn_calib_signals`, `nn_calib_override`), and
+  `bpf_probe_write_user` at the verifier's `locked_down` question (the
+  verifier reports `EINVAL`). The agent's unit gains no capability. Two
+  more pins under the pin root on such kernels (`prog_bpf_prog_load` /
+  `link_bpf_prog_load` from 6.9; `prog_locked_down` / `link_locked_down`
+  before) — `uninstall.sh` removes them with the rest.
+- **The signalling kfuncs are refused in a load of EVERY type (the review
+  of #553).** `bpf_send_signal_task` (6.13 and later) and the
+  `bpf_task_work_schedule_signal` / `bpf_task_work_schedule_resume` kfuncs
+  (6.18 and later; their `_impl` spellings on 6.18) are refused in a
+  foreign load of any program type — `syscall` (run with `BPF_PROG_RUN`),
+  XDP, tc, `cgroup_skb` and every other type a root process loads with no
+  opt-out — at the `bpf_prog_load` hook (`EPERM`, before the verifier), a
+  signed `bpf_prog_type` record (High) naming the kfunc. The kfuncs the
+  kernel's BTF has are read; a program the judge cannot read whole is
+  refused. Before this release, on 6.13 and later, **any root process**
+  could kill the agent and its watchdog this way: a `syscall` program doing
+  `bpf_task_from_pid(agent)` then `bpf_send_signal_task(…, SIGKILL, …)`
+  signals as `SI_KERNEL`, which no `task_kill` hook sees, and the judge
+  read only the types refused by default. Per kernel: before 6.13 none of
+  these kfuncs exists (nothing to refuse); on 6.9 to 6.12 a type let
+  through by default is not read at all (no cost); from 6.13 each foreign
+  load of such a type is read once, at the load (no cost per packet).
+  Cilium and systemd call none of them. Measured on Ubuntu 26.04 (`7.0.0-43`, our lab guest): with no agent, a
+  root `syscall` program run this way killed a `sleep`; with the agent
+  (installed `--allow-bpf-tools`), the same program against the agent —
+  `syscall`, XDP and tc, from a root process no line names and from
+  python3 — was refused `EPERM` at the load, each with a signed record
+  naming `bpf_send_signal_task`, and the agent kept its pid; the same
+  programs without the signal loaded (and ran), bpftrace and BCC's
+  `opensnoop-bpfcc` ran. `bpf_prog_load_guard`: 5,613 instructions
+  processed; `verifier-check` 0 failing, the highest program 360,991.
+- **A failed calibration suspends the opt-outs (before 6.9).** The
+  `locked_down` guard for `bpf_probe_write_user` is attached whatever the
+  calibration does (a failed one used to drop it). While the content judge
+  is not armed — a calibration that failed, or that read other calls than
+  its programs make (it now takes exactly the two signal calls and the one
+  override call, each a different helper), a configuration not written —
+  the `bpf` hook honours **no** `bpf-loader-allow` line: their types are
+  refused again, as without the line, until a start arms the judge. The
+  observe failure `bpf content judge` says so in `nn-admin status`.
+- **The profile alarm compares profiles.** The signed `agent_boot` row
+  carries `profile` and `profile_source`; an `alpha` start without a signed
+  `profile.local` alarms after a boot of the `enforcing` profile, observing
+  or not (a row written before this release: after one that ran its
+  responses). The alarm is also a degradation of source `profile` in
+  `nn-admin status --key` (and counts against the trust level). A reader of
+  the audit chain keyed on `detect_only` keeps working; one that wants the
+  profile reads `profile`.
+- **The profile alarm stays until something signed answers it (the review
+  of #553).** It no longer lives one boot only: while the chain holds a
+  `profile_downgraded` row that nothing signed answered, every later start
+  keeps the degradation of source `profile` (`PROFILE DOWNGRADE NOT
+  ACKNOWLEDGED` in the journal; `nn-admin status --key`, the trust level),
+  however many times the host reboots. It ends when a start runs a profile
+  from a signed `profile.local` (alpha or enforcing), or after a signed
+  `nn-admin config overlay set profile` succeeds (its `config_overlay_set`
+  row is the acknowledgement; the next start no longer alarms). An unsigned
+  return to `enforcing` (the manifest edited back) does not end it. No new
+  row is written per start: the chain already holds the event. An
+  observing `agent_boot` row of an agent before the profile field no longer
+  resets the known profile to "unknown".
+- **`install.sh --allow-bpf-tools` / `--allow-bpf-loader`**: an existing
+  line of a named loader that lacks some of the five tracing types is
+  widened (its own types kept); a policy file without a final newline no
+  longer makes the agent refuse the whole policy; nothing is signed over a
+  `rule-policy.local` whose signature does not verify (the install warns,
+  the lines are not applied — sign them by hand after a review); a script
+  named by `--allow-bpf-loader` is warned about (the kernel sees its
+  interpreter). `--help` and the summary say what the flag opens.
+- **`install.sh` signs no policy with a line opening `lsm`, `struct_ops`
+  or `ext` (the review of #553).** Such a line is hand-made (the flags
+  write the five tracing types only), and a program of those types blinds
+  or starves the agent — the content judge reads no return value. The
+  install warns, names the line and signs nothing; review the policy and
+  sign it yourself (`RULE_POLICY.md` §2.5).
+- **Feature probes (measured).** `bpftool feature probe kernel` loads a small
+  program of each type: the nine types refused by default are refused to
+  it (bpftool is no opt-out's loader) — nine signed `bpf_prog_type`
+  records, High, on Ubuntu 26.04 (7.0); no content-judge record. Run it
+  inside a trusted-installer window, or expect them. `bpftrace --info`
+  under the opt-out: six records, none High (its loads are the opt-out's,
+  Low).

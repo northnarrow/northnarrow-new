@@ -600,11 +600,35 @@ bpf-loader-allow /usr/bin/falco raw_tracepoint,tracing
   §1.1). `install.sh --allow-bpf-tools` (this host's bpftrace and the
   interpreter of BCC's tools) and `--allow-bpf-loader <path>` write these
   lines at a fresh install, signed with the install's key and applied
-  through the started agent; a line already in the policy is kept
+  through the started agent; a line already in the policy is kept, widened
+  to the tools' five types when it lacks some (lot 345), and nothing is
+  signed over a policy on disk whose signature does not verify
   (ALPHA_PROFILE.md §1.2).
 - It names an executable, not a user: while it is in force any root process
   that runs that executable may load those types. bpftrace runs what it is
-  given — opt out a tool only where its use outside a window is routine.
+  given — opt out a tool only where its use outside a window is routine. A
+  script (`#!`) is never the executable the kernel sees: name its
+  interpreter (`install.sh --allow-bpf-loader` warns).
+- **What no line opens (lot 345).** A loader the opt-out names is still
+  refused an fmod_ret (`BPF_MODIFY_RETURN`: it overrides any `security_*`
+  function's return) and a program that calls `bpf_send_signal`,
+  `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`,
+  `bpf_send_signal_task` or a `bpf_task_work_schedule_*` kfunc — the
+  agent's content judge (ALPHA_PROFILE.md §1.2 says where each kernel
+  judges it). NN-L-AT-001 `bpf_prog_type`, High, names the helper, the
+  kfunc or the fmod_ret. The kfuncs are refused in a load of every type
+  too, opted out or not (6.13 and later: the review of #553) — the helpers
+  only in the types this section opens. While the judge is not armed (a
+  start that could not calibrate it, before 6.9) no line is honoured.
+- **What a line opening `lsm`, `struct_ops` or `ext` gives away.** The
+  judge reads calls, not return values: an `lsm` program can deny the
+  agent's own file opens and `bpf()` calls, a `struct_ops` one (sched_ext,
+  6.12 and later) can starve it of CPU, an `ext` one takes the place of a
+  function of another loaded program and changes what it decides. A loader
+  such a line names can blind or starve the agent without any refused
+  call. Name those types only for a loader you
+  trust as much as the agent; `install.sh` signs no policy that has such a
+  line (the review of #553: it warns and leaves the signing to you).
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 BPF loader opt-out`).
 - **bpftool needs a window, not an opt-out.** Its `pids` column comes from

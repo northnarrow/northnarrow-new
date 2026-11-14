@@ -905,6 +905,9 @@ mod tests {
     /// locked or not out of the dumps is said, and signed.
     #[test]
     fn a_key_s_unprotected_memory_is_a_signed_degradation() {
+        // lot 345: the registry is one per process — the tests that write it
+        // run one at a time (a report here was signed into another test's log)
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         assert_eq!(memory_detail("k", true, true), None);
         let d = memory_detail("the agent's signing key", false, true).unwrap();
         assert!(d.contains("not locked in RAM"), "{d}");

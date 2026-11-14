@@ -4277,14 +4277,15 @@ fn allow_bpf_tools_names_bpftrace_and_the_bcc_interpreter() {
 
 /// Named (lot 341, the review of #550 F2): the policy signed keeps the
 /// policy in force and adds one line for each loader it does not name yet,
-/// with the tracing types; a line already there is kept as it is.
+/// with the tracing types; a line already there with them is kept as it is
+/// (lot 345: one that lacks some is widened — the next test).
 #[test]
 fn allow_bpf_tools_adds_lines_to_the_policy_in_force() {
     let dir = case_dir("bpf-tools-policy");
     let current = dir.join("rule-policy.local");
     fs::write(
         &current,
-        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe\n",
+        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n",
     )
     .unwrap();
     let (status, out, err) = bpf_loader_allow(
@@ -4298,7 +4299,7 @@ fn allow_bpf_tools_adds_lines_to_the_policy_in_force() {
     assert_eq!(status, 0, "{err}");
     assert_eq!(
         out,
-        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe\n\
+        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n\
          bpf-loader-allow /usr/bin/python3.12 kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n\
          allowed=/usr/bin/bpftrace (already in the policy) /usr/bin/python3.12\n"
     );
@@ -4327,6 +4328,241 @@ fn allow_bpf_tools_adds_lines_to_the_policy_in_force() {
         out,
         "bpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n"
     );
+}
+
+/// Named (lot 345; the re-check of #550, N4): a policy in force whose last
+/// line has no newline gets one before the lines added (they were glued to
+/// it: `…R011bpf-loader-allow …`, and the agent refused the whole policy);
+/// a line of a loader that lacks some tracing types is widened to them —
+/// its own kept, its comment too — and the summary says so (it said
+/// "already in the policy" while those types stayed refused).
+#[test]
+fn allow_bpf_tools_widens_a_narrower_line_and_mends_a_missing_newline() {
+    let dir = case_dir("bpf-tools-edges");
+    let current = dir.join("rule-policy.local");
+    fs::write(
+        &current,
+        "bpf-loader-allow /usr/bin/bpftrace kprobe,tracing   # the SRE's tracing\naudit R011",
+    )
+    .unwrap();
+    let (status, out, err) = bpf_loader_allow(
+        &dir,
+        "",
+        &format!(
+            "bpf_loader_policy '{}' <<< $'/usr/bin/bpftrace\\n/usr/bin/python3.12'\necho \"allowed=${{BPF_ALLOWED[*]}}\"",
+            current.display()
+        ),
+    );
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        out,
+        "bpf-loader-allow /usr/bin/bpftrace kprobe,tracing,tracepoint,perf_event,raw_tracepoint # the SRE's tracing\n\
+         audit R011\n\
+         bpf-loader-allow /usr/bin/python3.12 kprobe,tracepoint,perf_event,raw_tracepoint,tracing\n\
+         allowed=/usr/bin/bpftrace (widened: +tracepoint,perf_event,raw_tracepoint) /usr/bin/python3.12\n"
+    );
+    // a line of another loader, and one of a type past the tools', untouched
+    fs::write(
+        &current,
+        "bpf-loader-allow /usr/bin/falco lsm\nbpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing,ext",
+    )
+    .unwrap();
+    let (_, out, _) = bpf_loader_allow(
+        &dir,
+        "",
+        &format!(
+            "bpf_loader_policy '{}' <<< /usr/bin/bpftrace\necho \"allowed=${{BPF_ALLOWED[*]}}\"",
+            current.display()
+        ),
+    );
+    assert_eq!(
+        out,
+        "bpf-loader-allow /usr/bin/falco lsm\n\
+         bpf-loader-allow /usr/bin/bpftrace kprobe,tracepoint,perf_event,raw_tracepoint,tracing,ext\n\
+         allowed=/usr/bin/bpftrace (already in the policy)\n"
+    );
+}
+
+/// Named (lot 345; the re-check of #550, N3b): the lines are signed over
+/// the policy on disk only when it is the verified policy in force — a
+/// `rule-policy.local` that `nn-admin config overlay status` says is NOT
+/// LOADED (an unsigned edit on a kept configuration) is not signed with the
+/// install's key: nothing is applied, nothing claimed, the operator told.
+#[test]
+fn allow_bpf_tools_signs_nothing_over_an_unverified_policy() {
+    let dir = case_dir("bpf-tools-unverified");
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(dir.join("rule-policy.local"), "audit R011\n").unwrap();
+    fs::write(dir.join("key"), "k").unwrap();
+    let admin = |status_line: &str| {
+        write_exec(
+            &bin.join("nn-admin"),
+            &format!(
+                "echo \"$*\" >> '{calls}'\n[ \"$1 $2 $3\" = 'config overlay status' ] && printf '%s\\n' 'exec-allow               absent' '{status_line}'\nexit 0",
+                calls = dir.join("calls").display()
+            ),
+        )
+    };
+    let vars = format!(
+        "ETC_DIR='{}'; BIN_DIR='{}'; ALLOW_BPF_TOOLS=0; ALLOW_BPF_LOADERS=(/bin/sh)",
+        dir.display(),
+        bin.display()
+    );
+    let body = format!(
+        "apply_bpf_loader_allow '{}'\necho \"allowed=${{BPF_ALLOWED[*]-}}\"",
+        dir.join("key").display()
+    );
+    admin("rule-policy              NOT LOADED at the next start: signature does not verify");
+    let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("is not the verified policy in force"), "{err}");
+    assert!(out.ends_with("allowed=\n"), "{out}");
+    let calls = fs::read_to_string(dir.join("calls")).unwrap();
+    assert!(!calls.contains("policy set"), "{calls}");
+    // the verified policy: signed over it
+    fs::remove_file(dir.join("calls")).unwrap();
+    admin("rule-policy              signed (ts 1700000000, keys ab12)");
+    let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
+    assert_eq!(status, 0, "{err}");
+    let calls = fs::read_to_string(dir.join("calls")).unwrap();
+    assert!(calls.contains("policy set --file"), "{calls}");
+    assert!(out.ends_with("allowed=/bin/sh\n"), "{out}");
+    // no policy on disk: nothing to verify, the lines alone
+    fs::remove_file(dir.join("rule-policy.local")).unwrap();
+    fs::remove_file(dir.join("calls")).unwrap();
+    admin("rule-policy              NOT LOADED at the next start: anything");
+    let (_, out, _) = bpf_loader_allow(&dir, &vars, &body);
+    assert!(out.ends_with("allowed=/bin/sh\n"), "{out}");
+    let calls = fs::read_to_string(dir.join("calls")).unwrap();
+    assert!(!calls.contains("config overlay status"), "{calls}");
+}
+
+/// Named (the review of #553, F5): a hand-made `bpf-loader-allow` line in
+/// the policy in force that opens `lsm`, `struct_ops` or `ext` (a program
+/// of those types blinds or starves the agent: the content judge reads no
+/// return value) is not signed by install.sh with its own lines — it says
+/// so and signs nothing; a line of the tracing types is signed as before.
+#[test]
+fn allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext() {
+    let dir = case_dir("bpf-tools-wide-line");
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(dir.join("key"), "k").unwrap();
+    write_exec(
+        &bin.join("nn-admin"),
+        &format!(
+            "echo \"$*\" >> '{calls}'\n[ \"$1 $2 $3\" = 'config overlay status' ] && printf '%s\\n' 'rule-policy              signed (ts 1700000000, keys ab12)'\nexit 0",
+            calls = dir.join("calls").display()
+        ),
+    );
+    let vars = format!(
+        "ETC_DIR='{}'; BIN_DIR='{}'; ALLOW_BPF_TOOLS=0; ALLOW_BPF_LOADERS=(/bin/sh)",
+        dir.display(),
+        bin.display()
+    );
+    let body = format!(
+        "apply_bpf_loader_allow '{}'\necho \"allowed=${{BPF_ALLOWED[*]-}}\"",
+        dir.join("key").display()
+    );
+    for line in [
+        "bpf-loader-allow /usr/bin/falco lsm",
+        "bpf-loader-allow /usr/bin/scx_rusty kprobe,struct_ops",
+        "bpf-loader-allow /opt/x/loader ext,tracing   # the operator's",
+    ] {
+        fs::write(
+            dir.join("rule-policy.local"),
+            format!("audit R011\n{line}\n"),
+        )
+        .unwrap();
+        let _ = fs::remove_file(dir.join("calls"));
+        let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
+        assert_eq!(status, 0, "{err}");
+        assert!(
+            err.contains("opening lsm, struct_ops or ext"),
+            "{line}: {err}"
+        );
+        assert!(
+            err.contains(line.split_whitespace().nth(1).unwrap()),
+            "{err}"
+        );
+        assert!(out.ends_with("allowed=\n"), "{line}: {out}");
+        let calls = fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.contains("policy set"), "{line}: {calls}");
+    }
+    // the tracing types only: signed as before (a word that merely
+    // contains a type's name is not that type)
+    fs::write(
+        dir.join("rule-policy.local"),
+        "audit R011\nbpf-loader-allow /usr/bin/bpftrace kprobe,tracing,tracepoint\n",
+    )
+    .unwrap();
+    let _ = fs::remove_file(dir.join("calls"));
+    let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
+    assert_eq!(status, 0, "{err}");
+    assert!(out.ends_with("allowed=/bin/sh\n"), "{out}");
+    assert!(fs::read_to_string(dir.join("calls"))
+        .unwrap()
+        .contains("policy set --file"));
+}
+
+/// Named (lot 345; the re-check of #550, point 1 and N5): `--help` and the
+/// summary say the risk of `--allow-bpf-tools` — BCC's line is the Python
+/// interpreter's, so any root Python script may load tracing BPF, which
+/// reads every process's memory — and what stays refused; a script named
+/// by `--allow-bpf-loader` is warned about (the kernel sees its
+/// interpreter).
+#[test]
+fn the_risk_of_allow_bpf_tools_is_said_in_help_and_summary() {
+    let out = Command::new("bash")
+        .arg(repo_root().join("deploy/install.sh"))
+        .arg("--help")
+        .output()
+        .expect("bash runs");
+    let help = String::from_utf8_lossy(&out.stdout);
+    for want in [
+        "RISK: the kernel knows a loader by",
+        "ANY root",
+        "script run by python3",
+        "read the memory of every process, the agent's",
+        "fmod_ret programs and any program that",
+        "bpf_send_signal, bpf_probe_write_user or bpf_override_return",
+        "A script (#!) is",
+    ] {
+        assert!(help.contains(want), "{want:?} not in --help:\n{help}");
+    }
+    let s = install_summary(
+        "summary-bpf-risk",
+        "PROFILE_RECORDED=alpha; STARTED_NOW=1; MODE=full; BPF_ALLOWED=(/usr/bin/python3.12)",
+        false,
+    );
+    for want in [
+        "bpf tools : allowed for /usr/bin/python3.12",
+        "(for python3: ANY root",
+        "Python script), which read every process's memory, the agent's included.",
+        "fmod_ret, bpf_send_signal,",
+        "bpf_probe_write_user, bpf_override_return) stay refused",
+        "Remove the lines on a",
+    ] {
+        assert!(s.contains(want), "{want:?} not in:\n{s}");
+    }
+    let dir = case_dir("bpf-loader-script");
+    let script = dir.join("tool.py");
+    write_exec(&script, "import bcc");
+    fs::write(&script, "#!/usr/bin/python3 -u\nimport bcc\n").unwrap();
+    let (status, _, err) = bpf_loader_allow(
+        &dir,
+        "",
+        &format!("bpf_loader_script_warning '{}'", script.display()),
+    );
+    assert_eq!(status, 0);
+    assert!(
+        err.contains("is a script: the kernel sees its interpreter"),
+        "{err}"
+    );
+    assert!(err.contains("(/usr/bin/python3 -u)"), "{err}");
+    let (_, _, err) = bpf_loader_allow(&dir, "", "bpf_loader_script_warning /bin/sh");
+    assert!(err.is_empty(), "{err}");
 }
 
 /// Named (lot 341, the review of #550 F2): a fresh alpha install with
