@@ -2662,7 +2662,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `SUDO_ASKPASS` program as the user — a payload a local privilege
     /// escalation made root below it was "an administrator's session".
     pub fn is_interactive_admin(&self, pid: u32, as_of: AsOf) -> bool {
-        if !matches!(self.elevation_walk(pid, as_of), (Some(WalkEnd::Found(_)), _)) {
+        if !matches!(
+            self.elevation_walk(pid, as_of),
+            (Some(WalkEnd::Found(_)), _)
+        ) {
             return false;
         }
         let Some(live) = self.nearest_running(pid, as_of) else {
@@ -2757,7 +2760,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     fn first_exec_of(&self, hop: &Hop) -> Option<Entry> {
         let s = self.inner.state.read();
         let cur = s.map.get(&hop.pid).or_else(|| s.daemons.get(&hop.pid));
-        let execs: Vec<&Entry> = s.history.get(&hop.pid).into_iter().flatten().chain(cur).collect();
+        let execs: Vec<&Entry> = s
+            .history
+            .get(&hop.pid)
+            .into_iter()
+            .flatten()
+            .chain(cur)
+            .collect();
         let own = execs
             .iter()
             .find(|e| e.spawn_ns == hop.spawn_ns && e.start_ns == hop.start_ns)?;
@@ -7683,7 +7692,14 @@ mod tests {
             stat(tmp.path(), 711, 710, 34817, mf / (10 * MS));
             write_exe(tmp.path(), 711, forked);
             write_status(tmp.path(), 711, 710);
-            exec_forked(&t, (712, 711), "/home/alice/nn/deploy/uninstall.sh", tc, tfc, 0);
+            exec_forked(
+                &t,
+                (712, 711),
+                "/home/alice/nn/deploy/uninstall.sh",
+                tc,
+                tfc,
+                0,
+            );
             stat(tmp.path(), 712, 711, 34817, tfc / (10 * MS));
             write_loginuid(tmp.path(), 712, 1000);
             write_exe(tmp.path(), 712, "/usr/bin/bash");
@@ -7813,7 +7829,10 @@ mod tests {
         t.ingest_first_exec(264, 263, "/home/carol/payload", 24, 0);
         assert!(!admin(264));
         let why = t.not_interactive_admin_because(264, AsOf::Now).unwrap();
-        assert!(why.contains("(pid 262)") && why.contains("pid 263,"), "the nearest: {why}");
+        assert!(
+            why.contains("(pid 262)") && why.contains("pid 263,"),
+            "the nearest: {why}"
+        );
         // a root shell older than the agent (the start's scan: no exec seen)
         t.ingest_inner(
             270,

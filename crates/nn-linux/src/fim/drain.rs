@@ -4316,7 +4316,11 @@ mod tests {
         assert_eq!(v.severity, nn_model::Severity::High);
         // its drift row too: the evidence of the truncation
         let rows = std::fs::read_to_string(fx._dir.path().join("drift.jsonl")).unwrap();
-        assert_eq!(rows.lines().count(), 2, "the append's row and the truncation's");
+        assert_eq!(
+            rows.lines().count(),
+            2,
+            "the append's row and the truncation's"
+        );
         // and a log the agent watched larger than its baseline (a restart
         // after the log grew: the size noted at the watch, no read)
         let mut fx = LogFixture::new(4_000);
@@ -4351,7 +4355,8 @@ mod tests {
         let mut fx = LogFixture::new(0);
         fx.baseline_now();
         fx.append(b"a line rsyslogd wrote\n");
-        fx.drift(&fx.raw(rsyslogd, BOTH)).expect("rsyslogd's append");
+        fx.drift(&fx.raw(rsyslogd, BOTH))
+            .expect("rsyslogd's append");
         fx.truncate(0);
         let own = fx
             .drift(&fx.raw(logrotate, FIM_SETATTR_SIZE))
