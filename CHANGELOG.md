@@ -839,7 +839,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     image's identity) of a container runtime's modules, by name, the
     system's tool, is a Low record; the pump keeps `LD_LIBRARY_PATH`'s value
     when it is the one refused variable (`ExecFacts::library_path`), and
-    only containerd's state directories are accepted there. The module's
+    only containerd's `opt` library directories are accepted there. The module's
     file is still R018's at its load.
   - **The shutdown record (NN-L-FIM-019).** `systemd-update-utmp` writing
     wtmp at the host's shutdown, judged before its exec reached the lineage:
@@ -850,7 +850,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **Lab corpus.** The containers corpus also restarts docker (its start:
     `iptables`/`nft`, module loads), runs a `docker exec` and a build — the
     NN-L-EVA-002 of `xtables-nft-multi` lot 344 named did not reproduce on
-    Debian 13, Ubuntu 22.04, 24.04 or 26.04.
+    Debian 13, Ubuntu 22.04, 24.04 or 26.04. The `docker exec` step removes a
+    leftover `nn-corpus` container first, and its own whatever the exec did.
+  - **The review of #556.** (F1) The seals are read AT THE EXEC: the exec
+    LSM program reads the memfd's shmem inode (`shmem_inode_info.seals`, two
+    new optional BTF offsets, slots 135–136; the enum, tracepoint and
+    hook-argument slots move by two) and sets `exe_flags::MEMFD_SEALED` when
+    it is sealed against writing, shrinking and growing; the pump and R004
+    exempt only such an exec — a copy sealed after the exec (an OCI hook's
+    memfd, rewritten by its holder) is Critical. A ratchet
+    (`kernel_halves.rs`) keeps the flag the LSM program's alone. (F2) The
+    runtime compares' budget: 64 MiB a second per uid, 256 MiB of the
+    512 MiB reserved for root; a clone past its uid's share is kept
+    unverified and recorded High, never killed. (F3) The docs say what R018
+    does with an unpackaged module in `/lib/modules`: High, recorded only.
+    (F4) containerd's library path: exactly its `opt` directories, kept by
+    the pump only when root-only with root-only files (`ctr install` named
+    a residual). (F5) The utmp unit's write is exempt only as an append of
+    whole login records. (F6) The drain reads the writer's image only for a
+    process that started before the record. (F7) A runtime or manager is
+    recorded only when its file and directories are root's and writable by
+    no one else.
 - Lot 346 (alpha, false positives round 2B): a developer's and a
   self-hoster's normal work, each benign case told apart by identity —
   never by name alone (`docs/operator/UPGRADE_NOTES_WAVE4.md` §39).

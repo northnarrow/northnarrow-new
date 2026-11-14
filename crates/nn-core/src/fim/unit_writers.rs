@@ -50,6 +50,38 @@ pub const UTMP_IMAGES: &[&str] = &[
 /// The login records whose writes the drain reads the writer of: NN-L-FIM-019's.
 pub const LOGIN_RECORDS: &[&str] = &["/var/log/wtmp", "/var/log/btmp"];
 
+/// The review of #556 (F5): the size of a login record, glibc's
+/// `struct utmp` (wtmp's and btmp's) on the agent's architecture, which is
+/// systemd's: 400 bytes where its session is a `long` and its time a
+/// `timeval` (aarch64, s390x, loongarch64), 384 elsewhere (x86_64's 32-bit
+/// fields, every 32-bit target).
+pub const UTMP_RECORD_LEN: u64 = if cfg!(any(
+    target_arch = "aarch64",
+    target_arch = "s390x",
+    target_arch = "loongarch64"
+)) {
+    400
+} else {
+    384
+};
+
+/// The review of #556 (F5): `fe`'s write grew its file by whole login
+/// records since the drain last read it — what `systemd-update-utmp`
+/// writes (a boot, shutdown or runlevel record, appended). The kernel keeps
+/// one dirty mark per inode and the drain credits its LAST writer with
+/// every write since its last read, so a truncation or a rewrite before the
+/// unit's append (`systemctl restart systemd-update-utmp`) was the unit's
+/// write: a shrink, a rewrite of the same size or a part of a record is no
+/// append, whoever wrote last. Residual: a rewrite of earlier records in
+/// place followed by the unit's append within one mark still grows the file
+/// by whole records (the drain compares no prefix); it needs root.
+pub fn appended_whole_records(fe: &FimEvent) -> bool {
+    match (fe.baseline_size, fe.new_size) {
+        (Some(before), Some(after)) => after > before && (after - before) % UTMP_RECORD_LEN == 0,
+        _ => false,
+    }
+}
+
 /// The writes kept at most (the oldest out): the decision reads a write's
 /// fact right after the drain sent it.
 pub const KEPT_WRITES: usize = 256;

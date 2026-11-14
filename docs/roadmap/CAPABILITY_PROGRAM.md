@@ -11023,6 +11023,39 @@ number in parentheses is a lab PR.
     26.04; R011 High (recorded) of the initramfs hook `kmod` at Podman's
     install (lot 287's); R005 High of an `nc` at Debian 13's and Ubuntu
     26.04's boot.
+  - The review of #556 (fix round): F1, the seals read AT THE EXEC — the
+    exec LSM program reads the memfd's shmem inode (`shmem_inode_info.seals`
+    and `.vfs_inode`, optional slots 135–136) and sets
+    `exe_flags::MEMFD_SEALED`; the pump and R004 exempt only such an exec (a
+    copy rewritten and sealed after the exec — an OCI hook's memfd — stays
+    Critical; ratchet `kernel_halves.rs`). F2, the runtime compares' budget
+    per uid (64 MiB a second) with root's reserve (256 of 512 MiB); a clone
+    past its uid's share is recorded High, never killed. F3, R018's behaviour
+    stated (an unpackaged module in `/lib/modules`: High, recorded only).
+    F4, containerd's library path exact, kept only when root-only with
+    root-only files (`ctr install` a named residual). F5, the utmp unit's
+    write exempt only as an append of whole records (`UTMP_RECORD_LEN`,
+    glibc's `struct utmp` on the agent's architecture). F6, the drain's
+    writer read only for a process started before the record. F7, a runtime
+    or manager recorded only when its file and directories are root's and
+    writable by no one else. Lab (as measured, debian13 6.12.116, runc
+    1.1.15, docker.io 26.1.5, podman 5.4.2, the fix round's code): docker run
+    pulled/cached, run -d + exec, build, ctr run, run after a first start:
+    R004 Critical 0 (the kernel's seals read on 6.12: runc's clones still
+    exempt); containerd's starts R011 Low; Podman rootful run R004 0;
+    controls kept (CONTROL1 and 1b R004 Critical, CONTROL2 R011 High + R018
+    Critical, CONTROL3 FIM-019 High). Mutation: 26 mutants of the round's
+    code (two in the eBPF program, caught by the ratchet), 26 caught by a
+    named test. A first run in a user unit (umask 0002) gave false catches —
+    the tests' temporary trees were group-writable, so no runtime was
+    root-only: the tests now make their trees 0755/0644 whatever the umask,
+    and the affected mutants were run again; the owner check is caught where
+    the test's build tree is writable by its owner only (the test skips
+    otherwise, and as root). Guests: what the
+    lot's docker and podman installs left was purged (debian13: gnupg and
+    its libraries, `dbus-user-session`, `fuse3`, `needrestart` — installed by
+    those transactions, a simulated purge removing nothing else); what stays
+    on each is named in the PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).

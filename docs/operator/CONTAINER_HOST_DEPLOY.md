@@ -44,11 +44,14 @@ copy of its own image (`runc_cloned:/proc/self/exe`, the CVE-2019-5736
 defence; runc 1.1 on Debian 13). R004 has no verdict for it when every
 fact holds:
 
-- the memfd, sealed against writing, shrinking and growing, is the whole
-  image of an installed runtime (`runc` or `crun` in `/usr/bin`, `/usr/sbin`,
-  `/bin`, `/sbin` or `/usr/local/bin`), byte for byte — the exec pump
-  compares it at the exec, when the exec's parent runs an installed
-  runtime or its manager;
+- the memfd was sealed against writing, shrinking and growing when the
+  kernel executed it — the exec sensor's LSM program reads its seals at the
+  exec (a seal is never removed, so its bytes could not change since) —
+  and it is the whole image of an installed runtime (`runc` or `crun` in
+  `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or `/usr/local/bin`, a file
+  root owns that no one else can write, in directories no one else can
+  write), byte for byte — the exec pump compares it right after the exec,
+  when the exec's parent runs an installed runtime or its manager;
 - the process that made the copy runs that same file, by the kernel's
   exec records (the device and inode of the executed file, in any mount
   namespace: rootless Podman runs runc in its own): the `runc create` that
@@ -62,16 +65,31 @@ fact holds:
 
 Rootless Docker (its shim executed in rootlesskit's mount namespace) is not
 recognised as a manager and keeps the Critical. A memfd of any other
-program, an unsealed copy, a copy of runc run from a shell (`python3` executing runc's bytes from a memfd), a runtime outside
-those directories (k3s's bundled `runc`, a snap's) and a clone the agent
-could not compare (the process gone at once, more than about seventeen
-container starts in a second), and every one on an agent in tracepoint mode
-(no LSM identity), stay Critical. What remains possible: the
-bytes are compared a few milliseconds after the exec, so a process holding
-a writable descriptor of an unsealed memfd could rewrite and seal it in
-between. It would have to be the installed runtime itself, started by its
-manager, with code injected into it (an `LD_PRELOAD` the manager passes, a
-root `ptrace`).
+program, a copy not sealed when it was executed (sealed later included: any
+process holding a writable descriptor of the memfd — the parent of an OCI
+hook that runc executes from `/proc/<pid>/fd/N` — could rewrite and seal it
+after the exec), a copy of runc run from a shell (`python3` executing runc's
+bytes from a memfd), a runtime outside those directories or in one a user
+can write (k3s's bundled `runc`, a snap's, a link to a user's file), a clone
+the agent could not compare because the process was gone, every one on an
+agent in tracepoint mode (no seals read at the exec) and every one on a
+kernel whose BTF lacks `shmem_inode_info` stay Critical.
+
+The compares have a budget of their own: each user but root may spend
+64 MiB a second (about two runc 1.1 starts: runc is read twice, ~30 MiB),
+all of them together leave root 256 MiB of the 512 MiB a second, and root's
+starts (Docker's, rootful Podman's) may spend the rest. A clone past its
+user's share — every fact above holds, its bytes not compared — is recorded
+High, never killed. No user's container loop can make root's Docker starts
+Critical.
+
+What remains possible: the kernel reads the first bytes of the file (the
+binary's header) just before the LSM program reads the seals, so a writer
+racing that window chooses the header of a run whose every mapped byte is
+the sealed runtime's — no code of its own runs (the program headers,
+segments and interpreter are read from the sealed file; a `#!` line names
+an interpreter, which the process's image then is, never the copy
+compared).
 
 **containerd's and dockerd's module probes (R011, module tooling).**
 containerd and dockerd run `modprobe` at their start: containerd 1.7
@@ -85,11 +103,20 @@ parameter, every module named is a container runtime's (`overlay`, `aufs`,
 `erofs`, `bridge`, `br_netfilter`, `veth`, `xfrm_user`, `xfrm_algo`,
 `ip_tables`, `ip6_tables`, or of the `nf_`, `nft_`, `xt_`, `iptable_`,
 `ip6table_` families), and its environment holds no refused variable but
-that `LD_LIBRARY_PATH` (each entry under `/var/lib/containerd/` or
-`/opt/containerd/`). The module file is still judged at its load: R018
-records a packaged module, and a module no package installed, or a file out
-of the module tree, is Critical; the kernel's signature policy refuses an
-unsigned one. Any other module, a library path of the caller's,
+that `LD_LIBRARY_PATH`, with each entry exactly `/var/lib/containerd/opt/lib`
+or `/opt/containerd/lib` (never a directory below them: a snapshot's `lib`
+under `/var/lib/containerd/` is an image's content), reached through no
+link, that directory and every one above it root's and writable by no one
+else, and each file in it too. `ctr install <image>` (root, or containerd's
+socket, which is root's equal) fills that directory with an image's
+libraries, which then load into root's `modprobe`, recorded Low: a residual.
+The module file is still judged at its load, by R018: a file out of the
+module tree, or deeper than any module directory, is Critical with the
+loader's tree killed; a file inside `/lib/modules` that no package
+installed is **High, recorded only** (no kill) — the module-load judge
+refuses the load outside a trusted-installer window, and lets it through
+recorded under `alert`, `audit` or `off R018` or before its maps are armed
+([`RULE_POLICY.md`](RULE_POLICY.md) §2.4). Any other module, a library path of the caller's,
 `MODPROBE_OPTIONS`, `LD_PRELOAD`, a copy of the tool or another parent keeps
 R011's verdict. `containerd.service`'s own `ExecStartPre=modprobe overlay`
 (PID 1's child) was already a Low record.

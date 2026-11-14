@@ -134,11 +134,17 @@ const RUNTIME_MODULE_FAMILIES: &[&str] = &["nf_", "nft_", "xt_", "iptable_", "ip
 /// name).
 const MODULE_PROBING_MANAGERS: &[&str] = &["containerd", "dockerd"];
 
-/// Lot 347: where containerd's `opt` plugin roots the `LD_LIBRARY_PATH` it
-/// sets for itself and its children (`<root>/lib`; Debian's
-/// `/var/lib/containerd/opt`, upstream's `/opt/containerd`): root's state
-/// directories.
-const CONTAINERD_OPT_ROOTS: &[&str] = &["/var/lib/containerd/", "/opt/containerd/"];
+/// Lot 347: the library directory of containerd's `opt` plugin, which it
+/// puts in the `LD_LIBRARY_PATH` of itself and its children (`<root>/lib`;
+/// Debian's root `/var/lib/containerd/opt`, upstream's `/opt/containerd`).
+/// The review of #556 (F4): these exact directories, never a prefix — a
+/// snapshot's `…/snapshots/N/fs/lib` under `/var/lib/containerd/` is an
+/// image's content. The exec pump keeps the value only when each directory
+/// and its files are root's, writable by no one else
+/// (`nn_linux::sensors::kmod_exec`). Residual: `ctr install <image>` (root,
+/// or containerd's socket: root's equal) fills this directory with an
+/// image's libraries, which then load into root's `modprobe`, recorded Low.
+const CONTAINERD_OPT_LIBS: &[&str] = &["/var/lib/containerd/opt/lib", "/opt/containerd/lib"];
 
 /// Lot 347: `name` is a container runtime's module ([`RUNTIME_MODULES`],
 /// [`RUNTIME_MODULE_FAMILIES`]).
@@ -151,14 +157,13 @@ fn is_runtime_module(name: &str) -> bool {
 }
 
 /// Lot 347: `value` is the `LD_LIBRARY_PATH` containerd's `opt` plugin
-/// sets: each entry under [`CONTAINERD_OPT_ROOTS`] with no `.` or `..`
-/// segment, or empty (its own working directory: `/`, a unit's).
+/// sets: each entry exactly one of [`CONTAINERD_OPT_LIBS`] (the review of
+/// #556, F4: never a directory below them), or empty (its own working
+/// directory: `/`, a unit's).
 fn is_containerd_opt_library_path(value: &str) -> bool {
-    value.split(':').all(|e| {
-        e.is_empty()
-            || (CONTAINERD_OPT_ROOTS.iter().any(|r| e.starts_with(r))
-                && !e.split('/').any(|seg| seg == "." || seg == ".."))
-    })
+    value
+        .split(':')
+        .all(|e| e.is_empty() || CONTAINERD_OPT_LIBS.contains(&e))
 }
 
 pub struct R011KernelModuleTooling<H: PostureHost> {
@@ -204,11 +209,14 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
     ///   containerd 1.7 probes `aufs` with it (R011's kill at Docker's
     ///   install).
     ///
-    /// What the names load is the kernel's to judge: R018 judges the file
-    /// at its load (a module no package installed, or out of the module
-    /// tree, is Critical), the kernel's signature policy refuses an
-    /// unsigned one. Any other module, manager, tool or environment keeps
-    /// R011's verdict.
+    /// What the names load is judged at the load, by R018 (the review of
+    /// #556, F3): a file out of the module tree, or deeper than any module
+    /// directory, is Critical with the loader's tree killed; a file inside
+    /// `/lib/modules` no package installed is High, recorded only — the
+    /// module-load judge refuses it outside a trusted-installer window, and
+    /// lets it through recorded in its record mode (`alert`, `audit`, `off
+    /// R018`, its maps not armed). Any other module, manager, tool or
+    /// environment keeps R011's verdict.
     fn runtime_module_probe(&self, event: &Event) -> Option<String> {
         use kmod_exec_facts::Environment;
         let Event::ProcessSpawn {
@@ -693,6 +701,31 @@ mod tests {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
     }
 
+    /// The review of #556 (F4, named): containerd's `opt` library path is
+    /// accepted as its exact directories only — a snapshot's `lib` below
+    /// `/var/lib/containerd/` (an image's content) is no `opt` path (fails
+    /// on the lot's first head: any entry below the roots was).
+    #[test]
+    fn the_opt_library_path_is_exact_never_a_prefix() {
+        for ok in [
+            "/var/lib/containerd/opt/lib:",
+            "/var/lib/containerd/opt/lib",
+            "/opt/containerd/lib",
+            ":/opt/containerd/lib:",
+        ] {
+            assert!(is_containerd_opt_library_path(ok), "{ok}");
+        }
+        for path in [
+            "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs/lib:",
+            "/opt/containerd/lib/x",
+            "/opt/containerd/lib2",
+            "/var/lib/containerd/opt/lib/",
+            "/var/lib/containerd/opt/lib:/tmp",
+        ] {
+            assert!(!is_containerd_opt_library_path(path), "{path}");
+        }
+    }
+
     /// Named test (lot 285): a child of the module tool — the command of a
     /// `modprobe.d` install/remove directive, `/bin/sh -c …` — is recorded
     /// (Medium, no kill): its parent named like the tool, and running kmod's
@@ -919,6 +952,21 @@ mod tests {
             &["aufs"],
             ld("/var/lib/containerd/../../tmp"),
         ));
+        // the review of #556 (F4): an image's content below the opt roots
+        // (a snapshot's `lib`), another directory below them, a trailing
+        // `/` or a `.`: the exact directories only
+        for path in [
+            "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs/lib:",
+            "/var/lib/containerd/opt/lib/../../x:",
+            "/var/lib/containerd/opt/lib/x",
+            "/var/lib/containerd/opt/lib/",
+            "/opt/containerd/lib/./",
+            "/opt/containerd/libx",
+            "/var/lib/containerd/opt/lib:/tmp",
+        ] {
+            assert!(!is_containerd_opt_library_path(path), "{path}");
+            kill(judged(34_800, &["aufs"], ld(path)));
+        }
         // another variable refused (the pump kept no library path)
         kill(judged(
             34_800,

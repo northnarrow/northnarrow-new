@@ -30,12 +30,16 @@
 //! - Lot 347 ([`read_runtime_clone`], the same step): a memfd exec whose
 //!   parent runs an installed OCI runtime or its manager (by the identity of
 //!   its image, one `stat`) has its memfd — sealed against writing,
-//!   shrinking and growing — compared WHOLE, byte for byte, with the
-//!   installed runtimes of its length (`runc` re-executes itself from such a
-//!   copy, the CVE-2019-5736 defence); R004 then judges the lineage. The
-//!   runtimes are recorded with the shells, and again at such an exec (at
-//!   most once a second: a runtime installed this minute), under a budget
-//!   of their own ([`RUNTIME_BUDGET_PER_SECOND`]).
+//!   shrinking and growing AT THE EXEC (the LSM program's record,
+//!   `exe_flags::MEMFD_SEALED`: the review of #556, F1) — compared WHOLE,
+//!   byte for byte, with the installed runtimes of its length (`runc`
+//!   re-executes itself from such a copy, the CVE-2019-5736 defence); R004
+//!   then judges the lineage. The runtimes are recorded with the shells, and
+//!   again at such an exec (at most once a second: a runtime installed this
+//!   minute), under a budget of their own: each uid's share, root's reserve
+//!   ([`RUNTIME_BUDGET_PER_UID`], [`RUNTIME_ROOT_RESERVE`]: the review of
+//!   #556, F2); a clone past it is kept unverified (R004: recorded, never
+//!   killed).
 //!
 //! A name only chooses which installed files are recorded; what an exec
 //! runs is then told by the file, never by its name.
@@ -110,6 +114,10 @@ pub struct Bounds {
     spent: Mutex<Spent>,
     budget: u64,
     global_budget: u64,
+    /// The review of #556 (F2): root's own budget, and the part of the
+    /// global one the other uids together never spend (root's reserve).
+    root_budget: u64,
+    root_reserve: u64,
     compared: AtomicU64,
     skipped: AtomicU64,
     remembered: AtomicU64,
@@ -128,11 +136,24 @@ struct Spent {
 
 impl Bounds {
     fn new(budget: u64, global_budget: u64) -> Self {
+        Self::with_root_reserve(budget, global_budget, 0)
+    }
+
+    /// The review of #556 (F2): each uid but root spends `budget` a second,
+    /// all of them together `global_budget - root_reserve`; root spends up
+    /// to `global_budget` — no user's flood spends root's container starts.
+    fn with_root_reserve(budget: u64, global_budget: u64, root_reserve: u64) -> Self {
         Self {
             memo: Mutex::new((HashMap::new(), VecDeque::new())),
             spent: Mutex::new(Spent::default()),
             budget,
             global_budget,
+            root_budget: if root_reserve == 0 {
+                budget
+            } else {
+                global_budget
+            },
+            root_reserve: root_reserve.min(global_budget),
             compared: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             remembered: AtomicU64::new(0),
@@ -157,6 +178,8 @@ impl Bounds {
 
     /// `bytes` taken from `uid`'s budget and from every uid's for this
     /// second; `false` when they do not fit in either (nothing is taken).
+    /// The review of #556 (F2): a uid but root fits in the global budget
+    /// less root's reserve.
     fn take(&self, uid: u32, bytes: u64, now: Instant) -> bool {
         let second = Duration::from_secs(1);
         let mut s = self.spent.lock();
@@ -164,7 +187,12 @@ impl Bounds {
             Some((t, n)) if now.duration_since(t) < second => (t, n),
             _ => (now, 0),
         };
-        if all.1.saturating_add(bytes) > self.global_budget {
+        let (budget, global) = if uid == 0 {
+            (self.root_budget, self.global_budget)
+        } else {
+            (self.budget, self.global_budget - self.root_reserve)
+        };
+        if all.1.saturating_add(bytes) > global {
             s.all = Some(all);
             return false;
         }
@@ -190,7 +218,7 @@ impl Bounds {
             (e.0, e.1) = (now, 0);
         }
         e.2 = now;
-        if e.1.saturating_add(bytes) > self.budget {
+        if e.1.saturating_add(bytes) > budget {
             return false;
         }
         e.1 += bytes;
@@ -292,11 +320,16 @@ fn kernel_id(m: &std::fs::Metadata) -> (u64, u64) {
     )
 }
 
-/// `path` (followed) as an installed program of `kind`.
-fn image_of(path: &Path, kind: ProgramKind) -> Option<InstalledImage> {
+/// `path` (followed) as an installed program of `kind`, under `root`
+/// (`/` on the host). The review of #556 (F7): an OCI runtime or manager
+/// only when its file is one only root can change ([`root_only_path`]).
+fn image_of(path: &Path, kind: ProgramKind, root: &Path) -> Option<InstalledImage> {
     let real = std::fs::canonicalize(path).ok()?;
     let m = std::fs::metadata(&real).ok()?;
     if !m.is_file() {
+        return None;
+    }
+    if kind.is_container_runtime() && !root_only_path(&real, root) {
         return None;
     }
     Some(InstalledImage {
@@ -305,6 +338,29 @@ fn image_of(path: &Path, kind: ProgramKind) -> Option<InstalledImage> {
         path: real.to_string_lossy().into_owned(),
         kind,
     })
+}
+
+/// The review of #556 (F7): `real` (a resolved file or directory) and every
+/// directory above it up to `root` belong to `root`'s owner (root, on the host) and
+/// are writable by no one else (no group or other write bit) — a file only
+/// root can change or replace. A link in a binary directory to a file a
+/// user can rewrite (`/usr/local/bin/runc` → `/home/u/runc`), or a
+/// group-writable `/usr/local/bin` (Debian's old `staff`), records no
+/// runtime or manager: its file anchors R004's identity and its compare.
+/// The shells' records give no trust (a copy found to be a shell is judged
+/// as one) and are not narrowed.
+pub(crate) fn root_only_path(real: &Path, root: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(owner) = std::fs::metadata(&root).map(|m| m.uid()) else {
+        return false;
+    };
+    real.starts_with(&root)
+        && real
+            .ancestors()
+            .take_while(|a| a.starts_with(&root))
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.uid() == owner && m.mode() & 0o022 == 0))
 }
 
 /// The kind of an installed file, by the name of the file a path resolves
@@ -350,7 +406,7 @@ pub fn installed_under(root: &Path) -> Vec<InstalledImage> {
     }
     let mut out: Vec<InstalledImage> = Vec::new();
     for p in paths {
-        let Some(image) = kind_of(&p).and_then(|k| image_of(&p, k)) else {
+        let Some(image) = kind_of(&p).and_then(|k| image_of(&p, k, root)) else {
             continue;
         };
         if !out.iter().any(|i| i.id == image.id) {
@@ -539,10 +595,21 @@ const RUNTIME_MAX_LEN: u64 = 64 << 20;
 
 /// Lot 347: the bytes the runtime compares may read in a second, both
 /// files counted — a container start reads its runtime twice (~30 MiB for
-/// runc): about seventeen starts a second; past it a clone is not compared
-/// and R004 keeps its verdict. Only an exec whose parent runs an installed
-/// runtime or its manager reaches a compare.
+/// runc 1.1): about seventeen starts a second, root's (the review of #556,
+/// F2: every uid's, as it was, let one user's rootless loop spend root's
+/// Docker starts). Past its share a clone is not compared: kept unverified,
+/// R004 records it (High) and never kills. Only an exec whose parent runs
+/// an installed runtime or its manager reaches a compare.
 const RUNTIME_BUDGET_PER_SECOND: u64 = 512 << 20;
+
+/// The review of #556 (F2): each uid's share of it but root's — about two
+/// runc 1.1 starts a second (a rootless Podman user's).
+const RUNTIME_BUDGET_PER_UID: u64 = 64 << 20;
+
+/// The review of #556 (F2): the part of it the uids but root together
+/// never spend — root's container starts (Docker's, rootful Podman's) keep
+/// at least this whatever the users run.
+const RUNTIME_ROOT_RESERVE: u64 = 256 << 20;
 
 /// Lot 347: the runtimes recorded again at a memfd exec at most this often
 /// (a runtime installed since the minute's refresh: Docker's first
@@ -561,9 +628,11 @@ pub struct RuntimeChecks {
 }
 
 impl RuntimeChecks {
-    fn new(budget: u64) -> Self {
+    /// Each uid's `per_uid`, root up to `global`, which the others together
+    /// spend only less `root_reserve` (F2).
+    fn new(per_uid: u64, global: u64, root_reserve: u64) -> Self {
         Self {
-            bounds: Bounds::new(budget, budget),
+            bounds: Bounds::with_root_reserve(per_uid, global, root_reserve),
             refreshed: Mutex::new(None),
         }
     }
@@ -584,8 +653,13 @@ impl RuntimeChecks {
     }
 }
 
-static RUNTIMES: LazyLock<RuntimeChecks> =
-    LazyLock::new(|| RuntimeChecks::new(RUNTIME_BUDGET_PER_SECOND));
+static RUNTIMES: LazyLock<RuntimeChecks> = LazyLock::new(|| {
+    RuntimeChecks::new(
+        RUNTIME_BUDGET_PER_UID,
+        RUNTIME_BUDGET_PER_SECOND,
+        RUNTIME_ROOT_RESERVE,
+    )
+});
 
 /// Lot 347: the installed OCI runtimes and their managers under `root` —
 /// each of their names in the binary directories (and
@@ -612,7 +686,7 @@ pub fn installed_runtimes_under(root: &Path) -> Vec<InstalledImage> {
     for p in paths {
         let Some(image) = kind_of(&p)
             .filter(|k| k.is_container_runtime())
-            .and_then(|k| image_of(&p, k))
+            .and_then(|k| image_of(&p, k, root))
         else {
             continue;
         };
@@ -636,9 +710,12 @@ fn sealed(file: &std::fs::File) -> bool {
 /// Lot 347: the exec pump's step for a memfd exec (module docs) — the
 /// running image kept as an installed runtime's clone when its parent runs
 /// an installed runtime or its manager (by its image's identity), and the
-/// memfd, the exec's own file by its device and inode, sealed, is that
-/// runtime's image whole, byte for byte. Anything else keeps nothing: R004
-/// judges a memfd exec fileless without the clone.
+/// memfd, the exec's own file by its device and inode, sealed AT THE EXEC
+/// (the LSM program's `MEMFD_SEALED`: the review of #556, F1) and still,
+/// is that runtime's image whole, byte for byte. Past the budget's share
+/// (F2) such an exec is kept UNVERIFIED, with the installed runtime of its
+/// length. Anything else keeps nothing: R004 judges a memfd exec fileless
+/// without the clone.
 pub fn read_runtime_clone(event: &Event) {
     read_runtime_clone_with(event, Path::new("/proc"), Path::new("/"), &RUNTIMES);
 }
@@ -646,7 +723,7 @@ pub fn read_runtime_clone(event: &Event) {
 /// [`read_runtime_clone`] with `/proc` at `proc_root`, the host's root at
 /// `root` and `checks` (tests).
 fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks: &RuntimeChecks) {
-    use common::wire::exe::exe_flags::{KNOWN, MEMFD};
+    use common::wire::exe::exe_flags::{KNOWN, MEMFD, MEMFD_SEALED};
     let Event::ProcessSpawn {
         pid,
         ppid,
@@ -657,7 +734,12 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     else {
         return;
     };
-    if !exe.has(KNOWN) || !exe.has(MEMFD) || *pid == 0 || *ppid == 0 {
+    // the review of #556 (F1): sealed when the kernel executed it, by the
+    // LSM program's read of its seals — sealed only when the pump reads it,
+    // its bytes may have been rewritten after the exec (any holder of a
+    // writable descriptor: the parent of an OCI hook run from
+    // `/proc/<pid>/fd/N`)
+    if !exe.has(KNOWN) || !exe.has(MEMFD) || !exe.has(MEMFD_SEALED) || *pid == 0 || *ppid == 0 {
         return;
     }
     checks.refresh(root, Instant::now());
@@ -708,6 +790,16 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     let cost = 2 * m.len() * candidates.len() as u64;
     if !checks.bounds.take(*uid, cost, Instant::now()) {
         checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
+        // the review of #556 (F2): every fact but the bytes holds — kept
+        // unverified (R004 records it, never kills it)
+        program_identity::keep_runtime_clone(
+            event,
+            program_identity::RuntimeClone {
+                image: candidates[0].id,
+                seen,
+                unverified: true,
+            },
+        );
         return;
     }
     checks.bounds.compared.fetch_add(1, Ordering::Relaxed);
@@ -721,6 +813,7 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
             program_identity::RuntimeClone {
                 image: found.id,
                 seen,
+                unverified: false,
             },
         );
     }
@@ -753,10 +846,25 @@ mod tests {
     use nn_model::{StdioSocket, StdioSockets};
     use std::os::unix::fs::symlink;
 
+    /// `content` at `path` under `root`, the directories it makes 0755 and
+    /// the file 0644 — as a distribution installs them, whatever the test's
+    /// umask (0002 under a user unit): only root-only files are runtimes
+    /// (the review of #556, F7).
     fn put(root: &Path, path: &str, content: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let f = root.join(path.trim_start_matches('/'));
+        let made: Vec<PathBuf> = f
+            .ancestors()
+            .skip(1)
+            .take_while(|d| !d.exists())
+            .map(Path::to_path_buf)
+            .collect();
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        for d in made {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::write(&f, content).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         f
     }
 
@@ -855,7 +963,7 @@ mod tests {
     }
 
     /// Lot 347: a memfd exec of `pid` under `ppid`, its file `f` (its
-    /// identity as the LSM program reports it).
+    /// identity as the LSM program reports it: sealed at the exec, F1).
     fn memfd_exec(pid: u32, ppid: u32, ts: u64, f: &std::fs::File) -> Event {
         let mut e = nn_core::decision::rules::testutil::spawn("memfd:runc_clon", "/dev/fd/6");
         let id = kernel_id(&f.metadata().unwrap());
@@ -873,7 +981,8 @@ mod tests {
             (exe.dev, exe.ino) = id;
             exe.flags = common::wire::exe::exe_flags::KNOWN
                 | common::wire::exe::exe_flags::MEMFD
-                | common::wire::exe::exe_flags::DELETED;
+                | common::wire::exe::exe_flags::DELETED
+                | common::wire::exe::exe_flags::MEMFD_SEALED;
         }
         e
     }
@@ -908,14 +1017,17 @@ mod tests {
             symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
         };
         let fd_path = |f: &std::fs::File| PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
-        let checks = RuntimeChecks::new(1 << 30);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        // the clone compared (an uncompared one is no runtime's image)
         let run =
             |pid: u32, ppid: u32, parent: &Path, f: &std::fs::File, checks: &RuntimeChecks| {
                 link(ppid, parent);
                 link(pid, &fd_path(f));
                 let e = memfd_exec(pid, ppid, 347, f);
                 read_runtime_clone_with(&e, &proc, &root, checks);
-                runtime_clone_of(&e).map(|c| c.image)
+                runtime_clone_of(&e)
+                    .filter(|c| !c.unverified)
+                    .map(|c| c.image)
             };
         let all = SEALED | libc::F_SEAL_SEAL;
         // the runtime recorded at the exec (installed since the minute's
@@ -1008,10 +1120,22 @@ mod tests {
         link(34_709, &fd_path(&clone));
         read_runtime_clone_with(&tp, &proc, &root, &checks);
         assert_eq!(runtime_clone_of(&tp), None);
-        // the budget spent: counted, not compared
-        let poor = RuntimeChecks::new(1 << 20);
+        // the budget spent: counted, not compared — kept unverified, with
+        // the installed runtime of its length (the review of #556, F2)
+        let poor = RuntimeChecks::new(1 << 20, 1 << 20, 0);
         assert_eq!(run(34_710, 34_700, &runc, &clone, &poor), None);
         assert_eq!(poor.bounds.skipped.load(Ordering::Relaxed), 1);
+        let e = memfd_exec(34_710, 34_700, 347, &clone);
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
+            Some((runc_id, true))
+        );
+        // … but only a copy every other fact holds for: not sealed, nothing
+        let open = memfd(&image, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW);
+        link(34_724, &fd_path(&open));
+        let e = memfd_exec(34_724, 34_700, 347, &open);
+        read_runtime_clone_with(&e, &proc, &root, &poor);
+        assert_eq!(runtime_clone_of(&e), None);
         // the runtime upgraded: a new image at the path is the one compared
         // (the old inode's record names a file no longer there)
         // (the old image held open, as a process running it does: the new
@@ -1025,10 +1149,10 @@ mod tests {
         // before the new image is recorded (the second not over), the old
         // record names a file no longer at its path: its bytes are not the
         // new file's, whatever the new file holds
-        let stale = RuntimeChecks::new(1 << 30);
+        let stale = RuntimeChecks::new(1 << 30, 1 << 30, 0);
         *stale.refreshed.lock() = Some(Instant::now() + Duration::from_secs(3600));
         assert_eq!(run(34_714, 34_703, &shim, &memfd(&v2, all), &stale), None);
-        let fresh = RuntimeChecks::new(1 << 30);
+        let fresh = RuntimeChecks::new(1 << 30, 1 << 30, 0);
         assert_eq!(
             run(34_711, 34_712, &runc2, &memfd(&v2, all), &fresh),
             Some(runc2_id)
@@ -1037,6 +1161,220 @@ mod tests {
             run(34_713, 34_712, &runc2, &clone, &fresh),
             None,
             "the old bytes"
+        );
+    }
+
+    /// The review of #556 (F1, named): the memfd runc's OCI hook is executed
+    /// from (`/proc/<A>/fd/N`) was open for writing at the exec; its holder
+    /// then wrote runc's bytes into it and sealed it before the pump's read.
+    /// Sealed and runc's whole when the pump reads it, but not sealed when
+    /// the kernel executed it (no `MEMFD_SEALED` from the LSM program): no
+    /// clone kept (fails on the lot's first head: it was kept as runc's).
+    #[test]
+    fn a_memfd_sealed_only_after_its_exec_is_no_runtime_clone() {
+        use common::wire::exe::exe_flags::MEMFD_SEALED;
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        use std::io::{Seek, Write};
+        use std::os::fd::AsRawFd;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let image: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 241) as u8).collect();
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        let link = |pid: u32, to: &Path| {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+        };
+        // executed unsealed, holding another program; then rewritten with
+        // runc's bytes and sealed
+        let mut hook = memfd(b"\x7fELF the hook's payload", 0);
+        hook.set_len(0).unwrap();
+        hook.rewind().unwrap();
+        hook.write_all(&image).unwrap();
+        // SAFETY: F_ADD_SEALS on the descriptor `hook` owns; no memory.
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    hook.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    SEALED | libc::F_SEAL_SEAL,
+                )
+            },
+            0
+        );
+        assert!(sealed(&hook));
+        link(35_600, &runc);
+        link(
+            35_601,
+            &PathBuf::from(format!("/proc/self/fd/{}", hook.as_raw_fd())),
+        );
+        let mut e = memfd_exec(35_601, 35_600, 556, &hook);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.flags &= !MEMFD_SEALED;
+        }
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        assert_eq!(runtime_clone_of(&e), None, "sealed after the exec");
+        // the same file, the record sealed at the exec: runc's clone
+        let e = memfd_exec(35_602, 35_600, 556, &hook);
+        link(
+            35_602,
+            &PathBuf::from(format!("/proc/self/fd/{}", hook.as_raw_fd())),
+        );
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
+            Some((kernel_id(&std::fs::metadata(&runc).unwrap()), false))
+        );
+    }
+
+    /// The review of #556 (F2, named; its probe): seventeen 30 MiB compares
+    /// by one rootless user (runc 1.1's `runc init` clones in a loop) spent
+    /// the budget of every uid — root's Docker start in the same second was
+    /// not compared: R004's Critical and kill. Each uid but root has a share
+    /// well below the global budget, and the uids but root together leave
+    /// root a reserve: the user's third compare is refused, root's still
+    /// fits, and a crowd of users cannot spend root's reserve (fails on the
+    /// lot's first head: per-uid == global, nothing reserved).
+    #[test]
+    fn one_uid_cannot_spend_root_s_runtime_budget() {
+        let c = RuntimeChecks::new(
+            RUNTIME_BUDGET_PER_UID,
+            RUNTIME_BUDGET_PER_SECOND,
+            RUNTIME_ROOT_RESERVE,
+        );
+        let now = Instant::now();
+        let start = 30 << 20;
+        assert!(c.bounds.take(1000, start, now));
+        assert!(c.bounds.take(1000, start, now));
+        for _ in 0..15 {
+            assert!(!c.bounds.take(1000, start, now), "one user's share");
+        }
+        assert!(c.bounds.take(0, start, now), "root's start compared");
+        // many users: together never past the global budget less root's
+        // reserve
+        let mut users = 0u64;
+        for uid in 2000..2100 {
+            while c.bounds.take(uid, start, now) {
+                users += start;
+            }
+        }
+        assert!(
+            2 * start + users <= RUNTIME_BUDGET_PER_SECOND - RUNTIME_ROOT_RESERVE,
+            "{users}"
+        );
+        let mut root = start;
+        while c.bounds.take(0, start, now) {
+            root += start;
+        }
+        assert!(root >= RUNTIME_ROOT_RESERVE, "{root}");
+        // the shares are well below the global budget, root's reserve eight
+        // runc 1.1 starts
+        const {
+            assert!(RUNTIME_BUDGET_PER_UID * 4 <= RUNTIME_BUDGET_PER_SECOND - RUNTIME_ROOT_RESERVE);
+            assert!(RUNTIME_ROOT_RESERVE >= 8 * (30 << 20));
+        }
+        // the next second: the user's share again
+        assert!(c.bounds.take(1000, start, now + Duration::from_secs(1)));
+        // the pump's own checks are these
+        let b = &RUNTIMES.bounds;
+        assert_eq!(
+            (b.budget, b.global_budget, b.root_budget, b.root_reserve),
+            (
+                RUNTIME_BUDGET_PER_UID,
+                RUNTIME_BUDGET_PER_SECOND,
+                RUNTIME_BUDGET_PER_SECOND,
+                RUNTIME_ROOT_RESERVE
+            )
+        );
+        // lot 313's compares keep their own (no reserve: root a uid as any)
+        assert_eq!(
+            (BOUNDS.budget, BOUNDS.root_budget, BOUNDS.root_reserve),
+            (BUDGET_PER_SECOND, BUDGET_PER_SECOND, 0)
+        );
+    }
+
+    /// The review of #556 (F7, named): a runtime or manager is recorded only
+    /// when its resolved file and every directory above it are the owner's
+    /// of the tree's root (root's on the host) and writable by no one else.
+    /// A link to a file in a group-writable directory, a group- or
+    /// world-writable file, a link out of the tree: no runtime (fails on the
+    /// lot's first head: each was recorded by its name).
+    #[test]
+    fn a_runtime_file_a_user_can_rewrite_is_no_installed_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("root");
+        let out = tempfile::tempdir().unwrap();
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let kinds = |r: &Path| -> Vec<String> {
+            installed_runtimes_under(r)
+                .into_iter()
+                .map(|i| {
+                    Path::new(&i.path)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+        let runc = put(&r, "/usr/sbin/runc", b"runc image, 556 f7");
+        put(&r, "/usr/bin/containerd", b"containerd image, 556 f7");
+        // a group-writable directory's file, linked from a binary directory
+        let staff = put(&r, "/usr/local/share/rt/crun", b"crun image, 556 f7");
+        mode(staff.parent().unwrap(), 0o775);
+        std::fs::create_dir_all(r.join("usr/local/bin")).unwrap();
+        symlink(&staff, r.join("usr/local/bin/crun")).unwrap();
+        // a world-writable file
+        let conmon = put(&r, "/usr/bin/conmon", b"conmon image, 556 f7");
+        mode(&conmon, 0o757);
+        // a link out of the tree (a user's home on the host)
+        let home = put(out.path(), "/podman", b"podman image, 556 f7");
+        symlink(&home, r.join("usr/local/bin/podman")).unwrap();
+        let mut found = kinds(&r);
+        found.sort();
+        assert_eq!(found, ["containerd", "runc"]);
+        // the binary directory itself group-writable: nothing under it
+        mode(runc.parent().unwrap(), 0o775);
+        assert_eq!(kinds(&r), ["containerd"]);
+        // the shells' records are not narrowed (no trust flows from them)
+        let sh = put(&r, "/usr/sbin/sh", b"sh image, 556 f7");
+        assert!(image_of(&sh, ProgramKind::Shell, &r).is_some());
+    }
+
+    /// The review of #556 (F7): the owner counts, not the modes alone — a
+    /// file the test's user made, in directories only that user can write,
+    /// is no root-only file under `/` (root's), and is one under its own
+    /// tree (the user's). Skipped as root (root owns what it makes) and where
+    /// a directory above the test's binary is writable by others (the modes
+    /// alone would refuse it).
+    #[test]
+    fn a_file_of_another_owner_than_the_tree_s_root_is_not_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let t = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = put(t.path(), "/usr/sbin/runc", b"runc image, 556 f7 owner");
+        let real = std::fs::canonicalize(&f).unwrap();
+        let modes_alone = real
+            .ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.mode() & 0o022 == 0));
+        if !modes_alone {
+            return;
+        }
+        assert!(
+            !root_only_path(&real, Path::new("/")),
+            "the user's file under root's /"
+        );
+        assert!(
+            root_only_path(&real, t.path()),
+            "under its own owner's tree"
         );
     }
 
@@ -1076,12 +1414,17 @@ mod tests {
         let installed_kind = |(id, len): ((u64, u64), u64)| installed_kind_sized(id, len);
         let t = tempfile::tempdir().unwrap();
         let r = t.path();
+        // the tree's root as a host's, whatever the test's umask (F7)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(r, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let id = |p: &Path| {
             let m = std::fs::metadata(p).unwrap();
             (kernel_id(&m), m.len())
         };
         let runc = put(r, "/usr/bin/runc", b"runc image, 347 refresh");
-        let checks = RuntimeChecks::new(1 << 20);
+        let checks = RuntimeChecks::new(1 << 20, 1 << 20, 0);
         let now = Instant::now();
         checks.refresh(r, now);
         assert_eq!(

@@ -564,6 +564,13 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(dir.join(\"cgroup\"))",
         PROC,
     ),
+    // the review of #556 (F6): the writer's start, read with its image and
+    // cgroup; unreadable, no unit fact is kept (the High kill stays)
+    (
+        "crates/nn-linux/src/fim/drain.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
     (
         "crates/nn-linux/src/response/containment.rs",
         "read_state(format!(\"/proc/{pid}/cgroup\"))",

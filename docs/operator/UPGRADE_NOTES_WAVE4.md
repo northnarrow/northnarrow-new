@@ -2129,6 +2129,18 @@ detail.
   The FIM drain now reads the writer's image and cgroup at the write; the
   host's packaged binary in its own unit's cgroup has no verdict. Any other
   writer of wtmp or btmp keeps the High kill.
+- **The review of #556 narrowed each exemption.** A memfd is exempt only
+  when the kernel executed it already sealed against writing (the exec
+  sensor reads its seals at the exec; an agent in tracepoint mode, or on a
+  kernel whose BTF lacks `shmem_inode_info`, keeps the Critical). The
+  compares' budget is per user (64 MiB a second each) with a reserve for
+  root (256 MiB of 512): a clone past its user's share is recorded High,
+  never killed. A runtime or manager is recorded only when its file and its
+  directories are root's and writable by no one else. containerd's library
+  path is accepted only as exactly `/var/lib/containerd/opt/lib` or
+  `/opt/containerd/lib`, a root-only directory of root-only files. The utmp
+  unit's write is exempt only as an append of whole login records, by a
+  process that started before the record.
 - **Nothing to configure.** No overlay, allowlist entry or signed policy
   changes; the container-runtime overlay of `process-comm-allowlist` (R013)
   is unchanged. Detection records of these three shapes stop appearing.

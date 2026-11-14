@@ -614,6 +614,12 @@ pub struct RuntimeClone {
     /// later. R004 asks it for a forker the lineage holds no exec of — a
     /// fork that never executed (conmon's monitor, forked as it daemonized).
     pub seen: Vec<(u32, (u64, u64))>,
+    /// The review of #556 (F2): the bytes were NOT compared — the compare
+    /// budget's share of the exec's uid was spent this second; `image` is
+    /// then the installed runtime of the copy's length, every other fact
+    /// held (sealed at the exec and at the read, the parent a runtime's or a
+    /// manager's file). R004 records such an exec, never kills it.
+    pub unverified: bool,
 }
 
 impl RuntimeClone {
@@ -627,7 +633,8 @@ impl RuntimeClone {
 }
 
 /// Lot 347: the exec pump's answer for `event`, a memfd exec: its running
-/// image is an installed OCI runtime's ([`RuntimeClone`]).
+/// image is an installed OCI runtime's ([`RuntimeClone`]), or (F2) may be,
+/// its bytes not compared (`unverified`).
 pub fn keep_runtime_clone(event: &Event, clone: RuntimeClone) {
     if clone.image == (0, 0) {
         return;

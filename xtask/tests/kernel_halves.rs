@@ -629,3 +629,60 @@ fn the_guarded_points_are_published_by_identity() {
         );
     }
 }
+
+/// The review of #556 (F1): a memfd's seals are the kernel's, read AT THE
+/// EXEC — `exe_flags::MEMFD_SEALED` is set by the exec LSM program alone,
+/// from its read of the memfd's shmem inode, and R004's runtime exemption
+/// and the exec pump's compare only ask for it. No userland code sets it:
+/// the pump's own `F_GET_SEALS` comes after the exec, when any holder of a
+/// writable descriptor may have rewritten and sealed the copy.
+#[test]
+fn a_memfd_is_sealed_at_the_exec_by_the_kernel_alone() {
+    let l = code("agent-ebpf/src/exec_lsm.rs");
+    in_order(
+        body(&l, "try_exec_check_lsm"),
+        &[
+            "flags |= exe_flags::MEMFD;",
+            "if magic == TMPFS_MAGIC && memfd_sealed(inode) {",
+            "flags |= exe_flags::MEMFD_SEALED;",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&l, "memfd_sealed"),
+        &[
+            "off_opt!(SHMEM_INODE_INFO_SEALS_OFFSET)",
+            "off_opt!(SHMEM_INODE_INFO_VFS_INODE_OFFSET)",
+            "wrapping_sub(vfs_off)",
+            "& MEMFD_SEALS == MEMFD_SEALS",
+        ],
+    )
+    .unwrap();
+    let mut uses = Vec::new();
+    for (rel, text) in support::product_code(&repo_root()) {
+        for (at, _) in text.match_indices("MEMFD_SEALED") {
+            let from = text[..at].rfind('\n').map_or(0, |i| i + 1);
+            let to = text[at..].find('\n').map_or(text.len(), |i| at + i);
+            uses.push(format!("{rel}: {}", text[from..to].trim()));
+        }
+    }
+    for u in &uses {
+        assert!(
+            u.starts_with("common/src/wire/exe.rs: pub const MEMFD_SEALED")
+                || u == "agent-ebpf/src/exec_lsm.rs: flags |= exe_flags::MEMFD_SEALED;"
+                || u.contains(".has(MEMFD_SEALED)")
+                || u.contains(": use common::wire::exe::exe_flags::"),
+            "MEMFD_SEALED named outside the LSM program's set and the exemptions' reads: {u}"
+        );
+    }
+    for user in [
+        "crates/nn-linux/src/program_images.rs",
+        "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs",
+    ] {
+        assert!(
+            uses.iter()
+                .any(|u| u.starts_with(user) && u.contains(".has(MEMFD_SEALED)")),
+            "{user} no longer asks for the seals at the exec"
+        );
+    }
+}

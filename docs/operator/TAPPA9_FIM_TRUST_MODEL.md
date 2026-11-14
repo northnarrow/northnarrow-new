@@ -190,6 +190,23 @@ unit, and any other writer (`dd` appending a record) keep the High kill.
 What this trusts: root's units — only root places a process in a unit's
 cgroup, and the binary writes only its three records.
 
+The review of #556 tightened both facts. The kernel keeps one dirty mark
+per file and the drain credits its LAST writer with every write since its
+last read, so a root shell's truncation or rewrite of wtmp followed by
+`systemctl restart systemd-update-utmp` was the unit's write: the unit's
+fact now exempts only an append of whole login records (the file grew by a
+multiple of glibc's `struct utmp`, 384 bytes, 400 on aarch64, s390x and
+loongarch64, since the drain's last read); a shrink, a rewrite of the same
+size, a part of a record or unknown sizes keep the High kill. And the
+process the drain reads at the writer's pid must have started no later than
+the record (`/proc/<pid>/stat`'s start): a pid handed out again since names
+another process. Residuals (root's): a rewrite of earlier records in place
+followed by the unit's append within one mark still grows the file by whole
+records (the drain compares no prefix), and the record's time is its last
+close's, so a descriptor held open past the writer's exit lets a pid reused
+before that close pass (the writer's start in the record itself, #554's
+`modifier_start`, closes it).
+
 The script is read from the interpreter's argv with that interpreter's own
 option table (lot 292, BUG-44): `python3 -O /tmp/steal.py /usr/bin/aws` runs
 `/tmp/steal.py` and is no `aws` client (NN-L-FIM-011 kills it, as any other

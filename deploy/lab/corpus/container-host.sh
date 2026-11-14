@@ -54,7 +54,10 @@ step "containers docker run" 300 -- sudo docker run --rm "$IMG" sh -c 'echo nn-c
 # xtables-nft-multi, its module loads), a docker exec and a build — each a
 # container start through runc
 step "containers docker restart (its start)" 300 -- sudo systemctl restart docker
-step "containers docker exec" 300 -- sudo sh -c "docker run -d --name nn-corpus $IMG sleep 60 && docker exec nn-corpus true && docker rm -f nn-corpus"
+# (the review of #556: a leftover nn-corpus from a failed run removed first,
+# and the container removed whatever the exec did — the step's status is
+# the run's and the exec's)
+step "containers docker exec" 300 -- sudo sh -c "docker rm -f nn-corpus >/dev/null 2>&1; docker run -d --name nn-corpus $IMG sleep 60 && docker exec nn-corpus true; rc=\$?; docker rm -f nn-corpus >/dev/null 2>&1; exit \$rc"
 step "containers docker build" 600 -- sudo sh -c "d=\$(mktemp -d) && printf 'FROM $IMG\nRUN true\n' > \$d/Dockerfile && docker build -q -t nn-corpus-img \$d && docker rmi -f nn-corpus-img; rm -rf \$d"
 step "containers docker rmi" 120 -- sudo docker rmi -f "$IMG"
 step "containers k3s install (get.k3s.io)" 900 -- bash -c 'curl -sfL https://get.k3s.io | sudo sh -'

@@ -47,6 +47,13 @@ pub mod exe_flags {
     pub const DEEP: u32 = 1 << 5;
     /// No root within `EXE_WALK_DEPTH` levels: the path is unknown.
     pub const UNRESOLVED: u32 = 1 << 6;
+    /// Lot 347 (the review of #556, F1): with [`MEMFD`], on a tmpfs
+    /// superblock, the memfd was sealed against writing, shrinking and
+    /// growing when the LSM program read its shmem inode, at the exec: its
+    /// bytes could not change since (the kernel never removes a seal). Set
+    /// by the LSM program only — never in tracepoint mode, never by the
+    /// exec pump — and only with both `shmem_inode_info` offsets resolved.
+    pub const MEMFD_SEALED: u32 = 1 << 7;
 
     // Lot 310 (the review of #539): what the agent's exec pump adds in
     // userland, never the kernel programs (bits 16 and up).
