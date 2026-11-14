@@ -255,7 +255,7 @@ if [[ -n $KEY ]]; then
         id=$(echo "$o" | grep -o 'LOADED id [0-9]*' | awk '{print $3}')
         [[ -n $id ]] || { bad "B10 the $ty program not loaded in the window: $o"; continue; }
         uses=$(echo "$o" | grep -o 'USES .*' | cut -c6-)
-        nuse=$(echo "$uses" | wc -w); nref=$(echo "$uses" | grep -o '=ERR EPERM' | wc -l)
+        nuse=$(echo "$uses" | grep -o '=' | wc -l); nref=$(echo "$uses" | grep -o '=ERR EPERM' | wc -l)
         kinds=$(echo "$uses" | tr ' ' '\n' | grep -o '^[a-z-]*-' | sort -u | wc -l)
         held=$(recs "$n0" bpf_held_load | grep -c "program id $id ")
         used=$(recs "$n0" bpf_held_use | grep -c "of program id $id,")

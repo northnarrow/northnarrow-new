@@ -145,6 +145,8 @@ fi
 # C5/C6: a mount over what the watch reads, then the partition
 bound_partition() { # $1 label, $2 the path bound over
     local n=$1 path=$2 fake=/run/nn-cpu-fake
+    # C3's reset can take the cpuset controller off the root again (systemd)
+    grep -qw cpuset $CG/cgroup.subtree_control || { put +cpuset $CG/cgroup.subtree_control >/dev/null; ENABLED=1; sleep 12; }
     if (( NCPU < 2 )) || [[ ! -e $path ]]; then measure "$n no $path (or one CPU)"; return; fi
     sudo sh -c 'echo 0 > "$1"' _ "$fake" </dev/null
     sudo mount --bind "$fake" "$path" </dev/null; local rb=$?
