@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Lot 283a — benign corpus: a developer's workstation (uid 1000 in its ssh
 # session, an authenticated session; sudo only for the packages). Builds and
-# tests (a crate from a local git repository, a Go module, an npm project, a
-# Python venv), formatters and file tools over trees of small files (cargo
+# tests (a crate from a local git repository, a Go module, an npm project
+# installed by npm, yarn, pnpm and bun (lot 346), a Python venv), formatters and file tools over trees of small files (cargo
 # fmt, prettier --write, git checkout between two big branches, rsync
 # --inplace) and an AppImage-style run (a squashfs image mounted under /tmp
 # by squashfuse, its AppRun executed from the mount, then the
@@ -27,6 +27,7 @@ corpus_cleanup() {
     chmod -R u+w "$W" 2>/dev/null
     sudo rm -rf "$W"
     sudo rmdir /srv/nn-corpus 2>/dev/null
+    js_purge
     corpus_purge
     true
 }
@@ -37,6 +38,7 @@ command -v cargo >/dev/null || echo "  no cargo for $LABUSER: the cargo steps fa
 prep_crate
 prep_go
 prep_npm
+prep_js
 # two branches of one big tree: 3,000 files (2,400 under 4 KiB), 80 % of
 # them different on the other branch
 (
@@ -93,6 +95,7 @@ wl_cargo session dev
 step "dev cargo fmt (120 unformatted modules)" 300 -- env CARGO_HOME="$W/cache/cargo" bash -c "cd $W/crate && cargo fmt"
 wl_go session dev
 wl_npm session dev
+wl_js session dev
 step "dev prettier --write (300 small files)" 300 -- bash -c "cd $W/web && ./node_modules/.bin/prettier --write --loglevel warn src"
 wl_pip session dev
 step "dev git checkout b (2,400 of 3,000 differ)" 300 -- git -C "$W/big" checkout -q b

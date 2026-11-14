@@ -72,6 +72,11 @@ pub enum Trusted {
     PackageTransaction,
     /// A packaged program with a lineage of installed programs: its program.
     PackagedProgram(String),
+    /// Lot 346 (the mini-hunt): the packaged `go` command writing in its own
+    /// work, build-cache or module-cache directory
+    /// (`AuthSessionTracker::is_go_toolchain_own_write`), whoever started
+    /// it — `go test` stamps its archives' build ids in place.
+    GoToolchainOwnWork,
 }
 
 impl Trusted {
@@ -80,6 +85,10 @@ impl Trusted {
             Trusted::PackageTransaction => "package transaction run by root".to_string(),
             Trusted::PackagedProgram(p) => {
                 format!("packaged program {p} started by installed programs only")
+            }
+            Trusted::GoToolchainOwnWork => {
+                "the packaged Go toolchain in its own work, build-cache or module-cache directory"
+                    .to_string()
             }
         }
     }

@@ -10892,6 +10892,73 @@ number in parentheses is a lab PR.
     before the round was empty on both (the check's own apt packages aside).
   - Levels unchanged: the profile changes no capability's reach; it is the
     alpha's default (C17's responses run only after a signed switch).
+- **Lot 346 — developer tools and services, the alpha's false positives
+  round 2B (C10, C14, C17; no level changes).**
+  - What was open: `go test` held a developer's posture in ENGAGED
+    (`StagingExec` of its test binaries, also NN-L-IMP-001 Critical for its
+    archive rewrites); yarn, pnpm and bun were not known; npm's exemption
+    covered every write of a process named npm (the re-check of #552, N1:
+    `~/.npm-init.js` loaded by `npm init`, `/nix/store`, `/opt`, a user's
+    mount namespace); the exec record dropped empty arguments (N2); a
+    self-forking resolver and NodeLocal DNSCache/kube-dns were not proven
+    resolvers (N3, item 5); `pg_createcluster` by hand raised
+    ConfirmedIntrusion for `initdb` and its bootstrap `postgres`.
+  - Done, by identity: the packaged `go`'s own build outputs run by it (the
+    exec's forker, or the pre-exec check's kernel `ppid`) raise no
+    `StagingExec`, and the ransomware tracker trusts the packaged `go` in
+    its own directories (the packaged `go`: its path with its image, the
+    review of #555); npm (node running the CLI from `/usr` or a packaged
+    link) is exempt from the mass-write arm only in its own directories
+    and only when the exec has its image (`ROOT_DIR`: a root-only
+    directory in PID 1's mount namespace); `parse_argv_blob`
+    keeps empty arguments; a resolver whose recorded forkers ran the same
+    packaged file (≤ 2) from PID 1 is its unit's service; NodeLocal
+    DNSCache and kube-dns proven by their runtime's record as CoreDNS; the
+    packaged `initdb` (and the bootstrap `postgres` it starts) writing only
+    the service account's own data is that account's service.
+  - Lab (as measured; ubuntu2404 6.8.0-149 and debian13 6.12, `main`
+    1d8f427d before, the lot after): **db corpus** `pg_createcluster` + start: ConfirmedIntrusion
+    for `initdb` and `postgres` and ENGAGED → no raise, both guests.
+    **dev corpus** `go test`: `StagingExec` ENGAGED + NN-L-IMP-001
+    Critical → posture still OBSERVING at the go steps, no IMP-001, on
+    debian13 (be075d5b) and on ubuntu2404's second after-round (be075d5b);
+    its first (49ecceca) still showed both — the pre-exec check and the
+    tracker, found there and fixed. As a CI runner (a unit) `go test`:
+    ENGAGED → no transition. R001 High for the test binary on both, before
+    and after (lot 283b). **Package managers as a CI runner**
+    (units): `npm ci`, `pnpm install --force`, `bun install --force` 0
+    raises before and after (the corpus project crosses no threshold:
+    pnpm and bun link from their stores); `yarnpkg install` fails on
+    debian13 (its yarnpkg is berry, `--force` unknown). **N1 control**: the
+    packaged npm's `npm init -y` loading an encryptor from
+    `~/.npm-init.js` (80 documents): **0 raises and no record on `main`**
+    → ConfirmedIntrusion, both guests (still no NN-L-IMP-001: the tracker
+    trusts the packaged npm). **npm from an nvm prefix** (measured, kept
+    strict): `npm ci` in the session 0, in a unit ConfirmedIntrusion 1,
+    before and after. **Attack controls** after, both guests: a package's
+    postinstall encryptor, `NODE_OPTIONS=--require` into yarn, `bun run`
+    of an encryptor, a bun project's postinstall encryptor, node alone —
+    ConfirmedIntrusion and NN-L-IMP-001 Critical each; a program in a
+    go-build-shaped directory run by a shell — R001 High.
+  - The review of #555 (no new lab round; unit tests, the PR's CI guests):
+    F1 — `go` is the packaged toolchain only with its image (`ROOT_DIR`):
+    a container's or a user namespace's `go` gets no `StagingExec`
+    exemption, no mass-write exemption (lot 340's too) and no NN-L-IMP-001
+    trust. F2 — yarn, pnpm and bun are no longer exempt (judged as on
+    `main`): they load a project's code in their process on every install
+    and the arm judges only a window's crossing file, which that code can
+    keep in `node_modules`; re-arming the window after an exempt crossing
+    was weighed and not taken (one package-tree write per window, after
+    the documents, still lands the crossing there; no user-space path to
+    the kernel's window exists). Their false positive was never
+    reproduced in the lab (the rows above: 0 → 0). npm keeps N1's
+    narrowing, with the same padding named as its residual. F5 — an argv
+    block of exactly 512 bytes is marked cut (`wire::argv_read`). Named as
+    residuals: a program `go` forks by the user's choice from a
+    work-directory layout (`-exec`, `-toolexec`, `go:generate`, `GOFLAGS`;
+    F3) and `initdb -L` (F4).
+  - Level unchanged: the false-positive work of the alpha; C17's
+    provisional waits on the nightly.
 - **Lot 344 (alpha FP round 2A) — the host's and the agent's own records
   (C14, C17, C23; no level changes).**
   - What was open (lab rounds of lots 340/341, the alpha profile on plain

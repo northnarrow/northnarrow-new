@@ -1313,15 +1313,35 @@ impl core::fmt::Display for FsProtectOperation {
 }
 
 /// Decode the NUL-separated argv blob (Tappa 10.6 §13 Q1) into argument
-/// strings. `len` is the kernel-reported byte count (`argv_len`, clamped
-/// to the buffer). Trailing/empty segments (from a trailing NUL or a
-/// zero-padded tail) are dropped; each arg is UTF-8 lossy-decoded. A
-/// zeroed blob (older BPF / mixed fleet) yields an empty `Vec`.
+/// strings. `len` is the kernel-reported byte count (`argv_len`: the
+/// process's `[arg_start, arg_end)`, cut at the buffer). Each arg is UTF-8
+/// lossy-decoded. A zeroed blob (older BPF / mixed fleet) yields an empty
+/// `Vec`.
+///
+/// Lot 346 (the re-check of #552, N2): the last argument's NUL is dropped
+/// and no other — an empty argument is one, as `/proc/<pid>/cmdline` reads
+/// it (`script_args::argv_of_cmdline`, lot 310). The empty segments were
+/// dropped: `execve("/usr/sbin/logrotate", ["", "logrotate",
+/// "/etc/logrotate.conf"])` read as the packaged invocation (its argv
+/// digest), while logrotate also read `./logrotate` as a configuration. A
+/// cut argument (no final NUL) is kept as it is. Only a length past the
+/// buffer (no kernel's: it cuts at the buffer) leaves a zero tail that is
+/// the buffer's, not the process's: it is dropped. A blob with no byte but
+/// NULs names nothing (an argv of empty words, an older BPF's zeroed one).
 pub fn parse_argv_blob(blob: &[u8], len: u16) -> Vec<String> {
     let end = core::cmp::min(len as usize, blob.len());
-    blob[..end]
-        .split(|&b| b == 0)
-        .filter(|seg| !seg.is_empty())
+    let mut body = &blob[..end];
+    if body.iter().all(|&b| b == 0) {
+        return Vec::new();
+    }
+    if len as usize > blob.len() {
+        while let [rest @ .., 0] = body {
+            body = rest;
+        }
+    } else if let [rest @ .., 0] = body {
+        body = rest;
+    }
+    body.split(|&b| b == 0)
         .map(|seg| String::from_utf8_lossy(seg).into_owned())
         .collect()
 }
@@ -2211,6 +2231,34 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].starts_with('a'));
         assert!(out[0].contains('\u{FFFD}')); // lossy replacement char
+    }
+
+    /// Named test (lot 346, the re-check of #552, N2): an empty argument
+    /// is one — first, between two, last — and the last argument's NUL is
+    /// the only one dropped; a cut argument stays as it was cut.
+    #[test]
+    fn parse_argv_blob_keeps_empty_arguments() {
+        let parse = |blob: &[u8]| {
+            let mut b = [0u8; crate::wire::ARGV_LEN];
+            b[..blob.len()].copy_from_slice(blob);
+            parse_argv_blob(&b, blob.len() as u16)
+        };
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse(b"\0logrotate\0/etc/logrotate.conf\0"),
+            v(&["", "logrotate", "/etc/logrotate.conf"])
+        );
+        assert_eq!(
+            parse(b"python3\0-W\0\0/tmp/x.py\0"),
+            v(&["python3", "-W", "", "/tmp/x.py"])
+        );
+        assert_eq!(
+            parse(b"logrotate\0/etc/logrotate.conf\0\0"),
+            v(&["logrotate", "/etc/logrotate.conf", ""])
+        );
+        assert_eq!(parse(b"a\0\0\0b"), v(&["a", "", "", "b"]));
+        // an argv of empty words names nothing, as a zeroed blob
+        assert!(parse(b"\0\0").is_empty());
     }
 
     #[test]
