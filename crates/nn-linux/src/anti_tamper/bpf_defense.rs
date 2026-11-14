@@ -2520,10 +2520,15 @@ mod tests {
             (CALIB_SIGNALS, vec![0x20, 0, 0x30, 0x40]),
             (CALIB_SIGNALS, vec![0, 0x20, 0]),
             (CALIB_SIGNALS, vec![0x20, 0x20]),
+            // the two signals, and one of them again: as many distinct, one
+            // call too many (the mutation round)
+            (CALIB_SIGNALS, vec![0x20, 0x30, 0x20]),
             (CALIB_SIGNALS, vec![0; 16]),
             (CALIB_OVERRIDE, vec![0x10, 0x11]),
             (CALIB_OVERRIDE, vec![]),
             (CALIB_NONE, vec![0x10]),
+            // a kind with no program: nothing to take, refused all the same
+            (CALIB_NONE, vec![]),
         ] {
             let mut cal = [0u32; 9];
             let e = place_calibration(kind, &seen, &mut cal).expect_err("refused");
