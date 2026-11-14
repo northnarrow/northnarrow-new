@@ -6125,10 +6125,12 @@ mod tests {
         let (tmp, t) = pkg_fixture();
         t.ingest_spawn(700, 1, "/usr/bin/bash", 7);
         t.ingest_spawn(710, 700, "/usr/bin/sudo", 8);
-        t.ingest_spawn(720, 710, "/usr/bin/vim.basic", 9);
-        t.ingest_spawn(730, 710, "/usr/bin/apt-get", 10);
+        // lot 351: what sudo ran as root after authenticating (the kernel's
+        // fork record of each, `AuthSessionTracker::is_interactive_admin`)
+        t.ingest_first_exec(720, 710, "/usr/bin/vim.basic", 9, 0);
+        t.ingest_first_exec(730, 710, "/usr/bin/apt-get", 10, 0);
         t.ingest_spawn(740, 730, "/usr/bin/dpkg", 11);
-        t.ingest_spawn(750, 710, "/usr/bin/tee", 12);
+        t.ingest_first_exec(750, 710, "/usr/bin/tee", 12, 0);
         session_proc(tmp.path(), 720, 710, 34816);
         session_proc(tmp.path(), 740, 730, 34816);
         session_proc(tmp.path(), 750, 710, 0);

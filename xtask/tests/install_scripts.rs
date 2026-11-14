@@ -4659,13 +4659,28 @@ fn a_fresh_install_with_allow_bpf_tools_signs_the_loader_lines() {
 /// (the slice's `ActiveState` is `state`, its stop exits `stop_rc`) and the
 /// `system.control` parents in the case's directory: `empty` (made empty),
 /// `full` (holding a drop-in of another unit) and `absent`. The calls made,
-/// the script's output.
+/// the script's output. Lot 351: the slice's cgroup is the case's `slice`
+/// (no containment scope in it: [`stop_slice_with`]).
 fn stop_slice(case: &str, state: &str, stop_rc: u8) -> (String, String, PathBuf) {
+    stop_slice_with(case, state, stop_rc, |_| {})
+}
+
+/// [`stop_slice`], the case's directory prepared by `setup` first (lot 351:
+/// the containment scopes under `slice/`), the agent's containment record
+/// `{"pid":4242,…}`.
+fn stop_slice_with(
+    case: &str,
+    state: &str,
+    stop_rc: u8,
+    setup: impl FnOnce(&Path),
+) -> (String, String, PathBuf) {
     let dir = case_dir(case);
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(dir.join("empty")).unwrap();
     fs::create_dir_all(dir.join("full/other.service.d")).unwrap();
+    fs::create_dir_all(dir.join("slice")).unwrap();
+    setup(&dir);
     let calls = dir.join("calls");
     write_exec(
         &bin.join("systemctl"),
@@ -4675,7 +4690,7 @@ fn stop_slice(case: &str, state: &str, stop_rc: u8) -> (String, String, PathBuf)
         ),
     );
     let script = format!(
-        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nSYSTEM_CONTROL_DIRS=(\"$1/empty\" \"$1/full\" \"$1/absent\")\n{}\nstop_slice\necho done\n",
+        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nSYSTEM_CONTROL_DIRS=(\"$1/empty\" \"$1/full\" \"$1/absent\")\nSLICE_CGROUP=\"$1/slice\"\nCONTAINMENT_RECORD='[{{\"pid\":4242,\"scope\":\"throttled\",\"origin\":\"/system.slice/app.service\"}}]'\n{}\nstop_slice\necho done\n",
         block("deploy/uninstall.sh", "stop_slice")
     );
     let path = format!(
@@ -4751,6 +4766,292 @@ fn uninstall_stops_the_slice_and_removes_the_empty_system_control_dirs() {
     );
 }
 
+/// Lot 351 (named, the review of #559, F3): the agent's containment lives
+/// under the slice — `blocked.scope`, `throttled.scope`, cgroups the agent
+/// makes itself (no units) — and nothing in uninstall.sh looked at them: the
+/// guide said "nothing else runs in it". Each empty one is removed before
+/// the stop. One that holds a process the agent contained stays, its
+/// processes and the agent's record of where they came from said; the
+/// slice is then not stopped, and nothing is killed or moved.
+#[test]
+fn uninstall_removes_the_empty_containment_scopes_and_says_the_held_ones() {
+    let (calls, out, dir) = stop_slice_with("stop-slice-scopes-empty", "active", 0, |d| {
+        fs::create_dir_all(d.join("slice/blocked.scope")).unwrap();
+        fs::create_dir_all(d.join("slice/throttled.scope")).unwrap();
+    });
+    assert!(!dir.join("slice/blocked.scope").exists(), "{out}");
+    assert!(!dir.join("slice/throttled.scope").exists(), "{out}");
+    assert!(
+        out.contains("removed the empty") && out.contains("blocked.scope"),
+        "{out}"
+    );
+    assert!(calls.contains("stop northnarrow.slice"), "{calls}");
+    assert!(!out.contains("containment record"), "{out}");
+
+    let (calls, out, dir) = stop_slice_with("stop-slice-scopes-held", "active", 0, |d| {
+        fs::create_dir_all(d.join("slice/blocked.scope")).unwrap();
+        // a scope that holds processes is no empty directory
+        fs::create_dir_all(d.join("slice/throttled.scope")).unwrap();
+        fs::write(d.join("slice/throttled.scope/cgroup.procs"), "4242\n4243\n").unwrap();
+    });
+    assert!(
+        !dir.join("slice/blocked.scope").exists(),
+        "the empty one goes"
+    );
+    assert!(
+        dir.join("slice/throttled.scope/cgroup.procs").is_file(),
+        "the held one stays"
+    );
+    assert!(out.contains("(pids: 4242 4243 )"), "{out}");
+    assert!(out.contains("not killed nor released"), "{out}");
+    assert!(
+        out.contains("/system.slice/app.service"),
+        "the record: {out}"
+    );
+    assert!(out.contains("not stopped while they are in it"), "{out}");
+    assert!(!calls.contains("stop northnarrow.slice"), "{calls}");
+    assert!(
+        !dir.join("empty").exists(),
+        "the empty system.control still goes"
+    );
+    // it moves no process (no write into a cgroup) and signals none
+    let block = block("deploy/uninstall.sh", "stop_slice");
+    let code: Vec<&str> = block
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(
+        !code
+            .iter()
+            .any(|l| l.contains("> \"$") || l.contains(">> ")),
+        "{block}"
+    );
+    assert!(
+        !code
+            .iter()
+            .any(|l| l.starts_with("kill ") || l.contains("| xargs")),
+        "{block}"
+    );
+    assert!(!calls.contains("kill"), "{calls}");
+    // the record is read before /run/northnarrow goes
+    let text = read("deploy/uninstall.sh");
+    let rec = text
+        .find("CONTAINMENT_RECORD=$(")
+        .expect("the record is read");
+    assert!(rec < text.find("rm -rf \"$RUN_DIR\"").unwrap());
+}
+
+/// `system_control_dirs` of uninstall.sh with the record `record` (`None`:
+/// none): the directories it names.
+fn system_control_dirs(case: &str, record: Option<&str>) -> String {
+    let dir = case_dir(case);
+    if let Some(r) = record {
+        fs::write(dir.join("made-dirs"), r).unwrap();
+    }
+    let script = format!(
+        "set -euo pipefail\n{}\nsystem_control_dirs \"$1/made-dirs\" /etc/systemd/system.control /run/systemd/system.control\necho \"${{SYSTEM_CONTROL_DIRS[*]}}\"\n",
+        block("deploy/uninstall.sh", "system_control_dirs")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(&dir)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `record_made_dirs` of install.sh (`upgrade`: `UPGRADE=1`) on the case's
+/// `record`, with `present` already there among `a` and `b`: the record's
+/// text after it (`None`: no record).
+fn record_made_dirs(
+    case: &str,
+    upgrade: bool,
+    record: Option<&str>,
+    present: &[&str],
+) -> Option<String> {
+    let dir = case_dir(case);
+    if let Some(r) = record {
+        fs::write(dir.join("made-dirs"), r).unwrap();
+    }
+    for p in present {
+        fs::create_dir_all(dir.join(p)).unwrap();
+    }
+    let script = format!(
+        "set -euo pipefail\nUPGRADE={}\n{}\nrecord_made_dirs \"$1/made-dirs\" \"$1/a\" \"$1/b\"\n",
+        u8::from(upgrade),
+        block("deploy/install.sh", "record_made_dirs")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(&dir)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    fs::read_to_string(dir.join("made-dirs"))
+        .ok()
+        .map(|t| t.replace(&format!("{}/", dir.display()), ""))
+}
+
+/// Lot 351 (named, the review of #559, F5): `/etc/systemd/system.control`
+/// was removed whenever it was empty — one the host had before the install
+/// too. The first install records the directories its units are about to
+/// make (`made-dirs`); the uninstall removes /etc's, empty, only when it is
+/// listed — or when there is no record (an install older than lot 351, as
+/// before). /run's (this boot's) is removed when empty.
+#[test]
+fn only_a_system_control_dir_the_install_made_is_removed() {
+    // install: the first install lists what the host did not have
+    assert_eq!(
+        record_made_dirs("made-fresh", false, None, &[]).as_deref(),
+        Some("a\nb\n")
+    );
+    assert_eq!(
+        record_made_dirs("made-had-a", false, None, &["a"]).as_deref(),
+        Some("b\n")
+    );
+    assert_eq!(
+        record_made_dirs("made-had-both", false, None, &["a", "b"]).as_deref(),
+        Some("")
+    );
+    // an upgrade makes no record; an existing one is kept as it is
+    assert_eq!(record_made_dirs("made-upgrade", true, None, &[]), None);
+    assert_eq!(
+        record_made_dirs("made-kept", false, Some("a\n"), &[]).as_deref(),
+        Some("a\n")
+    );
+    // uninstall
+    let both = "/run/systemd/system.control /etc/systemd/system.control";
+    assert_eq!(system_control_dirs("scd-none", None), both);
+    assert_eq!(
+        system_control_dirs("scd-made", Some("/etc/systemd/system.control\n")),
+        both
+    );
+    assert_eq!(
+        system_control_dirs("scd-had", Some("")),
+        "/run/systemd/system.control"
+    );
+    assert_eq!(
+        system_control_dirs("scd-other", Some("/etc/systemd/system.control.d\n")),
+        "/run/systemd/system.control"
+    );
+    // the install records before the units' first start
+    let text = read("deploy/install.sh");
+    let rec = text
+        .find("\nrecord_made_dirs \"$ETC_DIR/made-dirs\" /etc/systemd/system.control\n")
+        .expect("recorded");
+    assert!(
+        rec < text
+            .find("systemctl enable --now northnarrow-agent.service")
+            .unwrap()
+    );
+    let un = read("deploy/uninstall.sh");
+    assert!(un.contains("\nsystem_control_dirs \"$ETC_DIR/made-dirs\" /etc/systemd/system.control /run/systemd/system.control\n"));
+    assert!(
+        !un.contains("SYSTEM_CONTROL_DIRS=(/etc"),
+        "no fixed list any more"
+    );
+}
+
+/// `rm_tree` of uninstall.sh on the case's `paths` (made by `setup` in the
+/// case's directory), a stub `mountpoint` answering yes for `mounted`: the
+/// script's output.
+fn rm_tree(
+    case: &str,
+    mounted: &str,
+    paths: &[&str],
+    setup: impl FnOnce(&Path),
+) -> (String, PathBuf) {
+    let dir = case_dir(case);
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    setup(&dir);
+    // as mountpoint(1), which follows a symbolic link: `link` (to the
+    // mount point) answers yes too
+    write_exec(
+        &bin.join("mountpoint"),
+        &format!(
+            "[ \"$3\" = '{}' ] || [ \"$3\" = '{}' ]",
+            dir.join(mounted).display(),
+            dir.join("link").display()
+        ),
+    );
+    let script = format!(
+        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\n{}\nrm_tree {}\necho done\n",
+        block("deploy/uninstall.sh", "rm_tree"),
+        paths
+            .iter()
+            .map(|p| format!("\"{}\"", dir.join(p).display()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", path)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.ends_with("done\n"), "{stdout}");
+    (stdout, dir)
+}
+
+/// Lot 351 (named, the review of #559, F4): `rm -rf` of the journal
+/// namespace's runtime directory, on every uninstall, emptied whatever a
+/// bind mount at that path showed. Every directory the uninstall removes
+/// from systemd's trees goes through `rm_tree`: a mount point is left and
+/// said, a tree is removed without crossing into another file system, an
+/// absent path is nothing — and no `rm -rf` of such a path is left outside
+/// it (the ratchet).
+#[test]
+fn the_uninstall_removes_no_mount_point_in_systemd_s_trees() {
+    let (out, dir) = rm_tree("rm-tree", "mnt", &["tree", "mnt", "absent", "link"], |d| {
+        fs::create_dir_all(d.join("tree/a/b")).unwrap();
+        fs::create_dir_all(d.join("mnt/keep")).unwrap();
+        std::os::unix::fs::symlink(d.join("mnt"), d.join("link")).unwrap();
+    });
+    // a symbolic link to a mount point is removed (the link, not its target)
+    assert!(fs::symlink_metadata(dir.join("link")).is_err(), "{out}");
+    assert!(!dir.join("tree").exists(), "{out}");
+    assert!(
+        dir.join("mnt/keep").is_dir(),
+        "a mount point is left: {out}"
+    );
+    assert!(out.contains("mnt is a mount point: left in place"), "{out}");
+    assert!(!out.contains("absent"), "{out}");
+    let block = block("deploy/uninstall.sh", "rm_tree");
+    assert!(
+        block.contains("rm -rf --one-file-system -- \"$d\""),
+        "{block}"
+    );
+    // the ratchet: no plain `rm -rf` of a path in systemd's trees
+    let text = read("deploy/uninstall.sh");
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split(" #").next().unwrap_or(line).trim_start();
+        if code.starts_with('#') || !code.contains("rm -rf") || code.contains("--one-file-system") {
+            continue;
+        }
+        for tree in ["systemd", "journal", "DROPIN", "JOURNALD"] {
+            assert!(
+                !code.contains(tree),
+                "uninstall.sh:{}: `rm -rf` of a path in systemd's trees outside rm_tree: {line}",
+                n + 1
+            );
+        }
+    }
+}
+
 /// Lot 350 (named, F2-5): `uninstall.sh --purge` after an uninstall that
 /// kept the state (the guide's two lines, in that order) found no list of
 /// the agent's BPF programs (it went with /run/northnarrow), waited for
@@ -4818,8 +5119,9 @@ fn uninstall_removes_the_journal_runtime_dir_and_the_export_parent() {
     let varlink = text
         .find("systemctl stop systemd-journald-varlink@northnarrow.socket")
         .expect("the varlink socket is stopped");
+    // lot 351 (F4): through rm_tree (no mount point, one file system)
     let runtime = text
-        .find("rm -rf \"$JOURNALD_NS_RUNTIME\"")
+        .find("rm_tree \"$JOURNALD_NS_RUNTIME\"")
         .expect("the runtime dir is removed");
     let purge = text.find("# ── 5. config + state").unwrap();
     assert!(

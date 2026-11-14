@@ -265,7 +265,7 @@ mod tests {
         let lineage = AuthSessionTracker::new(tmp.path());
         lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
         lineage.ingest_spawn(710, 700, "/usr/bin/sudo", 2);
-        lineage.ingest_spawn(720, 710, "/home/alice/deploy.sh", 3);
+        lineage.ingest_first_exec(720, 710, "/home/alice/deploy.sh", 3, 0);
         lineage.ingest_spawn(800, 700, "/home/alice/deploy.sh", 4);
         let rule = R009RootExecFromUserPath::new(lineage);
 
@@ -281,6 +281,78 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&other).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lot 351 (named, the review of #559, F2): any user may run sudo, and
+    /// `sudo -A` forks the user's `SUDO_ASKPASS` program, as the user,
+    /// before any authentication. A user with no sudo right at a terminal
+    /// ran `SUDO_ASKPASS=~/x sudo -A true`; `~/x` became root through a
+    /// local privilege escalation and ran `/home/alice/payload` as root —
+    /// R009 found sudo in its lineage: Low, no kill. Only the process sudo
+    /// ran as root after authenticating vouches now: the payload below the
+    /// askpass helper, and the payload it executed in its own place, are
+    /// High (the kill); the command sudo ran is still Low.
+    #[test]
+    fn sudo_s_askpass_helper_vouches_for_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (pid, ppid) in [
+            (700u32, 1u32),
+            (710, 700),
+            (715, 710),
+            (716, 710),
+            (720, 715),
+        ] {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("loginuid"), "1000").unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+            )
+            .unwrap();
+        }
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_exec(700, 1, "/usr/bin/bash", &[], 1, 1, 1000);
+        lineage.ingest_exec(710, 700, "/usr/bin/sudo", &[], 2, 2, 1000);
+        // the askpass helper sudo forked as the user, and its root payload
+        lineage.ingest_first_exec(715, 710, "/home/alice/askpass", 3, 1000);
+        lineage.ingest_first_exec(720, 715, "/home/alice/payload", 4, 0);
+        // the command sudo ran as root after authenticating
+        lineage.ingest_first_exec(716, 710, "/home/alice/deploy.sh", 5, 0);
+        let rule = R009RootExecFromUserPath::new(lineage.clone());
+        let run = |pid: u32, ppid: u32, path: &str| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p, ppid: pp, ..
+            } = &mut e
+            {
+                (*p, *pp) = (pid, ppid);
+            }
+            e
+        };
+        let v = rule
+            .evaluate(&run(720, 715, "/home/alice/payload"))
+            .expect("fires");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::KillProcessTree),
+            "below the askpass helper"
+        );
+        let v = rule
+            .evaluate(&run(716, 710, "/home/alice/deploy.sh"))
+            .expect("recorded");
+        assert_eq!((v.severity, v.action), (Severity::Low, ResponseAction::Log));
+        // the askpass helper, root now, executes its payload in place: its
+        // process is still the one sudo ran as the user
+        lineage.ingest_exec(715, 710, "/home/alice/payload", &[], 6, 3, 0);
+        let v = rule
+            .evaluate(&run(715, 710, "/home/alice/payload"))
+            .expect("fires");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::KillProcessTree),
+            "the askpass helper's own process"
+        );
     }
 
     /// Lot 350 (named, F2-2): Ubuntu 26.04's `sudo` is sudo-rs
@@ -312,7 +384,7 @@ mod tests {
                 let lineage = AuthSessionTracker::new(tmp.path());
                 lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
                 lineage.ingest_spawn(710, 700, sudo, 2);
-                lineage.ingest_spawn(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3);
+                lineage.ingest_first_exec(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3, 0);
                 let rule = R009RootExecFromUserPath::new(lineage);
                 let mut run = spawn_as(0, "uninstall.sh", "/home/alice/nn/deploy/uninstall.sh");
                 if let Event::ProcessSpawn { pid, ppid, .. } = &mut run {

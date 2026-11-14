@@ -2025,9 +2025,16 @@ pub fn process_drift(
     // created in a watched directory is its own inode, not the directory's
     // (`key`, the record's).
     let size_key = ident.key.unwrap_or(key);
-    let baseline_size = path_map
-        .last_size(&size_key)
-        .or_else(|| last_baseline.map(|b| b.size_bytes));
+    let last_read_size = path_map.last_size(&size_key);
+    let baseline_size = last_read_size.or_else(|| last_baseline.map(|b| b.size_bytes));
+    // Lot 351 (the review of #559, F1): read smaller than the drain last read
+    // (or watched) it — a shrink, whatever the start's baseline says. A log
+    // truncated back to its signed baseline's exact content (`truncate -s
+    // <baseline size>`: every line written since erased) matched the
+    // baseline's SHA and was dropped as a no-op below; NN-L-FIM-005 never ran.
+    let shrank_since_read = new_size
+        .zip(last_read_size)
+        .is_some_and(|(now, last)| now < last);
     // Lot 350 (F2-1): this read finds the very bytes the drain's last read of
     // the file found — the writes this record reports were already in that
     // read (the drain's own re-hash, or the start's baseline, closed the file
@@ -2069,7 +2076,14 @@ pub fn process_drift(
     // unchanged file). Deleted/Renamed always counts as drift
     // even if hashes are None on both sides (the file
     // disappeared — operator wants to know).
+    //
+    // Lot 351 (the review of #559, F1): the baseline is the start's, not the
+    // last state seen. A content back to the baseline's that the drain read
+    // larger since is a shrink of what it read (`shrank_since_read`), judged
+    // with the size it had (`FimEvent::baseline_size`). A same-size return
+    // to the baseline restores bytes whose change was judged when read.
     let real_drift = attrs.is_some()
+        || shrank_since_read
         || !matches!(
             (&baseline_sha256, &new_sha256),
             (Some(old), Some(new)) if old == new
@@ -3979,6 +3993,51 @@ mod tests {
             }
         }
 
+        /// Lot 351: the start's baseline of the log is its content now (its
+        /// SHA-256, size, mode and owner), as the install's signed one is.
+        fn baseline_now(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            let bytes = std::fs::read(&self.log).unwrap();
+            let m = std::fs::metadata(&self.log).unwrap();
+            self.base.sha256 = hex::encode(Sha256::digest(&bytes));
+            self.base.size_bytes = bytes.len() as u64;
+            self.base.mode = format!("0o{:o}", m.mode() & 0o7777);
+            self.base.uid = m.uid();
+            self.base.gid = m.gid();
+        }
+
+        /// Lot 351: `bytes` appended to the log (rsyslogd's write).
+        fn append(&self, bytes: &[u8]) {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.log)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+
+        /// Lot 351: the log truncated to `len` bytes.
+        fn truncate(&self, len: u64) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.log)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+
+        /// NN-L-FIM-005's verdict on `fe` as the record of a writer that is
+        /// not rsyslogd (`/usr/bin/truncate`, as root).
+        fn judged_as_another(fe: &FimEvent) -> Option<nn_model::Verdict> {
+            use nn_core::decision::Rule;
+            let mut fe = fe.clone();
+            fe.path = "/var/log/auth.log".into();
+            fe.modifier_exe = Some("/usr/bin/truncate".into());
+            fe.modifier_uid = 0;
+            nn_core::fim::rules::NnLFim005LogTruncated::new(Some(102)).evaluate(&Event::Fim(fe))
+        }
+
         fn raw(&self, pid: u32, op_flags: u8) -> FimDriftRaw {
             let mut raw = fake_raw(self.key.dev, self.key.ino, FimOp::Modified as u8);
             raw.modifier_pid = pid;
@@ -4228,6 +4287,86 @@ mod tests {
             !map.read_unchanged(&unwatched, 10, "aa"),
             "kept for a watched inode only"
         );
+    }
+
+    /// Lot 351 (named, the review of #559, F1): a log truncated back to the
+    /// exact content of its signed baseline (`truncate -s <baseline size>
+    /// /var/log/auth.log` by root, after rsyslogd appended a login's lines)
+    /// matched the baseline's SHA-256, mode and owner, and the drain dropped
+    /// the record as a no-op: no event, NN-L-FIM-005 never ran, the lines
+    /// were erased without a trace. Read smaller than the drain last read
+    /// it, it is a shrink, judged with that size (High).
+    #[test]
+    fn a_log_truncated_back_to_its_baseline_content_is_judged() {
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let login = b"sshd[901]: Accepted password for mallory from 203.0.113.7\n";
+        fx.append(login);
+        let appended = fx.drift(&fx.raw(600, BOTH)).expect("rsyslogd's append");
+        assert!(LogFixture::judged_as_rsyslogd(&appended, 102).is_none());
+        fx.truncate(4_000);
+        let fe = fx
+            .drift(&fx.raw(4_300, FIM_SETATTR_SIZE))
+            .expect("the truncation reached the rules");
+        assert_eq!(fe.new_size, Some(4_000));
+        assert_eq!(fe.baseline_size, Some(4_000 + login.len() as u64));
+        assert_eq!(fe.new_sha256.map(hex::encode), Some(fx.base.sha256.clone()));
+        let v = LogFixture::judged_as_another(&fe).expect("NN-L-FIM-005");
+        assert_eq!(v.severity, nn_model::Severity::High);
+        // its drift row too: the evidence of the truncation
+        let rows = std::fs::read_to_string(fx._dir.path().join("drift.jsonl")).unwrap();
+        assert_eq!(
+            rows.lines().count(),
+            2,
+            "the append's row and the truncation's"
+        );
+        // and a log the agent watched larger than its baseline (a restart
+        // after the log grew: the size noted at the watch, no read)
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        fx.append(login);
+        fx.path_map.note_size(&fx.key, 4_000 + login.len() as u64);
+        fx.truncate(4_000);
+        let fe = fx.drift(&fx.raw(4_300, FIM_SETATTR_SIZE)).expect("judged");
+        assert!(LogFixture::judged_as_another(&fe).is_some());
+    }
+
+    /// Lot 351 (the review of #559, F1): what is no shrink of what the drain
+    /// read stays the no-op it was — a size setattr that changed nothing
+    /// (`truncate -s` to the size the log has, the baseline's), a touch, and
+    /// a record read as the baseline the drain had read as such — and
+    /// `logrotate`'s `copytruncate` of a log whose baseline is empty is
+    /// judged on logrotate's own record only (as for any other baseline:
+    /// the packaged rotation is recorded Low, `LogRotation`), rsyslogd's
+    /// pending appends at its close staying exempt.
+    #[test]
+    fn what_shrank_nothing_since_the_drain_s_read_stays_a_no_op() {
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        assert!(fx.drift(&fx.raw(4_300, FIM_SETATTR_SIZE)).is_none());
+        assert!(fx.drift(&fx.raw(4_300, 0)).is_none());
+        fx.truncate(4_000);
+        assert!(fx.drift(&fx.raw(4_300, FIM_SETATTR_SIZE)).is_none());
+        assert!(fx.drift(&fx.raw(600, BOTH)).is_none());
+        // copytruncate, the baseline empty (a log rotated at the install)
+        let (logrotate, rsyslogd) = (4_200, 600);
+        let mut fx = LogFixture::new(0);
+        fx.baseline_now();
+        fx.append(b"a line rsyslogd wrote\n");
+        fx.drift(&fx.raw(rsyslogd, BOTH))
+            .expect("rsyslogd's append");
+        fx.truncate(0);
+        let own = fx
+            .drift(&fx.raw(logrotate, FIM_SETATTR_SIZE))
+            .expect("logrotate's truncation, on its own record");
+        assert_eq!((own.new_size, own.modifier_pid), (Some(0), logrotate));
+        let at_close = fx.raw(rsyslogd, BOTH | FIM_WRITE_TRUNCATED_BY_ANOTHER);
+        assert!(fx.drift(&at_close).is_none(), "nothing left to judge");
+        fx.append(b"the next line\n");
+        let next = fx.drift(&at_close).expect("rsyslogd's next append");
+        assert!(LogFixture::judged_as_rsyslogd(&next, 102).is_none());
     }
 
     /// The review of #554 (named, N2; lot 348): a size setattr by another
