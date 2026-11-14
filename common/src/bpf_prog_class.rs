@@ -127,22 +127,61 @@ pub const FORBIDDEN_HELPERS: [(u32, &str); 4] = [
     (117, "bpf_send_signal_thread"),
 ];
 
-/// Lot 345: the kfunc of the same reach (6.13 and later): a signal to any
-/// task the program holds, the agent's from `bpf_task_from_pid`.
-pub const FORBIDDEN_KFUNC: &str = "bpf_send_signal_task";
+/// Lot 345: the kfuncs of the same reach, each judged where the kernel's
+/// BTF has it (a kfunc exists only from 6.13, so only the `bpf_prog_load`
+/// hook, 6.9 and later, ever reads one): `bpf_send_signal_task` signals any
+/// task the program holds — the agent's, from `bpf_task_from_pid` — as
+/// `SI_KERNEL`, which no `task_kill` hook sees; the `bpf_task_work_schedule_*`
+/// kfuncs (6.18 and later, and their `_impl` spellings) run one of the
+/// program's callbacks in a task's own context, where `bpf_send_signal` and
+/// `bpf_probe_write_user` act on that task.
+///
+/// The review of #553 (F1): these are judged for a load of EVERY type, not
+/// only of the types refused by default — the kernel registers them for
+/// `syscall` (run by `BPF_PROG_RUN`), XDP, tc and `cgroup_skb` programs too,
+/// which any root process loads with no opt-out
+/// ([`judged_for_every_type`]).
+pub const FORBIDDEN_KFUNCS: [&str; 5] = [
+    "bpf_send_signal_task",
+    "bpf_task_work_schedule_signal",
+    "bpf_task_work_schedule_signal_impl",
+    "bpf_task_work_schedule_resume",
+    "bpf_task_work_schedule_resume_impl",
+];
+
+/// Lot 345: the slots of [`FORBIDDEN_HELPERS`], first in [`CALL_TARGETS`].
+pub const HELPER_SLOTS: usize = FORBIDDEN_HELPERS.len();
 
 /// Lot 345: the content judge's targets — the four helpers' (slots 0 to 3,
-/// a call with `src_reg` 0) and the kfunc's (slot 4, `src_reg`
+/// a call with `src_reg` 0) and the kfuncs' (slots 4 to 8, `src_reg`
 /// [`PSEUDO_KFUNC_CALL`]), each the `imm` of the call instruction as the
 /// judged copy holds it: the helper's id and the kfunc's BTF id in the
 /// kernel's copy of a load (the `bpf_prog_load` hook, 6.9 and later); the
 /// called address less `__bpf_call_base` once the verifier fixed the calls
 /// up (the `bpf_prog` hook, before 6.9). 0: no such call on this kernel.
-pub const CALL_TARGETS: usize = 5;
+pub const CALL_TARGETS: usize = HELPER_SLOTS + FORBIDDEN_KFUNCS.len();
 
 /// Lot 345: the content judge's configuration map's slots: the stage (0),
-/// the [`CALL_TARGETS`] (1 to 5), then [`CONTENT_LOCKDOWN_SLOT`].
-pub const CONTENT_CONF_SLOTS: u32 = 2 + CALL_TARGETS as u32;
+/// the [`CALL_TARGETS`] (1 to 9), then [`CONTENT_LOCKDOWN_SLOT`] and
+/// [`CONTENT_EVERY_TYPE_SLOT`].
+pub const CONTENT_CONF_SLOTS: u32 = 3 + CALL_TARGETS as u32;
+
+/// The review of #553 (F1): the slot of the content judge's configuration
+/// that holds how many kfunc targets this kernel has (the keys
+/// [`judged_for_every_type`]); not 0, the `bpf_prog_load` hook reads a
+/// foreign load of every type for them. 0 (6.9 to 6.12, before the first
+/// such kfunc): a type let through by default is not read at all.
+pub const CONTENT_EVERY_TYPE_SLOT: u32 = 2 + CALL_TARGETS as u32;
+
+/// The review of #553 (F1): whether the target whose slot plus one is
+/// `hit` (what the key map holds) is refused in a load of every type — a
+/// kfunc's; a helper's only in a type refused by default (the four act on
+/// the current task, or a probed function's return, from types no root
+/// loads without an opt-out).
+#[inline(always)]
+pub const fn judged_for_every_type(hit: u32) -> bool {
+    hit as usize > HELPER_SLOTS && hit as usize <= CALL_TARGETS
+}
 
 /// Lot 345: the slot of the content judge's configuration that holds this
 /// kernel's `LOCKDOWN_BPF_WRITE_USER` (`enum lockdown_reason`, from its
@@ -200,7 +239,7 @@ pub const PSEUDO_KFUNC_CALL: u8 = 2;
 
 /// Lot 345: the most instructions the content judge reads
 /// (`BPF_COMPLEXITY_LIMIT_INSNS`, the most a load may hold, rounded up to
-/// its 64 × 64 × 256 scan): a longer program is refused unjudged.
+/// its 32⁴ scan): a longer program is refused unjudged.
 pub const CONTENT_MAX_INSNS: u32 = 1 << 20;
 
 /// Lot 345: the slot of [`CALL_TARGETS`] that instruction `insn` (a
@@ -217,18 +256,16 @@ pub const fn forbidden_call(insn: u64, targets: &[u32; CALL_TARGETS]) -> u32 {
     if imm == 0 {
         return 0;
     }
-    if src == 0 {
-        let mut slot = 0;
-        while slot < CALL_TARGETS - 1 {
-            if targets[slot] == imm {
-                return slot as u32 + 1;
-            }
-            slot += 1;
+    let (mut slot, end) = match src {
+        0 => (0, HELPER_SLOTS),
+        PSEUDO_KFUNC_CALL => (HELPER_SLOTS, CALL_TARGETS),
+        _ => return 0,
+    };
+    while slot < end {
+        if targets[slot] == imm {
+            return slot as u32 + 1;
         }
-        return 0;
-    }
-    if src == PSEUDO_KFUNC_CALL && targets[CALL_TARGETS - 1] == imm {
-        return CALL_TARGETS as u32;
+        slot += 1;
     }
     0
 }
@@ -247,13 +284,13 @@ pub const fn call_key(insn: u64) -> u64 {
 }
 
 /// Lot 345: the key of a call of slot `slot`'s target `target` (a helper's
-/// call: `src_reg` 0; the kfunc's, the last slot: `src_reg`
+/// call: `src_reg` 0; a kfunc's, the slots past [`HELPER_SLOTS`]: `src_reg`
 /// [`PSEUDO_KFUNC_CALL`]); `None` for an absent target (0).
 pub const fn target_key(slot: usize, target: u32) -> Option<u64> {
     if target == 0 || slot >= CALL_TARGETS {
         return None;
     }
-    let src: u64 = if slot == CALL_TARGETS - 1 {
+    let src: u64 = if slot >= HELPER_SLOTS {
         PSEUDO_KFUNC_CALL as u64
     } else {
         0
@@ -278,8 +315,8 @@ pub enum ContentRefusal {
     FmodRet,
     /// [`CONTENT_UNJUDGED`].
     Unjudged,
-    /// A call of [`FORBIDDEN_HELPERS`]`[n]`, or of [`FORBIDDEN_KFUNC`] (`n`
-    /// 4).
+    /// A call of [`FORBIDDEN_HELPERS`]`[n]`, or of [`FORBIDDEN_KFUNCS`]`[n -
+    /// HELPER_SLOTS]`.
     Call(u8),
 }
 
@@ -318,10 +355,13 @@ pub fn content_response(target_dev: u64) -> Option<String> {
 
 /// Lot 345: the helper or kfunc slot `n` of [`CALL_TARGETS`] names.
 pub const fn call_target_name(n: u8) -> &'static str {
-    if (n as usize) < FORBIDDEN_HELPERS.len() {
-        FORBIDDEN_HELPERS[n as usize].1
+    let n = n as usize;
+    if n < HELPER_SLOTS {
+        FORBIDDEN_HELPERS[n].1
+    } else if n < CALL_TARGETS {
+        FORBIDDEN_KFUNCS[n - HELPER_SLOTS]
     } else {
-        FORBIDDEN_KFUNC
+        "an unknown target"
     }
 }
 
@@ -1297,8 +1337,8 @@ mod tests {
         let insn = |code: u8, src: u8, imm: u32| -> u64 {
             code as u64 | ((src as u64) << 12) | ((imm as u64) << 32)
         };
-        let pre = [36, 58, 109, 117, 9_001];
-        for (slot, imm) in pre.iter().enumerate().take(4) {
+        let pre = [36, 58, 109, 117, 9_001, 9_002, 9_003, 9_004, 9_005];
+        for (slot, imm) in pre.iter().enumerate().take(HELPER_SLOTS) {
             assert_eq!(
                 forbidden_call(insn(INSN_CALL, 0, *imm), &pre),
                 slot as u32 + 1
@@ -1315,6 +1355,14 @@ mod tests {
             forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, 9_001), &pre),
             5
         );
+        // the review of #553 (F1): each kfunc in its own slot
+        for (slot, imm) in pre.iter().enumerate().skip(HELPER_SLOTS) {
+            assert_eq!(
+                forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, *imm), &pre),
+                slot as u32 + 1
+            );
+            assert_eq!(forbidden_call(insn(INSN_CALL, 0, *imm), &pre), 0);
+        }
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 9_001), &pre), 0);
         // a bpf-to-bpf call (src_reg 1) to an offset that is the kfunc's id
         assert_eq!(forbidden_call(insn(INSN_CALL, 1, 9_001), &pre), 0);
@@ -1329,14 +1377,14 @@ mod tests {
             3
         );
         // a kernel without the kfunc (0): no call is it, not even imm 0
-        let no_kfunc = [36, 58, 109, 117, 0];
+        let no_kfunc = [36, 58, 109, 117, 0, 0, 0, 0, 0];
         assert_eq!(
             forbidden_call(insn(INSN_CALL, PSEUDO_KFUNC_CALL, 0), &no_kfunc),
             0
         );
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0), &[0; CALL_TARGETS]), 0);
         // after the fix-up: the address less __bpf_call_base, negative too
-        let post = [0x0012_3450, 0xfff0_0010, 0x0001_0000, 0x7fff_fff0, 0];
+        let post = [0x0012_3450, 0xfff0_0010, 0x0001_0000, 0x7fff_fff0, 0, 0, 0, 0, 0];
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0xfff0_0010), &post), 2);
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 109), &post), 0);
     }
@@ -1376,7 +1424,7 @@ mod tests {
     /// bits set or not — and a slot's key is its target's call only.
     #[test]
     fn the_call_keys_find_what_the_compares_find() {
-        let targets = [36, 58, 109, 117, 9_001];
+        let targets = [36, 58, 109, 117, 9_001, 9_002, 9_003, 9_004, 9_005];
         let keys: Vec<(u64, u32)> = (0..CALL_TARGETS)
             .filter_map(|s| target_key(s, targets[s]).map(|k| (k, s as u32 + 1)))
             .collect();
@@ -1401,6 +1449,9 @@ mod tests {
                     117,
                     9_000,
                     9_001,
+                    9_003,
+                    9_005,
+                    9_006,
                     u32::MAX,
                 ] {
                     for rest in [0u64, 0x0f00, 0xffff_0000, 0x7fff_0a00] {
@@ -1459,6 +1510,41 @@ mod tests {
         assert!(content_response(CONTENT_UNJUDGED as u64)
             .unwrap()
             .contains("could not read whole"));
-        assert_eq!(call_target_name(4), FORBIDDEN_KFUNC);
+        assert_eq!(call_target_name(4), FORBIDDEN_KFUNCS[0]);
+        assert_eq!(call_target_name(4), "bpf_send_signal_task");
+        assert_eq!(call_target_name(5), "bpf_task_work_schedule_signal");
+        assert_eq!(call_target_name(CALL_TARGETS as u8), "an unknown target");
+    }
+
+    /// Named (the review of #553, F1): the kfuncs that signal a task, or run
+    /// a callback in its context, are judged in a load of every type (a
+    /// `syscall`, XDP or tc program any root loads, no opt-out needed) — and
+    /// only they: the four helpers stay a matter of the types refused by
+    /// default. The configuration's every-type slot is its own.
+    #[test]
+    fn the_signal_kfuncs_are_judged_for_every_type() {
+        assert_eq!(FORBIDDEN_KFUNCS[0], "bpf_send_signal_task");
+        assert!(FORBIDDEN_KFUNCS.contains(&"bpf_task_work_schedule_signal"));
+        assert!(FORBIDDEN_KFUNCS.contains(&"bpf_task_work_schedule_resume_impl"));
+        for hit in 1..=HELPER_SLOTS as u32 {
+            assert!(!judged_for_every_type(hit), "{hit}");
+        }
+        for hit in HELPER_SLOTS as u32 + 1..=CALL_TARGETS as u32 {
+            assert!(judged_for_every_type(hit), "{hit}");
+            assert!(call_target_name(hit as u8 - 1).starts_with("bpf_"));
+        }
+        assert!(!judged_for_every_type(0));
+        assert!(!judged_for_every_type(CALL_TARGETS as u32 + 1));
+        const { assert!(CONTENT_EVERY_TYPE_SLOT < CONTENT_CONF_SLOTS) };
+        assert_ne!(CONTENT_EVERY_TYPE_SLOT, CONTENT_LOCKDOWN_SLOT);
+        assert!(CONTENT_EVERY_TYPE_SLOT > CALL_TARGETS as u32);
+        // a kfunc's key is a kfunc call's (src_reg 2), whatever its slot
+        for slot in HELPER_SLOTS..CALL_TARGETS {
+            assert_eq!(
+                target_key(slot, 7),
+                Some(0x85 | (2 << 12) | (7u64 << 32)),
+                "{slot}"
+            );
+        }
     }
 }

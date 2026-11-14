@@ -348,10 +348,23 @@ pub(crate) fn attach(
             }
         };
     if at_load {
-        let judge = ContentJudge::at_load(resolved.and_then(|r| r.forbidden_kfunc_id));
-        if let Err(e) = write_content_judge(ebpf, &judge, true) {
-            warn!(error = %e, "BPF self-defence: content judge NOT armed");
-            health.observe_failures.push((CONTENT_JUDGE, e));
+        let judge = ContentJudge::at_load(
+            resolved.map_or([None; common::bpf_prog_class::FORBIDDEN_KFUNCS.len()], |r| {
+                *r.forbidden_kfunc_ids
+            }),
+        );
+        match write_content_judge(ebpf, &judge, true) {
+            Ok(()) => info!(
+                kfuncs_every_type = judge.every_type,
+                "BPF self-defence: content judge armed at the load (a foreign load of every type \
+                 read for the signalling kfuncs this kernel has)"
+            ),
+            Err(e) => {
+                warn!(error = %e, "BPF self-defence: content judge NOT armed");
+                health
+                    .observe_failures
+                    .push((CONTENT_JUDGE, format!("{e} — {OPT_OUTS_SUSPENDED}")));
+            }
         }
     }
     // Lot 302: the bpf() guard pinned like the deny hooks (`prog_bpf`,
@@ -415,7 +428,7 @@ pub(crate) fn attach(
                 "BPF self-defence: content judge armed at the handle (calibrated)"
             ),
             Err(e) => {
-                warn!(error = %e, "BPF self-defence: content judge at the handle NOT armed — an opted-out loader's program is not read for signalling helpers");
+                warn!(error = %e, "BPF self-defence: content judge at the handle NOT fully armed — the error says what an opted-out loader still loads, or that the opt-outs are suspended");
                 health.observe_failures.push((CONTENT_JUDGE, e));
             }
         }
@@ -479,6 +492,10 @@ pub struct ContentJudge {
     pub stage: u32,
     /// `bpf_prog_class::CALL_TARGETS`, as the judged copy names them.
     pub targets: [u32; common::bpf_prog_class::CALL_TARGETS],
+    /// The review of #553 (F1): how many kfunc targets this kernel has —
+    /// not 0, a foreign load of EVERY type is read for them at
+    /// `bpf_prog_load` (`bpf_prog_class::CONTENT_EVERY_TYPE_SLOT`).
+    pub every_type: u32,
     /// Why there is no judge on this kernel (then `stage` is off).
     pub off: Option<String>,
 }
@@ -497,19 +514,39 @@ impl ContentJudge {
             .collect()
     }
 
-    /// 6.9 and later, at `bpf_prog_load`: the helpers' uapi ids, and the
-    /// kfunc's BTF id where vmlinux has it.
-    pub fn at_load(kfunc_btf_id: Option<u32>) -> Self {
-        use common::bpf_prog_class::{CALL_TARGETS, CONTENT_STAGE_LOAD, FORBIDDEN_HELPERS};
+    /// 6.9 and later, at `bpf_prog_load`: the helpers' uapi ids, and each
+    /// kfunc's BTF id where vmlinux has it (`kfunc_btf_ids`, in the order of
+    /// `bpf_prog_class::FORBIDDEN_KFUNCS`) — read in a foreign load of every
+    /// type (the review of #553, F1).
+    pub fn at_load(
+        kfunc_btf_ids: [Option<u32>; common::bpf_prog_class::FORBIDDEN_KFUNCS.len()],
+    ) -> Self {
+        use common::bpf_prog_class::{
+            CALL_TARGETS, CONTENT_STAGE_LOAD, FORBIDDEN_HELPERS, HELPER_SLOTS,
+        };
         let mut targets = [0u32; CALL_TARGETS];
         for (slot, (id, _)) in FORBIDDEN_HELPERS.iter().enumerate() {
             targets[slot] = *id;
         }
-        targets[CALL_TARGETS - 1] = kfunc_btf_id.unwrap_or(0);
+        for (k, id) in kfunc_btf_ids.iter().enumerate() {
+            targets[HELPER_SLOTS + k] = id.unwrap_or(0);
+        }
         Self {
             stage: CONTENT_STAGE_LOAD,
             targets,
+            every_type: kfunc_btf_ids.iter().flatten().count() as u32,
             off: None,
+        }
+    }
+
+    /// No judge on this kernel, and why (the opt-outs are then suspended:
+    /// the `bpf` hook honours none while the stage is off).
+    pub fn off(why: String) -> Self {
+        Self {
+            stage: common::bpf_prog_class::CONTENT_STAGE_OFF,
+            targets: [0; common::bpf_prog_class::CALL_TARGETS],
+            every_type: 0,
+            off: Some(why),
         }
     }
 
@@ -522,9 +559,7 @@ impl ContentJudge {
     /// `CONFIG_BPF_KPROBE_OVERRIDE`; `bpf_probe_write_user`'s slot stays 0
     /// (refused at the `locked_down` hook instead).
     pub fn at_handle(calibrated: [u32; common::bpf_prog_class::CALL_TARGETS]) -> Self {
-        use common::bpf_prog_class::{
-            CALL_TARGETS, CONTENT_STAGE_HANDLE, CONTENT_STAGE_OFF, FORBIDDEN_HELPERS,
-        };
+        use common::bpf_prog_class::{CALL_TARGETS, CONTENT_STAGE_HANDLE, FORBIDDEN_HELPERS};
         let mut targets = [0u32; CALL_TARGETS];
         // the slots the calibrations fill: override, send_signal, _thread
         targets[1..4].copy_from_slice(&calibrated[1..4]);
@@ -534,29 +569,37 @@ impl ContentJudge {
             .map(|s| FORBIDDEN_HELPERS[*s].1)
             .collect();
         if !missing.is_empty() {
-            return Self {
-                stage: CONTENT_STAGE_OFF,
-                targets: [0; CALL_TARGETS],
-                off: Some(format!(
-                    "the calibration found no verified call of {}",
-                    missing.join(", ")
-                )),
-            };
+            return Self::off(format!(
+                "the calibration found no verified call of {}",
+                missing.join(", ")
+            ));
         }
         Self {
             stage: CONTENT_STAGE_HANDLE,
             targets,
+            every_type: 0,
             off: None,
         }
     }
 }
 
+/// The review of #553 (F4): what a content judge that is not armed costs —
+/// said in its observe failure (a signed degradation).
+pub const OPT_OUTS_SUSPENDED: &str = "the bpf-loader-allow opt-outs are suspended: their types are \
+     refused to every loader outside a window again, until a start arms the judge";
+
 /// Lot 345 (before 6.9): calibrate the content judge — load each of the
 /// agent's calibration programs while `PROG_CONTENT_CALIB` asks for it (the
 /// `bpf_prog` hook writes the verified calls' targets), unload them, read
-/// the targets back — then arm the stage, attach the `locked_down` guard
-/// for `bpf_probe_write_user` (this kernel's `LOCKDOWN_BPF_WRITE_USER`,
-/// `lockdown`) and freeze the configuration.
+/// the targets back — then arm the stage and freeze the configuration.
+///
+/// The review of #553 (F4): the `locked_down` guard for
+/// `bpf_probe_write_user` (this kernel's `LOCKDOWN_BPF_WRITE_USER`,
+/// `lockdown`) is attached FIRST — it reads no calibration, and a failed one
+/// dropped it with the rest. A failed calibration leaves the stage off,
+/// which suspends the opt-outs (the `bpf` hook honours none then:
+/// [`OPT_OUTS_SUSPENDED`]) — fail closed, where the opted-out loaders got
+/// back the signals and the return override.
 fn arm_content_at_handle(
     ebpf: &mut Ebpf,
     btf: &Btf,
@@ -567,29 +610,6 @@ fn arm_content_at_handle(
     use common::bpf_prog_class::{
         CALIB_NONE, CALIB_OVERRIDE, CALIB_SIGNALS, CALL_TARGETS, CONTENT_LOCKDOWN_SLOT,
     };
-    let mut calibrated = [0u32; CALL_TARGETS];
-    for (kind, program) in [
-        (CALIB_SIGNALS, CALIB_SIGNALS_PROGRAM),
-        (CALIB_OVERRIDE, CALIB_OVERRIDE_PROGRAM),
-    ] {
-        clear_seen(ebpf)?;
-        set_calibration(ebpf, kind)?;
-        let loaded = load_calibration(ebpf, program);
-        set_calibration(ebpf, CALIB_NONE)?;
-        if let Err(e) = loaded {
-            // the override's helper is absent from some kernels' builds
-            debug!(program, error = %e, "BPF self-defence: calibration program not loaded");
-            continue;
-        }
-        place_calibration(kind, &read_seen(ebpf)?, &mut calibrated);
-    }
-    freeze_named(ebpf, CALIB_MAP)?;
-    freeze_named(ebpf, SEEN_MAP)?;
-    let judge = ContentJudge::at_handle(calibrated);
-    if let Some(why) = &judge.off {
-        freeze_named(ebpf, CONTENT_CONF_MAP)?;
-        return Err(why.clone());
-    }
     let write_user = match lockdown {
         Some(v) if v != 0 => match attach_guard_hook(
             ebpf,
@@ -607,16 +627,51 @@ fn arm_content_at_handle(
         },
         _ => Err("this kernel's BTF names no LOCKDOWN_BPF_WRITE_USER".to_string()),
     };
-    {
+    if let Ok(v) = &write_user {
         let m = ebpf
             .map_mut(CONTENT_CONF_MAP)
             .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
         let mut conf: Array<&mut MapData, u32> =
             Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
-        if let Ok(v) = &write_user {
-            conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)
-                .map_err(|e| format!("{CONTENT_CONF_MAP} slot {CONTENT_LOCKDOWN_SLOT}: {e}"))?;
+        conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)
+            .map_err(|e| format!("{CONTENT_CONF_MAP} slot {CONTENT_LOCKDOWN_SLOT}: {e}"))?;
+    }
+    let write_user_note = match &write_user {
+        Ok(_) => String::new(),
+        Err(e) => format!("; bpf_probe_write_user is not refused at the lockdown question ({e})"),
+    };
+    let mut calibrated = [0u32; CALL_TARGETS];
+    let mut wrong: Vec<String> = Vec::new();
+    for (kind, program) in [
+        (CALIB_SIGNALS, CALIB_SIGNALS_PROGRAM),
+        (CALIB_OVERRIDE, CALIB_OVERRIDE_PROGRAM),
+    ] {
+        clear_seen(ebpf)?;
+        set_calibration(ebpf, kind)?;
+        let loaded = load_calibration(ebpf, program);
+        set_calibration(ebpf, CALIB_NONE)?;
+        if let Err(e) = loaded {
+            // the override's helper is absent from some kernels' builds
+            debug!(program, error = %e, "BPF self-defence: calibration program not loaded");
+            continue;
         }
+        if let Err(e) = place_calibration(kind, &read_seen(ebpf)?, &mut calibrated) {
+            wrong.push(format!("{program}: {e}"));
+        }
+    }
+    freeze_named(ebpf, CALIB_MAP)?;
+    freeze_named(ebpf, SEEN_MAP)?;
+    let judge = if wrong.is_empty() {
+        ContentJudge::at_handle(calibrated)
+    } else {
+        ContentJudge::off(format!(
+            "the calibration read what its programs do not make ({})",
+            wrong.join("; ")
+        ))
+    };
+    if let Some(why) = &judge.off {
+        freeze_named(ebpf, CONTENT_CONF_MAP)?;
+        return Err(format!("{why} — {OPT_OUTS_SUSPENDED}{write_user_note}"));
     }
     write_content_judge(ebpf, &judge, true)?;
     write_user.map(|_| judge).map_err(|e| {
@@ -640,16 +695,38 @@ pub const CONTENT_KEYS_MAP: &str = "PROG_CONTENT_KEYS";
 /// Lot 345: the helper calls the hook recorded of calibration `kind`'s
 /// program (`seen`, by instruction, 0 for any other), in order, put in
 /// their targets' slots (`bpf_prog_class::calibration_slot`).
+///
+/// The review of #553 (F5): only when they are exactly the calls the
+/// program makes — as many as its slots, each a different helper: another
+/// load of the family in the window (its calls recorded over the
+/// program's) put wrong targets in silently, refusing every bpftrace or BCC
+/// load or judging nothing. Otherwise nothing is placed, and why is said.
 pub fn place_calibration(
     kind: u32,
     seen: &[u32],
     calibrated: &mut [u32; common::bpf_prog_class::CALL_TARGETS],
-) {
-    for (n, imm) in seen.iter().filter(|v| **v != 0).enumerate() {
-        if let Some(slot) = common::bpf_prog_class::calibration_slot(kind, n as u32) {
+) -> std::result::Result<(), String> {
+    use common::bpf_prog_class::calibration_slot;
+    let calls: Vec<u32> = seen.iter().copied().filter(|v| *v != 0).collect();
+    let want = (0u32..)
+        .take_while(|n| calibration_slot(kind, *n).is_some())
+        .count();
+    let mut distinct = calls.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if want == 0 || calls.len() != want || distinct.len() != want {
+        return Err(format!(
+            "{} helper call(s) read, {} distinct, where the program makes {want}",
+            calls.len(),
+            distinct.len()
+        ));
+    }
+    for (n, imm) in calls.iter().enumerate() {
+        if let Some(slot) = calibration_slot(kind, n as u32) {
             calibrated[slot as usize - 1] = *imm;
         }
     }
+    Ok(())
 }
 
 fn clear_seen(ebpf: &mut Ebpf) -> std::result::Result<(), String> {
@@ -713,6 +790,10 @@ fn write_content_judge(
         conf.set(i as u32 + 1, *t, 0)
             .map_err(|e| format!("{CONTENT_CONF_MAP} slot {}: {e}", i + 1))?;
     }
+    // the review of #553 (F1): the kfuncs read in a load of every type
+    let every = common::bpf_prog_class::CONTENT_EVERY_TYPE_SLOT;
+    conf.set(every, judge.every_type, 0)
+        .map_err(|e| format!("{CONTENT_CONF_MAP} slot {every}: {e}"))?;
     // the keys the hook looks each instruction up in (the CI of #553)
     {
         let m = ebpf
@@ -2367,56 +2448,92 @@ mod tests {
     #[test]
     fn the_content_judge_is_configured_for_the_kernel() {
         use common::bpf_prog_class::{CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD, CONTENT_STAGE_OFF};
-        let j = ContentJudge::at_load(Some(61_234));
+        let kf = [Some(61_234), None, None, None, None];
+        let j = ContentJudge::at_load(kf);
         assert_eq!(j.stage, CONTENT_STAGE_LOAD);
-        assert_eq!(j.targets, [36, 58, 109, 117, 61_234]);
+        assert_eq!(j.targets, [36, 58, 109, 117, 61_234, 0, 0, 0, 0]);
         assert_eq!(j.off, None);
-        assert_eq!(ContentJudge::at_load(None).targets[4], 0);
+        assert_eq!(j.every_type, 1);
+        assert_eq!(ContentJudge::at_load([None; 5]).targets[4], 0);
+        assert_eq!(ContentJudge::at_load([None; 5]).every_type, 0);
         // the calibration's slots: override, send_signal, send_signal_thread;
-        // whatever slot 0 and 4 held is not taken
-        let j = ContentJudge::at_handle([7, 0x10, 0x20, 0x30, 9]);
+        // whatever slot 0 and the kfuncs' held is not taken
+        let j = ContentJudge::at_handle([7, 0x10, 0x20, 0x30, 9, 9, 9, 9, 9]);
         assert_eq!(j.stage, CONTENT_STAGE_HANDLE);
-        assert_eq!(j.targets, [0, 0x10, 0x20, 0x30, 0]);
+        assert_eq!(j.targets, [0, 0x10, 0x20, 0x30, 0, 0, 0, 0, 0]);
+        assert_eq!(j.every_type, 0);
         // a kernel without the override helper
-        let j = ContentJudge::at_handle([0, 0, 0x20, 0x30, 0]);
+        let j = ContentJudge::at_handle([0, 0, 0x20, 0x30, 0, 0, 0, 0, 0]);
         assert_eq!(j.stage, CONTENT_STAGE_HANDLE);
-        assert_eq!(j.targets, [0, 0, 0x20, 0x30, 0]);
+        assert_eq!(j.targets, [0, 0, 0x20, 0x30, 0, 0, 0, 0, 0]);
         // the keys: one a target, its slot plus one; the kfunc's src_reg 2
-        let j = ContentJudge::at_load(Some(61_234));
+        let j = ContentJudge::at_load(kf);
         let keys = j.keys();
         assert_eq!(keys.len(), 5);
         assert!(keys.contains(&(0x85 | (109u64 << 32), 3)));
         assert!(keys.contains(&(0x85 | (2 << 12) | (61_234u64 << 32), 5)));
-        assert_eq!(ContentJudge::at_load(None).keys().len(), 4);
+        assert_eq!(ContentJudge::at_load([None; 5]).keys().len(), 4);
         // the calibration's records, in order: the signals' two calls into
         // their slots, the override's one; other instructions are 0
-        let mut cal = [0u32; 5];
+        let mut cal = [0u32; 9];
         place_calibration(
             common::bpf_prog_class::CALIB_SIGNALS,
             &[0, 0x20, 0, 0x30, 0, 0],
             &mut cal,
-        );
+        )
+        .unwrap();
         place_calibration(
             common::bpf_prog_class::CALIB_OVERRIDE,
             &[0, 0x10, 0, 0],
             &mut cal,
-        );
-        assert_eq!(cal, [0, 0x10, 0x20, 0x30, 0]);
+        )
+        .unwrap();
+        assert_eq!(cal, [0, 0x10, 0x20, 0x30, 0, 0, 0, 0, 0]);
         assert_eq!(
             ContentJudge::at_handle(cal).targets,
-            [0, 0x10, 0x20, 0x30, 0]
+            [0, 0x10, 0x20, 0x30, 0, 0, 0, 0, 0]
         );
         // no signal calibrated: off, said
-        let j = ContentJudge::at_handle([0, 0x10, 0x20, 0, 0]);
+        let j = ContentJudge::at_handle([0, 0x10, 0x20, 0, 0, 0, 0, 0, 0]);
         assert!(j.keys().is_empty());
         assert_eq!(j.stage, CONTENT_STAGE_OFF);
-        assert_eq!(j.targets, [0; 5]);
+        assert_eq!(j.targets, [0; 9]);
         assert!(
             j.off
                 .as_deref()
                 .is_some_and(|w| w.contains("bpf_send_signal_thread")),
             "{j:?}"
         );
+    }
+
+    /// Named (the review of #553, F5): the calibration takes the calls it
+    /// read only when they are exactly its program's — as many as its
+    /// slots, each a different helper. Another load of the family in the
+    /// window (more calls, fewer, the same one twice) placed wrong targets
+    /// silently: every bpftrace or BCC load refused, or nothing judged.
+    /// Then nothing is placed, and the start's judge is off (said, and the
+    /// opt-outs suspended).
+    #[test]
+    fn a_calibration_that_read_other_calls_is_refused() {
+        use common::bpf_prog_class::{CALIB_NONE, CALIB_OVERRIDE, CALIB_SIGNALS};
+        for (kind, seen) in [
+            (CALIB_SIGNALS, vec![0x20, 0, 0x30, 0x40]),
+            (CALIB_SIGNALS, vec![0, 0x20, 0]),
+            (CALIB_SIGNALS, vec![0x20, 0x20]),
+            (CALIB_SIGNALS, vec![0; 16]),
+            (CALIB_OVERRIDE, vec![0x10, 0x11]),
+            (CALIB_OVERRIDE, vec![]),
+            (CALIB_NONE, vec![0x10]),
+        ] {
+            let mut cal = [0u32; 9];
+            let e = place_calibration(kind, &seen, &mut cal).expect_err("refused");
+            assert!(e.contains("where the program makes"), "{e}");
+            assert_eq!(cal, [0; 9], "{kind} {seen:?}: nothing placed");
+        }
+        let j = ContentJudge::off("the calibration read what its programs do not make".into());
+        assert_eq!(j.stage, common::bpf_prog_class::CONTENT_STAGE_OFF);
+        assert!(j.keys().is_empty());
+        assert!(OPT_OUTS_SUSPENDED.contains("opt-outs are suspended"));
     }
 
     #[test]

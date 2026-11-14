@@ -534,9 +534,9 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&c, "content_refusal"),
         &[
-            "if !denied_by_default(ty)\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
+            "let kfuncs_only = !denied_by_default(ty);\n    if (kfuncs_only && !every_type)\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
             "let Some(addr) = ptr_scalar(prog) else {\n        return Some((CONTENT_UNJUDGED, ty));",
-            "match nn_prog_forbidden_call(addr) {\n        SCAN_CLEAN => None,",
+            "match nn_prog_forbidden_call(addr, kfuncs_only as u64) {\n        SCAN_CLEAN => None,",
             "_ => Some((CONTENT_UNJUDGED, ty)),",
         ],
     )
@@ -546,7 +546,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "try_bpf_prog_load_guard"),
         &[
             "if content_stage() != CONTENT_STAGE_LOAD {",
-            "if let Some((why, ty)) = content_refusal(prog) {\n        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n        return -EPERM;",
+            "if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {\n        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n        return -EPERM;",
         ],
     )
     .unwrap();
@@ -555,7 +555,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&c, "try_bpf_prog_guard"),
         &[
-            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n        if let Some((why, ty)) = content_refusal(prog) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
+            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n        if let Some((why, ty)) = content_refusal(prog, false) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
             "if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {\n        if let Some(addr) = ptr_scalar(prog) {\n            nn_calibrate(addr);",
             "if loading {\n        crate::bpf_census::mark_seen(id, prog);",
         ],
@@ -568,12 +568,12 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         &[
             "if len > CONTENT_MAX_INSNS as u64 {\n        return SCAN_UNJUDGED;",
             "while k < SCAN_FAN {",
-            "let r = nn_scan_span(insns, from, len);",
+            "let r = nn_scan_span(insns, from, len, kfuncs_only);",
         ],
     )
     .unwrap();
-    assert!(body(&c, "nn_scan_span").contains("let r = nn_scan_block(insns, at, len);"));
-    assert!(body(&c, "nn_scan_block").contains("let r = nn_scan_chunk(insns, at, len);"));
+    assert!(body(&c, "nn_scan_span").contains("let r = nn_scan_block(insns, at, len, kfuncs_only);"));
+    assert!(body(&c, "nn_scan_block").contains("let r = nn_scan_chunk(insns, at, len, kfuncs_only);"));
     assert_eq!(
         32 * 32 * 32 * 32,
         northnarrow_common_max_insns(),
@@ -583,7 +583,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "nn_scan_chunk"),
         &[
             "Err(_) => return SCAN_UNJUDGED,",
-            "if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {\n            return *slot as u64;",
+            "if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {\n            if kfuncs_only == 0 || judged_for_every_type(*slot) {\n                return *slot as u64;",
         ],
     )
     .unwrap();
@@ -614,15 +614,97 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&u, "arm_content_at_handle"),
         &[
-            "clear_seen(ebpf)?;\n        set_calibration(ebpf, kind)?;\n        let loaded = load_calibration(ebpf, program);\n        set_calibration(ebpf, CALIB_NONE)?;",
-            "place_calibration(kind, &read_seen(ebpf)?, &mut calibrated);",
-            "freeze_named(ebpf, CALIB_MAP)?;",
             "WRITE_USER_GUARD_PROGRAM,\n            WRITE_USER_GUARD_HOOK,",
+            "clear_seen(ebpf)?;\n        set_calibration(ebpf, kind)?;\n        let loaded = load_calibration(ebpf, program);\n        set_calibration(ebpf, CALIB_NONE)?;",
+            "if let Err(e) = place_calibration(kind, &read_seen(ebpf)?, &mut calibrated) {",
+            "freeze_named(ebpf, CALIB_MAP)?;",
             "write_content_judge(ebpf, &judge, true)?;",
         ],
     )
     .unwrap();
     assert!(body(&u, "load_calibration").contains("prog.unload()"));
+}
+
+/// Named (the review of #553, F1): on 6.13+ any root loaded a `syscall`
+/// program (run by `BPF_PROG_RUN`), an XDP or a tc one — types no opt-out
+/// is needed for, so the judge never read them — calling
+/// `bpf_task_from_pid` and `bpf_send_signal_task`, and killed the agent
+/// past its `task_kill` hook (`SI_KERNEL`). At the load stage a foreign
+/// load of EVERY type is now read for the kfunc targets (and only them,
+/// for those types), wherever this kernel has one; the agent counts them
+/// into the configuration's every-type slot.
+#[test]
+fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "try_bpf_prog_load_guard"),
+        &[
+            "if content_stage() != CONTENT_STAGE_LOAD {",
+            "content_refusal(prog, every_type_armed())",
+            "return -EPERM;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&c, "every_type_armed")
+        .contains("PROG_CONTENT_CONF.get(CONTENT_EVERY_TYPE_SLOT)"));
+    let refusal = body(&c, "content_refusal");
+    assert!(refusal.contains("let kfuncs_only = !denied_by_default(ty);"));
+    assert!(refusal.contains("if (kfuncs_only && !every_type)"));
+    assert!(!refusal.contains("if !denied_by_default(ty)"));
+    in_order(
+        body(&c, "nn_scan_chunk"),
+        &[
+            "PROG_CONTENT_KEYS.get(&call_key(insn))",
+            "if kfuncs_only == 0 || judged_for_every_type(*slot) {",
+        ],
+    )
+    .unwrap();
+    for f in ["nn_prog_forbidden_call", "nn_scan_span", "nn_scan_block"] {
+        assert!(body(&c, f).contains(", kfuncs_only);"), "{f} passes kfuncs_only on");
+    }
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "write_content_judge"),
+        &[
+            "let every = common::bpf_prog_class::CONTENT_EVERY_TYPE_SLOT;",
+            "conf.set(every, judge.every_type, 0)",
+            "freeze_named(ebpf, CONTENT_CONF_MAP)?;",
+        ],
+    )
+    .unwrap();
+    assert!(body(&u, "at_load").contains("every_type: kfunc_btf_ids.iter().flatten().count() as u32,"));
+    assert!(body(&u, "attach").contains("r.forbidden_kfunc_ids"));
+}
+
+/// Named (the review of #553, F4): before 6.9, a failed calibration
+/// dropped the `locked_down` guard for `bpf_probe_write_user` (which reads
+/// no calibration) and left the opted-out loaders every signalling helper.
+/// The guard is attached first now, and while the judge is off (its stage
+/// not armed) the `bpf` hook honours no opt-out: their types are refused
+/// again, and the observe failure says so.
+#[test]
+fn a_failed_calibration_suspends_the_opt_outs_and_keeps_the_lockdown_guard() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "nn_loader_opted_out"),
+        &[
+            "if bit == 0 || content_stage() == CONTENT_STAGE_OFF {\n        return 0;",
+            "caller_exe_key()",
+        ],
+    )
+    .unwrap();
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "arm_content_at_handle"),
+        &[
+            "WRITE_USER_GUARD_PROGRAM,\n            WRITE_USER_GUARD_HOOK,",
+            "conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)",
+            "clear_seen(ebpf)?;",
+            "if let Some(why) = &judge.off {\n        freeze_named(ebpf, CONTENT_CONF_MAP)?;\n        return Err(format!(\"{why} — {OPT_OUTS_SUSPENDED}{write_user_note}\"));",
+        ],
+    )
+    .unwrap();
+    assert!(u.contains("refused to every loader outside a window again, until a start arms the judge"));
 }
 
 /// `bpf_prog_class::CONTENT_MAX_INSNS`, read from its source.

@@ -187,10 +187,14 @@ pub struct ResolvedOffsets {
     /// and later): the BPF content judge reads the kernel's copy of a load
     /// there, else at `bpf_prog` once verified.
     pub prog_load_hook: bool,
-    /// Lot 345: the BTF type id of `bpf_prog_class::FORBIDDEN_KFUNC` in
-    /// vmlinux (a kfunc call's `imm` in a load's instructions), when the
-    /// kernel has it (6.13 and later).
-    pub forbidden_kfunc_id: Option<u32>,
+    /// Lot 345: the BTF type id in vmlinux of each of
+    /// `bpf_prog_class::FORBIDDEN_KFUNCS` (a kfunc call's `imm` in a load's
+    /// instructions), in its order, when the kernel has it
+    /// (`bpf_send_signal_task` 6.13 and later; the review of #553, F1: the
+    /// `bpf_task_work_schedule_*` kfuncs 6.18 and later). Boxed: the
+    /// resolved offsets stay the size they were (clippy's
+    /// `large_enum_variant`).
+    pub forbidden_kfunc_ids: Box<[Option<u32>; common::bpf_prog_class::FORBIDDEN_KFUNCS.len()]>,
     /// Lot 345: `LOCKDOWN_BPF_WRITE_USER` (`enum lockdown_reason`; its
     /// value moves with the kernel), what the verifier asks the
     /// `locked_down` hook when a program calls `bpf_probe_write_user`.
@@ -708,10 +712,10 @@ fn resolve_with(
             cgroup_join_unavailable,
             read_id_drift,
             prog_load_hook: btf.has_lsm_hook(super::bpf_defense::PROG_LOAD_GUARD_HOOK),
-            forbidden_kfunc_id: btf
-                .func_ids
-                .get(common::bpf_prog_class::FORBIDDEN_KFUNC)
-                .copied(),
+            forbidden_kfunc_ids: Box::new(
+                common::bpf_prog_class::FORBIDDEN_KFUNCS
+                    .map(|name| btf.func_ids.get(name).copied()),
+            ),
             lockdown_bpf_write_user: btf
                 .resolve_enum("lockdown_reason", "LOCKDOWN_BPF_WRITE_USER")
                 .ok()
@@ -1255,8 +1259,9 @@ struct Btf {
     /// Lot 277: the tracepoints of [`CGROUP_JOIN_TARGETS`] → their
     /// `btf_trace_<name>` typedef's type id.
     tracepoints: HashMap<String, u32>,
-    /// Lot 345: the FUNC's own type id of `bpf_prog_class::FORBIDDEN_KFUNC`
-    /// (what a kfunc call names), when the BTF has it.
+    /// Lot 345: the FUNC's own type id of each of
+    /// `bpf_prog_class::FORBIDDEN_KFUNCS` (what a kfunc call names) the BTF
+    /// has.
     func_ids: HashMap<String, u32>,
 }
 
@@ -1409,7 +1414,7 @@ impl Btf {
                 KIND_FWD => types.push(Ty::Fwd { name_off }),
                 KIND_FUNC => {
                     if let Some(nm) = name_of(name_off) {
-                        if nm == common::bpf_prog_class::FORBIDDEN_KFUNC {
+                        if common::bpf_prog_class::FORBIDDEN_KFUNCS.contains(&nm.as_str()) {
                             // this type's id: the base's count plus its index
                             func_ids
                                 .entry(nm.clone())
@@ -2944,22 +2949,32 @@ mod tests {
                 &[("LOCKDOWN_NONE", 0), ("LOCKDOWN_BPF_WRITE_USER", value)],
             );
             b.func("bpf_lsm_bpf_prog", int, &[p]);
+            // the review of #553 (F1): a 6.18's task_work kfunc (its
+            // `_impl` spelling) is read as well; a kfunc this BTF lacks is
+            // None in its place
             let kfunc = new_kernel.then(|| {
                 b.func("bpf_lsm_bpf_prog_load", int, &[p]);
-                b.func(common::bpf_prog_class::FORBIDDEN_KFUNC, int, &[p])
+                let signal = b.func("bpf_send_signal_task", int, &[p]);
+                let work = b.func("bpf_task_work_schedule_signal_impl", int, &[p]);
+                b.func("bpf_task_work_schedule_signal_impl", int, &[p]);
+                (signal, work)
             });
             (Btf::parse(&b.build()).expect("parses"), kfunc)
         };
         let (btf, kfunc) = build(true);
         let r = hooks_only(&btf);
         assert!(r.prog_load_hook);
-        assert!(kfunc.is_some());
-        assert_eq!(r.forbidden_kfunc_id, kfunc);
+        let (signal, work) = kfunc.expect("built");
+        assert_eq!(
+            *r.forbidden_kfunc_ids,
+            [Some(signal), None, Some(work), None, None],
+            "the first FUNC of a name is the kfunc's"
+        );
         assert_eq!(r.lockdown_bpf_write_user, Some(19));
         let (btf, _) = build(false);
         let r = hooks_only(&btf);
         assert!(!r.prog_load_hook);
-        assert_eq!(r.forbidden_kfunc_id, None);
+        assert_eq!(*r.forbidden_kfunc_ids, [None; 5]);
         assert_eq!(r.lockdown_bpf_write_user, Some(16));
     }
 

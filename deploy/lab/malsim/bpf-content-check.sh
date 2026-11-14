@@ -23,6 +23,15 @@
 #      compile, Debian's cloud kernels);
 #  B6  the agent still active, same pid; the content judge's stage at its
 #      start (its journal line).
+#  B7  (the review of #553, F1; a kernel with bpf_send_signal_task, 6.13+)
+#      a root process no bpf-loader-allow line names (a copy of python3)
+#      and python3 itself: a syscall, XDP or tc program calling
+#      bpf_task_from_pid(agent) + bpf_send_signal_task(SIGKILL) is refused
+#      at the load (EPERM), signed naming the kfunc, and (syscall) never
+#      runs; the same program without the signal, and a plain XDP or tc
+#      program, still load. Measured (no kfunc): skipped.
+#  B8  (the review of #553, F5) measured: what `bpftool feature probe
+#      kernel` and `bpftrace --info` make the agent record (count, High).
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -121,6 +130,52 @@ if [[ -n $TOOL ]]; then
 else
     measure "B5 no BCC tool here"
 fi
+
+# B7: the signal kfunc in the types any root loads
+if ! sudo $PROBE load-kfunc-signal --type syscall --pid 1 --no-signal --name k553_probe </dev/null 2>&1 | grep -q "NOFUNC"; then
+    OTHER=/tmp/nn-k553-py3
+    sudo cp "$PY" "$OTHER" </dev/null && sudo chmod 755 "$OTHER" </dev/null
+    for who in other python3; do
+        if [[ $who == other ]]; then RUNNER="$OTHER -I $HERE/bpf-probe.py"; else RUNNER=$PROBE; fi
+        for ty in syscall xdp tc; do
+            n0=$(lines "$DET")
+            o=$(sudo $RUNNER load-kfunc-signal --type "$ty" --pid "$APID" --sig 9 --run --name "k553_${ty}" </dev/null 2>&1); rc=$?
+            sleep 1.5
+            r=$(reason "$n0")
+            echo "=== CASE B7 $who $ty bpf_send_signal_task(agent): rc=$rc $o"
+            echo "    record: ${r:-(none)}"
+            if [[ $o == "ERR EPERM"* && $r == *"a call of bpf_send_signal_task"* ]]; then
+                pass "B7 $who: a $ty program signalling the agent refused at the load, signed"
+            else
+                bad "B7 $who: a $ty program signalling the agent: $o / ${r:-no record}"
+            fi
+        done
+    done
+    o=$(sudo $OTHER -I $HERE/bpf-probe.py load-kfunc-signal --type syscall --pid "$APID" --no-signal --run --name k553_nosig </dev/null 2>&1); rc=$?
+    echo "=== CASE B7 other syscall task lookup only: rc=$rc $o"
+    [[ $o == OK* ]] && pass "B7 a syscall program that only looks the task up loads" || bad "B7 the lookup alone refused: $o"
+    o=$(sudo $OTHER -I $HERE/bpf-probe.py load-kfunc-signal --type xdp --pid "$APID" --no-signal --name k553_xdp0 </dev/null 2>&1); rc=$?
+    echo "=== CASE B7 other xdp task lookup only: rc=$rc $o"
+    [[ $o == OK* ]] && pass "B7 an XDP program without the signal loads" || bad "B7 an XDP program without the signal refused: $o"
+    sudo rm -f "$OTHER" </dev/null
+else
+    measure "B7 no bpf_send_signal_task in this kernel's BTF (before 6.13)"
+fi
+
+# B8: what a feature probe costs (measured)
+for tool in "bpftool feature probe kernel" "bpftrace --info"; do
+    command -v "${tool%% *}" >/dev/null 2>&1 || { measure "B8 no ${tool%% *} here"; continue; }
+    n0=$(lines "$DET")
+    sudo timeout 60 $tool </dev/null >/dev/null 2>&1; rc=$?
+    sleep 2
+    new=$(since "$DET" "$n0")
+    all=$(printf '%s' "$new" | grep -c . || true)
+    high=$(printf '%s' "$new" | grep -ci '"severity":"high"' || true)
+    ops=$(printf '%s' "$new" | grep -o '"operation":"[a-z_]*"' | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+    why=$(printf '%s' "$new" | grep -o '"response":"[^"]*' | cut -c13-120 | sort | uniq -c | tr -s ' ' | head -3 | tr '\n' ';')
+    echo "=== CASE B8 $tool: rc=$rc records $all high $high ops ${ops:-none} responses ${why:-none}"
+    measure "B8 $tool: $all record(s), $high High"
+done
 
 systemctl is-active --quiet northnarrow-agent && [[ $(agent_pid) == "$APID" ]] && pass "B6 the agent active, same pid" || bad "B6 the agent restarted or stopped"
 echo "=== CASE B-END: rc=$fail"

@@ -17,6 +17,14 @@
 #       (lot 345) BPF_PROG_LOAD of a `tracing` program on kernel function
 #       FUNC (its BTF id read from /sys/kernel/btf/vmlinux) as fmod_ret
 #       (BPF_MODIFY_RETURN), or fentry with --fentry; `r0 = 0; exit`
+#   bpf-probe.py load-kfunc-signal --type syscall|xdp|tc|cgroup_skb --pid PID
+#       [--sig N] [--no-signal] [--run] [--name NAME]
+#       (the review of #553, F1) BPF_PROG_LOAD of a program of a type any
+#       root loads with no opt-out that does t = bpf_task_from_pid(PID);
+#       bpf_send_signal_task(t, N, PIDTYPE_TGID, 0); bpf_task_release(t)
+#       (--no-signal: the lookup and the release only); with --run and a
+#       syscall program, BPF_PROG_RUN it. Kfunc ids from the kernel's BTF.
+#       On a refused load the verifier's last line is printed when it ran.
 #   bpf-probe.py load-socket-filter [--pin PATH] [--name NAME]
 #       BPF_PROG_LOAD of a socket filter (a type the agent lets through)
 #   bpf-probe.py map-fd-by-id ID [--rdonly]
@@ -56,6 +64,12 @@ BPF_TRACE_FENTRY = 24
 BPF_MODIFY_RETURN = 26
 # lot 345: the helpers the content judge refuses, by uapi id
 CALLS = {"send_signal": 109, "send_signal_thread": 117, "override_return": 58, "write_user": 36}
+# the review of #553 (F1): types any root loads, no opt-out needed
+OPEN_TYPES = {"syscall": 31, "xdp": 6, "tc": 3, "cgroup_skb": 8}
+BPF_PROG_TEST_RUN = 10
+BPF_F_SLEEPABLE = 1 << 4
+PSEUDO_KFUNC_CALL = 2
+PIDTYPE_TGID = 1
 
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -93,6 +107,24 @@ def prog_load(prog_type, insns, name):
         nm,
     )
     return bpf(BPF_PROG_LOAD, attr)
+
+
+def prog_load_logged(prog_type, insns, name, flags=0):
+    """BPF_PROG_LOAD with prog_flags and the verifier's log (its last line
+    returned on a refusal; empty when the verifier never ran)."""
+    code = b"".join(insns)
+    code_buf = ctypes.create_string_buffer(code, len(code))
+    lic = ctypes.create_string_buffer(b"GPL\0")
+    log = ctypes.create_string_buffer(1 << 16)
+    nm = name.encode()[:15].ljust(16, b"\0")
+    attr = struct.pack(
+        "<IIQQIIQII16s",
+        prog_type, len(insns), ctypes.addressof(code_buf), ctypes.addressof(lic),
+        1, len(log), ctypes.addressof(log), 0, flags, nm,
+    )
+    fd, e = bpf(BPF_PROG_LOAD, attr)
+    text = log.value.decode(errors="replace").strip().splitlines()
+    return fd, e, (text[-1] if text else "")
 
 
 def prog_load_attach(prog_type, insns, name, attach_type, btf_id):
@@ -214,6 +246,49 @@ def main(argv):
         insns = body + [insn(0xB7, dst=0, imm=0), insn(0x95)]
         fd, e = prog_load(WRITE_USER_TYPES[kind], insns, opt(args, "--name", "k345_tr"))
         return report(fd, e)
+    if cmd == "load-kfunc-signal":
+        kind = opt(args, "--type", "syscall")
+        pid = opt(args, "--pid")
+        if kind not in OPEN_TYPES or pid is None:
+            print(f"unknown --type {kind} or no --pid", file=sys.stderr)
+            return 2
+        ids = {k: btf_func_id(k) for k in ("bpf_task_from_pid", "bpf_send_signal_task", "bpf_task_release")}
+        missing = [k for k, v in ids.items() if v is None]
+        if missing:
+            print(f"ERR NOFUNC {' '.join(missing)} not in the kernel's BTF")
+            return 1
+        sig = int(opt(args, "--sig", "9"))
+        kcall = lambda k: insn(0x85, src=PSEUDO_KFUNC_CALL, imm=ids[k])
+        signal = [] if "--no-signal" in args else [
+            insn(0xBF, dst=1, src=6),  # r1 = task
+            insn(0xB7, dst=2, imm=sig),  # r2 = sig
+            insn(0xB7, dst=3, imm=PIDTYPE_TGID),  # r3 = PIDTYPE_TGID
+            insn(0xB7, dst=4, imm=0),  # r4 = 0 (value)
+            kcall("bpf_send_signal_task"),
+        ]
+        tail = signal + [insn(0xBF, dst=1, src=6), kcall("bpf_task_release")]
+        insns = [
+            insn(0xB7, dst=1, imm=int(pid)),  # r1 = pid
+            kcall("bpf_task_from_pid"),  # r0 = task or NULL
+            insn(0x15, dst=0, off=1 + len(tail), imm=0),  # if r0 == 0 goto out
+            insn(0xBF, dst=6, src=0),  # r6 = task
+        ] + tail + [insn(0xB7, dst=0, imm=0), insn(0x95)]  # out: r0 = 0; exit
+        flags = BPF_F_SLEEPABLE if kind == "syscall" else 0
+        fd, e, last = prog_load_logged(OPEN_TYPES[kind], insns, opt(args, "--name", "k553_kf"), flags)
+        if fd is None:
+            print(f"ERR {errno.errorcode.get(e, '?')} {e}" + (f" verifier: {last[:160]}" if last else ""))
+            return 1
+        extra = ""
+        if "--run" in args and kind == "syscall":
+            attr = struct.pack("<IIIIQQIIIIQQIII", fd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            buf = ctypes.create_string_buffer(attr, 128)
+            r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_PROG_TEST_RUN), buf, ctypes.c_long(128))
+            re = ctypes.get_errno() if r < 0 else 0
+            retval = struct.unpack_from("<I", buf.raw, 4)[0]
+            extra = f" run {'OK retval ' + str(retval) if r >= 0 else 'ERR ' + errno.errorcode.get(re, '?')}"
+        os.close(fd)
+        print(f"OK fd {fd}{extra}")
+        return 0
     if cmd == "load-fmod-ret":
         func = opt(args, "--func", "security_file_open")
         btf_id = btf_func_id(func)
