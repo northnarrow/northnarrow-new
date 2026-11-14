@@ -126,6 +126,11 @@ const READBACK: &str = "a response's read-back of what it did (lot 312): a read 
 const UNITCG: &str = "a listed tool's unit's cgroup.procs, which the kernel writes: one that \
                       cannot be read, is empty or holds a line that is not a pid sanctions no \
                       reload — the signal is judged (High), the stricter side";
+/// Why the agent's own CPU watch may default (lot 349).
+const CPUS: &str = "lot 349: the agent's own CPU watch — a cpuset or online file, systemd's \
+                    system.conf or the command line that cannot be read narrows nothing the \
+                    agent should run on (the wider set is expected: a record, the stricter \
+                    side) and names no partition; the online CPUs have two sources";
 /// Why the installed shells' list may default (lot 313).
 const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed programs: an \
                       unreadable file adds none, the binary directories are still read, and \
@@ -463,6 +468,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_to_string(p.join(f))",
         KNOB,
     ),
+    ("crates/nn-linux/src/own_cpus.rs", "read_state(p)", CPUS),
     (
         "crates/nn-linux/src/known_system_prog.rs",
         "read_to_string(pdir.join(\"fdinfo\").join(fd.file_name()))",
@@ -1600,4 +1606,64 @@ fn print_the_sites() {
             println!("STRICT {file}:{l}");
         }
     }
+}
+
+/// The body of `fn name` in `code` (to its matching brace).
+fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = code
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name} not found"));
+    let open = start + code[start..].find('{').expect("a body");
+    &code[open..open + support::matching_brace(&code[open..])]
+}
+
+/// The re-check of #558 (F7): a regular FUSE file bound over a file the
+/// kernel-state round reads stalled the whole round (`O_NONBLOCK` does not
+/// reach FUSE's open and read) — the cross-view, the taint read, the CPU
+/// watch, the held set's prune. The round's reads that resolve a path go
+/// through its reader with a deadline (`state_read::ROUND_READER`), and a
+/// stall of any of them makes the CPU watch's round unjudged (the third in
+/// a row signed): the taint mask, the start's `/proc/1/stat`, a loader's
+/// `/proc` files, the CPU watch's start reads and sources.
+#[test]
+fn the_kernel_state_round_reads_within_a_deadline() {
+    let root = repo_root();
+    let read = |rel: &str| {
+        strip_comments(
+            &std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")),
+        )
+    };
+    let k = read("crates/nn-linux/src/kernel_state.rs");
+    let t = fn_body(&k, "tainted");
+    assert!(t.contains("crate::state_read::ROUND_READER"), "{t}");
+    assert!(
+        !t.contains("read_to_string") && !t.contains("state_read::read_state("),
+        "{t}"
+    );
+    let spawn = fn_body(&k, "spawn");
+    assert!(
+        spawn.contains("crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)"),
+        "{spawn}"
+    );
+    assert_eq!(
+        k.matches("judge_on_host(").count(),
+        1,
+        "the loader's proof only within the deadline (known_within)"
+    );
+    assert!(fn_body(&k, "known_within").contains("ROUND_READER"));
+    let x = read("crates/nn-linux/src/bpf_crossview.rs");
+    assert!(fn_body(&x, "host_user_space_start_ns").contains("ROUND_READER"));
+    let c = read("crates/nn-linux/src/own_cpus.rs");
+    let r = fn_body(&c, "round");
+    for n in [
+        "host_now,",
+        "reader.run(\"the CPU watch's sources\", Sources::open)",
+        "unjudged_by_stall(&mut r, reader.take_stall());",
+    ] {
+        assert!(r.contains(n), "{n}: {r}");
+    }
+    assert!(
+        !r.contains("host_now()") && !r.contains("Sources::open()"),
+        "{r}"
+    );
 }

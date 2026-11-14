@@ -167,7 +167,15 @@ impl BpfGuard {
     /// Lot 290: the cross-view for the kernel-state round (its kernel parts
     /// taken once; `None` when the attach could not set them up — a signed
     /// degradation then), its status file at `status`.
-    pub fn crossview(&self, status: Option<PathBuf>) -> Option<crate::bpf_crossview::CrossView> {
+    ///
+    /// Lot 349 (the re-check of #558, item 2): `window_open` tells it a
+    /// trusted-installer window is open (a held program still loaded once
+    /// none is, is signed).
+    pub fn crossview(
+        &self,
+        status: Option<PathBuf>,
+        window_open: Box<dyn Fn() -> bool + Send>,
+    ) -> Option<crate::bpf_crossview::CrossView> {
         let parts = self.0.census.lock().take()?;
         let guard = self.clone();
         Some(crate::bpf_crossview::CrossView {
@@ -177,6 +185,7 @@ impl BpfGuard {
             watch: crate::bpf_crossview::Watch::new(
                 crate::bpf_crossview::host_user_space_start_ns(),
             ),
+            window_open,
         })
     }
 

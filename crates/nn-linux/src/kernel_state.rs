@@ -29,6 +29,13 @@
 //!   — present at the start (the baseline, signed once) or appearing later
 //!   (a signed High) — with its type, name, tag and attach point.
 //!
+//! * Lot 349 (pre-alpha R001): the agent's own CPUs ([`crate::own_cpus`]):
+//!   its threads' affinity and its cgroup's effective CPUs against those it
+//!   should run on — a confinement (a sibling cgroup partition, its own
+//!   cgroup's `cpuset.cpus`, a thread's affinity, a move) is a signed High
+//!   detection (`FsProtectOperation::CpuConfined`) and a degradation while
+//!   it holds.
+//!
 //! The detections go through the bus as the `fs_protect` source's events
 //! (the kernel's refusals' source): judged, signed and counted like them.
 
@@ -53,10 +60,14 @@ pub const LIVEPATCH_DIR: &str = "/sys/kernel/livepatch";
 pub const ROOT_DEGRADATION: &str = "sysctl_judge_root";
 
 /// The taint mask under `root` (`/` on the host, a directory in the
-/// tests).
+/// tests). The re-check of #558 (F7): read within the round's deadline
+/// ([`crate::state_read::ROUND_READER`]) — a FUSE file bound over it no
+/// longer stalls the round.
 pub fn tainted(root: &Path) -> Result<u64, String> {
     let path = root.join(TAINTED.trim_start_matches('/'));
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{TAINTED}: {e}"))?;
+    let text = crate::state_read::ROUND_READER
+        .read_state(&path)
+        .map_err(|e| format!("{TAINTED}: {e}"))?;
     text.trim()
         .parse::<u64>()
         .map_err(|_| format!("{TAINTED} reads {:?}, not an integer", text.trim()))
@@ -132,6 +143,8 @@ pub enum Finding {
     KnownRootProgram(crate::known_system_prog::Known),
     /// Lot 290: the cross-view's finding.
     Bpf(crate::bpf_crossview::Finding),
+    /// Lot 349: the agent runs on fewer CPUs than it should.
+    Cpus(crate::own_cpus::Confinement),
 }
 
 impl Watch {
@@ -219,11 +232,30 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
                 u64::from(k.id),
             )
         }
+        // lot 349: what the cause names (a partition, a cgroup, a thread)
+        Finding::Cpus(c) => {
+            comm = c.cause.subject();
+            (
+                FsProtectOperation::CpuConfined,
+                c.target_dev(),
+                c.target_ino(),
+            )
+        }
+        // lot 349 (the re-check of #558, item 2): a held program after
+        // its window — the program's id and the verdict of its load
+        Finding::Bpf(crate::bpf_crossview::Finding::HeldOutlived(o, verdict)) => {
+            comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
+            (
+                FsProtectOperation::BpfHeldLoad,
+                common::wire::bpf_held_dev(common::wire::BPF_HELD_OUTLIVED, *verdict),
+                u64::from(o.id),
+            )
+        }
         Finding::Bpf(b) => {
             use crate::bpf_crossview::Finding as B;
             let (op, o) = match b {
                 B::Baseline(o) => (FsProtectOperation::BpfBaseline, o),
-                B::Unseen(o) => (FsProtectOperation::BpfUnseen, o),
+                B::Unseen(o) | B::HeldOutlived(o, _) => (FsProtectOperation::BpfUnseen, o),
             };
             comm = common::bpf_prog_class::object_comm(&o.name, &o.attach);
             // lot 304: a known system program's loader, and the bit
@@ -308,13 +340,7 @@ pub fn crossview_round(
             // lot 304: a baseline program a known system program's loader
             // is proven to hold (PID 1's restrict_filesystems)
             mark_known_baselines(&mut found, &|id, link| {
-                crate::known_system_prog::judge_on_host(
-                    id,
-                    link,
-                    cross.watch.program(id).as_ref(),
-                    agent_start,
-                    None,
-                )
+                known_within(id, link, cross.watch.program(id), agent_start, None)
             });
             if failing.take().is_some() {
                 info!("kernel state: the BPF cross-view runs again");
@@ -341,6 +367,30 @@ pub fn crossview_round(
             Vec::new()
         }
     }
+}
+
+/// The re-check of #558 (F7): [`crate::known_system_prog::judge_on_host`]
+/// within the round's deadline — its reads of the loader's `/proc` files
+/// (`stat`, `status`, `comm`, `fdinfo`) are paths a FUSE file can be bound
+/// over; past the deadline the program is not proven (the stricter record).
+fn known_within(
+    id: u32,
+    link: common::bpf_prog_class::KnownLink,
+    prog: Option<crate::known_system_prog::Program>,
+    agent_start: Option<u64>,
+    seen: Option<common::bpf_prog_class::SeenLoad>,
+) -> Result<crate::known_system_prog::Known, String> {
+    crate::state_read::ROUND_READER
+        .run("a loader's /proc files", move || {
+            crate::known_system_prog::judge_on_host(
+                id,
+                link,
+                prog.as_ref(),
+                agent_start,
+                seen.as_ref(),
+            )
+        })
+        .and_then(|r| r)
 }
 
 /// Lot 304: each baseline program of `found` that `known` proves a known
@@ -384,6 +434,7 @@ pub fn mark_known_baselines(
 pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) {
     tokio::spawn(async move {
         let mut w = Watch::default();
+        let mut cpus = crate::own_cpus::Watch::default();
         let mut failing: Option<String> = None;
         let mut tick = tokio::time::interval(PERIOD);
         let agent_start = crate::known_system_prog::agent_start_ns();
@@ -397,18 +448,24 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
             };
             let mut found = {
                 let known = |id: u32| match cross.as_ref() {
-                    Some(c) => crate::known_system_prog::judge_on_host(
+                    Some(c) => known_within(
                         id,
                         common::bpf_prog_class::KnownLink::RootCgroupSysctl,
-                        c.watch.program(id).as_ref(),
+                        c.watch.program(id),
                         agent_start,
-                        c.watch.seen().get(&id),
+                        c.watch.seen().get(&id).copied(),
                     ),
                     None => Err("no BPF cross-view on this host".to_string()),
                 };
                 round(&mut w, Path::new("/"), &known)
             };
             found.extend(crossed);
+            // lot 349: the agent's own CPUs — the re-check of #558 (F7): a
+            // read of this round that did not answer makes it unjudged
+            found.extend(
+                crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)
+                    .map(Finding::Cpus),
+            );
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
@@ -687,6 +744,31 @@ mod tests {
             ),
             "{e:?}"
         );
+        // the re-check of #558 (item 2): a held program after its window,
+        // signed as its held load's record with the use "outlived"
+        let e = event_of(
+            &Finding::Bpf(crate::bpf_crossview::Finding::HeldOutlived(
+                o.clone(),
+                (9u64 << 32) | 2,
+            )),
+            3,
+        );
+        assert!(
+            matches!(
+                &e,
+                Event::FsProtectDenial {
+                    pid: 0,
+                    target_ino: 77,
+                    operation: FsProtectOperation::BpfHeldLoad,
+                    comm,
+                    target_dev,
+                    ..
+                } if comm == "hide@bpf_lsm_file_open"
+                    && common::wire::bpf_held_of(*target_dev)
+                        == (common::wire::BPF_HELD_OUTLIVED, 9, 2)
+            ),
+            "{e:?}"
+        );
         // the kernel's own program: its early bit carried
         let kernel_s = crate::bpf_crossview::Object { early: true, ..o };
         assert!(matches!(
@@ -802,6 +884,36 @@ mod tests {
                     if *target_ino & CROSSVIEW_KNOWN_BIT == 0
             ),
             "{e:?}"
+        );
+    }
+
+    /// Lot 349 (pre-alpha R001): a confinement of the agent's CPUs is signed
+    /// as the kernel's act (pid 0), `comm` what its cause names, the cause
+    /// and counts in `target_dev`, the CPUs left in `target_ino`.
+    #[test]
+    fn a_cpu_confinement_is_signed_as_cpu_confined() {
+        use crate::own_cpus::{Cause, Confinement, CAUSE_PARTITION};
+        let c = Confinement {
+            left: vec![0],
+            expected: vec![0, 1, 2, 3],
+            cause: Cause::Partition(vec!["/k349part root 1-3".into()]),
+        };
+        let Event::FsProtectDenial {
+            pid,
+            comm,
+            target_dev,
+            target_ino,
+            operation,
+            ..
+        } = event_of(&Finding::Cpus(c), 4)
+        else {
+            panic!("not a denial")
+        };
+        assert_eq!(operation, FsProtectOperation::CpuConfined);
+        assert_eq!((pid, comm.as_str(), target_ino), (0, "/k349part", 1));
+        assert_eq!(
+            common::wire::cpu_confined_of(target_dev),
+            (CAUSE_PARTITION, 1, 4, 0)
         );
     }
 }

@@ -10,15 +10,16 @@
 #       (never attached: the load itself is what the agent judges)
 #   bpf-probe.py load-tracing [--type kprobe|tracepoint|perf_event|raw_tracepoint]
 #       [--call none|write_user|send_signal|send_signal_thread|override_return]
-#       [--name NAME]
+#       [--name NAME] [--pin PATH]
 #       (lot 345) BPF_PROG_LOAD of a tracing program that calls one helper
-#       (none: `r0 = 0; exit`) — what the content judge reads
+#       (none: `r0 = 0; exit`) — what the content judge reads; (lot 349)
+#       with --pin, pinned at PATH and its id printed ("OK fd N id I …")
 #   bpf-probe.py load-fmod-ret --func FUNC [--fentry] [--name NAME]
 #       (lot 345) BPF_PROG_LOAD of a `tracing` program on kernel function
 #       FUNC (its BTF id read from /sys/kernel/btf/vmlinux) as fmod_ret
 #       (BPF_MODIFY_RETURN), or fentry with --fentry; `r0 = 0; exit`
 #   bpf-probe.py load-kfunc-signal --type syscall|xdp|tc|cgroup_skb --pid PID
-#       [--sig N] [--no-signal] [--run] [--name NAME]
+#       [--sig N] [--no-signal] [--run] [--name NAME] [--pin PATH]
 #       (the review of #553, F1) BPF_PROG_LOAD of a program of a type any
 #       root loads with no opt-out that does t = bpf_task_from_pid(PID);
 #       bpf_send_signal_task(t, N, PIDTYPE_TGID, 0); bpf_task_release(t)
@@ -28,7 +29,12 @@
 #   bpf-probe.py load-socket-filter [--pin PATH] [--name NAME]
 #       BPF_PROG_LOAD of a socket filter (a type the agent lets through)
 #   bpf-probe.py map-fd-by-id ID [--rdonly]
-#   bpf-probe.py prog-fd-by-id ID
+#   bpf-probe.py prog-fd-by-id ID [--run]
+#       (lot 349) with --run, BPF_PROG_RUN on the handle given (a syscall
+#       program: "OK fd N run OK retval R")
+#   bpf-probe.py prog-ids | map-ids
+#       (lot 349) every program / map id on the host (*_GET_NEXT_ID: no
+#       handle)
 #   bpf-probe.py obj-get PATH [--rdonly]
 #   bpf-probe.py link-ids
 #       (lot 301) every link id on the host (BPF_LINK_GET_NEXT_ID: no handle)
@@ -36,14 +42,29 @@
 #       (lot 301) BPF_LINK_GET_FD_BY_ID; a handle given is described ("OK fd
 #       N prog P": BPF_OBJ_GET_INFO_BY_FD) and, with --detach, BPF_LINK_DETACH
 #       is tried on it ("... detach OK" / "... detach ERR <errno>")
+#   bpf-probe.py held-use --type kprobe|syscall --pid PID --until EPOCH
+#       [--sig N] [--func FUNC] [--name NAME]
+#       (the review of #558, F1) a window's loader that KEEPS its descriptor:
+#       loads a kprobe that calls bpf_send_signal(N) when PID hits FUNC
+#       (default do_sys_openat2), or a syscall program that signals PID with
+#       bpf_send_signal_task(N); prints its id at once ("LOADED id I" or
+#       "LOADED ERR ..."), sleeps until EPOCH (after the window), then uses
+#       it through its own descriptor and through one taken with
+#       pidfd_getfd: the syscall program by BPF_PROG_RUN; the kprobe by a
+#       perf event's PERF_EVENT_IOC_SET_BPF and by BPF_LINK_CREATE
+#       (BPF_PERF_EVENT); both as a prog array's value (a tail call's slot).
+#       One line: "USES <use>=OK|ERR <errno> ..." (an attach that succeeds
+#       is closed at once).
 #
 # A program loaded with --pin is pinned at PATH (its directory made) so it
 # outlives this process.
 import ctypes
 import errno
+import fcntl
 import os
 import struct
 import sys
+import time
 
 SYS_BPF = 321  # x86_64
 BPF_MAP_GET_FD_BY_ID = 14
@@ -52,6 +73,8 @@ BPF_OBJ_PIN = 6
 BPF_OBJ_GET = 7
 BPF_PROG_GET_FD_BY_ID = 13
 BPF_OBJ_GET_INFO_BY_FD = 15
+BPF_PROG_GET_NEXT_ID = 11
+BPF_MAP_GET_NEXT_ID = 12
 BPF_LINK_GET_FD_BY_ID = 30
 BPF_LINK_GET_NEXT_ID = 31
 BPF_LINK_DETACH = 34
@@ -69,6 +92,16 @@ OPEN_TYPES = {"syscall": 31, "xdp": 6, "tc": 3, "cgroup_skb": 8}
 BPF_PROG_TEST_RUN = 10
 BPF_F_SLEEPABLE = 1 << 4
 PSEUDO_KFUNC_CALL = 2
+# the review of #558 (F1): the uses of a held program
+BPF_MAP_CREATE = 0
+BPF_MAP_UPDATE_ELEM = 2
+BPF_LINK_CREATE = 28
+BPF_PERF_EVENT = 41
+MAP_TYPE_PROG_ARRAY = 3
+PERF_EVENT_IOC_SET_BPF = 0x40042408
+SYS_PERF_EVENT_OPEN = 298  # x86_64
+SYS_PIDFD_OPEN = 434
+SYS_PIDFD_GETFD = 438
 PIDTYPE_TGID = 1
 
 libc = ctypes.CDLL(None, use_errno=True)
@@ -176,6 +209,125 @@ def pin(fd, path):
     return bpf(BPF_OBJ_PIN, struct.pack("<QII", ctypes.addressof(p), fd, 0))
 
 
+def prog_id(fd):
+    """(lot 349) the id of program `fd` (struct bpf_prog_info: type, id)."""
+    info = ctypes.create_string_buffer(64)
+    _, ie = bpf(BPF_OBJ_GET_INFO_BY_FD, struct.pack("<IIQ", fd, 64, ctypes.addressof(info)))
+    return struct.unpack_from("<I", info.raw, 4)[0] if ie == 0 else f"? (info errno {ie})"
+
+
+def test_run(fd):
+    """BPF_PROG_RUN of program `fd` (no input): " run OK retval R" or " run ERR E"."""
+    attr = struct.pack("<IIIIQQIIIIQQIII", fd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    buf = ctypes.create_string_buffer(attr, 128)
+    r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_PROG_TEST_RUN), buf, ctypes.c_long(128))
+    re = ctypes.get_errno() if r < 0 else 0
+    retval = struct.unpack_from("<I", buf.raw, 4)[0]
+    return f" run {'OK retval ' + str(retval) if r >= 0 else 'ERR ' + errno.errorcode.get(re, '?')}"
+
+
+def pinned(fd, args):
+    """(lot 349) `--pin PATH`: pin `fd` there; the id and the pin, or ""."""
+    path = opt(args, "--pin")
+    if fd is None or not path:
+        return ""
+    _, pe = pin(fd, path)
+    return f" id {prog_id(fd)}" + (f" pinned {path}" if pe == 0 else f" PIN-ERR {pe}")
+
+
+def enum_ids(cmd):
+    """(lot 349) every id `cmd` (a *_GET_NEXT_ID) enumerates."""
+    out, cur = [], 0
+    while True:
+        buf = ctypes.create_string_buffer(struct.pack("<II", cur, 0), 128)
+        r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(cmd), buf, ctypes.c_long(128))
+        if r < 0:
+            e = ctypes.get_errno()
+            if e == errno.ENOENT:
+                return out, 0
+            return out, e
+        cur = struct.unpack_from("<I", buf.raw, 4)[0]
+        out.append(cur)
+
+
+def kfunc_signal_insns(ids, pid, sig, signal=True):
+    """t = bpf_task_from_pid(pid); bpf_send_signal_task(t, sig, TGID, 0);
+    bpf_task_release(t) (no signal: the lookup and the release only)."""
+    kcall = lambda k: insn(0x85, src=PSEUDO_KFUNC_CALL, imm=ids[k])
+    body = [] if not signal else [
+        insn(0xBF, dst=1, src=6),  # r1 = task
+        insn(0xB7, dst=2, imm=sig),  # r2 = sig
+        insn(0xB7, dst=3, imm=PIDTYPE_TGID),  # r3 = PIDTYPE_TGID
+        insn(0xB7, dst=4, imm=0),  # r4 = 0 (value)
+        kcall("bpf_send_signal_task"),
+    ]
+    tail = body + [insn(0xBF, dst=1, src=6), kcall("bpf_task_release")]
+    return [
+        insn(0xB7, dst=1, imm=int(pid)),  # r1 = pid
+        kcall("bpf_task_from_pid"),  # r0 = task or NULL
+        insn(0x15, dst=0, off=1 + len(tail), imm=0),  # if r0 == 0 goto out
+        insn(0xBF, dst=6, src=0),  # r6 = task
+    ] + tail + [insn(0xB7, dst=0, imm=0), insn(0x95)]  # out: r0 = 0; exit
+
+
+def errname(e):
+    return f"ERR {errno.errorcode.get(e, '?')}"
+
+
+def perf_kprobe(func):
+    """(the review of #558) a perf event on kprobe FUNC (the kprobe PMU), on
+    CPU 0, every task: its fd, or (None, errno)."""
+    pmu = int(open("/sys/bus/event_source/devices/kprobe/type").read())
+    name = ctypes.create_string_buffer(func.encode() + b"\0")
+    attr = bytearray(128)
+    struct.pack_into("<II", attr, 0, pmu, 128)  # type, size
+    struct.pack_into("<Q", attr, 16, 1)  # sample_period
+    struct.pack_into("<Q", attr, 56, ctypes.addressof(name))  # config1: kprobe_func
+    buf = ctypes.create_string_buffer(bytes(attr), 128)
+    r = libc.syscall(ctypes.c_long(SYS_PERF_EVENT_OPEN), buf, ctypes.c_long(-1), ctypes.c_long(0),
+                     ctypes.c_long(-1), ctypes.c_long(8))
+    return (r, 0) if r >= 0 else (None, ctypes.get_errno())
+
+
+def held_uses(kind, fds, func):
+    """(the review of #558) every use of the program behind each of `fds`."""
+    out = []
+    for label, fd in fds:
+        if kind == "syscall":
+            out.append(f"run-{label}=" + test_run(fd).strip().replace("run ", ""))
+        else:
+            pfd, e = perf_kprobe(func)
+            if pfd is None:
+                out.append(f"set-bpf-{label}=PERF-{errname(e)}")
+            else:
+                try:
+                    fcntl.ioctl(pfd, PERF_EVENT_IOC_SET_BPF, fd)
+                    out.append(f"set-bpf-{label}=OK")
+                except OSError as err:
+                    out.append(f"set-bpf-{label}={errname(err.errno)}")
+                os.close(pfd)
+            pfd, e = perf_kprobe(func)
+            if pfd is None:
+                out.append(f"link-create-{label}=PERF-{errname(e)}")
+            else:
+                lfd, le = bpf(BPF_LINK_CREATE, struct.pack("<IIII", fd, pfd, BPF_PERF_EVENT, 0))
+                out.append(f"link-create-{label}=" + ("OK" if lfd is not None else errname(le)))
+                if lfd is not None:
+                    os.close(lfd)
+                os.close(pfd)
+        mfd, me = bpf(BPF_MAP_CREATE, struct.pack("<IIIII", MAP_TYPE_PROG_ARRAY, 4, 4, 1, 0))
+        if mfd is None:
+            out.append(f"prog-array-{label}=MAP-{errname(me)}")
+            continue
+        key = ctypes.c_uint32(0)
+        val = ctypes.c_uint32(fd)
+        _, ue = bpf(BPF_MAP_UPDATE_ELEM, struct.pack("<IIQQQ", mfd, 0, ctypes.addressof(key),
+                                                     ctypes.addressof(val), 0))
+        out.append(f"prog-array-{label}=" + ("OK" if ue == 0 else errname(ue)))
+        os.close(mfd)
+    return out
+
+
 def report(fd, e, extra=""):
     if fd is None:
         print(f"ERR {errno.errorcode.get(e, '?')} {e}")
@@ -245,7 +397,7 @@ def main(argv):
             body = [insn(0xB7, dst=1, imm=0), insn(0x85, imm=CALLS[call])]
         insns = body + [insn(0xB7, dst=0, imm=0), insn(0x95)]
         fd, e = prog_load(WRITE_USER_TYPES[kind], insns, opt(args, "--name", "k345_tr"))
-        return report(fd, e)
+        return report(fd, e, pinned(fd, args))
     if cmd == "load-kfunc-signal":
         kind = opt(args, "--type", "syscall")
         pid = opt(args, "--pid")
@@ -258,36 +410,63 @@ def main(argv):
             print(f"ERR NOFUNC {' '.join(missing)} not in the kernel's BTF")
             return 1
         sig = int(opt(args, "--sig", "9"))
-        kcall = lambda k: insn(0x85, src=PSEUDO_KFUNC_CALL, imm=ids[k])
-        signal = [] if "--no-signal" in args else [
-            insn(0xBF, dst=1, src=6),  # r1 = task
-            insn(0xB7, dst=2, imm=sig),  # r2 = sig
-            insn(0xB7, dst=3, imm=PIDTYPE_TGID),  # r3 = PIDTYPE_TGID
-            insn(0xB7, dst=4, imm=0),  # r4 = 0 (value)
-            kcall("bpf_send_signal_task"),
-        ]
-        tail = signal + [insn(0xBF, dst=1, src=6), kcall("bpf_task_release")]
-        insns = [
-            insn(0xB7, dst=1, imm=int(pid)),  # r1 = pid
-            kcall("bpf_task_from_pid"),  # r0 = task or NULL
-            insn(0x15, dst=0, off=1 + len(tail), imm=0),  # if r0 == 0 goto out
-            insn(0xBF, dst=6, src=0),  # r6 = task
-        ] + tail + [insn(0xB7, dst=0, imm=0), insn(0x95)]  # out: r0 = 0; exit
+        insns = kfunc_signal_insns(ids, pid, sig, "--no-signal" not in args)
         flags = BPF_F_SLEEPABLE if kind == "syscall" else 0
         fd, e, last = prog_load_logged(OPEN_TYPES[kind], insns, opt(args, "--name", "k553_kf"), flags)
         if fd is None:
             print(f"ERR {errno.errorcode.get(e, '?')} {e}" + (f" verifier: {last[:160]}" if last else ""))
             return 1
-        extra = ""
+        extra = pinned(fd, args)
         if "--run" in args and kind == "syscall":
-            attr = struct.pack("<IIIIQQIIIIQQIII", fd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-            buf = ctypes.create_string_buffer(attr, 128)
-            r = libc.syscall(ctypes.c_long(SYS_BPF), ctypes.c_long(BPF_PROG_TEST_RUN), buf, ctypes.c_long(128))
-            re = ctypes.get_errno() if r < 0 else 0
-            retval = struct.unpack_from("<I", buf.raw, 4)[0]
-            extra = f" run {'OK retval ' + str(retval) if r >= 0 else 'ERR ' + errno.errorcode.get(re, '?')}"
+            extra += test_run(fd)
         os.close(fd)
         print(f"OK fd {fd}{extra}")
+        return 0
+    if cmd == "held-use":
+        kind = opt(args, "--type", "kprobe")
+        pid, until = opt(args, "--pid"), opt(args, "--until")
+        if kind not in ("kprobe", "syscall") or pid is None or until is None:
+            print("held-use: --type kprobe|syscall --pid PID --until EPOCH", file=sys.stderr)
+            return 2
+        sig = int(opt(args, "--sig", "9"))
+        name = opt(args, "--name", "k558_held")
+        if kind == "syscall":
+            ids = {k: btf_func_id(k) for k in ("bpf_task_from_pid", "bpf_send_signal_task", "bpf_task_release")}
+            if any(v is None for v in ids.values()):
+                print("LOADED ERR NOFUNC (no bpf_send_signal_task)", flush=True)
+                return 1
+            fd, e, last = prog_load_logged(OPEN_TYPES["syscall"], kfunc_signal_insns(ids, pid, sig), name,
+                                           BPF_F_SLEEPABLE)
+        else:
+            # if (bpf_get_current_pid_tgid() >> 32 == PID) bpf_send_signal(SIG)
+            insns = [
+                insn(0x85, imm=14),  # call bpf_get_current_pid_tgid
+                insn(0x77, dst=0, imm=32),  # r0 >>= 32
+                insn(0x55, dst=0, off=2, imm=int(pid)),  # if r0 != PID goto out
+                insn(0xB7, dst=1, imm=sig),  # r1 = sig
+                insn(0x85, imm=CALLS["send_signal"]),
+                insn(0xB7, dst=0, imm=0),  # out: r0 = 0
+                insn(0x95),
+            ]
+            fd, e, last = prog_load_logged(PROG_TYPE_KPROBE, insns, name)
+        if fd is None:
+            print(f"LOADED {errname(e)}" + (f" verifier: {last[:120]}" if last else ""), flush=True)
+            return 1
+        print(f"LOADED id {prog_id(fd)} fd {fd}", flush=True)
+        while time.time() < float(until):
+            time.sleep(0.5)
+        fds = [("own", fd)]
+        try:
+            pidfd = os.pidfd_open(os.getpid())
+            r = libc.syscall(ctypes.c_long(SYS_PIDFD_GETFD), ctypes.c_long(pidfd), ctypes.c_long(fd),
+                             ctypes.c_long(0))
+            if r >= 0:
+                fds.append(("getfd", r))
+            else:
+                print(f"GETFD {errname(ctypes.get_errno())}", flush=True)
+        except OSError as err:
+            print(f"GETFD {errname(err.errno)}", flush=True)
+        print("USES " + " ".join(held_uses(kind, fds, opt(args, "--func", "do_sys_openat2"))), flush=True)
         return 0
     if cmd == "load-fmod-ret":
         func = opt(args, "--func", "security_file_open")
@@ -303,7 +482,15 @@ def main(argv):
         flags = BPF_F_RDONLY if "--rdonly" in args else 0
         return report(*bpf(BPF_MAP_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, flags)))
     if cmd == "prog-fd-by-id":
-        return report(*bpf(BPF_PROG_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0)))
+        fd, e = bpf(BPF_PROG_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0))
+        return report(fd, e, test_run(fd) if fd is not None and "--run" in args else "")
+    if cmd in ("prog-ids", "map-ids"):
+        found, e = enum_ids(BPF_PROG_GET_NEXT_ID if cmd == "prog-ids" else BPF_MAP_GET_NEXT_ID)
+        if e:
+            print(f"ERR {errno.errorcode.get(e, '?')} {e}")
+            return 1
+        print("OK " + " ".join(str(i) for i in found))
+        return 0
     if cmd == "obj-get":
         flags = BPF_F_RDONLY if "--rdonly" in args else 0
         p = ctypes.create_string_buffer(args[0].encode() + b"\0")
