@@ -348,11 +348,10 @@ pub(crate) fn attach(
             }
         };
     if at_load {
-        let judge = ContentJudge::at_load(
-            resolved.map_or([None; common::bpf_prog_class::FORBIDDEN_KFUNCS.len()], |r| {
-                *r.forbidden_kfunc_ids
-            }),
-        );
+        let judge = ContentJudge::at_load(resolved.map_or(
+            [None; common::bpf_prog_class::FORBIDDEN_KFUNCS.len()],
+            |r| *r.forbidden_kfunc_ids,
+        ));
         match write_content_judge(ebpf, &judge, true) {
             Ok(()) => info!(
                 kfuncs_every_type = judge.every_type,
@@ -585,7 +584,8 @@ impl ContentJudge {
 
 /// The review of #553 (F4): what a content judge that is not armed costs —
 /// said in its observe failure (a signed degradation).
-pub const OPT_OUTS_SUSPENDED: &str = "the bpf-loader-allow opt-outs are suspended: their types are \
+pub const OPT_OUTS_SUSPENDED: &str =
+    "the bpf-loader-allow opt-outs are suspended: their types are \
      refused to every loader outside a window again, until a start arms the judge";
 
 /// Lot 345 (before 6.9): calibrate the content judge — load each of the

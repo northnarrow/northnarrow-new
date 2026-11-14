@@ -2471,7 +2471,9 @@ mod tests {
         drop(log);
         let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         assert_eq!(
-            AuditLog::open(&fresh, key, [7u8; 16]).unwrap().previous_boot_profile(),
+            AuditLog::open(&fresh, key, [7u8; 16])
+                .unwrap()
+                .previous_boot_profile(),
             None
         );
     }

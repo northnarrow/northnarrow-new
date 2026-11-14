@@ -217,12 +217,10 @@ pub(crate) fn attest(
                                 &detail,
                                 signed,
                             );
-                        } else if let Some(detail) =
-                            nn_core::response::profile::pending_downgrade(
-                                log.profile_downgrade_pending(),
-                                profile,
-                            )
-                        {
+                        } else if let Some(detail) = nn_core::response::profile::pending_downgrade(
+                            log.profile_downgrade_pending(),
+                            profile,
+                        ) {
                             // The review of #553 (F2): a downgrade the chain
                             // holds, unanswered by anything signed, alarms at
                             // every start — a second reboot laundered it (the

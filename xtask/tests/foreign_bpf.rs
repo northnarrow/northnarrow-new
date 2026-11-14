@@ -572,8 +572,12 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         ],
     )
     .unwrap();
-    assert!(body(&c, "nn_scan_span").contains("let r = nn_scan_block(insns, at, len, kfuncs_only);"));
-    assert!(body(&c, "nn_scan_block").contains("let r = nn_scan_chunk(insns, at, len, kfuncs_only);"));
+    assert!(
+        body(&c, "nn_scan_span").contains("let r = nn_scan_block(insns, at, len, kfuncs_only);")
+    );
+    assert!(
+        body(&c, "nn_scan_block").contains("let r = nn_scan_chunk(insns, at, len, kfuncs_only);")
+    );
     assert_eq!(
         32 * 32 * 32 * 32,
         northnarrow_common_max_insns(),
@@ -645,8 +649,7 @@ fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
         ],
     )
     .unwrap();
-    assert!(body(&c, "every_type_armed")
-        .contains("PROG_CONTENT_CONF.get(CONTENT_EVERY_TYPE_SLOT)"));
+    assert!(body(&c, "every_type_armed").contains("PROG_CONTENT_CONF.get(CONTENT_EVERY_TYPE_SLOT)"));
     let refusal = body(&c, "content_refusal");
     assert!(refusal.contains("let kfuncs_only = !denied_by_default(ty);"));
     assert!(refusal.contains("if (kfuncs_only && !every_type)"));
@@ -660,7 +663,10 @@ fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
     )
     .unwrap();
     for f in ["nn_prog_forbidden_call", "nn_scan_span", "nn_scan_block"] {
-        assert!(body(&c, f).contains(", kfuncs_only);"), "{f} passes kfuncs_only on");
+        assert!(
+            body(&c, f).contains(", kfuncs_only);"),
+            "{f} passes kfuncs_only on"
+        );
     }
     let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
     in_order(
@@ -672,7 +678,9 @@ fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
         ],
     )
     .unwrap();
-    assert!(body(&u, "at_load").contains("every_type: kfunc_btf_ids.iter().flatten().count() as u32,"));
+    assert!(
+        body(&u, "at_load").contains("every_type: kfunc_btf_ids.iter().flatten().count() as u32,")
+    );
     assert!(body(&u, "attach").contains("r.forbidden_kfunc_ids"));
 }
 
@@ -704,7 +712,9 @@ fn a_failed_calibration_suspends_the_opt_outs_and_keeps_the_lockdown_guard() {
         ],
     )
     .unwrap();
-    assert!(u.contains("refused to every loader outside a window again, until a start arms the judge"));
+    assert!(
+        u.contains("refused to every loader outside a window again, until a start arms the judge")
+    );
 }
 
 /// `bpf_prog_class::CONTENT_MAX_INSNS`, read from its source.

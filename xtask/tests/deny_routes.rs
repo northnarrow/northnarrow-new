@@ -364,9 +364,12 @@ fn bare_path(init: &str) -> bool {
     let e = e.strip_prefix('&').unwrap_or(e).trim();
     let e = e.split(" as ").next().unwrap_or(e).trim();
     !e.is_empty()
-        && e.split("::")
-            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        && e.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && e.split("::").all(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        && e.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 /// The functions `body` calls: `(module, name)` — `module` the path
@@ -866,7 +869,8 @@ fn a_re_export_a_macro_and_a_function_pointer_of_the_gate_are_caught() {
 #[test]
 fn a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught() {
     let code = ebpf_code();
-    let helper_fn = "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n";
+    let helper_fn =
+        "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n";
     let lower = "\n    if relaxed() {\n        return 0;\n    }\n";
     let upper = "\n    if RELAXED() {\n        return 0;\n    }\n";
     let cases = [
@@ -885,7 +889,10 @@ fn a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught() {
         let mut c = planted(&code, "task_kill.rs", "try_task_kill", call, helper);
         c.get_mut("execq.rs").unwrap().push_str(helper_fn);
         let r = gate_reads(&c);
-        if !r.iter().any(|l| l.contains("try_task_kill reaches EXECQ_CONF")) {
+        if !r
+            .iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF"))
+        {
             green.push(what);
         }
     }

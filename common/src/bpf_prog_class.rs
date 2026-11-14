@@ -1384,7 +1384,17 @@ mod tests {
         );
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0), &[0; CALL_TARGETS]), 0);
         // after the fix-up: the address less __bpf_call_base, negative too
-        let post = [0x0012_3450, 0xfff0_0010, 0x0001_0000, 0x7fff_fff0, 0, 0, 0, 0, 0];
+        let post = [
+            0x0012_3450,
+            0xfff0_0010,
+            0x0001_0000,
+            0x7fff_fff0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 0xfff0_0010), &post), 2);
         assert_eq!(forbidden_call(insn(INSN_CALL, 0, 109), &post), 0);
     }

@@ -334,7 +334,10 @@ mod tests {
         let text = pending_downgrade(since, &manifest_alpha).expect("still an alarm");
         assert!(text.contains("2026-11-14T10:00:00Z"), "{text}");
         assert!(text.contains("alpha (install manifest)"), "{text}");
-        assert!(text.contains("nn-admin config overlay set profile"), "{text}");
+        assert!(
+            text.contains("nn-admin config overlay set profile"),
+            "{text}"
+        );
         assert!(pending_downgrade(since, &manifest_enforcing).is_some());
         // a signed profile.local answers it, either way
         assert_eq!(pending_downgrade(since, &overlay_alpha), None);

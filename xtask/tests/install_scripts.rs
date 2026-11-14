@@ -4470,12 +4470,22 @@ fn allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext() {
         "bpf-loader-allow /usr/bin/scx_rusty kprobe,struct_ops",
         "bpf-loader-allow /opt/x/loader ext,tracing   # the operator's",
     ] {
-        fs::write(dir.join("rule-policy.local"), format!("audit R011\n{line}\n")).unwrap();
+        fs::write(
+            dir.join("rule-policy.local"),
+            format!("audit R011\n{line}\n"),
+        )
+        .unwrap();
         let _ = fs::remove_file(dir.join("calls"));
         let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
         assert_eq!(status, 0, "{err}");
-        assert!(err.contains("opening lsm, struct_ops or ext"), "{line}: {err}");
-        assert!(err.contains(line.split_whitespace().nth(1).unwrap()), "{err}");
+        assert!(
+            err.contains("opening lsm, struct_ops or ext"),
+            "{line}: {err}"
+        );
+        assert!(
+            err.contains(line.split_whitespace().nth(1).unwrap()),
+            "{err}"
+        );
         assert!(out.ends_with("allowed=\n"), "{line}: {out}");
         let calls = fs::read_to_string(dir.join("calls")).unwrap_or_default();
         assert!(!calls.contains("policy set"), "{line}: {calls}");
@@ -4491,7 +4501,9 @@ fn allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext() {
     let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
     assert_eq!(status, 0, "{err}");
     assert!(out.ends_with("allowed=/bin/sh\n"), "{out}");
-    assert!(fs::read_to_string(dir.join("calls")).unwrap().contains("policy set --file"));
+    assert!(fs::read_to_string(dir.join("calls"))
+        .unwrap()
+        .contains("policy set --file"));
 }
 
 /// Named (lot 345; the re-check of #550, point 1 and N5): `--help` and the
