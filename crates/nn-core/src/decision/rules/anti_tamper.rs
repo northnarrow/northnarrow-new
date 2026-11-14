@@ -395,6 +395,11 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 349 (pre-alpha R001): not refused — the agent's own CPU
+            // watch (`nn_linux::own_cpus`), read by the kernel-state round.
+            FsProtectOperation::CpuConfined => {
+                return Some(cpu_confined_verdict(self, event, comm, *target_dev, *target_ino));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -409,6 +414,56 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 349 (pre-alpha R001): the agent runs on fewer CPUs than it should —
+/// High, not a refusal (nothing was asked of a hook: a sibling partition
+/// takes the CPUs of every cgroup of its parent). `target_dev` the cause and
+/// the counts (`common::wire::cpu_confined_of`), `target_ino` the mask of
+/// the CPUs left below 64, `comm` what the cause names.
+fn cpu_confined_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    comm: &str,
+    target_dev: u64,
+    target_ino: u64,
+) -> Verdict {
+    use common::wire::{
+        cpu_confined_of, CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
+        CPU_CAUSE_PARTITION,
+    };
+    let (cause, left, expected, threads) = cpu_confined_of(target_dev);
+    let why = match cause {
+        CPU_CAUSE_PARTITION => format!(
+            "a cgroup in cpuset.cpus.partition root or isolated (`{comm}`) took them from every \
+             other cgroup of its parent — the agent's among them; no hook is asked"
+        ),
+        CPU_CAUSE_CGROUP_CPUSET => format!(
+            "its own cgroup's cpuset.cpus was narrowed (`{comm}`; its floor is its parent's CPUs)"
+        ),
+        CPU_CAUSE_AFFINITY => format!(
+            "the CPU affinity of {threads} of its threads was narrowed (`{comm}` among them)"
+        ),
+        CPU_CAUSE_CGROUP_MOVE => format!("it was moved to another cgroup (`{comm}`)"),
+        _ => format!("cause {cause} (`{comm}`)"),
+    };
+    let cpus: Vec<String> = (0..64u32)
+        .filter(|c| target_ino & (1u64 << c) != 0)
+        .map(|c| c.to_string())
+        .collect();
+    let reasoning = format!(
+        "The agent may run on {left} of the {expected} CPUs it should (CPUs {}{}): {why}. \
+         Confined to one busy CPU its sensors' rings overflow and its responses come late. Not \
+         refused — the agent's own CPU watch, read every 5 s; `nn-admin status` shows it \
+         (degradation `own_cpus`) while it holds.",
+        if cpus.is_empty() {
+            "none below 64".to_string()
+        } else {
+            cpus.join(",")
+        },
+        if left > 64 { ", those below 64" } else { "" }
+    );
+    build_verdict(rule, event, ResponseAction::Log, Severity::High, &reasoning)
 }
 
 /// Lot 345 (the re-check of #550, N2 and point 1 (ii)): the reason of a
@@ -1030,6 +1085,67 @@ mod tests {
         assert!(r.contains("cgroup v1 hierarchy (inode 9:709)"), "{r}");
         let r = direct(FsProtectOperation::OomAdj);
         assert!(r.contains("protected pid 709 (oom_score_adj)"), "{r}");
+    }
+
+    /// Lot 349 (pre-alpha R001, named): the agent confined to fewer CPUs is
+    /// a signed High detection naming the cause and the CPUs left, never
+    /// worded as a refusal.
+    #[test]
+    fn the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause() {
+        use common::wire::{
+            cpu_confined_dev, CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
+            CPU_CAUSE_PARTITION,
+        };
+        let confined = |dev: u64, mask: u64, comm: &str| Event::FsProtectDenial {
+            pid: 0,
+            uid: 0,
+            comm: comm.into(),
+            target_dev: dev,
+            target_ino: mask,
+            operation: FsProtectOperation::CpuConfined,
+            timestamp_ns: 1,
+        };
+        for (cause, comm, says) in [
+            (
+                CPU_CAUSE_PARTITION,
+                "/k349part",
+                "cpuset.cpus.partition root or isolated (`/k349part`)",
+            ),
+            (
+                CPU_CAUSE_CGROUP_CPUSET,
+                "/northnarrow.slice/northnarrow-agent.service",
+                "own cgroup's cpuset.cpus",
+            ),
+            (CPU_CAUSE_AFFINITY, "tid 7", "affinity of 2 of its threads"),
+            (
+                CPU_CAUSE_CGROUP_MOVE,
+                "/pen",
+                "moved to another cgroup (`/pen`)",
+            ),
+        ] {
+            let v = NnLAt001AntiTamperDenial
+                .evaluate(&confined(cpu_confined_dev(cause, 1, 4, 2), 0b1, comm))
+                .expect("verdict");
+            assert_eq!(v.severity, Severity::High, "{cause}");
+            assert!(matches!(v.action, ResponseAction::Log));
+            assert!(
+                v.reasoning
+                    .contains("may run on 1 of the 4 CPUs it should (CPUs 0)"),
+                "{}",
+                v.reasoning
+            );
+            assert!(v.reasoning.contains(says), "{}", v.reasoning);
+            assert!(v.reasoning.contains("Not refused"), "{}", v.reasoning);
+            assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
+        }
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&confined(
+                cpu_confined_dev(CPU_CAUSE_PARTITION, 2, 96, 0),
+                0b1010,
+                "/p",
+            ))
+            .unwrap();
+        assert!(v.reasoning.contains("(CPUs 1,3)"), "{}", v.reasoning);
     }
 
     /// Lot 280b (named): a new taint of code entering the kernel is a

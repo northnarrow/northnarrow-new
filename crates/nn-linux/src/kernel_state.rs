@@ -29,6 +29,13 @@
 //!   — present at the start (the baseline, signed once) or appearing later
 //!   (a signed High) — with its type, name, tag and attach point.
 //!
+//! * Lot 349 (pre-alpha R001): the agent's own CPUs ([`crate::own_cpus`]):
+//!   its threads' affinity and its cgroup's effective CPUs against those it
+//!   should run on — a confinement (a sibling cgroup partition, its own
+//!   cgroup's `cpuset.cpus`, a thread's affinity, a move) is a signed High
+//!   detection (`FsProtectOperation::CpuConfined`) and a degradation while
+//!   it holds.
+//!
 //! The detections go through the bus as the `fs_protect` source's events
 //! (the kernel's refusals' source): judged, signed and counted like them.
 
@@ -132,6 +139,8 @@ pub enum Finding {
     KnownRootProgram(crate::known_system_prog::Known),
     /// Lot 290: the cross-view's finding.
     Bpf(crate::bpf_crossview::Finding),
+    /// Lot 349: the agent runs on fewer CPUs than it should.
+    Cpus(crate::own_cpus::Confinement),
 }
 
 impl Watch {
@@ -217,6 +226,15 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
                 FsProtectOperation::SysctlRootProg,
                 common::bpf_prog_class::root_prog_known_dev(k.entry as u16, k.seen, k.link_id),
                 u64::from(k.id),
+            )
+        }
+        // lot 349: what the cause names (a partition, a cgroup, a thread)
+        Finding::Cpus(c) => {
+            comm = c.cause.subject();
+            (
+                FsProtectOperation::CpuConfined,
+                c.target_dev(),
+                c.target_ino(),
             )
         }
         Finding::Bpf(b) => {
@@ -384,6 +402,7 @@ pub fn mark_known_baselines(
 pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) {
     tokio::spawn(async move {
         let mut w = Watch::default();
+        let mut cpus = crate::own_cpus::Watch::default();
         let mut failing: Option<String> = None;
         let mut tick = tokio::time::interval(PERIOD);
         let agent_start = crate::known_system_prog::agent_start_ns();
@@ -409,6 +428,8 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
                 round(&mut w, Path::new("/"), &known)
             };
             found.extend(crossed);
+            // lot 349: the agent's own CPUs
+            found.extend(crate::own_cpus::round(&mut cpus).map(Finding::Cpus));
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
@@ -802,6 +823,36 @@ mod tests {
                     if *target_ino & CROSSVIEW_KNOWN_BIT == 0
             ),
             "{e:?}"
+        );
+    }
+
+    /// Lot 349 (pre-alpha R001): a confinement of the agent's CPUs is signed
+    /// as the kernel's act (pid 0), `comm` what its cause names, the cause
+    /// and counts in `target_dev`, the CPUs left in `target_ino`.
+    #[test]
+    fn a_cpu_confinement_is_signed_as_cpu_confined() {
+        use crate::own_cpus::{Cause, Confinement, CAUSE_PARTITION};
+        let c = Confinement {
+            left: vec![0],
+            expected: vec![0, 1, 2, 3],
+            cause: Cause::Partition(vec!["/k349part root 1-3".into()]),
+        };
+        let Event::FsProtectDenial {
+            pid,
+            comm,
+            target_dev,
+            target_ino,
+            operation,
+            ..
+        } = event_of(&Finding::Cpus(c), 4)
+        else {
+            panic!("not a denial")
+        };
+        assert_eq!(operation, FsProtectOperation::CpuConfined);
+        assert_eq!((pid, comm.as_str(), target_ino), (0, "/k349part", 1));
+        assert_eq!(
+            common::wire::cpu_confined_of(target_dev),
+            (CAUSE_PARTITION, 1, 4, 0)
         );
     }
 }

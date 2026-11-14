@@ -1257,6 +1257,48 @@ pub const FS_OP_BPF_BASELINE: u8 = 43;
 /// in a softirq): the arming process is not known.
 pub const FS_OP_SIGIO: u8 = 44;
 
+/// Lot 349 (pre-alpha R001): NOT a refusal — the agent runs on fewer CPUs
+/// than it should (a sibling cgroup in `cpuset.cpus.partition` root or
+/// isolated, its own cgroup's `cpuset.cpus`, a thread's affinity, a move),
+/// read by its kernel-state round (`nn_linux::own_cpus`): `target_dev` =
+/// the cause | CPUs left << 8 | CPUs expected << 24 | threads confined <<
+/// 40, `target_ino` = the mask of the CPUs left below 64. The kernel never
+/// emits it.
+pub const FS_OP_CPU_CONFINED: u8 = 45;
+
+/// Lot 349: the causes of an [`FS_OP_CPU_CONFINED`] record (`target_dev`'s
+/// low byte): a cgroup partition took the CPUs, the agent's own cgroup's
+/// `cpuset.cpus`, a thread's affinity, a move to another cgroup.
+pub const CPU_CAUSE_PARTITION: u64 = 1;
+pub const CPU_CAUSE_CGROUP_CPUSET: u64 = 2;
+pub const CPU_CAUSE_AFFINITY: u64 = 3;
+pub const CPU_CAUSE_CGROUP_MOVE: u64 = 4;
+
+/// Lot 349: an [`FS_OP_CPU_CONFINED`] record's `target_dev` — the cause,
+/// the CPUs left, the CPUs expected and the threads confined (each count
+/// capped at 0xffff).
+pub const fn cpu_confined_dev(cause: u64, left: u64, expected: u64, threads: u64) -> u64 {
+    const fn cap(v: u64) -> u64 {
+        if v > 0xffff {
+            0xffff
+        } else {
+            v
+        }
+    }
+    (cause & 0xff) | cap(left) << 8 | cap(expected) << 24 | cap(threads) << 40
+}
+
+/// Lot 349: [`cpu_confined_dev`] told back: (cause, CPUs left, CPUs
+/// expected, threads confined).
+pub const fn cpu_confined_of(target_dev: u64) -> (u64, u64, u64, u64) {
+    (
+        target_dev & 0xff,
+        (target_dev >> 8) & 0xffff,
+        (target_dev >> 24) & 0xffff,
+        (target_dev >> 40) & 0xffff,
+    )
+}
+
 /// `SIGIO` (x86-64 and aarch64 alike).
 pub const SIGIO: i32 = 29;
 
@@ -1274,7 +1316,7 @@ pub const fn sigio_signal(sig: i32) -> i32 {
 }
 
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SIGIO;
+pub const FS_OP_LAST: u8 = FS_OP_CPU_CONFINED;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1325,6 +1367,7 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_SYSCTL_ROOT_PROG
             | FS_OP_BPF_UNSEEN
             | FS_OP_BPF_BASELINE
+            | FS_OP_CPU_CONFINED
     )
 }
 
@@ -2537,8 +2580,16 @@ mod tests {
             FS_OP_BPF_UNSEEN,
             FS_OP_BPF_BASELINE,
             FS_OP_SIGIO,
+            FS_OP_CPU_CONFINED,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
+        // lot 349: a CPU confinement's fields go and come back
+        let dev = cpu_confined_dev(CPU_CAUSE_AFFINITY, 1, 4, 70_000);
+        assert_eq!(cpu_confined_of(dev), (CPU_CAUSE_AFFINITY, 1, 4, 0xffff));
+        assert_eq!(
+            cpu_confined_of(cpu_confined_dev(CPU_CAUSE_PARTITION, 0, 2, 0)),
+            (1, 0, 2, 0)
+        );
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);
             for b in &ops[i + 1..] {

@@ -856,6 +856,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 290: nor a load the signed per-loader opt-out let through,
             // nor the cross-view's findings (a program the hook never saw,
             // the start's baseline): signed, no refusal.
+            // Lot 349: nor the agent's own CPU watch (a confinement found).
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -868,6 +869,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfProgOptOut
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
+                    | nn_model::FsProtectOperation::CpuConfined
             ) {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
                     // Lot 293 (external bug hunt BUG14): a refused signal
@@ -3131,7 +3133,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(minor, 20);
+        // lot 349: the agent's own CPU watch's record, one more
+        assert_eq!(minor, 21);
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3164,6 +3167,7 @@ mod tests {
             w::FS_OP_IOPRIO,
             w::FS_OP_SYSCTL,
             w::FS_OP_CGROUP_JOIN,
+            w::FS_OP_CPU_CONFINED,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }
@@ -3303,6 +3307,8 @@ mod tests {
             nn_model::FsProtectOperation::SysctlRootProg,
             // lot 281: an injection's record (no refusal) raises nothing
             nn_model::FsProtectOperation::ExemptInjection,
+            // lot 349: nor the agent's own CPU watch's
+            nn_model::FsProtectOperation::CpuConfined,
         ] {
             assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }

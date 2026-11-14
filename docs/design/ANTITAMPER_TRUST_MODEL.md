@@ -2624,3 +2624,73 @@ python, bpftool — stays High and raises DefenseImpairment.
 is not told apart) and a loader no one else steers (a debugger attached to
 the user's manager, or a preload root gave the packaged binary, can make it
 load a program of the type — refused, Low).
+
+## Lot 349 — the agent's own CPUs; a window's forbidden BPF load after the window
+
+**The agent's CPUs (pre-alpha R001; the review of #557, F1).** A cgroup v2
+partition (`cpuset.cpus.partition` `root` or `isolated`) takes exclusive
+CPUs from its parent's effective set, and so from every other cgroup under
+that parent: a sibling of `northnarrow.slice` made a partition of every CPU
+but one leaves the agent's threads on that one. No LSM hook is asked — the
+kernel rewrites the tasks' masks itself (`cpuset_update_tasks_cpumask`) —
+so the `task_setscheduler` deny (`taskset -p`, `chrt`) and the cgroup
+guard (a write of the agent's own `cpuset.cpus`, floor empty) never see it.
+The kernel-state round reads it instead (`crates/nn-linux/src/own_cpus.rs`):
+each thread's `sched_getaffinity` and the effective CPUs of the agent's
+cgroup (or of its nearest ancestor with the file), against what it should
+run on — the online CPUs, less `isolcpus=` (domain), narrowed by systemd's
+`[Manager] CPUAffinity=` (read once, at the start: a later edit takes
+effect only at a re-exec, and read live it would let root shrink the
+expectation before the partition) and by a slice's `cpuset.cpus` (systemd's
+`AllowedCPUs=`, which the cgroup guard refuses to any writer but PID 1 with
+its registered value outside a window). A shrink is signed
+(`FsProtectOperation::CpuConfined`, NN-L-AT-001 High: the cause, the CPUs
+left and expected, `comm` the partition, cgroup or thread) once per
+confinement (cause and CPUs), and kept as the degradation `own_cpus` while
+it holds. A round whose online CPUs differ from the last round's, or
+between its two reads, is skipped: the kernel updates the cpusets after a
+hotplug.
+
+**What this trusts**: the kernel's affinity masks and cpuset files (read
+from the agent's own process and `/sys/fs/cgroup`), and systemd's
+`system.conf` at the agent's start. Root can still starve the agent by
+other means a record names (a CPU flood: `CPUWeight=` on the slice is not
+set — R12c-3, open since lab PR 271 — named), and the watchdog's CPUs are not watched. Measured on
+5.15 and 6.8: when systemd drops the cpuset controller from the slice
+(an `AllowedCPUs=` reset), the kernel leaves the tasks' masks as they were
+— the agent stays on fewer CPUs, recorded (cause `affinity`); the agent
+does not widen its own masks (a restart does). Root offlining CPUs
+narrows the host for everyone, the agent with it: no record (a hotplug).
+
+**A window's forbidden load (pre-alpha R002).** From 6.9 the content judge
+runs at `bpf_prog_load` only, on the kernel's copy of the instructions;
+a trusted-installer window lets a load through whatever it calls. On 7.0
+a kprobe calling `bpf_send_signal` and a `syscall` program calling
+`bpf_send_signal_task`, both loaded in a window and pinned, were taken by
+id and through the pin by a root process after the window, and the
+`syscall` program ran (`BPF_PROG_RUN`), with no record. Before 6.9 the
+`bpf_prog` hook judges every foreign handle with the calibrated targets, so
+the same handles were refused (measured on 6.8). Now the load hook scans a
+window's foreign load too (the scan alone, `content_scan`: no caller
+exemption) and hands the verdict to the `bpf_prog` hook that gives the
+load its descriptor (`PROG_CONTENT_HELD_INFLIGHT`, by thread), which keeps
+it by program id (`PROG_CONTENT_HELD`, 1024 ids; full, a fail-open
+counted). A later handle on a kept program outside a window, by a caller
+outside the family and not a fresh instance, is refused and signed as the
+load's refusal (`bpf_prog_type`, the call), in every mode.
+
+**What stays open**: the window's loader keeps the descriptor its load gave
+it (no new handle: not judged again — the window is the operator's); an
+agent restart forgets the kept ids (the program is then its baseline,
+High for a refused type); a program loaded before the agent started is
+signed High at the start but its handles are not judged from 6.9 (its
+verified instructions carry the helpers' addresses, which only the
+pre-6.9 calibration reads).
+
+**A copy of `/etc` over `/etc` (pre-alpha R003).** Measured on Ubuntu 24.04
+and 26.04: a bind of a copy over `/etc` after the key load is signed within
+one integrity round (`integrity_drift` `mount_over_protected`, the mount
+and each protected path it hides), in the real chain (the agent writes to
+the log it anchored). No `sb_mount`/`move_mount` hook (CM-12): a refusal of
+a mount over `/etc` would have to tell systemd's and the container
+runtimes' own mounts apart, and the record exists.

@@ -827,3 +827,104 @@ fn northnarrow_common_max_insns() -> u64 {
     assert!(e.contains("const SCAN_FAN: u64 = 32;"));
     1 << 20
 }
+
+/// Lot 349 (pre-alpha R002, named; the lab on Ubuntu 26.04, 7.0): from 6.9
+/// the judge reads a load's content at `bpf_prog_load` only, and a window
+/// lets a load through whatever it calls — a kprobe calling
+/// `bpf_send_signal` or a syscall program calling `bpf_send_signal_task`,
+/// loaded in a window, was then taken by id or through its pin by any root
+/// process (and the syscall program run) with no refusal and no record. The
+/// load's verdict is kept now, and the program's later handles outside a
+/// window are refused to a caller outside the family and signed as the
+/// load's refusal would be — in every mode (no `enforce()`), before the
+/// census marks the load seen.
+#[test]
+fn a_window_s_forbidden_load_is_refused_at_its_later_handles() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "try_bpf_prog_load_guard"),
+        &[
+            "if content_stage() != CONTENT_STAGE_LOAD {",
+            "let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);",
+            "content_refusal(prog, every_type_armed())",
+            "return -EPERM;",
+            "if crate::inode_protect::override_active() && !caller_is_exempt() && !fresh_instance_may_load() {",
+            "content_scan(prog, every_type_armed())",
+            "PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &((u64::from(why) << 32) | u64::from(ty)), 0);",
+        ],
+    )
+    .unwrap();
+    let guard = body(&c, "try_bpf_prog_guard");
+    in_order(
+        guard,
+        &[
+            "let loading = crate::bpf_census::take_load_mark();",
+            "if content_stage() == CONTENT_STAGE_LOAD {",
+            "if loading {",
+            "PROG_CONTENT_HELD_INFLIGHT.get_ptr(&tid)",
+            "let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);",
+            "if PROG_CONTENT_HELD.insert(&id, &v, 0).is_err() {",
+            "crate::fail_open::bump(fail_open_hook::BPF);",
+            "} else if let Some(v) = PROG_CONTENT_HELD.get_ptr(&id) {",
+            "if !caller_is_exempt() && !crate::inode_protect::override_active() && !fresh_instance_may_load() {",
+            "emit_denial_kind(FS_OP_BPF_PROG_TYPE, (v >> 32) as u8, v as u32);",
+            "return -EPERM;",
+            "if loading {",
+            "crate::bpf_census::mark_seen(id, prog);",
+        ],
+    )
+    .unwrap();
+    let held = &guard[guard
+        .find("if content_stage() == CONTENT_STAGE_LOAD {")
+        .unwrap()..];
+    let held = &held[..held.find("crate::bpf_census::mark_seen").unwrap()];
+    assert!(
+        !held.contains("enforce()"),
+        "the held programs' refusal holds in every mode"
+    );
+    // the window's verdict reads the content alone; the refusal keeps the
+    // caller's exemptions
+    let scan = body(&c, "content_scan");
+    for exemption in [
+        "caller_is_exempt",
+        "override_active",
+        "fresh_instance_may_load",
+    ] {
+        assert!(
+            !scan.contains(exemption),
+            "content_scan judges no caller ({exemption})"
+        );
+        assert!(
+            body(&c, "content_refusal").contains(exemption),
+            "{exemption}"
+        );
+    }
+    in_order(
+        scan,
+        &[
+            "let kfuncs_only = !denied_by_default(ty);",
+            "if kfuncs_only && !every_type {",
+            "match nn_prog_forbidden_call(addr, kfuncs_only as u64) {",
+            "_ => Some((CONTENT_UNJUDGED, ty)),",
+        ],
+    )
+    .unwrap();
+    assert!(c.contains(
+        "pub static PROG_CONTENT_HELD: HashMap<u32, u64> = HashMap::with_max_entries(PROG_CONTENT_HELD_MAX, 0);"
+    ));
+    // the lab check
+    let lab =
+        fs::read_to_string(repo_root().join("deploy/lab/malsim/bpf-content-check.sh")).unwrap();
+    in_order(
+        &lab,
+        &[
+            "trusted-installer-grant --key \"$KEY\" --window-secs 40",
+            "load-tracing --call send_signal --name k349_sig --pin $PINS/sig",
+            "load-kfunc-signal --type syscall --pid \"$APID\" --sig 28 --name k349_kf --pin $PINS/kf",
+            "for how in \"prog-fd-by-id $id\" \"obj-get $pin\"; do",
+            "[[ $r1 == \"ERR EPERM\"* && $r == *\"a call of $call\"* ]]",
+            "sudo rm -rf \"$PINS\" </dev/null",
+        ],
+    )
+    .unwrap();
+}
