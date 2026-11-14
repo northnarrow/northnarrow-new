@@ -18,6 +18,9 @@
 #  H1  a foreign tracing program's load (bpf-probe.py, run by python3: a
 #      tracepoint and a kprobe program, never attached): EPERM and a signed
 #      bpf_prog_type — loaded, and bpf_prog_opt_out, when python3 is named;
+#      lot 345: a named loader's program that calls bpf_probe_write_user is
+#      refused all the same (its content), a plain one loads
+#      (deploy/lab/malsim/bpf-content-check.sh: every such helper, fmod_ret);
 #  H2  bpftrace -e 'tracepoint:syscalls:sys_enter_openat { … }': refused —
 #      runs when bpftrace is named;
 #  H3  a BCC tool (opensnoop-bpfcc: its interpreter is the loader) or
@@ -84,6 +87,13 @@ n0=$(lines "$DET")
 for t in tracepoint kprobe; do
     o=$(sudo $PROBE load-kprobe-write-user --type "$t" --name "k341_hd_${t:0:5}")
     [[ $o == OK* ]]; ran=$?
+    if allowed "$PY"; then
+        # lot 345: the opt-out never covers bpf_probe_write_user
+        [[ $ran -ne 0 ]] && pass "H1 $t calling bpf_probe_write_user refused although $PY is named ($o)" \
+            || bad "H1 $t calling bpf_probe_write_user loaded by a named loader"
+        o=$(sudo $PROBE load-tracing --type "$t" --call none --name "k345_hd_${t:0:5}")
+        [[ $o == OK* ]]; ran=$?
+    fi
     expect_load "H1 $t" "$PY" "$ran" "$o"
     sleep 1.2
 done
@@ -135,7 +145,9 @@ if [[ -n $TOOL ]]; then
     expect_load "H3 $TOOL" "$LOADER" "$ran" "$o"
 else
     measure "H3 no BCC or libbpf tool here: bpf-probe.py's raw_tracepoint loader instead"
-    o=$(sudo $PROBE load-kprobe-write-user --type raw_tracepoint --name k341_hd_raw)
+    # lot 345: a plain program (one calling bpf_probe_write_user is refused
+    # to a named loader too, H1)
+    o=$(sudo $PROBE load-tracing --type raw_tracepoint --call none --name k341_hd_raw)
     [[ $o == OK* ]]; ran=$?
     expect_load "H3 raw_tracepoint" "$PY" "$ran" "$o"
 fi

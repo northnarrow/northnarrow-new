@@ -567,6 +567,9 @@ fn an_incomplete_role_is_said() {
 /// signed degradation (`thread_caps`) — the registry holds it.
 #[test]
 fn an_incomplete_or_failed_role_is_a_signed_degradation() {
+    // lot 345: the registry is one per process — the tests that write it
+    // run one at a time (a report here was signed into another test's log)
+    let _g = crate::boot::degradation::TEST_LOCK.lock();
     let full = CapSet::from_bits(u64::MAX >> 23);
     let incomplete = Entered {
         role: Role::Writer,

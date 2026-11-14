@@ -166,8 +166,11 @@ pub(crate) fn attest(
                         );
                     }
                 }
-                match log.boot_probe(
+                match log.boot_probe_profiled(
                     detect_only_source.as_deref(),
+                    // lot 345: the profile signed, for the next start's
+                    // comparison
+                    Some((profile.profile.as_str(), profile.source.label())),
                     integrity.label(),
                     integrity.provenance(),
                     &northnarrow_agent::build_info::agent_build(),
@@ -191,17 +194,43 @@ pub(crate) fn attest(
                                  crash or power loss; recorded in this boot's audit entry"
                             );
                         }
-                        // Lot 341 (the review of #550, F8): an observe-only
-                        // start after a run that enforced, with no signed
-                        // profile.local asking for it, is signed
+                        // Lot 341 (the review of #550, F8): an alpha start
+                        // after a run of the enforcing profile, with no signed
+                        // profile.local asking for it, is signed. Lot 345 (the
+                        // re-check, N3): judged profile to profile, and kept
+                        // for `nn-admin status` (its degradations, the trust
+                        // level) — an audit row alone was read by no one.
                         if let Some(detail) = nn_core::response::profile::unsigned_downgrade(
-                            log.previous_boot_enforced(),
+                            log.previous_boot_profile(),
                             profile,
                         ) {
                             error!(detail = %detail, "PROFILE DOWNGRADED WITHOUT A SIGNATURE");
-                            if let Err(e) = log.attest_profile_downgrade(&detail) {
-                                warn!(error = %format!("{e:#}"), "profile downgrade not recorded");
-                            }
+                            let signed = match log.attest_profile_downgrade(&detail) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!(error = %format!("{e:#}"), "profile downgrade not recorded");
+                                    false
+                                }
+                            };
+                            northnarrow_agent::boot::degradation::keep(
+                                nn_core::response::profile::DOWNGRADE_SOURCE,
+                                &detail,
+                                signed,
+                            );
+                        } else if let Some(detail) = nn_core::response::profile::pending_downgrade(
+                            log.profile_downgrade_pending(),
+                            profile,
+                        ) {
+                            // The review of #553 (F2): a downgrade the chain
+                            // holds, unanswered by anything signed, alarms at
+                            // every start — a second reboot laundered it (the
+                            // boot before had run alpha); its row exists
+                            error!(detail = %detail, "PROFILE DOWNGRADE NOT ACKNOWLEDGED");
+                            northnarrow_agent::boot::degradation::keep(
+                                nn_core::response::profile::DOWNGRADE_SOURCE,
+                                &detail,
+                                true,
+                            );
                         }
                         Some(Arc::new(parking_lot::Mutex::new(log)))
                     }

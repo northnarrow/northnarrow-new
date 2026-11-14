@@ -81,6 +81,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
+- Lot 345: hardening of the allowed BPF loaders before the alpha tag (the
+  re-check of #550).
+  - **The content judge.** A loader the signed per-loader opt-out names
+    (`install.sh --allow-bpf-tools`: python3, so any root Python script;
+    bpftrace) is still refused an fmod_ret (`BPF_MODIFY_RETURN`, read at
+    byte 68 of the kernel's copy of the attr: it overrides any `security_*`
+    function's return) and a program calling `bpf_send_signal`,
+    `bpf_send_signal_thread`, `bpf_probe_write_user`, `bpf_override_return`
+    or the `bpf_send_signal_task` kfunc. From 6.9 at `bpf_prog_load` on the
+    kernel's copy of the instructions (no id given); before 6.9 at
+    `bpf_prog` once verified, on every foreign handle, against targets the
+    hook calibrates from two of the agent's own programs (kallsyms is hidden
+    from the agent's unit), and `bpf_probe_write_user` at the verifier's
+    `locked_down` question. The scan is four global BPF functions (32 ×
+    32 × 32 × 32 instructions, each verified once), one lookup of the
+    instruction's call key in a frozen map each (5.15's verifier processed
+    950,584 instructions for a first shape, 12,328 for this one); a longer
+    or unreadable program is refused. Each refusal is a signed
+    `bpf_prog_type` naming the helper.
+  - **F8 profile to profile.** `agent_boot` signs the profile and its
+    source; the `profile_downgraded` alarm compares the previous boot's
+    profile (an observing boot in between no longer launders it) and is a
+    degradation in `nn-admin status`.
+  - **install.sh**: the policy's edges (a narrower existing line widened, a
+    missing final newline, no signing over an unverified policy, a script
+    warned about); `--help` and the summary say what `--allow-bpf-tools`
+    opens.
+  - **The `deny_routes` ratchet** follows macros, function pointers and
+    bare function names, and forbids a gate switch's name outside a function
+    of its own file (a re-export, a macro): the three plants of the
+    re-check's probe now fail it.
+  - **The review of #553.** F1: the signalling kfuncs
+    (`bpf_send_signal_task`, 6.13+; `bpf_task_work_schedule_signal` /
+    `_resume`, 6.18+) are refused at `bpf_prog_load` in a foreign load of
+    EVERY type — a `syscall` program run with `BPF_PROG_RUN`, XDP, tc: any
+    root process killed the agent and its watchdog this way on 6.13+ (lab:
+    Ubuntu 26.04, 7.0). F2: the `profile_downgraded` alarm is kept at every
+    start until a signed `profile.local` runs or a signed `config overlay
+    set profile` acknowledges it (a second reboot laundered it). F3: the
+    ratchet strips any visibility and attributes, and a `static`/`const`
+    initialized by a bare path is an alias whatever its type. F4: the
+    `locked_down` guard is attached before the calibration, and an unarmed
+    judge suspends every `bpf-loader-allow` line (fail closed). F5: the
+    calibration takes exactly its programs' calls; `install.sh` signs no
+    policy with a line opening `lsm`, `struct_ops` or `ext`.
 - Lot 332: verifier headroom on every kernel, for alpha testers' kernels the
   lab has not seen.
   - **`verifier-check` measures every program and gates it.** The count
@@ -854,9 +899,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     leftover `nn-corpus` container first, and its own whatever the exec did.
   - **The review of #556.** (F1) The seals are read AT THE EXEC: the exec
     LSM program reads the memfd's shmem inode (`shmem_inode_info.seals`, two
-    new optional BTF offsets, slots 135–136; the enum, tracepoint and
-    hook-argument slots move by two) and sets `exe_flags::MEMFD_SEALED` when
-    it is sealed against writing, shrinking and growing; the pump and R004
+    new optional BTF offsets, slots 137–138 after lot 345's 135–136; the
+    enum, tracepoint and hook-argument slots move by two more: 153 in all)
+    and sets `exe_flags::MEMFD_SEALED` when it is sealed against writing,
+    shrinking and growing; the pump and R004
     exempt only such an exec — a copy sealed after the exec (an OCI hook's
     memfd, rewritten by its holder) is Critical. A ratchet
     (`kernel_halves.rs`) keeps the flag the LSM program's alone. (F2) The

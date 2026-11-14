@@ -826,6 +826,11 @@ mod tests {
     /// failed is recorded as `close_failed`, not as "closed".
     #[test]
     fn close_with_unwritable_map_is_recorded_as_failed() {
+        // lot 345: the close reports its unprotected drop-ins into the
+        // process's one registry — the tests that write it run one at a
+        // time (its report was signed into another test's log: the gate's
+        // flake of `a_degradation_withdrawn_before_its_flush_is_still_signed`)
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let dir = tempfile::TempDir::new().unwrap();
         let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
         let log = AuditLog::open(&dir.path().join("audit.log"), key, [1u8; 16]).unwrap();
