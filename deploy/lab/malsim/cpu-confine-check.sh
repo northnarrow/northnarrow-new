@@ -76,7 +76,8 @@ else
         bad "C1 no cpu_confined record within 15 s of the partition"
     fi
     st=$(status)
-    deg=$(printf '%s\n' "$st" | grep -i 'own_cpus\|may run on CPUs' | head -1 | cut -c1-200)
+    # the degradation's own line (the manifest's revisions quote it too)
+    deg=$(printf '%s\n' "$st" | grep -E '^  - own_cpus: ' | head -1 | cut -c1-200)
     echo "    status: ${deg:-(no own_cpus line)}"
     [[ -n $deg ]] && pass "C1 nn-admin status shows the confinement" || bad "C1 nn-admin status does not show it"
     put member "$PART/cpuset.cpus.partition" >/dev/null
@@ -84,7 +85,7 @@ else
     sleep 12
     st=$(status)
     echo "=== CASE C1 partition undone: rc=0 affinity $(affinity)"
-    printf '%s\n' "$st" | grep -qi 'may run on CPUs' && bad "C1 the confinement still in the status after the partition went" || pass "C1 the partition undone: the degradation left the status"
+    printf '%s\n' "$st" | grep -qE '^  - own_cpus: ' && bad "C1 the confinement still in the status after the partition went" || pass "C1 the partition undone: the degradation left the status"
 fi
 
 # C2: a CPU offline and online again
@@ -106,17 +107,29 @@ fi
 if [[ -n $KEY ]] && (( NCPU >= 2 )); then
     n3=$(lines "$DET")
     sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 120 </dev/null >/dev/null 2>&1; w=$?
+    WEND=$(( $(date +%s) + 120 ))
     o=$(sudo timeout 30 systemctl set-property --runtime northnarrow.slice AllowedCPUs=0-$((NCPU - 2)) </dev/null 2>&1); r=$?
     sleep 15
     echo "=== CASE C3 slice AllowedCPUs=0-$((NCPU - 2)): rc=$w/$r ${o:0:80} slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $(affinity)"
+    [[ -z $(confined "$n3") ]] && pass "C3 systemd's AllowedCPUs= on the slice: no cpu_confined" || bad "C3 a cpu_confined record for the slice's AllowedCPUs=: $(confined "$n3" | head -1 | cut -c1-200)"
+    n3=$(lines "$DET")
     sudo timeout 30 systemctl set-property --runtime northnarrow.slice AllowedCPUs= </dev/null >/dev/null 2>&1
     # systemd may leave the slice's last value: the file put back inside the window
     put "" $CG/northnarrow.slice/cpuset.cpus >/dev/null
     sudo rm -f /run/systemd/system.control/northnarrow.slice.d/50-AllowedCPUs.conf </dev/null
     sudo timeout 30 systemctl daemon-reload </dev/null
-    sleep 10
-    echo "=== CASE C3 slice AllowedCPUs reset: rc=0 slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $(affinity)"
-    [[ -z $(confined "$n3") ]] && pass "C3 systemd's AllowedCPUs= on the slice: no cpu_confined" || bad "C3 a cpu_confined record for the slice's AllowedCPUs=: $(confined "$n3" | head -1 | cut -c1-200)"
+    sleep 12
+    now=$(affinity)
+    echo "=== CASE C3 slice AllowedCPUs reset: rc=0 slice cpuset.cpus [$(cat $CG/northnarrow.slice/cpuset.cpus 2>&1)] affinity $now"
+    if [[ $now == *" $(cat /sys/devices/system/cpu/online);" && $now != *";"*";"* ]]; then
+        [[ -z $(confined "$n3") ]] && pass "C3 the reset gave every CPU back: no cpu_confined" || bad "C3 a cpu_confined record after the reset gave every CPU back: $(confined "$n3" | head -1 | cut -c1-200)"
+    else
+        # measured on 5.15: the kernel left the threads' masks narrowed when
+        # the slice's cpuset went: the agent does run on fewer CPUs
+        confined "$n3" | grep -q . && measure "C3 the kernel left the agent's threads on $now after the reset: signed cpu_confined (true)" || bad "C3 the agent left on $now after the reset, no cpu_confined"
+    fi
+    # the window's end: what follows runs outside it
+    while (( $(date +%s) <= WEND )); do sleep 2; done
 else
     measure "C3 no admin key (or one CPU): no window"
 fi

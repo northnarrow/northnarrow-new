@@ -126,6 +126,11 @@ const READBACK: &str = "a response's read-back of what it did (lot 312): a read 
 const UNITCG: &str = "a listed tool's unit's cgroup.procs, which the kernel writes: one that \
                       cannot be read, is empty or holds a line that is not a pid sanctions no \
                       reload — the signal is judged (High), the stricter side";
+/// Why the agent's own CPU watch may default (lot 349).
+const CPUS: &str = "lot 349: the agent's own CPU watch — a cpuset or online file, systemd's \
+                    system.conf or the command line that cannot be read narrows nothing the \
+                    agent should run on (the wider set is expected: a record, the stricter \
+                    side) and names no partition; the online CPUs have two sources";
 /// Why the installed shells' list may default (lot 313).
 const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed programs: an \
                       unreadable file adds none, the binary directories are still read, and \
@@ -462,6 +467,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/kernel_state.rs",
         "read_to_string(p.join(f))",
         KNOB,
+    ),
+    (
+        "crates/nn-linux/src/own_cpus.rs",
+        "read_state(p)",
+        CPUS,
     ),
     (
         "crates/nn-linux/src/known_system_prog.rs",

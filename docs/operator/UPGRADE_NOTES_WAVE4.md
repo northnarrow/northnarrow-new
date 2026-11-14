@@ -2369,3 +2369,61 @@ detail.
     not watched by FIM. A hook planted there stays R011 High when it runs,
     because it is not in a system tree.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes.
+
+## 43. The agent's own CPUs, a window's BPF load, the release's features (lot 349)
+
+- **A confinement of the agent's CPUs is a signed record.** A sibling
+  cgroup in `cpuset.cpus.partition=root` (or `isolated`) takes its CPUs
+  from every other cgroup of the parent — the agent's among them — with no
+  hook asked: root could confine the agent to one CPU and nothing was
+  recorded. Every 5 s the kernel-state round now compares each thread's
+  CPU affinity and the agent's cgroup's `cpuset.cpus.effective` with the
+  CPUs it should run on: the online CPUs, less those `isolcpus=` isolates,
+  narrowed by systemd's `[Manager] CPUAffinity=` (read at the agent's
+  start) and by the `cpuset.cpus` of a slice above it (`AllowedCPUs=` on
+  `northnarrow.slice`). A shrink is a signed NN-L-AT-001 `cpu_confined`
+  High that names the cause (a partition and its cgroup, the agent's own
+  cgroup's `cpuset.cpus`, a thread's affinity, a move to another cgroup),
+  and the degradation `own_cpus` in `nn-admin status --key` ("the agent may
+  run on CPUs 0 of the 0-3 it should …") while it holds; when it ends the
+  degradation leaves the status.
+  - **What records nothing:** a CPU taken offline or brought back (the
+    round whose online CPUs moved is skipped), a container runtime enabling
+    the cpuset controller above the agent, and `AllowedCPUs=` on
+    `northnarrow.slice` set by systemd (a reservation: set it inside a
+    trusted-installer window, as any change of the slice). A host whose
+    real-time workload uses an `isolated` partition gets the record: the
+    agent does run on fewer CPUs there.
+  - Not watched: the watchdog's CPUs (the agent's own threads only).
+- **A program loaded in a window cannot be taken after it (6.9 and
+  later).** A program the BPF content judge refuses outside a window (a
+  tracing program calling `bpf_send_signal`, `bpf_probe_write_user`,
+  `bpf_override_return`; from 6.13 any program calling
+  `bpf_send_signal_task`) loaded INSIDE a trusted-installer window was, on
+  6.9 and later, free for any root process to take by id or through its pin
+  once the window closed — and to attach or run (a `syscall` program
+  signalled the agent past its `task_kill` hook). Its handles after the
+  window are refused now (`EPERM`, signed `bpf_prog_type`, the call named),
+  as before 6.9. The loader's own descriptor, kept from inside the window,
+  is not judged again (the window is the operator's). An agent restart
+  forgets the programs it kept: they are then the new start's baseline.
+  - **A program loaded before the agent started** is signed High at the
+    agent's start when its type is one the agent refuses outside a window
+    (the cross-view's baseline, `bpf_baseline`, naming its id, name, tag and
+    attach point); before 6.9 its handles are judged and refused like any,
+    from 6.9 they are not (its content cannot be read without the
+    calibration the older kernels need): remove such a program, or reboot,
+    before you trust the host.
+- **A copy of `/etc` over `/etc` is signed, as before.** Mounted after the
+  agent loaded its key, it is `integrity_drift` `mount_over_protected` in
+  the audit chain within one integrity round (30 s), naming the mount and
+  each protected path it hides (measured on Ubuntu 24.04 and 26.04). No
+  hook refuses the mount.
+- **`--build-features` names the linked crates' test features.** A binary
+  whose nn-core or nn-linux was built with `test-util` (a `cargo test`
+  build: their test doors) prints `nn-core/test-util,nn-linux/test-util`
+  beside the agent's own lab features; a release build prints `none` as
+  before, and release.yml refuses any artefact that does not.
+- **Nothing to configure.** No overlay, allowlist or signed policy changes;
+  the eBPF object adds two maps (`PROG_CONTENT_HELD`,
+  `PROG_CONTENT_HELD_INFLIGHT`), unpinned.

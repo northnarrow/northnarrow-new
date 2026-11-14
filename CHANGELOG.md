@@ -81,6 +81,55 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
+- Lot 349 (pre-alpha self-protection blockers R001–R003, R090; rc2).
+  - **The agent watches its own CPUs (R001).** Root could confine the agent
+    to one CPU without touching it: a sibling cgroup put in
+    `cpuset.cpus.partition=root` (or `isolated`) takes its CPUs from every
+    other cgroup of the parent, the agent's among them, and no hook is
+    asked — nothing was recorded (on 6.8 and 7.0; on 5.15 since #557
+    enabled `+cpuset` at the root). The kernel-state round (5 s) now reads
+    every thread's affinity and the agent's cgroup's `cpuset.cpus.effective`
+    against the CPUs it should run on: the online CPUs, less those
+    `isolcpus=` isolates, narrowed by systemd's `[Manager] CPUAffinity=`
+    (read at the start) and by a slice's `cpuset.cpus` (systemd's
+    `AllowedCPUs=` on `northnarrow.slice`, a reservation the drop-in judge
+    keeps). A shrink is a signed NN-L-AT-001 `cpu_confined` High naming the
+    cause — the partition (and its cgroup), the agent's own cgroup's
+    `cpuset.cpus`, a thread's affinity, a move to another cgroup — and the
+    degradation `own_cpus` in `nn-admin status` while it holds. A CPU taken
+    offline (the round whose online CPUs moved is skipped), a container
+    runtime enabling the cpuset controller above the agent, and systemd's
+    own `AllowedCPUs=` on the slice record nothing
+    (`crates/nn-linux/src/own_cpus.rs`, `deploy/lab/malsim/cpu-confine-check.sh`).
+  - **A window's forbidden BPF load is refused at its later handles (R002,
+    6.9 and later).** From 6.9 the content judge reads a load at
+    `bpf_prog_load` only, and a trusted-installer window lets a load through
+    whatever it calls: a kprobe calling `bpf_send_signal`, or a `syscall`
+    program calling `bpf_send_signal_task`, loaded in a window, was taken
+    after it by id or through its pin by any root process — and the syscall
+    program run — with no refusal and no record (measured on 7.0; before
+    6.9 the `bpf_prog` hook refuses every such handle). The load's verdict
+    is kept now (`PROG_CONTENT_HELD`, an eBPF map), and a later handle on
+    the program, by id or path, outside a window and outside the agent's
+    family, is refused (`EPERM`) and signed `bpf_prog_type` naming the call,
+    in every mode. A program loaded before the agent started stays as
+    before: signed High at the start (the cross-view's baseline, for a
+    refused type), its handles not refused on 6.9 and later (named).
+  - **A copy of `/etc` mounted over `/etc` (R003): measured, unchanged.**
+    The integrity round signs it today (`integrity_drift`
+    `mount_over_protected`, naming the mount and every protected path it
+    hides) on Ubuntu 24.04 and 26.04; no new hook.
+  - **No test feature in a release (R090).** A ratchet resolves the release
+    build's feature set (`cargo build --workspace --release`, what
+    `cargo xtask build --release` runs in release.yml; normal and build
+    edges only) and fails on any test-only feature (`test-util` of any
+    crate, `test-privileged`, `debug-trigger`, the demos, `schema-check`) or
+    a `test`/`debug`/`demo`/`mock` feature of any crate; every feature a
+    member declares must be classified. The agent's `--build-features`
+    now also names the test features its linked crates were compiled with
+    (`nn-core/test-util`, `nn-linux/test-util`: only a `cargo test` build
+    has them), so release.yml's check of every artefact (`none`) refuses a
+    shipped binary built with one.
 - Lot 345: hardening of the allowed BPF loaders before the alpha tag (the
   re-check of #550).
   - **The content judge.** A loader the signed per-loader opt-out names

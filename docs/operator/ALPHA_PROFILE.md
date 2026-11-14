@@ -59,7 +59,16 @@ coordinator's corrected decision of 13/11/2026 puts them back.)
 | A ptrace attach of PID 1 (a debugger, `/proc/1/mem`) | PID 1's memory rewritten between a deny hook's read of a write PID 1 may make (a unit's limit, a thaw) and the kernel's |
 
 Each refusal is recorded as it is under `enforcing` (`NN-L-AT-001`, the
-operation, signed). A refused foreign load raises the posture to ENGAGED
+operation, signed). What no hook can refuse is recorded instead, under every
+profile: the kernel-state round (5 s) signs a new kernel taint, a foreign
+`cgroup/sysctl` program on the root cgroup, a BPF object its hook never saw
+loading, and (lot 349) **the agent confined to fewer CPUs than it should**
+— a sibling cgroup in `cpuset.cpus.partition` root or isolated takes the
+CPUs of every other cgroup of its parent with no hook asked: a signed
+`cpu_confined` High naming the cause, and the degradation `own_cpus` in
+`nn-admin status` while it holds (a CPU hotplug, a container runtime's
+cpuset enable and systemd's `AllowedCPUs=` on `northnarrow.slice` record
+nothing; `UPGRADE_NOTES_WAVE4.md` §43). A refused foreign load raises the posture to ENGAGED
 (never the decisive tamper on its own); under `alpha` nothing follows from
 it but the record.
 
@@ -154,6 +163,16 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       `CONFIG_BPF_KPROBE_OVERRIDE` has no `bpf_override_return` to refuse.
     - A program longer than 1,048,576 instructions, or one the judge cannot
       read, is refused as if it called one.
+    - **A program loaded inside a window** (lot 349): a window lets any
+      load through, but what the judge would refuse outside one is kept —
+      once the window closes, a handle on that program by id or through its
+      pin, by any process outside the agent's family, is refused (`EPERM`,
+      a signed `bpf_prog_type` naming the call), so a `syscall` program
+      calling `bpf_send_signal_task` cannot be taken and run after the
+      window (measured on 7.0, where it was). Before 6.9 the `bpf_prog`
+      hook judges every such handle anyway. A program loaded before the
+      agent started is signed High at its start (the cross-view's
+      baseline); from 6.9 its later handles are not judged.
   - Each refusal is a signed `bpf_prog_type` record (High) that names the
     helper, the kfunc or the fmod_ret. What stays open: a tracing program
     that reads (the agent's keys in its memory are not protected from it),

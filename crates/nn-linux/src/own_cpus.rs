@@ -40,6 +40,9 @@ pub const DEGRADATION: &str = "own_cpus";
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The host's online CPUs.
 pub const ONLINE: &str = "/sys/devices/system/cpu/online";
+/// The kernel's per-CPU counters: one `cpuN` line per online CPU (the
+/// online list's second source).
+pub const PROC_STAT: &str = "/proc/stat";
 /// How many cgroups the search for a partition reads at most.
 pub const PARTITION_SCAN_MAX: usize = 4096;
 /// How many partitions, and confined threads, a record names at most.
@@ -184,6 +187,20 @@ impl Confinement {
     pub fn target_ino(&self) -> u64 {
         cpu_mask(&self.left)
     }
+}
+
+/// The online CPUs: those of the online list and of `/proc/stat`'s `cpuN`
+/// lines together — one source faked or unreadable (a file bound over the
+/// online list) does not narrow what the agent should run on.
+pub fn online_of(list: Vec<u32>, proc_stat: &str) -> Vec<u32> {
+    let mut out = list;
+    out.extend(proc_stat.lines().filter_map(|l| {
+        let n = l.split_whitespace().next()?.strip_prefix("cpu")?;
+        n.parse::<u32>().ok()
+    }));
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// A mask of the CPUs below 64.
@@ -476,7 +493,7 @@ pub fn manager_affinity(files: &[String]) -> Option<Vec<u32>> {
 /// `/run` and `/etc` (a name in a later directory replaces the earlier).
 pub fn system_conf_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(t) = std::fs::read_to_string(root.join("etc/systemd/system.conf")) {
+    if let Some(t) = read_text(&root.join("etc/systemd/system.conf")) {
         out.push(t);
     }
     let mut dropins: std::collections::BTreeMap<std::ffi::OsString, PathBuf> =
@@ -499,7 +516,7 @@ pub fn system_conf_files(root: &Path) -> Vec<String> {
     out.extend(
         dropins
             .values()
-            .filter_map(|p| std::fs::read_to_string(p).ok()),
+            .filter_map(|p| read_text(p)),
     );
     out
 }
@@ -507,7 +524,7 @@ pub fn system_conf_files(root: &Path) -> Vec<String> {
 /// [`Host`] as this host is now.
 pub fn host_now() -> Host {
     Host {
-        isolated: std::fs::read_to_string("/proc/cmdline")
+        isolated: read_text(Path::new("/proc/cmdline"))
             .map(|t| isolated_by_cmdline(&t))
             .unwrap_or_default(),
         manager: manager_affinity(&system_conf_files(Path::new("/"))),
@@ -523,8 +540,16 @@ pub fn own_cgroup(proc_self_cgroup: &str) -> Option<String> {
         .filter(|p| p.starts_with('/'))
 }
 
+/// Every read of the watch: the file as text (`state_read::read_state`),
+/// `None` when it cannot be read — which narrows nothing the agent should run
+/// on (the wider set is expected: a record, the stricter side) and names no
+/// partition; an unreadable online list leaves the other source.
+fn read_text(p: &Path) -> Option<String> {
+    crate::state_read::read_state(p).ok()
+}
+
 fn read_cpus(p: &Path) -> Option<Vec<u32>> {
-    let t = std::fs::read_to_string(p).ok()?;
+    let t = read_text(p)?;
     Some(cpu_list(t.trim()))
 }
 
@@ -598,10 +623,10 @@ pub fn partitions_under(root: &Path) -> Vec<String> {
             break;
         }
         if dir != root {
-            if let Ok(state) = std::fs::read_to_string(dir.join("cpuset.cpus.partition")) {
+            if let Some(state) = read_text(&dir.join("cpuset.cpus.partition")) {
                 let state = state.trim();
                 if state.starts_with("root") || state.starts_with("isolated") {
-                    let cpus = std::fs::read_to_string(dir.join("cpuset.cpus.effective"))
+                    let cpus = read_text(&dir.join("cpuset.cpus.effective"))
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
                     let rel = dir.strip_prefix(root).unwrap_or(&dir);
@@ -660,11 +685,14 @@ pub fn own_threads() -> Vec<(u32, Vec<u32>)> {
 /// One read of the host: the online CPUs (read twice: before and after the
 /// rest) and the reading.
 pub fn read_host(start_cgroup: Option<&str>) -> (Reading, Vec<u32>) {
-    let online = || read_cpus(Path::new(ONLINE)).unwrap_or_default();
+    let online = || {
+        online_of(
+            read_cpus(Path::new(ONLINE)).unwrap_or_default(),
+            read_text(Path::new(PROC_STAT)).as_deref().unwrap_or(""),
+        )
+    };
     let first = online();
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|t| own_cgroup(&t));
+    let cgroup = read_text(Path::new("/proc/self/cgroup")).and_then(|t| own_cgroup(&t));
     let r = read_under(
         Path::new(CGROUP_ROOT),
         first,
@@ -941,6 +969,16 @@ mod tests {
         assert_eq!(manager_affinity(&system_conf_files(t.path())), Some(vec![0, 1]));
     }
 
+    /// The online CPUs from two sources: a fake online list (a file bound
+    /// over it, `0`) does not hide the CPUs `/proc/stat` counts.
+    #[test]
+    fn the_online_cpus_are_both_sources_together() {
+        let stat = "cpu  1 2 3\ncpu0 1 2\ncpu1 1 2\ncpu2 1 2\ncpu3 1 2\nintr 5\nctxt 9\n";
+        assert_eq!(online_of(vec![0], stat), all());
+        assert_eq!(online_of(all(), ""), all());
+        assert_eq!(online_of(vec![], "cpu  1\ncpu1 2\n"), vec![1]);
+    }
+
     #[test]
     fn the_cgroup_line_and_the_lists() {
         assert_eq!(
@@ -975,10 +1013,23 @@ mod tests {
         let member = root.join("system.slice");
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("cpuset.cpus.partition"), "member\n").unwrap();
+        // an isolated partition takes CPUs as surely; an invalid one is named
+        // too (its state as the kernel writes it)
+        let iso = root.join("rt.slice/iso");
+        std::fs::create_dir_all(&iso).unwrap();
+        std::fs::write(iso.join("cpuset.cpus.partition"), "isolated invalid (cpus not exclusive)\n").unwrap();
+        // an empty effective list is no answer: the nearest ancestor's is read
+        std::fs::write(agent.join("cpuset.cpus.effective"), "\n").unwrap();
         let r = read_under(root, all(), Some(START.into()), None, vec![(1, vec![0])]);
         assert_eq!(r.effective, Some(vec![0]), "the root's, the nearest with the file");
         assert_eq!(r.configured, vec![(SLICE.to_string(), vec![0, 1])]);
-        assert_eq!(partitions_under(root), vec!["/k349part root 1-3".to_string()]);
+        assert_eq!(
+            partitions_under(root),
+            vec![
+                "/k349part root 1-3".to_string(),
+                "/rt.slice/iso isolated invalid (cpus not exclusive) ".to_string()
+            ]
+        );
         let c = judge(START, &Host::default(), &r, &|| partitions_under(root)).expect("confined");
         assert_eq!((c.left, c.expected), (vec![0], vec![0, 1]));
         std::fs::write(agent.join("cpuset.cpus.effective"), "0-1\n").unwrap();
