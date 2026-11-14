@@ -2784,8 +2784,11 @@ Now:
   descriptors (a devmap's or cpumap's XDP program, a `struct_ops` map);
 - a race: another thread's `dup2` between the hook's read of the
   descriptor and the kernel's, or a rewrite of a prog array's value in
-  that gap (the kernel copies it after the hook) — each lost attempt is
-  refused and signed, and the load was signed;
+  that gap (the kernel copies it after the hook) — a lost attempt is
+  refused and signed, but a stall (userfaultfd or FUSE on the copied key,
+  or perf's context lock for `SET_BPF`) makes the race deterministic and
+  the winning use leaves no record of its own; the load, and the program
+  still loaded after the window, are signed High (re-check 2 of #558, N4);
 - a program loaded before the agent started: signed High at the start
   (its baseline) but neither its handles (from 6.9) nor its loader's
   descriptor are judged. Its verified instructions carry the helpers'

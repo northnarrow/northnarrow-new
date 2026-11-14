@@ -2486,8 +2486,9 @@ detail.
     program's run jumped into it with no record. The kernel's read is
     tried next now, and a value neither read gives is refused (`EPERM`,
     `bpf_held_use` High, "a value not read", the prog array's map id). A
-    tool that updates a prog array from a page it never touched gets
-    `EPERM` once and succeeds when it retries.
+    tool that updates a prog array from a value neither read can see is
+    refused (a retry from the same memory is refused again), and the
+    refusal is signed.
   - **Still loaded after the window: signed (its re-check, item 2).**
     Once no window is open, the kernel-state round signs each held
     program still loaded — attached by a link or an attach made inside
@@ -2502,7 +2503,12 @@ detail.
     only, where such a program can call `bpf_send_signal_task`). A
     descriptor swapped by another thread (`dup2`) between the hook's read
     and the kernel's, or a prog array's value rewritten in that gap, can
-    win a race: each lost attempt is refused and signed. Check
+    win a race. Each attempt that loses the race is refused and signed,
+    but a stall (userfaultfd or FUSE on the prog array's key copy, or on
+    perf's context lock for `SET_BPF`) can make the race deterministic,
+    and the winning attempt leaves no record at its use (re-check 2 of
+    #558, N4): the load's High and the "still loaded after the window"
+    High are then the only records. Check
     `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
   - **Held across an agent restart, emptied as programs go.** The held set
     (`PROG_CONTENT_HELD`, 1024 ids) is pinned now: a restart keeps it. Each
@@ -2557,8 +2563,11 @@ detail.
   - **P2: the `dup2` race.** Another thread's `dup2` of a descriptor
     between the agent's check and the kernel's own read (a few
     microseconds), or a prog array's value rewritten in that gap, can
-    win: each lost attempt is refused and signed (`bpf_held_use`), so a
-    tight loop leaves records as it tries, and the load was signed. No
+    win. A lost attempt is refused and signed (`bpf_held_use`); but a
+    stall on the copy (userfaultfd or FUSE on the prog array's key, or
+    on perf's context lock for `SET_BPF`) makes the race deterministic,
+    and the winning use then leaves no record of its own (N4). The load
+    and the "still loaded after the window" record are signed High. No
     hook exists that sees the resolved program for every run and attach.
   - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
     attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
