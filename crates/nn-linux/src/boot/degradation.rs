@@ -160,6 +160,36 @@ pub fn report_signed(
     }
 }
 
+/// Lot 345 (the re-check of #550, N3b): a degradation its finder already
+/// signed in a row of its own kind (`signed`: the start's `integrity_drift`
+/// `profile_downgraded`), kept for `nn-admin status` and the trust level;
+/// signed here only when that row could not be (`signed` false: at the
+/// log's open or the next flush, like [`report`]'s).
+pub fn keep(source: &str, detail: &str, signed: bool) {
+    if !signed {
+        report(source, detail);
+        return;
+    }
+    let mut r = REGISTRY.lock();
+    if r.entries
+        .iter()
+        .any(|d| d.source == source && d.detail == detail)
+    {
+        return;
+    }
+    let at_boot = !r.boot_over;
+    // past the cap a signed one is only counted (its row exists)
+    let _ = push(
+        &mut r,
+        Degradation {
+            source: source.to_string(),
+            detail: detail.to_string(),
+            at_boot,
+            signed: true,
+        },
+    );
+}
+
 /// Keep `d`, or count it past [`MAX_KEPT`]: then it is returned with the
 /// sink, to be signed once the registry's lock is released (it is not kept,
 /// so no flush would sign it).
@@ -528,6 +558,48 @@ mod tests {
             ]
         );
         assert_eq!(count(), 3);
+        reset_for_tests();
+    }
+
+    /// Named (lot 345; the re-check of #550, N3b): an unsigned profile
+    /// downgrade the start signed as its own `profile_downgraded` row is
+    /// kept for `nn-admin status` (listed, counted against the trust level)
+    /// and not signed a second time; one whose row could not be written is
+    /// signed at the log's open, as any report.
+    #[test]
+    fn a_downgrade_signed_by_its_finder_is_listed_not_signed_again() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        keep(
+            "profile",
+            "alpha (install manifest) after a run of the enforcing profile",
+            true,
+        );
+        keep(
+            "profile",
+            "alpha (install manifest) after a run of the enforcing profile",
+            true,
+        );
+        assert_eq!(
+            snapshot(),
+            ["profile: alpha (install manifest) after a run of the enforcing profile"]
+        );
+        assert_eq!(count(), 1);
+        assert!(entries().iter().all(|d| d.signed && d.at_boot));
+        let log = open_log(dir.path());
+        assert_eq!(
+            attach_audit_log(Some(Arc::clone(&log))),
+            0,
+            "its row exists"
+        );
+        assert_eq!(flush(), 0);
+        assert!(degraded_rows(dir.path()).is_empty());
+        // its own row could not be written: signed like a report
+        keep("profile", "unsigned", false);
+        assert_eq!(flush(), 1);
+        assert_eq!(degraded_rows(dir.path())[0]["source"], "profile");
+        assert_eq!(count(), 2);
         reset_for_tests();
     }
 

@@ -128,7 +128,8 @@ impl ProfileSource {
     /// A short label for the boot line, the status and `agent_boot`.
     pub fn label(&self) -> &'static str {
         match self {
-            ProfileSource::Overlay => "signed profile.local",
+            // the review of #553 (F2): the chain's reader matches it
+            ProfileSource::Overlay => nn_evidence::audit::PROFILE_SOURCE_SIGNED,
             ProfileSource::InstallManifest => "install manifest",
             ProfileSource::Default => "built-in default",
         }
@@ -173,30 +174,58 @@ pub fn resolve(overlay: Option<Profile>, manifest: Option<Profile>) -> ResolvedP
     }
 }
 
-/// Lot 341 (the review of #550, F8): the alarm of an observe-only start
-/// after a run that enforced (`previous_enforced`: the chain's last
-/// `agent_boot` said `detect_only: false`) when nothing signed asked for it
-/// — the profile is `alpha` and not from a verified `profile.local` (a
-/// deleted overlay, a manifest edited while the agent was stopped). A
-/// signed `profile = alpha` is the operator's switch: no alarm. The text
-/// the start signs, `None` when there is nothing to say.
-pub fn unsigned_downgrade(
-    previous_enforced: Option<bool>,
-    now: &ResolvedProfile,
-) -> Option<String> {
-    (previous_enforced == Some(true)
+/// Lot 341 (the review of #550, F8): the alarm of an `alpha` start after a
+/// run of the `enforcing` profile when nothing signed asked for it — the
+/// profile is `alpha` and not from a verified `profile.local` (a deleted
+/// overlay, a manifest edited while the agent was stopped). A signed
+/// `profile = alpha` is the operator's switch: no alarm. The text the start
+/// signs, `None` when there is nothing to say.
+///
+/// Lot 345 (the re-check of #550, N3): `previous` is the PROFILE the chain's
+/// last `agent_boot` signed (`nn_evidence`'s `previous_boot_profile`), no
+/// longer whether it enforced: one boot of the enforcing profile under a
+/// detect-only drop-in observed, and the downgrade after it went unsaid.
+pub fn unsigned_downgrade(previous: Option<&str>, now: &ResolvedProfile) -> Option<String> {
+    (previous == Some(Profile::Enforcing.as_str())
         && now.profile.observe_only()
         && now.source != ProfileSource::Overlay)
         .then(|| {
             format!(
-                "the response profile is {} after a run that enforced, and no signed \
-                 profile.local asked for it: a switch to alpha is a signed `nn-admin config \
-                 overlay set profile` — check who removed the overlay or edited the install \
-                 manifest",
+                "the response profile is {} after a run of the enforcing profile, and no \
+                 signed profile.local asked for it: a switch to alpha is a signed `nn-admin \
+                 config overlay set profile` — check who removed the overlay or edited the \
+                 install manifest",
                 now.describe()
             )
         })
 }
+
+/// The review of #553 (F2): the alarm of a start while an unsigned
+/// downgrade the chain holds (signed at `pending_since`,
+/// `nn_evidence`'s `profile_downgrade_pending`) is still unanswered — the
+/// profile now is not from a verified `profile.local`. One reboot after the
+/// downgrade, [`unsigned_downgrade`] compared to the boot that alarmed (it
+/// ran alpha) and said nothing: the alarm, the status' degradation and the
+/// trust level were laundered. A signed `profile.local` (its start) or a
+/// signed `nn-admin config overlay set profile` answers it; an unsigned
+/// return to enforcing does not (the downgrade happened, and no key saw it).
+pub fn pending_downgrade(pending_since: Option<&str>, now: &ResolvedProfile) -> Option<String> {
+    let since = pending_since?;
+    (now.source != ProfileSource::Overlay).then(|| {
+        format!(
+            "an unsigned downgrade of the response profile (signed in the audit chain at {since}) \
+             is not acknowledged: the profile is {} now, and no signed profile.local has been run \
+             since — acknowledge it with a signed `nn-admin config overlay set profile` (alpha or \
+             enforcing), after checking who removed the overlay or edited the install manifest",
+            now.describe()
+        )
+    })
+}
+
+/// Lot 345 (the re-check of #550, N3b): the source the start keeps an
+/// unsigned downgrade under in the agent's degradations — what `nn-admin
+/// status --key` lists, and what lowers the trust level.
+pub const DOWNGRADE_SOURCE: &str = "profile";
 
 /// The agent-wide no-enforcement gate, resolved once at the start.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,12 +284,67 @@ mod tests {
         let manifest_alpha = resolve(None, Some(Profile::Alpha));
         let overlay_alpha = resolve(Some(Profile::Alpha), Some(Profile::Enforcing));
         let enforcing = resolve(None, Some(Profile::Enforcing));
-        let text = unsigned_downgrade(Some(true), &manifest_alpha).expect("an alarm");
+        let text = unsigned_downgrade(Some("enforcing"), &manifest_alpha).expect("an alarm");
         assert!(text.contains("alpha (install manifest)"), "{text}");
-        assert_eq!(unsigned_downgrade(Some(true), &overlay_alpha), None);
-        assert_eq!(unsigned_downgrade(Some(false), &manifest_alpha), None);
+        assert_eq!(unsigned_downgrade(Some("enforcing"), &overlay_alpha), None);
+        assert_eq!(unsigned_downgrade(Some("alpha"), &manifest_alpha), None);
         assert_eq!(unsigned_downgrade(None, &manifest_alpha), None);
-        assert_eq!(unsigned_downgrade(Some(true), &enforcing), None);
+        assert_eq!(unsigned_downgrade(Some("enforcing"), &enforcing), None);
+    }
+
+    /// Named (lot 345; the re-check of #550, N3a): the chain of the review —
+    /// a boot of the enforcing profile, one boot of it under a detect-only
+    /// drop-in (it observed: no profile changed, no alarm), then the
+    /// manifest edited to `alpha` — alarms at the third boot: the boot before
+    /// it signed the profile `enforcing`. Compared on `detect_only`, the
+    /// observing boot in between laundered it.
+    #[test]
+    fn an_observing_boot_between_does_not_launder_the_downgrade() {
+        let manifest_alpha = resolve(None, Some(Profile::Alpha));
+        let enforcing = resolve(None, Some(Profile::Enforcing));
+        // boot 2: the enforcing profile again (its gate on by the drop-in)
+        assert_eq!(unsigned_downgrade(Some("enforcing"), &enforcing), None);
+        // boot 3: the chain's last boot signed `enforcing`, observing or not
+        let text = unsigned_downgrade(Some(enforcing.profile.as_str()), &manifest_alpha)
+            .expect("the downgrade is said");
+        assert!(
+            text.contains("after a run of the enforcing profile"),
+            "{text}"
+        );
+        // an unknown previous profile (an observing boot before the field)
+        assert_eq!(unsigned_downgrade(None, &manifest_alpha), None);
+    }
+
+    /// Named (the review of #553, F2): the chain of the review — boot 1
+    /// enforcing, boot 2 alpha from the manifest (alarm, signed), boot 3 and
+    /// boot 4 alpha again — still alarms at boots 3 and 4: the downgrade the
+    /// chain holds is pending until something signed answers it. A start
+    /// from a signed profile.local answers it; an unsigned enforcing start
+    /// does not.
+    #[test]
+    fn a_pending_downgrade_alarms_at_every_start_until_signed() {
+        let manifest_alpha = resolve(None, Some(Profile::Alpha));
+        let overlay_alpha = resolve(Some(Profile::Alpha), Some(Profile::Enforcing));
+        let overlay_enforcing = resolve(Some(Profile::Enforcing), Some(Profile::Alpha));
+        let manifest_enforcing = resolve(None, Some(Profile::Enforcing));
+        let since = Some("2026-11-14T10:00:00Z");
+        // boots 3 and 4: the previous boot ran alpha — no new downgrade …
+        assert_eq!(unsigned_downgrade(Some("alpha"), &manifest_alpha), None);
+        // … but the chain's is pending
+        let text = pending_downgrade(since, &manifest_alpha).expect("still an alarm");
+        assert!(text.contains("2026-11-14T10:00:00Z"), "{text}");
+        assert!(text.contains("alpha (install manifest)"), "{text}");
+        assert!(
+            text.contains("nn-admin config overlay set profile"),
+            "{text}"
+        );
+        assert!(pending_downgrade(since, &manifest_enforcing).is_some());
+        // a signed profile.local answers it, either way
+        assert_eq!(pending_downgrade(since, &overlay_alpha), None);
+        assert_eq!(pending_downgrade(since, &overlay_enforcing), None);
+        // nothing pending
+        assert_eq!(pending_downgrade(None, &manifest_alpha), None);
+        assert_eq!(ProfileSource::Overlay.label(), "signed profile.local");
     }
 
     #[test]

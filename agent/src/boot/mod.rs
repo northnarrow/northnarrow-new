@@ -1013,7 +1013,8 @@ mod tests {
         // `checks::audit_log`); the boot's own row after the self-test, in
         // the attest phase, and the open deferred by the previous agent's
         // hooks there too, before it
-        let agent_boot = at(".boot_probe(");
+        // lot 345: the row signs the profile too (`boot_probe_profiled`)
+        let agent_boot = at(".boot_probe_profiled(");
         assert!(agent_boot > selftest);
         let deferred = at("open_after_attach(&refusals, agent_id)");
         assert!(at("boot.enter(BootPhase::Attest)") < deferred);
@@ -1181,7 +1182,7 @@ mod tests {
         // in the audit log before this boot's own row
         let recorded = at("refusal::record_fallback(");
         assert!(recorded > at("boot.enter(BootPhase::Attest)"));
-        assert!(recorded < at(".boot_probe("));
+        assert!(recorded < at(".boot_probe_profiled("));
         let sources = start_sources();
         assert!(!sources.contains("record_refused_boot("));
         // review #466 F7: no exit of the start but the refusal's — main()'s

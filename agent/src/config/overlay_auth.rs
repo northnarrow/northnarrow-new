@@ -54,7 +54,9 @@ use nn_core::config::overlay_auth::{hex, Vouch};
 /// Audit op of an overlay accepted at boot with a content not yet in the chain.
 pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
 /// Audit op of an overlay stored through `nn-admin config overlay set`.
-pub const AUDIT_OP_SET: &str = "config_overlay_set";
+/// The review of #553 (F2): the chain's reader names it too (one of kind
+/// `profile` acknowledges a pending profile downgrade) — one constant.
+pub const AUDIT_OP_SET: &str = nn_evidence::audit::OVERLAY_SET_OP;
 
 /// Where the agent reads overlay `kind`: the path `gate` verified it at
 /// this boot (CLI flags can move them; [`OverlayGate::verified`] records

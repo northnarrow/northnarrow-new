@@ -65,8 +65,13 @@ const GATE_SWITCHES: &[(&str, &str)] = &[
 const SITES: &[(&str, &str, usize, Route)] = &[
     ("bpf_defense.rs", "try_bpf_map_guard", 2, Enforced("a read or write handle on one of the agent's MAPS (a program is loaded against a map, or a map written, only through one)")),
     ("bpf_defense.rs", "try_bpf_prog_guard", 1, Enforced("a handle on one of the agent's PROGRAMS (an freplace of one of its functions needs it)")),
+    ("bpf_defense.rs", "try_bpf_prog_guard", 1, Enforced("before 6.9, a handle on a foreign program of a type refused by default (one a signed per-loader opt-out lets through) whose verified instructions call bpf_send_signal(_thread) or bpf_override_return: it kills the agent past task_kill or blinds it (lot 345)")),
+    ("bpf_defense.rs", "try_bpf_prog_load_guard", 1, Enforced("from 6.9, a foreign load of a type refused by default whose instructions call bpf_send_signal(_thread), bpf_probe_write_user, bpf_override_return or the bpf_send_signal_task kfunc, opted out or not (lot 345)")),
+    ("bpf_defense.rs", "try_bpf_write_user_guard", 1, Enforced("before 6.9, the verifier's lockdown question for bpf_probe_write_user asked by a foreign loader: it rewrites the memory of the process the probe fires in, the agent's (lot 345)")),
+    ("bpf_defense.rs", "nn_calib_signals", 1, Enforced("never attached: the content judge's calibration program, loaded, read by the bpf_prog hook and unloaded at the start (signal 0) (lot 345)")),
     ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("a foreign load of the nine program types that signal a process (`bpf_send_signal` kills the agent past task_kill), rewrite its memory, override a kernel function's return or take a hook's place, outside a window and the signed per-loader opt-out (install.sh --allow-bpf-tools / --allow-bpf-loader)")),
     ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("a cgroup/sysctl program on the root cgroup: it runs after the sysctl guard and rewrites the value the guard judged")),
+    ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("an fmod_ret (BPF_MODIFY_RETURN) load the signed per-loader opt-out lets through: it overrides any security_* function's return — security_file_open failing for the agent blinds it (lot 345)")),
     ("bpf_defense.rs", "try_bpf_syscall_observe", 3, Enforced("a handle on one of the agent's links (by id or its pin), a handle by id on its maps or programs or one under its pin directories, a detach or update of one of its links")),
     ("cgroup_files.rs", "refuse_switch", 1, Enforced("the kprobes and lockdown switches: kprobes/enabled=0 disarms every kprobe of the agent, lockdown takes the kernel-memory helpers from its programs (it blinds the agent)")),
     ("cgroup_files.rs", "refuse_limit", 1, Enforced("a resource file of the agent's units' cgroups (kill, freeze, limits)")),
@@ -122,6 +127,37 @@ fn ebpf_code() -> BTreeMap<String, String> {
 
 /// Every function of `code` with a body: `(name, body)`.
 fn functions(code: &str) -> Vec<(String, &str)> {
+    function_spans(code)
+        .into_iter()
+        .map(|(name, start, end)| (name, &code[start..end]))
+        .collect()
+}
+
+/// Lot 345 (the re-check of #550, N1): every `macro_rules!` of `code` with
+/// its body: `(name, body)` — a macro is followed like a function.
+fn macros(code: &str) -> Vec<(String, &str)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = code[from..].find("macro_rules!") {
+        let at = from + i + "macro_rules!".len();
+        from = at;
+        let name: String = code[at..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let Some(open) = code[at..].find('{') else {
+            continue;
+        };
+        let start = at + open;
+        let len = matching_brace(&code[start..]);
+        out.push((name, &code[start..start + len]));
+    }
+    out
+}
+
+/// Every function of `code` with a body: `(name, start, end)` of its body.
+fn function_spans(code: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(i) = code[from..].find("fn ") {
@@ -149,7 +185,7 @@ fn functions(code: &str) -> Vec<(String, &str)> {
         }
         let start = at + 3 + open;
         let len = matching_brace(&code[start..]);
-        out.push((name, &code[start..start + len]));
+        out.push((name, start, start + len));
     }
     out
 }
@@ -211,22 +247,180 @@ fn words(hay: &str, w: &str) -> usize {
 fn all_functions(code: &BTreeMap<String, String>) -> BTreeMap<String, Vec<(String, String)>> {
     let mut out: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (file, text) in code {
-        for (name, body) in functions(text) {
-            out.entry(name)
-                .or_default()
-                .push((file.clone(), body.to_string()));
+        // lot 345: a macro's body too, by the macro's name; and (its
+        // mini-hunt) a `use … as` alias and a function-pointer static or
+        // constant, each by its name, its "body" the path or expression it
+        // stands for — followed from there
+        for (name, body) in functions(text)
+            .into_iter()
+            .chain(macros(text))
+            .map(|(n, b)| (n, b.to_string()))
+            .chain(aliases(text))
+        {
+            out.entry(name).or_default().push((file.clone(), body));
         }
     }
     out
 }
 
+/// Lot 345 (the mini-hunt of N1): the other names a function goes by in
+/// `code` — each `use path::name as alias` (`alias`, its body `path::name`),
+/// braces too, and each `static`/`const` of a function-pointer type (its
+/// name, its body the initializer). The review of #553 (F3): whatever
+/// visibility (`pub(super)`, `pub(in …)`), behind any attributes
+/// (`#[allow(…)] use …`), and a `static`/`const` whose initializer is a
+/// bare path whatever its type (a `type` alias of `fn() -> bool`).
+fn aliases(code: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // each statement that starts a line, to its `;`
+    let starts = code.match_indices('\n').map(|(i, _)| i + 1).chain([0]);
+    let stmts = starts.filter_map(|at| {
+        let rest = &code[at..];
+        let end = rest.find(';')?;
+        Some(&rest[..end])
+    });
+    for stmt in stmts {
+        let st = item_head(stmt);
+        if let Some(rest) = st.strip_prefix("use ") {
+            let (prefix, items) = match rest.split_once('{') {
+                Some((p, i)) => (p.trim_end_matches("::").trim(), i.trim_end_matches('}')),
+                None => ("", rest),
+            };
+            for item in items.split(',') {
+                if let Some((path, alias)) = item.split_once(" as ") {
+                    let path = path.trim();
+                    let full = if prefix.is_empty() {
+                        path.to_string()
+                    } else {
+                        format!("{prefix}::{path}")
+                    };
+                    out.push((alias.trim().to_string(), format!("{full};")));
+                }
+            }
+        } else if let Some(rest) = st
+            .strip_prefix("static ")
+            .or_else(|| st.strip_prefix("const "))
+        {
+            let Some((head, init)) = rest.split_once('=') else {
+                continue;
+            };
+            let Some((name, ty)) = head.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().strip_prefix("mut ").unwrap_or(name.trim());
+            if ty.contains("fn(") || ty.contains("fn (") || bare_path(init) {
+                out.push((name.trim().to_string(), format!("{};", init.trim())));
+            }
+        }
+    }
+    out
+}
+
+/// The review of #553 (F3): an item's text past its attributes (`#[…]`,
+/// any number, nested brackets) and its visibility (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in path)`).
+fn item_head(stmt: &str) -> &str {
+    let mut st = stmt.trim();
+    loop {
+        if let Some(rest) = st.strip_prefix("#[") {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(i) => st = rest[i + 1..].trim_start(),
+                None => return st,
+            }
+        } else if let Some(rest) = st.strip_prefix("pub(") {
+            match rest.find(')') {
+                Some(i) => st = rest[i + 1..].trim_start(),
+                None => return st,
+            }
+        } else if let Some(rest) = st.strip_prefix("pub ") {
+            st = rest.trim_start();
+        } else {
+            return st;
+        }
+    }
+}
+
+/// The review of #553 (F3): whether `init` (a `static`'s or `const`'s
+/// initializer) is a bare path — `crate::execq::is_relaxed_ptr`,
+/// `is_relaxed_ptr`, behind `&` or before `as …` — what names a function
+/// whatever the item's declared type.
+fn bare_path(init: &str) -> bool {
+    let e = init.trim();
+    let e = e.strip_prefix('&').unwrap_or(e).trim();
+    let e = e.split(" as ").next().unwrap_or(e).trim();
+    !e.is_empty()
+        && e.split("::").all(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        && e.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
 /// The functions `body` calls: `(module, name)` — `module` the path
 /// segment before the name (`crate::execq::conf(` → `execq`), `None` for a
-/// bare call or a method.
-fn calls(body: &str) -> BTreeSet<(Option<String>, String)> {
+/// bare call or a method. Lot 345 (the re-check of #550, N1): and the
+/// macros it invokes (`crate::execq::relaxed!(`), every path it names
+/// without calling it (`let f = crate::execq::relaxed; f()`: a function
+/// pointer), and every bare word that names a function of the object
+/// (`fns`) without calling it (`let f = relaxed;` after a `use`).
+fn calls(
+    body: &str,
+    fns: &BTreeMap<String, Vec<(String, String)>>,
+) -> BTreeSet<(Option<String>, String)> {
     let b = body.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut out = BTreeSet::new();
+    let module_before = |s: usize| -> Option<String> {
+        if s >= 2 && &body[s - 2..s] == "::" {
+            let mut m = s - 2;
+            while m > 0 && ident(b[m - 1]) {
+                m -= 1;
+            }
+            Some(body[m..s - 2].to_string())
+        } else {
+            None
+        }
+    };
+    // every identifier not followed by `(`: a path's last segment, or a
+    // bare word naming a function of the object
+    let mut i = 0;
+    while i < b.len() {
+        if !ident(b[i]) || (i > 0 && ident(b[i - 1])) || b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len() && ident(b[i]) {
+            i += 1;
+        }
+        let word = &body[s..i];
+        let next = body[i..].trim_start();
+        if next.starts_with('(') || next.starts_with("::") {
+            continue; // a call (below) or a path's inner segment
+        }
+        let module = module_before(s);
+        let is_field = s > 0 && b[s - 1] == b'.';
+        if (module.is_some() || !is_field) && fns.contains_key(word) {
+            out.insert((module, word.to_string()));
+        }
+    }
+    // (a macro invocation, `name!(`, is a word not followed by `(`: above)
     for (at, _) in body.match_indices('(') {
         let mut s = at;
         while s > 0 && ident(b[s - 1]) {
@@ -235,15 +429,7 @@ fn calls(body: &str) -> BTreeSet<(Option<String>, String)> {
         if s == at || b[s].is_ascii_digit() {
             continue;
         }
-        let mut module = None;
-        if s >= 2 && &body[s - 2..s] == "::" {
-            let mut m = s - 2;
-            while m > 0 && ident(b[m - 1]) {
-                m -= 1;
-            }
-            module = Some(body[m..s - 2].to_string());
-        }
-        out.insert((module, body[s..at].to_string()));
+        out.insert((module_before(s), body[s..at].to_string()));
     }
     out
 }
@@ -290,6 +476,46 @@ fn gate_reads(code: &BTreeMap<String, String>) -> Vec<String> {
                 found.push(format!("{file} names {switch} (only {owner:?} may)"));
             }
         }
+        // Lot 345 (the re-check of #550, N1): no macro names a switch — a
+        // macro of the switch's own file expands wherever it is invoked
+        for (name, body) in macros(text) {
+            for (switch, _) in GATE_SWITCHES {
+                if words(body, switch) > 0 {
+                    found.push(format!("{file} macro {name}! names {switch}"));
+                }
+            }
+        }
+        // … and in its own file a switch is named only in its declaration
+        // and inside a function's body: a re-export (`use self::SWITCH as
+        // X`), a constant or a static of it is another name to read it by
+        for (switch, owner) in GATE_SWITCHES {
+            if file != owner {
+                continue;
+            }
+            let bodies = function_spans(text);
+            let tb = text.as_bytes();
+            for (at, _) in text.match_indices(switch) {
+                let end = at + switch.len();
+                let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+                if (at > 0 && ident(&tb[at - 1])) || tb.get(end).is_some_and(ident) {
+                    continue;
+                }
+                if bodies.iter().any(|(_, s, e)| (*s..*e).contains(&at)) {
+                    continue;
+                }
+                let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+                let before = text[line_start..at].trim();
+                let declaration =
+                    before.ends_with("static") && (before == "static" || before.starts_with("pub"));
+                if !declaration {
+                    let line_end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+                    found.push(format!(
+                        "{file} names {switch} outside a function and its declaration: {}",
+                        text[line_start..line_end].trim()
+                    ));
+                }
+            }
+        }
     }
     for (file, name, _, route) in SITES {
         if !matches!(route, Enforced(_)) {
@@ -310,7 +536,7 @@ fn gate_reads(code: &BTreeMap<String, String>) -> Vec<String> {
                 }
             }
             let in_file = at.split(' ').next().unwrap_or_default().to_string();
-            for (module, callee) in calls(body) {
+            for (module, callee) in calls(body, &fns) {
                 for (f, next) in callees(&fns, &in_file, &module, &callee) {
                     todo.push((next.as_str(), format!("{f} {callee}")));
                 }
@@ -504,4 +730,171 @@ fn a_helper_that_reads_the_gate_from_the_self_protection_is_caught() {
             .any(|l| l.contains("try_sysctl_guard reaches HOST_DENY_MODE")),
         "{r:#?}"
     );
+}
+
+/// Named (lot 345; the re-check of #550, N1 — its probe, planted): a
+/// re-export of a switch in its own file, a macro of that file reading it
+/// and a helper of that file taken as a function pointer, each read from
+/// the self-protection, fail the ratchet. All three left it green.
+#[test]
+fn a_re_export_a_macro_and_a_function_pointer_of_the_gate_are_caught() {
+    let code = ebpf_code();
+    assert!(gate_reads(&code).is_empty(), "{:#?}", gate_reads(&code));
+    // (a) a re-export in the switch's own file, read through its new name
+    let mut reexport = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    if unsafe { crate::execq::RELAX_Q.get(0) }.is_some() {\n        return 0;\n    }\n",
+        "",
+    );
+    reexport
+        .get_mut("execq.rs")
+        .unwrap()
+        .push_str("\npub(crate) use self::EXECQ_CONF as RELAX_Q;\n");
+    let r = gate_reads(&reexport);
+    assert!(
+        r.iter().any(
+            |l| l.contains("execq.rs names EXECQ_CONF outside a function") && l.contains("RELAX_Q")
+        ),
+        "{r:#?}"
+    );
+    // (b) a macro in the switch's own file, invoked from the site
+    let mut mac = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    if crate::execq::execq_relaxed!() {\n        return 0;\n    }\n",
+        "",
+    );
+    mac.get_mut("execq.rs").unwrap().push_str(
+        "\nmacro_rules! execq_relaxed {\n    () => {\n        matches!(unsafe { crate::execq::EXECQ_CONF.get(0) }, Some(m) if *m != 0)\n    };\n}\npub(crate) use execq_relaxed;\n",
+    );
+    let r = gate_reads(&mac);
+    assert!(
+        r.iter()
+            .any(|l| l.contains("execq.rs macro execq_relaxed! names EXECQ_CONF")),
+        "{r:#?}"
+    );
+    assert!(
+        r.iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF through execq.rs execq_relaxed")),
+        "the site follows the macro: {r:#?}"
+    );
+    // a macro that reads it through a helper of the file, not by name
+    let mut via = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    if crate::execq::relaxed_m!() {\n        return 0;\n    }\n",
+        "",
+    );
+    via.get_mut("execq.rs").unwrap().push_str(
+        "\nmacro_rules! relaxed_m {\n    () => {\n        crate::execq::relaxed_inner()\n    };\n}\n\
+         \npub(crate) fn relaxed_inner() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n",
+    );
+    let r = gate_reads(&via);
+    assert!(
+        r.iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF through execq.rs relaxed_inner")),
+        "{r:#?}"
+    );
+    // (c) a helper of the switch's file called through a function pointer
+    let mut ptr = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    let relaxed = crate::execq::is_relaxed_ptr;\n    if relaxed() {\n        return 0;\n    }\n",
+        "",
+    );
+    ptr.get_mut("execq.rs").unwrap().push_str(
+        "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n",
+    );
+    let r = gate_reads(&ptr);
+    assert!(
+        r.iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF through execq.rs is_relaxed_ptr")),
+        "{r:#?}"
+    );
+    // … and by its bare name after a `use`
+    let mut bare = planted(
+        &code,
+        "task_kill.rs",
+        "try_task_kill",
+        "\n    let relaxed = is_relaxed_ptr;\n    if relaxed() {\n        return 0;\n    }\n",
+        "\nuse crate::execq::is_relaxed_ptr;\n",
+    );
+    bare.get_mut("execq.rs").unwrap().push_str(
+        "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n",
+    );
+    let r = gate_reads(&bare);
+    assert!(
+        r.iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF through execq.rs is_relaxed_ptr")),
+        "{r:#?}"
+    );
+    // the mini-hunt: a `use … as` alias of the helper, and a static
+    // function pointer to it, in the site's file
+    for (call, helper) in [
+        (
+            "\n    if relaxed() {\n        return 0;\n    }\n",
+            "\nuse crate::execq::{is_relaxed_ptr as relaxed};\n",
+        ),
+        (
+            "\n    if RELAXED() {\n        return 0;\n    }\n",
+            "\nstatic RELAXED: fn() -> bool = crate::execq::is_relaxed_ptr;\n",
+        ),
+    ] {
+        let mut other = planted(&code, "task_kill.rs", "try_task_kill", call, helper);
+        other.get_mut("execq.rs").unwrap().push_str(
+            "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n",
+        );
+        let r = gate_reads(&other);
+        assert!(
+            r.iter()
+                .any(|l| l
+                    .contains("try_task_kill reaches EXECQ_CONF through execq.rs is_relaxed_ptr")),
+            "{helper}: {r:#?}"
+        );
+    }
+}
+
+/// Named (the review of #553, F3): the four spellings its probe planted in
+/// `task_kill.rs`, each reaching `EXECQ_CONF` from `try_task_kill` through
+/// `execq::is_relaxed_ptr`, left the ratchet green — a `pub(super) use … as`,
+/// a `use … as` behind an attribute, a `static` whose type is a `type`
+/// alias of a function pointer, a `pub(super) static`. Each is caught, and
+/// a mini-hunt's variants with them (`pub(in crate)`, two attributes, a
+/// `const` through an alias, `&` before the path).
+#[test]
+fn a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught() {
+    let code = ebpf_code();
+    let helper_fn =
+        "\npub(crate) fn is_relaxed_ptr() -> bool {\n    EXECQ_CONF.get(0).is_none()\n}\n";
+    let lower = "\n    if relaxed() {\n        return 0;\n    }\n";
+    let upper = "\n    if RELAXED() {\n        return 0;\n    }\n";
+    let cases = [
+        ("pub(super) use", lower, "\npub(super) use crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("attr use", lower, "\n#[allow(unused_imports)] use crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("type alias static", upper, "\ntype RelaxFn = fn() -> bool;\nstatic RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
+        ("pub(super) static", upper, "\npub(super) static RELAXED: fn() -> bool = crate::execq::is_relaxed_ptr;\n"),
+        // the mini-hunt
+        ("pub(in crate) use", lower, "\npub(in crate) use crate::execq::{is_relaxed_ptr as relaxed};\n"),
+        ("two attributes", lower, "\n#[allow(unused_imports)]\n#[cfg(not(test))]\nuse crate::execq::is_relaxed_ptr as relaxed;\n"),
+        ("const via alias", upper, "\ntype RelaxFn = fn() -> bool;\npub(crate) const RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
+        ("static of a reference", upper, "\nstatic RELAXED: &RelaxFn = &crate::execq::is_relaxed_ptr;\n"),
+    ];
+    let mut green = Vec::new();
+    for (what, call, helper) in cases {
+        let mut c = planted(&code, "task_kill.rs", "try_task_kill", call, helper);
+        c.get_mut("execq.rs").unwrap().push_str(helper_fn);
+        let r = gate_reads(&c);
+        if !r
+            .iter()
+            .any(|l| l.contains("try_task_kill reaches EXECQ_CONF"))
+        {
+            green.push(what);
+        }
+    }
+    assert!(green.is_empty(), "ratchet stays green for: {green:?}");
 }

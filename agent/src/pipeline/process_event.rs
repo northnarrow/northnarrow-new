@@ -622,6 +622,14 @@ pub(crate) fn process_event(
                         ) {
                             "not refused: found by the BPF cross-view of the kernel-state round"
                                 .to_string()
+                        } else if let Some(content) = (*operation
+                            == nn_model::FsProtectOperation::BpfProgType)
+                            .then(|| common::bpf_prog_class::content_response(*target_dev))
+                            .flatten()
+                        {
+                            // lot 345: the content, not the type — named in
+                            // the signed record (its reasoning is not)
+                            content
                         } else if *operation == nn_model::FsProtectOperation::BpfProgType {
                             "denied in kernel (the bpf LSM hook: a refused program type)"
                                 .to_string()

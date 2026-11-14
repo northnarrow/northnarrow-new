@@ -10960,3 +10960,86 @@ number in parentheses is a lab PR.
   - Level unchanged: the false-positive work of the alpha; C17's
     provisional waits on the nightly.
 
+
+- **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases
+  (before the alpha tag; the re-check of #550, N1–N5 and point 1; C27, C28;
+  no level changes).**
+  - **What was open.**
+    - A loader `install.sh --allow-bpf-tools` names was let through the five
+      tracing types whole: python3, and with it any root Python script, and
+      bpftrace. It could load an fmod_ret on any `security_*` function, or a
+      program calling `bpf_send_signal` (it kills the agent past
+      `task_kill`), `bpf_probe_write_user` or `bpf_override_return`.
+    - `--help` and the summary did not say what the flag opens.
+    - F8 compared `detect_only`: one observing boot in between laundered the
+      alarm, and the alarm was only an audit row.
+    - install.sh glued its lines to a policy without a final newline, kept a
+      narrower existing line while saying "allowed", and signed over a
+      policy whose signature did not verify.
+    - The `deny_routes` ratchet missed a re-export, a macro and a function
+      pointer of a gate switch.
+  - **Done.**
+    - The content judge: fmod_ret refused at the `bpf` hook; the helpers and
+      the kfunc at `bpf_prog_load` (6.9+) or at `bpf_prog` once verified
+      (5.15–6.8), with targets calibrated from the agent's own programs and
+      `bpf_probe_write_user` refused at the verifier's `locked_down`
+      question. The signed record names the helper.
+    - F8 compares profile to profile, and the alarm is a degradation in
+      `nn-admin status`.
+    - The install edges are fixed, and `--help` and the summary say the risk.
+    - The ratchet follows macros, paths, bare names, `use … as` aliases and
+      function-pointer statics.
+    - Mini-hunt: two opt-out lines of one executable merge their types; the
+      degradation registry's unlocked test writers take its lock (a gate
+      flake).
+    - 44 targeted mutants: 43 caught by a named test; 1 redundant clause
+      removed.
+  - **Lab, as measured** (our guests, lease k345, `nn-lab.sh
+    bpf-content-check` after `install.sh --allow-bpf-tools`, then a cold
+    boot): Ubuntu 22.04 (5.15.0-202), Ubuntu 24.04 (6.8.0-149), Debian 13
+    (6.12.116) and Ubuntu 26.04 (7.0.0-43).
+    - **Still loads**: a plain kprobe, an fentry, bpftrace and (except on
+      Debian, which has no kheaders) `opensnoop-bpfcc`.
+    - **Refused on all four, each signed with the helper named**: an fmod_ret
+      on `security_file_open`, a program calling `bpf_send_signal`,
+      `_thread`, `bpf_override_return` or `bpf_probe_write_user`, and
+      bpftrace's `signal()`. All `EPERM`, except `bpf_probe_write_user`
+      before 6.9, which is `EINVAL` (the lockdown question).
+    - **`verifier-check`**: 0 failing and every program within the 900,000
+      gate. `bpf_prog_guard` processed 12,328 / 8,461 / 8,461 / 7,642.
+      5.15 needed 950,584 with the first shape, which the PR's CI caught.
+    - **After the cold boot**: agent and watchdog active, the judge armed
+      again, `bpf_send_signal` refused again.
+    - `uninstall.sh --purge` left nothing.
+  - **Levels unchanged**: the opt-out still lets an allowed loader read
+    memory (declared); what it no longer opens is the kill and the blinding.
+  - **The review of #553 (fix round).** F1 (P1): on 6.13+ any root process
+    killed the agent with a `syscall`, XDP or tc program calling
+    `bpf_task_from_pid` + `bpf_send_signal_task` (`SI_KERNEL`, no
+    `task_kill`), types the judge never read. The `bpf_prog_load` hook now
+    reads a foreign load of every type for the signalling kfuncs this kernel
+    has (`bpf_send_signal_task`; `bpf_task_work_schedule_signal` / `_resume`,
+    6.18+), the helpers still for the refused types only. F2: the
+    `profile_downgraded` alarm is kept at every start until a signed
+    `profile.local` runs or a signed `config overlay set profile` answers it.
+    F3: the ratchet's four spellings. F4: the `locked_down` guard before the
+    calibration; an unarmed judge suspends every opt-out. F5: the
+    calibration takes exactly its programs' calls; `install.sh` signs no
+    line opening `lsm`, `struct_ops` or `ext`. Tests:
+    `the_signal_kfuncs_are_judged_for_every_type`,
+    `a_load_of_every_type_is_read_for_the_signal_kfuncs`,
+    `a_downgrade_stays_pending_through_two_reboots`,
+    `a_pending_downgrade_alarms_at_every_start_until_signed`,
+    `a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught`,
+    `a_failed_calibration_suspends_the_opt_outs_and_keeps_the_lockdown_guard`,
+    `a_calibration_that_read_other_calls_is_refused`,
+    `allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext`.
+    Lab, as measured (Ubuntu 26.04, 7.0, lease k345): with no agent a root `syscall`
+    program killed a `sleep` through `bpf_send_signal_task`; with the agent,
+    `syscall`/XDP/tc programs signalling it were refused `EPERM` at the load
+    (a root process no line names, and python3), signed naming the kfunc,
+    the agent's pid unchanged; without the signal they loaded; bpftrace,
+    BCC, fentry and the earlier B1–B6 cases as before; `verifier-check` 0
+    failing (`bpf_prog_load_guard` 5,613 processed); cold boot 77 pins, 50
+    LSM programs, judge re-armed (5 kfunc keys). `bpftool feature probe`:
+    9 High type refusals (named in the docs). Levels unchanged.

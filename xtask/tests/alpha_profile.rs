@@ -152,6 +152,9 @@ fn a_suppressed_response_says_what_would_have_run() {
 /// Named (lot 341, the review of #550 F8): the start signs an unsigned
 /// downgrade — after its own `agent_boot`, from the chain's previous boot
 /// and the resolved profile — and the profile reaches the attest phase.
+/// Lot 345 (the re-check, N3): the boot's row signs the profile, the
+/// comparison reads the previous boot's PROFILE (not whether it enforced),
+/// and the alarm is kept for `nn-admin status`.
 #[test]
 fn the_start_signs_an_unsigned_downgrade_to_alpha() {
     let code = product_code(&repo_root());
@@ -165,15 +168,29 @@ fn the_start_signs_an_unsigned_downgrade_to_alpha() {
         .contains("profile: &nn_core::response::profile::ResolvedProfile,"));
     let attest = body(evidence, "attest");
     let probe = attest
-        .find("match log.boot_probe(")
+        .find("match log.boot_probe_profiled(")
         .expect("the boot's row");
+    assert!(attest[probe..].contains("Some((profile.profile.as_str(), profile.source.label())),"));
     let check = attest
-        .find("nn_core::response::profile::unsigned_downgrade(\n                            log.previous_boot_enforced(),\n                            profile,\n                        )")
-        .expect("the downgrade judged from the chain and the profile");
+        .find("nn_core::response::profile::unsigned_downgrade(\n                            log.previous_boot_profile(),\n                            profile,\n                        )")
+        .expect("the downgrade judged from the chain's previous profile and the profile");
     let sign = attest
         .find("log.attest_profile_downgrade(&detail)")
         .expect("and signed");
-    assert!(probe < check && check < sign);
+    let kept = attest
+        .find("northnarrow_agent::boot::degradation::keep(")
+        .expect("and kept for the status");
+    assert!(probe < check && check < sign && sign < kept);
+    assert!(!attest.contains("previous_boot_enforced"));
+    // the review of #553 (F2): a downgrade the chain holds, unanswered by
+    // anything signed, is kept for the status at every later start too
+    let pending = attest
+        .find("nn_core::response::profile::pending_downgrade(\n                            log.profile_downgrade_pending(),\n                            profile,\n                        )")
+        .expect("the pending downgrade judged from the chain");
+    let kept_again = attest[pending..]
+        .find("northnarrow_agent::boot::degradation::keep(\n                                nn_core::response::profile::DOWNGRADE_SOURCE,\n                                &detail,\n                                true,")
+        .expect("and kept for the status, its row in the chain");
+    assert!(kept < pending && kept_again > 0);
     let boot = at("agent/src/boot/mod.rs");
     assert!(boot.contains("        &detect_only_source,\n        &profile,\n        integrity,"));
 }

@@ -95,7 +95,12 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
   `--grant-key`) and applies it through the agent (`nn-admin policy set`):
   the signed per-loader opt-out of [`RULE_POLICY.md`](RULE_POLICY.md) §2.5.
   The lines join the policy in force; a loader it already names keeps its
-  line.
+  line, widened to those five types when it lacks some (lot 345; the
+  summary says `(widened: +…)`). The lines are signed over the policy on
+  disk only when it is the verified policy in force (`nn-admin config
+  overlay status` does not say NOT LOADED): an unsigned edit of a kept
+  configuration is never signed with the install's key — the install warns
+  and signs nothing.
 - `--allow-bpf-tools` names `bpftrace` (as found on the system path) and the
   interpreter BCC's tools run under (`/usr/sbin/*-bpfcc` on Debian and
   Ubuntu, `/usr/share/bcc/tools/*` on Fedora: their shebang, `python3`).
@@ -103,13 +108,68 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
   signed line by hand (RULE_POLICY.md §2.5).
 - **What it opens.** The kernel matches a loader by the executable it runs:
   while a line is in force, **any root process running that executable**
-  may load the tracing types — bpftrace runs the script it is given (its
-  `signal()` is `bpf_send_signal`), and BCC's line names the Python
-  interpreter, so any root Python program may. That is the hole §1.1
-  closes, reopened for the tools the tester chose: an alpha host with
-  `--allow-bpf-tools` is not protected against a local root that uses
-  them. The other refused types (`raw_tracepoint_writable`, `struct_ops`,
-  `ext`, `lsm`) take a hook's place and are never named by these flags.
+  may load the tracing types — bpftrace runs the script it is given, and
+  BCC's line names the Python interpreter, so **any root Python script**
+  may. A tracing program reads the memory of every process, the agent's
+  included. `install.sh --help` and its summary say so. The other refused
+  types (`raw_tracepoint_writable`, `struct_ops`, `ext`, `lsm`) take a
+  hook's place and are never named by these flags.
+- **What it does not open (lot 345).** Whoever loads it, opted out or not,
+  the agent refuses a program that would kill or blind it:
+  - an **fmod_ret** (`BPF_MODIFY_RETURN`) program — it overrides the return
+    of any `security_*` function (`security_file_open` failing for the
+    agent blinds it the way an LSM program would). The `bpf` hook reads the
+    attach type from the kernel's copy of the load's arguments;
+  - a program that **calls `bpf_send_signal`, `bpf_send_signal_thread`,
+    `bpf_probe_write_user` or `bpf_override_return`** (and, on 6.13 and
+    later, the `bpf_send_signal_task` kfunc; on 6.18 and later the
+    `bpf_task_work_schedule_signal` / `_resume` kfuncs, which run a
+    callback in a task's own context): the signal kills the agent past its
+    `task_kill` hook, the write rewrites its memory, the override fakes a
+    kernel function's return. bpftrace's `signal()` (behind `--unsafe`) is
+    refused this way; BCC's tools call none of them.
+    - **The kfuncs, in a load of every type (the review of #553).** The
+      kernel also lets a `syscall` program (run with `BPF_PROG_RUN`), an
+      XDP, tc or `cgroup_skb` one call them — types any root loads with no
+      opt-out. From 6.13 the `bpf_prog_load` hook reads every foreign load
+      for them, whatever its type, and refuses it (`EPERM`, signed, the
+      kfunc named): before this release any root process could kill the
+      agent and its watchdog with such a program. No kernel before 6.13
+      has these kfuncs.
+    - **6.9 and later**: judged at the `bpf_prog_load` hook, on the kernel's
+      copy of the instructions, before the verifier — a refused program
+      never gets an id (`EPERM`).
+    - **5.15 to 6.8** (no `bpf_prog_load` hook): judged at the `bpf_prog`
+      hook once the verifier fixed the calls up, on every handle a foreign
+      caller takes (the load's, and one by id: the program has an id a
+      moment before its descriptor). The verified call names the helper by
+      its address, which the agent cannot read from `kallsyms` (its unit has
+      no `CAP_SYSLOG`): it **calibrates** the targets at its start from its
+      own programs (the hook reads the calls of two small programs the
+      agent loads, never attaches and unloads). `bpf_probe_write_user`,
+      which the agent cannot calibrate (a program calling it needs
+      `CAP_SYS_ADMIN`), is refused at the verifier's lockdown question
+      (`locked_down`, `LOCKDOWN_BPF_WRITE_USER`): the load fails with
+      `EINVAL` (the verifier: "unknown func"). A kernel built without
+      `CONFIG_BPF_KPROBE_OVERRIDE` has no `bpf_override_return` to refuse.
+    - A program longer than 1,048,576 instructions, or one the judge cannot
+      read, is refused as if it called one.
+  - Each refusal is a signed `bpf_prog_type` record (High) that names the
+    helper, the kfunc or the fmod_ret. What stays open: a tracing program
+    that reads (the agent's keys in its memory are not protected from it),
+    and what a hand-signed line opening `lsm`, `struct_ops` or `ext` gives
+    its loader (RULE_POLICY.md §2.5: return values are not judged).
+  - **A start that could not arm the judge suspends the opt-outs** (the
+    review of #553): the calibration failed, or read other calls than its
+    programs make — then no `bpf-loader-allow` line is honoured, their
+    types are refused again, and the degradation `bpf content judge` says
+    so. The `locked_down` guard for `bpf_probe_write_user` is attached
+    whatever the calibration does.
+  - **A feature probe is refused like any load (measured).** `bpftool feature
+    probe kernel` (bpftool named by no line) is refused the nine types
+    refused by default: nine signed records, High (Ubuntu 26.04, 7.0) —
+    run it in a trusted-installer window. `bpftrace --info` under the
+    opt-out makes no High record.
 - The flags go with a fresh install that `install.sh` starts (not
   `--upgrade`, `--no-enable` or a package step: refused before anything
   changes). Every load they let through is recorded (`bpf_prog_opt_out`,
@@ -144,12 +204,28 @@ signed `agent_boot` row names the source of detect-only
 is at most L2 while no response runs.
 
 **An unsigned downgrade is an alarm.** A start whose profile is `alpha`
-from the install manifest (or no overlay) right after a run that enforced
-(the chain's last `agent_boot` said `detect_only: false`) signs an
-`integrity_drift` of kind `profile_downgraded` and logs `PROFILE DOWNGRADED
-WITHOUT A SIGNATURE`: a signed `profile.local` that was deleted, or a
-manifest edited while the agent was stopped. A signed `profile = alpha` is
-the operator's switch and raises nothing.
+from the install manifest (or no overlay) right after a run of the
+`enforcing` profile (the chain's last `agent_boot` signed `profile:
+"enforcing"`; lot 345 — a row written before the field: one that ran its
+responses) signs an `integrity_drift` of kind `profile_downgraded` and logs
+`PROFILE DOWNGRADED WITHOUT A SIGNATURE`: a signed `profile.local` that was
+deleted, or a manifest edited while the agent was stopped. Lot 345: the
+comparison is profile to profile — one observing boot of the enforcing
+profile in between (a detect-only drop-in) no longer launders it — and the
+alarm is in `nn-admin status --key` too: a degradation of source `profile`
+(listed below the summary, `sensors : DEGRADED`, and counted against the
+trust level). A signed `profile = alpha` is the operator's switch and
+raises nothing.
+
+**The alarm stays until something signed answers it** (the review of
+#553). One reboot later the previous boot had run `alpha`, and the alarm
+used to vanish. Now every start keeps the degradation while the chain
+holds a `profile_downgraded` row that nothing signed answered since (the
+journal says `PROFILE DOWNGRADE NOT ACKNOWLEDGED`). It ends when a start
+runs a profile from a signed `profile.local`, or after a signed `nn-admin
+config overlay set profile` (alpha or enforcing: the acknowledgement)
+succeeds. An unsigned return to `enforcing` does not end it: the downgrade
+happened, and no key has seen it.
 
 ## 3. What you see
 

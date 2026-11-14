@@ -328,6 +328,14 @@ impl Rule for NnLAt001AntiTamperDenial {
                     self, event, *pid, comm, *target_dev, *target_ino,
                 ));
             }
+            // Lot 345 (the re-check of #550, N2 and point 1 (ii)): the
+            // content refused a load the type alone would let through (a
+            // signed per-loader opt-out names its loader and type)
+            FsProtectOperation::BpfProgType
+                if common::bpf_prog_class::content_refusal(*target_dev).is_some() =>
+            {
+                content_refusal_text(*target_dev, *target_ino)
+            }
             FsProtectOperation::BpfProgType => {
                 let t = u32::try_from(*target_ino).unwrap_or(u32::MAX);
                 format!(
@@ -401,6 +409,41 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 345 (the re-check of #550, N2 and point 1 (ii)): the reason of a
+/// load the content refused (`target_dev` a `bpf_prog_class::CONTENT_*`
+/// code, `target_ino` the program type — 0 when the verifier's lockdown
+/// question refused it, before the type is known).
+fn content_refusal_text(target_dev: u64, target_ino: u64) -> String {
+    use common::bpf_prog_class::{
+        call_target_name, content_refusal, prog_type_name, ContentRefusal,
+    };
+    let program = match u32::try_from(target_ino) {
+        Ok(t) if t != 0 => format!("a `{}` BPF program", prog_type_name(t)),
+        _ => "a BPF program".to_string(),
+    };
+    let what = match content_refusal(target_dev) {
+        Some(ContentRefusal::FmodRet) => {
+            "attached as fmod_ret (BPF_MODIFY_RETURN): it overrides the \
+             return of the function it is attached to, any security_* hook's (security_file_open \
+             failing for the agent blinds it)"
+                .to_string()
+        }
+        Some(ContentRefusal::Call(n)) => format!(
+            "that calls {}: it kills the agent past its task_kill hook, rewrites a process's \
+             memory or overrides a kernel function's return",
+            call_target_name(n)
+        ),
+        _ => "whose instructions could not be read whole (longer than the judge reads, or a \
+             failed read): refused as if it called a helper that kills or blinds the agent"
+            .to_string(),
+    };
+    format!(
+        "to load {program} {what} (or to take a handle on one) — refused to every loader outside \
+         the agent's family and a trusted-installer window, even one the signed per-rule policy's \
+         `bpf-loader-allow` names"
+    )
 }
 
 /// Lot 340: a known system program's feature probe
@@ -1358,6 +1401,80 @@ mod tests {
         }
         let h = v(ev("python3", 0, PROG_TYPE_KPROBE));
         assert_eq!(h.severity, Severity::High);
+    }
+
+    /// Lot 345 (named; the re-check of #550, N2 and point 1 (ii)): a load
+    /// the content refused — an fmod_ret, a forbidden helper's or kfunc's
+    /// call, an unreadable program — is named for what it is, High, and
+    /// says the opt-out does not cover it; the type's own refusal keeps its
+    /// text.
+    #[test]
+    fn a_content_refusal_is_named_and_high() {
+        use common::bpf_prog_class::{
+            CONTENT_CALL, CONTENT_FMOD_RET, CONTENT_UNJUDGED, PROG_TYPE_KPROBE, PROG_TYPE_TRACING,
+        };
+        let ev = |dev: u8, ino: u32| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "python3".into(),
+            target_dev: dev as u64,
+            target_ino: ino as u64,
+            operation: FsProtectOperation::BpfProgType,
+            timestamp_ns: 1,
+        };
+        let v = |e| NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        for (dev, ty, parts) in [
+            (
+                CONTENT_FMOD_RET,
+                PROG_TYPE_TRACING,
+                &["`tracing` BPF program", "fmod_ret", "security_file_open"][..],
+            ),
+            (
+                CONTENT_CALL + 2,
+                PROG_TYPE_KPROBE,
+                &["`kprobe`", "calls bpf_send_signal:"][..],
+            ),
+            (
+                CONTENT_CALL + 3,
+                PROG_TYPE_KPROBE,
+                &["calls bpf_send_signal_thread"][..],
+            ),
+            (
+                CONTENT_CALL + 1,
+                PROG_TYPE_KPROBE,
+                &["calls bpf_override_return"][..],
+            ),
+            (
+                CONTENT_CALL,
+                0,
+                &["load a BPF program that calls bpf_probe_write_user"][..],
+            ),
+            (
+                CONTENT_CALL + 4,
+                PROG_TYPE_TRACING,
+                &["calls bpf_send_signal_task"][..],
+            ),
+            (
+                CONTENT_UNJUDGED,
+                PROG_TYPE_KPROBE,
+                &["could not be read whole"][..],
+            ),
+        ] {
+            let h = v(ev(dev, ty));
+            assert_eq!(h.severity, Severity::High, "{dev}");
+            for part in parts
+                .iter()
+                .chain(&["even one the signed per-rule policy's `bpf-loader-allow` names"])
+            {
+                assert!(h.reasoning.contains(part), "{part}: {}", h.reasoning);
+            }
+        }
+        let t = v(ev(0, PROG_TYPE_KPROBE));
+        assert!(
+            t.reasoning.contains("a type that can rewrite"),
+            "{}",
+            t.reasoning
+        );
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load
