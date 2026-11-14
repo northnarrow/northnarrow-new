@@ -22,10 +22,169 @@
 use std::io;
 use std::path::Path;
 
+/// The review of #558 (F7): the most [`read_state`] reads of a file. The
+/// largest state files its callers read stay far below it — `/proc/stat`
+/// of an 8192-CPU host (about 1 MiB), the mount table of some 80 000
+/// mounts, a socket table (`/proc/<pid>/net/tcp`) of some 100 000 sockets
+/// — while a regular file of any size bound over one (a sparse tmpfs file)
+/// no longer exhausts the agent: a file above it is an error, never cut.
+pub const STATE_MAX_BYTES: u64 = 16 << 20;
+
 /// The file at `path` as text, bytes that are not UTF-8 replaced by U+FFFD.
 /// Fails only when the file cannot be read.
+///
+/// The review of #558 (F7): read bounded and without blocking — opened
+/// `O_NONBLOCK` (a FIFO bound over the file no longer waits for a writer),
+/// a regular file only (procfs, sysfs and cgroupfs files are: a FIFO, a
+/// device such as `/dev/zero`, a directory fail as an error), at most
+/// [`STATE_MAX_BYTES`] (more fails as an error). The error is the caller's
+/// error path as before — never an empty answer.
 pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
-    std::fs::read(path).map(nn_core::posture::host::state_text)
+    read_bounded(path.as_ref(), STATE_MAX_BYTES).map(nn_core::posture::host::state_text)
+}
+
+/// The bytes of the regular file at `path`, at most `max` ([`read_state`]'s
+/// rules with a caller's own bound).
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    read_file_bounded(&f, max)
+}
+
+/// The bytes of an open file, read from its offset: a regular file only
+/// (`fstat`), at most `max` — more is an error, never a cut answer.
+pub fn read_file_bounded(f: &std::fs::File, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let t = f.metadata()?.file_type();
+    if !t.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (a FIFO, a device, a directory): not read",
+        ));
+    }
+    let mut bytes = Vec::new();
+    f.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("more than {max} bytes: not read"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The re-check of #558 (F7): how long a read of the kernel-state round
+/// waits for its answer ([`TimedReader`]). A state file answers in
+/// microseconds; a FUSE file bound over one answers when its daemon cares to.
+pub const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The re-check of #558 (F7): how many reads that did not answer may hold a
+/// helper thread at once — past it, a read fails at once, no thread made.
+pub const STALLED_MAX: usize = 4;
+
+/// The re-check of #558 (F7): a reader with a deadline. `O_NONBLOCK` does
+/// not reach a FUSE file — its `FUSE_OPEN` and `FUSE_READ` wait for the
+/// daemon, before any check of the file — so a regular FUSE file bound over
+/// a file the kernel-state round reads (`/proc/sys/kernel/tainted`,
+/// `/proc/1/stat`, a loader's `/proc/<pid>/stat`) stalled the whole round:
+/// the cross-view, the taint read, the CPU watch and the held set's prune.
+/// [`TimedReader::run`] runs the read on a helper thread and waits for it
+/// at most its deadline: past it the read fails (the helper stays blocked
+/// in the kernel until the daemon answers, counted; at most [`STALLED_MAX`]
+/// of them, then every read fails at once) and the stall is kept for the
+/// round ([`TimedReader::take_stall`]), which the CPU watch takes as a round
+/// it cannot judge — [`crate::own_cpus::UNJUDGED_ROUNDS`] of them in a row
+/// are signed.
+#[derive(Debug)]
+pub struct TimedReader {
+    deadline: std::time::Duration,
+    max: usize,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stall: parking_lot::Mutex<Option<String>>,
+}
+
+/// The kernel-state round's reader ([`READ_DEADLINE`], [`STALLED_MAX`]).
+pub static ROUND_READER: std::sync::LazyLock<TimedReader> =
+    std::sync::LazyLock::new(|| TimedReader::new(READ_DEADLINE, STALLED_MAX));
+
+impl TimedReader {
+    /// A reader waiting at most `deadline`, with at most `max` reads
+    /// unanswered at once.
+    pub fn new(deadline: std::time::Duration, max: usize) -> Self {
+        TimedReader {
+            deadline,
+            max,
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stall: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// `read` (of `what`, in words) on a helper thread, its answer waited
+    /// for at most the deadline; `Err(why)` past it, or at once while
+    /// `max` earlier reads have not answered — the stall kept for
+    /// [`Self::take_stall`].
+    pub fn run<T: Send + 'static>(
+        &self,
+        what: &str,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        use std::sync::atomic::Ordering;
+        let busy = self.in_flight.load(Ordering::SeqCst);
+        if busy >= self.max {
+            return Err(self.stalled(format!(
+                "{what}: not read — {busy} earlier reads have not answered (a FUSE file bound \
+                 over a state file?)"
+            )));
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let in_flight = std::sync::Arc::clone(&self.in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("nn-timed-read".into())
+            .spawn(move || {
+                let out = read();
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(out);
+            });
+        if let Err(e) = spawned {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
+        }
+        rx.recv_timeout(self.deadline).map_err(|_| {
+            self.stalled(format!(
+                "{what} did not answer within {} ms (a FUSE file bound over it?): not read",
+                self.deadline.as_millis()
+            ))
+        })
+    }
+
+    /// `path` as [`read_state`] reads it, within the deadline (a timeout is
+    /// `ErrorKind::TimedOut`).
+    pub fn read_state(&self, path: impl AsRef<Path>) -> io::Result<String> {
+        let path = path.as_ref().to_path_buf();
+        let what = path.display().to_string();
+        self.run(&what, move || read_state(&path))
+            .map_err(|why| io::Error::new(io::ErrorKind::TimedOut, why))?
+    }
+
+    /// The first stall since the last call, if any (the round takes it).
+    pub fn take_stall(&self) -> Option<String> {
+        self.stall.lock().take()
+    }
+
+    /// How many reads have not answered.
+    pub fn unanswered(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn stalled(&self, why: String) -> String {
+        tracing::warn!(detail = %why, "kernel state: a read did not answer");
+        self.stall.lock().get_or_insert_with(|| why.clone());
+        why
+    }
 }
 
 pub use antitamper_bpf::config_read::Config;
@@ -322,6 +481,98 @@ mod tests {
         let text = read_state(&status).unwrap();
         assert!(text.lines().any(|l| l.starts_with("PPid:")), "{text}");
         assert!(read_state("/proc/nonexistent-n6").is_err());
+    }
+
+    /// The review of #558 (F7): a state read never blocks and is bounded —
+    /// a FIFO bound over a state file fails at once (it no longer waits
+    /// for a writer), a device is not read (`/dev/null` was an empty
+    /// answer, `/dev/zero` an endless one), a file above the bound fails
+    /// (never cut), the kernel's files read as before.
+    #[test]
+    fn a_state_read_is_bounded_and_never_blocks() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("stat");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_state(&at).map_err(|e| e.kind()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO's read waited for a writer");
+        assert_eq!(got, Err(io::ErrorKind::InvalidInput));
+        let e = read_state("/dev/null").expect_err("a device is no state file");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(read_state(d.path()).is_err(), "a directory");
+        let big = d.path().join("big");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(STATE_MAX_BYTES + 1).unwrap();
+        let e = read_state(&big).expect_err("above the bound");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        f.set_len(STATE_MAX_BYTES).unwrap();
+        assert_eq!(read_state(&big).unwrap().len() as u64, STATE_MAX_BYTES);
+        assert!(read_bounded(&big, 10).is_err(), "a caller's own bound");
+        let stat = read_state("/proc/self/stat").unwrap();
+        assert!(
+            stat.starts_with(&format!("{} (", std::process::id())),
+            "{stat}"
+        );
+        assert!(
+            read_state("/proc/nonexistent-f7").is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        );
+    }
+
+    /// The re-check of #558 (F7): a FUSE file bound over a state file
+    /// stalled the kernel-state round (`O_NONBLOCK` does not reach FUSE's
+    /// open and read). Here a FIFO opened for reading without `O_NONBLOCK`
+    /// stands for it — the open waits for a writer that never comes, in the
+    /// kernel, as FUSE's does for its daemon. The timed read fails at its
+    /// deadline, keeps the stall for the round, and past `max` unanswered
+    /// reads fails at once without a thread; once the stalled read
+    /// answers, reads go through again.
+    #[test]
+    fn a_read_that_never_answers_is_bounded_in_time() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("tainted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let r = TimedReader::new(std::time::Duration::from_millis(200), 1);
+        let at = fifo.clone();
+        let t0 = std::time::Instant::now();
+        let e = r
+            .run("the taint mask", move || {
+                std::fs::read(&at).map(|b| b.len())
+            })
+            .expect_err("a read that never answers");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "bounded");
+        assert!(e.contains("did not answer within 200 ms"), "{e}");
+        assert_eq!(r.take_stall().as_deref(), Some(e.as_str()));
+        assert_eq!(r.take_stall(), None, "taken once");
+        assert_eq!(r.unanswered(), 1, "its helper still waits");
+        // the bound reached: no second thread, a failure at once
+        let t1 = std::time::Instant::now();
+        let e = r.run("the next read", || 1).expect_err("at the bound");
+        assert!(t1.elapsed() < std::time::Duration::from_millis(150));
+        assert!(e.contains("1 earlier reads have not answered"), "{e}");
+        assert!(r.take_stall().is_some());
+        // the writer comes: the stalled read answers, the reader reads again
+        let w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        drop(w);
+        for _ in 0..200 {
+            if r.unanswered() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(r.unanswered(), 0);
+        assert_eq!(r.run("a read", || 7), Ok(7));
+        let stat = r.read_state("/proc/self/stat").unwrap();
+        assert!(stat.starts_with(&format!("{} (", std::process::id())));
+        assert_eq!(r.take_stall(), None, "answered reads keep no stall");
     }
 
     /// Lot 311 (F4): a failed read is one degradation of its source while

@@ -54,6 +54,15 @@
 //! docs/architecture/module-map.toml, checked by
 //! xtask/tests/workspace_layers.rs.
 
+/// Lot 349 (pre-alpha R090): whether this build of nn-linux has its
+/// `test-util` feature — the test doors (an `UnlockToken` minted for a test,
+/// `ProcRef::for_test`, a test clock) a release must never carry. The agent's
+/// `--build-features` names it (`build_info::DEPENDENCY_TEST_FEATURES`), so
+/// the release workflow's check of every artefact (`none`) refuses a binary
+/// built with it; xtask/tests/supply_chain.rs holds the release build's
+/// resolved features to none of them.
+pub const TEST_UTIL: bool = cfg!(feature = "test-util");
+
 // Lot 283b: whose account a uid is (`login.defs`, `passwd`), for the
 // decision engine's host.
 pub mod accounts;
@@ -434,6 +443,10 @@ pub mod known_system_prog;
 /// Lot 285: the module files' write history pinned beside the pin root
 /// (kept through an agent restart and an upgrade within the boot).
 pub mod module_writes;
+/// Lot 349 (pre-alpha R001): the agent's own CPUs — its threads' affinity
+/// and its cgroup's effective CPUs against those it should run on, read by
+/// the kernel-state round; a confinement is signed and a degradation.
+pub mod own_cpus;
 /// Lot 273d: our units' own drop-ins made inside a window, judged at its
 /// close.
 pub mod own_dropins;

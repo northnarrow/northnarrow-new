@@ -68,6 +68,7 @@
 #   deploy/lab/nn-lab.sh foreign-bpf-check  # lot 290: foreign BPF — the refused program types (a kprobe with bpf_probe_write_user, bpftrace outside/inside a window, the signed per-loader opt-out), the agent's objects off limits (FOREIGN_BPF_ONLY="F2 F4" a subset), the frozen maps, the cross-view (its status file, a program loaded in the agent's gap), systemd's BPF unit features, R011 Low
 #   deploy/lab/nn-lab.sh host-deny-check    # lot 341: the host's integrity and the agent's self-protection under every profile — a foreign tracing program, bpftrace and a BCC/libbpf tool refused unless the signed policy names their loader (install.sh --allow-bpf-tools), the agent's maps, programs and links, kernel.ftrace_enabled=0, kprobes/enabled=0, a SIGSTOP to the agent and a cgroup v1 freezer move refused (the guard enforcing: NN_BPF_DEFENSE_ENFORCE=1 in the units' environment)
 #   deploy/lab/nn-lab.sh bpf-content-check  # lot 345: a loader the signed opt-out names (install.sh --allow-bpf-tools, NN_LAB_INSTALL_EXTRA) still cannot load a program calling bpf_send_signal(_thread), bpf_override_return or bpf_probe_write_user, nor an fmod_ret — bpftrace, BCC and a plain tracing program still load
+#   deploy/lab/nn-lab.sh cpu-confine-check  # lot 349: the agent's own CPUs — a sibling cgroup partition confining it to CPU 0 is a signed cpu_confined High and an own_cpus degradation in nn-admin status; the cpuset controller enabled above it, a CPU hotplug, systemd's AllowedCPUs= on its slice (in a window) record nothing
 #   deploy/lab/nn-lab.sh own-pins-check     # lot 301: every BPF object the agent pins is its own to the guard — no link of the agent's (the start-in-cgroup tracker's among them) given to root by id, a handle on and a detach of the tracker's links refused and signed, the tracker still marking (the guard enforcing for the run; KEEP_ENFORCE=1 leaves it so)
 #   deploy/lab/nn-lab.sh deny-selftest-check  # lot 302: every deny hook proves it denies each round — the guard enforcing for the run, ROUNDS rounds with every attempt refused and reported, nothing judged or held back, the budgets spent before 2 rounds, one hook detached on purpose (DETACH=inode_mknod: the degradation, then the alert), the bpf() guard refusing through a restart gap (SKIP_DETACH=1 / SKIP_GAP=1 leave those out; KEEP_ENFORCE=1)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
@@ -1784,6 +1785,17 @@ cmd_bpf_content_check() {
     vssh "cd ~/northnarrow && bash deploy/lab/malsim/bpf-content-check.sh"
 }
 
+cmd_cpu_confine_check() {
+    # Lot 349 (deploy/lab/malsim/cpu-confine-check.sh): the agent's own
+    # CPUs — a sibling cgroup in cpuset.cpus.partition=root confining it to
+    # CPU 0 is signed (NN-L-AT-001 cpu_confined, High) and shown in
+    # `nn-admin status` while it holds; the cpuset controller enabled above
+    # it, a CPU taken offline and back, systemd's AllowedCPUs= on its slice
+    # (in a signed window) record nothing. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && bash deploy/lab/malsim/cpu-confine-check.sh"
+}
+
 cmd_own_pins_check() {
     # Lot 301 (deploy/lab/malsim/own-pins-check.sh): every BPF object the
     # agent pins is its own to the BPF guard — no link of the agent's given
@@ -2603,6 +2615,7 @@ case "${1:-help}" in
     foreign-bpf-check) cmd_foreign_bpf_check ;;
     host-deny-check) cmd_host_deny_check ;;
     bpf-content-check) cmd_bpf_content_check ;;
+    cpu-confine-check) cmd_cpu_confine_check ;;
     own-pins-check) cmd_own_pins_check ;;
     selftest-check) cmd_selftest_check ;;
     deny-selftest-check) cmd_deny_selftest_check ;;

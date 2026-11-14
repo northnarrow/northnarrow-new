@@ -32,6 +32,23 @@
 #      program, still load. Measured (no kfunc): skipped.
 #  B8  (the review of #553, F5) measured: what `bpftool feature probe
 #      kernel` and `bpftrace --info` make the agent record (count, High).
+#  B9  (lot 349, pre-alpha R002) a program the judge refuses outside a
+#      window, loaded INSIDE one and pinned — a kprobe calling
+#      bpf_send_signal, and (6.13+) a syscall program calling
+#      bpf_send_signal_task: after the window its handle by id and through
+#      its pin is refused to root, signed naming the call (from 6.9 the
+#      verdict is kept at the load; before, the calibrated judge reads it at
+#      the handle). The pins are removed.
+#  B10 (the review of #558, F1) the window's loader KEEPS its descriptor: a
+#      kprobe calling bpf_send_signal(SIGKILL) for the agent's pid, and
+#      (6.13+) a syscall program calling bpf_send_signal_task(agent,
+#      SIGKILL), loaded inside a window by processes that stay alive; after
+#      the window each uses its own descriptor and one taken with
+#      pidfd_getfd — the syscall program by BPF_PROG_RUN, the kprobe by a
+#      perf event's PERF_EVENT_IOC_SET_BPF and by BPF_LINK_CREATE, both as a
+#      prog array's value. Every use refused (EPERM), the load signed
+#      (bpf_held_load) and each kind of use signed (bpf_held_use), the agent
+#      alive with the same pid.
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -176,6 +193,81 @@ for tool in "bpftool feature probe kernel" "bpftrace --info"; do
     echo "=== CASE B8 $tool: rc=$rc records $all high $high ops ${ops:-none} responses ${why:-none}"
     measure "B8 $tool: $all record(s), $high High"
 done
+
+# B9: a window's forbidden load, taken after the window
+NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent </dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
+KEY=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" </dev/null && { echo "$k"; break; }; done)
+PINS=/sys/fs/bpf/k349b9
+if [[ -n $KEY ]]; then
+    sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 40 </dev/null >/dev/null 2>&1
+    wend=$(( $(date +%s) + 40 ))
+    declare -A LOADED
+    LOADED[kprobe]=$(sudo $PROBE load-tracing --call send_signal --name k349_sig --pin $PINS/sig </dev/null 2>&1)
+    LOADED[syscall]=$(sudo $PROBE load-kfunc-signal --type syscall --pid "$APID" --sig 28 --name k349_kf --pin $PINS/kf </dev/null 2>&1)
+    echo "=== CASE B9 window loads: rc=0 kprobe: ${LOADED[kprobe]} | syscall: ${LOADED[syscall]}"
+    while (( $(date +%s) <= wend )); do sleep 2; done
+    sleep 3
+    for ty in kprobe syscall; do
+        o=${LOADED[$ty]}
+        if [[ $ty == syscall && $o == *NOFUNC* ]]; then
+            measure "B9 no bpf_send_signal_task in this kernel's BTF (before 6.13)"
+            continue
+        fi
+        id=$(echo "$o" | grep -o ' id [0-9]*' | awk '{print $2}')
+        [[ -n $id ]] || { bad "B9 the $ty program not loaded in the window: $o"; continue; }
+        call=$([[ $ty == kprobe ]] && echo bpf_send_signal || echo bpf_send_signal_task)
+        pin=$([[ $ty == kprobe ]] && echo $PINS/sig || echo $PINS/kf)
+        for how in "prog-fd-by-id $id" "obj-get $pin"; do
+            n0=$(lines "$DET")
+            r1=$(sudo $PROBE $how </dev/null 2>&1)
+            sleep 1.5
+            r=$(reason "$n0")
+            echo "=== CASE B9 $ty ${how%% *} after the window: rc=0 $r1"
+            echo "    record: ${r:-(none)}"
+            [[ $r1 == "ERR EPERM"* && $r == *"a call of $call"* ]] && pass "B9 the window's $ty program ($call): ${how%% *} refused after the window, signed" || bad "B9 the window's $ty program ($call): ${how%% *} after the window: $r1 / ${r:-no record}"
+        done
+    done
+    sudo rm -rf "$PINS" </dev/null
+else
+    measure "B9 no admin key on this guest: no window"
+fi
+
+# B10: a window's forbidden load, used after the window through its loader's
+# own descriptor (the review of #558, F1)
+if [[ -n $KEY ]]; then
+    sleep 2
+    n0=$(lines "$DET")
+    sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 20 </dev/null >/dev/null 2>&1
+    until=$(( $(date +%s) + 25 ))
+    OUTS=$(mktemp -d)
+    for ty in kprobe syscall; do
+        sudo timeout 90 $PROBE held-use --type $ty --pid "$APID" --sig 9 --until $until --name "k558_$ty" </dev/null >"$OUTS/$ty" 2>&1 &
+    done
+    wait
+    sleep 2
+    for ty in kprobe syscall; do
+        o=$(tr '\n' ' ' < "$OUTS/$ty")
+        echo "=== CASE B10 $ty kept descriptor after the window: rc=0 $o"
+        if [[ $ty == syscall && $o == *NOFUNC* ]]; then
+            measure "B10 no bpf_send_signal_task in this kernel's BTF (before 6.13)"
+            continue
+        fi
+        id=$(echo "$o" | grep -o 'LOADED id [0-9]*' | awk '{print $3}')
+        [[ -n $id ]] || { bad "B10 the $ty program not loaded in the window: $o"; continue; }
+        uses=$(echo "$o" | grep -o 'USES .*' | cut -c6-)
+        nuse=$(echo "$uses" | grep -o '=' | wc -l); nref=$(echo "$uses" | grep -o '=ERR EPERM' | wc -l)
+        kinds=$(echo "$uses" | tr ' ' '\n' | grep -o '^[a-z-]*-' | sort -u | wc -l)
+        held=$(recs "$n0" bpf_held_load | grep -c "program id $id ")
+        used=$(recs "$n0" bpf_held_use | grep -c "of program id $id,")
+        echo "    uses $nuse, refused $nref, kinds $kinds; records: bpf_held_load x$held, bpf_held_use x$used"
+        [[ $nuse -gt 0 && $nref -eq $nuse ]] && pass "B10 $ty: every use of the kept descriptor refused ($nref/$nuse)" || bad "B10 $ty: a use let through: $uses"
+        [[ $held -ge 1 ]] && pass "B10 $ty: the window's load signed (bpf_held_load)" || bad "B10 $ty: the window's load not signed"
+        [[ $used -ge $kinds ]] && pass "B10 $ty: each kind of use signed (bpf_held_use x$used, $kinds kinds)" || bad "B10 $ty: uses signed x$used for $kinds kinds"
+    done
+    rm -rf "$OUTS"
+else
+    measure "B10 no admin key on this guest: no window"
+fi
 
 systemctl is-active --quiet northnarrow-agent && [[ $(agent_pid) == "$APID" ]] && pass "B6 the agent active, same pid" || bad "B6 the agent restarted or stopped"
 echo "=== CASE B-END: rc=$fail"

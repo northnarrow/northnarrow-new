@@ -2370,6 +2370,208 @@ detail.
     because it is not in a system tree.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes.
 
+## 43. The agent's own CPUs, a window's BPF load, the release's features (lot 349)
+
+- **A confinement of the agent's CPUs is a signed record.** A sibling
+  cgroup in `cpuset.cpus.partition=root` (or `isolated`) takes its CPUs
+  from every other cgroup of the parent — the agent's among them — with no
+  hook asked: root could confine the agent to one CPU and nothing was
+  recorded. Every 5 s the kernel-state round now compares each thread's
+  CPU affinity and the agent's cgroup's `cpuset.cpus.effective` with the
+  CPUs it should run on: the online CPUs, less those `isolcpus=` isolates,
+  narrowed by systemd's `[Manager] CPUAffinity=` (read at the agent's
+  start) and by the `cpuset.cpus` of a slice above it (`AllowedCPUs=` on
+  `northnarrow.slice`). A shrink is a signed NN-L-AT-001 `cpu_confined`
+  High that names the cause (a partition and its cgroup, the agent's own
+  cgroup's `cpuset.cpus`, a thread's affinity, a move to another cgroup),
+  and the degradation `own_cpus` in `nn-admin status --key` ("the agent may
+  run on CPUs 0 of the 0-3 it should …") while it holds; when it ends the
+  degradation leaves the status.
+  - **What records nothing:** a CPU taken offline or brought back (each
+    round is judged against the CPUs online at its two reads and at the
+    last round's: the kernel narrows the masks to the active CPUs), a container runtime enabling
+    the cpuset controller above the agent, and `AllowedCPUs=` on
+    `northnarrow.slice` set by systemd (a reservation: set it inside a
+    trusted-installer window, as any change of the slice). A host whose
+    real-time workload uses an `isolated` partition gets the record: the
+    agent does run on fewer CPUs there.
+  - **Removing that `AllowedCPUs=` is recorded (measured, true).** When
+    systemd then drops the cpuset controller from the slice, the kernel
+    leaves the agent's threads on the CPUs they had (Ubuntu 22.04 and
+    24.04: three of four after `AllowedCPUs=0-2` was reset): the agent
+    does run on fewer CPUs than it should, and says so (`cpu_confined`,
+    cause `affinity`). Restart the agent (inside a window) to give it every
+    CPU back; it does not widen its own threads' masks.
+  - **Nothing blinds it silently (the review of #558, F2, F3, F6, F7).**
+    - A round it cannot judge — the online CPUs moving at every round (root
+      toggling a CPU), a cgroup file it reads reached through a mount — no
+      longer passes silently: three in a row are a signed `cpu_confined`
+      High, cause "the watch could not judge".
+    - The online CPUs, `/proc/stat`, `/proc/self/cgroup` and the thread
+      list are files opened once at the agent's start (a sysfs or procfs
+      file, by its filesystem's magic: a FUSE file there at the start is
+      refused) and read afresh each round: a file bound over
+      `/sys/devices/system/cpu/online` later changes nothing. The expected
+      CPUs are the union of the online list and `/proc/stat`'s: one faked
+      source cannot narrow them.
+    - The cgroup files are opened beneath the cgroup root opened at the
+      start (`openat2`, `RESOLVE_NO_XDEV`, no symlinks): a bind mount over
+      the slice's `cpuset.cpus` (or over the slice's directory) makes the
+      round unjudged, never a narrower expectation; the partition walk
+      skips mounted directories.
+    - systemd's repeated `[Manager] CPUAffinity=` are merged, as systemd
+      does (an empty one resets): the expectation was the last one alone,
+      narrower. The agent unit's own `CPUAffinity=` (an operator pinning
+      the EDR to housekeeping CPUs) is what it should run on when every
+      file that sets it is in the agent's unit directories and older than
+      the install; set later, or in a host-wide drop-in, it stays a
+      confinement (the drop-in judge's assumption on ctime).
+    - Every state read (`read_state`, the watch's sources) opens
+      non-blocking, takes a regular file only and reads at most a bound
+      (16 MiB; the watch's sources 4 MiB): a FIFO or `/dev/zero` bound over
+      one no longer stalls the round or exhausts the agent.
+    - **A read that does not answer no longer stalls the round (its
+      re-check, F7).** `O_NONBLOCK` does not reach a FUSE file: a regular
+      FUSE file bound over `/proc/sys/kernel/tainted`, `/proc/1/stat`, a
+      loader's `/proc` files or a file the CPU watch reads at its start
+      stalled the whole kernel-state round (the cross-view, the taint
+      read, the CPU watch, the held set's prune). Those reads now wait at
+      most 2 s for their answer (a helper thread; at most four left
+      blocked, then each such read fails at once): the round goes on, and
+      a round with such a read is one the CPU watch cannot judge — three
+      in a row are the signed `cpu_confined` "could not judge" record,
+      naming the read.
+    - Still open: another sysfs or procfs file bound over the online file
+      BEFORE the agent starts passes the magic check (the union keeps it
+      from narrowing unless both sources are faked); a FUSE regular file
+      bound over a file the round reads costs each round its 2 s deadline
+      (reads outside that round are not timed); a slice's `cpuset.cpus`
+      written inside a window narrows the expectation; `CPUAffinity=numa` is not read;
+      three rounds of real hotplug in a row give the "could not judge"
+      record (true: the watch could not judge).
+  - Not watched: the watchdog's CPUs (the agent's own threads only).
+- **A program loaded in a window cannot be taken after it (6.9 and
+  later).** A program the BPF content judge refuses outside a window (a
+  tracing program calling `bpf_send_signal`, `bpf_probe_write_user`,
+  `bpf_override_return`; from 6.13 any program calling
+  `bpf_send_signal_task`) loaded INSIDE a trusted-installer window was, on
+  6.9 and later, free for any root process to take by id or through its pin
+  once the window closed — and to attach or run (a `syscall` program
+  signalled the agent past its `task_kill` hook). Its handles after the
+  window are refused now (`EPERM`, signed `bpf_prog_type`, the call named),
+  as before 6.9.
+  - **Nor run or attached after it, through any descriptor (every
+    kernel; the review of #558).** The loader's own descriptor, kept from
+    inside the window (or passed over a socket, or taken by another root
+    process with `pidfd_getfd`), ran or attached the program after the
+    window with no refusal and no record: `BPF_PROG_RUN` of a `syscall`
+    program calling `bpf_send_signal_task` (6.13+), a kprobe calling
+    `bpf_send_signal` attached by a perf event's `PERF_EVENT_IOC_SET_BPF`
+    (silent) or by `BPF_LINK_CREATE` (Medium only), on every kernel. The
+    program, not the descriptor, is judged now: every `BPF_PROG_RUN`,
+    `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`, `BPF_LINK_UPDATE`,
+    `BPF_RAW_TRACEPOINT_OPEN`, `PERF_EVENT_IOC_SET_BPF` and prog-array
+    update (a tail call's slot) of a held program outside a window, by a
+    process outside the agent's family, is refused (`EPERM`) and signed
+    (`bpf_held_use`, High, naming the use and the program id).
+  - **The window's load itself is signed** (`bpf_held_load`, High, not
+    refused, naming the call and the program id), on every kernel, so it
+    is never silent — even where it is used in a way no hook sees.
+  - **A tail call's slot fails closed (its re-check, N1).** A prog array's
+    update was judged on its value read the way a user pointer is read,
+    and let through when that read failed: a value in a page not yet in
+    memory (the kernel's own copy, after the check, brings it in) or the
+    kernel pointer a `syscall` program's own update passes
+    (`bpf_sys_bpf`). A held program then went into a slot, and a clean
+    program's run jumped into it with no record. The kernel's read is
+    tried next now, and a value neither read gives is refused (`EPERM`,
+    `bpf_held_use` High, "a value not read", the prog array's map id). A
+    tool that updates a prog array from a page it never touched gets
+    `EPERM` once and succeeds when it retries.
+  - **Still loaded after the window: signed (its re-check, item 2).**
+    Once no window is open, the kernel-state round signs each held
+    program still loaded — attached by a link or an attach made inside
+    the window, pinned, or kept by a descriptor — as `bpf_held_load`
+    High, "still loaded after the window closed", naming the program,
+    its call and where it is attached; once per program and per agent
+    start (an agent restart signs it again).
+  - **What stays open:** what was attached INSIDE the window keeps running
+    after it (a link, pinned or not; a perf event; a prog array filled
+    then; an iterator link read later with `cat`), and an XDP or tc program
+    attached over netlink (`ip link`, `tc`: no `bpf(2)` command; 6.13+
+    only, where such a program can call `bpf_send_signal_task`). A
+    descriptor swapped by another thread (`dup2`) between the hook's read
+    and the kernel's, or a prog array's value rewritten in that gap, can
+    win a race: each lost attempt is refused and signed. Check
+    `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
+  - **Held across an agent restart, emptied as programs go.** The held set
+    (`PROG_CONTENT_HELD`, 1024 ids) is pinned now: a restart keeps it. Each
+    kernel-state round removes the ids no longer loaded. When it is full,
+    a window's forbidden load is refused (`bpf_held_use`, "held set full":
+    fail closed) instead of being kept nowhere.
+  - **A program loaded before the agent started** is signed High at the
+    agent's start when its type is one the agent refuses outside a window
+    (the cross-view's baseline, `bpf_baseline`, naming its id, name, tag and
+    attach point); before 6.9 its handles are judged and refused like any,
+    from 6.9 they are not, nor (on any kernel) the runs and attaches of the
+    descriptor its loader kept: its content cannot be read without the
+    calibration the older kernels need, and a dump of it
+    (`BPF_OBJ_GET_INFO_BY_FD`) has its calls blanked for a reader without
+    `CAP_SYSLOG`, which the agent's unit does not grant. Remove such a
+    program, or reboot, before you trust the host.
+- **A copy of `/etc` over `/etc` is signed, as before.** Mounted after the
+  agent loaded its key, it is `integrity_drift` `mount_over_protected` in
+  the audit chain within one integrity round (30 s), naming the mount and
+  each protected path it hides (measured on Ubuntu 24.04 and 26.04). No
+  hook refuses the mount.
+- **`--build-features` names the linked crates' test features.** A binary
+  whose nn-core or nn-linux was built with `test-util` (a `cargo test`
+  build: their test doors) prints `nn-core/test-util,nn-linux/test-util`
+  beside the agent's own lab features; a release build prints `none` as
+  before, and release.yml refuses any artefact that does not.
+  - **Its limits (the review of #558, F8, named).** The ratchet's `--cfg`
+    scan reads release.yml and `.cargo/config.toml` only — not a legacy
+    `.cargo/config`, a `RUSTFLAGS` set by xtask, a script writing
+    `$GITHUB_ENV`, nor a `build.rs` printing `cargo::rustc-cfg`. The
+    backstop is `--build-features` on the artefact, which sees any of them
+    for nn-core's and nn-linux's `test-util` in the agent binary only: the
+    watchdog and nn-admin are not asked, and no symbol check is made (Phase
+    1 checks the shipped binaries). Its name filter for third-party test
+    features (`test`, `debug`, `demo`, `mock`, `fake`) fails closed on a
+    harmless name (`debugger_visualizer`): such a feature is classified by
+    hand.
+- **Nothing to configure.** No overlay, allowlist or signed policy changes;
+  the eBPF object adds two maps: `PROG_CONTENT_HELD`, pinned under the pin
+  root (an uninstall removes it with the rest), and
+  `PROG_CONTENT_HELD_INFLIGHT`, unpinned. Two new NN-L-AT-001 operations:
+  `bpf_held_load` (not refused) and `bpf_held_use` (refused).
+- **Residuals, named (the re-check of #558).**
+  - **P1, after the alpha: the trusted-installer window is the host's.**
+    While it lasts, EVERY root process gets what it lifts — an untrusted
+    module, kexec, the protected files, `systemctl stop` of the agent, a
+    forbidden BPF load and what it attaches — not only the process tree
+    of the `nn-admin trusted-installer-grant` that opened it. Scoping the
+    window to the requester's tree is one fix for all of them; until then
+    open a window only on a host you trust for its length, and keep it
+    short (`--window-secs`).
+  - **P2: the `dup2` race.** Another thread's `dup2` of a descriptor
+    between the agent's check and the kernel's own read (a few
+    microseconds), or a prog array's value rewritten in that gap, can
+    win: each lost attempt is refused and signed (`bpf_held_use`), so a
+    tight loop leaves records as it tries, and the load was signed. No
+    hook exists that sees the resolved program for every run and attach.
+  - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
+    attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
+    carry a map's descriptor where the agent reads a program's: on 6.8 a
+    counted fail-open (with a rate-limited `deny_fail_open` record), on
+    7.0 a random id that is never held in practice — noise on hosts with
+    sched_ext or a BPF TCP congestion control, never a false refusal.
+  - **P3: the CPU watch's sources trusted by filesystem type.** A file of
+    the same filesystem bound over the online list and `/proc/stat` (or a
+    cgroup2 subtree over `/sys/fs/cgroup`) BEFORE the agent's first round
+    passes the check and can narrow what it expects; it needs a boot unit
+    or an upgrade, since the agent does not restart outside a window.
+
 ## 44. Our own install, boot and uninstall: no High; a purge leaves nothing undeclared (lot 350)
 
 - **rsyslog's log after a fresh install is no truncation.** The agent's

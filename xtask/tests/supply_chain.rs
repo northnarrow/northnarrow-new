@@ -3292,3 +3292,224 @@ fn codeql_scans_every_language_of_the_tree() {
         assert!(!code.contains(banned), "{FILE}: `{banned}`");
     }
 }
+
+/// Lot 349 (pre-alpha R090): the features no release may carry — the test
+/// doors (`test-util`: nn-core's and nn-linux's, an `UnlockToken` minted for
+/// a test, `ProcRef::for_test`, a test clock; tokio's `test-util`, its paused
+/// clock), the lab's (`test-privileged`, `debug-trigger`), the demos'
+/// (`demo-tappa5`, `posture-demo`) and the agent tests' OCSF validator
+/// (`schema-check`).
+const TEST_ONLY_FEATURES: &[&str] = &[
+    "test-util",
+    "test-privileged",
+    "debug-trigger",
+    "demo-tappa5",
+    "posture-demo",
+    "schema-check",
+];
+
+/// Lot 349 (pre-alpha R090): the workspace's features a release may carry
+/// (`default`, nn-common's `std`, nn-export's `sinks`; nn-scan's `yara`,
+/// whose build fails with the reason). A feature a member declares is in one
+/// list or the other.
+const RELEASE_FEATURES: &[&str] = &["default", "std", "sinks", "yara"];
+
+/// Lot 349: the packages of `cargo tree --workspace` with `edges` (the
+/// features too), and the features each has, as (package, feature).
+fn resolved_features(
+    edges: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<(String, String)>,
+) {
+    let out =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(repo_root())
+            .args([
+                "tree",
+                "--workspace",
+                "--locked",
+                "--offline",
+                "-e",
+                edges,
+                "--prefix",
+                "none",
+                "-f",
+                "{p} [{f}]",
+            ])
+            .output()
+            .expect("cargo tree runs");
+    assert!(
+        out.status.success(),
+        "cargo tree failed (build the workspace once, or `cargo fetch --locked`):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut packages = std::collections::BTreeSet::new();
+    let mut found = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = line.split_whitespace().next().unwrap_or("").to_string();
+        // a feature node: `nn-core feature "test-util"` (then, maybe, why)
+        if let Some(rest) = line.split(" feature \"").nth(1) {
+            let f = rest.split('"').next().unwrap_or("");
+            found.insert((name, f.to_string()));
+            continue;
+        }
+        // a package node: `nn-core v0.0.1 (/…) [a,b]`
+        if let (Some(open), Some(close)) = (line.rfind(" ["), line.rfind(']')) {
+            packages.insert(name.clone());
+            for f in line[open + 2..close].split(',').filter(|f| !f.is_empty()) {
+                found.insert((name.clone(), f.to_string()));
+            }
+        }
+    }
+    (packages, found)
+}
+
+/// Lot 349 (pre-alpha R090, named): the release build's feature set — the
+/// exact build release.yml runs (`cargo --locked xtask build --release
+/// --locked`, no `--features`: PROC-015 above), which is `cargo build
+/// --workspace --release` (xtask's userland build) — enables no test-only
+/// feature of any crate. Its graph is the workspace's normal and build
+/// edges: a dev-dependency's feature (the agent's tests ask nn-core and
+/// nn-linux for `test-util`) is not in it. Adding `features = ["test-util"]`
+/// to a normal dependency, a test feature to a default, or a `test` /
+/// `debug` / `demo` / `mock` feature of any crate to the release path fails
+/// here.
+#[test]
+fn the_release_build_enables_no_test_feature() {
+    let wf = fs::read_to_string(repo_root().join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        wf.contains("run: cargo --locked xtask build --release --locked"),
+        "release.yml: the release build this test resolves is `cargo --locked xtask build \
+         --release --locked`"
+    );
+    let xtask = fs::read_to_string(repo_root().join("xtask/src/main.rs")).unwrap();
+    assert!(
+        xtask.contains("cmd.current_dir(&root).args([\"build\", \"--workspace\"]);"),
+        "xtask's userland build is `cargo build --workspace` (the graph resolved here)"
+    );
+    let (packages, release) = resolved_features("normal,build,features");
+    for krate in [
+        "northnarrow-agent",
+        "northnarrow-watchdog",
+        "nn-core",
+        "nn-linux",
+        "tokio",
+    ] {
+        assert!(
+            packages.contains(krate),
+            "cargo tree's release graph does not list {krate} ({} packages read)",
+            packages.len()
+        );
+    }
+    let bad: Vec<String> = release
+        .iter()
+        .filter(|(_, f)| {
+            TEST_ONLY_FEATURES.contains(&f.as_str())
+                || ["test", "debug", "demo", "mock", "fake"]
+                    .iter()
+                    .any(|w| f.to_ascii_lowercase().contains(w))
+        })
+        .map(|(p, f)| format!("{p}/{f}"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "the release build (cargo build --workspace --release) enables test-only features: {}",
+        bad.join(", ")
+    );
+    // the mini-hunt: a `--cfg feature="…"` in the release's flags turns a
+    // test door on with no feature at all (cargo tree would not see it)
+    for rel in [".github/workflows/release.yml", ".cargo/config.toml"] {
+        let text = fs::read_to_string(repo_root().join(rel)).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            assert!(
+                code.starts_with('#') || !code.contains("--cfg"),
+                "{rel}:{}: a --cfg in the release's flags: {code}",
+                i + 1
+            );
+        }
+    }
+    // the reader sees one where there is one: the tests' graph has them
+    let (_, tests) = resolved_features("normal,build,dev,features");
+    for want in [("nn-core", "test-util"), ("nn-linux", "test-util")] {
+        assert!(
+            tests.iter().any(|(p, f)| p == want.0 && f == want.1),
+            "the dev graph should show {}/{}: the parse reads nothing",
+            want.0,
+            want.1
+        );
+    }
+}
+
+/// Lot 349 (pre-alpha R090, named): every feature a workspace member
+/// declares is classified — one a release may carry, or a test-only one —
+/// and every test-only feature of a crate the agent links is named by the
+/// agent's `--build-features` (`build_info::LAB_FEATURES` for its own,
+/// `DEPENDENCY_TEST_FEATURES` for its dependencies'), which release.yml
+/// checks to be `none` on the tarball's, the .deb's and the .rpm's binary:
+/// a shipped binary built with one is refused before the upload.
+#[test]
+fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
+    let members = support::members();
+    let mut unclassified = Vec::new();
+    for m in &members {
+        for f in &m.features {
+            if !TEST_ONLY_FEATURES.contains(&f.as_str()) && !RELEASE_FEATURES.contains(&f.as_str())
+            {
+                unclassified.push(format!("{}/{f}", m.name));
+            }
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "classify each feature as release (RELEASE_FEATURES) or test-only (TEST_ONLY_FEATURES): {}",
+        unclassified.join(", ")
+    );
+    let info = fs::read_to_string(repo_root().join("agent/src/build_info.rs")).unwrap();
+    let agent = members
+        .iter()
+        .find(|m| m.name == "northnarrow-agent")
+        .expect("the agent");
+    let linked: Vec<&str> = agent
+        .deps
+        .iter()
+        .filter(|d| d.kind == "normal" && d.path)
+        .map(|d| d.name.as_str())
+        .collect();
+    let mut unnamed = Vec::new();
+    for m in members.iter().filter(|m| linked.contains(&m.name.as_str())) {
+        for f in m.features.iter().filter(|f| f.as_str() == "test-util") {
+            let entry = format!("(\"{}/{f}\", ", m.name);
+            if !info.contains(&entry) {
+                unnamed.push(format!("{}/{f}", m.name));
+            }
+        }
+    }
+    assert!(
+        unnamed.is_empty(),
+        "build_info::DEPENDENCY_TEST_FEATURES must name {}",
+        unnamed.join(", ")
+    );
+    for (entry, krate) in [
+        ("nn-core/test-util", "nn_core"),
+        ("nn-linux/test-util", "nn_linux"),
+    ] {
+        assert!(
+            info.contains(&format!("(\"{entry}\", {krate}::TEST_UTIL),")),
+            "build_info names {entry} with what {krate} was compiled with"
+        );
+        let lib = if krate == "nn_core" {
+            "crates/nn-core/src/lib.rs"
+        } else {
+            "crates/nn-linux/src/lib.rs"
+        };
+        assert!(fs::read_to_string(repo_root().join(lib))
+            .unwrap()
+            .contains("pub const TEST_UTIL: bool = cfg!(feature = \"test-util\");"));
+    }
+    assert!(
+        info.contains(".chain(DEPENDENCY_TEST_FEATURES)"),
+        "build_features() names the dependencies' test features"
+    );
+}

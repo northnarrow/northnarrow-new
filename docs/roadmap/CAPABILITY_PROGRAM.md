@@ -11346,6 +11346,169 @@ number in parentheses is a lab PR.
   - Levels unchanged: false-positive work of the alpha; no new capability.
 
 
+- **Lot 349 — pre-alpha self-protection blockers R001–R003 and the release
+  feature ratchet R090 (rc2; C23, C27; no level changes).**
+  - What was open at rc1 (a5eb2744, the pre-alpha checks): R001, root
+    confined the agent to one CPU through a sibling cgroup in
+    `cpuset.cpus.partition=root` with no hook and no record (the review of
+    #557, F1); R002, from 6.9 a program loaded inside a window, or before the
+    agent, could be taken by id; R003, a copy of `/etc` mounted over `/etc`
+    after the key load; R090, no check that a release build enables no
+    test-only feature.
+  - Done: (R001) the kernel-state round reads every thread's affinity and
+    the agent's cgroup's effective CPUs against the CPUs it should run on
+    (online, less `isolcpus=`, narrowed by systemd's `CPUAffinity=` at the
+    start and a slice's `cpuset.cpus`); a shrink is NN-L-AT-001
+    `cpu_confined` High naming the cause and the degradation `own_cpus`
+    while it holds (`crates/nn-linux/src/own_cpus.rs`, a new
+    `FsProtectOperation`); the online CPUs come from the online list and
+    `/proc/stat` together; a round whose online CPUs moved is skipped.
+    (R002) the load hook scans a window's foreign load too and the
+    `bpf_prog` hook keeps the verdict by program id; a later handle by id
+    or pin outside a window is refused and signed in every mode. (R003)
+    measured, unchanged: the integrity round signs it today. (R090) an xtask
+    ratchet resolves the release graph (`cargo tree --workspace -e
+    normal,build,features`) and fails on any test-only feature, any
+    unclassified feature of a member, a `--cfg` in the release's flags; the
+    agent's `--build-features` names its linked crates' `test-util`, which
+    release.yml's artefact check refuses.
+  - Lab (as measured): our own guests, one at a time, alpha profile with
+    `--allow-bpf-tools`, a fresh install each round (ubuntu2204 had another
+    lot's rc1 install left without `--purge`: recorded and purged before the
+    round, nothing measured on it), uninstalled with `--purge` after. Before
+    = rc1 a5eb2744, after = the lot. **ubuntu2404** (6.8.0-149): before, a
+    sibling partition of CPUs 1–3 left the agent's 43 threads on CPU 0 with
+    no record, no degradation; the window's and the pre-agent `bpf_send_signal`
+    kprobes' handles by id and pin refused (EPERM, `bpf_prog_type` High ×4:
+    the calibrated judge); a copy of `/etc` over `/etc` signed
+    `mount_over_protected` within 45 s. After: After: the cpuset controller enabled at the root, no record; the partition
+    `cpu_confined` High naming `/nn-cpu-check` and `own_cpus` in the status
+    within 15 s (44 threads on CPU 0), gone from the status once undone; CPU
+    3 offline and back, no record; systemd's `AllowedCPUs=0-2` on the slice,
+    no record — its reset left the threads on 0–2 (the kernel keeps the masks
+    when the cpuset controller leaves the slice), signed `cpu_confined`
+    (true); `bpf-content-check` every case PASS, B9 the window's kprobe
+    refused by id and pin after the window, signed; the pre-agent kprobe
+    refused by id and pin (baseline High); `/etc` signed as before. **ubuntu2204**
+    (5.15.0-202), after: the cpuset controller enabled at the root, no
+    record; the partition `cpu_confined` High naming `/nn-cpu-check` and
+    `own_cpus` in the status within 15 s, gone once undone; CPU 3 offline
+    and back, no record; the window's kprobe refused by id and pin, the
+    pre-agent one too (baseline High); `/etc` signed as on 6.8;
+    `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing, the
+    highest 551,900 of 900,000 (`bpf_prog_guard` 18,479); a second round
+    (the CPU check's window, still open in the first, had let
+    `bpf-content-check`'s loads through: the check now waits for its end)
+    every case PASS, the reset's record true as on 6.8. **ubuntu2604** (7.0):
+    before, the window's kprobe and `syscall` program (calling
+    `bpf_send_signal_task`, SIGWINCH to the agent) and the pre-agent kprobe
+    were taken by id and pin and the syscall program run, no record (the
+    pre-agent one signed High at the start, the cross-view's baseline); a
+    copy of `/etc` signed `mount_over_protected`. After: After: R001 as on 6.8 (C0–C3 PASS, the reset's record true);
+    `bpf-content-check` every case PASS — B9: the window's kprobe and the
+    window's `syscall` program calling `bpf_send_signal_task` refused by id
+    and through the pin after the window, each signed `bpf_prog_type`
+    naming the call; B7 unchanged; the pre-agent kprobe: High at the start,
+    its handles by id and pin still given (named); `/etc` signed
+    `mount_over_protected`.
+  - **Fix round (the independent review of #558).** F1 (P1): a program
+    loaded in a window stayed usable after it through its loader's own
+    descriptor — `BPF_PROG_RUN` of a `syscall` program calling
+    `bpf_send_signal_task` (cmd 10 was not even observed), a kprobe
+    calling `bpf_send_signal` attached by `PERF_EVENT_IOC_SET_BPF`
+    (silent) or `BPF_LINK_CREATE` (Medium), a prog array's slot,
+    `pidfd_getfd` of the descriptor. Now every run and attach of a held id
+    outside a window is refused and signed (`bpf_held_use`) at the `bpf`
+    hook (before its `observed` filter) and the `file_ioctl` hooks, through
+    one global function that resolves the caller's descriptor to the
+    program id; the window's load is signed on every kernel
+    (`bpf_held_load`, High); F5: the held set is pinned, emptied of freed
+    ids each kernel-state round, and full it refuses the load (fail
+    closed). F2/F3/F6/F7: the CPU watch never skips without bound (three
+    unjudged rounds are signed), reads its sources through files opened at
+    the start and the cgroup tree with `openat2` `RESOLVE_NO_XDEV`, merges
+    systemd's `CPUAffinity=` and takes the agent unit's installed one, and
+    every state read is non-blocking, regular-file only and bounded. F4,
+    F8, F9: named (the agent has no `CAP_SYSLOG`, so a dump's calls are
+    blanked; the R090 ratchet's `--cfg` scan and filter; `content_scan`
+    duplicating `content_refusal`'s body).
+    - Lab, as measured. **ubuntu2604** (7.0.0-43): the first round's
+      agent did not start — the verifier refused `file_ioctl` and
+      `file_ioctl_compat` (LLVM folded the held check into `r0 = -r0`, an
+      unknown return); fixed (a volatile read keeps the two constant
+      returns). Then: B9 as before; **B10: the window's `syscall` program
+      (`bpf_send_signal_task`, SIGKILL to the agent) run after the window
+      through its loader's descriptor and one taken with `pidfd_getfd`:
+      `BPF_PROG_RUN` refused (EPERM) both times, its prog-array slot
+      refused; the kprobe's `PERF_EVENT_IOC_SET_BPF`, `BPF_LINK_CREATE`
+      and prog-array slot refused through both descriptors;
+      `bpf_held_load` ×1 and `bpf_held_use` for each kind of use, per
+      program; the agent alive, same pid.** `verifier-check`: 117
+      programs, 112 OK, 5 not counted, 0 failing; highest 362,329
+      (`fim_rename_observe`); `bpf_prog_load_guard` 6,901 insns
+      processed. A third round (installed with `--allow-bpf-tools`, which
+      the second lacked for B0–B5): every case PASS, B0–B10 and C0–C6 — C5
+      and C6 (a file saying 0 bound over the online list, then over the
+      slice's `cpuset.cpus`, each with the partition) signed `cpu_confined`
+      High; the agent the same pid. **ubuntu2204** (5.15.0-202): every case PASS; **B10: the
+      window's kprobe (`bpf_send_signal`, SIGKILL for the agent's pid)
+      through both descriptors — `PERF_EVENT_IOC_SET_BPF`,
+      `BPF_LINK_CREATE`, the prog-array slot: 6/6 refused, `bpf_held_load`
+      ×1, `bpf_held_use` ×3, the agent alive, same pid**; C5 (a file
+      saying 0 bound over the online list) and C6 (one bound over the
+      slice's `cpuset.cpus`), each with the C1 partition: a signed
+      `cpu_confined` High; `verifier-check` 117 programs, 110 OK, 7 not
+      counted, 0 failing, the highest 551,900 of 900,000 (unchanged;
+      `bpf_prog_guard` 25,410, `bpf_syscall_observe` 42,540,
+      `file_ioctl` 3,705).
+  - Its re-check (the second fix round). N1 (P2): a prog array's update
+    was let through when its value could not be read through the user
+    path (a page not resident; `bpf_sys_bpf`'s kernel pointer) — a held
+    program could go into a slot a clean program tail-calls. The kernel
+    path is read next (`bpf_cmd::slot_value`), and a value neither reads
+    is refused and signed (`bpf_held_use`, `BPF_HELD_SLOT_UNREAD`, the
+    prog array's id): `a_prog_array_value_the_hook_cannot_read_is_refused_and_signed`
+    (fails on 08d37e2f), `a_prog_array_value_neither_path_reads_is_refused`,
+    `a_tail_call_slot_whose_value_cannot_be_read_is_a_refusal_named`.
+    Once no window is open, the cross-view signs each held program still
+    loaded (`bpf_held_load`, `BPF_HELD_OUTLIVED`, High, once per program
+    and agent start): `a_held_program_still_loaded_after_its_window_is_signed_once`,
+    `a_held_program_that_outlives_its_window_is_high_and_named`. F7: the
+    kernel-state round's path reads (the taint mask, `/proc/1/stat`, a
+    loader's `/proc` files, the CPU watch's start reads and sources) wait
+    at most 2 s (`state_read::TimedReader`, at most four helpers left
+    blocked), and a read past its deadline makes the CPU watch's round
+    unjudged (three in a row signed): `a_read_that_never_answers_is_bounded_in_time`,
+    `a_round_whose_read_does_not_answer_is_unjudged_and_signed_at_the_third`,
+    the ratchet `the_kernel_state_round_reads_within_a_deadline`. F4's
+    sentence corrected in the trust model (a kernel-side iterator could
+    judge the content with no new capability; not done for the alpha);
+    the window's global scope (P1, after the alpha), N2, N3 (P3) and the
+    `dup2` race (P2) named in UPGRADE_NOTES_WAVE4 §43.
+    - Lab, as measured (the verifier only, the eBPF object
+      `e9140765…`, nothing installed): **ubuntu2204** (5.15.0-202)
+      `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing,
+      the highest 551,900 of 900,000 (`module_read_file_observe`,
+      unchanged; `bpf_syscall_observe` 44,638, `bpf_prog_guard` 25,410,
+      `file_ioctl` 3,705); **ubuntu2604** (7.0.0-43) 117 programs, 112
+      OK, 5 not counted, 0 failing, the highest 362,329
+      (`fim_rename_observe`; `bpf_syscall_observe` 16,513,
+      `bpf_prog_load_guard` 6,901). N1, item 2 and F7 were not run in a
+      guest: their evidence is the host tests named above.
+  - Not done (named): the watchdog's CPUs; a CPU offlined by root narrows
+    the host for all (no record); the kernel leaves the threads' masks
+    narrowed when systemd drops the cpuset controller after an
+    `AllowedCPUs=` reset (recorded, true; the agent does not widen its own
+    masks); `CPUWeight=` on the slice against a CPU flood (R12c-3, open since lab PR 271: root
+    out-weighs it, and a slice unit change needs its own upgrade round);
+    from 6.9 a program loaded before the agent is not judged at its handles
+    (High at the start), nor (any kernel) its loader's kept descriptor;
+    what a window itself attached keeps running, a netlink XDP/tc attach,
+    the other program-holding maps, a `dup2` race (each lost attempt
+    signed); no `sb_mount` hook (R003 is recorded, not refused).
+  - Levels unchanged: blockers of the pre-alpha closed or measured; no new
+    capability.
+
 - **Lot 345 — hardening of the allowed BPF loaders, F8, install edge cases
   (before the alpha tag; the re-check of #550, N1–N5 and point 1; C27, C28;
   no level changes).**

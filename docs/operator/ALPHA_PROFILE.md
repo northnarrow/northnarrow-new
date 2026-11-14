@@ -59,7 +59,16 @@ coordinator's corrected decision of 13/11/2026 puts them back.)
 | A ptrace attach of PID 1 (a debugger, `/proc/1/mem`) | PID 1's memory rewritten between a deny hook's read of a write PID 1 may make (a unit's limit, a thaw) and the kernel's |
 
 Each refusal is recorded as it is under `enforcing` (`NN-L-AT-001`, the
-operation, signed). A refused foreign load raises the posture to ENGAGED
+operation, signed). What no hook can refuse is recorded instead, under every
+profile: the kernel-state round (5 s) signs a new kernel taint, a foreign
+`cgroup/sysctl` program on the root cgroup, a BPF object its hook never saw
+loading, and (lot 349) **the agent confined to fewer CPUs than it should**
+— a sibling cgroup in `cpuset.cpus.partition` root or isolated takes the
+CPUs of every other cgroup of its parent with no hook asked: a signed
+`cpu_confined` High naming the cause, and the degradation `own_cpus` in
+`nn-admin status` while it holds (a CPU hotplug, a container runtime's
+cpuset enable and systemd's `AllowedCPUs=` on `northnarrow.slice` record
+nothing; `UPGRADE_NOTES_WAVE4.md` §43). A refused foreign load raises the posture to ENGAGED
 (never the decisive tamper on its own); under `alpha` nothing follows from
 it but the record.
 
@@ -154,6 +163,38 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       `CONFIG_BPF_KPROBE_OVERRIDE` has no `bpf_override_return` to refuse.
     - A program longer than 1,048,576 instructions, or one the judge cannot
       read, is refused as if it called one.
+    - **A program loaded inside a window** (lot 349, and its review's
+      fixes): a window lets any load through, but what the judge would
+      refuse outside one is held by id and signed at the load
+      (`bpf_held_load`, High). Once the window closes, by any process
+      outside the agent's family and through ANY descriptor — a new handle
+      by id or through its pin (a signed `bpf_prog_type` naming the call),
+      the loader's own descriptor kept from the window, one passed over a
+      socket or taken with `pidfd_getfd` — every run and attach of it is
+      refused (`EPERM`, a signed `bpf_held_use` naming the use and the
+      program id): `BPF_PROG_RUN`, `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`,
+      `BPF_LINK_UPDATE`, `BPF_RAW_TRACEPOINT_OPEN`, a perf event's
+      `PERF_EVENT_IOC_SET_BPF`, a prog array's update (a tail call's slot;
+      a value the agent cannot read — a page not yet in memory, the kernel
+      pointer of a `syscall` program's own update — is refused too, signed
+      `bpf_held_use` naming the prog array: fail closed). So a `syscall`
+      program calling `bpf_send_signal_task`, or a kprobe calling
+      `bpf_send_signal`, loaded in a window cannot be run or attached after
+      it. What stays open: what was attached INSIDE the window keeps
+      running (a link, pinned or not, a perf event, a prog array filled
+      then, an iterator link read later), a netlink attach (an XDP or tc
+      program through `ip link` / `tc`, no `bpf(2)` command), and a race
+      (another thread's `dup2` of the descriptor between the agent's check
+      and the kernel's: each lost attempt is refused and signed) — each
+      such program's load is the signed High record above, and once the
+      window has closed the agent signs each one still loaded (High,
+      `bpf_held_load` "still loaded after the window", with where it is
+      attached). The window itself is the host's: while it lasts every
+      root process, not only the installer, gets what it lifts. A
+      program loaded before the agent started is signed High at its start
+      (the cross-view's baseline); from 6.9 its handles, runs and attaches
+      are not judged (the agent cannot read its calls: it has no
+      `CAP_SYSLOG`, so the kernel blanks them in a dump).
   - Each refusal is a signed `bpf_prog_type` record (High) that names the
     helper, the kfunc or the fmod_ret. What stays open: a tracing program
     that reads (the agent's keys in its memory are not protected from it),

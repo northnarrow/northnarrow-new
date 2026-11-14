@@ -151,6 +151,12 @@ fn the_core_s_threads_get_the_core_s_set() {
 /// sets.
 const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
     (
+        "crates/nn-linux/src/state_read.rs",
+        ".name(\"nn-timed-read\".into())",
+        "the re-check of #558 (F7): a state read with a deadline, the read its caller made itself \
+         before, on a helper the caller starts — the caller's own sets, inherited; no role",
+    ),
+    (
         "crates/nn-linux/src/systemd_reload.rs",
         ".spawn(move || worker(rx, Path::new(socket), worker_audit, after))",
         "the function it runs enters the writer's role first (lot 273c)",
