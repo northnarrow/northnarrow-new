@@ -11263,6 +11263,19 @@ number in parentheses is a lab PR.
     and command, and exits 4 when any is left. B, C and `is_credential_reader`
     named as P3 residuals (§45). Lab: not run for this round (unit and host
     tests only).
+  - Fix round 2 (the re-check 1 of #560): H(b) (P2), a sudo was recognised
+    by its path only — a fake `/usr/bin/sudo` in a chroot or a mount
+    namespace, executed with the caller's own real uid, vouched for its
+    root payload. The sudo or su that vouches must have its image
+    (`ROOT_DIR`, PID 1's mount namespace), and `ROOT_DIR` needs PID 1's
+    root directory too (named tests:
+    `a_sudo_or_su_not_of_the_host_s_image_vouches_for_nothing`,
+    `a_sudo_not_of_the_host_s_image_vouches_for_nothing` (R009),
+    `a_chrooted_process_has_no_root_dir`). H(a) (P2: an LPE that sets its
+    real uid to a sudoer's whose sudo asks for nothing), F and G named as
+    residuals (§45); `uninstall.sh --help` lists exit 4 (I, ratchet
+    `uninstall_help_lists_every_exit_code`). Lab: not run for this round
+    (unit and host tests only).
 - **Lot 350 — the pre-alpha's Phase 2: our own install, boot and uninstall
   raise no High; a purge leaves nothing undeclared (C06, C11; no level
   changes).**

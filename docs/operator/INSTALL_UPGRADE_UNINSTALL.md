@@ -428,11 +428,22 @@ user-writable path, R009's match. What the running agent does with them:
   ./x` and `sudo bash -c './x'` (an exec in place of the command) stay the
   administrator's. The review of #560: a sudo or su that a process already
   root ran vouches for nothing — root's ask for no credential, so after a
-  local privilege escalation `sudo ~/payload` is R009 High, the journal
-  saying "was run by a process already root"; the walk goes on to an
-  elevation further up (`sudo -i` then root's own `sudo`, `sudo su -`, `su
-  -` then `sudo`: the administrator's). The operator's `sudo
-  ./deploy/uninstall.sh` from a user's terminal stays Low.
+  local privilege escalation that keeps its real uid 0, `sudo ~/payload` is
+  R009 High, the journal saying "was run by a process already root"; the
+  walk goes on to an elevation further up (`sudo -i` then root's own
+  `sudo`, `sudo su -`, `su -` then `sudo`: the administrator's). Its
+  re-check 1: nor does a sudo or su not executed as the host's binary — the
+  one that vouches must have its image (a root-only directory, PID 1's
+  mount namespace and root directory): a fake `/usr/bin/sudo` in a chroot
+  or a mount namespace is R009 High, the journal saying "was not executed
+  from the host's root-only directory". **Residual (P2):** an escalation
+  that first sets its real uid to a sudoer's whose sudo asks for nothing (a
+  `NOPASSWD` sudoer, the default user of cloud images; or a sudo timestamp
+  root forges in `/run/sudo/ts`) and then runs the host's sudo is still
+  seen as an administrator's `sudo ~/payload`: Low, no kill
+  (`UPGRADE_NOTES_WAVE4.md` §45). The operator's `sudo
+  ./deploy/uninstall.sh` from a user's terminal, and `sudo -i` then the
+  script, stay Low.
 - **What the script executes from its tree afterwards** (the new agent's
   `--version`) runs after it opened its window: asked for an installer
   (`nn-admin trusted-installer-grant --for-installer`, which the scripts

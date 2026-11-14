@@ -984,6 +984,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     that leaves any exits 4 (`--package`: 0). The FIM residual of an empty
     baseline (it recurs after every rotation) and `is_credential_reader`
     are named P3s (`UPGRADE_NOTES_WAVE4.md` §45).
+  - **The re-check 1 of #560 (H(b)) — a sudo was recognised by its path
+    only**: a fake `/usr/bin/sudo` in a chroot or a private mount namespace,
+    executed with the caller's own real uid, vouched for the root payload it
+    forked (R009 Low, the FIM kill hold, the impair sanction). The sudo or
+    su that vouches must have its image now (`cannot_vouch`: `Entry::image`,
+    `ROOT_DIR` in PID 1's mount namespace, as #555 F1's `go`), and
+    `ROOT_DIR` also needs PID 1's root directory (`exec_facts::same_root`:
+    a chroot's view of the executed path's directory is root's choice).
+    `uninstall.sh --help` lists its exit 4.
+  - **Residual, P2 (H(a), named for a later lot):** a local privilege
+    escalation that sets its real uid to a sudoer's whose sudo asks for
+    nothing (a `NOPASSWD` sudoer — a cloud image's default user — or a
+    timestamp root forges in `/run/sudo/ts`, which FIM does not watch) and
+    then runs the host's sudo still gets the session's cover: sudo
+    authorizes by the real uid. Closing it needs the real uid to stay the
+    same from the sudo up to the login (§45).
 - Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
   raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
   record is told by identity, none by a name.
