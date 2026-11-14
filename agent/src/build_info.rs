@@ -17,10 +17,23 @@ use crate::audit::AgentBuild;
 pub fn build_features() -> Vec<&'static str> {
     LAB_FEATURES
         .iter()
+        .chain(DEPENDENCY_TEST_FEATURES)
         .filter(|(_, built)| *built)
         .map(|(name, _)| *name)
         .collect()
 }
+
+/// Lot 349 (pre-alpha R090): the test features of the crates the agent
+/// links, as they were compiled into this binary — on only where a test
+/// build's dev-dependency asks for them (`cargo test`), never in a release
+/// build (`cargo xtask build --release`). Named by [`build_features`], so the
+/// release workflow's `--build-features` check (`none`) refuses a shipped
+/// binary carrying one; xtask/tests/supply_chain.rs holds this list to every
+/// such feature of the workspace.
+pub const DEPENDENCY_TEST_FEATURES: &[(&str, bool)] = &[
+    ("nn-core/test-util", nn_core::TEST_UTIL),
+    ("nn-linux/test-util", nn_linux::TEST_UTIL),
+];
 
 /// External audit PROC-015 (NN-AUD-302): every cargo feature of this crate
 /// (`agent/Cargo.toml`), with whether this binary was built with it. All

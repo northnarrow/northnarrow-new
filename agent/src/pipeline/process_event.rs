@@ -514,15 +514,20 @@ pub(crate) fn process_event(
             // Lot 280b: what the kernel-state round found — the kernel's own
             // record, not a refusal.
             // Lot 290: and its BPF cross-view.
+            // Lot 349: and the agent's own CPU watch.
             let found = matches!(
                 operation,
                 nn_model::FsProtectOperation::KernelTaint
                     | nn_model::FsProtectOperation::SysctlRootProg
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
+                    | nn_model::FsProtectOperation::CpuConfined
             );
             // Lot 290: a load the signed per-loader opt-out let through.
             let loader_opted_out = *operation == nn_model::FsProtectOperation::BpfProgOptOut;
+            // Lot 349 (the review of #558, F1): a window's load the content
+            // judge refuses outside one — let through, held.
+            let held_load = *operation == nn_model::FsProtectOperation::BpfHeldLoad;
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
@@ -561,6 +566,15 @@ pub(crate) fn process_event(
                         value = ?value,
                         "SYSCTL OPT-OUT: a guarded sysctl's write let through by the signed \
                          per-rule policy's sysctl-allow (recorded, not refused)"
+                    );
+                } else if held_load {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        prog_id = target_ino,
+                        target_dev,
+                        "BPF HELD: a program the content judge refuses outside a window, loaded \
+                         inside one (recorded, not refused; its runs and attaches outside a \
+                         window are refused)"
                     );
                 } else if found {
                     warn!(
@@ -607,6 +621,10 @@ pub(crate) fn process_event(
                             "not refused: a taint flag of code entering the kernel, read by the \
                              kernel-state round"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::CpuConfined {
+                            "not refused: the agent runs on fewer CPUs than it should, read by \
+                             the kernel-state round's CPU watch"
+                                .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
                             "not refused: found on the root cgroup's cgroup/sysctl slot by the \
                              kernel-state round"
@@ -615,6 +633,41 @@ pub(crate) fn process_event(
                             "not refused: let through by the signed per-rule policy's \
                              bpf-loader-allow (the loader's executable and the type)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldLoad
+                            && common::wire::bpf_held_of(*target_dev).0
+                                == common::wire::BPF_HELD_OUTLIVED
+                        {
+                            // the re-check of #558 (item 2): found by the
+                            // round after the window
+                            format!(
+                                "not refused: program id {target_ino}, held at a trusted-installer \
+                                 window's load, still loaded after the window — found by the BPF \
+                                 cross-view of the kernel-state round"
+                            )
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldLoad {
+                            // lot 349 (the review of #558, F1): the program
+                            // named in the signed record
+                            format!(
+                                "not refused: program id {target_ino} loaded inside a \
+                                 trusted-installer window, held — its runs, attaches and handles \
+                                 outside a window are refused"
+                            )
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldUse {
+                            let (how, _, _) = common::wire::bpf_held_of(*target_dev);
+                            if how == common::wire::BPF_HELD_SLOT_UNREAD {
+                                // the re-check of #558 (N1): no program read
+                                format!(
+                                    "denied in kernel (the BPF guard): {} (prog array map id \
+                                     {target_ino}), fail closed",
+                                    common::wire::bpf_held_use_name(how)
+                                )
+                            } else {
+                                format!(
+                                    "denied in kernel (the BPF guard): {} of program id \
+                                     {target_ino}, held at a window's load",
+                                    common::wire::bpf_held_use_name(how)
+                                )
+                            }
                         } else if matches!(
                             operation,
                             nn_model::FsProtectOperation::BpfUnseen

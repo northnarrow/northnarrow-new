@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-use northnarrow_agent::build_info::LAB_FEATURES;
+use northnarrow_agent::build_info::{DEPENDENCY_TEST_FEATURES, LAB_FEATURES};
 
 fn expected() -> String {
     let mut features = Vec::new();
@@ -27,6 +27,14 @@ fn expected() -> String {
     }
     if cfg!(feature = "test-privileged") {
         features.push("test-privileged");
+    }
+    // lot 349: the linked crates' test features, as this test build compiled
+    // them (the agent's dev-dependencies turn them on; a release never)
+    if nn_core::TEST_UTIL {
+        features.push("nn-core/test-util");
+    }
+    if nn_linux::TEST_UTIL {
+        features.push("nn-linux/test-util");
     }
     if features.is_empty() {
         "none".to_string()
@@ -103,6 +111,7 @@ fn every_cargo_feature_is_named_by_build_features() {
     // off while this build has it on.
     let built: Vec<&str> = LAB_FEATURES
         .iter()
+        .chain(DEPENDENCY_TEST_FEATURES)
         .filter(|(_, on)| *on)
         .map(|(n, _)| *n)
         .collect();

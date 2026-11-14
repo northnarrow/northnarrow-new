@@ -90,6 +90,10 @@ const FMODE_WRITE: u32 = 0x2;
 const FS_IOC_SETFLAGS: c_uint = northnarrow_common::wire::FS_IOC_SETFLAGS;
 const FS_IOC32_SETFLAGS: c_uint = northnarrow_common::wire::FS_IOC32_SETFLAGS;
 const FS_IOC_FSSETXATTR: c_uint = northnarrow_common::wire::FS_IOC_FSSETXATTR;
+/// Lot 349 (the review of #558, F1): a perf event's program attach.
+const PERF_EVENT_IOC_SET_BPF: c_uint = northnarrow_common::bpf_cmd::PERF_EVENT_IOC_SET_BPF;
+/// Lot 349: [`PERF_EVENT_IOC_SET_BPF`]'s use in a held program's record.
+const BPF_HELD_SET_BPF: u32 = northnarrow_common::wire::BPF_HELD_SET_BPF;
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -838,6 +842,23 @@ unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
     // but the chattr-family commands returns before any read.
 
     let cmd: c_uint = ctx.arg(1);
+
+    // Lot 349 (the review of #558, F1): a perf event's
+    // `PERF_EVENT_IOC_SET_BPF` attaches the program whose descriptor is the
+    // argument (a kprobe calling `bpf_send_signal`, kept from a window) with
+    // no `bpf(2)` command — judged as the `bpf` hook judges an attach
+    if cmd == PERF_EVENT_IOC_SET_BPF {
+        let fd: u64 = ctx.arg(2);
+        let held = crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF));
+        // the lab on 7.0: LLVM knows the global function returns 0 or 1 and
+        // folded the branch into `-held`, which the verifier reads as an
+        // unknown return value (not in [-4095, 0]) and refuses the program;
+        // a volatile read keeps the two constant returns
+        if core::ptr::read_volatile(&held) == crate::bpf_defense::HELD_REFUSED {
+            return -EPERM;
+        }
+        return 0;
+    }
 
     if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {
         return 0;
