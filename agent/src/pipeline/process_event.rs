@@ -633,6 +633,17 @@ pub(crate) fn process_event(
                             "not refused: let through by the signed per-rule policy's \
                              bpf-loader-allow (the loader's executable and the type)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::BpfHeldLoad
+                            && common::wire::bpf_held_of(*target_dev).0
+                                == common::wire::BPF_HELD_OUTLIVED
+                        {
+                            // the re-check of #558 (item 2): found by the
+                            // round after the window
+                            format!(
+                                "not refused: program id {target_ino}, held at a trusted-installer \
+                                 window's load, still loaded after the window — found by the BPF \
+                                 cross-view of the kernel-state round"
+                            )
                         } else if *operation == nn_model::FsProtectOperation::BpfHeldLoad {
                             // lot 349 (the review of #558, F1): the program
                             // named in the signed record
@@ -643,11 +654,20 @@ pub(crate) fn process_event(
                             )
                         } else if *operation == nn_model::FsProtectOperation::BpfHeldUse {
                             let (how, _, _) = common::wire::bpf_held_of(*target_dev);
-                            format!(
-                                "denied in kernel (the BPF guard): {} of program id {target_ino}, \
-                                 held at a window's load",
-                                common::wire::bpf_held_use_name(how)
-                            )
+                            if how == common::wire::BPF_HELD_SLOT_UNREAD {
+                                // the re-check of #558 (N1): no program read
+                                format!(
+                                    "denied in kernel (the BPF guard): {} (prog array map id \
+                                     {target_ino}), fail closed",
+                                    common::wire::bpf_held_use_name(how)
+                                )
+                            } else {
+                                format!(
+                                    "denied in kernel (the BPF guard): {} of program id \
+                                     {target_ino}, held at a window's load",
+                                    common::wire::bpf_held_use_name(how)
+                                )
+                            }
                         } else if matches!(
                             operation,
                             nn_model::FsProtectOperation::BpfUnseen

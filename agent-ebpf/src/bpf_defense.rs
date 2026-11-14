@@ -81,7 +81,7 @@ use northnarrow_common::bpf_cmd::{
     attach_target_offset, judges_attach_target, observed, prog_fd_offset, BPF_LINK_CREATE,
     BPF_LINK_DETACH, BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_MAP_UPDATE_ELEM,
     BPF_OBJ_GET, BPF_PROG_ATTACH, BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD, BPF_RAW_TRACEPOINT_OPEN,
-    MAP_TYPE_PROG_ARRAY, MAP_UPDATE_VALUE_OFFSET,
+    MAP_TYPE_PROG_ARRAY, MAP_UPDATE_VALUE_OFFSET, slot_value, SlotValue,
 };
 use northnarrow_common::bpf_prog_class::{
     call_key, denied_by_default, judged_for_every_type, opt_out_refuses_attach, type_bit,
@@ -96,7 +96,7 @@ use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     bpf_held_dev, BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_HELD_FULL, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
+    BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
 
@@ -516,29 +516,45 @@ pub extern "C" fn nn_held_use(fd: u64, how: u64) -> u64 {
 }
 
 /// Lot 349 (the review of #558, F1): a `BPF_MAP_UPDATE_ELEM` of map `map_fd`
-/// with the value at user address `value` — a prog array's value is a
-/// program descriptor (a tail call's slot: a clean program loaded after the
-/// window would jump into the held one) — judged as [`nn_held_use`]; any
-/// other map is let through after two reads. A global BPF function.
+/// with the value at address `value` — a prog array's value is a program
+/// descriptor (a tail call's slot: a clean program loaded after the window
+/// would jump into the held one) — judged as [`nn_held_use`]; any other
+/// map is let through after two reads. A global BPF function.
+///
+/// The re-check of #558 (N1): the value read through the user path only
+/// was let through when that read failed — a page not resident (the user
+/// path is nofault; the kernel's copy after the hook faults it in) or
+/// `bpf_sys_bpf`'s kernel pointer (a `syscall` program's update) — and the
+/// slot took a held program. Now the kernel path is tried next
+/// ([`slot_value`]), and a value neither reads is refused, signed
+/// ([`BPF_HELD_SLOT_UNREAD`], the prog array's id): fail closed.
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_held_slot(map_fd: u64, value: u64) -> u64 {
     if caller_is_exempt() || crate::inode_protect::override_active() {
         return HELD_PASS;
     }
-    match unsafe { map_of_fd(map_fd as u32) } {
-        Ok(Some((_, ty))) if ty == MAP_TYPE_PROG_ARRAY => {}
+    let map_id = match unsafe { map_of_fd(map_fd as u32) } {
+        Ok(Some((id, ty))) if ty == MAP_TYPE_PROG_ARRAY => id,
         Ok(_) => return HELD_PASS,
         Err(()) => {
             crate::fail_open::bump(fail_open_hook::BPF);
             return HELD_PASS;
         }
-    }
-    match unsafe { bpf_probe_read_user::<u32>(value as *const u32) } {
-        Ok(fd) => nn_held_use(u64::from(fd), u64::from(BPF_MAP_UPDATE_ELEM)),
-        Err(_) => {
-            crate::fail_open::bump(fail_open_hook::BPF);
-            HELD_PASS
+    };
+    let user = unsafe { bpf_probe_read_user::<u32>(value as *const u32) }.ok();
+    let kernel = match user {
+        Some(_) => None,
+        None => unsafe { bpf_probe_read_kernel::<u32>(value as *const u32) }.ok(),
+    };
+    match slot_value(user, kernel) {
+        SlotValue::Fd(fd) => nn_held_use(u64::from(fd), u64::from(BPF_MAP_UPDATE_ELEM)),
+        SlotValue::Unreadable => {
+            if fresh_instance_may_load() {
+                return HELD_PASS;
+            }
+            emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_SLOT_UNREAD, 0, map_id);
+            HELD_REFUSED
         }
     }
 }
@@ -1690,7 +1706,9 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
 
 /// Lot 349 (the review of #558, F1): `cmd`, a run or an attach of a held
 /// program ([`prog_fd_offset`], a prog array's update) — refused, signed.
-/// An unreadable descriptor is a fail-open, counted.
+/// An unreadable descriptor is a fail-open, counted; a prog array's value
+/// neither path reads is refused ([`nn_held_slot`], the re-check of #558,
+/// N1).
 #[inline(always)]
 unsafe fn held_use_refused(cmd: u32, attr: *const c_void) -> bool {
     if cmd == BPF_MAP_UPDATE_ELEM {

@@ -434,6 +434,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::a_held_program_s_load_and_uses_are_named_and_high",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_tail_call_slot_whose_value_cannot_be_read_is_a_refusal_named",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_held_program_that_outlives_its_window_is_high_and_named",
             "deploy/lab/malsim/bpf-content-check.sh::B10",
             "deploy/lab/malsim/cpu-confine-check.sh::C1",
             "deploy/lab/malsim/foreign-bpf-check.sh::F2",

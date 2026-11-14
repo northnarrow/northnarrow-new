@@ -336,7 +336,7 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
             "let crossed = match cross.as_mut() {",
             "Some(c) => crossview_round(c, &mut failing, agent_start),",
             "common::bpf_prog_class::KnownLink::RootCgroupSysctl,",
-            "c.watch.program(id).as_ref(),",
+            "c.watch.program(id),",
             "round(&mut w, Path::new(\"/\"), &known)",
             "found.extend(crossed);",
             "tx.send(event_of(&f, monotonic_ns()))",
@@ -349,7 +349,8 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
             "match cross.round() {",
             // lot 304: a known system program's baseline marked first
             "mark_known_baselines(&mut found, &|id, link| {",
-            "cross.watch.program(id).as_ref(),",
+            // the re-check of #558 (F7): within the round's deadline
+            "known_within(id, link, cross.watch.program(id), agent_start, None)",
             "found.into_iter().map(Finding::Bpf).collect()",
             "crate::boot::degradation::report(DEGRADATION, &line)",
         ],
@@ -996,7 +997,7 @@ fn a_held_program_is_refused_at_every_run_and_attach() {
     in_order(
         body(&c, "nn_held_slot"),
         &[
-            "Ok(Some((_, ty))) if ty == MAP_TYPE_PROG_ARRAY => {}",
+            "Ok(Some((id, ty))) if ty == MAP_TYPE_PROG_ARRAY => id,",
             "Ok(_) => return HELD_PASS,",
             "bpf_probe_read_user::<u32>(value as *const u32)",
             "nn_held_use(u64::from(fd), u64::from(BPF_MAP_UPDATE_ELEM))",
@@ -1027,6 +1028,58 @@ fn a_held_program_is_refused_at_every_run_and_attach() {
     assert!(ip.contains(
         "const PERF_EVENT_IOC_SET_BPF: c_uint = northnarrow_common::bpf_cmd::PERF_EVENT_IOC_SET_BPF;"
     ));
+}
+
+/// The re-check of #558 (N1, P2): a prog array's update was let through
+/// when the hook could not read its value through the user path — a page
+/// not resident (the user path is nofault; the kernel's copy after the hook
+/// faults it in) or `bpf_sys_bpf`'s kernel pointer from a `syscall`
+/// program — so a held program went into a tail call's slot, and a clean
+/// program's run jumped into it with no `bpf_held_use`. Now the kernel path
+/// is read next, and a value neither path reads is refused and signed
+/// (fail closed): after the value's reads, the only pass is a fresh
+/// instance of the agent's own.
+#[test]
+fn a_prog_array_value_the_hook_cannot_read_is_refused_and_signed() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let slot = body(&c, "nn_held_slot");
+    in_order(
+        slot,
+        &[
+            "if caller_is_exempt() || crate::inode_protect::override_active() {",
+            "Ok(Some((id, ty))) if ty == MAP_TYPE_PROG_ARRAY => id,",
+            "let user = unsafe { bpf_probe_read_user::<u32>(value as *const u32) }.ok();",
+            "None => unsafe { bpf_probe_read_kernel::<u32>(value as *const u32) }.ok(),",
+            "match slot_value(user, kernel) {",
+            "SlotValue::Fd(fd) => nn_held_use(u64::from(fd), u64::from(BPF_MAP_UPDATE_ELEM)),",
+            "SlotValue::Unreadable => {",
+            "if fresh_instance_may_load() {",
+            "return HELD_PASS;",
+            "emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_SLOT_UNREAD, 0, map_id);",
+            "HELD_REFUSED",
+        ],
+    )
+    .unwrap();
+    let after = &slot[slot.find("let user =").expect("the value's reads")..];
+    assert_eq!(
+        after.matches("HELD_PASS").count(),
+        1,
+        "after the value's reads, only a fresh instance passes: {after}"
+    );
+    assert!(
+        !after.contains("fail_open::bump"),
+        "an unreadable value is no fail-open: {after}"
+    );
+    // the decision is common's, unit-tested there
+    let cmd = code("common/src/bpf_cmd.rs");
+    in_order(
+        body(&cmd, "slot_value"),
+        &[
+            "(Some(fd), _) | (None, Some(fd)) => SlotValue::Fd(fd),",
+            "(None, None) => SlotValue::Unreadable,",
+        ],
+    )
+    .unwrap();
 }
 
 /// The review of #558 (F1): the window's forbidden load itself was silent
@@ -1099,11 +1152,31 @@ fn a_full_held_set_refuses_the_window_s_load_and_the_round_empties_it() {
         &[
             "let held = self.parts.held();",
             "let en = self.parts.enumerate()?;",
-            "let gone = stale_held(&held, &en.progs);",
+            "let gone = stale_held(&ids, &en.progs);",
             "self.parts.release_held(&gone);",
+            // the re-check of #558 (item 2): what outlives its window
+            "judge(&mut self.watch, seen, &en, &own);",
+            "found.extend(outlived(",
+            "(self.window_open)(),",
         ],
     )
     .unwrap();
+    // the re-check of #558 (item 2): signed once no window is open, once
+    in_order(
+        body(&x, "outlived"),
+        &[
+            "if window_open {",
+            "return Vec::new();",
+            "if w.outlived.insert(*id) {",
+            "Finding::HeldOutlived(o.clone(), *verdict)",
+        ],
+    )
+    .unwrap();
+    let ev = code("agent/src/boot/evidence.rs");
+    assert!(
+        ev.contains("Box::new(move || window.is_window_open()),"),
+        "the cross-view is told the window's state"
+    );
     assert!(x.contains("pub const HELD_MAP: &str = \"PROG_CONTENT_HELD\";"));
     assert!(c.contains("pub static PROG_CONTENT_HELD: HashMap<u32, u64> ="));
 }
