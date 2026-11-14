@@ -861,8 +861,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     memfd, rewritten by its holder) is Critical. A ratchet
     (`kernel_halves.rs`) keeps the flag the LSM program's alone. (F2) The
     runtime compares' budget: 64 MiB a second per uid, 256 MiB of the
-    512 MiB reserved for root; a clone past its uid's share is kept
-    unverified and recorded High, never killed. (F3) The docs say what R018
+    512 MiB reserved for root; a memfd past the budget is kept unverified,
+    "not compared (budget)" — root's recorded High, never killed, any other
+    uid's (the re-check, N1: a user spends its own share with decoy hooks,
+    then a sealed payload of runc's length) the Critical kill, as before the
+    lot; root over its own budget is a named residual. (F3) The docs say what R018
     does with an unpackaged module in `/lib/modules`: High, recorded only.
     (F4) containerd's library path: exactly its `opt` directories, kept by
     the pump only when root-only with root-only files (`ctr install` named

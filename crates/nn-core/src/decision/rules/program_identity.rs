@@ -618,7 +618,9 @@ pub struct RuntimeClone {
     /// budget's share of the exec's uid was spent this second; `image` is
     /// then the installed runtime of the copy's length, every other fact
     /// held (sealed at the exec and at the read, the parent a runtime's or a
-    /// manager's file). R004 records such an exec, never kills it.
+    /// manager's file) — any program of that length. R004 records root's,
+    /// never killing it, and kills any other uid's (the re-check of #556,
+    /// N1: a user spends its own share with decoys).
     pub unverified: bool,
 }
 

@@ -2134,9 +2134,11 @@ detail.
   sensor reads its seals at the exec; an agent in tracepoint mode, or on a
   kernel whose BTF lacks `shmem_inode_info`, keeps the Critical). The
   compares' budget is per user (64 MiB a second each) with a reserve for
-  root (256 MiB of 512): a clone past its user's share is recorded High,
-  never killed. A runtime or manager is recorded only when its file and its
-  directories are root's and writable by no one else. containerd's library
+  root (256 MiB of 512): a memfd past the budget is "not compared
+  (budget)" — root's recorded High, never killed; any other uid's (a user
+  can spend its own share) killed, Critical, as before. A runtime or
+  manager is recorded only when its file and its directories are root's and
+  writable by no one else. containerd's library
   path is accepted only as exactly `/var/lib/containerd/opt/lib` or
   `/opt/containerd/lib`, a root-only directory of root-only files. The utmp
   unit's write is exempt only as an append of whole login records, by a

@@ -38,8 +38,9 @@
 //!   again at such an exec (at most once a second: a runtime installed this
 //!   minute), under a budget of their own: each uid's share, root's reserve
 //!   ([`RUNTIME_BUDGET_PER_UID`], [`RUNTIME_ROOT_RESERVE`]: the review of
-//!   #556, F2); a clone past it is kept unverified (R004: recorded, never
-//!   killed).
+//!   #556, F2); a clone past it is kept unverified, "not compared (budget)"
+//!   (R004: root's recorded, never killed; any other uid's the Critical
+//!   kill — the re-check of #556, N1: a user spends its own share).
 //!
 //! A name only chooses which installed files are recorded; what an exec
 //! runs is then told by the file, never by its name.
@@ -597,8 +598,9 @@ const RUNTIME_MAX_LEN: u64 = 64 << 20;
 /// files counted — a container start reads its runtime twice (~30 MiB for
 /// runc 1.1): about seventeen starts a second, root's (the review of #556,
 /// F2: every uid's, as it was, let one user's rootless loop spend root's
-/// Docker starts). Past its share a clone is not compared: kept unverified,
-/// R004 records it (High) and never kills. Only an exec whose parent runs
+/// Docker starts). Past its share a clone is not compared: kept unverified;
+/// R004 records root's (High) and never kills it, and kills any other
+/// uid's (the re-check of #556, N1). Only an exec whose parent runs
 /// an installed runtime or its manager reaches a compare.
 const RUNTIME_BUDGET_PER_SECOND: u64 = 512 << 20;
 
@@ -791,7 +793,8 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     if !checks.bounds.take(*uid, cost, Instant::now()) {
         checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
         // the review of #556 (F2): every fact but the bytes holds — kept
-        // unverified (R004 records it, never kills it)
+        // unverified, any program of that length (R004: root's recorded,
+        // never killed; any other uid's killed — the re-check, N1)
         program_identity::keep_runtime_clone(
             event,
             program_identity::RuntimeClone {
@@ -1225,6 +1228,56 @@ mod tests {
             runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
             Some((kernel_id(&std::fs::metadata(&runc).unwrap()), false))
         );
+    }
+
+    /// The re-check of #556 (N1; its probe): a user spends its OWN share
+    /// (decoy hooks, genuine runc copies), then a sealed memfd of runc's
+    /// LENGTH but other bytes (a padded payload, an OCI hook run from
+    /// `/proc/<pid>/fd/N`) under runc is kept "not compared" — the fact R004
+    /// judges by the uid: a uid but 0 keeps the Critical kill
+    /// (`a_users_uncompared_memfd_past_its_own_share_stays_critical`).
+    #[test]
+    fn a_users_payload_of_runc_len_past_its_own_share_is_kept_not_compared() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let image: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 241) as u8).collect();
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let checks = RuntimeChecks::new(
+            RUNTIME_BUDGET_PER_UID,
+            RUNTIME_BUDGET_PER_SECOND,
+            RUNTIME_ROOT_RESERVE,
+        );
+        // the user's own decoys spend its share
+        assert!(checks
+            .bounds
+            .take(1000, RUNTIME_BUDGET_PER_UID, Instant::now()));
+        let link = |pid: u32, to: &Path| {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+        };
+        let payload: Vec<u8> = image.iter().map(|b| b ^ 0x5a).collect();
+        let hook = memfd(&payload, SEALED | libc::F_SEAL_SEAL);
+        link(35_700, &runc);
+        link(
+            35_701,
+            &PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&hook)
+            )),
+        );
+        let mut e = memfd_exec(35_701, 35_700, 556, &hook);
+        if let Event::ProcessSpawn { uid, .. } = &mut e {
+            *uid = 1000;
+        }
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
+            Some((runc_id, true)),
+            "kept not compared, never as runc's compared image"
+        );
+        assert_eq!(checks.bounds.skipped.load(Ordering::Relaxed), 1);
     }
 
     /// The review of #556 (F2, named; its probe): seventeen 30 MiB compares

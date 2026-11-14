@@ -78,10 +78,19 @@ kernel whose BTF lacks `shmem_inode_info` stay Critical.
 The compares have a budget of their own: each user but root may spend
 64 MiB a second (about two runc 1.1 starts: runc is read twice, ~30 MiB),
 all of them together leave root 256 MiB of the 512 MiB a second, and root's
-starts (Docker's, rootful Podman's) may spend the rest. A clone past its
-user's share — every fact above holds, its bytes not compared — is recorded
-High, never killed. No user's container loop can make root's Docker starts
-Critical.
+starts (Docker's, rootful Podman's) may spend the rest. A memfd past the
+budget — every fact above holds, its bytes not compared, so it may be any
+program of the runtime's length — is "not compared (budget)": root's (uid 0
+of the initial user namespace) is recorded High, never killed; any other
+uid's stays the Critical kill, since a user can spend its own share on
+purpose (decoy OCI hooks of genuine runc copies, then a sealed payload
+padded to runc's length). No user's container loop can make root's Docker
+starts Critical; a rootless user's container start past its own share (a
+third runc 1.1 start in a second) is killed as before lot 347.
+
+Residual, named: root spending its own budget (512 MiB a second of
+compares), then executing a memfd of its own under the runtime, is recorded
+High, not killed — root, who needs no such route.
 
 What remains possible: the kernel reads the first bytes of the file (the
 binary's header) just before the LSM program reads the seals, so a writer

@@ -98,7 +98,14 @@
 //! holds but whose bytes were not compared — its uid's share of the
 //! compare budget spent this second (the review of #556, F2: each uid but
 //! root has its own share, root a reserve no user can spend) — is recorded
-//! High, never killed. Residual: the kernel reads the file's first bytes
+//! High, never killed, only for uid 0 (the initial user namespace's root):
+//! any other uid spends its own share (the re-check of #556, N1: three
+//! decoy hooks, then a sealed payload of runc's length) and its uncompared
+//! memfd stays the Critical kill. Either verdict says "not compared
+//! (budget)" — a memfd of the runtime's length, any program's — never a
+//! copy of the runtime. Residual: root spending its own budget, then
+//! executing its own memfd under the runtime, is recorded, not killed —
+//! root, who needs no such route. Residual: the kernel reads the file's first bytes
 //! (the binary's header, `bprm->buf`) just before the LSM hook reads the
 //! seals; a writer racing that window chooses the header of a run whose
 //! every mapped byte is the sealed runtime's (no code of its own: the
@@ -130,8 +137,11 @@ enum RuntimeCopy {
     /// code.
     Compared,
     /// The review of #556 (F2): not compared (its uid's share of the
-    /// budget spent this second): recorded, never killed.
-    Unverified,
+    /// budget spent this second) — a memfd of the runtime's length, any
+    /// program's: root's recorded, never killed; any other uid's the
+    /// Critical kill (the re-check of #556, N1: a user spends its own
+    /// share; [`R004ExecFromProcSelfFd::not_compared`]).
+    NotCompared,
 }
 
 /// R14a (plan §3.5): how the agent starts its own workers — the one
@@ -428,6 +438,38 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 == Some((exe.dev, exe.ino))
     }
 
+    /// The re-check of #556 (N1): the verdict on a memfd exec whose every
+    /// identity fact holds but whose bytes the pump did not compare (the
+    /// budget's share of `uid` spent this second). Only uid 0 — the initial
+    /// user namespace's root, a budget no user can spend — is recorded High
+    /// without a kill; any other uid chooses to spend its own share (decoy
+    /// hooks), so its uncompared memfd stays the Critical kill. Neither text
+    /// calls it a copy of the runtime: nobody compared its bytes.
+    fn not_compared(&self, event: &Event, uid: u32) -> Verdict {
+        if uid == 0 {
+            build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::High,
+                "memfd exec under an installed container runtime and its manager, sealed at \
+                 the exec, of an installed runtime's length — not compared (budget): root's \
+                 compare budget spent this second, its bytes may be any program's (lot 347); \
+                 recorded, not killed",
+            )
+        } else {
+            build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                "memfd-style exec detected — fileless execution, highly suspicious; under an \
+                 installed container runtime, of an installed runtime's length, not compared \
+                 (budget): its uid's share of the compare budget spent this second (lot 347)",
+            )
+        }
+    }
+
     /// Lot 347 (module docs): `event`, a memfd exec, is an installed OCI
     /// runtime executing its own image's copy, sealed at the exec, started
     /// by an installed manager — each by the kernel's records; its bytes
@@ -458,7 +500,7 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         // the pump's compare: the sealed memfd is this installed runtime
         let clone = program_identity::runtime_clone_of(event)?;
         let copy = if clone.unverified {
-            RuntimeCopy::Unverified
+            RuntimeCopy::NotCompared
         } else {
             RuntimeCopy::Compared
         };
@@ -573,17 +615,8 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             let fileless = if exe.has(MEMFD) {
                 match self.runtime_self_clone(event, as_of) {
                     Some(RuntimeCopy::Compared) => false,
-                    Some(RuntimeCopy::Unverified) => {
-                        return Some(build_verdict(
-                            self,
-                            event,
-                            ResponseAction::Log,
-                            Severity::High,
-                            "memfd exec of an installed container runtime's copy of itself — \
-                             sealed at the exec, under its manager by the kernel's records, its \
-                             bytes not compared (the compare budget of its uid spent this \
-                             second: lot 347); recorded, not killed",
-                        ));
+                    Some(RuntimeCopy::NotCompared) => {
+                        return Some(self.not_compared(event, *uid));
                     }
                     None => true,
                 }
@@ -1943,12 +1976,12 @@ mod lot310 {
         assert!(kills(judged(unsealed_at_exec(35_604), true)));
     }
 
-    /// The review of #556 (F2, named): a copy whose every identity fact
-    /// holds but whose bytes the pump did not compare (its uid's share of
-    /// the budget spent this second) is recorded High, never killed — the
-    /// alpha's Docker starts past a flood. One whose facts fail stays the
-    /// Critical kill (fails on the lot's first head: every uncompared clone
-    /// was killed).
+    /// The review of #556 (F2, named): root's memfd whose every identity
+    /// fact holds but whose bytes the pump did not compare (root's budget
+    /// spent this second) is recorded High, never killed — the alpha's
+    /// Docker starts past a flood. One whose facts fail stays the Critical
+    /// kill (fails on the lot's first head: every uncompared clone was
+    /// killed). Any other uid's: the next test (N1).
     #[test]
     fn an_uncompared_runtime_copy_is_recorded_never_killed() {
         use crate::decision::rules::program_identity::{
@@ -2000,11 +2033,100 @@ mod lot310 {
             "{}",
             v.reasoning
         );
+        // the re-check of #556 (N1): the text vouches for no bytes
+        assert!(
+            v.reasoning.contains("not compared (budget)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
         // CONTROL: the runtime run by a session's shell — the kill
         let under_shell = memfd_exec(35_622, 35_621, 35_621, 400);
         assert!(lineage.ingest_spawn_event(&under_shell));
         keep_runtime_clone(&under_shell, unverified);
         assert!(kills(r.evaluate(&under_shell)));
+    }
+
+    /// The re-check of #556 (N1, named; its probe): a rootless user runs
+    /// three decoy OCI hooks (sealed genuine runc copies, compared) that
+    /// spend its OWN share of the compare budget, then a sealed payload
+    /// padded to runc's length — the pump keeps it unverified. A uid but 0
+    /// chose that downgrade: its uncompared memfd stays the Critical kill,
+    /// as before the lot, and the text says "not compared (budget)", never
+    /// a copy of the runtime (fails on eb16784d: High, recorded only, "the
+    /// runtime's copy of itself").
+    #[test]
+    fn a_users_uncompared_memfd_past_its_own_share_stays_critical() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        let (runc, conmon) = ((0x0fd0_0556, 556_021), (0x0fd0_0556, 556_022));
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (conmon, "/usr/bin/conmon", ProgramKind::RuntimeManager),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for e in [
+            lineage_exec(35_630, 1, 1, conmon, 100),
+            lineage_exec(35_631, 35_630, 35_630, runc, 200),
+        ] {
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = R004::new(lineage.clone());
+        let as_uid = |pid: u32, uid: u32| {
+            let mut e = memfd_exec(pid, 35_631, 35_631, 400);
+            if let Event::ProcessSpawn { uid: u, gid, .. } = &mut e {
+                (*u, *gid) = (uid, uid);
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+            e
+        };
+        let judged = |e: &Event, unverified: bool| {
+            keep_runtime_clone(
+                e,
+                RuntimeClone {
+                    image: runc,
+                    seen: Vec::new(),
+                    unverified,
+                },
+            );
+            r.evaluate(e)
+        };
+        // the user's decoys, compared: exempt
+        assert!(judged(&as_uid(35_632, 1000), false).is_none());
+        // its payload past its own share: the kill, the text vouching for
+        // no bytes
+        let v = judged(&as_uid(35_633, 1000), true).expect("judged");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("not compared (budget)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        // a subordinate uid (a rootless container's root, mapped): the same
+        let sub = judged(&as_uid(35_634, 100_000), true);
+        assert!(kills(sub), "a mapped root is no uid 0");
+        // CONTROL: root's past its own budget — recorded, not killed (the
+        // named residual)
+        let v = judged(&as_uid(35_635, 0), true).expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
     }
 
     /// The executor's identities: at most [`ExecutorImages::CAP`], the

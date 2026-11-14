@@ -11029,8 +11029,11 @@ number in parentheses is a lab PR.
     `exe_flags::MEMFD_SEALED`; the pump and R004 exempt only such an exec (a
     copy rewritten and sealed after the exec — an OCI hook's memfd — stays
     Critical; ratchet `kernel_halves.rs`). F2, the runtime compares' budget
-    per uid (64 MiB a second) with root's reserve (256 of 512 MiB); a clone
-    past its uid's share is recorded High, never killed. F3, R018's behaviour
+    per uid (64 MiB a second) with root's reserve (256 of 512 MiB); a memfd
+    past the budget is "not compared (budget)": root's recorded High, never
+    killed, any other uid's the Critical kill (re-check N1, test
+    `a_users_uncompared_memfd_past_its_own_share_stays_critical`; residual:
+    root over its own budget). F3, R018's behaviour
     stated (an unpackaged module in `/lib/modules`: High, recorded only).
     F4, containerd's library path exact, kept only when root-only with
     root-only files (`ctr install` a named residual). F5, the utmp unit's
