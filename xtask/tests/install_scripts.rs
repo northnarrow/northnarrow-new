@@ -339,6 +339,8 @@ exec /bin/rm "$@""#,
             r#"if [ "$2" = show ] && [ "${3:-}" = id ]; then
     echo "Error: get by id ($4): No such file or directory" >&2; exit 255
 fi
+# lot 350: another product's LSM programs (systemd's RestrictFileSystems=)
+[ "$2" = show ] && [ -z "${3:-}" ] && cat "$NN_TEST_DIR/foreign-lsm" 2>/dev/null
 exit 0"#,
         );
         write_exec(&stub.join("sleep"), "exit 0");
@@ -484,7 +486,12 @@ exit 0"#,
 
     /// [`Self::uninstall`] with `extra` (shell) set before the run.
     fn uninstall_with(&self, package: bool, key: Option<&str>, extra: &str) -> Run {
-        let body = section("deploy/uninstall.sh", "log() {", "# ── 2. LSM programs");
+        self.uninstall_to(package, key, extra, "# ── 2. LSM programs")
+    }
+
+    /// Lot 350: [`Self::uninstall_with`] through the section before `end`.
+    fn uninstall_to(&self, package: bool, key: Option<&str>, extra: &str, end: &str) -> Run {
+        let body = section("deploy/uninstall.sh", "log() {", end);
         let prelude = format!(
             "PURGE=0; YES=1; PACKAGE={}; GRANT_KEY={}\n\
              BIN_DIR=$T/bin; UNIT_DIR=$T/units; ETC_DIR=$T/etc; STATE_DIR=$T/state; BPFFS_ROOT=$T/pins\n\
@@ -4646,4 +4653,204 @@ fn a_fresh_install_with_allow_bpf_tools_signs_the_loader_lines() {
         "{r:#?}"
     );
     assert!(r.stdout.contains("bpf tools : refused"), "{}", r.stdout);
+}
+
+/// Lot 350 (F2-5): `stop_slice` of uninstall.sh with a stub `systemctl`
+/// (the slice's `ActiveState` is `state`, its stop exits `stop_rc`) and the
+/// `system.control` parents in the case's directory: `empty` (made empty),
+/// `full` (holding a drop-in of another unit) and `absent`. The calls made,
+/// the script's output.
+fn stop_slice(case: &str, state: &str, stop_rc: u8) -> (String, String, PathBuf) {
+    let dir = case_dir(case);
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(dir.join("empty")).unwrap();
+    fs::create_dir_all(dir.join("full/other.service.d")).unwrap();
+    let calls = dir.join("calls");
+    write_exec(
+        &bin.join("systemctl"),
+        &format!(
+            "echo \"$*\" >> '{calls}'\ncase \"$*\" in\n  'show -p ActiveState --value northnarrow.slice') echo '{state}' ;;\n  'stop northnarrow.slice') exit {stop_rc} ;;\nesac\nexit 0",
+            calls = calls.display()
+        ),
+    );
+    let script = format!(
+        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nSYSTEM_CONTROL_DIRS=(\"$1/empty\" \"$1/full\" \"$1/absent\")\n{}\nstop_slice\necho done\n",
+        block("deploy/uninstall.sh", "stop_slice")
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(&dir)
+        .env("PATH", path)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.ends_with("done\n"), "{stdout}");
+    (fs::read_to_string(&calls).unwrap_or_default(), stdout, dir)
+}
+
+/// Lot 350 (named, F2-5): after `uninstall.sh --purge`, `northnarrow.slice`
+/// stayed loaded and active until the next boot (its file removed, never
+/// stopped), and the empty `/run/systemd/system.control` the agent's unit
+/// had made stayed in /run. The slice is stopped once its file is gone and
+/// the units are stopped (after the reload: its `RefuseManualStop=` went
+/// with the file), and forgotten; a slice that does not stop is said and
+/// does not fail the uninstall. Only an EMPTY `system.control` directory is
+/// removed. The order in the script: the slice's file, the reload, then the
+/// stop.
+#[test]
+fn uninstall_stops_the_slice_and_removes_the_empty_system_control_dirs() {
+    let (calls, out, dir) = stop_slice("stop-slice-active", "active", 0);
+    assert!(calls.contains("stop northnarrow.slice"), "{calls}");
+    assert!(calls.contains("reset-failed northnarrow.slice"), "{calls}");
+    assert!(out.contains("stopped northnarrow.slice"), "{out}");
+    assert!(
+        !dir.join("empty").exists(),
+        "an empty system.control dir goes"
+    );
+    assert!(
+        dir.join("full/other.service.d").is_dir(),
+        "a dir that holds anything stays"
+    );
+    assert!(out.contains("removed the empty"), "{out}");
+
+    // already inactive (a slice another boot never started): not stopped
+    let (calls, out, _) = stop_slice("stop-slice-inactive", "inactive", 0);
+    assert!(!calls.contains("stop northnarrow.slice"), "{calls}");
+    assert!(!out.contains("stopped"), "{out}");
+
+    // a stop that fails is said, the uninstall goes on
+    let (calls, out, _) = stop_slice("stop-slice-refused", "active", 1);
+    assert!(calls.contains("stop northnarrow.slice"), "{calls}");
+    assert!(out.contains("did not stop (active)"), "{out}");
+
+    let text = read("deploy/uninstall.sh");
+    let file = text
+        .find("rm -f \"$UNIT_DIR/northnarrow.slice\"")
+        .expect("the slice's file is removed");
+    let reload = file
+        + text[file..]
+            .find("systemctl daemon-reload")
+            .expect("a reload");
+    let stop = text.find("\nstop_slice\n").expect("stop_slice is run");
+    assert!(
+        file < reload && reload < stop,
+        "file, reload, then the stop"
+    );
+    assert!(
+        stop < text.find("# ── 5. config + state").unwrap(),
+        "with or without --purge"
+    );
+}
+
+/// Lot 350 (named, F2-5): `uninstall.sh --purge` after an uninstall that
+/// kept the state (the guide's two lines, in that order) found no list of
+/// the agent's BPF programs (it went with /run/northnarrow), waited for
+/// every LSM program on the host — systemd's own (`RestrictFileSystems=`,
+/// Debian 13) never detach — and failed after 30 s with the state left. It
+/// waits for none when nothing of NorthNarrow could hold one: no pin root
+/// and no unit process when the run started, no NorthNarrow process. Any of
+/// them, and the wait (and its failure) is as before.
+#[test]
+fn a_purge_after_a_kept_uninstall_does_not_wait_for_other_products_lsm_programs() {
+    const THROUGH_LSM: &str = "# ── 3. immutable flags";
+    let setup = |case: &str, pins: bool, exe: &str| {
+        let host = Host::new(case, &[], pins, false);
+        fs::remove_file(host.dir.join("own-ids")).unwrap();
+        fs::write(
+            host.dir.join("foreign-lsm"),
+            "12: lsm  name restrict_filesy  tag 9f8e7d6c5b4a3210  gpl\n",
+        )
+        .unwrap();
+        let p = host.dir.join("proc/4100");
+        fs::create_dir_all(&p).unwrap();
+        std::os::unix::fs::symlink(exe, p.join("exe")).unwrap();
+        host
+    };
+    let extra = "PROC_ROOT=$T/proc";
+
+    // the second run of the guide's two lines: nothing of ours is left
+    let host = setup("purge-after-keep", false, "/usr/bin/bash");
+    let r = host.uninstall_to(false, None, extra, THROUGH_LSM);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stdout.contains("other products' are not waited for"),
+        "{r:#?}"
+    );
+
+    // a NorthNarrow process runs (its binary removed since): the wait, as before
+    let host = setup(
+        "purge-after-keep-nn-proc",
+        false,
+        "/usr/local/bin/northnarrow-agent (deleted)",
+    );
+    let r = host.uninstall_to(false, None, extra, THROUGH_LSM);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stderr.contains("LSM program(s) still loaded"), "{r:#?}");
+
+    // a pin root when the run started (an agent older than the list): the wait
+    let host = setup("purge-after-keep-pins", true, "/usr/bin/bash");
+    let r = host.uninstall_to(false, None, extra, THROUGH_LSM);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stdout.contains("waiting for every LSM program"), "{r:#?}");
+}
+
+/// Lot 350 (named, F2-5 mini-hunt): `--purge` left `/var/log/northnarrow`
+/// (the export's parent install.sh makes) and every uninstall the journal
+/// namespace's runtime directory `/run/systemd/journal.northnarrow` (its
+/// sockets) until the next boot; the namespace's varlink socket stayed
+/// listening. All three go; a `/var/log/northnarrow` holding anything else
+/// stays.
+#[test]
+fn uninstall_removes_the_journal_runtime_dir_and_the_export_parent() {
+    let text = read("deploy/uninstall.sh");
+    let conf = text
+        .find("if [[ -e \"$JOURNALD_NS_CONF\" ]]; then")
+        .unwrap();
+    let varlink = text
+        .find("systemctl stop systemd-journald-varlink@northnarrow.socket")
+        .expect("the varlink socket is stopped");
+    let runtime = text
+        .find("rm -rf \"$JOURNALD_NS_RUNTIME\"")
+        .expect("the runtime dir is removed");
+    let purge = text.find("# ── 5. config + state").unwrap();
+    assert!(
+        conf < varlink && varlink < runtime && runtime < purge,
+        "order"
+    );
+    assert!(text
+        .contains("JOURNALD_NS_RUNTIME=${JOURNALD_NS_RUNTIME:-/run/systemd/journal.northnarrow}"));
+    // the purge's removal of the export's parent, run on a fixture (the
+    // export itself removed, as the purge's loop above it does)
+    for (case, other, gone) in [
+        ("export-parent-empty", false, true),
+        ("export-parent-other", true, false),
+    ] {
+        let dir = case_dir(case);
+        fs::create_dir_all(dir.join("log/northnarrow")).unwrap();
+        if other {
+            fs::write(dir.join("log/northnarrow/other.log"), "x").unwrap();
+        }
+        let script = format!(
+            "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nEXPORT_DIR=$1/log/northnarrow/export\n{}\necho done\n",
+            block("deploy/uninstall.sh", "export_parent")
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .arg(&dir)
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(!dir.join("log/northnarrow").exists(), gone, "{case}");
+    }
 }

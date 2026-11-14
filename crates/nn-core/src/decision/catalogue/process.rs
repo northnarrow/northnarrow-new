@@ -131,7 +131,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R005_NetcatExec",
-        severities: &[Severity::High],
+        severities: &[Severity::High, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
@@ -139,9 +139,18 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    `nc.traditional`), recorded only.",
         false_positives: "Administrators and scripts use netcat for port checks and file \
                           transfers; every such exec is recorded (Log), none is acted on. The \
-                          name is the process's own: a renamed copy is not seen.",
+                          name is the process's own: a renamed copy is not seen. Lot 350: \
+                          cloud-init's own `nc -U /run/cloud-init/share/<phase>.sock` (cloud-init \
+                          24; 25: `nc -Uu -W1 <socket> -s <return socket>`) at every boot of a \
+                          cloud image is recorded at Low, recognised by \
+                          identity only — the packaged netcat's file, root's, that argv and no \
+                          inet stream, in the cgroup of the cloud-init unit of that phase, forked \
+                          by the unit's own shell, PID 1's fork; any other netcat is High.",
         how_to_test: "`nc -z 127.0.0.1 22` (any netcat invocation).",
-        tests: &["crates/nn-core/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias"],
+        tests: &[
+            "crates/nn-core/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias",
+            "crates/nn-core/src/decision/rules/r005_netcat_exec.rs::r005_records_cloud_init_s_own_netcat_at_low_only",
+        ],
         attack_note: "T1095 for netcat's use as a raw TCP/UDP channel (a reverse or bind \
                       shell); the rule sees the name only, not the connection.",
     },

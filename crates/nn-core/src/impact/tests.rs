@@ -580,6 +580,7 @@ fn one_event_is_assessed_once() {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         }))
         .is_none());
 }

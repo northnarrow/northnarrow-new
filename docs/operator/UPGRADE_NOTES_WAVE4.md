@@ -2369,3 +2369,39 @@ detail.
     not watched by FIM. A hook planted there stays R011 High when it runs,
     because it is not in a system tree.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes.
+
+## 44. Our own install, boot and uninstall: no High; a purge leaves nothing undeclared (lot 350)
+
+- **rsyslog's log after a fresh install is no truncation.** The agent's
+  first baseline read of `/var/log/syslog` (and its own re-hash of each
+  record) closes the log, which emits rsyslogd's pending appends — appends
+  that read had already measured, so the record read "no growth" and
+  NN-L-FIM-005 was High at 4 of 10 fresh installs on Ubuntu. A record whose
+  bytes are the very bytes the drain read for the file's previous record,
+  with the kernel's record of `O_APPEND` writes by rsyslogd alone, is
+  rsyslogd's append now. A truncation by another writer, by rsyslogd itself,
+  or a rewrite in place stays High. The drift log is unchanged.
+- **`sudo ./deploy/uninstall.sh` at a terminal is Low every time.** It was
+  High 3 runs in 7: a shell that runs `sudo` as its last command executes
+  sudo in place of itself, and sudo's monitor, forked in the same 10 ms
+  clock tick, was not known as sudo's. sudo-rs (`/usr/lib/cargo/bin/sudo`,
+  Ubuntu 26.04's `sudo`; `/usr/bin/sudo-rs`, `/usr/bin/su-rs`) counts as
+  sudo for an administrator's session (R009, the FIM rules' session checks,
+  the credential readers). A High R009 now names, in the agent's journal,
+  which part of the session check failed.
+- **cloud-init's own netcat at boot is Low.** On cloud images with
+  cloud-init 24 or later (Debian 13, Ubuntu 26.04), every boot ran `nc -U
+  /run/cloud-init/share/<phase>.sock` (cloud-init 25: `nc -Uu -W1 <socket> -s
+  <return socket>`) as root: R005 High and the posture
+  ENGAGED. That exec — the packaged `nc.openbsd`, on that socket, in the
+  cgroup of the cloud-init unit of that phase, forked by the unit's own
+  `ExecStart=` shell — is recorded Low and raises no ExploitAttempt. Any
+  other netcat is High as before.
+- **`uninstall.sh` stops `northnarrow.slice`** (it stayed loaded and active
+  until the next boot) and removes the empty `system.control` directories,
+  the journal namespace's runtime directory and varlink socket, and, with
+  `--purge`, `/var/log/northnarrow`. A `--purge` after an uninstall that
+  kept the state no longer fails on hosts with other products' BPF-LSM
+  programs (systemd's `RestrictFileSystems=`). What remains after a purge
+  (kernel modules loaded on demand, the host's own logs) is listed in
+  [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.

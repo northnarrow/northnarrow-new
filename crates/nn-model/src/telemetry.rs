@@ -152,6 +152,19 @@ pub struct FimEvent {
     /// record with its own writer.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub truncated_by_another: bool,
+    /// Lot 350 (F2-1): the drain's read of the file for this `Modified` found
+    /// the very bytes — size and SHA-256 — its read for the file's previous
+    /// record found: the writes this record reports were already in the
+    /// content that record was judged on. A record leaves the kernel at the
+    /// close of ANY file of the inode, the drain's own re-hash included: a
+    /// log `rsyslogd` holds open has its pending appends emitted by the
+    /// drain's read of the previous record, after that read had measured
+    /// them — the size then reads "no growth" (NN-L-FIM-005 High at a fresh
+    /// install, the start's baseline reading the log). Not a proof by itself:
+    /// NN-L-FIM-005's carve-out also needs [`Self::appends_only`] and the
+    /// rsyslog daemon as the writer.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub unchanged_since_read: bool,
 }
 
 /// Wave 2 (TST-004): a watched file's permission bits and ownership, as
@@ -760,6 +773,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -866,6 +880,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

@@ -8,7 +8,7 @@ use nn_model::{Event, ResponseAction, Severity};
 
 use super::rules::testutil::{spawn, spawn_as};
 use super::rules::{
-    R001ExecFromTmp, R002ExecFromDevShm, R003ExecFromVarTmp, R005NetcatExec, R008HiddenHomeBinary,
+    R001ExecFromTmp, R002ExecFromDevShm, R003ExecFromVarTmp, R008HiddenHomeBinary,
     R010BinaryInWebroot,
 };
 use super::Rule;
@@ -20,6 +20,7 @@ use crate::posture::host::testing::TestHost as H;
 // weakening variables) are the agent's (`decision::host_tests`).
 type RuleEngine = super::RuleEngine<H>;
 type R004ExecFromProcSelfFd = super::rules::R004ExecFromProcSelfFd<H>;
+type R005NetcatExec = super::rules::R005NetcatExec<H>;
 type R006ReverseShellTooling = super::rules::R006ReverseShellTooling<H>;
 type R007CryptoMiner = super::rules::R007CryptoMiner<H>;
 type R009RootExecFromUserPath = super::rules::R009RootExecFromUserPath<H>;
@@ -200,7 +201,7 @@ fn rules_share_consistent_metadata() {
         Box::new(R002ExecFromDevShm),
         Box::new(R003ExecFromVarTmp),
         Box::new(R004ExecFromProcSelfFd::default()),
-        Box::new(R005NetcatExec),
+        Box::new(R005NetcatExec::default()),
         Box::new(R006ReverseShellTooling::new(Default::default())),
         Box::new(R007CryptoMiner::new(Default::default())),
         Box::new(R008HiddenHomeBinary),
@@ -248,7 +249,7 @@ fn rule_ids_are_pinned() {
         R004ExecFromProcSelfFd::default().id(),
         "R004_ExecFromProcSelfFd"
     );
-    assert_eq!(R005NetcatExec.id(), "R005_NetcatExec");
+    assert_eq!(R005NetcatExec::default().id(), "R005_NetcatExec");
     assert_eq!(
         R006ReverseShellTooling::new(Default::default()).id(),
         "R006_ReverseShellTooling"
@@ -1279,6 +1280,7 @@ fn a_snapshot_completes_a_chain_while_the_session_is_open() {
         moved_in: false,
         appends_only: false,
         truncated_by_another: false,
+        unchanged_since_read: false,
     });
     // The read's own record (the FIM rule) — a late chain completion on
     // the open flow's connect would also do; either way one chain verdict.
@@ -1498,6 +1500,7 @@ fn fim_event(path: &str, op: nn_model::telemetry::FimOp, pid: u32, uid: u32, ts:
         moved_in: false,
         appends_only: false,
         truncated_by_another: false,
+        unchanged_since_read: false,
     })
 }
 

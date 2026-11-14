@@ -456,6 +456,8 @@ fn spawn_rules<H: DecisionHost>(
     let r011_lineage = lineage.clone();
     // lot 313 (the review of #549, F2): the shell socat starts
     let r006_lineage = lineage.clone();
+    // lot 350 (F2-3): cloud-init's own netcat on its unix socket
+    let r005_lineage = lineage.clone();
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -485,7 +487,7 @@ fn spawn_rules<H: DecisionHost>(
         Box::new(R001ExecFromTmp),
         Box::new(R003ExecFromVarTmp),
         // Records, the High ones first.
-        Box::new(R005NetcatExec),
+        Box::new(R005NetcatExec::default().with_lineage(r005_lineage)),
         Box::new(R007CryptoMiner::name_fragments(al())),
         Box::new(R008HiddenHomeBinary),
         Box::new(R014AtBatchScheduling::new(al())),

@@ -65,6 +65,7 @@ STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 RUN_DIR=${RUN_DIR:-/run/northnarrow}
 BPFFS_ROOT=${BPFFS_ROOT:-/sys/fs/bpf/northnarrow}
 JOURNALD_NS_CONF=/etc/systemd/journald@northnarrow.conf
+JOURNALD_NS_RUNTIME=${JOURNALD_NS_RUNTIME:-/run/systemd/journal.northnarrow}
 # install.sh's upgrade transactions (lab PR 220): the copies of a run that
 # could not finish its rollback; --purge removes them with the rest.
 UPGRADE_TXN_ROOT=${UPGRADE_TXN_ROOT:-/var/lib/northnarrow-upgrade}
@@ -302,6 +303,30 @@ remove_pins() {
         rm -rf "$d" 2>/dev/null || true
     done
 }
+# >>> nn_lsm_holders (run by xtask/tests/install_scripts.rs)
+# Lot 350 (F2-5): what of NorthNarrow can hold one of its LSM programs —
+# when the run starts, its pin root (or the tracker's beside it) or a process
+# of its units (NN_HELD); at the wait, a process running a NorthNarrow binary
+# (an e2e or a manual run, its file deleted or not). A purge after an
+# uninstall that kept the state had none of them, no list of the agent's
+# programs either (it went with /run/northnarrow), and waited for every LSM
+# program on the host: systemd's own (RestrictFileSystems=, Debian 13)
+# never detach, and the purge failed with the state left.
+nn_procs_running() {
+    local e
+    for e in "${PROC_ROOT:-/proc}"/[0-9]*/exe; do
+        e=$(readlink "$e" 2>/dev/null) || continue
+        case "${e##*/}" in
+            northnarrow-agent* | northnarrow-watchdog*) return 0 ;;
+        esac
+    done
+    return 1
+}
+# <<< nn_lsm_holders
+NN_HELD=0
+if pins_present || nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog; then
+    NN_HELD=1
+fi
 if (( ! PACKAGE )) && pins_present && units_inactive; then
     log "units inactive but $BPFFS_ROOT (or the tracker's pins beside it) exists — removing the stale pins first"
     remove_pins
@@ -429,6 +454,12 @@ elif (( AT_BOOT )); then
     # were disabled before this boot and bpffs is new: no NorthNarrow program
     # can be loaded (other products' LSM programs are not ours to wait for).
     log "at boot, the units disabled since before it: no NorthNarrow BPF program is loaded"
+elif (( ! NN_HELD )) && ! nn_procs_running; then
+    # Lot 350 (F2-5): nothing of NorthNarrow could hold one (no pin root and
+    # no unit process when the run started, no NorthNarrow process now): the
+    # kernel unloaded the agent's programs with their last reference. Other
+    # products' are not waited for (external audit DEP-006).
+    log "no $OWN_IDS_FILE, and nothing of NorthNarrow holds an LSM program (no pin root or unit process at the start, no NorthNarrow process): other products' are not waited for"
 else
     # An agent older than the list (or none ever ran): every LSM program on
     # the host, as before, naming what is left.
@@ -500,6 +531,15 @@ if [[ -e "$JOURNALD_NS_CONF" ]]; then
     rm -rf "${JOURNALD_NS_CONF}.d" 2>/dev/null || true
     systemctl stop systemd-journald@northnarrow.service 2>/dev/null || true
     systemctl stop systemd-journald@northnarrow.socket 2>/dev/null || true
+    # Lot 350 (F2-5, the mini-hunt): the namespace's varlink socket too
+    systemctl stop systemd-journald-varlink@northnarrow.socket 2>/dev/null || true
+fi
+# Lot 350 (F2-5, the mini-hunt): the namespace's runtime directory (its
+# sockets, /run's tmpfs) outlived the stop until the next boot. Its journal
+# files are elsewhere (/var/log/journal, /run/log/journal: --purge below).
+if [[ -d "$JOURNALD_NS_RUNTIME" ]]; then
+    log "removing $JOURNALD_NS_RUNTIME"
+    rm -rf "$JOURNALD_NS_RUNTIME" 2>/dev/null || true
 fi
 # Tappa 9.5.1 control-surface baits: inert files the install dropped
 # across /etc, /var/lib and /run. Remove them even when config/state
@@ -517,6 +557,34 @@ for d in /sys/fs/cgroup/northnarrow-deny-selftest /sys/fs/cgroup/northnarrow-mov
     if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed $d"; fi
 done
 systemctl daemon-reload
+# >>> stop_slice (run by xtask/tests/install_scripts.rs)
+# Lot 350 (F2-5): the units' slice outlived its file until the next boot —
+# loaded, active, its cgroup there. Its file is gone at the reload above, and
+# with it its RefuseManualStop=: stopped now (both units are stopped, nothing
+# else runs in it), then forgotten. The empty `system.control` directories
+# the agent's unit made the parents of (`mkdir -p` before every start, their
+# children removed above) go too: systemd makes them again when it needs one
+# (`systemctl set-property`); one that holds anything stays.
+stop_slice() {
+    local state
+    state=$(systemctl show -p ActiveState --value northnarrow.slice 2>/dev/null || true)
+    if [[ -n "$state" && "$state" != inactive ]]; then
+        if systemctl stop northnarrow.slice 2>/dev/null; then
+            log "stopped northnarrow.slice"
+        else
+            log "northnarrow.slice did not stop ($state): it goes at the next boot"
+        fi
+    fi
+    systemctl reset-failed northnarrow.slice 2>/dev/null || true
+    local d
+    for d in "${SYSTEM_CONTROL_DIRS[@]}"; do
+        if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed the empty $d"; fi
+    done
+    return 0
+}
+# <<< stop_slice
+SYSTEM_CONTROL_DIRS=(/etc/systemd/system.control /run/systemd/system.control)
+stop_slice
 
 # ── 5. config + state ─────────────────────────────────────────────────
 BOOTSTRAP_KEY=/root/northnarrow-admin.key
@@ -553,6 +621,14 @@ if (( PURGE )); then
     for d in "$ETC_DIR" "$STATE_DIR" "$UPGRADE_TXN_ROOT" "${EXPORT_DIR:-/var/log/northnarrow/export}"; do
         [[ -e "$d" ]] && { log "PURGE: removing $d"; rm -rf "$d"; }
     done
+    # >>> export_parent (run by xtask/tests/install_scripts.rs)
+    # Lot 350 (F2-5, the mini-hunt): the export's parent install.sh made
+    # (/var/log/northnarrow), when nothing else is in it
+    d=$(dirname "${EXPORT_DIR:-/var/log/northnarrow/export}")
+    if [[ ${d##*/} == northnarrow && -d "$d" ]] && rmdir "$d" 2>/dev/null; then
+        log "PURGE: removed $d"
+    fi
+    # <<< export_parent
     # Its admin.pub line went with $ETC_DIR: the key opens nothing here any
     # more, and a reinstall bootstraps a new one at the same path.
     [[ -f "$BOOTSTRAP_KEY" ]] && { log "PURGE: removing the bootstrap admin private key $BOOTSTRAP_KEY"; rm -f "$BOOTSTRAP_KEY"; }

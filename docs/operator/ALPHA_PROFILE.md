@@ -316,3 +316,25 @@ uninstall.sh: REBOOT NOW to finish: sudo systemctl reboot
 
 No key is needed on that path. After the reboot, `journalctl -b -u
 northnarrow-uninstall` shows what was removed.
+
+**What a tester's own install, boot and uninstall record** (lot 350, the
+pre-alpha's Phase 2): no High. Three records a tester saw on a host that
+did nothing else are told by identity now:
+
+- NN-L-FIM-005 on `/var/log/syslog` right after a fresh install (Ubuntu,
+  rsyslog): rsyslogd's appends the agent's own baseline read had already
+  measured ([`TAPPA9_FIM_TRUST_MODEL.md`](TAPPA9_FIM_TRUST_MODEL.md)).
+- R005 at every boot of a cloud image (Debian 13, Ubuntu 26.04: cloud-init
+  24 and later asks each boot phase with `nc -U
+  /run/cloud-init/share/<phase>.sock`, cloud-init 25 with `nc -Uu -W1 <that
+  socket> -s <its return socket>`): recorded Low, and no ExploitAttempt,
+  for that packaged netcat on that socket, in the cgroup of the cloud-init
+  unit of that phase, forked by the unit's own shell — any other netcat is
+  High as before.
+- R009 for `sudo ./deploy/uninstall.sh` (or `install.sh`) at a terminal:
+  Low every time, sudo-rs included
+  ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §2.1).
+
+`uninstall.sh --purge` leaves nothing of NorthNarrow; what stays until the
+next boot (kernel modules loaded on demand, the host's own logs) is listed
+in [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.

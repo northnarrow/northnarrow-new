@@ -11208,6 +11208,76 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 350 — the pre-alpha's Phase 2: our own install, boot and uninstall
+  raise no High; a purge leaves nothing undeclared (C06, C11; no level
+  changes).**
+  - What was open (the Phase 2 of the pre-alpha checks on rc1): NN-L-FIM-005
+    High on `/var/log/syslog` at 4 of 10 fresh installs on Ubuntu (F2-1);
+    R009 High for `sudo ./deploy/uninstall.sh` at a terminal in 3 of 7,
+    where the guide says Low (F2-2); R005 High and the posture ENGAGED at
+    every boot of Debian 13 and Ubuntu 26.04, cloud-init's own `nc -U`
+    (F2-3); `northnarrow.slice` active, an empty `/run/systemd/system.control`
+    and `nf_tables` left after `--purge`, undeclared (F2-5).
+  - Found: (1) a FIM record leaves the kernel at the close of any file of the
+    inode; rsyslogd never closes its log, so the first-boot baseline's read
+    and the drain's own re-hash emitted appends they had already measured
+    (two drift rows 5 ms apart with one new hash, the second High). (2) a new
+    journal line (why a session is not an administrator's) named "lineage
+    lost at sudo's monitor": a shell executing sudo in place (`bash -c 'cd
+    … && sudo …'`, `script -c`), the monitor forked in sudo's exec's tick, its
+    `/proc` start rounded down to the shell's image; and sudo-rs (Ubuntu
+    26.04's `sudo`) was no elevation binary. (3) R005 and ExploitAttempt
+    judged a netcat by its name only. (4) the slice's file was removed but
+    the slice never stopped; the mini-hunt and the lab added the journal
+    namespace's runtime directory and varlink socket and
+    `/var/log/northnarrow`, and a `--purge` after a kept uninstall that
+    failed on Debian 13 and Ubuntu 26.04 (it waited for systemd's own BPF-LSM
+    programs).
+  - Done: (1) the drain's last read keeps its SHA-256
+    (`FimEvent::unchanged_since_read`), taken by rsyslogd's carve-out only
+    with the kernel's record of `O_APPEND` writes by rsyslogd alone; the
+    watched size read before the watch. (2) `fork_entry` reads the parent's
+    exec of the file the fork runs within the fork's window (authentication
+    binaries only, lot 278's restrictions); sudo-rs/su-rs listed, a ratchet
+    against the exec policy's list. (3) `posture::cloud_init`: R005 Low and no
+    ExploitAttempt for cloud-init's own netcat, by its image, argv, streams,
+    unit cgroup and the unit's shell. (4) `uninstall.sh` stops the slice and
+    removes the empty `system.control` parents, the namespace's runtime
+    directory and varlink socket, `/var/log/northnarrow` (purge); the purge
+    after a kept uninstall waits for no foreign LSM program when nothing of
+    NorthNarrow can hold one; the guide lists what remains (modules loaded
+    on demand, the host's logs).
+  - Lab (as measured): our own guests, one at a time; before = rc1 (on
+    ubuntu2404 and ubuntu2604 with the R009 journal line only), after = this
+    lot; 3 cycles each of a fresh install, a cold boot, a §3.7 restart, an
+    uninstall keeping the state and a purge, with 6 sudo samples per cycle.
+    **F2-1** (fresh installs on the guests with rsyslog): NN-L-FIM-005
+    High ubuntu2404 1/3 → 0/3, ubuntu2604 1/3 → 0/3 (the High's drift rows:
+    two records 5 ms apart with one new hash); a targeted stress (40 rounds
+    of `logger` and a root read of the log) gave none on rc1 nor after: it
+    does not reproduce the install's race. **F2-2** (sudo at a terminal,
+    script samples living 2 s as `uninstall.sh` does): High debian13 3/12 →
+    0/15, ubuntu2404 6/15 → 0/15, ubuntu2604 (sudo-rs) 15/15 → 0/15;
+    `uninstall.sh` R009 ubuntu2604 High 3/3 → Low 3/3, debian13 and
+    ubuntu2404 Low 3/3 both; without a terminal High 3/3 per guest, before
+    and after (the control). **F2-3** (each cold boot): R005 High and
+    ENGAGED debian13 3/3 → Low 3/3 (the first after-round still High: Debian
+    13's cloud-init 25 asks with `nc -Uu -W1 <socket> -s <return socket>`,
+    named by R005's new journal line; recognised since), ubuntu2604 3/3 →
+    Low 3/3, the posture Alerted (F2-4); ubuntu2404 runs no such unit.
+    **F2-5** (after each purge): `northnarrow.slice` loaded and active, its
+    cgroup there 9/9 → inactive, no cgroup 9/9; `/run/systemd/system.control`
+    (empty), `/var/log/northnarrow` and `/run/systemd/journal.northnarrow`
+    left → none; `--purge` after a kept uninstall rc 1, the state left,
+    debian13 3/3 and ubuntu2604 3/3 → rc 0 9/9 (the before-round's kept
+    state on debian13 purged by the lot's script too); `nf_tables` (and
+    `unix_diag` on ubuntu2604) loaded after, declared.
+  - Not done: Phase 2's F2-4 (ALERTED on an idle host), F2-6 (Low noise at each
+    start), F2-7 (glibc warning) and F2-8 (the tester's path) stay with
+    their phases; Fedora's `ncat` under cloud-init is not recognised (no
+    lab).
+  - Levels unchanged: the pre-alpha's Phase 2 findings; no new capability.
+
 - **Lot 348 — the alpha's false positives round 4 and lab confirmations
   before the alpha (C06, C11, C14; no level changes).**
   - What was open (lot 347's lab, seen and not in its scope): on 5.15

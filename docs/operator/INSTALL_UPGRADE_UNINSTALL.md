@@ -404,7 +404,16 @@ user-writable path, R009's match. What the running agent does with them:
 - **The script's own exec** comes before any window it can open. Below
   COMBAT, R009 records it (High) and does not kill it (RULE_POLICY.md §1);
   run by an administrator's `sudo` at a terminal, the record is Low (an
-  administrator's session).
+  administrator's session). Lot 350: every time — it was High 3 runs in 7
+  in the pre-alpha's lab. A shell that runs `sudo` as its last command
+  (`ssh -t host 'cd tree && sudo ./deploy/uninstall.sh'`, `script -c`)
+  executes sudo in place of itself, and sudo's monitor, forked in the same
+  10 ms clock tick, was not known as sudo's: the session was lost. And
+  sudo-rs (Ubuntu 26.04's `sudo`, `/usr/lib/cargo/bin/sudo`; Debian's
+  `sudo-rs`, `su-rs`) is an elevation binary as sudo is. Without a terminal
+  (`ssh host sudo …`, automation) the record stays High; when it does, the
+  agent's journal says which part of the session check failed (`not an
+  administrator's sudo/su session at a terminal: …`).
 - **What the script executes from its tree afterwards** (the new agent's
   `--version`) runs after it opened its window: asked for an installer
   (`nn-admin trusted-installer-grant --for-installer`, which the scripts
@@ -461,7 +470,14 @@ the agent's own BPF programs to unload (the ids in
 other products' LSM programs are left alone) → `chattr -R -i` on state and
 config → remove
 binaries, units, `journald@northnarrow.conf`, `/run/northnarrow` and the
-ten bait files → `daemon-reload`. Without `--purge` the admin key, the
+ten bait files → `daemon-reload` → stop `northnarrow.slice` (lot 350: its
+file is gone at the reload, and with it its `RefuseManualStop=`; it stayed
+loaded and active, its cgroup there, until the next boot; once stopped,
+`systemctl status northnarrow.slice` reads `loaded`, `inactive (dead)` like
+any slice systemd knows no file of) and remove the
+empty `system.control` directories the agent's unit made the parents of
+(`/etc/systemd/system.control`, `/run/systemd/system.control`: one that
+holds anything stays). Without `--purge` the admin key, the
 signed audit chain and the chain logs stay on disk: they are evidence and
 identity, and a later reinstall picks them up (`install.sh` leaves an
 existing `admin.pub` untouched). The summary names every private admin
@@ -473,6 +489,19 @@ or `--purge` removes both. `--yes` skips the confirmation prompt.
 If an unrelated NorthNarrow process (an e2e test, a manual
 `northnarrow-agent` run) still holds the LSM programs, the script stops
 and names the condition instead of leaving a half-removed host.
+
+The two lines in that order — an uninstall that keeps the state, then
+`--purge` later to retire the host — work (lot 350). The second run finds
+no list of the agent's programs (it went with `/run/northnarrow`) and used
+to wait for every LSM program on the host: systemd's own
+(`RestrictFileSystems=`, Debian 13) never detach, and the purge failed after
+30 s with everything left. When nothing of NorthNarrow can hold one — no pin
+root and no unit process when the run starts, no process running a
+NorthNarrow binary — other products' programs are not waited for; any of
+them, and the wait is as before. Every uninstall also stops the journal
+namespace's varlink socket and removes its runtime directory
+(`/run/systemd/journal.northnarrow`); `--purge` removes `/var/log/northnarrow`
+when nothing else is in it.
 
 **A wedged agent** (lot 341): its unit active but `nn-admin status` not
 answered within 10 s (`ANSWER_TIMEOUT`), or, with stale protected pins, an
@@ -489,6 +518,25 @@ answers keeps the rule above: without the window, nothing is disabled.
 The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
 NorthNarrow program, config, state or bait behind — and every foreign LSM
 program in place — then reinstalls (`nn-lab.sh uninstall-check`).
+
+**What remains after `--purge`** (lot 350; the pre-alpha's state diff on
+five distributions, before and after): nothing of NorthNarrow on disk, in
+systemd or in the kernel's BPF objects — no file, unit, slice, account,
+pin, program, nftables table or bpffs entry. What stays until the next
+boot, and is not NorthNarrow's to remove:
+
+- **Kernel modules the kernel loaded on demand** for the agent: `nf_tables`
+  (and its dependencies `nfnetlink`, `libcrc32c` where nothing else had
+  loaded them), loaded by `nft` for the agent's table, and `unix_diag`
+  (Ubuntu 26.04), loaded by the socket inventory. They are not unloaded: the host's own firewall
+  (nftables, `iptables-nft`, a container runtime) may use them, and
+  removing one in use breaks it.
+- **The host's own logs** of the agent's life: systemd's lines about the
+  units in the system journal (and `/var/log/syslog` where rsyslog runs).
+  `--purge` removes the agent's journal namespace, not the host's journal.
+
+The volatile kernel values a cold boot changes (`kernel.threads-max`,
+`net.ipv4.tcp_fastopen_key`, …) are no residue.
 
 ### 3.1 Host hardening checks (`nn-admin host-check`)
 
