@@ -101,6 +101,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     runtime enabling the cpuset controller above the agent, and systemd's
     own `AllowedCPUs=` on the slice record nothing
     (`crates/nn-linux/src/own_cpus.rs`, `deploy/lab/malsim/cpu-confine-check.sh`).
+    The review of #558 (F2, F3, F6, F7): a round it cannot judge is no
+    longer skipped without end (toggling a CPU each round, or a FUSE file
+    bound over the online list, blinded it): it judges against the online
+    CPUs of the round and the last, and three rounds in a row it cannot
+    judge are a signed `cpu_confined` "could not judge"; its sources are
+    files opened at the start (a later bind over them changes nothing) and
+    the cgroup files are opened beneath the cgroup root with
+    `RESOLVE_NO_XDEV` (a bind over the slice's `cpuset.cpus` no longer
+    narrows the expectation); systemd's repeated `CPUAffinity=` merge, and
+    the agent unit's own installed `CPUAffinity=` is no confinement; every
+    state read is non-blocking, regular files only, bounded (a FIFO or
+    `/dev/zero` over one no longer stalls or exhausts the agent).
   - **A window's forbidden BPF load is refused at its later handles (R002,
     6.9 and later).** From 6.9 the content judge reads a load at
     `bpf_prog_load` only, and a trusted-installer window lets a load through

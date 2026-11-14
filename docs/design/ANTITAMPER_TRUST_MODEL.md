@@ -2662,6 +2662,33 @@ set — R12c-3, open since lab PR 271 — named), and the watchdog's CPUs are no
 does not widen its own masks (a restart does). Root offlining CPUs
 narrows the host for everyone, the agent with it: no record (a hotplug).
 
+**The review of #558 (F2, F3, F6, F7): what blinded the watch.** A round
+whose online CPUs moved was skipped with no bound, so root toggling a CPU
+each round — or a FUSE file over `/sys/devices/system/cpu/online` giving a
+new list at each read — kept every round skipped; a bind over the slice's
+`cpuset.cpus` narrowed the expectation (the partition then judged no
+confinement); a FIFO or `/dev/zero` over a read file stalled the round or
+exhausted the agent. Now: the round is judged against the intersection of
+its two online reads and the last round's (a real hotplug: the kernel ANDs
+the masks with the active CPUs), an unsettled round never clears a
+confinement in force, and three rounds in a row it cannot judge are signed
+(`cpu_confined`, cause "could not judge"); the online list, `/proc/stat`,
+`/proc/self/cgroup` and the thread list are opened once at the start (by
+filesystem magic) and read with `pread` at 0, the expectation the union of
+the two online sources; the cgroup files are opened with `openat2`
+(`RESOLVE_BENEATH|NO_XDEV|NO_SYMLINKS|NO_MAGICLINKS`) from the cgroup2
+root opened at the start, a crossing of a mount making the round
+unjudged; systemd's `CPUAffinity=` merges as systemd merges it; the agent
+unit's own `CPUAffinity=` counts only from the agent's unit directories,
+older than the install; state reads are `O_NONBLOCK`, regular files only,
+bounded. **What stays open**: a sysfs/procfs file of another kind bound
+over the online list before the agent starts (the magic check passes it;
+the union keeps one source from narrowing); a FUSE regular file stalls a
+read; the posture host's `LinuxHost::read` is unbounded; a slice's
+`cpuset.cpus` written inside a window narrows the expectation after it;
+the unit's setting trusts ctime (root sets the clock back), as the drop-in
+judge does.
+
 **A window's forbidden load (pre-alpha R002).** From 6.9 the content judge
 runs at `bpf_prog_load` only, on the kernel's copy of the instructions;
 a trusted-installer window lets a load through whatever it calls. On 7.0

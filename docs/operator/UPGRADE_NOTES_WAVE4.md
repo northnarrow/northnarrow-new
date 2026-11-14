@@ -2387,8 +2387,9 @@ detail.
   and the degradation `own_cpus` in `nn-admin status --key` ("the agent may
   run on CPUs 0 of the 0-3 it should …") while it holds; when it ends the
   degradation leaves the status.
-  - **What records nothing:** a CPU taken offline or brought back (the
-    round whose online CPUs moved is skipped), a container runtime enabling
+  - **What records nothing:** a CPU taken offline or brought back (each
+    round is judged against the CPUs online at its two reads and at the
+    last round's: the kernel narrows the masks to the active CPUs), a container runtime enabling
     the cpuset controller above the agent, and `AllowedCPUs=` on
     `northnarrow.slice` set by systemd (a reservation: set it inside a
     trusted-installer window, as any change of the slice). A host whose
@@ -2401,6 +2402,41 @@ detail.
     does run on fewer CPUs than it should, and says so (`cpu_confined`,
     cause `affinity`). Restart the agent (inside a window) to give it every
     CPU back; it does not widen its own threads' masks.
+  - **Nothing blinds it silently (the review of #558, F2, F3, F6, F7).**
+    - A round it cannot judge — the online CPUs moving at every round (root
+      toggling a CPU), a cgroup file it reads reached through a mount — no
+      longer passes silently: three in a row are a signed `cpu_confined`
+      High, cause "the watch could not judge".
+    - The online CPUs, `/proc/stat`, `/proc/self/cgroup` and the thread
+      list are files opened once at the agent's start (a sysfs or procfs
+      file, by its filesystem's magic: a FUSE file there at the start is
+      refused) and read afresh each round: a file bound over
+      `/sys/devices/system/cpu/online` later changes nothing. The expected
+      CPUs are the union of the online list and `/proc/stat`'s: one faked
+      source cannot narrow them.
+    - The cgroup files are opened beneath the cgroup root opened at the
+      start (`openat2`, `RESOLVE_NO_XDEV`, no symlinks): a bind mount over
+      the slice's `cpuset.cpus` (or over the slice's directory) makes the
+      round unjudged, never a narrower expectation; the partition walk
+      skips mounted directories.
+    - systemd's repeated `[Manager] CPUAffinity=` are merged, as systemd
+      does (an empty one resets): the expectation was the last one alone,
+      narrower. The agent unit's own `CPUAffinity=` (an operator pinning
+      the EDR to housekeeping CPUs) is what it should run on when every
+      file that sets it is in the agent's unit directories and older than
+      the install; set later, or in a host-wide drop-in, it stays a
+      confinement (the drop-in judge's assumption on ctime).
+    - Every state read (`read_state`, the watch's sources) opens
+      non-blocking, takes a regular file only and reads at most a bound
+      (16 MiB; the watch's sources 4 MiB): a FIFO or `/dev/zero` bound over
+      one no longer stalls the round or exhausts the agent.
+    - Still open: another sysfs or procfs file bound over the online file
+      BEFORE the agent starts passes the magic check (the union keeps it
+      from narrowing unless both sources are faked); a FUSE regular file
+      can still stall a read; a slice's `cpuset.cpus` written inside a
+      window narrows the expectation; `CPUAffinity=numa` is not read;
+      three rounds of real hotplug in a row give the "could not judge"
+      record (true: the watch could not judge).
   - Not watched: the watchdog's CPUs (the agent's own threads only).
 - **A program loaded in a window cannot be taken after it (6.9 and
   later).** A program the BPF content judge refuses outside a window (a
@@ -2463,6 +2499,17 @@ detail.
   build: their test doors) prints `nn-core/test-util,nn-linux/test-util`
   beside the agent's own lab features; a release build prints `none` as
   before, and release.yml refuses any artefact that does not.
+  - **Its limits (the review of #558, F8, named).** The ratchet's `--cfg`
+    scan reads release.yml and `.cargo/config.toml` only — not a legacy
+    `.cargo/config`, a `RUSTFLAGS` set by xtask, a script writing
+    `$GITHUB_ENV`, nor a `build.rs` printing `cargo::rustc-cfg`. The
+    backstop is `--build-features` on the artefact, which sees any of them
+    for nn-core's and nn-linux's `test-util` in the agent binary only: the
+    watchdog and nn-admin are not asked, and no symbol check is made (Phase
+    1 checks the shipped binaries). Its name filter for third-party test
+    features (`test`, `debug`, `demo`, `mock`, `fake`) fails closed on a
+    harmless name (`debugger_visualizer`): such a feature is classified by
+    hand.
 - **Nothing to configure.** No overlay, allowlist or signed policy changes;
   the eBPF object adds two maps: `PROG_CONTENT_HELD`, pinned under the pin
   root (an uninstall removes it with the rest), and

@@ -849,7 +849,12 @@ unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
     // no `bpf(2)` command — judged as the `bpf` hook judges an attach
     if cmd == PERF_EVENT_IOC_SET_BPF {
         let fd: u64 = ctx.arg(2);
-        if crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF)) == crate::bpf_defense::HELD_REFUSED {
+        let held = crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF));
+        // the lab on 7.0: LLVM knows the global function returns 0 or 1 and
+        // folded the branch into `-held`, which the verifier reads as an
+        // unknown return value (not in [-4095, 0]) and refuses the program;
+        // a volatile read keeps the two constant returns
+        if core::ptr::read_volatile(&held) == crate::bpf_defense::HELD_REFUSED {
             return -EPERM;
         }
         return 0;
