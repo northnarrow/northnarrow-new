@@ -2487,8 +2487,9 @@ detail.
     tried next now, and a value neither read gives is refused (`EPERM`,
     `bpf_held_use` High, "a value not read", the prog array's map id). A
     tool that updates a prog array from a value neither read can see is
-    refused (a retry from the same memory is refused again), and the
-    refusal is signed.
+    refused and signed. The refusal comes before the kernel's copy, so
+    nothing faults the page in: the same retry is refused again until
+    the tool touches that page itself.
   - **Still loaded after the window: signed (its re-check, item 2).**
     Once no window is open, the kernel-state round signs each held
     program still loaded — attached by a link or an attach made inside
