@@ -162,5 +162,6 @@ fn tcp_v4(pid: u32, dst: [u8; 4], dst_port: u16, ts: u64) -> Event {
         dst_addr: a,
         dst_port,
         timestamp_ns: ts,
+        fork: Default::default(),
     }
 }

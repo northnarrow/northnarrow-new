@@ -228,7 +228,13 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
                 None => (0, 0),
             };
             let forker = crate::fork_parent::take(task, start, dev, ino);
-            unsafe { (*raw_ptr).fork_ppid = forker };
+            unsafe {
+                (*raw_ptr).fork_ppid = forker.ppid;
+                // lot 352: the forker's start and the anchor, for the
+                // chains' ancestry across a forker that never executed
+                (*raw_ptr).fork_parent_start = forker.parent_start;
+                (*raw_ptr).fork_anchor = forker.anchor;
+            }
         }
         // Parent: task->real_parent, then tgid (userspace ppid) +
         // the start of its thread-group leader (PID-reuse key) + comm.

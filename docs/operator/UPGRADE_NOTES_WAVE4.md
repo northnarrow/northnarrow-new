@@ -2719,3 +2719,34 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 | A sudo or su further up covers what runs below `su bob` / `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session) | the session check | a hop below that ran as another user as a barrier (a decision of its own) |
 | `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
 | A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |
+
+## 46. A link's new path, the whole module tree, chains across forks (lot 352)
+
+- **A hard link made to a watched file is judged where it went.** A
+  `Linked` detection now names the watched file in `path` and the new link
+  in `dest_path`; NN-L-FIM-002 (Critical) fires for a link into /tmp,
+  /var/tmp, /dev/shm or /home (and for one deeper than 16 directories,
+  whose place is not known). A link elsewhere (a backup tree) is a drift row
+  only, as before. Links were dropped as no-op touches: expect `Linked`
+  drift rows of watched files you did not see before (`cp -al`, backup
+  tools that hard-link a system tree).
+- **NN-L-FIM-008 covers every kernel version's module tree, at any
+  depth.** A write below `/lib/modules/<version>/` (or `/usr/lib/modules/`)
+  is Critical outside a package transaction. A kernel or DKMS package
+  install is one Low record per package-manager process (dpkg, its postinst's
+  depmod) per 15 minutes; the other writes are counted in the record budget
+  as coalesced (`detections_held` audit entries, with paths). An
+  administrator's `depmod -a` is Low; `make modules_install` and a DKMS
+  build run outside a package transaction (the dkms service at boot) are
+  Critical: the alpha profile records them, it kills nothing. A file moved
+  or linked into a version directory is not seen (no open).
+- **The cross-PID chains follow processes that never executed.** A fork-only
+  descendant of a process holding a precursor (a credential-store read, a
+  /tmp exec, a canary trip) now completes NN-L-CHAIN-004/005/006/008 as an
+  exec'd one did: a Python `os.fork()` worker, a subshell's command, a
+  double-forked daemon. Expect these chains where a parent reads a watched
+  credential store and its forked workers connect out.
+- **Wire.** The fork record map grew to 32 bytes an entry (65,536 entries,
+  about 1 MiB more kernel memory); the exec record grew 16 bytes, the TCP
+  connect record 24. The eBPF object and the agent are rebuilt together.
+

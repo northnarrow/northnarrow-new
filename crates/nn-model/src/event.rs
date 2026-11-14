@@ -308,6 +308,10 @@ pub enum Event {
         dst_addr: [u8; ADDR_LEN],
         dst_port: u16,
         timestamp_ns: u64,
+        /// Lot 352: the connecting process's fork record when it executed
+        /// nothing since its fork ([`ForkRecord`]).
+        #[serde(default, skip_serializing_if = "ForkRecord::is_unknown")]
+        fork: ForkRecord,
     },
     /// DNS query (kprobe `udp_sendmsg` filtered to dest port 53).
     DnsQuery {
@@ -1390,6 +1394,9 @@ impl From<&ProcessSpawnRaw> for Event {
             exe: ExeIdentity {
                 // lot 310: who forked the process, for its first exec
                 fork_parent: raw.fork_ppid,
+                // lot 352: the forker's start and the anchor of that fork
+                fork_parent_start: raw.fork_parent_start,
+                fork_anchor: raw.fork_anchor,
                 ..ExeIdentity::from_raw(&raw.exe)
             },
             argv_truncated: raw.trunc_flags & crate::wire::spawn_trunc::ARGV != 0,
@@ -1535,10 +1542,50 @@ pub struct ExeIdentity {
     /// PID 1.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub fork_parent: u32,
+    /// Lot 352: with `fork_parent`, the forker's own start, read at the fork
+    /// (`ProcessSpawnRaw::fork_parent_start`); 0 when not known.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub fork_parent_start: u64,
+    /// Lot 352: with `fork_parent`, the nearest process up the forks that
+    /// had executed when this one was forked — the forker, or the forker's
+    /// own anchor when the forker executed nothing since its fork
+    /// (`ProcessSpawnRaw::fork_anchor`); 0 when not known.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fork_anchor: u32,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Lot 352: the kernel's fork record of a process that executed nothing
+/// since its fork (`TcpConnectRaw::fork_*`): a Python `os.fork()` child, a
+/// shell's subshell, a daemon's grandchild. It has no exec record, so this
+/// is the only place the process tree names it: the cross-PID chains'
+/// ancestry learns its edge to its forker, and the forker's to the anchor
+/// when the forker executed nothing either. All zero when not known (the
+/// process executed since its fork, the record was lost or not attached).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRecord {
+    /// The process's own start (`task->start_time`).
+    pub start_ns: u64,
+    /// The forker's tgid.
+    pub parent: u32,
+    /// The forker's start, read at the fork.
+    pub parent_start_ns: u64,
+    /// The nearest process up the forks that had executed at the fork.
+    pub anchor: u32,
+}
+
+impl ForkRecord {
+    /// No record carried.
+    pub fn is_unknown(&self) -> bool {
+        self.parent == 0 || self.start_ns == 0
+    }
 }
 
 impl ExeIdentity {
@@ -1558,6 +1605,8 @@ impl ExeIdentity {
             pass: raw.pass,
             root,
             fork_parent: 0,
+            fork_parent_start: 0,
+            fork_anchor: 0,
         }
     }
 
@@ -1832,6 +1881,12 @@ impl From<&TcpConnectRaw> for Event {
             dst_addr: raw.dst_addr,
             dst_port: raw.dst_port,
             timestamp_ns: raw.timestamp_ns,
+            fork: ForkRecord {
+                start_ns: raw.fork_start,
+                parent: raw.fork_ppid,
+                parent_start_ns: raw.fork_parent_start,
+                anchor: raw.fork_anchor,
+            },
         }
     }
 }

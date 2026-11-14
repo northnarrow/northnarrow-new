@@ -203,9 +203,14 @@ impl RuleInputs {
         let (svc_homes, caches) = account_dirs(&passwd, crate::accounts::uid_min(&login_defs));
         let mut svc_data = vec![(PathBuf::from("/var/lib"), None)];
         svc_data.extend(svc_homes.into_iter().map(|(h, uid)| (h, Some(uid))));
+        // Lot 352 (NN-L-FIM-008): the kernel's module trees, at any depth —
+        // a write-open below them is reported (`TREE_CRITICAL`) and judged
+        // as the tree's `Created` / `Modified` ([`kmod_tree_write`])
+        let mut critical = own(CRITICAL_FILES_PREFIXES);
+        critical.extend(own(nn_core::fim::rules::KMOD_TREES));
         RuleInputs {
             sensitive: own(SENSITIVE_FILES),
-            critical: own(CRITICAL_FILES_PREFIXES),
+            critical,
             persistence: own(PERSISTENCE_PREFIXES),
             carveout,
             probe_dir: PathBuf::from(crate::telemetry_probe::PROBE_DIR),
@@ -1373,10 +1378,13 @@ pub use crate::path_text::{path_is_exact, CUT_MARK, UNREAD_COMPONENT};
 /// name of `OPEN_PATH_SLOT_LEN - 1` bytes may have been cut (a longer name
 /// reads the same) and gets [`CUT_MARK`]; an empty slot is a read that
 /// failed, [`UNREAD_COMPONENT`].
-fn components(r: &OpenRecordRaw) -> Vec<String> {
-    (0..(r.path_n as usize).min(OPEN_PATH_SLOTS))
+/// Lot 352: of any kernel walk in the open sensor's slot layout
+/// (`OPEN_PATH_SLOTS` names of `OPEN_PATH_SLOT_LEN` bytes, the leaf first):
+/// an open record's, the FIM link record's too.
+fn components_of(path: &[u8], path_n: u16) -> Vec<String> {
+    (0..(path_n as usize).min(OPEN_PATH_SLOTS))
         .map(|i| {
-            let slot = &r.path[i * OPEN_PATH_SLOT_LEN..(i + 1) * OPEN_PATH_SLOT_LEN];
+            let slot = &path[i * OPEN_PATH_SLOT_LEN..(i + 1) * OPEN_PATH_SLOT_LEN];
             match slot.iter().position(|&b| b == 0) {
                 Some(0) => UNREAD_COMPONENT.to_string(),
                 Some(end) if end < OPEN_PATH_SLOT_LEN - 1 => {
@@ -1393,7 +1401,12 @@ fn components(r: &OpenRecordRaw) -> Vec<String> {
 
 /// Mount-relative path (`/a/b/c`) of a record.
 pub fn relative_path(r: &OpenRecordRaw) -> String {
-    let c = components(r);
+    relative_path_of(&r.path, r.path_n)
+}
+
+/// Lot 352: the mount-relative path of a kernel walk ([`components_of`]).
+pub fn relative_path_of(path: &[u8], path_n: u16) -> String {
+    let c = components_of(path, path_n);
     let parts: Vec<&str> = c
         .iter()
         .rev()
@@ -1462,8 +1475,91 @@ fn file_capability(r: &OpenRecordRaw) -> FileCapability {
 /// so never written as an absolute path. `mnt[<major>:<minor>:<root
 /// inode>]` names the root as `/proc/<pid>/mountinfo` would.
 fn unplaced_path(r: &OpenRecordRaw, rel: &str) -> String {
-    let (major, minor) = (r.root_dev >> 20, r.root_dev & 0xF_FFFF);
-    format!("mnt[{major}:{minor}:{}]{rel}", r.root_ino)
+    unplaced_at((r.root_dev, r.root_ino), rel)
+}
+
+fn unplaced_at(root: (u64, u64), rel: &str) -> String {
+    let (major, minor) = (root.0 >> 20, root.0 & 0xF_FFFF);
+    format!("mnt[{major}:{minor}:{}]{rel}", root.1)
+}
+
+/// Lot 352: the absolute path of a kernel walk — its names (the open
+/// sensor's slot layout), whether it stopped before a filesystem root, and
+/// that root — as [`events_of`] names an open record's file: the mount
+/// point of the root, else the walk marked cut, else the root's
+/// `mnt[major:minor:ino]`.
+pub fn walk_path(
+    path: &[u8],
+    path_n: u16,
+    truncated: bool,
+    root: (u64, u64),
+    mounts: &mut MountTable,
+) -> String {
+    let rel = relative_path_of(path, path_n);
+    match mounts.absolute(root, &rel) {
+        Some(abs) => abs,
+        None if truncated => format!("{CUT_MARK}{rel}"),
+        None => unplaced_at(root, &rel),
+    }
+}
+
+/// `file->f_mode` bit: the open created the file.
+const FMODE_CREATED: u32 = 0x10_0000;
+
+/// Lot 352 (pre-alpha Phase 4, NN-L-FIM-008): the FIM event of a
+/// write-open the kernel reported below a kernel module tree
+/// (`TREE_CRITICAL`, [`nn_core::fim::rules::KMOD_TREES`]) at any depth —
+/// `Created` when the open created the file (`FMODE_CREATED`), else
+/// `Modified` (a module rewritten in place). FIM's own hooks report the
+/// tree's directory itself (its direct children), so those are left to
+/// them. The path starts with a tree's absolute name, so the walk reached a
+/// filesystem root the mount table places (a cut walk reads `…/…`, an
+/// unplaced one `mnt[…]…`, and names no tree: the open is reported as a
+/// critical one, as before), and the tree's own names are exact; a name
+/// below them that the kernel cut or could not read is still in the tree —
+/// depmod's temporary indexes (`modules.dep.<pid>.<usec>.<sec>`) and a
+/// module given a long name are longer than a slot (the lab of lot 352).
+fn kmod_tree_write(r: &OpenRecordRaw, path: &str, comm: &str) -> Option<FimEvent> {
+    if r.reason & open_reason::CRITICAL == 0 {
+        return None;
+    }
+    let rest = nn_core::fim::rules::KMOD_TREES
+        .iter()
+        .find_map(|t| path.strip_prefix(t))?;
+    if !rest.contains('/') {
+        return None;
+    }
+    let op = if r.mode & FMODE_CREATED != 0 {
+        FimOp::Created
+    } else {
+        FimOp::Modified
+    };
+    Some(FimEvent {
+        timestamp_ns: r.timestamp_ns,
+        path: path.to_string(),
+        op,
+        new_sha256: None,
+        baseline_sha256: None,
+        new_size: None,
+        baseline_size: None,
+        modifier_exe: None,
+        modifier_pid: r.pid,
+        modifier_uid: r.uid,
+        modifier_comm: comm.to_string(),
+        dest_path: None,
+        child_truncated: false,
+        wide_coverage: false,
+        owner_uid: None,
+        reader_dac_capable: false,
+        capability: None,
+        attrs: None,
+        file_key: None,
+        is_dir: false,
+        moved_in: false,
+        appends_only: false,
+        truncated_by_another: false,
+        unchanged_since_read: false,
+    })
 }
 
 /// The events one record stands for.
@@ -1487,8 +1583,14 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
     };
     let comm = comm_of(r);
     let mut out = Vec::new();
-    let file_open =
+    let mut file_open =
         open_reason::SENSITIVE | open_reason::CRITICAL | open_reason::PERSIST | open_reason::PROBE;
+    // Lot 352: a write-open below a kernel module tree is that tree's
+    // creation or modification (NN-L-FIM-008), not a critical file's open
+    if let Some(fe) = kmod_tree_write(r, &filename, &comm) {
+        out.push(Event::Fim(fe));
+        file_open &= !open_reason::CRITICAL;
+    }
     if r.reason & file_open != 0 {
         out.push(Event::FileOpen {
             pid: r.pid,
@@ -2530,6 +2632,135 @@ mod tests {
         let taught = pump.find("teach_fork(r, lineage);").expect("taught");
         assert!(taught < pump.find("events_of(r, &mut mounts)").unwrap());
         assert!(taught < pump.find("if open_only(r) && !tx.open_room() {").unwrap());
+    }
+
+    /// Lot 352 (pre-alpha Phase 4, NN-L-FIM-008): a write-open the kernel
+    /// reports below a module tree (its directory is a `TREE_CRITICAL` one)
+    /// is the tree's `Created` — the open made the file — or `Modified`, at
+    /// any depth and kernel version, under either name of the tree; and
+    /// NN-L-FIM-008 judges it. A direct child of the tree is FIM's own (the
+    /// critical open, as before), and so is an open elsewhere or a path the
+    /// mount table does not place.
+    #[test]
+    fn a_write_open_below_a_module_tree_is_its_creation_or_modification() {
+        use nn_core::decision::Rule as _;
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((7, 2), "/".into());
+        mounts.loaded = Some(Instant::now());
+        let mut created = record(
+            open_reason::CRITICAL,
+            &[
+                "nn-test.ko",
+                "6.8.0-1-generic",
+                "modules",
+                "lib",
+                "usr",
+                "/",
+            ],
+            (7, 2),
+        );
+        created.mode = 2 | FMODE_CREATED;
+        let ev = events_of(&created, &mut mounts);
+        let [Event::Fim(fe)] = &ev[..] else {
+            panic!("{ev:?}");
+        };
+        assert_eq!(fe.op, FimOp::Created);
+        assert_eq!(fe.path, "/usr/lib/modules/6.8.0-1-generic/nn-test.ko");
+        assert_eq!((fe.modifier_pid, fe.modifier_uid), (42, 1000));
+        let v = nn_core::fim::rules::NnLFim008KernelModuleModified
+            .evaluate(&ev[0])
+            .expect("FIM-008 judges the tree");
+        assert_eq!(v.severity, nn_model::Severity::Critical);
+        let mut modified = record(
+            open_reason::CRITICAL,
+            &[
+                "ext4.ko",
+                "ext4",
+                "fs",
+                "kernel",
+                "6.12.0-1-amd64",
+                "modules",
+                "lib",
+                "/",
+            ],
+            (7, 2),
+        );
+        modified.mode = 2;
+        let ev = events_of(&modified, &mut mounts);
+        assert!(
+            matches!(&ev[..], [Event::Fim(fe)] if fe.op == FimOp::Modified
+                && fe.path == "/lib/modules/6.12.0-1-amd64/kernel/fs/ext4/ext4.ko"),
+            "{ev:?}"
+        );
+        // FIM's own: the tree's direct child, another critical tree, an
+        // unplaced path, a record of another reason
+        for (comps, root, reason) in [
+            (
+                &["x.ko", "modules", "lib", "/"][..],
+                (7, 2),
+                open_reason::CRITICAL,
+            ),
+            (
+                &["x", "sudoers.d", "etc", "/"][..],
+                (7, 2),
+                open_reason::CRITICAL,
+            ),
+            (
+                &["x.ko", "6.8", "modules", "lib", "/"][..],
+                (9, 9),
+                open_reason::CRITICAL,
+            ),
+            (
+                &["x.ko", "6.8", "modules", "lib", "/"][..],
+                (7, 2),
+                open_reason::PERSIST,
+            ),
+            // a walk that stopped before a root
+            (
+                &["x.ko", "6.8", "modules", "lib"][..],
+                (0, 0),
+                open_reason::CRITICAL,
+            ),
+        ] {
+            let mut r = record(reason, comps, root);
+            r.mode = 2 | FMODE_CREATED;
+            let ev = events_of(&r, &mut mounts);
+            assert!(
+                matches!(&ev[..], [Event::FileOpen { kernel_class, .. }] if *kernel_class == reason),
+                "{comps:?}: {ev:?}"
+            );
+        }
+        // a name below the tree longer than a slot (depmod's temporary
+        // index, a module's long name) or unread: still the tree's
+        // (a slot holds 31 bytes and its NUL, as the kernel reads it)
+        let long = &"modules.dep.12345.678901.1794695493"[..OPEN_PATH_SLOT_LEN - 1];
+        for leaf in [long, ""] {
+            let mut r = record(
+                open_reason::CRITICAL,
+                &[
+                    leaf,
+                    "6.12.116+deb13-cloud-amd64",
+                    "modules",
+                    "lib",
+                    "usr",
+                    "/",
+                ],
+                (7, 2),
+            );
+            r.mode = 2 | FMODE_CREATED;
+            let ev = events_of(&r, &mut mounts);
+            assert!(
+                matches!(&ev[..], [Event::Fim(fe)] if fe.op == FimOp::Created
+                    && fe.path.starts_with("/usr/lib/modules/6.12.116+deb13-cloud-amd64/")
+                    && !path_is_exact(&fe.path)),
+                "{leaf}: {ev:?}"
+            );
+        }
+        // the sensor is told about the trees
+        let inputs = RuleInputs::from_host(&OpenSensorExtras::default());
+        for t in nn_core::fim::rules::KMOD_TREES {
+            assert!(inputs.critical.iter().any(|c| c == t), "{t}");
+        }
     }
 
     /// Lab PR 225: the rename and unlink bursts and the signal to a

@@ -220,6 +220,42 @@ fn chain_verdict_with(
 /// triggers on purpose: their precursors (credential read, `/tmp`
 /// exec, canary trip) are rare and high-confidence, and handing data
 /// to a local proxy (`127.0.0.1:9050`) is a real exfiltration path.
+/// Lot 352: what `event` makes known of the process tree to the shared
+/// ancestry (D4) — an exec's edge under the process that forked it (the
+/// kernel's fork record, else its parent at exec), and a connect's of a
+/// process that executed nothing since its fork. A forker that executed
+/// nothing either is entered under its anchor, the nearest process up the
+/// forks that had executed ([`CorrelationStore::observe_exec`],
+/// [`CorrelationStore::observe_fork`]): the cross-PID chains no longer
+/// break at a fork-only process — a Python `os.fork()` child, a shell's
+/// subshell, a daemon's exited intermediate.
+fn observe_lineage<H: PostureHost>(store: &mut CorrelationStore<H>, event: &Event) {
+    match event {
+        Event::ProcessSpawn {
+            pid,
+            ppid,
+            start_ns,
+            exe,
+            ..
+        } => store.observe_exec(
+            *pid,
+            *ppid,
+            *start_ns,
+            exe.fork_parent,
+            exe.fork_parent_start,
+            exe.fork_anchor,
+        ),
+        Event::TcpConnect { pid, fork, .. } if !fork.is_unknown() => store.observe_fork(
+            *pid,
+            fork.start_ns,
+            fork.parent,
+            fork.parent_start_ns,
+            fork.anchor,
+        ),
+        _ => {}
+    }
+}
+
 fn is_on_host(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
@@ -418,15 +454,9 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
     /// reads as a reuse ([`CorrelationStore::observe_spawn`]), so a record
     /// without it is observed when judged, as before.
     fn observe_arrival(&self, event: &Event) {
-        if let Event::ProcessSpawn {
-            pid,
-            ppid,
-            start_ns,
-            ..
-        } = event
-        {
+        if let Event::ProcessSpawn { start_ns, .. } = event {
             if *start_ns != 0 {
-                self.buf.lock().observe_spawn(*pid, *ppid, *start_ns);
+                observe_lineage(&mut self.buf.lock(), event);
             }
         }
     }
@@ -454,9 +484,17 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
             // (POS-003), not `parent_start_ns` (the parent's start: since
             // lab PR 238 its thread-group leader's, the forking thread's
             // before).
+            // Lot 352: a connect of a process that executed nothing since
+            // its fork (a Python `os.fork()` child, a subshell, a daemon's
+            // grandchild) names its place in the tree — the kernel's fork
+            // record — before its flow's rows are judged (the same queue,
+            // behind it).
+            Event::TcpConnect { .. } => {
+                observe_lineage(&mut self.buf.lock(), event);
+                None
+            }
             Event::ProcessSpawn {
                 pid,
-                ppid,
                 filename,
                 timestamp_ns,
                 start_ns,
@@ -464,7 +502,7 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
                 ..
             } => {
                 let mut store = self.buf.lock();
-                store.observe_spawn(*pid, *ppid, *start_ns);
+                observe_lineage(&mut store, event);
                 // Review 61: the file the kernel executed. External audit
                 // NETR-008: any staging directory, not `/tmp/` alone.
                 if !crate::decision::rules::is_staging_path(exe.path_or(filename)) {
@@ -1002,7 +1040,6 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
             // a miss nothing changes here.
             Event::ProcessSpawn {
                 pid,
-                ppid,
                 filename,
                 exe,
                 timestamp_ns,
@@ -1018,13 +1055,10 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
                 if package_mediated(self.lineage.as_ref(), *pid, *timestamp_ns) {
                     return None;
                 }
-                self.buf.lock().complete_exec_sequence(
-                    *pid,
-                    *ppid,
-                    *start_ns,
-                    *timestamp_ns,
-                    egress.start_ns,
-                );
+                let mut store = self.buf.lock();
+                observe_lineage(&mut store, event);
+                store.complete_exec_sequence(*pid, *start_ns, *timestamp_ns, egress.start_ns);
+                drop(store);
                 Some(late_chain_verdict(
                     self,
                     &egress,
@@ -2001,6 +2035,212 @@ mod tests {
             fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
             "{fired:?}"
         );
+    }
+
+    // ── Lot 352: chains across fork-only processes ──────────────────
+
+    /// An exec carrying the kernel's fork record: the forker, its start
+    /// and the anchor of that fork (lot 352).
+    fn exec_forked(
+        pid: u32,
+        ppid: u32,
+        filename: &str,
+        start: u64,
+        fork: (u32, u64, u32),
+    ) -> Event {
+        let mut e = spawn_at(pid, ppid, filename, start);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            (exe.fork_parent, exe.fork_parent_start, exe.fork_anchor) = fork;
+        }
+        e
+    }
+
+    /// The connect of `pid` (started at `start`), with the fork record of a
+    /// process that executed nothing since its fork when `fork` names one
+    /// (`(forker, forker start, anchor)`), as the connect kprobe carries it.
+    fn connect_of(pid: u32, start: u64, fork: Option<(u32, u64, u32)>, ts: u64) -> Event {
+        let fork = fork.map_or_else(nn_model::ForkRecord::default, |(parent, ps, anchor)| {
+            nn_model::ForkRecord {
+                start_ns: start,
+                parent,
+                parent_start_ns: ps,
+                anchor,
+            }
+        });
+        Event::TcpConnect {
+            pid,
+            uid: 0,
+            comm: "python3".to_string(),
+            family: 2,
+            src_addr: [0; 16],
+            src_port: 40_000,
+            dst_addr: [0; 16],
+            dst_port: 8000,
+            timestamp_ns: ts,
+            fork,
+        }
+    }
+
+    fn fired_on(rules: &[Box<dyn Rule>], events: &[Event]) -> Vec<String> {
+        let mut fired = Vec::new();
+        for e in events {
+            fired = fire_ids(rules, e);
+        }
+        fired
+    }
+
+    /// Lot 352 (pre-alpha Phase 4, CHAIN-004f): the reader forks a child
+    /// with `os.fork()` — no exec — and the child connects. The child's
+    /// connect carries its fork record: the chain reaches the reader. Before
+    /// the fix the child had no edge and nothing fired; a connect without
+    /// the record still gives none.
+    #[test]
+    fn chain004_fires_for_a_fork_only_child_of_the_reader() {
+        let rules = chain_rules();
+        let events = [
+            spawn_at(100, 1, "/usr/bin/python3", 10 * SEC),
+            cred_fim(100, 11 * SEC),
+            connect_of(101, 11 * SEC + 1, Some((100, 10 * SEC, 100)), 13 * SEC),
+            flow(101, 8000, 13 * SEC),
+        ];
+        let fired = fired_on(&rules, &events);
+        assert!(
+            fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
+            "{fired:?}"
+        );
+        assert!(!fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()));
+        let rules = chain_rules();
+        let mut unknown = events.clone();
+        unknown[2] = connect_of(101, 11 * SEC + 1, None, 13 * SEC);
+        assert!(fired_on(&rules, &unknown).is_empty(), "no record, no edge");
+    }
+
+    /// Lot 352 (Phase 4, CHAIN-005f): a copy of python run from /tmp forks
+    /// a child that connects at once.
+    #[test]
+    fn chain005_fires_for_a_fork_only_child_of_a_staged_exec() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/tmp/nn-c5f", 10 * SEC),
+                connect_of(101, 11 * SEC, Some((100, 10 * SEC, 100)), 11 * SEC + 1),
+                flow(101, 8000, 11 * SEC + 1),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    /// Lot 352 (Phase 4, CHAIN-006e — the e2e's recipe in Python, which
+    /// fired on no kernel): the ancestor (100) runs a daemonising child that
+    /// executes (200); it forks an intermediate that never executes (300),
+    /// which forks the grandchild (400) and exits; the grandchild executes
+    /// and, after the ancestor tripped the canary, connects. The
+    /// grandchild's exec names its forker 300, the forker's start, and the
+    /// anchor 200 (300 executed nothing): 400 → 300 → 200 → 100. Its parent
+    /// at exec is the intermediate, or PID 1 once it has exited: both.
+    #[test]
+    fn chain006_fires_for_the_e2e_recipe_with_a_fork_only_intermediate() {
+        for ppid_at_exec in [300, 1] {
+            let rules = chain_rules();
+            let fired = fired_on(
+                &rules,
+                &[
+                    spawn_at(100, 1, "/usr/bin/python3", 10 * SEC),
+                    exec_forked(200, 100, "/usr/bin/python3", 11 * SEC, (100, 10 * SEC, 100)),
+                    exec_forked(
+                        400,
+                        ppid_at_exec,
+                        "/usr/bin/python3",
+                        13 * SEC,
+                        (300, 12 * SEC, 200),
+                    ),
+                    canary_trip(100, 14 * SEC),
+                    connect_of(400, 13 * SEC, None, 17 * SEC),
+                    flow(400, 8080, 17 * SEC),
+                ],
+            );
+            assert!(
+                fired.contains(&"NN-L-CHAIN-006_CrossPidCanaryExfil".to_string()),
+                "parent at exec {ppid_at_exec}: {fired:?}"
+            );
+        }
+    }
+
+    /// Lot 352 (Phase 4, CHAIN-006f): a daemon that never executes — the
+    /// ancestor forks (300), which `setsid`s, forks the grandchild (400) and
+    /// exits; the ancestor trips the canary; the grandchild connects. Its
+    /// connect carries its record: forker 300, anchor 100.
+    #[test]
+    fn chain006_fires_for_a_daemon_s_fork_only_grandchild() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/usr/bin/python3", 10 * SEC),
+                canary_trip(100, 14 * SEC),
+                connect_of(400, 12 * SEC, Some((300, 11 * SEC, 100)), 16 * SEC),
+                flow(400, 8080, 16 * SEC),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-006_CrossPidCanaryExfil".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    /// Lot 352: a subshell — a staged script's shell forks (300, never
+    /// executes) and the subshell runs `curl` (400): curl's exec names the
+    /// subshell and the anchor, the script. CHAIN-005 reaches the script.
+    #[test]
+    fn chain005_crosses_a_subshell() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/tmp/install.sh", 10 * SEC),
+                exec_forked(400, 300, "/usr/bin/curl", 12 * SEC, (300, 11 * SEC, 100)),
+                flow(400, 4444, 13 * SEC),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    /// Lot 352: a fork record never lends a chain to a later holder of a
+    /// pid. The dropper (100) exits and its pid goes to a process whose own
+    /// record was lost (its anchor is itself) — its child's connect names
+    /// a forker the tree knows as another process: no edge. And when the
+    /// new holder's anchor is known (a fork of `make`), it is entered as the
+    /// new incarnation under `make`: the dropper's precursor is not its.
+    #[test]
+    fn a_fork_record_of_a_reused_pid_lends_no_chain() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/tmp/dropper", 10 * SEC),
+                connect_of(101, 21 * SEC, Some((100, 20 * SEC, 100)), 22 * SEC),
+                flow(101, 4444, 22 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "{fired:?}");
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/tmp/dropper", 10 * SEC),
+                spawn_at(50, 1, "/usr/bin/make", 5 * SEC),
+                connect_of(101, 21 * SEC, Some((100, 20 * SEC, 50)), 22 * SEC),
+                flow(101, 4444, 22 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "{fired:?}");
     }
 
     /// External audit NETR-014: the cross-PID chains grade by age too — an

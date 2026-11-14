@@ -946,6 +946,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 352 (pre-alpha Phase 4, detection efficacy): three documented cases
+  that fired on no kernel.
+  - **NN-L-FIM-002 — a hard link of a watched setuid binary into
+    /var/tmp never fired.** The link record carried the SOURCE
+    (`/usr/bin/passwd`), never in a user-writable directory, and the drain
+    dropped it as a no-op touch (a link changes no content). The link hook
+    now sends the new link's path as the kernel's dentries name it
+    (`FimLinkRaw`: the drift record and the walk, the open sensor's slot
+    layout, on the FIM ring, told apart by size); the event names it in
+    `dest_path`, a `Linked` is never content-suppressed, and the rule judges
+    the new link (a walk deeper than its 16 names fails closed).
+    `fim_rename_observe` is untouched (512/512 bytes of stack).
+  - **NN-L-FIM-008 — only direct children of /lib/modules were seen.**
+    `/lib/modules/$(uname -r)/x.ko` (the documented case) is a write in a
+    subdirectory nothing watched. The module trees (`/lib/modules/`,
+    `/usr/lib/modules/` on merged-/usr) are critical trees of the file-open
+    sensor: a write-open at any depth, in every kernel version's directory,
+    is the tree's `Created` (`FMODE_CREATED`) or `Modified`, judged by
+    NN-L-FIM-008 (no eBPF change). A package transaction's writes are one
+    Low record per package-manager process within 15 minutes, the rest
+    counted as coalesced (`KmodTreeWrites`); the host's depmod writing the
+    indexes is Low; NN-L-FIM-001 leaves the tree to NN-L-FIM-008.
+  - **NN-L-CHAIN-004/005/006 — a descendant that never executed lost the
+    chain.** The ancestry learned edges at exec only, so a Python
+    `os.fork()` child, a shell's subshell or a daemon's intermediate (the
+    e2e's recipe in Python fired on no kernel) broke it. The kernel's fork
+    record now carries, per fork, the forker's start and the child's
+    *anchor* — the nearest process up the forks that had executed
+    (`fork_record::fork_anchor`) — in the exec record (`fork_parent_start`,
+    `fork_anchor`) and, for a process that executed nothing since its fork,
+    in its connect record (`TcpConnectRaw` 80 → 104 bytes,
+    `Event::TcpConnect::fork`). The chains' tree enters an exec under its
+    forker, a fork-only process under its forker and a forker that never
+    executed under its anchor, never under a pid the tree knows as another
+    process.
 - Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
   - **F1 — a log truncated back to its signed baseline's exact content was
     dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written

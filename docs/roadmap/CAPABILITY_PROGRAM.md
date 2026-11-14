@@ -11208,6 +11208,74 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 352 — the pre-alpha's Phase 4 misses: a link's new path, the whole
+  module tree, chains across fork-only descendants (C05, C06, C07, C14; no
+  level changes).**
+  - What was open (the Phase 4 of the pre-alpha checks on rc2, detection
+    efficacy): NN-L-FIM-002 did not fire for `ln /usr/bin/passwd
+    /var/tmp/x` (the link record named the source, and the drain dropped a
+    link as a no-op touch); NN-L-FIM-008 saw only the direct children of
+    `/lib/modules`, not `/lib/modules/$(uname -r)/x.ko`; NN-L-CHAIN-004/005/006
+    lost the chain through a process that never executed (edges at exec
+    only: a Python `os.fork()` child, a subshell, a daemon's intermediate —
+    CHAIN-006 fired on no kernel, the e2e's recipe in Python included).
+  - Done: the link hook sends the new link's path as the kernel's walk of
+    its dentries (`FimLinkRaw` on the FIM ring; `fim_rename_observe`
+    untouched), the event names it in `dest_path` and a `Linked` is never
+    content-suppressed; the module trees are critical trees of the
+    file-open sensor, a write-open at any depth (a name below the tree cut
+    or unread included) becomes the tree's `Created`/`Modified`, a package
+    transaction's writes are one Low record per process per 15 minutes
+    (`KmodTreeWrites`), the host's depmod's indexes Low; the fork record
+    carries the forker's start and the child's anchor (the nearest process
+    up the forks that had executed) in the exec record and, for a fork-only
+    process, in its connect record, and the chains' tree enters exec under
+    its forker, a fork-only process under its forker and a forker that
+    never executed under its anchor (one feed, ratchet
+    `xtask/tests/chain_ancestry.rs`). Named tests:
+    `fim002_judges_the_new_link_s_path`,
+    `a_link_to_a_watched_binary_reaches_the_rules_with_its_new_path`,
+    `a_write_open_below_a_module_tree_is_its_creation_or_modification`,
+    `a_package_transaction_s_tree_writes_are_coalesced_into_one_record`,
+    `the_host_s_depmod_writing_an_index_is_recorded`,
+    `fim001_leaves_the_module_tree_to_fim008`,
+    `chain004_fires_for_a_fork_only_child_of_the_reader`,
+    `chain005_fires_for_a_fork_only_child_of_a_staged_exec`,
+    `chain005_crosses_a_subshell`,
+    `chain006_fires_for_the_e2e_recipe_with_a_fork_only_intermediate`,
+    `chain006_fires_for_a_daemon_s_fork_only_grandchild`,
+    `a_fork_record_of_a_reused_pid_lends_no_chain`,
+    `a_fork_of_a_process_that_never_executed_inherits_its_anchor`.
+  - Lab (alpha profile, the Phase 4 recipes): Debian 13 (6.12.116, round r1)
+    and Ubuntu 24.04 (6.8.0-149, round r2). On both: FIM-002 Critical for
+    the link into /var/tmp and into /var/tmp/…/a/b, none for a link into
+    /srv; FIM-008 Critical for an empty `.ko` in `/lib/modules/$(uname -r)/`,
+    in its `kernel/`, for a copy of a real module there and for a direct
+    child; CHAIN-004 for the fork+exec and the fork-only child, CHAIN-005 for
+    the fork-only child of a /tmp copy of python and through a subshell,
+    CHAIN-006 for the daemon with an exec, the e2e's recipe (exec'd
+    daemoniser → fork-only intermediate → exec'd grandchild) and the
+    fork-only daemon; a benign fork-only child connecting: NET-007 Medium
+    only. r2 also: FIM-008 Critical for a module of a 50-byte name and for an
+    index written by `tee`; `depmod -a` (it rewrote `modules.dep`) 10 Low
+    records (r1, before the cut-name fix, none: depmod's temporary names are
+    longer than a slot). `verifier-check` on 6.12 and 6.8: every program OK
+    and within the 900,000 budget, `fim_rename_observe` 512/512 bytes of
+    stack as before, `fim_link_observe` 8,559 instructions processed,
+    `fork_parent_record` 400, the TCP connect kprobes 577 and 529; the
+    guests left uninstalled and off. Mutation testing of the new code: 56
+    mutants, every one caught by a named test (four survivors of the first
+    round got tests: a record without a start, a forker hop without a start,
+    an index name below a subdirectory, a link without its walk).
+  - Not done (named): a file moved or hard-linked INTO a module version
+    directory makes no open and is not seen below the top (the rename hook
+    is at the verifier's 512-byte stack); a fork-only hop between a forker
+    and its anchor is not entered (a precursor recorded by such a middle hop
+    is not found); a fork-only process's UDP datagram carries no fork record
+    (only the TCP connect does); a module more than 11 directories below a
+    version directory (the walk's 16 names) is a critical write-open of the
+    posture, not FIM-008.
+  - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**
   - What was open (two pre-existing P2 the review of #559 found, and its

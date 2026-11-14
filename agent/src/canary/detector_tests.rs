@@ -639,6 +639,7 @@ fn connect_to(dst: &str, dst_port: u16, pid: u32, ts: u64) -> Event {
         dst_addr,
         dst_port,
         timestamp_ns: ts,
+        fork: Default::default(),
     }
 }
 

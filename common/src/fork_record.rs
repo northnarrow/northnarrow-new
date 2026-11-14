@@ -74,6 +74,35 @@ pub const fn on_exec(record: Option<(u64, bool)>, start: u64, executor: bool) ->
     }
 }
 
+/// Lot 352: the anchor a fork records for its child — the nearest process
+/// up the forks that had executed when the child was forked. `forker` is
+/// the forking process's tgid, `forker_start` its start
+/// (`task_struct->start_time` of its thread-group leader) and
+/// `forker_record` its own fork record as `(start, used, anchor)`, if the
+/// map holds one.
+///
+/// A forker that executed nothing since its own fork (its record unused
+/// and its own: a daemon's intermediate, a shell's subshell, a Python
+/// `os.fork()` child) passes its anchor on; any other forker (it executed,
+/// it was forked before the record was attached, the map evicted it) is the
+/// anchor itself. The cross-PID chains walk from a process to its forker,
+/// and from a forker that never executed to its anchor: a forker that has
+/// exited (the intermediate of a double fork) no longer breaks the chain at
+/// a process the agent never saw execute.
+#[inline(always)]
+pub const fn fork_anchor(
+    forker: u32,
+    forker_start: u64,
+    forker_record: Option<(u64, bool, u32)>,
+) -> u32 {
+    match forker_record {
+        Some((start, false, anchor)) if start == forker_start && start != 0 && anchor != 0 => {
+            anchor
+        }
+        _ => forker,
+    }
+}
+
 /// A missing or stale record is a loss (`FORK_RECORD_LOST`) when the
 /// process started after the record was attached (`since`, the agent's
 /// `CLOCK_MONOTONIC` at the attach; 0: not attached yet).
@@ -85,6 +114,32 @@ pub const fn counts_as_lost(outcome: OnExec, start: u64, since: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 352: the anchor passes down the forks that executed nothing —
+    /// the e2e's recipe: an ancestor (100) spawns a daemonising child that
+    /// executes (200), which forks an intermediate (300, never executes),
+    /// which forks the grandchild (400). The intermediate's anchor is 200,
+    /// and the grandchild's too: 300 executed nothing.
+    #[test]
+    fn a_fork_of_a_process_that_never_executed_inherits_its_anchor() {
+        // 200 executed: its record is used — 300's anchor is 200 itself
+        let a300 = fork_anchor(200, 20, Some((20, true, 100)));
+        assert_eq!(a300, 200);
+        // 300 executed nothing: 400's anchor is 300's
+        assert_eq!(fork_anchor(300, 30, Some((30, false, a300))), 200);
+    }
+
+    /// Lot 352: a forker of no record of its own (forked before the agent,
+    /// evicted), of an earlier task's record, or of a record without an
+    /// anchor, is the anchor itself.
+    #[test]
+    fn a_forker_of_unknown_history_is_the_anchor() {
+        assert_eq!(fork_anchor(300, 30, None), 300);
+        // an earlier task at the same address
+        assert_eq!(fork_anchor(300, 30, Some((29, false, 100))), 300);
+        assert_eq!(fork_anchor(300, 30, Some((30, false, 0))), 300);
+        assert_eq!(fork_anchor(300, 0, Some((0, false, 100))), 300);
+    }
 
     /// A unit on systemd ≥ 254: PID 1's fork, the executor, then `sh -c`,
     /// then whatever `sh` runs: the executor and the unit's program carry

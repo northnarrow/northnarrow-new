@@ -645,16 +645,16 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// the egress handed to its incarnation), its `TmpExec` recorded, and
     /// the egress marked answered by CHAIN-007. Lab PR 267 (R12a): kept —
     /// the exec's own CHAIN-002, judged after this rule, answers it too
-    /// unless it already did, as in order ([`NotedEgress`]).
+    /// unless it already did, as in order ([`NotedEgress`]). Lot 352: the
+    /// exec's edges are the caller's ([`Self::observe_exec`]), observed
+    /// first.
     pub fn complete_exec_sequence(
         &mut self,
         pid: u32,
-        ppid: u32,
         start_ns: u64,
         exec_ts: u64,
         egress_start_ns: u64,
     ) {
-        self.observe_spawn(pid, ppid, start_ns);
         let key = ProcKey { pid, start_ns };
         self.record(key, PrecursorKind::TmpExec, exec_ts);
         self.answer_egress(key, egress_start_ns, EgressChain::Sequence);
@@ -869,6 +869,93 @@ impl<H: PostureHost> CorrelationStore<H> {
                 }
             }
         }
+    }
+
+    /// Lot 352: the exec of `child_pid` (own start `start_ns`) as the kernel
+    /// recorded it — under the process that FORKED it when the exec is the
+    /// first since that fork (`fork_parent`, else the parent at exec time,
+    /// `ppid`: an orphan's is its reaper), and, when that forker executed
+    /// nothing since its own fork (`fork_anchor` is another process: a
+    /// daemon's intermediate, a subshell), the forker's own edge to its
+    /// anchor ([`Self::observe_fork_hop`]). Without the fork record (0) the
+    /// edge is `ppid`'s, as before.
+    pub fn observe_exec(
+        &mut self,
+        child_pid: u32,
+        ppid: u32,
+        start_ns: u64,
+        fork_parent: u32,
+        fork_parent_start: u64,
+        fork_anchor: u32,
+    ) {
+        if fork_parent == 0
+            || fork_parent == child_pid
+            || !self.forker_is_known_as(fork_parent, fork_parent_start, fork_anchor)
+        {
+            self.observe_spawn(child_pid, ppid, start_ns);
+            return;
+        }
+        self.observe_fork_hop(fork_parent, fork_parent_start, fork_anchor);
+        self.observe_spawn(child_pid, fork_parent, start_ns);
+    }
+
+    /// Lot 352: the tree may name `forker` as the fork record does — its
+    /// recorded start is the forker's (or unknown), or the forker's own
+    /// edge to its anchor is learned from the record. Not when the tree
+    /// holds another process at that pid and the record gives no anchor
+    /// beyond the forker (its own record lost): the edge would hand a later
+    /// holder of the pid that process's precursors.
+    fn forker_is_known_as(&self, forker: u32, forker_start: u64, anchor: u32) -> bool {
+        let known = self.tree.start_of(forker);
+        known == 0
+            || forker_start == 0
+            || known == forker_start
+            || (anchor != 0 && anchor != forker)
+    }
+
+    /// Lot 352: a process that executed nothing since its fork (no exec
+    /// record), named by the kernel's fork record a later event carried
+    /// (a connect): its edge to its forker, with its own start, and the
+    /// forker's to its anchor when the forker executed nothing either. An
+    /// edge the tree already holds for that very process (the same start)
+    /// is kept: its exec, or an earlier record, named it.
+    pub fn observe_fork(
+        &mut self,
+        pid: u32,
+        start_ns: u64,
+        forker: u32,
+        forker_start: u64,
+        anchor: u32,
+    ) {
+        if pid <= 1
+            || forker == 0
+            || forker == pid
+            || start_ns == 0
+            || !self.forker_is_known_as(forker, forker_start, anchor)
+        {
+            return;
+        }
+        self.observe_fork_hop(forker, forker_start, anchor);
+        if self.tree.start_of(pid) != start_ns {
+            self.observe_spawn(pid, forker, start_ns);
+        }
+    }
+
+    /// Lot 352: the edge of `forker` (started at `forker_start`) to
+    /// `anchor`, the nearest process up the forks that had executed, when
+    /// they differ — the forker executed nothing since its fork, so the
+    /// tree has no exec of it — and the tree does not hold that very
+    /// process already.
+    fn observe_fork_hop(&mut self, forker: u32, forker_start: u64, anchor: u32) {
+        if forker <= 1
+            || anchor == 0
+            || anchor == forker
+            || forker_start == 0
+            || self.tree.start_of(forker) == forker_start
+        {
+            return;
+        }
+        self.observe_spawn(forker, anchor, forker_start);
     }
 
     /// Same-PID **or** any-ancestor: `true` if `pid` itself, or any
@@ -1493,6 +1580,106 @@ mod tests {
         assert!(s.ancestry().is_ancestor(200, ProcKey::unresolved(100)));
     }
 
+    /// Lot 352: an exec is entered under its forker when the kernel named
+    /// one (an orphan's parent at exec is its reaper), and a forker that
+    /// executed nothing since its fork under its anchor, with its start.
+    /// Without a forker the edge is the parent's at exec, as before.
+    #[test]
+    fn an_exec_is_entered_under_its_forker_and_the_forker_under_its_anchor() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(200, 100, 11 * SEC);
+        s.observe_exec(400, 1, 13 * SEC, 300, 12 * SEC, 200);
+        let t = s.ancestry();
+        assert_eq!(t.parent_of(400), Some(300));
+        assert_eq!((t.parent_of(300), t.start_of(300)), (Some(200), 12 * SEC));
+        assert_eq!(
+            t.get_ancestors(400),
+            vec![key(300, 12 * SEC), key(200, 11 * SEC), key(100, 0)]
+        );
+        // the forker executed: one edge
+        s.observe_exec(500, 1, 14 * SEC, 200, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(500), Some(200));
+        assert_eq!(s.ancestry().parent_of(200), Some(100), "untouched");
+        // no fork record: the parent at exec
+        s.observe_exec(600, 200, 15 * SEC, 0, 0, 0);
+        assert_eq!(s.ancestry().parent_of(600), Some(200));
+        s.observe_exec(700, 200, 15 * SEC, 700, 1, 1);
+        assert_eq!(s.ancestry().parent_of(700), Some(200), "its own pid");
+    }
+
+    /// Lot 352: a forker the tree knows as another process (another start)
+    /// whose record names no anchor beyond itself is not trusted with the
+    /// edge: the exec falls back to its parent at exec, the connect is not
+    /// entered. With an anchor, the forker is entered as the new
+    /// incarnation, and the earlier holder's precursor is not its.
+    #[test]
+    fn a_forker_of_another_incarnation_is_not_trusted() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(100, 1, 10 * SEC);
+        s.record_for_pid(100, PrecursorKind::TmpExec, 10 * SEC);
+        s.observe_exec(200, 150, 21 * SEC, 100, 20 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(200), Some(150));
+        s.observe_fork(201, 21 * SEC, 100, 20 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(201), None);
+        // the forker's start unknown, or the same: trusted
+        s.observe_fork(202, 21 * SEC, 100, 0, 100);
+        assert_eq!(s.ancestry().parent_of(202), Some(100));
+        s.observe_fork(203, 21 * SEC, 100, 10 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(203), Some(100));
+        // a forker the tree does not know at all: trusted
+        s.observe_fork(204, 21 * SEC, 90, 20 * SEC, 90);
+        assert_eq!(s.ancestry().parent_of(204), Some(90));
+        assert_eq!(s.ancestry().parent_of(90), None, "its own anchor: no hop");
+        // with an anchor: the new incarnation, under its anchor
+        s.observe_spawn(50, 1, 5 * SEC);
+        s.observe_fork(205, 21 * SEC, 100, 20 * SEC, 50);
+        assert_eq!(s.ancestry().parent_of(205), Some(100));
+        assert_eq!(
+            (s.ancestry().parent_of(100), s.ancestry().start_of(100)),
+            (Some(50), 20 * SEC)
+        );
+        assert!(!s.has_recent_in_ancestors(205, PrecursorKind::TmpExec, 22 * SEC, W));
+    }
+
+    /// Lot 352: a connect's fork record is entered once; a record without
+    /// the process's start, without a forker, naming the process itself or
+    /// PID 1's own is not; an edge the tree holds for that very process (an
+    /// earlier record) is kept. A forker hop is learned only for a forker
+    /// that is not PID 1, with a start, an anchor other than itself, and
+    /// not already known as that very process.
+    #[test]
+    fn a_connect_s_fork_record_is_entered_once() {
+        let mut s = CorrelationStore::new();
+        s.observe_fork(1, 5 * SEC, 9, 4 * SEC, 9);
+        s.observe_fork(300, 0, 9, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 0, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 300, 4 * SEC, 9);
+        assert!(s.ancestry().is_empty());
+        s.observe_fork(300, 5 * SEC, 9, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 8, 4 * SEC, 8);
+        assert_eq!(s.ancestry().parent_of(300), Some(9), "kept");
+        // hops
+        s.observe_fork(301, 6 * SEC, 1, 2 * SEC, 7);
+        assert_eq!(s.ancestry().parent_of(1), None, "PID 1 has no hop");
+        s.observe_fork(302, 6 * SEC, 20, 0, 7);
+        assert_eq!(s.ancestry().parent_of(20), None, "no forker start");
+        s.observe_fork(303, 6 * SEC, 21, 3 * SEC, 0);
+        assert_eq!(s.ancestry().parent_of(21), None, "no anchor");
+        s.observe_fork(304, 6 * SEC, 22, 3 * SEC, 7);
+        assert_eq!(s.ancestry().parent_of(22), Some(7));
+        s.observe_fork(305, 6 * SEC, 22, 3 * SEC, 6);
+        assert_eq!(s.ancestry().parent_of(22), Some(7), "known: kept");
+        // a record without a start never touches a known process (an
+        // unknown start would read as a reuse of its pid)
+        s.observe_spawn(40, 9, 5 * SEC);
+        s.record_for_pid(40, PrecursorKind::TmpExec, 6 * SEC);
+        s.observe_fork(40, 0, 8, 4 * SEC, 8);
+        s.observe_fork(306, 7 * SEC, 40, 0, 7);
+        assert_eq!(s.ancestry().parent_of(40), Some(9));
+        assert_eq!(s.ancestry().start_of(40), 5 * SEC);
+        assert!(s.has_recent_for_pid(40, PrecursorKind::TmpExec, 7 * SEC, W));
+    }
+
     /// Lab PR 246: a network canary trip's own connection, noted when a
     /// row of it reached the rules before the trip, is dropped under every
     /// key of the pid (unresolved, previous incarnation): no late read or
@@ -1834,7 +2021,8 @@ mod tests {
             Some(12 * SEC),
             "a late exec's CHAIN-007"
         );
-        s.complete_exec_sequence(42, 1, SEC, 10 * SEC, 12 * SEC);
+        s.observe_spawn(42, 1, SEC);
+        s.complete_exec_sequence(42, SEC, 10 * SEC, 12 * SEC);
         assert!(
             s.exec_sequence_egress(42, SEC, 10 * SEC, W).is_none(),
             "once"

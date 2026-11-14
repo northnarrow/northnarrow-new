@@ -77,9 +77,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF,
-    FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
-    FIM_WRITE_TRUNCATED_BY_ANOTHER,
+    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
+    FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
+    FIM_WRITE_ONE_WRITER, FIM_WRITE_TRUNCATED_BY_ANOTHER,
 };
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use nn_model::Event;
@@ -1805,6 +1805,37 @@ pub fn process_drift(
     lineage: Option<&AuthSessionTracker>,
     outbox: Option<&mut Vec<Event>>,
 ) -> Result<bool> {
+    process_record(
+        raw,
+        None,
+        path_map,
+        last_baseline,
+        drift_db,
+        classifier,
+        rate_limiter,
+        watched_paths,
+        lineage,
+        outbox,
+    )
+}
+
+/// Lot 352: [`process_drift`] of a ring record — a drift record, or a link
+/// record's ([`FimLinkRaw`]) with the new link's path the kernel walked
+/// (`link`): a `Linked` event names it as its `dest_path`, the file the
+/// watched inode now also is (NN-L-FIM-002 judges it).
+#[allow(clippy::too_many_arguments)] // drain pipeline context, as process_drift
+pub fn process_record(
+    raw: &FimDriftRaw,
+    link: Option<&str>,
+    path_map: &InodePathMap,
+    last_baseline: Option<&BaselineEntry>,
+    drift_db: &mut impl DriftSink,
+    classifier: &DriftClassifier,
+    rate_limiter: &DriftRateLimiter,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+    lineage: Option<&AuthSessionTracker>,
+    outbox: Option<&mut Vec<Event>>,
+) -> Result<bool> {
     let key = InodeKey {
         dev: raw.target_dev,
         ino: raw.target_ino,
@@ -2094,7 +2125,15 @@ pub fn process_drift(
     // wants to know). `FimOp::Opened` never reaches here — BUG-012
     // (v2) handles every read above this point — so it needs no
     // entry in this set.
-    let suppress_on_match = matches!(op, FimOp::Modified | FimOp::Created | FimOp::Linked);
+    // Lot 352: never a link made to the watched inode (its record carries
+    // the new link's walk, `link`) — a link changes no content (the source's
+    // hash is the baseline's by construction), it gives the watched inode a
+    // new name, and NN-L-FIM-002 judges where. It was dropped here as a
+    // no-op touch (a `content_restored` row on a Critical path), so the
+    // rule never saw one. A link made INTO a watched directory (no walk:
+    // the directory's record) is judged as before.
+    let suppress_on_match =
+        matches!(op, FimOp::Modified | FimOp::Created) || (op == FimOp::Linked && link.is_none());
     if !real_drift && suppress_on_match {
         // Lab PR 229: the setattr hook fires before the change lands; the
         // read above may have come first. The event waits for it.
@@ -2222,6 +2261,9 @@ pub fn process_drift(
         // Lab PR 225: the file's new path, not the directory it went to.
         let dest_path = if matches!(op, FimOp::Renamed) && raw.dest_ino != 0 {
             rename_destination(raw, &path, path_map)
+        } else if op == FimOp::Linked {
+            // lot 352: the new link's path, from the kernel's walk
+            link.map(str::to_string)
         } else {
             None
         };
@@ -2495,6 +2537,28 @@ fn read_login_unit_writer(fe: &FimEvent, writer_start: u64, proc_root: &Path, ho
     }
 }
 
+/// Lot 352: one record of the FIM ring — a [`FimDriftRaw`], or a
+/// [`FimLinkRaw`] (told apart by its size: the ring carries both), whose
+/// walk becomes the new link's absolute path
+/// ([`crate::sensors::open_sensor::walk_path`]).
+fn decode_record(
+    bytes: &[u8],
+    mounts: &mut crate::sensors::open_sensor::MountTable,
+) -> std::result::Result<(FimDriftRaw, Option<String>), bytemuck::PodCastError> {
+    if bytes.len() == std::mem::size_of::<FimLinkRaw>() {
+        let link = bytemuck::try_from_bytes::<FimLinkRaw>(bytes)?;
+        let path = crate::sensors::open_sensor::walk_path(
+            &link.path,
+            link.path_n,
+            link.path_truncated != 0,
+            (link.root_dev, link.root_ino),
+            mounts,
+        );
+        return Ok((link.drift, Some(path)));
+    }
+    Ok((*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?, None))
+}
+
 /// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
 /// names the destination directory (`dest_dev`/`dest_ino`); NN-L-FIM-010
 /// used to match that directory's path, so `x → x.locked` never fired. The
@@ -2719,6 +2783,9 @@ pub async fn drain_loop(
     // flood of events (an unprivileged loop of reads was enough) filled it:
     // the FIM kill rules never saw a persistence write (review 75).
     let mut outbox: Vec<Event> = Vec::new();
+    // Lot 352: a link record's walk is mapped to its mount point as the open
+    // sensor's records are.
+    let mut mounts = crate::sensors::open_sensor::MountTable::load();
     // External audit NN-AUD-119 / NN-AUD-120: the periodic steps, each at
     // most once per period however often the loop turns.
     let mut retry_pacer = Pacer::new(RETRY_EVERY);
@@ -2730,7 +2797,7 @@ pub async fn drain_loop(
     // One event through the pipeline: the baseline looked up by the watched
     // path, the hash and the rules' input built off the runtime's threads,
     // the drift log locked for its append only (external audit FIMP-003).
-    let check = |raw: &FimDriftRaw, outbox: &mut Vec<Event>| -> Result<bool> {
+    let check = |raw: &FimDriftRaw, link: Option<&str>, outbox: &mut Vec<Event>| -> Result<bool> {
         // lot 344: the writer's fork records, before anything of the record
         // is judged
         teach_fork(raw, Some(&lineage));
@@ -2741,8 +2808,9 @@ pub async fn drain_loop(
             })
             .and_then(|p| baseline_cache.get_content(&p));
         off_the_runtime(|| {
-            process_drift(
+            process_record(
                 raw,
+                link,
                 inode_map.as_ref(),
                 last_baseline.as_ref(),
                 &mut drift_db.as_ref(),
@@ -2781,7 +2849,7 @@ pub async fn drain_loop(
                 back
             });
             for key in back {
-                if let Err(e) = check(&returned_raw(key), &mut outbox) {
+                if let Err(e) = check(&returned_raw(key), None, &mut outbox) {
                     warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a returned file failed");
                 }
             }
@@ -2797,7 +2865,7 @@ pub async fn drain_loop(
         }
         // External audit FIMR-004: files renamed over watched ones, landed.
         for raw in replacement_raws(&inode_map) {
-            if let Err(e) = check(&raw, &mut outbox) {
+            if let Err(e) = check(&raw, None, &mut outbox) {
                 warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a replaced file failed");
             }
         }
@@ -2823,12 +2891,13 @@ pub async fn drain_loop(
         while let Some(item) = inner.next() {
             drained += 1;
             let bytes: &[u8] = item.as_ref();
-            let raw = match bytemuck::try_from_bytes::<FimDriftRaw>(bytes) {
-                Ok(r) => *r,
+            let (raw, link) = match decode_record(bytes, &mut mounts) {
+                Ok(r) => r,
                 Err(e) => {
                     warn!(
                         target: "fim.drain",
                         expected = std::mem::size_of::<FimDriftRaw>(),
+                        expected_link = std::mem::size_of::<FimLinkRaw>(),
                         got = bytes.len(),
                         error = %e,
                         "ringbuf entry rejected"
@@ -2851,7 +2920,7 @@ pub async fn drain_loop(
                 .is_some_and(|t| t.skip(raw.modifier_pid, raw.timestamp_ns))
             {
                 outbox.push(self_test_event(&raw, &inode_map));
-            } else if let Err(e) = check(&raw, &mut outbox) {
+            } else if let Err(e) = check(&raw, link.as_deref(), &mut outbox) {
                 warn!(
                     target: "fim.drain",
                     error = %format!("{e:#}"),
@@ -4787,6 +4856,119 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(!row.decision_engine_skipped);
+    }
+
+    /// Lot 352 (pre-alpha Phase 4, NN-L-FIM-002): a hard link made to a
+    /// watched SUID binary reaches the rules with the new link's path the
+    /// kernel walked (`dest_path`), and NN-L-FIM-002 kills where it went. It
+    /// was dropped as a no-op (the link changes no content: the hash is the
+    /// baseline's), and it named only the source. The ring record carries
+    /// the walk ([`decode_record`]): a link record becomes the drift record
+    /// and the path, a drift record no path, any other size an error.
+    #[test]
+    fn a_link_to_a_watched_binary_reaches_the_rules_with_its_new_path() {
+        use nn_core::decision::Rule as _;
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("passwd");
+        std::fs::write(&watched, b"the setuid binary").unwrap();
+        let meta = std::fs::metadata(&watched).unwrap();
+        let watched_s = watched.to_string_lossy().to_string();
+        path_map.insert(
+            InodeKey {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            watched_s.clone(),
+        );
+        let baseline = dummy_baseline(
+            &watched_s,
+            &hex::encode(Sha256::digest(b"the setuid binary")),
+        );
+        let raw = fake_raw(meta.dev(), meta.ino(), FimOp::Linked as u8);
+        let mut out: Vec<Event> = Vec::new();
+        let emitted = process_record(
+            &raw,
+            Some("/var/tmp/nn-link"),
+            &path_map,
+            Some(&baseline),
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted, "a link is no no-op touch");
+        let Some(Event::Fim(fe)) = out.pop() else {
+            panic!("expected Event::Fim");
+        };
+        assert_eq!(
+            (fe.op, fe.path.as_str()),
+            (FimOp::Linked, watched_s.as_str())
+        );
+        assert_eq!(fe.dest_path.as_deref(), Some("/var/tmp/nn-link"));
+        let v = nn_core::fim::rules::NnLFim002NewSuidBinary
+            .evaluate(&Event::Fim(fe))
+            .expect("NN-L-FIM-002 judges the new link");
+        assert_eq!(v.action, nn_model::ResponseAction::KillProcessTree);
+        // a link record without the walk (a link INTO a watched directory,
+        // whose record is the directory's) is judged as before: no content
+        // changed, no event
+        let mut out: Vec<Event> = Vec::new();
+        let emitted = process_record(
+            &raw,
+            None,
+            &path_map,
+            Some(&baseline),
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(!emitted && out.is_empty(), "{out:?}");
+
+        // the ring: a link record and a drift record told apart by size
+        let mut mounts = crate::sensors::open_sensor::MountTable::load();
+        let mut link = FimLinkRaw {
+            drift: raw,
+            root_dev: 0,
+            root_ino: 0,
+            path_n: 0,
+            path_truncated: 1,
+            _pad: [0; 5],
+            path: [0; 512],
+        };
+        for (i, name) in [&b"nn-link"[..], b"tmp", b"var"].iter().enumerate() {
+            link.path[i * 32..i * 32 + name.len()].copy_from_slice(name);
+        }
+        link.path_n = 3;
+        let (drift, path) = decode_record(bytemuck::bytes_of(&link), &mut mounts).unwrap();
+        assert_eq!(drift.op, FimOp::Linked as u8);
+        let cut = crate::sensors::open_sensor::CUT_MARK;
+        assert_eq!(
+            path,
+            Some(format!("{cut}/var/tmp/nn-link")),
+            "cut: no root reached"
+        );
+        let (_, none) = decode_record(bytemuck::bytes_of(&raw), &mut mounts).unwrap();
+        assert_eq!(none, None);
+        assert!(decode_record(&[0u8; 7], &mut mounts).is_err());
     }
 
     /// External audit FIMR-004: a file renamed over a watched one (the
