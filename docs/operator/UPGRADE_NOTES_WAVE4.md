@@ -2381,8 +2381,10 @@ detail.
   with the kernel's record of `O_APPEND` writes by rsyslogd alone, is
   rsyslogd's append now. A truncation by another writer, by rsyslogd itself,
   or a rewrite in place stays High. The drift log is unchanged.
-- **`sudo ./deploy/uninstall.sh` at a terminal is Low every time.** It was
-  High 3 runs in 7: a shell that runs `sudo` as its last command executes
+- **`sudo ./deploy/uninstall.sh` at a terminal is Low** (the race is
+  closed: 0 High in 15 runs; lot 351's wording: an exec record lost to a
+  full ring or the lineage cache's eviction can still leave one High). It
+  was High 3 runs in 7: a shell that runs `sudo` as its last command executes
   sudo in place of itself, and sudo's monitor, forked in the same 10 ms
   clock tick, was not known as sudo's. sudo-rs (`/usr/lib/cargo/bin/sudo`,
   Ubuntu 26.04's `sudo`; `/usr/bin/sudo-rs`, `/usr/bin/su-rs`) counts as
@@ -2405,3 +2407,44 @@ detail.
   programs (systemd's `RestrictFileSystems=`). What remains after a purge
   (kernel modules loaded on demand, the host's own logs) is listed in
   [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.
+
+## 45. A log shrunk back to its baseline, sudo's askpass helper, the uninstall's leftovers (lot 351)
+
+- **A log truncated back to its baseline's exact content is recorded.**
+  The drain dropped a record whose content matched the start's signed
+  baseline as a no-op; a `truncate -s <baseline size>` of a log after
+  rsyslogd's appends matched it, and the lines written since were erased
+  with no drift row and no NN-L-FIM-005. A file read smaller than the drain
+  last read it is a change now, whatever the baseline says: a drift row and
+  NN-L-FIM-005 (High; a scheduled `copytruncate` of a log whose baseline is
+  empty is Low on logrotate's own record). A watched configuration file
+  edited in place and then shrunk back to its baseline is recorded too (it
+  was dropped). A growth the drain never read before the truncation is not
+  seen (`TAPPA9_FIM_TRUST_MODEL.md`).
+- **`sudo -A`'s askpass helper is no administrator's session.** The session
+  checks (R009, the FIM rules' kill hold, the impair rules' sanction, the
+  posture's admin changes) took any descendant of a sudo or su. sudo forks
+  the user's `SUDO_ASKPASS` program, as the user, before authenticating: a
+  root payload below it (a local privilege escalation) was Low, no kill.
+  Only the process sudo or su ran as root after authenticating vouches now
+  (its child's first exec since the fork, by the kernel's fork record, as
+  root, no PAM helper); what sudo runs as the user, `sudo -u bob` and `su
+  bob` vouch for no root act below them. `sudo env … ./x` and `sudo bash -c
+  …` keep the session (up to three execs in place). A High R009 says in the
+  journal "the sudo or su in its lineage (pid N) ran nothing as root after
+  authenticating above it".
+- **`uninstall.sh` and the agent's containment cgroups.** `blocked.scope`
+  and `throttled.scope` under `northnarrow.slice` are removed when empty.
+  One holding a process the agent contained is left with it — not killed,
+  not released — the processes and the agent's containment record printed,
+  and the slice is then not stopped (it goes at the next boot).
+- **`/etc/systemd/system.control` is removed only when the install made
+  it.** A first install records the directories its units are about to
+  make in `/etc/northnarrow/made-dirs`; the uninstall removes /etc's empty
+  `system.control` only when it is listed (or when no record exists: an
+  install older than this one). No action on upgrade: the record is made by
+  a first install only.
+- **The uninstall removes no mount point in systemd's trees.** The
+  directories it removes there (drop-in directories, the journal
+  namespace's runtime directory and journals) are left when they are a
+  mount point, and their removal does not cross into another file system.

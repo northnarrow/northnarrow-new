@@ -857,6 +857,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
+  - **F1 — a log truncated back to its signed baseline's exact content was
+    dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written
+    since erased without a trace). A file read smaller than the drain last
+    read it (`InodePathMap::last_size`) is drift whatever the baseline says
+    (`process_drift`: `shrank_since_read`).
+  - **F2 — `is_interactive_admin` took any descendant of a sudo or su**,
+    `sudo -A`'s askpass helper included (the user's program, as the user,
+    before authenticating): a root payload below it was R009 Low, no kill.
+    The elevation hop vouches only through the process it ran as root after
+    authenticating — the first exec of its child's process (the spawn
+    cache's history), forked by it (the kernel's fork record), real uid 0,
+    no PAM helper (`elevation_walk`, `elevated_child`); one walk for the
+    check, its status and its journal reason. Ratchet: `ELEVATION_EXES` and
+    the PAM helpers are `AUTH_BINARY_EXES`.
+  - **#559's P3s.** `uninstall.sh` removes the agent's empty containment
+    cgroups (`blocked.scope`, `throttled.scope`) and leaves a held one —
+    neither killed nor released, its processes and the containment record
+    printed, the slice not stopped; removes `/etc/systemd/system.control`
+    only when the first install recorded making it (`made-dirs`,
+    `record_made_dirs`); removes directories in systemd's trees through
+    `rm_tree` (never a mount point, `--one-file-system`; a ratchet forbids a
+    plain `rm -rf` there). "Low every time" in the guides is exact now.
 - Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
   raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
   record is told by identity, none by a name.

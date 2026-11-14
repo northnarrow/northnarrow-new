@@ -11208,6 +11208,50 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
+  askpass helper, the uninstall's leftovers (C06, C11; no level changes).**
+  - What was open (two pre-existing P2 the review of #559 found, and its
+    P3s): F1, a log truncated back to its signed baseline's exact content
+    matched the baseline and was dropped as a no-op (no drift row, no
+    NN-L-FIM-005); F2, an administrator's session was any descendant of a
+    sudo or su — `sudo -A` forks the user's askpass program, as the user,
+    before authenticating, and a root payload below it was R009 Low, no
+    kill; F3–F7, the uninstall's slice stop and the containment scopes, `rm
+    -rf` of the journal namespace's runtime directory, `system.control`
+    removed when the host had it, no `ELEVATION_EXES ⊆ AUTH_BINARY_EXES`
+    ratchet, "Low every time".
+  - Done: a file read smaller than the drain last read it is drift whatever
+    the baseline says; the sudo or su vouches only through the process it ran
+    as root after authenticating (its child's first exec since the fork, by
+    the kernel's fork record, real uid 0, no PAM helper — one walk for the
+    check, its status and its journal reason; a ratchet keeps every caller
+    on it, another the lists' inclusion); `uninstall.sh` removes the empty
+    containment scopes and leaves a held one (not killed, not released, its
+    processes and the containment record printed, the slice not stopped),
+    removes /etc's `system.control` only when the first install recorded
+    making it (`made-dirs`), and removes directories in systemd's trees
+    through `rm_tree` (no mount point, `--one-file-system`; a ratchet).
+  - Lab (ubuntu2404 6.8.0-149, sudo 1.9.15p5, rounds r1 and r2; ubuntu2604
+    7.0.0-43, sudo-rs 0.2.13, round r1; one guest at a time, clean before,
+    purged and powered off after): a user with no sudo right running
+    `sudo -A` with an askpass program whose child (a setuid-root helper
+    standing for a local privilege escalation) executes a payload from its
+    home as root — R009 High, the journal saying "the sudo or su in its
+    lineage (pid …) ran nothing as root after authenticating above it" (r1,
+    r2); the askpass program executing the payload in its own place — High,
+    the same journal line; an administrator's `sudo ~/x.sh` and `sudo env
+    K=1 ~/x.sh` at a terminal — Low (both guests); the operator's `sudo
+    ./deploy/uninstall.sh` at a terminal — R009 Low (both guests, r1 and
+    r2). sudo-rs refuses a user with no rule before any authentication: the
+    askpass program never ran there (not reachable that way). The first
+    install recorded `/etc/systemd/system.control` in `made-dirs` (the
+    host had none); the uninstall removed it, empty, with /run's, the slice
+    stopped, the journal namespace's runtime directory removed; the
+    `--purge` after left no agent, slice cgroup, `system.control`, runtime
+    directory, configuration, state or pin (both guests). GNU `rm` takes
+    `--one-file-system` on both (`/usr/bin/gnurm` on 26.04). No containment
+    scope existed (the alpha profile contains nothing): the held-scope path
+    is covered by its host test only.
 - **Lot 350 — the pre-alpha's Phase 2: our own install, boot and uninstall
   raise no High; a purge leaves nothing undeclared (C06, C11; no level
   changes).**
