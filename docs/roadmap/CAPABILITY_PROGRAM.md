@@ -11002,4 +11002,20 @@ number in parentheses is a lab PR.
     is run — every renamed copy, inline destinations, links and renames, and
     `ln`/`cat`/`command -v` in lab scripts. F5: the watchdog e2e finds the
     start's own Low record by the same filter (positive control).
+    Mutation: 11 mutants of the round's userland code, 11 caught (the first
+    survivor, the lineage's kernel-fork path, got its case).
+    Lab, as measured (lease k344). Ubuntu 22.04 (5.15.0-202), the round's
+    object through the verifier (`verifier-check synced`): every program OK,
+    the highest `module_read_file_observe` 551,900 (55.2%, as before);
+    processed `fim_write_intent_observe` 4,136 (655 in the 13/11 report),
+    `fim_setattr_observe` 3,561 (1,316), `fim_close_emit_observe` 486 (464),
+    `bpf_syscall_observe` 36,148 (32,058), `fim_file_open_sensor` 145,204
+    (144,651). Ubuntu 24.04 (6.8), an alpha install: our watchdog's start
+    NN-L-BPF-002 Low ×1, no High; two `copytruncate` rotations — logrotate's
+    records Low, no rsyslogd record; `truncate -s 0` of syslog High; the
+    collapse of `/var/log/kern.log`'s first 4 KiB through an `O_APPEND` fd by
+    a fork that exits, its pid then given to `rsyslogd -n -f /dev/null`
+    (`ns_last_pid`; it exits, no action), the fd closed by the fork's child:
+    on #554's head 343e47e4 no record (×2), on this round NN-L-FIM-005 High
+    for the writer (`python3`, its pid) ×2.
 
