@@ -788,7 +788,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
         }
 
         // ALERTED -> ENGAGED tier
-        if exploit_attempt(event) {
+        if exploit_attempt_judged(&self.auth, event) {
             hits.push(TriggerType::ExploitAttempt);
         }
         if heavy_recon(event, recent) {
@@ -1494,6 +1494,15 @@ fn exploit_attempt(focal: &Event) -> bool {
         return false;
     };
     NETCAT_COMMS.iter().any(|c| comm == c) || OFFSEC_COMMS.iter().any(|c| comm == c)
+}
+
+/// Lot 350 (F2-3): [`exploit_attempt`], except cloud-init's own netcat
+/// asking a boot phase on its unix socket, by identity
+/// ([`crate::posture::cloud_init::cloud_init_socket_client`]): every boot of
+/// a cloud image ran it as root and raised the posture to ENGAGED.
+fn exploit_attempt_judged<H: PostureHost>(auth: &AuthSessionTracker<H>, focal: &Event) -> bool {
+    exploit_attempt(focal)
+        && crate::posture::cloud_init::cloud_init_socket_client(auth, focal).is_none()
 }
 
 fn critical_file_modification(focal: &Event) -> bool {
@@ -2680,6 +2689,28 @@ mod tests {
         let focal = spawn(42, 1, "ncat", "/usr/bin/ncat", 1);
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::ExploitAttempt));
+    }
+
+    /// Lot 350 (named, F2-3): cloud-init's own netcat on its unix socket
+    /// (`crate::posture::cloud_init`) raises no ExploitAttempt — every boot
+    /// of a cloud image was ENGAGED; a netcat with a host and a port, or
+    /// `-e`, from the same unit's shell still raises it.
+    #[test]
+    fn cloud_init_s_own_netcat_raises_no_exploit_attempt() {
+        use crate::posture::cloud_init::tests_support as ci;
+        let (_tmp, t) = ci::cloud_final_host();
+        assert!(!exploit_attempt_judged(
+            &t,
+            &ci::netcat(&["nc", "-U", ci::SOCK])
+        ));
+        assert!(exploit_attempt_judged(
+            &t,
+            &ci::netcat(&["nc", "203.0.113.7", "4444"])
+        ));
+        assert!(exploit_attempt_judged(
+            &t,
+            &ci::netcat(&["nc", "-e", "/bin/sh", ci::SOCK])
+        ));
     }
 
     #[test]

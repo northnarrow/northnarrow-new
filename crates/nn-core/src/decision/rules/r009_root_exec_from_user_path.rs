@@ -169,6 +169,19 @@ impl<H: DecisionHost> Rule for R009RootExecFromUserPath<H> {
                  or a package transaction — recorded",
             ));
         }
+        // Lot 350 (F2-2): why the session was not an administrator's, in the
+        // agent's journal (the record's text is unchanged)
+        if let Some(why) = self
+            .lineage
+            .as_ref()
+            .and_then(|l| l.not_interactive_admin_because(*pid, AsOf::judged(*timestamp_ns)))
+        {
+            tracing::info!(
+                rule = "R009_RootExecFromUserPath",
+                pid = *pid,
+                "not an administrator's sudo/su session at a terminal: {why}"
+            );
+        }
         Some(build_verdict(
             self,
             event,
@@ -268,6 +281,47 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&other).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lot 350 (named, F2-2): Ubuntu 26.04's `sudo` is sudo-rs
+    /// (`/usr/lib/cargo/bin/sudo` behind the alternatives; Debian's
+    /// `/usr/bin/sudo-rs`). It was no elevation binary: an administrator's
+    /// `sudo ./deploy/uninstall.sh` at a terminal there was R009 High at
+    /// every run, where the guide says Low. Its session is recorded at Low,
+    /// as sudo's; the same exec without a terminal is still High.
+    #[test]
+    fn a_sudo_rs_session_at_a_terminal_is_recorded_low() {
+        for sudo in [
+            "/usr/lib/cargo/bin/sudo",
+            "/usr/bin/sudo-rs",
+            "/usr/lib/cargo/bin/su",
+            "/usr/bin/su-rs",
+        ] {
+            for (tty, severity) in [(34816, Severity::Low), (0, Severity::High)] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                for (pid, ppid) in [(700u32, 1u32), (710, 700), (720, 710)] {
+                    let d = tmp.path().join(pid.to_string());
+                    std::fs::create_dir_all(&d).unwrap();
+                    std::fs::write(d.join("loginuid"), "1000").unwrap();
+                    std::fs::write(
+                        d.join("stat"),
+                        format!("{pid} (x) S {ppid} {pid} {pid} {tty} -1 0\n"),
+                    )
+                    .unwrap();
+                }
+                let lineage = AuthSessionTracker::new(tmp.path());
+                lineage.ingest_spawn(700, 1, "/usr/bin/bash", 1);
+                lineage.ingest_spawn(710, 700, sudo, 2);
+                lineage.ingest_spawn(720, 710, "/home/alice/nn/deploy/uninstall.sh", 3);
+                let rule = R009RootExecFromUserPath::new(lineage);
+                let mut run = spawn_as(0, "uninstall.sh", "/home/alice/nn/deploy/uninstall.sh");
+                if let Event::ProcessSpawn { pid, ppid, .. } = &mut run {
+                    (*pid, *ppid) = (720, 710);
+                }
+                let v = rule.evaluate(&run).expect("recorded");
+                assert_eq!(v.severity, severity, "{sudo}");
+            }
+        }
     }
 
     /// Lab PR 175: the package transaction is root's package manager while

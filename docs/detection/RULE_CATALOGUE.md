@@ -16,7 +16,7 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High | KillProcessTree | T1059, T1027.011 |
 | [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium | KillProcessTree, Log | T1059 |
 | [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical | KillProcessTree | T1620 |
-| [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High | Log | T1095 |
+| [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High, Low | Log | T1095 |
 | [`R006_ReverseShellTooling`](#r006_reverseshelltooling) | Reverse shell tooling | Critical, High | KillProcessTree, Log | T1095, T1059.004 |
 | [`R007_CryptoMiner`](#r007_cryptominer) | Crypto miner | Critical, High | KillProcessTree, Log | T1496.001 |
 | [`R008_HiddenHomeBinary`](#r008_hiddenhomebinary) | Executable in hidden user directory | Medium | Log | T1564.001 |
@@ -131,7 +131,7 @@ Netcat family launched — category `lateral_movement`.
 
 | | |
 |---|---|
-| Severity | High |
+| Severity | High, Low |
 | Response | Log |
 | ATT&CK | T1095 Non-Application Layer Protocol (Command and Control) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
@@ -139,11 +139,11 @@ Netcat family launched — category `lateral_movement`.
 
 **Observes.** An exec whose `comm` is a netcat (`nc`, `ncat`, `netcat`, `nc.openbsd`, `nc.traditional`), recorded only.
 
-**Known false positives.** Administrators and scripts use netcat for port checks and file transfers; every such exec is recorded (Log), none is acted on. The name is the process's own: a renamed copy is not seen.
+**Known false positives.** Administrators and scripts use netcat for port checks and file transfers; every such exec is recorded (Log), none is acted on. The name is the process's own: a renamed copy is not seen. Lot 350: cloud-init's own `nc -U /run/cloud-init/share/<phase>.sock` (cloud-init 24; 25: `nc -Uu -W1 <socket> -s <return socket>`) at every boot of a cloud image is recorded at Low, recognised by identity only — the packaged netcat's file, root's, that argv and no inet stream, in the cgroup of the cloud-init unit of that phase, forked by the unit's own shell, PID 1's fork; any other netcat is High.
 
 **How to test.** `nc -z 127.0.0.1 22` (any netcat invocation).
 
-**Tests.** `crates/nn-core/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias`
+**Tests.** `crates/nn-core/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias`, `crates/nn-core/src/decision/rules/r005_netcat_exec.rs::r005_records_cloud_init_s_own_netcat_at_low_only`
 
 **ATT&CK note.** T1095 for netcat's use as a raw TCP/UDP channel (a reverse or bind shell); the rule sees the name only, not the connection.
 

@@ -1284,6 +1284,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 
@@ -1561,6 +1562,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

@@ -400,6 +400,14 @@ pub fn populate_watched_paths(
         };
         let key = plan.own;
         let path_str = path.to_string_lossy().into_owned();
+        // Lot 350 (F2-1): the size read BEFORE the kernel watches the inode —
+        // every write a record reports comes after it (an append landing
+        // between the watch and a later read was measured in it, and its
+        // record then read "no growth": NN-L-FIM-005 High)
+        let watched_size = std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_file() && m.ino() == key.ino)
+            .map(|m| m.len());
         match hmap.insert(AyaInodeKey(key), 1u8, 0) {
             Ok(()) => {
                 inserted += 1;
@@ -412,10 +420,8 @@ pub fn populate_watched_paths(
                 // the start is measured against it (the baseline of the path
                 // may not be in the drain's cache yet: rsyslogd's first
                 // append at every start read as a truncation)
-                if let Ok(m) = std::fs::symlink_metadata(path) {
-                    if m.is_file() && m.ino() == key.ino {
-                        inode_map.note_size(&key, m.len());
-                    }
+                if let Some(size) = watched_size {
+                    inode_map.note_size(&key, size);
                 }
                 // External audit EBPF-016: a watch on overlayfs, FUSE or NFS
                 // goes into the boot's signed identity record.

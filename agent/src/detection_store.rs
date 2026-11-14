@@ -1978,6 +1978,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         });
         let r = DetectionRecord::from_rule(
             2,

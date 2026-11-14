@@ -173,6 +173,25 @@ another process by the time the drain reads it, so `/proc/<pid>/exe` is read
 only while `/proc/<pid>/stat` shows that start, and the lineage answers only
 for that process — an `rsyslogd` started at a reused pid lends nothing.
 
+Lot 350 (the pre-alpha's Phase 2: NN-L-FIM-005 High on `/var/log/syslog`
+at 4 of 10 fresh installs on Ubuntu 24.04 and 26.04). Nothing of the install
+touches rsyslog or its logs: a record leaves the kernel at the close of ANY
+file of the inode, and rsyslogd never closes its log. Its pending appends
+are emitted when another process closes the log — at a fresh install the
+first-boot baseline reading it, then the drain's own re-hash of the record
+before. An append rsyslogd made before that re-hash was measured by it, and
+its record, emitted by the re-hash's close, read the very same bytes: "no
+growth", judged a truncation. The drain now keeps, beside the size of its
+last read of a file, the SHA-256 of that read's content, and the event says
+whether this read found the same bytes (`FimEvent::unchanged_since_read`).
+rsyslogd's carve-out takes it — with the kernel's record of `O_APPEND` writes
+by rsyslogd alone and the daemon's image, never by itself: the appends were
+already in the content the previous record was judged on. The same bytes
+without that kernel record, from another writer, a shrink, or the same size
+with other bytes (rewritten in place): High, as before. And the size a file
+had when it was watched is read before the kernel watches its inode (it was
+read after: an append landing in between was measured in it).
+
 Residuals, named: a process that runs rsyslogd's image itself (an rsyslog
 module, `LD_PRELOAD` into rsyslogd) writes as rsyslogd — its growth of a log,
 or its collapse inside the window of another process's truncation, is

@@ -741,6 +741,7 @@ fn config_changes_are_findings_and_paths_are_watched() {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     };
     let f = h

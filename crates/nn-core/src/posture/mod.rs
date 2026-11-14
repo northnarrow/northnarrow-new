@@ -37,6 +37,7 @@
 //! Ed25519-signed command path.
 
 pub mod clock;
+pub mod cloud_init;
 pub mod corroboration;
 pub mod daemon_data;
 pub mod entry;

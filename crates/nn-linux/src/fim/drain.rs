@@ -199,12 +199,22 @@ struct PathMapInner {
     /// symlinked path.
     chains: HashMap<String, Vec<InodeKey>>,
     /// Lot 340: the size of each watched file as the drain last read its
-    /// content ([`InodePathMap::last_size`]); dropped with its entry.
-    sizes: HashMap<InodeKey, u64>,
+    /// content ([`InodePathMap::last_size`]); dropped with its entry. Lot 350:
+    /// with the content's SHA-256 that read found ([`LastRead`]).
+    sizes: HashMap<InodeKey, LastRead>,
     /// The review of #554 (F1): the writer (pid) of the last size setattr's
     /// record of each watched file since the file's last other `Modified`
     /// record ([`InodePathMap::note_truncation`]); dropped with its entry.
     truncations: HashMap<InodeKey, u32>,
+}
+
+/// Lot 350 (F2-1): the drain's last read of a watched file — its size and,
+/// for a read of its content, the content's SHA-256 (`None`: the size the
+/// file had when it was watched, read without its content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastRead {
+    size: u64,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,15 +361,44 @@ impl InodePathMap {
     /// smaller file, and every append rsyslogd made to it was a "truncation"
     /// (NN-L-FIM-005 High) until it outgrew the file rotated away.
     pub fn last_size(&self, key: &InodeKey) -> Option<u64> {
-        self.inner.read().sizes.get(key).copied()
+        self.inner.read().sizes.get(key).map(|r| r.size)
     }
 
     /// Lot 340: the drain read `size` bytes in the file `key` names (kept
-    /// only for a watched inode).
+    /// only for a watched inode). Lot 350: a size without its content (the
+    /// file's when it was watched): no read of the content to compare with.
     pub fn note_size(&self, key: &InodeKey, size: u64) {
+        self.note(key, LastRead { size, sha256: None });
+    }
+
+    /// Lot 350 (F2-1): the drain read the content of the file `key` names —
+    /// `size` bytes, SHA-256 `sha256` (kept only for a watched inode).
+    pub fn note_read(&self, key: &InodeKey, size: u64, sha256: &str) {
+        self.note(
+            key,
+            LastRead {
+                size,
+                sha256: Some(sha256.to_string()),
+            },
+        );
+    }
+
+    /// Lot 350 (F2-1): the drain's last read of the content of the file
+    /// `key` names ([`Self::note_read`]) found `size` bytes of SHA-256
+    /// `sha256` — the same bytes as a read now. `false` before a read of its
+    /// content (a size noted when it was watched compares nothing).
+    pub fn read_unchanged(&self, key: &InodeKey, size: u64, sha256: &str) -> bool {
+        self.inner
+            .read()
+            .sizes
+            .get(key)
+            .is_some_and(|r| r.size == size && r.sha256.as_deref() == Some(sha256))
+    }
+
+    fn note(&self, key: &InodeKey, read: LastRead) {
         let mut g = self.inner.write();
         if g.entries.contains_key(key) {
-            g.sizes.insert(*key, size);
+            g.sizes.insert(*key, read);
         }
     }
 
@@ -1952,6 +1991,7 @@ pub fn process_drift(
                 moved_in: ident.moved_in,
                 appends_only: false,
                 truncated_by_another: false,
+                unchanged_since_read: false,
             }));
             return Ok(true);
         }
@@ -1988,8 +2028,15 @@ pub fn process_drift(
     let baseline_size = path_map
         .last_size(&size_key)
         .or_else(|| last_baseline.map(|b| b.size_bytes));
-    if let Some(n) = new_size {
-        path_map.note_size(&size_key, n);
+    // Lot 350 (F2-1): this read finds the very bytes the drain's last read of
+    // the file found — the writes this record reports were already in that
+    // read (the drain's own re-hash, or the start's baseline, closed the file
+    // and so emitted the pending record of writes it had already read)
+    let unchanged_since_read = content
+        .as_ref()
+        .is_some_and(|c| path_map.read_unchanged(&size_key, c.size, &c.sha256));
+    if let Some(c) = &content {
+        path_map.note_read(&size_key, c.size, &c.sha256);
     }
     // the review of #554 (N2, lot 348): a size setattr explains a later
     // shrink only when it shrank the file
@@ -2197,6 +2244,7 @@ pub fn process_drift(
             moved_in: ident.moved_in,
             appends_only: appends_only(raw, op),
             truncated_by_another,
+            unchanged_since_read,
         };
         // lot 347: a login record's packaged writer, read while it runs
         read_login_unit_writer(&fe, raw.modifier_start, Path::new("/proc"), Path::new("/"));
@@ -2855,6 +2903,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         moved_in: false,
         appends_only: false,
         truncated_by_another: false,
+        unchanged_since_read: false,
     })
 }
 
@@ -4058,6 +4107,127 @@ mod tests {
         let unseen = fx.drift(&fx.raw(rsyslogd, BOTH)).unwrap();
         assert!(!unseen.truncated_by_another);
         assert!(LogFixture::judged_as_rsyslogd(&unseen, 0).is_some());
+    }
+
+    /// Lot 350 (named, F2-1: NN-L-FIM-005 High on `/var/log/syslog` at 4 of
+    /// 10 fresh installs on Ubuntu). A record leaves the kernel at the close
+    /// of ANY file of the inode: rsyslogd never closes its log, so its
+    /// pending appends leave at the close of the start's baseline read — or
+    /// of the drain's own re-hash of the previous record. An append landing
+    /// before that re-hash is measured by it, and its record, emitted by the
+    /// re-hash's close, reads the very same bytes: "no growth", High on
+    /// `main`. It is rsyslogd's append (the kernel's record: `O_APPEND`
+    /// writes by rsyslogd alone, all already read): exempt. The same bytes
+    /// without the kernel's record of appends by one writer, a writer that is
+    /// not rsyslogd, a shrink, or the same size with other bytes (an
+    /// in-place rewrite): High, as on `main`.
+    #[test]
+    fn rsyslogd_s_appends_the_drain_already_read_are_not_a_truncation() {
+        use nn_core::decision::Rule;
+        use std::io::{Seek, Write};
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let rsyslogd = 600;
+        let mut fx = LogFixture::new(4_000);
+        let append = |fx: &LogFixture, line: &[u8]| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&fx.log)
+                .unwrap()
+                .write_all(line)
+                .unwrap()
+        };
+        // two appends, then the start's baseline read closes the log: the
+        // first record; the drain's read of it measures both
+        append(&fx, b"systemd[1]: Started northnarrow-agent.service\n");
+        append(&fx, b"systemd[1]: Reloading finished in 227 ms.\n");
+        let first = fx.drift(&fx.raw(rsyslogd, BOTH)).expect("a drift");
+        assert!(
+            LogFixture::judged_as_rsyslogd(&first, 102).is_none(),
+            "an append"
+        );
+        // the second append's record, emitted by that read's own close
+        let again = fx.drift(&fx.raw(rsyslogd, BOTH)).expect("a drift");
+        assert_eq!(
+            again.new_size, again.baseline_size,
+            "no growth since the read"
+        );
+        for uid in [0, 102] {
+            assert!(
+                LogFixture::judged_as_rsyslogd(&again, uid).is_none(),
+                "appends already read are rsyslogd's appends"
+            );
+        }
+        // the same bytes, without the kernel's record of appends by one writer
+        for flags in [0, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER] {
+            let fe = fx.drift(&fx.raw(rsyslogd, flags)).expect("a drift");
+            for uid in [0, 102] {
+                let v = LogFixture::judged_as_rsyslogd(&fe, uid).expect("not known as appends");
+                assert_eq!(v.severity, nn_model::Severity::High);
+            }
+        }
+        // the same bytes, a writer that is not the rsyslog daemon
+        let fe = fx.drift(&fx.raw(4_300, BOTH)).expect("a drift");
+        let mut other = fe.clone();
+        other.path = "/var/log/auth.log".into();
+        other.modifier_exe = Some("/usr/bin/python3.12".into());
+        let v = nn_core::fim::rules::NnLFim005LogTruncated::new(Some(102))
+            .evaluate(&Event::Fim(other))
+            .expect("not rsyslogd");
+        assert_eq!(v.severity, nn_model::Severity::High);
+        // the same size, other bytes (rewritten in place): not the bytes read
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fx.log)
+            .unwrap();
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(b"yyyy").unwrap();
+        drop(f);
+        let fe = fx.drift(&fx.raw(rsyslogd, BOTH)).expect("a drift");
+        assert_eq!(fe.new_size, fe.baseline_size);
+        for uid in [0, 102] {
+            let v = LogFixture::judged_as_rsyslogd(&fe, uid).expect("rewritten in place");
+            assert_eq!(v.severity, nn_model::Severity::High);
+        }
+        // a shrink: High
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fx.log)
+            .unwrap()
+            .set_len(1_000)
+            .unwrap();
+        let fe = fx.drift(&fx.raw(rsyslogd, BOTH)).expect("a drift");
+        for uid in [0, 102] {
+            let v = LogFixture::judged_as_rsyslogd(&fe, uid).expect("a shrink");
+            assert_eq!(v.severity, nn_model::Severity::High);
+        }
+    }
+
+    /// Lot 350 (F2-1): the size noted when a file is watched compares no
+    /// content — only a read of its content does, and a new file at the
+    /// inode's entry forgets it.
+    #[test]
+    fn only_a_read_of_the_content_is_compared() {
+        let map = InodePathMap::new();
+        let k = InodeKey { dev: 1, ino: 2 };
+        map.insert(k, "/var/log/syslog".into());
+        map.note_size(&k, 10);
+        assert!(!map.read_unchanged(&k, 10, "aa"), "a size alone");
+        map.note_read(&k, 10, "aa");
+        assert!(map.read_unchanged(&k, 10, "aa"));
+        assert!(!map.read_unchanged(&k, 10, "ab"), "other bytes");
+        assert!(!map.read_unchanged(&k, 11, "aa"), "another size");
+        map.remove(&k);
+        map.insert(k, "/var/log/syslog".into());
+        assert!(
+            !map.read_unchanged(&k, 10, "aa"),
+            "forgotten with its entry"
+        );
+        let unwatched = InodeKey { dev: 1, ino: 3 };
+        map.note_read(&unwatched, 10, "aa");
+        assert!(
+            !map.read_unchanged(&unwatched, 10, "aa"),
+            "kept for a watched inode only"
+        );
     }
 
     /// The review of #554 (named, N2; lot 348): a size setattr by another
@@ -6423,6 +6593,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         };
         let read = |fe: &FimEvent| {
             read_login_unit_writer(fe, 0, &proc, &root);
@@ -6543,6 +6714,7 @@ mod tests {
                 moved_in: false,
                 appends_only: false,
                 truncated_by_another: false,
+                unchanged_since_read: false,
             };
             read_login_unit_writer(&fe, 0, &proc, &root);
             unit_of(&fe)
@@ -6625,6 +6797,7 @@ mod tests {
                 moved_in: false,
                 appends_only: false,
                 truncated_by_another: false,
+                unchanged_since_read: false,
             };
             read_login_unit_writer(&fe, writer_start, &proc, &root);
             unit_of(&fe)

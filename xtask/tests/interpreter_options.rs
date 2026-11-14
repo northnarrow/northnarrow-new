@@ -242,6 +242,13 @@ const KNOWN: &[(&str, usize, &str)] = &[
          (`sh -i -c /bin/true` reads a startup file)",
     ),
     (
+        "crates/nn-core/src/posture/cloud_init.rs",
+        4,
+        "lot 350: exact argvs, cloud-init's units' `nc -U <socket>` (cloud-init 24) and `nc -Uu \
+         -W1 <socket> -s <return socket>` (25), and their shell's `sh -c '<the unit's line>'`: \
+         every word compared, no option read — any other argv is judged as before",
+    ),
+    (
         "crates/nn-core/src/decision/rules/kmod_invocation.rs",
         15,
         "kmod's own options and arguments (`--help`, `--version`, its argv after the tool's \
