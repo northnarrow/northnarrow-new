@@ -362,6 +362,38 @@ mod tests {
             .is_none());
     }
 
+    /// #554's KVM suites: the signed detection record carries no reasoning,
+    /// so the watchdog e2e knows the fresh instance's record by its severity
+    /// — NN-L-BPF-002 is Low for that command only, High for every other it
+    /// fires on, whoever the caller (an allowlisted name included).
+    #[test]
+    fn bpf002_is_low_for_a_fresh_instance_only() {
+        let (_, r2) = rules();
+        let mut fired = 0;
+        let cmds = (0u32..64).chain([
+            BPF_CMD_FOREIGN_MAP_WRITE,
+            BPF_CMD_FOREIGN_GET_FD,
+            BPF_CMD_FRESH_INSTANCE_GET_FD,
+            0xFFFF_0004,
+            u32::MAX,
+        ]);
+        for cmd in cmds {
+            for comm in ["northnarrow-wat", "northnarrow-age", "bpftool", "myobs"] {
+                let Some(v) = r2.evaluate(&ev(comm, cmd, 9)) else {
+                    continue;
+                };
+                fired += 1;
+                assert_eq!(
+                    v.severity == Severity::Low,
+                    cmd == BPF_CMD_FRESH_INSTANCE_GET_FD,
+                    "cmd {cmd:#x} from {comm}: {:?}",
+                    v.severity
+                );
+            }
+        }
+        assert!(fired > 4, "the rule fired {fired} times");
+    }
+
     #[test]
     fn own_object_handle_is_high_even_for_known_tooling() {
         let (_, r2) = rules();

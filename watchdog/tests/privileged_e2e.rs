@@ -1336,6 +1336,11 @@ fn heads(records: &[&String]) -> Vec<String> {
 /// takes the same path) — and that record, found by the same filter, is
 /// this test's positive control (F5): the start was seen and judged, not
 /// lost to a filter or a profile that records nothing.
+///
+/// #554's KVM suites: the agent's `bpf` hook knew the agent's sibling
+/// `northnarrow-watchdog` as the watchdog, not this one (`--watchdog-exe`):
+/// two High records at every run; and the control looked for the verdict's
+/// reasoning, which the signed record does not carry.
 #[test]
 fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
     let mut fx = E2eFixture::setup();
@@ -1369,10 +1374,14 @@ fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
         "the watchdog's own start recorded as a foreign BPF handle: {:?}",
         heads(&foreign)
     );
+    // The signed record carries no reasoning (`DetectionRecord`): the
+    // fresh instance's record is NN-L-BPF-002's only Low one (nn-core
+    // `bpf002_is_low_for_a_fresh_instance_only`), here for the watchdog's
+    // pid and its name.
     assert!(
         start
             .iter()
-            .any(|l| l.contains("a fresh instance of the agent or the watchdog")),
+            .any(|l| l.contains("\"comm\":\"northnarrow-wat\"")),
         "the watchdog's start was not seen: no Low record of its own (pid {wd_pid}): {:?}",
         heads(&start)
     );
