@@ -146,10 +146,14 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/usr/bin/passwd",
     "/usr/bin/pkexec",
     "/usr/bin/su",
+    "/usr/bin/su-rs",
     "/usr/bin/sudo",
+    "/usr/bin/sudo-rs",
     "/usr/bin/sudoedit",
     "/usr/bin/systemd-run",
     "/usr/bin/unix_chkpwd",
+    "/usr/lib/cargo/bin/su",
+    "/usr/lib/cargo/bin/sudo",
     "/usr/lib/gdm/gdm-session-worker",
     "/usr/lib/gdm3/gdm-session-worker",
     "/usr/lib/polkit-1/polkit-agent-helper-1",
@@ -180,8 +184,12 @@ pub const ELEVATION_EXES: &[&str] = &[
     "/bin/su",
     "/bin/sudo",
     "/usr/bin/su",
+    "/usr/bin/su-rs",
     "/usr/bin/sudo",
+    "/usr/bin/sudo-rs",
     "/usr/bin/sudoedit",
+    "/usr/lib/cargo/bin/su",
+    "/usr/lib/cargo/bin/sudo",
 ];
 
 /// Hard-coded allowlist of system package-management / cache-refresh
@@ -2024,12 +2032,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // exec: the parent's image there is "only later" and the lineage
         // was lost. Then, and only then, the parent's exec up to the latest
         // time the fork can have happened (`forked_by`, the boot clock's
-        // start and the two ticks of rounding) answers — if it is the only
-        // identity the parent took in between (review of #493, B1: a
-        // parent that forks and then executes another script of the same
-        // interpreter must not lend the fork that script; the rule of
-        // [`Self::orphan_entry`]), and only an identity its executable alone
-        // decides (second review of #493: a script, an npm entrypoint, an
+        // start and the two ticks of rounding) answers — the exec of the
+        // file the fork runs (lot 350: a parent can take two images in that
+        // window, a shell's `-c` executed into sudo in place; it was the only
+        // identity the parent took in between, review of #493, B1: a parent
+        // that forks and then executes another script of the same
+        // interpreter must not lend the fork that script — no interpreter's
+        // identity is lent at all, below), and only an identity its
+        // executable alone decides (second review of #493: a script, an npm entrypoint, an
         // interpreter's inline program come from an argv the process
         // writes, and a fork of a fork that never executed — G runs
         // `python3 evil.py`, its fork forks the child, then executes
@@ -2039,27 +2049,37 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // read again): a fork made after the exec runs it; one made before
         // runs the earlier image, the same file or no answer.
         let forked_by = ticks.saturating_add(2).saturating_mul(tick);
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         let parent = match self.cached_live(ppid, Some(start_ns)) {
-            CachedAt::Current(e) | CachedAt::Past(e) => e,
-            CachedAt::LaterOnly => {
-                let e = self.only_identity_between(ppid, start_ns, forked_by)?;
-                // third review of #493: only an authentication binary's
-                // monitor — a child forked before its parent's exec that
-                // executed the same file itself (restic, clamscan: canary
-                // readers) before that exec reached the cache would take
-                // the identity, and nothing tells the two apart
-                if e.runs != Runs::Inline
-                    || e.js_pm.is_some()
-                    || is_interpreter(&e.exe)
-                    || !is_auth_binary(&e.exe)
-                {
+            CachedAt::Current(e) | CachedAt::Past(e) if e.exe == exe => e,
+            // Lot 350 (F2-2: R009 High for an administrator's `sudo
+            // ./deploy/uninstall.sh` at a terminal, 3 times in 7): the parent
+            // ran another image at the fork's earliest time and executed, in
+            // the fork's tick, the authentication binary the fork runs — a
+            // shell's `-c` line executed into sudo in place (`bash -c 'cd … &&
+            // sudo …'`, `script -c 'sudo …'`, `env sudo`). The lookup at the
+            // earliest time found the shell, the monitor runs sudo, and the
+            // session was lost whenever sudo's exec and its fork of the
+            // monitor fell in one clock tick. Read as of lot 278's case: the
+            // parent's exec of that very file within the fork's window, an
+            // authentication binary's, whose executable alone decides.
+            // Lot 278: no image at the earliest time. In both cases, third
+            // review of #493: only an authentication binary's monitor — a
+            // child forked before its parent's exec that executed the same
+            // file itself (restic, clamscan: canary readers) before that exec
+            // reached the cache would take the identity, and nothing tells
+            // the two apart. Lot 350: of the parent's execs in the window,
+            // those of the file the fork runs (the shell's and sudo's are two
+            // images).
+            CachedAt::Current(_) | CachedAt::Past(_) | CachedAt::LaterOnly => {
+                let e = self.only_identity_between(ppid, start_ns, forked_by, &exe)?;
+                if !is_auth_monitor_identity(&e) {
                     return None;
                 }
                 e
             }
             CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
         };
-        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe != parent.exe {
             return None;
         }
@@ -2093,24 +2113,23 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// Lot 278 (review of #493, B1): the exec `pid` ran in `(after, by]`
     /// when every exec the cache holds of it in that span is one identity —
     /// the same executable, script and npm entrypoint — of a process
-    /// started by `by`; `None` when there is none, or more than one.
-    fn only_identity_between(&self, pid: u32, after: u64, by: u64) -> Option<Entry> {
+    /// started by `by`; `None` when there is none, or more than one. Lot 350
+    /// (F2-2): of the execs of the file `exe` only — what `/proc` shows the
+    /// fork running: a fork made in the span before the parent executed that
+    /// file runs the earlier image, which `/proc` shows instead (a shell's
+    /// `-c` line executed into sudo in place is two images in one tick).
+    fn only_identity_between(&self, pid: u32, after: u64, by: u64, exe: &Path) -> Option<Entry> {
         let s = self.inner.state.read();
         let cur = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
         let past = s.history.get(&pid).into_iter().flatten();
         let mut found: Option<&Entry> = None;
         for e in past.chain(cur) {
-            if e.spawn_ns <= after || e.spawn_ns > by || e.start_ns > by {
+            if e.spawn_ns <= after || e.spawn_ns > by || e.start_ns > by || e.exe != exe {
                 continue;
             }
             match found {
                 None => found = Some(e),
-                Some(f)
-                    if f.exe != e.exe
-                        || f.runs != e.runs
-                        || f.js_pm != e.js_pm
-                        || f.encrypts != e.encrypts =>
-                {
+                Some(f) if f.runs != e.runs || f.js_pm != e.js_pm || f.encrypts != e.encrypts => {
                     return None
                 }
                 Some(_) => {}
@@ -2627,6 +2646,65 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         self.has_valid_loginuid(live) && self.has_controlling_tty(live)
     }
 
+    /// Lot 350 (F2-2): why `pid` is not in an administrator's interactive
+    /// session ([`Self::is_interactive_admin`]) — the first of its checks
+    /// that fails, said for the record of a rule that judged it so (R009) —
+    /// or `None` when it is in one. The same walk and reads as the check.
+    pub fn not_interactive_admin_because(&self, pid: u32, as_of: AsOf) -> Option<String> {
+        match self.lineage_walk_to(
+            pid,
+            as_of,
+            |hop| is_elevation_binary(&hop.exe),
+            LINEAGE_DEPTH_CAP,
+        ) {
+            Some(WalkEnd::Found(_)) => {}
+            Some(WalkEnd::Root) => return Some("no sudo or su in its lineage".to_string()),
+            Some(WalkEnd::Cut) => {
+                return Some(
+                    "its lineage is cut below any sudo or su (a parent started after its \
+                     child, or the depth cap)"
+                        .to_string(),
+                )
+            }
+            None => {
+                let lost = self.first_unread_hop(pid, as_of);
+                return Some(format!(
+                    "its lineage is lost at pid {lost} ({}): neither its exec nor its fork known",
+                    if self.is_running(lost) {
+                        "running"
+                    } else {
+                        "gone"
+                    }
+                ));
+            }
+        }
+        let Some(live) = self.nearest_running(pid, as_of) else {
+            return Some("nothing of its session runs any more".to_string());
+        };
+        if !self.has_valid_loginuid(live) {
+            return Some(format!("pid {live}, the nearest running, has no login uid"));
+        }
+        if !self.has_controlling_tty(live) {
+            return Some(format!(
+                "pid {live}, the nearest running, has no controlling terminal"
+            ));
+        }
+        None
+    }
+
+    /// The first pid up `pid`'s lineage whose hop cannot be read
+    /// ([`Self::not_interactive_admin_because`]'s word for a lost walk).
+    fn first_unread_hop(&self, pid: u32, as_of: AsOf) -> u32 {
+        let mut cur = pid;
+        for _ in 0..=LINEAGE_DEPTH_CAP {
+            match self.hop(cur, as_of) {
+                Some(h) if h.ppid > 1 && h.ppid != cur => cur = h.ppid,
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
     /// The login uid of `pid`, or of its nearest running ancestor once it
     /// has exited: the login uid is inherited, so the session's shell
     /// answers for a short-lived process. Scopes the posture's
@@ -2675,6 +2753,23 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     pub fn system_service(&self, pid: u32) -> Option<String> {
         let path = self.cgroup_path(pid)?;
         crate::posture::daemon_data::system_service(&path).map(str::to_string)
+    }
+
+    /// Lot 350 (F2-3): [`Self::system_service`] of the process that started
+    /// at `start_ns` (an exec event's own start, the kernel's monotonic
+    /// clock) — `/proc/<pid>/stat` shows that start before and after its
+    /// cgroup is read. `None` when it does not (the process exited, or its
+    /// pid names a later one), for no start, or outside a service.
+    pub fn system_service_started(&self, pid: u32, start_ns: u64) -> Option<String> {
+        let started = || {
+            self.proc_start_ticks(pid)
+                .is_some_and(|ticks| self.ticks_show_start(ticks, start_ns))
+        };
+        if pid <= 1 || start_ns == 0 || !started() {
+            return None;
+        }
+        let unit = self.system_service(pid)?;
+        started().then_some(unit)
     }
 
     /// The cgroup path that places `pid` ([`placing_cgroup`]).
@@ -3971,6 +4066,15 @@ fn is_system_daemon_binary(exe: &Path) -> bool {
 fn is_package_manager_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     PACKAGE_MANAGER_EXES.iter().any(|p| s == *p)
+}
+
+/// Lot 278 (the third review of #493), lot 350: an exec whose identity a
+/// fork of it that executed nothing may take from a later exec of its
+/// parent's (the fork's window, [`AuthSessionTracker::fork_entry`]) — an
+/// authentication binary run as itself: no interpreter, no script, no npm
+/// entrypoint (what those run comes from an argv the process writes).
+fn is_auth_monitor_identity(e: &Entry) -> bool {
+    e.runs == Runs::Inline && e.js_pm.is_none() && !is_interpreter(&e.exe) && is_auth_binary(&e.exe)
 }
 
 fn is_elevation_binary(exe: &Path) -> bool {
@@ -7376,6 +7480,152 @@ mod tests {
         write_exe(tmp.path(), 711, "/usr/bin/sudo");
         write_started(tmp.path(), "711", 710, 1_010);
         assert!(!t.is_interactive_admin(712, judged));
+    }
+
+    /// Lot 350 (named, F2-2: R009 High for an administrator's `sudo
+    /// ./deploy/uninstall.sh` at a terminal, 3 runs in 7; the lab's journal:
+    /// "its lineage is lost at pid <sudo's monitor> (running)"). The shell's
+    /// fork that runs sudo first executed the shell's `-c` line in place
+    /// (`bash -c 'cd … && sudo …'`, `script -c 'sudo …'`): its pid ran dash,
+    /// then sudo. sudo's monitor, forked in the tick of sudo's exec, shows a
+    /// start (rounded down to the tick) at which its parent still ran dash:
+    /// the monitor (sudo's image) was no fork of dash's, and the session was
+    /// lost — on `main` 88 of these 144 timings. Every timing keeps it now;
+    /// a fork that runs the earlier image (forked before sudo's exec), or a
+    /// later exec that is no authentication binary, lends nothing.
+    #[test]
+    fn sudo_executed_in_place_by_a_shell_keeps_its_monitor_s_session() {
+        const US: u64 = 1_000;
+        const MS: u64 = 1_000_000;
+        let stat = |dir: &Path, pid: u32, ppid: u32, tty: i64, ticks: u64| {
+            let d = dir.join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S {ppid} {pid} {pid} {tty} -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+            )
+            .unwrap();
+        };
+        // the session: the shell 700, its fork 710 executing dash then
+        // `second`, 710's fork 711 running `forked` (its monitor), the
+        // command 712 that 711 forked; `a`..`e` the microseconds between
+        let session = |a: u64, b: u64, c: u64, d: u64, e: u64, second: &str, forked: &str| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::live_on(tmp.path(), 0);
+            let tfs = 10_000 * MS + a * US;
+            let te = tfs + b * US;
+            let mf = te + c * US;
+            let tfc = mf + d * US;
+            let tc = tfc + e * US;
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5_000 * MS, 5_000 * MS, 1000);
+            stat(tmp.path(), 700, 1, 34816, 500);
+            write_loginuid(tmp.path(), 700, 1000);
+            t.ingest_exec(710, 700, "/usr/bin/dash", &[], tfs + 50 * US, tfs, 1000);
+            t.ingest_exec(710, 700, second, &[], te, tfs, 1000);
+            stat(tmp.path(), 710, 700, 34816, tfs / (10 * MS));
+            write_exe(tmp.path(), 710, second);
+            stat(tmp.path(), 711, 710, 34817, mf / (10 * MS));
+            write_exe(tmp.path(), 711, forked);
+            write_status(tmp.path(), 711, 710);
+            t.ingest_exec(
+                712,
+                711,
+                "/home/alice/nn/deploy/uninstall.sh",
+                &[],
+                tc,
+                tfc,
+                0,
+            );
+            stat(tmp.path(), 712, 711, 34817, tfc / (10 * MS));
+            write_loginuid(tmp.path(), 712, 1000);
+            write_exe(tmp.path(), 712, "/usr/bin/bash");
+            let admin = t.is_interactive_admin(712, AsOf::Judged(tc));
+            (tmp, admin)
+        };
+        let mut lost = Vec::new();
+        for a in [0, 3_000, 9_900] {
+            for b in [100, 1_000, 5_000] {
+                for c in [200, 1_000, 5_000, 12_000] {
+                    for d in [100, 2_000] {
+                        for e in [500, 3_000] {
+                            if !session(a, b, c, d, e, "/usr/bin/sudo", "/usr/bin/sudo").1 {
+                                lost.push(format!("a={a} b={b} c={c} d={d} e={e}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "{} sessions lost:\n{}",
+            lost.len(),
+            lost.join("\n")
+        );
+        // the fork runs the earlier image (made before sudo's exec): not sudo's
+        assert!(!session(0, 100, 200, 100, 500, "/usr/bin/sudo", "/usr/bin/dash").1);
+        // the parent's later exec is no authentication binary: nothing lent
+        assert!(
+            !session(
+                0,
+                100,
+                200,
+                100,
+                500,
+                "/usr/bin/python3.12",
+                "/usr/bin/python3.12"
+            )
+            .1
+        );
+        assert!(
+            !session(
+                0,
+                100,
+                200,
+                100,
+                500,
+                "/home/alice/sudo",
+                "/home/alice/sudo"
+            )
+            .1
+        );
+        // the same class (the mini-hunt): sudo-rs (Ubuntu 26.04), su, an
+        // `env sudo`/`exec sudo` — any authentication binary a shell
+        // executes in place of itself
+        for auth in ["/usr/lib/cargo/bin/sudo", "/usr/bin/su", "/usr/bin/sudo-rs"] {
+            assert!(session(0, 100, 200, 100, 500, auth, auth).1, "{auth}");
+        }
+    }
+
+    /// Lot 350 (F2-2): the session check says which of its parts failed —
+    /// for R009's journal line — and nothing for an administrator's session.
+    #[test]
+    fn why_a_session_is_not_an_administrator_s_is_said() {
+        let (_tmp, t) = admin_session(34816, 1000);
+        assert_eq!(t.not_interactive_admin_because(200, AsOf::Now), None);
+        let (_tmp, t) = admin_session(0, 1000);
+        let why = t.not_interactive_admin_because(200, AsOf::Now).unwrap();
+        assert!(why.contains("no controlling terminal"), "{why}");
+        let (_tmp, t) = admin_session(34816, LOGINUID_UNSET);
+        let why = t.not_interactive_admin_because(200, AsOf::Now).unwrap();
+        assert!(why.contains("no login uid"), "{why}");
+        let (_tmp, t) = admin_session(34816, 1000);
+        let why = t.not_interactive_admin_because(999, AsOf::Now).unwrap();
+        assert!(why.contains("lost at pid 999 (gone)"), "{why}");
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 1, "/usr/bin/bash", 1);
+        t.ingest_spawn(200, 50, "/home/alice/x.sh", 2);
+        let why = t.not_interactive_admin_because(200, AsOf::Now).unwrap();
+        assert!(why.contains("no sudo or su"), "{why}");
+        // with every part there but nothing running
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
+        t.ingest_spawn(200, 100, "/usr/sbin/useradd", 3);
+        let why = t.not_interactive_admin_because(200, AsOf::Now).unwrap();
+        assert!(why.contains("nothing of its session runs"), "{why}");
     }
 
     #[test]

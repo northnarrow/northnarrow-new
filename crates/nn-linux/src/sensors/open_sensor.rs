@@ -1536,6 +1536,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         }));
     }
     if r.reason & open_reason::FILE_CAP != 0 {
@@ -1563,6 +1564,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         }));
     }
     // External audit POS-002: one event per crossing; an open crossing

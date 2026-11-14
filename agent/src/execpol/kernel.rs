@@ -321,6 +321,31 @@ pub fn image_entries(
 mod tests {
     use super::*;
 
+    /// Lot 350 (named, F2-2; ratchet): every sudo and su image the exec
+    /// policy's admin tier knows — they fork the command and wait for it, so
+    /// they stay in its lineage — is an elevation binary of the lineage's
+    /// session check (`ELEVATION_EXES`). Ubuntu 26.04's sudo-rs was in this
+    /// list and not in that one: an administrator's `sudo uninstall.sh` at a
+    /// terminal was R009 High there. `doas`, `pkexec` and `run0` replace
+    /// themselves with the command (no lineage hop) and are not asked.
+    #[test]
+    fn every_sudo_and_su_image_is_an_elevation_binary_of_the_session_check() {
+        let lineage = nn_core::posture::lineage::ELEVATION_EXES;
+        let mut asked = 0;
+        for p in ELEVATION_IMAGES {
+            let base = p.rsplit('/').next().unwrap_or(p);
+            if matches!(base, "doas" | "pkexec" | "run0") {
+                continue;
+            }
+            asked += 1;
+            assert!(
+                lineage.contains(&p),
+                "{p}: an elevation image of the exec policy that R009's session check does not know"
+            );
+        }
+        assert_eq!(asked, ELEVATION_IMAGES.len() - 3);
+    }
+
     #[test]
     fn the_cgroup2_mount() {
         let t = |text: &str| nn_linux::mountinfo::parse(text.as_bytes());

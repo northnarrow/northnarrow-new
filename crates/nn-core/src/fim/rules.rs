@@ -564,6 +564,13 @@ fn is_authorized_keys_path(path: &str) -> bool {
 /// an `O_APPEND` file removes a range through the same write check, with no
 /// setattr; a shrink nothing else explains is judged as before.
 ///
+/// Lot 350 (F2-1): or (a), the kernel's record of its appends and a read
+/// that finds the very bytes the drain read for the file's previous record
+/// ([`FimEvent::unchanged_since_read`]): the drain's own re-hash of a log
+/// rsyslogd holds open closes it and so emits rsyslogd's pending appends,
+/// already measured — a fresh install's baseline read `/var/log/syslog`,
+/// and the next record read "no growth".
+///
 /// So a non-rsyslogd writer, a uid mismatch, OR a truncation on a
 /// log path all still raise the verdict. Sizes ride on the
 /// `FimEvent` from the drain's re-hash (`new_size`) and the
@@ -635,7 +642,17 @@ impl NnLFim005LogTruncated {
         // (`FimEvent::truncated_by_another`: the kernel saw that setattr
         // while the writes were pending, and the drain read its own record
         // — `logrotate`'s `copytruncate`, judged there with its writer).
-        let appended = fe.appends_only && (grew || fe.truncated_by_another);
+        // Lot 350 (F2-1): or its appends were already in the content the
+        // file's previous record was judged on — the drain read the very
+        // same bytes then and now (`FimEvent::unchanged_since_read`: its
+        // re-hash, or the start's baseline, closed the log and emitted the
+        // record of appends it had just read; at a fresh install the size
+        // read "no growth", High). Never by itself: the kernel's record that
+        // every write of this record was an `O_APPEND` write by rsyslogd
+        // alone, and the daemon's image, are still needed.
+        let read_already = fe.unchanged_since_read
+            && matches!((fe.new_size, fe.baseline_size), (Some(new), Some(base)) if new == base);
+        let appended = fe.appends_only && (grew || fe.truncated_by_another || read_already);
         exe_match && ((uid_match && grew) || appended)
     }
 }
@@ -3280,6 +3297,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 
@@ -3318,6 +3336,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 
@@ -3349,6 +3368,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 
@@ -3842,6 +3862,43 @@ mod tests {
             .is_some());
     }
 
+    /// Lot 350 (named, F2-1): rsyslogd's appends emitted by the drain's own
+    /// re-hash were already in the bytes the previous record was judged on
+    /// (`unchanged_since_read`: the same size and SHA-256) — exempt, for
+    /// root's rsyslogd and the `syslog` user's, only with the kernel's record
+    /// of `O_APPEND` writes by the daemon alone. Without that record, from
+    /// another writer, or with sizes that are not the same: High.
+    #[test]
+    fn fim005_rsyslogd_appends_already_read_are_exempt_and_nothing_else() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        let ev = |exe: &str, uid: u32, new: u64, base: u64, appends: bool, read: bool| {
+            let Event::Fim(mut fe) =
+                fim_log_modify("/var/log/syslog", Some(exe), uid, Some(new), Some(base))
+            else {
+                unreachable!()
+            };
+            fe.appends_only = appends;
+            fe.unchanged_since_read = read;
+            Event::Fim(fe)
+        };
+        for uid in [0, TEST_SYSLOG_UID] {
+            assert!(r
+                .evaluate(&ev(RSYSLOGD_EXE, uid, 8_292, 8_292, true, true))
+                .is_none());
+            for (exe, new, appends, read) in [
+                (RSYSLOGD_EXE, 8_292, true, false),
+                (RSYSLOGD_EXE, 8_292, false, true),
+                ("/usr/bin/python3.12", 8_292, true, true),
+                (RSYSLOGD_EXE, 4_196, true, true),
+            ] {
+                let v = r
+                    .evaluate(&ev(exe, uid, new, 8_292, appends, read))
+                    .unwrap_or_else(|| panic!("{exe} {new} {appends} {read}"));
+                assert_eq!(v.severity, Severity::High);
+            }
+        }
+    }
+
     /// The review of #554 (named, F1): an `O_APPEND` write is no proof that
     /// nothing shrank — `fallocate(FALLOC_FL_COLLAPSE_RANGE)` on an
     /// `O_APPEND` file removes a range through the same write check, with
@@ -4130,6 +4187,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 
@@ -4881,6 +4939,7 @@ mod tests {
             moved_in: false,
             appends_only: false,
             truncated_by_another: false,
+            unchanged_since_read: false,
         })
     }
 

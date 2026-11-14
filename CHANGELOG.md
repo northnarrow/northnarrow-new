@@ -857,6 +857,49 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
+  raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
+  record is told by identity, none by a name.
+  - **F2-1 — NN-L-FIM-005 on `/var/log/syslog` at a fresh install (Ubuntu,
+    4 of 10).** Nothing of the install touches rsyslog: a record leaves the
+    kernel at the close of any file of the inode, and the first-boot
+    baseline's read (then the drain's own re-hash) closed the log rsyslogd
+    holds open, emitting appends that read had already measured — "no
+    growth". The drain keeps the SHA-256 of its last read beside its size
+    (`FimEvent::unchanged_since_read`), and rsyslogd's carve-out takes the
+    same bytes only with the kernel's record of `O_APPEND` writes by rsyslogd
+    alone. The size a file had when it was watched is read before the kernel
+    watches it.
+  - **F2-2 — R009 High for `sudo ./deploy/uninstall.sh` at a terminal (3 of
+    7).** The agent's journal (a new line saying why a session was not an
+    administrator's) named it: "lineage lost at sudo's monitor". A shell
+    running `sudo` as its last command executes it in place; the monitor,
+    forked in the tick of sudo's exec, shows a start rounded down to a time
+    its parent still ran the shell, and was not known as sudo's. The fork's
+    image is now read as the parent's exec of the file the fork runs within
+    the fork's window (an authentication binary's only, as lot 278). And
+    sudo-rs and su-rs (Ubuntu 26.04's `sudo`) are elevation and
+    authentication binaries; a ratchet keeps every sudo/su image of the exec
+    policy in the session check's list.
+  - **F2-3 — R005 High and the posture ENGAGED at every boot of a cloud
+    image (Debian 13, Ubuntu 26.04).** cloud-init's own `nc -U
+    /run/cloud-init/share/<phase>.sock` (cloud-init 24; cloud-init 25 — Debian
+    13 — asks with `nc -Uu -W1 <socket> -s <return socket>`, a unix datagram
+    socket; the two argvs exactly) (`crate::posture::cloud_init`: the
+    packaged netcat's file from a root-only directory, root's, that argv and
+    no inet stream, in the cgroup of the cloud-init unit of that phase,
+    forked by the unit's `ExecStart=` shell, PID 1's fork) is R005 Low and no
+    ExploitAttempt; any other netcat is High.
+  - **F2-5 — what a purge left.** `northnarrow.slice` is stopped (loaded and
+    active until the next boot), the empty `system.control` directories and
+    the journal namespace's runtime directory and varlink socket go, and
+    `--purge` removes `/var/log/northnarrow`. A purge after an uninstall that
+    kept the state failed on Debian 13 (it waited for systemd's own BPF-LSM
+    programs): with nothing of NorthNarrow able to hold one, other products'
+    are not waited for. The modules the kernel loaded on demand
+    (`nf_tables`, `unix_diag`) are not unloaded — the host's firewall may use
+    them — and are listed with the host's own logs as what remains
+    (`INSTALL_UPGRADE_UNINSTALL.md` §3).
 - Lot 348 (alpha false positives, round 4): the last records a tester on
   Ubuntu 22.04/24.04 or Debian 13 with containers saw, each told by identity
   (the writing thread, the kernel's exec records, the lineage, a file's
