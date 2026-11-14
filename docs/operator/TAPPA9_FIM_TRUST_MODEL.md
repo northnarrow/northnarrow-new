@@ -203,12 +203,30 @@ change whatever the baseline says — recorded and judged with the size it
 had (High; logrotate's scheduled `copytruncate` of a log whose baseline is
 empty is Low on logrotate's own record, as any other rotation). A
 same-size return to the baseline (bytes rewritten in place, then back) is
-still dropped: its change was judged when it was read. Not closed: a
-growth the drain never read — no record of the log between the agent's
-start at the baseline and the truncation (rsyslogd keeps its log open; a
-record leaves the kernel at a close) — then a truncation back to the
-baseline: the drain cannot tell it from a `truncate` that changed nothing.
-The kernel's record of the size before the setattr would close it.
+still dropped: its change was judged when it was read. Not closed (P3,
+the review of #560): a growth the drain never read, then a truncation back
+to the size it last read and the baseline's content. A record leaves the
+kernel only at a close of the file, and rsyslogd keeps its log open: its
+appends leave none, and the drain's last read stays where it was. The drain
+cannot tell such a truncation from a `truncate` that changed nothing, in two
+cases:
+
+- after the agent's start, the last read is the baseline's size until the
+  first close of the log — days, on a quiet host: a truncation back to the
+  baseline's exact content (the install-time lines, routine ones included,
+  byte for byte) erases what was appended since, unseen;
+- **when the signed baseline is empty** (a log installed right after a
+  rotation: plausible on a quiet host) the case **comes back after every
+  rotation**, not only after the agent's start. A judged shrink
+  (`copytruncate`) or a new log (`create`) leaves the last read at 0; the
+  appends after it leave no record; a truncation to 0 matches both the empty
+  baseline and the last read — no record, no NN-L-FIM-005, for the rest of
+  each rotation period (a kernel line `module verification failed:
+  tainting kernel` from a module load, erased).
+
+The kernel's size before the setattr (or the largest size seen while a
+record of the file was pending) in the record would close both: an eBPF and
+wire change, for a later lot.
 
 Residuals, named: a process that runs rsyslogd's image itself (an rsyslog
 module, `LD_PRELOAD` into rsyslogd) writes as rsyslogd — its growth of a log,
@@ -238,6 +256,8 @@ An administrator session's configuration changes still raise the posture to ENGA
 Whoever holds an administrator's session and sudo password is that administrator to these rules.
 
 Lot 351 (the review of #559, F2): the sudo or su in the writer's lineage vouches only through the process it ran as root after authenticating — its child's process, whose first exec since that fork (the kernel's fork record) ran as root and is no PAM helper. Any user may run sudo, and `sudo -A` forks the user's `SUDO_ASKPASS` program, as the user, before any authentication: a write below it — even by a process that became root there through a local privilege escalation — was "an administrator's session". It is not now; nor is `sudoedit`'s editor or `sudo -u`/`su` to another user. A session older than the agent's start (no exec of it could be seen) is judged on the uid `/proc` showed at the start.
+
+The review of #560 (A): a sudo or su that a process already root ran (the real uid its exec of the binary ran as is 0) vouches for nothing — root's sudo and su ask for no credential. After a local privilege escalation, `sudo tee /etc/…` (sudo executed in place or from a fork, with or without an askpass helper) was "forked by sudo, as root": the rules' kill was held. It is not now; the walk goes on to a sudo or su further up (an administrator's `sudo -i`, then root's own `sudo`: still the administrator's). sudo's monitor (a fork of sudo, root's) answers by the exec of the sudo it is a fork of. Residuals (P3): a sudo or su further up covers what runs below a `su bob` or `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session); a sudo older than the agent's start is not held against (its caller cannot be read: `/proc` shows sudo as root once it has authenticated).
 
 ## A store's own client (review 85)
 

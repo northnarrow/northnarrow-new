@@ -880,6 +880,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `record_made_dirs`); removes directories in systemd's trees through
     `rm_tree` (never a mount point, `--one-file-system`; a ratchet forbids a
     plain `rm -rf` there). "Low every time" in the guides is exact now.
+  - **The review of #560 (A) — a sudo or su that root ran vouched for its
+    child**: only the child's uid was checked, not who ran sudo. After a
+    local privilege escalation, `sudo ~/payload` (in place or from a fork,
+    with or without an askpass helper) was R009 Low, no kill, and held the
+    FIM rules' kill and the impair sanction. A sudo or su whose own exec ran
+    as real uid 0 vouches for nothing now (`invoked_by_root`; sudo's monitor
+    by the front-end's exec), and the walk goes on to an outer elevation;
+    `sudo su -` and `sudo sudo` are judged by the outer sudo
+    (`is_monitor_of` keeps the old pass-over for sudo's monitor only).
+  - **The review of #560 (D, E)** — `uninstall.sh`: a kill cgroup left by an
+    interrupted kill (`blocked.scope/neutralize-*`) is removed when empty,
+    thawed when held; every process left is named by pid and command; a run
+    that leaves any exits 4 (`--package`: 0). The FIM residual of an empty
+    baseline (it recurs after every rotation) and `is_credential_reader`
+    are named P3s (`UPGRADE_NOTES_WAVE4.md` §45).
 - Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
   raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
   record is told by identity, none by a name.

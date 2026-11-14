@@ -336,7 +336,8 @@ did nothing else are told by identity now:
   sudo's exec is closed (the lab: 0 High in 15 runs); an exec record lost
   to a full ring or the lineage cache's eviction can still leave a High.
   Lot 351: what vouches is the process sudo ran as root after
-  authenticating — never `sudo -A`'s askpass helper or what it runs
+  authenticating — never `sudo -A`'s askpass helper or what it runs, nor a
+  sudo a process already root ran (the review of #560)
   ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §2.1).
 
 `uninstall.sh --purge` leaves nothing of NorthNarrow; what stays until the

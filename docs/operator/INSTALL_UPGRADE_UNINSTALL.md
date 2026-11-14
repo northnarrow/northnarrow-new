@@ -421,10 +421,18 @@ user-writable path, R009's match. What the running agent does with them:
   sudo runs as the user (`sudo -A`'s askpass helper, before any
   authentication; `sudoedit`'s editor), `sudo -u`/`su` to another user, and
   anything below those — even a process that became root there and
-  executed its payload in place — is no administrator's session: R009
-  High, the journal saying "ran nothing as root after authenticating".
-  `sudo env … ./x` and `sudo bash -c './x'` (an exec in place of the
-  command) stay the administrator's.
+  executed its payload in place — is no administrator's session, unless a
+  sudo or su further up elevated it (P3: an administrator's `sudo -i`, then
+  `su bob`, covers a root payload bob's program runs below): R009 High, the
+  journal saying "ran nothing as root after authenticating". `sudo env …
+  ./x` and `sudo bash -c './x'` (an exec in place of the command) stay the
+  administrator's. The review of #560: a sudo or su that a process already
+  root ran vouches for nothing — root's ask for no credential, so after a
+  local privilege escalation `sudo ~/payload` is R009 High, the journal
+  saying "was run by a process already root"; the walk goes on to an
+  elevation further up (`sudo -i` then root's own `sudo`, `sudo su -`, `su
+  -` then `sudo`: the administrator's). The operator's `sudo
+  ./deploy/uninstall.sh` from a user's terminal stays Low.
 - **What the script executes from its tree afterwards** (the new agent's
   `--version`) runs after it opened its window: asked for an installer
   (`nn-admin trusted-installer-grant --for-installer`, which the scripts
@@ -503,7 +511,14 @@ from), leaves the scope and the slice in place, and the processes stay
 there, outside any unit, until they exit or the next boot: a throttled one
 under the scope's limits, a blocked one no longer blocked (the agent's
 nftables table is gone). To release one by hand: `echo <pid> >
-/sys/fs/cgroup<its origin>/cgroup.procs`. Every directory the uninstall
+/sys/fs/cgroup<its origin>/cgroup.procs`. A kill cgroup an agent stopped in
+the middle of a kill left (`blocked.scope/neutralize-*`, the tree in it
+frozen; the agent's next start finishes such a kill, and none starts after
+an uninstall) is removed when empty, and **thawed** when it holds processes
+— they run again, unwatched. Each process left is named by its pid and its
+command; the run says them again after its summary and exits **4** (the
+removal is otherwise complete; with `--package`, a package's hook, it says
+them and exits 0): decide on each — kill it, or release it as above. Every directory the uninstall
 removes from systemd's trees (drop-in directories, the journal namespace's
 runtime directory and journals) is never a mount point there — one is left
 and said — and its removal does not cross into another file system

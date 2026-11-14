@@ -11252,6 +11252,17 @@ number in parentheses is a lab PR.
     `--one-file-system` on both (`/usr/bin/gnurm` on 26.04). No containment
     scope existed (the alpha profile contains nothing): the held-scope path
     is covered by its host test only.
+  - Fix round (the review of #560): A (P2), a sudo or su that a process
+    already root ran vouched for its child — after an LPE, `sudo ~/payload`
+    was R009 Low and held the FIM kill and the impair sanction; now it
+    vouches for nothing and the walk goes on to an outer elevation (named
+    tests: `root_s_own_sudo_vouches_for_nothing`,
+    `a_sudo_or_su_root_ran_vouches_for_nothing`,
+    `root_s_own_sudo_holds_no_fim_kill`). D/E (P3): the uninstall removes
+    or thaws an interrupted kill's cgroups, names every process left by pid
+    and command, and exits 4 when any is left. B, C and `is_credential_reader`
+    named as P3 residuals (§45). Lab: not run for this round (unit and host
+    tests only).
 - **Lot 350 — the pre-alpha's Phase 2: our own install, boot and uninstall
   raise no High; a purge leaves nothing undeclared (C06, C11; no level
   changes).**
