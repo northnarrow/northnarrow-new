@@ -2719,3 +2719,33 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 | A sudo or su further up covers what runs below `su bob` / `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session) | the session check | a hop below that ran as another user as a barrier (a decision of its own) |
 | `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
 | A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |
+
+## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
+
+- **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)
+  carries version 2, and a decoder refuses a version 1 envelope as
+  `ProtocolVersionUnsupported` (`OLDEST_PROTOCOL_VERSION`): the formats
+  changed since version 1 was set (the status reply grew by appended
+  fields), and an old envelope would be misread. The live admin socket still
+  speaks bare frames, as before: `nn-admin` and the agent must come from the
+  same release (an `nn-admin` of another release may misread the replies).
+  From now on a change to a frame the tests pin raises the version
+  (`a_pinned_frame_changes_only_with_a_new_protocol_version`).
+- **The help.** `nn-admin`'s commands and options are described for an
+  operator (no lot, review or design references), the shared options have
+  one help text, and `install.sh --help` lists its package-hook options and
+  its exit codes. A script that parsed the help text sees new wording; the
+  options, the output of the commands and the exit codes are unchanged.
+  `nn-admin` writes no colour when `NO_COLOR` is set (non-empty).
+- **`install.sh --upgrade`** names each side's build on its UPGRADE line:
+  `installed: northnarrow-agent 0.0.1 (sha256 …) → new: northnarrow-agent
+  0.0.1 (build v0.0.1-…, sha256 …)`, and says when the two binaries are the
+  same build. The "UPGRADE complete" line carries the new build too.
+- **A release's `SHA256SUMS` is signed** (`SHA256SUMS.asc`, the `.rpm`'s
+  release key) from the first tag after this change: the check without
+  `gh` of [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §5.
+  A tag release without it is not published.
+- **The journal** names an absent optional kernel field's own effect (it
+  named the DNS decoder for every field that was not btrfs's, a hook's
+  argument or the move guard's).
+

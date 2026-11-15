@@ -380,6 +380,13 @@ pub struct VersionedAdminMessage {
     the `version` first and refuses one outside `1..=PROTOCOL_VERSION`
     whatever the message. A migration of the live wire tells the two
     shapes apart by something only one of them can hold.
+  - *Lot 354.* `PROTOCOL_VERSION` is 2 (the formats changed since 1: the
+    status reply grew by appended fields), and the decoder accepts
+    `OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION` (2..=2): a version 1
+    envelope named a format this build would misread, so the tolerance
+    above holds only while a format stays decodable. A change to a frame
+    the tests pin raises the version (the ratchet
+    `a_pinned_frame_changes_only_with_a_new_protocol_version`).
 
 ### 6.3 Signed-payload structure (NEW)
 

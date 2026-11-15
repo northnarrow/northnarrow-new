@@ -228,7 +228,10 @@ while [[ $# -gt 0 ]]; do
             echo "  or cosign with --attestation) and the tree is the tarball's (--require-attestation: the default)."
             echo "  --allow-unverified     install a tree whose attestation did not verify, or a build from source"
             echo "                         (lab, development): logged, recorded as 'checksums', 'manifest' or"
-            echo "                         'source-tree' with the flag (--allow-manifest-only: its former name)"
+            echo "                         'source-tree' with the flag (--allow-manifest-only: its former name)."
+            echo "                         It means: nothing proved this tree is the project's release. Do not use it"
+            echo "                         to get past a refusal of a downloaded release: verify the download first"
+            echo "                         (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5 has a way without gh)"
             echo "  --source-tree          the tree is a build from source (cargo xtask build --release), not a"
             echo "                         release: install it without MANIFEST.sha256 (recorded as 'source-tree')"
             echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
@@ -263,11 +266,22 @@ while [[ $# -gt 0 ]]; do
             echo "                         types: a tracing program can read the memory of every process, the agent's"
             echo "                         included. The agent still refuses fmod_ret programs and any program that"
             echo "                         calls bpf_send_signal, bpf_probe_write_user or bpf_override_return (the ones"
-            echo "                         that would kill or blind it), whoever loads it (docs/operator/ALPHA_PROFILE.md"
-            echo "                         §1.2). A tester's choice, for a test host"
+            echo "                         that would kill or blind it), whoever loads it"
+            echo "                         (docs/operator/ALPHA_PROFILE.md §1.2). A tester's choice, for a test host"
             echo "  --allow-bpf-loader PATH"
             echo "                         the same for one executable (absolute path; repeatable). A script (#!) is"
             echo "                         not one: the kernel sees its interpreter, so name that"
+            echo "  -h, --help             this help"
+            echo "  For the package manager's hooks only (the .deb and .rpm call them; not for a manual install):"
+            echo "  --package-stop         stop the running units before the package manager replaces the files"
+            echo "  --package-configure    install the units and configuration the package put in place, and start them"
+            echo "  --package-verify       check the started agent's health after a package transaction"
+            echo "  --defer-health-check   with --package-configure: leave the health check to --package-verify"
+            echo "Exit codes: 0 done; 1 refused or failed, nothing changed (a check, a verification, a"
+            echo "  prerequisite); 2 a usage error (an unknown or conflicting option); 3 an upgrade rolled back:"
+            echo "  the previous version runs again; 4 an upgrade whose rollback could not be completed (the"
+            echo "  message says how to finish it); 129, 130, 143 interrupted by a signal (HUP, INT, TERM)."
+            echo "Full guide: docs/operator/INSTALL_UPGRADE_UNINSTALL.md"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -988,6 +1002,8 @@ TXN_SUMS=""         # the SHA-256 of every backed-up regular file, kept in memor
 UNITS_TO_RESTART=()
 old_ver=unknown
 new_ver=unknown
+old_build=unknown
+new_build=unknown
 # Every path a run may create or replace, one per line. A file install.sh
 # creates only when it is missing (admin.pub and the bootstrap key, the
 # COMBAT rulesets and carve-out list) is listed only when it is missing.
@@ -1977,10 +1993,25 @@ host_support_check() {
 }
 # <<< host_support
 
+# Lot 354 (pre-alpha checks, F2b-2): what tells two builds of one version
+# apart, for the upgrade's lines — "0.0.1 → 0.0.1" said nothing. The
+# release's build (`git describe`, the Build: line mk-tarball writes in
+# README-RELEASE.md) when there is one, and the start of the binary's
+# SHA-256. It reads the file; it runs nothing.
+build_label() { # <binary> [the release tree's root, which holds README-RELEASE.md]
+    local sha build=
+    sha=$(sha256sum "$1" 2>/dev/null | cut -c1-12)
+    if [[ -n ${2:-} ]]; then
+        build=$(cd "$2" 2>/dev/null && awk '/^Build:/ { print $2; exit }' README-RELEASE.md 2>/dev/null)
+    fi
+    echo "${build:+build $build, }sha256 ${sha:-unknown}"
+}
+
 tree_version() {
     new_ver=$(exec "$AGENT_BIN" --version 2>/dev/null) || true
     new_ver=${new_ver%%$'\n'*}
     new_ver=${new_ver:-unknown}
+    new_build=$(build_label "$AGENT_BIN" "${REPO_ROOT:-}")
     # The re-review of #497 (RR2): the drop-ins of our units' directories
     # this release's agent would quarantine, every one whatever its age
     # (its integrity round moves only one changed after its install) —
@@ -2251,6 +2282,7 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
         WINDOW_OPENED=1
     fi
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
+    old_build=$(build_label "$BIN_DIR/northnarrow-agent")
     if [[ $MODE == full ]]; then
         # the window is open: R009 records the tree's execs at Low (lot 278)
         tree_version
@@ -2266,7 +2298,9 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
     if (( STARTED_FOR_WINDOW )); then
         echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
     elif [[ $MODE == full ]]; then
-        echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+        echo "install.sh: UPGRADE — installed: $old_ver ($old_build) → new: $new_ver ($new_build)"
+        [[ ${old_build#*sha256 } == "${new_build#*sha256 }" ]] &&
+            echo "install.sh:   the same build as the one installed (its agent binary is identical)"
     else
         echo "install.sh: stopping $old_ver for the package manager"
     fi
@@ -3009,7 +3043,7 @@ if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
     rm -f "$PKG_RESTART_FILE"
     txn_commit
     echo ""
-    echo "install.sh: UPGRADE complete — health check passed ($new_ver); the audit chain carries a new agent_boot entry."
+    echo "install.sh: UPGRADE complete — health check passed ($new_ver, $new_build); the audit chain carries a new agent_boot entry."
     exit 0
 fi
 txn_commit

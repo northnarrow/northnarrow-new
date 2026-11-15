@@ -162,21 +162,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
                 }
             }
             for m in &r.absent {
-                let effect = if m.struct_name.starts_with("btrfs_") {
-                    "files on btrfs keep the superblock's device in their inode keys, so FIM \
-                     and file protection do not match them (review 55)"
-                } else if m.struct_name.starts_with("bpf_lsm_") {
-                    // Lab PR 164: the programs reading it are not attached;
-                    // a missing deny hook refuses the start unless
-                    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1.
-                    northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
-                } else if m.struct_name == common::btf_offsets::CGROUP_MOVE_TARGET.func {
-                    // Lot 273: the move guard's attach point, of another
-                    // shape on this kernel (its absence is signed).
-                    northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
-                } else {
-                    "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
-                };
+                let effect = absent_field_effect(m.name, m.struct_name);
                 warn!(
                     offset = m.name,
                     kernel_struct = m.struct_name,
@@ -519,5 +505,71 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
             println!("btf-check {}: UNPARSEABLE — {e}", path.display());
             3
         }
+    }
+}
+
+/// Lot 354 (pre-alpha checks, F8-1): what an optional kernel field absent on
+/// this kernel costs, for the journal's line. It named the DNS decoder for
+/// every field that was not btrfs's, a hook's argument or the move guard's
+/// (80 and more: `task_struct.fs`, whose absence turns the exploit guard
+/// off, read as a DNS limit). A field of no family below gets the neutral
+/// text: the signed degradations and `nn-admin capabilities` name the loss.
+fn absent_field_effect(name: &str, struct_name: &str) -> &'static str {
+    if struct_name.starts_with("btrfs_") {
+        "files on btrfs keep the superblock's device in their inode keys, so FIM \
+         and file protection do not match them (review 55)"
+    } else if struct_name.starts_with("bpf_lsm_") {
+        // Lab PR 164: the programs reading it are not attached;
+        // a missing deny hook refuses the start unless
+        // NN_ANTI_TAMPER_ALLOW_DEGRADED=1.
+        northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(struct_name)
+    } else if struct_name == common::btf_offsets::CGROUP_MOVE_TARGET.func {
+        // Lot 273: the move guard's attach point, of another
+        // shape on this kernel (its absence is signed).
+        northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
+    } else if struct_name == "iov_iter" || struct_name == "iter_type" {
+        "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
+    } else if name == "TASK_STRUCT_FS_OFFSET" {
+        "the exploit guard is not attached (it reads task_struct.fs); the signed \
+         degradation and nn-admin status say so"
+    } else {
+        "the sensor paths that read this field are off; the signed degradations and \
+         nn-admin capabilities name what is lost"
+    }
+}
+
+#[cfg(test)]
+mod absent_field_effect_tests {
+    use super::absent_field_effect;
+
+    /// Lot 354 (F8-1): the DNS text only for the DNS decoder's fields.
+    #[test]
+    fn an_absent_field_names_its_own_effect() {
+        let dns = "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC";
+        assert_eq!(
+            absent_field_effect("IOV_ITER_UBUF_BASE_OFFSET", "iov_iter"),
+            dns
+        );
+        assert_eq!(absent_field_effect("ITER_UBUF_VALUE", "iter_type"), dns);
+        let fs = absent_field_effect("TASK_STRUCT_FS_OFFSET", "task_struct");
+        assert!(fs.contains("exploit guard"), "{fs}");
+        for (name, s) in [
+            ("BPF_PROG_LEN_OFFSET", "bpf_prog"),
+            ("TASK_STRUCT_PID_OFFSET", "task_struct"),
+            ("FILE_F_INODE_OFFSET", "file"),
+        ] {
+            let e = absent_field_effect(name, s);
+            assert!(!e.contains("DNS"), "{name}: {e}");
+            assert!(e.contains("are off"), "{name}: {e}");
+        }
+        assert!(absent_field_effect("BTRFS_INODE_ROOT_OFFSET", "btrfs_inode").contains("btrfs"));
+        let neutral = absent_field_effect("X", "file");
+        let hook = absent_field_effect("INODE_SETATTR_DENTRY_ARG", "bpf_lsm_inode_setattr");
+        assert_ne!(hook, neutral);
+        let mv = absent_field_effect("X", common::btf_offsets::CGROUP_MOVE_TARGET.func);
+        assert_eq!(
+            mv,
+            northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
+        );
     }
 }

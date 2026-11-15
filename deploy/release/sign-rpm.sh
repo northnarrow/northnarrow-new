@@ -14,6 +14,18 @@
 #   sign-rpm.sh selftest RPM          on a copy, with throwaway keys: signed
 #                                     accepted; unsigned, signed by another
 #                                     key, and altered after signing refused
+#                                     (the .rpm, and a SHA256SUMS file)
+#   sign-rpm.sh sign-sums FPR FILE    a detached, armoured signature of FILE
+#                                     (the release's SHA256SUMS) by FPR, in
+#                                     FILE.asc
+#   sign-rpm.sh verify-sums PUBKEY FILE
+#                                     exit 0 only if FILE.asc is a valid
+#                                     signature of FILE by PUBKEY alone
+#
+# Lot 354 (pre-alpha checks, F1-2): SHA256SUMS is signed with the same
+# release key, so a tester without `gh attestation` (Ubuntu 24.04 ships gh
+# 2.45) checks every file of a release with gpg and the public key
+# committed at the tag (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5).
 #
 # The release workflow signs on a tag with the release key (rpm-sign job)
 # and runs `selftest` on every run; the lab's pkg-check runs `selftest` on
@@ -70,6 +82,46 @@ cmd_verify() {
     return $rc
 }
 
+cmd_sign_sums() {
+    local fpr=${1:?usage: sign-rpm.sh sign-sums FPR FILE} file=${2:?usage: sign-rpm.sh sign-sums FPR FILE}
+    need gpg
+    [[ -f "$file" ]] || die "no such file: $file"
+    local -a pass=()
+    if [[ -n "${NN_RPM_GPG_PASSPHRASE_FILE:-}" ]]; then
+        [[ -r "$NN_RPM_GPG_PASSPHRASE_FILE" ]] || die "NN_RPM_GPG_PASSPHRASE_FILE is not readable"
+        pass=(--pinentry-mode loopback --passphrase-file "$NN_RPM_GPG_PASSPHRASE_FILE")
+    fi
+    rm -f "$file.asc"
+    gpg --batch --yes "${pass[@]}" --local-user "$fpr" --digest-algo sha256 \
+        --armor --detach-sign --output "$file.asc" "$file" || die "gpg could not sign $file"
+    echo "sign-rpm: signed $(basename "$file") with $fpr: $(basename "$file").asc"
+}
+
+cmd_verify_sums() {
+    local pub=${1:?usage: sign-rpm.sh verify-sums PUBKEY FILE} file=${2:?usage: sign-rpm.sh verify-sums PUBKEY FILE}
+    need gpg
+    need gpgv
+    [[ -s "$pub" ]] || die "public key not found: $pub"
+    if [[ ! -f "$file" || ! -f "$file.asc" ]]; then
+        echo "sign-rpm: REFUSED — $(basename "$file") or its signature $(basename "$file").asc is missing" >&2
+        return 1
+    fi
+    # A keyring holding only this key: a key the host trusts for other
+    # files does not make this one pass.
+    local ring rc=0
+    ring=$(mktemp -d)
+    GNUPGHOME=$ring gpg --batch --quiet --dearmor --output "$ring/key.gpg" "$pub" 2>/dev/null \
+        || { rm -rf "$ring"; die "cannot read $pub"; }
+    if gpgv --homedir "$ring" --keyring "$ring/key.gpg" "$file.asc" "$file" >/dev/null 2>&1; then
+        echo "sign-rpm: $(basename "$file"): good signature by $(basename "$pub")"
+    else
+        echo "sign-rpm: REFUSED — $(basename "$file"): no valid signature by $(basename "$pub")" >&2
+        rc=1
+    fi
+    rm -rf "$ring"
+    return $rc
+}
+
 cmd_selftest() {
     local src=${1:?usage: sign-rpm.sh selftest RPM}
     [[ -f "$src" ]] || die "no such file: $src"
@@ -106,6 +158,24 @@ cmd_selftest() {
     printf '\xff' | dd of="$work/altered/$name" bs=1 seek=$((size - 64)) conv=notrunc status=none
     cmp -s "$work/signed/$name" "$work/altered/$name" && { printf '\x00' | dd of="$work/altered/$name" bs=1 seek=$((size - 64)) conv=notrunc status=none; }
     expect refused "signed package altered after signing" "$work/altered/$name"
+    # Lot 354: the signed SHA256SUMS, the same way
+    expect_sums() { # expect_sums ok|refused WHAT DIR
+        local want=$1 what=$2 dir=$3 got
+        if cmd_verify_sums "$work/a.asc" "$dir/SHA256SUMS" >/dev/null 2>&1; then got=ok; else got=refused; fi
+        if [[ $got == "$want" ]]; then echo "sign-rpm: selftest ok    $what: $got"; else echo "sign-rpm: selftest FAIL  $what: $got (expected $want)" >&2; fail=1; fi
+    }
+    mkdir "$work/sums" "$work/sums-other" "$work/sums-altered" "$work/sums-none"
+    (cd "$work/signed" && sha256sum "$name") > "$work/sums/SHA256SUMS"
+    cp "$work/sums/SHA256SUMS" "$work/sums-other/SHA256SUMS"
+    cp "$work/sums/SHA256SUMS" "$work/sums-none/SHA256SUMS"
+    cmd_sign_sums "$fpr_a" "$work/sums/SHA256SUMS" >/dev/null
+    expect_sums ok "SHA256SUMS signed by the expected key" "$work/sums"
+    cmd_sign_sums "$fpr_b" "$work/sums-other/SHA256SUMS" >/dev/null
+    expect_sums refused "SHA256SUMS signed by another key" "$work/sums-other"
+    cp "$work/sums/SHA256SUMS" "$work/sums/SHA256SUMS.asc" "$work/sums-altered/"
+    echo "0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz" >> "$work/sums-altered/SHA256SUMS"
+    expect_sums refused "SHA256SUMS altered after signing" "$work/sums-altered"
+    expect_sums refused "SHA256SUMS without its signature" "$work/sums-none"
     (( fail == 0 )) || die "selftest failed"
     echo "sign-rpm: selftest passed"
 }
@@ -114,5 +184,7 @@ case "${1:-}" in
     sign) shift; cmd_sign "$@" ;;
     verify) shift; cmd_verify "$@" ;;
     selftest) shift; cmd_selftest "$@" ;;
-    *) echo "usage: sign-rpm.sh sign FPR RPM... | verify PUBKEY RPM... | selftest RPM" >&2; exit 2 ;;
+    sign-sums) shift; cmd_sign_sums "$@" ;;
+    verify-sums) shift; cmd_verify_sums "$@" ;;
+    *) echo "usage: sign-rpm.sh sign FPR RPM... | verify PUBKEY RPM... | selftest RPM | sign-sums FPR FILE | verify-sums PUBKEY FILE" >&2; exit 2 ;;
 esac

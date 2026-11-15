@@ -862,10 +862,16 @@ fn install_opens_the_window_before_it_executes_its_tree() {
     assert_eq!(r.status, 0, "{r:#?}");
     assert_eq!(r.called(TREE), 1, "{r:#?}");
     assert!(r.index(GRANT) < r.index(TREE), "{r:#?}");
+    // Lot 354 (F2b-2): each side with its build (the binary's SHA-256)
+    let line = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("UPGRADE — installed:"))
+        .unwrap_or_else(|| panic!("no UPGRADE line: {r:#?}"));
     assert!(
-        r.stdout
-            .contains("installed: northnarrow-agent 0.0.1 → new: northnarrow-agent 0.0.2"),
-        "{r:#?}"
+        line.contains("installed: northnarrow-agent 0.0.1 (sha256 ")
+            && line.contains(") → new: northnarrow-agent 0.0.2 (sha256 "),
+        "{line}"
     );
 
     let host = Host::new("install-window-first-refused", &both, true, true);
@@ -879,6 +885,76 @@ fn install_opens_the_window_before_it_executes_its_tree() {
     let r = host.install_from("full", false, None, bin);
     assert_eq!(r.status, 0, "{r:#?}");
     assert_eq!((r.called(GRANT), r.called(TREE)), (0, 1), "{r:#?}");
+}
+
+/// Lot 354 (pre-alpha checks, F2b-2): an upgrade between two builds of the
+/// same version said "0.0.1 → 0.0.1". Each side now names its build: the
+/// release's (`Build:` of the tree's README-RELEASE.md) and the start of
+/// the agent binary's SHA-256 — different binaries, different hashes; the
+/// same binary is said to be the same build.
+#[test]
+fn the_upgrade_line_tells_two_builds_of_one_version_apart() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    for (case, same) in [
+        ("upgrade-builds-differ", false),
+        ("upgrade-builds-same", true),
+    ] {
+        let host = Host::new(case, &both, true, true);
+        let tree = host.dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let installed = fs::read(host.dir.join("bin/northnarrow-agent")).unwrap();
+        if same {
+            fs::write(tree.join("northnarrow-agent"), &installed).unwrap();
+            fs::set_permissions(
+                tree.join("northnarrow-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        } else {
+            write_exec(
+                &tree.join("northnarrow-agent"),
+                "echo 'northnarrow-agent 0.0.1' # another build",
+            );
+        }
+        fs::write(
+            tree.join("README-RELEASE.md"),
+            "NorthNarrow\nBuild:     v0.0.1-rc2-1913-g03879ade — 2026-11-14T00:00:00Z\n",
+        )
+        .unwrap();
+        let r = host.install_with(
+            "full",
+            true,
+            Some("key-role"),
+            "$T/tree/northnarrow-agent",
+            "REPO_ROOT=$T/tree",
+        );
+        assert_eq!(r.status, 0, "{r:#?}");
+        let line = r
+            .stdout
+            .lines()
+            .find(|l| l.contains("UPGRADE — installed:"))
+            .unwrap_or_else(|| panic!("no UPGRADE line: {r:#?}"));
+        let sha = |side: &str| -> String {
+            let at = line.find(side).unwrap_or_else(|| panic!("{side}: {line}"));
+            let rest = &line[at..];
+            let s = rest.find("sha256 ").unwrap_or_else(|| panic!("{line}")) + 7;
+            rest[s..s + 12].to_string()
+        };
+        let (old, new) = (sha("installed:"), sha("→ new:"));
+        assert!(old.chars().all(|c| c.is_ascii_hexdigit()), "{line}");
+        assert!(
+            line.contains(
+                "→ new: northnarrow-agent 0.0.1 (build v0.0.1-rc2-1913-g03879ade, sha256 "
+            ),
+            "{line}"
+        );
+        assert_eq!(old == new, same, "{line}");
+        assert_eq!(
+            r.stdout.contains("the same build as the one installed"),
+            same,
+            "{r:#?}"
+        );
+    }
 }
 
 /// Lot 278: install.sh executes the tree's agent only in `tree_version`,

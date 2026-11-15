@@ -36,11 +36,20 @@
 //! └─────────────┴─────────────────┴───────────────────────────┘
 //! ```
 //!
-//! [`PROTOCOL_VERSION`] is the highest version this build understands.
-//! A peer that decodes a frame whose `version` exceeds its
-//! `PROTOCOL_VERSION` returns
-//! [`FrameError::ProtocolVersionUnsupported`] and closes the
-//! connection — the rule is *forward-incompatible, backward-tolerant*.
+//! [`PROTOCOL_VERSION`] is the highest version this build understands,
+//! [`OLDEST_PROTOCOL_VERSION`] the oldest. A peer that decodes a frame
+//! whose `version` is outside that range returns
+//! [`FrameError::ProtocolVersionUnsupported`] and closes the connection:
+//! a newer peer may send what this build cannot decode, and an older
+//! version named a format this build would misread.
+//!
+//! Lot 354: the version moves with the wire format. The frames pinned byte
+//! for byte by `encoded_frames_are_pinned` are recorded per version in the
+//! tests' `PINNED_FRAMES_AT_VERSION`, and
+//! `a_pinned_frame_changes_only_with_a_new_protocol_version` fails when a
+//! pinned frame changes while `PROTOCOL_VERSION` stays. Version 2 marks the
+//! formats that changed since version 1 was set (the status reply has grown
+//! by appended fields since the frames were first pinned).
 //!
 //! The decoder [`decode_versioned_frame`] rejects anything that is not a
 //! well-formed v1 envelope, and reads the `version` before the message: a
@@ -2035,7 +2044,20 @@ pub const MAX_FRAME_BODY: usize = 64 * 1024;
 /// only be set once every reachable peer (agent + every shipped
 /// `nn-admin`) has been updated to *decode* it. Encoders may
 /// continue to emit the older value indefinitely.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Lot 354: it moves whenever a frame pinned by the tests changes (the
+/// ratchet `a_pinned_frame_changes_only_with_a_new_protocol_version`). 2
+/// marks the formats that changed incompatibly since 1. The live admin
+/// socket still speaks bare frames ([`encode_frame`]), so `nn-admin` and
+/// the agent must come from the same release.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// The oldest envelope version this build decodes. Version 1 named
+/// formats this build would misread (fields appended to the status reply
+/// since), so a version 1 envelope is
+/// [`FrameError::ProtocolVersionUnsupported`], not a guess. Raise it with
+/// [`PROTOCOL_VERSION`] whenever the older format can no longer be decoded.
+pub const OLDEST_PROTOCOL_VERSION: u16 = 2;
 
 /// Errors that can occur when encoding or decoding a frame.
 #[derive(Debug)]
@@ -2078,7 +2100,7 @@ impl core::fmt::Display for FrameError {
                 supported,
             } => write!(
                 f,
-                "protocol version {received} unsupported (this build speaks up to {supported})"
+                "protocol version {received} unsupported (this build speaks {OLDEST_PROTOCOL_VERSION} to {supported})"
             ),
         }
     }
@@ -2149,7 +2171,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(AdminMessage, usize)>, FrameEr
 /// in v0 (see the module doc-comment "Protocol versioning" section).
 ///
 /// Encoders set `version` to [`PROTOCOL_VERSION`]; decoders accept
-/// any `version` in `1..=PROTOCOL_VERSION` (the v0 wire shape — a
+/// any `version` in `OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION` (the v0 wire shape — a
 /// bare `AdminMessage` body — is [`decode_frame`]'s, never an
 /// envelope's). A peer that receives a `version` outside that range
 /// returns [`FrameError::ProtocolVersionUnsupported`].
@@ -2189,7 +2211,7 @@ pub fn encode_versioned_frame(msg: &VersionedAdminMessage) -> Result<Vec<u8>, Fr
 
 /// Strict v1 decode: returns `Ok(Some((envelope, consumed)))` only
 /// for a well-formed [`VersionedAdminMessage`] whose `version` is
-/// `1..=PROTOCOL_VERSION` AND whose body postcard-decodes with no
+/// `OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION` AND whose body postcard-decodes with no
 /// trailing bytes.
 ///
 /// Lot 299 (external bug hunt, edition 1.2: BUG-36): the `version` is
@@ -2217,7 +2239,7 @@ pub fn decode_versioned_frame(
     }
     let body = &buf[4..4 + len];
     let (version, rest) = postcard::take_from_bytes::<u16>(body)?;
-    if !(1..=PROTOCOL_VERSION).contains(&version) {
+    if !(OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
         return Err(FrameError::ProtocolVersionUnsupported {
             received: version,
             supported: PROTOCOL_VERSION,
@@ -4625,6 +4647,52 @@ mod tests {
         assert_eq!(env.version, PROTOCOL_VERSION);
     }
 
+    // The frames `encoded_frames_are_pinned` holds, byte for byte; their
+    // digest is recorded per PROTOCOL_VERSION in PINNED_FRAMES_AT_VERSION.
+    const STATUS_REQUEST: &str = "0000000102";
+    const CHALLENGE: &str =
+        "00000021031111111111111111111111111111111111111111111111111111111111111111";
+    // Lab PR 267 (R12a): one byte longer — the `None` of the appended
+    // `event_bus` (telemetry, withheld here); every byte before it is
+    // the lab PR 240 pin's. R12b (lab PR 269): one byte longer again —
+    // the `None` of the appended `event_bus_decision` (telemetry,
+    // withheld here); every byte before it is R12a's pin (the length
+    // prefix 0x4c → 0x4d).
+    // R12c (lab PR 270): one byte longer (0x4d -> 0x4e) — the absent
+    // tag of `response_dispatch`, appended last.
+    // Lot 276: one byte longer (0x4e -> 0x4f) — the absent tag of
+    // `export`, appended last; every byte before it is R12c's pin.
+    // Lot 322: two bytes longer (0x4f -> 0x51) — the absent tags of
+    // `execpol_env_unread_total` and `execpol_lost_total`, appended
+    // last; every byte before them is lot 276's pin.
+    // Lot 325: three bytes longer (0x51 -> 0x54) — the absent tags of
+    // `execpol_env_truncated_total`, `execpol_env_changed_total` and
+    // `execpol_lost_open_total`; every byte before them is lot 322's.
+    // The review of #547: one more (0x55), `open_sensor_per_call_total`.
+    // Lot 341: two more (0x57), `profile` and `records_today`; every
+    // byte before them is the review of #547's.
+    // Lot 313: two more (0x59), the absent tags of
+    // `program_copy_compared_total` and `program_copy_skipped_total`,
+    // appended last; every byte before them is lot 341's pin.
+    const STATUS_RESPONSE: &str = concat!(
+        "00000059050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000",
+    );
+    const SHUTDOWN_REQUEST: &str = concat!(
+        "0000007a0602abababababababababababababababababababababababababababababababab808f",
+        "b2af06cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd011e015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a",
+    );
+    const FORCE_POSTURE_REQUEST: &str = concat!(
+        "0000003a08030101010101010101010101010101010101010101010101010101010101010101818f",
+        "b2af0602020202020202020202020202020202020200",
+    );
+    // Lot 354: the envelope at PROTOCOL_VERSION 2 (its second byte; it was
+    // 01 before the version moved).
+    const QUORUM_NOT_MET_VERSIONED: &str = "000000050207050201";
+
     /// Wave 4 restructure, R03 (lab PR 240): whole frames pinned, byte for
     /// byte, as `main` 2e1438f encoded them before this module left
     /// `common` (the variant index alone is pinned above). postcard and
@@ -4633,48 +4701,6 @@ mod tests {
     /// payload inside a frame and `PostureKind` (moved to nn-model by R02).
     #[test]
     fn encoded_frames_are_pinned() {
-        const STATUS_REQUEST: &str = "0000000102";
-        const CHALLENGE: &str =
-            "00000021031111111111111111111111111111111111111111111111111111111111111111";
-        // Lab PR 267 (R12a): one byte longer — the `None` of the appended
-        // `event_bus` (telemetry, withheld here); every byte before it is
-        // the lab PR 240 pin's. R12b (lab PR 269): one byte longer again —
-        // the `None` of the appended `event_bus_decision` (telemetry,
-        // withheld here); every byte before it is R12a's pin (the length
-        // prefix 0x4c → 0x4d).
-        // R12c (lab PR 270): one byte longer (0x4d -> 0x4e) — the absent
-        // tag of `response_dispatch`, appended last.
-        // Lot 276: one byte longer (0x4e -> 0x4f) — the absent tag of
-        // `export`, appended last; every byte before it is R12c's pin.
-        // Lot 322: two bytes longer (0x4f -> 0x51) — the absent tags of
-        // `execpol_env_unread_total` and `execpol_lost_total`, appended
-        // last; every byte before them is lot 276's pin.
-        // Lot 325: three bytes longer (0x51 -> 0x54) — the absent tags of
-        // `execpol_env_truncated_total`, `execpol_env_changed_total` and
-        // `execpol_lost_open_total`; every byte before them is lot 322's.
-        // The review of #547: one more (0x55), `open_sensor_per_call_total`.
-        // Lot 341: two more (0x57), `profile` and `records_today`; every
-        // byte before them is the review of #547's.
-        // Lot 313: two more (0x59), the absent tags of
-        // `program_copy_compared_total` and `program_copy_skipped_total`,
-        // appended last; every byte before them is lot 341's pin.
-        const STATUS_RESPONSE: &str = concat!(
-            "00000059050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "00000000000000000000000000",
-        );
-        const SHUTDOWN_REQUEST: &str = concat!(
-            "0000007a0602abababababababababababababababababababababababababababababababab808f",
-            "b2af06cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd011e015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
-            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
-            "5a5a5a5a5a5a",
-        );
-        const FORCE_POSTURE_REQUEST: &str = concat!(
-            "0000003a08030101010101010101010101010101010101010101010101010101010101010101818f",
-            "b2af0602020202020202020202020202020202020200",
-        );
-        const QUORUM_NOT_MET_V1: &str = "000000050107050201";
-
         let frame = |m: AdminMessage| hex::encode(encode_frame(&m).unwrap());
         assert_eq!(
             frame(AdminMessage::Status(StatusRequest {})),
@@ -4718,7 +4744,122 @@ mod tests {
             },
         ));
         let versioned = hex::encode(encode_versioned_frame(&quorum).unwrap());
-        assert_eq!(versioned, QUORUM_NOT_MET_V1);
+        assert_eq!(versioned, QUORUM_NOT_MET_VERSIONED);
+    }
+
+    /// Lot 354: the digest of the pinned frames at every PROTOCOL_VERSION,
+    /// oldest first. The rows are history: never edit one, append one. Row
+    /// 1 is the frames as lab PR 240 first pinned them (the status reply was
+    /// 0x4b bytes long then); row 2 the frames when the version moved to
+    /// mark the formats changed since.
+    const _: () = assert!(
+        OLDEST_PROTOCOL_VERSION >= 1 && OLDEST_PROTOCOL_VERSION <= PROTOCOL_VERSION,
+        "the oldest version decoded is at most the current one"
+    );
+
+    const PINNED_FRAMES_AT_VERSION: [(u16, &str); 2] = [
+        (
+            1,
+            "e9acc80ae2d89bd2a65f21b5a336c6e1ca2bd3edde7c43006a322b112e6f35f3",
+        ),
+        (
+            2,
+            "c503c86c903c2fa3257d9c1a318aa3fcb885b04a5b345ca325b992dff2fcadfb",
+        ),
+    ];
+
+    /// SHA-256 of the pinned frames' hex, one per line, in a fixed order.
+    fn pinned_frames_digest() -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for frame in [
+            STATUS_REQUEST,
+            CHALLENGE,
+            STATUS_RESPONSE,
+            SHUTDOWN_REQUEST,
+            FORCE_POSTURE_REQUEST,
+            QUORUM_NOT_MET_VERSIONED,
+        ] {
+            h.update(frame.as_bytes());
+            h.update(b"\n");
+        }
+        hex::encode(h.finalize())
+    }
+
+    /// Lot 354 (the protocol ratchet): a pinned frame that changes is a
+    /// change of the wire format, so it comes with a new PROTOCOL_VERSION
+    /// and a new row of PINNED_FRAMES_AT_VERSION. The versions in the table
+    /// run 1, 2, … with no gap, the last one is PROTOCOL_VERSION, its
+    /// digest is the frames' now, and no two versions record the same
+    /// frames.
+    #[test]
+    fn a_pinned_frame_changes_only_with_a_new_protocol_version() {
+        for (i, (version, _)) in PINNED_FRAMES_AT_VERSION.iter().enumerate() {
+            assert_eq!(
+                usize::from(*version),
+                i + 1,
+                "PINNED_FRAMES_AT_VERSION: the versions run 1, 2, … in order"
+            );
+        }
+        let digests: alloc::collections::BTreeSet<&str> =
+            PINNED_FRAMES_AT_VERSION.iter().map(|(_, d)| *d).collect();
+        assert_eq!(
+            digests.len(),
+            PINNED_FRAMES_AT_VERSION.len(),
+            "two protocol versions record the same frames"
+        );
+        let (last_version, last_digest) =
+            PINNED_FRAMES_AT_VERSION[PINNED_FRAMES_AT_VERSION.len() - 1];
+        let now = pinned_frames_digest();
+        let recorded = PINNED_FRAMES_AT_VERSION
+            .iter()
+            .find(|(v, _)| *v == PROTOCOL_VERSION)
+            .map(|(_, d)| *d);
+        assert_eq!(
+            recorded,
+            Some(now.as_str()),
+            "the pinned frames are not the ones recorded for PROTOCOL_VERSION {PROTOCOL_VERSION}: \
+             a pinned frame changed, so the wire format changed. Raise PROTOCOL_VERSION to {} \
+             (and OLDEST_PROTOCOL_VERSION if the old format can no longer be decoded), re-pin \
+             the versioned frame, and append its row to PINNED_FRAMES_AT_VERSION",
+            PROTOCOL_VERSION + 1
+        );
+        assert_eq!(
+            last_version, PROTOCOL_VERSION,
+            "PINNED_FRAMES_AT_VERSION ends at {last_version}, PROTOCOL_VERSION is {PROTOCOL_VERSION}"
+        );
+        assert_eq!(last_digest, now);
+    }
+
+    /// Lot 354: a version 1 envelope named a format this build would
+    /// misread; it is refused as unsupported, not decoded.
+    #[test]
+    fn an_envelope_older_than_the_oldest_version_is_unsupported() {
+        // version 1 in particular (named, not derived from the constant):
+        // its formats are not this build's
+        for version in [1].into_iter().chain(1..OLDEST_PROTOCOL_VERSION) {
+            let old = VersionedAdminMessage {
+                version,
+                message: AdminMessage::Status(StatusRequest {}),
+            };
+            let frame = encode_versioned_frame(&old).unwrap();
+            let strict = decode_versioned_frame(&frame);
+            assert!(
+                matches!(
+                    strict,
+                    Err(FrameError::ProtocolVersionUnsupported {
+                        received,
+                        supported: PROTOCOL_VERSION
+                    }) if received == version
+                ),
+                "version {version}: {strict:?}"
+            );
+        }
+        let current = encode_versioned_frame(&VersionedAdminMessage::current(
+            AdminMessage::Status(StatusRequest {}),
+        ))
+        .unwrap();
+        assert!(matches!(decode_versioned_frame(&current), Ok(Some(_))));
     }
 
     /// Lot 299 (external bug hunt, edition 1.2: BUG-36): a v2 envelope
@@ -4728,7 +4869,11 @@ mod tests {
     #[cfg(not(feature = "debug-trigger"))]
     #[test]
     fn future_version_unknown_variant_is_unsupported() {
-        let body: [u8; 4] = [0x02, 0x3B, 0xAA, 0xBB];
+        // Lot 354: the version after this build's (2 before PROTOCOL_VERSION
+        // moved to 2); one byte as a postcard varint.
+        let future = u8::try_from(PROTOCOL_VERSION + 1).expect("below 128: one varint byte");
+        assert!(future < 0x80);
+        let body: [u8; 4] = [future, 0x3B, 0xAA, 0xBB];
         let mut frame = Vec::with_capacity(4 + body.len());
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&body);
@@ -4737,9 +4882,9 @@ mod tests {
             matches!(
                 strict,
                 Err(FrameError::ProtocolVersionUnsupported {
-                    received: 2,
+                    received,
                     supported: PROTOCOL_VERSION
-                })
+                }) if received == PROTOCOL_VERSION + 1
             ),
             "strict: {strict:?}"
         );
