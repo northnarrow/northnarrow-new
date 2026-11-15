@@ -1845,7 +1845,7 @@ Ancestor credential read followed by descendant egress — category `chain_exfil
 | Sensor — data | network (TCP connect, DNS, flows, listeners); file (file_open LSM, FIM drift); exec (sched_process_exec, bprm_check_security) — DC0078 Network Traffic Flow, DC0055 File Access, DC0032 Process Creation |
 | Validation | e2e (V2 Critical sub-gate) |
 
-**Observes.** An outbound flow from a process whose ancestor (not itself) read a FIM-watched credential store: within 300 s Critical kill, within 30 minutes one High record. The ancestry comes from the exec sensor and the kernel's fork record (lot 352): a descendant that executed nothing since its fork (a Python `os.fork()` child, a subshell, a daemon's grandchild) is named by its connect, and a forker that never executed by its anchor, the nearest process up the forks that had.
+**Observes.** An outbound flow from a process whose ancestor (not itself) read a FIM-watched credential store: within 300 s Critical kill, within 30 minutes one High record. The ancestry comes from the exec sensor and the kernel's fork record (lot 352): a descendant that executed nothing since its fork (a Python `os.fork()` child, a subshell, a daemon's grandchild) is named by its connect, and a forker that never executed by its anchor, the nearest process up the forks that had. A read counts for the process that made it (the kernel's open record carries its start): a later holder of an exited ancestor's pid lends that ancestor's descendants nothing.
 
 **Known false positives.** As NN-L-CHAIN-001, through a child: a browser or password manager whose watched store was read by the parent and whose helper process syncs.
 

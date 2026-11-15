@@ -2747,7 +2747,12 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   /tmp exec, a canary trip) now completes NN-L-CHAIN-004/005/006/008 as an
   exec'd one did: a Python `os.fork()` worker, a subshell's command, a
   double-forked daemon. Expect these chains where a parent reads a watched
-  credential store and its forked workers connect out.
+  credential store and its forked workers connect out. A read or a canary
+  trip counts for the process that made it (the re-check of #561): a later
+  holder of an exited process's pid lends that process's descendants
+  nothing. FIM events and canary trips in the agent's event records carry
+  the process's start when the kernel said it (`modifier_start`,
+  `accessor_start_ns`, nanoseconds of `CLOCK_MONOTONIC`; absent when 0).
 - **Wire.** The fork record map grew to 32 bytes an entry (65,536 entries,
   about 1 MiB more kernel memory); the exec record grew 16 bytes, the TCP
   connect record 24. The eBPF object and the agent are rebuilt together.

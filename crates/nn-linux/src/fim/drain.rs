@@ -2023,6 +2023,8 @@ pub fn process_record(
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                // lot 352 (the re-check of #561, N1): the reader's start
+                modifier_start: process_start(raw),
             }));
             return Ok(true);
         }
@@ -2301,6 +2303,7 @@ pub fn process_record(
             appends_only: appends_only(raw, op),
             truncated_by_another,
             unchanged_since_read,
+            modifier_start: process_start(raw),
         };
         // lot 347: a login record's packaged writer, read while it runs
         read_login_unit_writer(&fe, raw.modifier_start, Path::new("/proc"), Path::new("/"));
@@ -2361,6 +2364,18 @@ fn note_real_shrink(
         && new_size.zip(before).is_some_and(|(n, b)| n < b)
     {
         path_map.note_truncation(key, raw.modifier_pid);
+    }
+}
+
+/// Lot 352 (the re-check of #561, N1): the start of the process the record
+/// names, when the kernel said it — an open's reader and a write seen at close
+/// (`modifier_start`), else a process that executed nothing since its fork
+/// (its fork record's `fork_start`); 0 otherwise.
+fn process_start(raw: &FimDriftRaw) -> u64 {
+    if raw.modifier_start != 0 {
+        raw.modifier_start
+    } else {
+        raw.fork_start
     }
 }
 
@@ -2987,6 +3002,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        modifier_start: 0,
     })
 }
 
@@ -5988,6 +6004,52 @@ mod tests {
         assert_eq!(verdict.action, ResponseAction::KillProcess);
     }
 
+    /// Lot 352 (the re-check of #561, N1): the read forwarded to the rules
+    /// carries its reader's start, as the kernel's record says it, for the
+    /// chains to tag the read with; a record without a start of its own
+    /// carries its fork record's (a process that executed nothing since its
+    /// fork), else none.
+    #[test]
+    fn a_forwarded_read_carries_its_reader_s_start() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, "/root/.aws/credentials");
+        let mut out: Vec<Event> = Vec::new();
+        let mut raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+        raw.modifier_start = 41_000;
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted);
+        match out.as_slice() {
+            [Event::Fim(fe)] => assert_eq!(fe.modifier_start, 41_000),
+            other => panic!("expected one Event::Fim, got {other:?}"),
+        }
+        let mut forked = fake_raw(key_ino.dev, key_ino.ino, FimOp::Modified as u8);
+        assert_eq!(process_start(&forked), 0, "not said");
+        (forked.fork_ppid, forked.fork_start) = (7, 33_000);
+        assert_eq!(process_start(&forked), 33_000, "its fork record's");
+        forked.modifier_start = 34_000;
+        assert_eq!(process_start(&forked), 34_000, "its own first");
+    }
+
     /// BUG-012 (v2) #3 — regression guard: a `Modified` on a critical
     /// path STILL drifts exactly as before. The read carve-out must
     /// not touch the integrity-changing ops FIM-001..009 depend on.
@@ -6915,6 +6977,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         };
         let read = |fe: &FimEvent| {
             read_login_unit_writer(fe, 0, &proc, &root);
@@ -7036,6 +7099,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                modifier_start: 0,
             };
             read_login_unit_writer(&fe, 0, &proc, &root);
             unit_of(&fe)
@@ -7119,6 +7183,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                modifier_start: 0,
             };
             read_login_unit_writer(&fe, writer_start, &proc, &root);
             unit_of(&fe)

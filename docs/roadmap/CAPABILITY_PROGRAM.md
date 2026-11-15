@@ -11309,6 +11309,40 @@ number in parentheses is a lab PR.
     (pre-existing, not introduced here); lot 352 extends it to CHAIN-005
     for fork-only children. It is handled by a separate lot (355): an
     AppImage is judged by its image file, not by its `/tmp` mount point.
+  - Re-check 1 of #561 (second fix round). F1 was closed for an exec'd
+    reuser only. N1 (P2): a FORK-ONLY process that takes an exited
+    intermediate's pid and reads a credential store or trips a canary still
+    lent its read to the intermediate's descendants — recorded under the
+    tree's key for the pid (the intermediate's, entered by a hop), or handed
+    to it by a stale hop when the tree had not seen the pid — a false
+    CHAIN-004/006 Critical on a double-forked daemon's worker (and on rc2
+    with an exec'd intermediate). A precursor now keeps the start of the
+    process that made it (the kernel's open record carries the reader's
+    start: `FimDriftRaw::modifier_start`, else a fork-only process's fork
+    record; the trip's `accessor_start_ns`), and an ancestor walk counts it
+    only for that incarnation; the same pid's own queries and the
+    reader's own hand-over are unchanged
+    (`a_fork_only_reuser_s_read_is_not_lent_through_a_stale_hop`,
+    `a_stale_hop_takes_over_a_fork_only_reuser_s_read_without_its_chain`,
+    `a_fork_only_reuser_of_an_exec_d_intermediate_lends_its_read_to_no_one`,
+    `a_fork_only_reuser_s_canary_trip_is_not_lent_through_a_stale_hop`,
+    `an_ancestor_walk_counts_a_precursor_for_its_own_incarnation_only`,
+    `a_late_exec_s_sequence_takes_its_own_process_s_read_only`; the
+    legitimate reader keeps both chains:
+    `a_fork_only_reader_keeps_its_chains_past_a_stale_record_of_its_pid`).
+    N2: the ratchet refuses a store wrapper over the forker's hop and
+    `observe_exec`/`observe_fork` named outside `observe_lineage`
+    (`the_ratchet_sees_a_hop_wrapper_and_an_entry_outside_observe_lineage`).
+    No lab round (one eBPF line, the open record's start: the PR's lab VM
+    gate loads it on 5.15 and 6.8). Residuals: an event that does not say
+    its process's start (an exec'd process's open-sensor record or connect,
+    a write by an exec'd process not seen at close, a record whose fork
+    record was evicted) counts under the tree's incarnation of the pid, as
+    before — an exec'd process is in the tree by its exec record; N3 (P3,
+    evasion, not a regression from rc2): a stale record is dropped whole, so
+    a dropper whose fork-only intermediate exits and has its pid reused by
+    an exec before the child's connect loses its chain (a full pid rotation
+    within the window).
   - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**

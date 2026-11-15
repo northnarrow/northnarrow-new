@@ -314,10 +314,13 @@ pub(crate) fn emit_drift(op: u8, key: InodeKey) {
 
 /// [`emit_drift`] of an open (`Opened`): without the writer's fork records
 /// (lot 344) — the file-open hooks are the longest programs the verifier
-/// walks (`fim_file_open_sensor`), and an open changes nothing.
+/// walks (`fim_file_open_sensor`), and an open changes nothing. Lot 352 (the
+/// re-check of #561, N1): with the reader's start (`modifier_start`, two
+/// reads, no map), so the chains key a credential read or a canary trip to
+/// the process that made it, not to an earlier holder of its pid.
 #[inline(always)]
 pub(crate) fn emit_drift_opened(key: InodeKey) {
-    emit_drift_raw(FIM_OP_OPENED, key, NO_DEST, 0, false);
+    emit_drift_raw(FIM_OP_OPENED, key, NO_DEST, 0, false, true);
 }
 
 /// Lot 344: the current process's fork records when it has executed nothing
@@ -356,13 +359,13 @@ const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 /// tolerate that read for privileged loaders; 5.15 does not.
 #[inline(always)]
 fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
-    emit_drift_raw(op, key, dest, op_flags, true);
+    emit_drift_raw(op, key, dest, op_flags, true, false);
 }
 
 /// [`emit_drift_with_dest`], the writer's fork records carried when
-/// `forks` (lot 344).
+/// `forks` (lot 344), and its own start when `own_start` (lot 352).
 #[inline(always)]
-fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bool) {
+fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bool, own_start: bool) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => {
@@ -395,6 +398,9 @@ fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bo
         core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
         if forks {
             fill_forks(raw_ptr);
+        }
+        if own_start {
+            (*raw_ptr).modifier_start = crate::fork_parent::current_start();
         }
     }
     entry.submit(0);

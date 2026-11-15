@@ -196,7 +196,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    kernel's fork record (lot 352): a descendant that executed nothing since its \
                    fork (a Python `os.fork()` child, a subshell, a daemon's grandchild) is \
                    named by its connect, and a forker that never executed by its anchor, the \
-                   nearest process up the forks that had.",
+                   nearest process up the forks that had. A read counts for the process that \
+                   made it (the kernel's open record carries its start): a later holder of an \
+                   exited ancestor's pid lends that ancestor's descendants nothing.",
         false_positives: "As NN-L-CHAIN-001, through a child: a browser or password manager \
                           whose watched store was read by the parent and whose helper process \
                           syncs.",

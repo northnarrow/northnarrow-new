@@ -990,6 +990,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     goes back under its reaper. The ancestry ratchet names `observe_spawn`
     as an identifier (a function path too), and `observe_spawn` is
     crate-private.
+  - **The re-check of #561.** A credential read or a canary trip keeps the
+    start of the process that made it (`FimEvent::modifier_start`, the
+    trip's `accessor_start_ns`; the kernel's open record now carries the
+    reader's start, `FimDriftRaw::modifier_start`, no layout change), under
+    whatever key the ancestry tree gave it. An ancestor walk counts it only
+    for that process: a fork-only process that takes an exited intermediate's
+    pid (a double-forked daemon's) and reads a credential store or trips a
+    canary no longer lends a Critical NN-L-CHAIN-004/006 to the daemon's
+    worker — whether its read went under the intermediate's key or a stale
+    fork record handed it there. The same pid's own chains and the reader's
+    children are unchanged. The ancestry ratchet also refuses a store
+    wrapper over the forker's hop and `observe_exec`/`observe_fork` named
+    outside the chain rules' `observe_lineage`.
 - Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
   - **F1 — a log truncated back to its signed baseline's exact content was
     dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written

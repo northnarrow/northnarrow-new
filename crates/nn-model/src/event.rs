@@ -428,6 +428,14 @@ pub enum Event {
         /// the field existed reads as a first trip.
         #[serde(default = "canary_first_trip_default")]
         first_trip: bool,
+        /// Lot 352 (the re-check of #561, N1): the accessor's start
+        /// (`task->start_time`, `CLOCK_MONOTONIC` ns) when the source event
+        /// said it — an open's reader (`FimEvent::modifier_start`), an exec's
+        /// process, a connect of a process that executed nothing since its
+        /// fork — else 0. The chains tag the trip with it, as a credential
+        /// read.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        accessor_start_ns: u64,
     },
     /// Tappa 10 (N3) — userland-finalised network flow. The
     /// agent's `net::flow_tracker` stitches the BPF-side

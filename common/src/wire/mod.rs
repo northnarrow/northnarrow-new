@@ -2049,10 +2049,13 @@ pub struct FimDriftRaw {
     pub fork_parent_start: u64,
     /// Lot 344, the review of #554 (F1): for a `Modified` seen at close, the
     /// writer's start (its thread group leader's `task->start_time`,
-    /// `CLOCK_MONOTONIC` ns) at its last write; 0 otherwise (or unread). The
+    /// `CLOCK_MONOTONIC` ns) at its last write; lot 352 (the re-check of
+    /// #561, N1): for an `Opened`, the reader's; 0 otherwise (or unread). The
     /// record leaves the kernel when the file closes, and its writer may be
     /// gone by then: userland reads `/proc/<modifier_pid>` only for the
-    /// process that started then, never the next holder of the pid.
+    /// process that started then, never the next holder of the pid. An open's
+    /// start is the one the chains tag its credential read or canary trip
+    /// with (`FimEvent::modifier_start`).
     pub modifier_start: u64,
 }
 

@@ -337,7 +337,15 @@ impl<H: PostureHost> Rule for NnLChain001CredReadThenEgress<H> {
             // they fed a KillProcessTree. FIM-015/017 still log them.
             Event::Fim(fe) if is_credential_store_access(fe) && !fe.wide_coverage => {
                 let mut store = self.buf.lock();
-                store.record_for_pid(fe.modifier_pid, PrecursorKind::CredRead, fe.timestamp_ns);
+                // Lot 352 (the re-check of #561, N1): tagged with the
+                // reader's start, so a walk through an earlier holder of the
+                // pid (a daemon's exited intermediate) does not lend it.
+                store.record_for_proc(
+                    fe.modifier_pid,
+                    fe.modifier_start,
+                    PrecursorKind::CredRead,
+                    fe.timestamp_ns,
+                );
                 // Review 70: the read happened before an egress of the same
                 // process that was processed first (another ring). Lab PR
                 // 235: claimed, so a `/tmp` exec processed later still
@@ -648,11 +656,19 @@ impl<H: PostureHost> Rule for NnLChain003CanaryThenEgress<H> {
             Event::CanaryTripped {
                 access_kind,
                 accessor_pid,
+                accessor_start_ns,
                 timestamp_ns,
                 ..
             } => {
                 let mut store = self.buf.lock();
-                store.record_for_pid(*accessor_pid, PrecursorKind::CanaryTrip, *timestamp_ns);
+                // Lot 352 (the re-check of #561, N1): tagged with the
+                // accessor's start, as a credential read.
+                store.record_for_proc(
+                    *accessor_pid,
+                    *accessor_start_ns,
+                    PrecursorKind::CanaryTrip,
+                    *timestamp_ns,
+                );
                 // Lab PR 246: a network trip is a connect; that connection is
                 // the trip's, not an egress after it (the engine's flow
                 // ledger keeps every rule off its rows from now on). A row
@@ -1017,7 +1033,13 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
                 }
                 let egress =
                     store.answer_sequence_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
-                store.record(key, PrecursorKind::CredRead, fe.timestamp_ns);
+                // the key's, tagged with the reader's start (lot 352)
+                store.record_for_proc(
+                    fe.modifier_pid,
+                    fe.modifier_start,
+                    PrecursorKind::CredRead,
+                    fe.timestamp_ns,
+                );
                 Some(late_chain_verdict(
                     self,
                     &egress,
@@ -1319,6 +1341,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -1396,6 +1419,7 @@ mod tests {
             accessor_exe: None,
             timestamp_ns: ts_ns,
             first_trip: true,
+            accessor_start_ns: 0,
         }
     }
 
@@ -1597,6 +1621,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(
@@ -2262,6 +2287,170 @@ mod tests {
             ],
         );
         assert!(fired.is_empty(), "{fired:?}");
+    }
+
+    /// A credential read by the process started at `start` (the reader's
+    /// start the kernel's open record carries, lot 352).
+    fn cred_fim_of(pid: u32, start: u64, ts_ns: u64) -> Event {
+        let mut e = cred_fim(pid, ts_ns);
+        if let Event::Fim(fe) = &mut e {
+            fe.modifier_start = start;
+        }
+        e
+    }
+
+    /// A canary trip by the process started at `start`.
+    fn canary_trip_of(pid: u32, start: u64, ts_ns: u64) -> Event {
+        let mut e = canary_trip(pid, ts_ns);
+        if let Event::CanaryTripped {
+            accessor_start_ns, ..
+        } = &mut e
+        {
+            *accessor_start_ns = start;
+        }
+        e
+    }
+
+    /// The re-check of #561, N1 (A): the worker's first connect entered the
+    /// daemon's fork-only intermediate (300, 11 s), which then exited. A
+    /// process that never executes takes pid 300 (50 s) and reads a
+    /// credential store: its read goes under the tree's key for 300, the
+    /// intermediate's. The worker's next flow walks to that key — the read
+    /// is the reuser's (its start says so), not the intermediate's: no
+    /// CHAIN-004 kill of the daemon's worker.
+    #[test]
+    fn a_fork_only_reuser_s_read_is_not_lent_through_a_stale_hop() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/sbin/daemond", 5 * SEC),
+                connect_of(400, 12 * SEC, Some((300, 11 * SEC, 200)), 20 * SEC),
+                flow(400, 443, 20 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "false chain for the worker: {fired:?}");
+    }
+
+    /// The re-check of #561, N1 (B): the tree never saw pid 300. The fork-only
+    /// reuser's read (50 s) waits under the pid's unknown key; the worker's
+    /// connect then enters the stale intermediate (300, 11 s), whose hand-over
+    /// takes what happened since 11 s — the read among it. It keeps its
+    /// reader's start: no chain for the worker.
+    #[test]
+    fn a_stale_hop_takes_over_a_fork_only_reuser_s_read_without_its_chain() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/sbin/daemond", 5 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                connect_of(400, 12 * SEC, Some((300, 11 * SEC, 200)), 60 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "false chain for the worker: {fired:?}");
+    }
+
+    /// The re-check of #561, N1 (C, before lot 352): the intermediate (300)
+    /// executed `sh`, forked the worker and exited; a fork-only process takes
+    /// its pid and reads a credential store. No chain for the worker.
+    #[test]
+    fn a_fork_only_reuser_of_an_exec_d_intermediate_lends_its_read_to_no_one() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/sbin/daemond", 5 * SEC),
+                spawn_at(300, 200, "/usr/bin/sh", 11 * SEC),
+                spawn_at(400, 300, "/usr/bin/worker", 12 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "false chain for the worker: {fired:?}");
+    }
+
+    /// The re-check of #561, N1, with a canary: the fork-only reuser of the
+    /// intermediate's pid trips a canary. No CHAIN-006 for the worker.
+    #[test]
+    fn a_fork_only_reuser_s_canary_trip_is_not_lent_through_a_stale_hop() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/sbin/daemond", 5 * SEC),
+                connect_of(400, 12 * SEC, Some((300, 11 * SEC, 200)), 20 * SEC),
+                flow(400, 443, 20 * SEC),
+                canary_trip_of(300, 50 * SEC, 55 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "false chain for the worker: {fired:?}");
+    }
+
+    /// The re-check of #561, N1, mini-hunt: CHAIN-007's late read (processed
+    /// after the egress it preceded) is recorded with its reader's start too.
+    /// The dropper (300, /tmp) forked its worker (400) and exited; a fork-only
+    /// process took pid 300 and read a credential store: whatever the pid's
+    /// own chains say, the worker's flow is no CHAIN-004 through the dropper.
+    #[test]
+    fn a_late_read_of_a_reused_pid_is_lent_to_no_descendant() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(300, 1, "/tmp/dropper", 11 * SEC),
+                spawn_at(400, 300, "/usr/bin/worker", 12 * SEC),
+                flow(300, 443, 56 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(
+            !fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    /// The re-check of #561, N1, the other side: a fork-only reader (300,
+    /// 50 s) keeps its chains. Its read waits under the tree's key for the
+    /// pid (an earlier holder's: a stale hop entered it); its child's connect
+    /// enters the reader itself, whose hand-over takes the read: CHAIN-004.
+    /// Its own flow is CHAIN-001, as before.
+    #[test]
+    fn a_fork_only_reader_keeps_its_chains_past_a_stale_record_of_its_pid() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/bin/python3", 5 * SEC),
+                connect_of(450, 12 * SEC, Some((300, 11 * SEC, 200)), 20 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                connect_of(400, 56 * SEC, Some((300, 50 * SEC, 200)), 58 * SEC),
+                flow(400, 443, 58 * SEC),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
+            "{fired:?}"
+        );
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/bin/python3", 5 * SEC),
+                connect_of(450, 12 * SEC, Some((300, 11 * SEC, 200)), 20 * SEC),
+                cred_fim_of(300, 50 * SEC, 55 * SEC),
+                flow(300, 443, 58 * SEC),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()),
+            "{fired:?}"
+        );
     }
 
     /// Review of #561, F2: the dropper (100, /tmp) forks 101 and exits; 101's
