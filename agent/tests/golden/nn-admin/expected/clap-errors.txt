@@ -218,6 +218,16 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.status.key.missing-value
+$ nn-admin status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.status.agent-id-file.missing-value
 $ nn-admin status --agent-id-file
 exit: 2
@@ -432,6 +442,49 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.detections.min-severity.missing-value
+$ nn-admin detections --min-severity
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--min-severity <MIN_SEVERITY>' but none was supplied
+|   [possible values: low, medium, high, critical]
+|
+| For more information, try '--help'.
+
+### clap.detections.status.missing-value
+$ nn-admin detections --status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--status <STATUS>' but none was supplied
+|   [possible values: open, acknowledged, investigating, resolved, false-positive]
+|
+| For more information, try '--help'.
+
+### clap.detections.sensor.missing-value
+$ nn-admin detections --sensor
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--sensor <SENSOR>' but none was supplied
+|   [possible values: exec, file, module-load, network, anti-tamper, canary]
+|
+| For more information, try '--help'.
+
+### clap.detections.path.missing-value
+$ nn-admin detections --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.detections.agent-id-file.missing-value
 $ nn-admin detections --agent-id-file
 exit: 2
@@ -508,6 +561,17 @@ exit: 2
 (empty)
 --- stderr
 | error: a value is required for '--id <ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.status.missing-value
+$ nn-admin detection-set-status --status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--status <STATUS>' but none was supplied
+|   [possible values: acknowledged, investigating, resolved, false-positive]
 |
 | For more information, try '--help'.
 
@@ -608,6 +672,16 @@ exit: 2
 (empty)
 --- stderr
 | error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.shutdown.cosign-key.missing-value
+$ nn-admin shutdown --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
 |
 | For more information, try '--help'.
 
@@ -789,6 +863,16 @@ exit: 2
 (empty)
 --- stderr
 | error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.cosign-key.missing-value
+$ nn-admin rotate-keys add --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
 |
 | For more information, try '--help'.
 
@@ -1048,6 +1132,16 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.audit.verify.expect-head.missing-value
+$ nn-admin audit verify --expect-head
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--expect-head <EXPECT_HEAD>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.audit.verify.min-seq.missing-value
 $ nn-admin audit verify --min-seq
 exit: 2
@@ -1091,6 +1185,17 @@ exit: 2
 | error: unexpected argument '--no-such-flag' found
 |
 | Usage: nn-admin chain verify [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.log.missing-value
+$ nn-admin chain verify --log
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--log <LOG>' but none was supplied
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, heartbeat, all]
 |
 | For more information, try '--help'.
 
@@ -2315,6 +2420,16 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.net.resolve.ip.missing-value
+$ nn-admin net resolve --ip
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--ip <IP>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.net.resolve.key.missing-value
 $ nn-admin net resolve --key
 exit: 2
@@ -2653,6 +2768,30 @@ exit: 2
 (empty)
 --- stderr
 | error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.for-installer.given-twice
+$ nn-admin trusted-installer-grant --for-installer --for-installer
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--for-installer' cannot be used multiple times
+|
+| Usage: nn-admin trusted-installer-grant [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.for-installer.with-a-value
+$ nn-admin trusted-installer-grant --for-installer=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--for-installer' found; no more were expected
+|
+| Usage: nn-admin trusted-installer-grant --key <KEY> --for-installer
 |
 | For more information, try '--help'.
 
@@ -3558,6 +3697,16 @@ exit: 2
 (empty)
 --- stderr
 | error: a value is required for '--policy <POLICY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.test.events.missing-value
+$ nn-admin policy test --events
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--events <EVENTS>' but none was supplied
 |
 | For more information, try '--help'.
 

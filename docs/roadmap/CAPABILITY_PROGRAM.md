@@ -11208,6 +11208,47 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
+  operator's help, the protocol version (docs and UX; no level changes).**
+  - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and
+    the external audit's T7): six README figures the code did not have (93
+    rules, 17 deny hooks, 81 programs, 11 Kani proofs, 29 golden cases,
+    3,619 tests), the README's "recorded, not refused" for modules and
+    foreign BPF and "not refused yet" for `prlimit`; GOLDEN_REPLAY §3
+    without 7 cases, 8 nn-admin commands in no operator document; internal
+    references in the help of nn-admin and the scripts, options with no
+    help, no table of exit codes; `NO_COLOR` read by nn-admin nowhere;
+    `PROTOCOL_VERSION` 1 across incompatible formats; no verification path
+    without `gh attestation`; the upgrade's "0.0.1 → 0.0.1"; the journal's
+    DNS text for every absent optional field; four lab cases and four lab
+    checks that expected what the release's BPF guard no longer does.
+  - Done: the figures counted from the code and checked against the README
+    (`xtask/tests/readme_figures.rs`, failing on rc2's README), the tables of
+    golden cases and nn-admin commands checked complete; the help ratchets
+    (`xtask/tests/operator_help.rs`, nn-admin's `help_text_tests`); one
+    `NO_COLOR` helper; `PROTOCOL_VERSION` 2 with `OLDEST_PROTOCOL_VERSION`
+    and the frames' ratchet (failing on rc2's protocol);
+    `SHA256SUMS.asc` signed on a tag by the release key (release.yml's
+    `rpm-sign`, its self-test on every run) and the guide's path without
+    gh; `docs/operator/NN_ADMIN.md`; the drafts `KNOWN_LIMITATIONS.md` and
+    `TESTING_THE_ALPHA.md`; the lab suites' expectations.
+  - Lab: none (no guest in this lot). The lab suites' new expectations are
+    those the pre-alpha's Phase 3 measured on a release build; they are run
+    again in the next lab round. `SHA256SUMS.asc` is first produced by the
+    next tag.
+  - The review of #562 (fix round): the four limitation sentences that
+    read as ways around open residuals restated as behaviour (what is not
+    recorded, what the operator can do); `install.sh` checks
+    `SHA256SUMS.asc` itself with `gpgv` against the tree's copy of the
+    committed release key and its pinned fingerprint, a new level
+    `signed-checksums` that installs with no flag on a host with no
+    attestation verifier (Ubuntu 24.04), fail-closed on a bad signature,
+    another key, a missing key or a mismatch (throwaway-key tests); the
+    protocol history copied in `xtask/tests/protocol_history.rs` (an edit
+    in place fails); the `NO_COLOR` ratchet over every binary and every
+    tracked shell script; the README's test floor within 200 of the count.
+    Lab: none (the signed path is covered by the install tests with
+    throwaway keys; no signed release exists yet).
 - **Lot 352 — the pre-alpha's Phase 4 misses: a link's new path, the whole
   module tree, chains across fork-only descendants (C05, C06, C07, C14; no
   level changes).**

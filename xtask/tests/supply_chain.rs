@@ -356,11 +356,15 @@ fn rpm_is_signed_on_tags_by_its_own_job() {
         "rpm-sign must not get an OIDC token"
     );
     let rpm_sign_text = job_text("rpm-sign");
+    // Lot 354 (pre-alpha checks, F1-2): SHA256SUMS signed too, and checked
+    // against the committed key, for a verification without gh.
     for needle in [
         "sign-rpm.sh sign",
         "sign-rpm.sh verify",
         "RPM-GPG-KEY-northnarrow.asc",
         "SHA256SUMS",
+        "sign-rpm.sh sign-sums \"$fpr\" dist/SHA256SUMS",
+        "sign-rpm.sh verify-sums \"$pub\" dist/SHA256SUMS",
     ] {
         assert!(
             rpm_sign_text.contains(needle),
@@ -395,6 +399,12 @@ fn rpm_is_signed_on_tags_by_its_own_job() {
         sign_if.contains("needs.rpm-sign.result == 'success'"),
         "on a tag, sign must require a successful rpm-sign, got `{sign_if}`"
     );
+    for job in ["sign", "publish"] {
+        assert!(
+            job_text(job).contains("a tag release without the signed SHA256SUMS"),
+            "{job} must refuse a tag release without SHA256SUMS.asc"
+        );
+    }
     assert!(
         job_text("package").contains("sign-rpm.sh selftest"),
         "the package job exercises the signing path on every run"

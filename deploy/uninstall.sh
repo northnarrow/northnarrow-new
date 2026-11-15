@@ -11,7 +11,7 @@
 #      wait until the agent's own programs (the ids it lists in
 #      /run/northnarrow/bpf-own-ids) are unloaded — anything still holding
 #      an fd keeps denying the unlinks below. Other products' BPF-LSM
-#      programs are not waited for (external audit DEP-006);
+#      programs are not waited for;
 #   3. lift chattr +i from the state directory (the agent sets it at boot);
 #   4. remove binaries, units, the journald namespace config, /run and the
 #      10 inert control-surface bait files;
@@ -21,8 +21,8 @@
 #      signed audit chain and the admin key are evidence and identity,
 #      an uninstall must not destroy them by default. --purge also
 #      removes the bootstrap admin private key install.sh wrote
-#      (/root/northnarrow-admin.key since external audit DEP-001; it used
-#      to live in /etc/northnarrow and went with it).
+#      (/root/northnarrow-admin.key; older releases kept it in
+#      /etc/northnarrow, which went with it).
 #
 # Usage:
 #   sudo ./deploy/uninstall.sh --grant-key KEY          # binaries + units, keep config/state
@@ -32,15 +32,14 @@
 #               the stop and the pin root's removal need while the hooks
 #               are attached. With both units stopped and the pin root of
 #               the last agent still protected, the installed agent is
-#               started for the window, then stopped again (external
-#               audit DEP-020)
-#   --yes       no confirmation prompt
+#               started for the window, then stopped again
+#   -y, --yes   no confirmation prompt
 #   --package   run from a package's post-removal hook: the package manager
 #               already removed binaries and units and the pre-removal hook
 #               stopped the agent; a pin root that is still protected is
 #               reported instead of failing the package operation
 #
-# Lot 341 (alpha 2/4): a WEDGED agent — its unit active but its admin socket
+# A WEDGED agent — its unit active but its admin socket
 # not answering, or an agent that does not come up for the window — cannot
 # open the trusted-installer window, and its hooks refuse the stop until the
 # next boot (bpffs does not survive one). The script then disables both
@@ -53,7 +52,7 @@
 # A unit that does not stop (no window on a protected host) stops the
 # script before anything is disabled or removed.
 #
-# Lot 351: a removal that leaves processes the agent contained (a held
+# Contained processes: a removal that leaves processes the agent contained (a held
 # blocked.scope or throttled.scope, a thawed blocked.scope/neutralize-*)
 # names them at the end and exits 4 — the removal is otherwise complete;
 # decide on each (kill it, or release it). With --package it names them

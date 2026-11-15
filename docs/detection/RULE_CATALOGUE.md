@@ -786,7 +786,7 @@ Systemd unit file dropped or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`
 
-**ATT&CK note.** /etc/systemd/user is watched but not among the rule's directories: a user unit there draws no verdict. A .timer here is recorded as this rule, which the engine evaluates before NN-L-FIM-023.
+**ATT&CK note.** /etc/systemd/user is watched but not among the rule's directories: a user unit there draws no verdict. A .timer here draws one record whose primary is NN-L-FIM-023 (it acts on the writer), this rule among its matches.
 
 ### NN-L-FIM-010_RansomwareExtensionRename
 
@@ -1078,7 +1078,7 @@ systemd timer unit created — category `fim_persistence`.
 
 **Known false positives.** Package transactions are recorded at Low, writes in an interactive sudo or su session at High.
 
-**How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`: one record naming NN-L-FIM-009 (primary: same severity and action, registered first) and this rule among its matches (lab PR 236, multi-match).
+**How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`, then remove it: one record naming this rule (primary: High, the KillProcess aimed at cp — what it would have done under `alpha`) with NN-L-FIM-009 among its matches (its own kill held), as the golden case `shadow-fim009-fim023-timer` shows (lab PR 236, multi-match).
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `crates/nn-core/src/decision/tests.rs::shadow_fim023_fires_with_fim009_on_a_timer`
 
@@ -1697,7 +1697,7 @@ Canary file access — category `canary_deception`.
 
 **Known false positives.** No workflow reads a decoy, but a program that reads whole trees (backup, anti-malware, indexer, sync: the built-in canary readers and the signed canary-readers.local) is recorded High, not killed (external audit DEC-005); every access after the first trip is a Low record (DEC-004).
 
-**How to test.** Deploy a File canary (`nn-admin canary deploy --name t --key <key> file --path /root/aws_keys_old.txt`) and `cat` it from a shell: the shell's tree is killed, the posture goes to COMBAT.
+**How to test.** Deploy a File canary (`nn-admin canary deploy --name t --key <key> file --path /root/aws_keys_old.txt`, with a key holding the `canary-manage` role, which the key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1) and `cat` it from a shell: the shell's tree is killed, the posture goes to COMBAT.
 
 **Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open`, `crates/nn-core/src/decision/rules/canary.rs::a_reader_of_whole_trees_is_recorded_not_killed`, `agent/tests/canary_privileged_e2e.rs::file_canary_open_triggers_canary_tripped_event_and_combat`
 
@@ -1719,7 +1719,7 @@ Canary process executed — category `canary_deception`.
 
 **Known false positives.** No workflow runs the decoy (operators use nn-admin); an exec after the first trip is a Low record (DEC-004).
 
-**How to test.** Deploy a Process canary (`nn-admin canary deploy --name t --key <key> process --path /usr/local/bin/sysadmin-helper --fake-arg0 helper`) and run it: the caller's tree is killed.
+**How to test.** Deploy a Process canary (`nn-admin canary deploy --name t --key <key> process --path /usr/local/bin/sysadmin-helper --fake-arg0 helper`, with a key holding the `canary-manage` role, which the key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1). The agent registers the path and creates no file: place the decoy there yourself (`sudo cp /bin/true /usr/local/bin/sysadmin-helper`), then run it: the caller's tree is killed. Without the file the run ends with "command not found" and no record.
 
 **Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec`, `agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat`
 
@@ -1741,7 +1741,7 @@ Canary network connect — category `canary_deception`.
 
 **Known false positives.** The operator's own scanner or monitoring check that probes the canary's port trips it; a deploy is refused when a listener on the host would receive the canary's connections. Every connect kills; a connection from another host is not seen.
 
-**How to test.** Deploy a Network canary (`nn-admin canary deploy --name t --key <key> network --bind-addr 127.0.0.1 --bind-port 4444`) and connect to it from a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).
+**How to test.** Deploy a Network canary (`nn-admin canary deploy --name t --key <key> network --bind-addr 127.0.0.1 --bind-port 4444`, with a key holding the `canary-manage` role, which the key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1) and connect to it from a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).
 
 **Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect`, `agent/src/canary/detector_tests.rs::a_network_canary_trip_draws_canary_003_on_the_connector`, `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector`
 
@@ -1763,7 +1763,7 @@ Canary credential read — category `canary_deception`.
 
 **Known false positives.** Legitimate cloud CLIs read the real credentials, not the decoy; a reader of whole trees is recorded High, not killed (DEC-005), and an access after the first trip is a Low record (DEC-004).
 
-**How to test.** Deploy a Credential canary (`nn-admin canary deploy --name t --key <key> credential --path /root/.aws/credentials.bak --cred-family aws`) and `grep -r AKIA /root` from a shell.
+**How to test.** Deploy a Credential canary (`nn-admin canary deploy --name t --key <key> credential --path /root/.aws/credentials.bak --cred-family aws`, with a key holding the `canary-manage` role, which the key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1) and `grep -r AKIA /root` from a shell.
 
 **Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read`, `crates/nn-core/src/decision/rules/canary.rs::a_later_access_to_a_tripped_canary_is_recorded_not_killed`
 

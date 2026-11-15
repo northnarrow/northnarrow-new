@@ -946,6 +946,79 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 354 (pre-alpha Phase 9, part 1): the docs match the code, the
+  operator's help, the protocol version.
+  - **README figures checked by a test.** `xtask/tests/readme_figures.rs`
+    counts from the code the rules (95: 87 in the engine, 8 outside it),
+    their strongest test (35 / 55 / 5), the ATT&CK mapping, the deny hooks
+    (22 mandatory, 6 optional), the eBPF programs (117, the 2 iterators
+    included), the test functions (a floor less than 200 under the count:
+    more than 5,500), the golden
+    cases (35 decision, 15 posture), the fuzz targets (14) and the Kani
+    proofs (4: the README said 11), and fails when the README states
+    another figure anywhere. GOLDEN_REPLAY.md §3 lists the 7 cases it
+    missed, and a test keeps both tables whole.
+  - **README claims.** Untrusted kernel modules and foreign BPF loads of the
+    nine refused types are **refused** (with the signed opt-outs
+    `--allow-bpf-tools` / `--allow-bpf-loader`), not "recorded, not
+    refused"; `prlimit`, scheduler, nice and I/O-priority starvation are
+    refused (the "not refused yet" lines were stale); the coexistence with
+    bpftrace, BCC, Falco and Tetragon stated as the code behaves.
+  - **The operator's help.** `nn-admin --help`, `install.sh --help` and
+    `uninstall.sh --help` name no lot, review, audit finding or design
+    section; every option has help (the shared `--socket`, `--agent-id-file`,
+    `--json`, `--key`, … from one table); `install.sh --help` lists its
+    package-hook options and its exit codes. `nn-admin canary deploy
+    process` says the decoy is the operator's to place (it said it
+    materialised one), `canary burn` that the decoy file stays. Ratchets:
+    `xtask/tests/operator_help.rs` and nn-admin's `help_text_tests`.
+    `docs/operator/NN_ADMIN.md`: every command (8 had no word in any
+    operator document), the roles, and every exit code of nn-admin,
+    install.sh, uninstall.sh and the agent.
+  - **`NO_COLOR`.** nn-admin's colours obey `NO_COLOR` (one helper); the
+    colour never carries the message alone; no tracked shell script prints a
+    colour. Ratchets over every binary's production code (a terminal check
+    only next to `NO_COLOR`, whatever its spelling; an escape sequence only
+    in nn-admin's helper; the daemons' log layer from `stdout_ansi`) and
+    every tracked shell script (`xtask/tests/operator_help.rs`).
+  - **`PROTOCOL_VERSION` 2.** The admin envelope's version marks the formats
+    changed since 1 (the status reply grew by appended fields), and a version
+    1 envelope is refused as unsupported (`OLDEST_PROTOCOL_VERSION`), not
+    misread. The live socket speaks bare frames: the version has no effect
+    on it today. Ratchet: `a_pinned_frame_changes_only_with_a_new_protocol_version`
+    fails when a frame pinned by `encoded_frames_are_pinned` changes while
+    the version stays, and `xtask/tests/protocol_history.rs` when a row of
+    its history is edited in place.
+  - **`install.sh` checks the signed checksums itself** (the review of
+    #562). With `SHA256SUMS.asc` next to `SHA256SUMS`, it verifies the
+    signature with `gpgv` against the tree's copy of the committed release
+    key (`mk-tarball.sh` ships it) and the fingerprint it pins, then reads
+    the tarball's checksum from that signed copy. On a host with no
+    attestation verifier (Ubuntu 24.04's gh 2.45) a release then installs
+    with no flag, recorded as a level of its own, `signed-checksums`
+    (`nn-admin host-check`: OK). A bad signature, a signature by another
+    key or a release key missing from the tree is refused whatever the
+    flags; a verifier that ran and refused is not overruled by the
+    signature. Tests with throwaway keys (`xtask/tests/install_scripts.rs`).
+  - **The install guide, as a tester uses it.** A verification without
+    `gh attestation` (the tag's SSH signature, then `SHA256SUMS.asc`, a new
+    OpenPGP signature of the checksums by the release key, checked against
+    the key committed at the tag); gh 2.49+ stated for the attestation; what
+    `--allow-unverified` means and when not to use it; the upgrade's
+    measured window without all LSM programs; the uninstall's exit codes; the
+    `.rpm` not lab-tested; the three SBOMs (not covering the eBPF crates); a
+    start refused for missing deny hooks leaves the attached ones pinned.
+  - **The upgrade's lines name the builds.** `install.sh --upgrade` printed
+    "0.0.1 → 0.0.1" between two builds of one version; each side now names
+    its build (the release's `git describe`, the agent binary's SHA-256).
+  - **The journal's effect of an absent optional kernel field** named the
+    DNS decoder for every field; it names the field's own effect now.
+  - **Lab suites** expect what the release's BPF guard does: a foreign
+    handle on the agent's maps refused as `bpf_handle` (C08, C35, C36, C43),
+    and the maps and programs read with bpftool inside a window (T0, T1,
+    S1, S7).
+  - **Drafts for testers** (until rc-final):
+    `docs/operator/KNOWN_LIMITATIONS.md`, `docs/operator/TESTING_THE_ALPHA.md`.
 - Lot 352 (pre-alpha Phase 4, detection efficacy): three documented cases
   that fired on no kernel.
   - **NN-L-FIM-002 — a hard link of a watched setuid binary into

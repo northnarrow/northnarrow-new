@@ -1695,6 +1695,13 @@ BPF_MODE=$(jentry northnarrow-agent "$PID" INFO "BPF self-defence: own objects r
     | grep -oE ' mode="(enforce|observe)"' | cut -d'"' -f2)
 BPF_MODE=${BPF_MODE:-enforce}
 if [[ "$BPF_MODE" == enforce ]]; then BPF_EXPECT=denied; else BPF_EXPECT=allowed; fi
+# Lot 354 (pre-alpha checks, Phase 3): in enforce, a foreign handle on the
+# agent's maps is refused when it is taken — by id or through its pin — and
+# signed as NN-L-AT-001 `deny=bpf_handle`, before any write could reach the
+# bpf_map check: the suite looked for NN-L-BPF-002 / `deny=bpf_map` and
+# reported a deviation where the defence held. Observing (a lab build), the
+# handle is taken and recorded as before.
+if [[ "$BPF_MODE" == enforce ]]; then BPF_MAP_EV="deny=bpf_handle"; else BPF_MAP_EV="NN-L-BPF-002|deny=bpf_map"; fi
 echo "agent pid $PID, kernel $(uname -r), bpf guard mode $BPF_MODE, $(date -u +%FT%TZ)" >&2
 
 # A signal from a root shell to the live agent or watchdog: the target is
@@ -1771,7 +1778,7 @@ run_case C06 "unlink the agent unit (systemctl mask)" denied "deny=unlink" 0 -- 
 selected C07 && pin_list > "$SCRATCH/pins.before"
 POST=$(post post_pins_kept "$SCRATCH/pins.before") \
 run_case C07 "rm -rf the bpffs pin root" denied "deny=unlink" 0 -- bash -c "rm -rf $PINS"
-run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
+run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "$BPF_MAP_EV" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
 # Lot 273b: where the update went through (a lab build's BPF guard only
 # observes), PID 1 is now in the agent's family — every later case of
 # systemd's (C12's set-property) would be let through: take it out again
@@ -3301,15 +3308,15 @@ elif [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC
         # our own child, still unreaped; signalled only if it is still that process
         nnpy signal "$FRESH" northnarrow-age "${FRESH_START:-0}" TERM >/dev/null 2>&1; wait "$FRESH" 2>/dev/null
     fi
-    run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
-    run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
+    run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "$BPF_MAP_EV" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
+    run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "$BPF_MAP_EV" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
     run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
     # External audit ATP-013: the twelve ring buffers and RING_DROPS left
     # the eBPF object before the guard listed the agent's maps; by id, a
     # foreign root process got a writable handle on each. Lab PR 215: the
     # deny hooks' fail-open counters (DENY_FAIL_OPEN) leave it the same way
     # and are asked for too: zeroing them would hide a fail-open.
-    run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
+    run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "$BPF_MAP_EV" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
     skipped_case C34,C35,C36,C37,C43 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
 fi
