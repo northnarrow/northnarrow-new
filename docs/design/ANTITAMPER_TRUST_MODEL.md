@@ -2865,6 +2865,127 @@ Now:
 and 26.04: a bind of a copy over `/etc` after the key load is signed within
 one integrity round (`integrity_drift` `mount_over_protected`, the mount
 and each protected path it hides), in the real chain (the agent writes to
-the log it anchored). No `sb_mount`/`move_mount` hook (CM-12): a refusal of
-a mount over `/etc` would have to tell systemd's and the container
-runtimes' own mounts apart, and the record exists.
+the log it anchored). Lot 357 refuses it in the host's namespace (the
+mount guard, below): `/etc` is a directory above the agent's
+configuration, and systemd's and the container runtimes' own mounts are
+told apart by namespace and by the kernel's canonical points, not by
+path.
+
+## Lot 357 — a mount on, over or below the paths the agent depends on is refused
+
+Four review rounds of lot 353 (#563) kept finding one more by-path read
+that a FUSE or a tmpfs mounted by root over `/proc`, `/sys`, the cgroup
+root, `/etc/northnarrow` or `/run/northnarrow` could stall or blind. Each
+site was bounded in turn; the class stayed open, because the mount itself
+was let through (CM-12, "recorded, not refused"). The mount guard closes it
+where it starts.
+
+### Mechanism
+
+- **Four BPF-LSM hooks** (`agent-ebpf/src/mount_guard.rs`): `sb_mount`
+  (`mount(2)`: a new mount, a bind, a move), `move_mount` (the new mount
+  API: `fsmount` or `open_tree`, then `move_mount`, which util-linux 2.39
+  and later uses for every mount), `sb_umount` and `sb_pivotroot`. The
+  decision is one function, `common::mount_guard::decide`, that the
+  programs call with what they read from the kernel and the host's tests
+  judge.
+- **Scope: PID 1's mount namespace, and any other whose change reaches
+  it**, for a caller with `CAP_SYS_ADMIN` in PID 1's user namespace. A raw
+  `unshare(CLONE_NEWNS)` keeps the shared peer groups, and the kernel copies
+  a mount made on a shared peer to the others with no other LSM call: a
+  mount over `/run/northnarrow` made in such a child landed in the host's
+  view. So in another namespace the operation is judged as it would be in
+  the host's when the mount it changes (the target's mount; for an unmount
+  its parent) has a peer in PID 1's namespace, or a slave there of it or
+  of a peer (`mnt_share`, `mnt_slave_list`: four peers and two slaves each
+  read; more is taken as reaching it). A container (private), `unshare -m`
+  (util-linux makes it private), a unit's sandbox (systemd makes it a
+  slave) reach nothing and are untouched — the agent's own unit binds its
+  directories onto themselves there (`ReadWritePaths=`), which an identity
+  rule in every namespace would have refused. An unprivileged call is the
+  kernel's own `EPERM` and leaves no record. The namespaces are PID 1's
+  (`/proc/1/ns/mnt`, `/proc/1/ns/user`), written before the hooks attach.
+- **The target as the kernel resolved it**, never the caller's string: the
+  `struct path` the hook receives, the mounts stacked there (a target that
+  is a mount's root is a mount over that mount; the guard steps down to the
+  directory below, at most three mounts), the dentries' names up to their
+  file system's root, the file systems' magic.
+- **The protected points** (`nn_linux::anti_tamper::mount_guard::
+  protected_points`), by device and inode in PID 1's root, in the pinned
+  `MOUNT_PROTECTED` map:
+  - the kernel views `/proc`, `/sys`, `/sys/fs/cgroup` (and a hybrid
+    host's `unified`), `/sys/fs/bpf` — each checked to be its own file
+    system first — refused on, and below them every mount but the kernel's
+    own (`common::mount_guard::ALLOWED_KERNEL_MOUNTS`: binfmt_misc and
+    systemd's autofs for it, nfsd, xenfs, debugfs, tracefs, securityfs,
+    configfs, fusectl, pstore, efivarfs, a bpffs at `/sys/fs/bpf`,
+    selinuxfs, smackfs, resctrl, a hybrid host's cgroup hierarchies — by
+    type, by the view's file system, by the names of the point up to its
+    root, and by the one mount it may stack on); a dentry of proc, sysfs,
+    cgroup2, a bpffs, or of the kernel's file systems the agent reads below
+    `/sys` (tracefs: the tracepoint formats; debugfs: the kprobes switch;
+    securityfs: the lockdown state) is below a view at any depth, by its
+    magic;
+  - the agent's own directories (`/etc/northnarrow`, `/var/lib/northnarrow`,
+    `/run/northnarrow`, the pin root, the units' drop-in directories):
+    refused on and anywhere below, within six levels (nothing of theirs
+    lies deeper: no one else may add an entry to them);
+  - the binaries and units, and every directory above any protected point
+    (`/`, `/etc`, `/var`, `/var/lib`, `/run`, `/usr`, `/usr/local/bin`…):
+    refused on — a tmpfs over `/var/lib` or an overlay over `/etc` hides
+    the agent's directories as surely;
+  - every one of their mounts held: no unmount (lazy or not), no move
+    away by `move_mount(2)`.
+- **A move through `mount(2)`'s `MS_MOVE`** names its source by a string the
+  kernel resolves after the hook: in the host's namespace it is refused,
+  whatever it moves. `move_mount(2)` names the mount, and is judged by it.
+- **`pivot_root(2)`** in the host's namespace is refused.
+- **Let through:** a remount and a change of propagation (they cover
+  nothing; `systemd` makes `/` shared at every boot); an unmount by PID 1
+  (systemd-shutdown's last pass, after the agent has stopped); everything
+  inside the signed trusted-installer window, recorded when it is what the
+  guard refuses outside one (`FS_OP_MOUNT_WINDOW`, NN-L-AT-001 Low).
+- **The record:** a refusal is `FS_OP_MOUNT` (NN-L-AT-001 High, decisive),
+  signed at each attempt within the attempt budget: the operation, the
+  reason, the view, the mounts covered, the target by device and inode.
+- **Fail-safe:** a kernel without one of the hooks or the offsets they read
+  (five new optional ones: `path.mnt`, `vfsmount.mnt_root`, `mount.mnt`,
+  `mount.mnt_parent`, `mount.mnt_mountpoint`), PID 1's namespaces
+  unreadable, a load or attach that fails: what is not attached is a
+  signed degradation and the start goes on. The by-path defences of lot 353
+  (the anchored views, the bounded readers) and the signed mount watch
+  (`mount_over_protected`) remain under the guard, not instead of it. A
+  read that fails in a hook lets the operation through, counted
+  (`DENY_FAIL_OPEN` slots 29–32).
+
+- **`mount_setattr(2)`** has no LSM hook, and `do_mount_setattr` (the one
+  function with the resolved path) is inlined on 5.15 and 6.18: no `fentry`
+  either. It covers nothing — read-only makes the agent's writes there fail
+  (each a signed degradation; the agent's own namespace keeps its copies'
+  flags), and a propagation change is what the guard follows whatever its
+  origin. The change itself is signed: the integrity round compares the
+  options and propagation of every mount a watched path resolves through
+  with the first it saw (`mount_attrs_changed`, High, within one round;
+  `crate::mount_attrs`). A lazy unmount (`MNT_DETACH`) goes through
+  `sb_umount` like any other.
+
+### Residual
+
+- A slave of a slave (a host mount two masters away from a child's peer
+  group) is not read; four peers and two slaves each are, more is taken
+  as reaching the host.
+- `mount_setattr(2)` is observed (≤ one integrity round), not refused; a
+  remount read-only of a protected file system (`MS_REMOUNT`) is a denial
+  of service, not a view, and is let through.
+- An old-API bind's source is not judged (where it lands is).
+- Mounts made before the agent's start (or inside a window) are the
+  start's check (`mounts_over`) and the watch's.
+- No boot self-test: the agent holds no `CAP_SYS_ADMIN`, so its own attempt
+  is outside the guard's scope; the lab proves the hooks.
+- Behaviour an operator meets: `mount --move` in the host's namespace on
+  util-linux before 2.39 (Ubuntu 22.04) is refused; a runtime
+  `systemd-sysext`/`systemd-confext refresh` (an overlay over `/usr` or
+  `/etc`) is refused outside a window; a separate `/var`'s mount unit
+  cannot unmount it at shutdown (systemd-shutdown's own pass, PID 1,
+  does).
+

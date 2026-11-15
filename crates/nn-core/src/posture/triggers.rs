@@ -861,6 +861,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // one (let through, held: the review of #558, F1).
             // The review of #565 (F2): nor any sole trace — the round's
             // summary of the findings its quota held back included.
+            // Lot 357: nor a mount the signed window let through.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -875,6 +876,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfBaseline
                     | nn_model::FsProtectOperation::CpuConfined
                     | nn_model::FsProtectOperation::BpfHeldLoad
+                    | nn_model::FsProtectOperation::MountWindow
             ) && !operation.is_sole_trace()
             {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
@@ -3259,8 +3261,10 @@ mod tests {
         // lot 349: the agent's own CPU watch's record, one more; the review
         // of #558 (F1): a held program's load and its refused uses, two more;
         // lot 356: the held load and the kernel-state round's five findings
-        // are sole traces; the review of #565 (F2): and the round's summary
-        assert_eq!((minor, sole), (17, 7));
+        // are sole traces; the review of #565 (F2): and the round's summary;
+        // lot 357: a mount the window let through, one more minor (the
+        // refused mount is decisive)
+        assert_eq!((minor, sole), (18, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3282,6 +3286,8 @@ mod tests {
             w::FS_OP_RLIMIT,
             w::FS_OP_OOM_ADJ,
             w::FS_OP_CGROUP_MOVE,
+            // lot 357: a mount refused over the agent's paths
+            w::FS_OP_MOUNT,
         ] {
             assert!(!w::is_minor_denial(decisive), "{decisive}");
         }
@@ -3294,6 +3300,7 @@ mod tests {
             w::FS_OP_SYSCTL,
             w::FS_OP_CGROUP_JOIN,
             w::FS_OP_BPF_HELD_USE,
+            w::FS_OP_MOUNT_WINDOW,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }

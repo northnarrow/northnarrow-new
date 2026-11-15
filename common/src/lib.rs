@@ -59,6 +59,7 @@ pub mod fork_record;
 /// letters and meanings are).
 pub mod kernel_taint;
 pub mod module_judge;
+pub mod mount_guard;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 pub mod sysctl_judge;

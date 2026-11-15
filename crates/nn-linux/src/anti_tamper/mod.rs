@@ -50,6 +50,7 @@ pub use nn_core::anti_tamper::combat_allow;
 /// Lab PR 215: the deny hooks' fail-open counters (`DENY_FAIL_OPEN`).
 pub mod fail_open;
 pub mod filesystem;
+pub mod mount_guard;
 pub mod network_isolate;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
@@ -554,6 +555,14 @@ fn attach_reporting(
             cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
         ));
     }
+
+    // Lot 357: the mount guard — a mount on, over or below the paths the
+    // agent depends on, refused in PID 1's mount namespace. Not a deny hook
+    // of the count: a kernel without it (or part of it) signs the guard's
+    // absence and the start goes on; the by-path defences remain.
+    report
+        .degraded
+        .extend(mount_guard::attach(ebpf, &btf, pin_root).degraded);
 
     // Lot 277: the start-in-cgroup tracker (the per-rule policy's
     // exemptions by cgroup or unit hold for processes started in their

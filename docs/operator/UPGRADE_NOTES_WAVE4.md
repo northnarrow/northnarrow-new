@@ -2966,3 +2966,60 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 | `bpf_held_load` (and its outliving; a held program found unseen or in the baseline) | no | **yes**: the only record of a program that can signal the agent | sole trace, never under the round's quota |
 | `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined` | no (found by the kernel-state round) | **yes**: the only record of foreign kernel code, a program the agent never saw, the agent confined | sole trace, 32 a kind a round by name, the most dangerous first; the rest carried to the next rounds |
 | `sole_trace_summary` | no (the round's findings past its quota) | **yes**: the only signed count of those findings, naming each kind's highest-ranked, first and last | sole trace, one a round |
+
+## 51. A mount on, over or below the agent's paths is refused (lot 357)
+
+- **What changes.** In PID 1's mount namespace, for root (`CAP_SYS_ADMIN`
+  in PID 1's user namespace), the agent's kernel hooks now refuse
+  (`EPERM`, signed High: NN-L-AT-001, operation `mount`):
+  - a mount on or over `/proc`, `/sys`, `/sys/fs/cgroup`, `/sys/fs/bpf`,
+    `/etc/northnarrow`, `/var/lib/northnarrow`, `/run/northnarrow`, the
+    agent's pin directory, its binaries, its units and their drop-in
+    directories, and every directory above them (`/`, `/etc`, `/var`,
+    `/var/lib`, `/run`, `/usr`, `/usr/local/bin`…);
+  - a mount anywhere below the agent's own directories;
+  - a mount below `/proc`, `/sys`, the cgroup root or the bpffs that is not
+    one of the kernel's own pseudo-filesystems at its usual point
+    (binfmt_misc and systemd's automount for it, nfsd, xenfs, debugfs,
+    tracefs, securityfs, configfs, fusectl, pstore, efivarfs, bpffs,
+    selinuxfs, smackfs, resctrl, a hybrid host's cgroup hierarchies), and
+    any mount inside the tracefs, the debugfs or the securityfs —
+    `/proc/<pid>/…` (a tmpfs over `/proc/<agent>/fd` fed the agent false
+    facts) and a cgroup directory are never one;
+  - an unmount (lazy too) or a move of one of those mounts, a move through
+    `mount(2)`'s `MS_MOVE`, `pivot_root`.
+- **Also from another mount namespace whose change reaches the host's**
+  (a raw `unshare(CLONE_NEWNS)` keeps the shared peer groups: a mount there
+  is copied into the host's view): judged as in the host's. A container,
+  `unshare -m` and a unit's sandbox are private or slaves: untouched.
+- **`mount_setattr(2)`** (read-only, propagation) has no kernel hook: not
+  refused, signed High (`integrity_drift` `mount_attrs_changed`) within one
+  integrity round when it changes a mount that holds the agent's paths. A
+  write the agent can no longer make there is already a signed degradation
+  (lot 353).
+- **What does not change.** Containers, `unshare -m`, systemd's sandboxes
+  of its units, snapd's and the container runtimes' mounts elsewhere
+  (`/var/lib/docker`, `/snap`, `/run/netns`, `/run/user`…) are not judged;
+  nor are remounts, propagation changes, PID 1's unmounts (the last pass of
+  a shutdown) or an unprivileged caller's mount (the kernel refuses it).
+  The mount watch (`integrity_drift` `mount_over_protected`) stays: it
+  signs a mount the guard does not see (one propagated from another
+  namespace, one on a kernel without the guard).
+- **For you.**
+  - To mount, unmount or move one of these on purpose (a maintenance step,
+    `systemd-sysext refresh` or `systemd-confext refresh` at run time),
+    open a trusted-installer window: inside it the guard lets everything
+    through and records what it let through (operation `mount_window`,
+    Low).
+  - On Ubuntu 22.04 (util-linux 2.37), `mount --move` in the host's
+    namespace is refused: `mount(2)` names the moved mount by a string the
+    hook cannot resolve. From util-linux 2.39 (Ubuntu 24.04, Debian 13)
+    `mount --move` uses `move_mount(2)` and only a protected mount is
+    refused.
+  - A separate `/var` (or `/usr`) partition: its mount unit cannot unmount
+    it at shutdown (refused, the unit is marked failed); systemd-shutdown's
+    own pass (PID 1) unmounts or remounts it read-only as before.
+  - A kernel without the hooks (`sb_mount`, `move_mount`, `sb_umount`,
+    `sb_pivotroot`) or the offsets they read: the start signs
+    `mount guard not attached` (a degradation, not a refused start) and the
+    mount watch alone records such mounts.

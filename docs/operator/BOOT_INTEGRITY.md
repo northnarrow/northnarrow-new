@@ -317,7 +317,7 @@ What these checks close, and what they do not:
   identity was there: it looks like a first install); the bpffs itself
   unmounted (`umount -l /sys/fs/bpf`) and a fresh one mounted in its
   place, which puts the pins out of the start's reach as a reboot does
-  (no deny hook covers `mount(2)` or `umount(2)` yet: CM-12); the chains
+  (lot 357: the mount guard now refuses both in the host's namespace); the chains
   other than the audit log moved away on a restart (not refused: signed
   by the boot's chain check against the head anchor); the copies'
   exemption in the lab builds; a mount laid after the start's one load

@@ -6,6 +6,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 357 (pre-alpha): the **mount guard** — a mount on, over or below the
+  paths the agent depends on is refused in PID 1's mount namespace
+  (`agent-ebpf/src/mount_guard.rs`, the decision in
+  `common::mount_guard`, `UPGRADE_NOTES_WAVE4.md` §51). Four review rounds
+  of lot 353 kept finding one more by-path read a root FUSE or tmpfs could
+  stall or blind; the mount itself is now refused.
+  - **Hooks:** `sb_mount` (a new mount, a bind, a move), `move_mount` (the
+    new mount API, util-linux 2.39+), `sb_umount`, `sb_pivotroot`, each
+    reading the target as the kernel resolved it (the dentry, the mounts
+    stacked there, the names up to the file system's root), never the
+    caller's string.
+  - **Refused, signed High (`FS_OP_MOUNT`, NN-L-AT-001):** a mount on or
+    over `/proc`, `/sys`, the cgroup root, `/sys/fs/bpf`, the agent's
+    directories, binaries, units and every directory above them; anywhere
+    below the agent's directories; below a view unless it is the kernel's
+    own pseudo-filesystem at its canonical point (binfmt_misc and its
+    autofs, nfsd, xenfs, debugfs, tracefs, securityfs, configfs, fusectl,
+    pstore, efivarfs, bpffs, selinuxfs, smackfs, resctrl, a hybrid host's
+    cgroup hierarchies — by type, point and what it covers); inside the
+    tracefs, debugfs or securityfs; an unmount or
+    move of their mounts; an old-API `MS_MOVE`; `pivot_root`.
+  - **Propagation:** in another mount namespace, what reaches PID 1's (the
+    target's mount a peer of a host mount, or a master of one: a raw
+    `unshare(CLONE_NEWNS)`) is judged as in the host's.
+  - **`mount_setattr(2)`** (no kernel hook) is signed High by the integrity
+    round when a mount that holds the agent's paths changes its options or
+    propagation (`mount_attrs_changed`).
+  - **Untouched:** every other mount namespace (containers, `unshare -m`,
+    units' sandboxes), unprivileged callers, remounts and propagation
+    changes, PID 1's unmounts; the signed trusted-installer window lets
+    everything through and records what it let through
+    (`FS_OP_MOUNT_WINDOW`, Low).
+  - **Fail-safe:** a kernel without the hooks or the five new optional
+    offsets (`path.mnt`, `vfsmount.mnt_root`, `mount.mnt`, `.mnt_parent`,
+    `.mnt_mountpoint`) signs the guard's absence; the start goes on and the
+    by-path defences remain. Fail-open slots 29–32.
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

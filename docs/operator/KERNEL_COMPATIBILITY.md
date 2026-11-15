@@ -1240,6 +1240,79 @@ unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`.
   the same loop of refused creates: 264,890 records held back, 0 lost by
   the ring or the task denials' budget, the ptrace's recorded.
 
+## The mount guard (lot 357)
+
+**What it needs.** The LSM hooks `sb_mount`, `move_mount` (5.2+),
+`sb_umount` and `sb_pivotroot`, in the BPF LSM since 5.7, their arguments
+checked at boot (`HOOK_ARG_CHECKS`); five optional offsets resolved from
+the kernel's BTF (`path.mnt`, `vfsmount.mnt_root`, `mount.mnt`,
+`mount.mnt_parent`, `mount.mnt_mountpoint`), and the namespace and
+credential offsets the agent already resolves. Not a deny hook of the
+count: where a hook is absent, an offset unknown or a program refused by
+the verifier, that part of the guard is not attached, the boot signs the
+degradation and the start goes on (the by-path defences and the signed
+mount watch remain).
+
+**The verifier.** A first shape — every offset read through the runtime
+map inside the walks — needed more than the 5.15 verifier's million
+instructions for `mount_guard_sb_mount` and `mount_guard_move_mount`
+(both refused on 5.15.0-202; the agent started, signed the two hooks
+missing and kept `sb_umount` and `sb_pivotroot`: the fail-safe, measured).
+Then the propagation walk took the hooks' frames past 5.15's 512 bytes
+across their calls. Now: the offsets are read once per run into a map
+slot (not the stack), the dentry and mount reads are branch-free, the
+names are compared by length and hash, a bind and a move made elsewhere
+take the same decision shape as a mount of an unknown type, and the reach
+is one boolean with early returns.
+
+**`mount_setattr(2)`.** No LSM hook, and `do_mount_setattr` (the one
+function with the resolved path) is inlined on 5.15.0-203 and 6.18 (absent
+from their BTF and kallsyms): no `fentry` either. The integrity round
+signs its effect instead (`mount_attrs_changed`).
+
+**As measured** (our lab guests, lot 357, the lot's tree, the agent
+installed as an operator with the alpha profile):
+- **Ubuntu 26.04** (`7.0.0-43-generic`, util-linux 2.41): `verifier-check`
+  121 programs, 116 OK, 5 not counted, 0 failing — `mount_guard_move_mount`
+  476,453 processed (47.6 %, the object's highest), `mount_guard_sb_mount`
+  141,252, `sb_umount` 7,426, `sb_pivotroot` 3,647; stack 384 of 512. The
+  probe: 40 refused cases in the host's namespace and 5 from another one
+  (`unshare -m --propagation unchanged`, a raw `CLONE_NEWNS` over
+  `/etc/northnarrow`, `/proc` and below `/var/lib/northnarrow`, a child
+  whose mounts the host was made a slave of by `mount_setattr`) — each
+  `EPERM`, no mount, one High record; the 20 allowed cases without a record
+  (the kernel's fusectl, configfs and binfmt_misc mounted again,
+  `unshare -m`, a unit's sandbox, `systemd-nspawn`, `podman run` with and
+  without a network, snapd, an unprivileged call, a mount below
+  `/run/northnarrow` in a private namespace); the window's mount let
+  through with one Low record; a read-only bpffs and a `/` made a slave by
+  `mount_setattr` each a `mount_attrs_changed` High; the agent active
+  throughout. A cold boot: agent and watchdog active, the guard's four
+  links pinned, no guard record since the boot, both at once and 30 s
+  later.
+- **Ubuntu 22.04** (`5.15.0-203-generic`, util-linux 2.37: `mount` uses
+  `mount(2)`; the new-API cases by syscall): `verifier-check` 121 programs,
+  114 OK, 7 not counted, 0 failing — `mount_guard_move_mount` 523,420
+  processed (52.3 %), `mount_guard_sb_mount` 323,812, `sb_umount` 9,671,
+  `sb_pivotroot` 4,711; stack 384 of 512; the object's highest
+  `module_read_file_observe` 551,900 (55.2 %). The same probe: 40 refused
+  in the host's namespace and 5 from another one, each `EPERM`, no mount,
+  one High; the 20 allowed cases without a record (`systemd-nspawn` and
+  `podman` installed for the round and purged after it); the window's
+  mount Low; `mount_attrs_changed` High for the read-only bpffs and the
+  slave `/`; a cold boot without a guard record, the four links pinned.
+- **Ubuntu 24.04** (`6.8.0-149-generic`, util-linux 2.39: `mount` uses the
+  new API, `move_mount`): `verifier-check` 121 programs, 118 OK, 3 not
+  counted, 0 failing — `mount_guard_move_mount` 286,061 (28.6 %, the
+  object's highest), `mount_guard_sb_mount` 89,771, `sb_umount` 8,019,
+  `sb_pivotroot` 3,982. The probe with #563's re-check 4 cases added (a
+  tmpfs over `/proc/<pid>/fd` and over `/proc/self`, a FUSE over
+  `/sys/fs/cgroup/system.slice`; tracefs unmounted and mounted again): 43
+  refused in the host's namespace and 5 from another one, each `EPERM`, no
+  mount, one High; the 22 allowed cases without a record (the window's
+  mount Low); `mount_attrs_changed` High for the read-only bpffs and the
+  slave `/`.
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest

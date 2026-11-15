@@ -759,6 +759,9 @@ enum MountSource {
 pub struct MountWatch {
     source: Option<MountSource>,
     chains: BTreeMap<String, Vec<Mount>>,
+    /// Lot 357: the attributes of the mounts the watched paths resolve
+    /// through ([`crate::mount_attrs`]).
+    attrs: crate::mount_attrs::AttrWatch,
 }
 
 /// One round of the mount check. `primary` is [`MOUNTINFO_HOST`]; when it
@@ -808,6 +811,7 @@ pub fn mount_round<T: AsRef<[u8]>>(
         }
         watch.source = Some(source);
         watch.chains.clear();
+        watch.attrs = Default::default();
     }
     for p in &watched {
         // A chain not resolved yet (no root mount in an odd read) is taken
@@ -823,6 +827,27 @@ pub fn mount_round<T: AsRef<[u8]>>(
     };
     let mut out = mounts_over_protected(&mounts, own_files, &sandbox);
     out.extend(malformed_over_protected(text.as_ref(), own_files));
+    // Lot 357 (the coordinator's mount_setattr point): a mount a watched
+    // path resolves through made read-only, or its propagation changed —
+    // no LSM hook refuses `mount_setattr(2)`; signed High
+    let ids: std::collections::BTreeSet<u64> = watched
+        .iter()
+        .flat_map(|p| mount_chain(&mounts, p).into_iter().map(|m| m.id))
+        .collect();
+    out.extend(
+        watch
+            .attrs
+            .round(text.as_ref(), &ids)
+            .into_iter()
+            .map(|(mp, what)| Finding {
+                kind: "mount_attrs_changed",
+                detail: format!(
+                    "{mp}: {what} since the agent started — a mount that holds the agent's \
+                     paths (read-only: its writes there fail; propagation: what lets a mount made \
+                     in another namespace reach the host's view, which the mount guard follows)"
+                ),
+            }),
+    );
     out.extend(hidden_by_mounts(
         &mounts,
         &watched,
@@ -1868,7 +1893,7 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
-        if f.kind == "own_dropin_weakening" {
+        if f.kind == "own_dropin_weakening" || f.kind == "mount_attrs_changed" {
             extra["severity"] = "high".into();
         }
         if reappeared > 0 {

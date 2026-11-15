@@ -11305,6 +11305,55 @@ number in parentheses is a lab PR.
     rank is its type's.
   - Levels unchanged: C23 keeps its level (a record made reliable; no new
     defence).
+- **Lot 357 — a mount on, over or below the paths the agent depends on is
+  refused (pre-alpha; C23; no level change).**
+  - What was open: four review rounds of #563 kept finding one more by-path
+    read that a root FUSE or tmpfs over `/proc`, `/sys`, the cgroup root,
+    `/etc/northnarrow` or `/run/northnarrow` could stall or blind (CM-12:
+    mounts were recorded, not refused).
+  - Done: the mount guard (`agent-ebpf/src/mount_guard.rs`, the decision in
+    `common::mount_guard`, the points in
+    `nn_linux::anti_tamper::mount_guard`): BPF-LSM `sb_mount`, `move_mount`,
+    `sb_umount`, `sb_pivotroot`, judging the target by its dentry and mount;
+    in PID 1's mount namespace and in any other whose change reaches it
+    (peers, slaves: the coordinator's propagation point); the protected
+    points and every directory above them by kernel identity (the
+    ancestors point); the kernel's own pseudo-filesystems below the views
+    allowed by type, point and what they cover; the window lets through,
+    recorded Low; a kernel without it signs the degradation.
+    `mount_setattr(2)` (no hook, `do_mount_setattr` inlined) is signed by
+    the integrity round (`mount_attrs_changed`). Defence in depth (#563's
+    re-check 3, R3-1 to R3-3, and its `trusted_exe` / host-file checks on a
+    bounded reader): on #563's code, with it. Mutation: 40 mutants of the
+    decision and the points (38 caught by a named test, two tests added for
+    the first survivors; one equivalent: an unread type never matches),
+    9 of the propagation decision (9 caught).
+  - Lab (as measured, our own guests, the lot's tree, the agent installed as
+    an operator, the alpha profile): ubuntu2604 (7.0.0-43) 40 refused cases
+    in the host's namespace and 5 from another one, each `EPERM`, no mount,
+    one High; 20 allowed cases (the kernel's own remounts of fusectl,
+    configfs, binfmt_misc; `unshare -m`; a unit's sandbox; systemd-nspawn;
+    podman; snapd; an unprivileged call; a private namespace) without a
+    record; `verifier-check` 116 OK, 0 failing, highest
+    `mount_guard_move_mount` 476,453 (47.6 %); a cold boot without a guard
+    record. ubuntu2204 (5.15.0-203, util-linux 2.37): the same, 40 and 5
+    refused, 20 allowed without a record; `verifier-check` 114 OK, 0
+    failing, `mount_guard_move_mount` 523,420 (52.3 %), the object's
+    highest `module_read_file_observe` 551,900. ubuntu2404 (6.8.0-149,
+    util-linux 2.39): with #563's re-check 4 cases (a tmpfs over
+    `/proc/<pid>/fd` and `/proc/self`, a FUSE over a cgroup directory),
+    43 and 5 refused, 22 allowed without a record; `verifier-check` 118 OK,
+    0 failing, highest `mount_guard_move_mount` 286,061 (28.6 %). Each
+    round: `systemd-nspawn` and `podman` installed for it and purged after
+    it, a read-only bpffs and a `/` made a slave by `mount_setattr` each a
+    `mount_attrs_changed` High, a cold boot without a guard record. First rounds, before the fixes:
+    on 5.15 the first shape was refused by the verifier (the fail-safe
+    measured: two hooks signed missing, the start went on), and
+    systemd-nspawn's binds below its own `/proc` were refused (its peer
+    group larger than the walk reads) until a container's own proc stopped
+    counting as the host's view.
+  - Not covered in a guest: a kernel without `move_mount` (all supported
+    kernels have it); a slave of a slave of a child's peer group.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

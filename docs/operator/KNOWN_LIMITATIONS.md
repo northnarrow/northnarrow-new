@@ -145,12 +145,20 @@ analysis is in the
   tracing programs (for BCC that is any root Python script), and a tracing
   program can read the memory of every process, the agent's keys included.
   *For you:* use the opt-out on a test VM only.
-- **Mounts are recorded, not refused.** A mount over the agent's
-  configuration, state, unit or binary directories is not refused:
-  refusing it would also break
-  the mounts of systemd and container runtimes. It is a signed
-  `integrity_drift` (`mount_over_protected`) within one integrity round
-  (about 30 s).
+- **Mounts are refused in the host's namespace only.** A mount on, over or
+  below the agent's directories, binaries, units, `/proc`, `/sys`, the
+  cgroup root or the bpffs is refused in PID 1's mount namespace (lot 357,
+  the mount guard), and so are an unmount or a move of their mounts and
+  `pivot_root` — and so is one made in another namespace that propagates
+  into the host's (a raw `unshare(CLONE_NEWNS)`, a container's `rshared`
+  bind of a host directory). `mount_setattr(2)` (read-only, propagation)
+  has no kernel hook: it is not refused, it is a signed `integrity_drift`
+  (`mount_attrs_changed`, High) within one integrity round (about 30 s), as
+  is any mount on a kernel where the guard is not attached (a signed
+  degradation). *For you:* on Ubuntu 22.04,
+  `mount --move` in the host's namespace is refused (util-linux 2.37 names
+  the source by a string only); a runtime `systemd-sysext refresh` or
+  `systemd-confext refresh` needs a trusted-installer window.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is

@@ -447,6 +447,24 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::SoleTraceSummary => {
                 return Some(sole_trace_summary_verdict(self, event, *target_dev, *target_ino));
             }
+            // Lot 357: the mount guard, in PID 1's mount namespace.
+            FsProtectOperation::Mount => mount_text(*target_dev, *target_ino),
+            FsProtectOperation::MountWindow => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) made {}, which the mount guard refuses outside a \
+                     trusted-installer window; the signed window let it through (recorded, not \
+                     refused). Check that the installer or the operator meant it: a mount there \
+                     hides what the agent reads by path.",
+                    mount_text(*target_dev, *target_ino)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -461,6 +479,30 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 357: a mount guard record's words — the operation, why it is
+/// refused, the view and the mounts covered, the target by device and
+/// inode (`common::mount_guard::record_of`).
+fn mount_text(target_dev: u64, target_ino: u64) -> String {
+    use common::mount_guard::{op_name, reach_name, reach_of, record_of, view_name, why_name};
+    let (dev, op, why, view, stack) = record_of(target_dev);
+    let reach = reach_name(reach_of(target_dev));
+    let view = match view_name(view) {
+        "" => String::new(),
+        v => format!(", in {v}"),
+    };
+    let stacked = match stack {
+        0 => String::new(),
+        1 => ", stacked over one mount".to_string(),
+        n => format!(", stacked over {n} mounts"),
+    };
+    format!(
+        "a {} ({reach}) — {}{view}{stacked} (target inode {dev}:{target_ino}); such a mount \
+         would hide or stall what the agent reads by path",
+        op_name(op),
+        why_name(why)
+    )
 }
 
 /// The review of #565 (F2): one kernel-state round's findings past its
@@ -1011,6 +1053,41 @@ mod tests {
             operation: op,
             timestamp_ns: 1,
         }
+    }
+
+    /// Lot 357: a refused mount names the operation, the reason, the view
+    /// and the target; High. The same mount let through by the window is
+    /// Low, never a refusal.
+    #[test]
+    fn a_refused_mount_names_what_it_would_have_hidden() {
+        use common::mount_guard::{
+            record_dev, MG_OP_MOUNT, MG_OP_UMOUNT, MG_WHY_BELOW_VIEW, MG_WHY_UMOUNT,
+        };
+        let mut e = denial(FsProtectOperation::Mount);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x803, MG_OP_MOUNT, MG_WHY_BELOW_VIEW, 1, 1);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        for words in [
+            "`bash` attempted a mount(2) of a new file system (made in PID 1's mount namespace)",
+            "below a kernel view",
+            "in /proc",
+            "stacked over one mount",
+            "target inode 2051:709",
+            "the kernel refused it",
+        ] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        let mut e = denial(FsProtectOperation::MountWindow);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x803, MG_OP_UMOUNT, MG_WHY_UMOUNT, 0, 0);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert!(v.reasoning.contains("umount(2)"), "{}", v.reasoning);
+        assert!(v.reasoning.contains("the signed window let it through"));
+        assert!(!v.reasoning.contains("the kernel refused it"));
     }
 
     /// Review 82: the kexec wire byte decodes to `Kexec`, and an unknown

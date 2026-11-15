@@ -21,7 +21,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 29;
+pub const FAIL_OPEN_SLOTS: u32 = 33;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
@@ -70,6 +70,13 @@ pub mod hook {
     /// Lot 293 (external bug hunt BUG14): a signal through a file's owner
     /// (SIGIO, SIGURG, the `F_SETSIG` signal) to a target it cannot tell.
     pub const FILE_SEND_SIGIOTASK: u32 = 28;
+    /// Lot 357: the mount guard's four hooks (`agent-ebpf/src/mount_guard.rs`):
+    /// a mount, move, unmount or pivot let through because a read of its
+    /// target, its mount or the caller failed.
+    pub const SB_MOUNT: u32 = 29;
+    pub const MOVE_MOUNT: u32 = 30;
+    pub const SB_UMOUNT: u32 = 31;
+    pub const SB_PIVOTROOT: u32 = 32;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -105,6 +112,10 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "task_setnice",
     "task_setioprio",
     "file_send_sigiotask",
+    "sb_mount",
+    "move_mount",
+    "sb_umount",
+    "sb_pivotroot",
 ];
 
 #[cfg(test)]
@@ -145,11 +156,15 @@ mod tests {
             (hook::TASK_SETNICE, "task_setnice"),
             (hook::TASK_SETIOPRIO, "task_setioprio"),
             (hook::FILE_SEND_SIGIOTASK, "file_send_sigiotask"),
+            (hook::SB_MOUNT, "sb_mount"),
+            (hook::MOVE_MOUNT, "move_mount"),
+            (hook::SB_UMOUNT, "sb_umount"),
+            (hook::SB_PIVOTROOT, "sb_pivotroot"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::FILE_SEND_SIGIOTASK + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::SB_PIVOTROOT + 1, FAIL_OPEN_SLOTS);
     }
 }

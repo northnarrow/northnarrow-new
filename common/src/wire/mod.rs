@@ -1507,8 +1507,25 @@ impl SoleTraceSummary {
     }
 }
 
+/// Lot 357: a mount refused by the mount guard (`agent-ebpf/src/mount_guard.rs`,
+/// `crate::mount_guard`) in PID 1's mount namespace — on or over a
+/// protected point (a kernel view, the agent's directories, binaries,
+/// units, a directory above them), below the agent's directories, below a
+/// view and not the kernel's own pseudo-filesystem there, an unmount or a
+/// move of a protected mount, an old-API move, a pivot of the root.
+/// `target_dev` = `crate::mount_guard::record_dev` (the target's device,
+/// the operation, the reason, the view, the mounts covered), `target_ino`
+/// = the target dentry's inode (the mount's root for an unmount or a move
+/// away). Decisive.
+pub const FS_OP_MOUNT: u8 = 49;
+
+/// Lot 357: NOT a refusal — what [`FS_OP_MOUNT`] refuses, let through by
+/// the signed trusted-installer window (the fields as its). Minor: a
+/// window's mounts spend the minor budget, never a decisive record's.
+pub const FS_OP_MOUNT_WINDOW: u8 = 50;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SOLE_TRACE_SUMMARY;
+pub const FS_OP_LAST: u8 = FS_OP_MOUNT_WINDOW;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1564,6 +1581,8 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_SIGIO
             | FS_OP_CGROUP_JOIN
             | FS_OP_EXEMPT_INJECT
+            // lot 357: a mount the window let through
+            | FS_OP_MOUNT_WINDOW
     )
 }
 
@@ -2877,6 +2896,8 @@ mod tests {
             FS_OP_BPF_HELD_LOAD,
             FS_OP_BPF_HELD_USE,
             FS_OP_SOLE_TRACE_SUMMARY,
+            FS_OP_MOUNT,
+            FS_OP_MOUNT_WINDOW,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

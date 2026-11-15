@@ -390,6 +390,7 @@ pub mod worker;
 
 // Lab PR 265 (review of #468 R1, R3): the one `mountinfo` reader, byte by
 // byte, of the start's mount check and the self-integrity watcher.
+pub mod mount_attrs;
 pub mod mountinfo;
 
 // Lot 311 (third bug hunt, F4 and N6): the kernel's state files read as
