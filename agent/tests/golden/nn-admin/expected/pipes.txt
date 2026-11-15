@@ -210,7 +210,7 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "name": "release verified at install",
 |     "status": "<status>",
 |     "value": "<value>",
-|     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
+|     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `SHA256SUMS` and `SHA256SUMS.asc` beside it (`signed-checksums`), or with `gh` or `cosign` for its tag-bound attestation (`attested`); install.sh refuses less without `--allow-unverified`: `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
 |   },
 |   {
 |     "id": "cgroup_v1",
