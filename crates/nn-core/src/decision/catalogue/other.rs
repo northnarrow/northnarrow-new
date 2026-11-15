@@ -23,8 +23,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           (external audit DEC-005); every access after the first trip is a \
                           Low record (DEC-004).",
         how_to_test: "Deploy a File canary (`nn-admin canary deploy --name t --key <key> file \
-                      --path /root/aws_keys_old.txt`) and `cat` it from a shell: the shell's \
-                      tree is killed, the posture goes to COMBAT.",
+                      --path /root/aws_keys_old.txt`, with a key holding the `canary-manage` role, which the \
+                      key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1) and `cat` it from a \
+                      shell: the shell's tree is killed, the posture goes to COMBAT.",
         tests: &[
             "crates/nn-core/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open",
             "crates/nn-core/src/decision/rules/canary.rs::a_reader_of_whole_trees_is_recorded_not_killed",
@@ -46,8 +47,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "No workflow runs the decoy (operators use nn-admin); an exec after \
                           the first trip is a Low record (DEC-004).",
         how_to_test: "Deploy a Process canary (`nn-admin canary deploy --name t --key <key> \
-                      process --path /usr/local/bin/sysadmin-helper --fake-arg0 helper`) and \
-                      run it: the caller's tree is killed.",
+                      process --path /usr/local/bin/sysadmin-helper --fake-arg0 helper`, with a key \
+                      holding the `canary-manage` role, which the key `install.sh` writes lacks: \
+                      COMBAT_RECOVERY.md §1.1). The agent registers the path and creates no file: \
+                      place the decoy there yourself (`sudo cp /bin/true \
+                      /usr/local/bin/sysadmin-helper`), then run it: the caller's tree is \
+                      killed. Without the file the run ends with \"command not found\" and no \
+                      record.",
         tests: &[
             "crates/nn-core/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec",
             "agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat",
@@ -70,8 +76,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           host would receive the canary's connections. Every connect kills; a \
                           connection from another host is not seen.",
         how_to_test: "Deploy a Network canary (`nn-admin canary deploy --name t --key <key> \
-                      network --bind-addr 127.0.0.1 --bind-port 4444`) and connect to it from \
-                      a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).",
+                      network --bind-addr 127.0.0.1 --bind-port 4444`, with a key holding the `canary-manage` role, which the \
+                      key `install.sh` writes lacks: COMBAT_RECOVERY.md §1.1) and \
+                      connect to it from a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).",
         tests: &[
             "crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect",
             "agent/src/canary/detector_tests.rs::a_network_canary_trip_draws_canary_003_on_the_connector",
@@ -94,8 +101,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           reader of whole trees is recorded High, not killed (DEC-005), and an \
                           access after the first trip is a Low record (DEC-004).",
         how_to_test: "Deploy a Credential canary (`nn-admin canary deploy --name t --key <key> \
-                      credential --path /root/.aws/credentials.bak --cred-family aws`) and \
-                      `grep -r AKIA /root` from a shell.",
+                      credential --path /root/.aws/credentials.bak --cred-family aws`, with a key \
+                      holding the `canary-manage` role, which the key `install.sh` writes lacks: \
+                      COMBAT_RECOVERY.md §1.1) and `grep -r AKIA /root` from a shell.",
         tests: &[
             "crates/nn-core/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read",
             "crates/nn-core/src/decision/rules/canary.rs::a_later_access_to_a_tripped_canary_is_recorded_not_killed",

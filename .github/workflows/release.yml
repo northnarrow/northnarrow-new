@@ -376,6 +376,13 @@ jobs:
           sha256sum northnarrow-*.x86_64.rpm RPM-GPG-KEY-northnarrow.asc >> SHA256SUMS.new
           mv SHA256SUMS.new SHA256SUMS
           sha256sum -c SHA256SUMS && cat SHA256SUMS
+          # Lot 354 (pre-alpha checks, F1-2): SHA256SUMS signed with the same
+          # key, checked against the committed public key alone, so a tester
+          # without `gh attestation` verifies every file of the release with
+          # gpg (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5).
+          cd ..
+          NN_RPM_GPG_PASSPHRASE_FILE=$pass deploy/release/sign-rpm.sh sign-sums "$fpr" dist/SHA256SUMS
+          deploy/release/sign-rpm.sh verify-sums "$pub" dist/SHA256SUMS
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -413,6 +420,9 @@ jobs:
           cd dist && sha256sum -c SHA256SUMS
           if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = true ] && [ ! -s RPM-GPG-KEY-northnarrow.asc ]; then
             echo "::error::a tag release without the signed .rpm"; exit 1
+          fi
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = true ] && [ ! -s SHA256SUMS.asc ]; then
+            echo "::error::a tag release without the signed SHA256SUMS"; exit 1
           fi
 
       - name: Attest build provenance
@@ -452,6 +462,9 @@ jobs:
           cd dist && sha256sum -c SHA256SUMS
           if [ ! -s RPM-GPG-KEY-northnarrow.asc ]; then
             echo "::error::a tag release without the signed .rpm"; exit 1
+          fi
+          if [ ! -s SHA256SUMS.asc ]; then
+            echo "::error::a tag release without the signed SHA256SUMS"; exit 1
           fi
 
       - name: Publish to the GitHub release (never over a published asset)

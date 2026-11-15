@@ -136,13 +136,22 @@ if [[ ${SWITCHES_CONFIDENTIALITY:-0} == 1 ]]; then
 fi
 
 echo "== T0. the check channel at rest"
+# Lot 354 (pre-alpha checks, Phase 3): a release's BPF guard refuses root's
+# bpftool handle on the agent's maps outside a window (the defence, signed
+# bpf_handle): every read of them here is made inside one. A window lifts
+# the file deny hooks; the tracker and its maps run as outside it.
+window 60
 s0=$(silent); for _ in $(seq 1 20); do /bin/true; done; sleep 6; s1=$(silent)
 echo "    births the fentry missed: $s0 → $s1 over 6 s of forks, ftrace $(cat $FT)"
 [[ -n $s0 && $s0 == "$s1" ]] && pass "T0 ftrace on: no birth counted missed ($s1) — the forks were seen" || bad "T0 [$s0] → [$s1]"
 
 echo "== T1. kernel.ftrace_enabled=0 inside a window"
-a0=$(lines "$AUDIT"); e0=$(epoch_boot)
+a0=$(lines "$AUDIT")
 window 180
+# the epoch read inside the window (lot 354): outside one it read nothing,
+# and the reset check below passed on any value
+e0=$(epoch_boot)
+[[ -n $e0 ]] || bad "T1 the marks' epoch not readable inside a window"
 r=$(echo 0 | sudo tee "$FT" 2>&1 >/dev/null); now=$(cat "$FT")
 if [[ $now != 0 ]]; then
     echo "    write: [$r], ftrace_enabled $now"

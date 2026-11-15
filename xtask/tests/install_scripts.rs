@@ -862,10 +862,16 @@ fn install_opens_the_window_before_it_executes_its_tree() {
     assert_eq!(r.status, 0, "{r:#?}");
     assert_eq!(r.called(TREE), 1, "{r:#?}");
     assert!(r.index(GRANT) < r.index(TREE), "{r:#?}");
+    // Lot 354 (F2b-2): each side with its build (the binary's SHA-256)
+    let line = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("UPGRADE — installed:"))
+        .unwrap_or_else(|| panic!("no UPGRADE line: {r:#?}"));
     assert!(
-        r.stdout
-            .contains("installed: northnarrow-agent 0.0.1 → new: northnarrow-agent 0.0.2"),
-        "{r:#?}"
+        line.contains("installed: northnarrow-agent 0.0.1 (sha256 ")
+            && line.contains(") → new: northnarrow-agent 0.0.2 (sha256 "),
+        "{line}"
     );
 
     let host = Host::new("install-window-first-refused", &both, true, true);
@@ -879,6 +885,76 @@ fn install_opens_the_window_before_it_executes_its_tree() {
     let r = host.install_from("full", false, None, bin);
     assert_eq!(r.status, 0, "{r:#?}");
     assert_eq!((r.called(GRANT), r.called(TREE)), (0, 1), "{r:#?}");
+}
+
+/// Lot 354 (pre-alpha checks, F2b-2): an upgrade between two builds of the
+/// same version said "0.0.1 → 0.0.1". Each side now names its build: the
+/// release's (`Build:` of the tree's README-RELEASE.md) and the start of
+/// the agent binary's SHA-256 — different binaries, different hashes; the
+/// same binary is said to be the same build.
+#[test]
+fn the_upgrade_line_tells_two_builds_of_one_version_apart() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    for (case, same) in [
+        ("upgrade-builds-differ", false),
+        ("upgrade-builds-same", true),
+    ] {
+        let host = Host::new(case, &both, true, true);
+        let tree = host.dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let installed = fs::read(host.dir.join("bin/northnarrow-agent")).unwrap();
+        if same {
+            fs::write(tree.join("northnarrow-agent"), &installed).unwrap();
+            fs::set_permissions(
+                tree.join("northnarrow-agent"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        } else {
+            write_exec(
+                &tree.join("northnarrow-agent"),
+                "echo 'northnarrow-agent 0.0.1' # another build",
+            );
+        }
+        fs::write(
+            tree.join("README-RELEASE.md"),
+            "NorthNarrow\nBuild:     v0.0.1-rc2-1913-g03879ade — 2026-11-14T00:00:00Z\n",
+        )
+        .unwrap();
+        let r = host.install_with(
+            "full",
+            true,
+            Some("key-role"),
+            "$T/tree/northnarrow-agent",
+            "REPO_ROOT=$T/tree",
+        );
+        assert_eq!(r.status, 0, "{r:#?}");
+        let line = r
+            .stdout
+            .lines()
+            .find(|l| l.contains("UPGRADE — installed:"))
+            .unwrap_or_else(|| panic!("no UPGRADE line: {r:#?}"));
+        let sha = |side: &str| -> String {
+            let at = line.find(side).unwrap_or_else(|| panic!("{side}: {line}"));
+            let rest = &line[at..];
+            let s = rest.find("sha256 ").unwrap_or_else(|| panic!("{line}")) + 7;
+            rest[s..s + 12].to_string()
+        };
+        let (old, new) = (sha("installed:"), sha("→ new:"));
+        assert!(old.chars().all(|c| c.is_ascii_hexdigit()), "{line}");
+        assert!(
+            line.contains(
+                "→ new: northnarrow-agent 0.0.1 (build v0.0.1-rc2-1913-g03879ade, sha256 "
+            ),
+            "{line}"
+        );
+        assert_eq!(old == new, same, "{line}");
+        assert_eq!(
+            r.stdout.contains("the same build as the one installed"),
+            same,
+            "{r:#?}"
+        );
+    }
 }
 
 /// Lot 278: install.sh executes the tree's agent only in `tree_version`,
@@ -2666,6 +2742,18 @@ fn an_upgrade_without_a_key_changes_nothing() {
 /// A release tree `name` next to its tarball and SHA256SUMS, made the way
 /// mk-tarball.sh makes them, from the lab's `new` tree.
 fn release(lab: &Lab, name: &str) -> PathBuf {
+    release_signed(lab, name, None, None)
+}
+
+/// The same, with `in_tree` (when given) as the tree's release key, and
+/// SHA256SUMS signed by `signer` (SHA256SUMS.asc next to it), the way the
+/// release's tag job signs it.
+fn release_signed(
+    lab: &Lab,
+    name: &str,
+    in_tree: Option<&ThrowawayKey>,
+    signer: Option<&ThrowawayKey>,
+) -> PathBuf {
     let rel = lab.case.join("rel");
     let tree = rel.join(name);
     let _ = fs::remove_dir_all(&rel);
@@ -2678,6 +2766,9 @@ fn release(lab: &Lab, name: &str) -> PathBuf {
         .unwrap()
         .success();
     assert!(ok);
+    if let Some(k) = in_tree {
+        k.public(&tree.join(RELEASE_KEY_REL));
+    }
     let sh = |script: &str| {
         let out = Command::new("bash")
             .arg("-c")
@@ -2693,13 +2784,28 @@ fn release(lab: &Lab, name: &str) -> PathBuf {
     sh(&format!(
         "tar -czf {name}.tar.gz {name} && sha256sum {name}.tar.gz > SHA256SUMS"
     ));
+    if let Some(k) = signer {
+        k.sign(&rel.join("SHA256SUMS"));
+    }
     tree
 }
 
 impl Lab {
     /// install.sh from a release tree (absolute path), a fresh install.
     fn install_release(&self, tree: &Path, args: &[&str]) -> Run {
-        let text = read("deploy/install.sh").replace("\nrequire_root\n", "\n");
+        self.install_release_pinned(tree, args, None)
+    }
+
+    /// The same, with `pin` (when given) in place of the release key's
+    /// fingerprint install.sh pins: a throwaway key's, never the release
+    /// key itself.
+    fn install_release_pinned(&self, tree: &Path, args: &[&str], pin: Option<&str>) -> Run {
+        let mut text = read("deploy/install.sh").replace("\nrequire_root\n", "\n");
+        if let Some(fpr) = pin {
+            let line = format!("\nRELEASE_KEY_FPR={}\n", release_key_fpr());
+            assert!(text.contains(&line), "install.sh pins no release key");
+            text = text.replace(&line, &format!("\nRELEASE_KEY_FPR={fpr}\n"));
+        }
         let mut cmd = script_command(&self.case, &text);
         cmd.args(args)
             .args([
@@ -2869,6 +2975,439 @@ exit 0"#,
         assert!(r.stderr.contains("is not the one in"), "{r:#?}");
         assert!(!lab.installed());
     }
+}
+
+// ── Lot 354: SHA256SUMS.asc, the signed level ────────────────────────────
+
+/// Where the tree carries its copy of the committed release key, and where
+/// install.sh reads it.
+const RELEASE_KEY_REL: &str = "deploy/release/RPM-GPG-KEY-northnarrow.asc";
+
+/// The release key's fingerprint install.sh pins (`RELEASE_KEY_FPR=`).
+fn release_key_fpr() -> String {
+    let text = read("deploy/install.sh");
+    let pins: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("RELEASE_KEY_FPR="))
+        .collect();
+    assert_eq!(pins.len(), 1, "install.sh pins one release key: {pins:?}");
+    pins[0].to_string()
+}
+
+/// A throwaway OpenPGP signing key (ed25519) in a GNUPGHOME of its own,
+/// under the system's temporary directory: gpg-agent's socket path must
+/// stay short. The release key is never used, only read. The agent is
+/// stopped and the home removed on drop.
+struct ThrowawayKey {
+    home: PathBuf,
+    fpr: String,
+}
+
+impl ThrowawayKey {
+    fn new(tag: &str) -> ThrowawayKey {
+        let home = std::env::temp_dir().join(format!("nngpg-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut k = ThrowawayKey {
+            home,
+            fpr: String::new(),
+        };
+        k.gpg(&[
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            &format!("nn throwaway {tag} <throwaway@example.invalid>"),
+            "ed25519",
+            "sign",
+            "never",
+        ]);
+        let colons = k.gpg(&["--with-colons", "--list-keys"]);
+        k.fpr = colons
+            .lines()
+            .find(|l| l.starts_with("fpr:"))
+            .and_then(|l| l.split(':').nth(9))
+            .expect("the throwaway key's fingerprint")
+            .to_string();
+        assert_eq!(k.fpr.len(), 40, "{colons}");
+        k
+    }
+
+    fn gpg(&self, args: &[&str]) -> String {
+        let out = Command::new("gpg")
+            .env("GNUPGHOME", &self.home)
+            .args(args)
+            .output()
+            .expect("gpg runs");
+        assert!(out.status.success(), "gpg {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// The armoured public key, written to `to`.
+    fn public(&self, to: &Path) {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::write(to, self.gpg(&["--armor", "--export", &self.fpr])).unwrap();
+    }
+
+    /// `file.asc`, a detached armoured signature of `file`.
+    fn sign(&self, file: &Path) {
+        let asc = format!("{}.asc", file.display());
+        let f = file.to_str().unwrap();
+        self.gpg(&[
+            "--batch",
+            "--yes",
+            "--local-user",
+            &self.fpr,
+            "--armor",
+            "--detach-sign",
+            "--output",
+            &asc,
+            f,
+        ]);
+    }
+}
+
+impl Drop for ThrowawayKey {
+    fn drop(&mut self) {
+        let _ = Command::new("gpgconf")
+            .env("GNUPGHOME", &self.home)
+            .args(["--kill", "gpg-agent"])
+            .status();
+        let _ = fs::remove_dir_all(&self.home);
+    }
+}
+
+/// `sums_signature SUMS SIG KEY FPR WORK` from install.sh: its exit status
+/// and the keyring it dearmoured.
+fn sums_signature(case: &Path, sums: &Path, key: &Path, fpr: &str) -> (i32, Vec<u8>) {
+    let work = case.join("work");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).unwrap();
+    let script = format!(
+        "set -uo pipefail\n{}\nsums_signature \"$@\"\n",
+        block("deploy/install.sh", "sums_signature")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(sums)
+        .arg(format!("{}.asc", sums.display()))
+        .arg(key)
+        .arg(fpr)
+        .arg(&work)
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code().unwrap_or(-1),
+        fs::read(work.join("key.gpg")).unwrap_or_default(),
+    )
+}
+
+/// Lot 354 (the review of #562): install.sh takes SHA256SUMS.asc as proof
+/// only when it is a good signature of SHA256SUMS by the key the tree
+/// carries, and that key's primary fingerprint is the one install.sh pins.
+/// A SHA256SUMS changed after signing, a signature by another key (also
+/// when the tree carries that other key), a missing key, a file that is
+/// not one armoured key and a garbage signature all fail; the key is
+/// dearmoured byte for byte as `gpg --dearmor` does (checked on the
+/// committed key, which is only read).
+#[test]
+fn sums_signature_accepts_only_the_pinned_key_s_good_signature() {
+    let case = case_dir("sums-signature");
+    let k1 = ThrowawayKey::new("sig1");
+    let k2 = ThrowawayKey::new("sig2");
+    let key1 = case.join("key1.asc");
+    let key2 = case.join("key2.asc");
+    k1.public(&key1);
+    k2.public(&key2);
+    let sums = case.join("SHA256SUMS");
+    fs::write(&sums, format!("{}  {NAME}.tar.gz\n", "a".repeat(64))).unwrap();
+    k1.sign(&sums);
+
+    assert_eq!(sums_signature(&case, &sums, &key1, &k1.fpr).0, 0, "good");
+    let lower = k1.fpr.to_lowercase();
+    assert_eq!(sums_signature(&case, &sums, &key1, &lower).0, 0, "case");
+
+    // the key that signed is not the pinned one, whatever the tree carries
+    assert_eq!(sums_signature(&case, &sums, &key1, &k2.fpr).0, 1, "pin");
+    k2.sign(&sums);
+    assert_eq!(
+        sums_signature(&case, &sums, &key1, &k1.fpr).0,
+        1,
+        "other key"
+    );
+    assert_eq!(
+        sums_signature(&case, &sums, &key2, &k1.fpr).0,
+        1,
+        "the other key swapped in the tree"
+    );
+    assert_eq!(sums_signature(&case, &sums, &key2, &k2.fpr).0, 0);
+
+    // SHA256SUMS changed after it was signed
+    k1.sign(&sums);
+    append(&sums, &format!("{}  extra\n", "b".repeat(64)));
+    assert_eq!(sums_signature(&case, &sums, &key1, &k1.fpr).0, 1, "altered");
+    k1.sign(&sums);
+    assert_eq!(sums_signature(&case, &sums, &key1, &k1.fpr).0, 0);
+
+    // a garbage signature
+    let asc = case.join("SHA256SUMS.asc");
+    let good = fs::read(&asc).unwrap();
+    fs::write(
+        &asc,
+        "-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP SIGNATURE-----\n",
+    )
+    .unwrap();
+    assert_eq!(sums_signature(&case, &sums, &key1, &k1.fpr).0, 1, "garbage");
+    fs::write(&asc, good).unwrap();
+
+    // no key, or a file that is not one armoured key
+    let missing = case.join("none.asc");
+    assert_eq!(
+        sums_signature(&case, &sums, &missing, &k1.fpr).0,
+        2,
+        "missing"
+    );
+    let empty = case.join("empty.asc");
+    fs::write(&empty, "").unwrap();
+    assert_eq!(sums_signature(&case, &sums, &empty, &k1.fpr).0, 2, "empty");
+    let two = case.join("two.asc");
+    fs::write(
+        &two,
+        format!(
+            "{}{}",
+            fs::read_to_string(&key1).unwrap(),
+            fs::read_to_string(&key2).unwrap()
+        ),
+    )
+    .unwrap();
+    assert_eq!(sums_signature(&case, &sums, &two, &k1.fpr).0, 2, "two keys");
+    let text = case.join("text.asc");
+    fs::write(&text, "not a key\n").unwrap();
+    assert_eq!(sums_signature(&case, &sums, &text, &k1.fpr).0, 2, "text");
+
+    // no gpgv: not checked (3), never taken for a good signature
+    let empty_path = case.join("no-tools");
+    fs::create_dir_all(&empty_path).unwrap();
+    let out = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(format!(
+            "set -uo pipefail\n{}\nsums_signature \"$@\"\n",
+            block("deploy/install.sh", "sums_signature")
+        ))
+        .arg("bash")
+        .arg(&sums)
+        .arg(case.join("SHA256SUMS.asc"))
+        .arg(&key1)
+        .arg(&k1.fpr)
+        .arg(case.join("work"))
+        .env("PATH", &empty_path)
+        .output()
+        .expect("bash runs");
+    assert_eq!(out.status.code(), Some(3), "no gpgv: {out:?}");
+
+    // the committed key, dearmoured as gpg does; its signature is not k1's
+    let committed = repo_root().join(RELEASE_KEY_REL);
+    let (rc, ring) = sums_signature(&case, &sums, &committed, &release_key_fpr());
+    assert_eq!(rc, 1, "k1's signature is not the release key's");
+    let gpg = Command::new("gpg")
+        .env("GNUPGHOME", &k1.home)
+        .arg("--dearmor")
+        .stdin(fs::File::open(&committed).unwrap())
+        .output()
+        .expect("gpg runs");
+    assert!(gpg.status.success(), "{gpg:?}");
+    assert!(
+        !ring.is_empty() && ring == gpg.stdout,
+        "dearmoured as gpg does"
+    );
+}
+
+/// Lot 354 (the review of #562, the coordinator's decision): a release
+/// whose SHA256SUMS.asc is a good signature by the pinned key installs with
+/// no flag on a host without an attestation verifier (Ubuntu 24.04's gh
+/// 2.45), recorded as `signed-checksums`, nothing logged as an override. A
+/// bad signature, a signature by another key, a release key missing from
+/// the tree and a tarball that is not the one the signed SHA256SUMS lists
+/// are refused whatever the flags, before anything is copied. A verifier
+/// that runs and refuses is not overruled by the signature; one that
+/// verifies still gives `attested`.
+#[test]
+fn a_release_signed_by_the_release_key_installs_and_a_bad_signature_never_does() {
+    let k1 = ThrowawayKey::new("rel1");
+    let k2 = ThrowawayKey::new("rel2");
+
+    let lab = Lab::new("signed");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    let r = lab.install_release_pinned(&tree, &[], Some(&k1.fpr));
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stdout.contains(&format!(
+            "SHA256SUMS.asc is a good signature by the release key {}",
+            k1.fpr
+        )),
+        "{r:#?}"
+    );
+    assert!(
+        r.stdout.contains("tarball matches the signed SHA256SUMS"),
+        "{r:#?}"
+    );
+    let m = lab.manifest();
+    assert_eq!(m["provenance"], "signed-checksums");
+    assert!(m["verify_override"].is_null(), "{m}");
+    assert_eq!(m["attestation"]["verified"], false);
+    assert!(!lab.logged().contains("auth.warning"), "{}", lab.logged());
+    // the same release with the release key's pin: k1 is not that key
+    let lab = Lab::new("signed-other-pin");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    let r = lab.install_release(&tree, &[]);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stderr.contains("is not a good signature"), "{r:#?}");
+    assert!(!lab.installed());
+
+    // refused whatever the flags, nothing copied
+    let refused = |lab: &Lab, tree: &Path, want: &str| {
+        for args in [&[][..], &["--allow-unverified"][..]] {
+            let r = lab.install_release_pinned(tree, args, Some(&k1.fpr));
+            assert_eq!(r.status, 1, "{want} {args:?}: {r:#?}");
+            assert!(r.stderr.contains(want), "{want} {args:?}: {r:#?}");
+            assert!(!lab.installed(), "{want} {args:?}");
+        }
+    };
+    // signed by another key
+    let lab = Lab::new("signed-by-another");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k2));
+    refused(
+        &lab,
+        &tree,
+        "is not a good signature of SHA256SUMS by the release key",
+    );
+    // SHA256SUMS changed after it was signed
+    let lab = Lab::new("signed-altered");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    append(
+        &lab.case.join("rel/SHA256SUMS"),
+        &format!("{}  extra\n", "0".repeat(64)),
+    );
+    refused(
+        &lab,
+        &tree,
+        "is not a good signature of SHA256SUMS by the release key",
+    );
+    // a signature, and no release key in the tree
+    let lab = Lab::new("signed-no-key");
+    let tree = release_signed(&lab, NAME, None, Some(&k1));
+    refused(&lab, &tree, "the release key is missing from");
+    // a tarball that is not the one the signed SHA256SUMS lists (the same
+    // tree packed again: other bytes, the same MANIFEST.sha256)
+    let lab = Lab::new("signed-other-tarball");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!("tar --mtime=@1 -czf {NAME}.tar.gz {NAME}"))
+        .current_dir(lab.case.join("rel"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    refused(&lab, &tree, "does not match SHA256SUMS");
+
+    // a verifier that ran and refused is not overruled by the signature
+    let lab = Lab::new("signed-gh-refuses");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    write_exec(
+        &lab.case.join("stub/gh"),
+        r#"[ "$1 $2" = "attestation --help" ] && exit 0
+echo "verification failed: no matching attestation for the tag identity"; exit 1"#,
+    );
+    let r = lab.install_release_pinned(&tree, &[], Some(&k1.fpr));
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(
+        r.stderr.contains(
+            "SHA256SUMS.asc verified, but a verifier that ran and refused is not overruled by it"
+        ),
+        "{r:#?}"
+    );
+    assert!(!lab.installed());
+    let r = lab.install_release_pinned(&tree, &["--allow-unverified"], Some(&k1.fpr));
+    assert_eq!(r.status, 0, "{r:#?}");
+    let m = lab.manifest();
+    assert_eq!(m["provenance"], "signed-checksums");
+    assert_eq!(m["verify_override"], "--allow-unverified");
+    assert_eq!(m["attestation"]["failure"], "gh attestation verify failed");
+
+    // a verifier that verifies: attested, the signature checked as well
+    let lab = Lab::new("signed-and-attested");
+    let tree = release_signed(&lab, NAME, Some(&k1), Some(&k1));
+    write_exec(&lab.case.join("stub/gh"), "exit 0");
+    let r = lab.install_release_pinned(&tree, &[], Some(&k1.fpr));
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stdout.contains("is a good signature by the release key"),
+        "{r:#?}"
+    );
+    assert_eq!(lab.manifest()["provenance"], "attested");
+}
+
+/// Lot 354: the fingerprint install.sh pins is the committed release key's
+/// (read with `gpg --show-keys`, the key untouched), the README and the
+/// install guide publish it, and mk-tarball puts the key where install.sh
+/// reads it.
+#[test]
+fn install_pins_the_committed_release_key() {
+    let home = std::env::temp_dir().join(format!("nngpg-{}-show", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args(["--with-colons", "--show-keys"])
+        .arg(repo_root().join(RELEASE_KEY_REL))
+        .output()
+        .expect("gpg runs");
+    let _ = Command::new("gpgconf")
+        .env("GNUPGHOME", &home)
+        .args(["--kill", "all"])
+        .status();
+    let _ = fs::remove_dir_all(&home);
+    assert!(out.status.success(), "{out:?}");
+    let colons = String::from_utf8_lossy(&out.stdout);
+    let fprs: Vec<&str> = colons
+        .lines()
+        .filter(|l| l.starts_with("fpr:"))
+        .filter_map(|l| l.split(':').nth(9))
+        .collect();
+    assert_eq!(fprs.len(), 1, "one primary key, no subkey: {colons}");
+    let pinned = release_key_fpr();
+    assert_eq!(fprs[0], pinned, "install.sh pins another key");
+    let spaced: String = pinned
+        .as_bytes()
+        .chunks(4)
+        .enumerate()
+        .map(|(i, c)| {
+            let sep = match i {
+                0 => "",
+                5 => "  ",
+                _ => " ",
+            };
+            format!("{sep}{}", std::str::from_utf8(c).unwrap())
+        })
+        .collect();
+    for doc in ["README.md", "docs/operator/INSTALL_UPGRADE_UNINSTALL.md"] {
+        assert!(read(doc).contains(&spaced), "{doc}: no `{spaced}`");
+    }
+    let mk = read("deploy/release/mk-tarball.sh");
+    assert!(
+        mk.contains(&format!(
+            "cp -p {RELEASE_KEY_REL} \"$tree/deploy/release/\""
+        )),
+        "mk-tarball.sh does not ship the release key"
+    );
+    assert!(read("deploy/install.sh")
+        .contains(&format!("RELEASE_KEY=\"$REPO_ROOT/{RELEASE_KEY_REL}\"")));
 }
 
 /// The lab's path: a build from source (no MANIFEST.sha256) installs with

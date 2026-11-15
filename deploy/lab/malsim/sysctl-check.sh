@@ -107,6 +107,11 @@ echo "nn-admin: $NNADMIN  key: $KEY  kernel $(uname -r)"
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 6; }
 
 echo "== S1. the judge on the root cgroup"
+# Lot 354 (pre-alpha checks, Phase 3): a release's BPF guard refuses root's
+# bpftool handle on the agent's programs outside a window (signed
+# bpf_handle), so bpftool sees the judge only inside one: every read of it
+# here is made in a window, every judged write outside one.
+window 60
 sudo bpftool cgroup show "$CG" 2>&1 | sed 's/^/    /'
 row=$(sudo bpftool cgroup show "$CG" 2>/dev/null | grep nn_sysctl_guard)
 pins=$(sudo ls "$PINS" 2>/dev/null | tr '\n' ' ')
@@ -128,6 +133,7 @@ else bad "S1 row=[$row] pins=[$pins]"; fi
 [[ $note == *cgroup/sysctl* ]] && pass "S1 the manifest's sysctl_judge: $note" || bad "S1 manifest note [$note]"
 ID1=$(judge_ids)
 
+no_window
 echo "== S2. a second thread flips the buffer"
 PM0=$(cat "$PM"); RT0=$(cat "$RT")
 d0=$(lines "$DET")
@@ -212,8 +218,9 @@ for _ in range(n):
     if w: os.pwrite(fd, v, 0)
     else: os.pread(fd, 32, 0)
 print((time.perf_counter_ns() - t) // n)' "$PM" "${1:-20000}" "${2:-w}"; }
-no_window
+window 30
 ID1=$(judge_ids)
+no_window
 echo "    pid_max $(cat "$PM") (written back as it is: judged, harmless), no window; judge [$ID1]"
 sudo sysctl -q kernel.bpf_stats_enabled=1
 read -r c0 t0 < <(prog_stat); bench 20000 w >/dev/null; read -r c1 t1 < <(prog_stat)
@@ -221,7 +228,12 @@ w_calls=$((c1 - c0)); w_ns=$(( w_calls > 0 ? (t1 - t0) / w_calls : 0 ))
 read -r c0 t0 < <(prog_stat); bench 20000 r >/dev/null; read -r c1 t1 < <(prog_stat)
 r_calls=$((c1 - c0)); r_ns=$(( r_calls > 0 ? (t1 - t0) / r_calls : 0 ))
 sudo sysctl -q kernel.bpf_stats_enabled=0
+if (( w_calls == 0 && r_calls == 0 )); then
+    # the statistics are read outside a window, where the measure is taken
+    echo "RESULT per-call: n/a — bpftool does not see nn_sysctl_guard outside a window (the BPF guard enforces)"
+else
 echo "RESULT per-call: a write $w_ns ns ($w_calls calls), a read $r_ns ns ($r_calls calls) — run_time_ns / run_cnt of nn_sysctl_guard"
+fi
 on1=$(for _ in 1 2 3; do bench 20000 w; done | sort -n | sed -n 2p)
 window 300
 sudo rm -f "$PINS/link_nn_sysctl_guard"; sleep 1
@@ -237,8 +249,9 @@ sleep 1
 off=$(for _ in 1 2 3; do bench 20000 w; done | sort -n | sed -n 2p)
 gone=$(judge_ids)
 restart_agent
-ID2=$(judge_ids)
 on2=$(for _ in 1 2 3; do bench 20000 w; done | sort -n | sed -n 2p)
+window 30
+ID2=$(judge_ids)
 echo "RESULT wall: a write of pid_max (same value) attached $on1 / $on2 ns, detached $off ns (medians of 3 × 20,000)"
 echo "    judge ids: before [$ID1], its pin removed [$held] (the agent holds the link), link $lid detached [$gone], after the restart [$ID2]"
 n2=$(wc -w <<<"$ID2")

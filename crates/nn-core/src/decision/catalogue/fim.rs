@@ -209,8 +209,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window",
         ],
         attack_note: "/etc/systemd/user is watched but not among the rule's directories: a user \
-            unit there draws no verdict. A .timer here is recorded as this rule, which the engine \
-            evaluates before NN-L-FIM-023.",
+            unit there draws no verdict. A .timer here draws one record whose primary is \
+            NN-L-FIM-023 (it acts on the writer), this rule among its matches.",
     },
     RuleDoc {
         id: "NN-L-FIM-010_RansomwareExtensionRename",
@@ -517,9 +517,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
             buffer).",
         false_positives: "Package transactions are recorded at Low, writes in an interactive sudo \
             or su session at High.",
-        how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`: \
-            one record naming NN-L-FIM-009 (primary: same severity and action, registered \
-            first) and this rule among its matches (lab PR 236, multi-match).",
+        how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`, \
+            then remove it: one record naming this rule (primary: High, the KillProcess aimed \
+            at cp — what it would have done under `alpha`) with NN-L-FIM-009 among its matches \
+            (its own kill held), as the golden case `shadow-fim009-fim023-timer` shows (lab \
+            PR 236, multi-match).",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::d3_fim_rules_table",
             "crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire",
