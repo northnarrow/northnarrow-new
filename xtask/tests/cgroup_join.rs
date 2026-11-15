@@ -613,16 +613,24 @@ fn the_agent_asks_the_marks_where_it_decides() {
     let pe = code("agent/src/pipeline/process_event.rs");
     assert!(pe.contains("let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;"));
     // lot 281: an injection signed only when an exemption covered the
-    // process (whatever its taint now), with the injector's lineage
+    // process (whatever its taint now), with the injector's lineage — lot
+    // 353 (re-check 4 of #563): or when whether one did could not be judged
+    // (`Covering::Unjudged`), with the same lineage
     in_order(
         &pe,
         &[
             "let injection = *operation == nn_model::FsProtectOperation::ExemptInjection;",
-            ".and_then(|t| engine.exempt_covering(t));",
-            "if injection && covered.is_none() {",
+            ".map(|t| engine.exempt_covering(t));",
+            "Some(Covering::Exempt(e)) => (Some(e), None),",
+            "Some(Covering::Unjudged(why)) => (None, Some(why)),",
+            "Some(Covering::NotCovered) | None => (None, None),",
+            "if injection && covered.is_none() && unjudged.is_none() {",
             "return;",
             "let admin = posture.interactive_admin_status(",
             "anti_tamper::exempt_injection(\n                        &event, exemption, admin,\n                    )",
+            "let admin = posture.interactive_admin_status(",
+            "anti_tamper::unjudged_injection(\n                        &event, why, admin,\n                    )",
+            "(None, None) => at001.evaluate(&event),",
         ],
     )
     .unwrap();

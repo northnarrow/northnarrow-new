@@ -469,13 +469,25 @@ pub(crate) fn process_event(
             // kernel taints its mark) — signed only when an exemption of the
             // per-rule policy covered it: High, Critical from a non-root
             // injector or one outside an administrator's interactive
-            // session. Any other process's is a debug line.
+            // session. Any other process's is a debug line. Lot 353
+            // (re-check 4 of #563): and when whether one covered it could
+            // not be judged (a fact it is judged by not read while the
+            // process is there: a mount below /proc/<pid>) — signed as for
+            // an exempt process, saying so; on 8c1c5d12 a debug line.
             let injection = *operation == nn_model::FsProtectOperation::ExemptInjection;
-            let covered = injection
+            let covering = injection
                 .then(|| u32::try_from(*target_ino).ok())
                 .flatten()
-                .and_then(|t| engine.exempt_covering(t));
-            if injection && covered.is_none() {
+                .map(|t| engine.exempt_covering(t));
+            let (covered, unjudged) = {
+                use northnarrow_agent::decision::rule_policy::Covering;
+                match covering {
+                    Some(Covering::Exempt(e)) => (Some(e), None),
+                    Some(Covering::Unjudged(why)) => (None, Some(why)),
+                    Some(Covering::NotCovered) | None => (None, None),
+                }
+            };
+            if injection && covered.is_none() && unjudged.is_none() {
                 debug!(
                     pid, uid, comm = %Escaped(comm),
                     injected_pid = target_ino,
@@ -484,8 +496,8 @@ pub(crate) fn process_event(
                 );
                 return;
             }
-            let verdict = match &covered {
-                Some(exemption) => {
+            let verdict = match (&covered, &unjudged) {
+                (Some(exemption), _) => {
                     let admin = posture.interactive_admin_status(
                         *pid,
                         northnarrow_agent::posture::lineage::AsOf::of_event(&event),
@@ -494,7 +506,16 @@ pub(crate) fn process_event(
                         &event, exemption, admin,
                     )
                 }
-                None => at001.evaluate(&event),
+                (None, Some(why)) => {
+                    let admin = posture.interactive_admin_status(
+                        *pid,
+                        northnarrow_agent::posture::lineage::AsOf::of_event(&event),
+                    );
+                    northnarrow_agent::decision::rules::anti_tamper::unjudged_injection(
+                        &event, why, admin,
+                    )
+                }
+                (None, None) => at001.evaluate(&event),
             };
             // Review 75: a loop of denied attempts is logged and stored
             // within the rule's budget for that uid. Lot 356 (pre-alpha
@@ -550,6 +571,15 @@ pub(crate) fn process_event(
                         exemption = %exemption,
                         "EXEMPTION REVOKED: code-injection access to an exempt process — not \
                          refused; that process and what it forks are never exempt again"
+                    );
+                } else if let Some(why) = &unjudged {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        injected_pid = target_ino,
+                        unjudged = %Escaped(why),
+                        "EXEMPTION UNJUDGED: code-injection access to a process whether an \
+                         exemption covered which could not be judged — not refused; that \
+                         process and what it forks are never exempt again"
                     );
                 } else if joined {
                     warn!(
@@ -615,6 +645,12 @@ pub(crate) fn process_event(
                                 "not refused: the exemption ({exemption}) and every other no \
                                  longer hold for pid {target_ino} or what it forks \
                                  (start-in-cgroup tracker, injection taint)"
+                            )
+                        } else if let Some(why) = &unjudged {
+                            format!(
+                                "not refused: whether an exemption covered pid {target_ino} \
+                                 could not be judged ({why}); none holds for it or what it \
+                                 forks again (start-in-cgroup tracker, injection taint)"
                             )
                         } else if joined {
                             format!(

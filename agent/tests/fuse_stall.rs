@@ -22,6 +22,12 @@
 //! read beneath the anchored roots failed with the filter's `EPERM`); a
 //! walk from the root that crossed mounts would be held on the FUSE below.
 //!
+//! Re-check 4 of #563 (R4-1): a fourth FUSE over this process's own
+//! `/proc/<pid>/fd`. The decision thread's walk opened its last file again
+//! by name through `self/fd/N`, crossing it: on 8c1c5d12 that loop made no
+//! round at all; it reopens through its own `thread-self/fd` now, each
+//! name of the way checked.
+//!
 //! A test binary of its own, with this one test: the run forks (the user
 //! namespace), and a fork while other tests' threads hold a lock (the
 //! allocator's, a registry's) left the child waiting on it for ever.
@@ -179,9 +185,12 @@ fn run_loops(dir: &Path) -> i32 {
 
     // the mounts: a FUSE over `/proc` and one over the socket's directory,
     // each answering the first lookup and holding the rest — and, first,
-    // one below `/proc` over the sleeper's directory (fix round 5)
+    // one below `/proc` over the sleeper's directory (fix round 5) and one
+    // over this process's own descriptors (re-check 4, R4-1)
+    let own_fd = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
     let below = PathBuf::from(format!("/proc/{sleeper_pid}"));
-    let (Some(below_fuse), Some(proc_fuse), Some(run_fuse)) = (
+    let (Some(own_fd_fuse), Some(below_fuse), Some(proc_fuse), Some(run_fuse)) = (
+        nn_linux::fuse_testing::smart_fuse_over(&own_fd, 1),
         nn_linux::fuse_testing::smart_fuse_over(&below, 1),
         nn_linux::fuse_testing::smart_fuse_over(Path::new("/proc"), 1),
         nn_linux::fuse_testing::smart_fuse_over(&run, 1),
@@ -327,6 +336,7 @@ fn run_loops(dir: &Path) -> i32 {
     drop(run_fuse);
     drop(proc_fuse);
     drop(below_fuse);
+    drop(own_fd_fuse);
     let _ = sleeper.kill();
     rt.shutdown_timeout(Duration::from_secs(2));
     rc
@@ -339,7 +349,8 @@ fn run_loops(dir: &Path) -> i32 {
 /// `/proc/<pid>/exe` by path), the entropy sampler (`read_dir` of the
 /// host's view by path) and the serve loop (the admin socket's rebind by
 /// path, past its first check) stall; in the first review's tree the signed
-/// appends did, in the first re-check's the rule refresh.
+/// appends did, in the first re-check's the rule refresh; on 8c1c5d12 the
+/// decision's, under the FUSE over this process's own `/proc/<pid>/fd`.
 #[test]
 fn the_critical_loops_keep_going_under_a_fuse_that_answers_one_lookup() {
     let dir = tempfile::TempDir::new().unwrap();

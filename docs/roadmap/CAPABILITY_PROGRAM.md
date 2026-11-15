@@ -11399,6 +11399,28 @@ number in parentheses is a lab PR.
     `test-one cgroup_join_privileged_e2e`): 92de8ac5 12 passed, 4 failed —
     the CI's four; with the fix 16 passed, 0 failed. Uninstalled
     (`--purge`), no pin left, powered off.
+  - Re-check 4 of #563: open — (R4-1) the walk's last open went by name
+    through `self/fd/N`, no mount check: a tmpfs over `/proc/<agent
+    pid>/fd` gave the decision thread its files for every fact, a FUSE
+    there held its loop (the harness's `0 rounds — STALLED`); (R4-2) a
+    sysfs link with `..` was `ELOOP`, then a plain `openat` crossing mounts;
+    (P2) an exemption that could not be judged was "none", an injection
+    into that process a debug line. Done: the reopen through the thread's
+    own `thread-self/fd` (every name checked, kept per thread), the entry
+    checked, the file compared with the walk's (mount, inode); a link's
+    `..` walked from its directory, never above the root; `openat2`'s
+    `EAGAIN` (a `..` raced by a rename or a mount) tried again, then walked;
+    `Covering::Unjudged`, signed (`unjudged_injection`). Named:
+    `the_decision_s_facts_are_never_read_through_a_mount_over_its_descriptors`
+    (agent), `a_link_s_dotdot_is_walked_from_its_directory_as_openat2_walks_it`,
+    `a_sysfs_link_with_a_dotdot_crosses_no_mount_without_openat2`,
+    `a_dotdot_raced_by_renames_is_read_all_the_same`,
+    `a_descriptor_is_reopened_through_this_thread_s_own_directory`
+    (kernel_roots), `an_exemption_that_could_not_be_judged_is_not_none`
+    (rule_policy), `a_fact_that_cannot_be_read_is_told_from_a_process_gone`
+    (decision_host_linux); the FUSE harness with a fourth FUSE over the
+    agent's own `/proc/<pid>/fd`. Lab: none (no guest needed; the cases run
+    in a user and mount namespace in CI).
 - **Lot 356 — a window's held BPF load is always signed, never
   rate-limited (pre-alpha F3-8; C23; no level change).**
   - What was open (P2, every kernel): `bpf_held_load`, the record of a

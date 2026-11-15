@@ -1070,6 +1070,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     own view: the start-in-cgroup tracker's pin directories beside the pin
     root are made and removed again (a planted one was left, the debug
     plant never made).
+  - Re-check 4 of #563 (§47.3): **the decision thread's last open of a
+    walk crosses no mount, a sysfs link's `..` is walked beneath the root,
+    and an injection into a process whose exemption could not be judged is
+    signed.** The one-name-at-a-time walk (fix round 5) opened the file it
+    reached again by name through `self/fd/N` beneath the `/proc` root — a
+    plain lookup of `<pid>/fd`: a tmpfs over `/proc/<agent pid>/fd` gave
+    the decision thread its files for every fact (the uid, the cgroup, the
+    `Tgid` its marks are read for), a FUSE there held it. It reopens through
+    the thread's own `thread-self/fd` now, every name of the way checked
+    (kept per thread), the entry itself procfs's, and the file opened is
+    compared with the one the walk reached (mount and inode: `EXDEV` on any
+    difference); a directory is opened again through its own descriptor
+    (`.`). `chmod_fd` and `reopen_fd` go the same way. A link whose target
+    climbs with `..` (`/sys/class/net/lo -> ../../devices/…`) was `ELOOP`,
+    then a plain `openat` that crossed mounts: the walk follows it from the
+    link's directory, never above the root, each step's mount checked; and
+    `openat2` beneath a root, whose `..` answers `EAGAIN` while any rename
+    or mount on the host races it, is tried again, then walked. An
+    exemption judged by a fact of the process that cannot be read while it
+    is there (a mount laid below `/proc/<pid>`) is no longer "none covers
+    it": code injected into that process is signed (NN-L-AT-001, `EXEMPTION
+    UNJUDGED`), saying which exemption and why. At the merge of #564: the
+    AppImage daemon's facts are read beneath the anchored `/proc` root.
 - Lot 356 (pre-alpha F3-8, P2): **a window's held BPF load is always
   signed, never rate-limited.** `bpf_held_load` (a program the content
   judge refuses outside a trusted-installer window, loaded inside one and

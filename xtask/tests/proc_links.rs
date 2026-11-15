@@ -151,8 +151,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
          (`KERNEL_MAGICS`), no path segment, and `starts_with(\"/proc\")` asks whether a path is \
          under the `/proc` view at all (before the views are anchored); the module resolves the \
          magic links of `/proc` as the kernel does, matching none; `chmod_fd` and `reopen_fd` \
-         (the review of #563, F2) open the process's own `/proc/self/fd` directory beneath the \
-         anchored root to reach a descriptor they hold, matching nothing a caller wrote; `current_exe` reads the process's own `/proc/self/exe` beneath the root (std read it by path)",
+         (the review of #563, F2) and the walk's reopen (re-check 4, R4-1) open the thread's \
+         own `thread-self/fd` directory beneath the anchored root to reach a descriptor they \
+         hold, matching nothing a caller wrote; `current_exe` reads the process's own `/proc/self/exe` beneath the root (std read it by path)",
     ),
     (
         "crates/nn-linux/src/impact/entropy.rs",

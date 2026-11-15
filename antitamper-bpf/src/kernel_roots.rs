@@ -44,6 +44,11 @@
 //!   directories — is a view of its own ([`bpf_view`]); a thread whose
 //!   seccomp filter refuses `openat2` (the decision thread's) walks one
 //!   name at a time instead, no mount crossed ([`openat_walked`]).
+//! - Re-check 4 of #563: that walk opens the file it reached again through
+//!   the thread's own `thread-self/fd`, every name checked, and compares
+//!   it with what the walk reached ([`reopen_checked`]); a link's `..` is
+//!   walked from its directory, never above the root; `openat2`'s `EAGAIN`
+//!   (a `..` raced by a rename or a mount) is tried again, then walked.
 //! - A path under no view is not this module's ([`view_of`] says `None`).
 
 use std::ffi::{CString, OsString};
@@ -649,8 +654,9 @@ const CROSSING: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
 
 /// `rel` opened beneath `dir` with `flags` (plus `O_CLOEXEC | O_NOCTTY`)
 /// and `resolve`. Where `openat2` cannot be called — a kernel without it
-/// (`ENOSYS`), a seccomp filter that refuses it (`EPERM`) — the walk it
-/// would do, one name at a time ([`openat_walked`]).
+/// (`ENOSYS`), a seccomp filter that refuses it (`EPERM`) — or keeps
+/// answering `EAGAIN` (a `..` raced by renames or mounts), the walk it would
+/// do, one name at a time ([`openat_walked`]).
 fn openat2(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File> {
     let c = CString::new(rel.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -667,26 +673,33 @@ fn openat2(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File>
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = flags as u64;
     how.resolve = resolve;
-    // SAFETY: `c` is NUL-terminated and `how` outlives the call, its size
-    // given.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            &how as *const libc::open_how,
-            std::mem::size_of::<libc::open_how>(),
-        )
-    };
-    if fd >= 0 {
-        // SAFETY: a new descriptor the kernel gave this call alone.
-        return Ok(unsafe { File::from_raw_fd(fd as i32) });
+    // re-check 4 of #563 (the mini-hunt): a `..` beneath the root (a sysfs
+    // link's) is `EAGAIN` while any rename or mount on the host raced the
+    // walk — tried again, then walked one name at a time
+    for _ in 0..4 {
+        // SAFETY: `c` is NUL-terminated and `how` outlives the call, its
+        // size given.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: a new descriptor the kernel gave this call alone.
+            return Ok(unsafe { File::from_raw_fd(fd as i32) });
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EAGAIN) => continue,
+            Some(libc::ENOSYS | libc::EPERM) => return openat_walked(dir, rel, flags, resolve),
+            _ => return Err(e),
+        }
     }
-    let e = io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::ENOSYS | libc::EPERM) => openat_walked(dir, rel, flags, resolve),
-        _ => Err(e),
-    }
+    openat_walked(dir, rel, flags, resolve)
 }
 
 /// Lot 353 (fix round 5, the KVM suites of #563): `rel` opened beneath
@@ -706,23 +719,29 @@ fn openat2(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File>
 /// the one before and its mount read ([`mount_of`]: nothing asked of a FUSE
 /// root reached, only the kernel's cached answer), refused (`EXDEV`) when it
 /// is not `dir`'s — before any name is looked up in it; a symbolic link to
-/// follow is followed from its directory when its target is names alone
-/// (procfs's `self`), any other (a magic link, a `..`) is `ELOOP`, which
-/// the callers resolve from the root as they resolve a magic link; a `..`
-/// of `rel` is `EXDEV` (`RESOLVE_BENEATH`). The file is
-/// then opened with `flags` through its checked descriptor
-/// (`/proc/self/fd/N` beneath the anchored `/proc` root: the inode checked,
-/// no name looked up again), or, before `/proc` is anchored, by its name in
-/// its checked parent, the file opened checked again.
+/// follow is followed from its directory when its target is names and
+/// `..` alone (procfs's `self`; re-check 4 of #563, R4-2: sysfs's
+/// `class/net/lo -> ../../devices/…`, a `..` going back to the directory
+/// the walk came from, never above `dir`: `EXDEV`, as `RESOLVE_BENEATH`),
+/// any other (a magic link, an absolute target) is `ELOOP`, which the
+/// callers resolve from the root as they resolve a magic link; a `..` of
+/// `rel` is `EXDEV`. The file reached is then opened with `flags`: a
+/// directory through its own checked descriptor (`.`), any other through
+/// [`reopen_checked`] (re-check 4 of #563, R4-1: on 8c1c5d12 by name
+/// through `self/fd/N`, crossing a mount over `/proc/<pid>/fd`), or,
+/// before `/proc` is anchored, by its name in its checked parent — the
+/// file opened compared with the one the walk reached either way (mount
+/// and inode: `EXDEV` on any difference).
 fn openat_walked(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File> {
     if resolve & libc::RESOLVE_NO_XDEV == 0 {
         return openat(dir, rel, flags);
     }
     let err = io::Error::from_raw_os_error;
+    // the steps left: a name, or a `..` of a link's target (`None`)
     let mut todo = std::collections::VecDeque::new();
     for c in rel.components() {
         match c {
-            Component::Normal(n) => todo.push_back(n.to_os_string()),
+            Component::Normal(n) => todo.push_back(Some(n.to_os_string())),
             Component::CurDir => {}
             _ => return Err(err(libc::EXDEV)),
         }
@@ -730,80 +749,129 @@ fn openat_walked(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result
     if todo.is_empty() {
         return openat(dir, Path::new("."), flags);
     }
-    let (mount, _) = mount_of(dir)?;
+    let mount = mount_of(dir)?.mount;
+    // procfs is the one view with magic links (`socket:[N]` a name of none)
+    let magic_links = magic_of(dir)? == PROC_SUPER_MAGIC;
     let is = |mode: u32, kind: libc::mode_t| mode & libc::S_IFMT == kind;
     let (path_only, nofollow) = (flags & libc::O_PATH != 0, flags & libc::O_NOFOLLOW != 0);
-    let mut parent: Option<File> = None;
+    // the checked directories below `dir` the walk is in, the last the
+    // one it is in now: a `..` goes back to the one before
+    let mut dirs: Vec<File> = Vec::new();
     let mut links = 0;
-    while let Some(name) = todo.pop_front() {
-        let at = parent.as_ref().unwrap_or(dir);
+    while let Some(step) = todo.pop_front() {
+        let Some(name) = step else {
+            // never above `dir` (`RESOLVE_BENEATH`)
+            dirs.pop().ok_or_else(|| err(libc::EXDEV))?;
+            continue;
+        };
+        let at = dirs.last().unwrap_or(dir);
         let file = openat(at, Path::new(&name), libc::O_PATH | libc::O_NOFOLLOW)?;
-        let (m, mode) = mount_of(&file)?;
-        if m != mount {
+        let id = mount_of(&file)?;
+        if id.mount != mount {
             return Err(err(libc::EXDEV));
         }
         let last = todo.is_empty();
-        if is(mode, libc::S_IFLNK) && !(last && path_only && nofollow) {
-            // a link of names alone, followed from its directory (procfs's
-            // `self`, `mounts`); a magic link (an absolute target, a
-            // `socket:[N]`), a `..`, a ninth link: the caller's
+        if is(id.mode, libc::S_IFLNK) && !(last && path_only && nofollow) {
+            // a link of names and `..` alone, followed from its directory;
+            // a magic link (an absolute target, a `socket:[N]`), a ninth
+            // link: the caller's
             links += 1;
-            let names = (links <= 8)
+            let steps = (links <= 8)
                 .then(|| link_of(&file).ok())
                 .flatten()
-                .and_then(|t| relative_names(&t))
+                .and_then(|t| link_steps(&t, magic_links))
                 .ok_or_else(|| err(libc::ELOOP))?;
-            for n in names.into_iter().rev() {
-                todo.push_front(n);
+            for s in steps.into_iter().rev() {
+                todo.push_front(s);
             }
             continue;
         }
         if !last {
-            parent = Some(file);
+            dirs.push(file);
             continue;
         }
         if path_only {
-            if flags & libc::O_DIRECTORY != 0 && !is(mode, libc::S_IFDIR) {
+            if flags & libc::O_DIRECTORY != 0 && !is(id.mode, libc::S_IFDIR) {
                 return Err(err(libc::ENOTDIR));
             }
             return Ok(file);
         }
         let flags = flags & !libc::O_NOFOLLOW;
-        if let Some(proc) = VIEWS.get().and_then(|v| v.proc.root.as_ref().ok()) {
-            return openat(
-                proc,
-                Path::new(&format!("self/fd/{}", file.as_raw_fd())),
-                flags,
-            );
+        if is(id.mode, libc::S_IFDIR) {
+            return reopen_dir(&file, id, flags);
+        }
+        if VIEWS.get().is_some_and(|v| v.proc.root.as_ref().is_ok()) {
+            return reopen_checked(&file, flags);
         }
         let f = openat(at, Path::new(&name), flags | libc::O_NOFOLLOW)?;
-        if mount_of(&f)?.0 != mount {
+        if !mount_of(&f)?.same_file(id) {
             return Err(err(libc::EXDEV));
         }
         return Ok(f);
     }
-    Err(err(libc::ENOENT))
+    // the walk ended on a `..`: the directory it went back to
+    match dirs.pop() {
+        Some(d) if path_only => Ok(d),
+        Some(d) => {
+            let id = mount_of(&d)?;
+            reopen_dir(&d, id, flags & !libc::O_NOFOLLOW)
+        }
+        None => openat(dir, Path::new("."), flags),
+    }
 }
 
-/// The names of a symbolic link's target made of names alone — relative,
-/// no `.` or `..`, none naming a kernel object (`socket:[N]`, `mnt:[N]`:
-/// a magic link's) — or `None`.
-fn relative_names(target: &Path) -> Option<Vec<OsString>> {
-    let mut names = Vec::new();
+/// The checked directory `d` (`O_PATH`, `id` its [`mount_of`]) opened
+/// with `flags` through its own descriptor (`.`: no name looked up, no
+/// mount crossed), compared with it.
+fn reopen_dir(d: &File, id: Ident, flags: i32) -> io::Result<File> {
+    let f = openat(d, Path::new("."), flags)?;
+    if !mount_of(&f)?.same_file(id) {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(f)
+}
+
+/// The steps of a symbolic link's target made of names and `..` alone —
+/// relative, a `..` as `None`; with `magic_links` (procfs), none naming a
+/// kernel object (`socket:[N]`, `mnt:[N]`: a magic link's) — or `None`.
+fn link_steps(target: &Path, magic_links: bool) -> Option<Vec<Option<OsString>>> {
+    let mut steps = Vec::new();
     for c in target.components() {
         match c {
-            Component::Normal(n) if !n.as_bytes().contains(&b':') => names.push(n.to_os_string()),
+            Component::Normal(n) if !(magic_links && n.as_bytes().contains(&b':')) => {
+                steps.push(Some(n.to_os_string()))
+            }
+            Component::ParentDir => steps.push(None),
+            Component::CurDir => {}
             _ => return None,
         }
     }
-    (!names.is_empty()).then_some(names)
+    (!steps.is_empty()).then_some(steps)
 }
 
-/// The mount of the open `f` (its id; its device on a kernel before 5.8,
-/// which has none) and its mode, as the kernel has them cached: `statx`
-/// with `AT_STATX_DONT_SYNC` and no attribute asked — a FUSE root a walk
-/// reached is never asked anything, so its daemon cannot hold the caller.
-fn mount_of(f: &File) -> io::Result<(u64, u32)> {
+/// What [`mount_of`] tells of an open file, as the kernel has it cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ident {
+    /// Its mount's id (its device on a kernel before 5.8, which has none).
+    mount: u64,
+    /// Its inode's number.
+    ino: u64,
+    /// Its mode (type and permissions).
+    mode: u32,
+}
+
+impl Ident {
+    /// The same file on the same mount.
+    fn same_file(self, other: Ident) -> bool {
+        (self.mount, self.ino) == (other.mount, other.ino)
+    }
+}
+
+/// The mount of the open `f`, its inode and its mode, as the kernel has
+/// them cached: `statx` with `AT_STATX_DONT_SYNC` and no attribute asked —
+/// a FUSE root a walk reached is never asked anything, so its daemon cannot
+/// hold the caller.
+fn mount_of(f: &File) -> io::Result<Ident> {
     // SAFETY: `statx` is plain old data, valid when zeroed.
     let mut sx: libc::statx = unsafe { std::mem::zeroed() };
     // SAFETY: the fd is live, the empty path NUL-terminated, `sx` writable.
@@ -819,12 +887,98 @@ fn mount_of(f: &File) -> io::Result<(u64, u32)> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    let id = if sx.stx_mask & libc::STATX_MNT_ID != 0 {
+    let mount = if sx.stx_mask & libc::STATX_MNT_ID != 0 {
         sx.stx_mnt_id
     } else {
         (u64::from(sx.stx_dev_major) << 20) | u64::from(sx.stx_dev_minor)
     };
-    Ok((id, u32::from(sx.stx_mode)))
+    Ok(Ident {
+        mount,
+        ino: sx.stx_ino,
+        mode: u32::from(sx.stx_mode),
+    })
+}
+
+thread_local! {
+    /// [`with_fd_dir`]'s directory, kept for the thread whose tid it holds.
+    static FD_DIR: std::cell::RefCell<Option<(libc::pid_t, File, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lot 353 (re-check 4 of #563, R4-1): `op` on this thread's own
+/// descriptor directory and its mount — `thread-self/fd` opened `O_PATH`
+/// beneath the `/proc` root the start anchored, every name of the way
+/// checked (`openat2` with `RESOLVE_NO_XDEV`, or the walk one name at a
+/// time where it cannot be called), never `/proc/<pid>/fd` looked up by
+/// name, where a mount may lie. Kept for the thread (a mount laid over it
+/// since is never walked), opened again in a forked child (another tid).
+/// `Err` when `/proc` was not anchored.
+fn with_fd_dir<T>(op: impl FnOnce(&File, u64) -> io::Result<T>) -> io::Result<T> {
+    let open = || -> io::Result<(File, u64)> {
+        let views = views();
+        let proc = views
+            .proc
+            .root
+            .as_ref()
+            .map_err(|why| not_anchored(Path::new("/proc/thread-self/fd"), why))?;
+        let d = openat2(
+            proc,
+            Path::new("thread-self/fd"),
+            libc::O_PATH | libc::O_DIRECTORY,
+            NO_CROSSING,
+        )?;
+        let m = mount_of(&d)?.mount;
+        Ok((d, m))
+    };
+    // SAFETY: gettid has no preconditions.
+    let tid = unsafe { libc::gettid() };
+    let mut op = Some(op);
+    let kept = FD_DIR.try_with(|c| {
+        let mut c = c.try_borrow_mut().ok()?;
+        if !matches!(&*c, Some((t, _, _)) if *t == tid) {
+            *c = None;
+            let (d, m) = open().ok()?;
+            *c = Some((tid, d, m));
+        }
+        let (_, d, m) = c.as_ref()?;
+        Some(op.take()?(d, *m))
+    });
+    match (kept, op) {
+        (Ok(Some(r)), _) => r,
+        // not kept (a thread ending, a reentrant call, an error): opened
+        // for this call alone
+        (_, Some(op)) => {
+            let (d, m) = open()?;
+            op(&d, m)
+        }
+        (_, None) => Err(io::Error::other("the descriptor directory: no answer")),
+    }
+}
+
+/// Lot 353 (re-check 4 of #563, R4-1): the file `f` refers to (an `O_PATH`
+/// descriptor too) opened again with `flags`, through its entry in this
+/// thread's own descriptor directory ([`with_fd_dir`]): the entry itself
+/// looked at first (`O_PATH | O_NOFOLLOW`: procfs's, nothing mounted on
+/// it), the file opened compared with `f` — the same mount and inode, or
+/// `EXDEV`. On 8c1c5d12 the walk's reopen went by name through
+/// `self/fd/N`: a tmpfs over `/proc/<pid>/fd` gave the decision thread its
+/// files for every fact, a FUSE there held it. The kernel has no reopen of
+/// a descriptor without a name (`openat` takes no `AT_EMPTY_PATH`; a
+/// directory is opened again through `.`, [`reopen_dir`]).
+fn reopen_checked(f: &File, flags: i32) -> io::Result<File> {
+    let want = mount_of(f)?;
+    let name = PathBuf::from(f.as_raw_fd().to_string());
+    with_fd_dir(|dir, mount| {
+        let exdev = || io::Error::from_raw_os_error(libc::EXDEV);
+        if mount_of(&openat(dir, &name, libc::O_PATH | libc::O_NOFOLLOW)?)?.mount != mount {
+            return Err(exdev());
+        }
+        let got = openat(dir, &name, flags & !libc::O_NOFOLLOW)?;
+        if !mount_of(&got)?.same_file(want) {
+            return Err(exdev());
+        }
+        Ok(got)
+    })
 }
 
 /// `rel` opened beneath `dir` with plain `openat` (magic links followed).
@@ -1315,28 +1469,40 @@ pub fn read_dir_max<P: AsRef<Path>>(path: P, max: usize) -> io::Result<Vec<OsStr
 }
 
 /// Lot 353 (the review of #563, F2): `chmod` of the file `f` refers to —
-/// an `O_PATH` descriptor too, which `fchmod` refuses — through its
-/// `/proc/self/fd` entry beneath the `/proc` root the start anchored (the
-/// directory opened crossing no mount), never through the `/proc` mounted
-/// now. `Err` when that root is not anchored: the caller's fallback.
+/// an `O_PATH` descriptor too, which `fchmod` refuses — through its entry
+/// in this thread's own descriptor directory beneath the `/proc` root the
+/// start anchored (re-check 4 of #563: `thread-self/fd`, every name of the
+/// way checked, and the entry itself procfs's: [`with_fd_dir`]), never
+/// through the `/proc` mounted now. `Err` when that root is not anchored:
+/// the caller's fallback.
 pub fn chmod_fd(f: &File, mode: u32) -> io::Result<()> {
-    let dir = open("/proc/self/fd", libc::O_PATH | libc::O_DIRECTORY)?;
     let name = CString::new(f.as_raw_fd().to_string())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: a live directory fd and a NUL-terminated name; the magic link
-    // is followed to the file `f` refers to.
-    if unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    with_fd_dir(|dir, mount| {
+        let entry = openat(
+            dir,
+            Path::new(&f.as_raw_fd().to_string()),
+            libc::O_PATH | libc::O_NOFOLLOW,
+        )?;
+        if mount_of(&entry)?.mount != mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        // SAFETY: a live directory fd and a NUL-terminated name; the magic
+        // link is followed to the file `f` refers to.
+        if unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
 }
 
 /// Lot 353 (the review of #563, F2): the file `f` refers to (an `O_PATH`
-/// descriptor too) opened again with `flags`, through its `/proc/self/fd`
-/// entry beneath the `/proc` root the start anchored, as [`chmod_fd`].
+/// descriptor too) opened again with `flags`, through its entry in this
+/// thread's own descriptor directory, as [`chmod_fd`] — and (re-check 4)
+/// compared with `f`: the same mount and inode, or `EXDEV`
+/// ([`reopen_checked`]).
 pub fn reopen_fd(f: &File, flags: i32) -> io::Result<File> {
-    let dir = open("/proc/self/fd", libc::O_PATH | libc::O_DIRECTORY)?;
-    openat(&dir, Path::new(&f.as_raw_fd().to_string()), flags)
+    reopen_checked(f, flags)
 }
 
 /// The names in the open directory `f` (not `.` and `..`): lot 353, the
@@ -2427,5 +2593,358 @@ mod tests {
             return 18;
         }
         0
+    }
+
+    /// `(dev, ino)` of what an open reached, or its errno.
+    fn reached(r: io::Result<File>) -> Result<(u64, u64), Option<i32>> {
+        use std::os::unix::fs::MetadataExt;
+        r.and_then(|f| f.metadata())
+            .map(|m| (m.dev(), m.ino()))
+            .map_err(|e| e.raw_os_error())
+    }
+
+    /// Lot 353 (re-check 4 of #563, R4-2; named): a symbolic link whose
+    /// target climbs with `..` (sysfs's `class/net/lo -> ../../devices/…`) is
+    /// followed by the walk one name at a time from the link's directory, as
+    /// `openat2` beneath the root follows it — the same file reached, the
+    /// same refusal of a climb above the root (`EXDEV`). On 8c1c5d12 it was
+    /// `ELOOP`, which the callers opened again with a plain `openat`.
+    #[test]
+    fn a_link_s_dotdot_is_walked_from_its_directory_as_openat2_walks_it() {
+        let _ = views();
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::fs::write(d.join("b/f"), b"ok").unwrap();
+        // a name with a `:` (sysfs's `pci0000:00`): a name, off procfs
+        std::fs::create_dir_all(d.join("b:c")).unwrap();
+        std::fs::write(d.join("b:c/f"), b"ok").unwrap();
+        for (name, target) in [
+            ("a/colon", "../b:c"),
+            ("a/l", "../b"),
+            ("a/deep", "../a/../b/f"),
+            ("a/up", "../../x"),
+            ("a/m", ".."),
+            ("a/n", "l/../l/f"),
+        ] {
+            std::os::unix::fs::symlink(target, d.join(name)).unwrap();
+        }
+        let root = open_path(d, libc::O_PATH | libc::O_DIRECTORY).unwrap();
+        let dirs = libc::O_PATH | libc::O_DIRECTORY;
+        for (rel, flags) in [
+            ("a/colon/f", READ_FLAGS),
+            ("a/l/f", READ_FLAGS),
+            ("a/deep", READ_FLAGS),
+            ("a/n", READ_FLAGS),
+            ("a/m/b/f", READ_FLAGS),
+            ("a/l", dirs),
+            ("a/m", dirs),
+            ("a/m", libc::O_RDONLY | libc::O_DIRECTORY),
+            ("a/up", libc::O_PATH),
+            ("a/up/f", READ_FLAGS),
+            ("a/m/..", dirs),
+        ] {
+            let walked = reached(openat_walked(
+                &root,
+                Path::new(rel),
+                flags | libc::O_CLOEXEC,
+                NO_CROSSING,
+            ));
+            let native = reached(openat2(&root, Path::new(rel), flags, NO_CROSSING));
+            assert_eq!(
+                walked, native,
+                "{rel} (flags {flags:#x}): the walk and openat2"
+            );
+        }
+        // what they reached, named
+        assert_eq!(
+            reached(openat_walked(
+                &root,
+                Path::new("a/deep"),
+                READ_FLAGS,
+                NO_CROSSING
+            )),
+            reached(std::fs::File::open(d.join("b/f")))
+        );
+        assert_eq!(
+            reached(openat_walked(
+                &root,
+                Path::new("a/up/f"),
+                READ_FLAGS,
+                NO_CROSSING
+            )),
+            Err(Some(libc::EXDEV))
+        );
+    }
+
+    /// Lot 353 (re-check 4 of #563, the mini-hunt; named): a sysfs path
+    /// through a link that climbs with `..` is read while renames race it —
+    /// `openat2` beneath the root answers `EAGAIN` when any rename or mount
+    /// on the host raced a `..`: on 8c1c5d12 that error was the read's.
+    #[test]
+    fn a_dotdot_raced_by_renames_is_read_all_the_same() {
+        const PATH: &str = "/sys/class/net/lo/address";
+        let Ok(want) = std::fs::read(PATH) else {
+            eprintln!("skipped: no {PATH} here");
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"x").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::rename(&a, &b);
+                    let _ = std::fs::rename(&b, &a);
+                }
+            })
+        };
+        let mut failed = None;
+        for _ in 0..20_000 {
+            match read(PATH, 4096) {
+                Ok(got) if got == want => {}
+                other => {
+                    failed = Some(format!("{other:?}"));
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
+        assert_eq!(failed, None, "a read of {PATH} raced by renames");
+    }
+
+    /// Lot 353 (re-check 4 of #563, R4-1): a descriptor is opened again
+    /// through this thread's own descriptor directory — the same file (an
+    /// `O_PATH` one too), on another thread through that thread's, and in a
+    /// forked child through the child's (the directory a thread keeps is its
+    /// tid's: the parent's would name the parent's descriptors).
+    #[test]
+    fn a_descriptor_is_reopened_through_this_thread_s_own_directory() {
+        let _ = views();
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"ok").unwrap();
+        let f = open_path(&p, libc::O_PATH).unwrap();
+        let same = |r: io::Result<File>| reached(r) == reached(File::open(&p));
+        assert!(same(reopen_fd(&f, libc::O_RDONLY)), "this thread");
+        assert!(same(reopen_fd(&f, libc::O_RDONLY)), "this thread, kept");
+        let g = f.try_clone().unwrap();
+        let q = p.clone();
+        let other = std::thread::spawn(move || {
+            reached(reopen_fd(&g, libc::O_RDONLY)) == reached(File::open(&q))
+        });
+        assert!(other.join().unwrap(), "another thread");
+        // SAFETY: fork; the child reopens and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // a descriptor the parent does not hold, at a number it has free
+            let mine: Vec<File> = (0..8)
+                .filter_map(|_| open_path(&p, libc::O_PATH).ok())
+                .collect();
+            let ok = mine.iter().all(|m| same(reopen_fd(m, libc::O_RDONLY)));
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the forked child: {status:#x}"
+        );
+    }
+
+    /// The decision thread's filter in a test's child: `openat2` refused
+    /// with `EPERM`, every other call allowed. `false` when refused.
+    fn refuse_openat2() -> bool {
+        let mut prog = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_openat2 as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let fprog = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_mut_ptr(),
+        };
+        // SAFETY: a filter program that outlives the call, on this thread.
+        unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                && libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &fprog as *const libc::sock_fprog as libc::c_ulong,
+                    0,
+                    0,
+                ) == 0
+        }
+    }
+
+    /// Lot 353 (re-check 4 of #563, R4-2; named): without `openat2` (the
+    /// decision thread's filter), a sysfs path through a link that climbs
+    /// with `..` is read beneath the `/sys` root as by path, and a mount laid
+    /// on the link's target (a tmpfs over `/sys/devices/virtual/net/lo`) is
+    /// refused at its root, never read: on 8c1c5d12 the walk's `ELOOP` sent
+    /// it to a plain `openat`, which crossed the tmpfs and read its file. In
+    /// a user and mount namespace of a child (skipped where the host refuses
+    /// one; a failure under CI).
+    #[test]
+    fn a_sysfs_link_with_a_dotdot_crosses_no_mount_without_openat2() {
+        let _ = views();
+        // SAFETY: fork; the child mounts in namespaces of its own and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = dotdot_child();
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(rc) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 => {}
+            99 => assert!(
+                std::env::var_os("CI").is_none(),
+                "under CI this test must run, never skip"
+            ),
+            rc => panic!("the child failed with {rc}"),
+        }
+    }
+
+    /// The child of
+    /// [`a_sysfs_link_with_a_dotdot_crosses_no_mount_without_openat2`]: 0
+    /// when it holds, 99 when the host refuses the namespaces.
+    fn dotdot_child() -> i32 {
+        const PATH: &str = "/sys/class/net/lo/address";
+        const FAKE: &[u8] = b"FAKE-FACT\n";
+        let Ok(want) = std::fs::read(PATH) else {
+            return 99; // no loopback in sysfs here
+        };
+        if !std::fs::read_link("/sys/class/net/lo")
+            .is_ok_and(|t| t.components().any(|c| c == Component::ParentDir))
+        {
+            return 99;
+        }
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        // SAFETY: the child's own namespaces; no data.
+        let refused = unsafe {
+            libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                || libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+        };
+        // uid 0 mapped to the caller's (the cover's file written as it)
+        let w = |p: &str, s: String| std::fs::write(p, s).is_ok();
+        if refused
+            || !(w("/proc/self/setgroups", "deny".into())
+                && w("/proc/self/uid_map", format!("0 {uid} 1"))
+                && w("/proc/self/gid_map", format!("0 {gid} 1")))
+        {
+            return 99;
+        }
+        let views = Views::open();
+        let Ok(sys) = views.sys.root.as_ref() else {
+            return 98;
+        };
+        if !refuse_openat2() {
+            return 97;
+        }
+        let text = |p: &str| {
+            with_file_in(&views, Path::new(p), READ_FLAGS, |f| {
+                read_file_bounded(&f, 1 << 12)
+            })
+            .expect("a view's path")
+        };
+        // under the filter: read beneath the root as by path, the walk
+        // itself following the link
+        if text(PATH).ok() != Some(want) {
+            return 10;
+        }
+        if reached(openat_walked(
+            sys,
+            Path::new("class/net/lo/address"),
+            READ_FLAGS,
+            NO_CROSSING,
+        ))
+        .is_err()
+        {
+            return 11;
+        }
+        // a tmpfs over the link's target, holding a file of the name read
+        // SAFETY: NUL-terminated strings, no data.
+        let covered = unsafe {
+            libc::mount(
+                c"none".as_ptr(),
+                c"/sys/devices/virtual/net/lo".as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        } == 0
+            && std::fs::write("/sys/devices/virtual/net/lo/address", FAKE).is_ok()
+            && std::fs::read(PATH).is_ok_and(|b| b == FAKE);
+        if !covered {
+            eprintln!(
+                "missing here: a tmpfs over /sys/devices/virtual/net/lo ({})",
+                io::Error::last_os_error()
+            );
+            return 99;
+        }
+        if errno_of(openat_walked(
+            sys,
+            Path::new("class/net/lo/address"),
+            READ_FLAGS,
+            NO_CROSSING,
+        )) != Some(libc::EXDEV)
+        {
+            return 12;
+        }
+        match text(PATH) {
+            Ok(b) if b == FAKE => 13,
+            Err(e)
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    && e.to_string().contains("not the kernel's") =>
+            {
+                0
+            }
+            _ => 14,
+        }
+    }
+
+    /// The errno of a failed open.
+    fn errno_of(r: io::Result<File>) -> Option<i32> {
+        r.err().and_then(|e| e.raw_os_error())
     }
 }

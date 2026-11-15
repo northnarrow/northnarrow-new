@@ -82,8 +82,9 @@ impl<H: DecisionHost> RuleEngine<H> {
     /// Lot 281: the exemption of the policy in force (any rule's) that
     /// covers process `pid` whatever was injected into it
     /// ([`rule_policy::covering`]) — asked when code was first injected into
-    /// a process.
-    pub fn exempt_covering(&self, pid: u32) -> Option<String> {
+    /// a process. Lot 353 (re-check 4 of #563): or one that could not be
+    /// judged ([`rule_policy::Covering::Unjudged`]).
+    pub fn exempt_covering(&self, pid: u32) -> rule_policy::Covering {
         rule_policy::covering(&self.policy.current(), pid, &*self.facts)
     }
 

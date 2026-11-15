@@ -3184,6 +3184,50 @@ agent's own directories.
   view (the agent pins nothing), and another file system over it at the
   start is refused and named with the other views (`kernel_views`).
 
+### 47.3 Re-check 4 of #563: the walk's last open, a link's `..`, an exemption not judged
+
+- **The decision thread's walk opens its file again through its own
+  descriptor directory.** Where `openat2` is refused (the decision thread's
+  filter), the walk one name at a time checks every name's mount, but the
+  file it reached was then opened again by name through `self/fd/N` beneath
+  the `/proc` root — a lookup of `<pid>`, then `fd`, with no mount check: a
+  tmpfs over `/proc/<agent pid>/fd` gave the decision thread its files for
+  every fact (a uid, a cgroup, the `Tgid` the marks are read for), a FUSE
+  there held its loop. The reopen goes through the thread's own
+  `thread-self/fd` now, every name of the way checked as the walk checks
+  them (the directory kept for the thread, opened again in a forked
+  child); the entry itself is looked at first (procfs's, nothing mounted
+  on it), and the file opened is compared with the one the walk reached —
+  the same mount and inode, or the open fails (`EXDEV`). A directory is
+  opened again through its own descriptor (`.`), no name looked up. The
+  kernel has no reopen of a descriptor without a name. `kernel_roots`'s
+  `chmod_fd` and `reopen_fd` (the quarantine, the admin socket, the copy-
+  on-write journal) go through the same directory and checks. A cover laid
+  over a thread's own `fd` directory fails its reads closed (or sends them
+  to the bounded crossing, which reads the kernel's file systems only).
+- **A link whose target climbs with `..` is walked beneath the root.**
+  sysfs's links (`/sys/class/net/<if> -> ../../devices/…`) were `ELOOP` to
+  the walk, then opened with a plain `openat` that crossed whatever was
+  mounted on the way: the walk follows a target of names and `..` from the
+  link's directory, a `..` going back to the directory it came from, never
+  above the root (`EXDEV`), each step's mount checked. A name with a `:` is
+  a name off procfs (`pci0000:00`); on procfs it is still a magic link's.
+  Beside it: `openat2` beneath a root answers `EAGAIN` for a `..` while any
+  rename or mount on the host races the walk — that error was the read's;
+  it is tried again, then walked one name at a time.
+- **An exemption that could not be judged is signed.** When code is first
+  injected into a process (a debugger's attach, a write handle on its
+  memory, `process_vm_writev`, `pidfd_getfd`), the agent asks whether an
+  exemption of the per-rule policy covered it. A fact it is judged by that
+  could not be read while the process is there (a mount laid below
+  `/proc/<pid>`, a read that did not answer) made it "none covers it", and
+  the injection was a debug line. It is now `Covering::Unjudged`: signed
+  as for an exempt process (NN-L-AT-001, Log, High — Critical from a
+  non-root injector or one outside an administrator's interactive session),
+  the journal's `EXEMPTION UNJUDGED` and the record naming the exemption
+  and the file that could not be read. A process gone (no file) is still
+  "none".
+
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 
 - **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)

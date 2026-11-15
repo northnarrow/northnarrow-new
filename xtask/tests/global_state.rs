@@ -363,6 +363,15 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "antitamper-bpf/src/kernel_roots.rs",
+        "FD_DIR",
+        Process,
+        "lot 353 (re-check 4 of #563, R4-1): a thread-local — the thread's own descriptor \
+         directory (`thread-self/fd` beneath the anchored /proc root, every name checked) the \
+         reopen of a descriptor goes through, opened once per thread (its tid's: again in a \
+         forked child)",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
         "CPUS",
         HostFact,
         "lot 353 (the review of #563, F2): the host's possible CPUs, read once beneath the \

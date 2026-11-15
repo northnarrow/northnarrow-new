@@ -211,6 +211,13 @@ mod testing {
         fn injected(&self, _pid: u32) -> Option<crate::decision::rule_policy::Injected> {
             None
         }
+        fn unread(
+            &self,
+            _pid: u32,
+            _fact: crate::decision::rule_policy::ExemptionFact,
+        ) -> Option<String> {
+            None
+        }
     }
 
     /// Samples nothing: no burst's files are read.
