@@ -74,6 +74,27 @@ pub fn is_staging_path(path: &str) -> bool {
     STAGING_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
+/// Lot 355: the path the staging rules judge an exec by — the file the
+/// kernel executed (review 61), or the caller's string without it — or
+/// `None` for a file of a user's program image
+/// (`exe_flags::USER_IMAGE`: an AppImage's, served read-only at its
+/// runtime's `/tmp/.mount_*`), which is judged as that image is, never as
+/// staged in its mount point's directory. The one reading of an exec's
+/// image the staging rules use (R001..R003, the chains' staging
+/// precursor, the posture's exec arm; `xtask/tests/staged_images.rs`).
+pub fn staging_judged_path<'a>(
+    exe: &'a nn_model::ExeIdentity,
+    filename: &'a str,
+) -> Option<&'a str> {
+    (!exe.has(common::wire::exe::exe_flags::USER_IMAGE)).then(|| exe.path_or(filename))
+}
+
+/// Lot 355: the exec ran a staged image — [`staging_judged_path`] under
+/// one of [`STAGING_PREFIXES`].
+pub fn is_staged_exec(exe: &nn_model::ExeIdentity, filename: &str) -> bool {
+    staging_judged_path(exe, filename).is_some_and(is_staging_path)
+}
+
 /// Lab PR 166: the kill of the tool rules R011..R013 for an exec of
 /// `image`. A copy run from a staging directory is the payload itself, as
 /// for R001..R003, which those rules outrank (PROC-009): its tree, so a

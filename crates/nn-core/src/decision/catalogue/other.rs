@@ -151,13 +151,18 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    PR 244), judged on the kernel timestamps.",
         false_positives: "An installer or a test binary run from a temporary directory that \
                           talks to the network. A process of a package transaction is spared \
-                          (NETR-008, lab PR 175); its flow falls to NN-L-NET-008.",
+                          (NETR-008, lab PR 175); its flow falls to NN-L-NET-008. Lot 355: an \
+                          AppImage's programs (its runtime's read-only `/tmp/.mount_*`, tied to \
+                          the image file by the exec pump) are no staging exec: no precursor, \
+                          for CHAIN-005/007 either.",
         how_to_test: "Run from /tmp a helper that connects out as its first act (the e2e \
                       compiles one, which wins the race against R001's kill), or run the \
                       agent in detect-only mode and `cp /usr/bin/curl /tmp/c && /tmp/c \
                       http://127.0.0.1:8080/`.",
         tests: &[
             "crates/nn-core/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress",
+            "crates/nn-core/src/decision/rules/chain.rs::an_appimage_program_draws_no_staging_verdict",
+            "crates/nn-core/src/decision/rules/chain.rs::an_untied_mount_s_program_is_still_staged",
             "crates/nn-core/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002",
         ],

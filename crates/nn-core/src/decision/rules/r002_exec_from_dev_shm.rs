@@ -33,7 +33,9 @@ impl Rule for R002ExecFromDevShm {
             return None;
         };
         // Review 61: the file the kernel executed, not the caller's string.
-        let filename = exe.path_or(filename);
+        // Lot 355: a file of a user's program image (an AppImage's) is the
+        // image's, not staged in its mount point's directory.
+        let filename = crate::decision::rules::staging_judged_path(exe, filename)?;
         if !filename.starts_with("/dev/shm/") {
             return None;
         }

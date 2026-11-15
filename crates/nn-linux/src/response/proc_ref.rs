@@ -497,6 +497,26 @@ fn started_by(ticks: u64, seen_ns: u64) -> bool {
     ticks.saturating_mul(tick) <= seen_ns + suspended_ns() + 2 * tick
 }
 
+/// Lot 355: did a process with `/proc` start `ticks` (BOOTTIME) surely
+/// start at or after `since_ns` (MONOTONIC), two ticks of slack for the
+/// rounding? Its MONOTONIC start is at least its BOOTTIME start less all
+/// the time the host has spent suspended so far, so a process older than
+/// `since_ns` by more than the slack is never taken for a newer one (one
+/// that started since, then saw the host suspended, is taken for older:
+/// no).
+pub(crate) fn started_since(ticks: u64, since_ns: u64) -> bool {
+    started_since_with(ticks, since_ns, tick_ns(), suspended_ns())
+}
+
+/// [`started_since`] with the clock tick and the host's suspended time.
+fn started_since_with(ticks: u64, since_ns: u64, tick: u64, suspended: u64) -> bool {
+    ticks
+        .saturating_mul(tick)
+        .saturating_sub(suspended)
+        .saturating_add(2 * tick)
+        >= since_ns
+}
+
 fn tick_ns() -> u64 {
     // SAFETY: sysconf has no preconditions.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
@@ -527,6 +547,35 @@ pub fn proc_start_ns(pid: u32) -> Option<u64> {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    /// Lot 355: a process started at or after a time is told so with two
+    /// ticks of slack; one that started before it is not taken for newer
+    /// because the host has been suspended since (its BOOTTIME start runs
+    /// ahead of its MONOTONIC one by that time).
+    #[test]
+    fn started_since_takes_the_suspended_time_off() {
+        const T: u64 = 10_000_000;
+        // MONOTONIC 100 s, nothing suspended
+        assert!(started_since_with(10_000, 100 * 1_000_000_000, T, 0));
+        assert!(
+            started_since_with(9_998, 100 * 1_000_000_000, T, 0),
+            "two ticks"
+        );
+        assert!(!started_since_with(9_997, 100 * 1_000_000_000, T, 0));
+        // started at MONOTONIC 50 s, then 60 s suspended: BOOTTIME shows 110 s
+        assert!(!started_since_with(
+            11_000,
+            100 * 1_000_000_000,
+            T,
+            60 * 1_000_000_000
+        ));
+        assert!(started_since_with(
+            11_000,
+            50 * 1_000_000_000,
+            T,
+            60 * 1_000_000_000
+        ));
+    }
 
     fn sleeper() -> std::process::Child {
         Command::new("sleep")

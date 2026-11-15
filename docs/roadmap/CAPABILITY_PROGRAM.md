@@ -11208,6 +11208,54 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
+  not by its `/tmp` mount (C14; no level changes).**
+  - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
+    a FUSE squashfs at `/tmp/.mount_*` gave R001 High and then CHAIN-002 or
+    CHAIN-005 Critical ("would have: KillProcessTree"), Chrome for Testing's
+    headless shell mounted the same way too; from the home, NN-L-NET-007
+    Medium only. A desktop tester would see Critical records at each launch.
+  - Done: the exec pumps tie a read-only FUSE mount of the exec's user (on
+    no FUSE mount) to the image file the same process had just executed (the
+    user's own file outside the staging directories and the system trees),
+    entered by a path under the mount point, with a daemon of that file
+    (device and inode) started since, holding `/dev/fuse`, not stopped; its
+    execs are `USER_IMAGE` while that mount and daemon are there. One door
+    for "staged" (exec: `staging_judged_path` / `is_staged_exec`; process:
+    `staged_image_as`, the spawn cache keeping the mark for forks) for
+    R001..R003, the staging chains, the posture's exec arm, NN-L-NET-008,
+    the transfer-tool and impair staged-ancestor tests; a ratchet
+    (`xtask/tests/staged_images.rs`). Named tests in `sensors::app_image`,
+    `rules::chain` (the three F3 shapes, the untied controls, the
+    credential read, the late CHAIN-007), R001..R003, NET-008, the posture,
+    transfer tools and impair.
+  - Lab, ubuntu2404 (6.8), alpha profile, the AppImage project's type-2
+    runtime around lot 352's F3 app in `~/Applications`, and its
+    appimagetool AppImage. Before (round 1: this branch with the tie never
+    holding — the exec of the image file, walked to the task's root, was
+    refused as not plain — so rc2's judgement): main-connects, zygote
+    fork+exec and the credential read R001 High + CHAIN-002 Critical, the
+    zygote fork-only R001 High + NET-008 High, appimagetool R001 High ×2.
+    After (rounds 2 and 3, the fix; round 3 on the final code): the four
+    AppImage shapes NN-L-NET-007 Medium only (the credential read
+    NN-L-FIM-017 High besides, as for any user program), appimagetool none —
+    as the home reference (NET-007 only). Controls, still judged (round 3):
+    `squashfuse` over the same squashfs R001 High and CHAIN-002 Critical
+    (fork+exec), R001 High and NET-008 High (fork-only), CHAIN-002 Critical
+    also while the AppImage's daemon served its own mount; a writable FUSE
+    mount (`bindfs`, `rw`) R001 High and CHAIN-002 Critical; the AppImage
+    copied to `/tmp` R001 High ×5 and CHAIN-002 Critical. A fork-only
+    child's NET-008 in the `squashfuse` control was seen in rounds 1 and 3,
+    not 2: its image is read from `/proc` and the child exits within a
+    second (pre-existing). Not measured: snap and flatpak (none on the
+    guest; their images are no FUSE mounts in a staging directory, and the
+    mark is set for nothing else); debian13/ubuntu2604 (no eBPF, deny hook,
+    unit, install or self-test change).
+  - Residual (named): a malicious AppImage is a user program, judged by its
+    behaviour; `/proc` ties no FUSE mount to its serving process, so a user
+    who stops its own AppImage's runtime after the mount and puts its own
+    read-only filesystem at the path the runtime then executes gets that
+    filesystem judged as the image (programs it could run from its home).
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

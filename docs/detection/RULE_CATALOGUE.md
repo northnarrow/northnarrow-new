@@ -51,11 +51,11 @@ Exec from /tmp/ — category `execution`.
 
 **Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it).
 
-**Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT).
+**Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot 355: an AppImage's own programs, served read-only at its runtime's `/tmp/.mount_*` (the exec pump ties the mount to the image file the user ran, `USER_IMAGE`), are the image's: no record, as from the home. An AppImage itself in `/tmp`, an extracted one, a writable FUSE mount or another program's daemon stay judged.
 
 **How to test.** As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. Run as root it is R009's verdict.
 
-**Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
+**Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged`, `crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
 
 **ATT&CK note.** No technique is "execution from a staging directory": T1059 follows design §7.1 and V2 row TQ18 (the script or shell a dropper runs). A native payload is evidence of the Execution tactic, not of an interpreter.
 
@@ -1383,11 +1383,11 @@ Outbound from a staging-directory exec to non-resolver — category `net_high`.
 
 **Observes.** An outbound flow (at its connect, while it is open, at its close) from a process whose image lies in `/tmp`, `/var/tmp` or `/dev/shm` (named from the spawn cache or `/proc`), other than one to port 53 of a configured resolver. A process of a root package transaction is recorded (Log), not killed. To port 53 of a server that is no configured resolver — a match new in lab PR 224, which exempts only the host's resolvers — the kill is held behind the per-rule response policy (off by default): recorded at the same severity.
 
-**Known false positives.** Installers and self-extracting archives that run a helper from a staging directory and call out; package-manager transactions are carved out. A staged exec followed by egress within 5 minutes is NN-L-CHAIN-002/005's (they run first).
+**Known false positives.** Installers and self-extracting archives that run a helper from a staging directory and call out; package-manager transactions are carved out. A staged exec followed by egress within 5 minutes is NN-L-CHAIN-002/005's (they run first). Lot 355: an AppImage's programs (its runtime's read-only `/tmp/.mount_*`, tied to the image by the exec pump; the spawn cache keeps it for their forks) are the image's, not staged.
 
 **How to test.** In detect-only (R001 would kill the exec first), run a copy of `python3` from `/tmp` that connects more than 5 minutes after its exec, when the chain precursor is gone: `cp /usr/bin/python3 /tmp/nn-py; /tmp/nn-py -c 'import socket,time; time.sleep(330); socket.create_connection(("<peer>", 80))'`.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_008_fires_on_tmp_exec_outbound`, `crates/nn-core/src/decision/rules/net.rs::net_008_covers_every_staging_directory`, `crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_008_fires_on_tmp_exec_outbound`, `crates/nn-core/src/decision/rules/net.rs::net_008_spares_an_appimage_program`, `crates/nn-core/src/decision/rules/net.rs::net_008_covers_every_staging_directory`, `crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction`
 
 **ATT&CK note.** A staged payload calling out is mapped to its likeliest purpose, fetching the next stage (T1105); the flow's protocol is not seen, and a staged payload's C2 channel draws the rule as well.
 
@@ -1803,11 +1803,11 @@ Credential-store access followed by network egress — category `chain_exfiltrat
 
 **Observes.** An outbound flow (at its connect, while it is open, at its close), other than one to port 53 of a configured resolver, from a process whose image is in a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its exec. To port 53 of a server that is no configured resolver — a match new in lab PR 224, which exempts only the host's resolvers — the kill is held behind the per-rule response policy (off by default): recorded at the same severity. It also completes when the exec record is processed after the flow (lab PR 244), judged on the kernel timestamps.
 
-**Known false positives.** An installer or a test binary run from a temporary directory that talks to the network. A process of a package transaction is spared (NETR-008, lab PR 175); its flow falls to NN-L-NET-008.
+**Known false positives.** An installer or a test binary run from a temporary directory that talks to the network. A process of a package transaction is spared (NETR-008, lab PR 175); its flow falls to NN-L-NET-008. Lot 355: an AppImage's programs (its runtime's read-only `/tmp/.mount_*`, tied to the image file by the exec pump) are no staging exec: no precursor, for CHAIN-005/007 either.
 
 **How to test.** Run from /tmp a helper that connects out as its first act (the e2e compiles one, which wins the race against R001's kill), or run the agent in detect-only mode and `cp /usr/bin/curl /tmp/c && /tmp/c http://127.0.0.1:8080/`.
 
-**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `crates/nn-core/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `crates/nn-core/src/decision/rules/chain.rs::an_appimage_program_draws_no_staging_verdict`, `crates/nn-core/src/decision/rules/chain.rs::an_untied_mount_s_program_is_still_staged`, `crates/nn-core/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
 
 **ATT&CK note.** T1059 and T1571 as the design and the V2 technique rows (TQ18, TQ55) have them. The image need not be an interpreter, and the trigger is any port but 53, so a payload calling home on 443 (T1071) fires it too, which the mapping does not claim.
 

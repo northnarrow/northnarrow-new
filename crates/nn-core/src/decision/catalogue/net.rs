@@ -195,7 +195,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "Installers and self-extracting archives that run a helper from a \
                           staging directory and call out; package-manager transactions are \
                           carved out. A staged exec followed by egress within 5 minutes is \
-                          NN-L-CHAIN-002/005's (they run first).",
+                          NN-L-CHAIN-002/005's (they run first). Lot 355: an AppImage's \
+                          programs (its runtime's read-only `/tmp/.mount_*`, tied to the image \
+                          by the exec pump; the spawn cache keeps it for their forks) are the \
+                          image's, not staged.",
         how_to_test: "In detect-only (R001 would kill the exec first), run a copy of `python3` \
                       from `/tmp` that connects more than 5 minutes after its exec, when the \
                       chain precursor is gone: `cp /usr/bin/python3 /tmp/nn-py; /tmp/nn-py -c \
@@ -203,6 +206,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       socket.create_connection((\"<peer>\", 80))'`.",
         tests: &[
             "crates/nn-core/src/decision/rules/net.rs::net_008_fires_on_tmp_exec_outbound",
+            "crates/nn-core/src/decision/rules/net.rs::net_008_spares_an_appimage_program",
             "crates/nn-core/src/decision/rules/net.rs::net_008_covers_every_staging_directory",
             "crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction",
         ],
