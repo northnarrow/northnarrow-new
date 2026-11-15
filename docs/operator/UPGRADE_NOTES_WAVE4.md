@@ -1646,16 +1646,9 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
 - **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
   /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
   as the agent's own process starting.
-- Residual, declared: a renamed copy of the tool (`cp /usr/bin/systemctl
-  /tmp/x`), a command read from a file or standard input (`nft -f`,
-  `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
-  regular expression beyond a part of the name, or a part less than half of
-  it, a symbolic link to a tool given to killall. The kernel's `task_kill`
-  reports to NN-L-EVA-003 only SIGINT, QUIT, ABRT, KILL, TERM, STOP and
-  TSTP to a registered tool's process, and never one from PID 1 or from
-  another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
-  signal that ends a tool, sent by a command line this reader does not
-  name, is not recorded (lot 330 is to report every default-fatal signal).
+- Residual, declared: some ways to stop a listed tool are not recognised
+  by these tables, and only some of the signals that end a registered tool
+  are recorded (lot 330 is to report every default-fatal signal).
 
 ## 33. The exec environment's check complete (lot 325)
 
@@ -1912,11 +1905,9 @@ are judged as before; `CHANGELOG.md` has the detail.
   never silence — `nn-admin status` shows "shell copies: N running images
   compared, M execs not compared". The dynamic loader is recorded with the
   shells: a renamed copy of `ld-linux-x86-64.so.2` running bash is the
-  loader, its operand the program. Residuals: a copy that differs from the installed
-  file by one byte (an appended byte changes its length) or is patched in
-  a sample, a shell rebuilt or downloaded, under another name; a
-  container's own shells (only the host's are recorded; on overlayfs the
-  hook's identity is not `stat`'s, so a container's copy is not compared).
+  loader, its operand the program. Residuals: a shell that is not byte-identical to an
+  installed one, and a container's own shells, are judged by name only. A
+  behaviour-based check, independent of identity, is the next lot's.
   A behaviour-based check, independent of identity, is the next lot's.
 - **R006 reads socat's addresses as socat does** (BUG-112). The
   distribution's socat whose address runs a shell is killed in more
@@ -1975,13 +1966,10 @@ are judged as before; `CHANGELOG.md` has the detail.
     (a) and deletions (d) keep the trust their lineage gives.
 
   Expect an assessment of a backup job that encrypts with a packaged tool
-  in bulk and deletes the originals. **Open (lot 331)**: the LOTL shape of
-  an encryption tool then `rm` (`gpg --encrypt-files *; rm *`) is decisive
-  in the unit tests but was NOT reproduced live on Ubuntu 24.04 (lab r3,
-  r4: no NN-L-IMP-001, in one inline and one interactive session); `ccrypt
-  -r` (renames) was, on Debian 13. Residual: an encryptor that forks a
-  process per file and a deletion by a process of another session; a tool
-  no table names.
+  in bulk and deletes the originals. **Open (lot 331)**: the shape of an encryption tool followed by
+  deletions is decisive in the unit tests but not yet confirmed live on
+  every tested system. Encryption that does not show these shapes may be
+  seen only by weaker signals (KNOWN_LIMITATIONS).
 
 ## 37. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
 

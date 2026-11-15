@@ -535,7 +535,7 @@ sums_signature() {   # <sums> <sig> <key> <fpr> <work dir>
         > "$work/gpgv.status" 2> "$work/gpgv.err" || return 1
     LC_ALL=C awk -v fpr="$fpr" '
         $1 == "[GNUPG:]" && $2 == "VALIDSIG" && toupper($NF) == toupper(fpr) { good = 1 }
-        $1 == "[GNUPG:]" && ($2 == "BADSIG" || $2 == "ERRSIG") { bad = 1 }
+        $1 == "[GNUPG:]" && ($2 == "BADSIG" || $2 == "ERRSIG" || $2 == "REVKEYSIG") { bad = 1 }
         END { exit (good && !bad) ? 0 : 1 }' "$work/gpgv.status" || return 1
 }
 # <<< sums_signature

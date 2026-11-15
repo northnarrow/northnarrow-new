@@ -1416,6 +1416,11 @@ attestation also names the runner and the workflow run. `install.sh` makes
 the same check itself (§5.1): with `SHA256SUMS` and `SHA256SUMS.asc` next to
 the tarball, and no attestation verifier on the host, it installs with no
 flag, recorded as `signed-checksums`.
+`install.sh`'s checks run from the tree they verify: they catch a corrupted
+or partly swapped download, not a tarball swapped whole, which brings its own
+`install.sh`, key and fingerprint. Only the check above, with the key and
+fingerprint taken from the repository at the signed tag (on GitHub, not the
+tarball's copy of these docs), covers that.
 
 The attestation binds the file digest to the exact commit, workflow and
 runner that produced it; a tarball rebuilt elsewhere, or modified after
@@ -1440,6 +1445,12 @@ workflows use is pinned by commit SHA, and every tool installed with
 kani) by version with `--locked` (external audit SUP-002, SUP-005).
 
 ### 5.1 `install.sh` verifies the release itself
+
+`install.sh`'s checks run from the tree they verify: they catch a corrupted
+or partly swapped download, not a tarball swapped whole, which brings its own
+`install.sh`, key and fingerprint. Only the check above, with the key and
+fingerprint taken from the repository at the signed tag (on GitHub, not the
+tarball's copy of these docs), covers that.
 
 The manual commands above stay valid, but since lab PR 21 the installer
 performs the checks and refuses to touch the host when one fails — and

@@ -289,9 +289,7 @@ pull` and an `apt purge` reached it. Since lot 282
 - the replacement shape (copy then delete) counts outside an authenticated
   session only: ransomware run from an SSH shell that way is judged by the
   ransomware tracker (NN-L-IMP-001), not by the mass-write signal. What
-  neither sees — originals deleted more than a minute after the copies, a
-  deleter in another cgroup or forked once per file, tracepoint mode — is
-  listed in the design's §10.5.
+  neither signal sees is listed in the design's §10.5.
 
 None of this is a policy directive: the per-rule policy does not change it,
 and no `enforce` brings the old behaviour back.
