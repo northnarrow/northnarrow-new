@@ -1729,7 +1729,15 @@ impl<H: PostureHost> Rule for NnLNet008OutboundFromTmpExec<H> {
                 looked_up.as_str()
             }
         };
-        if !crate::decision::rules::is_staging_path(exe) {
+        // lot 355: a program of a user's image (an AppImage's, served at its
+        // runtime's `/tmp/.mount_*`) is judged as that image, not as staged
+        let staged = match self.lineage.as_ref() {
+            Some(l) => {
+                l.staged_image_as(nf.pid, crate::posture::lineage::AsOf::of_event(event), exe)
+            }
+            None => crate::decision::rules::is_staging_path(exe),
+        };
+        if !staged {
             return None;
         }
         if self.lineage.as_ref().is_some_and(|l| {
@@ -4264,6 +4272,57 @@ mod tests {
             rule.evaluate(&flow_from(None, 4244, 8080)).is_none(),
             "inside the judgement: not known, no /proc"
         );
+    }
+
+    /// Lot 355: a program of a user's image (an AppImage's, its exec marked
+    /// `USER_IMAGE` by the pump) connecting from its runtime's `/tmp` mount
+    /// is that image's: no NN-L-NET-008, by its image path or the row's;
+    /// its fork too. The same path from an exec the pump did not tie is
+    /// staged, as before.
+    #[test]
+    fn net_008_spares_an_appimage_program() {
+        use common::wire::exe::exe_flags::{KNOWN, USER_IMAGE};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let app = "/tmp/.mount_k355ab/usr/bin/app";
+        for (pid, flags) in [(4300, KNOWN | USER_IMAGE), (4301, KNOWN)] {
+            let mut e = crate::decision::rules::testutil::spawn_exe("app", app, app, flags);
+            if let Event::ProcessSpawn {
+                pid: p,
+                timestamp_ns,
+                start_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *timestamp_ns, *start_ns) = (pid, 500, 400);
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        lineage.ingest_kernel_fork(4302, 600, 4300, 1000, 2_000);
+        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage.clone()));
+        assert!(rule.evaluate(&flow_from(None, 4300, 8080)).is_none());
+        assert!(rule.evaluate(&flow_from(Some(app), 4300, 8080)).is_none());
+        assert!(
+            rule.evaluate(&flow_from(None, 4302, 8080)).is_none(),
+            "its fork"
+        );
+        assert!(
+            rule.evaluate(&flow_from(None, 4301, 8080)).is_some(),
+            "untied"
+        );
+        // the review of #564 (F7): a row's path another file than the
+        // image the cache holds for the process (its exec of a file staged
+        // since, the event lost) is judged by that path
+        for pid in [4300, 4302] {
+            assert!(
+                rule.evaluate(&flow_from(Some("/tmp/evil"), pid, 8080))
+                    .is_some(),
+                "{pid}"
+            );
+        }
+        // without a lineage, the row's path alone: staged
+        let bare = NnLNet008OutboundFromTmpExec::new(None);
+        assert!(bare.evaluate(&flow_from(Some(app), 4300, 8080)).is_some());
     }
 
     /// External audit NETR-008: the review-49 carve-out — a package

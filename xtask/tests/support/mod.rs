@@ -619,12 +619,12 @@ fn field_len(item: &str) -> Option<usize> {
 
 /// The next `#[cfg(test)]` / `#[cfg(any(test` at or after `from`.
 fn find_test_cfg(code: &str, from: usize) -> Option<usize> {
-    let a = code[from..].find("#[cfg(test)]").map(|i| from + i);
-    let b = code[from..].find("#[cfg(any(test").map(|i| from + i);
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    // the review of #564 (F3): `#[cfg(all(test, feature = "std"))]` (the
+    // `common` crate's test modules) is a test item too
+    ["#[cfg(test)]", "#[cfg(any(test", "#[cfg(all(test"]
+        .iter()
+        .filter_map(|m| code[from..].find(m).map(|i| from + i))
+        .min()
 }
 
 /// The length up to and including the brace that closes `s`'s first `{`.

@@ -2800,6 +2800,67 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   named the DNS decoder for every field that was not btrfs's, a hook's
   argument or the move guard's).
 
+## 49. An AppImage's program is its image's, not a staging exec in /tmp (lot 355)
+
+- **What changes.** An AppImage (type 2) serves its own image read-only at
+  `$TMPDIR/.mount_*` (`/tmp` by default) and runs its programs from there.
+  Each was an exec from `/tmp`: R001 High at every launch, then
+  NN-L-CHAIN-002 or NN-L-CHAIN-005 Critical ("would have: KillProcessTree")
+  as soon as the program, or its zygote's child, connected, and
+  NN-L-NET-008 High; the same program run from the home drew none of them.
+  The exec pumps now mark such an exec a user's image (`USER_IMAGE`) when
+  the kernel's state ties the mount to the image file the user ran:
+  - a FUSE filesystem (not `fuseblk`) whose superblock is read-only, mounted
+    by the exec's user (`user_id=`), on a mount that is no FUSE mount;
+  - entered by the process that had just executed the image file — the
+    user's own regular file, outside the staging directories and the system
+    trees, still that file at its path — by a path the caller named under
+    that mount point;
+  - with a daemon of that same image file (device and inode) started since
+    the image's exec, neither stopped nor traced (`TracerPid:`), holding
+    `/dev/fuse` and the image file itself open (device and inode: a
+    runtime's daemon keeps open the file it serves), and no other regular
+    file a staged image could be served from (one under a staging
+    directory, unlinked, on a memory or FUSE filesystem, or a `memfd`).
+
+  Later execs of the mount's files (`AppRun`'s program, a zygote's
+  `/proc/self/exe`, a helper) are the image's while that mount and its
+  daemon are there. R001..R003, the chains' staging precursor (CHAIN-002,
+  -005, -007), the posture's exec arm, NN-L-NET-008 and the staged-ancestor
+  test of the transfer-tool and impair rules judge such a program as the
+  image, as from the home (`nn_linux::sensors::app_image`).
+- **What stays judged.** An AppImage itself in `/tmp`, `/var/tmp` or
+  `/dev/shm`, or the user's legit AppImage made to serve a file staged
+  there through the runtime's documented `TARGET_APPIMAGE` variable (its
+  daemon holds that file, not its image); another user's; one extracted (`--appimage-extract-and-run`,
+  or a host without FUSE: a writable copy in `/tmp`); a writable FUSE
+  mount; a squashfs served by another program (`squashfuse` over a
+  downloaded file), whatever AppImage runs meanwhile; a mount over another
+  FUSE mount; an AppImage installed in a system tree (`/opt`, `/usr`), not
+  the user's own file; tracepoint mode. And
+  whatever the program then does: a credential read followed by an egress
+  is NN-L-CHAIN-001, a file it stages and runs is R001, persistence and a
+  shell with a socket are judged as for any user program. A script of the
+  image that a system interpreter runs is judged by its path, as before.
+- **Residual.** A malicious AppImage the user runs is a user program,
+  judged by its behaviour. `/proc` shows no tie of a FUSE mount to the
+  process that serves it, so the pump ties the mount through the exec that
+  entered it and a daemon of the image started since. No mount namespace
+  is needed to swap what is served: a user who stops its own AppImage's
+  runtime after the mount, unmounts it, mounts its own read-only squashfs
+  there and starts the image again with `--appimage-mount` (a daemon of
+  the image, started since), then lets the runtime go on, gets its
+  squashfs's programs judged as the image's. So does a runtime made to
+  serve a file of the user's home (`TARGET_APPIMAGE` there, with the image
+  held as well). Those are programs it could run from its home, which it
+  can write: the impact stays the user's own. Every fact is checked on the
+  uid (the mount's `user_id`, the image's owner, the daemon's real uid, the
+  exec's), no other user inherits the mark, and root's exec from
+  `/tmp/.mount_*` is still R009. A kernel record of the process the
+  connection's `/dev/fuse` file is handed to would close the swap.
+- **Operator action.** None: no setting, no overlay. The records name the
+  program's path as before.
+
 ## 50. A window's held BPF load is always signed (lot 356)
 
 - **A held load's record spends no budget.** A program the content judge

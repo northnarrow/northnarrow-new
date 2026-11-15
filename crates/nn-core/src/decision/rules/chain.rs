@@ -512,8 +512,9 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
                 let mut store = self.buf.lock();
                 observe_lineage(&mut store, event);
                 // Review 61: the file the kernel executed. External audit
-                // NETR-008: any staging directory, not `/tmp/` alone.
-                if !crate::decision::rules::is_staging_path(exe.path_or(filename)) {
+                // NETR-008: any staging directory, not `/tmp/` alone. Lot 355:
+                // an AppImage's program (a user's image) is no staging exec.
+                if !crate::decision::rules::is_staged_exec(exe, filename) {
                     return None;
                 }
                 let key = ProcKey {
@@ -1067,7 +1068,7 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
                 timestamp_ns,
                 start_ns,
                 ..
-            } if crate::decision::rules::is_staging_path(exe.path_or(filename)) => {
+            } if crate::decision::rules::is_staged_exec(exe, filename) => {
                 let egress = self.buf.lock().exec_sequence_egress(
                     *pid,
                     *start_ns,
@@ -3358,5 +3359,150 @@ mod tests {
         fire_ids(&rules, &tmp_spawn(42, 150 * SEC));
         let in_order = fire_ids(&rules, &flow(42, 443, 200 * SEC));
         assert!(!in_order.iter().any(|id| id == C007), "{in_order:?}");
+    }
+
+    // ── Lot 355: an AppImage's program is its image's ─────────────────
+
+    const APP: &str = "/tmp/.mount_k355ab/usr/bin/app";
+
+    /// An exec of the AppImage's program from its runtime's mount, marked
+    /// a user's image by the exec pump (`user_image`) or not (a writable
+    /// FUSE mount, another program's daemon: the pump's tie refused).
+    fn app_exec(pid: u32, ppid: u32, ts: u64, user_image: bool) -> Event {
+        let mut e = proc_spawn(pid, ppid, "app", APP, ts);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.path = APP.to_string();
+            exe.flags = common::wire::exe::exe_flags::KNOWN
+                | if user_image {
+                    common::wire::exe::exe_flags::USER_IMAGE
+                } else {
+                    0
+                };
+        }
+        e
+    }
+
+    /// Every rule of the chains and R001 on `e`.
+    fn judged(rules: &[Box<dyn Rule>], e: &Event) -> Vec<String> {
+        let mut ids = fire_ids(rules, e);
+        ids.extend(
+            crate::decision::rules::R001ExecFromTmp
+                .evaluate(e)
+                .map(|v| v.rule_id),
+        );
+        ids
+    }
+
+    /// The three shapes of lot 352's lab (an Electron/Chromium app as an
+    /// AppImage): the browser process connecting itself, its zygote's
+    /// network service by fork and exec of `/proc/self/exe`, its zygote
+    /// (executed by the browser) connecting. From the image's mount
+    /// (`user_image`): no R001, no CHAIN-002/005; from a mount the pump did
+    /// not tie to an image: both, as for any staged program.
+    fn appimage_shapes(user_image: bool) -> Vec<(&'static str, Vec<String>)> {
+        let mut out = Vec::new();
+        // the browser process connects
+        let rules = chain_rules();
+        let mut ids = judged(&rules, &app_exec(100, 1, 10 * SEC, user_image));
+        ids.extend(judged(&rules, &flow(100, 4444, 11 * SEC)));
+        out.push(("main-connects", ids));
+        // the network service: fork and exec by the zygote, which the
+        // browser executed
+        let rules = chain_rules();
+        let mut ids = judged(&rules, &app_exec(100, 1, 10 * SEC, user_image));
+        ids.extend(judged(
+            &rules,
+            &app_exec(200, 100, 10 * SEC + 1, user_image),
+        ));
+        ids.extend(judged(
+            &rules,
+            &app_exec(300, 200, 10 * SEC + 2, user_image),
+        ));
+        ids.extend(judged(&rules, &flow(300, 4444, 11 * SEC)));
+        out.push(("zygote-forkexec", ids));
+        // the zygote's own egress (its fork-only child connects as it)
+        let rules = chain_rules();
+        let mut ids = judged(&rules, &app_exec(100, 1, 10 * SEC, user_image));
+        ids.extend(judged(
+            &rules,
+            &app_exec(200, 100, 10 * SEC + 1, user_image),
+        ));
+        ids.extend(judged(&rules, &flow(200, 4444, 11 * SEC)));
+        out.push(("zygote-forkonly", ids));
+        out
+    }
+
+    /// Lot 355 (lot 352's lab, ubuntu2404): an AppImage's program, its
+    /// zygote and the zygote's children, run from the runtime's read-only
+    /// mount under `/tmp`, are the image's — judged as the same program run
+    /// from the home: no R001, no Critical staging chain. Fails on rc2:
+    /// R001 and CHAIN-002/005 fire on each shape.
+    #[test]
+    fn an_appimage_program_draws_no_staging_verdict() {
+        for (shape, ids) in appimage_shapes(true) {
+            assert!(ids.is_empty(), "{shape}: {ids:?}");
+        }
+    }
+
+    /// Lot 355: the same shapes from a mount the pump did not tie to an
+    /// image (a writable FUSE mount, `squashfuse` serving a downloaded
+    /// file, an AppImage itself in `/tmp`): staged, R001 and the chain.
+    #[test]
+    fn an_untied_mount_s_program_is_still_staged() {
+        for (shape, ids) in appimage_shapes(false) {
+            assert!(
+                ids.iter().any(|i| i == "R001_ExecFromTmp"),
+                "{shape}: {ids:?}"
+            );
+            assert!(
+                ids.iter()
+                    .any(|i| i == C002 || i == "NN-L-CHAIN-005_CrossPidTmpC2"),
+                "{shape}: {ids:?}"
+            );
+        }
+    }
+
+    /// Lot 355: an AppImage's program is judged by what it does as any user
+    /// program — a credential read then an egress is CHAIN-001 (and its
+    /// descendant's egress CHAIN-004), the image or not.
+    #[test]
+    fn an_appimage_that_reads_credentials_is_still_judged() {
+        let rules = chain_rules();
+        judged(&rules, &app_exec(100, 1, 10 * SEC, true));
+        judged(&rules, &app_exec(200, 100, 10 * SEC + 1, true));
+        fire_ids(&rules, &cred_fim(100, 11 * SEC));
+        let same = fire_ids(&rules, &flow(100, 443, 12 * SEC));
+        assert!(same.iter().any(|i| i == C001), "{same:?}");
+        let child = fire_ids(&rules, &flow(200, 443, 13 * SEC));
+        assert!(
+            child
+                .iter()
+                .any(|i| i == "NN-L-CHAIN-004_CrossPidCredExfil"),
+            "{child:?}"
+        );
+        assert!(!same.iter().chain(&child).any(|i| i == C002 || i == C007));
+    }
+
+    /// Lot 355: CHAIN-007's late completion (the exec processed after the
+    /// credential read and the egress) takes an AppImage's program for no
+    /// staging exec either; unmarked, the same order completes it.
+    #[test]
+    fn a_late_appimage_exec_completes_no_staging_sequence() {
+        for (user_image, expect) in [(true, false), (false, true)] {
+            let rules = chain_rules();
+            fire_ids(&rules, &cred_fim(42, 11 * SEC));
+            fire_ids(&rules, &flow(42, 443, 12 * SEC));
+            // the exec's process start, as the late completion keys it
+            let mut exec = app_exec(42, 1, 10 * SEC, user_image);
+            if let Event::ProcessSpawn { start_ns, .. } = &mut exec {
+                *start_ns = 9 * SEC;
+            }
+            let ids = fire_ids(&rules, &exec);
+            assert_eq!(
+                ids.iter().any(|i| i == C007),
+                expect,
+                "{user_image}: {ids:?}"
+            );
+        }
     }
 }

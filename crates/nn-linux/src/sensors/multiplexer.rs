@@ -685,7 +685,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     exec_check_rb,
                     &tx,
                     &rt,
-                    resolved::<ExecCheckRaw>,
+                    check_resolved,
                 )?),
             ),
             (
@@ -1462,6 +1462,16 @@ fn mark_known_probe(e: &mut Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize
 fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
     crate::sensors::exe_identity::resolve(&mut e);
     (e, [None, None])
+}
+
+/// Lot 355: the exec-check pump's step — the path made absolute as every
+/// exec's ([`resolved`]), then a check of an exec of an AppImage's program
+/// marked as its image's ([`crate::sensors::app_image`]), as its exec is:
+/// the posture's exec arm judges both.
+fn check_resolved(raw: &ExecCheckRaw, e: Event) -> (Event, [Option<Event>; 2]) {
+    let (mut e, carried) = resolved(raw, e);
+    crate::sensors::app_image::read(&mut e);
+    (e, carried)
 }
 
 /// Lot 279: the exec pump's own step — an exec of a kernel-module tool

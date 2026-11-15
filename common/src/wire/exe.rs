@@ -80,6 +80,17 @@ pub mod exe_flags {
     /// (any value, as glibc's `getenv` finds it): getopt reads no option
     /// after the first operand.
     pub const POSIXLY_CORRECT: u32 = 1 << 21;
+    /// Lot 355: the executed file is a file of a user's program image — an
+    /// AppImage's. It lies on a read-only FUSE filesystem the user mounted
+    /// (on no other FUSE mount), executed by the process that had just
+    /// executed the image file (the user's own regular file, outside the
+    /// staging directories), with a daemon of that same image file (by
+    /// device and inode) started since and serving; or on such a
+    /// filesystem the pump already tied to its image, with that daemon
+    /// still serving (`nn_linux::sensors::app_image`). The staging rules
+    /// judge such an exec as the image's, not by its mount point under
+    /// `/tmp`.
+    pub const USER_IMAGE: u32 = 1 << 22;
 }
 
 /// Lot 310: a device number as `stat(2)` reports it, in the kernel's

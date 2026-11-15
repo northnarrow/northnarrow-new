@@ -101,10 +101,11 @@ pub fn precursor_of<H: PostureHost>(
     let mut shell_below = false;
     for hop in ancestors.iter().take(MAX_HOPS) {
         let Some(id) = lineage.exec_identity(hop.pid, as_of) else {
-            // Gone or deleted: `image_path` still names a staged image.
+            // Gone or deleted: `image_path` still names a staged image
+            // (lot 355: not a user's image's file, an AppImage's program).
             if lineage
                 .image_path_as(hop.pid, as_of)
-                .is_some_and(|p| crate::decision::rules::is_staging_path(&p))
+                .is_some_and(|p| lineage.staged_image_as(hop.pid, as_of, &p))
             {
                 return Some("a staging-directory image among its ancestors");
             }
@@ -114,7 +115,7 @@ pub fn precursor_of<H: PostureHost>(
         // lot 292: an argv whose options could not be read still shows
         // what may be its script — a detection looks at it
         let script = id.runs.mentioned();
-        if crate::decision::rules::is_staging_path(&exe)
+        if lineage.staged_image_as(hop.pid, as_of, &exe)
             || script.is_some_and(crate::decision::rules::is_staging_path)
         {
             return Some("a staging-directory image among its ancestors");
@@ -173,6 +174,33 @@ mod tests {
             precursor_of(&s, &l, 11, 1_000, crate::posture::lineage::AsOf::Now),
             None
         );
+    }
+
+    /// Lot 355: a transfer tool run by an AppImage's program (its exec
+    /// marked a user's image by the pump) has no staged ancestor; the same
+    /// path unmarked is one.
+    #[test]
+    fn an_appimage_program_is_no_staged_ancestor() {
+        use common::wire::exe::exe_flags::{KNOWN, USER_IMAGE};
+        let app = "/tmp/.mount_k355ab/usr/bin/app";
+        for (flags, staged) in [(KNOWN | USER_IMAGE, false), (KNOWN, true)] {
+            let (_t, l) = lineage_of(&[(21, 20, "/usr/bin/curl")]);
+            let mut e = crate::decision::rules::testutil::spawn_exe("app", app, app, flags);
+            if let nn_model::Event::ProcessSpawn {
+                pid, timestamp_ns, ..
+            } = &mut e
+            {
+                (*pid, *timestamp_ns) = (20, 1);
+            }
+            assert!(l.ingest_spawn_event(&e));
+            let s = store_of(&[(21, 20)]);
+            let got = precursor_of(&s, &l, 21, 1_000, crate::posture::lineage::AsOf::Now);
+            assert_eq!(
+                got.is_some_and(|w| w == "a staging-directory image among its ancestors"),
+                staged,
+                "{flags:#x}: {got:?}"
+            );
+        }
     }
 
     #[test]

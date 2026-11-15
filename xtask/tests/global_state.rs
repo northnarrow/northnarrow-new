@@ -602,6 +602,16 @@ const STATICS: &[Kept] = &[
          exec, bounded, the oldest out first)",
     ),
     kept(
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "PUMP",
+        HostFact,
+        "lot 355: the host's processes whose latest exec ran a possible program image (a user's \
+         file outside the system trees and the staging directories), and the FUSE filesystems \
+         the exec pumps tied to their image (an AppImage's mount under /tmp, by device), which \
+         the exec and exec-check pumps read an exec of a file of such a mount against (one host; \
+         keyed by pid and start / by device, bounded, the oldest out first)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,

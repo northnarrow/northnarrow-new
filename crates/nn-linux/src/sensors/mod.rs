@@ -10,6 +10,9 @@
 //! [`ExecSensor`] is preserved as a thin compatibility wrapper so the
 //! existing live integration test keeps working.
 
+/// Lot 355: an AppImage's program judged by its image, not its `/tmp`
+/// mount point.
+pub mod app_image;
 /// Lab PR 267 (R12a): the priority event bus between the sensors and the
 /// event loop.
 pub mod bus;

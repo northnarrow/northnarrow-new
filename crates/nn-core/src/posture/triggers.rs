@@ -1596,7 +1596,8 @@ fn staging_exec<H: PostureAgent>(
         } => (*pid, filename, exe, *timestamp_ns, Some(*ppid)),
         _ => return None,
     };
-    let image = exe.path_or(filename);
+    // lot 355: an AppImage's program (a user's image) is no staged exec
+    let image = crate::decision::rules::staging_judged_path(exe, filename)?;
     if !crate::decision::rules::is_staging_path(image) {
         return None;
     }
@@ -2779,6 +2780,44 @@ mod tests {
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
         assert_eq!(hits, vec![TriggerType::StagingExec]);
+    }
+
+    /// Lot 355: an AppImage's program, its exec (and the LSM program's check
+    /// of it) marked a user's image by the exec pumps, is no staging exec;
+    /// the same path unmarked is one.
+    #[test]
+    fn an_appimage_program_is_no_staging_exec() {
+        use common::wire::exe::exe_flags::{KNOWN, USER_IMAGE};
+        let det = detector_with_empty_proc();
+        let app = "/tmp/.mount_k355ab/usr/bin/app";
+        for (pid, flags, staged) in [(9100, KNOWN | USER_IMAGE, false), (9101, KNOWN, true)] {
+            let mut e = spawn(pid, 1, "app", app, 5);
+            let mut check = Event::ExecCheck {
+                pid: pid + 10,
+                ppid: 1,
+                uid: 1000,
+                comm: "app".into(),
+                filename: app.into(),
+                timestamp_ns: 5,
+                exe: nn_model::ExeIdentity {
+                    path: app.into(),
+                    flags,
+                    ..Default::default()
+                },
+            };
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.path = app.into();
+                exe.flags = flags;
+            }
+            for ev in [&mut e, &mut check] {
+                let hits = det.detect(ev, &[]);
+                assert_eq!(
+                    hits.contains(&TriggerType::StagingExec),
+                    staged,
+                    "{flags:#x} {hits:?}"
+                );
+            }
+        }
     }
 
     /// Named test (lot 346, item 1): `go test` runs each package's test
