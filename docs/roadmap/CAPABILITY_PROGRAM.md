@@ -11660,7 +11660,13 @@ number in parentheses is a lab PR.
     debootstrap, schroot, arch-chroot, a chroot's cgroup2, an rbind of
     `/sys`, a lazy sysfs) without a record; two earlier rounds of the fix
     refused the chroot's cgroup2 unmount on all three. Cold boot: agent and
-    watchdog active, five guard links, no guard record.
+    watchdog active, five guard links, no guard record. Then item 5 of the
+    lot on #563's merged code (the integrity round, the watchdog's markers
+    and `bpf-foreign` beneath their anchors, `trusted_exe` and host files
+    on bounded readers, the guard's own `/proc` reads beneath the anchored
+    root; §47.1): ubuntu2204 again on that tree, the same verifier figures
+    and verdicts, a clean cold boot; `agent/tests/fuse_stall.rs` under
+    `CI=true` passed (14.3 s).
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
