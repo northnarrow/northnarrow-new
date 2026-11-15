@@ -286,13 +286,15 @@ static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(102
 static PTRACE_READ_SEEN: LruHashMap<[u64; 2], u64> = LruHashMap::with_max_entries(1024, 0);
 
 /// The re-check 2 of #567 (point 2): the packaged `systemd-journald`'s
-/// images (the kernel's `(dev, ino)`, as `mm->exe_file` gives them) → the
-/// cgroup id of `systemd-journald.service`, written by the agent at its
-/// start and at each 10 s re-read (`nn_linux::journald_identity`). Its
-/// refused reads of the agent's `/proc/<pid>/exe` are not recorded; they
-/// stay refused.
+/// identities — its images (the kernel's `(dev, ino)`, as `mm->exe_file`
+/// gives them) each in its units' cgroups (`systemd-journald.service`,
+/// `systemd-journald@northnarrow.service`), by id
+/// (`northnarrow_common::ptrace_read::quiet_key`) — written by the agent
+/// at its start and at each 10 s re-read (`nn_linux::journald_identity`).
+/// Their refused reads of the agent's `/proc/<pid>/exe` are not recorded;
+/// they stay refused.
 #[map]
-pub static PTRACE_READ_QUIET: HashMap<InodeKey, u64> = HashMap::with_max_entries(4, 0);
+pub static PTRACE_READ_QUIET: HashMap<[u64; 3], u8> = HashMap::with_max_entries(8, 0);
 
 /// Budget for task-denial records, per CPU: `[window start (ns), records
 /// in the window]`. A loop of fresh `/bin/kill` processes defeats the
@@ -461,9 +463,10 @@ pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
         Some(k) => k,
         None => InodeKey { dev: 0, ino: 0 },
     };
-    let journald = unsafe { PTRACE_READ_QUIET.get(&exe) }.copied();
     let cgroup = unsafe { aya_ebpf::helpers::generated::bpf_get_current_cgroup_id() };
-    if ptrace_read::quiet(journald, cgroup) {
+    if ptrace_read::quiet(exe.dev, exe.ino, cgroup, |k| unsafe {
+        PTRACE_READ_QUIET.get(k).is_some()
+    }) {
         return;
     }
     let now = unsafe { bpf_ktime_get_ns() };

@@ -15,10 +15,13 @@
 //!   recorded ([`quiet`]): its image is the file at its install path that
 //!   root owns, in a directory only root may write, that the package
 //!   database does not disown (read again every 10 s, as lot 310's
-//!   `systemd-executor` identities are), AND it runs in
-//!   `systemd-journald.service`'s cgroup. Root running that binary in that
-//!   cgroup loses only the record, never the refusal; nothing else is
-//!   exempt (PID 1, logind, polkit: no read of theirs was measured);
+//!   `systemd-executor` identities are), AND it runs in the cgroup of
+//!   `systemd-journald.service` or of the namespace instance the agent's
+//!   units log to (`systemd-journald@northnarrow.service`,
+//!   `LogNamespace=northnarrow`: the reader of every line the agent
+//!   writes). Root running that binary in one of those cgroups loses only
+//!   the record, never the refusal; nothing else is exempt (PID 1, logind,
+//!   polkit: no read of theirs was measured);
 //! - every other caller is recorded once an hour per caller IMAGE and
 //!   target ([`seen_key`], [`DEDUP_NS`]), not per process: a periodic
 //!   reader is one record an hour, a short-lived tool at most 24 a day, and
@@ -36,15 +39,19 @@ pub const fn seen_key(exe_dev: u64, exe_ino: u64, target_tgid: u32) -> [u64; 2] 
     [exe_ino, (exe_dev & 0xffff_ffff) << 32 | target_tgid as u64]
 }
 
-/// The caller is the packaged journald in its unit: its image is one of
-/// journald's (`journald_cgroup`: the cgroup id written for that image,
-/// `None` when it is none of them) and it runs in that cgroup. A cgroup id
-/// of 0 (none read: a cgroup v1 host) never matches.
-pub const fn quiet(journald_cgroup: Option<u64>, cgroup: u64) -> bool {
-    match journald_cgroup {
-        Some(c) => c != 0 && c == cgroup,
-        None => false,
-    }
+/// The key of the kernel's journald identities (`PTRACE_READ_QUIET`): an
+/// image (the device in the kernel's form, the inode) in a cgroup (its id).
+pub const fn quiet_key(exe_dev: u64, exe_ino: u64, cgroup: u64) -> [u64; 3] {
+    [exe_dev, exe_ino, cgroup]
+}
+
+/// The caller is the packaged journald in its unit: its image in its
+/// cgroup is one of journald's identities (`journald`: whether the map
+/// holds that [`quiet_key`]). A cgroup id of 0 (none read: a cgroup v1
+/// host) is never asked.
+#[inline(always)]
+pub fn quiet(exe_dev: u64, exe_ino: u64, cgroup: u64, journald: impl FnOnce(&[u64; 3]) -> bool) -> bool {
+    cgroup != 0 && journald(&quiet_key(exe_dev, exe_ino, cgroup))
 }
 
 /// A record is due: none for this key yet, or the last at least
@@ -64,7 +71,7 @@ mod tests {
     /// The eBPF record's steps, on a host's day: the quiet check, then the
     /// dedup by image and target.
     struct Kernel {
-        journald: HashMap<(u64, u64), u64>,
+        journald: Vec<[u64; 3]>,
         seen: HashMap<[u64; 2], u64>,
         records: Vec<(u64, u64)>,
     }
@@ -72,7 +79,7 @@ mod tests {
     impl Kernel {
         fn new() -> Kernel {
             Kernel {
-                journald: HashMap::from([((0x0080_0001, 4242), 77)]),
+                journald: vec![quiet_key(0x0080_0001, 4242, 77), quiet_key(0x0080_0001, 4242, 78)],
                 seen: HashMap::new(),
                 records: Vec::new(),
             }
@@ -80,7 +87,7 @@ mod tests {
         /// A refused read of `target` by a process running `exe` in
         /// `cgroup` at `now`.
         fn read(&mut self, exe: (u64, u64), cgroup: u64, target: u32, now: u64) {
-            if quiet(self.journald.get(&exe).copied(), cgroup) {
+            if quiet(exe.0, exe.1, cgroup, |k| self.journald.contains(k)) {
                 return;
             }
             let k = seen_key(exe.0, exe.1, target);
@@ -116,6 +123,8 @@ mod tests {
             let now = 1_000 * S + t * S;
             k.read(JOURNALD, 77, AGENT, now);
             k.read(JOURNALD, 77, WATCHDOG, now);
+            // the namespace instance the agent's units log to
+            k.read(JOURNALD, 78, AGENT, now);
             if t % 2 == 0 {
                 k.read(HTOP, 900, AGENT, now);
             }
@@ -143,10 +152,17 @@ mod tests {
     /// image in journald's cgroup, a cgroup v1 host (no id), are recorded.
     #[test]
     fn only_the_packaged_journald_in_its_unit_is_quiet() {
-        assert!(quiet(Some(77), 77));
-        assert!(!quiet(Some(77), 78), "journald's image in another cgroup");
-        assert!(!quiet(None, 77), "another image in journald's cgroup");
-        assert!(!quiet(Some(0), 0), "no cgroup id: never quiet");
+        let map = [quiet_key(1, 2, 77)];
+        let held = |k: &[u64; 3]| map.contains(k);
+        assert!(quiet(1, 2, 77, held));
+        assert!(!quiet(1, 2, 79, held), "journald's image in another cgroup");
+        assert!(!quiet(1, 3, 77, held), "another image in journald's cgroup");
+        assert!(!quiet(2, 2, 77, held), "another device");
+        let zero = [quiet_key(1, 2, 0)];
+        assert!(
+            !quiet(1, 2, 0, |k: &[u64; 3]| zero.contains(k)),
+            "no cgroup id: never quiet"
+        );
         let mut k = Kernel::new();
         k.read(JOURNALD, 500, AGENT, S);
         k.read(HTOP, 77, AGENT, S);

@@ -13,10 +13,13 @@
 //!   — the kernel's `(dev, ino)`, as `mm->exe_file` gives it — read again
 //!   every 10 s with lot 310's `systemd-executor` identities, each read
 //!   replacing the set (an upgrade's new inode in, the old one out);
-//! - its unit's cgroup, `system.slice/systemd-journald.service` (its id,
-//!   the directory's inode on cgroup v2): the kernel compares it with the
-//!   caller's (`bpf_get_current_cgroup_id`). No cgroup v2: no identity,
-//!   every read recorded.
+//! - its unit's cgroup ([`JOURNALD_CGROUPS`]: `systemd-journald.service`,
+//!   and the namespace instance the agent's and the watchdog's units log
+//!   to, `systemd-journald@northnarrow.service` (`LogNamespace=northnarrow`:
+//!   it reads the agent's `/proc/<pid>/exe` for every line the agent
+//!   writes) — by id, the directory's inode on cgroup v2: the kernel
+//!   compares it with the caller's (`bpf_get_current_cgroup_id`). No
+//!   cgroup v2: no identity, every read recorded.
 //!
 //! Root running that binary in that cgroup loses the record of its reads,
 //! never their refusal. Nothing else is exempt: PID 1, logind or polkit
@@ -35,8 +38,13 @@ pub const JOURNALD_PATHS: &[&str] = &[
     "/lib/systemd/systemd-journald",
 ];
 
-/// journald's unit's cgroup, under the cgroup v2 root.
-pub const JOURNALD_CGROUP: &str = "system.slice/systemd-journald.service";
+/// journald's units' cgroups, under the cgroup v2 root: the system
+/// instance, and the namespace instance the agent's units log to (no
+/// other: `systemd-journald@<other>.service` is not ours to quiet).
+pub const JOURNALD_CGROUPS: &[&str] = &[
+    "system.slice/systemd-journald.service",
+    "system.slice/systemd-journald@northnarrow.service",
+];
 
 /// A directory `owner` owns that no one else may write.
 fn dir_owned_by(dir: &Path, owner: u32) -> bool {
@@ -54,18 +62,23 @@ fn cgroup_id(dir: &Path) -> Option<u64> {
 }
 
 /// journald's images under `root` (`/` on the host, a test's tree), each
-/// with the id of its unit's cgroup under `cgroup_root` (the cgroup v2
-/// root; `None`: none) — `owner` the files' owner (0), `owned` the package
-/// database. Sorted, without duplicates; empty without the cgroup.
+/// with the id of each of its units' cgroups under `cgroup_root` (the
+/// cgroup v2 root; `None`: none) — `owner` the files' owner (0), `owned`
+/// the package database. Sorted, without duplicates; empty without a
+/// cgroup.
 pub fn quiet_under(
     root: &Path,
     cgroup_root: Option<&Path>,
     owner: u32,
     owned: Owned,
 ) -> Vec<((u64, u64), u64)> {
-    let Some(cgroup) = cgroup_root.and_then(|r| cgroup_id(&r.join(JOURNALD_CGROUP))) else {
+    let cgroups: Vec<u64> = JOURNALD_CGROUPS
+        .iter()
+        .filter_map(|c| cgroup_root.and_then(|r| cgroup_id(&r.join(c))))
+        .collect();
+    if cgroups.is_empty() {
         return Vec::new();
-    };
+    }
     let in_root_dirs: Vec<&str> = JOURNALD_PATHS
         .iter()
         .copied()
@@ -75,10 +88,14 @@ pub fn quiet_under(
                 .is_some_and(|d| dir_owned_by(&root.join(d.strip_prefix("/").unwrap_or(d)), owner))
         })
         .collect();
-    let mut ids = crate::systemd_executor::packaged(&in_root_dirs, root, owner, owned);
+    let mut ids: Vec<((u64, u64), u64)> =
+        crate::systemd_executor::packaged(&in_root_dirs, root, owner, owned)
+            .into_iter()
+            .flat_map(|id| cgroups.iter().map(move |c| (id, *c)))
+            .collect();
     ids.sort_unstable();
     ids.dedup();
-    ids.into_iter().map(|id| (id, cgroup)).collect()
+    ids
 }
 
 /// The host's ([`quiet_under`] of `/`, the cgroup v2 root, root's files,
@@ -90,9 +107,9 @@ fn quiet_now() -> Vec<((u64, u64), u64)> {
     quiet_under(Path::new("/"), cgroups.as_deref(), 0, &|p| owners.owned(p))
 }
 
-/// The eBPF map `PTRACE_READ_QUIET`, once the ptrace guard is attached.
-type KernelMap =
-    aya::maps::HashMap<aya::maps::MapData, crate::anti_tamper::filesystem::AyaInodeKey, u64>;
+/// The eBPF map `PTRACE_READ_QUIET` (`common::ptrace_read::quiet_key` →
+/// 1), once the ptrace guard is attached.
+type KernelMap = aya::maps::HashMap<aya::maps::MapData, [u64; 3], u8>;
 
 /// The kernel's copy of the identities, and the last ones read (written
 /// when the map is installed after a read).
@@ -122,19 +139,19 @@ fn publish(map: &mut Option<KernelMap>, ids: &[((u64, u64), u64)]) {
     let Some(map) = map.as_mut() else {
         return;
     };
+    let keys: Vec<[u64; 3]> = ids
+        .iter()
+        .map(|((dev, ino), cgroup)| common::ptrace_read::quiet_key(*dev, *ino, *cgroup))
+        .collect();
     let old: Vec<_> = map.keys().filter_map(Result::ok).collect();
     for k in old {
-        if !ids.iter().any(|((dev, ino), _)| (k.0.dev, k.0.ino) == (*dev, *ino)) {
+        if !keys.contains(&k) {
             let _ = map.remove(&k);
         }
     }
-    for ((dev, ino), cgroup) in ids {
-        let key = crate::anti_tamper::filesystem::AyaInodeKey(common::wire::InodeKey {
-            dev: *dev,
-            ino: *ino,
-        });
-        if let Err(e) = map.insert(key, *cgroup, 0) {
-            tracing::warn!(error = %e, dev, ino, "PTRACE_READ_QUIET: journald's identity not written to the kernel");
+    for k in keys {
+        if let Err(e) = map.insert(k, 1, 0) {
+            tracing::warn!(error = %e, dev = k[0], ino = k[1], cgroup = k[2], "PTRACE_READ_QUIET: journald's identity not written to the kernel");
         }
     }
 }
@@ -185,13 +202,23 @@ mod tests {
         let r = root.path();
         let exe = r.join("usr/lib/systemd/systemd-journald");
         file(&exe);
-        let unit = cg.path().join(JOURNALD_CGROUP);
+        let unit = cg.path().join(JOURNALD_CGROUPS[0]);
         std::fs::create_dir_all(&unit).unwrap();
         let id = std::fs::metadata(&unit).unwrap().ino();
         let md = std::fs::metadata(&exe).unwrap();
         let kernel_dev = crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(md.dev());
         let got = quiet_under(r, Some(cg.path()), me(), &no_db);
         assert_eq!(got, vec![((kernel_dev, md.ino()), id)]);
+        // the namespace instance the agent's units log to, and no other
+        let ns = cg.path().join(JOURNALD_CGROUPS[1]);
+        std::fs::create_dir_all(&ns).unwrap();
+        std::fs::create_dir_all(cg.path().join("system.slice/systemd-journald@other.service"))
+            .unwrap();
+        let ns_id = std::fs::metadata(&ns).unwrap().ino();
+        let mut want = vec![((kernel_dev, md.ino()), id), ((kernel_dev, md.ino()), ns_id)];
+        want.sort_unstable();
+        assert_eq!(quiet_under(r, Some(cg.path()), me(), &no_db), want);
+        std::fs::remove_dir(&ns).unwrap();
         // no cgroup v2 root, or no unit cgroup: nothing is quiet
         assert!(quiet_under(r, None, me(), &no_db).is_empty());
         let empty = tempfile::tempdir().unwrap();
