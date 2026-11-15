@@ -2442,7 +2442,12 @@ mod tests {
             (view.kind(), rel.as_path(), view.refused()),
             (Kind::Bpf, Path::new("northnarrow-cgroup-join-v2_3"), None)
         );
-        assert!(metadata(BPF_ROOT).unwrap().is_dir());
+        // a non-root runner may be refused the root's metadata (mode 0700):
+        // the same refusal the open below accepts, never a crossing
+        match metadata(BPF_ROOT) {
+            Ok(m) => assert!(m.is_dir()),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
+        }
         // the parent of a pin directory: the bpffs root, opened beneath its
         // view — refused by its mode to another user, never a crossing
         match open(BPF_ROOT, libc::O_RDONLY | libc::O_DIRECTORY) {
