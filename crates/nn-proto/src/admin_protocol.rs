@@ -1010,12 +1010,13 @@ pub struct StatusResponse {
     #[serde(default)]
     pub program_copy_skipped_total: Option<u64>,
     /// The review of #565 (F2): the kernel-state round's findings its quota
-    /// held back since the agent's start (named past the quota only in one
-    /// signed `sole_trace_summary` record per round), `(kind, count)` for
-    /// the kinds that held some back — `bpf_unseen`, `bpf_baseline`,
-    /// `bpf_held_outlived`, `sysctl_root_prog`, `kernel_taint`,
-    /// `cpu_confined`. Telemetry; `None` from an agent older than the
-    /// field. Appended after lot 313's counters.
+    /// held back since the agent's start, each counted once (counted in one
+    /// signed `sole_trace_summary` record per round, and carried into the
+    /// next rounds until named), `(kind, count)` for the kinds that held
+    /// some back — `bpf_unseen`, `bpf_baseline`, `sysctl_root_prog`,
+    /// `kernel_taint`, `cpu_confined` (a held program's records are never
+    /// held back). Telemetry; `None` from an agent older than the field.
+    /// Appended after lot 313's counters.
     #[serde(default)]
     pub kernel_state_held_back: Option<Vec<(String, u64)>>,
 }

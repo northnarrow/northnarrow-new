@@ -2272,16 +2272,30 @@ trace (no budget, no cap), and root makes BPF objects at will — 20,000 tiny
 programs loaded faster than the hook's seen map keeps them were thousands
 of High records a round, each taking the bus's reserve of the rare tamper
 events and (until then) uid 0's record budget. A round now signs at most
-`ROUND_QUOTA` (32) findings of each kind by name — the types refused
-outside a window and the links of hidden programs first, a proven known
-system program last — and the rest in ONE `sole_trace_summary` record with
-each kind's count (High; Medium when all are the start's baseline). Nothing
-is dropped silently: the counts are in that signed record and in `nn-admin
-status --key` (`kernel_state_held_back`), each object held back is listed
-in `bpf-foreign` as `suppressed` until it is gone. One kind's flood never
-holds back another kind's finding. Residual: the cross-view's sets of the
-objects signed and of the loads seen grow with what root loads (an
-object's key, a few dozen bytes, kept for the agent's life).
+`ROUND_QUOTA` (32) findings of each kind by name — ranked by what the
+object can do (`bpf_prog_class::reach`): a held program (a signal or write
+helper or kfunc in its load), an fmod_ret and the link of a hidden program
+first, then the types run in the kernel or on the host's traffic (kprobe,
+tracing, LSM, struct_ops, ext, syscall, XDP, tc), then the others, socket
+filters and cgroup_skb last, a proven known system program after all — and
+the rest in ONE `sole_trace_summary` record with each kind's count and,
+in its `comm`, each kind's highest-ranked, first and last held back (High;
+Medium when all are the start's baseline). The re-check of #565: a held
+program's records (its outliving, the program found unseen) are never
+under the quota (R1), and what a round holds back is carried into the next,
+first in its rank, until a round names it (R2). Nothing is dropped
+silently: the counts are in the signed records and in `nn-admin status
+--key` (`kernel_state_held_back`), each object held back is listed in
+`bpf-foreign` as `suppressed` until it is named or gone. One kind's flood
+never holds back another kind's finding. Residuals: an unseen program's
+content is not read (the enumeration reads no instructions), so its rank
+is its type's — only a held program's load was judged for a signal or
+write call; past 1,024 carried findings the lowest-ranked are counted and
+listed, never named one by one; a sustained flood of one rank delays the
+named records of that rank and below (each kind's first 32 a round); the
+cross-view's sets of the objects signed and of the loads seen grow with
+what root loads (an object's key, a few dozen bytes, kept for the agent's
+life).
 
 **Operator notes.**
 - `bpftool prog|map|link show` outside a window stops at the first

@@ -488,10 +488,6 @@ fn sole_trace_summary_verdict(
             "BPF objects present at the agent's start (bpf_baseline)",
         ),
         (
-            u64::from(s.outlived),
-            "held programs still loaded after their window (bpf_held_load, outlived)",
-        ),
-        (
             u64::from(s.root_prog),
             "programs on the root cgroup's cgroup/sysctl slot (sysctl_root_prog)",
         ),
@@ -502,16 +498,28 @@ fn sole_trace_summary_verdict(
             kinds.push(format!("{n} {what}"));
         }
     }
+    // the re-check of #565 (R2): the record names each kind's
+    // highest-ranked, first and last held back
+    let named = match event {
+        Event::FsProtectDenial { comm, .. } if !comm.is_empty() && comm != "kernel" => {
+            format!(" Held back: {comm}.")
+        }
+        _ => String::new(),
+    };
     let reasoning = format!(
         "The kernel-state round found more than {} of one kind this round: {} more were not \
-         signed one by one ({} in all; each kind's first {} were, the most dangerous first — \
-         a type refused outside a window, a link whose program is hidden). Each is listed in \
-         /run/northnarrow/bpf-foreign (state `suppressed`) and counted in `nn-admin status`. A \
-         host with many BPF programs meets it at the agent's start; appearing later, it is a \
-         flood of objects made to bury one — check `bpftool prog` and `bpftool link`.",
+         signed one by one ({} in all, {} of them carried from an earlier round; each kind's \
+         first {} were, the most dangerous first — a held program, an fmod_ret, a link whose \
+         program is hidden, then the types run in the kernel or on the host's traffic, socket \
+         filters and cgroup_skb last).{named} Each is carried into the next round until it is \
+         signed by name, listed in /run/northnarrow/bpf-foreign (state `suppressed`) and \
+         counted in `nn-admin status`. A host with many BPF programs meets it at the agent's \
+         start; appearing later, it is a flood of objects made to bury one — check `bpftool \
+         prog` and `bpftool link`.",
         s.quota,
         kinds.join(", "),
         s.total(),
+        s.carried,
         s.quota,
     );
     let severity = if s.total() == u64::from(s.baseline) {
@@ -1998,16 +2006,36 @@ mod tests {
             .evaluate(&ev(start))
             .expect("verdict");
         assert_eq!(v.severity, Severity::Medium, "{}", v.reasoning);
-        let outlived = common::wire::SoleTraceSummary {
-            outlived: 5,
+        // the re-check of #565 (R2): the objects the record names, and the
+        // carried among the counted
+        let root = common::wire::SoleTraceSummary {
+            root_prog: 5,
+            carried: 2,
             quota: 32,
             ..Default::default()
         };
+        let named = "sysctl_root_prog 5 top=prog:90:cgroup_sysctl first=prog:88:cgroup_sysctl \
+                     last=prog:92:cgroup_sysctl";
         let v = NnLAt001AntiTamperDenial
-            .evaluate(&ev(outlived))
+            .evaluate(&Event::FsProtectDenial {
+                pid: 0,
+                uid: 0,
+                comm: named.into(),
+                target_dev: root.target_dev(),
+                target_ino: root.target_ino(),
+                operation: FsProtectOperation::SoleTraceSummary,
+                timestamp_ns: 1,
+            })
             .expect("verdict");
         assert_eq!(v.severity, Severity::High);
-        assert!(v.reasoning.contains("5 held programs"), "{}", v.reasoning);
+        for n in [
+            "5 programs on the root cgroup's cgroup/sysctl slot",
+            "5 in all, 2 of them carried",
+            &format!("Held back: {named}."),
+            "carried into the next round",
+        ] {
+            assert!(v.reasoning.contains(n), "{n}: {}", v.reasoning);
+        }
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load

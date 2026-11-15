@@ -45,6 +45,10 @@
 //! dangerous first, and signs the rest in ONE summary record with their
 //! counts ([`within_quota`]); each held back is listed in the cross-view's
 //! status file and counted in `nn-admin status` ([`held_back_counts`]).
+//! Its re-check: a held program's records are never under the quota (R1);
+//! a BPF object is ranked by what it can do, the summary names each kind's
+//! highest-ranked, first and last held back, and what a round held back is
+//! carried into the next until named ([`Quota`], R2).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -162,17 +166,35 @@ pub enum Finding {
     /// Lot 349: the agent runs on fewer CPUs than it should.
     Cpus(crate::own_cpus::Confinement),
     /// The review of #565 (F2): what the round's quota held back, counted
-    /// — one per round that held some back.
-    HeldBack(common::wire::SoleTraceSummary),
+    /// — one per round that held some back; its re-check (R2): naming each
+    /// kind's highest-ranked, first and last held back.
+    HeldBack(HeldBack),
+}
+
+/// The review of #565 (F2; its re-check, R2): a round's summary of what its
+/// quota held back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBack {
+    /// The counts per kind (the record's `target_dev` and `target_ino`).
+    pub counts: common::wire::SoleTraceSummary,
+    /// The record's `comm`: for each kind that held some back, its name,
+    /// its count and three of them ([`named_as`]) — the highest-ranked
+    /// held back (`top`), the first and the last in the round's order — the
+    /// kinds apart by `; `: `bpf_unseen 968 top=prog:1040:cgroup_sock
+    /// first=prog:33:socket_filter last=prog:1000:socket_filter`.
+    pub objects: String,
 }
 
 /// The review of #565 (F2): the kinds a round's quota counts apart — the
-/// fields of `common::wire::SoleTraceSummary`.
+/// fields of `common::wire::SoleTraceSummary`. Its re-check (R1): a held
+/// program's records — its outliving, the program found unseen or in the
+/// baseline — are of no kind, never under the quota: the held set bounds
+/// them (1,024 ids, each signed once), and they are the only record of a
+/// held load whose own record the ring had no room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     Unseen,
     Baseline,
-    Outlived,
     RootProgram,
     Taint,
     Cpus,
@@ -180,10 +202,9 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, in the summary's order.
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 5] = [
         Kind::Unseen,
         Kind::Baseline,
-        Kind::Outlived,
         Kind::RootProgram,
         Kind::Taint,
         Kind::Cpus,
@@ -194,101 +215,215 @@ impl Kind {
         match self {
             Kind::Unseen => "bpf_unseen",
             Kind::Baseline => "bpf_baseline",
-            Kind::Outlived => "bpf_held_outlived",
             Kind::RootProgram => "sysctl_root_prog",
             Kind::Taint => "kernel_taint",
             Kind::Cpus => "cpu_confined",
         }
     }
 
-    /// The kind of finding `f` (`None` for the summary itself).
+    /// The kind of finding `f` — `None` (never under the quota) for the
+    /// summary itself and for every record about a held program.
     pub fn of(f: &Finding) -> Option<Kind> {
         use crate::bpf_crossview::Finding as B;
         Some(match f {
+            Finding::Bpf(B::HeldOutlived(..)) => return None,
+            Finding::Bpf(B::Unseen(o) | B::Baseline(o)) if o.held.is_some() => return None,
             Finding::Taint { .. } => Kind::Taint,
             Finding::RootProgram(_) | Finding::KnownRootProgram(_) => Kind::RootProgram,
             Finding::Bpf(B::Unseen(_)) => Kind::Unseen,
             Finding::Bpf(B::Baseline(_)) => Kind::Baseline,
-            Finding::Bpf(B::HeldOutlived(..)) => Kind::Outlived,
             Finding::Cpus(_) => Kind::Cpus,
             Finding::HeldBack(_) => return None,
         })
     }
 }
 
-/// The review of #565 (F2): the order a kind's findings are named in under
-/// the quota, lowest first — a link whose program the enumeration does not
-/// show, or a program of a type refused outside a window (kprobe, tracing,
-/// LSM, …), before the others; a proven known system program last.
-fn rank(f: &Finding) -> u8 {
+/// The re-check of #565 (R2): the rank of a proven known system program —
+/// after every reach.
+const RANK_KNOWN: u8 = common::bpf_prog_class::REACH_FILTER + 1;
+
+/// The review of #565 (F2; its re-check, R2): the order a kind's findings
+/// are named in under the quota, lowest first — a BPF object by what it can
+/// do (`common::bpf_prog_class::reach`): a held program (a signal or write
+/// helper or kfunc), an fmod_ret and a link whose program is hidden first,
+/// then the types run in the kernel's paths or on the host's traffic
+/// (kprobe, fentry, LSM, tracing, struct_ops, syscall, XDP, tc, …), then
+/// the others, then socket filters and cgroup_skb; a proven known system
+/// program last. Within a rank, the round's order (the carried first).
+pub fn rank(f: &Finding) -> u8 {
     use crate::bpf_crossview::Finding as B;
+    use common::bpf_prog_class::{reach, REACH_KERNEL, REACH_SIGNAL_OR_WRITE};
     match f {
         Finding::Bpf(B::Unseen(o) | B::Baseline(o) | B::HeldOutlived(o, _)) => {
             if o.known.is_some() {
-                2
-            } else if o.is_link
-                || (!o.early && common::bpf_prog_class::denied_by_default(o.object_type))
-            {
-                0
+                RANK_KNOWN
+            } else if o.is_link {
+                REACH_SIGNAL_OR_WRITE
             } else {
-                1
+                reach(o.object_type, o.attach_type, o.held.is_some(), o.early)
             }
         }
-        Finding::KnownRootProgram(_) => 1,
-        _ => 0,
+        Finding::KnownRootProgram(_) => RANK_KNOWN,
+        _ => REACH_KERNEL,
     }
 }
 
-/// The review of #565 (F2): a round's `found` within the quota — at most
-/// `quota` findings of each kind ([`Kind`]), the most dangerous first
-/// ([`rank`], then the round's order), and, when the quota held some back,
-/// ONE more finding last: their counts per kind
-/// ([`Finding::HeldBack`], each count saturating at its field). Returns
-/// the findings to sign and those held back, each in the round's order.
-/// One kind's flood never holds back another kind's finding.
-pub fn within_quota(found: Vec<Finding>, quota: usize) -> (Vec<Finding>, Vec<Finding>) {
-    let mut keep = vec![true; found.len()];
-    for kind in Kind::ALL {
-        let mut of_kind: Vec<usize> = (0..found.len())
-            .filter(|i| Kind::of(&found[*i]) == Some(kind))
-            .collect();
-        of_kind.sort_by_key(|i| rank(&found[*i]));
-        for i in of_kind.into_iter().skip(quota) {
-            keep[i] = false;
-        }
-    }
-    let mut counts = [0u64; Kind::ALL.len()];
-    let (mut signed, mut held) = (Vec::new(), Vec::new());
-    for (f, k) in found.into_iter().zip(keep) {
-        if k {
-            signed.push(f);
-        } else {
-            if let Some(kind) = Kind::of(&f) {
-                counts[kind as usize] += 1;
+/// The re-check of #565 (R2): how the summary names a finding held back —
+/// `prog:<id>:<type>` or `link:<id>:<link type>`, a root `cgroup/sysctl`
+/// program `prog:<id>:cgroup_sysctl`, a taint `taint:<new flags>`, a
+/// confinement `cpus:<cause>` (no spaces: the comm's fields are apart by
+/// them).
+pub fn named_as(f: &Finding) -> String {
+    use crate::bpf_crossview::Finding as B;
+    use common::bpf_prog_class::{link_type_name, prog_type_name};
+    let s = match f {
+        Finding::Bpf(B::Unseen(o) | B::Baseline(o) | B::HeldOutlived(o, _)) => {
+            if o.is_link {
+                format!("link:{}:{}", o.id, link_type_name(o.object_type))
+            } else {
+                format!("prog:{}:{}", o.id, prog_type_name(o.object_type))
             }
-            held.push(f);
+        }
+        Finding::RootProgram(id) => format!("prog:{id}:cgroup_sysctl"),
+        Finding::KnownRootProgram(k) => format!("prog:{}:cgroup_sysctl", k.id),
+        Finding::Taint { new, .. } => format!("taint:{new:#x}"),
+        Finding::Cpus(c) => format!("cpus:{}", c.cause.subject()),
+        Finding::HeldBack(_) => String::new(),
+    };
+    s.replace([' ', ';'], "_")
+}
+
+/// The re-check of #565 (R2): the findings a round's quota held back that
+/// the next round carries ([`Quota`]) — at most this many, the
+/// highest-ranked kept (the others are counted, and listed `suppressed`
+/// while the enumeration shows them).
+pub const CARRY_MAX: usize = 1_024;
+
+/// One round within its quota ([`within_quota`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Within {
+    /// The findings to sign: those named, in the round's order, then the
+    /// summary when some were held back.
+    pub signed: Vec<Finding>,
+    /// Those held back, in the round's order: the carried ones first.
+    pub held: Vec<Finding>,
+    /// How many of `held` (its first ones) an earlier round carried —
+    /// counted in `nn-admin status` when first held back.
+    pub again: usize,
+}
+
+/// The review of #565 (F2; its re-check, R2): a round's findings within the
+/// quota — `carried` (what earlier rounds held back, [`Quota`]) first, then
+/// `found`: at most `quota` of each kind ([`Kind`]) named, the most
+/// dangerous first ([`rank`], then the round's order), and, when the quota
+/// held some back, ONE more finding last: their counts per kind and the
+/// objects it names ([`Finding::HeldBack`], each count saturating at its
+/// field). One kind's flood never holds back another kind's finding, nor a
+/// held program's (of no kind).
+pub fn within_quota(carried: Vec<Finding>, found: Vec<Finding>, quota: usize) -> Within {
+    let from_carry = carried.len();
+    let mut all = carried;
+    all.extend(found);
+    let mut by_rank: Vec<usize> = (0..all.len()).collect();
+    by_rank.sort_by_key(|i| rank(&all[*i]));
+    let mut keep = vec![true; all.len()];
+    let mut named = [0usize; Kind::ALL.len()];
+    // each kind's held back, highest-ranked first
+    let mut held_of: [Vec<usize>; Kind::ALL.len()] = std::array::from_fn(|_| Vec::new());
+    for i in by_rank {
+        let Some(kind) = Kind::of(&all[i]) else {
+            continue;
+        };
+        if named[kind as usize] < quota {
+            named[kind as usize] += 1;
+        } else {
+            keep[i] = false;
+            held_of[kind as usize].push(i);
         }
     }
-    if !held.is_empty() {
-        let c = |k: Kind| counts[k as usize];
-        signed.push(Finding::HeldBack(common::wire::SoleTraceSummary {
-            unseen: u32::try_from(c(Kind::Unseen)).unwrap_or(u32::MAX),
-            baseline: u32::try_from(c(Kind::Baseline)).unwrap_or(u32::MAX),
-            outlived: u16::try_from(c(Kind::Outlived)).unwrap_or(u16::MAX),
-            root_prog: u16::try_from(c(Kind::RootProgram)).unwrap_or(u16::MAX),
-            taint: u8::try_from(c(Kind::Taint)).unwrap_or(u8::MAX),
-            cpus: u8::try_from(c(Kind::Cpus)).unwrap_or(u8::MAX),
-            quota: u16::try_from(quota).unwrap_or(u16::MAX),
+    let mut objects = Vec::new();
+    for kind in Kind::ALL {
+        let h = &held_of[kind as usize];
+        let (Some(top), Some(first), Some(last)) = (h.first(), h.iter().min(), h.iter().max())
+        else {
+            continue;
+        };
+        objects.push(format!(
+            "{} {} top={} first={} last={}",
+            kind.name(),
+            h.len(),
+            named_as(&all[*top]),
+            named_as(&all[*first]),
+            named_as(&all[*last]),
+        ));
+    }
+    let again = (0..from_carry).filter(|i| !keep[*i]).count();
+    let mut out = Within {
+        again,
+        ..Within::default()
+    };
+    for (f, k) in all.into_iter().zip(keep) {
+        if k {
+            out.signed.push(f);
+        } else {
+            out.held.push(f);
+        }
+    }
+    if !out.held.is_empty() {
+        let c = |k: Kind| held_of[k as usize].len();
+        out.signed.push(Finding::HeldBack(HeldBack {
+            counts: common::wire::SoleTraceSummary {
+                unseen: u32::try_from(c(Kind::Unseen)).unwrap_or(u32::MAX),
+                baseline: u32::try_from(c(Kind::Baseline)).unwrap_or(u32::MAX),
+                carried: u16::try_from(again).unwrap_or(u16::MAX),
+                root_prog: u16::try_from(c(Kind::RootProgram)).unwrap_or(u16::MAX),
+                taint: u8::try_from(c(Kind::Taint)).unwrap_or(u8::MAX),
+                cpus: u8::try_from(c(Kind::Cpus)).unwrap_or(u8::MAX),
+                quota: u16::try_from(quota).unwrap_or(u16::MAX),
+            },
+            objects: objects.join("; "),
         }));
     }
-    (signed, held)
+    out
+}
+
+/// The re-check of #565 (R2): the round's quota across rounds — what one
+/// round held back is carried into the next, first in its rank, until a
+/// round names it (once: a carried finding is never found again, the
+/// cross-view and the root's watch sign each object once).
+#[derive(Debug, Default)]
+pub struct Quota {
+    /// The findings held back the next round carries (at most
+    /// [`CARRY_MAX`], in the round's order).
+    carry: Vec<Finding>,
+}
+
+impl Quota {
+    /// One round's `found` within `quota` ([`within_quota`]), with what
+    /// the last round carried; what it holds back is carried in turn — the
+    /// [`CARRY_MAX`] highest-ranked.
+    pub fn apply(&mut self, found: Vec<Finding>, quota: usize) -> Within {
+        let w = within_quota(std::mem::take(&mut self.carry), found, quota);
+        let mut by_rank: Vec<usize> = (0..w.held.len()).collect();
+        by_rank.sort_by_key(|i| rank(&w.held[*i]));
+        by_rank.truncate(CARRY_MAX);
+        by_rank.sort_unstable();
+        self.carry = by_rank.into_iter().map(|i| w.held[i].clone()).collect();
+        w
+    }
+
+    /// The findings the next round carries.
+    pub fn carried(&self) -> &[Finding] {
+        &self.carry
+    }
 }
 
 /// The review of #565 (F2): the findings the rounds' quota held back since
 /// the start, per [`Kind`] (`nn-admin status`).
 static HELD_BACK: [AtomicU64; Kind::ALL.len()] = [const { AtomicU64::new(0) }; Kind::ALL.len()];
 
-/// Count `held` (a round's findings the quota held back) in
+/// Count `held` (a round's findings the quota held back for the first
+/// time: the re-check of #565, R2 — a carried one is counted once) in
 /// [`held_back_counts`].
 fn count_held_back(held: &[Finding]) {
     for f in held {
@@ -419,12 +554,16 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
                 u64::from(o.id),
             )
         }
-        // the review of #565 (F2): the counts the round's quota held back
-        Finding::HeldBack(h) => (
-            FsProtectOperation::SoleTraceSummary,
-            h.target_dev(),
-            h.target_ino(),
-        ),
+        // the review of #565 (F2): the counts the round's quota held back;
+        // its re-check (R2): each kind's highest-ranked, first and last
+        Finding::HeldBack(h) => {
+            comm = h.objects.clone();
+            (
+                FsProtectOperation::SoleTraceSummary,
+                h.counts.target_dev(),
+                h.counts.target_ino(),
+            )
+        }
         Finding::Bpf(b) => {
             use crate::bpf_crossview::Finding as B;
             let (op, o) = match b {
@@ -610,16 +749,18 @@ fn log_round(found: &[Finding], held: &[Finding]) {
                 warn!(finding = ?b, "kernel state: a BPF object the bpf hook never saw loading")
             }
             Finding::HeldBack(h) => warn!(
-                quota = h.quota,
-                held_back = h.total(),
-                unseen = h.unseen,
-                baseline = h.baseline,
-                outlived = h.outlived,
-                root_prog = h.root_prog,
-                taint = h.taint,
-                cpus = h.cpus,
+                quota = h.counts.quota,
+                held_back = h.counts.total(),
+                carried = h.counts.carried,
+                unseen = h.counts.unseen,
+                baseline = h.counts.baseline,
+                root_prog = h.counts.root_prog,
+                taint = h.counts.taint,
+                cpus = h.counts.cpus,
+                named = %h.objects,
                 "kernel state: findings past the round's quota per kind held back — counted in \
-                 one signed record, listed in the BPF cross-view's status file"
+                 one signed record, listed in the BPF cross-view's status file, carried into the \
+                 next round"
             ),
             _ => {}
         }
@@ -627,6 +768,14 @@ fn log_round(found: &[Finding], held: &[Finding]) {
     for f in held {
         tracing::debug!(finding = ?f, "kernel state: a finding past the round's quota (counted)");
     }
+}
+
+/// The BPF objects of `found` (their keys).
+fn objects(found: &[Finding]) -> impl Iterator<Item = (bool, u32)> + '_ {
+    found.iter().filter_map(|f| match f {
+        Finding::Bpf(b) => Some(b.object()),
+        _ => None,
+    })
 }
 
 /// Start the round: every [`PERIOD`], its findings sent on `tx` (the
@@ -639,6 +788,7 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
         let mut failing: Option<String> = None;
         let mut tick = tokio::time::interval(PERIOD);
         let agent_start = crate::known_system_prog::agent_start_ns();
+        let mut quota = Quota::default();
         loop {
             tick.tick().await;
             // lot 304: the cross-view first — the root's programs are told
@@ -669,18 +819,16 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
             );
             // the review of #565 (F2): at most ROUND_QUOTA of each kind by
             // name, the rest counted in one summary record — in the status
-            // file and `nn-admin status` too
-            let (found, held) = within_quota(found, ROUND_QUOTA);
-            log_round(&found, &held);
-            count_held_back(&held);
+            // file and `nn-admin status` too; its re-check (R2): the rest
+            // carried into the next round until named
+            let w = quota.apply(found, ROUND_QUOTA);
+            log_round(&w.signed, &w.held);
+            count_held_back(&w.held[w.again..]);
             if let Some(c) = cross.as_mut() {
-                c.held_back(held.iter().filter_map(|f| match f {
-                    Finding::Bpf(b) => Some(b.object()),
-                    _ => None,
-                }));
+                c.quota_round(objects(&w.signed), objects(&w.held));
                 c.write_status();
             }
-            for f in found {
+            for f in w.signed {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
                 }
@@ -938,6 +1086,8 @@ mod tests {
             attach: "bpf_lsm_file_open".into(),
             early: false,
             known: None,
+            attach_type: 0,
+            held: None,
         };
         let e = event_of(
             &Finding::Bpf(crate::bpf_crossview::Finding::Unseen(o.clone())),
@@ -1021,6 +1171,8 @@ mod tests {
             attach: "bpf_lsm_file_open".into(),
             early: false,
             known: None,
+            attach_type: 0,
+            held: None,
         };
         let mut found = vec![
             B::Baseline(o(21, false)),
@@ -1142,11 +1294,20 @@ mod tests {
             attach: "-".into(),
             early: false,
             known: None,
+            attach_type: 0,
+            held: None,
         }
     }
 
     fn unseen(id: u32, t: u32) -> Finding {
         Finding::Bpf(crate::bpf_crossview::Finding::Unseen(object(id, t)))
+    }
+
+    /// One round with nothing carried (the tests of a single round).
+    fn one_round(found: Vec<Finding>) -> (Vec<Finding>, Vec<Finding>) {
+        let w = within_quota(Vec::new(), found, ROUND_QUOTA);
+        assert_eq!(w.again, 0);
+        (w.signed, w.held)
     }
 
     fn summary_of(found: &[Finding]) -> Vec<common::wire::SoleTraceSummary> {
@@ -1165,6 +1326,25 @@ mod tests {
             .collect()
     }
 
+    /// The summary's `comm` (the objects it names).
+    fn named_of(found: &[Finding]) -> String {
+        found
+            .iter()
+            .find_map(|f| match event_of(f, 1) {
+                Event::FsProtectDenial {
+                    operation: FsProtectOperation::SoleTraceSummary,
+                    comm,
+                    ..
+                } => Some(comm),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn ids(found: &[Finding]) -> Vec<(bool, u32)> {
+        objects(found).collect()
+    }
+
     /// The review of #565 (F2): root loaded thousands of socket filters
     /// faster than the hook's seen map keeps them, and each came back a
     /// round later as a High `bpf_unseen` record — never capped, taking the
@@ -1175,7 +1355,7 @@ mod tests {
     #[test]
     fn a_flood_beyond_the_round_s_quota_is_quota_records_and_one_signed_summary() {
         let flood: Vec<Finding> = (100..1_100).map(|id| unseen(id, 1)).collect();
-        let (signed, held) = within_quota(flood, ROUND_QUOTA);
+        let (signed, held) = one_round(flood);
         assert_eq!(signed.len(), ROUND_QUOTA + 1, "quota + 1 summary");
         assert_eq!(held.len(), 1_000 - ROUND_QUOTA);
         let summaries = summary_of(&signed);
@@ -1193,34 +1373,32 @@ mod tests {
         );
         assert_eq!(s.quota as usize, ROUND_QUOTA);
         assert_eq!(
-            s.baseline + u32::from(s.outlived) + u32::from(s.root_prog),
+            s.baseline + u32::from(s.carried) + u32::from(s.root_prog),
             0
         );
         // the named ones are signed as before, in the round's order
-        let named: Vec<u32> = signed
-            .iter()
-            .filter_map(|f| match f {
-                Finding::Bpf(b) => Some(b.object().1),
-                _ => None,
-            })
-            .collect();
+        let named: Vec<u32> = ids(&signed).into_iter().map(|k| k.1).collect();
         assert_eq!(named, (100..100 + ROUND_QUOTA as u32).collect::<Vec<_>>());
         // at the quota, or under it: no summary
-        let (signed, held) = within_quota(
-            (0..ROUND_QUOTA as u32).map(|i| unseen(i, 1)).collect(),
-            ROUND_QUOTA,
-        );
+        let (signed, held) = one_round((0..ROUND_QUOTA as u32).map(|i| unseen(i, 1)).collect());
         assert_eq!((signed.len(), held.len()), (ROUND_QUOTA, 0));
         assert!(summary_of(&signed).is_empty());
         assert_eq!(
-            within_quota(Vec::new(), ROUND_QUOTA),
-            (Vec::new(), Vec::new())
+            within_quota(Vec::new(), Vec::new(), ROUND_QUOTA),
+            Within::default()
         );
         // the quota is at most half the bus's P0 reserve
         const { assert!(ROUND_QUOTA * 2 <= nn_core::bus::P0_RESERVE) };
         // and the summary is a sole trace: no budget, cap or coalescing
-        let e = event_of(&Finding::HeldBack(s), 1);
+        let Some(h @ Finding::HeldBack(_)) = signed_summary(1_000) else {
+            panic!("no summary")
+        };
+        let e = event_of(&h, 1);
         assert!(nn_core::bus::sole_trace(&e), "{e:?}");
+    }
+
+    fn signed_summary(n: u32) -> Option<Finding> {
+        one_round((0..n).map(|id| unseen(id, 1)).collect()).0.pop()
     }
 
     /// The review of #565 (F2): a flood of one kind holds back nothing of
@@ -1245,13 +1423,17 @@ mod tests {
             expected: vec![0, 1],
             cause: crate::own_cpus::Cause::Partition(vec!["/x root 1".into()]),
         }));
-        let (signed, held) = within_quota(found, ROUND_QUOTA);
+        let (signed, held) = one_round(found);
         let n = |k: Kind| signed.iter().filter(|f| Kind::of(f) == Some(k)).count();
         assert_eq!(n(Kind::Unseen), ROUND_QUOTA);
         assert_eq!(n(Kind::Baseline), ROUND_QUOTA);
-        for k in [Kind::Taint, Kind::RootProgram, Kind::Outlived, Kind::Cpus] {
+        for k in [Kind::Taint, Kind::RootProgram, Kind::Cpus] {
             assert_eq!(n(k), 1, "{k:?} held back by another kind's flood");
         }
+        assert!(
+            ids(&signed).contains(&(false, 77)),
+            "the outliving held back by another kind's flood"
+        );
         assert_eq!(held.len(), (100 - ROUND_QUOTA) + (40 - ROUND_QUOTA));
         let s = summary_of(&signed);
         assert_eq!(s.len(), 1);
@@ -1259,7 +1441,7 @@ mod tests {
             (
                 s[0].unseen,
                 s[0].baseline,
-                s[0].outlived,
+                s[0].carried,
                 s[0].root_prog,
                 s[0].taint,
                 s[0].cpus
@@ -1277,6 +1459,82 @@ mod tests {
         assert_eq!(signed.len() - 1 + held.len(), 100 + 40 + 4);
     }
 
+    /// The re-check of #565 (R1): a held load the ring had no room for is
+    /// refused and counted, and its program — taken by id in the window —
+    /// is named only by its outliving; 40 outlivings in one round held 33
+    /// to 40 back under the quota, so a root holding 32 other held programs
+    /// alive left that one counted only. A held program's records — its
+    /// outliving, the program found unseen or in the baseline — are of no
+    /// kind: every one is named, whatever else the round found.
+    #[test]
+    fn a_held_program_s_records_are_never_under_the_round_s_quota() {
+        use crate::bpf_crossview::Finding as B;
+        let held = |id: u32| crate::bpf_crossview::Object {
+            held: Some(0x0b_0000_0002),
+            ..object(id, 2)
+        };
+        // the probe of the re-check: 40 outlivings of kprobes
+        let found: Vec<Finding> = (1..=40)
+            .map(|id| Finding::Bpf(B::HeldOutlived(object(id, 2), 0x0b_0000_0002)))
+            .collect();
+        let (signed, held_back) = one_round(found);
+        assert!(held_back.is_empty(), "{held_back:?}");
+        assert_eq!(
+            ids(&signed),
+            (1..=40).map(|id| (false, id)).collect::<Vec<_>>()
+        );
+        assert!(summary_of(&signed).is_empty(), "nothing held back");
+        // a thousand held programs outliving, a thousand unseen and
+        // baseline ones held: each named, and a flood of plain unseen
+        // ones still under its own quota
+        let mut found: Vec<Finding> = (1..=1_000)
+            .map(|id| Finding::Bpf(B::HeldOutlived(held(id), 0x0b_0000_0002)))
+            .collect();
+        found.extend((2_001..=2_100).map(|id| Finding::Bpf(B::Unseen(held(id)))));
+        found.extend((3_001..=3_100).map(|id| Finding::Bpf(B::Baseline(held(id)))));
+        found.extend((4_001..=4_100).map(|id| unseen(id, 1)));
+        let (signed, held_back) = one_round(found);
+        assert_eq!(held_back.len(), 100 - ROUND_QUOTA);
+        assert!(held_back
+            .iter()
+            .all(|f| matches!(f, Finding::Bpf(B::Unseen(o)) if o.held.is_none())));
+        assert_eq!(ids(&signed).len(), 1_000 + 100 + 100 + ROUND_QUOTA);
+        for f in [
+            Finding::Bpf(B::HeldOutlived(object(9, 2), 0)),
+            Finding::Bpf(B::Unseen(held(9))),
+            Finding::Bpf(B::Baseline(held(9))),
+        ] {
+            assert_eq!(Kind::of(&f), None, "{f:?} under the quota");
+        }
+        assert!(!Kind::ALL.iter().any(|k| k.name().contains("outlived")));
+    }
+
+    /// The re-check of #565 (R1): the cross-view marks each finding about a
+    /// program the round's held set has with its held load's verdict —
+    /// links and the programs not held are left as they are.
+    #[test]
+    fn the_cross_view_marks_a_held_program_s_findings_held() {
+        use crate::bpf_crossview::{mark_held, Finding as B, Object};
+        let mut found = vec![
+            B::Unseen(object(5, 1)),
+            B::Baseline(object(6, 2)),
+            B::Unseen(Object {
+                is_link: true,
+                ..object(5, 1)
+            }),
+            B::HeldOutlived(object(7, 2), 9),
+        ];
+        mark_held(&mut found, &[(5, 0x0b_0000_0001), (7, 9)]);
+        let held: Vec<Option<u64>> = found
+            .iter()
+            .map(|f| {
+                let (B::Unseen(o) | B::Baseline(o) | B::HeldOutlived(o, _)) = f;
+                o.held
+            })
+            .collect();
+        assert_eq!(held, vec![Some(0x0b_0000_0001), None, None, Some(9)]);
+    }
+
     /// The review of #565 (F2): under the quota the most dangerous are
     /// named first — a kprobe loaded last among a thousand socket filters,
     /// and a link whose program the enumeration does not show, are signed
@@ -1292,14 +1550,8 @@ mod tests {
             is_link: true,
             ..object(6_000, 1)
         })));
-        let (signed, _) = within_quota(found, ROUND_QUOTA);
-        let named: Vec<(bool, u32)> = signed
-            .iter()
-            .filter_map(|f| match f {
-                Finding::Bpf(b) => Some(b.object()),
-                _ => None,
-            })
-            .collect();
+        let (signed, _) = one_round(found);
+        let named = ids(&signed);
         assert!(
             named.contains(&(false, 5_000)),
             "the kprobe held back: {named:?}"
@@ -1320,7 +1572,7 @@ mod tests {
                 ..object(999, 29)
             })),
         );
-        let (signed, held) = within_quota(base, ROUND_QUOTA);
+        let (signed, held) = one_round(base);
         assert_eq!(held.len(), 1);
         // one held back is one summary, counting it
         let s = summary_of(&signed);
@@ -1332,5 +1584,213 @@ mod tests {
             },
             (false, 999)
         );
+    }
+
+    /// The re-check of #565 (R2): an XDP program loaded among a thousand
+    /// socket filters shared their rank and was held back — the summary
+    /// named no object, and no later round named it. A BPF object is
+    /// ranked by what it can do: the XDP is named the round it is found;
+    /// so are tc, kprobe, fentry, LSM, struct_ops and syscall programs and
+    /// an fmod_ret; a held program and a link whose program is hidden
+    /// before them; socket filters and cgroup_skb last.
+    #[test]
+    fn an_xdp_among_a_thousand_socket_filters_is_named_the_round_it_is_found() {
+        use crate::bpf_crossview::{Finding as B, Object};
+        // the probe of the re-check
+        let mut found: Vec<Finding> = (1..=1_000).map(|id| unseen(id, 1)).collect();
+        found.push(unseen(5_000, 6)); // BPF_PROG_TYPE_XDP
+        let (signed, held) = one_round(found);
+        assert!(
+            ids(&signed).contains(&(false, 5_000)),
+            "the XDP held back: {:?}",
+            ids(&signed)
+        );
+        assert!(!held
+            .iter()
+            .any(|f| matches!(f, Finding::Bpf(b) if b.object() == (false, 5_000))));
+        // each type of wide reach among a thousand socket filters and
+        // cgroup_skb programs (the rank is the type's, the id last)
+        let wide = [
+            (6_000, 6),  // xdp
+            (6_001, 3),  // sched_cls
+            (6_002, 4),  // sched_act
+            (6_003, 2),  // kprobe
+            (6_004, 26), // tracing (fentry)
+            (6_005, 29), // lsm
+            (6_006, 27), // struct_ops
+            (6_007, 31), // syscall
+            (6_008, 5),  // tracepoint
+        ];
+        let mut found: Vec<Finding> = (1..=500).map(|id| unseen(id, 1)).collect();
+        found.extend((501..=1_000).map(|id| unseen(id, 8)));
+        found.extend(wide.iter().map(|(id, t)| unseen(*id, *t)));
+        // a cgroup_sock_addr (another type), an fmod_ret, a held one, a
+        // link whose program is hidden
+        found.push(unseen(7_000, 18));
+        found.push(Finding::Bpf(B::Unseen(Object {
+            attach_type: common::bpf_prog_class::ATTACH_MODIFY_RETURN,
+            ..object(7_001, 26)
+        })));
+        found.push(Finding::Bpf(B::Unseen(Object {
+            is_link: true,
+            ..object(7_002, 1)
+        })));
+        let (signed, _) = one_round(found);
+        let named = ids(&signed);
+        for (id, _) in wide {
+            assert!(named.contains(&(false, id)), "{id} held back: {named:?}");
+        }
+        for key in [(false, 7_000), (false, 7_001), (true, 7_002)] {
+            assert!(named.contains(&key), "{key:?} held back: {named:?}");
+        }
+        assert_eq!(named.len(), ROUND_QUOTA);
+        // the ranks themselves, most dangerous first
+        let o = |t: u32| Finding::Bpf(B::Unseen(object(1, t)));
+        let r = |f: Finding| rank(&f);
+        let held_one = Finding::Bpf(B::Unseen(Object {
+            held: Some(1),
+            ..object(1, 1)
+        }));
+        let fmod_ret = Finding::Bpf(B::Unseen(Object {
+            attach_type: common::bpf_prog_class::ATTACH_MODIFY_RETURN,
+            ..object(1, 26)
+        }));
+        assert_eq!(r(held_one), r(fmod_ret.clone()));
+        assert!(r(fmod_ret) < r(o(6)));
+        for (wide, other) in [(6, 18), (3, 18), (2, 18), (31, 18), (29, 15)] {
+            assert!(r(o(wide)) < r(o(other)), "{wide} {other}");
+        }
+        for low in [1, 8] {
+            assert!(r(o(18)) < r(o(low)), "{low}");
+            assert!(r(o(99)) < r(o(low)), "an unknown type below a filter");
+        }
+        let kernel_s = Finding::Bpf(B::Unseen(Object {
+            early: true,
+            ..object(1, 2)
+        }));
+        assert_eq!(r(kernel_s), r(o(18)), "the kernel's own kprobe");
+        let known = Finding::Bpf(B::Baseline(Object {
+            known: Some((1, 0)),
+            ..object(1, 29)
+        }));
+        assert!(r(o(1)) < r(known));
+    }
+
+    /// The re-check of #565 (R2): the summary carried only counts — no
+    /// object, no id, no type. It names, per kind, the highest-ranked held
+    /// back and the first and the last in the round's order (id and type).
+    #[test]
+    fn the_summary_names_each_kind_s_highest_ranked_first_and_last_held_back() {
+        use crate::bpf_crossview::{Finding as B, Object};
+        let mut found: Vec<Finding> = (1..=1_000).map(|id| unseen(id, 1)).collect();
+        // under the quota's 32 kprobes, one cgroup_sock_addr: the highest
+        // ranked held back
+        found.extend((2_001..=2_032).map(|id| unseen(id, 2)));
+        found.push(unseen(3_000, 18));
+        found.push(Finding::Bpf(B::Baseline(Object {
+            is_link: true,
+            ..object(9, 2)
+        })));
+        found.extend((10..=50).map(|id| Finding::Bpf(B::Baseline(object(id, 8)))));
+        found.extend((800..=840).map(Finding::RootProgram));
+        let (signed, held) = one_round(found);
+        let named = named_of(&signed);
+        assert_eq!(
+            named,
+            "bpf_unseen 1001 top=prog:3000:cgroup_sock_addr first=prog:1:socket_filter \
+             last=prog:3000:cgroup_sock_addr; bpf_baseline 10 top=prog:41:cgroup_skb \
+             first=prog:41:cgroup_skb last=prog:50:cgroup_skb; sysctl_root_prog 9 \
+             top=prog:832:cgroup_sysctl first=prog:832:cgroup_sysctl \
+             last=prog:840:cgroup_sysctl"
+        );
+        assert_eq!(held.len(), 1_001 + 10 + 9);
+        // the link is named (a hidden program first), the cgroup_skb ones
+        // after it in the round's order
+        assert!(ids(&signed).contains(&(true, 9)));
+        // what it names cannot spill into the next field
+        let c = Finding::Cpus(crate::own_cpus::Confinement {
+            left: vec![0],
+            expected: vec![0, 1],
+            cause: crate::own_cpus::Cause::CgroupCpuset("/a b;c".into(), vec![0]),
+        });
+        assert!(!named_as(&c).contains([' ', ';']), "{}", named_as(&c));
+        assert_eq!(named_as(&unseen(4, 99)), "prog:4:type_99");
+    }
+
+    /// The re-check of #565 (R2): a finding the quota held back was never
+    /// named after — the cross-view signs an object once, before the quota.
+    /// What a round holds back is carried into the next, first in its rank,
+    /// until a round names it: a thousand socket filters are each named
+    /// exactly once, 32 a round; an XDP found meanwhile is named the round
+    /// it comes; each summary says how many it counts were carried; the
+    /// carry is bounded, the highest-ranked kept.
+    #[test]
+    fn what_a_round_held_back_is_named_by_a_later_round_once() {
+        let mut q = Quota::default();
+        let mut named: Vec<(bool, u32)> = Vec::new();
+        let w = q.apply((1..=1_000).map(|id| unseen(id, 1)).collect(), ROUND_QUOTA);
+        named.extend(ids(&w.signed));
+        assert_eq!((w.again, w.held.len()), (0, 1_000 - ROUND_QUOTA));
+        assert_eq!(q.carried().len(), 1_000 - ROUND_QUOTA);
+        // the next round: an XDP comes, named at once; the carried first
+        let w = q.apply(vec![unseen(5_000, 6)], ROUND_QUOTA);
+        let now = ids(&w.signed);
+        assert!(now.contains(&(false, 5_000)), "{now:?}");
+        assert_eq!(
+            now[..ROUND_QUOTA - 1],
+            (33..33 + ROUND_QUOTA as u32 - 1)
+                .map(|id| (false, id))
+                .collect::<Vec<_>>()[..]
+        );
+        assert_eq!(w.again, 1_000 - ROUND_QUOTA - (ROUND_QUOTA - 1));
+        let s = summary_of(&w.signed)[0];
+        assert_eq!(u64::from(s.carried), s.total(), "every one held carried");
+        named.extend(now);
+        let mut rounds = 2;
+        while !q.carried().is_empty() {
+            let w = q.apply(Vec::new(), ROUND_QUOTA);
+            named.extend(ids(&w.signed));
+            rounds += 1;
+            assert!(rounds < 40, "never all named");
+        }
+        named.sort_unstable();
+        let mut want: Vec<(bool, u32)> = (1..=1_000).map(|id| (false, id)).collect();
+        want.push((false, 5_000));
+        assert_eq!(named, want, "each named exactly once");
+        assert_eq!(rounds, 1_001usize.div_ceil(ROUND_QUOTA));
+        // the carry is bounded: past it the highest-ranked are kept
+        let mut q = Quota::default();
+        let mut flood: Vec<Finding> = (1..=CARRY_MAX as u32 + 500)
+            .map(|id| unseen(id, 1))
+            .collect();
+        flood.extend((100_001..=100_000 + ROUND_QUOTA as u32 + 5).map(|id| unseen(id, 18)));
+        q.apply(flood, ROUND_QUOTA);
+        assert_eq!(q.carried().len(), CARRY_MAX);
+        let carried = ids(q.carried());
+        for id in 100_001 + ROUND_QUOTA as u32..=100_000 + ROUND_QUOTA as u32 + 5 {
+            assert!(carried.contains(&(false, id)), "{id} not carried");
+        }
+        assert!(
+            !carried.contains(&(false, CARRY_MAX as u32 + 500)),
+            "the lowest-ranked last kept"
+        );
+        // the mini-hunt: every kind is carried — the root's 64 cgroup/sysctl
+        // programs are all named by the second round, each once
+        let mut q = Quota::default();
+        let w = q.apply((1..=64).map(Finding::RootProgram).collect(), ROUND_QUOTA);
+        let first: Vec<&Finding> = w
+            .signed
+            .iter()
+            .filter(|f| matches!(f, Finding::RootProgram(_)))
+            .collect();
+        assert_eq!(first.len(), ROUND_QUOTA);
+        let w = q.apply(Vec::new(), ROUND_QUOTA);
+        assert_eq!(
+            w.signed,
+            (ROUND_QUOTA as u32 + 1..=64)
+                .map(Finding::RootProgram)
+                .collect::<Vec<_>>()
+        );
+        assert!(q.carried().is_empty());
     }
 }

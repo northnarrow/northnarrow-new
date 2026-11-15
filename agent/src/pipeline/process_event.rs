@@ -640,17 +640,19 @@ pub(crate) fn process_event(
                             let s = common::wire::SoleTraceSummary::of(*target_dev, *target_ino);
                             format!(
                                 "not refused: {} findings of the kernel-state round past its \
-                                 quota of {} per kind, counted (unseen {}, baseline {}, \
-                                 outlived {}, root cgroup/sysctl {}, taint {}, cpus {}) — each \
-                                 listed in /run/northnarrow/bpf-foreign",
+                                 quota of {} per kind, counted (unseen {}, baseline {}, root \
+                                 cgroup/sysctl {}, taint {}, cpus {}; {} carried from an \
+                                 earlier round) — held back: {}; each carried into the next \
+                                 round and listed in /run/northnarrow/bpf-foreign",
                                 s.total(),
                                 s.quota,
                                 s.unseen,
                                 s.baseline,
-                                s.outlived,
                                 s.root_prog,
                                 s.taint,
-                                s.cpus
+                                s.cpus,
+                                s.carried,
+                                comm
                             )
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
                             "not refused: found on the root cgroup's cgroup/sysctl slot by the \

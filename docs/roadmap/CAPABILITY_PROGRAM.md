@@ -11283,6 +11283,26 @@ number in parentheses is a lab PR.
     of one map delete in `hold`). Not covered in a guest: the race of F1
     (a handle by id between the id and the hook, with the ring full) and a
     flood past the round's quota — by the ratchet and the unit tests only.
+  - The re-check of #565 (the second fix round): (R1, P3) the outlivings
+    were under the quota — 40 in a round held 33 to 40 back, so a held load
+    refused for want of room, named only by its outliving, could end
+    counted only; a held program's records (its outliving, the program
+    found unseen or in the baseline) are now never under it. (R2, P3) an
+    XDP program among a thousand socket filters shared their rank and was
+    held back, the summary named no object and no later round named it; a
+    BPF object is now ranked by what it can do (a held program, an
+    fmod_ret, a hidden program's link; kprobe, tracing, LSM, struct_ops,
+    syscall, XDP, tc; the others; socket filters and cgroup_skb last), the
+    summary names each kind's highest-ranked, first and last held back, and
+    what a round holds back is carried into the next until named (at most
+    1,024). Tests: `a_held_program_s_records_are_never_under_the_round_s_quota`,
+    `an_xdp_among_a_thousand_socket_filters_is_named_the_round_it_is_found`,
+    `the_summary_names_each_kind_s_highest_ranked_first_and_last_held_back`,
+    `what_a_round_held_back_is_named_by_a_later_round_once`. Mutation: 15 mutants of the new code, 15 caught by a named test.
+    Lab: none (no eBPF change: the object's code, maps and BTF are
+    byte-identical to the one `verifier-check` passed on 5.15; only its line
+    info moved). Residual: an unseen program's content is not read, so its
+    rank is its type's.
   - Levels unchanged: C23 keeps its level (a record made reliable; no new
     defence).
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the

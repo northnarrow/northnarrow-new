@@ -424,7 +424,11 @@ fn a_held_load_refused_for_want_of_room_keeps_its_id_held() {
 /// only through its quota — the findings held back counted for `nn-admin
 /// status`, marked `suppressed` for the cross-view's status file, which is
 /// written after the quota — and the cross-view no longer writes the status
-/// itself nor logs each finding before the quota.
+/// itself nor logs each finding before the quota. Its re-check (R2): the
+/// quota is the one across rounds (what it held back carried into the
+/// next), a carried finding is counted once, and the ones it names are no
+/// longer `suppressed`; (R1) the cross-view marks a held program's findings
+/// before the quota.
 #[test]
 fn the_kernel_state_round_signs_through_its_quota() {
     let k = code("crates/nn-linux/src/kernel_state.rs");
@@ -432,20 +436,33 @@ fn the_kernel_state_round_signs_through_its_quota() {
     in_order(
         spawn,
         &[
-            "let (found, held) = within_quota(found, ROUND_QUOTA);",
-            "log_round(&found, &held);",
-            "count_held_back(&held);",
-            "c.held_back(",
+            "let mut quota = Quota::default();",
+            "loop {",
+            "let w = quota.apply(found, ROUND_QUOTA);",
+            "log_round(&w.signed, &w.held);",
+            "count_held_back(&w.held[w.again..]);",
+            "c.quota_round(objects(&w.signed), objects(&w.held));",
             "c.write_status();",
-            "for f in found {",
+            "for f in w.signed {",
             "tx.send(event_of(&f, monotonic_ns()))",
         ],
     )
     .unwrap();
     assert_eq!(spawn.matches("tx.send(").count(), 1, "{spawn}");
+    assert_eq!(spawn.matches("within_quota(").count(), 0, "{spawn}");
+    let x = code("crates/nn-linux/src/bpf_crossview.rs");
+    in_order(
+        body(&x, "round"),
+        &[
+            "found.extend(outlived(",
+            "mark_held(&mut found, &held);",
+            "self.watch.last = Some(foreign);",
+            "Ok(found)",
+        ],
+    )
+    .unwrap();
     let cr = body(&k, "crossview_round");
     assert!(!cr.contains("warn!(finding"), "{cr}");
-    let x = code("crates/nn-linux/src/bpf_crossview.rs");
     let round = body(&x, "round");
     assert!(!round.contains("render_status"), "{round}");
     assert!(
@@ -1148,5 +1165,53 @@ fn a_memfd_is_sealed_at_the_exec_by_the_kernel_alone() {
                 .any(|u| u.starts_with(user) && u.contains(".has(MEMFD_SEALED)")),
             "{user} no longer asks for the seals at the exec"
         );
+    }
+}
+
+/// The re-check of #565: the review's F4 gave the ring-drop sampler's
+/// budget and refused-load counters their own wording (records HELD BACK,
+/// loads REFUSED), and the five privileged e2e tests that took the
+/// sampler's lines by the loss message ("ring-buffer events DROPPED")
+/// found none of them — red in the guests only. A test takes those lines
+/// by the field the sampler logs on every one (`ring_drop_lines`:
+/// `dropped_since_last_sample=`), never by one of `drop_warning`'s
+/// messages.
+#[test]
+fn the_e2e_tests_take_the_ring_drop_lines_by_their_field() {
+    let rd = code("crates/nn-linux/src/sensors/ring_drops.rs");
+    in_order(
+        body(&rd, "install"),
+        &[
+            "ring = RING_DROP_NAMES[i],",
+            "dropped_since_last_sample = n - p,",
+            "drop_warning(i)",
+        ],
+    )
+    .unwrap();
+    let e2e = code("agent/tests/privileged_e2e.rs");
+    assert!(
+        body(&e2e, "ring_drop_lines").contains(".contains(\"dropped_since_last_sample=\")"),
+        "the helper takes the sampler's field"
+    );
+    assert!(e2e.matches("ring_drop_lines(&text)").count() >= 4);
+    let mut files = Vec::new();
+    for dir in ["agent/tests", "tests"] {
+        support::rs_files(&repo_root().join(dir), &mut files);
+    }
+    assert!(!files.is_empty());
+    for f in files {
+        let src = strip_comments(&fs::read_to_string(&f).unwrap());
+        for message in [
+            "events DROPPED",
+            "HELD BACK before the ring",
+            "loads REFUSED —",
+        ] {
+            assert!(
+                !src.contains(message),
+                "{}: takes the ring-drop lines by a message of drop_warning ({message:?}); \
+                 use their field, as ring_drop_lines does",
+                f.display()
+            );
+        }
     }
 }

@@ -129,11 +129,15 @@ and from starving the rest:
   loaded faster than the hook's seen map keeps them were thousands of
   `bpf_unseen` records a round), so the kernel-state round names at most
   `ROUND_QUOTA` (32, half the reserve) findings of each kind, the most
-  dangerous first, and signs the rest in ONE `sole_trace_summary` record
-  with each kind's count — never a silent drop: the counts are in that
-  signed record and in `nn-admin status --key` (`kernel_state_held_back`),
-  each BPF object held back in `/run/northnarrow/bpf-foreign` (state
-  `suppressed`). A held load is one per id of the held set (1,024).
+  dangerous first (by what the object can do), and signs the rest in ONE
+  `sole_trace_summary` record with each kind's count and its
+  highest-ranked, first and last held back — never a silent drop: the
+  counts are in that signed record and in `nn-admin status --key`
+  (`kernel_state_held_back`), each BPF object held back in
+  `/run/northnarrow/bpf-foreign` (state `suppressed`), and carried into
+  the next rounds until named (at most 1,024). A held load, and a held
+  program's outliving, are one per id of the held set (1,024), never under
+  the quota.
 
 `DefenderSignal` shares the file-open sensor's ring and pump with the FIM
 credential reads, mass writes and bursts (review #471 M2): the pump sends

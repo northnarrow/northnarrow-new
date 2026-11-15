@@ -1435,6 +1435,19 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// The ring-drop sampler's journal lines (`nn_linux::sensors::ring_drops::
+/// drop_warning`), whatever their message: each carries its counter
+/// (`ring=`) and `dropped_since_last_sample=`. The re-check of #565: the
+/// review's F4 gave the budgets' and the refused loads' counters their own
+/// wording (records HELD BACK, loads REFUSED — no "events DROPPED"), and a
+/// filter on the loss message alone found none of them.
+#[cfg(feature = "debug-trigger")]
+fn ring_drop_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| l.contains("dropped_since_last_sample="))
+        .collect()
+}
+
 #[cfg(feature = "debug-trigger")]
 fn read_agent_log(path: &Path) -> String {
     strip_ansi(&std::fs::read_to_string(path).unwrap_or_default())
@@ -2082,10 +2095,7 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
         std::thread::sleep(wait);
     }
     let text = read_agent_log(&log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         !drops.iter().any(|l| l.contains("fs_protect")),
         "the denial ring filled during the loop: {drops:#?}"
@@ -2241,10 +2251,7 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
     // round, every 10 s), and none of the decisive budget's
     std::thread::sleep(Duration::from_secs(12));
     let text = read_agent_log(&log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         drops.iter().any(|l| l.contains("minor_denial_rate")),
         "the handle loop was not held back by its own budget: {drops:#?}"
@@ -2494,10 +2501,7 @@ fn a_flood_of_minor_refusals_never_hides_a_held_load() {
     // every 10 s)
     std::thread::sleep(Duration::from_secs(12));
     let text = read_agent_log(&log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         drops.iter().any(|l| l.contains("minor_denial_rate")),
         "the flood was not held back by its own budget: {drops:#?}"
@@ -2554,10 +2558,7 @@ fn assert_decisive_record_after_flood(
     // the sampler's round, every 10 s
     std::thread::sleep(Duration::from_secs(12));
     let text = read_agent_log(log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         drops.iter().any(|l| l.contains("minor_denial_rate")),
         "the flood was not held back by its own budget: {drops:#?}"

@@ -262,6 +262,16 @@ pub struct Object {
     /// Lot 304: a baseline program proven a known system program
     /// ([`crate::known_system_prog`]): its loader's pid and uid.
     pub known: Option<(u32, u32)>,
+    /// The re-check of #565 (R2): the program's expected attach type (0 for
+    /// a link): an fmod_ret (`BPF_MODIFY_RETURN`) overrides the return of
+    /// the function it is attached to.
+    pub attach_type: u32,
+    /// The re-check of #565 (R1): the verdict of the program's held load
+    /// (`why << 32 | type`, the content judge's: a call of a signal or write
+    /// helper or kfunc, or a program it could not read whole) when the
+    /// round's held set has its id — a record about a held program is never
+    /// under the round's quota.
+    pub held: Option<u64>,
 }
 
 /// A finding to sign.
@@ -394,6 +404,20 @@ impl Watch {
         self.rounds
     }
 
+    /// The review of #565 (F2; its re-check, R2): the round's quota named
+    /// `named` (no longer `suppressed`: a round carried them) and held back
+    /// `held` (`suppressed` while listed).
+    pub fn quota_round(
+        &mut self,
+        named: impl IntoIterator<Item = (bool, u32)>,
+        held: impl IntoIterator<Item = (bool, u32)>,
+    ) {
+        for key in named {
+            self.suppressed.remove(&key);
+        }
+        self.suppressed.extend(held);
+    }
+
     /// The state the status file names an object by.
     pub fn state_of(&self, key: (bool, u32)) -> &'static str {
         if self.suppressed.contains(&key) {
@@ -443,6 +467,8 @@ pub fn judge(
                 || (p.attach_read == 1
                     && common::bpf_prog_class::is_kernel_program(&p.name, &p.attach)),
             known: None,
+            attach_type: p.expected_attach_type,
+            held: None,
         });
     }
     // a link is judged through its program; one whose program the program
@@ -460,6 +486,8 @@ pub fn judge(
             attach: format!("program {} not enumerated", l.prog_id),
             early: false,
             known: None,
+            attach_type: 0,
+            held: None,
         });
     }
     // the review of #565 (F2): an object held back by a quota is forgotten
@@ -522,6 +550,23 @@ pub fn outlived(
         }
     }
     out
+}
+
+/// The re-check of #565 (R1): each finding of `found` about a program the
+/// round's held set has (`held`, read before the enumeration) carries the
+/// verdict of its held load ([`Object::held`]): a held program's record —
+/// its outliving, or the program found unseen — is never under the round's
+/// quota (`crate::kernel_state::Kind::of`).
+pub fn mark_held(found: &mut [Finding], held: &[(u32, u64)]) {
+    for f in found.iter_mut() {
+        let (Finding::Baseline(o) | Finding::Unseen(o) | Finding::HeldOutlived(o, _)) = f;
+        if o.is_link {
+            continue;
+        }
+        if let Some((_, verdict)) = held.iter().find(|(id, _)| *id == o.id) {
+            o.held = Some(*verdict);
+        }
+    }
 }
 
 /// The status file's body: one line per foreign object.
@@ -637,16 +682,25 @@ impl CrossView {
             &foreign,
             (self.window_open)(),
         ));
+        // the re-check of #565 (R1): a finding about a held program carries
+        // its held load's verdict — never under the round's quota
+        mark_held(&mut found, &held);
         // the review of #565 (F2): written once the round's quota is
         // applied ([`Self::write_status`])
         self.watch.last = Some(foreign);
         Ok(found)
     }
 
-    /// The review of #565 (F2): the objects whose finding the round's quota
-    /// held back — `suppressed` in the status file while listed.
-    pub fn held_back(&mut self, keys: impl IntoIterator<Item = (bool, u32)>) {
-        self.watch.suppressed.extend(keys);
+    /// The review of #565 (F2; its re-check, R2): the round's quota — each
+    /// object whose finding it held back (`held`) is `suppressed` in the
+    /// status file while listed, until a later round names it (`named`:
+    /// the quota carries what it held back into the next round).
+    pub fn quota_round(
+        &mut self,
+        named: impl IntoIterator<Item = (bool, u32)>,
+        held: impl IntoIterator<Item = (bool, u32)>,
+    ) {
+        self.watch.quota_round(named, held);
     }
 
     /// The last round's status file (once: a round that failed writes
@@ -996,7 +1050,7 @@ mod tests {
         let (found, foreign) = judge(&mut w, vec![], &r, &own);
         assert_eq!(found.len(), 2, "{found:?}");
         // the round's quota held the second back
-        w.suppressed.insert(found[1].object());
+        w.quota_round([found[0].object()], [found[1].object()]);
         let body = render_status(&w, &foreign);
         let line = |id: &str| {
             body.lines()
@@ -1013,6 +1067,12 @@ mod tests {
             )),
             "{body}"
         );
+        // the re-check of #565 (R2): a later round named it (carried)
+        w.quota_round([found[1].object()], []);
+        assert!(render_status(&w, &foreign)
+            .lines()
+            .any(|l| l.starts_with("prog 11 socket_filter") && l.ends_with(" unseen")));
+        w.quota_round([], [found[1].object()]);
         // gone from the enumeration: forgotten
         let (_, foreign) = judge(&mut w, vec![], &en(vec![prog(10, 1, "f10")], None), &own);
         assert!(w.suppressed.is_empty());

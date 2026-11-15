@@ -988,6 +988,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `a_flood_beyond_the_round_s_quota_is_quota_records_and_one_signed_summary`,
     `one_kind_s_flood_never_holds_back_another_kind_s_findings`,
     `a_flood_of_sole_traces_leaves_the_uid_s_decisive_refusals_their_records`).
+    Its re-check: (R1) 40 outlivings in a round held 33 to 40 back, so a held
+    load refused for want of room — named only by its outliving — could end
+    counted only: a held program's records (its outliving, the program found
+    unseen or in the baseline, marked by `bpf_crossview::mark_held`) are of
+    no kind, never under the quota
+    (`a_held_program_s_records_are_never_under_the_round_s_quota`). (R2) an
+    XDP program among a thousand socket filters was held back (one rank), the
+    summary named no object and no later round named it: a BPF object is
+    ranked by what it can do (`bpf_prog_class::reach`: a held program, an
+    fmod_ret, a hidden program's link; kprobe, tracing, LSM, struct_ops,
+    syscall, XDP, tc; the others; socket filters and cgroup_skb last), the
+    summary's `comm` names each kind's highest-ranked, first and last held
+    back, and what a round holds back is carried into the next until named
+    (`kernel_state::Quota`, at most `CARRY_MAX` 1,024; the summary's
+    `target_ino` bits 0–15 count the carried, in place of the outlivings;
+    `an_xdp_among_a_thousand_socket_filters_is_named_the_round_it_is_found`,
+    `the_summary_names_each_kind_s_highest_ranked_first_and_last_held_back`,
+    `what_a_round_held_back_is_named_by_a_later_round_once`).
   - Audit of every "minor" kind in `UPGRADE_NOTES_WAVE4.md` §50; a privileged
     e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`: a flood of
     refused handles on one CPU, then 64 window loads there, each signed with
