@@ -484,17 +484,18 @@ impl Rule for NnLAt001AntiTamperDenial {
                 ));
             }
             // The re-check of #567 (b): a read-mode access refused, recorded
-            // once a minute per caller and target — Low: journald's metadata
-            // reads of the agent's log lines meet it as surely as `nsenter`.
+            // — Low; the re-check 2 (point 2): once an hour per caller image
+            // and target, never for the packaged journald in its units'
+            // cgroups (its metadata reads of the agent's log lines, all day).
             FsProtectOperation::PtraceRead => {
                 let reasoning = format!(
                     "`{comm}` (pid {pid}) was refused a read-mode access (ptrace mode \
                      {target_dev:#x}) to the agent's process {target_ino}: one of its \
                      /proc/<pid>/ links — ns/* (nsenter, `systemctl bind` or `mount-image` \
                      entering its namespace), exe, root, cwd, fd/, environ, maps or io. Recorded \
-                     once a minute per caller and process; journald reading the agent's \
-                     executable for its log lines, lsof and a monitoring agent's process \
-                     collector are refused the same way."
+                     once an hour per caller program and process; lsof, htop and a monitoring \
+                     agent's process collector are refused the same way, and journald (its \
+                     reads of the agent's executable for its log lines) unrecorded."
                 );
                 return Some(build_verdict(
                     self,

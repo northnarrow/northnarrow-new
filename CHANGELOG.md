@@ -94,6 +94,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `/proc/<pid>/…` and `/proc/1/root/…` beneath the anchored `/proc` root;
     WSL's binfmt `status` lock judged by its identity (source `none`, root
     `/wsl/binfmt-status-lock`, `/run`'s device).
+  - **Its re-check 2** (§51.3): an unmount is judged by the subtree it
+    takes — `mount --rbind /sys /mnt/s; umount -l /mnt/s` took the host's
+    `/sys/fs/bpf` and `/sys/fs/cgroup` (and their copies in every slave
+    namespace: the bpffs's last mount) with no refusal, a raw namespace's
+    `umount -l /` the same; `sb_umount` walks the subtree in the kernel's
+    order (`common::mount_guard::umount_below`, 32 steps; offsets
+    `mount.mnt_mounts`, `.mnt_child`, slots 152–153), each mount judged as
+    the top, a subtree wider than the walk refused in a guarded namespace or
+    when a mount read is in a peer group; the read-mode ptrace record skips
+    the packaged journald in its units' cgroups (`PTRACE_READ_QUIET`: its
+    image and the cgroups of `systemd-journald.service` and
+    `systemd-journald@northnarrow.service`, read every 10 s;
+    `nn_linux::journald_identity`) and is once an hour per caller image and
+    target for every other caller (`PTRACE_READ_SEEN`,
+    `common::ptrace_read`), the refusal unchanged; `ProcFacts`'s `/proc`
+    root is named so the kernel-views ratchet follows it.
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

@@ -518,12 +518,14 @@ unsafe fn target_of(o: &Offs, real: *const u8) -> Option<(u8, u8)> {
 /// The re-check 2 of #567 (N3): the mounts below an unmounted one
 /// (`common::mount_guard::Tree`) — its children (`mnt_mounts`, a
 /// `list_head` whose entries are the children's `mnt_child`), each asked
-/// what its unmount takes (`common::mount_guard::below_of`): by its id in
-/// a guarded namespace (`by_id`), by its place under its parent's group.
-/// A link that cannot be read (NULL) ends its list.
+/// what its unmount takes (`common::mount_guard::below_of`): its place
+/// under its parent's group, its id in a guarded namespace (`by_id`: 1
+/// there, 0 elsewhere — the key is multiplied by it, no branch), a group
+/// not followed under a copy of a held mount. A link that cannot be read
+/// (NULL) ends its list.
 struct Subtree<'a> {
     o: &'a Offs,
-    by_id: bool,
+    by_id: u64,
 }
 
 impl Subtree<'_> {
@@ -557,24 +559,60 @@ impl Tree for Subtree<'_> {
         unsafe { peek_ptr(m.add(self.o.mnt_parent as usize)) }
     }
     #[inline(always)]
-    fn below(&self, m: *const u8) -> u8 {
+    fn below(&self, m: *const u8) -> u64 {
         let o = self.o;
         let parent = self.parent(m);
         let group = unsafe { peek_u32(parent.add(o.mnt_group_id as usize)) };
-        let mnt = (m as usize).wrapping_add(o.mount_mnt as usize) as *const u8;
-        let (root, _) = unsafe { mount_root_flags(o, mnt) };
         below_of(
-            root & MG_HOLD != 0,
-            || self.by_id && unsafe { held_flags(o, m) } & HELD_REFUSE != 0,
             group,
+            || unsafe { held_at(o, m, group) != 0 },
             || unsafe {
-                let (dev, ino) = place_key(o, m, group);
-                MOUNT_HELD.get(&InodeKey { dev, ino }).is_some()
+                let mnt = (m as usize).wrapping_add(o.mount_mnt as usize) as *const u8;
+                mount_root_flags(o, mnt).0 & MG_HOLD != 0
+            },
+            || unsafe {
+                let (dev, ino) = held_by_id(peek_u32(m.add(o.mnt_id as usize)));
+                // outside a guarded namespace the key is (0, 0): never held
+                let key = InodeKey {
+                    dev: dev.wrapping_mul(self.by_id),
+                    ino,
+                };
+                match MOUNT_HELD.get(&key) {
+                    Some(f) => *f & HELD_REFUSE != 0,
+                    None => false,
+                }
             },
             || unsafe { MOUNT_GROUPS.get(&group).is_some() },
             || unsafe { parent_held_like(o, parent) },
         )
     }
+}
+
+/// The re-check 2 of #567 (N3): whether an unmount of the mount `real`
+/// takes a held mount below it (`common::mount_guard::umount_below`,
+/// `below_takes_held`): 1, else 0. Out of line, a BPF-to-BPF call: the
+/// walk's states end with its frame (inlined, each of its exits carried
+/// its own state into the rest of the hook, whose propagation walk 5.15's
+/// verifier then explored once per exit, past its million instructions —
+/// the round's first lab run on ubuntu2204). Whether `real`'s namespace is
+/// guarded is read here, without a branch the walk would carry: a guarded
+/// namespace's number is 1 to 3, made 1 or 0 by arithmetic.
+#[inline(never)]
+fn subtree_takes(o: &Offs, real: *const u8) -> u64 {
+    let g = unsafe { guard_of(o, real) } as u64;
+    let by_id = (g | g.wrapping_neg()) >> 63;
+    below_takes_held(umount_below(&Subtree { o, by_id }, real), by_id != 0) as u64
+}
+
+/// The re-check 2 of #567 (N3): a held mount sits at the mount `m`'s place
+/// under the peer group `group` (`MOUNT_HELD`'s [`held_by_place`] key): 1,
+/// else 0. Out of line: the place's name buffer and keys live in its own
+/// frame, not in [`subtree_takes`]'s (5.15 gives a chain of calls 512
+/// bytes of stack).
+#[inline(never)]
+unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {
+    let (dev, ino) = place_key(o, m, group);
+    MOUNT_HELD.get(&InodeKey { dev, ino }).is_some() as u64
 }
 
 /// [`held_by_place`]'s key of the mount `m`'s place (its mountpoint's
@@ -598,8 +636,7 @@ unsafe fn parent_held_like(o: &Offs, m: *const u8) -> bool {
     if up.is_null() || up == m {
         return true;
     }
-    let (dev, ino) = place_key(o, m, PLACE_ANY_GROUP);
-    MOUNT_HELD.get(&InodeKey { dev, ino }).is_some()
+    held_at(o, m, PLACE_ANY_GROUP) != 0
 }
 
 /// The `MOUNT_HELD` flags of a mount (a `struct mount`) by its id.
@@ -662,13 +699,17 @@ unsafe fn name_of(o: &Offs, dentry: *const u8, out: &mut NameKey) {
     let qstr = dentry.add(o.d_name as usize);
     out.len = peek_u32(qstr.add(o.qstr_len as usize));
     let name = peek_ptr(qstr.add(o.qstr_name as usize));
-    let mut buf = [0u8; 16];
+    // two words, not sixteen bytes: zeroed by two stores, never a call to
+    // the `memset` subprogram (its frame counts against 5.15's 512 bytes of
+    // a call chain: the re-check 2 of #567, `held_at` below `subtree_takes`)
+    let mut words = core::mem::MaybeUninit::<[u64; 2]>::uninit();
+    crate::zero::zero(words.as_mut_ptr());
     let _ = generated::bpf_probe_read_kernel_str(
-        buf.as_mut_ptr() as *mut c_void,
+        words.as_mut_ptr() as *mut c_void,
         16,
         name as *const c_void,
     );
-    out.h = fnv16(&buf);
+    out.h = fnv16(&*(words.as_ptr() as *const [u8; 16]));
 }
 
 /// A kernel string as the allow list compares it (a file-system type),
@@ -1087,26 +1128,18 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
         return 0;
     }
     let real = real_mount(o, mnt);
-    let (flags, key) = mount_root_flags(o, mnt);
-    // the namespace the unmounted mount is in
-    let guard = guard_of(o, real);
     // The re-check 2 of #567 (N3): what the kernel takes below the mount —
     // a lazy unmount (`MNT_DETACH`) calls this hook once, for the top, and
     // `umount_tree()` then takes the whole subtree, propagating the unmount
     // of each mount to the peers and slaves of its parent (`mount --rbind
     // /sys /mnt/s; umount -l /mnt/s` took the host's childless
     // `/sys/fs/bpf`, in every slave namespace too: the bpffs's last mount).
-    // Read first, while one state enters the walk.
-    let below = below_takes_held(
-        umount_below(
-            &Subtree {
-                o,
-                by_id: guard != 0,
-            },
-            real,
-        ),
-        guard != 0,
-    );
+    // Read first, while one state enters the walk, in a function of its own
+    // ([`subtree_takes`]: what the walk leaves behind is not carried on).
+    let below = subtree_takes(o, real) != 0;
+    let (flags, key) = mount_root_flags(o, mnt);
+    // the namespace the unmounted mount is in
+    let guard = guard_of(o, real);
     let mut q = query(MG_OP_UMOUNT, &c, guard);
     q.reaches = false;
     let mut reach = reach_in(guard);

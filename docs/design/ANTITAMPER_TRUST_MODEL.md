@@ -2967,7 +2967,8 @@ where it starts.
   options and propagation of every mount a watched path resolves through
   with the first it saw (`mount_attrs_changed`, High, within one round;
   `crate::mount_attrs`). A lazy unmount (`MNT_DETACH`) goes through
-  `sb_umount` like any other.
+  `sb_umount` once, for the mount it names; what it takes below that mount
+  is read by the hook (the re-check 2 of #567, below).
 
 ### The review of #567
 
@@ -3017,8 +3018,51 @@ where it starts.
   directories or below a view, by type, point and root; the start signs
   each, the integrity round's first read too (High).
 
+### The re-check 2 of #567
+
+- **An unmount's subtree (N3).** `umount_tree()` takes the subtree of the
+  mount `sb_umount` was asked about (all of it for `MNT_DETACH`; for a
+  plain unmount the mount has no child) and `propagate_umount()` takes,
+  for each mount in it, the mount at the same place under every peer and
+  slave of its parent — no other LSM call. The hook now walks that
+  subtree in `next_mnt()`'s order (`mount.mnt_mounts`, `mnt_child`,
+  `mnt_parent`; 32 steps, `common::mount_guard::umount_below`), each mount
+  judged as the top is (`below_of`: its root a held mount's, then by its
+  id in a guarded namespace, then its place under its parent's group, a
+  group not followed failing closed under a copy of a held mount). A walk
+  not finished refuses in a guarded namespace, or when a mount read sits
+  under a parent in a peer group (`below_takes_held`). Read before the top
+  is judged, folded into `q.held`: one state enters the walk (5.15's
+  verifier).
+- **The read-mode ptrace record (point 2).** `emit_task_read_denial`:
+  nothing for the packaged journald — its image (`mm->exe_file`) and its
+  cgroup id (`bpf_get_current_cgroup_id`) a key of `PTRACE_READ_QUIET`,
+  which the agent fills from the file at journald's install path (root's,
+  in a root-only directory, not disowned) and the cgroups of
+  `systemd-journald.service` and `systemd-journald@northnarrow.service`,
+  read again every 10 s; every other caller once an hour per image and
+  target (`PTRACE_READ_SEEN`, an exact key). The refusal is the hook's,
+  after the record, whatever it did. Root running journald's binary in
+  journald's cgroup loses the record of its reads, not their refusal.
+- **If the bpffs loses its last mount.** The pins go with the super block
+  (`kill_litter_super` evicts each pinned inode, dropping its object's
+  reference). The deny programs' links (`reattach_fresh`: the link's
+  descriptor closed once pinned) are then unreferenced: every deny hook
+  detaches at once, the agent still running; its sensors (links its
+  `Ebpf` holds) and maps (its descriptors) stay. The deny self-test signs
+  the hooks it tries as missed; the integrity round signs
+  `protected_mount_gone`; the next start finds no pins (no bpffs: hooks
+  for that run only, signed; a fresh bpffs: a first start). Holding each
+  deny link's descriptor for the agent's life would keep the hooks for
+  the run (not done: named).
+
 ### Residual
 
+- An unmount whose subtree is wider than the walk, in a namespace not
+  guarded, with only private mounts read: let through (a container
+  runtime's old root has that shape; so has a copy hidden behind 32
+  private mounts). An unmount through a regrouped parent before the
+  refresh: one shared slave of it ends the walk (§51.2's window).
 - A change reaches a guarded namespace through one group (the target's
   is a guarded mount's own or master group); two masters deep is not
   followed. An unmount's propagation is judged the same way (the parent's

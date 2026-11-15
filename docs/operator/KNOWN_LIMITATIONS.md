@@ -180,6 +180,37 @@ analysis is in the
   (binds of `/var`) or a host whose `/` is a tmpfs signs its layout as not
   canonical at each start (`mount_not_canonical`) — a `systemd-sysext`,
   `confext` or composefs overlay merged at boot does not.
+- **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
+  takes the whole subtree of the mount it names, and the kernel carries
+  the unmount of each mount in it onto the peers and slaves of its parent:
+  the guard reads that subtree, 32 steps of it (the re-check 2 of #567).
+  Two unmounts it does not refuse, root building them on purpose:
+  - in a namespace that is not PID 1's, the agent's or the watchdog's (a
+    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 steps are all
+    private mounts, behind which lies a copy (an rbind of `/sys`) in one of
+    the host's peer groups: the kernel takes the host's childless
+    `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
+    the watchdog's and the units' namespaces (slaves of the host's). The
+    bpffs then loses its last mount, and its pins with it: the deny hooks,
+    which only their pins hold once the agent has started, detach at once
+    — the kill, ptrace, file, cgroup and BPF guards and the mount guard
+    itself — while the agent's sensors go on; the deny self-test signs
+    each hook it tries as missed at its next round, and the integrity
+    round signs `protected_mount_gone` (High); the next start, its pins
+    gone, starts as after a reboot;
+  - a peer of a held mount's parent regrouped since the agent's last
+    refresh of the peer groups (a second after `mount(2)`, up to 30 s
+    after `mount_setattr(2)`): one shared slave of that parent — every
+    sandboxed unit's namespace is one — is enough to hide the walk's end,
+    not 16 mounts. Its unmount can take the host's childless `/sys/fs/bpf`
+    or `/sys/fs/cgroup`. It hides the host's mount of the pins, not the
+    pins: the regroup freed the old slaves, so the agent's and the units'
+    copies stay, and so does the bpffs; the integrity round signs
+    `protected_mount_gone`.
+  *For you:* treat a `protected_mount_gone` or a missed deny hook you did
+  not cause as an incident. In PID 1's namespace a lazy unmount wider than
+  the walk is refused even when it is harmless (an rbind of `/` made
+  `rslave`): use `umount -R`, or a trusted-installer window.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is

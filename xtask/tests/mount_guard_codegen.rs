@@ -35,8 +35,10 @@ fn the_allow_list_check_is_never_inlined_into_the_decision() {
 /// host's `/sys/fs/bpf` and `/sys/fs/cgroup` through the copies below it,
 /// in every slave namespace too: the bpffs lost its last mount. The walk
 /// (`common::mount_guard::umount_below`, its host tests the probes'
-/// graphs) runs before the top is judged, its verdict folded into the
-/// unmount's.
+/// graphs) runs first, out of line (`subtree_takes`, its place look-up
+/// `held_at`: inlined, 5.15's verifier went past its million instructions
+/// and the call chain past 512 bytes of stack), its verdict folded into
+/// the unmount's before the top is judged.
 #[test]
 fn an_unmount_is_judged_by_the_subtree_it_takes() {
     let e = source("agent-ebpf/src/mount_guard.rs");
@@ -45,18 +47,34 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
         .expect("try_sb_umount is gone");
     let hook = &e[at..];
     let hook = &hook[..hook.find("\n}\n").expect("its end")];
-    let walk = hook.find("umount_below(").expect("the subtree is not read");
-    let verdict = hook.find("below_takes_held(").expect("its verdict");
+    let walk = hook
+        .find("let below = subtree_takes(o, real) != 0;")
+        .expect("the subtree is not read");
     let top = hook
         .find("if guard != 0 && !q.held {")
         .expect("the top's own check");
-    assert!(verdict < walk && walk < top, "the walk is folded in before the top");
+    assert!(walk < top, "the walk is folded in before the top");
     assert!(hook.contains("if below {\n        q.held = true;"));
+    for (f, sig) in [
+        ("subtree_takes", "fn subtree_takes(o: &Offs, real: *const u8) -> u64 {"),
+        ("held_at", "unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {"),
+    ] {
+        let at = e.find(sig).unwrap_or_else(|| panic!("{f} is gone"));
+        let attr = e[..at].trim_end().lines().last().unwrap_or("");
+        assert_eq!(attr.trim(), "#[inline(never)]", "{f} must stay out of line");
+    }
+    let walker = &e[e.find("fn subtree_takes(").unwrap()..];
+    assert!(walker[..walker.find("\n}\n").unwrap()]
+        .contains("below_takes_held(umount_below(&Subtree { o, by_id }, real), by_id != 0)"));
     // the tree read is the kernel's: the children and the siblings' links
     let tree = &e[e.find("impl Tree for Subtree").expect("the kernel's tree")..];
     for f in ["o.mnt_mounts", "o.mnt_child", "o.mnt_parent", "below_of("] {
         assert!(tree.contains(f), "{f}");
     }
+    // no sixteen-byte array to zero in the place's name: a `memset` call
+    let name = &e[e.find("unsafe fn name_of(").unwrap()..];
+    let name = &name[..name.find("\n}\n").unwrap()];
+    assert!(!name.contains("[0u8; 16]") && name.contains("crate::zero::zero("));
     let c = source("common/src/mount_guard.rs");
     assert!(c.contains("pub const SUBTREE_MAX: u32 = 32;"));
 }

@@ -1534,9 +1534,10 @@ pub const FS_OP_MOUNT_NOTED: u8 = 51;
 /// `PTRACE_MODE_NOAUDIT`): its `/proc/<pid>/ns/*` links (`nsenter`,
 /// `systemctl bind` or `mount-image` entering the agent's namespace), `exe`,
 /// `root`, `cwd`, `fd/`, `environ`, `maps`, `io` — the fields as
-/// [`FS_OP_PTRACE`]'s. Recorded once a minute per caller and target
-/// (journald's metadata reads of the agent's log lines, `lsof`, a
-/// monitoring agent's process collector meet it too). Minor.
+/// [`FS_OP_PTRACE`]'s. The re-check 2 of #567: recorded once an hour per
+/// caller image and target (`lsof`, `htop`, a monitoring agent's process
+/// collector meet it too), never for the packaged journald in its units'
+/// cgroups (`crate::ptrace_read`). Minor.
 pub const FS_OP_PTRACE_READ: u8 = 52;
 
 /// Lot 280b: the last denial code (the tests' loops).

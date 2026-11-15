@@ -3485,8 +3485,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     `/proc/<pid>/…` (a tmpfs over `/proc/<agent>/fd` fed the agent false
     facts) and a cgroup directory are never one;
   - an unmount (lazy too) or a move of one of those mounts — the mounts
-    themselves, by their id, not a copy of one (§51.1) —, a move through
-    `mount(2)`'s `MS_MOVE`, `pivot_root`;
+    themselves, by their id, not a copy of one (§51.1) — and an unmount
+    that takes one with it (§51.3: what a lazy unmount takes below the
+    mount it names), a move through `mount(2)`'s `MS_MOVE`, `pivot_root`;
   - a remount of the super block of a view or of a file system the agent's
     paths are on, and a bind remount making one of those mounts read-only
     or `noexec` (§51.1).
@@ -3635,9 +3636,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   `systemctl bind northnarrow-agent.service … /run/northnarrow` (and
   `mount-image`) fail at entering the agent's namespace — the ptrace guard
   refuses the open of its `/proc/<pid>/ns/mnt` (a read-mode access), a
-  signed Low record (`ptrace_read`) once a minute per caller and target
-  since §51.2; before it, that refusal left no record — and would be
-  refused there.
+  signed Low record (`ptrace_read`) since §51.2 (once an hour per caller
+  program and target since §51.3); before it, that refusal left no record —
+  and would be refused there.
 - **The units' drop-in directories.** `install.sh` and the agent's
   `ExecStartPre=+` lines make `/etc/systemd/system/<unit>.service.d`,
   `/run/systemd/system/<unit>.service.d` and their `system.control`
@@ -3784,7 +3785,8 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   target, through the non-decisive budget, raising no posture trigger.
   journald reading the agent's executable for its log lines, `lsof` and a
   monitoring agent's process collector meet it too: a few Low records a
-  minute on a host that runs them. A `PTRACE_MODE_NOAUDIT` check (`ps`
+  minute on a host that runs them (§51.3: once an hour per caller program,
+  none from journald). A `PTRACE_MODE_NOAUDIT` check (`ps`
   reading `/proc/<pid>/stat`) stays silent.
 - **btrfs (d).** The guard's key of an inode is now one function
   (`common::mount_guard::inode_key`), the hooks' and the unit tests': two
@@ -3809,3 +3811,74 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   `/`) to another one is refused as a move away (CRIU or podman restoring
   external slave mounts of `/sys` or `/run`: niche); SysRq-u (§51.1,
   remounts).
+
+### 51.3 The re-check 2 of #567: what an unmount takes below, journald's reads
+
+- **A lazy unmount is judged by the subtree it takes (N3).** `umount -l`
+  (`MNT_DETACH`) calls the kernel's hook once, for the mount it names; the
+  kernel then takes that mount's whole subtree and propagates the unmount
+  of each mount in it to the peers and slaves of that mount's parent, with
+  no other check. `mount --rbind /sys /mnt/s; umount -l /mnt/s` — the copy
+  at a place nothing is held at — took the host's childless `/sys/fs/bpf`
+  and `/sys/fs/cgroup` through the copies below it, and the copies in every
+  slave namespace (the agent's own included): the bpffs lost its last
+  mount, with no refusal. The same held for a raw namespace's `umount -l
+  /`. Now the guard reads the subtree in the kernel's order (32 steps: a
+  child, the next sibling, or the parent on the way back up), and refuses
+  the unmount when a mount in it is held (by its id in a guarded
+  namespace), or its unmount propagates onto a held mount (its place under
+  its parent's peer group; a group not followed yet, regrouped since:
+  under a copy of a held mount), or — the subtree wider than the walk — it
+  is in PID 1's, the agent's or the watchdog's namespace, or a mount read
+  in it sits under a parent in a peer group. A refusal is the usual signed
+  High (`NN-L-AT-001`, operation `mount`, an unmount).
+- **What goes through.** An rbind made `rslave` before its lazy unmount
+  (its copies propagate nothing), a chroot's own mounts (`mount -t sysfs`,
+  its cgroup2, a proc at `$T`: new mounts, at no held mount's place), a
+  container runtime's old root after `pivot_root` (every mount a slave or
+  private, in a namespace of its own), `umount -R` (one mount at a time,
+  each judged as before).
+- **For you.** In PID 1's namespace, a lazy unmount of more than the walk
+  reads at once (an rbind of `/` and its submounts) is refused even when
+  `rslave`: unmount it with `umount -R`, or inside a trusted-installer
+  window. Two new optional offsets (`struct mount`'s `mnt_mounts` and
+  `mnt_child`): a kernel without them does not attach the guard (a signed
+  degradation, as for the others).
+- **The refused reads of the agent's processes (point 2).** The read-mode
+  ptrace record (§51.2) was once a minute per caller process and target:
+  about 2,880 Low records a day from journald alone, and as many from each
+  periodic reader. Now:
+  - the packaged `systemd-journald` is not recorded — its image at its
+    install path (root's file, in a directory only root may write, not
+    disowned by the package database, read again every 10 s) running in
+    the cgroup of `systemd-journald.service` or of the namespace instance
+    the agent's units log to (`systemd-journald@northnarrow.service`). Its
+    reads are still refused (its lines from the agent carry no `_EXE`, as
+    before);
+  - every other caller is recorded once an hour per caller program (its
+    executable's identity, not its process) and target: htop or a
+    monitoring agent is one record an hour per process of the agent's, a
+    tool run each minute (`pidof`, `lsof`, `ss -p`) the same, and a program
+    never seen before (`nsenter -t <agent> -m`) at its first use.
+- **What happens if the bpffs loses its last mount** (what N3 did, and
+  what the residual below can still do): the kernel frees the pins with
+  the super block. The deny hooks (the kill, ptrace, file, cgroup, BPF and
+  mount guards) are held by their pins alone once the agent's start is
+  over: they detach at once, while the agent runs. The agent's sensors
+  and maps, which its process holds, go on. The deny self-test signs each
+  hook it tries (kill, ptrace, file, cgroup move, BPF) as missed at its
+  next round (a degradation, then an alert), and the integrity round signs
+  `protected_mount_gone`. The next start finds no
+  bpffs at `/sys/fs/bpf` (its hooks attach for that run only, a signed
+  degradation) or, if root mounted a fresh one, an empty pin root it takes
+  for a first start: the previous run's pins are out of its reach, as after
+  a reboot (BOOT_INTEGRITY.md).
+- **Named, not changed:** a lazy unmount in a namespace that is not PID
+  1's, the agent's or the watchdog's, of a subtree whose first 32 steps
+  read only private mounts, behind which lies a copy in one of the host's
+  peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
+  namespace) is not refused: the walk is bounded. And the regroup window
+  of §51.2 (a peer of a regrouped held parent unmounting through it before
+  the refresh) needs only one shared slave of that parent, not 16 mounts —
+  every sandboxed unit's namespace is one — hiding the host's bpffs mount
+  (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both.

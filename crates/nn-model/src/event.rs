@@ -1245,7 +1245,8 @@ pub enum FsProtectOperation {
     MountNoted,
     /// The re-check of #567 (b): a READ-mode ptrace access to one of the
     /// agent's processes refused (its `/proc/<pid>/ns/*`, `exe`, `fd/` …),
-    /// recorded once a minute per caller and target. `target_dev` the
+    /// recorded once an hour per caller image and target (the re-check 2:
+    /// never for the packaged journald in its units). `target_dev` the
     /// ptrace mode, `target_ino` the target tgid.
     PtraceRead,
     /// Wire byte the agent does not recognise (forward-compatible

@@ -352,6 +352,50 @@ mod tests {
         }
     }
 
+    /// The re-check 2 of #567 (N3): the mount guard's subtree walk
+    /// (`subtree_takes`) and its place look-up (`held_at`) are functions of
+    /// their own in the object, which `sb_umount` calls. Inlined, each exit
+    /// of the walk carried its own state into the rest of the hook and 5.15
+    /// processed more than its million instructions (the round's first lab
+    /// run); the place's name buffer zeroed by a `memset` call put the call
+    /// chain past 512 bytes of stack. xtask's `mount_guard_codegen` pins the
+    /// source.
+    #[test]
+    fn the_mount_guards_subtree_walk_is_a_function_of_the_object() {
+        if EMBEDDED != "1" || EBPF_BYTES.is_empty() {
+            assert!(
+                std::env::var_os(REQUIRE_OBJECT_ENV).is_none(),
+                "{REQUIRE_OBJECT_ENV} is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(EBPF_BYTES).expect("the eBPF object parses");
+        for name in ["subtree_takes", "held_at"] {
+            let found: Vec<&str> = obj
+                .functions
+                .values()
+                .map(|f| f.name.as_str())
+                .filter(|n| n.contains("mount_guard") && n.ends_with(&format!("{}{name}", name.len())))
+                .collect();
+            assert_eq!(found.len(), 1, "{name} is not one function of the object: {found:?}");
+        }
+        const CALL: u8 = 0x85;
+        let p = obj
+            .programs
+            .get("mount_guard_sb_umount")
+            .expect("mount_guard_sb_umount missing");
+        let f = obj
+            .functions
+            .get(&p.function_key())
+            .expect("mount_guard_sb_umount's function missing");
+        assert!(
+            f.instructions
+                .iter()
+                .any(|i| i.code == CALL && i.src_reg() == 1),
+            "mount_guard_sb_umount calls no function: the subtree walk was inlined into it"
+        );
+    }
+
     /// The emulation itself: a loop whose latch falls through to its
     /// header is caught, a jump loop and a DAG are not.
     #[test]
