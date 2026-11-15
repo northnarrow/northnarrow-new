@@ -2708,6 +2708,43 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 | `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
 | A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |
 
+## 46. A link's new path, the whole module tree, chains across forks (lot 352)
+
+- **A hard link made to a watched file is judged where it went.** A
+  `Linked` detection now names the watched file in `path` and the new link
+  in `dest_path`; NN-L-FIM-002 (Critical) fires for a link into /tmp,
+  /var/tmp, /dev/shm or /home (and for one deeper than 16 directories,
+  whose place is not known). A link elsewhere (a backup tree) is a drift row
+  only, as before. Links were dropped as no-op touches: expect `Linked`
+  drift rows of watched files you did not see before (`cp -al`, backup
+  tools that hard-link a system tree).
+- **NN-L-FIM-008 covers every kernel version's module tree, up to 10
+  directories below the version directory** (merged `/usr`; 11 with a
+  separate `/lib`). A write below `/lib/modules/<version>/` (or
+  `/usr/lib/modules/`) is Critical outside a package transaction. A kernel or DKMS package
+  install is one Low record per package-manager process (dpkg, its postinst's
+  depmod) per 15 minutes; the other writes are counted in the record budget
+  as coalesced (`detections_held` audit entries, at most 8 paths kept). An
+  administrator's `depmod -a` is Low; a module installed outside a package
+  transaction (`make modules_install`, the NVIDIA installer, `vboxconfig`, a
+  DKMS build by the dkms service at boot) is one Critical per file: the alpha
+  profile records them, it kills nothing. A file moved, hard-linked or
+  symlinked into a version directory is not seen (no open).
+- **The cross-PID chains follow processes that never executed.** A fork-only
+  descendant of a process holding a precursor (a credential-store read, a
+  /tmp exec, a canary trip) now completes NN-L-CHAIN-004/005/006/008 as an
+  exec'd one did: a Python `os.fork()` worker, a subshell's command, a
+  double-forked daemon. Expect these chains where a parent reads a watched
+  credential store and its forked workers connect out. A read or a canary
+  trip counts for the process that made it (the re-check of #561): a later
+  holder of an exited process's pid lends that process's descendants
+  nothing. FIM events and canary trips in the agent's event records carry
+  the process's start when the kernel said it (`modifier_start`,
+  `accessor_start_ns`, nanoseconds of `CLOCK_MONOTONIC`; absent when 0).
+- **Wire.** The fork record map grew to 32 bytes an entry (65,536 entries,
+  about 1 MiB more kernel memory); the exec record grew 16 bytes, the TCP
+  connect record 24. The eBPF object and the agent are rebuilt together.
+
 ## 47. A mount cannot stall the agent; stuck restarts are named and a loop is signed (lot 353)
 
 The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
@@ -2949,4 +2986,3 @@ abort).
 - **The journal** names an absent optional kernel field's own effect (it
   named the DNS decoder for every field that was not btrfs's, a hook's
   argument or the move guard's).
-

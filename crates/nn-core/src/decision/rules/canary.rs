@@ -75,6 +75,7 @@ fn as_canary(e: &Event) -> Option<CanaryView<'_>> {
             accessor_exe,
             timestamp_ns,
             first_trip,
+            ..
         } => Some(CanaryView {
             canary_id,
             canary_name,
@@ -528,6 +529,7 @@ mod tests {
             accessor_exe: Some("/tmp/payload".to_string()),
             timestamp_ns: 1_700_000_000_000_000_000,
             first_trip: true,
+            accessor_start_ns: 0,
         }
     }
 
@@ -559,6 +561,7 @@ mod tests {
                 accessor_exe,
                 timestamp_ns,
                 first_trip,
+                accessor_start_ns: 0,
             },
             _ => unreachable!(),
         }
@@ -778,6 +781,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 

@@ -758,6 +758,7 @@ mod tests {
             dst_addr: a,
             dst_port: port,
             timestamp_ns: ts,
+            fork: Default::default(),
         }
     }
 

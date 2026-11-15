@@ -29,7 +29,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap},
     programs::{BtfTracePointContext, TracePointContext},
 };
-use northnarrow_common::fork_record::{counts_as_lost, on_exec, OnExec, EXECUTOR_IDS_MAX};
+use northnarrow_common::fork_record::{counts_as_lost, fork_anchor, on_exec, OnExec, EXECUTOR_IDS_MAX};
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::InodeKey;
 
@@ -40,13 +40,19 @@ use crate::btf_offsets::{
 /// One task's fork: the forker's thread-group id, whether an exec used the
 /// record (the re-check 4: kept, not removed, so a later exec is told from a
 /// lost record), and the task's own start time (the record of an earlier
-/// task at the same address is not this one's). 16 bytes.
+/// task at the same address is not this one's). Lot 352: the forker's start
+/// and the child's anchor ([`northnarrow_common::fork_record::fork_anchor`]:
+/// the nearest process up the forks that had executed), so the chains'
+/// ancestry crosses a forker that never executed and has exited. 32 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ForkParent {
     pub parent_tgid: u32,
     pub used: u32,
     pub start: u64,
+    pub parent_start: u64,
+    pub anchor: u32,
+    pub _pad: u32,
 }
 
 /// `task_struct` address → [`ForkParent`]. LRU: a fork always gets its
@@ -103,10 +109,27 @@ pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
     }) else {
         return 0;
     };
+    // Lot 352: the forker's start and its own record (a thread forks for
+    // its process: its leader's), for the child's anchor
+    let leader = leader_of(parent);
+    let parent_start = if leader.is_null() {
+        0
+    } else {
+        unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }
+            .unwrap_or(0)
+    };
+    let own = if leader.is_null() {
+        None
+    } else {
+        unsafe { FORK_PARENTS.get(&(leader as u64)) }.map(|r| (r.start, r.used != 0, r.anchor))
+    };
     let rec = ForkParent {
         parent_tgid,
         used: 0,
         start,
+        parent_start,
+        anchor: fork_anchor(parent_tgid, parent_start, own),
+        _pad: 0,
     };
     let _ = FORK_PARENTS.insert(&(child as u64), &rec, 0);
     0
@@ -121,17 +144,33 @@ pub fn fork_parent_forget(_ctx: TracePointContext) -> u32 {
     0
 }
 
+/// Lot 352: what an exec carries of its process's fork record — the forker
+/// (0: not known), the forker's start and the anchor.
+#[derive(Clone, Copy)]
+pub struct Taken {
+    pub ppid: u32,
+    pub parent_start: u64,
+    pub anchor: u32,
+}
+
 /// The forker of `task` (started at `start`) for this exec, whose file is
 /// `(dev, ino)` (`(0, 0)`: not known, tracepoint mode):
-/// [`northnarrow_common::fork_record::on_exec`]. 0 when not known.
+/// [`northnarrow_common::fork_record::on_exec`]. 0 when not known. Lot 352:
+/// with the forker's start and the anchor of the record, both 0 with it.
 #[inline(always)]
-pub fn take(task: *const u8, start: u64, dev: u64, ino: u64) -> u32 {
+pub fn take(task: *const u8, start: u64, dev: u64, ino: u64) -> Taken {
     let key = task as u64;
+    let none = Taken {
+        ppid: 0,
+        parent_start: 0,
+        anchor: 0,
+    };
     let Some(rec) = FORK_PARENTS.get_ptr_mut(&key) else {
         lost(OnExec::Missing, start);
-        return 0;
+        return none;
     };
     let (rec_start, used, forker) = unsafe { ((*rec).start, (*rec).used != 0, (*rec).parent_tgid) };
+    let (parent_start, anchor) = unsafe { ((*rec).parent_start, (*rec).anchor) };
     let executor =
         (dev != 0 || ino != 0) && unsafe { EXECUTOR_IDS.get(&InodeKey { dev, ino }) }.is_some();
     let outcome = on_exec(Some((rec_start, used)), start, executor);
@@ -143,15 +182,35 @@ pub fn take(task: *const u8, start: u64, dev: u64, ino: u64) -> u32 {
         OnExec::First { keep: false } => unsafe { (*rec).used = 1 },
         _ => {}
     }
-    outcome.fork_ppid(forker)
+    let ppid = outcome.fork_ppid(forker);
+    if ppid == 0 {
+        return none;
+    }
+    Taken {
+        ppid,
+        parent_start,
+        anchor,
+    }
 }
 
 /// Lot 340: a process's fork record while it has executed nothing since
-/// its fork: the forker's tgid and the process's own start.
+/// its fork: the forker's tgid and the process's own start. (Lot 352 keeps
+/// it at 16 bytes: `fim_rename_observe`, which carries two, is at the
+/// verifier's 512-byte stack; [`Lineage`] is the connect's.)
 #[derive(Clone, Copy)]
 pub struct Unexecuted {
     pub ppid: u32,
     pub start: u64,
+}
+
+/// Lot 352: [`Unexecuted`] with the forker's start and the anchor the fork
+/// recorded — what a connect carries.
+#[derive(Clone, Copy)]
+pub struct Lineage {
+    pub ppid: u32,
+    pub start: u64,
+    pub parent_start: u64,
+    pub anchor: u32,
 }
 
 /// Lot 340: the unexecuted fork record of the thread group whose leader is
@@ -228,6 +287,29 @@ pub fn unexecuted_forks() -> (Option<Unexecuted>, Option<Unexecuted>) {
         return (Some(own), None);
     }
     (Some(own), unexecuted_of(parent))
+}
+
+/// Lot 352: the current process's own fork record when it has executed
+/// nothing since its fork, with the forker's start and the anchor — what a
+/// connect carries (the connecting process has no exec record). The
+/// unexecuted test of [`unexecuted_of`]: unused, its start the leader's.
+#[inline(always)]
+pub fn current_lineage() -> Option<Lineage> {
+    let leader = leader_of(unsafe { bpf_get_current_task() } as *const u8);
+    if leader.is_null() {
+        return None;
+    }
+    let start =
+        unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }.ok()?;
+    match unsafe { FORK_PARENTS.get(&(leader as u64)) } {
+        Some(rec) if rec.used == 0 && rec.start == start && rec.parent_tgid != 0 => Some(Lineage {
+            ppid: rec.parent_tgid,
+            start,
+            parent_start: rec.parent_start,
+            anchor: rec.anchor,
+        }),
+        _ => None,
+    }
 }
 
 /// A process the record should hold (started after it was attached) that

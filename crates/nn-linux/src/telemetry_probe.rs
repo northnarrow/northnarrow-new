@@ -2606,6 +2606,7 @@ pub fn round_events_for_tests(
                 dst_addr: lo4(1),
                 dst_port: 40001,
                 timestamp_ns: ts,
+                fork: Default::default(),
             },
         ),
         (
