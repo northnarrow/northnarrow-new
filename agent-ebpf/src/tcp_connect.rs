@@ -295,6 +295,18 @@ fn populate_common(raw_ptr: *mut TcpConnectRaw) {
         (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
     }
+    // Lot 352: a process that executed nothing since its fork has no exec
+    // record — its fork record names its place in the process tree for the
+    // cross-PID chains (a Python `os.fork()` child, a subshell, a daemon's
+    // grandchild)
+    if let Some(f) = crate::fork_parent::current_lineage() {
+        unsafe {
+            (*raw_ptr).fork_start = f.start;
+            (*raw_ptr).fork_parent_start = f.parent_start;
+            (*raw_ptr).fork_ppid = f.ppid;
+            (*raw_ptr).fork_anchor = f.anchor;
+        }
+    }
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
     unsafe {
         let dst = (*raw_ptr).comm.as_mut_ptr();

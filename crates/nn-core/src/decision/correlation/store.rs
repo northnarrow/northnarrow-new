@@ -263,6 +263,12 @@ struct Precursor {
     /// for it — no second record, and it no longer keeps its process's
     /// flows from the netflow pacing.
     aged_reported: bool,
+    /// Lot 352 (the re-check of #561, N1): the start of the process whose
+    /// event recorded it (`task->start_time`), 0 when the event did not say.
+    /// The key is the ancestry tree's incarnation of the pid at recording,
+    /// which can be an earlier holder's — a fork-only process the tree
+    /// learned from a fork record, long exited — and a hand-over keeps it.
+    proc_start: u64,
 }
 
 impl Precursor {
@@ -277,6 +283,16 @@ impl Precursor {
     fn can_complete(&self, now_ns: u64) -> bool {
         self.ts_ns >= now_ns.saturating_sub(CORRELATION_WINDOW_NS)
             || (!self.aged_reported && self.kept(now_ns, 0))
+    }
+
+    /// Lot 352 (the re-check of #561, N1): may count for the process that
+    /// started at `start` (0: any) — its event named that process, or did not
+    /// say. An ancestor walk asks with the hop's own start: a reused pid's
+    /// read, recorded under the incarnation the tree held for the pid (a
+    /// daemon's exited intermediate), is not the hop's to lend to that
+    /// intermediate's descendants.
+    fn of(&self, start: u64) -> bool {
+        self.proc_start == 0 || start == 0 || self.proc_start == start
     }
 }
 
@@ -332,7 +348,7 @@ impl<H: PostureHost> CorrelationStore<H> {
     // ── recording ───────────────────────────────────────────────────
 
     /// Record a `kind` precursor for an explicit [`ProcKey`] (an exec
-    /// precursor, keyed with the start its event carries).
+    /// precursor, keyed with the start its event carries: the process's).
     pub fn record(&mut self, key: ProcKey, kind: PrecursorKind, ts_ns: u64) {
         self.push(
             key,
@@ -340,6 +356,7 @@ impl<H: PostureHost> CorrelationStore<H> {
                 kind,
                 ts_ns,
                 aged_reported: false,
+                proc_start: key.start_ns,
             },
         );
     }
@@ -383,9 +400,28 @@ impl<H: PostureHost> CorrelationStore<H> {
     }
 
     /// Record for `pid`'s current incarnation (a precursor from a non-exec
-    /// event: a FIM read, a canary trip).
+    /// event: a FIM read, a canary trip), made by the process that started at
+    /// `start_ns` as the event says it (0: not said). Lot 352 (the re-check
+    /// of #561, N1): the key is the tree's, the precursor keeps that start —
+    /// the tree's incarnation can be an earlier holder of the pid, and an
+    /// ancestor walk through it then skips the precursor ([`Precursor::of`]).
+    pub fn record_for_proc(&mut self, pid: u32, start_ns: u64, kind: PrecursorKind, ts_ns: u64) {
+        self.push(
+            self.current_key(pid),
+            Precursor {
+                kind,
+                ts_ns,
+                aged_reported: false,
+                proc_start: start_ns,
+            },
+        );
+    }
+
+    /// [`Self::record_for_proc`] of an event that does not say its
+    /// process's start (tests).
+    #[cfg(test)]
     pub fn record_for_pid(&mut self, pid: u32, kind: PrecursorKind, ts_ns: u64) {
-        self.record(self.current_key(pid), kind, ts_ns);
+        self.record_for_proc(pid, 0, kind, ts_ns);
     }
 
     /// `pid`'s current incarnation as the ancestry tree knows it
@@ -627,7 +663,7 @@ impl<H: PostureHost> CorrelationStore<H> {
             .iter()
             .filter_map(|k| self.per_proc.get(k))
             .flatten()
-            .filter(|p| p.kind == PrecursorKind::CredRead && within(p.ts_ns))
+            .filter(|p| p.kind == PrecursorKind::CredRead && within(p.ts_ns) && p.of(start_ns))
             .map(|p| p.ts_ns)
             .min()?;
         keys.iter()
@@ -645,16 +681,16 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// the egress handed to its incarnation), its `TmpExec` recorded, and
     /// the egress marked answered by CHAIN-007. Lab PR 267 (R12a): kept —
     /// the exec's own CHAIN-002, judged after this rule, answers it too
-    /// unless it already did, as in order ([`NotedEgress`]).
+    /// unless it already did, as in order ([`NotedEgress`]). Lot 352: the
+    /// exec's edges are the caller's ([`Self::observe_exec`]), observed
+    /// first.
     pub fn complete_exec_sequence(
         &mut self,
         pid: u32,
-        ppid: u32,
         start_ns: u64,
         exec_ts: u64,
         egress_start_ns: u64,
     ) {
-        self.observe_spawn(pid, ppid, start_ns);
         let key = ProcKey { pid, start_ns };
         self.record(key, PrecursorKind::TmpExec, exec_ts);
         self.answer_egress(key, egress_start_ns, EgressChain::Sequence);
@@ -681,10 +717,23 @@ impl<H: PostureHost> CorrelationStore<H> {
         now_ns: u64,
         window_ns: u64,
     ) -> bool {
+        self.has_recent_of(key, 0, kind, now_ns, window_ns)
+    }
+
+    /// [`Self::has_recent`] counting only the precursors that may be the
+    /// process started at `start`'s ([`Precursor::of`]; 0: any).
+    fn has_recent_of(
+        &mut self,
+        key: ProcKey,
+        start: u64,
+        kind: PrecursorKind,
+        now_ns: u64,
+        window_ns: u64,
+    ) -> bool {
         let hit = self.with_in_window(key, now_ns, window_ns, |events, match_cutoff| {
             events
                 .iter()
-                .any(|e| e.kind == kind && e.ts_ns >= match_cutoff)
+                .any(|e| e.kind == kind && e.ts_ns >= match_cutoff && e.of(start))
         });
         self.drop_if_empty(&key);
         hit
@@ -756,19 +805,33 @@ impl<H: PostureHost> CorrelationStore<H> {
         kind: PrecursorKind,
         now_ns: u64,
     ) -> Option<ChainAge> {
+        self.chain_age_of(key, 0, kind, now_ns)
+    }
+
+    /// [`Self::chain_age`] of the precursors that may be the process started
+    /// at `start`'s ([`Precursor::of`]; 0: any).
+    fn chain_age_of(
+        &mut self,
+        key: ProcKey,
+        start: u64,
+        kind: PrecursorKind,
+        now_ns: u64,
+    ) -> Option<ChainAge> {
         let retention = retention_ns(kind);
         let q = self.per_proc.get_mut(&key)?;
         q.retain(|e| e.kept(now_ns, retention));
         let fresh_cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
         let retention_cutoff = now_ns.saturating_sub(retention);
-        let age = if q.iter().any(|e| e.kind == kind && e.ts_ns >= fresh_cutoff) {
+        let age = if q
+            .iter()
+            .any(|e| e.kind == kind && e.ts_ns >= fresh_cutoff && e.of(start))
+        {
             Some(ChainAge::Fresh)
         } else {
             let mut newest: Option<u64> = None;
-            for e in q
-                .iter_mut()
-                .filter(|e| e.kind == kind && !e.aged_reported && e.ts_ns >= retention_cutoff)
-            {
+            for e in q.iter_mut().filter(|e| {
+                e.kind == kind && !e.aged_reported && e.ts_ns >= retention_cutoff && e.of(start)
+            }) {
                 e.aged_reported = true;
                 newest = Some(newest.map_or(e.ts_ns, |n| n.max(e.ts_ns)));
             }
@@ -792,7 +855,9 @@ impl<H: PostureHost> CorrelationStore<H> {
 
     /// [`Self::chain_age`] over `pid`'s strict ancestors (CHAIN-004/006): a
     /// fresh precursor in any of them first (the Critical verdict), else
-    /// the nearest ancestor with an aged, unreported one.
+    /// the nearest ancestor with an aged, unreported one. Lot 352 (the
+    /// re-check of #561, N1): each hop's own, by its start
+    /// ([`Precursor::of`]).
     pub fn chain_age_in_ancestors(
         &mut self,
         pid: u32,
@@ -803,7 +868,7 @@ impl<H: PostureHost> CorrelationStore<H> {
             return Some(ChainAge::Fresh);
         }
         for ancestor in self.tree.get_ancestors(pid) {
-            if let Some(age) = self.chain_age(ancestor, kind, now_ns) {
+            if let Some(age) = self.chain_age_of(ancestor, ancestor.start_ns, kind, now_ns) {
                 return Some(age);
             }
         }
@@ -822,8 +887,24 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// before the exec that started it (another ring) — and the rest is
     /// dropped. A re-exec of the same process (same start) keeps its
     /// state. Without a start, a second sighting of the PID is a reuse
-    /// and its state is dropped, as before.
-    pub fn observe_spawn(&mut self, child_pid: u32, ppid: u32, start_ns: u64) {
+    /// and its state is dropped, as before. A start older than the recorded
+    /// one is an earlier incarnation's late record: ignored.
+    ///
+    /// Crate-private (review of #561, F4): outside the store an exec's or a
+    /// fork-only process's edge is entered by [`Self::observe_exec`] /
+    /// [`Self::observe_fork`], from the kernel's fork record.
+    pub(crate) fn observe_spawn(&mut self, child_pid: u32, ppid: u32, start_ns: u64) {
+        // Lot 352 (review of #561, F1): a start older than the one recorded
+        // for the PID is an earlier incarnation's record (a fork record of a
+        // process that has exited, an event processed late), never a new
+        // one: starts only grow for a PID. Entering it would move the
+        // current holder's precursors onto the dead process (those at or
+        // after its older start) and put the holder under that process's
+        // parent.
+        let known = self.tree.start_of(child_pid);
+        if start_ns != 0 && start_ns < known {
+            return;
+        }
         let previous = self.tree.observe(child_pid, ppid, start_ns);
         if previous == Some(start_ns) && start_ns != 0 {
             return;
@@ -871,6 +952,107 @@ impl<H: PostureHost> CorrelationStore<H> {
         }
     }
 
+    /// Lot 352: the exec of `child_pid` (own start `start_ns`) as the kernel
+    /// recorded it — under the process that FORKED it when the exec is the
+    /// first since that fork (`fork_parent`, else the parent at exec time,
+    /// `ppid`: an orphan's is its reaper), and, when that forker executed
+    /// nothing since its own fork (`fork_anchor` is another process: a
+    /// daemon's intermediate, a subshell), the forker's own edge to its
+    /// anchor ([`Self::observe_fork_hop`]). Without the fork record (0) the
+    /// edge is `ppid`'s, as before.
+    pub fn observe_exec(
+        &mut self,
+        child_pid: u32,
+        ppid: u32,
+        start_ns: u64,
+        fork_parent: u32,
+        fork_parent_start: u64,
+        fork_anchor: u32,
+    ) {
+        if fork_parent == 0
+            || fork_parent == child_pid
+            || !self.forker_is_known_as(fork_parent, fork_parent_start, fork_anchor)
+        {
+            // Review of #561, F2: a later exec of the same process (same
+            // start: `sh -c '…; exec python3'`) carries no fork record and
+            // names its parent at exec — an orphan's reaper. The forker of
+            // one incarnation does not change: the edge the tree holds for
+            // it is kept (re-entered, for its recency).
+            let parent = if start_ns != 0 && self.tree.start_of(child_pid) == start_ns {
+                self.tree.parent_of(child_pid).unwrap_or(ppid)
+            } else {
+                ppid
+            };
+            self.observe_spawn(child_pid, parent, start_ns);
+            return;
+        }
+        self.observe_fork_hop(fork_parent, fork_parent_start, fork_anchor);
+        self.observe_spawn(child_pid, fork_parent, start_ns);
+    }
+
+    /// Lot 352: the tree may name `forker` as the fork record does — its
+    /// recorded start is the forker's (or unknown), or the forker's own
+    /// edge to its anchor is learned from the record. Not when the tree
+    /// holds another process at that pid and the record gives no anchor
+    /// beyond the forker (its own record lost): the edge would hand a later
+    /// holder of the pid that process's precursors. Nor when the record's
+    /// forker started before the process the tree holds at that pid (review
+    /// of #561, F1): the forker has exited and its pid was reused — a stale
+    /// record, which would lend the reused pid's precursors (a `/tmp` exec)
+    /// to the forker's descendants, a benign daemon's worker.
+    fn forker_is_known_as(&self, forker: u32, forker_start: u64, anchor: u32) -> bool {
+        let known = self.tree.start_of(forker);
+        known == 0
+            || forker_start == 0
+            || known == forker_start
+            || (anchor != 0 && anchor != forker && forker_start > known)
+    }
+
+    /// Lot 352: a process that executed nothing since its fork (no exec
+    /// record), named by the kernel's fork record a later event carried
+    /// (a connect): its edge to its forker, with its own start, and the
+    /// forker's to its anchor when the forker executed nothing either. An
+    /// edge the tree already holds for that very process (the same start)
+    /// is kept: its exec, or an earlier record, named it.
+    pub fn observe_fork(
+        &mut self,
+        pid: u32,
+        start_ns: u64,
+        forker: u32,
+        forker_start: u64,
+        anchor: u32,
+    ) {
+        if pid <= 1
+            || forker == 0
+            || forker == pid
+            || start_ns == 0
+            || !self.forker_is_known_as(forker, forker_start, anchor)
+        {
+            return;
+        }
+        self.observe_fork_hop(forker, forker_start, anchor);
+        if self.tree.start_of(pid) != start_ns {
+            self.observe_spawn(pid, forker, start_ns);
+        }
+    }
+
+    /// Lot 352: the edge of `forker` (started at `forker_start`) to
+    /// `anchor`, the nearest process up the forks that had executed, when
+    /// they differ — the forker executed nothing since its fork, so the
+    /// tree has no exec of it — and the tree does not hold that very
+    /// process already.
+    fn observe_fork_hop(&mut self, forker: u32, forker_start: u64, anchor: u32) {
+        if forker <= 1
+            || anchor == 0
+            || anchor == forker
+            || forker_start == 0
+            || self.tree.start_of(forker) == forker_start
+        {
+            return;
+        }
+        self.observe_spawn(forker, anchor, forker_start);
+    }
+
     /// Same-PID **or** any-ancestor: `true` if `pid` itself, or any
     /// process in its lineage, has a `kind` precursor in window. The
     /// cross-PID kill-chain query (design §4 G4) the D6 chains build on.
@@ -888,7 +1070,9 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// Strictly an **ancestor** (not self) has a `kind` precursor in
     /// window — the pure cross-PID query the D6 CHAIN-004..008 rules use,
     /// so they never shadow the same-PID CHAIN-001..003. External audit
-    /// NETR-009: each ancestor is queried with its own incarnation.
+    /// NETR-009: each ancestor is queried with its own incarnation; lot 352
+    /// (the re-check of #561, N1): and counts only what may be that
+    /// incarnation's ([`Precursor::of`]).
     pub fn has_recent_in_ancestors(
         &mut self,
         pid: u32,
@@ -897,7 +1081,7 @@ impl<H: PostureHost> CorrelationStore<H> {
         window_ns: u64,
     ) -> bool {
         for ancestor in self.tree.get_ancestors(pid) {
-            if self.has_recent(ancestor, kind, now_ns, window_ns) {
+            if self.has_recent_of(ancestor, ancestor.start_ns, kind, now_ns, window_ns) {
                 return true;
             }
         }
@@ -911,12 +1095,18 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// kind's retention while its aged correlation is not recorded yet.
     /// Read-only: nothing is pruned.
     pub fn has_precursor_in_lineage(&self, pid: u32, now_ns: u64) -> bool {
-        let live = |key: &ProcKey| {
+        // lot 352 (the re-check of #561, N1): an ancestor's own ([`Precursor::of`])
+        let live = |key: &ProcKey, of: u64| {
             self.per_proc
                 .get(key)
-                .is_some_and(|q| q.iter().any(|p| p.can_complete(now_ns)))
+                .is_some_and(|q| q.iter().any(|p| p.can_complete(now_ns) && p.of(of)))
         };
-        live(&self.current_key(pid)) || self.tree.get_ancestors(pid).iter().any(live)
+        live(&self.current_key(pid), 0)
+            || self
+                .tree
+                .get_ancestors(pid)
+                .iter()
+                .any(|a| live(a, a.start_ns))
     }
 
     /// Lab PR 224 (CM-02 d): the first of `kinds` that `pid` or one of its
@@ -932,17 +1122,25 @@ impl<H: PostureHost> CorrelationStore<H> {
         kinds: &[PrecursorKind],
         now_ns: u64,
     ) -> Option<PrecursorKind> {
-        let mut lineage = vec![self.current_key(pid)];
-        lineage.extend(self.tree.get_ancestors(pid));
-        let holds = |key: &ProcKey, kind: PrecursorKind| {
-            self.per_proc
-                .get(key)
-                .is_some_and(|q| q.iter().any(|p| p.kind == kind && p.can_complete(now_ns)))
+        // lot 352 (the re-check of #561, N1): the process's own, whatever
+        // its start; an ancestor's own ([`Precursor::of`])
+        let mut lineage = vec![(self.current_key(pid), 0)];
+        lineage.extend(
+            self.tree
+                .get_ancestors(pid)
+                .into_iter()
+                .map(|a| (a, a.start_ns)),
+        );
+        let holds = |key: &ProcKey, of: u64, kind: PrecursorKind| {
+            self.per_proc.get(key).is_some_and(|q| {
+                q.iter()
+                    .any(|p| p.kind == kind && p.can_complete(now_ns) && p.of(of))
+            })
         };
         kinds
             .iter()
             .copied()
-            .find(|&kind| lineage.iter().any(|key| holds(key, kind)))
+            .find(|&kind| lineage.iter().any(|(key, of)| holds(key, *of, kind)))
     }
 
     /// Read-only view of the ancestry tree (lineage queries / tests).
@@ -1493,6 +1691,202 @@ mod tests {
         assert!(s.ancestry().is_ancestor(200, ProcKey::unresolved(100)));
     }
 
+    /// Lot 352: an exec is entered under its forker when the kernel named
+    /// one (an orphan's parent at exec is its reaper), and a forker that
+    /// executed nothing since its fork under its anchor, with its start.
+    /// Without a forker the edge is the parent's at exec, as before.
+    #[test]
+    fn an_exec_is_entered_under_its_forker_and_the_forker_under_its_anchor() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(200, 100, 11 * SEC);
+        s.observe_exec(400, 1, 13 * SEC, 300, 12 * SEC, 200);
+        let t = s.ancestry();
+        assert_eq!(t.parent_of(400), Some(300));
+        assert_eq!((t.parent_of(300), t.start_of(300)), (Some(200), 12 * SEC));
+        assert_eq!(
+            t.get_ancestors(400),
+            vec![key(300, 12 * SEC), key(200, 11 * SEC), key(100, 0)]
+        );
+        // the forker executed: one edge
+        s.observe_exec(500, 1, 14 * SEC, 200, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(500), Some(200));
+        assert_eq!(s.ancestry().parent_of(200), Some(100), "untouched");
+        // no fork record: the parent at exec
+        s.observe_exec(600, 200, 15 * SEC, 0, 0, 0);
+        assert_eq!(s.ancestry().parent_of(600), Some(200));
+        s.observe_exec(700, 200, 15 * SEC, 700, 1, 1);
+        assert_eq!(s.ancestry().parent_of(700), Some(200), "its own pid");
+    }
+
+    /// Lot 352: a forker the tree knows as another process (another start)
+    /// whose record names no anchor beyond itself is not trusted with the
+    /// edge: the exec falls back to its parent at exec, the connect is not
+    /// entered. With an anchor, the forker is entered as the new
+    /// incarnation, and the earlier holder's precursor is not its.
+    #[test]
+    fn a_forker_of_another_incarnation_is_not_trusted() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(100, 1, 10 * SEC);
+        s.record_for_pid(100, PrecursorKind::TmpExec, 10 * SEC);
+        s.observe_exec(200, 150, 21 * SEC, 100, 20 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(200), Some(150));
+        s.observe_fork(201, 21 * SEC, 100, 20 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(201), None);
+        // the forker's start unknown, or the same: trusted
+        s.observe_fork(202, 21 * SEC, 100, 0, 100);
+        assert_eq!(s.ancestry().parent_of(202), Some(100));
+        s.observe_fork(203, 21 * SEC, 100, 10 * SEC, 100);
+        assert_eq!(s.ancestry().parent_of(203), Some(100));
+        // a forker the tree does not know at all: trusted
+        s.observe_fork(204, 21 * SEC, 90, 20 * SEC, 90);
+        assert_eq!(s.ancestry().parent_of(204), Some(90));
+        assert_eq!(s.ancestry().parent_of(90), None, "its own anchor: no hop");
+        // with an anchor: the new incarnation, under its anchor
+        s.observe_spawn(50, 1, 5 * SEC);
+        s.observe_fork(205, 21 * SEC, 100, 20 * SEC, 50);
+        assert_eq!(s.ancestry().parent_of(205), Some(100));
+        assert_eq!(
+            (s.ancestry().parent_of(100), s.ancestry().start_of(100)),
+            (Some(50), 20 * SEC)
+        );
+        assert!(!s.has_recent_in_ancestors(205, PrecursorKind::TmpExec, 22 * SEC, W));
+    }
+
+    /// Review of #561, F1: a fork record whose forker started before the
+    /// process the tree holds at that pid is stale — the forker exited and
+    /// its pid went to a later process. The exec falls back to its parent at
+    /// exec, the connect is not entered, and the pid's holder keeps its
+    /// edge, its start and its precursors; so it does when the earlier
+    /// holder's own exec is processed late. A newer record is the pid's new
+    /// incarnation, as before.
+    #[test]
+    fn a_stale_fork_record_moves_nothing_onto_the_exited_forker() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(200, 1, 5 * SEC);
+        s.observe_spawn(300, 77, 50 * SEC);
+        s.record_for_pid(300, PrecursorKind::TmpExec, 50 * SEC);
+        let holder_kept = |s: &CorrelationStore| {
+            let t = s.ancestry();
+            (t.parent_of(300), t.start_of(300)) == (Some(77), 50 * SEC)
+                && s.per_proc.contains_key(&key(300, 50 * SEC))
+        };
+        s.observe_fork(400, 12 * SEC, 300, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(400), None);
+        assert!(holder_kept(&s), "the connect's record");
+        s.observe_exec(401, 1, 12 * SEC, 300, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(401), Some(1));
+        assert!(holder_kept(&s), "the exec's record");
+        s.observe_spawn(300, 200, 11 * SEC);
+        assert!(holder_kept(&s), "the earlier holder's late exec");
+        s.observe_fork(402, 61 * SEC, 300, 60 * SEC, 200);
+        let t = s.ancestry();
+        assert_eq!(t.parent_of(402), Some(300));
+        assert_eq!((t.parent_of(300), t.start_of(300)), (Some(200), 60 * SEC));
+        assert!(!s.has_recent_in_ancestors(402, PrecursorKind::TmpExec, 62 * SEC, W));
+        // a record without a start is a reuse of the pid, as before
+        s.observe_spawn(300, 9, 0);
+        assert_eq!(s.ancestry().parent_of(300), Some(9));
+    }
+
+    /// The re-check of #561, N1: a precursor keeps the start its event named
+    /// under whatever key the tree gave it. An ancestor walk counts it only for
+    /// that incarnation (or when either start is unknown): the tree's key for a
+    /// pid can be an exited fork-only intermediate's, and a later holder's
+    /// read under it is not the intermediate's to lend to its descendants —
+    /// whether recorded under that key or handed to it by a stale hop. The
+    /// same pid's own query still finds it, and a hand-over to the reader's
+    /// own incarnation carries it to the reader's children.
+    #[test]
+    fn an_ancestor_walk_counts_a_precursor_for_its_own_incarnation_only() {
+        let (r, now) = (PrecursorKind::CredRead, 60 * SEC);
+        // (A) under the stale key
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(300, 200, 11 * SEC);
+        s.observe_spawn(400, 300, 12 * SEC);
+        s.record_for_proc(300, 50 * SEC, r, 55 * SEC);
+        assert!(
+            s.per_proc.contains_key(&key(300, 11 * SEC)),
+            "the tree's key"
+        );
+        assert!(!s.has_recent_in_ancestors(400, r, now, W));
+        assert_eq!(s.chain_age_in_ancestors(400, r, now), None);
+        assert!(!s.has_recent_in_lineage(400, r, now, W));
+        assert!(!s.has_precursor_in_lineage(400, now));
+        assert_eq!(s.precursor_in_lineage(400, &[r], now), None);
+        assert!(s.has_recent_for_pid(300, r, now, W), "the pid's own query");
+        assert!(s.has_precursor_in_lineage(300, now));
+        assert_eq!(s.precursor_in_lineage(300, &[r], now), Some(r));
+        // the intermediate's own read, or one that names no start, is lent
+        s.record_for_proc(300, 11 * SEC, PrecursorKind::CanaryTrip, 56 * SEC);
+        assert!(s.has_recent_in_ancestors(400, PrecursorKind::CanaryTrip, now, W));
+        s.record_for_pid(300, PrecursorKind::TmpExec, 57 * SEC);
+        assert!(s.has_recent_in_ancestors(400, PrecursorKind::TmpExec, now, W));
+        // (B) handed to the stale hop from the pid's unknown key
+        let mut s = CorrelationStore::new();
+        s.record_for_proc(300, 50 * SEC, r, 55 * SEC);
+        s.observe_fork(400, 12 * SEC, 300, 11 * SEC, 200);
+        assert_eq!(s.ancestry().start_of(300), 11 * SEC);
+        assert!(s.per_proc.contains_key(&key(300, 11 * SEC)), "handed over");
+        assert!(!s.has_recent_in_ancestors(400, r, now, W));
+        assert_eq!(s.chain_age_in_ancestors(400, r, now), None);
+        // the reader's own incarnation entered: its child's walk counts it
+        s.observe_fork(401, 56 * SEC, 300, 50 * SEC, 200);
+        assert!(s.per_proc.contains_key(&key(300, 50 * SEC)), "the reader's");
+        assert!(s.has_recent_in_ancestors(401, r, now, W));
+        assert_eq!(s.chain_age_in_ancestors(401, r, now), Some(ChainAge::Fresh));
+        assert!(!s.has_recent_in_ancestors(400, r, now, W));
+    }
+
+    /// The re-check of #561, N1: a late exec's CHAIN-007 counts the reads of
+    /// its own process only — a read that names another start is not.
+    #[test]
+    fn a_late_exec_s_sequence_takes_its_own_process_s_read_only() {
+        let mut s = CorrelationStore::new();
+        s.record_for_proc(300, 50 * SEC, PrecursorKind::CredRead, 52 * SEC);
+        s.note_egress(ProcKey::unresolved(300), note(300, 53 * SEC, 443));
+        assert!(s.exec_sequence_egress(300, 40 * SEC, 41 * SEC, W).is_none());
+        assert!(s.exec_sequence_egress(300, 50 * SEC, 51 * SEC, W).is_some());
+    }
+
+    /// Lot 352: a connect's fork record is entered once; a record without
+    /// the process's start, without a forker, naming the process itself or
+    /// PID 1's own is not; an edge the tree holds for that very process (an
+    /// earlier record) is kept. A forker hop is learned only for a forker
+    /// that is not PID 1, with a start, an anchor other than itself, and
+    /// not already known as that very process.
+    #[test]
+    fn a_connect_s_fork_record_is_entered_once() {
+        let mut s = CorrelationStore::new();
+        s.observe_fork(1, 5 * SEC, 9, 4 * SEC, 9);
+        s.observe_fork(300, 0, 9, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 0, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 300, 4 * SEC, 9);
+        assert!(s.ancestry().is_empty());
+        s.observe_fork(300, 5 * SEC, 9, 4 * SEC, 9);
+        s.observe_fork(300, 5 * SEC, 8, 4 * SEC, 8);
+        assert_eq!(s.ancestry().parent_of(300), Some(9), "kept");
+        // hops
+        s.observe_fork(301, 6 * SEC, 1, 2 * SEC, 7);
+        assert_eq!(s.ancestry().parent_of(1), None, "PID 1 has no hop");
+        s.observe_fork(302, 6 * SEC, 20, 0, 7);
+        assert_eq!(s.ancestry().parent_of(20), None, "no forker start");
+        s.observe_fork(303, 6 * SEC, 21, 3 * SEC, 0);
+        assert_eq!(s.ancestry().parent_of(21), None, "no anchor");
+        s.observe_fork(304, 6 * SEC, 22, 3 * SEC, 7);
+        assert_eq!(s.ancestry().parent_of(22), Some(7));
+        s.observe_fork(305, 6 * SEC, 22, 3 * SEC, 6);
+        assert_eq!(s.ancestry().parent_of(22), Some(7), "known: kept");
+        // a record without a start never touches a known process (an
+        // unknown start would read as a reuse of its pid)
+        s.observe_spawn(40, 9, 5 * SEC);
+        s.record_for_pid(40, PrecursorKind::TmpExec, 6 * SEC);
+        s.observe_fork(40, 0, 8, 4 * SEC, 8);
+        s.observe_fork(306, 7 * SEC, 40, 0, 7);
+        assert_eq!(s.ancestry().parent_of(40), Some(9));
+        assert_eq!(s.ancestry().start_of(40), 5 * SEC);
+        assert!(s.has_recent_for_pid(40, PrecursorKind::TmpExec, 7 * SEC, W));
+    }
+
     /// Lab PR 246: a network canary trip's own connection, noted when a
     /// row of it reached the rules before the trip, is dropped under every
     /// key of the pid (unresolved, previous incarnation): no late read or
@@ -1834,7 +2228,8 @@ mod tests {
             Some(12 * SEC),
             "a late exec's CHAIN-007"
         );
-        s.complete_exec_sequence(42, 1, SEC, 10 * SEC, 12 * SEC);
+        s.observe_spawn(42, 1, SEC);
+        s.complete_exec_sequence(42, SEC, 10 * SEC, 12 * SEC);
         assert!(
             s.exec_sequence_egress(42, SEC, 10 * SEC, W).is_none(),
             "once"

@@ -79,15 +79,16 @@ use aya_ebpf::{
     maps::{HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
 };
+use northnarrow_common::wire::open_sensor::{OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN};
 use northnarrow_common::wire::{
-    FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
+    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
     FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_DEST_LEAF,
     FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
     FIM_WRITE_TRUNCATED_BY_ANOTHER, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_FLAGS_OFFSET, FILE_F_INODE_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_FLAGS_OFFSET, FILE_F_INODE_OFFSET,
     FILE_F_MODE_OFFSET,
     INODE_I_INO_OFFSET, INODE_I_SB_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
     SUPER_BLOCK_S_DEV_OFFSET,
@@ -313,10 +314,13 @@ pub(crate) fn emit_drift(op: u8, key: InodeKey) {
 
 /// [`emit_drift`] of an open (`Opened`): without the writer's fork records
 /// (lot 344) — the file-open hooks are the longest programs the verifier
-/// walks (`fim_file_open_sensor`), and an open changes nothing.
+/// walks (`fim_file_open_sensor`), and an open changes nothing. Lot 352 (the
+/// re-check of #561, N1): with the reader's start (`modifier_start`, two
+/// reads, no map), so the chains key a credential read or a canary trip to
+/// the process that made it, not to an earlier holder of its pid.
 #[inline(always)]
 pub(crate) fn emit_drift_opened(key: InodeKey) {
-    emit_drift_raw(FIM_OP_OPENED, key, NO_DEST, 0, false);
+    emit_drift_raw(FIM_OP_OPENED, key, NO_DEST, 0, false, true);
 }
 
 /// Lot 344: the current process's fork records when it has executed nothing
@@ -355,13 +359,13 @@ const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 /// tolerate that read for privileged loaders; 5.15 does not.
 #[inline(always)]
 fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
-    emit_drift_raw(op, key, dest, op_flags, true);
+    emit_drift_raw(op, key, dest, op_flags, true, false);
 }
 
 /// [`emit_drift_with_dest`], the writer's fork records carried when
-/// `forks` (lot 344).
+/// `forks` (lot 344), and its own start when `own_start` (lot 352).
 #[inline(always)]
-fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bool) {
+fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bool, own_start: bool) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => {
@@ -394,6 +398,9 @@ fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bo
         core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
         if forks {
             fill_forks(raw_ptr);
+        }
+        if own_start {
+            (*raw_ptr).modifier_start = crate::fork_parent::current_start();
         }
     }
     entry.submit(0);
@@ -811,7 +818,11 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
     let old_dentry: *const c_void = ctx.arg(0);
     if let Some(src_inode) = inode_from_dentry(old_dentry) {
         if let Some(key) = should_emit(src_inode) {
-            emit_drift(FIM_OP_LINKED, key);
+            // Lot 352 (NN-L-FIM-002): with the NEW link's path — the drift
+            // record named the source only, and the link's directory is
+            // rarely watched
+            let new_dentry: *const c_void = ctx.arg(2);
+            emit_link(key, new_dentry as *const u8);
         }
     }
     // Also check the NEW DIR — a hardlink created INTO a
@@ -822,6 +833,62 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
         emit_drift(FIM_OP_LINKED, key);
     }
     0
+}
+
+/// Lot 352: a link made to the watched inode `key` — its drift record
+/// (`Linked`) and the walk of the new link's dentries up to the filesystem
+/// root ([`FimLinkRaw`], the open sensor's walk), on the FIM ring. A full
+/// ring drops it, counted as the drift records are.
+#[inline(always)]
+unsafe fn emit_link(key: InodeKey, new_dentry: *const u8) {
+    let mut entry = match FS_FIM_EVENTS.reserve::<FimLinkRaw>(0) {
+        Some(e) => e,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+            return;
+        }
+    };
+    let raw: *mut FimLinkRaw = entry.as_mut_ptr();
+    crate::zero::zero(raw);
+    let d: *mut FimDriftRaw = &mut (*raw).drift;
+    (*d).timestamp_ns = bpf_ktime_get_ns();
+    (*d).modifier_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    (*d).modifier_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+    (*d).target_dev = key.dev;
+    (*d).target_ino = key.ino;
+    (*d).op = FIM_OP_LINKED;
+    crate::comm::comm_into(&mut (*d).modifier_comm);
+    fill_forks(d);
+    let dst = (*raw).path.as_mut_ptr();
+    let mut cur = new_dentry;
+    let mut n: usize = 0;
+    let mut top: *const u8 = core::ptr::null();
+    for i in 0..OPEN_PATH_SLOTS {
+        if cur.is_null() {
+            break;
+        }
+        let name = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+        if !name.is_null() {
+            let slot = core::slice::from_raw_parts_mut(dst.add(i * OPEN_PATH_SLOT_LEN), OPEN_PATH_SLOT_LEN);
+            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+        }
+        n = i + 1;
+        let up = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_PARENT_OFFSET)));
+        if up == cur {
+            top = cur;
+            break;
+        }
+        cur = up;
+    }
+    (*raw).path_n = n as u16;
+    if top.is_null() {
+        (*raw).path_truncated = 1;
+    } else {
+        let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(top.add(off!(DENTRY_D_INODE_OFFSET))));
+        (*raw).root_dev = root.dev;
+        (*raw).root_ino = root.ino;
+    }
+    entry.submit(0);
 }
 
 /// `file_open` observation — fires on EVERY open of a watched

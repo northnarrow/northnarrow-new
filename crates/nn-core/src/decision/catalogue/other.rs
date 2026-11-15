@@ -205,7 +205,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0078", "DC0055", "DC0032"],
         observes: "An outbound flow from a process whose ancestor (not itself) read a \
                    FIM-watched credential store: within 300 s Critical kill, within 30 \
-                   minutes one High record. The ancestry comes from the exec sensor.",
+                   minutes one High record. The ancestry comes from the exec sensor and the \
+                   kernel's fork record (lot 352): a descendant that executed nothing since its \
+                   fork (a Python `os.fork()` child, a subshell, a daemon's grandchild) is \
+                   named by its connect, and a forker that never executed by its anchor, the \
+                   nearest process up the forks that had. A read counts for the process that \
+                   made it (the kernel's open record carries its start): a later holder of an \
+                   exited ancestor's pid lends that ancestor's descendants nothing.",
         false_positives: "As NN-L-CHAIN-001, through a child: a browser or password manager \
                           whose watched store was read by the parent and whose helper process \
                           syncs.",
@@ -214,6 +220,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       e2e does exactly this.",
         tests: &[
             "crates/nn-core/src/decision/rules/chain.rs::chain004_cross_pid_cred_exfil_fires",
+            "crates/nn-core/src/decision/rules/chain.rs::chain004_fires_for_a_fork_only_child_of_the_reader",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_cred_read_parent_then_descendant_egress_trips_chain_004",
         ],
         attack_note: "As NN-L-CHAIN-001.",
@@ -232,9 +239,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "As NN-L-CHAIN-002, through a child (an installer run from /tmp whose \
                           helper downloads); a package transaction is spared.",
         how_to_test: "A program run from /tmp forks a child that connects out to a port other \
-                      than 53; the e2e builds one.",
+                      than 53 — with or without an exec, through a subshell (lot 352); the \
+                      e2e builds one.",
         tests: &[
             "crates/nn-core/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires",
+            "crates/nn-core/src/decision/rules/chain.rs::chain005_fires_for_a_fork_only_child_of_a_staged_exec",
+            "crates/nn-core/src/decision/rules/chain.rs::chain005_crosses_a_subshell",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005",
         ],
         attack_note: "As NN-L-CHAIN-002.",
@@ -251,9 +261,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "As NN-L-CHAIN-003, through a child: a backup client that reads a \
                           canary and hands the upload to a helper process.",
         how_to_test: "A process forks a daemonised grandchild, then trips a File canary; the \
-                      grandchild connects out afterwards (the e2e's recipe).",
+                      grandchild connects out afterwards (the e2e's recipe). Lot 352: also when \
+                      the daemon's intermediate never executes and has exited (Python's \
+                      `os.fork()` + `setsid` + `os.fork()`), the grandchild executing or not.",
         tests: &[
             "crates/nn-core/src/decision/rules/chain.rs::cross_pid_chains_grade_by_age",
+            "crates/nn-core/src/decision/rules/chain.rs::chain006_fires_for_the_e2e_recipe_with_a_fork_only_intermediate",
+            "crates/nn-core/src/decision/rules/chain.rs::chain006_fires_for_a_daemon_s_fork_only_grandchild",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_canary_trip_parent_then_descendant_egress_trips_chain_006",
         ],
         attack_note: "As NN-L-CHAIN-003.",

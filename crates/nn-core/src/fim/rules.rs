@@ -123,6 +123,33 @@ const CRON_DROPIN_PATHS: &[&str] = &[
 /// modified kmod is a rootkit-class compromise.
 const KMOD_PREFIX: &str = "/lib/modules/";
 
+/// Lot 352 (pre-alpha Phase 4, NN-L-FIM-008): the kernel's module trees, at
+/// any depth — `/lib/modules/<version>/…`, where the modules and their
+/// indexes are, and the same tree as the kernel names it on a merged-`/usr`
+/// system (`/lib` a link to `usr/lib`). FIM watches the directory
+/// `/lib/modules` itself (its direct children); the file-open sensor
+/// reports a write-open anywhere below (`TREE_CRITICAL`), which becomes the
+/// `Created` / `Modified` this rule judges.
+pub const KMOD_TREES: &[&str] = &[KMOD_PREFIX, "/usr/lib/modules/"];
+
+/// Lot 352: `path` is in a kernel module tree ([`KMOD_TREES`]).
+pub fn in_kmod_tree(path: &str) -> bool {
+    starts_with_any(path, KMOD_TREES)
+}
+
+/// Lot 352: the index files `depmod` writes beside a kernel version's
+/// modules — `<tree>/<version>/modules.<name>` (its temporary names too):
+/// no module code.
+fn is_kmod_index(path: &str) -> bool {
+    KMOD_TREES
+        .iter()
+        .find_map(|t| path.strip_prefix(t))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(version, leaf)| {
+            !version.is_empty() && !leaf.contains('/') && leaf.starts_with("modules.")
+        })
+}
+
 /// NN-L-FIM-009: systemd unit file roots. Created or Modified
 /// op is High — drop-in unit persistence (MITRE T1543.002).
 const SYSTEMD_UNIT_PREFIXES: &[&str] = &[
@@ -202,6 +229,17 @@ fn starts_with_any(path: &str, prefixes: &[&str]) -> bool {
 
 fn is_user_writable(path: &str) -> bool {
     starts_with_any(path, USER_WRITABLE_PREFIXES)
+}
+
+/// Lot 352: the path NN-L-FIM-002 judges for a link's path as the kernel
+/// walk names it — the path itself, or, on a filesystem the agent's mount
+/// table does not place (`mnt[major:minor:ino]/rel`, a mount of another
+/// namespace), the path within that filesystem.
+fn link_judged_at(path: &str) -> &str {
+    match path.strip_prefix("mnt[").and_then(|p| p.split_once(']')) {
+        Some((_, rel)) => rel,
+        None => path,
+    }
 }
 
 /// Resolve a local system user's uid by parsing `/etc/passwd` once.
@@ -321,7 +359,9 @@ impl<H: PostureAgent> Rule for NnLFim001SystemBinaryModified<H> {
             }
             _ => return None,
         };
-        if !starts_with_any(&fe.path, SYSTEM_BINARY_PREFIXES) {
+        // Lot 352: a module tree under `/usr/lib/` is NN-L-FIM-008's ground
+        // (the file-open sensor names it so on a merged-`/usr` system)
+        if !starts_with_any(&fe.path, SYSTEM_BINARY_PREFIXES) || in_kmod_tree(&fe.path) {
             return None;
         }
         // BUG-73: NN-L-FIM-009's audit record, not a kill
@@ -377,7 +417,17 @@ impl Rule for NnLFim002NewSuidBinary {
         if !matches!(fe.op, FimOp::Created | FimOp::Linked) {
             return None;
         }
-        if !is_user_writable(&fe.path) {
+        // Lot 352 (pre-alpha Phase 4): a link made to a watched file names
+        // the NEW link in `dest_path` (the kernel's walk of its dentries) —
+        // `path` is the watched source (`/usr/bin/passwd`), never in a
+        // user-writable directory. A link INTO a watched directory names
+        // it in `path`, as before.
+        let at = match (fe.op, fe.dest_path.as_deref()) {
+            (FimOp::Linked, Some(dest)) => dest,
+            _ => fe.path.as_str(),
+        };
+        let cut = at != fe.path && at.starts_with(nn_model::path_text::CUT_MARK);
+        if !cut && !is_user_writable(link_judged_at(at)) {
             return None;
         }
         if fe.op == FimOp::Created {
@@ -388,6 +438,35 @@ impl Rule for NnLFim002NewSuidBinary {
                 Severity::Medium,
                 "File created in a watched user-writable directory — recorded (a \
                  hardlink of a watched binary is the kill case, §13 Q2)",
+            ));
+        }
+        if cut {
+            // the walk ended before a filesystem root (a link more than
+            // `OPEN_PATH_SLOTS` directories deep): where it is is not
+            // known, and no package or tool links a SUID-root binary there
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                &format!(
+                    "Watched inode hardlinked deeper than the kernel's walk ({}) — its \
+                     directory not known, judged as user-writable (SUID evasion path, §13 Q2)",
+                    nn_model::log_escape::Escaped(at)
+                ),
+            ));
+        }
+        if at != fe.path {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                &format!(
+                    "Watched inode hardlinked into a user-writable dir ({}) — SUID evasion \
+                     path (§13 Q2)",
+                    nn_model::log_escape::Escaped(at)
+                ),
             ));
         }
         Some(fim_verdict(
@@ -1000,7 +1079,9 @@ impl Rule for NnLFim008KernelModuleModified {
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
-        if !fe.path.starts_with(KMOD_PREFIX) {
+        // Lot 352: the whole tree, at any depth (`/lib/modules/$(uname
+        // -r)/x.ko`, on a merged-`/usr` system `/usr/lib/modules/…`)
+        if !in_kmod_tree(&fe.path) {
             return None;
         }
         Some(fim_verdict(
@@ -1605,7 +1686,7 @@ pub fn is_credential_store_access(fe: &FimEvent) -> bool {
 /// rules' own constants, like [`is_credential_path`].
 pub fn is_critical_rule_path(path: &str) -> bool {
     SYSTEM_BINARY_PREFIXES.iter().any(|p| path.starts_with(p))
-        || path.starts_with(KMOD_PREFIX)
+        || in_kmod_tree(path)
         || (path.contains(PAM_MODULE_DIR_FRAGMENT) && path.ends_with(PAM_MODULE_SUFFIX))
         || path == LD_SO_PRELOAD_PATH
         || HONEYPOT_PATHS.contains(&path)
@@ -2632,6 +2713,126 @@ impl<H: PostureHost> Rule for PackageManaged<H> {
     }
 }
 
+/// Lot 352: how long the records of one package-manager process's writes
+/// in the kernel's module trees are coalesced into its first.
+const KMOD_TRANSACTION_COALESCE_NS: u64 = 15 * 60 * 1_000_000_000;
+
+/// Lot 352: the package-manager processes whose first module-tree record
+/// is remembered at most (the oldest forgotten first).
+const KMOD_TRANSACTIONS_MAX: usize = 256;
+
+/// Lot 352 (pre-alpha Phase 4, NN-L-FIM-008 over the whole tree): the
+/// module trees' writes that are no module installed behind the package
+/// manager's back. `inner` is NN-L-FIM-008 behind [`PackageManaged`].
+///
+/// - A package transaction's (its `Low` record): a kernel package writes
+///   thousands of files below `/lib/modules/<version>/` (each module, its
+///   `.dpkg-new`, the indexes its postinst's `depmod` rewrites). The first
+///   write of each package-manager process is recorded; the rest of that
+///   process's writes within [`KMOD_TRANSACTION_COALESCE_NS`] are counted
+///   into the detection budget as coalesced (the next record's
+///   `suppressed_before`, the reporter's signed entry with their paths) —
+///   no detection is lost, the store is not flooded.
+/// - `depmod`'s own index files (`<tree>/<version>/modules.*`) written by
+///   the host's `kmod` (the multi-call binary `depmod` is; by the image the
+///   exec recorded, [`AuthSessionTracker::ran_host_file`]): an
+///   administrator's `depmod -a`, `make modules_install`'s. `Low` record:
+///   an index names modules, it is none — a module written to the tree is
+///   judged on its own write.
+///
+/// Anything else keeps NN-L-FIM-008's verdict.
+pub struct KmodTreeWrites<H: PostureHost> {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker<H>,
+    /// pid → the time of its first recorded write, in insertion order.
+    first: Mutex<VecDeque<(u32, u64)>>,
+}
+
+impl<H: PostureHost> KmodTreeWrites<H> {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker<H>) -> Self {
+        Self {
+            inner,
+            lineage,
+            first: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// `pid`'s write at `ts_ns` is the first of its transaction to record
+    /// (none of its writes recorded within the window before it).
+    fn first_of_transaction(&self, pid: u32, ts_ns: u64) -> bool {
+        let mut first = self.first.lock();
+        if let Some(i) = first.iter().position(|(p, _)| *p == pid) {
+            let at = first[i].1;
+            if ts_ns >= at && ts_ns - at < KMOD_TRANSACTION_COALESCE_NS {
+                return false;
+            }
+            first.remove(i);
+        }
+        if first.len() >= KMOD_TRANSACTIONS_MAX {
+            first.pop_front();
+        }
+        first.push_back((pid, ts_ns));
+        true
+    }
+
+    /// The writer ran the host's `kmod` (`/usr/bin/kmod`, `/bin/kmod`).
+    fn runs_host_kmod(&self, pid: u32, ts_ns: u64) -> bool {
+        let at = crate::posture::lineage::AsOf::judged(ts_ns);
+        ["/usr/bin/kmod", "/bin/kmod"]
+            .iter()
+            .any(|p| self.lineage.ran_host_file(pid, at, p))
+    }
+}
+
+impl<H: PostureHost> Rule for KmodTreeWrites<H> {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        if verdict.action == ResponseAction::Log {
+            let at = crate::posture::lineage::AsOf::judged(fe.timestamp_ns);
+            if self
+                .lineage
+                .is_package_transaction_write(fe.modifier_pid, at)
+                && !self.first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
+            {
+                crate::detection_budget::count_coalesced(self.id(), fe.modifier_uid, || {
+                    (fe.path.clone(), fe.path.clone())
+                });
+                return None;
+            }
+            return Some(verdict);
+        }
+        if is_kmod_index(&fe.path) && self.runs_host_kmod(fe.modifier_pid, fe.timestamp_ns) {
+            return Some(Verdict {
+                action: ResponseAction::Log,
+                severity: Severity::Low,
+                reasoning: format!(
+                    "{} [an index of the module tree written by the host's depmod (kmod): \
+                     recorded — the modules it names inside the tree are judged on their \
+                     own writes]",
+                    verdict.reasoning
+                ),
+                ..verdict
+            });
+        }
+        Some(verdict)
+    }
+}
+
 /// Lot 283b (the coordinator's decision of 06/11/2026, after lot 283a's
 /// benign corpus): a rule's kill held behind a [`PolicySwitch`] —
 /// NN-L-FIM-007's and NN-L-FIM-009's, whose kill of the writer came after
@@ -3196,7 +3397,12 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
             Arc::clone(&installer_override),
         ))),
         pkg(Box::new(NnLFim002NewSuidBinary)),
-        pkg(Box::new(NnLFim008KernelModuleModified)),
+        // Lot 352: the whole module tree — a package transaction's writes
+        // coalesced, depmod's indexes recorded
+        Box::new(KmodTreeWrites::new(
+            pkg(Box::new(NnLFim008KernelModuleModified)),
+            lineage.clone(),
+        )),
         // High next.
         admin(acct(Box::new(NnLFim003SensitiveConfigModified))),
         Box::new(NnLFim004AuthorizedKeysModified),
@@ -3298,6 +3504,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -3337,6 +3544,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -3369,6 +3577,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -3454,6 +3663,23 @@ mod tests {
     }
 
     // ── NN-L-FIM-001 ────────────────────────────────────────────
+
+    /// Lot 352: a module tree under `/usr/lib/` (as the file-open sensor
+    /// names it on a merged-`/usr` system) is NN-L-FIM-008's ground, not a
+    /// second Critical of NN-L-FIM-001; the rest of `/usr/lib/` is still
+    /// FIM-001's.
+    #[test]
+    fn fim001_leaves_the_module_tree_to_fim008() {
+        let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
+        let tree = "/usr/lib/modules/6.8.0-1-generic/kernel/fs/x.ko";
+        assert!(r.evaluate(&fim_event(FimOp::Modified, tree)).is_none());
+        assert!(NnLFim008KernelModuleModified
+            .evaluate(&fim_event(FimOp::Modified, tree))
+            .is_some());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/usr/lib/systemd/systemd"))
+            .is_some());
+    }
 
     #[test]
     fn fim001_fires_on_system_binary_modified() {
@@ -3541,6 +3767,52 @@ mod tests {
         assert!(r
             .evaluate(&fim_event(FimOp::Linked, "/etc/cron.d/x"))
             .is_none());
+    }
+
+    /// Lot 352 (pre-alpha Phase 4, FIM-002): `ln /usr/bin/passwd
+    /// /var/tmp/nn-link` — the event names the watched source in `path` and
+    /// the new link, as the kernel walked it, in `dest_path`: the link is
+    /// judged where it is. A link elsewhere (a backup tree), one of a path
+    /// the mount table does not place but whose filesystem path is
+    /// user-writable, and one deeper than the walk (its directory not known:
+    /// judged as user-writable).
+    #[test]
+    fn fim002_judges_the_new_link_s_path() {
+        let r = NnLFim002NewSuidBinary;
+        let link = |dest: &str| {
+            let mut e = fim_event(FimOp::Linked, "/usr/bin/passwd");
+            if let Event::Fim(fe) = &mut e {
+                fe.dest_path = Some(dest.to_string());
+            }
+            e
+        };
+        let v = r.evaluate(&link("/var/tmp/nn-link")).expect("fires");
+        assert_eq!(v.severity, Severity::Critical);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(
+            v.reasoning.contains("/var/tmp/nn-link"),
+            "the link is named"
+        );
+        assert!(r
+            .evaluate(&link("/backup/daily.0/usr/bin/passwd"))
+            .is_none());
+        assert!(r.evaluate(&link("mnt[8:1:2]/tmp/x")).is_some());
+        assert!(r.evaluate(&link("mnt[8:1:2]/srv/x")).is_none());
+        let cut = format!("{}/a/b/x", nn_model::path_text::CUT_MARK);
+        let v = r.evaluate(&link(&cut)).expect("a cut walk fails closed");
+        assert_eq!(v.severity, Severity::Critical);
+        // only a link's walk: a Created of a cut path is judged by its path
+        assert!(r.evaluate(&fim_event(FimOp::Created, &cut)).is_none());
+        // without the walk (an older record) the source is judged, as before
+        assert!(r
+            .evaluate(&fim_event(FimOp::Linked, "/usr/bin/passwd"))
+            .is_none());
+        // a Created keeps its path (the dest is a rename's)
+        let mut created = fim_event(FimOp::Created, "/etc/x");
+        if let Event::Fim(fe) = &mut created {
+            fe.dest_path = Some("/tmp/y".to_string());
+        }
+        assert!(r.evaluate(&created).is_none());
     }
 
     // ── NN-L-FIM-003 ────────────────────────────────────────────
@@ -4188,6 +4460,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -4940,6 +5213,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         })
     }
 
@@ -7363,6 +7637,229 @@ mod tests {
             assert!(fim019
                 .evaluate(&write("/var/log/wtmp", 560, "login"))
                 .is_none());
+        }
+    }
+
+    // ── lot 352 — the whole module tree ───────────────────────────────
+
+    mod kmod_tree {
+        use super::*;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+
+        type Tracker = crate::posture::lineage::AuthSessionTracker<IdTestHost>;
+        const S: u64 = 1_000_000_000;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        const KMOD: (u64, u64) = (KDEV, 7711);
+        /// The uid of these tests' writes: the detection budget's pair.
+        const UID: u32 = 4_242;
+
+        fn exec(pid: u32, exe: &str, argv: &[&str], id: (u64, u64), start: u64) -> Event {
+            Event::ProcessSpawn {
+                pid,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                comm: "kmod".into(),
+                filename: exe.into(),
+                timestamp_ns: start + S / 10,
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.0,
+                    ino: id.1,
+                    flags: KNOWN | ROOT_DIR,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        }
+
+        fn write_at(op: FimOp, path: &str, pid: u32, ts: u64) -> Event {
+            let mut e = written_by(op, path, pid, "w");
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = ts;
+                fe.modifier_uid = UID;
+            }
+            e
+        }
+
+        /// Lot 352: the index files depmod writes beside a version's
+        /// modules, and nothing else.
+        #[test]
+        fn the_index_files_are_depmod_s_names_beside_a_version() {
+            for p in [
+                "/lib/modules/6.8.0-1-generic/modules.dep",
+                "/lib/modules/6.8.0-1-generic/modules.dep.bin.tmp",
+                "/usr/lib/modules/6.12.0-1-amd64/modules.alias",
+            ] {
+                assert!(is_kmod_index(p), "{p}");
+            }
+            for p in [
+                "/lib/modules/modules.dep",
+                "/lib/modules//modules.dep",
+                "/lib/modules/6.8.0-1-generic/kernel/modules.x",
+                "/lib/modules/6.8.0-1-generic/modules.d/evil.ko",
+                "/lib/modules/6.8.0-1-generic/evil.ko",
+                "/etc/modules.dep",
+            ] {
+                assert!(!is_kmod_index(p), "{p}");
+            }
+            assert!(in_kmod_tree("/usr/lib/modules/x/y.ko"));
+            assert!(!in_kmod_tree("/usr/lib/modulesx/y.ko"));
+        }
+
+        /// Lot 352: a kernel package's thousands of writes below the tree
+        /// are one Low record per package-manager process within the window,
+        /// the rest counted as coalesced (at most 8 paths kept); another writer
+        /// keeps the kill, and the same process past the window records
+        /// again.
+        #[test]
+        fn a_package_transaction_s_tree_writes_are_coalesced_into_one_record() {
+            let (_tmp, t) = pkg_fixture();
+            let rule = KmodTreeWrites::new(
+                Box::new(PackageManaged::new(
+                    Box::new(NnLFim008KernelModuleModified),
+                    t.clone(),
+                )),
+                t,
+            );
+            let dir = "/usr/lib/modules/6.8.0-99-generic/kernel";
+            let first = rule
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    &format!("{dir}/a.ko.dpkg-new"),
+                    200,
+                    10 * S,
+                ))
+                .expect("the first is recorded");
+            assert_eq!(
+                (first.action, first.severity),
+                (ResponseAction::Log, Severity::Low)
+            );
+            for (i, leaf) in ["b.ko.dpkg-new", "c.ko.dpkg-new"].iter().enumerate() {
+                let ts = (11 + i as u64) * S;
+                assert!(rule
+                    .evaluate(&write_at(FimOp::Created, &format!("{dir}/{leaf}"), 200, ts))
+                    .is_none());
+            }
+            let held: Vec<_> = crate::detection_budget::take_held()
+                .into_iter()
+                .filter(|h| h.rule == "NN-L-FIM-008_KernelModuleModified" && h.uid == UID)
+                .collect();
+            assert_eq!(held.len(), 1, "one held pair");
+            assert_eq!(held[0].count, 2);
+            assert!(held[0].samples.iter().any(|s| s.ends_with("c.ko.dpkg-new")));
+            // the postinst's systemctl, another process of the transaction
+            assert!(rule
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    &format!("{dir}/d.ko"),
+                    400,
+                    12 * S
+                ))
+                .is_some());
+            // not a package write: the kill
+            let v = rule
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    &format!("{dir}/evil.ko"),
+                    600,
+                    12 * S,
+                ))
+                .unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
+            // past the window, a new record
+            let later = 10 * S + KMOD_TRANSACTION_COALESCE_NS;
+            assert!(rule
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    &format!("{dir}/e.ko"),
+                    200,
+                    later
+                ))
+                .is_some());
+            assert!(rule
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    &format!("{dir}/f.ko"),
+                    200,
+                    later + S
+                ))
+                .is_none());
+            // elsewhere: not the tree's
+            assert!(rule
+                .evaluate(&write_at(FimOp::Created, "/etc/x", 600, 12 * S))
+                .is_none());
+        }
+
+        /// Lot 352: the remembered processes are bounded, the oldest
+        /// forgotten first.
+        #[test]
+        fn the_coalesced_transactions_are_bounded() {
+            let (_tmp, t) = pkg_fixture();
+            let rule = KmodTreeWrites::new(Box::new(NnLFim008KernelModuleModified), t);
+            for pid in 0..KMOD_TRANSACTIONS_MAX as u32 + 1 {
+                assert!(rule.first_of_transaction(10_000 + pid, S));
+            }
+            assert_eq!(rule.first.lock().len(), KMOD_TRANSACTIONS_MAX);
+            assert!(
+                rule.first_of_transaction(10_000, 2 * S),
+                "the oldest was forgotten"
+            );
+            assert!(!rule.first_of_transaction(10_000 + KMOD_TRANSACTIONS_MAX as u32, 2 * S));
+            // a write timed before its process's first starts over
+            assert!(rule.first_of_transaction(10_000, S / 2));
+        }
+
+        /// Lot 352: depmod — the host's kmod — writing the tree's indexes
+        /// outside a package transaction (an administrator's `depmod -a`):
+        /// a Low record. A module it writes, an index written by a copy of
+        /// kmod or by another program, keep the kill.
+        #[test]
+        fn the_host_s_depmod_writing_an_index_is_recorded() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            assert!(t.ingest_spawn_event(&exec(900, "/usr/bin/kmod", &["depmod", "-a"], KMOD, S)));
+            assert!(t.ingest_spawn_event(&exec(901, "/tmp/kmod", &["depmod"], (KDEV, 9), S)));
+            let rule = KmodTreeWrites::new(Box::new(NnLFim008KernelModuleModified), t);
+            let index = "/lib/modules/6.8.0-1-generic/modules.dep.tmp";
+            // kmod at either of its paths (merged-/usr or not)
+            for (path, other) in [
+                ("/usr/bin/kmod", "/bin/kmod"),
+                ("/bin/kmod", "/usr/bin/kmod"),
+            ] {
+                IdTestHost::set_file_id(path, Some((STAT_DEV, KMOD.1)));
+                IdTestHost::set_file_id(other, None);
+                let v = rule
+                    .evaluate(&write_at(FimOp::Created, index, 900, 2 * S))
+                    .unwrap();
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::Low),
+                    "{path}"
+                );
+                assert!(v.reasoning.contains("depmod"), "the depmod carve-out");
+            }
+            for (path, pid) in [
+                ("/lib/modules/6.8.0-1-generic/evil.ko", 900),
+                (index, 901),
+                (index, 902),
+            ] {
+                let v = rule
+                    .evaluate(&write_at(FimOp::Created, path, pid, 2 * S))
+                    .unwrap();
+                assert_eq!(v.action, ResponseAction::KillProcessTree, "{path} by {pid}");
+            }
+            IdTestHost::set_file_id("/usr/bin/kmod", None);
+            IdTestHost::set_file_id("/bin/kmod", None);
         }
     }
 
