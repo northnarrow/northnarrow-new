@@ -3847,6 +3847,43 @@ fn program_copies_line(out: &StatusOutcome, tty: bool) -> Option<String> {
     ))
 }
 
+/// The review of #565 (F2): the kernel-state round's findings its quota
+/// held back since the agent's start — `None` when none was (or from an
+/// agent before the field).
+fn kernel_state_held_back_line(out: &StatusOutcome, tty: bool) -> Option<String> {
+    let held = out
+        .kernel_state_held_back
+        .as_ref()
+        .filter(|h| !h.is_empty())?;
+    let kinds: Vec<String> = held.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    Some(format!(
+        "kernel-state quota: {} findings held back since the start ({}) — past the round's \
+         quota per kind, each counted in a signed sole_trace_summary record, the BPF objects \
+         listed in /run/northnarrow/bpf-foreign",
+        colorize(
+            &held.iter().map(|(_, n)| n).sum::<u64>().to_string(),
+            "31",
+            tty
+        ),
+        kinds.join(", ")
+    ))
+}
+
+/// [`kernel_state_held_back_line`]'s counts as a JSON object (`null` when
+/// absent).
+fn kernel_state_held_back_json(out: &StatusOutcome) -> String {
+    match &out.kernel_state_held_back {
+        Some(h) => format!(
+            "{{{}}}",
+            h.iter()
+                .map(|(k, n)| format!("\"{}\":{n}", k.replace('"', "")))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => "null".to_string(),
+    }
+}
+
 /// The content check's counters as a JSON object (`null` when absent).
 fn program_copies_json(out: &StatusOutcome) -> String {
     match (
@@ -3916,7 +3953,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3980,6 +4017,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             out.telemetry_signed,
             // lot 313 (the review of #549, F1)
             program_copies_json(out),
+            // the review of #565 (F2)
+            kernel_state_held_back_json(out),
         );
         return;
     }
@@ -4035,6 +4074,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
         println!("{}", execq_line(out, tty));
         println!("{}", ransomware_line(out, tty));
         if let Some(line) = program_copies_line(out, tty) {
+            println!("{line}");
+        }
+        // the review of #565 (F2): shown when the quota held some back
+        if let Some(line) = kernel_state_held_back_line(out, tty) {
             println!("{line}");
         }
         println!("{}", defense_line(out, tty));
@@ -6257,6 +6300,7 @@ mod flow_sock_line_tests {
             open_sensor_per_call_total: None,
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
+            kernel_state_held_back: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -6266,6 +6310,32 @@ mod flow_sock_line_tests {
             records_today: None,
             telemetry_signed: true,
         }
+    }
+
+    /// The review of #565 (F2): the kernel-state round's findings its quota
+    /// held back are in the status — a line with the total and each kind
+    /// when some were, none when none were (or from an older agent), and
+    /// the JSON object of the counts (`null` from an older agent).
+    #[test]
+    fn the_kernel_state_quota_s_held_back_findings_are_in_the_status() {
+        let mut o = outcome(None, None, None);
+        assert!(super::kernel_state_held_back_line(&o, false).is_none());
+        assert_eq!(super::kernel_state_held_back_json(&o), "null");
+        o.kernel_state_held_back = Some(vec![]);
+        assert!(super::kernel_state_held_back_line(&o, false).is_none());
+        assert_eq!(super::kernel_state_held_back_json(&o), "{}");
+        o.kernel_state_held_back = Some(vec![
+            ("bpf_unseen".to_string(), 12_000),
+            ("bpf_baseline".to_string(), 3),
+        ]);
+        let l = super::kernel_state_held_back_line(&o, false).unwrap();
+        assert!(l.contains("12003 findings held back"), "{l}");
+        assert!(l.contains("bpf_unseen 12000, bpf_baseline 3"), "{l}");
+        assert!(l.contains("sole_trace_summary"), "{l}");
+        let j: serde_json::Value =
+            serde_json::from_str(&super::kernel_state_held_back_json(&o)).unwrap();
+        assert_eq!(j["bpf_unseen"], 12_000);
+        assert_eq!(j["bpf_baseline"], 3);
     }
 
     /// Named (lot 341, alpha 2/4): `status` starts with a human summary —

@@ -41,6 +41,66 @@ pub const PROG_TYPE_EXT: u32 = 28;
 pub const PROG_TYPE_LSM: u32 = 29;
 /// `BPF_PROG_TYPE_CGROUP_SYSCTL` (lot 304).
 pub const PROG_TYPE_CGROUP_SYSCTL: u32 = 23;
+/// `BPF_PROG_TYPE_SOCKET_FILTER` (the re-check of #565, R2).
+pub const PROG_TYPE_SOCKET_FILTER: u32 = 1;
+/// `BPF_PROG_TYPE_SCHED_CLS` (tc).
+pub const PROG_TYPE_SCHED_CLS: u32 = 3;
+/// `BPF_PROG_TYPE_SCHED_ACT` (tc).
+pub const PROG_TYPE_SCHED_ACT: u32 = 4;
+/// `BPF_PROG_TYPE_XDP`.
+pub const PROG_TYPE_XDP: u32 = 6;
+/// `BPF_PROG_TYPE_CGROUP_SKB`.
+pub const PROG_TYPE_CGROUP_SKB: u32 = 8;
+/// `BPF_PROG_TYPE_SYSCALL` (run by `BPF_PROG_RUN`).
+pub const PROG_TYPE_SYSCALL: u32 = 31;
+
+/// The re-check of #565 (R2): what a program found by the cross-view can
+/// do, the kernel-state round's order under its quota (lowest first) —
+/// [`REACH_SIGNAL_OR_WRITE`], [`REACH_KERNEL`], [`REACH_OTHER`],
+/// [`REACH_FILTER`].
+pub type Reach = u8;
+/// A call of a signal or write helper or kfunc: a held program (the content
+/// judge's verdict of its load names one, or a program it could not read
+/// whole, refused as if it called one), an fmod_ret (it overrides a kernel
+/// function's return), a link whose program the enumeration does not show
+/// (what it can do is not read).
+pub const REACH_SIGNAL_OR_WRITE: Reach = 0;
+/// A type run in the kernel's own paths or on the host's traffic: the types
+/// refused outside a window ([`denied_by_default`]: kprobe, tracepoint,
+/// perf_event, raw_tracepoint, tracing — fentry, fexit —, struct_ops, ext,
+/// LSM), syscall, XDP and tc.
+pub const REACH_KERNEL: Reach = 1;
+/// Any other type (a cgroup's or a socket's hooks, the flow dissector, …), a
+/// type this build does not know, and the kernel's own programs.
+pub const REACH_OTHER: Reach = 2;
+/// Socket filters and cgroup_skb: they read or drop one socket's or one
+/// cgroup's packets.
+pub const REACH_FILTER: Reach = 3;
+
+/// The re-check of #565 (R2): the [`Reach`] of a program of `prog_type`
+/// (`attach_type` its expected attach type) — `held` when the held set has
+/// its id; `kernel_own` when it is the kernel's own (loaded before user
+/// space, or one of [`KERNEL_PROGRAMS`]).
+pub const fn reach(prog_type: u32, attach_type: u32, held: bool, kernel_own: bool) -> Reach {
+    if held {
+        REACH_SIGNAL_OR_WRITE
+    } else if kernel_own {
+        REACH_OTHER
+    } else if prog_type == PROG_TYPE_TRACING && attach_type == ATTACH_MODIFY_RETURN {
+        REACH_SIGNAL_OR_WRITE
+    } else if denied_by_default(prog_type)
+        || matches!(
+            prog_type,
+            PROG_TYPE_SYSCALL | PROG_TYPE_XDP | PROG_TYPE_SCHED_CLS | PROG_TYPE_SCHED_ACT
+        )
+    {
+        REACH_KERNEL
+    } else if matches!(prog_type, PROG_TYPE_SOCKET_FILTER | PROG_TYPE_CGROUP_SKB) {
+        REACH_FILTER
+    } else {
+        REACH_OTHER
+    }
+}
 
 /// `BPF_TRACE_ITER` (`enum bpf_attach_type`): an iterator's link.
 pub const ATTACH_TRACE_ITER: u32 = 28;
@@ -1029,6 +1089,17 @@ mod tests {
             PROG_TYPES[PROG_TYPE_CGROUP_SYSCTL as usize],
             "BPF_PROG_TYPE_CGROUP_SYSCTL"
         );
+        // the re-check of #565 (R2): the types its reach names
+        for (t, n) in [
+            (PROG_TYPE_SOCKET_FILTER, "BPF_PROG_TYPE_SOCKET_FILTER"),
+            (PROG_TYPE_SCHED_CLS, "BPF_PROG_TYPE_SCHED_CLS"),
+            (PROG_TYPE_SCHED_ACT, "BPF_PROG_TYPE_SCHED_ACT"),
+            (PROG_TYPE_XDP, "BPF_PROG_TYPE_XDP"),
+            (PROG_TYPE_CGROUP_SKB, "BPF_PROG_TYPE_CGROUP_SKB"),
+            (PROG_TYPE_SYSCALL, "BPF_PROG_TYPE_SYSCALL"),
+        ] {
+            assert_eq!(PROG_TYPES[t as usize], n);
+        }
         assert_eq!(ATTACH_TYPES[ATTACH_TRACE_ITER as usize], "BPF_TRACE_ITER");
         assert_eq!(ATTACH_TYPES[ATTACH_LSM_MAC as usize], "BPF_LSM_MAC");
     }

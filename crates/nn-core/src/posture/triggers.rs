@@ -859,6 +859,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 349: nor the agent's own CPU watch (a confinement found),
             // nor a window's load of a program the judge refuses outside
             // one (let through, held: the review of #558, F1).
+            // The review of #565 (F2): nor any sole trace — the round's
+            // summary of the findings its quota held back included.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -873,7 +875,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfBaseline
                     | nn_model::FsProtectOperation::CpuConfined
                     | nn_model::FsProtectOperation::BpfHeldLoad
-            ) {
+            ) && !operation.is_sole_trace()
+            {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
                     // Lot 293 (external bug hunt BUG14): a refused signal
                     // through a file's owner names the process whose I/O
@@ -3208,7 +3211,11 @@ mod tests {
     /// signed at each attempt) still spent the decisive budget: 50 refused
     /// opens of `kprobes/enabled` held back a refused unlink's record on that
     /// CPU (R1); the renices and sysctl writes shared the task denials'
-    /// budget with the refused signals (R2).
+    /// budget with the refused signals (R2). Lot 356 (pre-alpha F3-8): the
+    /// non-decisive records are the minor ones and the sole traces
+    /// (`common::wire::is_sole_trace`), disjoint — a window's held load
+    /// spent the minor budget, and a flood of refused uses held its record
+    /// back.
     #[test]
     fn the_kernel_s_minor_denials_are_exactly_the_non_decisive_ones_here() {
         const S: u64 = 1_000_000_000;
@@ -3222,12 +3229,20 @@ mod tests {
             operation: op,
             timestamp_ns: 4 * S,
         };
-        let mut minor = 0;
+        let (mut minor, mut sole) = (0, 0);
         for byte in 1..=common::wire::FS_OP_LAST {
             let op = nn_model::FsProtectOperation::from_wire(byte);
             let hits = det.detect(&refusal(op), &[]);
             let decisive = hits.contains(&TriggerType::AntiTamperDenial);
-            if common::wire::is_minor_denial(byte) {
+            // lot 356 (pre-alpha F3-8): a third class, the sole traces —
+            // never decisive, never minor, through no budget at all
+            if common::wire::is_sole_trace(byte) {
+                sole += 1;
+                assert!(
+                    !decisive && !common::wire::is_minor_denial(byte),
+                    "{op:?} is a sole trace and decisive here ({hits:?}) or minor in the kernel"
+                );
+            } else if common::wire::is_minor_denial(byte) {
                 minor += 1;
                 assert!(
                     !decisive,
@@ -3242,8 +3257,10 @@ mod tests {
             }
         }
         // lot 349: the agent's own CPU watch's record, one more; the review
-        // of #558 (F1): a held program's load and its refused uses, two more
-        assert_eq!(minor, 23);
+        // of #558 (F1): a held program's load and its refused uses, two more;
+        // lot 356: the held load and the kernel-state round's five findings
+        // are sole traces; the review of #565 (F2): and the round's summary
+        assert_eq!((minor, sole), (17, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3276,11 +3293,24 @@ mod tests {
             w::FS_OP_IOPRIO,
             w::FS_OP_SYSCTL,
             w::FS_OP_CGROUP_JOIN,
-            w::FS_OP_CPU_CONFINED,
-            w::FS_OP_BPF_HELD_LOAD,
             w::FS_OP_BPF_HELD_USE,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
+        }
+        // lot 356: the only trace of what was let through — no budget
+        for sole in [
+            w::FS_OP_CPU_CONFINED,
+            w::FS_OP_BPF_HELD_LOAD,
+            w::FS_OP_KERNEL_TAINT,
+            w::FS_OP_SYSCTL_ROOT_PROG,
+            w::FS_OP_BPF_UNSEEN,
+            w::FS_OP_BPF_BASELINE,
+            w::FS_OP_SOLE_TRACE_SUMMARY,
+        ] {
+            assert!(
+                w::is_sole_trace(sole) && !w::is_minor_denial(sole),
+                "{sole}"
+            );
         }
     }
 

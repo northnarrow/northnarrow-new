@@ -642,6 +642,13 @@ const STATICS: &[Kept] = &[
         "malformed records the pumps rejected, per ring",
     ),
     kept(
+        "crates/nn-linux/src/kernel_state.rs",
+        "HELD_BACK",
+        Telemetry,
+        "the review of #565 (F2): the kernel-state round's findings its quota held back, per \
+         kind (`nn-admin status`) — the one round of the process",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/ring_drops.rs",
         "TOTALS",
         Kernel,
@@ -856,6 +863,11 @@ const START_CALLS: &[(&str, &str)] = &[
         "detection_budget::admit_acted",
         "R12c (lab PR 270): an acting detection against the same budget — its record \
          always written, its journal lines the budget's",
+    ),
+    (
+        "detection_budget::admit_unspent",
+        "the review of #565 (F2): a sole trace's record against the same budget — the \
+         pair's held count taken, no token spent",
     ),
     (
         "log_escape::stdout_ansi",

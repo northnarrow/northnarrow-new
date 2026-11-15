@@ -11208,6 +11208,103 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 356 — a window's held BPF load is always signed, never
+  rate-limited (pre-alpha F3-8; C23; no level change).**
+  - What was open (P2, every kernel): `bpf_held_load`, the record of a
+    program the content judge refuses outside a trusted-installer window,
+    loaded inside one and held (lot 349), was a "minor" record. It spent the
+    per-CPU budget of the non-decisive refusals (50 a second); a flood of
+    refused uses of an earlier held program on that CPU spent it, and the
+    load in the same second was held with only the anonymous
+    `minor_denial_rate` count behind it — no record named the program, no
+    `TelemetryLoss`. The pre-alpha lab lost it 1 time in 3 on 6.8.
+  - Done: a third class of record, the sole traces (`wire::is_sole_trace`:
+    the held load and its outliving, and the kernel-state round's
+    `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`,
+    `cpu_confined`), out of `is_minor_denial`. In the kernel `hold` signs
+    through `emit_sole_trace` (no budget, no dedup) and a ring with no room
+    refuses the load (fail closed, counted in the new `RING_DROPS` slot
+    `held_load_unsigned`; its id kept held since the review of #565, below);
+    in the agent a sole trace is
+    logged and stored past NN-L-AT-001's per-uid budget, and the bus never
+    coalesces or caps one. The audit of every minor kind is in
+    `UPGRADE_NOTES_WAVE4.md` §50. Ratchets: `xtask/tests/kernel_halves.rs`
+    (the sole traces' operations and that writer kept to `hold`),
+    `xtask/tests/self_defense.rs`; the posture's equivalence test pins the
+    three classes. Mutation: 12 mutants of the new code, 12 caught by a
+    named test.
+  - Lab (as measured, our own guests, the lot's tree, the agent installed
+    as an operator): ubuntu2404 (6.8.0-149), the investigation's X2 then X3
+    on CPU 0, 10 times: **0 of 10 lost** — each X3 load's `bpf_held_load`
+    present naming its program, X2 refused 11,256–17,598 uses a round; the
+    ring's drops only `minor_denial_rate` (144,898), no
+    `held_load_unsigned`, no `fs_protect`. ubuntu2604 (7.0.0-43): the same,
+    3 times, **0 of 3 lost**; verifier headroom OK (highest
+    `fim_rename_observe` 362,329, 36.2%). ubuntu2204 (5.15.0-202): the
+    verifier-check OK, `bpf_prog_guard` 23,628 processed, highest
+    `module_read_file_observe` 551,900 (55.2%) < 900k; there the new
+    privileged e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`)
+    passes on the lot's tree (64 window loads on CPU 0 behind a flood of
+    refused handles, each signed naming its program, none refused) and
+    fails on rc2 with the test alone (the held load of program 136 left no
+    record; the flood's `minor_denial_rate` drops 2,318,301). On a guest
+    with no `/etc/northnarrow` the guard fixture's last run is refused at
+    `agent_mounts` (the first run made the directory after registering the
+    host's): the lab made it first, as `install.sh` does. X2's
+    `dup2` slot race (§43, a named residual, not this lot's) still let a
+    held program into a slot 0–4 times in 20,000 on 6.8, 0 on 7.0.
+  - Not covered in a guest: the ring-full refusal (a ring with no room at
+    the held load) — by the ratchet and the verifier only.
+  - The review of #565 (the fix round): (F1, P2) a load refused for want of
+    room let its id go — a handle taken by id between the id's allocation
+    and the hook kept the program un-held, its runs and attaches after the
+    window let through and no `BPF_HELD_OUTLIVED` naming it; the id now
+    stays held (no eBPF program removes a held id: ratchet
+    `a_held_load_refused_for_want_of_room_keeps_its_id_held`). (F2, P2) the
+    sole traces were bounded by their sources, and the cross-view's are
+    not: root makes BPF objects at will, each unseen or baseline object
+    one High record, uncapped, in the rare events' P0 reserve and in uid 0's
+    record budget. The kernel-state round now names at most `ROUND_QUOTA`
+    (32, half the reserve) findings of each kind — the types refused
+    outside a window and hidden programs' links first — and signs the rest
+    in ONE `sole_trace_summary` record (`FS_OP_SOLE_TRACE_SUMMARY`) with
+    each kind's count, also in `nn-admin status --key`
+    (`kernel_state_held_back`) and, per object, `suppressed` in
+    `bpf-foreign`; a sole trace takes no token of the per-uid budget.
+    (F3) the ratchet refuses an `as` alias, a constant or a literal that
+    would carry a sole trace into a budget; (F4) the journal says
+    `held_load_unsigned` loads were refused. Mutation: 20 mutants of the
+    new code, 20 caught by a named test (two tests strengthened after a
+    first survivor each), plus the review's probe, a bare `46` and the
+    removal put back, each caught by the ratchets. Lab (as measured):
+    ubuntu2204 (5.15.0-202) `verifier-check` of the fix round's tree OK —
+    `bpf_prog_guard` 23,629 processed, highest `module_read_file_observe`
+    551,900 (55.2%) < 900k; no other guest (the eBPF change is the removal
+    of one map delete in `hold`). Not covered in a guest: the race of F1
+    (a handle by id between the id and the hook, with the ring full) and a
+    flood past the round's quota — by the ratchet and the unit tests only.
+  - The re-check of #565 (the second fix round): (R1, P3) the outlivings
+    were under the quota — 40 in a round held 33 to 40 back, so a held load
+    refused for want of room, named only by its outliving, could end
+    counted only; a held program's records (its outliving, the program
+    found unseen or in the baseline) are now never under it. (R2, P3) an
+    XDP program among a thousand socket filters shared their rank and was
+    held back, the summary named no object and no later round named it; a
+    BPF object is now ranked by what it can do (a held program, an
+    fmod_ret, a hidden program's link; kprobe, tracing, LSM, struct_ops,
+    syscall, XDP, tc; the others; socket filters and cgroup_skb last), the
+    summary names each kind's highest-ranked, first and last held back, and
+    what a round holds back is carried into the next until named (at most
+    1,024). Tests: `a_held_program_s_records_are_never_under_the_round_s_quota`,
+    `an_xdp_among_a_thousand_socket_filters_is_named_the_round_it_is_found`,
+    `the_summary_names_each_kind_s_highest_ranked_first_and_last_held_back`,
+    `what_a_round_held_back_is_named_by_a_later_round_once`. Mutation: 15 mutants of the new code, 15 caught by a named test.
+    Lab: none (no eBPF change: the object's code, maps and BTF are
+    byte-identical to the one `verifier-check` passed on 5.15; only its line
+    info moved). Residual: an unseen program's content is not read, so its
+    rank is its type's.
+  - Levels unchanged: C23 keeps its level (a record made reliable; no new
+    defence).
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

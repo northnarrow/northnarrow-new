@@ -567,7 +567,8 @@ pub fn install(ebpf: &mut Ebpf) -> RingDrops {
                         ring = RING_DROP_NAMES[i],
                         dropped_since_last_sample = n - p,
                         total = n,
-                        "ring-buffer events DROPPED — the consumer fell behind; events of this sensor were lost"
+                        "{}",
+                        drop_warning(i)
                     );
                 }
             }
@@ -582,9 +583,98 @@ pub fn install(ebpf: &mut Ebpf) -> RingDrops {
     bindings
 }
 
+/// The journal's line for a growth of counter `slot`. The review of #565
+/// (F4): every counter was "events DROPPED … lost", but two count no lost
+/// event: `held_load_unsigned` counts window loads REFUSED (fail closed: the
+/// ring had no room for their record; retry the load) and
+/// `minor_denial_rate` records held back by their own budget (every one of
+/// those operations was refused, its count is the record).
+pub fn drop_warning(slot: usize) -> &'static str {
+    match u32::try_from(slot) {
+        Ok(ring_slot::HELD_LOAD_UNSIGNED) => {
+            "trusted-installer window loads REFUSED — the fs_protect ring had no room for their \
+             record (fail closed: the program is held, not handed out; retry the load); no \
+             event was lost"
+        }
+        Ok(ring_slot::MINOR_DENIAL_RATE) => {
+            "non-decisive refusals' records held back by their per-CPU budget — every one was \
+             refused; the count is their record"
+        }
+        // the mini-hunt of #565 (F4): the other budgets hold records back
+        // before the ring — the consumer did not fall behind
+        Ok(
+            ring_slot::DNS_RATE
+            | ring_slot::LISTEN_RATE
+            | ring_slot::IOURING_RATE
+            | ring_slot::TASK_DENIAL_RATE
+            | ring_slot::INBOUND_RATE
+            | ring_slot::DNS_ANSWER_RATE
+            | ring_slot::TLS_RATE
+            | ring_slot::DENIAL_RATE,
+        ) => {
+            "records over their budget HELD BACK before the ring, not recorded — the consumer did \
+             not fall behind; a refusal or decision still applied"
+        }
+        Ok(ring_slot::FORK_RECORD_LOST) => {
+            "fork-parent records evicted under a flood of forks — those execs' fork parent is \
+             not known (the decisions that need it fail closed)"
+        }
+        Ok(ring_slot::FIM_DIRTY_FULL) => {
+            "write markers the kernel could not store (its map full) — those closes emit no \
+             Modified record"
+        }
+        _ => {
+            "ring-buffer events DROPPED — the consumer fell behind; events of this sensor were lost"
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review of #565 (F4): a growth of `held_load_unsigned` was logged
+    /// as "events DROPPED … lost" — it counts loads REFUSED (fail closed),
+    /// no event lost; nor is `minor_denial_rate` a loss. Every other
+    /// counter keeps the loss line.
+    #[test]
+    fn the_held_load_unsigned_warning_says_refused_not_lost() {
+        let held = drop_warning(ring_slot::HELD_LOAD_UNSIGNED as usize);
+        assert!(
+            held.contains("REFUSED") && held.contains("retry the load"),
+            "{held}"
+        );
+        assert!(
+            !held.contains("were lost") && !held.contains("DROPPED"),
+            "{held}"
+        );
+        let minor = drop_warning(ring_slot::MINOR_DENIAL_RATE as usize);
+        assert!(
+            minor.contains("refused") && !minor.contains("were lost"),
+            "{minor}"
+        );
+        // a ring that overflowed lost events
+        for slot in [ring_slot::FS_PROTECT, ring_slot::EXEC, ring_slot::BPF] {
+            assert!(drop_warning(slot as usize).contains("were lost"), "{slot}");
+        }
+        assert!(drop_warning(usize::MAX).contains("were lost"));
+        // the mini-hunt: a budget held records back before the ring, the
+        // consumer did not fall behind
+        for slot in [
+            ring_slot::DENIAL_RATE,
+            ring_slot::TASK_DENIAL_RATE,
+            ring_slot::DNS_RATE,
+            ring_slot::TLS_RATE,
+        ] {
+            let l = drop_warning(slot as usize);
+            assert!(
+                l.contains("HELD BACK") && !l.contains("fell behind;"),
+                "{slot}: {l}"
+            );
+        }
+        assert!(drop_warning(ring_slot::FORK_RECORD_LOST as usize).contains("fork parent"));
+        assert!(drop_warning(ring_slot::FIM_DIRTY_FULL as usize).contains("Modified"));
+    }
 
     /// Review of #495, D3: a DNS pump's loss watch — the first read is the
     /// base, a growth or an unreadable counter is a loss, a steady one none;
@@ -697,6 +787,14 @@ mod tests {
             assert!(security_losses(&prev, &cur).is_empty(), "{n}");
         }
         assert!(!SECURITY_RINGS.contains(&ring_slot::MINOR_DENIAL_RATE));
+        // lot 356: a window's held load refused for want of room for its
+        // record hid nothing (the program was never handed out); the lost
+        // reservation is the security ring's
+        let mut cur = prev.clone();
+        cur[ring_slot::HELD_LOAD_UNSIGNED as usize] = 5;
+        assert!(security_losses(&prev, &cur).is_empty());
+        assert!(!SECURITY_RINGS.contains(&ring_slot::HELD_LOAD_UNSIGNED));
+        assert!(SECURITY_RINGS.contains(&ring_slot::FS_PROTECT));
         // another security ring keeps its threshold
         let mut cur = prev.clone();
         cur[ring_slot::FS_PROTECT as usize] = TELEMETRY_LOSS_THRESHOLD;
