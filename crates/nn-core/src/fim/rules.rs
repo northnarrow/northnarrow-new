@@ -2822,7 +2822,8 @@ impl<H: PostureHost> Rule for KmodTreeWrites<H> {
                 severity: Severity::Low,
                 reasoning: format!(
                     "{} [an index of the module tree written by the host's depmod (kmod): \
-                     recorded — the modules it names are judged on their own writes]",
+                     recorded — the modules it names inside the tree are judged on their \
+                     own writes]",
                     verdict.reasoning
                 ),
                 ..verdict
@@ -7712,7 +7713,7 @@ mod tests {
 
         /// Lot 352: a kernel package's thousands of writes below the tree
         /// are one Low record per package-manager process within the window,
-        /// the rest counted as coalesced (with their paths); another writer
+        /// the rest counted as coalesced (at most 8 paths kept); another writer
         /// keeps the kill, and the same process past the window records
         /// again.
         #[test]

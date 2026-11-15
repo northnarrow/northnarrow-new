@@ -2730,16 +2730,18 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   only, as before. Links were dropped as no-op touches: expect `Linked`
   drift rows of watched files you did not see before (`cp -al`, backup
   tools that hard-link a system tree).
-- **NN-L-FIM-008 covers every kernel version's module tree, at any
-  depth.** A write below `/lib/modules/<version>/` (or `/usr/lib/modules/`)
-  is Critical outside a package transaction. A kernel or DKMS package
+- **NN-L-FIM-008 covers every kernel version's module tree, up to 10
+  directories below the version directory** (merged `/usr`; 11 with a
+  separate `/lib`). A write below `/lib/modules/<version>/` (or
+  `/usr/lib/modules/`) is Critical outside a package transaction. A kernel or DKMS package
   install is one Low record per package-manager process (dpkg, its postinst's
   depmod) per 15 minutes; the other writes are counted in the record budget
-  as coalesced (`detections_held` audit entries, with paths). An
-  administrator's `depmod -a` is Low; `make modules_install` and a DKMS
-  build run outside a package transaction (the dkms service at boot) are
-  Critical: the alpha profile records them, it kills nothing. A file moved
-  or linked into a version directory is not seen (no open).
+  as coalesced (`detections_held` audit entries, at most 8 paths kept). An
+  administrator's `depmod -a` is Low; a module installed outside a package
+  transaction (`make modules_install`, the NVIDIA installer, `vboxconfig`, a
+  DKMS build by the dkms service at boot) is one Critical per file: the alpha
+  profile records them, it kills nothing. A file moved, hard-linked or
+  symlinked into a version directory is not seen (no open).
 - **The cross-PID chains follow processes that never executed.** A fork-only
   descendant of a process holding a precursor (a credential-store read, a
   /tmp exec, a canary trip) now completes NN-L-CHAIN-004/005/006/008 as an

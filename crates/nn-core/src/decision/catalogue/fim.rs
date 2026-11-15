@@ -36,8 +36,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::File],
         data_components: &["DC0039"],
         observes: "A hard link, in /tmp, /var/tmp, /dev/shm or /home, to a watched inode (the \
-            kernel reports a link only when its source is watched, such as a setuid-root system \
-            binary): Critical. The new link's path is the kernel's walk of its dentries (lot \
+            kernel reports a link only when its source is watched; of the setuid-root binaries, \
+            the shipped watch list names sudo, su and passwd only: a link of pkexec, mount, chsh, \
+            newgrp, gpasswd, fusermount3 or ssh-keysign is not seen): Critical. The new link's path is the kernel's walk of its dentries (lot \
             352: the record named only the source); a walk deeper than its 16 names, whose \
             directory is not known, is judged as user-writable. A file created in a watched directory there is recorded (Medium, \
             Log): the hook carries no mode bits.",
@@ -178,16 +179,19 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0039", "DC0061"],
-        observes: "A new or rewritten file under /lib/modules, at any depth and in every \
-            kernel version's directory (lot 352; /usr/lib/modules on a merged-/usr system): a \
-            dropped or modified .ko. FIM watches /lib/modules itself; below it, the file-open \
+        observes: "A new or rewritten file under /lib/modules, in every kernel version's \
+            directory and up to 10 directories below it (lot 352; /usr/lib/modules on a merged-/usr \
+            system, 11 with a separate /lib: the kernel's walk keeps 16 names): a dropped or \
+            modified .ko. FIM watches /lib/modules itself; below it, the file-open \
             sensor reports a write-open (its tree is a critical one).",
         false_positives: "Kernel and DKMS package transactions write here and are recorded at Low, \
             one record per package-manager process within 15 minutes (the rest counted as \
-            coalesced, with their paths); the host's depmod writing the indexes \
-            (`modules.*`) is recorded at Low; a module built and installed by hand (`make \
-            modules_install`) is killed. Not seen below the top: a file moved or linked into \
-            the tree (no open).",
+            coalesced, at most 8 of their paths kept); the host's depmod writing the indexes \
+            (`modules.*`) is recorded at Low; a module installed outside a package transaction \
+            (`make modules_install`, the NVIDIA installer, `vboxconfig`, DKMS at boot) is one \
+            Critical kill per file. Not seen below the top: a file moved, hard-linked or \
+            symlinked into the tree (no open); a module deeper than the walk is the posture's \
+            critical write-open, not this rule's.",
         how_to_test: "`sudo touch /lib/modules/$(uname -r)/nn-test.ko`, then remove it; expect \
             Critical, KillProcessTree aimed at touch.",
         tests: &[

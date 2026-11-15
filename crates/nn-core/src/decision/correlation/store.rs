@@ -822,8 +822,24 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// before the exec that started it (another ring) — and the rest is
     /// dropped. A re-exec of the same process (same start) keeps its
     /// state. Without a start, a second sighting of the PID is a reuse
-    /// and its state is dropped, as before.
-    pub fn observe_spawn(&mut self, child_pid: u32, ppid: u32, start_ns: u64) {
+    /// and its state is dropped, as before. A start older than the recorded
+    /// one is an earlier incarnation's late record: ignored.
+    ///
+    /// Crate-private (review of #561, F4): outside the store an exec's or a
+    /// fork-only process's edge is entered by [`Self::observe_exec`] /
+    /// [`Self::observe_fork`], from the kernel's fork record.
+    pub(crate) fn observe_spawn(&mut self, child_pid: u32, ppid: u32, start_ns: u64) {
+        // Lot 352 (review of #561, F1): a start older than the one recorded
+        // for the PID is an earlier incarnation's record (a fork record of a
+        // process that has exited, an event processed late), never a new
+        // one: starts only grow for a PID. Entering it would move the
+        // current holder's precursors onto the dead process (those at or
+        // after its older start) and put the holder under that process's
+        // parent.
+        let known = self.tree.start_of(child_pid);
+        if start_ns != 0 && start_ns < known {
+            return;
+        }
         let previous = self.tree.observe(child_pid, ppid, start_ns);
         if previous == Some(start_ns) && start_ns != 0 {
             return;
@@ -892,7 +908,17 @@ impl<H: PostureHost> CorrelationStore<H> {
             || fork_parent == child_pid
             || !self.forker_is_known_as(fork_parent, fork_parent_start, fork_anchor)
         {
-            self.observe_spawn(child_pid, ppid, start_ns);
+            // Review of #561, F2: a later exec of the same process (same
+            // start: `sh -c '…; exec python3'`) carries no fork record and
+            // names its parent at exec — an orphan's reaper. The forker of
+            // one incarnation does not change: the edge the tree holds for
+            // it is kept (re-entered, for its recency).
+            let parent = if start_ns != 0 && self.tree.start_of(child_pid) == start_ns {
+                self.tree.parent_of(child_pid).unwrap_or(ppid)
+            } else {
+                ppid
+            };
+            self.observe_spawn(child_pid, parent, start_ns);
             return;
         }
         self.observe_fork_hop(fork_parent, fork_parent_start, fork_anchor);
@@ -904,13 +930,17 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// edge to its anchor is learned from the record. Not when the tree
     /// holds another process at that pid and the record gives no anchor
     /// beyond the forker (its own record lost): the edge would hand a later
-    /// holder of the pid that process's precursors.
+    /// holder of the pid that process's precursors. Nor when the record's
+    /// forker started before the process the tree holds at that pid (review
+    /// of #561, F1): the forker has exited and its pid was reused — a stale
+    /// record, which would lend the reused pid's precursors (a `/tmp` exec)
+    /// to the forker's descendants, a benign daemon's worker.
     fn forker_is_known_as(&self, forker: u32, forker_start: u64, anchor: u32) -> bool {
         let known = self.tree.start_of(forker);
         known == 0
             || forker_start == 0
             || known == forker_start
-            || (anchor != 0 && anchor != forker)
+            || (anchor != 0 && anchor != forker && forker_start > known)
     }
 
     /// Lot 352: a process that executed nothing since its fork (no exec
@@ -1639,6 +1669,42 @@ mod tests {
             (Some(50), 20 * SEC)
         );
         assert!(!s.has_recent_in_ancestors(205, PrecursorKind::TmpExec, 22 * SEC, W));
+    }
+
+    /// Review of #561, F1: a fork record whose forker started before the
+    /// process the tree holds at that pid is stale — the forker exited and
+    /// its pid went to a later process. The exec falls back to its parent at
+    /// exec, the connect is not entered, and the pid's holder keeps its
+    /// edge, its start and its precursors; so it does when the earlier
+    /// holder's own exec is processed late. A newer record is the pid's new
+    /// incarnation, as before.
+    #[test]
+    fn a_stale_fork_record_moves_nothing_onto_the_exited_forker() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(200, 1, 5 * SEC);
+        s.observe_spawn(300, 77, 50 * SEC);
+        s.record_for_pid(300, PrecursorKind::TmpExec, 50 * SEC);
+        let holder_kept = |s: &CorrelationStore| {
+            let t = s.ancestry();
+            (t.parent_of(300), t.start_of(300)) == (Some(77), 50 * SEC)
+                && s.per_proc.contains_key(&key(300, 50 * SEC))
+        };
+        s.observe_fork(400, 12 * SEC, 300, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(400), None);
+        assert!(holder_kept(&s), "the connect's record");
+        s.observe_exec(401, 1, 12 * SEC, 300, 11 * SEC, 200);
+        assert_eq!(s.ancestry().parent_of(401), Some(1));
+        assert!(holder_kept(&s), "the exec's record");
+        s.observe_spawn(300, 200, 11 * SEC);
+        assert!(holder_kept(&s), "the earlier holder's late exec");
+        s.observe_fork(402, 61 * SEC, 300, 60 * SEC, 200);
+        let t = s.ancestry();
+        assert_eq!(t.parent_of(402), Some(300));
+        assert_eq!((t.parent_of(300), t.start_of(300)), (Some(200), 60 * SEC));
+        assert!(!s.has_recent_in_ancestors(402, PrecursorKind::TmpExec, 62 * SEC, W));
+        // a record without a start is a reuse of the pid, as before
+        s.observe_spawn(300, 9, 0);
+        assert_eq!(s.ancestry().parent_of(300), Some(9));
     }
 
     /// Lot 352: a connect's fork record is entered once; a record without

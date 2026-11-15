@@ -11272,9 +11272,43 @@ number in parentheses is a lab PR.
     is at the verifier's 512-byte stack); a fork-only hop between a forker
     and its anchor is not entered (a precursor recorded by such a middle hop
     is not found); a fork-only process's UDP datagram carries no fork record
-    (only the TCP connect does); a module more than 11 directories below a
-    version directory (the walk's 16 names) is a critical write-open of the
-    posture, not FIM-008.
+    (only the TCP connect does); a module more than 10 directories below a
+    version directory on merged `/usr` (11 with a separate `/lib`: the walk's
+    16 names) is a critical write-open of the posture, not FIM-008; a symlink
+    created in the tree (no open) is not seen, and an `external`/`search`
+    directive of `/etc/depmod.d` makes depmod index modules outside it; a
+    module installed outside a package transaction (`make modules_install`,
+    the NVIDIA installer, `vboxconfig`) is one Critical per file; a coalesced
+    package transaction keeps at most 8 of its paths (the record budget's
+    samples); NN-L-FIM-002 sees a hard link of sudo, su and passwd only among
+    the setuid-root binaries (the watch list: `pkexec` is not watched).
+  - Review of #561 (fix round): F1, a fork record of a forker that started
+    before the process the tree holds at its pid (the forker exited, the
+    pid reused) lent the reused pid's precursors to a benign daemon's worker
+    (CHAIN-005, a kill of its tree): such a record is stale and not
+    followed, and the store never enters a start older than the one it
+    holds for a pid (`a_stale_fork_record_gives_a_daemon_s_worker_no_chain`,
+    `a_stale_fork_record_moves_nothing_onto_the_exited_forker`); F2, a
+    second exec (`sh -c '…; exec python3'`) put an orphan back under its
+    reaper: a later exec of the same process keeps the edge the tree holds
+    for it (`a_second_exec_keeps_an_orphan_under_its_forker`); F4, the
+    ratchet names `observe_spawn` as an identifier (a function path too) and
+    allows only the fork-record entries inside the store, `observe_spawn` is
+    `pub(crate)` (`the_ratchet_sees_a_call_a_path_and_a_store_wrapper`); F5,
+    the residuals above corrected. F3 (Electron AppImages), measured on
+    Ubuntu 24.04 (6.8, alpha profile, the lab's own account): an
+    AppImage-style image on `squashfuse` under `/tmp/.mount_*` gives R001
+    High plus NN-L-CHAIN-005 Critical when its zygote forks (no exec) the
+    process that connects, NN-L-CHAIN-002 Critical when that process is
+    started by fork+exec or the main process connects itself; Chrome for
+    Testing's `chrome-headless-shell` mounted the same way gives the same
+    (R001 High, CHAIN-002 Critical, sandboxed and `--no-sandbox`); the image
+    and the headless shell run from `$HOME` give NN-L-NET-007 Medium only.
+    The responses were would-have tree kills (the alpha profile kills
+    nothing). This false-positive class exists on rc2 with CHAIN-002
+    (pre-existing, not introduced here); lot 352 extends it to CHAIN-005
+    for fork-only children. It is handled by a separate lot (355): an
+    AppImage is judged by its image file, not by its `/tmp` mount point.
   - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**

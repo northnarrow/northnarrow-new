@@ -254,11 +254,16 @@ and the link in `dest_path`, and a link is never dropped as a no-op touch
 judges the link's directory; a walk deeper than its 16 names is judged as
 user-writable. The kernel's module trees (`/lib/modules/`, and
 `/usr/lib/modules/` as a merged-`/usr` kernel names it) are critical trees of
-the file-open sensor: a write-open at any depth is the tree's `Created` or
-`Modified` for NN-L-FIM-008, while FIM's own hooks keep the directory's
-direct children. A file moved or hard-linked INTO a version directory makes
-no open and is not seen there (the rename hook is at the verifier's stack
-limit).
+the file-open sensor: a write-open up to 10 directories below a version
+directory (merged `/usr`; 11 with a separate `/lib`: the kernel's walk keeps
+16 names) is the tree's `Created` or `Modified` for NN-L-FIM-008, while FIM's
+own hooks keep the directory's direct children; a deeper one is the
+posture's critical write-open, not NN-L-FIM-008's. A file moved, hard-linked
+or symlinked INTO a version directory makes no open and is not seen there
+(the rename hook is at the verifier's stack limit). Of the setuid-root
+binaries, the shipped watch list (`configs/fim-paths.v1`) names sudo, su and
+passwd only: a hard link of `pkexec` (or `mount`, `chsh`, `newgrp`,
+`gpasswd`, `fusermount3`, `ssh-keysign`) is not reported.
 
 Lot 340: a directory of a credential store opened (a listing: `find /`,
 plocate's `updatedb`) is no verdict of NN-L-FIM-015/016/017; a file of the

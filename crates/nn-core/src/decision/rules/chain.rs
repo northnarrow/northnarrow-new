@@ -2243,6 +2243,50 @@ mod tests {
         assert!(fired.is_empty(), "{fired:?}");
     }
 
+    /// Review of #561, F1: a daemon (200) executed; its fork-only
+    /// intermediate (300, 11 s) forked the worker (400) and exited. Its pid
+    /// went to a test binary run from /tmp (50 s). The worker's later
+    /// connect still names the intermediate of 11 s: a stale record, which
+    /// lends the worker nothing of the pid's new holder — no chain, no kill
+    /// of the daemon's worker.
+    #[test]
+    fn a_stale_fork_record_gives_a_daemon_s_worker_no_chain() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(200, 1, "/usr/sbin/daemond", 5 * SEC),
+                spawn_at(300, 77, "/tmp/go-build1/x.test", 50 * SEC),
+                connect_of(400, 12 * SEC, Some((300, 11 * SEC, 200)), 60 * SEC),
+                flow(400, 443, 60 * SEC),
+            ],
+        );
+        assert!(fired.is_empty(), "{fired:?}");
+    }
+
+    /// Review of #561, F2: the dropper (100, /tmp) forks 101 and exits; 101's
+    /// first exec carries its forker, then `sh -c '…; exec python3'` execs
+    /// again — no fork record, the parent at exec is the reaper. The forker
+    /// of one process does not change: the chain still reaches the dropper.
+    #[test]
+    fn a_second_exec_keeps_an_orphan_under_its_forker() {
+        let rules = chain_rules();
+        let fired = fired_on(
+            &rules,
+            &[
+                spawn_at(100, 1, "/tmp/dropper", 10 * SEC),
+                exec_forked(101, 1, "/bin/sh", 11 * SEC, (100, 10 * SEC, 100)),
+                spawn_at(101, 1, "/usr/bin/python3", 11 * SEC),
+                connect_of(101, 11 * SEC, None, 12 * SEC),
+                flow(101, 4444, 12 * SEC),
+            ],
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
+            "{fired:?}"
+        );
+    }
+
     /// External audit NETR-014: the cross-PID chains grade by age too — an
     /// ancestor's read 10 minutes old is one High record for a descendant's
     /// egress; a fresh read in any ancestor is the kill, before an aged one

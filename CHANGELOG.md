@@ -962,8 +962,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `/lib/modules/$(uname -r)/x.ko` (the documented case) is a write in a
     subdirectory nothing watched. The module trees (`/lib/modules/`,
     `/usr/lib/modules/` on merged-/usr) are critical trees of the file-open
-    sensor: a write-open at any depth, in every kernel version's directory,
-    is the tree's `Created` (`FMODE_CREATED`) or `Modified`, judged by
+    sensor: a write-open up to 10 directories below every kernel version's
+    directory (11 with a separate `/lib`; review of #561), is the tree's `Created` (`FMODE_CREATED`) or `Modified`, judged by
     NN-L-FIM-008 (no eBPF change). A package transaction's writes are one
     Low record per package-manager process within 15 minutes, the rest
     counted as coalesced (`KmodTreeWrites`); the host's depmod writing the
@@ -981,6 +981,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     forker, a fork-only process under its forker and a forker that never
     executed under its anchor, never under a pid the tree knows as another
     process.
+  - **The review of #561.** A fork record whose forker started before the
+    process the tree holds at its pid is stale (the forker exited, its pid
+    reused): it is not followed, and the store never enters a start older
+    than the one it holds for a pid — a reused pid's `/tmp` exec no longer
+    lends a benign daemon's worker NN-L-CHAIN-005. A later exec of the same
+    process (`sh -c '…; exec python3'`) keeps its edge: an orphan no longer
+    goes back under its reaper. The ancestry ratchet names `observe_spawn`
+    as an identifier (a function path too), and `observe_spawn` is
+    crate-private.
 - Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
   - **F1 — a log truncated back to its signed baseline's exact content was
     dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written
