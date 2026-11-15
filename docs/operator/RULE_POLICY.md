@@ -107,6 +107,14 @@ work. Four changes, each a default the signed per-rule policy can undo with
   account of another NSS source (LDAP, SSSD) has no `/etc/passwd` entry: from
   `UID_MIN` up it counts as a person's, and so does a rootless container's
   sub-uid (it carries its owner's standing).
+  Lot 355: an AppImage's own programs, served read-only at its runtime's
+  `/tmp/.mount_*` and tied by the exec pump to the image file the user ran
+  (`USER_IMAGE`), are no exec from `/tmp` at all: no R001, no staging
+  chain, as the same program run from the home
+  (`UPGRADE_NOTES_WAVE4.md` §49). An extracted AppImage
+  (`/tmp/appimage_extracted_*`), one run from `/tmp` itself or made to
+  serve a file staged there (`TARGET_APPIMAGE`), and a FUSE mount the pump
+  does not tie stay a person's exec as above.
 - **R013, a runc.** A `runc` executed from outside the system directories is
   a High record, its kill held (`enforce R013` gives it back): k3s runs its
   own from `/var/lib/rancher/k3s/data/<hash>/bin/runc`, and the corpus saw

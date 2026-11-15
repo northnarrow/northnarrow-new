@@ -21,12 +21,19 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, \
                           `postgres`, `nobody`) is killed in every posture: the whitelist is \
                           empty and the process allowlist does not apply. A root exec is \
-                          R009's (R009 runs first; R001's kill of it waits for COMBAT).",
+                          R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot \
+                          355: an AppImage's own programs, served read-only at its runtime's \
+                          `/tmp/.mount_*` (the exec pump ties the mount to the image file the \
+                          user ran, `USER_IMAGE`), are the image's: no record, as from the \
+                          home. An AppImage itself in `/tmp`, an extracted one, a writable \
+                          FUSE mount or another program's daemon stay judged.",
         how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
                       && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
         tests: &[
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp",
+            "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged",
+            "crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s",
             "agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp",
         ],

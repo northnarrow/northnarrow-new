@@ -2549,3 +2549,36 @@ mod rev548_recheck {
         );
     }
 }
+
+/// Lot 355: a security tool stopped by an AppImage's program (its exec
+/// marked a user's image by the exec pump) has no staged lineage; the
+/// same path unmarked is one.
+#[test]
+fn an_appimage_program_is_no_staged_lineage() {
+    use common::wire::exe::exe_flags::{KNOWN, USER_IMAGE};
+    let app = "/tmp/.mount_k355ab/usr/bin/app";
+    for (pid, flags) in [(700, KNOWN | USER_IMAGE), (800, KNOWN)] {
+        let h = host();
+        let mut e = crate::decision::rules::testutil::spawn_exe("app", app, app, flags);
+        if let nn_model::Event::ProcessSpawn {
+            pid: p,
+            ppid,
+            timestamp_ns,
+            start_ns,
+            ..
+        } = &mut e
+        {
+            (*p, *ppid, *timestamp_ns, *start_ns) = (pid, 200, 99 * S, 99 * S);
+        }
+        assert!(h.lineage.ingest_spawn_event(&e));
+        let f = h
+            .run(
+                pid + 1,
+                pid,
+                "/usr/bin/systemctl",
+                &["systemctl", "stop", "aegis"],
+            )
+            .unwrap();
+        assert_eq!(f.suspicious.is_some(), flags & USER_IMAGE == 0, "{f:?}");
+    }
+}
