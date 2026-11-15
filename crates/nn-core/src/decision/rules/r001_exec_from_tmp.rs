@@ -94,11 +94,11 @@ mod tests {
     /// Lab PR 166: the payload's forked children die with it.
     #[test]
     fn r001_kills_the_process_tree() {
-        for uid in [0, 998, 1000] {
+        for (case, uid) in [0, 998, 1000].into_iter().enumerate() {
             let v = R001ExecFromTmp
                 .evaluate(&spawn_as(uid, "payload", "/tmp/payload"))
                 .expect("fires");
-            assert_eq!(v.action, ResponseAction::KillProcessTree, "uid {uid}");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "case {case}");
         }
     }
 

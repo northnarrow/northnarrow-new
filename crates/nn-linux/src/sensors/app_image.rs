@@ -813,17 +813,20 @@ mod tests {
     #[test]
     fn a_writable_or_stacked_fuse_mount_is_not_an_image() {
         let uid = me();
-        for (parent, opts) in [
+        for (case, (parent, opts)) in [
             (30, format!("rw,user_id={uid}")),
             (30, format!("ro,user_id={}", uid + 1)),
             (30, "ro".to_string()),
             (45, format!("ro,user_id={uid}")),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let f = fixture();
             table(f.proc.path(), 61, parent, &opts);
             assert!(
                 !run(&mut AppImages::default(), &f, uid, &apprun()),
-                "{parent} {opts}"
+                "case {case}"
             );
         }
         // the image's mount, and another mount of its filesystem on a FUSE mount
@@ -870,14 +873,17 @@ mod tests {
     /// holding `/dev/fuse`, another user's.
     #[test]
     fn a_daemon_that_is_not_the_runtime_s_is_no_tie() {
-        for (state, ticks, fuse, uid) in [
+        for (case, (state, ticks, fuse, uid)) in [
             ("S", 0, true, me()),
             ("T", FRESH, true, me()),
             ("t", FRESH, true, me()),
             ("Z", FRESH, true, me()),
             ("S", FRESH, false, me()),
             ("S", FRESH, true, me() + 1),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let f = fixture();
             let image = f.image.clone();
             daemon(f.proc.path(), DAEMON, &image, uid, state, ticks, fuse);
@@ -893,7 +899,7 @@ mod tests {
             images.note(f.proc.path(), &mut first);
             let mut e = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), ts);
             images.note(f.proc.path(), &mut e);
-            assert!(!user_image(&e), "{state} {ticks} {fuse} {uid}");
+            assert!(!user_image(&e), "case {case}");
         }
     }
 
