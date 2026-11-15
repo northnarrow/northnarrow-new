@@ -63,6 +63,7 @@
 //! (like the actuator/evidence) so the ladder stays a pure, deterministic
 //! state machine in unit tests while production reads the live `/proc`.
 
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -158,7 +159,7 @@ impl SystemProtectedProcs {
             watchdog_exe,
             sshd_exes: SSHD_EXES.iter().map(PathBuf::from).collect(),
             proc_root: PathBuf::from("/proc"),
-            read_link: |p| fs::read_link(p),
+            read_link: |p| antitamper_bpf::kernel_roots::read_link(p),
             unreadable_warn: WarnEvery::new(UNREADABLE_WARN_EVERY),
         }
     }
@@ -180,7 +181,7 @@ impl SystemProtectedProcs {
             watchdog_exe: watchdog_exe.into(),
             sshd_exes,
             proc_root: proc_root.into(),
-            read_link: |p| fs::read_link(p),
+            read_link: |p| antitamper_bpf::kernel_roots::read_link(p),
             unreadable_warn: WarnEvery::new(UNREADABLE_WARN_EVERY),
         }
     }

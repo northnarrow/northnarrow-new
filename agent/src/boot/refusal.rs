@@ -56,8 +56,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use northnarrow_agent::agent_id::AgentIdentity;
@@ -426,16 +425,30 @@ fn open_dir(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// The name `name` in the directory `dir` is open on, resolved through the
-/// descriptor (`/proc/self/fd/<fd>/<name>`): a rename or a mount of the
-/// directory's path after the open does not move it.
-fn in_dir(dir: &File, name: &OsStr) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name)
+/// What sits at `path` (the directory of `--pid-file`, named on the
+/// command line), named without following it or reading it.
+fn what_is_path(path: &Path) -> &'static str {
+    kind_of(antitamper_bpf::kernel_roots::symlink_metadata(path))
 }
 
-/// What sits at `path`, named without following it or reading it.
-fn what_is(path: &Path) -> &'static str {
-    match std::fs::symlink_metadata(path).map(|m| m.file_type()) {
+/// Every name below is resolved beneath the descriptor of the directory it
+/// is in (`nn_linux::anchored::open_beneath`, `openat2`): a rename or a
+/// mount of the directory's path after the open does not move it. Lot 353
+/// (the review of #563, F1): it was `/proc/self/fd/<fd>/<name>`, through
+/// the `/proc` mounted at the time — a tmpfs over `/proc` lost the refused
+/// start's fallback chain, a FUSE held it.
+///
+/// What sits at `name` in `dir`, named without following it or reading it.
+fn what_is(dir: &File, name: &OsStr) -> &'static str {
+    kind_of(
+        nn_linux::anchored::open_beneath(dir, name, libc::O_PATH | libc::O_NOFOLLOW, 0)
+            .and_then(|f| f.metadata()),
+    )
+}
+
+/// What a file of `meta` is, in words.
+fn kind_of(meta: std::io::Result<std::fs::Metadata>) -> &'static str {
+    match meta.map(|m| m.file_type()) {
         Ok(t) if t.is_symlink() => "a symbolic link",
         Ok(t) if t.is_dir() => "a directory",
         Ok(t) if t.is_file() => "a regular file",
@@ -482,7 +495,7 @@ impl FallbackDir {
             Some(libc::ELOOP) | Some(libc::ENOTDIR) => format!(
                 "the directory of --pid-file {} is {}, not followed",
                 pid_dir.display(),
-                what_is(pid_dir)
+                what_is_path(pid_dir)
             ),
             _ => format!("the directory of --pid-file {}: {e}", pid_dir.display()),
         })?;
@@ -503,7 +516,7 @@ impl FallbackDir {
                 pmeta.mode() & 0o7777
             ));
         }
-        let up = std::fs::symlink_metadata(in_dir(&parent, OsStr::new("..")))
+        let up = nn_linux::anchored::parent_metadata(&parent)
             .map_err(|e| format!("lstat {}/..: {e}", pid_dir.display()))?;
         if up.dev() != pmeta.dev() {
             return Err(format!(
@@ -511,21 +524,29 @@ impl FallbackDir {
                 pid_dir.display()
             ));
         }
-        let at = in_dir(&parent, name);
         if create {
-            match std::fs::DirBuilder::new().mode(0o700).create(&at) {
+            match nn_linux::anchored::mkdir_beneath(&parent, name, 0o700) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(format!("creating {}: {e}", path.display())),
             }
         }
-        let dir = match open_dir(&at) {
+        let dir = match nn_linux::anchored::open_beneath(
+            &parent,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        ) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
             Err(e) => {
                 return Err(match e.raw_os_error() {
                     Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
-                        format!("{} is {}, not followed", path.display(), what_is(&at))
+                        format!(
+                            "{} is {}, not followed",
+                            path.display(),
+                            what_is(&parent, name)
+                        )
                     }
                     _ => format!("{}: {e}", path.display()),
                 })
@@ -568,20 +589,19 @@ impl FallbackDir {
     pub(crate) fn create(&self, bytes: &[u8]) -> Result<PathBuf, String> {
         for _ in 0..3 {
             let name = format!("refusal-{}.jsonl", uuid::Uuid::new_v4().simple());
-            let at = in_dir(&self.dir, OsStr::new(&name));
-            let mut f = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(&at)
-            {
+            let at = OsStr::new(&name);
+            let mut f = match nn_linux::anchored::open_beneath(
+                &self.dir,
+                at,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0o600,
+            ) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(format!("creating a file in {}: {e}", self.path.display())),
             };
             if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-                let _ = std::fs::remove_file(&at);
+                let _ = nn_linux::anchored::unlink_beneath(&self.dir, at, 0);
                 return Err(format!("writing {}/{name}: {e}", self.path.display()));
             }
             // the new name (tmpfs: already there)
@@ -596,9 +616,9 @@ impl FallbackDir {
 
     /// The names in the directory, at most `max` of them.
     fn names(&self, max: usize) -> Result<Vec<OsString>, String> {
-        let mut names: Vec<OsString> = std::fs::read_dir(in_dir(&self.dir, OsStr::new("")))
+        let mut names: Vec<OsString> = nn_linux::anchored::names_beneath(&self.dir)
             .map_err(|e| format!("listing {}: {e}", self.path.display()))?
-            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .into_iter()
             .take(max)
             .collect();
         names.sort();
@@ -611,18 +631,19 @@ impl FallbackDir {
     /// group and others, of one link and at most [`MAX_FALLBACK_BYTES`],
     /// read to that bound. Why not, without any of its content.
     fn read(&self, name: &OsStr) -> Result<Vec<u8>, String> {
-        let at = in_dir(&self.dir, name);
-        let f = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&at)
-            .map_err(|e| match e.raw_os_error() {
-                Some(libc::ELOOP) => "a symbolic link, not followed".to_string(),
-                _ => format!("{}: {e}", what_is(&at)),
-            })?;
+        let f = nn_linux::anchored::open_beneath(
+            &self.dir,
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => "a symbolic link, not followed".to_string(),
+            _ => format!("{}: {e}", what_is(&self.dir, name)),
+        })?;
         let meta = f.metadata().map_err(|e| format!("fstat: {e}"))?;
         if !meta.file_type().is_file() {
-            return Err(format!("{}, not a regular file", what_is(&at)));
+            return Err(format!("{}, not a regular file", what_is(&self.dir, name)));
         }
         if meta.uid() != self.uid {
             return Err(format!("owned by uid {}", meta.uid()));
@@ -652,10 +673,10 @@ impl FallbackDir {
     /// Remove the entry `name` (an unlink: a link goes, not its target; an
     /// empty directory too).
     fn remove(&self, name: &OsStr) -> std::io::Result<()> {
-        let at = in_dir(&self.dir, name);
-        match std::fs::remove_file(&at) {
-            Err(e) if std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) => {
-                std::fs::remove_dir(&at).map_err(|_| e)
+        match nn_linux::anchored::unlink_beneath(&self.dir, name, 0) {
+            Err(e) if e.raw_os_error() == Some(libc::EISDIR) => {
+                nn_linux::anchored::unlink_beneath(&self.dir, name, libc::AT_REMOVEDIR)
+                    .map_err(|_| e)
             }
             r => r,
         }
@@ -947,6 +968,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use northnarrow_agent::audit::AgentSigningKey;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
     fn cli(dir: &Path, audit_log: &Path) -> Cli {

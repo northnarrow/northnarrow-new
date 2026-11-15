@@ -203,20 +203,17 @@ pub fn cgroup2_root() -> Option<PathBuf> {
 }
 
 fn is_cgroup2(p: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path, `s` a writable statfs.
-    let rc = unsafe { libc::statfs(c.as_ptr(), &mut s) };
-    rc == 0 && s.f_type as i64 == CGROUP2_SUPER_MAGIC
+    // lot 353: beneath the root the agent's start anchored (a `statfs` of
+    // the path asked a FUSE mounted over it, which may never answer)
+    crate::kernel_roots::open(p, libc::O_PATH | libc::O_DIRECTORY)
+        .and_then(|f| crate::kernel_roots::magic_of(&f))
+        .is_ok_and(|m| m as i64 == CGROUP2_SUPER_MAGIC)
 }
 
 /// [`UnitCgroup`] of process `pid`, on this host's cgroup v2 mount.
 pub fn unit_cgroup_of(pid: u32) -> UnitCgroup {
     // lot 311 (F4): read as bytes — a cgroup's name is its creator's
-    let text = match std::fs::read(format!("/proc/{pid}/cgroup")) {
+    let text = match crate::kernel_roots::read_all(format!("/proc/{pid}/cgroup")) {
         Ok(t) => String::from_utf8_lossy(&t).into_owned(),
         Err(e) => {
             return UnitCgroup::Unavailable {
@@ -308,11 +305,11 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
 /// the one write PID 1 may make then. (The value is the file's bytes
 /// whatever its kind.)
 fn value_of(path: &Path, _kind: u8) -> Option<ValueEntry> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    let meta = crate::kernel_roots::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() {
         return None;
     }
-    let text = std::fs::read(path).ok()?;
+    let text = crate::kernel_roots::read_all(path).ok()?;
     let value = limit_value(&text)?;
     Some(ValueEntry {
         path: path.to_path_buf(),
@@ -327,7 +324,7 @@ fn value_of(path: &Path, _kind: u8) -> Option<ValueEntry> {
 /// The entry of `path` (`lstat`, never a link's target): `Ok(None)` when
 /// it does not exist, `Err` when it is not the kind it must be.
 fn entry_of(path: &Path, flags: u8, dir: bool) -> std::result::Result<Option<CgroupEntry>, String> {
-    let meta = match std::fs::symlink_metadata(path) {
+    let meta = match crate::kernel_roots::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),

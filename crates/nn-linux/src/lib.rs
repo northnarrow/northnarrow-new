@@ -74,6 +74,10 @@ pub mod agent_id;
 // A log's directory held open, so its path resolves through the descriptor
 // taken at start (R09a; was the agent's `anchored`).
 pub mod anchored;
+/// Lot 353 (re-check 2 of #563): the tests' FUSE that answers one lookup
+/// and holds the rest (the `test-util` feature; no build of the binaries).
+#[cfg(any(test, feature = "test-util"))]
+pub mod fuse_testing;
 
 // The agent's self-defence (Tappa 7): the LSM deny hooks and the kernel
 // maps they read, the BPF guard, the BTF revalidation, the fail-open

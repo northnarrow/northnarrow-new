@@ -356,7 +356,7 @@ pub fn io_thread_in_stat(stat: &str) -> Option<bool> {
 /// LSM `file_open` record) tells it; a follow-up lot.
 pub fn read_open_intent(tid: i32) -> OpenIntent {
     open_intent(
-        || std::fs::read_to_string(format!("/proc/{tid}/syscall")),
+        || antitamper_bpf::kernel_roots::read_to_string(format!("/proc/{tid}/syscall")),
         || read_task_stat(tid),
     )
 }
@@ -394,7 +394,8 @@ fn read_task_stat(tid: i32) -> Option<String> {
 
 /// The thread `tid` belongs to this process.
 pub fn is_own_thread(tid: i32) -> bool {
-    tid > 0 && std::fs::symlink_metadata(format!("/proc/self/task/{tid}")).is_ok()
+    tid > 0
+        && antitamper_bpf::kernel_roots::symlink_metadata(format!("/proc/self/task/{tid}")).is_ok()
 }
 
 /// The thread group (process) of `tid`, from `/proc/<tid>/status`.
@@ -461,7 +462,7 @@ pub fn file_id(fd: RawFd) -> io::Result<FileId> {
 ///   met in lot 315's mini-hunt): `ln f g`, then an open of `f` for writing
 ///   and an unlink of `f` while the open waits on the guard.
 pub fn fd_path(fd: RawFd) -> Option<String> {
-    let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let p = antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{fd}")).ok()?;
     let s = p.to_str()?.to_string();
     if !s.starts_with('/') {
         return None;
@@ -748,7 +749,7 @@ mod tests {
         let p = nn_linux::state_read::testing::sleeper_with_non_utf8_comm(30);
         let pid = p.pid();
         assert_eq!(tgid_of(pid as i32), Some(pid));
-        let start = super::super::trust::proc_start_ticks(std::path::Path::new("/proc"), pid);
+        let start = crate::cow::start_of(pid);
         assert!(start.is_some(), "its start unread");
         assert!(super::super::store::alive(super::super::trust::ProcId {
             pid,

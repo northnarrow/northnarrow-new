@@ -207,7 +207,7 @@ pub fn joined_entries_now() -> u32 {
         return n.clamp(1, common::cgroup_join::PID_LIMIT);
     }
     let read = |p: &str| {
-        std::fs::read_to_string(p)
+        antitamper_bpf::kernel_roots::read_to_string(p)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
     };
@@ -468,7 +468,7 @@ pub fn plan(
 
 /// `/proc/sys/kernel/random/boot_id`.
 pub(crate) fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
@@ -539,7 +539,7 @@ pub(crate) fn usable_dir(dir: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(format!("creating {}: {e}", dir.display())),
     }
-    match std::fs::symlink_metadata(dir) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(dir) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
             if m.permissions().mode() & 0o7777 != 0o700 {
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
@@ -569,7 +569,7 @@ pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entrie
     };
     let _ = PLANNED_AT.set(Instant::now());
     let plan = PLAN.get_or_init(|| {
-        let state = std::fs::read_to_string(STATE_PATH)
+        let state = antitamper_bpf::kernel_roots::read_to_string(STATE_PATH)
             .ok()
             .and_then(|t| PinState::parse(&t));
         // A `debug-trigger` build's test of a reset: the registered maps
@@ -786,7 +786,9 @@ fn purge_pin_dir(dir: &Path) {
 fn purge_pin_dir_at(dir: &Path, depth: u32) {
     // The third review of #494 (R2-d): a link is removed, never followed
     // (its target's files are another's).
-    if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
+    if antitamper_bpf::kernel_roots::symlink_metadata(dir)
+        .is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink())
+    {
         antitamper_bpf::purge_stale_pin(dir);
         return;
     }
@@ -798,12 +800,12 @@ fn purge_pin_dir_at(dir: &Path, depth: u32) {
             .is_some_and(|n| n.to_string_lossy().starts_with("link_"))
     });
     for f in &files {
-        match std::fs::symlink_metadata(f) {
+        match antitamper_bpf::kernel_roots::symlink_metadata(f) {
             Ok(m) if m.is_dir() && depth > 0 => purge_pin_dir_at(f, depth - 1),
             _ => antitamper_bpf::purge_stale_pin(f),
         }
     }
-    if let Err(e) = std::fs::remove_dir(dir) {
+    if let Err(e) = antitamper_bpf::kernel_roots::remove_dir(dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(error = %e, dir = %dir.display(), "cgroup exemptions: an old tracker pin directory NOT removed");
         }
@@ -1270,7 +1272,7 @@ fn freeze_pinned(ebpf: &Ebpf) -> Result<Vec<&'static str>, String> {
     let mut unfrozen = Vec::new();
     for name in PINNED_MAPS {
         let fd = map_data(ebpf, name)?.fd().as_fd().as_raw_fd();
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        let info = antitamper_bpf::kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}"))
             .map_err(|e| format!("{name}: its fdinfo: {e}"))?;
         match fdinfo_frozen(&info) {
             Some(true) => continue,
@@ -1419,7 +1421,7 @@ fn pin_new(
 fn debug_plant(_dir: &Path) {
     #[cfg(feature = "debug-trigger")]
     if std::env::var("NN_DEBUG_CGROUP_JOIN_PLANT").as_deref() == Ok("1") {
-        let r = std::fs::create_dir(_dir.join(JOINED_MAP));
+        let r = antitamper_bpf::kernel_roots::create_dir(_dir.join(JOINED_MAP));
         warn!(
             dir = %_dir.display(),
             planted = r.is_ok(),
@@ -1769,7 +1771,7 @@ fn lost_in(lost: &Lost, tgid: u32) -> Result<bool, String> {
 /// The tracker's pin directory beside pin root `root` (one after a start:
 /// the start removes the others) — a test's, a tool's.
 pub fn pinned_dir(root: &Path) -> Result<PathBuf, String> {
-    if let Some(st) = std::fs::read_to_string(STATE_PATH)
+    if let Some(st) = antitamper_bpf::kernel_roots::read_to_string(STATE_PATH)
         .ok()
         .and_then(|t| PinState::parse(&t))
         .filter(|st| st.dir.is_dir())
@@ -2085,10 +2087,7 @@ fn debug_self_inject() {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
-        let r = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!("/proc/{pid}/mem"));
+        let r = antitamper_bpf::kernel_roots::open(format!("/proc/{pid}/mem"), libc::O_RDWR);
         info!(
             pid,
             opened = r.is_ok(),

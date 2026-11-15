@@ -181,8 +181,9 @@ impl Kernel {
     pub fn counters(&self) -> [u64; counter::SLOTS as usize] {
         let mut out = [0u64; counter::SLOTS as usize];
         for (i, slot) in out.iter_mut().enumerate() {
-            if let Ok(v) = self.counters.get(&(i as u32), 0) {
-                *slot = v.iter().copied().fold(0u64, u64::wrapping_add);
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            if let Ok(v) = antitamper_bpf::per_cpu::sum(&self.counters, i as u32) {
+                *slot = v;
             }
         }
         out
@@ -234,7 +235,8 @@ pub fn cgroup2_mount(table: &nn_linux::mountinfo::MountTable) -> Option<std::pat
 /// cgroup's id is its directory's inode number on cgroup2); 0 for a slice
 /// that does not exist (yet).
 pub fn slice_ids(root: &Path) -> (u64, u64, u64) {
-    let id = |name: &str| std::fs::metadata(root.join(name)).map_or(0, |m| m.ino());
+    let id =
+        |name: &str| antitamper_bpf::kernel_roots::metadata(root.join(name)).map_or(0, |m| m.ino());
     (
         id("system.slice"),
         id("user.slice"),
@@ -264,7 +266,7 @@ pub const ELEVATION_IMAGES: [&str; 12] = [
 /// missing file, or one whose owner or mode would let another account
 /// change what it vouches for.
 pub fn trusted_image_key(path: &Path) -> Option<ExecqKey> {
-    let m = std::fs::metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(path).ok()?;
     if !m.is_file() || m.uid() != 0 || m.permissions().mode() & 0o022 != 0 {
         return None;
     }
@@ -305,7 +307,7 @@ pub fn image_entries(
         }
     }
     // init's image: `/proc/1/exe` names it even once unlinked.
-    if let Ok(m) = std::fs::metadata(proc_root.join("1/exe")) {
+    if let Ok(m) = antitamper_bpf::kernel_roots::metadata(proc_root.join("1/exe")) {
         add(
             ExecqKey {
                 dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),

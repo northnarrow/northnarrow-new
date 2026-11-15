@@ -2,26 +2,59 @@
 //! [`ChainHost`], as the chain code made them itself before R04a (Wave 4
 //! restructure, lab PR 241). Each body is the call that was in `chainlog`,
 //! `audit`, `chain_anchor` or `chain_tail`, with the same flags and modes.
+//!
+//! Lot 353 (the review of #563, F1): every one goes through
+//! [`crate::anchored`] — a name of an anchored directory is resolved
+//! beneath its descriptor (`openat2`, `renameat2`, `unlinkat`), never
+//! through `/proc`; any other path by path, as before — and a signed log
+//! whose appends fail is a degradation and the watchdog's
+//! ([`LinuxHost::append_failed`], [`unsigned_for_ms`]).
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::{DirBuilder, File, Metadata};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
-use crate::chain_host::ChainHost;
+use crate::chain_host::{ChainHost, Open};
 
 /// The agent's host: Linux.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxHost;
 
+/// The `open(2)` flags of `o` (`std`'s mapping: an append is a write; an
+/// exclusive create creates).
+pub fn open_flags(o: Open) -> i32 {
+    let access = match (o.read, o.write || o.append) {
+        (true, true) => libc::O_RDWR,
+        (false, true) => libc::O_WRONLY,
+        _ => libc::O_RDONLY,
+    };
+    access
+        | if o.append { libc::O_APPEND } else { 0 }
+        | if o.truncate { libc::O_TRUNC } else { 0 }
+        | if o.create_new {
+            libc::O_CREAT | libc::O_EXCL
+        } else if o.create {
+            libc::O_CREAT
+        } else {
+            0
+        }
+}
+
 impl ChainHost for LinuxHost {
     /// `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`: a symlink at the name is not
     /// the chain, and a FIFO cannot stall the reader.
     fn open_read_nofollow(path: &Path) -> io::Result<File> {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
+        crate::anchored::open(
+            path,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )
     }
 
     /// `O_NOFOLLOW` on a symlink: `ELOOP`.
@@ -29,63 +62,53 @@ impl ChainHost for LinuxHost {
         err.raw_os_error() == Some(libc::ELOOP)
     }
 
-    fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
-        options.mode(mode).open(path)
+    fn open_with_mode(options: Open, mode: u32, path: &Path) -> io::Result<File> {
+        crate::anchored::open(path, open_flags(options), mode)
     }
 
     /// `O_NOFOLLOW | O_NONBLOCK` (R11b, lab PR 262, review #466 F1: the
     /// non-blocking open too — a FIFO at the name cannot stall the writer;
     /// on a regular file the flag changes nothing).
-    fn open_with_mode_nofollow(
-        options: &mut OpenOptions,
-        mode: u32,
-        path: &Path,
-    ) -> io::Result<File> {
-        options
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
+    fn open_with_mode_nofollow(options: Open, mode: u32, path: &Path) -> io::Result<File> {
+        crate::anchored::open(
+            path,
+            open_flags(options) | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            mode,
+        )
+    }
+
+    /// `std`'s default mode for a file the open creates (`0o666`, less the
+    /// umask).
+    fn open(options: Open, path: &Path) -> io::Result<File> {
+        crate::anchored::open(path, open_flags(options), 0o666)
+    }
+
+    fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
+        crate::anchored::symlink_metadata(path)
+    }
+
+    fn exists(path: &Path) -> bool {
+        crate::anchored::metadata(path).is_ok()
+    }
+
+    fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
+        crate::anchored::read_dir_names(dir)
+    }
+
+    fn remove_file(path: &Path) -> io::Result<()> {
+        crate::anchored::remove_file(path)
     }
 
     fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {
         DirBuilder::new().mode(mode).recursive(true).create(dir)
     }
 
-    /// `renameat2(RENAME_NOREPLACE)`. External audit NN-AUD-115. On a
-    /// filesystem without the flag, fall back to an `lstat` check then a
-    /// plain rename (the window is inside the rotation's `+i` dance).
+    /// `renameat2(RENAME_NOREPLACE)`, beneath the anchored directories.
+    /// External audit NN-AUD-115. On a filesystem without the flag, fall
+    /// back to an `lstat` check then a plain rename (the window is inside
+    /// the rotation's `+i` dance).
     fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-        use std::os::unix::ffi::OsStrExt;
-        let cstr = |p: &Path| {
-            std::ffi::CString::new(p.as_os_str().as_bytes())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        };
-        let (f, t) = (cstr(from)?, cstr(to)?);
-        // SAFETY: two NUL-terminated paths that outlive the call; renameat2
-        // only reads them.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                f.as_ptr(),
-                libc::AT_FDCWD,
-                t.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINVAL) | Some(libc::ENOSYS) => {
-                if std::fs::symlink_metadata(to).is_ok() {
-                    return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
-                }
-                std::fs::rename(from, to)
-            }
-            _ => Err(err),
-        }
+        crate::anchored::rename_noreplace(from, to)
     }
 
     /// `pwrite` until all of `buf` is written.
@@ -93,8 +116,8 @@ impl ChainHost for LinuxHost {
         FileExt::write_all_at(file, buf, offset)
     }
 
-    /// Review entry 44: through the directory fd held since the first call
-    /// for the path's parent ([`crate::anchored::anchor`]).
+    /// Review entry 44: the path's directory anchored at the first call for
+    /// it ([`crate::anchored::anchor`]); the path itself unchanged.
     fn anchor(path: &Path) -> PathBuf {
         crate::anchored::anchor(path)
     }
@@ -118,7 +141,143 @@ impl ChainHost for LinuxHost {
             crate::boot::degradation::report(RETENTION_DEGRADATION, line);
         }
     }
+
+    /// Lot 353 (the review of #563, F1): a signed log whose appends fail is
+    /// a degradation of the agent ([`SIGNING_DEGRADATION`], one line per
+    /// log, named by its file — in `nn-admin status`, the trust level, and
+    /// signed when a chain takes rows again) and the watchdog's: the
+    /// `LoopProgress` it asks for carries how long the oldest failure has
+    /// lasted ([`unsigned_for_ms`]), and the watchdog records it in its hold
+    /// for the next agent to sign. Called with the writer's lock held: it
+    /// never signs here (the registry's [`crate::boot::degradation::note`]).
+    fn append_failed(path: &Path, why: Option<&str>) {
+        LazyLock::force(&EPOCH);
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let prefix = format!("{name}: ");
+        let changed = {
+            let mut failing = match FAILING.lock() {
+                Ok(f) => f,
+                Err(p) => p.into_inner(),
+            };
+            let changed = match why {
+                Some(_) => {
+                    let new = !failing.contains_key(path);
+                    failing
+                        .entry(path.to_path_buf())
+                        .or_insert_with(Instant::now);
+                    new
+                }
+                None => failing.remove(path).is_some(),
+            };
+            let oldest = failing.values().min().copied();
+            UNSIGNED_SINCE_MS.store(
+                oldest.map_or(0, |t| {
+                    u64::try_from(t.duration_since(*EPOCH).as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1)
+                }),
+                Ordering::SeqCst,
+            );
+            changed
+        };
+        if !changed || !registry_told() {
+            return;
+        }
+        match why {
+            Some(w) => {
+                tracing::error!(
+                    log = %path.display(),
+                    error = %w,
+                    "SIGNED LOG NOT WRITTEN — its appends fail; the agent's records are not on the \
+                     disk until they succeed again (a degradation; the watchdog records it)"
+                );
+                crate::boot::degradation::note(
+                    SIGNING_DEGRADATION,
+                    &format!("{prefix}appends fail: {w}"),
+                );
+            }
+            None => {
+                tracing::warn!(log = %path.display(), "signed log: appends succeed again");
+                // its record is kept for the next flush when not signed yet
+                crate::boot::degradation::retire_where(SIGNING_DEGRADATION, |d| {
+                    d.starts_with(&prefix)
+                });
+            }
+        }
+    }
 }
+
+/// Whether [`LinuxHost::append_failed`] tells the degradation registry:
+/// in the agent, from its start ([`tell_degradations`]); in tests, only on
+/// a thread that asked ([`tell_registry_in_tests`]) — the registry is the
+/// process's, and the tests that fail appends on purpose run beside the
+/// ones that read it (the watchdog's `unsigned_for_ms` is told always).
+fn registry_told() -> bool {
+    #[cfg(test)]
+    if TELL.with(std::cell::Cell::get) {
+        return true;
+    }
+    TELL_DEGRADATIONS.load(Ordering::SeqCst)
+}
+
+static TELL_DEGRADATIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The agent's start: from now on a signed log whose appends fail is a
+/// degradation of this process's status ([`LinuxHost::append_failed`]).
+pub fn tell_degradations() {
+    TELL_DEGRADATIONS.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+thread_local! {
+    static TELL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: this thread's failing appends are told to the degradation
+/// registry.
+#[cfg(test)]
+pub(crate) fn tell_registry_in_tests() {
+    TELL.with(|t| t.set(true));
+}
+
+/// Lot 353: the signed logs whose appends fail now, since when.
+static FAILING: LazyLock<Mutex<HashMap<PathBuf, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The time [`UNSIGNED_SINCE_MS`] counts from.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Milliseconds after [`EPOCH`] at which the oldest failing append of the
+/// logs failing now began (at least 1); 0 when every log takes its rows.
+static UNSIGNED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Lot 353 (the review of #563, F1): how long the oldest failure of the
+/// signed logs failing now has lasted, in milliseconds (at least 1); 0
+/// when every signed log takes its rows. The agent's `LoopProgress` reply
+/// carries it to the watchdog.
+pub fn unsigned_for_ms() -> u64 {
+    let since = UNSIGNED_SINCE_MS.load(Ordering::SeqCst);
+    if since == 0 {
+        return 0;
+    }
+    let now = u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX);
+    now.saturating_sub(since).max(1)
+}
+
+/// Whether the appends of the signed log `path` fail now.
+pub fn is_failing(path: &Path) -> bool {
+    match FAILING.lock() {
+        Ok(f) => f.contains_key(path),
+        Err(p) => p.into_inner().contains_key(path),
+    }
+}
+
+/// Lot 353: the degradation's source of a signed log whose appends fail
+/// ([`LinuxHost::append_failed`]).
+pub const SIGNING_DEGRADATION: &str = "signed_log";
 
 /// Lot 319: the degradation's source of a rotating chain whose retention
 /// stalled ([`LinuxHost::retention_stalled`]).
@@ -138,7 +297,7 @@ mod tests {
         archive_path_for, manifest_path, ChainPayload, ManifestEvent, NoProtection,
         RotatingChainLog, RotationConfig,
     };
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -161,6 +320,109 @@ mod tests {
         }
     }
 
+    /// Lot 353 (the review of #563, F1, its probe in a user namespace): a
+    /// tmpfs laid over `/proc` after the open does not stop a signed record
+    /// — the audit log's append and a rotating chain's appends across its
+    /// rotations (create, rename, listing, eviction) reach the files (rc2:
+    /// every open of `/proc/self/fd/<n>/<name>` failed with `ENOENT`, no
+    /// signed record at all while the mount stayed), and nothing is told
+    /// failing — a tmpfs over the logs' directory as well (review entry
+    /// 44: the rows land in the real files). Skipped where the host refuses
+    /// a user namespace.
+    #[test]
+    fn a_tmpfs_over_proc_does_not_stop_the_signed_records() {
+        let dir = TempDir::new().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLog::open(&audit_path, key(dir.path()), [3; 16]).unwrap();
+        audit.append(sample_draft(1)).unwrap();
+        let active = dir.path().join("hb.jsonl");
+        let cfg = RotationConfig {
+            size_cap_bytes: 300,
+            max_archives: 2,
+            file_mode: 0o600,
+        };
+        let mut chain = RotatingChainLog::<P>::open(
+            &active,
+            key(dir.path()),
+            cfg,
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        let target = dir.path().to_path_buf();
+        let rc = crate::anchored::testing::in_userns(|| {
+            // over /proc, and over the logs' directory (review entry 44)
+            if !crate::anchored::testing::tmpfs_over(Path::new("/proc"))
+                || !crate::anchored::testing::tmpfs_over(&target)
+            {
+                return 99;
+            }
+            if fs::metadata("/proc/self").is_ok() {
+                return 10; // the cover did not take
+            }
+            if audit.append(sample_draft(2)).is_err() {
+                return 11;
+            }
+            for n in 0..20 {
+                if chain.append(p(n)).is_err() {
+                    return 12;
+                }
+            }
+            if is_failing(&audit_path) || is_failing(&active) {
+                return 13;
+            }
+            0
+        });
+        match crate::fuse_testing::ran(rc) {
+            None => {}
+            Some(rc) => {
+                assert_eq!(rc, 0, "the child failed");
+                let text = fs::read_to_string(&audit_path).unwrap();
+                assert!(text.contains("test_op_2"), "the row is in the file");
+                let seqs = crate::chainlog::earliest_archive(&active);
+                assert!(seqs.is_some_and(|s| s > 1), "rotated and evicted: {seqs:?}");
+            }
+        }
+    }
+
+    /// Lot 353 (the review of #563, F1): a signed log whose append fails is
+    /// never silent — the failure is a degradation (`signed_log`, named by
+    /// the file) and the watchdog's (`unsigned_for_ms` > 0) until an append
+    /// succeeds again; then the line leaves the status.
+    #[test]
+    fn a_failing_signed_append_is_a_degradation_and_the_watchdog_s() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        tell_registry_in_tests();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit-fail.jsonl");
+        let mut log = AuditLog::open(&path, key(dir.path()), [4; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        assert!(!is_failing(&path));
+        // the file replaced by a directory: the append's open fails
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(log.append(sample_draft(2)).is_err());
+        let lines = crate::boot::degradation::snapshot();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("signed_log: audit-fail.jsonl: appends fail")),
+            "{lines:?}"
+        );
+        assert!(is_failing(&path));
+        assert!(unsigned_for_ms() > 0, "the watchdog's");
+        fs::remove_dir(&path).unwrap();
+        log.append(sample_draft(3)).unwrap();
+        assert!(
+            !crate::boot::degradation::snapshot()
+                .iter()
+                .any(|l| l.contains("audit-fail.jsonl")),
+            "it leaves the status"
+        );
+        assert!(!is_failing(&path));
+        crate::boot::degradation::reset_for_tests();
+    }
+
     /// External audit NN-AUD-115: the fresh active file after a rotation is
     /// created with `O_EXCL` — a symlink, dangling or not, is never followed
     /// (`chainlog::create_fresh_active`, `chainlog`'s
@@ -169,7 +431,7 @@ mod tests {
     fn an_exclusive_create_follows_no_symlink() {
         let dir = TempDir::new().unwrap();
         let create = |p: &Path| {
-            LinuxHost::open_with_mode(OpenOptions::new().create_new(true).write(true), 0o600, p)
+            LinuxHost::open_with_mode(Open::new().create_new(true).write(true), 0o600, p)
         };
         let victim = dir.path().join("victim");
         fs::write(&victim, b"victim").unwrap();
@@ -900,7 +1162,7 @@ mod tests {
         fn is_symlink_refusal(err: &io::Error) -> bool {
             LinuxHost::is_symlink_refusal(err)
         }
-        fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
+        fn open_with_mode(options: Open, mode: u32, path: &Path) -> io::Result<File> {
             if PIPE_NEXT.with(|c| c.replace(false)) {
                 let (r, w) = std::io::pipe()?;
                 PIPE.with(|p| *p.borrow_mut() = Some(r));
@@ -908,11 +1170,7 @@ mod tests {
             }
             LinuxHost::open_with_mode(options, mode, path)
         }
-        fn open_with_mode_nofollow(
-            options: &mut OpenOptions,
-            mode: u32,
-            path: &Path,
-        ) -> io::Result<File> {
+        fn open_with_mode_nofollow(options: Open, mode: u32, path: &Path) -> io::Result<File> {
             LinuxHost::open_with_mode_nofollow(options, mode, path)
         }
         fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {

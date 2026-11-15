@@ -583,6 +583,11 @@ pub const CLEAN_STOP_REASONS: [&str; 5] = [
     "sighup",
 ];
 
+/// Lot 353 (pre-alpha Phase 3, X6): the stop reason of an agent the
+/// watchdog's stuck recovery stopped (it did not answer its STATUS pings):
+/// never a clean stop — its SIGINT is the watchdog's, not an operator's.
+pub const STUCK_STOP_REASON: &str = "stuck_unresponsive";
+
 /// Check the newest lines of the chain (`lines`, in chain order, as fetched;
 /// `None`: the source could not be read, `why`) against `last` at `now`.
 pub fn check(
@@ -932,8 +937,14 @@ pub fn check(
             // that is not a clean stop (a pump that exited, a thread lost)
             // is a failure the agent came back from
             if b.kind == BeatKind::Stop && b.seq != newest.seq && !stop_is_clean(b) {
+                // lot 353: the watchdog's stuck recovery, named as such
+                let stuck = if b.stop_reason.as_deref() == Some(STUCK_STOP_REASON) {
+                    " — the watchdog's stuck recovery stopped an agent that did not answer"
+                } else {
+                    ""
+                };
                 degraded.push(format!(
-                    "the agent stopped at beat {} ({}) and started again: not a clean stop",
+                    "the agent stopped at beat {} ({}) and started again: not a clean stop{stuck}",
                     b.seq,
                     b.stop_reason.as_deref().unwrap_or("no reason given")
                 ));

@@ -30,7 +30,22 @@
 //! [`SLOW_QUEUE_CAP`] bursts with their I/O, inside the stop's budget, and
 //! the stop then threw the assessments away and the decision thread judged
 //! the same bursts again with their I/O. What it prepared goes back with its
-//! assessment, the rest unprepared. Nothing it was handed is ever dropped:
+//! assessment, the rest unprepared.
+//!
+//! Lot 353 (re-check 2 of #563, R2-3): the decision thread never judges a
+//! burst with its I/O. A full queue, a thread that is not running, or a
+//! thread held on one preparation past [`SLOW_HELD_AFTER`] (a FUSE that
+//! does not answer on a burst's files or on the package database) leaves
+//! the burst to the decision thread, which judges it **without** the I/O
+//! ([`RansomTracker::prepare_without_io`]: no file sampled, no package
+//! asked — the writer is not trusted by one), counted (`unprepared`) and
+//! WARNed; the bursts queued behind a held preparation come back the same
+//! way, at once. Until then, past 256 bursts, the decision thread sampled
+//! the files and asked the package database itself — and a mount that did
+//! not answer held it (the watchdog's stuck recovery followed). While the
+//! thread is held, the degradation [`SLOW_HELD`] stands (noted from the
+//! decision thread without I/O; withdrawn by the thread once its
+//! preparation answers). Nothing it was handed is ever dropped:
 //! an event it has no assessment for goes back without one. And no
 //! `catch_unwind` around the preparation: the agent's release build aborts
 //! on a panic (`panic = "abort"`, the watchdog restarts it, as for a panic
@@ -50,6 +65,22 @@ use tracing::{error, warn};
 
 /// Bursts waiting to be prepared at most.
 pub(crate) const SLOW_QUEUE_CAP: usize = 256;
+
+/// Lot 353 (re-check 2 of #563, R2-3): a preparation that has not answered
+/// after this long holds the thread — the bursts are judged without their
+/// I/O until it answers (a preparation is milliseconds: four files of 64
+/// KiB, a package lookup bounded at 1.5 s).
+pub(crate) const SLOW_HELD_AFTER: Duration = Duration::from_secs(10);
+
+/// Lot 353 (re-check 2 of #563, R2-3): the degradation's source while the
+/// thread is held.
+pub(crate) const SLOW_HELD: &str = "ransomware_slow_work";
+
+/// Lot 353 (re-check 2 of #563, R2-3): the degradation's text.
+pub(crate) const SLOW_HELD_DETAIL: &str = "the ransomware tracker's preparation of a burst did \
+     not answer (a mount that does not answer on a burst's files or on the package database?): \
+     the bursts are judged without their files sampled and without the package database until \
+     it answers";
 
 /// An event handed back to the decision thread, with the assessment
 /// prepared for it (`None`: unprepared — the stop came first, or the event
@@ -71,6 +102,11 @@ struct Shared {
     wait_max_us: AtomicU64,
     /// A full queue (or no thread) left the burst to the decision thread.
     full: AtomicU64,
+    /// Lot 353 (re-check 2 of #563, R2-3): when the preparation the thread
+    /// is on started (`None`: idle), and whether its hold is noted.
+    busy_since: Mutex<Option<Instant>>,
+    held_noted: AtomicBool,
+    held_after: Duration,
 }
 
 /// The dispatcher of slow work (see the module's doc).
@@ -83,6 +119,15 @@ impl SlowWork {
     /// Start its thread (`nn-slow-work`); `waker` ends the decision's wait
     /// when an event is ready.
     pub(crate) fn start(tracker: Arc<RansomTracker>, waker: Option<BusWaker>) -> Self {
+        Self::start_with(tracker, waker, SLOW_HELD_AFTER)
+    }
+
+    /// [`Self::start`], a preparation held past `held_after` (the tests').
+    pub(crate) fn start_with(
+        tracker: Arc<RansomTracker>,
+        waker: Option<BusWaker>,
+        held_after: Duration,
+    ) -> Self {
         let shared = Arc::new(Shared {
             tracker,
             inbox: Mutex::new(VecDeque::new()),
@@ -93,6 +138,9 @@ impl SlowWork {
             deferred: AtomicU64::new(0),
             wait_max_us: AtomicU64::new(0),
             full: AtomicU64::new(0),
+            busy_since: Mutex::new(None),
+            held_noted: AtomicBool::new(false),
+            held_after,
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -128,9 +176,10 @@ impl SlowWork {
 
     /// The decision thread: `event` is a burst whose assessment is not
     /// prepared — hand it over and judge the next event. `Err(event)`: the
-    /// queue is full or the thread is not running — the caller judges it
-    /// now (counted). Lot 317: a thread that has ended (a panic in an
-    /// unwinding build) is not running.
+    /// queue is full, the thread is not running or is held — the caller
+    /// judges it now, without its I/O ([`Self::primed`], counted). Lot 317:
+    /// a thread that has ended (a panic in an unwinding build) is not
+    /// running.
     pub(crate) fn defer(&self, event: Event) -> Result<(), Box<Event>> {
         let s = &self.shared;
         let running = self
@@ -138,7 +187,8 @@ impl SlowWork {
             .lock()
             .as_ref()
             .is_some_and(|t| !t.is_finished())
-            && !s.stop.load(Ordering::Acquire);
+            && !s.stop.load(Ordering::Acquire)
+            && !self.held();
         {
             let mut q = s.inbox.lock();
             if running && q.len() < SLOW_QUEUE_CAP {
@@ -153,8 +203,8 @@ impl SlowWork {
         if n.is_power_of_two() {
             warn!(
                 total = n,
-                "dispatcher of slow work full (or not running): a ransomware burst is judged on \
-                 the decision thread with its I/O"
+                "dispatcher of slow work full, held or not running: a ransomware burst is judged \
+                 on the decision thread without its I/O (no file sampled, no package asked)"
             );
         }
         Err(Box::new(event))
@@ -167,19 +217,47 @@ impl SlowWork {
         let mut out: Vec<Prepared> = self.shared.ready.lock().drain(..).collect();
         // lot 317 (review F8): a thread that has ended (a panic, in a build
         // that unwinds) prepares nothing more — what it was handed comes
-        // back unprepared now, not at the stop
-        if self.thread.lock().as_ref().is_some_and(|t| t.is_finished()) {
+        // back unprepared now, not at the stop; lot 353 (re-check 2 of
+        // #563, R2-3): nor while it is held on one preparation — the bursts
+        // behind it are judged now, without their I/O
+        if self.thread.lock().as_ref().is_some_and(|t| t.is_finished()) || self.held() {
             out.extend(self.shared.inbox.lock().drain(..).map(|(_, e)| (e, None)));
         }
         out
     }
 
+    /// Lot 353 (re-check 2 of #563, R2-3): whether the thread has been on
+    /// one preparation past [`SLOW_HELD_AFTER`] — noted once as the
+    /// degradation [`SLOW_HELD`] (without I/O: signed at the next flush),
+    /// withdrawn by the thread once that preparation answers.
+    pub(crate) fn held(&self) -> bool {
+        let s = &self.shared;
+        let held = s
+            .busy_since
+            .lock()
+            .is_some_and(|t| t.elapsed() >= s.held_after);
+        if held && !s.held_noted.swap(true, Ordering::AcqRel) {
+            nn_linux::boot::degradation::note(SLOW_HELD, SLOW_HELD_DETAIL);
+        }
+        held
+    }
+
     /// The decision thread, right before it judges an event handed back
-    /// ([`Self::take_ready`], [`Self::stop`]): its assessment, when one was
-    /// prepared, memoised (`RansomTracker::prime`); the event to judge.
+    /// ([`Self::take_ready`], [`Self::stop`]) or one [`Self::defer`] did
+    /// not take: its assessment memoised (`RansomTracker::prime`) — the one
+    /// prepared, or for a burst none was prepared for, one made now without
+    /// its I/O (lot 353, re-check 2 of #563, R2-3: never the judgement's
+    /// own I/O on the decision thread); the event to judge.
     pub(crate) fn primed(&self, (event, a): Prepared) -> Event {
+        let tracker = &self.shared.tracker;
+        let a = a.or_else(|| {
+            tracker
+                .needs_preparing(&event)
+                .then(|| tracker.prepare_without_io(&event))
+                .flatten()
+        });
         if let Some(a) = a {
-            self.shared.tracker.prime(&event, a);
+            tracker.prime(&event, a);
         }
         event
     }
@@ -239,7 +317,15 @@ fn run(s: &Shared) {
             }
         };
         // lot 317 (BUG-115): no catch_unwind — see the module's doc
+        *s.busy_since.lock() = Some(Instant::now());
         let prepared = s.tracker.prepare(&event);
+        *s.busy_since.lock() = None;
+        // lot 353 (re-check 2 of #563, R2-3): a hold noted by the decision
+        // thread ends with the preparation that answered
+        if s.held_noted.swap(false, Ordering::AcqRel) {
+            nn_linux::boot::degradation::withdraw(SLOW_HELD, &[]);
+            warn!("dispatcher of slow work: the held preparation answered — bursts prepared again");
+        }
         s.wait_max_us
             .fetch_max(at.elapsed().as_micros() as u64, Ordering::Relaxed);
         // an event with no assessment goes back as it came: never dropped
@@ -359,6 +445,9 @@ mod tests {
             deferred: AtomicU64::new(0),
             wait_max_us: AtomicU64::new(0),
             full: AtomicU64::new(0),
+            busy_since: Mutex::new(None),
+            held_noted: AtomicBool::new(false),
+            held_after: SLOW_HELD_AFTER,
         }
     }
 
@@ -496,5 +585,120 @@ mod tests {
         slow.shared.stop.store(true, Ordering::Release);
         slow.shared.wake_thread.notify_all();
         running.unwrap().join().unwrap();
+    }
+
+    // ── lot 353 (re-check 2 of #563, R2-3) ─────────────────────────────
+
+    /// A sampler whose first call is held until `release` (a FUSE that does
+    /// not answer on a burst's files), recording the thread of every call.
+    struct Held {
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        threads: Mutex<Vec<String>>,
+    }
+
+    impl northnarrow_agent::impact::entropy::Sampler for Held {
+        fn sample(
+            &self,
+            _path: &str,
+            _since: Duration,
+        ) -> northnarrow_agent::impact::entropy::Sample {
+            let me = std::thread::current().name().unwrap_or("?").to_string();
+            self.threads.lock().push(me);
+            if let Some(rx) = self.release.lock().take() {
+                let _ = rx.recv();
+            }
+            northnarrow_agent::impact::entropy::Sample::default()
+        }
+        fn sample_copies(
+            &self,
+            copy: &str,
+            _suffix: &str,
+            since: Duration,
+        ) -> northnarrow_agent::impact::entropy::Sample {
+            self.sample(copy, since)
+        }
+    }
+
+    fn rewrites(pid: u32, ts: u64) -> Event {
+        Event::MassWrite {
+            pid,
+            uid: 1000,
+            comm: "enc".to_string(),
+            count: 20,
+            filename: format!("/srv/data/f{pid}"),
+            timestamp_ns: ts,
+            overwrites: true,
+            cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
+            own_data: 0,
+        }
+    }
+
+    /// Re-check 2 of #563 (R2-3): a preparation held on the burst's files
+    /// holds the thread of slow work only. Past the hold bound the next
+    /// burst is not taken, and the decision thread's assessment of it
+    /// (`primed` with none prepared) samples nothing: the sampler is never
+    /// entered from the decision thread, the burst is judged without its
+    /// I/O (counted), and the hold is a degradation. On main a burst the
+    /// dispatcher did not take was judged with its I/O on the decision
+    /// thread (`assess`): the held sampler held it.
+    #[test]
+    fn a_held_preparation_never_brings_the_io_onto_the_decision_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = northnarrow_agent::posture::lineage::AuthSessionTracker::new(tmp.path());
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = Arc::new(Held {
+            release: Mutex::new(Some(gate)),
+            threads: Mutex::new(Vec::new()),
+        });
+        let tracker = Arc::new(RansomTracker::with(
+            lineage,
+            northnarrow_agent::impact::trust::ProgramOwners::new(tmp.path()),
+            Arc::clone(&held) as Arc<dyn northnarrow_agent::impact::entropy::Sampler>,
+        ));
+        let slow = SlowWork::start_with(Arc::clone(&tracker), None, Duration::from_millis(200));
+        slow.defer(rewrites(5001, 10)).unwrap();
+        let started = Instant::now();
+        while held.threads.lock().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "sampled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        slow.defer(rewrites(5002, 20)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // held: the burst behind it comes back unprepared, the next is
+        // refused — both judged here without their I/O
+        let back = slow.take_ready();
+        assert_eq!(back.len(), 1, "the waiting burst comes back");
+        let refused = slow.defer(rewrites(5003, 30)).expect_err("held: not taken");
+        let me = std::thread::current().name().unwrap_or("?").to_string();
+        for x in back.into_iter().chain([(*refused, None)]) {
+            let e = slow.primed(x);
+            let a = tracker.assess(&e).expect("a burst");
+            assert!(a.trusted.is_none());
+        }
+        assert!(
+            !held.threads.lock().contains(&me),
+            "the sampler was entered from the decision's thread: {:?}",
+            held.threads.lock()
+        );
+        let c = tracker.counts();
+        assert_eq!((c.unprepared, c.inline), (2, 0), "{c:?}");
+        assert!(
+            nn_linux::boot::degradation::entries()
+                .iter()
+                .any(|d| d.source == SLOW_HELD),
+            "the hold is a degradation"
+        );
+        release.send(()).unwrap();
+        let started = Instant::now();
+        while slow.take_ready().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!slow.held());
+        slow.defer(rewrites(5004, 40))
+            .expect("taken again once it answers");
+        slow.stop();
     }
 }

@@ -943,7 +943,7 @@ pub(crate) fn caller_exe(proc: &Path, pid: u32, comm: &str) -> Option<String> {
     if now.trim_end_matches('\n') != comm {
         return None;
     }
-    std::fs::read_link(dir.join("exe"))
+    antitamper_bpf::kernel_roots::read_link(dir.join("exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }

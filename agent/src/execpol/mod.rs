@@ -31,7 +31,7 @@ use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
 use aya::programs::Lsm;
-use aya::{Btf, Ebpf};
+use aya::Ebpf;
 use common::wire::execpol::{counter, mode};
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -211,7 +211,8 @@ fn attach_commit(ebpf: &mut Ebpf) -> Result<()> {
 
 /// The re-check of #547 (G6): [`ENV_PROGRAM`] on `bprm_check_security`.
 fn attach_env_lsm(ebpf: &mut Ebpf) -> Result<()> {
-    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the environment check")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf()
+        .context("loading vmlinux BTF for the environment check")?;
     let prog: &mut Lsm = ebpf
         .program_mut(ENV_PROGRAM)
         .ok_or_else(|| anyhow!("program {ENV_PROGRAM} missing from the eBPF object"))?
@@ -225,7 +226,8 @@ fn attach_env_lsm(ebpf: &mut Ebpf) -> Result<()> {
 }
 
 fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
-    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the mapping check")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf()
+        .context("loading vmlinux BTF for the mapping check")?;
     let prog: &mut Lsm = ebpf
         .program_mut(MAP_PROGRAM)
         .ok_or_else(|| anyhow!("program {MAP_PROGRAM} missing from the eBPF object"))?

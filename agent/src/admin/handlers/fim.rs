@@ -275,7 +275,7 @@ mod lot311 {
     fn a_read_error_ends_the_count_and_a_non_utf8_line_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("drift.jsonl");
-        std::fs::create_dir(&d).unwrap();
+        antitamper_bpf::kernel_roots::create_dir(&d).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let p = d.clone();
         std::thread::spawn(move || {
@@ -284,7 +284,7 @@ mod lot311 {
         let got = rx.recv_timeout(std::time::Duration::from_secs(5));
         assert_eq!(got.ok(), Some((0, String::new())), "the count never ended");
         let f = dir.path().join("rows.jsonl");
-        std::fs::write(
+        antitamper_bpf::kernel_roots::write(
             &f,
             b"{\"ts\":\"2026-01-01T00:00:00Z\"}\n{\"x\":\"\xff\"}\n{\"ts\":\"2026-01-02T00:00:00Z\"}\n",
         )

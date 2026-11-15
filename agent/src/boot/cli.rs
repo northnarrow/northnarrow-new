@@ -994,7 +994,9 @@ impl Cli {
             },
             classes: common::wire::execq::class::ALL,
             scanner: self.exec_quarantine_scanner.clone().unwrap_or_else(|| {
-                let own = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+                let own = antitamper_bpf::kernel_roots::current_exe()
+                    .and_then(|p| p.canonicalize())
+                    .ok();
                 northnarrow_agent::execq::sibling_scanner_exe(own.as_deref())
             }),
             scan_user: self.exec_quarantine_scan_user.clone(),
@@ -1005,7 +1007,9 @@ impl Cli {
     /// `--watchdog-exe`, or the watchdog next to this agent (review 26).
     pub(crate) fn resolved_watchdog_exe(&self) -> PathBuf {
         self.watchdog_exe.clone().unwrap_or_else(|| {
-            let own = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+            let own = antitamper_bpf::kernel_roots::current_exe()
+                .and_then(|p| p.canonicalize())
+                .ok();
             northnarrow_agent::posture::sibling_watchdog_exe(own.as_deref())
         })
     }

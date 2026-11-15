@@ -74,6 +74,29 @@ pub enum Exemption {
     Unit(String),
 }
 
+/// Lot 353 (re-check 4 of #563): the fact of a process an exemption's
+/// kind is judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExemptionFact {
+    /// Its uid (`/proc/<pid>/status`).
+    Uid,
+    /// Its cgroup (`/proc/<pid>/cgroup`): an exemption by cgroup or unit.
+    Cgroup,
+    /// Its executable (`/proc/<pid>/exe` and the image it names).
+    Exe,
+}
+
+impl Exemption {
+    /// The fact this exemption is judged by.
+    pub fn fact(&self) -> ExemptionFact {
+        match self {
+            Exemption::Uid(_) => ExemptionFact::Uid,
+            Exemption::Exe { .. } => ExemptionFact::Exe,
+            Exemption::Cgroup(_) | Exemption::Unit(_) => ExemptionFact::Cgroup,
+        }
+    }
+}
+
 impl fmt::Display for Exemption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -954,6 +977,36 @@ pub trait ActorFacts: Send + Sync {
     /// known (no tracker, the process gone or started before the marks'
     /// last reset, a mark the kernel could not take) — no exemption either.
     fn injected(&self, pid: u32) -> Option<Injected>;
+    /// Lot 353 (re-check 4 of #563): why `fact` of `pid` cannot be read
+    /// while the process is there — a mount laid below `/proc/<pid>`, a read
+    /// that did not answer, a refusal — or `None`: it reads, or the process
+    /// is gone. An exemption judged by it is then not known not to cover
+    /// the process ([`covering`]'s [`Covering::Unjudged`]).
+    fn unread(&self, pid: u32, fact: ExemptionFact) -> Option<String>;
+}
+
+/// Lot 353 (re-check 4 of #563): whether an exemption of the policy covers
+/// a process code was first injected into ([`covering`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Covering {
+    /// One covers it: `rule: what`.
+    Exempt(String),
+    /// None covers it as far as its facts were read, but one is judged by a
+    /// fact that could not be read while the process is there: `rule: what
+    /// — why`. Not "none": the record is signed as for an exempt process.
+    Unjudged(String),
+    /// None covers it.
+    NotCovered,
+}
+
+impl Covering {
+    /// The exemption that covers it, if one does.
+    pub fn exemption(&self) -> Option<&str> {
+        match self {
+            Covering::Exempt(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// Lot 281: what the kernel's marks say of the code a process runs.
@@ -1098,7 +1151,11 @@ pub fn exempt(
 /// Lot 281: the exemption of `policy` (any rule's) that covers process
 /// `pid` whatever was injected into it — the agent's question when code
 /// was first injected into a process: was it an exempt one? `rule: what`.
-pub fn covering(policy: &RulePolicy, pid: u32, facts: &dyn ActorFacts) -> Option<String> {
+/// Lot 353 (re-check 4 of #563): none found, an exemption judged by a fact
+/// of `pid` that cannot be read while it is there ([`ActorFacts::unread`]:
+/// a mount laid below `/proc/<pid>`) is [`Covering::Unjudged`] — on
+/// 8c1c5d12 it was "none covers it", the injection a debug line.
+pub fn covering(policy: &RulePolicy, pid: u32, facts: &dyn ActorFacts) -> Covering {
     struct Clean<'a>(&'a dyn ActorFacts);
     impl ActorFacts for Clean<'_> {
         fn uid(&self, pid: u32) -> Option<u32> {
@@ -1116,10 +1173,34 @@ pub fn covering(policy: &RulePolicy, pid: u32, facts: &dyn ActorFacts) -> Option
         fn injected(&self, _: u32) -> Option<Injected> {
             Some(Injected::No)
         }
+        fn unread(&self, pid: u32, fact: ExemptionFact) -> Option<String> {
+            self.0.unread(pid, fact)
+        }
     }
-    policy.all_exemptions().find_map(|(rule, ex)| {
+    if let Some(e) = policy.all_exemptions().find_map(|(rule, ex)| {
         exempt(ex, pid, None, &Clean(facts)).and_then(|e| e.holds().map(|e| format!("{rule}: {e}")))
-    })
+    }) {
+        return Covering::Exempt(e);
+    }
+    // each fact asked at most once
+    let mut asked: Vec<(ExemptionFact, Option<String>)> = Vec::new();
+    for (rule, ex) in policy.all_exemptions() {
+        for e in ex {
+            let fact = e.fact();
+            let why = match asked.iter().find(|(f, _)| *f == fact) {
+                Some((_, why)) => why.clone(),
+                None => {
+                    let why = facts.unread(pid, fact);
+                    asked.push((fact, why.clone()));
+                    why
+                }
+            };
+            if let Some(why) = why {
+                return Covering::Unjudged(format!("{rule}: {e} — {why}"));
+            }
+        }
+    }
+    Covering::NotCovered
 }
 
 #[cfg(test)]
@@ -1471,6 +1552,8 @@ mod tests {
         started: Option<bool>,
         /// Lot 281.
         injected: Option<Injected>,
+        /// Lot 353 (re-check 4 of #563): the fact that cannot be read.
+        unread: Option<(ExemptionFact, &'static str)>,
         reads: Mutex<Vec<&'static str>>,
     }
 
@@ -1495,6 +1578,12 @@ mod tests {
             self.reads.lock().push("injected");
             self.injected
         }
+        fn unread(&self, _: u32, fact: ExemptionFact) -> Option<String> {
+            self.reads.lock().push("unread");
+            self.unread
+                .filter(|(f, _)| *f == fact)
+                .map(|(_, why)| why.to_string())
+        }
     }
 
     fn facts() -> Facts {
@@ -1504,6 +1593,7 @@ mod tests {
             exe: Some(("/usr/bin/backup", [7u8; 32])),
             started: Some(true),
             injected: Some(Injected::No),
+            unread: None,
             reads: Mutex::new(Vec::new()),
         }
     }
@@ -1656,6 +1746,7 @@ mod tests {
             exe: None,
             started: None,
             injected: None,
+            unread: None,
             reads: Mutex::new(Vec::new()),
         };
         for (case, e) in [
@@ -1778,7 +1869,8 @@ mod tests {
             }),
             ..facts()
         };
-        let got = covering(&p, 42, &tainted).expect("an exemption covered it");
+        let got = covering(&p, 42, &tainted);
+        let got = got.exemption().expect("an exemption covered it");
         assert!(
             got.starts_with("NN-L-IMP-001_RansomwareEncryption: exe /usr/bin/backup"),
             "{got}"
@@ -1789,8 +1881,91 @@ mod tests {
             uid: Some(5),
             ..facts()
         };
-        assert_eq!(covering(&p, 42, &nobody), None);
-        assert_eq!(covering(&RulePolicy::builtin(), 42, &tainted), None);
+        assert_eq!(covering(&p, 42, &nobody), Covering::NotCovered);
+        assert_eq!(
+            covering(&RulePolicy::builtin(), 42, &tainted),
+            Covering::NotCovered
+        );
+    }
+
+    /// Lot 353 (re-check 4 of #563, P2; named): code injected into a process
+    /// whose exemption could not be judged — a fact it is judged by that
+    /// cannot be read while the process is there (a mount laid below
+    /// `/proc/<pid>`) — is `Unjudged`, naming the exemption and why; on
+    /// 8c1c5d12 "none covers it", the injection a debug line. A fact that
+    /// reads (or a process gone) is still "none"; an exemption that holds
+    /// is still the answer; a policy without exemptions asks nothing.
+    #[test]
+    fn an_exemption_that_could_not_be_judged_is_not_none() {
+        let p = parse(
+            "exempt R017 uid 1\n\
+             exempt NN-L-IMP-001 exe /usr/bin/backup sha256 0707070707070707070707070707070707070707070707070707070707070707\n",
+        )
+        .unwrap();
+        let hidden = Facts {
+            uid: None,
+            exe: None,
+            unread: Some((
+                ExemptionFact::Exe,
+                "/proc/42/exe: not read — a mount below /proc",
+            )),
+            ..facts()
+        };
+        match covering(&p, 42, &hidden) {
+            Covering::Unjudged(why) => {
+                assert!(
+                    why.starts_with("NN-L-IMP-001_RansomwareEncryption: exe /usr/bin/backup")
+                        && why.ends_with("— /proc/42/exe: not read — a mount below /proc"),
+                    "{why}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // the uid's fact reads (not 1), the exe's does not: still unjudged
+        let other_uid = Facts {
+            uid: Some(5),
+            ..hidden
+        };
+        assert!(matches!(
+            covering(&p, 42, &other_uid),
+            Covering::Unjudged(_)
+        ));
+        // every fact reads: none covers it
+        let read = Facts {
+            exe: None,
+            uid: Some(5),
+            ..facts()
+        };
+        assert_eq!(covering(&p, 42, &read), Covering::NotCovered);
+        // an exemption that holds is the answer, whatever is unread
+        let holds = Facts {
+            uid: Some(1),
+            exe: None,
+            unread: Some((ExemptionFact::Exe, "x")),
+            ..facts()
+        };
+        assert_eq!(
+            covering(&p, 42, &holds),
+            Covering::Exempt("R017_ShellFromNonstandardPath: uid 1".into())
+        );
+        // no exemption: nothing asked
+        let f = Facts {
+            unread: Some((ExemptionFact::Uid, "x")),
+            ..facts()
+        };
+        assert_eq!(
+            covering(&RulePolicy::builtin(), 42, &f),
+            Covering::NotCovered
+        );
+        assert!(f.reads.lock().is_empty());
+        // each fact asked once
+        let twice = parse("exempt R017 uid 1\nexempt NN-L-IMP-001 uid 2\n").unwrap();
+        let f = Facts {
+            uid: Some(5),
+            ..facts()
+        };
+        assert_eq!(covering(&twice, 42, &f), Covering::NotCovered);
+        assert_eq!(f.reads.lock().iter().filter(|r| **r == "unread").count(), 1);
     }
 
     /// Facts are read only for the kinds present, once each.

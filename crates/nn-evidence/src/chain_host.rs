@@ -21,10 +21,84 @@
 //! The writers take the key (`AuditLog::open(path, key, agent_id)`), so they
 //! find the host through it; a reader that takes no key names the host
 //! (`boot_check::<H>`).
+//!
+//! Lot 353 (the review of #563, F1): every file operation a writer makes
+//! on its log after the open — the append, the fsync's open, the tail read
+//! again, the rotation's create, rename, listing and eviction, the
+//! manifest's — is one of the host's ([`ChainHost::open`],
+//! [`ChainHost::symlink_metadata`], [`ChainHost::read_dir_names`],
+//! [`ChainHost::remove_file`], …) on the log's own path: the agent's host
+//! resolves a name of an anchored directory beneath the descriptor it
+//! holds (`openat2`, `renameat2`, `unlinkat`), never through `/proc`. The
+//! flags of an open are an [`Open`] (`std`'s `OpenOptions` cannot be read
+//! back). A reader that anchors nothing uses [`StdHost`].
 
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The flags of an open the chain code asks its host for: `std`'s
+/// `OpenOptions`, which a host that opens beneath a directory descriptor
+/// cannot read back. The same builder, by value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Open {
+    pub read: bool,
+    pub write: bool,
+    pub append: bool,
+    pub truncate: bool,
+    pub create: bool,
+    pub create_new: bool,
+}
+
+impl Open {
+    /// No access asked yet (`OpenOptions::new`).
+    pub const fn new() -> Self {
+        Self {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+        }
+    }
+    pub const fn read(mut self, v: bool) -> Self {
+        self.read = v;
+        self
+    }
+    pub const fn write(mut self, v: bool) -> Self {
+        self.write = v;
+        self
+    }
+    pub const fn append(mut self, v: bool) -> Self {
+        self.append = v;
+        self
+    }
+    pub const fn truncate(mut self, v: bool) -> Self {
+        self.truncate = v;
+        self
+    }
+    pub const fn create(mut self, v: bool) -> Self {
+        self.create = v;
+        self
+    }
+    pub const fn create_new(mut self, v: bool) -> Self {
+        self.create_new = v;
+        self
+    }
+    /// The same open as `std`'s `OpenOptions`.
+    pub fn std(&self) -> OpenOptions {
+        let mut o = OpenOptions::new();
+        o.read(self.read)
+            .write(self.write)
+            .append(self.append)
+            .truncate(self.truncate)
+            .create(self.create)
+            .create_new(self.create_new);
+        o
+    }
+}
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -38,16 +112,43 @@ pub trait ChainHost: 'static {
     fn is_symlink_refusal(err: &io::Error) -> bool;
 
     /// Open with `options`; a file the open creates gets `mode`.
-    fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File>;
+    fn open_with_mode(options: Open, mode: u32, path: &Path) -> io::Result<File>;
 
     /// [`Self::open_with_mode`] without following a final symlink and
     /// without blocking on a FIFO (R11b, lab PR 262: the audit chain's
     /// opens, after review #466 F1).
-    fn open_with_mode_nofollow(
-        options: &mut OpenOptions,
-        mode: u32,
-        path: &Path,
-    ) -> io::Result<File>;
+    fn open_with_mode_nofollow(options: Open, mode: u32, path: &Path) -> io::Result<File>;
+
+    /// Open with `options` (a file it creates gets `std`'s default mode,
+    /// less the umask). Lot 353: the writers' plain opens of their own
+    /// files (the fsync's, the tail's read), the host's like the others.
+    fn open(options: Open, path: &Path) -> io::Result<File> {
+        options.std().open(path)
+    }
+
+    /// `std::fs::symlink_metadata` of `path`, as the host resolves it.
+    fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
+    /// Whether `path` names something (a final symlink followed), as the
+    /// host resolves it.
+    fn exists(path: &Path) -> bool {
+        path.exists()
+    }
+
+    /// The names in the directory `dir` (not `.` and `..`), as the host
+    /// resolves it.
+    fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
+        std::fs::read_dir(dir)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect()
+    }
+
+    /// `std::fs::remove_file` of `path`, as the host resolves it.
+    fn remove_file(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
 
     /// Create `dir` and its missing parents, each with `mode`.
     fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()>;
@@ -85,6 +186,52 @@ pub trait ChainHost: 'static {
     /// the disk use grows: the host makes it seen (the agent: a degradation
     /// in `nn-admin status`, signed in the audit chain). Default: nothing.
     fn retention_stalled(_active: &Path, _why: Option<&str>) {}
+
+    /// Lot 353 (the review of #563, F1): the appends of the signed log
+    /// `path` fail (`Some(why)`: the row is not on the disk) or succeed
+    /// again (`None`) — told by its writer at each change. A signing chain
+    /// that stops taking rows is never silent: the host makes it seen (the
+    /// agent: a degradation in `nn-admin status`, and the watchdog's
+    /// `LoopProgress`). Default: nothing.
+    fn append_failed(_path: &Path, _why: Option<&str>) {}
+}
+
+/// The host of a reader that anchors nothing (a verifier, `nn-admin`'s
+/// reads of a log by its path): `std`'s calls by path, symlinks followed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StdHost;
+
+impl ChainHost for StdHost {
+    fn open_read_nofollow(path: &Path) -> io::Result<File> {
+        OpenOptions::new().read(true).open(path)
+    }
+    fn is_symlink_refusal(_err: &io::Error) -> bool {
+        false
+    }
+    fn open_with_mode(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+        options.std().open(path)
+    }
+    fn open_with_mode_nofollow(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+        options.std().open(path)
+    }
+    fn create_dir_all_with_mode(dir: &Path, _mode: u32) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+    fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        if std::fs::symlink_metadata(to).is_ok() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        std::fs::rename(from, to)
+    }
+    fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = file;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(buf)
+    }
+    fn anchor(path: &Path) -> PathBuf {
+        path.to_path_buf()
+    }
 }
 
 /// The key a chain writer signs with.
@@ -112,7 +259,7 @@ pub(crate) mod testing {
     use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
     use sha2::{Digest, Sha256};
 
-    use super::{ChainHost, ChainSigner};
+    use super::{ChainHost, ChainSigner, Open};
 
     /// Plain `std`: no mode, symlinks followed, no anchor; the rename
     /// checks the target first (the agent's fallback on a filesystem
@@ -126,15 +273,11 @@ pub(crate) mod testing {
         fn is_symlink_refusal(_err: &io::Error) -> bool {
             false
         }
-        fn open_with_mode(options: &mut OpenOptions, _mode: u32, path: &Path) -> io::Result<File> {
-            options.open(path)
+        fn open_with_mode(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+            options.std().open(path)
         }
-        fn open_with_mode_nofollow(
-            options: &mut OpenOptions,
-            _mode: u32,
-            path: &Path,
-        ) -> io::Result<File> {
-            options.open(path)
+        fn open_with_mode_nofollow(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+            options.std().open(path)
         }
         fn create_dir_all_with_mode(dir: &Path, _mode: u32) -> io::Result<()> {
             std::fs::create_dir_all(dir)
@@ -305,15 +448,11 @@ pub(crate) mod testing {
         fn is_symlink_refusal(err: &io::Error) -> bool {
             PortableHost::is_symlink_refusal(err)
         }
-        fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File> {
+        fn open_with_mode(options: Open, mode: u32, path: &Path) -> io::Result<File> {
             open_fault(path)?;
             PortableHost::open_with_mode(options, mode, path)
         }
-        fn open_with_mode_nofollow(
-            options: &mut OpenOptions,
-            mode: u32,
-            path: &Path,
-        ) -> io::Result<File> {
+        fn open_with_mode_nofollow(options: Open, mode: u32, path: &Path) -> io::Result<File> {
             open_fault(path)?;
             PortableHost::open_with_mode_nofollow(options, mode, path)
         }

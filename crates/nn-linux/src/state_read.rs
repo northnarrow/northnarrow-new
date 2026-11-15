@@ -44,36 +44,19 @@ pub fn read_state<P: AsRef<Path>>(path: P) -> io::Result<String> {
 }
 
 /// The bytes of the regular file at `path`, at most `max` ([`read_state`]'s
-/// rules with a caller's own bound).
+/// rules with a caller's own bound). Lot 353: a path under `/proc`, `/sys`
+/// or the cgroup2 hierarchy is opened beneath the root the agent's start
+/// anchored ([`antitamper_bpf::kernel_roots`]): a mount laid over the view
+/// since (a FUSE that does not answer) is never walked, one below it is
+/// read only when it is the kernel's, within a deadline.
 pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-        .open(path)?;
-    read_file_bounded(&f, max)
+    antitamper_bpf::kernel_roots::read(path, max)
 }
 
 /// The bytes of an open file, read from its offset: a regular file only
 /// (`fstat`), at most `max` — more is an error, never a cut answer.
 pub fn read_file_bounded(f: &std::fs::File, max: u64) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    let t = f.metadata()?.file_type();
-    if !t.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file (a FIFO, a device, a directory): not read",
-        ));
-    }
-    let mut bytes = Vec::new();
-    f.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("more than {max} bytes: not read"),
-        ));
-    }
-    Ok(bytes)
+    antitamper_bpf::kernel_roots::read_file_bounded(f, max)
 }
 
 /// The re-check of #558 (F7): how long a read of the kernel-state round
@@ -402,14 +385,14 @@ pub mod testing {
     /// them: parent `ppid`, real uid `uid`, start `ticks` (field 22).
     pub fn write_non_utf8_proc(root: &std::path::Path, pid: u32, ppid: u32, uid: u32, ticks: u64) {
         let dir = root.join(pid.to_string());
-        std::fs::create_dir_all(&dir).expect("fixture dir");
+        antitamper_bpf::kernel_roots::create_dir_all(&dir).expect("fixture dir");
         let mut stat = format!("{pid} (").into_bytes();
         stat.extend_from_slice(NON_UTF8_COMM);
         stat.extend_from_slice(
             format!(") S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n")
                 .as_bytes(),
         );
-        std::fs::write(dir.join("stat"), stat).expect("fixture stat");
+        antitamper_bpf::kernel_roots::write(dir.join("stat"), stat).expect("fixture stat");
         let mut status = b"Name:\t".to_vec();
         status.extend_from_slice(NON_UTF8_COMM);
         status.extend_from_slice(
@@ -418,10 +401,10 @@ pub mod testing {
             )
             .as_bytes(),
         );
-        std::fs::write(dir.join("status"), status).expect("fixture status");
+        antitamper_bpf::kernel_roots::write(dir.join("status"), status).expect("fixture status");
         let mut comm = NON_UTF8_COMM.to_vec();
         comm.push(b'\n');
-        std::fs::write(dir.join("comm"), comm).expect("fixture comm");
+        antitamper_bpf::kernel_roots::write(dir.join("comm"), comm).expect("fixture comm");
     }
 
     /// Start one, sleeping `secs`, and wait until the kernel shows its
@@ -433,7 +416,7 @@ pub mod testing {
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).expect("n6 dir");
+        antitamper_bpf::kernel_roots::create_dir_all(&dir).expect("n6 dir");
         let link = dir.join(std::ffi::OsStr::from_bytes(NON_UTF8_COMM));
         std::os::unix::fs::symlink("/bin/sh", &link).expect("n6 symlink");
         let child = Command::new(&link)
@@ -448,7 +431,9 @@ pub mod testing {
             .expect("spawn the n6 sleeper");
         let comm = PathBuf::from(format!("/proc/{}/comm", child.id()));
         for _ in 0..500 {
-            if std::fs::read(&comm).is_ok_and(|c| c.starts_with(NON_UTF8_COMM)) {
+            if antitamper_bpf::kernel_roots::read_all(&comm)
+                .is_ok_and(|c| c.starts_with(NON_UTF8_COMM))
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -461,6 +446,77 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// Lot 353 (named, pre-alpha Phase 3 X6): the kernel's state is read
+    /// beneath the roots the start anchored — a mount laid over its view
+    /// since (a tmpfs over `/sys/fs/cgroup` and over `/proc/sys/kernel`, as
+    /// the FUSE that held the agent's threads) is not walked: the reads give
+    /// the kernel's files, never the cover's emptiness (rc2 read the cover:
+    /// not found). In a user and mount namespace of a child, skipped where
+    /// the host refuses one.
+    #[test]
+    fn a_state_read_is_not_held_by_a_mount_laid_over_its_view() {
+        let _ = antitamper_bpf::kernel_roots::init();
+        let (Ok(controllers), Ok(release)) = (
+            std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers"),
+            std::fs::read_to_string("/proc/sys/kernel/osrelease"),
+        ) else {
+            return; // no cgroup2 root here
+        };
+        // SAFETY: fork; the child mounts in namespaces of its own and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = (|| {
+                let tmpfs = |target: &std::ffi::CStr| {
+                    // SAFETY: NUL-terminated strings, no data.
+                    unsafe {
+                        libc::mount(
+                            c"none".as_ptr(),
+                            target.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    }
+                };
+                // SAFETY: the child's own namespaces; no data.
+                let refused = unsafe {
+                    libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                        || libc::mount(
+                            std::ptr::null(),
+                            c"/".as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_REC | libc::MS_PRIVATE,
+                            std::ptr::null(),
+                        ) != 0
+                };
+                if refused || tmpfs(c"/sys/fs/cgroup") != 0 || tmpfs(c"/proc/sys/kernel") != 0 {
+                    return 99;
+                }
+                if std::fs::read("/proc/sys/kernel/osrelease").is_ok() {
+                    return 10; // the covers did not take
+                }
+                if read_state("/sys/fs/cgroup/cgroup.controllers").ok() != Some(controllers) {
+                    return 11;
+                }
+                if read_state("/proc/sys/kernel/osrelease").ok() != Some(release) {
+                    return 12;
+                }
+                0
+            })();
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(rc) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 | 99 => {}
+            rc => panic!("the child failed with {rc}"),
+        }
+    }
 
     /// N6: the kernel shows such a process's `stat` and `status` with its
     /// `comm` as it is — not UTF-8 — and the reader still reads them.

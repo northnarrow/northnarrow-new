@@ -86,7 +86,7 @@ pub fn host_checks(checks: &[crate::host_hardening::Check]) -> Vec<HostCheck> {
 
 /// `/proc/sys/kernel/osrelease`, or `unknown`.
 pub fn kernel_release() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
 }

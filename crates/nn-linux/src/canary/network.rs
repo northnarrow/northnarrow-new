@@ -159,8 +159,11 @@ fn decode_proc_addr(hex: &str, v6: bool) -> Option<IpAddr> {
 /// The TCP listeners of this host's network namespace. A missing
 /// `/proc/net/tcp6` (IPv6 disabled) holds none.
 pub fn listeners() -> std::io::Result<Vec<(IpAddr, u16)>> {
-    let mut out = parse_listeners(&std::fs::read_to_string("/proc/net/tcp")?, false);
-    match std::fs::read_to_string("/proc/net/tcp6") {
+    let mut out = parse_listeners(
+        &antitamper_bpf::kernel_roots::read_to_string("/proc/net/tcp")?,
+        false,
+    );
+    match antitamper_bpf::kernel_roots::read_to_string("/proc/net/tcp6") {
         Ok(t) => out.extend(parse_listeners(&t, true)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),

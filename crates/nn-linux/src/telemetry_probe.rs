@@ -1195,7 +1195,7 @@ impl AttachView {
             own: env
                 .own_ids_file
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok()),
+                .and_then(|p| antitamper_bpf::kernel_roots::read_to_string(p).ok()),
             live: crate::anti_tamper::bpf_defense::live_links(env.pin_root.as_deref())
                 .into_iter()
                 .filter(|(_, prog)| *prog != 0)
@@ -1223,7 +1223,7 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>, env: SelfTestEnv) -> Optio
         info!(env = INTERVAL_ENV, "telemetry probe disabled");
         return None;
     };
-    if let Err(e) = std::fs::create_dir_all(PROBE_DIR) {
+    if let Err(e) = antitamper_bpf::kernel_roots::create_dir_all(PROBE_DIR) {
         warn!(error = %e, dir = PROBE_DIR, "telemetry probe: cannot create the probe directory — probe disabled");
         return None;
     }
@@ -1463,11 +1463,18 @@ async fn run_round(
         return;
     };
     let file = probe_file(&nonce);
-    if let Err(e) = std::fs::write(&file, b"nn-telemetry-probe\n") {
+    // lot 353 (re-check 1 of #563): the probe file, the pins and the deny
+    // self-test's targets are walked by path — each off the runtime's
+    // worker (a mount over them that does not answer holds a thread, never
+    // a worker the status answers on)
+    let written = crate::runtime::off_the_runtime(|| {
+        antitamper_bpf::kernel_roots::write(&file, b"nn-telemetry-probe\n")
+    });
+    if let Err(e) = written {
         warn!(error = %e, path = %file.display(), "telemetry probe: cannot write the probe file — round skipped");
         return;
     }
-    let exe = match std::env::current_exe() {
+    let exe = match antitamper_bpf::kernel_roots::current_exe() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "telemetry probe: current_exe unknown — round skipped");
@@ -1483,7 +1490,7 @@ async fn run_round(
     // Lot 302: the program-id list and the links, once: the deny hooks'
     // plan now, the attach checks at the end (the agent's own cost)
     let view_started = Instant::now();
-    let view = AttachView::read(env);
+    let view = crate::runtime::off_the_runtime(|| AttachView::read(env));
     let links = view.deny_links();
     let mut checks_cost = view_started.elapsed();
     {
@@ -1504,7 +1511,9 @@ async fn run_round(
         }));
     }
     // Lot 302: the deny self-test's targets and plan (none in a window)
-    let deny_run = (!window_before).then(|| prepare_deny(probe, env, &exe, links.as_deref()));
+    let deny_run = (!window_before).then(|| {
+        crate::runtime::off_the_runtime(|| prepare_deny(probe, env, &exe, links.as_deref()))
+    });
     let planned: Vec<Result<(), String>> = deny_run
         .as_ref()
         .map(|d| d.planned.clone())
@@ -1524,7 +1533,10 @@ async fn run_round(
     if let Some(raw) = deny_run.as_ref().and_then(DenyRun::write_fd) {
         hand_over_write_fd(&mut cmd, raw);
     }
-    let mut child = match cmd.spawn() {
+    // Lot 353 (re-check 2 of #563, R2-4): the spawn off the runtime's
+    // worker — its exec resolves the image by path, and a mount over the
+    // image's directory that does not answer held the worker until it did
+    let mut child = match crate::runtime::off_the_runtime(|| cmd.spawn()) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, exe = %exe.display(), "telemetry probe: cannot spawn the probe child — round skipped");
@@ -1532,7 +1544,9 @@ async fn run_round(
             if let Some(d) = deny_run {
                 d.finish().await;
             }
-            let _ = std::fs::remove_file(&file);
+            crate::runtime::off_the_runtime(|| {
+                let _ = std::fs::remove_file(&file);
+            });
             return;
         }
     };
@@ -1736,7 +1750,7 @@ impl DenyRun {
             None => Duration::ZERO,
         };
         if let Some(c) = self.cgroup {
-            let _ = std::fs::remove_dir(&c);
+            let _ = antitamper_bpf::kernel_roots::remove_dir(&c);
         }
         cpu
     }
@@ -1973,7 +1987,7 @@ fn attach_checks(probe: &TelemetryProbe, view: &AttachView) -> Vec<(Sensor, Outc
         .collect();
     // module_load: and every module new in the kernel's list reported
     let loads = probe.loads.load(Ordering::Relaxed);
-    let now = std::fs::read_to_string("/proc/modules")
+    let now = antitamper_bpf::kernel_roots::read_to_string("/proc/modules")
         .ok()
         .map(|t| module_names(&t));
     let mut st = probe.tracker.lock();
@@ -2179,12 +2193,13 @@ fn debug_detach(pin_root: Option<&Path>) {
     let (Some(root), Some(dir)) = (pin_root, Path::new(PROBE_DIR).parent()) else {
         return;
     };
-    let Ok(names) = std::fs::read_to_string(dir.join("debug-deny-detach")) else {
+    let Ok(names) = antitamper_bpf::kernel_roots::read_to_string(dir.join("debug-deny-detach"))
+    else {
         return;
     };
     for hook in names.split_whitespace() {
         let (_, link) = antitamper_bpf::lsm_pin_paths(root, hook);
-        if std::fs::symlink_metadata(&link).is_err() {
+        if antitamper_bpf::kernel_roots::symlink_metadata(&link).is_err() {
             continue;
         }
         match std::fs::remove_file(&link) {
@@ -2230,7 +2245,8 @@ fn debug_blind(seen: &mut [bool; SENSORS]) {
     let Some(dir) = std::path::Path::new(PROBE_DIR).parent() else {
         return;
     };
-    let Ok(names) = std::fs::read_to_string(dir.join("debug-probe-blind")) else {
+    let Ok(names) = antitamper_bpf::kernel_roots::read_to_string(dir.join("debug-probe-blind"))
+    else {
         return;
     };
     for s in Sensor::ALL {
@@ -2287,7 +2303,7 @@ pub fn run_child(nonce: &str) -> i32 {
     }
     let mut out = String::new();
     // the open is the step, whatever it answers
-    let _ = std::fs::read(probe_file(nonce));
+    let _ = antitamper_bpf::kernel_roots::read_all(probe_file(nonce));
     out.push_str("file=ok\n");
     let dns = match send_dns_probe(&dns_name(nonce), SocketAddr::V4(PROBE_DNS_DEST)) {
         Ok(_) => "ok".to_string(),

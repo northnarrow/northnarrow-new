@@ -335,7 +335,10 @@ fn decision_loop(
                             rx.decided();
                             continue;
                         }
-                        Err(e) => *e,
+                        // lot 353 (re-check 2 of #563, R2-3): not taken
+                        // (full, held, not running) — judged without its
+                        // I/O, never the sampler's on this thread
+                        Err(e) => p.slow.primed((*e, None)),
                     }
                 } else {
                     e
@@ -405,6 +408,8 @@ async fn watch_loop(
                 debug_crash_mid_action(&cli.admin_socket, dispatcher);
                 #[cfg(feature = "debug-trigger")]
                 debug_hang_next_action(&cli.admin_socket, dispatcher);
+                #[cfg(feature = "debug-trigger")]
+                debug_walk_on_workers(&cli.admin_socket);
                 // R12c (lab PR 270): the response dispatcher's thread ended —
                 // no response runs (each is answered "not run" and counted);
                 // as a dead pump: signed, and the agent stops for a restart.
@@ -443,6 +448,20 @@ async fn watch_loop(
                 }
             }
             _ = sigint.recv() => {
+                // Lot 353 (pre-alpha Phase 3, X6): the watchdog's stuck
+                // recovery names its SIGINT (a marker it left first) — the
+                // stop is then no operator's clean `sigint`
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                if let Some(detail) = nn_linux::self_integrity::take_stuck_marker(
+                    std::path::Path::new(nn_proto::watchdog_hold::STUCK_PATH),
+                    std::process::id(),
+                    now,
+                ) {
+                    warn!(detail = %detail, "SIGINT from the watchdog's stuck recovery; shutting down");
+                    return nn_proto::watchdog_hold::STUCK_STOP_REASON;
+                }
                 info!("SIGINT received; shutting down");
                 return "sigint";
             }
@@ -520,7 +539,7 @@ fn debug_trigger(admin_socket: &std::path::Path, name: &str) -> bool {
         return false;
     };
     let trigger = dir.join(name);
-    if std::fs::symlink_metadata(&trigger).is_err() {
+    if antitamper_bpf::kernel_roots::symlink_metadata(&trigger).is_err() {
         return false;
     }
     let _ = std::fs::remove_file(&trigger);
@@ -538,6 +557,34 @@ fn debug_hang_next_action(admin_socket: &std::path::Path, dispatcher: &Dispatche
     }
     warn!("debug-trigger: the next response's action hangs past the stall bound");
     dispatcher.hang_next_action();
+}
+
+/// `debug-trigger` builds only: a file `debug-walk-on-workers` next to the
+/// admin socket, holding a path, has every runtime worker walk that path by
+/// itself (`std::fs::metadata`, no anchored root, no deadline) — rc2's
+/// failure (lot 353, pre-alpha Phase 3 X6): a FUSE there that never answers
+/// holds the workers, the admin socket stops answering, and the lab sees the
+/// watchdog's stuck recovery name its cause, a SIGKILL that cannot end the
+/// agent, and the abort of that FUSE's connection.
+#[cfg(feature = "debug-trigger")]
+fn debug_walk_on_workers(admin_socket: &std::path::Path) {
+    let Some(dir) = admin_socket.parent() else {
+        return;
+    };
+    let trigger = dir.join("debug-walk-on-workers");
+    let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&trigger) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&trigger);
+    let path = std::path::PathBuf::from(text.trim());
+    let workers = antitamper_bpf::kernel_roots::available_parallelism();
+    warn!(path = %path.display(), workers, "debug-trigger: every runtime worker walks the path by itself");
+    for _ in 0..workers {
+        let p = path.clone();
+        tokio::spawn(async move {
+            let _ = std::fs::metadata(&p);
+        });
+    }
 }
 
 /// R12c-3 (review of #477): the decision thread's nice value, below the
@@ -562,7 +609,7 @@ fn debug_protected_query(
         return;
     };
     let trigger = dir.join("debug-protected-query");
-    let Ok(text) = std::fs::read_to_string(&trigger) else {
+    let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&trigger) else {
         return;
     };
     let _ = std::fs::remove_file(&trigger);
@@ -571,7 +618,7 @@ fn debug_protected_query(
         .filter_map(|p| p.parse::<u32>().ok())
         .take(64)
     {
-        let exe = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        let exe = match antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe")) {
             Ok(p) => p.display().to_string(),
             Err(e) => format!("unreadable ({e})"),
         };
@@ -596,7 +643,7 @@ fn debug_stall_loop(admin_socket: &std::path::Path, ctl: &DecisionControl) {
         return;
     };
     let trigger = dir.join("debug-stall-loop");
-    let Ok(text) = std::fs::read_to_string(&trigger) else {
+    let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&trigger) else {
         return;
     };
     let _ = std::fs::remove_file(&trigger);
@@ -631,7 +678,7 @@ fn debug_abort_pump(
         return;
     };
     let trigger = dir.join("debug-abort-pump");
-    let Ok(label) = std::fs::read_to_string(&trigger) else {
+    let Ok(label) = antitamper_bpf::kernel_roots::read_to_string(&trigger) else {
         return;
     };
     let _ = std::fs::remove_file(&trigger);

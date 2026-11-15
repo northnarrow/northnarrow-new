@@ -233,8 +233,8 @@ fn take_expected_denial(expected: &Mutex<Vec<Expected>>, event: &Event) -> bool 
     true
 }
 
-/// Run the self-test with `exe` (the agent's own binary,
-/// `/proc/self/exe`) as the child. Blocking, at most [`CHILD_TIMEOUT`].
+/// Run the self-test with `exe` (the agent's own binary, the path
+/// `/proc/self/exe` names: `kernel_roots::current_exe`) as the child. Blocking, at most [`CHILD_TIMEOUT`].
 /// The outcome, and the denial it leaves for the event loop to take.
 pub fn run(exe: &Path) -> (SelfTestOutcome, ExpectedDenial) {
     let mut cmd = Command::new(exe);
@@ -312,7 +312,8 @@ pub fn run_move_child(procs: &str, pid: &str) -> i32 {
     if pid.parse::<u32>().is_err() {
         return EXIT_OTHER;
     }
-    let mut f = match std::fs::OpenOptions::new().write(true).open(procs) {
+    // lot 353: beneath the cgroup2 root anchored at this process's start
+    let mut f = match antitamper_bpf::kernel_roots::open(procs, libc::O_WRONLY) {
         Ok(f) => f,
         Err(_) => return EXIT_OTHER,
     };
@@ -379,8 +380,8 @@ pub fn run_move(
     let expected = ExpectedDenial::default();
     let dir = root.join(MOVE_SELFTEST_CGROUP);
     // A leftover of an earlier boot (empty: its processes are gone).
-    let _ = std::fs::remove_dir(&dir);
-    if let Err(e) = std::fs::create_dir(&dir) {
+    let _ = antitamper_bpf::kernel_roots::remove_dir(&dir);
+    if let Err(e) = antitamper_bpf::kernel_roots::create_dir(&dir) {
         return (
             SelfTestOutcome::Inconclusive(format!("cannot make {}: {e}", dir.display())),
             expected,
@@ -397,7 +398,7 @@ pub fn run_move(
     let mut target = match target_cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = std::fs::remove_dir(&dir);
+            let _ = antitamper_bpf::kernel_roots::remove_dir(&dir);
             return (
                 SelfTestOutcome::Inconclusive(format!("cannot spawn {MOVE_TARGET_FLAG}: {e}")),
                 expected,
@@ -431,7 +432,7 @@ pub fn run_move(
     if let Err(e) = roles.evict(target_pid) {
         warn!(pid = target_pid, error = %e, "move guard self-test: the target's role not evicted");
     }
-    let _ = std::fs::remove_dir(&dir);
+    let _ = antitamper_bpf::kernel_roots::remove_dir(&dir);
     (outcome, expected)
 }
 

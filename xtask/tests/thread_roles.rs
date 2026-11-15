@@ -151,6 +151,25 @@ fn the_core_s_threads_get_the_core_s_set() {
 /// sets.
 const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
     (
+        "agent/src/admin/socket_watch.rs",
+        ".name(\"nn-sock-bind\".into())",
+        "lot 353 (re-check 2 of #563, R2-1): the admin socket's bind with a deadline, the bind \
+         its caller (the serve task) made itself before, on a helper it starts — the caller's \
+         sets, inherited; no role",
+    ),
+    (
+        "agent/src/admin/socket_watch.rs",
+        ".name(\"nn-sock-watch\".into())",
+        "lot 353 (re-check 2 of #563, R2-1): the socket's look and rebind, which the serve loop \
+         made itself before, on a helper it starts — the caller's sets, inherited; no role",
+    ),
+    (
+        "crates/nn-linux/src/fuse_testing.rs",
+        ".name(\"nn-test-fuse\".into())",
+        "lot 353 (re-check 2 of #563): the tests' FUSE daemon (`test-util` builds only, never \
+         the binaries')",
+    ),
+    (
         "crates/nn-linux/src/state_read.rs",
         ".name(\"nn-timed-read\".into())",
         "the re-check of #558 (F7): a state read with a deadline, the read its caller made itself \

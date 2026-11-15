@@ -488,15 +488,17 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
         }
         "PathExists" => path.exists(),
         "PathIsDirectory" => path.is_dir(),
-        "FileNotEmpty" => std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0),
+        "FileNotEmpty" => {
+            crate::kernel_roots::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+        }
         "DirectoryNotEmpty" => std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some()),
         "FileIsExecutable" => {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path)
+            crate::kernel_roots::metadata(path)
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         }
         "PathIsSymbolicLink" => {
-            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            crate::kernel_roots::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
         }
         _ => return None,
     };

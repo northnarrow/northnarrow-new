@@ -282,7 +282,8 @@ fn same_over(
     id: Option<(u64, u64)>,
     ranges: &[(u64, u64)],
 ) -> bool {
-    let Ok(fb) = std::fs::File::open(b) else {
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    let Ok(fb) = antitamper_bpf::kernel_roots::open(b, libc::O_RDONLY) else {
         return false;
     };
     let Ok(mb) = fb.metadata() else {
@@ -326,7 +327,7 @@ fn kernel_id(m: &std::fs::Metadata) -> (u64, u64) {
 /// only when its file is one only root can change ([`root_only_path`]).
 fn image_of(path: &Path, kind: ProgramKind, root: &Path) -> Option<InstalledImage> {
     let real = std::fs::canonicalize(path).ok()?;
-    let m = std::fs::metadata(&real).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(&real).ok()?;
     if !m.is_file() {
         return None;
     }
@@ -354,14 +355,17 @@ pub(crate) fn root_only_path(real: &Path, root: &Path) -> bool {
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;
     };
-    let Ok(owner) = std::fs::metadata(&root).map(|m| m.uid()) else {
+    let Ok(owner) = antitamper_bpf::kernel_roots::metadata(&root).map(|m| m.uid()) else {
         return false;
     };
     real.starts_with(&root)
         && real
             .ancestors()
             .take_while(|a| a.starts_with(&root))
-            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.uid() == owner && m.mode() & 0o022 == 0))
+            .all(|a| {
+                antitamper_bpf::kernel_roots::metadata(a)
+                    .is_ok_and(|m| m.uid() == owner && m.mode() & 0o022 == 0)
+            })
 }
 
 /// The kind of an installed file, by the name of the file a path resolves
@@ -377,7 +381,7 @@ fn kind_of(path: &Path) -> Option<ProgramKind> {
 /// `/etc/shells`' and the binary directories'.
 pub fn installed_under(root: &Path) -> Vec<InstalledImage> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(text) = std::fs::read(root.join("etc/shells")) {
+    if let Ok(text) = antitamper_bpf::kernel_roots::read_all(root.join("etc/shells")) {
         for line in String::from_utf8_lossy(&text).lines() {
             let line = line.trim();
             if line.starts_with('/') {
@@ -467,7 +471,10 @@ fn identify(
     uid: u32,
     bounds: &Bounds,
 ) -> Result<Option<ProgramKind>, Unverified> {
-    let file = std::fs::File::open(path).map_err(|_| Unverified::Unreadable)?;
+    // lot 353 (#563, the lab's FUSE over /proc): `/proc/<pid>/exe`
+    // beneath the anchored root
+    let file = antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)
+        .map_err(|_| Unverified::Unreadable)?;
     let m = file.metadata().map_err(|_| Unverified::Unreadable)?;
     let id = (
         crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
@@ -758,7 +765,7 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     checks.refresh(root, Instant::now());
     // first the parent, one `stat` of its image: a runtime's or a manager's
     let image = |pid: u32| {
-        std::fs::metadata(proc_root.join(pid.to_string()).join("exe"))
+        antitamper_bpf::kernel_roots::metadata(proc_root.join(pid.to_string()).join("exe"))
             .ok()
             .map(|m| kernel_id(&m))
     };
@@ -779,7 +786,11 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
             seen.push((grand, id));
         }
     }
-    let Ok(file) = std::fs::File::open(proc_root.join(pid.to_string()).join("exe")) else {
+    // lot 353: through the `/proc` root the agent's start anchored
+    let Ok(file) = antitamper_bpf::kernel_roots::open(
+        proc_root.join(pid.to_string()).join("exe"),
+        libc::O_RDONLY,
+    ) else {
         return;
     };
     let Ok(m) = file.metadata() else {
@@ -841,7 +852,7 @@ fn installed_at_its_path(id: (u64, u64)) -> Option<ProgramKind> {
     if !image.kind.is_container_runtime() {
         return None;
     }
-    std::fs::metadata(&image.path)
+    antitamper_bpf::kernel_roots::metadata(&image.path)
         .is_ok_and(|m| kernel_id(&m) == id)
         .then_some(image.kind)
 }

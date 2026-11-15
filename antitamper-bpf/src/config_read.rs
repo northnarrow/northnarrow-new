@@ -74,18 +74,17 @@ fn kind_of(t: std::fs::FileType) -> &'static str {
 pub fn read_config(path: &Path) -> Config {
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let unjudgeable = |e: std::io::Error| match e.raw_os_error() {
         Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG) => Config::Absent,
         _ => Config::Unjudgeable(format!(
             "it could not be read ({e}): what systemd reads there cannot be judged"
         )),
     };
-    let at = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)
-    {
+    // lot 353: a kernel file (`/proc/sys/…`) beneath the view's root the
+    // start anchored, and the reopen through `/proc/self/fd` too — a mount
+    // laid over `/proc` since is never walked
+    let at = match crate::kernel_roots::open(path, libc::O_PATH) {
         Ok(f) => f,
         Err(e) => return unjudgeable(e),
     };
@@ -103,7 +102,10 @@ pub fn read_config(path: &Path) -> Config {
             kind_of(t)
         ));
     }
-    let f = match std::fs::File::open(format!("/proc/self/fd/{}", at.as_raw_fd())) {
+    let f = match crate::kernel_roots::open(
+        format!("/proc/self/fd/{}", at.as_raw_fd()),
+        libc::O_RDONLY,
+    ) {
         Ok(f) => f,
         Err(e) => return unjudgeable(e),
     };

@@ -117,7 +117,7 @@ pub(crate) fn build(
     // and the restore verbs copy (it was a process-wide setter).
     let mut exec_cfg = exec_cfg;
     {
-        let own_exe = std::env::current_exe().ok();
+        let own_exe = antitamper_bpf::kernel_roots::current_exe().ok();
         let deny = northnarrow_agent::response::quarantine::own_files(
             &exec_cfg,
             own_exe.as_deref(),

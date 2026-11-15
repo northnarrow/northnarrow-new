@@ -24,6 +24,7 @@
 //! and stays readable in PR diffs. Documented choice.
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
@@ -114,7 +115,7 @@ pub fn block_outbound_for_pid(
     if let Err(e) = ensure_blocked_cgroup(cfg) {
         return io_failed(pid, "ensure_blocked_cgroup", &e);
     }
-    let scope_id = match fs::metadata(cfg.blocked_cgroup_dir()) {
+    let scope_id = match antitamper_bpf::kernel_roots::metadata(cfg.blocked_cgroup_dir()) {
         Ok(m) => m.ino(),
         Err(e) => return io_failed(pid, "stat the blocked scope", &e),
     };
@@ -196,12 +197,13 @@ fn blocked(pid: u32) -> ExecutionOutcome {
 /// failed.
 fn inet_sockets_of(proc: &Path, pid: u32) -> usize {
     let dir = proc.join(pid.to_string());
-    let Ok(fds) = fs::read_dir(dir.join("fd")) else {
+    let fd_dir = dir.join("fd");
+    let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(&fd_dir) else {
         return 0;
     };
     let held: HashSet<u64> = fds
-        .flatten()
-        .filter_map(|e| fs::read_link(e.path()).ok())
+        .into_iter()
+        .filter_map(|e| antitamper_bpf::kernel_roots::read_link(fd_dir.join(e)).ok())
         .filter_map(|l| {
             l.to_str()?
                 .strip_prefix("socket:[")?
@@ -244,7 +246,9 @@ fn in_effect(pid: u32, cfg: &ExecutorConfig, scope_id: u64) -> Result<(), &'stat
     let Ok(text) = crate::state_read::read_state(format!("/proc/{pid}/cgroup")) else {
         return Err("its cgroup could not be read back");
     };
-    let now = fs::metadata(cfg.blocked_cgroup_dir()).ok().map(|m| m.ino());
+    let now = antitamper_bpf::kernel_roots::metadata(cfg.blocked_cgroup_dir())
+        .ok()
+        .map(|m| m.ino());
     judge_effect(&text, &cfg.blocked_cgroup_match(), now, scope_id)
 }
 
@@ -360,13 +364,13 @@ fn apply_block_ruleset(cfg: &ExecutorConfig) -> std::io::Result<()> {
 /// idempotent (`AlreadyExists` is silently ignored).
 pub(crate) fn create_cgroup_dir(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
-        if let Err(e) = fs::create_dir(parent) {
+        if let Err(e) = antitamper_bpf::kernel_roots::create_dir(parent) {
             if e.kind() != ErrorKind::AlreadyExists {
                 return Err(e);
             }
         }
     }
-    if let Err(e) = fs::create_dir(dir) {
+    if let Err(e) = antitamper_bpf::kernel_roots::create_dir(dir) {
         if e.kind() != ErrorKind::AlreadyExists {
             return Err(e);
         }
@@ -378,7 +382,8 @@ pub(crate) fn create_cgroup_dir(dir: &Path) -> std::io::Result<()> {
 /// Write a PID into `cgroup.procs`. The cgroupfs accepts only one
 /// PID per write; we follow that contract literally.
 pub(crate) fn write_pid(path: &Path, pid: u32) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).open(path)?;
+    // lot 353: beneath the cgroup2 root the agent's start anchored
+    let mut f = antitamper_bpf::kernel_roots::open(path, libc::O_WRONLY)?;
     f.write_all(format!("{pid}").as_bytes())?;
     Ok(())
 }

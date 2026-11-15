@@ -1520,6 +1520,14 @@ pub fn decode_loop_progress(body: &[u8]) -> Result<LoopProgressResponse, StatusL
     }
     postcard::take_from_bytes::<LoopProgressResponse>(rest)
         .map(|(progress, _)| progress)
+        .or_else(|_| {
+            // an agent older than the field (lot 353): its two
+            postcard::take_from_bytes::<LoopProgressV1>(rest).map(|(v1, _)| LoopProgressResponse {
+                iterations: v1.iterations,
+                since_last_ms: v1.since_last_ms,
+                unsigned_ms: 0,
+            })
+        })
         .map_err(StatusLivenessError::Postcard)
 }
 
@@ -1718,10 +1726,25 @@ pub struct LoopProgressRequest {}
 /// round at least every 5 s on an idle host (its telemetry-task check), so
 /// a counter that does not move over three pings 30 s apart is a loop
 /// that stands still. Fields are only appended.
+///
+/// Lot 353 (the review of #563, F1): `unsigned_ms`, how long the agent's
+/// signed records have been failing (its oldest failing log's first failed
+/// append; 0 when every signed log takes its rows) — a signing failure is
+/// never silent, the watchdog records it. An older agent's reply has no
+/// such field ([`decode_loop_progress`]: 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LoopProgressResponse {
     pub iterations: u64,
     pub since_last_ms: u64,
+    #[serde(default)]
+    pub unsigned_ms: u64,
+}
+
+/// The reply of an agent before lot 353 (two fields).
+#[derive(Deserialize)]
+struct LoopProgressV1 {
+    iterations: u64,
+    since_last_ms: u64,
 }
 
 /// Lab PR 217 (NN-AUD-243 residue, capability C17) — signed `unlock`: the
@@ -3586,11 +3609,24 @@ mod tests {
         let reply = encode_frame(&AdminMessage::LoopProgressResponse(LoopProgressResponse {
             iterations: 300,
             since_last_ms: 1_250,
+            unsigned_ms: 4_000,
         }))
         .unwrap();
         let got = decode_loop_progress(&reply[4..]).expect("a progress reply");
         assert_eq!(got.iterations, 300);
         assert_eq!(got.since_last_ms, 1_250);
+        assert_eq!(got.unsigned_ms, 4_000, "lot 353: the signing failure's age");
+        // an agent before lot 353: two fields, no signing failure told
+        let mut older = vec![LOOP_PROGRESS_RESPONSE_INDEX as u8];
+        older.extend(postcard::to_allocvec(&(300u64, 1_250u64)).unwrap());
+        assert_eq!(
+            decode_loop_progress(&older).unwrap(),
+            LoopProgressResponse {
+                iterations: 300,
+                since_last_ms: 1_250,
+                unsigned_ms: 0
+            }
+        );
         let mut newer = reply[4..].to_vec();
         newer.extend([1, 9]);
         assert_eq!(decode_loop_progress(&newer).unwrap(), got);
@@ -3612,6 +3648,7 @@ mod tests {
         roundtrip(AdminMessage::LoopProgressResponse(LoopProgressResponse {
             iterations: u64::MAX,
             since_last_ms: 0,
+            unsigned_ms: 1,
         }));
     }
 

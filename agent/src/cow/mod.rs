@@ -58,7 +58,17 @@ use config::CowConfig;
 use guard::Runtime;
 use restore::Selector;
 use store::{now_ms, RestoreBy, RestoreReport, Store};
-use trust::{proc_start_ticks, ProcId};
+use trust::ProcId;
+
+/// Lot 353 (the review of #563, F2): the start of process `pid`, its
+/// `stat` read beneath the `/proc` root the start anchored.
+pub(crate) fn start_of(pid: u32) -> Option<u64> {
+    trust::proc_start_ticks(
+        |p| antitamper_bpf::kernel_roots::read_all(p),
+        std::path::Path::new("/proc"),
+        pid,
+    )
+}
 
 /// The rule whose kill is a ransomware verdict's.
 pub const RANSOMWARE_RULE: &str = "NN-L-FIM-010";
@@ -282,7 +292,7 @@ impl CowGuard {
         if pid <= 1 {
             return;
         }
-        let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
+        let start = crate::cow::start_of(pid).unwrap_or(0);
         let now = now_ms();
         let mut s = self.signals.lock();
         if s.len() >= 1024 {
@@ -333,7 +343,7 @@ impl CowGuard {
         };
         self.flag(pid, rule);
         if neutralized {
-            let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
+            let start = crate::cow::start_of(pid).unwrap_or(0);
             self.on_neutralized(vec![ProcId { pid, start }], format!("{rule} kill"));
         }
     }
@@ -558,7 +568,7 @@ mod tests {
         let g = guard(GuardState::Off);
         let me = std::process::id();
         g.flag(me, "test");
-        let start = proc_start_ticks(std::path::Path::new("/proc"), me).unwrap();
+        let start = crate::cow::start_of(me).unwrap();
         assert!(g.flagged(ProcId { pid: me, start }));
         assert!(g.flagged(ProcId { pid: me, start: 0 }));
         assert!(!g.flagged(ProcId {

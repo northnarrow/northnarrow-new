@@ -381,7 +381,8 @@ struct Inputs {
 }
 
 fn read(root: &Path, rel: &str) -> Result<String, String> {
-    std::fs::read_to_string(root.join(rel)).map_err(|e| format!("read {rel}: {e}"))
+    antitamper_bpf::kernel_roots::read_to_string(root.join(rel))
+        .map_err(|e| format!("read {rel}: {e}"))
 }
 
 fn inputs(root: &Path) -> Result<Inputs, String> {

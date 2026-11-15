@@ -11208,6 +11208,219 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 353 — the pre-alpha's Phase 3, case X6 (P1): a FUSE over `/proc`,
+  `/sys` or the cgroup root does not stall the agent's critical loops
+  (mounts over the agent's own directories: lot 357); stuck restarts are
+  named and a loop is signed (C14, C23; no level changes).**
+  - What was open: a FUSE over `/sys/fs/cgroup` that never answered the
+    agent's threads held the integrity and kernel-state rounds in the
+    kernel on the runtime's workers (5.15: `LOOKUP`, `OPENDIR`), the cgroup
+    guard's `statfs` uninterruptibly (6.12: `STATFS`, SIGKILL could not end
+    the agent), the mount rounds' root keys (`GETATTR`/`STATX`) and std's
+    CPU count (`cpu.max` by path); the admin socket stopped answering, the
+    watchdog's stuck recovery restarted the agent (or failed, 6.12, the
+    agent down while the FUSE stayed), and the log said `sigint`.
+  - Done: the kernel's views read beneath roots anchored at the start
+    (`antitamper_bpf::kernel_roots`, `openat2` with `RESOLVE_NO_XDEV`; a
+    crossing below a root only into the kernel's file systems, bounded; a
+    view covered at the start refused, `kernel_views`), every path read of
+    the agent's, nn-linux's, antitamper-bpf's and the watchdog's production
+    code through it, the rounds off the runtime, a ratchet
+    (`xtask/tests/kernel_views.rs`); `mount_over_protected` covers the views
+    and is High; the stuck recovery names its cause (`stuck_unresponsive`,
+    the stop no clean `sigint`), a restart loop is `agent_restart_loop`
+    (High, a status degradation), `stuck_recovery_failed` High, and the
+    watchdog aborts a FUSE over `/proc`, `/sys` or our directories holding an
+    agent SIGKILL cannot end (`fuse_aborted`, High).
+  - Lab (our own guests, one at a time under a lease, clean before, purged
+    and powered off after; the X6 FUSE: a FUSE over the cgroup2 root that
+    never answers the agent's threads and gives every other process `EIO`):
+    - ubuntu2204 (5.15.0-202), the final tree (r4): held 180 s, no request
+      of the agent reached it (0 of the agent's threads; 75 of others), the
+      agent kept its pid, `nn-admin status` answered at 20/60/100/140/175 s,
+      the watchdog saw no ping fail; `mount_over_protected` High signed
+      within a round, naming `fuse.nnf03` and its source, and cleared after.
+      (r1, before every reader was routed: two of the agent's threads
+      reached it, the admin socket stopped at 60 s, and the restart was
+      signed `stuck_unresponsive`, its stop no `sigint`.)
+    - debian13 (6.12.116), the final tree (r5): the same — 0 of the agent's
+      threads (489 of others), same pid, status answered, no ping failure,
+      the record High and cleared. (r2, r3: one `FUSE_STATX` of the open
+      sensor's mount roots, which `root_key` no longer asks.)
+    - debian13, rc2's stall forced (r6, the lab's `debug-walk-on-workers`:
+      every runtime worker walks a path under the FUSE by itself): the
+      workers held, the status lost at 30 and 60 s; the stuck recovery
+      signed `stuck_unresponsive` ("did not answer 2 STATUS pings in a row
+      … failing for 29 s"), the stop `stuck_unresponsive`; SIGKILL could not
+      end the agent (`stuck_recovery_failed`, High); the watchdog aborted the
+      FUSE's connection (`fuse_aborted`, High, naming the mount, its source
+      and the connection); the agent exited and was respawned (a new pid
+      answering) within 90 s, the FUSE gone. ubuntu2204 (5.15, r7): the
+      same chain — the status lost, `stuck_unresponsive` ("… failing for
+      30 s"), SIGKILL could not end the agent there either (the request
+      already read by the daemon), `stuck_recovery_failed` and
+      `fuse_aborted` High, respawned within 90 s.
+  - The review of #563 (round 1): what was still open — every signed append
+    opened its log through `/proc/self/fd/<dir>/<name>` (a FUSE over `/proc`
+    held the audit lock and the High record of that mount, a tmpfs lost
+    every signed record silently), reads of `/proc`/`/sys` the ratchet did
+    not see (the known-program walk, the socket re-bind chmod, the
+    quarantine, the kill walk's `procfs` crate, aya's per-thread CPU count,
+    the BTF loads), a tmpfs or cgroup2 subtree over the cgroup2 root
+    unrecorded and taken for cgroup v1 at a restart, WSL2's
+    `binfmt_misc/status` tmpfs a High at every boot, the watchdog's holds
+    removed unsigned. Done: the anchored names resolved beneath the held
+    directory fds (`nn_linux::anchored`, `openat2`/`renameat2`/`unlinkat`),
+    every chain writer's file operation its host's (`ChainHost::open`,
+    `symlink_metadata`, `read_dir_names`, `remove_file`), a signing failure a
+    degradation and the watchdog's (`LoopProgress.unsigned_ms`,
+    `signed_records_failed` High); the reads routed (`kernel_roots::chmod_fd`,
+    `reopen_fd`, `vmlinux_btf`, `antitamper_bpf::per_cpu`), the ratchet a
+    per-function and same-file taint of view paths plus third-party calls and
+    per-CPU receivers (38 sites at the review's head); stacked or bound
+    mounts at a view point High, refused at the start (`/proc/self/cgroup`
+    tells a unified host); the WSL mount exempted by type, point, parent and
+    source in PID 1's table; the holds removed only once signed; the FUSE
+    abort re-reads the mount first.
+  - Lab of the review round (debian13, 6.12.116, our own guest under a
+    lease, clean before, purged and powered off after; the mounts laid in
+    PID 1's namespace, the observer in a private one):
+    - f1 (FUSE over `/proc` 120 s, the round's first tree): the agent kept
+      its pid, `nn-admin status` answered at 15/45/75/105/118 s, no ping
+      failed; `mount_over_protected` (High) signed during the mount and
+      cleared; 2 runtime workers reached the FUSE (`FUSE_LOOKUP "1"`: the
+      systemd executor's listing of PID 1's descriptors; one `FUSE_STATX` of
+      the root). A tmpfs over `/proc` 60 s: the record High and cleared, no
+      signing error, no ping failure. X6 again (a FUSE over the cgroup2 root
+      180 s): 0 agent threads, same pid, status answered, High and cleared.
+    - f2 (the FUSE answering the agent with errors, 90 s): 2 agent requests
+      (`STATX` of the root at 32.8 s; `LOOKUP "self"`: the telemetry probe's
+      `current_exe`); then never answering: the probe's round held on
+      `current_exe`, the status lost at 15 and 45 s, the stuck recovery
+      restarted the agent (named) — routed since.
+    - f3/f4 (the final tree but one, two rounds): the signed chains kept
+      taking rows under the FUSE (audit +13/+14, heartbeat +5/+5), the
+      record High and cleared, no signing error, same pid; 1 runtime worker
+      held (`FUSE_STATX` of the root at 32–33 s), the status lost once at
+      45 s (1 ping failed), no restart. A tmpfs over `/proc`: High, audit
+      +7/+9, heartbeat +3/+3, no ping failure.
+    - f5/f6 (a trace of the agent's path calls, the install allowing bpf
+      tools): the one `FUSE_STATX` of the root at 28.5 s again, from a
+      runtime worker whose last traced calls were the telemetry probe's
+      self-test files and an audit-log read — its caller not found (the
+      trace lost the event); the open sensor's mount check, routed after
+      f3, was not it.
+  - Re-check 1 of #563: open — that `FUSE_STATX` was the open sensor's rule
+    refresh (every 60 s, on a runtime worker), walking the mass-write
+    carve-out `/proc/` from `/`: a one-worker runtime (a 1-vCPU host) stopped
+    whole, and the X6 chain came back; the canary writer opened
+    `/proc/1/root` by path; the ratchet missed four planted shapes; WSL2's
+    exemption could be named by any root. Done: `kernel_roots::walk_root`
+    (a view's walk starts at its anchored root, no mount crossed), the
+    refresher a thread of its own (`PumpThread::every`) with its build
+    bounded (`build_bounded`, 10 s, unjudged → `open_sensor_rules`), the
+    start's build bounded (else `sys_enter_openat`); the other periodic
+    by-path walks in `off_the_runtime`, the admin socket's look bounded;
+    the canary root and the tracefs reads anchored; WSL's exemption on a
+    kernel whose release names Microsoft; the ratchet's root-walk,
+    `*at`/`AT_FDCWD`, slice, view-returning and cross-file rules.
+  - Lab of re-check 1 (debian13, our own guest under a lease, clean before,
+    purged and powered off after; a cold boot with ONE vCPU, so the
+    agent's runtime has one worker; a FUSE over `/proc` laid in PID 1's
+    namespace that never answers the agent, 180 s): round r2b (this round's
+    tree): `nproc` 1; a FUSE over `/proc` that never answers the agent
+    (`EIO` to others), 180 s, laid in PID 1's namespace. No agent thread
+    sent it a request (`stalled=0`, 0 threads); `nn-admin status` answered
+    at 15/45/75/105/135/165/178 s, no ping failed, the same pid, no restart;
+    the rule refresh ran under the mount (one `rules refreshed`, none
+    unjudged); the signed chains took rows (audit +11, heartbeat +7), no
+    signing error; `mount_over_protected` (High) signed during the mount and
+    cleared after it. The deny self-test's step that opens a target's
+    `/proc/<pid>/mem` (the probe's child, by path) failed under the FUSE and
+    was signed as a `deny_selftest` degradation, as a step that cannot judge
+    is.
+  - Re-check 2 of #563: open — three by-path walks on critical threads
+    (the decision's `trusted_exe` open of `/proc/<pid>/exe`, the admin
+    socket's rebind in the serve loop after its bounded look, the entropy
+    sampler on `/proc/1/root` with an inline fallback onto the decision
+    thread), the probe's spawn on a worker, the systemd watch's leak; the
+    ratchet missed a field and an exec. Done, systematically: a census of
+    every view and own-directory path by thread (373 literal sites; 35
+    by-path uses, 23 on a critical thread, 28 fixed, 7 accepted with a
+    reason), each critical one moved beneath the anchored roots or onto a
+    bounded helper; the ratchet's field, exec, import, handed-closure,
+    callable and transitive-return rules (it lists 24 sites at 65bf765b);
+    the harness test of the critical loops under a FUSE answering one
+    lookup, the runtime on one worker.
+  - Lab of re-check 2: debian13 (6.12; our own guest under a lease, clean
+    before, purged and powered off after), a cold boot with ONE vCPU (the
+    agent's runtime on one worker), round r3b: a FUSE over `/proc` laid in PID
+    1's namespace for 180 s that answers the agent's first lookup (`ENOENT`)
+    and holds every later request of the agent (`EIO` to others). The agent
+    sent it no request at all (answered 0, held 0, 0 threads); `nn-admin
+    status` answered at each of 12 samples (15 s to 178 s), no watchdog ping
+    failed, the same pid (695), no restart; decisions flowed during the mount
+    — an encryptor's copy-then-delete of 60 documents (`NN-L-IMP-001`
+    Critical: the entropy sampler read the burst's files beneath the anchored
+    root) and a program dropped in `/dev/shm` and run (`R002` High); the
+    signed chains took rows (audit +14, heartbeat +7), no signing error;
+    `mount_over_protected` (High) signed during the mount and cleared after
+    it. As in r2b, the deny self-test's step that opens a target's
+    `/proc/<pid>/mem` from the probe's child (another process, by path) failed
+    under the FUSE and was signed as a `deny_selftest` degradation.
+  - Re-check 3 of #563: open — the namespace tests (the FUSE harness, the
+    watchdog's `by_path_bounds`, nn-linux's anchored, chain, open sensor and
+    caps tests) skipped in CI in 0.00 s (no capabilities in an unprivileged
+    user namespace on the runner); the integrity round, the watchdog's
+    markers and the `bpf-foreign` write by path in our own directories,
+    outside the census. Done: the CI test job enables the namespaces and a
+    namespace test fails instead of skipping under CI (ratchet
+    `namespace_tests_in_ci`); §47.1 states exactly what is not covered,
+    each item to be closed by the mount refusal, lot 357 (coordinator's
+    decision). No lab this round.
+  - Fix round 5 of #563 (the PR's KVM suites, 22.04 and 24.04): open —
+    four tests of `cgroup_join_privileged_e2e` failed, two causes. (1) The
+    decision thread's seccomp filter refuses `openat2` (R14c-1): every read
+    beneath the anchored roots failed there with `EPERM`, no exemption by
+    executable matched, and a debugger's attach or a `process_vm_writev`
+    into an exempt process tainted its mark but was not signed. (2) The
+    bpffs at `/sys/fs/bpf` is a mount below `/sys`: the tracker's pin
+    directories, made and removed by their parent beneath the `/sys` root,
+    were refused (`EXDEV`) — a planted directory left, the debug plant never
+    made. Done: refused or missing `openat2`, `kernel_roots` walks one name
+    at a time, no mount crossed (each step's mount from the kernel's cache,
+    nothing asked of a FUSE); `/sys/fs/bpf` anchored as a view of its own.
+    Named: `the_decision_thread_reads_the_kernel_s_views_under_its_filter`
+    (caps), `a_walk_without_openat2_crosses_no_mount_and_follows_no_magic_link`,
+    `a_pin_directory_s_parent_is_beneath_the_bpffs_root` (kernel_roots), the
+    FUSE harness's decision loop in its role under its filter with a FUSE
+    below `/proc` (stalled with the walk crossing mounts, read nothing on
+    92de8ac5). Lab (ubuntu2404, 6.8, installed as CI installs, then
+    `test-one cgroup_join_privileged_e2e`): 92de8ac5 12 passed, 4 failed —
+    the CI's four; with the fix 16 passed, 0 failed. Uninstalled
+    (`--purge`), no pin left, powered off.
+  - Re-check 4 of #563: open — (R4-1) the walk's last open went by name
+    through `self/fd/N`, no mount check: a tmpfs over `/proc/<agent
+    pid>/fd` gave the decision thread its files for every fact, a FUSE
+    there held its loop (the harness's `0 rounds — STALLED`); (R4-2) a
+    sysfs link with `..` was `ELOOP`, then a plain `openat` crossing mounts;
+    (P2) an exemption that could not be judged was "none", an injection
+    into that process a debug line. Done: the reopen through the thread's
+    own `thread-self/fd` (every name checked, kept per thread), the entry
+    checked, the file compared with the walk's (mount, inode); a link's
+    `..` walked from its directory, never above the root; `openat2`'s
+    `EAGAIN` (a `..` raced by a rename or a mount) tried again, then walked;
+    `Covering::Unjudged`, signed (`unjudged_injection`). Named:
+    `the_decision_s_facts_are_never_read_through_a_mount_over_its_descriptors`
+    (agent), `a_link_s_dotdot_is_walked_from_its_directory_as_openat2_walks_it`,
+    `a_sysfs_link_with_a_dotdot_crosses_no_mount_without_openat2`,
+    `a_dotdot_raced_by_renames_is_read_all_the_same`,
+    `a_descriptor_is_reopened_through_this_thread_s_own_directory`
+    (kernel_roots), `an_exemption_that_could_not_be_judged_is_not_none`
+    (rule_policy), `a_fact_that_cannot_be_read_is_told_from_a_process_gone`
+    (decision_host_linux); the FUSE harness with a fourth FUSE over the
+    agent's own `/proc/<pid>/fd`. Lab: none (no guest needed; the cases run
+    in a user and mount namespace in CI).
 - **Lot 356 — a window's held BPF load is always signed, never
   rate-limited (pre-alpha F3-8; C23; no level change).**
   - What was open (P2, every kernel): `bpf_held_load`, the record of a

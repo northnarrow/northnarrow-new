@@ -228,7 +228,10 @@ pub async fn serve_with_marker_path(
     // A stale socket (or anything else but a directory) at the path is
     // removed without following a link; the mode is forced to 0600 so a
     // slack umask never widens the socket (socket_watch::bind).
-    let (mut listener, bound) = socket_watch::bind(&socket_path)?;
+    // Lot 353 (re-check 2 of #563, R2-1): bound on a helper thread with a
+    // deadline — never by path on this task's worker
+    let (mut listener, bound) =
+        socket_watch::bind_within(&socket_path, socket_watch::BIND_DEADLINE).await?;
     info!(
         path = %socket_path.display(),
         "admin socket listening (mode 0600)"
@@ -250,12 +253,32 @@ pub async fn serve_with_marker_path(
     // External audit ASK-012 (NN-AUD-238): who may connect.
     let own_euid = own_euid(&socket_path);
     let mut foreign = ForeignPeers::new(socket_path.clone(), own_euid);
+    // Lot 353 (re-check 2 of #563, R2-1): the socket's check runs on a
+    // helper thread (the look and the rebind, whole); its answer is taken
+    // here when it comes — the loop never waits for it
+    let mut looking: Option<tokio::sync::oneshot::Receiver<socket_watch::Looked>> = None;
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = check.tick() => {
-                if let Some(rebound) = watch.check(audit_log.as_ref()) {
-                    listener = rebound;
+                if looking.is_none() {
+                    looking = watch.start_check();
+                } else {
+                    watch.still_held();
+                }
+                continue;
+            }
+            looked = async {
+                match looking.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            }, if looking.is_some() => {
+                looking = None;
+                if let Ok(looked) = looked {
+                    if let Some(rebound) = watch.finish(looked, audit_log.as_ref()) {
+                        listener = rebound;
+                    }
                 }
                 continue;
             }
@@ -955,7 +978,7 @@ pub(super) fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> 
         .ok()
         .map(|s| s.trim_end_matches('\n').to_string())
         .filter(|s| !s.is_empty());
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+    let exe = antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
     if let PeerPidfd::Open(fd) = &pidfd {

@@ -155,6 +155,14 @@ fn stop_result(stop_reason: &str) -> Result<()> {
             "the response dispatcher's thread ended; the agent stopped so the watchdog restarts it"
         );
     }
+    if stop_reason == nn_proto::watchdog_hold::STUCK_STOP_REASON {
+        // Lot 353 (pre-alpha Phase 3, X6): the watchdog's stuck recovery —
+        // its SIGINT after STATUS pings the agent did not answer — a
+        // failure, not a clean stop.
+        anyhow::bail!(
+            "the watchdog's stuck recovery stopped the agent (it did not answer its STATUS pings)"
+        );
+    }
     if stop_reason == "decision_thread_failed" {
         // R12b: no thread to judge on — a failure, not a clean stop.
         anyhow::bail!(
@@ -189,9 +197,15 @@ mod tests {
             "sensor_pump_exited",
             "response_dispatcher_exited",
             "decision_thread_failed",
+            // lot 353: the watchdog's stuck recovery
+            nn_proto::watchdog_hold::STUCK_STOP_REASON,
         ] {
             assert!(stop_result(r).is_err(), "{r}");
             assert!(!CLEAN_STOP_REASONS.contains(&r), "{r}");
         }
+        assert_eq!(
+            nn_proto::watchdog_hold::STUCK_STOP_REASON,
+            nn_evidence::heartbeat::STUCK_STOP_REASON
+        );
     }
 }

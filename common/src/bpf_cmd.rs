@@ -22,6 +22,10 @@
 
 /// `BPF_MAP_CREATE`.
 pub const BPF_MAP_CREATE: u32 = 0;
+/// Lot 353 (the review of #563, F2): `BPF_MAP_LOOKUP_ELEM` — the per-CPU
+/// maps' reads (`antitamper_bpf::per_cpu`, sized by a CPU count read once,
+/// never aya's per-thread read of `/sys`).
+pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 /// Lot 349 (the review of #558, F1): `BPF_MAP_UPDATE_ELEM` — of a prog
 /// array, it puts a program in a tail call's slot.
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
@@ -170,8 +174,9 @@ pub const PERF_EVENT_IOC_SET_BPF: u32 = 0x4004_2408;
 /// Every number above with its uapi name, for the checks against the
 /// header and the kernel's BTF. A command added above goes here too
 /// (`every_constant_is_listed` checks it).
-pub const UAPI: [(&str, u32); 23] = [
+pub const UAPI: [(&str, u32); 24] = [
     ("BPF_MAP_CREATE", BPF_MAP_CREATE),
+    ("BPF_MAP_LOOKUP_ELEM", BPF_MAP_LOOKUP_ELEM),
     ("BPF_MAP_UPDATE_ELEM", BPF_MAP_UPDATE_ELEM),
     ("BPF_MAP_GET_NEXT_KEY", BPF_MAP_GET_NEXT_KEY),
     ("BPF_PROG_LOAD", BPF_PROG_LOAD),

@@ -74,6 +74,33 @@ impl PumpThread {
         Ok(Self { handle, stop })
     }
 
+    /// Lot 353 (re-check 1 of #563, N1): `tick` every `every` (the first
+    /// `every` after the start) on a thread of its own named after `label`,
+    /// as [`Self::spawn`] — off the runtime's workers: a tick a mount holds
+    /// (a FUSE that does not answer on a path it walks) holds this thread
+    /// alone, never a worker the status and the admin socket answer on.
+    /// The stop flag is read at least every [`POLL_MS`] between ticks.
+    pub fn every(
+        label: &'static str,
+        every: Duration,
+        mut tick: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn(label, move |stop| {
+            let poll = Duration::from_millis(POLL_MS as u64);
+            let mut due = std::time::Instant::now() + every;
+            while !stop.load(Ordering::Acquire) {
+                let now = std::time::Instant::now();
+                if now >= due {
+                    tick();
+                    due = std::time::Instant::now() + every;
+                    continue;
+                }
+                std::thread::sleep((due - now).min(poll));
+            }
+            Ok(())
+        })
+    }
+
     /// Ask the pump to end (it does within [`POLL_MS`]).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -121,8 +148,9 @@ where
 }
 
 /// A telemetry task the multiplexer keeps (external audit SNS-001): a pump
-/// on a thread of its own (R12b), or a task of the runtime (the FIM and
-/// network drains, the open sensor's rule refresher, the loss recorder).
+/// on a thread of its own (R12b; lot 353: the open sensor's rule
+/// refresher too, [`PumpThread::every`]), or a task of the runtime (the
+/// FIM and network drains, the loss recorder).
 pub enum Pump {
     Task(JoinHandle<()>),
     Thread(PumpThread),
@@ -291,7 +319,8 @@ impl DropTrigger {
         {
             self.read_at = Some(now);
             let was = self.on;
-            self.on = std::fs::read_to_string(DEBUG_RING_DROP).is_ok_and(|t| drops(label, &t));
+            self.on = antitamper_bpf::kernel_roots::read_to_string(DEBUG_RING_DROP)
+                .is_ok_and(|t| drops(label, &t));
             if self.on != was {
                 tracing::warn!(
                     pump = label,
@@ -322,6 +351,44 @@ mod tests {
     use super::*;
 
     use crate::sensors::bus::channel;
+
+    /// Lot 353 (re-check 1 of #563, N1): a periodic tick on a thread of its
+    /// own — not before its first period, again at each, and the thread ends
+    /// within two polls of its stop.
+    #[test]
+    fn every_ticks_on_its_own_thread_and_stops() {
+        use std::sync::atomic::AtomicUsize;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&ticks);
+        let me = std::thread::current().id();
+        let other = Arc::new(AtomicBool::new(true));
+        let o = Arc::clone(&other);
+        let started = std::time::Instant::now();
+        let t = PumpThread::every("tick_test", Duration::from_millis(100), move || {
+            if std::thread::current().id() == me {
+                o.store(false, Ordering::SeqCst);
+            }
+            n.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(ticks.load(Ordering::SeqCst), 0, "not before its period");
+        while ticks.load(Ordering::SeqCst) < 3 {
+            assert!(started.elapsed() < Duration::from_secs(5), "it ticks");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "once a period"
+        );
+        assert!(other.load(Ordering::SeqCst), "on a thread of its own");
+        let stopped = std::time::Instant::now();
+        t.stop();
+        while !t.is_finished() {
+            assert!(stopped.elapsed() < STOP_WITHIN, "it stops");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     use nn_model::Event;
     use std::collections::VecDeque;
 

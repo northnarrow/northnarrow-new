@@ -86,8 +86,9 @@ impl LossWatch {
         let map = self.map.as_ref()?;
         let mut sum = 0u64;
         for slot in self.slots {
-            let per_cpu = map.get(slot, 0).ok()?;
-            sum = sum.saturating_add(per_cpu.iter().sum::<u64>());
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            let per_cpu = antitamper_bpf::per_cpu::sum(map, *slot).ok()?;
+            sum = sum.saturating_add(per_cpu);
         }
         Some(sum)
     }
@@ -228,9 +229,8 @@ pub fn total() -> u64 {
 fn read_map(map: &PerCpuArray<MapData, u64>) -> Vec<Option<u64>> {
     (0..RING_DROP_SLOTS)
         .map(|slot| {
-            map.get(&slot, 0)
-                .ok()
-                .map(|per_cpu| per_cpu.iter().sum::<u64>())
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            antitamper_bpf::per_cpu::sum(map, slot).ok()
         })
         .collect()
 }
@@ -369,11 +369,11 @@ const PACKAGE_MANAGER_SCRIPTS: &[&str] = &[
 /// a package manager. An unprivileged user running `dpkg -l` does not
 /// count, so a user cannot open the exemption for their own flood.
 fn package_transaction_running(proc_root: &std::path::Path) -> bool {
-    let Ok(dir) = std::fs::read_dir(proc_root) else {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let Ok(dir) = antitamper_bpf::kernel_roots::read_dir(proc_root) else {
         return false;
     };
-    dir.flatten().any(|e| {
-        let name = e.file_name();
+    dir.into_iter().any(|name| {
         let Some(pid) = name
             .to_str()
             .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
@@ -399,7 +399,7 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
         {
             return true;
         }
-        let Ok(cmdline) = std::fs::read(base.join("cmdline")) else {
+        let Ok(cmdline) = antitamper_bpf::kernel_roots::read_all(base.join("cmdline")) else {
             return false;
         };
         nn_core::posture::lineage::ExecIdentity::of_exec(&exe.to_string_lossy(), &argv_of(&cmdline))
@@ -415,8 +415,9 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
 /// transaction unlinks dnf's interpreter, which is still python.
 fn image_path(proc_pid: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::MetadataExt;
-    let exe = std::fs::read_link(proc_pid.join("exe")).unwrap_or_default();
-    let unlinked = std::fs::metadata(proc_pid.join("exe")).is_ok_and(|m| m.nlink() == 0);
+    let exe = antitamper_bpf::kernel_roots::read_link(proc_pid.join("exe")).unwrap_or_default();
+    let unlinked =
+        antitamper_bpf::kernel_roots::metadata(proc_pid.join("exe")).is_ok_and(|m| m.nlink() == 0);
     executed_path(exe, unlinked)
 }
 

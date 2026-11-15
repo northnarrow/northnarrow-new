@@ -883,7 +883,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 |---|---|
 | `unit_dropin` | a `.conf` drop-in for one of the units (the agent's, the watchdog's and, since lab PR 216, the watchdog's `OnFailure=` handler `northnarrow-watchdog-failed.service`) that `install.sh` did not create, in any directory of systemd's unit search path (`/etc`, `/run` and `/usr/lib/systemd/system`, `system.control`, `transient`, `system.attached`, the generator directories; also `northnarrow-.service.d` and `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` (lab PR 180) |
 | `limit_changed` | `oom_score_adj`, `memory.max`, `pids.max`, `cpu.max` or `cgroup.freeze` differs from boot; since R14c (lot 272) also the process's `no_new_privs`, its seccomp mode (`Seccomp:` 2, the unit's `SystemCallFilter=`/`SystemCallArchitectures=`/`LockPersonality=`) and its core size limit (`limit_unexpected` when, at boot, any differs from what the unit sets: 1, 2, 0) |
-| `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view), or — laid after the agent started — over a directory above them (a tmpfs over `/var/lib`, a bind over `/etc` or `/usr/local/bin`, a second bpffs on `/sys/fs/bpf`: the detail says what it hides; lab PR 180) |
+| `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view), or — laid after the agent started — over a directory above them (a tmpfs over `/var/lib`, a bind over `/etc` or `/usr/local/bin`, a second bpffs on `/sys/fs/bpf`: the detail says what it hides; lab PR 180); lot 353: a mount over the kernel's views the agent reads — at `/proc`, `/sys` or `/sys/fs/cgroup` of another file system than theirs (a FUSE over the cgroup2 root), or below `/proc` or `/sys` of a file system not the kernel's (a tmpfs over `/proc/sys/kernel`) — naming the mount, its file system and its source. Signed High (lot 353) |
 | `protected_mount_gone` | a mount those paths resolved through when the agent started is no longer mounted (a lazy unmount of a separate `/var`, of `/sys/fs/bpf`): they now resolve through the mount below (lab PR 180) |
 | `mountinfo_unreadable` | neither `/proc/1/mountinfo` nor the agent's own `/proc/self/mountinfo` can be read: the mount checks above are not running (lab PR 180; with only the first unreadable the agent checks its own namespace) |
 | `combat_reconcile` | at start, a `NORTHNARROW_COMBAT` chain left by a run killed or crashed in COMBAT was torn down (`result` `repaired`, with `rules_torn_down`), or could not be checked or torn down (`failed`: the host may still be isolated, [COMBAT_RECOVERY.md](COMBAT_RECOVERY.md)) (lab PR 180) |
@@ -896,8 +896,11 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `watchdog_exit` | the watchdog exited on a failure, with its exit status and reason (§3.9); systemd restarts it, as often as it fails (one record per run). Written by the watchdog just before it exits (lab PR 216) |
 | `watchdog_failed` | systemd put `northnarrow-watchdog.service` in the failed state — a start or stop job of the unit failed (a death of the process is restarted, without limit) — and no longer restarts it: the agent runs without a supervisor until the unit is started. Written by the unit's `OnFailure=` handler with systemd's `service_result`, `exit_code` and `exit_status` (lab PR 216, §3.9) |
 | `watchdog_gone` | the watchdog the agent had verified no longer runs (a crash, a kill, a stop), and what the agent finds in its place. Signed by the agent itself, within 30 s (lab PR 216) |
-| `stuck_recovery_failed` | the agent stopped answering (or its event loop stood still) and the watchdog's SIGINT then SIGKILL could not end it: the agent kept its `PROTECTED_PIDS` entry and its pidfile and stays supervised (lab PR 216) |
+| `stuck_recovery_failed` | the agent stopped answering (or its event loop stood still) and the watchdog's SIGINT then SIGKILL could not end it: the agent kept its `PROTECTED_PIDS` entry and its pidfile and stays supervised (lab PR 216). Signed High (lot 353) |
 | `event_loop_stalled` | the agent's admin socket answered three STATUS pings in a row while its event loop made no round (90 s or more); the watchdog recovers it like a hang (lab PR 216) |
+| `stuck_unresponsive` | the watchdog's stuck recovery stopped the agent: which ping failed, how many in a row and for how long (lot 353). The stop the recovery's SIGINT starts is `stuck_unresponsive` too — its `agent_stop` row and its heartbeat stop beat — never a clean `sigint` |
+| `fuse_aborted` | the stuck recovery's SIGKILL could not end the agent — a thread of it held in a FUSE request its daemon never answered — and the watchdog aborted that FUSE connection: only a FUSE over `/proc`, `/sys` (the cgroup tree) or the agent's own directories with requests waiting, never a user's FUSE elsewhere. The detail names the mount, its source, the connection and whether the abort took. Signed High (lot 353) |
+| `agent_restart_loop` | three stuck recoveries within 10 minutes: the agent is restarted again and again and blind meanwhile (a mount over a path it reads held for long, a starved host). Signed High; a degradation of `nn-admin status` for that run; the watchdog's unit status reads `DEGRADED: … (a restart loop)` (lot 353) |
 
 The memory limits are absolute (`MemoryHigh=9G`, `MemoryMax=11G`, sized
 for the model of the LLM advisor, removed in Wave 4, and not re-sized yet:
@@ -1223,6 +1226,32 @@ round — are a stuck agent (`event_loop_stalled`, then the SIGINT / SIGKILL
 recovery). An agent older than lab PR 216 closes the
 connection at that request; the watchdog then counts its STATUS answer
 alone, as before, and logs it once.
+
+**A stuck recovery names its cause** (lot 353). Before its SIGINT the
+watchdog records what failed — the STATUS pings the agent did not answer,
+how many in a row and for how long (or its event loop that stood still) —
+in a hold record the agent signs (`stuck_unresponsive`) and in a marker
+(`/run/northnarrow/watchdog.stuck`) the agent reads at that SIGINT: its
+stop is then `stuck_unresponsive`, a failure (`heartbeat watch` says
+`DEGRADED`, naming the stuck recovery), not an operator's clean `sigint`.
+Three stuck recoveries within 10 minutes are a restart loop
+(`agent_restart_loop`, High, a degradation of the status). A recovery whose
+SIGKILL cannot end the agent is `stuck_recovery_failed` (High, signed by the
+next agent: the watchdog holds no key); when a FUSE over `/proc`, `/sys` or
+the agent's directories holds it, the watchdog aborts that FUSE connection
+(`fuse_aborted`, High) and the agent comes back (self-protection, under
+every profile).
+
+**A mount over the kernel's views does not hold the agent** (lot 353). The
+agent reads `/proc`, `/sys` and the cgroup2 hierarchy beneath descriptors
+of their roots taken at its start: a mount laid over them since (a FUSE over
+`/sys/fs/cgroup` that never answers) is not walked; one below them is read
+only when it is the kernel's own file system, within a deadline. A root
+already covered when the agent starts is not read at all, and that is a
+signed degradation (`kernel_views`). The mount itself is
+`mount_over_protected` (High). The integrity and kernel-state rounds also
+run off the runtime's worker threads, so a read that blocks never holds the
+admin socket.
 
 **A recovery that fails does not unprotect.** The watchdog evicts the
 agent's pid from `PROTECTED_PIDS` only after its pidfd reports the exit.

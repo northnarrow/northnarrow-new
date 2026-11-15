@@ -74,7 +74,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{Array as AyaArray, MapData},
-    Btf, Ebpf,
+    Ebpf,
 };
 use common::wire::{FsGrant, InodeKey, KillGrant};
 use rand::Rng;
@@ -127,7 +127,7 @@ pub const WATCHDOG_COMM: &str = "northnarrow-wat";
 /// pidfile writer emits `<pid>\n`); rejects multi-line content
 /// because the canonical writer never produces such bytes.
 pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
-    let raw = match std::fs::read_to_string(path) {
+    let raw = match antitamper_bpf::kernel_roots::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!(
@@ -384,7 +384,7 @@ fn attach_reporting(
         );
     }
 
-    // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
+    // `antitamper_bpf::kernel_roots::vmlinux_btf()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
     // `attach_btf_id` the kernel expects, so without it no deny hook can
     // attach. Review 53: that is the same state as every deny hook
@@ -392,7 +392,7 @@ fn attach_reporting(
     // to be a WARN and an early `Ok`, and only the net sensor's own BTF
     // load kept such an agent from running (a tmpfs over /sys/kernel/btf
     // before a restart is enough to hide the file).
-    let btf = match Btf::from_sys_fs() {
+    let btf = match antitamper_bpf::kernel_roots::vmlinux_btf() {
         Ok(b) => b,
         Err(e) => {
             let infra = [format!(
@@ -1252,10 +1252,12 @@ const SHUTDOWN_EXE_PATHS: &[&str] = &[
 fn shutdown_exe_key() -> Option<InodeKey> {
     use std::os::unix::fs::MetadataExt;
     SHUTDOWN_EXE_PATHS.iter().find_map(|p| {
-        std::fs::metadata(p).ok().map(|m| InodeKey {
-            dev: filesystem::stat_dev_to_kernel_dev(m.dev()),
-            ino: m.ino(),
-        })
+        antitamper_bpf::kernel_roots::metadata(p)
+            .ok()
+            .map(|m| InodeKey {
+                dev: filesystem::stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            })
     })
 }
 
@@ -1408,10 +1410,12 @@ impl ExeIdentity {
     /// The file at `path` (symlinks followed).
     pub fn of_file(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| Self {
-            dev: m.dev(),
-            ino: m.ino(),
-        })
+        antitamper_bpf::kernel_roots::metadata(path)
+            .ok()
+            .map(|m| Self {
+                dev: m.dev(),
+                ino: m.ino(),
+            })
     }
 
     /// The program `pid` runs; `None` when it is gone or unreadable.

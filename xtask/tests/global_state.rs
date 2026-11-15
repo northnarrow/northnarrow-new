@@ -354,12 +354,121 @@ const STATICS: &[Kept] = &[
          per object",
     ),
     kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "VIEWS",
+        Process,
+        "lot 353: the descriptors of the kernel's views' roots (/proc, /sys, the cgroup2 root) \
+         the process anchored at its start, before any mount laid over them — one start per \
+         process; the tests build their own `Views`",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "FD_DIR",
+        Process,
+        "lot 353 (re-check 4 of #563, R4-1): a thread-local — the thread's own descriptor \
+         directory (`thread-self/fd` beneath the anchored /proc root, every name checked) the \
+         reopen of a descriptor goes through, opened once per thread (its tid's: again in a \
+         forked child)",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "CPUS",
+        HostFact,
+        "lot 353 (the review of #563, F2): the host's possible CPUs, read once beneath the \
+         anchored /sys root (aya re-read them by path on every fresh thread)",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "FAILING",
+        Process,
+        "lot 353 (the review of #563, F1): the process's signed logs whose appends fail now — \
+         one agent's evidence, told to its status and to the watchdog",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "UNSIGNED_SINCE_MS",
+        Process,
+        "lot 353: when the oldest failing signed append of the process began (FAILING's), for \
+         the watchdog's LoopProgress",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "TELL_DEGRADATIONS",
+        Process,
+        "lot 353: the agent process's start turned its signing degradations on (a test \
+         process leaves them off)",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "EPOCH",
+        Process,
+        "lot 353: the process's clock origin of UNSIGNED_SINCE_MS",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "WALKS",
+        Process,
+        "lot 353: the helper threads a path crossing a mount below a view holds blocked are the \
+         process's, bounded once for it (WALKS_MAX)",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "STALLED",
+        Telemetry,
+        "lot 353: the process's count of reads crossing a mount below a view that did not answer",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "REFUSED",
+        Telemetry,
+        "lot 353: the process's count of view paths refused for reaching a file system not the \
+         kernel's",
+    ),
+    kept(
         "crates/nn-linux/src/state_read.rs",
         "ROUND_READER",
         Process,
         "the kernel-state round's reader with a deadline (the re-check of #558, F7): one round \
          per agent process, and the helper threads a FUSE file leaves blocked are the process's, \
          bounded once for it (STALLED_MAX); the tests make their own TimedReader",
+    ),
+    kept(
+        "agent/src/pipeline/mod.rs",
+        "IN_FLIGHT",
+        Process,
+        "lot 353 (re-check 2 of #563, R2-5): whether a question to systemd's private socket is \
+         unanswered — one systemd and one blocking pool per agent process; the test hands its \
+         own flag to `systemd_state_with`",
+    ),
+    kept(
+        "crates/nn-linux/src/accounts.rs",
+        "READER",
+        Process,
+        "lot 353 (re-check 2 of #563): the bounded reader of the host's account files (one look \
+         unanswered at a time), beside the process's one account table (`TABLE`)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "BUILD_READER",
+        Process,
+        "lot 353 (re-check 1 of #563): the reader of the file-open sensor's rule builds, with a \
+         deadline, one unanswered at a time: one sensor per agent process, and a build a mount \
+         leaves blocked is the process's helper thread, bounded once for it; the tests make \
+         their own TimedReader",
+    ),
+    kept(
+        "crates/nn-linux/src/self_integrity.rs",
+        "WSL",
+        HostFact,
+        "lot 353 (re-check 1 of #563, N5): whether the running kernel is WSL's (its release, \
+         `uname`), read once",
+    ),
+    kept(
+        "crates/nn-linux/src/self_integrity.rs",
+        "WSL_FOR_TESTS",
+        Scratch,
+        "lot 353 (re-check 1 of #563, N5): a test's answer for `on_wsl` on its own thread, set \
+         and cleared within the test; never set outside the module's tests",
     ),
     kept(
         "crates/nn-linux/src/sensors/task_free.rs",
@@ -763,8 +872,22 @@ const STATICS: &[Kept] = &[
 /// and why each may: `module::function`.
 const START_CALLS: &[(&str, &str)] = &[
     (
+        "degradation::note",
+        "lot 353 (re-check 2 of #563, R2-3): the dispatcher of slow work's hold, a degradation \
+         of this process's status (noted without I/O from the decision thread)",
+    ),
+    (
+        "degradation::withdraw",
+        "lot 353 (re-check 2 of #563, R2-3): that hold withdrawn once its preparation answers",
+    ),
+    (
         "loop_progress::start",
         "fixes the event loop's heartbeat origin at the process's start",
+    ),
+    (
+        "chain_host_linux::tell_degradations",
+        "lot 353 (the review of #563, F1): the agent process's failing signed appends are \
+         degradations of its status from its start (a test process leaves them off)",
     ),
     ("loop_progress::tick", "one round of the event loop"),
     (

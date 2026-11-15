@@ -669,11 +669,10 @@ impl BudgetSpender {
     /// Each budget's window restarted at `now_ns` (`CLOCK_MONOTONIC`, the
     /// programs' clock) with every one of its records spent, on every CPU.
     pub fn spend(&self, now_ns: u64) -> Result<(), String> {
-        let cpus = aya::util::nr_cpus().map_err(|(w, e)| format!("{w}: {e}"))?;
+        // lot 353 (#563 F2): no per-thread read of /sys by path
         for m in self.0.lock().iter_mut() {
-            let values = aya::maps::PerCpuValues::try_from(vec![[now_ns, BUDGET_PER_SEC]; cpus])
+            antitamper_bpf::per_cpu::set(m, 0, [now_ns, BUDGET_PER_SEC], 0)
                 .map_err(|e| e.to_string())?;
-            m.set(0, values, 0).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -938,11 +937,14 @@ fn attempt_one(hook: &str, errno: i32, nonce: &str, plan: &Plan) -> String {
         // attach mode (`mem_open`): the hook records it; a read-mode access
         // (`environ`) it refuses without a record
         "ptrace_access_check" => word(
-            std::fs::File::open(format!("/proc/{t}/mem")).map(drop),
+            antitamper_bpf::kernel_roots::open(format!("/proc/{t}/mem"), libc::O_RDONLY).map(drop),
             errno,
         ),
         "inode_unlink" => word(std::fs::remove_file(d.join(file::UNLINK)), errno),
-        "inode_rmdir" => word(std::fs::remove_dir(d.join(file::RMDIR)), errno),
+        "inode_rmdir" => word(
+            antitamper_bpf::kernel_roots::remove_dir(d.join(file::RMDIR)),
+            errno,
+        ),
         "inode_rename" => word(
             std::fs::rename(
                 d.join(file::RENAME),
@@ -952,7 +954,7 @@ fn attempt_one(hook: &str, errno: i32, nonce: &str, plan: &Plan) -> String {
         ),
         "inode_setattr" => {
             let p = d.join(file::ATTR);
-            match std::fs::metadata(&p) {
+            match antitamper_bpf::kernel_roots::metadata(&p) {
                 Ok(m) => word(
                     std::fs::set_permissions(
                         &p,
@@ -980,7 +982,10 @@ fn attempt_one(hook: &str, errno: i32, nonce: &str, plan: &Plan) -> String {
                 .map(drop),
             errno,
         ),
-        "inode_mkdir" => word(std::fs::create_dir(d.join(format!("d.{nonce}"))), errno),
+        "inode_mkdir" => word(
+            antitamper_bpf::kernel_roots::create_dir(d.join(format!("d.{nonce}"))),
+            errno,
+        ),
         "inode_mknod" => match cstr(&d.join(format!("p.{nonce}"))) {
             // SAFETY: a FIFO at a NUL-terminated path of the round's.
             Some(c) => word(
@@ -1001,7 +1006,7 @@ fn attempt_one(hook: &str, errno: i32, nonce: &str, plan: &Plan) -> String {
         "inode_removexattr" => xattr_remove(&d.join(file::REMOVEXATTR), XATTR_NAME, errno),
         "inode_set_acl" => {
             let p = d.join(file::SET_ACL);
-            match std::fs::metadata(&p) {
+            match antitamper_bpf::kernel_roots::metadata(&p) {
                 Ok(m) => xattr_set(&p, ACL_NAME, &minimal_acl(m.permissions().mode()), errno),
                 Err(e) => format!("skipped: {e}"),
             }
@@ -1640,8 +1645,8 @@ pub fn make_move_cgroup() -> Option<PathBuf> {
     let root = antitamper_bpf::cgroup_guard::cgroup2_root()?;
     let dir = root.join(MOVE_CGROUP);
     // a leftover of a round (empty: its target is gone)
-    let _ = std::fs::remove_dir(&dir);
-    std::fs::create_dir(&dir).ok()?;
+    let _ = antitamper_bpf::kernel_roots::remove_dir(&dir);
+    antitamper_bpf::kernel_roots::create_dir(&dir).ok()?;
     Some(dir)
 }
 

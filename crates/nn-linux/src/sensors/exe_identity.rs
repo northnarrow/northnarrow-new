@@ -11,7 +11,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use aya::programs::Lsm;
-use aya::{Btf, Ebpf};
+use aya::Ebpf;
 use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
 use nn_model::Event;
 use parking_lot::Mutex;
@@ -131,7 +131,8 @@ fn tracepoint_fallback(points: &AttachPoints, why: &str) {
 }
 
 fn attach_lsm(ebpf: &mut Ebpf) -> Result<()> {
-    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the exec sensor")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf()
+        .context("loading vmlinux BTF for the exec sensor")?;
     let prog: &mut Lsm = ebpf
         .program_mut(EXEC_LSM_PROGRAM)
         .ok_or_else(|| anyhow!("program {EXEC_LSM_PROGRAM} missing from eBPF object"))?
@@ -217,7 +218,7 @@ fn fallback_exec_path(pid: u32, filename: &str, cut: bool) -> Option<String> {
     if filename.starts_with('/') && !cut {
         return Some(lexically_normal(filename));
     }
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+    antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }

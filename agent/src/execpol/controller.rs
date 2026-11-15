@@ -245,7 +245,7 @@ impl<K: KernelIo> Controller<K> {
             return;
         };
         let fill = dir.join("debug-execpol-fill");
-        if let Ok(text) = std::fs::read_to_string(&fill) {
+        if let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&fill) {
             let _ = std::fs::remove_file(&fill);
             let n = self.k.debug_fill(text.contains("env"));
             warn!(
@@ -255,7 +255,7 @@ impl<K: KernelIo> Controller<K> {
             );
         }
         let empty = dir.join("debug-execpol-empty");
-        if std::fs::symlink_metadata(&empty).is_ok() {
+        if antitamper_bpf::kernel_roots::symlink_metadata(&empty).is_ok() {
             let _ = std::fs::remove_file(&empty);
             let n = self.k.debug_empty();
             warn!(

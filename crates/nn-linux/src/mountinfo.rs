@@ -115,7 +115,19 @@ impl MountTable {
 
 /// The table at `path`, read as bytes (`std::fs::read`).
 pub fn read(path: &Path) -> std::io::Result<MountTable> {
-    std::fs::read(path).map(|b| parse(&b))
+    read_bytes(path).map(|b| parse(&b))
+}
+
+/// The largest mount table read (a container host's tens of thousands of
+/// mounts fit).
+pub const MOUNTINFO_MAX: u64 = 64 << 20;
+
+/// Lot 353: the bytes of a mount table (`/proc/<pid>/mountinfo`), read
+/// beneath the `/proc` root the start anchored
+/// ([`antitamper_bpf::kernel_roots`]) — a FUSE mounted over `/proc` since
+/// is not walked.
+pub fn read_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    antitamper_bpf::kernel_roots::read(path, MOUNTINFO_MAX)
 }
 
 /// Every line of `text` ([`MountTable`]); a last line without its newline
@@ -255,22 +267,31 @@ impl MountEntry {
     /// subvolume shows a device of its own). `None` for a FUSE mount
     /// ([`is_fuse`]: never `stat`ed — its daemon names the root and may
     /// stall the caller) and for a mount point that does not show it.
+    ///
+    /// Lot 353 (pre-alpha Phase 3, X6): a mount point under a kernel view is
+    /// opened beneath the root the agent's start anchored, and the open
+    /// directory is `stat`ed from the kernel's cache (`AT_STATX_DONT_SYNC`):
+    /// a FUSE mounted over this mount's point since (over `/sys/fs/cgroup`,
+    /// `/tmp`) is what the path reaches then, and its daemon was asked
+    /// (`FUSE_GETATTR`, `FUSE_STATX`) and never answered — now it is never
+    /// asked, and its device is not this mount's: `None`.
     pub fn root_key(&self) -> Option<(u64, u64)> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         if is_fuse(&self.fstype) {
             return None;
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(&self.mount_point)
-            .ok()?;
-        let st = file.metadata().ok()?;
-        let dev = (u64::from(libc::major(st.dev())) << 20) | u64::from(libc::minor(st.dev()));
+        let file = antitamper_bpf::kernel_roots::open_crossing(
+            &self.mount_point,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+        .ok()?;
+        let (dev, ino, mode) = antitamper_bpf::kernel_roots::stat_cached(&file).ok()?;
+        if mode & libc::S_IFMT != libc::S_IFDIR {
+            return None;
+        }
         if dev != self.kernel_dev() && self.fstype.as_bytes() != b"btrfs" {
             return None;
         }
-        Some((dev, st.ino()))
+        Some((dev, ino))
     }
 }
 
@@ -405,6 +426,71 @@ mod tests {
         // an empty field anywhere else is still not the kernel's shape
         let t = line("57 29 0:44  /home/u/mnt rw - fuse.x x rw");
         assert!(t.entries.is_empty());
+    }
+
+    /// Lot 353 (named, pre-alpha Phase 3 X6 on 6.12 and 5.15): the root key
+    /// of the cgroup2 mount is read beneath the root the start anchored and
+    /// from the kernel's cache — a mount laid over `/sys/fs/cgroup` since
+    /// (the FUSE the open sensor's and the exec quarantine's mount rounds
+    /// asked `FUSE_STATX` / `FUSE_GETATTR`, held) is never what it reads:
+    /// the key stays the cgroup2 root's (rc2 opened the cover by path and
+    /// found another device). In a user and mount namespace of a child,
+    /// skipped where the host refuses one.
+    #[test]
+    fn a_root_key_is_not_read_through_a_mount_laid_over_it() {
+        let _ = antitamper_bpf::kernel_roots::init();
+        let table = read(Path::new("/proc/self/mountinfo")).unwrap();
+        let Some(cg) = table
+            .entries
+            .iter()
+            .find(|m| m.mount_point == Path::new("/sys/fs/cgroup") && m.fstype == "cgroup2")
+            .cloned()
+        else {
+            return; // no cgroup2 root at /sys/fs/cgroup here
+        };
+        let Some(want) = cg.root_key() else {
+            return; // a cgroup namespace's view: no key to compare
+        };
+        // SAFETY: fork; the child mounts in namespaces of its own and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // SAFETY: the child's own namespaces; NUL-terminated strings.
+            let rc = unsafe {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                    || libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) != 0
+                    || libc::mount(
+                        c"none".as_ptr(),
+                        c"/sys/fs/cgroup".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    ) != 0
+                {
+                    99
+                } else if cg.root_key() == Some(want) {
+                    0
+                } else {
+                    10
+                }
+            };
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(rc) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 | 99 => {}
+            rc => panic!("the child failed with {rc}"),
+        }
     }
 
     /// Lot 311 (the review of #538, F1, F7): a FUSE mount is told by its

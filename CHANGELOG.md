@@ -946,6 +946,153 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 353 (pre-alpha Phase 3, case X6, P1): **a FUSE over `/proc`, `/sys`
+  or the cgroup root does not stall the agent's critical loops; stuck
+  restarts are named and a loop is signed** (mounts over the agent's own
+  directories: lot 357)
+  (`UPGRADE_NOTES_WAVE4.md` §47). A FUSE over `/sys/fs/cgroup` that never
+  answered held the integrity and kernel-state rounds in the kernel, on the
+  runtime's workers; the admin socket stopped answering, the watchdog
+  restarted the agent, and the log said `agent_stop` `sigint`.
+  - **Kernel views anchored at the start** (`antitamper_bpf::kernel_roots`):
+    `/proc`, `/sys` and the cgroup2 root opened once and checked to be the
+    kernel's (`fstatfs`, on a helper thread with a deadline); every read of
+    them opened beneath those roots (`openat2`, `RESOLVE_BENEATH |
+    RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`) — the shared readers
+    (`state_read`, `mountinfo`, `config_read`), the posture's process table,
+    the integrity and kernel-state rounds, the CPU watch, the sysctl judge's
+    root, the cgroup floors and guards, the responses' cgroups. A mount
+    below a view is read only when it is the kernel's, within 2 s; a FUSE,
+    tmpfs or disk below `/proc` or `/sys` is refused. A view covered at the
+    start is not read (`kernel_views` degradation). A ratchet
+    (`xtask/tests/kernel_views.rs`) forbids a path walk of `/proc` or `/sys`
+    outside it.
+  - **The two rounds run off the runtime's workers** (`off_the_runtime`).
+  - **`mount_over_protected` covers the kernel's views** (a mount at
+    `/proc`, `/sys`, `/sys/fs/cgroup` of another file system, or below
+    `/proc`/`/sys` of a file system not the kernel's), names the mount's
+    source, and is signed High.
+  - **The watchdog's stuck recovery names its cause**
+    (`stuck_unresponsive`: which ping failed, how many, for how long), the
+    agent's stop is `stuck_unresponsive` (not clean: `heartbeat watch`
+    DEGRADED), and three recoveries within 10 minutes are
+    `agent_restart_loop` (High, a status degradation);
+    `stuck_recovery_failed` is High.
+  - **The watchdog aborts a FUSE holding an agent SIGKILL cannot end**
+    (6.12: a FUSE request already read waits uninterruptibly): only one over
+    `/proc`, `/sys` or the agent's own directories with requests waiting,
+    signed `fuse_aborted` (High).
+  - The CPU count (`kernel_roots::available_parallelism`) and the mount
+    roots (`MountEntry::root_key`, cached `statx`) no longer walk or ask a
+    FUSE mounted over the cgroup tree.
+  - The review of #563 (§47.1): **no signed record walks `/proc`** — the
+    anchored names are resolved beneath the directories' descriptors
+    (`openat2`/`renameat2`/`unlinkat`, `nn_linux::anchored`) by every chain
+    writer (through `ChainHost`'s new `open`, `symlink_metadata`,
+    `read_dir_names`, `remove_file`), the flat chains, the COMBAT log and a
+    refused start's fallback chain: a FUSE over `/proc` held every signed
+    append under the audit lock, a tmpfs made them all fail silently. **A
+    signing failure is a degradation** (`signed_log`) and the watchdog's
+    (`LoopProgress.unsigned_ms`, `signed_records_failed` High). **Every
+    `/proc`/`/sys` read routed** (known-program walk, socket re-bind chmod,
+    quarantine, kill's walk without the `procfs` crate, copy-on-write trust,
+    ring-drop/package/systemd/kmod scans, the exec checks' `/proc/<pid>/exe`
+    and `environ`, the mount table's watch, `current_exe` (the telemetry
+    probe's round); per-CPU maps through
+    `antitamper_bpf::per_cpu`, the BTF through `kernel_roots::vmlinux_btf`),
+    the ratchet a per-function and same-file taint of view paths plus
+    third-party calls (it fails on all 38 sites of the review's head). **A mount stacked or
+    bound over `/proc`, `/sys` or the cgroup2 root** is High and not
+    anchored; a tmpfs over a unified host's cgroup2 root is refused at the
+    start, never taken for cgroup v1. **WSL2's `binfmt_misc/status` tmpfs**
+    is no longer a High at every boot. **The watchdog's holds are never
+    dropped** (removed once all signed). The FUSE abort re-reads the mount
+    first.
+  - Re-check 1 of #563 (§47.1): **the open sensor's rule refresh** places
+    the `/proc/` and `/sys/` carve-outs beneath the anchored roots
+    (`kernel_roots::walk_root`) and runs on a thread of its own, its build
+    bounded (10 s; a build that does not answer is the degradation
+    `open_sensor_rules`, the rules written stay) — it walked `/proc` from `/`
+    on a runtime worker, the lab's one `FUSE_STATX`, which stopped a
+    one-worker runtime. **The periodic by-path walks run off the workers**
+    (the link self-check, the telemetry probe, the installer window's
+    close, the shutdown identity, the program images, the watchdog
+    exemption); the admin socket's look is bounded (2 s). The canary's
+    writer and the tracefs reads beneath the anchored roots; WSL2's
+    exemption on WSL's kernel only. The ratchet refuses walks from `/`,
+    `*at` and `AT_FDCWD` calls on a view path, slices of view paths and
+    their items, view-returning functions, and cross-file calls handing a
+    view path (the re-check's four plants). Named: the watchdog's ping and
+    hold by path, `/proc/1/root` by path in the file responses, the probe's
+    exec by path, the systemd watch's blocking pool.
+  - Re-check 2 of #563 (§47.1): a census of every `/proc`, `/sys` and own
+    directory path by thread, and every by-path use on a critical thread
+    moved. **The decision thread** opens a rule exemption's
+    `/proc/<pid>/exe` beneath the anchored root and reads the account
+    database there, bounded (200 ms, once a second). **No ransomware burst
+    is judged with its I/O on the decision thread**: the sampler and the
+    copy check read the host's view beneath the anchored root; a full,
+    held (10 s) or stopped dispatcher of slow work leaves the burst judged
+    without its I/O (`unprepared`; degradation `ransomware_slow_work`).
+    **The admin socket's whole check** (look, clear, bind, mode) runs on a
+    helper, never in the serve loop; the start's bind is bounded. **The
+    watchdog's connect and records** run on helpers with deadlines. **No
+    exec walks a view**: workers by `execveat` of the image's descriptor
+    (R004's own launch `/dev/fd/<n>`), the deny self-test by the path
+    `/proc/self/exe` names; the probe's spawn off the runtime. The file
+    responses and the CoW journal through `kernel_roots`; one systemd
+    question in flight. The ratchet follows fields, execs, imported
+    helpers, closures handed a view, callables and transitive returns, and
+    fails on the re-check's plants; a harness test (`agent/tests/fuse_stall.rs`)
+    runs the critical loops under a FUSE that answers one lookup.
+  - Re-check 3 of #563 (§47.1): **the namespace tests run in CI.** The CI
+    test job enables unprivileged user namespaces (AppArmor's restriction
+    lifted on the runner), and under CI a test that runs in a user and
+    mount namespace fails instead of skipping (`fuse_testing::ran`; the
+    ratchet `xtask/tests/namespace_tests_in_ci.rs`): the FUSE harness and
+    the watchdog's `by_path_bounds` had "passed" there in 0.00 s. §47.1 now
+    states what the lot does not cover — the integrity round's, the
+    watchdog's markers' and `bpf-foreign`'s by-path steps in our own
+    directories, `trusted_exe` and `ran_host_file` on the decision thread,
+    the ratchet's bypasses — each to be closed by the mount refusal, lot
+    357.
+  - Fix round 5 of #563 (§47.2): **the decision thread reads the views
+    under its filter, and the bpffs is a view of its own.** The decision
+    thread's seccomp filter refuses `openat2` (R14c-1): every read beneath
+    the anchored roots failed there with `EPERM` — no process fact (uid,
+    cgroup, `exe … sha256`), so no exemption by executable matched and an
+    injection into an exempt process was not signed (the KVM suites'
+    `EXEMPTION REVOKED`). Refused, `kernel_roots` now walks one name at a
+    time (`openat` `O_PATH`, each step's mount read from the kernel's cache:
+    a mount below the root is `EXDEV` before anything is asked of it; the
+    file reopened through its checked descriptor). `/sys/fs/bpf`, a mount
+    below `/sys` that the `/sys` root does not cross, is anchored as its
+    own view: the start-in-cgroup tracker's pin directories beside the pin
+    root are made and removed again (a planted one was left, the debug
+    plant never made).
+  - Re-check 4 of #563 (§47.3): **the decision thread's last open of a
+    walk crosses no mount, a sysfs link's `..` is walked beneath the root,
+    and an injection into a process whose exemption could not be judged is
+    signed.** The one-name-at-a-time walk (fix round 5) opened the file it
+    reached again by name through `self/fd/N` beneath the `/proc` root — a
+    plain lookup of `<pid>/fd`: a tmpfs over `/proc/<agent pid>/fd` gave
+    the decision thread its files for every fact (the uid, the cgroup, the
+    `Tgid` its marks are read for), a FUSE there held it. It reopens through
+    the thread's own `thread-self/fd` now, every name of the way checked
+    (kept per thread), the entry itself procfs's, and the file opened is
+    compared with the one the walk reached (mount and inode: `EXDEV` on any
+    difference); a directory is opened again through its own descriptor
+    (`.`). `chmod_fd` and `reopen_fd` go the same way. A link whose target
+    climbs with `..` (`/sys/class/net/lo -> ../../devices/…`) was `ELOOP`,
+    then a plain `openat` that crossed mounts: the walk follows it from the
+    link's directory, never above the root, each step's mount checked; and
+    `openat2` beneath a root, whose `..` answers `EAGAIN` while any rename
+    or mount on the host races it, is tried again, then walked. An
+    exemption judged by a fact of the process that cannot be read while it
+    is there (a mount laid below `/proc/<pid>`) is no longer "none covers
+    it": code injected into that process is signed (NN-L-AT-001, `EXEMPTION
+    UNJUDGED`), saying which exemption and why. At the merge of #564: the
+    AppImage daemon's facts are read beneath the anchored `/proc` root.
 - Lot 356 (pre-alpha F3-8, P2): **a window's held BPF load is always
   signed, never rate-limited.** `bpf_held_load` (a program the content
   judge refuses outside a trusted-installer window, loaded inside one and

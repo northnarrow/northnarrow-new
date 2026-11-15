@@ -67,7 +67,7 @@ const MANAGER_PATHS: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/syste
 /// on Ubuntu 26.04 recorded `64769` (stat's 253:1) where the exec carried
 /// `265289729`, and the unlinked executor's launch was killed.
 fn file_id(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| {
+    antitamper_bpf::kernel_roots::metadata(path).ok().map(|m| {
         (
             crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
             m.ino(),
@@ -78,7 +78,7 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
 /// [`file_id`] of a file `owner` owns that no one else may write (`0` on
 /// the host; a test's own uid in its tree).
 fn trusted_file_id(path: &Path, owner: u32) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(path).ok()?;
     (m.is_file() && m.uid() == owner && m.mode() & 0o022 == 0).then(|| {
         (
             crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
@@ -91,7 +91,7 @@ fn trusted_file_id(path: &Path, owner: u32) -> Option<(u64, u64)> {
 /// tree), without the ` (deleted)` the kernel adds to an unlinked file:
 /// `/usr/lib/systemd/systemd-executor`.
 fn link_target(path: &Path, root: &Path) -> Option<String> {
-    let t = std::fs::read_link(path).ok()?;
+    let t = antitamper_bpf::kernel_roots::read_link(path).ok()?;
     let t = t.to_string_lossy();
     let t = t.strip_suffix(" (deleted)").unwrap_or(&t);
     let rel = Path::new(t).strip_prefix(root).ok()?;
@@ -269,11 +269,14 @@ pub fn seed(images: &ExecutorImages) -> usize {
 /// names an install path, ` (deleted)` or not), read through the
 /// descriptor: files root owns that no one else may write.
 fn held_executors(pid_dir: &Path, root: &Path, owner: u32) -> Vec<(u64, u64)> {
-    let Ok(fds) = std::fs::read_dir(pid_dir.join("fd")) else {
+    // lot 353 (the review of #563, F2; the lab's FUSE over /proc: this
+    // listing of PID 1's descriptors held a runtime worker): beneath the
+    // anchored /proc root
+    let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(pid_dir.join("fd")) else {
         return Vec::new();
     };
-    fds.flatten()
-        .map(|fd| fd.path())
+    fds.into_iter()
+        .map(|fd| pid_dir.join("fd").join(fd))
         .filter(|held| {
             link_target(held, root).is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()))
         })
@@ -291,15 +294,15 @@ fn held_by_user_managers(
     managers: &[(u64, u64)],
 ) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    let ns = |d: &Path| std::fs::read_link(d.join("ns/mnt")).ok();
+    let ns = |d: &Path| antitamper_bpf::kernel_roots::read_link(d.join("ns/mnt")).ok();
     let Some(init_ns) = ns(&proc_root.join("1")) else {
         return out;
     };
-    let Ok(dir) = std::fs::read_dir(proc_root) else {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let Ok(dir) = antitamper_bpf::kernel_roots::read_dir(proc_root) else {
         return out;
     };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
+    for name in dir {
         if name == "1"
             || !name
                 .to_str()
@@ -307,7 +310,7 @@ fn held_by_user_managers(
         {
             continue;
         }
-        let pid_dir = entry.path();
+        let pid_dir = proc_root.join(&name);
         let is_manager = file_id(&pid_dir.join("exe")).is_some_and(|id| managers.contains(&id))
             && ns(&pid_dir).is_some_and(|n| n == init_ns);
         if is_manager {

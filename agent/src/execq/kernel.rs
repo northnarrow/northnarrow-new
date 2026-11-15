@@ -260,8 +260,9 @@ impl Kernel {
     pub fn counters(&self) -> [u64; counter::SLOTS as usize] {
         let mut out = [0u64; counter::SLOTS as usize];
         for (i, slot) in out.iter_mut().enumerate() {
-            if let Ok(v) = self.counters.get(&(i as u32), 0) {
-                *slot = v.iter().copied().fold(0u64, u64::wrapping_add);
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            if let Ok(v) = antitamper_bpf::per_cpu::sum(&self.counters, i as u32) {
+                *slot = v;
             }
         }
         out
@@ -519,7 +520,7 @@ pub fn point_roots<'a>(
         if kind == 0 {
             continue;
         }
-        let Ok(st) = std::fs::metadata(path) else {
+        let Ok(st) = antitamper_bpf::kernel_roots::metadata(path) else {
             continue;
         };
         if !st.is_dir() {
@@ -541,7 +542,9 @@ pub fn point_roots<'a>(
 /// device), mount id `id`.
 #[cfg(test)]
 pub(crate) fn tmp_mount_line(id: u32) -> String {
-    let dev = std::fs::metadata("/tmp").unwrap().dev();
+    let dev = antitamper_bpf::kernel_roots::metadata("/tmp")
+        .unwrap()
+        .dev();
     format!(
         "{id} 1 {}:{} / /tmp rw - tmpfs tmpfs rw\n",
         libc::major(dev),

@@ -207,7 +207,7 @@ impl ExeHandle {
     /// `x (deleted)` was "nothing on disk to quarantine", and NEUTRALIZE
     /// left it runnable.
     pub fn of_pid(pid: u32) -> std::io::Result<Option<Self>> {
-        match fs::File::open(format!("/proc/{pid}/exe")) {
+        match antitamper_bpf::kernel_roots::open(format!("/proc/{pid}/exe"), libc::O_RDONLY) {
             Ok(f) => {
                 let uid = fsuid_of(pid);
                 Self::from_file(f).map(|h| Some(h.with_offender_uid(uid)))
@@ -222,7 +222,9 @@ impl ExeHandle {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         // SAFETY: geteuid(2) takes no argument and cannot fail.
         let me = unsafe { libc::geteuid() };
-        Self::from_file(fs::File::open(path)?).map(|h| h.with_offender_uid(Some(me)))
+        // lot 353 (#563): a path under /proc beneath the anchored root
+        Self::from_file(antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)?)
+            .map(|h| h.with_offender_uid(Some(me)))
     }
 
     /// Lot 312 (review F1): the uid the offender acted as ([`Self::of_pid`]
@@ -269,7 +271,8 @@ impl ExeHandle {
     /// shows it (a ` (deleted)` suffix kept): what the logs and the vault's
     /// record name when no name can be verified ([`Self::current_path`]).
     fn shown_path(&self) -> Option<PathBuf> {
-        fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .ok()
     }
 
     /// Where the inode is now, verified: the name the agent's own
@@ -290,7 +293,8 @@ impl ExeHandle {
             return None;
         }
         let p = self.shown_path()?;
-        let m = super::on_host_path(&p, |q| fs::symlink_metadata(q)).ok()?;
+        let m =
+            super::on_host_path(&p, |q| antitamper_bpf::kernel_roots::symlink_metadata(q)).ok()?;
         self.is_inode(m.dev(), m.ino()).then_some(p)
     }
 
@@ -643,11 +647,10 @@ fn restore_in_place(
         })
     };
     let (dev, ino, mode) = (want("dev")?, want("ino")?, want("mode")? as u32);
+    // lot 353 (re-check 2 of #563): the host's view beneath the anchored
+    // `/proc` root, never by a path walk of the `/proc` mounted now
     let held = super::on_host_path(path, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_PATH | libc::O_NOFOLLOW)
     })?;
     let m = held.metadata()?;
     let same_birth = match (inode["btime_ns"].as_i64(), btime_of(held.as_raw_fd())) {
@@ -671,20 +674,19 @@ fn restore_in_place(
             "the file was written since it was emptied — not overwritten",
         ));
     }
-    let via = format!("/proc/self/fd/{}", held.as_raw_fd());
+    // Lot 353 (the review of #563, F2): the held inode reached through the
+    // /proc root the start anchored, never the /proc mounted now.
     if m.mode() & 0o7777 != mode {
-        fs::set_permissions(&via, fs::Permissions::from_mode(mode))?;
+        antitamper_bpf::kernel_roots::chmod_fd(&held, mode)?;
     }
     if emptied {
-        let mut w = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&via)?;
+        let mut w = antitamper_bpf::kernel_roots::reopen_fd(&held, libc::O_WRONLY)?;
         w.write_all(&plaintext)?;
         w.sync_all()?;
     }
     // read back: the inode holds what was taken, with its mode
-    let now = fs::read(&via)?;
+    let mut now = Vec::new();
+    antitamper_bpf::kernel_roots::reopen_fd(&held, libc::O_RDONLY)?.read_to_end(&mut now)?;
     let mode_now = held.metadata()?.mode() & 0o7777;
     let sha = hex::encode(Sha256::digest(&now));
     if Some(sha.as_str()) != meta["sha256"].as_str() || mode_now != mode {
@@ -787,12 +789,11 @@ fn write_restored(plaintext: &[u8], out_path: &Path, cfg: &ExecutorConfig) -> st
         return Err(invalid("the destination must name a file"));
     };
     let dir = super::on_host_path(parent, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_DIRECTORY)
     })?;
-    if let Ok(real) = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+    if let Ok(real) =
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+    {
         let real = match real.strip_prefix("/proc/1/root") {
             Ok(rel) => Path::new("/").join(rel),
             Err(_) => real,
@@ -1107,10 +1108,8 @@ fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         };
         return Err(std::io::Error::other(format!("{kind}, not a regular file")));
     }
-    let f = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(format!("/proc/self/fd/{}", at.as_raw_fd()))?;
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let f = antitamper_bpf::kernel_roots::reopen_fd(&at, libc::O_RDONLY | libc::O_NONBLOCK)?;
     let mut bytes = Vec::new();
     f.take(MAX_SHELLS_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_SHELLS_BYTES {
@@ -1410,11 +1409,11 @@ fn neutralize_in_place(
         "no name of it verified"
     };
     if id.nlink == 1 || own {
-        let emptied = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(format!("/proc/self/fd/{}", handle.file.as_raw_fd()));
+        // lot 353 (#563 F2): beneath the anchored /proc root
+        let emptied = antitamper_bpf::kernel_roots::reopen_fd(
+            &handle.file,
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_NONBLOCK,
+        );
         if let Err(e) = &emptied {
             warn!(error = %e, "quarantine: emptying the held binary failed");
         }
@@ -1577,10 +1576,7 @@ fn remove_verified(
         return Err(QuarantineError::PathSwapped);
     };
     let dir = super::on_host_path(parent, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_DIRECTORY)
     })?;
     let cname =
         std::ffi::CString::new(name.as_bytes()).map_err(|_| QuarantineError::PathSwapped)?;

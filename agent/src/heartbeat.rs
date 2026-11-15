@@ -125,7 +125,7 @@ fn loss_now(s: &Sources) -> Vec<Option<u64>> {
 
 /// The kernel's boot id.
 fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }

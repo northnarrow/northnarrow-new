@@ -32,7 +32,7 @@
 //! the tracker.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -43,9 +43,14 @@ pub use nn_core::impact::entropy::*;
 pub struct FsSampler;
 
 /// The host's view of `p` (`/proc/1/root`), or `p` where it cannot be
-/// reached (tests).
+/// reached (tests). Lot 353 (re-check 2 of #563, R2-3): a path under
+/// `/proc` — every walk of it goes through `kernel_roots` ([`entries`],
+/// [`classify`]: beneath the `/proc` root the start anchored, the magic
+/// link followed as the kernel resolves it), never `std::fs` by path: a
+/// FUSE over `/proc` held the sampler (and, past a full queue, the decision
+/// thread) on `read_dir` and `open`.
 fn host_view(p: &Path) -> PathBuf {
-    if std::fs::metadata("/proc/1/root/").is_ok() {
+    if antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok() {
         crate::response::host_path(p)
     } else {
         p.to_path_buf()
@@ -94,23 +99,42 @@ pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf)
     let cutoff = SystemTime::now().checked_sub(since);
     let mut files: Vec<(PathBuf, Option<u32>)> = vec![(path.to_path_buf(), None)];
     if let Some(dir) = path.parent() {
-        if let Ok(entries) = std::fs::read_dir(host(dir)) {
-            for e in entries.take(DIR_SCAN_MAX).flatten() {
-                if files.len() >= SAMPLE_FILES_MAX * 2 {
-                    break;
-                }
-                let name = dir.join(e.file_name());
-                if name == path {
-                    continue;
-                }
-                let Ok(meta) = e.metadata() else { continue };
-                if meta.is_file() && meta.len() >= BLOCK as u64 && recent(&meta, cutoff) {
-                    files.push((name, None));
-                }
+        for (name, meta) in entries(dir, DIR_SCAN_MAX, host) {
+            if files.len() >= SAMPLE_FILES_MAX * 2 {
+                break;
+            }
+            if name == path {
+                continue;
+            }
+            if meta.is_file() && meta.len() >= BLOCK as u64 && recent(&meta, cutoff) {
+                files.push((name, None));
             }
         }
     }
     examine(files, host)
+}
+
+/// Lot 353 (re-check 2 of #563, R2-3): the first `max` entries of `dir`,
+/// each with its own metadata (no link followed), read through `host` and
+/// `kernel_roots` — beneath the anchored `/proc` root for the host's view,
+/// never by a path walk of the `/proc` mounted now. An entry gone between
+/// the listing and its look is left out.
+fn entries(
+    dir: &Path,
+    max: usize,
+    host: &dyn Fn(&Path) -> PathBuf,
+) -> impl Iterator<Item = (PathBuf, std::fs::Metadata)> {
+    let names = antitamper_bpf::kernel_roots::read_dir_max(host(dir), max).unwrap_or_default();
+    let dir = dir.to_path_buf();
+    let looks: Vec<(PathBuf, std::fs::Metadata)> = names
+        .into_iter()
+        .filter_map(|n| {
+            let name = dir.join(n);
+            let meta = antitamper_bpf::kernel_roots::symlink_metadata(host(&name)).ok()?;
+            Some((name, meta))
+        })
+        .collect();
+    looks.into_iter()
 }
 
 /// [`FsSampler::sample_copies`]'s work: `copy` first, then the other copies
@@ -198,7 +222,8 @@ pub fn sample_copies_dir(
 /// tree (`0777`) is where an encryptor walks.
 fn shared_dir(dir: &Path, host: &dyn Fn(&Path) -> PathBuf) -> bool {
     let shared = libc::S_ISVTX | libc::S_IWOTH;
-    std::fs::metadata(host(dir)).is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
+    antitamper_bpf::kernel_roots::metadata(host(dir))
+        .is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
 }
 
 /// Whose copies count in a directory (lab PR 238).
@@ -256,18 +281,13 @@ impl CopyScan<'_> {
             // not walked either).
             Owners::Nobody => return,
         };
-        let Ok(entries) = std::fs::read_dir((self.host)(dir)) else {
-            return;
-        };
-        for e in entries.flatten() {
+        for (name, meta) in entries(dir, self.budget, self.host) {
             if self.budget == 0 || files.len() >= SAMPLE_FILES_MAX * 2 {
                 break;
             }
             self.budget -= 1;
-            // The entry's own type (no link followed; `d_type` where the
-            // filesystem gives it, no `stat`).
-            let Ok(kind) = e.file_type() else { continue };
-            let name = dir.join(e.file_name());
+            // The entry's own type (no link followed).
+            let kind = meta.file_type();
             if kind.is_dir() {
                 if let Some(s) = subdirs.as_deref_mut() {
                     s.push(name);
@@ -277,7 +297,9 @@ impl CopyScan<'_> {
             if !kind.is_file() || name == self.skip {
                 continue;
             }
-            let leaf = e.file_name();
+            let Some(leaf) = name.file_name() else {
+                continue;
+            };
             let Some(stem) = leaf
                 .to_str()
                 .and_then(|l| l.strip_suffix(self.dot_suffix.as_str()))
@@ -287,7 +309,6 @@ impl CopyScan<'_> {
             if stem.is_empty() {
                 continue;
             }
-            let Ok(meta) = e.metadata() else { continue };
             if meta.len() < BLOCK as u64 || !recent(&meta, self.cutoff) {
                 continue;
             }
@@ -300,7 +321,7 @@ impl CopyScan<'_> {
             // Its original is gone: a copy still waiting for its deletion
             // (or a `.bak` kept beside its file) is not one.
             let gone = matches!(
-                std::fs::symlink_metadata((self.host)(&dir.join(stem))),
+                antitamper_bpf::kernel_roots::symlink_metadata((self.host)(&dir.join(stem))),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound
             );
             if gone {
@@ -342,13 +363,15 @@ enum Kind {
 }
 
 /// One file: `None` when it cannot be read, is no regular file of at
-/// least a block, or is not `owner`'s (when given).
+/// least a block, or is not `owner`'s (when given). Lot 353 (re-check 2 of
+/// #563, R2-3): opened through `kernel_roots` (the host's view beneath the
+/// anchored `/proc` root).
 fn classify(path: &Path, owner: Option<u32>) -> Option<Kind> {
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .ok()?;
+    let mut f = antitamper_bpf::kernel_roots::open(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
+    )
+    .ok()?;
     let meta = f.metadata().ok()?;
     if !meta.is_file() || meta.size() < BLOCK as u64 {
         return None;

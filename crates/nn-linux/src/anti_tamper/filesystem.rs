@@ -1022,7 +1022,7 @@ pub(crate) fn lsm_hook_absent(err: &anyhow::Error, hook: &str) -> bool {
 /// target, which a registration by `stat` would have write-denied — a
 /// `fim_baseline.jsonl -> /etc/passwd` made `/etc/passwd` unwritable.
 fn own_entry_meta(path: &Path) -> std::io::Result<std::fs::Metadata> {
-    let meta = std::fs::symlink_metadata(path)?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         warn!(
             link = %link_at(path).unwrap_or_else(|| path.display().to_string()),
@@ -1063,7 +1063,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     // name, a second key file).
     // External audit ATP-007: the directory itself (`lstat`); a link is not
     // registered (`attach` refuses the start for it).
-    match std::fs::symlink_metadata(etc_dir) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(etc_dir) {
         Ok(meta) if meta.is_dir() => {
             let key = InodeKey {
                 dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -1275,7 +1275,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
         let dir = state_dir.join(sub);
         // External audit ATP-007: the sub-directory itself, never a link's
         // target (`refuse_linked_state_dir` already refused one at boot).
-        match std::fs::symlink_metadata(&dir) {
+        match antitamper_bpf::kernel_roots::symlink_metadata(&dir) {
             Ok(meta) if meta.is_dir() => {
                 let key = InodeKey {
                     dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -1435,7 +1435,7 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
                 continue;
             }
         }
-        let meta = match std::fs::metadata(&path) {
+        let meta = match antitamper_bpf::kernel_roots::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Review 26: the list spans both install layouts, so the
@@ -1502,7 +1502,7 @@ pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<us
         paths.push(entry.path());
     }
     for path in &paths {
-        let meta = match std::fs::symlink_metadata(path) {
+        let meta = match antitamper_bpf::kernel_roots::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, path = %path.display(), "anti-tamper FS: cannot stat a bpffs pin — not protected");
@@ -1932,7 +1932,8 @@ fn ensure_quarantine_dirs(dir: &Path) -> Result<()> {
             return Err(anyhow!("{link}: the vault is not created through a link"));
         }
     }
-    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let is_dir =
+        |p: &Path| antitamper_bpf::kernel_roots::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     if is_dir(&vault) {
         return Ok(());
     }
@@ -1972,9 +1973,9 @@ fn state_dir_own_entries() -> Vec<PathBuf> {
 /// `"<path> -> <target>"` when `path` itself is a symbolic link (its final
 /// component; `lstat`), else `None`.
 fn link_at(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path).ok()?;
     meta.file_type().is_symlink().then(|| {
-        let target = std::fs::read_link(path)
+        let target = antitamper_bpf::kernel_roots::read_link(path)
             .map(|t| t.display().to_string())
             .unwrap_or_else(|_| "?".to_string());
         format!("{} -> {target}", path.display())
@@ -1993,7 +1994,7 @@ fn link_at(path: &Path) -> Option<String> {
 /// [`attach`] before the registration. A missing directory is fine: the
 /// attach creates it.
 pub fn refuse_linked_state_dir(dir: &Path) -> Result<()> {
-    let links: Vec<String> = match std::fs::symlink_metadata(dir) {
+    let links: Vec<String> = match antitamper_bpf::kernel_roots::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(anyhow!(e).context(format!("lstat {}", dir.display()))),
         Ok(m) if m.file_type().is_symlink() => link_at(dir).into_iter().collect(),
@@ -2180,8 +2181,8 @@ pub(crate) fn release_runtime_inodes(pin_root: &Path, keys: &[(u64, u64)]) -> Re
 /// rename or setattr by a foreign caller outside the trusted-installer
 /// window (the start-in-cgroup tracker's registered pins).
 pub(crate) fn register_agent_file(ebpf: &mut Ebpf, path: &Path) -> Result<()> {
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         return Err(anyhow!("{} is not a regular file", path.display()));
     }
@@ -2495,14 +2496,32 @@ impl StateDirProtection {
     }
 }
 
-/// Lot 296: `path` resolves outside `dir` (both resolved: a log's path is
-/// anchored through `/proc/self/fd/<n>`, the directory it was opened in).
-/// `false` when either does not resolve: the caller's own check decides.
+/// Lot 296: `path` is outside `dir`. Lot 353 (the review of #563, F1): a
+/// log's path is its own again (its name resolved beneath the directory the
+/// writer anchored, never through `/proc/self/fd/<n>`), so it is told by
+/// its names — no `canonicalize`, which walked the path from `/` (and
+/// `/proc`, where a FUSE held the rotation's locks): under `dir` with no
+/// `..`, and no symbolic link at its last name (a link in the directory to
+/// a file elsewhere is not the directory's). A name that does not resolve
+/// is the caller's own check.
 fn outside_dir(path: &Path, dir: &Path) -> bool {
-    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
-        (Ok(p), Ok(d)) => !p.starts_with(&d),
-        _ => false,
+    use std::path::Component;
+    if !path.starts_with(dir) || path.components().any(|c| c == Component::ParentDir) {
+        return true;
     }
+    crate::anchored::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// The `PROTECTED_INODES` key of the file at `path`, its name resolved
+/// beneath its anchored directory (lot 353: never by a path walked from
+/// `/`).
+fn key_of(path: &Path) -> Result<InodeKey> {
+    let meta = crate::anchored::symlink_metadata(path)
+        .with_context(|| format!("symlink_metadata({})", path.display()))?;
+    Ok(InodeKey {
+        dev: crate::fim::attach::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    })
 }
 
 impl crate::chainlog::ProtectionManager for StateDirProtection {
@@ -2531,7 +2550,7 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
             );
             return Ok(());
         }
-        let key = crate::fim::attach::key_for_path(path)?;
+        let key = key_of(path)?;
         // at-authz-1: rotated chain logs are integrity files — WRITE+MUTATE.
         self.inodes
             .lock()
@@ -2539,7 +2558,7 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
     }
 
     fn release(&self, path: &Path) -> Result<()> {
-        let key = crate::fim::attach::key_for_path(path)?;
+        let key = key_of(path)?;
         let mut inodes = self.inodes.lock();
         // An archive sealed before review 81 may have no key: nothing to drop.
         if inodes.contains(key) {
@@ -2555,9 +2574,11 @@ mod tests {
     use tempfile::TempDir;
 
     /// Lot 296: the state directory's protection registers its own files
-    /// only — one named through the anchor of its directory
-    /// (`/proc/self/fd/<n>`, as the chain logs name theirs) is inside; a
-    /// test agent's log in a directory of its own, or a link out, is not.
+    /// only — one named through the anchor of its directory (as the chain
+    /// logs name theirs; lot 353: its own path, resolved beneath the
+    /// anchored descriptor — it was `/proc/self/fd/<n>`) is inside; a test
+    /// agent's log in a directory of its own, a `..` out, or a link out, is
+    /// not.
     #[test]
     fn only_the_state_directory_s_files_are_its_to_register() {
         let state = TempDir::new().unwrap();
@@ -2571,18 +2592,18 @@ mod tests {
         assert!(!outside_dir(&inside, state.path()));
         assert!(outside_dir(&elsewhere, state.path()));
         // anchored, as the writers name their files
-        let fd = std::fs::File::open(&sub).unwrap();
-        let anchored = PathBuf::from(format!(
-            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
-            fd.as_raw_fd()
-        ));
+        let anchored = crate::anchored::anchor(&inside);
+        assert!(crate::anchored::is_anchored(&anchored));
         assert!(!outside_dir(&anchored, state.path()));
-        let fd2 = std::fs::File::open(other.path()).unwrap();
-        let anchored2 = PathBuf::from(format!(
-            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
-            fd2.as_raw_fd()
-        ));
+        let anchored2 = crate::anchored::anchor(&elsewhere);
         assert!(outside_dir(&anchored2, state.path()));
+        // a `..` out of the directory is not its file
+        let up = state
+            .path()
+            .join("..")
+            .join(other.path().file_name().unwrap())
+            .join("actions.jsonl.manifest.jsonl");
+        assert!(outside_dir(&up, state.path()));
         // a link in the directory to a file elsewhere is not its file
         let link = sub.join("link.jsonl");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();

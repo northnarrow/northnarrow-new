@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
@@ -125,7 +124,8 @@ pub struct Mismatch {
 /// offset. Never panics; never reads kernel memory (BTF is a static
 /// description). See [`RevalidateOutcome`] for how the caller acts.
 pub fn revalidate_offsets() -> RevalidateOutcome {
-    let data = match fs::read(VMLINUX_BTF) {
+    // lot 353: beneath the `/sys` root the agent's start anchored
+    let data = match antitamper_bpf::kernel_roots::read_all(VMLINUX_BTF) {
         Ok(d) => d,
         Err(e) => {
             return RevalidateOutcome::SkippedNoBtf {
@@ -377,7 +377,8 @@ pub fn resolve_fields_from(
     path: &std::path::Path,
     queries: &[(&str, &[&str])],
 ) -> Result<Vec<Result<usize, String>>, String> {
-    let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let data = antitamper_bpf::kernel_roots::read_all(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let btf = Btf::parse(&data).map_err(|e| e.to_string())?;
     Ok(queries
         .iter()
@@ -390,7 +391,7 @@ pub fn resolve_fields_from(
 /// `/sys/kernel/btf/vmlinux`). Powers `northnarrow-agent --btf-check`
 /// and the computed kernel matrix (multi-kernel, level 2).
 pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
-    let data = match fs::read(path) {
+    let data = match antitamper_bpf::kernel_roots::read_all(path) {
         Ok(d) => d,
         Err(e) => {
             return ResolveOutcome::SkippedNoBtf {
@@ -407,7 +408,8 @@ pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
     let dir = (path.file_name() == Some(std::ffi::OsStr::new("vmlinux")))
         .then(|| path.parent())
         .flatten();
-    let modules = |m: &str| dir.and_then(|d| fs::read(d.join(m)).ok());
+    let modules =
+        |m: &str| dir.and_then(|d| antitamper_bpf::kernel_roots::read_all(d.join(m)).ok());
     resolve_with(
         &btf,
         REVALIDATE,
@@ -898,11 +900,14 @@ pub fn resolve_tracepoint_fields_from(roots: &[&str], fs_magic: u64) -> Tracepoi
 /// file mounted over one path is caught whatever its root is).
 fn read_format_file(path: &str, fs_magic: u64) -> std::io::Result<String> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    // lot 353 (re-check 1 of #563, the ratchet's mini-hunt): beneath the
+    // `/sys` root the start anchored, tracefs crossed within the deadline
+    // (a by-path open walked the `/sys` mounted now); a temporary root (the
+    // tests') by path
+    let file = antitamper_bpf::kernel_roots::open_crossing(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
     match crate::fs_type::magic_of_file(&file) {
         Some(m) if m == fs_magic => {}
         Some(m) => {
@@ -1943,6 +1948,7 @@ fn name_at(strings: &[u8], off: u32) -> Result<&str, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const UPSTREAM_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 310\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\n\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:16;\tsize:4;\tsigned:1;\n";
     const RHEL9_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 295\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\tfield:unsigned char common_preempt_lazy_count;\toffset:8;\tsize:1;\tsigned:0;\n\n\tfield:__data_loc char[] filename;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:16;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:20;\tsize:4;\tsigned:1;\n";

@@ -63,7 +63,7 @@ impl Host {
     /// This host's (`/proc/meminfo`, `/sys/devices/system/cpu/online`,
     /// `pid_max` and `threads-max`); what cannot be read is taken as large.
     pub fn read() -> Self {
-        let mem_total = std::fs::read_to_string("/proc/meminfo")
+        let mem_total = crate::kernel_roots::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|t| {
                 t.lines().find_map(|l| {
@@ -72,13 +72,13 @@ impl Host {
                 })
             })
             .unwrap_or(u64::MAX);
-        let cpus = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        let cpus = crate::kernel_roots::read_to_string("/sys/devices/system/cpu/online")
             .ok()
             .map(|t| cpu_list(&t).len() as u32)
             .filter(|n| *n > 0)
             .unwrap_or(u32::MAX);
         let read = |p: &str| {
-            std::fs::read_to_string(p)
+            crate::kernel_roots::read_to_string(p)
                 .ok()
                 .and_then(|t| t.trim().parse::<u64>().ok())
                 .unwrap_or(u64::MAX)
@@ -299,13 +299,13 @@ pub fn floors_due(dirs: &[PathBuf]) -> Vec<FloorDue> {
                 continue;
             };
             let path = dir.join(name);
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let Ok(meta) = crate::kernel_roots::symlink_metadata(&path) else {
                 continue;
             };
             if !meta.file_type().is_file() {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = crate::kernel_roots::read_to_string(&path) else {
                 continue;
             };
             if !below_floor(kind, &text, &floor) {
@@ -361,11 +361,11 @@ pub fn restore_floors(
             continue;
         }
         for w in &d.writes {
-            if let Err(e) = std::fs::write(&d.path, format!("{w}\n")) {
+            if let Err(e) = crate::kernel_roots::write(&d.path, format!("{w}\n")) {
                 r.why = Some(format!("writing {w:?}: {e}"));
             }
         }
-        let back = std::fs::read_to_string(&d.path).unwrap_or_default();
+        let back = crate::kernel_roots::read_to_string(&d.path).unwrap_or_default();
         let kind = limit_kind_of(d.name);
         r.ok = r.why.is_none() && !below_floor(kind, &back, &d.floor);
         if !r.ok && r.why.is_none() {

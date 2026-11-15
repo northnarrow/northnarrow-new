@@ -1204,7 +1204,7 @@ pub fn freeze_map(map: &MapData) -> std::result::Result<bool, String> {
         map_fd: u32,
     }
     let fd = map.fd().as_fd().as_raw_fd();
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+    let info = antitamper_bpf::kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .map_err(|e| format!("its fdinfo: {e}"))?;
     match fdinfo_frozen(&info) {
         Some(true) => return Ok(false),
@@ -1287,7 +1287,7 @@ pub fn resolve_loader_opt_outs(
 /// A regular file's `(st_dev, st_ino)` through `path` (a symlink followed).
 fn stat_executable(path: &str) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
+    let m = antitamper_bpf::kernel_roots::metadata(path)?;
     if !m.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -1504,7 +1504,7 @@ fn dump_verifier_log(program: &str, e: &anyhow::Error) {
         return;
     }
     let path = format!("/run/northnarrow/verifier-{program}.log");
-    if let Err(w) = std::fs::write(&path, format!("{e:#}")) {
+    if let Err(w) = antitamper_bpf::kernel_roots::write(&path, format!("{e:#}")) {
         warn!(error = %w, path, "BPF self-defence: could not write the verifier log");
     }
 }
@@ -1574,13 +1574,9 @@ impl BpfObj {
 /// (`/proc/self/fd`, each read from `/proc/self/fdinfo`).
 fn held_objects() -> Vec<BpfObj> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-        for entry in entries.flatten() {
-            let Some(fd) = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.parse::<i32>().ok())
-            else {
+    if let Ok(entries) = antitamper_bpf::kernel_roots::read_dir("/proc/self/fd") {
+        for name in entries {
+            let Some(fd) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
                 continue;
             };
             if let Some(o) = obj_from_fdinfo(fd) {
@@ -1593,7 +1589,8 @@ fn held_objects() -> Vec<BpfObj> {
 
 /// The BPF object `/proc/self/fdinfo/<fd>` describes, if any.
 fn obj_from_fdinfo(fd: i32) -> Option<BpfObj> {
-    let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+    let text =
+        antitamper_bpf::kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
     parse_obj_fdinfo(&text)
 }
 
@@ -1651,7 +1648,7 @@ pub fn own_pin_dirs(pin_root: &Path) -> Vec<PathBuf> {
         if !entry.file_name().as_bytes().starts_with(name.as_bytes()) {
             continue;
         }
-        if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+        if antitamper_bpf::kernel_roots::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
             out.push(entry.path());
         }
     }
@@ -1702,7 +1699,7 @@ fn walk_pins(
         let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
         paths.sort();
         for path in paths {
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(&path) else {
                 continue;
             };
             if meta.is_dir() && depth < PIN_WALK_DEPTH {
@@ -1948,11 +1945,14 @@ impl BpfGuard {
                 if guard.stopping() {
                     return;
                 }
-                let live: HashSet<u32> = live_links(own.pin_root.as_deref())
-                    .into_iter()
-                    .filter(|(_, prog)| *prog != 0)
-                    .map(|(id, _)| id)
-                    .collect();
+                // lot 353 (re-check 1 of #563): the pins walked by path
+                // (`/sys/fs/bpf`) — off the runtime's worker
+                let live: HashSet<u32> =
+                    crate::runtime::off_the_runtime(|| live_links(own.pin_root.as_deref()))
+                        .into_iter()
+                        .filter(|(_, prog)| *prog != 0)
+                        .map(|(id, _)| id)
+                        .collect();
                 for id in &ids {
                     // re-read per link: the stop can begin during the walk
                     if guard.stopping() {
