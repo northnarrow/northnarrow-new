@@ -2778,13 +2778,24 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   1 time in 3 on 6.8; it held on every kernel. Now the record is written
   through no budget, one per held program.
 - **No room for the record, no load.** When the agent's denial ring has no
-  room for a held load's record, the load is refused (`EPERM`) and its id
-  let go, counted in the new ring-drop counter `held_load_unsigned`
-  (signed, not a security ring: the program was never handed out; the lost
-  reservation is counted in `fs_protect`, which is one). A held program
-  that nothing names does not exist any more. An installer that sees a
-  window load refused with `EPERM` and `held_load_unsigned` > 0 in `nn-admin
-  status` met a full ring: retry the load.
+  room for a held load's record, the load is refused (`EPERM`), counted in
+  the new ring-drop counter `held_load_unsigned` (signed, not a security
+  ring: the load's descriptor was never handed out; the lost reservation is
+  counted in `fs_protect`, which is one; the journal's line says
+  "REFUSED", not "lost"). Its id stays held: the kernel gives the program
+  its id before the hook runs, and a process that took a handle on it by id
+  in between keeps it alive — its runs and attaches outside a window are
+  refused and signed (`bpf_held_use`), and once the window closes the
+  kernel-state round signs it once (`bpf_held_load`, "still loaded after
+  the window"); the round releases the id when it is no longer loaded. An
+  installer that sees a window load refused with `EPERM` and
+  `held_load_unsigned` > 0 in `nn-admin status` met a full ring: retry the
+  load. Residual (lot 349's, unchanged): with the held set full (1,024
+  ids) there is no room to hold the id, and a handle taken by id in the
+  same race keeps the refused program un-held — the load's `bpf_held_use`
+  record (held set full) names it, and the cross-view signs it
+  `bpf_unseen` once it is in two enumerations (its load was refused before
+  the hook recorded it).
 - **A sole trace in the agent too.** The held load, its "still loaded after
   the window" record and the kernel-state round's findings (`kernel_taint`,
   `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined`) are the
@@ -2793,9 +2804,30 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   spent it, and the held load's record was a held count naming a process,
   not the program), never coalesced or capped by the event bus, and they
   wait for room in its tamper queue instead of being dropped after 50 ms.
-  None changes the posture: they stay non-decisive. A held program's
-  refused uses (`bpf_held_use`) keep the non-decisive budget — a caller
-  repeats them at will, and each is refused whatever its record.
+  They take no token of that budget either: a flood of them no longer
+  turns root's next decisive refusals into held counts. None changes the
+  posture: they stay non-decisive. A held program's refused uses
+  (`bpf_held_use`) keep the non-decisive budget — a caller repeats them at
+  will, and each is refused whatever its record.
+- **The kernel-state round's quota.** Root makes BPF objects at will: tens
+  of thousands of tiny programs loaded faster than the agent's seen map
+  keeps them come back as one `bpf_unseen` record each. A round (every
+  5 s) now signs at most 32 findings of each kind by name — a program of a
+  type refused outside a window, and a link whose program is hidden,
+  first — and the rest in ONE `sole_trace_summary` record (NN-L-AT-001,
+  High; Medium when all are the start's baseline) with each kind's count.
+  Nothing is dropped silently: the counts are in that signed record and in
+  `nn-admin status --key` (`kernel-state quota`, JSON
+  `kernel_state_held_back`), and each BPF object held back is listed in
+  `/run/northnarrow/bpf-foreign` with the state `suppressed`. A host with
+  thousands of BPF programs (Cilium, Calico) gets, at the agent's start, 32
+  `bpf_baseline` records and one Medium summary instead of thousands of
+  records.
+- **`PROTOCOL_VERSION` is 3** (§48): the status reply grew by
+  `kernel_state_held_back`; a version 2 envelope is refused as unsupported
+  (`OLDEST_PROTOCOL_VERSION` 3). No effect at run time today — the live
+  admin socket speaks bare frames — and an older `nn-admin` reads the
+  newer reply without the field: use the `nn-admin` of the agent's release.
 - **No action on upgrade.** The ring-drop counters gain one slot
   (`held_load_unsigned`, slot 31) at the end: readers by name are unchanged.
 
@@ -2810,4 +2842,5 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 | `bpf_prog_opt_out`, `sysctl_opt_out` | no: the signed per-rule policy lets it through | no: the operator's signed choice; the content judge still refuses a signalling or overriding program; recorded once a second per caller | minor |
 | `cgroup_join`, `exempt_injection` | no | no: the kernel's mark already strips the exemption | minor |
 | `bpf_held_load` (and its outliving) | no | **yes**: the only record of a program that can signal the agent | sole trace |
-| `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined` | no (found by the kernel-state round) | **yes**: the only record of foreign kernel code, a program the agent never saw, the agent confined | sole trace |
+| `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined` | no (found by the kernel-state round) | **yes**: the only record of foreign kernel code, a program the agent never saw, the agent confined | sole trace, 32 a kind a round by name |
+| `sole_trace_summary` | no (the round's findings past its quota) | **yes**: the only signed count of those findings | sole trace, one a round |

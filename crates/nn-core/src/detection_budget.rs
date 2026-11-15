@@ -273,6 +273,18 @@ impl DetectionBudget {
         }
     }
 
+    /// The review of #565 (F2): a record written outside the budget (a
+    /// sole trace, bounded by its source): the pair's count held since its
+    /// previous record, taken — no token spent, no pair made.
+    pub fn admit_unspent_at(&self, rule: &str, uid: u32, now: Instant) -> u64 {
+        let mut g = self.inner.lock();
+        let Some(bucket) = g.rules.get_mut(rule).and_then(|u| u.get_mut(&uid)) else {
+            return 0;
+        };
+        bucket.refill(now);
+        std::mem::take(&mut bucket.held_since_record)
+    }
+
     /// A detection its rule coalesced into an earlier record of the same
     /// action: counted as one held back (the next record of the pair, the
     /// reporter's entry), the pair's budget not spent. Not counted when
@@ -346,6 +358,11 @@ pub fn admit_acted(rule: &str, uid: u32) -> Acted {
     BUDGET.admit_acted_at(rule, uid, Instant::now())
 }
 
+/// [`DetectionBudget::admit_unspent_at`] on the process-wide budget, now.
+pub fn admit_unspent(rule: &str, uid: u32) -> u64 {
+    BUDGET.admit_unspent_at(rule, uid, Instant::now())
+}
+
 /// [`DetectionBudget::count_coalesced_at`] on the process-wide budget, now.
 pub fn count_coalesced(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) {
     BUDGET.count_coalesced_at(rule, uid, Instant::now(), sample)
@@ -374,6 +391,30 @@ mod tests {
 
     fn nos() -> (String, String) {
         (String::new(), String::new())
+    }
+
+    /// The review of #565 (F2): a sole trace's record takes the pair's held
+    /// count and no token — 500 of them leave the pair its whole burst, and
+    /// a pair it never met is not made.
+    #[test]
+    fn an_unspent_record_takes_the_held_count_and_no_token() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        assert_eq!(b.admit_unspent_at("R", 7, t0), 0);
+        assert_eq!(b.inner.lock().keys, 0, "no pair made");
+        // the pair made by a budgeted record: the unspent ones take nothing
+        assert!(b.admit_at("R", 7, t0, nos).record());
+        for _ in 0..500 {
+            b.admit_unspent_at("R", 7, t0);
+        }
+        for _ in 1..BURST {
+            assert!(b.admit_at("R", 7, t0, nos).record(), "the burst is whole");
+        }
+        assert_eq!(b.admit_at("R", 7, t0, nos), Admit::Hold { first: true });
+        assert_eq!(b.admit_at("R", 7, t0, nos), Admit::Hold { first: false });
+        assert_eq!(b.admit_unspent_at("R", 7, t0), 2, "carries the two held");
+        assert_eq!(b.admit_unspent_at("R", 7, t0), 0);
+        assert_eq!(b.admit_at("R", 7, t0, nos), Admit::Hold { first: false });
     }
 
     /// R12c (lab PR 270): an acting detection is recorded past the budget

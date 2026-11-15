@@ -587,8 +587,17 @@ fn emit_held(operation: u8, how: u32, verdict: u64, id: u32) {
 /// refusals' one, and a flood of refused uses of an earlier held program on
 /// the CPU held it back that second — the program held, its record a count
 /// naming nothing. The ring with no room for it, the load is refused too
-/// and its id let go (fail closed, counted: `held_load_unsigned`) — a held
-/// program nothing names must not exist.
+/// (fail closed, counted: `held_load_unsigned`).
+///
+/// The review of #565 (F1): and its id stays HELD. The program has its id
+/// before this hook (`bpf_prog_alloc_id`, then `bpf_prog_new_fd`): a handle
+/// taken by id in between (outside the family, inside the window, or before
+/// the held set names it) keeps the refused program alive. Let go, its runs
+/// and attaches after the window were let through and nothing named it;
+/// kept, they are refused and signed ([`nn_held_use`]), the round signs it
+/// once after the window (`BPF_HELD_OUTLIVED`), and releases the id once no
+/// longer loaded. No eBPF program removes a held id
+/// (`xtask/tests/kernel_halves.rs`).
 #[inline(always)]
 unsafe fn hold(id: u32, verdict: u64) -> bool {
     if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {
@@ -603,7 +612,6 @@ unsafe fn hold(id: u32, verdict: u64) -> bool {
         },
     );
     if !signed {
-        let _ = PROG_CONTENT_HELD.remove(&id);
         crate::drops::bump(northnarrow_common::ring_drops::ring_slot::HELD_LOAD_UNSIGNED);
         return false;
     }

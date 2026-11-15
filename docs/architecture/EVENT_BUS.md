@@ -120,11 +120,20 @@ and from starving the rest:
   review, C6: the rare events past the reserve);
 - lot 356 (pre-alpha F3-8): a sole trace (`core_bus::sole_trace`,
   `FsProtectOperation::is_sole_trace`: a window's held BPF load, its
-  outliving, the kernel-state round's findings) is no flood of P0 — no
-  process repeats one at will — but one of the rare tamper events: never
-  capped, never coalesced (each names its program or finding), it takes
-  the reserve and waits for room; the decision records it past its rule's
-  budget for the uid.
+  outliving, the kernel-state round's findings) is no flood of P0 but one
+  of the rare tamper events: never capped, never coalesced (each names its
+  program or finding), it takes the reserve and waits for room; the
+  decision records it past its rule's budget for the uid, and (the review
+  of #565, F2) takes no token of that budget. Rare by its source's bound,
+  not by nature: root makes BPF objects at will (20,000 tiny programs
+  loaded faster than the hook's seen map keeps them were thousands of
+  `bpf_unseen` records a round), so the kernel-state round names at most
+  `ROUND_QUOTA` (32, half the reserve) findings of each kind, the most
+  dangerous first, and signs the rest in ONE `sole_trace_summary` record
+  with each kind's count — never a silent drop: the counts are in that
+  signed record and in `nn-admin status --key` (`kernel_state_held_back`),
+  each BPF object held back in `/run/northnarrow/bpf-foreign` (state
+  `suppressed`). A held load is one per id of the held set (1,024).
 
 `DefenderSignal` shares the file-open sensor's ring and pump with the FIM
 credential reads, mass writes and bursts (review #471 M2): the pump sends

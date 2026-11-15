@@ -859,6 +859,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 349: nor the agent's own CPU watch (a confinement found),
             // nor a window's load of a program the judge refuses outside
             // one (let through, held: the review of #558, F1).
+            // The review of #565 (F2): nor any sole trace — the round's
+            // summary of the findings its quota held back included.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -873,7 +875,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfBaseline
                     | nn_model::FsProtectOperation::CpuConfined
                     | nn_model::FsProtectOperation::BpfHeldLoad
-            ) {
+            ) && !operation.is_sole_trace()
+            {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
                     // Lot 293 (external bug hunt BUG14): a refused signal
                     // through a file's owner names the process whose I/O
@@ -3214,8 +3217,8 @@ mod tests {
         // lot 349: the agent's own CPU watch's record, one more; the review
         // of #558 (F1): a held program's load and its refused uses, two more;
         // lot 356: the held load and the kernel-state round's five findings
-        // are sole traces
-        assert_eq!((minor, sole), (17, 6));
+        // are sole traces; the review of #565 (F2): and the round's summary
+        assert_eq!((minor, sole), (17, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3260,6 +3263,7 @@ mod tests {
             w::FS_OP_SYSCTL_ROOT_PROG,
             w::FS_OP_BPF_UNSEEN,
             w::FS_OP_BPF_BASELINE,
+            w::FS_OP_SOLE_TRACE_SUMMARY,
         ] {
             assert!(
                 w::is_sole_trace(sole) && !w::is_minor_denial(sole),

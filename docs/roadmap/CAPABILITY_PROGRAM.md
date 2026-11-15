@@ -11223,8 +11223,9 @@ number in parentheses is a lab PR.
     `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`,
     `cpu_confined`), out of `is_minor_denial`. In the kernel `hold` signs
     through `emit_sole_trace` (no budget, no dedup) and a ring with no room
-    refuses the load and lets its id go (fail closed, counted in the new
-    `RING_DROPS` slot `held_load_unsigned`); in the agent a sole trace is
+    refuses the load (fail closed, counted in the new `RING_DROPS` slot
+    `held_load_unsigned`; its id kept held since the review of #565, below);
+    in the agent a sole trace is
     logged and stored past NN-L-AT-001's per-uid budget, and the bus never
     coalesces or caps one. The audit of every minor kind is in
     `UPGRADE_NOTES_WAVE4.md` §50. Ratchets: `xtask/tests/kernel_halves.rs`
@@ -11254,6 +11255,34 @@ number in parentheses is a lab PR.
     held program into a slot 0–4 times in 20,000 on 6.8, 0 on 7.0.
   - Not covered in a guest: the ring-full refusal (a ring with no room at
     the held load) — by the ratchet and the verifier only.
+  - The review of #565 (the fix round): (F1, P2) a load refused for want of
+    room let its id go — a handle taken by id between the id's allocation
+    and the hook kept the program un-held, its runs and attaches after the
+    window let through and no `BPF_HELD_OUTLIVED` naming it; the id now
+    stays held (no eBPF program removes a held id: ratchet
+    `a_held_load_refused_for_want_of_room_keeps_its_id_held`). (F2, P2) the
+    sole traces were bounded by their sources, and the cross-view's are
+    not: root makes BPF objects at will, each unseen or baseline object
+    one High record, uncapped, in the rare events' P0 reserve and in uid 0's
+    record budget. The kernel-state round now names at most `ROUND_QUOTA`
+    (32, half the reserve) findings of each kind — the types refused
+    outside a window and hidden programs' links first — and signs the rest
+    in ONE `sole_trace_summary` record (`FS_OP_SOLE_TRACE_SUMMARY`) with
+    each kind's count, also in `nn-admin status --key`
+    (`kernel_state_held_back`) and, per object, `suppressed` in
+    `bpf-foreign`; a sole trace takes no token of the per-uid budget.
+    (F3) the ratchet refuses an `as` alias, a constant or a literal that
+    would carry a sole trace into a budget; (F4) the journal says
+    `held_load_unsigned` loads were refused. Mutation: 20 mutants of the
+    new code, 20 caught by a named test (two tests strengthened after a
+    first survivor each), plus the review's probe, a bare `46` and the
+    removal put back, each caught by the ratchets. Lab (as measured):
+    ubuntu2204 (5.15.0-202) `verifier-check` of the fix round's tree OK —
+    `bpf_prog_guard` 23,629 processed, highest `module_read_file_observe`
+    551,900 (55.2%) < 900k; no other guest (the eBPF change is the removal
+    of one map delete in `hold`). Not covered in a guest: the race of F1
+    (a handle by id between the id and the hook, with the ring full) and a
+    flood past the round's quota — by the ratchet and the unit tests only.
   - Levels unchanged: C23 keeps its level (a record made reliable; no new
     defence).
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the

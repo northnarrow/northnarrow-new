@@ -472,9 +472,10 @@ pub const SOURCES: [SourceContract; 16] = [
                 allows: "(lot 356, pre-alpha F3-8) none for a sole trace — a trusted-installer \
                      window's load the content judge refuses outside one (bpf_held_load) is \
                      signed through no budget, one record per held program; when the ring has \
-                     no room for it the load is refused (fail closed: a held program nothing \
-                     names never exists) and counted; not a loss (the program was never handed \
-                     out; the lost reservation is fs_protect's)",
+                     no room for it the load is refused (fail closed) and counted, its id kept \
+                     held (the review of #565: a handle taken by id before the refusal keeps \
+                     its runs and attaches refused); not a loss (the load's descriptor was never \
+                     handed out; the lost reservation is fs_protect's)",
                 counter: "held_load_unsigned",
             },
         ],

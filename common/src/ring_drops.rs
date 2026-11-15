@@ -106,10 +106,13 @@ pub mod ring_slot {
     /// Lot 356 (pre-alpha F3-8): a trusted-installer window's load that the
     /// content judge refuses outside one, refused because the `fs_protect`
     /// ring had no room for its record (`wire::FS_OP_BPF_HELD_LOAD`, a sole
-    /// trace: no budget holds it back). Fail closed — a held program nothing
-    /// names must not exist; the lost reservation itself is counted in
-    /// [`FS_PROTECT`], a security ring. Counted and signed, not a loss: the
-    /// program was never handed out.
+    /// trace: no budget holds it back). Fail closed; the lost reservation
+    /// itself is counted in [`FS_PROTECT`], a security ring. Counted and
+    /// signed, not a loss: the load's descriptor was never handed out, and
+    /// (the review of #565, F1) its id stays held — a handle taken by id
+    /// before the refusal keeps the program, but its runs and attaches
+    /// outside a window are refused and signed, and the kernel-state round
+    /// signs it once after the window (`BPF_HELD_OUTLIVED`).
     pub const HELD_LOAD_UNSIGNED: u32 = 31;
 }
 

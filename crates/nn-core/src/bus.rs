@@ -269,9 +269,13 @@ pub fn guarded_write_open(event: &Event) -> bool {
 /// wait behind them.
 ///
 /// Lot 356 (pre-alpha F3-8): but a sole trace ([`sole_trace`]: a window's
-/// held load, the kernel-state round's findings), which no process repeats
-/// at will — one of the rare ones: never capped, it takes the reserve and
-/// waits for room ([`when_full`]).
+/// held load, the kernel-state round's findings) — one of the rare ones:
+/// never capped, it takes the reserve and waits for room ([`when_full`]).
+/// The review of #565 (F2): rare by its source's bound, not by nature —
+/// root makes BPF objects at will, so the kernel-state round names at most
+/// `nn_linux::kernel_state::ROUND_QUOTA` (half this reserve) of each kind
+/// and signs the rest in one summary record; a held load is one per id of
+/// the held set.
 pub fn floods_p0(event: &Event) -> bool {
     match event {
         Event::FsProtectDenial { .. } => !sole_trace(event),

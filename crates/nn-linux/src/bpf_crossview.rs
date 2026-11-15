@@ -278,6 +278,14 @@ pub enum Finding {
     HeldOutlived(Object, u64),
 }
 
+impl Finding {
+    /// The object's key (`(is_link, id)`).
+    pub fn object(&self) -> (bool, u32) {
+        let (Finding::Baseline(o) | Finding::Unseen(o) | Finding::HeldOutlived(o, _)) = self;
+        (o.is_link, o.id)
+    }
+}
+
 /// What the cross-view keeps between rounds.
 #[derive(Debug, Default)]
 pub struct Watch {
@@ -300,6 +308,13 @@ pub struct Watch {
     /// Lot 349 (the re-check of #558, item 2): the held programs signed
     /// as outliving their window.
     outlived: BTreeSet<u32>,
+    /// The review of #565 (F2): the objects whose finding the round's
+    /// quota held back (counted in its summary record, never named one by
+    /// one) — kept while the enumeration shows them.
+    suppressed: BTreeSet<(bool, u32)>,
+    /// The foreign objects of the last round, until its status file is
+    /// written ([`CrossView::write_status`]).
+    last: Option<Vec<Object>>,
 }
 
 /// Lot 304: what the known-program judgement reads of a record — its
@@ -381,7 +396,10 @@ impl Watch {
 
     /// The state the status file names an object by.
     pub fn state_of(&self, key: (bool, u32)) -> &'static str {
-        if !key.0 && self.seen.contains_key(&key.1) {
+        if self.suppressed.contains(&key) {
+            // the review of #565 (F2): past the round's quota, counted
+            "suppressed"
+        } else if !key.0 && self.seen.contains_key(&key.1) {
             "seen"
         } else if self.signed.contains(&key) && self.first.contains(&key) {
             "baseline"
@@ -444,6 +462,10 @@ pub fn judge(
             known: None,
         });
     }
+    // the review of #565 (F2): an object held back by a quota is forgotten
+    // once no longer listed
+    let listed_now: BTreeSet<(bool, u32)> = foreign.iter().map(|o| (o.is_link, o.id)).collect();
+    w.suppressed.retain(|k| listed_now.contains(k));
     let candidates: BTreeMap<(bool, u32), &Object> = foreign
         .iter()
         .filter(|o| o.is_link || !w.seen.contains_key(&o.id))
@@ -510,6 +532,19 @@ pub fn render_status(w: &Watch, foreign: &[Object]) -> String {
         std::process::id(),
         w.rounds()
     );
+    // the review of #565 (F2): what the round's quota held back
+    let held = foreign
+        .iter()
+        .filter(|o| w.suppressed.contains(&(o.is_link, o.id)))
+        .count();
+    if held > 0 {
+        body.push_str(&format!(
+            "# {held} listed `suppressed`: past the round's quota ({} named per kind), each \
+             counted in a signed sole_trace_summary record (nn-admin status: \
+             kernel_state_held_back)\n",
+            crate::kernel_state::ROUND_QUOTA
+        ));
+    }
     for o in foreign {
         let (kind, t) = if o.is_link {
             ("link", link_type_name(o.object_type))
@@ -602,13 +637,30 @@ impl CrossView {
             &foreign,
             (self.window_open)(),
         ));
+        // the review of #565 (F2): written once the round's quota is
+        // applied ([`Self::write_status`])
+        self.watch.last = Some(foreign);
+        Ok(found)
+    }
+
+    /// The review of #565 (F2): the objects whose finding the round's quota
+    /// held back — `suppressed` in the status file while listed.
+    pub fn held_back(&mut self, keys: impl IntoIterator<Item = (bool, u32)>) {
+        self.watch.suppressed.extend(keys);
+    }
+
+    /// The last round's status file (once: a round that failed writes
+    /// none).
+    pub fn write_status(&mut self) {
+        let Some(foreign) = self.watch.last.take() else {
+            return;
+        };
         if let Some(path) = &self.status {
             let body = render_status(&self.watch, &foreign);
             if let Err(e) = crate::atomic_file::replace(path, body.as_bytes(), 0o600) {
                 tracing::debug!(error = %e, path = %path.display(), "BPF cross-view: status file not written");
             }
         }
-        Ok(found)
     }
 }
 
@@ -927,6 +979,44 @@ mod tests {
         assert_eq!(attach_of(&plain, &BTreeMap::new()), "cgroup_device");
         let f = with_attach(prog(71, 26, "fe"), "do_unlinkat");
         assert_eq!(attach_of(&f, &BTreeMap::new()), "do_unlinkat");
+    }
+
+    /// The review of #565 (F2): an object whose finding the round's quota
+    /// held back is never dropped silently — the status file lists it
+    /// `suppressed`, with one line saying how many and where they are
+    /// counted; forgotten once the enumeration no longer shows it.
+    #[test]
+    fn an_object_the_round_s_quota_held_back_is_listed_suppressed() {
+        let own: BTreeSet<u32> = BTreeSet::new();
+        let mut w = Watch::default();
+        let r0 = en(vec![], None);
+        judge(&mut w, vec![], &r0, &own);
+        let r = en(vec![prog(10, 1, "f10"), prog(11, 1, "f11")], None);
+        judge(&mut w, vec![], &r, &own);
+        let (found, foreign) = judge(&mut w, vec![], &r, &own);
+        assert_eq!(found.len(), 2, "{found:?}");
+        // the round's quota held the second back
+        w.suppressed.insert(found[1].object());
+        let body = render_status(&w, &foreign);
+        let line = |id: &str| {
+            body.lines()
+                .find(|l| l.starts_with(&format!("prog {id} socket_filter")))
+                .unwrap_or_else(|| panic!("{id}: {body}"))
+                .to_string()
+        };
+        assert!(line("10").ends_with(" unseen"), "{body}");
+        assert!(line("11").ends_with(" suppressed"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "# 1 listed `suppressed`: past the round's quota ({} named per kind)",
+                crate::kernel_state::ROUND_QUOTA
+            )),
+            "{body}"
+        );
+        // gone from the enumeration: forgotten
+        let (_, foreign) = judge(&mut w, vec![], &en(vec![prog(10, 1, "f10")], None), &own);
+        assert!(w.suppressed.is_empty());
+        assert!(!render_status(&w, &foreign).contains("suppressed"));
     }
 
     /// Lot 290: the status file names each foreign object, its state and

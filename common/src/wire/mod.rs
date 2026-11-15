@@ -1398,8 +1398,76 @@ pub const fn bpf_held_use_name(how: u32) -> &'static str {
     }
 }
 
+/// The review of #565 (F2): NOT a refusal — the kernel-state round's
+/// findings past its quota of named records per kind (`nn_linux::
+/// kernel_state::ROUND_QUOTA`), ONE record per round that held some back,
+/// with their counts ([`SoleTraceSummary`]: `target_dev`, `target_ino`).
+/// Each object held back is listed in `/run/northnarrow/bpf-foreign`
+/// (state `suppressed`) and counted in `nn-admin status`. The kernel never
+/// emits it.
+pub const FS_OP_SOLE_TRACE_SUMMARY: u8 = 48;
+
+/// The review of #565 (F2): what one round's quota held back, per kind —
+/// an [`FS_OP_SOLE_TRACE_SUMMARY`]'s fields. `target_dev` = the unseen
+/// objects (low 32 bits) | the baseline objects (high 32 bits);
+/// `target_ino` = the held programs outliving their window (bits 0–15) |
+/// the root `cgroup/sysctl` programs (16–31) | the taint findings (32–39)
+/// | the CPU confinements (40–47) | the quota per kind (48–63). Each count
+/// saturates at its field's maximum (far above what a kind can reach in a
+/// round: 1,024 held ids, 64 programs on a cgroup slot, one taint and one
+/// confinement finding).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SoleTraceSummary {
+    pub unseen: u32,
+    pub baseline: u32,
+    pub outlived: u16,
+    pub root_prog: u16,
+    pub taint: u8,
+    pub cpus: u8,
+    pub quota: u16,
+}
+
+impl SoleTraceSummary {
+    /// The record's `target_dev`.
+    pub const fn target_dev(&self) -> u64 {
+        self.unseen as u64 | (self.baseline as u64) << 32
+    }
+
+    /// The record's `target_ino`.
+    pub const fn target_ino(&self) -> u64 {
+        self.outlived as u64
+            | (self.root_prog as u64) << 16
+            | (self.taint as u64) << 32
+            | (self.cpus as u64) << 40
+            | (self.quota as u64) << 48
+    }
+
+    /// A record's fields told back.
+    pub const fn of(target_dev: u64, target_ino: u64) -> Self {
+        Self {
+            unseen: target_dev as u32,
+            baseline: (target_dev >> 32) as u32,
+            outlived: target_ino as u16,
+            root_prog: (target_ino >> 16) as u16,
+            taint: (target_ino >> 32) as u8,
+            cpus: (target_ino >> 40) as u8,
+            quota: (target_ino >> 48) as u16,
+        }
+    }
+
+    /// Every finding held back.
+    pub const fn total(&self) -> u64 {
+        self.unseen as u64
+            + self.baseline as u64
+            + self.outlived as u64
+            + self.root_prog as u64
+            + self.taint as u64
+            + self.cpus as u64
+    }
+}
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_BPF_HELD_USE;
+pub const FS_OP_LAST: u8 = FS_OP_SOLE_TRACE_SUMMARY;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1471,18 +1539,30 @@ pub const fn is_minor_denial(operation: u8) -> bool {
 ///   cgroup's `cgroup/sysctl` slot ([`FS_OP_SYSCTL_ROOT_PROG`]), a program
 ///   or link the `bpf` hook never saw ([`FS_OP_BPF_UNSEEN`]) or present at
 ///   the start ([`FS_OP_BPF_BASELINE`]), the agent confined to fewer CPUs
-///   ([`FS_OP_CPU_CONFINED`]).
+///   ([`FS_OP_CPU_CONFINED`]);
+/// - the review of #565 (F2): the round's summary of the findings its quota
+///   held back ([`FS_OP_SOLE_TRACE_SUMMARY`], their counts).
 ///
-/// No caller repeats them at will: a held load is one per program kept in
-/// the held set (`PROG_CONTENT_HELD`, 1,024 ids, a window's loads only),
-/// a finding one per change the round sees. So they spend no budget at
-/// all — neither the kernel's per-CPU ones (the held load was minor until
-/// this lot: 50 refused uses of a held program on a CPU held back, that
-/// second, the next window load's record, the program never named) nor
-/// the agent's record budget per rule and uid, nor the bus's cap; the bus
-/// never coalesces them. A held load whose record the ring cannot take is
-/// refused (fail closed, counted: `held_load_unsigned`). Never decisive
-/// (the posture takes none as `AntiTamperDenial`) and never minor
+/// Bounded by construction, not by a budget: a held load is one per
+/// program kept in the held set (`PROG_CONTENT_HELD`, 1,024 ids, a
+/// window's loads only). The round's findings are NOT bounded by what
+/// they see — root makes BPF objects at will, and the cross-view's unseen
+/// and baseline objects are one record each (the review of #565, F2: 20,000
+/// tiny programs loaded faster than the hook's seen map keeps them were
+/// thousands of High records a round) — so the round names at most
+/// `nn_linux::kernel_state::ROUND_QUOTA` of each kind, the most dangerous
+/// first, and signs the rest in ONE summary record with their counts
+/// (never a silent drop: the counts are in the signed record and in
+/// `nn-admin status`, each object in `/run/northnarrow/bpf-foreign`). So
+/// they spend no budget at all — neither the kernel's per-CPU ones (the
+/// held load was minor until lot 356: 50 refused uses of a held program
+/// on a CPU held back, that second, the next window load's record, the
+/// program never named) nor the agent's record budget per rule and uid
+/// (they take no token from it: a flood of them leaves root's decisive
+/// refusals their records), nor the bus's cap; the bus never coalesces
+/// them. A held load whose record the ring cannot take is refused (fail
+/// closed, counted: `held_load_unsigned`) and its id stays held. Never
+/// decisive (the posture takes none as `AntiTamperDenial`) and never minor
 /// ([`is_minor_denial`]): `nn_core`'s posture test pins the three classes.
 pub const fn is_sole_trace(operation: u8) -> bool {
     matches!(
@@ -1493,6 +1573,7 @@ pub const fn is_sole_trace(operation: u8) -> bool {
             | FS_OP_BPF_UNSEEN
             | FS_OP_BPF_BASELINE
             | FS_OP_CPU_CONFINED
+            | FS_OP_SOLE_TRACE_SUMMARY
     )
 }
 
@@ -2708,6 +2789,7 @@ mod tests {
             FS_OP_CPU_CONFINED,
             FS_OP_BPF_HELD_LOAD,
             FS_OP_BPF_HELD_USE,
+            FS_OP_SOLE_TRACE_SUMMARY,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and
@@ -2778,6 +2860,9 @@ mod tests {
             FS_OP_BPF_UNSEEN,
             FS_OP_BPF_BASELINE,
             FS_OP_CPU_CONFINED,
+            // the review of #565 (F2): the round's summary of what its
+            // quota held back
+            FS_OP_SOLE_TRACE_SUMMARY,
         ] {
             assert!(is_sole_trace(op), "{op} is not a sole trace");
             assert!(!is_minor_denial(op), "{op} still spends the minor budget");
@@ -2790,10 +2875,44 @@ mod tests {
             );
             sole += usize::from(is_sole_trace(op));
         }
-        assert_eq!(sole, 6);
+        assert_eq!(sole, 7);
         // a held program's refused uses (and the held set full, a slot not
         // read) are refusals a caller repeats at will: they stay minor
         assert!(is_minor_denial(FS_OP_BPF_HELD_USE) && !is_sole_trace(FS_OP_BPF_HELD_USE));
+    }
+
+    /// The review of #565 (F2): the round's summary carries each kind's
+    /// count — they go and come back, a count past its field saturates
+    /// there (the callers saturate), and the total is their sum.
+    #[test]
+    fn a_sole_trace_summary_s_counts_go_and_come_back() {
+        let s = SoleTraceSummary {
+            unseen: 12_000,
+            baseline: u32::MAX,
+            outlived: 1_024,
+            root_prog: 64,
+            taint: 1,
+            cpus: 1,
+            quota: 32,
+        };
+        assert_eq!(SoleTraceSummary::of(s.target_dev(), s.target_ino()), s);
+        assert_eq!(s.total(), 12_000 + u64::from(u32::MAX) + 1_024 + 64 + 2);
+        let z = SoleTraceSummary::default();
+        assert_eq!((z.target_dev(), z.target_ino(), z.total()), (0, 0, 0));
+        let only = |f: fn(&mut SoleTraceSummary)| {
+            let mut s = SoleTraceSummary::default();
+            f(&mut s);
+            SoleTraceSummary::of(s.target_dev(), s.target_ino())
+        };
+        assert_eq!(only(|s| s.taint = 0xff).taint, 0xff);
+        assert_eq!(only(|s| s.cpus = 0xff).cpus, 0xff);
+        assert_eq!(only(|s| s.quota = 0xffff).quota, 0xffff);
+        assert_eq!(only(|s| s.root_prog = 0xffff).root_prog, 0xffff);
+        assert_eq!(
+            only(|s| s.cpus = 0xff).taint,
+            0,
+            "no field spills into another"
+        );
     }
 
     // ── Tappa 10 N2 — BPF emission wire types ──────────────────────

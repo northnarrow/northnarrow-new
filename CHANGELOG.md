@@ -960,14 +960,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `is_minor_denial`; the posture's equivalence test pins the three
     classes (decisive, minor, sole trace).
   - **Kernel:** `hold` signs through `inode_protect::emit_sole_trace` (no
-    budget, no dedup); a ring with no room refuses the load and lets its id
-    go (fail closed), counted in the new `RING_DROPS` slot
-    `held_load_unsigned` (31). A ratchet (`xtask/tests/kernel_halves.rs`)
-    keeps the sole traces' operations and that writer to `hold`.
+    budget, no dedup); a ring with no room refuses the load (fail closed),
+    counted in the new `RING_DROPS` slot `held_load_unsigned` (31), and
+    (the review of #565, F1) keeps its id held: a handle taken by id
+    between the id's allocation and the hook kept the refused program, and
+    with its id let go its runs and attaches after the window were let
+    through, unnamed (`a_held_load_refused_for_want_of_room_keeps_its_id_held`:
+    no eBPF program removes a held id). A ratchet
+    (`xtask/tests/kernel_halves.rs`) keeps the sole traces' operations and
+    that writer to `hold`; (F3) an `as` alias, a constant or a literal no
+    longer carries a sole trace into a budget
+    (`no_alias_or_literal_carries_a_sole_trace_into_a_budget`). (F4) The
+    journal says `held_load_unsigned` loads were REFUSED, not "events lost".
   - **Agent:** a sole trace is logged and stored past NN-L-AT-001's record
-    budget for the uid (`budget_admit_sole_trace`); the bus never coalesces
-    or caps one (`core_bus::sole_trace`: no flood of P0, it takes the
-    reserve and waits for room).
+    budget for the uid (`budget_admit_sole_trace`) and (F2) takes no token
+    of it (`detection_budget::admit_unspent`); the bus never coalesces or
+    caps one (`core_bus::sole_trace`: no flood of P0, it takes the reserve
+    and waits for room).
+  - **The kernel-state round's quota (the review of #565, F2).** Root makes
+    BPF objects at will, and each unseen or baseline object was one High
+    record, uncapped: a round now names at most `ROUND_QUOTA` (32) findings
+    of each kind, the most dangerous first, and signs the rest in ONE
+    `sole_trace_summary` record (`FS_OP_SOLE_TRACE_SUMMARY`, 48;
+    `wire::SoleTraceSummary`: each kind's count), counted in `nn-admin
+    status --key` (`kernel_state_held_back`) and listed `suppressed` in
+    `/run/northnarrow/bpf-foreign` (`kernel_state::within_quota`;
+    `a_flood_beyond_the_round_s_quota_is_quota_records_and_one_signed_summary`,
+    `one_kind_s_flood_never_holds_back_another_kind_s_findings`,
+    `a_flood_of_sole_traces_leaves_the_uid_s_decisive_refusals_their_records`).
   - Audit of every "minor" kind in `UPGRADE_NOTES_WAVE4.md` §50; a privileged
     e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`: a flood of
     refused handles on one CPU, then 64 window loads there, each signed with

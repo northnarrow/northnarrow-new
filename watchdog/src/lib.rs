@@ -4622,6 +4622,7 @@ mod tests {
                 open_sensor_per_call_total: None,
                 program_copy_compared_total: None,
                 program_copy_skipped_total: None,
+                kernel_state_held_back: None,
                 execq_script_refused_total: None,
                 event_bus: None,
                 event_bus_decision: None,

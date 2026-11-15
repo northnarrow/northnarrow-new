@@ -442,6 +442,11 @@ impl Rule for NnLAt001AntiTamperDenial {
                 ));
             }
             FsProtectOperation::BpfHeldUse => held_use_text(*target_dev, *target_ino),
+            // The review of #565 (F2): not a refusal — the kernel-state
+            // round's findings past its quota, counted
+            FsProtectOperation::SoleTraceSummary => {
+                return Some(sole_trace_summary_verdict(self, event, *target_dev, *target_ino));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -456,6 +461,65 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// The review of #565 (F2): one kernel-state round's findings past its
+/// quota of named records per kind, counted
+/// (`common::wire::SoleTraceSummary`). High when any of them is an object
+/// the `bpf` hook never saw, a held program outliving its window, a root
+/// `cgroup/sysctl` program, a taint or a confinement; Medium when all are
+/// the start's baseline (a host with thousands of BPF programs — Cilium,
+/// Calico — meets it at the agent's start).
+fn sole_trace_summary_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    target_dev: u64,
+    target_ino: u64,
+) -> Verdict {
+    let s = common::wire::SoleTraceSummary::of(target_dev, target_ino);
+    let mut kinds = Vec::new();
+    for (n, what) in [
+        (
+            u64::from(s.unseen),
+            "BPF objects the `bpf` hook never saw load (bpf_unseen)",
+        ),
+        (
+            u64::from(s.baseline),
+            "BPF objects present at the agent's start (bpf_baseline)",
+        ),
+        (
+            u64::from(s.outlived),
+            "held programs still loaded after their window (bpf_held_load, outlived)",
+        ),
+        (
+            u64::from(s.root_prog),
+            "programs on the root cgroup's cgroup/sysctl slot (sysctl_root_prog)",
+        ),
+        (u64::from(s.taint), "taint findings (kernel_taint)"),
+        (u64::from(s.cpus), "CPU confinements (cpu_confined)"),
+    ] {
+        if n > 0 {
+            kinds.push(format!("{n} {what}"));
+        }
+    }
+    let reasoning = format!(
+        "The kernel-state round found more than {} of one kind this round: {} more were not \
+         signed one by one ({} in all; each kind's first {} were, the most dangerous first — \
+         a type refused outside a window, a link whose program is hidden). Each is listed in \
+         /run/northnarrow/bpf-foreign (state `suppressed`) and counted in `nn-admin status`. A \
+         host with many BPF programs meets it at the agent's start; appearing later, it is a \
+         flood of objects made to bury one — check `bpftool prog` and `bpftool link`.",
+        s.quota,
+        kinds.join(", "),
+        s.total(),
+        s.quota,
+    );
+    let severity = if s.total() == u64::from(s.baseline) {
+        Severity::Medium
+    } else {
+        Severity::High
+    };
+    build_verdict(rule, event, ResponseAction::Log, severity, &reasoning)
 }
 
 /// Lot 349 (pre-alpha R001): the agent runs on fewer CPUs than it should —
@@ -1881,6 +1945,69 @@ mod tests {
             assert!(l.reasoning.contains(n), "{n}: {}", l.reasoning);
         }
         assert!(!l.reasoning.contains("refused it"), "{}", l.reasoning);
+    }
+
+    /// The review of #565 (F2): the round's summary of the findings its
+    /// quota held back is signed with each kind's count, High (Medium when
+    /// all are the start's baseline: a host with many BPF programs), not a
+    /// refusal, and says where each is listed.
+    #[test]
+    fn the_round_s_summary_of_what_its_quota_held_back_is_counted_and_signed() {
+        let ev = |s: common::wire::SoleTraceSummary| Event::FsProtectDenial {
+            pid: 0,
+            uid: 0,
+            comm: "kernel".into(),
+            target_dev: s.target_dev(),
+            target_ino: s.target_ino(),
+            operation: FsProtectOperation::SoleTraceSummary,
+            timestamp_ns: 1,
+        };
+        let flood = common::wire::SoleTraceSummary {
+            unseen: 11_968,
+            baseline: 3,
+            quota: 32,
+            ..Default::default()
+        };
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(flood))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.action, ResponseAction::Log);
+        for n in [
+            "more than 32 of one kind",
+            "11968 BPF objects the `bpf` hook never saw load (bpf_unseen)",
+            "3 BPF objects present at the agent's start (bpf_baseline)",
+            "11971 in all",
+            "/run/northnarrow/bpf-foreign",
+            "nn-admin status",
+        ] {
+            assert!(v.reasoning.contains(n), "{n}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("taint"),
+            "a kind with none named: {}",
+            v.reasoning
+        );
+        let start = common::wire::SoleTraceSummary {
+            baseline: 4_000,
+            quota: 32,
+            ..Default::default()
+        };
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(start))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::Medium, "{}", v.reasoning);
+        let outlived = common::wire::SoleTraceSummary {
+            outlived: 5,
+            quota: 32,
+            ..Default::default()
+        };
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(outlived))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        assert!(v.reasoning.contains("5 held programs"), "{}", v.reasoning);
     }
 
     /// Lot 290 (named): the foreign-BPF refusals are named and High; a load
