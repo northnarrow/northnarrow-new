@@ -36,8 +36,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::File],
         data_components: &["DC0039"],
         observes: "A hard link, in /tmp, /var/tmp, /dev/shm or /home, to a watched inode (the \
-            kernel reports a link only when its source is watched, such as a setuid-root system \
-            binary): Critical. A file created in a watched directory there is recorded (Medium, \
+            kernel reports a link only when its source is watched; of the setuid-root binaries, \
+            the shipped watch list names sudo, su and passwd only: a link of pkexec, mount, chsh, \
+            newgrp, gpasswd, fusermount3 or ssh-keysign is not seen): Critical. The new link's path is the kernel's walk of its dentries (lot \
+            352: the record named only the source); a walk deeper than its 16 names, whose \
+            directory is not known, is judged as user-writable. A file created in a watched directory there is recorded (Medium, \
             Log): the hook carries no mode bits.",
         false_positives: "Files that browsers, GnuPG or SDKs create in watched home paths are only \
             recorded (external audit FIMR-006). A link made inside a package transaction is \
@@ -46,6 +49,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             `sudo rm /var/tmp/nn-link`; expect Critical, KillProcessTree aimed at ln.",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir",
+            "crates/nn-core/src/fim/rules.rs::fim002_judges_the_new_link_s_path",
+            "crates/nn-linux/src/fim/drain.rs::a_link_to_a_watched_binary_reaches_the_rules_with_its_new_path",
             "crates/nn-core/src/fim/rules.rs::fim002_records_a_file_created_in_a_watched_user_writable_dir",
         ],
         attack_note: "T1548.001: a setuid binary kept under a name a user controls. The rule does \
@@ -174,14 +179,27 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0039", "DC0061"],
-        observes: "A new or rewritten file under /lib/modules: a dropped or modified .ko.",
-        false_positives: "Kernel and DKMS package transactions write here and are recorded at Low; \
-            a module built and installed by hand (`make modules_install`) is killed.",
+        observes: "A new or rewritten file under /lib/modules, in every kernel version's \
+            directory and up to 10 directories below it (lot 352; /usr/lib/modules on a merged-/usr \
+            system, 11 with a separate /lib: the kernel's walk keeps 16 names): a dropped or \
+            modified .ko. FIM watches /lib/modules itself; below it, the file-open \
+            sensor reports a write-open (its tree is a critical one).",
+        false_positives: "Kernel and DKMS package transactions write here and are recorded at Low, \
+            one record per package-manager process within 15 minutes (the rest counted as \
+            coalesced, at most 8 of their paths kept); the host's depmod writing the indexes \
+            (`modules.*`) is recorded at Low; a module installed outside a package transaction \
+            (`make modules_install`, the NVIDIA installer, `vboxconfig`, DKMS at boot) is one \
+            Critical kill per file. Not seen below the top: a file moved, hard-linked or \
+            symlinked into the tree (no open); a module deeper than the walk is the posture's \
+            critical write-open, not this rule's.",
         how_to_test: "`sudo touch /lib/modules/$(uname -r)/nn-test.ko`, then remove it; expect \
             Critical, KillProcessTree aimed at touch.",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim008_fires_on_kmod_modified",
             "crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire",
+            "crates/nn-linux/src/sensors/open_sensor.rs::a_write_open_below_a_module_tree_is_its_creation_or_modification",
+            "crates/nn-core/src/fim/rules.rs::a_package_transaction_s_tree_writes_are_coalesced_into_one_record",
+            "crates/nn-core/src/fim/rules.rs::the_host_s_depmod_writing_an_index_is_recorded",
         ],
         attack_note: "The file on disk; R018_KernelModuleLoad sees the load. T1014 because a \
             dropped module is the usual vehicle of a kernel rootkit; the rule does not see what \

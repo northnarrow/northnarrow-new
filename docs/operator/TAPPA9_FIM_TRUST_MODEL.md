@@ -245,6 +245,26 @@ before its record was judged is read from the lineage — its exec record, or
 its forker's exec — not from `/proc` alone. An open of a watched file
 (`Opened`, the credential reads) carries no fork record.
 
+Lot 352 (pre-alpha Phase 4): a hard link made to a watched file is sent
+with the new link's path as the kernel's dentries name it (the walk up from
+the new dentry to its filesystem root, mapped to its mount point as the
+file-open sensor's paths are); the event names the watched file in `path`
+and the link in `dest_path`, and a link is never dropped as a no-op touch
+(it changes no content: the source's hash is its baseline). NN-L-FIM-002
+judges the link's directory; a walk deeper than its 16 names is judged as
+user-writable. The kernel's module trees (`/lib/modules/`, and
+`/usr/lib/modules/` as a merged-`/usr` kernel names it) are critical trees of
+the file-open sensor: a write-open up to 10 directories below a version
+directory (merged `/usr`; 11 with a separate `/lib`: the kernel's walk keeps
+16 names) is the tree's `Created` or `Modified` for NN-L-FIM-008, while FIM's
+own hooks keep the directory's direct children; a deeper one is the
+posture's critical write-open, not NN-L-FIM-008's. A file moved, hard-linked
+or symlinked INTO a version directory makes no open and is not seen there
+(the rename hook is at the verifier's stack limit). Of the setuid-root
+binaries, the shipped watch list (`configs/fim-paths.v1`) names sudo, su and
+passwd only: a hard link of `pkexec` (or `mount`, `chsh`, `newgrp`,
+`gpasswd`, `fusermount3`, `ssh-keysign`) is not reported.
+
 Lot 340: a directory of a credential store opened (a listing: `find /`,
 plocate's `updatedb`) is no verdict of NN-L-FIM-015/016/017; a file of the
 store opened is judged as before.

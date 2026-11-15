@@ -172,6 +172,7 @@ impl Sweep {
                     dst_addr: dst,
                     dst_port: self.ports[i as usize % self.ports.len()],
                     timestamp_ns: self.start_ns + u64::from(i) * self.step_ns,
+                    fork: Default::default(),
                 }
             })
             .collect()

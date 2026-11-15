@@ -624,13 +624,13 @@ New SUID-root binary appeared in user-writable dir — category `fim_evasion`.
 | Sensor — data | file (file_open LSM, FIM drift) — DC0039 File Creation |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** A hard link, in /tmp, /var/tmp, /dev/shm or /home, to a watched inode (the kernel reports a link only when its source is watched, such as a setuid-root system binary): Critical. A file created in a watched directory there is recorded (Medium, Log): the hook carries no mode bits.
+**Observes.** A hard link, in /tmp, /var/tmp, /dev/shm or /home, to a watched inode (the kernel reports a link only when its source is watched; of the setuid-root binaries, the shipped watch list names sudo, su and passwd only: a link of pkexec, mount, chsh, newgrp, gpasswd, fusermount3 or ssh-keysign is not seen): Critical. The new link's path is the kernel's walk of its dentries (lot 352: the record named only the source); a walk deeper than its 16 names, whose directory is not known, is judged as user-writable. A file created in a watched directory there is recorded (Medium, Log): the hook carries no mode bits.
 
 **Known false positives.** Files that browsers, GnuPG or SDKs create in watched home paths are only recorded (external audit FIMR-006). A link made inside a package transaction is recorded at Low.
 
 **How to test.** `sudo ln /usr/bin/passwd /var/tmp/nn-link` (on the filesystem of /usr), then `sudo rm /var/tmp/nn-link`; expect Critical, KillProcessTree aimed at ln.
 
-**Tests.** `crates/nn-core/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir`, `crates/nn-core/src/fim/rules.rs::fim002_records_a_file_created_in_a_watched_user_writable_dir`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir`, `crates/nn-core/src/fim/rules.rs::fim002_judges_the_new_link_s_path`, `crates/nn-linux/src/fim/drain.rs::a_link_to_a_watched_binary_reaches_the_rules_with_its_new_path`, `crates/nn-core/src/fim/rules.rs::fim002_records_a_file_created_in_a_watched_user_writable_dir`
 
 **ATT&CK note.** T1548.001: a setuid binary kept under a name a user controls. The rule does not see a set-id bit itself; NN-L-FIM-001 and NN-L-FIM-025 do.
 
@@ -756,13 +756,13 @@ Kernel module file modified — category `fim_rootkit`.
 | Sensor — data | file (file_open LSM, FIM drift) — DC0039 File Creation, DC0061 File Modification |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** A new or rewritten file under /lib/modules: a dropped or modified .ko.
+**Observes.** A new or rewritten file under /lib/modules, in every kernel version's directory and up to 10 directories below it (lot 352; /usr/lib/modules on a merged-/usr system, 11 with a separate /lib: the kernel's walk keeps 16 names): a dropped or modified .ko. FIM watches /lib/modules itself; below it, the file-open sensor reports a write-open (its tree is a critical one).
 
-**Known false positives.** Kernel and DKMS package transactions write here and are recorded at Low; a module built and installed by hand (`make modules_install`) is killed.
+**Known false positives.** Kernel and DKMS package transactions write here and are recorded at Low, one record per package-manager process within 15 minutes (the rest counted as coalesced, at most 8 of their paths kept); the host's depmod writing the indexes (`modules.*`) is recorded at Low; a module installed outside a package transaction (`make modules_install`, the NVIDIA installer, `vboxconfig`, DKMS at boot) is one Critical kill per file. Not seen below the top: a file moved, hard-linked or symlinked into the tree (no open); a module deeper than the walk is the posture's critical write-open, not this rule's.
 
 **How to test.** `sudo touch /lib/modules/$(uname -r)/nn-test.ko`, then remove it; expect Critical, KillProcessTree aimed at touch.
 
-**Tests.** `crates/nn-core/src/fim/rules.rs::fim008_fires_on_kmod_modified`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim008_fires_on_kmod_modified`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `crates/nn-linux/src/sensors/open_sensor.rs::a_write_open_below_a_module_tree_is_its_creation_or_modification`, `crates/nn-core/src/fim/rules.rs::a_package_transaction_s_tree_writes_are_coalesced_into_one_record`, `crates/nn-core/src/fim/rules.rs::the_host_s_depmod_writing_an_index_is_recorded`
 
 **ATT&CK note.** The file on disk; R018_KernelModuleLoad sees the load. T1014 because a dropped module is the usual vehicle of a kernel rootkit; the rule does not see what the module does.
 
@@ -1845,13 +1845,13 @@ Ancestor credential read followed by descendant egress — category `chain_exfil
 | Sensor — data | network (TCP connect, DNS, flows, listeners); file (file_open LSM, FIM drift); exec (sched_process_exec, bprm_check_security) — DC0078 Network Traffic Flow, DC0055 File Access, DC0032 Process Creation |
 | Validation | e2e (V2 Critical sub-gate) |
 
-**Observes.** An outbound flow from a process whose ancestor (not itself) read a FIM-watched credential store: within 300 s Critical kill, within 30 minutes one High record. The ancestry comes from the exec sensor.
+**Observes.** An outbound flow from a process whose ancestor (not itself) read a FIM-watched credential store: within 300 s Critical kill, within 30 minutes one High record. The ancestry comes from the exec sensor and the kernel's fork record (lot 352): a descendant that executed nothing since its fork (a Python `os.fork()` child, a subshell, a daemon's grandchild) is named by its connect, and a forker that never executed by its anchor, the nearest process up the forks that had. A read counts for the process that made it (the kernel's open record carries its start): a later holder of an exited ancestor's pid lends that ancestor's descendants nothing.
 
 **Known false positives.** As NN-L-CHAIN-001, through a child: a browser or password manager whose watched store was read by the parent and whose helper process syncs.
 
 **How to test.** A parent reads a FIM-watched `Login Data` file (NN-L-FIM-015 kills the parent only) after forking a child that connects out afterwards; the e2e does exactly this.
 
-**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain004_cross_pid_cred_exfil_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_cred_read_parent_then_descendant_egress_trips_chain_004`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain004_cross_pid_cred_exfil_fires`, `crates/nn-core/src/decision/rules/chain.rs::chain004_fires_for_a_fork_only_child_of_the_reader`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_cred_read_parent_then_descendant_egress_trips_chain_004`
 
 **ATT&CK note.** As NN-L-CHAIN-001.
 
@@ -1871,9 +1871,9 @@ Ancestor /tmp exec followed by descendant egress — category `chain_c2`.
 
 **Known false positives.** As NN-L-CHAIN-002, through a child (an installer run from /tmp whose helper downloads); a package transaction is spared.
 
-**How to test.** A program run from /tmp forks a child that connects out to a port other than 53; the e2e builds one.
+**How to test.** A program run from /tmp forks a child that connects out to a port other than 53 — with or without an exec, through a subshell (lot 352); the e2e builds one.
 
-**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires`, `crates/nn-core/src/decision/rules/chain.rs::chain005_fires_for_a_fork_only_child_of_a_staged_exec`, `crates/nn-core/src/decision/rules/chain.rs::chain005_crosses_a_subshell`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005`
 
 **ATT&CK note.** As NN-L-CHAIN-002.
 
@@ -1893,9 +1893,9 @@ Ancestor canary trip followed by descendant egress — category `chain_exfiltrat
 
 **Known false positives.** As NN-L-CHAIN-003, through a child: a backup client that reads a canary and hands the upload to a helper process.
 
-**How to test.** A process forks a daemonised grandchild, then trips a File canary; the grandchild connects out afterwards (the e2e's recipe).
+**How to test.** A process forks a daemonised grandchild, then trips a File canary; the grandchild connects out afterwards (the e2e's recipe). Lot 352: also when the daemon's intermediate never executes and has exited (Python's `os.fork()` + `setsid` + `os.fork()`), the grandchild executing or not.
 
-**Tests.** `crates/nn-core/src/decision/rules/chain.rs::cross_pid_chains_grade_by_age`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_canary_trip_parent_then_descendant_egress_trips_chain_006`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::cross_pid_chains_grade_by_age`, `crates/nn-core/src/decision/rules/chain.rs::chain006_fires_for_the_e2e_recipe_with_a_fork_only_intermediate`, `crates/nn-core/src/decision/rules/chain.rs::chain006_fires_for_a_daemon_s_fork_only_grandchild`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_canary_trip_parent_then_descendant_egress_trips_chain_006`
 
 **ATT&CK note.** As NN-L-CHAIN-003.
 

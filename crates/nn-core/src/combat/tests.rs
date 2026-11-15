@@ -339,6 +339,7 @@ fn tcp_connect(pid: u32, dst: [u8; 4]) -> Event {
         dst_addr,
         dst_port: 443,
         timestamp_ns: 1,
+        fork: Default::default(),
     }
 }
 

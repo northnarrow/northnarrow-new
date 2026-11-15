@@ -1794,6 +1794,7 @@ mod tests {
             accessor_exe: None,
             timestamp_ns: 0,
             first_trip: true,
+            accessor_start_ns: 0,
         };
         use nn_model::CanaryTypeTag as T;
         for (kind, ty, class) in [

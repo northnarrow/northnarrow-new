@@ -154,6 +154,19 @@ pub struct ProcessSpawnRaw {
     /// pty by a process whose own stdio is a connected socket (the
     /// `pty.spawn` reverse shell: connect, `dup2` onto 0..2, spawn).
     pub parent_stdio: StdioRaw,
+    // ── Lot 352 APPENDED (never reorder the above) ──
+    /// Lot 352: with [`Self::fork_ppid`] (0 when that is 0), the forker's
+    /// own start (its thread-group leader's `task->start_time`, read at the
+    /// fork): the forker's identity once it has exited (a daemon's
+    /// intermediate), for the cross-PID chains' ancestry.
+    pub fork_parent_start: u64,
+    /// Lot 352: with [`Self::fork_ppid`], the nearest process up the forks
+    /// that had executed when this one was forked
+    /// ([`crate::fork_record::fork_anchor`]): the forker itself, or, when
+    /// the forker executed nothing since its own fork (a daemon's
+    /// intermediate, a shell's subshell), its anchor. 0 when not known.
+    pub fork_anchor: u32,
+    pub _pad_fork: u32,
 }
 
 /// Lab PR 224 (CM-03): `StdioRaw::flags`.
@@ -234,6 +247,9 @@ impl ProcessSpawnRaw {
             start_ns: 0,
             stdio: StdioRaw::zeroed(),
             parent_stdio: StdioRaw::zeroed(),
+            fork_parent_start: 0,
+            fork_anchor: 0,
+            _pad_fork: 0,
         }
     }
 }
@@ -380,6 +396,21 @@ pub struct TcpConnectRaw {
     /// the userland side (don't dereference); used as the key
     /// into `FLOW_SOCK_MAP` to correlate connect ↔ close.
     pub sk_ptr: u64,
+    // ── Lot 352 APPENDED (never reorder the above) ──
+    /// Lot 352: the connecting process's fork record when it has executed
+    /// nothing since its fork (a Python `os.fork()` child, a shell's
+    /// subshell, a daemon's grandchild): its own start
+    /// (`task->start_time` of its thread-group leader); 0 otherwise. Such a
+    /// process has no exec record, so the cross-PID chains' ancestry had
+    /// no edge for it.
+    pub fork_start: u64,
+    /// Lot 352: the forker's start, read at the fork (0 with `fork_start`).
+    pub fork_parent_start: u64,
+    /// Lot 352: the forker's thread-group id (0 with `fork_start`).
+    pub fork_ppid: u32,
+    /// Lot 352: the nearest process up the forks that had executed when
+    /// this one was forked ([`crate::fork_record::fork_anchor`]).
+    pub fork_anchor: u32,
 }
 
 impl TcpConnectRaw {
@@ -398,6 +429,10 @@ impl TcpConnectRaw {
             comm: [0u8; TASK_COMM_LEN],
             timestamp_ns: 0,
             sk_ptr: 0,
+            fork_start: 0,
+            fork_parent_start: 0,
+            fork_ppid: 0,
+            fork_anchor: 0,
         }
     }
 }
@@ -2133,10 +2168,13 @@ pub struct FimDriftRaw {
     pub fork_parent_start: u64,
     /// Lot 344, the review of #554 (F1): for a `Modified` seen at close, the
     /// writer's start (its thread group leader's `task->start_time`,
-    /// `CLOCK_MONOTONIC` ns) at its last write; 0 otherwise (or unread). The
+    /// `CLOCK_MONOTONIC` ns) at its last write; lot 352 (the re-check of
+    /// #561, N1): for an `Opened`, the reader's; 0 otherwise (or unread). The
     /// record leaves the kernel when the file closes, and its writer may be
     /// gone by then: userland reads `/proc/<modifier_pid>` only for the
-    /// process that started then, never the next holder of the pid.
+    /// process that started then, never the next holder of the pid. An open's
+    /// start is the one the chains tag its credential read or canary trip
+    /// with (`FimEvent::modifier_start`).
     pub modifier_start: u64,
 }
 
@@ -2193,6 +2231,35 @@ impl FimDriftRaw {
             modifier_start: 0,
         }
     }
+}
+
+/// Lot 352 (pre-alpha Phase 4, NN-L-FIM-002): the record `fim_link_observe`
+/// sends for a hard link made to a WATCHED file — its [`FimDriftRaw`]
+/// (`op` `FIM_OP_LINKED`, the watched source's `(dev, ino)`), then the NEW
+/// link's path as the kernel's dentries name it: the walk up from the new
+/// dentry, the leaf first, in the open sensor's slot layout
+/// ([`open_sensor::OPEN_PATH_SLOTS`] names of
+/// [`open_sensor::OPEN_PATH_SLOT_LEN`] bytes), and the filesystem root it
+/// reached, which userland maps to its mount point. The drift record alone
+/// named only the source (`/usr/bin/passwd`): the link's directory is
+/// rarely watched (`/var/tmp`), so NN-L-FIM-002 never saw where the link
+/// went. Sent on the FIM ring beside the drift records, told apart by its
+/// size. 712 bytes, 8-aligned.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FimLinkRaw {
+    pub drift: FimDriftRaw,
+    /// The top of the walk (a filesystem root), `(0, 0)` when the walk
+    /// stopped before it (`path_truncated`).
+    pub root_dev: u64,
+    pub root_ino: u64,
+    /// Names written in `path`.
+    pub path_n: u16,
+    /// The walk ended before a filesystem root.
+    pub path_truncated: u8,
+    pub _pad: [u8; 5],
+    pub path: [u8; open_sensor::OPEN_PATH_SLOTS * open_sensor::OPEN_PATH_SLOT_LEN],
 }
 
 /// R14a (plan §3.1, §3.3): the value of a `PROTECTED_PIDS` entry — the
@@ -2376,8 +2443,14 @@ mod tests {
         // The trailing _pad keeps the Pod free of implicit padding.
         // Tappa 10.9 step 2 appended `exe` (552) at 840: 1,392; POS-003
         // `start_ns` at 1,392: 1,400. Lab PR 224 appended `stdio` and
-        // `parent_stdio` (24 each) at 1,400: 1,448.
-        assert_eq!(size_of::<ProcessSpawnRaw>(), 1448);
+        // `parent_stdio` (24 each) at 1,400: 1,448. Lot 352 appended
+        // `fork_parent_start`, `fork_anchor` and its pad at 1,448: 1,464.
+        assert_eq!(size_of::<ProcessSpawnRaw>(), 1464);
+        assert_eq!(
+            core::mem::offset_of!(ProcessSpawnRaw, fork_parent_start),
+            1448
+        );
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, fork_anchor), 1456);
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, start_ns), 1392);
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, stdio), 1400);
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_stdio), 1424);
@@ -2456,6 +2529,9 @@ mod tests {
                 peer_addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             },
             parent_stdio: StdioRaw::zeroed(),
+            fork_parent_start: 0,
+            fork_anchor: 0,
+            _pad_fork: 0,
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);
@@ -2519,6 +2595,11 @@ mod tests {
         assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_parent_start), 160);
         assert_eq!(core::mem::offset_of!(FimDriftRaw, modifier_start), 168);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
+        // lot 352: the link record, the drift record then the walk
+        assert_eq!(size_of::<FimLinkRaw>(), 176 + 16 + 8 + 512);
+        assert_eq!(core::mem::offset_of!(FimLinkRaw, root_dev), 176);
+        assert_eq!(core::mem::offset_of!(FimLinkRaw, path), 200);
+        assert_eq!(align_of::<FimLinkRaw>(), 8);
         // FsProtectDenialRaw stays at the original 56-byte
         // shape; the FIM drift record is now a SUPERSET (first
         // 56 bytes identical, dest_dev + dest_ino appended).
@@ -2924,8 +3005,12 @@ mod tests {
     /// reorder fails fast.
     #[test]
     fn tcp_connect_raw_layout_is_stable_after_sk_ptr_extension() {
-        // 4+4+1+1+2+2+2+16+16+16+8+8 = 80 bytes.
-        assert_eq!(size_of::<TcpConnectRaw>(), 80);
+        // 4+4+1+1+2+2+2+16+16+16+8+8 = 80 bytes; lot 352 appended the
+        // fork record (8+8+4+4): 104.
+        assert_eq!(size_of::<TcpConnectRaw>(), 104);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, sk_ptr), 72);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, fork_start), 80);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, fork_anchor), 100);
         assert_eq!(align_of::<TcpConnectRaw>(), 8);
     }
 
@@ -2957,6 +3042,10 @@ mod tests {
             comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
             timestamp_ns: 1_700_000_000_000_000_000,
             sk_ptr: 0xFFFF_FFFF_DEAD_BEEF,
+            fork_start: 7,
+            fork_parent_start: 5,
+            fork_ppid: 41,
+            fork_anchor: 40,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<TcpConnectRaw>());

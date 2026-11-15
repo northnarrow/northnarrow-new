@@ -618,7 +618,15 @@ impl<H: CanaryHost> Detector<H> {
     /// `Registry::mark_tripped` + `CanaryAccessDb::append`
     /// path only fires on the rare match.
     pub fn process_event(&self, event: &Event) -> Option<Event> {
-        let (canary_id, access_kind, accessor_pid, accessor_uid, accessor_comm, ts) = match event {
+        let (
+            canary_id,
+            access_kind,
+            accessor_pid,
+            accessor_uid,
+            accessor_comm,
+            ts,
+            accessor_start_ns,
+        ) = match event {
             Event::Fim(fe) => {
                 let key = InodeKey {
                     dev: 0, // FimEvent doesn't carry (dev, ino) in V1.0; the
@@ -651,6 +659,7 @@ impl<H: CanaryHost> Detector<H> {
                     fe.modifier_uid,
                     fe.modifier_comm.clone(),
                     fe.timestamp_ns,
+                    fe.modifier_start,
                 )
             }
             Event::ProcessSpawn {
@@ -660,6 +669,7 @@ impl<H: CanaryHost> Detector<H> {
                 filename,
                 timestamp_ns,
                 exe,
+                start_ns,
                 ..
             } => {
                 // The file the kernel executed (review 61: a symlink or a
@@ -679,6 +689,7 @@ impl<H: CanaryHost> Detector<H> {
                     *uid,
                     comm.clone(),
                     *timestamp_ns,
+                    *start_ns,
                 )
             }
             // Lab PR 163: a connect to a network canary's address and
@@ -691,6 +702,7 @@ impl<H: CanaryHost> Detector<H> {
                 dst_addr,
                 dst_port,
                 timestamp_ns,
+                fork,
                 ..
             } => {
                 let dst = connect_destination(*family, dst_addr)?;
@@ -709,6 +721,8 @@ impl<H: CanaryHost> Detector<H> {
                     *uid,
                     comm.clone(),
                     *timestamp_ns,
+                    // lot 352: a fork-only connector's start (0 otherwise)
+                    fork.start_ns,
                 )
             }
             // All other event variants fall through.
@@ -833,6 +847,7 @@ impl<H: CanaryHost> Detector<H> {
             // External audit DEC-004: the K5 rules respond to the first
             // access only; every access is in the chain above.
             first_trip,
+            accessor_start_ns,
         })
     }
 }
