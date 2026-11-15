@@ -376,7 +376,9 @@ fn tie(
     let at = dir
         .join("root")
         .join(before.path.strip_prefix("/").unwrap_or(&before.path));
-    let meta = std::fs::metadata(at).ok()?;
+    // lot 353 (#563's census, at the merge of #564): beneath the /proc root
+    // the start anchored, as every read of the kernel's views
+    let meta = antitamper_bpf::kernel_roots::metadata(at).ok()?;
     if !(meta.is_file()
         && (kernel_dev(meta.dev()), meta.ino()) == (before.dev, before.ino)
         && meta.uid() == uid
@@ -435,14 +437,18 @@ fn find_daemon(
     before: &Ran,
 ) -> Option<(u32, u64)> {
     let image = (before.dev, before.ino);
-    std::fs::read_dir(proc_root).ok()?.flatten().find_map(|e| {
-        let d: u32 = e.file_name().to_str()?.parse().ok()?;
-        if d == pid {
-            return None;
-        }
-        let ticks = daemon_facts(proc_root, table, &e.path(), uid, image, &before.path)?;
-        crate::response::proc_ref::started_since(ticks, before.exec_ns).then_some((d, ticks))
-    })
+    antitamper_bpf::kernel_roots::read_dir(proc_root)
+        .ok()?
+        .into_iter()
+        .find_map(|name| {
+            let d: u32 = name.to_str()?.parse().ok()?;
+            if d == pid {
+                return None;
+            }
+            let at = proc_root.join(&name);
+            let ticks = daemon_facts(proc_root, table, &at, uid, image, &before.path)?;
+            crate::response::proc_ref::started_since(ticks, before.exec_ns).then_some((d, ticks))
+        })
 }
 
 /// The process `dir` (`/proc/<pid>`) runs the image `image` (its `exe`
@@ -460,10 +466,10 @@ fn daemon_facts(
 ) -> Option<u64> {
     // the link's text first: its target is then the image's directory's,
     // never a FUSE file to `stat`
-    if std::fs::read_link(dir.join("exe")).ok()? != image_path {
+    if antitamper_bpf::kernel_roots::read_link(dir.join("exe")).ok()? != image_path {
         return None;
     }
-    let meta = std::fs::metadata(dir.join("exe")).ok()?;
+    let meta = antitamper_bpf::kernel_roots::metadata(dir.join("exe")).ok()?;
     if (kernel_dev(meta.dev()), meta.ino()) != image {
         return None;
     }
@@ -506,13 +512,15 @@ fn daemon_facts(
 /// another namespace's) — by the descriptor's `fdinfo` mount, so a FUSE
 /// file is never `stat`ed. A pipe, a socket, a device are no image.
 fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
-    let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
+    let fd_dir = dir.join("fd");
+    let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(&fd_dir) else {
         return false;
     };
     let (mut fuse, mut held) = (false, false);
-    for fd in fds.flatten() {
+    for name in fds {
+        let fd = fd_dir.join(&name);
         // closed since the directory was read: nothing held
-        let Ok(text) = std::fs::read_link(fd.path()) else {
+        let Ok(text) = antitamper_bpf::kernel_roots::read_link(&fd) else {
             continue;
         };
         if text.as_os_str() == OsStr::new("/dev/fuse") {
@@ -523,13 +531,13 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         if !text.as_os_str().as_bytes().starts_with(b"/") {
             continue;
         }
-        let Some(m) = fd_mount(table, dir, fd.file_name().as_os_str()) else {
+        let Some(m) = fd_mount(table, dir, &name) else {
             return false;
         };
         if is_fuse(&m.fstype) {
             return false;
         }
-        let Ok(meta) = std::fs::metadata(fd.path()) else {
+        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&fd) else {
             return false;
         };
         if !meta.is_file() {

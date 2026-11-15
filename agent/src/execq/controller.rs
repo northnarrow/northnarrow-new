@@ -1693,7 +1693,9 @@ fn open_target(
     let want = (raw.exe.dev, raw.exe.ino);
     let matches = |f: &File| file_key(f).is_some_and(|(d, i, ..)| (d, i) == want);
     if have_proc {
-        if let Ok(f) = File::open(format!("/proc/{}/exe", raw.pid)) {
+        if let Ok(f) =
+            antitamper_bpf::kernel_roots::open(format!("/proc/{}/exe", raw.pid), libc::O_RDONLY)
+        {
             if matches(&f) {
                 return (Some(f), "image", None);
             }

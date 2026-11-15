@@ -54,7 +54,7 @@ use super::identity::FileId;
 use super::index::{FileState, Method, PostWrite, Refusal, Reservation};
 use super::journal::{host_view, Journal};
 use super::store::{now_ms, Stats, Store};
-use super::trust::{proc_start_ticks, ProcId, TrustFilter, WriterInfo};
+use super::trust::{ProcId, TrustFilter, WriterInfo};
 use crate::posture::lineage::AuthSessionTracker;
 
 /// Extra time the backstop gives a copier past its deadline.
@@ -145,7 +145,7 @@ pub struct Runtime {
 
 /// Probe: does `/proc/<tid>/syscall` of another task read?
 fn flags_source() -> String {
-    match std::fs::read_to_string("/proc/1/syscall") {
+    match antitamper_bpf::kernel_roots::read_to_string("/proc/1/syscall") {
         Ok(_) => "proc_syscall".into(),
         Err(e) => format!("unavailable ({e}): every open is treated as a write"),
     }
@@ -259,7 +259,13 @@ impl Runtime {
             })
             .collect();
         let rt = Arc::new(Self {
-            trust: TrustFilter::new(&cfg.trusted_writers, tracker),
+            // lot 353 (#563 F2): /proc read beneath the anchored root
+            trust: TrustFilter::new(&cfg.trusted_writers, tracker).with_reads(
+                super::trust::ProcReads {
+                    read_link: |p| antitamper_bpf::kernel_roots::read_link(p),
+                    read: |p| antitamper_bpf::kernel_roots::read_all(p),
+                },
+            ),
             group,
             pending: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
@@ -407,7 +413,8 @@ impl Runtime {
     fn mark_scope(&self, i: usize) -> Result<u64, String> {
         let s = &self.store.cfg.scopes[i];
         let host = host_view(&s.path);
-        let meta = std::fs::symlink_metadata(&host).map_err(|e| format!("stat: {e}"))?;
+        let meta = antitamper_bpf::kernel_roots::symlink_metadata(&host)
+            .map_err(|e| format!("stat: {e}"))?;
         if !meta.is_dir() {
             return Err("not a directory (or a link)".into());
         }
@@ -441,7 +448,7 @@ impl Runtime {
         let s = &self.store.cfg.scopes[i];
         let host = host_view(&s.path);
         let journal = host_view(&s.journal);
-        let dev = std::fs::symlink_metadata(&host)
+        let dev = antitamper_bpf::kernel_roots::symlink_metadata(&host)
             .map_err(|e| format!("stat: {e}"))?
             .dev();
         let mut stack = vec![host];
@@ -634,7 +641,7 @@ impl Runtime {
             return self.allow_fast(fd, read_at, &s.allowed_read_only);
         }
         let tgid = tgid_of(ev.tid).unwrap_or(ev.tid as u32);
-        let start = proc_start_ticks(Path::new("/proc"), tgid).unwrap_or(0);
+        let start = crate::cow::start_of(tgid).unwrap_or(0);
         let writer = ProcId { pid: tgid, start };
         let info = self.trust.evaluate(tgid, start);
         // Lot 315 (bug hunt 1.4, F6): the file is its device, inode number
@@ -1092,7 +1099,7 @@ mod lot311 {
         use std::os::unix::ffi::OsStrExt;
         let d = tempfile::tempdir().unwrap();
         let t = d.path().join("mountinfo");
-        std::fs::write(
+        antitamper_bpf::kernel_roots::write(
             &t,
             b"30 1 8:2 / /srv/data rw - ext4 /dev/sdb rw\n\
               57 1 0:44 / /home/u/\xff rw,nosuid,nodev - fuse.x x rw,user_id=1000\n",
@@ -1118,7 +1125,7 @@ mod lot311 {
         ));
         // the review of #538 (F2): a source `-`, and a line not in the
         // kernel's shape that still names the scope
-        std::fs::write(
+        antitamper_bpf::kernel_roots::write(
             &t,
             b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n32 1 8:3 / /srv/odd rw ext4 x rw\n",
         )
@@ -1127,7 +1134,8 @@ mod lot311 {
         assert!(is_mount_point_in(Path::new("/srv/odd"), &[&t], &mut rows));
         assert!(rows.holding(), "the odd line is signed");
         // the re-check: a table in the kernel's shape withdraws it
-        std::fs::write(&t, b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n").unwrap();
+        antitamper_bpf::kernel_roots::write(&t, b"31 1 0:44 / /srv/fuse rw - fuse.x - rw\n")
+            .unwrap();
         assert!(is_mount_point_in(Path::new("/srv/fuse"), &[&t], &mut rows));
         assert!(!rows.holding(), "withdrawn");
     }

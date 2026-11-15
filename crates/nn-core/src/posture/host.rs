@@ -73,9 +73,11 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// process's `exe`, its `ns/mnt`).
     fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf>;
 
-    /// The entries of the directory at `path` (the process table, R08b: the
-    /// security-tool detector's scan of it).
-    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir>;
+    /// The names of the entries of the directory at `path` (the process
+    /// table, R08b: the security-tool detector's scan of it). Lot 353: names,
+    /// so the agent's host reads them beneath the `/proc` root its start
+    /// anchored (`antitamper_bpf::kernel_roots`).
+    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<std::ffi::OsString>>;
 
     /// `path` is a directory (a process's entry in the process table).
     fn is_dir(path: &Path) -> bool;
@@ -197,8 +199,10 @@ pub(crate) mod testing {
             std::fs::read_link(path)
         }
 
-        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
-            std::fs::read_dir(path)
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<std::ffi::OsString>> {
+            std::fs::read_dir(path)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect()
         }
 
         fn is_dir(path: &Path) -> bool {
@@ -288,7 +292,7 @@ pub(crate) mod testing {
         fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
             TestHost::read_link(path)
         }
-        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<std::ffi::OsString>> {
             TestHost::read_dir(path)
         }
         fn is_dir(path: &Path) -> bool {

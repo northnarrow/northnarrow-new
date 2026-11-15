@@ -400,9 +400,9 @@ pub fn back_to_configured(bpffs_root: Option<&Path>, socket: &Path) -> Vec<Strin
             // the units' files set it below: the floor stays
             continue;
         }
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let current = antitamper_bpf::kernel_roots::read_to_string(&path).unwrap_or_default();
         if current.trim() != configured {
-            if let Err(e) = std::fs::write(&path, format!("{configured}\n")) {
+            if let Err(e) = antitamper_bpf::kernel_roots::write(&path, format!("{configured}\n")) {
                 warn!(path = %path.display(), error = %e, "anti-tamper cgroup: a file at its floor NOT put back to its configured value");
                 continue;
             }

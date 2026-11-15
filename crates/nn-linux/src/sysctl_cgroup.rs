@@ -273,17 +273,15 @@ fn query_root(cgroup_fd: i32) -> std::io::Result<RootQuery> {
     })
 }
 
-/// The root cgroup's directory, opened: the cgroup v2 mount of the
-/// hierarchy's top (`/proc/self/mountinfo`), checked to be the root
-/// ([`ROOT_CGROUP_INO`]).
+/// The root cgroup's directory, opened beneath the cgroup2 root the start
+/// anchored (`antitamper_bpf::kernel_roots`, lot 353), checked to be the
+/// root ([`ROOT_CGROUP_INO`]).
 fn open_root_cgroup() -> Result<std::fs::File, String> {
     use std::os::unix::fs::MetadataExt;
-    let table = crate::mountinfo::read(Path::new("/proc/self/mountinfo"))
-        .map_err(|e| format!("/proc/self/mountinfo unreadable: {e}"))?;
-    let at = cgroup2_root(&table).ok_or_else(|| {
-        "no cgroup v2 mount of the hierarchy's root (a cgroup v1 host)".to_string()
-    })?;
-    let f = std::fs::File::open(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+    // Lot 353 (pre-alpha Phase 3, X6): beneath the root the agent's start
+    // anchored — the open of the mount table's path stalled the round on
+    // a FUSE mounted over `/sys/fs/cgroup` (`FUSE_OPENDIR`, never answered)
+    let (f, at) = antitamper_bpf::kernel_roots::cgroup_root()?;
     let ino = f
         .metadata()
         .map_err(|e| format!("{}: {e}", at.display()))?
@@ -300,7 +298,9 @@ fn open_root_cgroup() -> Result<std::fs::File, String> {
 /// Remove the judge's pins in `dir` (its link first: the prior program
 /// detaches once this boot's runs) and, when `all`, the directory.
 fn purge_pins(dir: &Path, all: bool) {
-    if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
+    if antitamper_bpf::kernel_roots::symlink_metadata(dir)
+        .is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink())
+    {
         antitamper_bpf::purge_stale_pin(dir);
         return;
     }
@@ -308,7 +308,7 @@ fn purge_pins(dir: &Path, all: bool) {
     antitamper_bpf::purge_stale_pin(&link);
     antitamper_bpf::purge_stale_pin(&prog);
     if all {
-        if let Err(e) = std::fs::remove_dir(dir) {
+        if let Err(e) = antitamper_bpf::kernel_roots::remove_dir(dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %e, dir = %dir.display(), "sysctl judge: its pin directory NOT removed");
             }
@@ -323,7 +323,7 @@ fn usable_dir(dir: &Path) -> Result<(), String> {
     if let Some(why) = antitamper_bpf::pin_root_refusal_at(dir) {
         return Err(why);
     }
-    match std::fs::symlink_metadata(dir) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(dir) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(format!("{} is not a directory", dir.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()

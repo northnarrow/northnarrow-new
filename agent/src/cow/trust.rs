@@ -245,12 +245,32 @@ const CACHE_CAP: usize = 4096;
 /// The production filter: the built-in and configured writers, the lineage
 /// tracker the agent feeds from exec events, and a short cache keyed by the
 /// process identity and its executable (an exec keeps the start time).
+/// Lot 353 (the review of #563, F2): how the filter reads `/proc` — the
+/// agent's host gives the reads beneath the root its start anchored
+/// (`kernel_roots`, a FUSE over `/proc` cannot hold them); this module, in
+/// nn-core's layer, names no OS crate. Default: `std`'s, by path.
+#[derive(Clone, Copy)]
+pub struct ProcReads {
+    pub read_link: fn(&Path) -> std::io::Result<PathBuf>,
+    pub read: fn(&Path) -> std::io::Result<Vec<u8>>,
+}
+
+impl Default for ProcReads {
+    fn default() -> Self {
+        Self {
+            read_link: |p| std::fs::read_link(p),
+            read: |p| std::fs::read(p),
+        }
+    }
+}
+
 pub struct TrustFilter {
     writers: Vec<String>,
     tracker: AuthSessionTracker,
     /// Lot 292 (BUG-49): who installed an ancestor's program.
     owners: ProgramOwners,
     proc_root: PathBuf,
+    reads: ProcReads,
     cache: Mutex<HashMap<CacheKey, (Instant, std::sync::Arc<WriterInfo>)>>,
 }
 
@@ -266,8 +286,16 @@ impl TrustFilter {
             tracker,
             owners: ProgramOwners::default(),
             proc_root: PathBuf::from("/proc"),
+            reads: ProcReads::default(),
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The host's reads of `/proc` (lot 353: the agent's, beneath the
+    /// anchored root).
+    pub fn with_reads(mut self, reads: ProcReads) -> Self {
+        self.reads = reads;
+        self
     }
 
     /// The package database of `owners` in place of the host's (tests).
@@ -285,7 +313,7 @@ impl TrustFilter {
     /// Judge process `tgid` (start `start`). Reads the spawn cache and
     /// `/proc` only.
     pub fn evaluate(&self, tgid: u32, start: u64) -> std::sync::Arc<WriterInfo> {
-        let exe = std::fs::read_link(self.proc_root.join(tgid.to_string()).join("exe"))
+        let exe = (self.reads.read_link)(&self.proc_root.join(tgid.to_string()).join("exe"))
             .unwrap_or_default();
         let key = (ProcId { pid: tgid, start }, exe);
         let now = Instant::now();
@@ -319,7 +347,7 @@ impl TrustFilter {
         if let Some(l) = &lineage {
             ids.extend(l.iter().skip(1).map(|(pid, _)| ProcId {
                 pid: *pid,
-                start: proc_start_ticks(&self.proc_root, *pid).unwrap_or(0),
+                start: proc_start_ticks(self.reads.read, &self.proc_root, *pid).unwrap_or(0),
             }));
         }
         let info = std::sync::Arc::new(WriterInfo {
@@ -341,14 +369,20 @@ impl TrustFilter {
 
 /// `starttime`, field 22 of `/proc/<pid>/stat` (after the `(comm)` field,
 /// which may hold spaces or parentheses).
-pub fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
+/// Lot 353 (#563 F2): the file read by `read` (the agent's: beneath the
+/// anchored `/proc` root).
+pub fn proc_start_ticks(
+    read: fn(&Path) -> std::io::Result<Vec<u8>>,
+    proc_root: &Path,
+    pid: u32,
+) -> Option<u64> {
     // lot 311 (N6; the re-check of #542): read as bytes — a writer's `comm`
     // is its own choice; read strictly, a writer named `\xff\xfe` was "not
     // alive" and the in-place restore ran while it still wrote. The one
     // conversion, `nn_linux::state_read::read_state`'s own: this module is
     // in nn-core's layer (`xtask/tests/module_map.rs`), so not through
     // nn-linux
-    let stat = std::fs::read(proc_root.join(pid.to_string()).join("stat"))
+    let stat = read(&proc_root.join(pid.to_string()).join("stat"))
         .map(nn_core::posture::host::state_text)
         .ok()?;
     parse_stat_start(&stat)
@@ -905,11 +939,19 @@ mod tests {
         let pid = p.pid();
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         assert!(std::str::from_utf8(&comm).is_err(), "the fixture's comm");
-        let start = proc_start_ticks(Path::new("/proc"), pid).expect("its start");
+        let start =
+            proc_start_ticks(|p| std::fs::read(p), Path::new("/proc"), pid).expect("its start");
         assert!(super::super::store::alive(ProcId { pid, start }));
         let root = tempfile::tempdir().unwrap();
         nn_linux::state_read::testing::write_non_utf8_proc(root.path(), 4242, 1, 1000, 777);
-        assert_eq!(proc_start_ticks(root.path(), 4242), Some(777));
-        assert_eq!(proc_start_ticks(root.path(), 4243), None, "gone");
+        assert_eq!(
+            proc_start_ticks(|p| std::fs::read(p), root.path(), 4242),
+            Some(777)
+        );
+        assert_eq!(
+            proc_start_ticks(|p| std::fs::read(p), root.path(), 4243),
+            None,
+            "gone"
+        );
     }
 }

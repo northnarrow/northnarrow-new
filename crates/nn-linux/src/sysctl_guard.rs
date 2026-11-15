@@ -135,7 +135,7 @@ impl Ftrace {
 /// tests).
 pub fn ftrace(root: &Path) -> Ftrace {
     let path = root.join(FTRACE_ENABLED.trim_start_matches('/'));
-    match std::fs::read_to_string(&path) {
+    match antitamper_bpf::kernel_roots::read_to_string(&path) {
         Ok(t) => match t.trim().parse::<i64>() {
             Ok(0) => Ftrace::Off,
             Ok(_) => Ftrace::On,
@@ -188,7 +188,7 @@ pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
         &crate::sysctl_cgroup::opt_out_for,
         |path, text| {
             if write {
-                std::fs::write(path, text)
+                antitamper_bpf::kernel_roots::write(path, text)
             } else {
                 Ok(())
             }
@@ -224,7 +224,7 @@ pub fn check_with(
     mut put: impl FnMut(&Path, &str) -> std::io::Result<()>,
 ) -> Vec<Seen> {
     let read = |p: &str| {
-        std::fs::read_to_string(root.join(p.trim_start_matches('/')))
+        antitamper_bpf::kernel_roots::read_to_string(root.join(p.trim_start_matches('/')))
             .ok()
             .map(|t| t.trim().to_string())
     };

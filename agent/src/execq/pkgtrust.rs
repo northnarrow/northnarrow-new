@@ -127,7 +127,7 @@ impl PackageTrust {
     }
 
     fn dpkg_index(&self) -> Option<DpkgIndex> {
-        let status = std::fs::metadata(self.root.join("var/lib/dpkg/status"))
+        let status = antitamper_bpf::kernel_roots::metadata(self.root.join("var/lib/dpkg/status"))
             .and_then(|m| m.modified())
             .ok();
         let mut cache = self.dpkg.lock();

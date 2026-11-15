@@ -260,7 +260,7 @@ pub fn bpffs_findings(table: &MountTable, pin_root: &Path) -> Vec<String> {
 /// previous agent read it when it registered the inode (the name itself,
 /// `lstat`; the kernel's encoding of the device).
 pub fn inode_key(path: &Path) -> std::io::Result<InodeKey> {
-    let meta = std::fs::symlink_metadata(path)?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
     Ok(InodeKey {
         dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
         ino: meta.ino(),
@@ -287,7 +287,7 @@ pub enum PreviousAgent {
 /// at the name, as `preregister_self` asks), then the inode map opened.
 pub fn previous_agent(bpffs_root: &Path) -> PreviousAgent {
     let pinned = |name: &str| {
-        !matches!(std::fs::symlink_metadata(bpffs_root.join(name)),
+        !matches!(antitamper_bpf::kernel_roots::symlink_metadata(bpffs_root.join(name)),
                   Err(e) if e.kind() == std::io::ErrorKind::NotFound)
     };
     if !pinned(crate::anti_tamper::PROTECTED_PIDS_MAP_NAME) && !pinned("PROTECTED_INODES") {
@@ -387,7 +387,7 @@ pub fn restart_findings(
         Ok(None) => return Vec::new(),
         Err(why) => return vec![why],
     };
-    let protected = std::fs::metadata(exe)
+    let protected = antitamper_bpf::kernel_roots::metadata(exe)
         .map(|m| InodeKey {
             dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
             ino: m.ino(),
@@ -397,7 +397,7 @@ pub fn restart_findings(
         return Vec::new();
     }
     // the binary by its path (`/proc/self/exe` is a link to it)
-    let shown = std::fs::read_link(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let shown = antitamper_bpf::kernel_roots::read_link(exe).unwrap_or_else(|_| exe.to_path_buf());
     let restart = if protected {
         format!(
             "this start runs the binary the previous agent protected ({}), a restart of it",
@@ -471,7 +471,7 @@ pub struct IdentityPaths {
 /// hooks close to this process is there); an error other than "not found"
 /// counts as there: the key's load decides on it.
 pub fn key_absent(path: &Path) -> bool {
-    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    matches!(antitamper_bpf::kernel_roots::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// What is at `path`, looked at without following a link: `None` when the
@@ -479,7 +479,7 @@ pub fn key_absent(path: &Path) -> bool {
 /// not "not found" — is something (review of #468 R8: a lookup that fails
 /// counts against minting).
 fn something_at(path: &Path) -> Option<String> {
-    match std::fs::symlink_metadata(path) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(path) {
         Ok(_) => Some("is there".to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!("cannot be looked at ({e}): counted as there")),
@@ -511,7 +511,7 @@ pub fn prior_identity(paths: &IdentityPaths) -> Vec<String> {
             paths.agent_id.display()
         ));
     }
-    match std::fs::symlink_metadata(&paths.heads) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(&paths.heads) {
         Ok(m) if m.file_type().is_file() && m.len() == 0 => {}
         Ok(_) => out.push(format!(
             "the head anchor {} is not an empty file",

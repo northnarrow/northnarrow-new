@@ -165,7 +165,7 @@ impl Row {
 }
 
 fn execute() -> Result<bool> {
-    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+    let kernel = antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let (object, source) = object_bytes()?;
@@ -213,7 +213,7 @@ fn execute() -> Result<bool> {
             bail!("vmlinux BTF unparseable: {e}")
         }
     }
-    let btf = Btf::from_sys_fs().context("loading the vmlinux BTF")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf().context("loading the vmlinux BTF")?;
 
     // Lot 332: the budget, and the kprobe for kernels whose program info
     // has no count.

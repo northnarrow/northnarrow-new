@@ -1083,7 +1083,7 @@ fn the_guarded_points_are_published_by_identity() {
         body(&k, "point_roots<'a>"),
         &[
             "let kind = root_kind_of(point) & !root_kind::GUARDED;",
-            "let Ok(st) = std::fs::metadata(path) else {",
+            "let Ok(st) = antitamper_bpf::kernel_roots::metadata(path) else {",
             "if !st.is_dir() {",
             "dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(st.dev()),",
             "ino: st.ino(),",

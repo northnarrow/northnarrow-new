@@ -23,7 +23,7 @@
 use std::ffi::CString;
 use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -53,34 +53,42 @@ pub enum Record {
 /// else `p` (tests, a run without `CAP_SYS_PTRACE`).
 pub fn host_view(p: &Path) -> PathBuf {
     static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *REACHABLE.get_or_init(|| std::fs::metadata("/proc/1/root/").is_ok()) {
+    if *REACHABLE.get_or_init(|| antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok()) {
         crate::response::host_path(p)
     } else {
         p.to_path_buf()
     }
 }
 
+/// Lot 353 (re-check 2 of #563): every file of the journal is reached
+/// through `kernel_roots` — the host's view (`/proc/1/root/…`) beneath the
+/// `/proc` root the start anchored, or the journal's own descriptors —
+/// never by a path walk of the `/proc` mounted now: the journal's work runs
+/// on the guard's fanotify thread, and a FUSE over `/proc` held it (every
+/// open in a guarded scope waited on its permission event).
 fn open_dir(p: &Path) -> io::Result<OwnedFd> {
-    let c = CString::new(p.as_os_str().as_encoded_bytes())
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: NUL-terminated path.
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let f = antitamper_bpf::kernel_roots::open(
+        p,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    )?;
+    Ok(OwnedFd::from(f))
+}
+
+/// Mode 0700 on the directory `p` (no link followed), through its
+/// descriptor.
+fn chmod_700(p: &Path) -> io::Result<()> {
+    let f = antitamper_bpf::kernel_roots::open(p, libc::O_PATH | libc::O_NOFOLLOW)?;
+    antitamper_bpf::kernel_roots::chmod_fd(&f, 0o700).or_else(|_| {
+        // no anchored `/proc` (a test): the open directory itself
+        let d = antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        d.set_permissions(std::fs::Permissions::from_mode(0o700))
+    })
 }
 
 /// Create `p` 0700, or check the existing one: a directory (not a link)
 /// owned by the agent's uid with no group or other access.
 fn ensure_private_dir(p: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(p) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(p) {
         Ok(m) => {
             if !m.file_type().is_dir() {
                 bail!(
@@ -98,15 +106,14 @@ fn ensure_private_dir(p: &Path) -> Result<()> {
                 );
             }
             if m.mode() & 0o077 != 0 {
-                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
-                    .with_context(|| format!("chmod 0700 {}", p.display()))?;
+                chmod_700(p).with_context(|| format!("chmod 0700 {}", p.display()))?;
             }
             Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(p)
-            .with_context(|| format!("mkdir {}", p.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            antitamper_bpf::kernel_roots::create_dir_mode(p, 0o700)
+                .with_context(|| format!("mkdir {}", p.display()))
+        }
         Err(e) => Err(e).with_context(|| format!("stat {}", p.display())),
     }
 }
@@ -125,7 +132,7 @@ fn read_index(p: &Path) -> io::Result<Vec<u8>> {
     if REPLAY_READ_FAILS.with(|f| f.replace(false)) {
         return Err(io::Error::from_raw_os_error(libc::EIO));
     }
-    std::fs::read(p)
+    antitamper_bpf::kernel_roots::read_all(p)
 }
 
 /// A scope's journal, open.
@@ -158,7 +165,7 @@ impl Journal {
         let parent = host
             .parent()
             .ok_or_else(|| anyhow!("journal {} has no parent", path.display()))?;
-        if !parent.is_dir() {
+        if !antitamper_bpf::kernel_roots::is_dir(parent) {
             bail!(
                 "the directory above journal {} does not exist",
                 path.display()
@@ -171,7 +178,7 @@ impl Journal {
         let objects = open_dir(&host.join("objects"))?;
         let evidence = open_dir(&host.join("evidence"))?;
         let mut index = Self::open_index(&root)?;
-        let (mut lines, torn) = std::fs::read(host.join("index.jsonl"))
+        let (mut lines, torn) = antitamper_bpf::kernel_roots::read_all(host.join("index.jsonl"))
             .map(|b| {
                 let lines = b.iter().filter(|c| **c == b'\n').count() as u64;
                 (lines, b.last().is_some_and(|c| *c != b'\n'))
@@ -256,7 +263,9 @@ impl Journal {
 
     /// The device of the journal's filesystem.
     pub fn dev(&self) -> Option<u64> {
-        std::fs::metadata(&self.host).ok().map(|m| m.dev())
+        antitamper_bpf::kernel_roots::metadata(&self.host)
+            .ok()
+            .map(|m| m.dev())
     }
 
     pub fn object_name(id: u64) -> CString {
@@ -363,10 +372,11 @@ impl Journal {
 
     /// The object ids present in `objects/`.
     pub fn list_objects(&self) -> std::collections::BTreeSet<u64> {
-        std::fs::read_dir(self.host.join("objects"))
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter_map(|e| u64::from_str_radix(e.file_name().to_str()?, 16).ok())
+        antitamper_bpf::kernel_roots::read_dir(self.host.join("objects"))
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| u64::from_str_radix(n.to_str()?, 16).ok())
                     .collect()
             })
             .unwrap_or_default()
@@ -429,13 +439,14 @@ impl Journal {
     /// ([`Self::objects_dir`]).
     pub fn compaction_file(host: &Path) -> Result<std::fs::File> {
         let tmp = host.join("index.jsonl.new");
-        let _ = std::fs::remove_file(&tmp);
-        let f = std::fs::OpenOptions::new()
-            .append(true)
-            .create_new(true)
-            .open(&tmp)
-            .context("create index.jsonl.new")?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        let _ = antitamper_bpf::kernel_roots::remove_file(&tmp);
+        let f = antitamper_bpf::kernel_roots::create(
+            &tmp,
+            libc::O_WRONLY | libc::O_APPEND | libc::O_EXCL,
+            0o600,
+        )
+        .context("create index.jsonl.new")?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(f)
     }
 
@@ -448,7 +459,7 @@ impl Journal {
             f.write_all(&line)?;
         }
         f.sync_all()?;
-        std::fs::rename(
+        antitamper_bpf::kernel_roots::rename(
             self.host.join("index.jsonl.new"),
             self.host.join("index.jsonl"),
         )
@@ -496,12 +507,14 @@ impl Journal {
     /// (`tar -x`, `rsync -a`, `cp -p`) was deleted at the first expiry after
     /// its move, and the retention promised to the evidence never ran.
     pub fn expire_evidence(&self, cutoff_secs: i64) {
-        if let Ok(rd) = std::fs::read_dir(self.host.join("evidence")) {
-            for e in rd.filter_map(|e| e.ok()) {
-                if e.metadata()
+        let dir = self.host.join("evidence");
+        if let Ok(names) = antitamper_bpf::kernel_roots::read_dir(&dir) {
+            for n in names {
+                let p = dir.join(&n);
+                if antitamper_bpf::kernel_roots::symlink_metadata(&p)
                     .is_ok_and(|m| m.mtime().max(m.ctime()) < cutoff_secs)
                 {
-                    let _ = std::fs::remove_file(e.path());
+                    let _ = antitamper_bpf::kernel_roots::remove_file(&p);
                 }
             }
         }

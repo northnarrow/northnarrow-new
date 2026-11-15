@@ -19,11 +19,27 @@
 //! `bind` fail with `EADDRINUSE`, ASK-014), a missing parent is created
 //! 0700, and the mode is set to 0600 on the socket just bound — through an
 //! `O_PATH | O_NOFOLLOW` descriptor, never on what a link put in its place.
+//!
+//! Lot 353 (re-check 2 of #563, R2-1): the whole check — the look at the
+//! path, and for a socket taken away the clear, the parent's creation, the
+//! bind and the mode — runs on a helper thread of its own ([`look_and_rebind`],
+//! one in flight at most), never in the serve loop: the serve loop starts a
+//! check ([`SocketWatch::start_check`]) and takes its answer when it comes
+//! ([`SocketWatch::finish`]: the std listener made a tokio one there). Only
+//! the look was bounded, on a helper with a deadline; the rebind ran in the
+//! serve loop by path, and a FUSE over `/run/northnarrow` that answered the
+//! look and held the next lookup of the same name held the serve loop and
+//! its worker — on one worker, the whole runtime. A check that does not
+//! answer holds its helper only: the serve loop goes on serving the
+//! listener it has, and starts no other check until that one answers. The
+//! socket's name is the one `nn-admin` and the watchdog walk to, so it is
+//! bound by path; the mode is set beneath the anchored `/proc` root
+//! (`kernel_roots::chmod_fd`). The start's bind is bounded the same way
+//! ([`bind_within`]).
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,8 +94,52 @@ impl SocketId {
 }
 
 /// Bind the admin socket at `path` (see the module doc): the listener and
-/// the identity of the socket file. Must run inside the tokio runtime.
+/// the identity of the socket file, on the caller's thread (the tests'; the
+/// agent's start binds it through [`bind_within`]). Must run inside the
+/// tokio runtime.
+#[cfg(test)]
 pub fn bind(path: &Path) -> Result<(UnixListener, SocketId)> {
+    let (listener, id) = bind_std(path)?;
+    Ok((UnixListener::from_std(listener)?, id))
+}
+
+/// Lot 353 (re-check 2 of #563, R2-1): how long the start's bind and a
+/// check of the path wait for their helper.
+pub const BIND_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Lot 353 (re-check 2 of #563, R2-1): [`bind_std`] on a helper thread,
+/// awaited at most `deadline` (the start's bind, in the serve task: a mount
+/// over `/run/northnarrow` that does not answer holds the helper, never a
+/// worker of the runtime). Past it, an error: the serve loop does not
+/// start (an ERROR and a signed record, as for any bind that fails).
+pub async fn bind_within(path: &Path, deadline: Duration) -> Result<(UnixListener, SocketId)> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("nn-sock-bind".into())
+        .spawn(move || {
+            let _ = tx.send(bind_std(&p));
+        })
+        .context("no helper thread for the admin socket's bind")?;
+    let (listener, id) = tokio::time::timeout(deadline, rx)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "binding admin socket {}: no answer within {} s (a mount over its directory \
+                 that does not answer?)",
+                path.display(),
+                deadline.as_secs()
+            )
+        })?
+        .map_err(|_| anyhow!("the admin socket's bind helper ended without an answer"))??;
+    Ok((UnixListener::from_std(listener)?, id))
+}
+
+/// The bind itself, by path, on the caller's thread: whatever sits at the
+/// path cleared, the parent made, the socket bound (non-blocking, for the
+/// runtime) and its mode set — a std listener the runtime takes
+/// (`UnixListener::from_std`).
+fn bind_std(path: &Path) -> Result<(std::os::unix::net::UnixListener, SocketId)> {
     clear(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && fs::symlink_metadata(parent).is_err() {
@@ -90,8 +150,11 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketId)> {
                 .with_context(|| format!("creating socket parent dir {}", parent.display()))?;
         }
     }
-    let listener = UnixListener::bind(path)
+    let listener = std::os::unix::net::UnixListener::bind(path)
         .with_context(|| format!("binding admin socket {}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("admin socket {} non-blocking", path.display()))?;
     // bind() honours the umask; root:root remains via ownership of the
     // bind() syscall. The mode is the first gate; the accept loop checks
     // each peer's uid as well (external audit ASK-012, NN-AUD-238), so a
@@ -132,21 +195,20 @@ fn restrict(path: &Path) -> io::Result<SocketId> {
             "the path no longer holds the socket just bound",
         ));
     }
-    let mode = Permissions::from_mode(0o600);
-    match fs::set_permissions(format!("/proc/self/fd/{}", f.as_raw_fd()), mode.clone()) {
-        Ok(()) => {}
-        // No /proc: chmod by name, then check it is still that socket.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::set_permissions(path, mode)?;
-            let after = fs::symlink_metadata(path)?;
-            if SocketId::of(&after) != SocketId::of(&m) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the path changed while its mode was set",
-                ));
-            }
+    // Lot 353 (the review of #563, F2): through the /proc root the start
+    // anchored, never the /proc mounted now (a FUSE over it held the
+    // re-bind of WDG-007).
+    if antitamper_bpf::kernel_roots::chmod_fd(&f, 0o600).is_err() {
+        // No anchored /proc: chmod by name, then check it is still that
+        // socket.
+        fs::set_permissions(path, Permissions::from_mode(0o600))?;
+        let after = fs::symlink_metadata(path)?;
+        if SocketId::of(&after) != SocketId::of(&m) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the path changed while its mode was set",
+            ));
         }
-        Err(e) => return Err(e),
     }
     Ok(SocketId::of(&m))
 }
@@ -164,9 +226,38 @@ pub enum PathState {
     Unreadable(io::Error),
 }
 
+/// Lot 353 (re-check 1 of #563): how long a test's check waits for its
+/// helper ([`SocketWatch::check`]; the serve loop never waits for one).
+pub const LOOK_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Look at `path` (never through a link).
 pub fn path_state(path: &Path, bound: SocketId) -> PathState {
-    match fs::symlink_metadata(path) {
+    state_of(fs::symlink_metadata(path), bound)
+}
+
+/// Lot 353 (re-check 2 of #563, R2-1): what one check found — the path's
+/// state, and for a socket removed or replaced the bind again (`None`: not
+/// tried, the socket is the agent's, the path unreadable or retired).
+#[derive(Debug)]
+pub struct Looked {
+    state: PathState,
+    rebound: Option<Result<(std::os::unix::net::UnixListener, SocketId)>>,
+}
+
+/// Lot 353 (re-check 2 of #563, R2-1): one check, whole, on the caller's
+/// thread (a helper's: [`SocketWatch::start_check`]) — the look, and for a
+/// socket taken away its bind again (the clear, the parent, the bind, the
+/// mode). Nothing of it runs in the serve loop.
+pub fn look_and_rebind(path: &Path, bound: SocketId) -> Looked {
+    let state = path_state(path, bound);
+    let rebound = (matches!(state, PathState::Removed | PathState::Replaced(_))
+        && !is_retired(path))
+    .then(|| bind_std(path));
+    Looked { state, rebound }
+}
+
+fn state_of(looked: io::Result<fs::Metadata>, bound: SocketId) -> PathState {
+    match looked {
         Ok(m) => {
             let t = m.file_type();
             if t.is_socket() && SocketId::of(&m) == bound {
@@ -201,6 +292,12 @@ pub struct SocketWatch {
     unsigned: u32,
     /// The last "still not bound" warning.
     last_retry_log: Option<Instant>,
+    /// Lot 353 (re-check 2 of #563, R2-1): a check on its helper that has
+    /// not answered yet (one at a time), and since when.
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+    started: Option<Instant>,
+    /// The last "the check does not answer" warning.
+    last_held_log: Option<Instant>,
 }
 
 impl SocketWatch {
@@ -212,17 +309,97 @@ impl SocketWatch {
             last_signed: None,
             unsigned: 0,
             last_retry_log: None,
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: None,
+            last_held_log: None,
         }
     }
 
-    /// One look at the path: `Some(listener)` when the socket was removed
-    /// or replaced and has been bound again — the caller serves on it from
-    /// then on.
-    pub fn check(&mut self, audit_log: Option<&Arc<Mutex<AuditLog>>>) -> Option<UnixListener> {
+    /// Lot 353 (re-check 2 of #563, R2-1): start one check on a helper
+    /// thread ([`look_and_rebind`]); its answer comes on the receiver,
+    /// handed to [`Self::finish`]. `None`: the path is retired, or the
+    /// previous check has not answered (warned once a minute: its helper is
+    /// held — the serve loop goes on serving the listener it has).
+    pub fn start_check(&mut self) -> Option<tokio::sync::oneshot::Receiver<Looked>> {
+        use std::sync::atomic::Ordering;
         if is_retired(&self.path) {
             return None;
         }
-        let what = match path_state(&self.path, self.bound) {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            self.still_held();
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (path, bound, in_flight) = (self.path.clone(), self.bound, Arc::clone(&self.in_flight));
+        let spawned = std::thread::Builder::new()
+            .name("nn-sock-watch".into())
+            .spawn(move || {
+                let looked = look_and_rebind(&path, bound);
+                in_flight.store(false, Ordering::Release);
+                let _ = tx.send(looked);
+            });
+        if let Err(e) = spawned {
+            self.in_flight.store(false, Ordering::Release);
+            warn!(error = %e, "admin socket path not checked: no helper thread");
+            return None;
+        }
+        self.started = Some(Instant::now());
+        Some(rx)
+    }
+
+    /// A check started and not answered: warned once a minute.
+    pub fn still_held(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_held_log
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.last_held_log = Some(now);
+        warn!(
+            path = %self.path.display(),
+            secs = self.started.map_or(0, |t| t.elapsed().as_secs()),
+            "admin socket path: its check has not answered (a mount over its directory that \
+             does not answer?) — the serve loop goes on, no other check until it does"
+        );
+    }
+
+    /// One check, waited for at most `deadline` on the caller's thread (the
+    /// tests'): `Some(listener)` when the socket was removed or replaced
+    /// and has been bound again.
+    #[cfg(test)]
+    pub fn check(&mut self, audit_log: Option<&Arc<Mutex<AuditLog>>>) -> Option<UnixListener> {
+        let mut rx = self.start_check()?;
+        let started = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(looked) => return self.finish(looked, audit_log),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    if started.elapsed() < LOOK_DEADLINE =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Lot 353 (re-check 2 of #563, R2-1): a check's answer, in the serve
+    /// loop — reported (a signed finding for a socket taken away), and the
+    /// socket bound again made the runtime's listener: `Some(listener)`, the
+    /// caller serves on it from then on.
+    pub fn finish(
+        &mut self,
+        looked: Looked,
+        audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    ) -> Option<UnixListener> {
+        self.started = None;
+        if is_retired(&self.path) {
+            return None;
+        }
+        let Looked { state, rebound } = looked;
+        let what = match state {
             PathState::Ours => return None,
             PathState::Unreadable(e) => {
                 if self.retry_log_due() {
@@ -238,7 +415,9 @@ impl SocketWatch {
             PathState::Replaced(what) => what,
         };
         let first = !self.pending;
-        let rebound = bind(&self.path);
+        let rebound = rebound
+            .unwrap_or_else(|| Err(anyhow!("the path was retired")))
+            .and_then(|(l, id)| Ok((UnixListener::from_std(l)?, id)));
         if first {
             self.report(what, rebound.as_ref().err(), audit_log);
         }

@@ -82,7 +82,7 @@ impl CanaryHost for LinuxHost {
     }
 
     fn accessor_exe(accessor_pid: u32) -> Option<String> {
-        std::fs::read_link(format!("/proc/{accessor_pid}/exe"))
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/{accessor_pid}/exe"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
     }
@@ -93,7 +93,7 @@ impl CanaryHost for LinuxHost {
 /// (`(major << 20) | minor`). `None` when the file is not there.
 pub fn stat_inode_key(path: &Path) -> Option<InodeKey> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::symlink_metadata(path).ok()?;
     let dev = m.dev();
     Some(InodeKey {
         dev: ((libc::major(dev) as u64) << 20) | libc::minor(dev) as u64,
@@ -268,7 +268,7 @@ mod stop_tests {
     }
 
     fn jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
-        std::fs::read_to_string(path)
+        antitamper_bpf::kernel_roots::read_to_string(path)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -338,14 +338,15 @@ mod stop_tests {
 
     /// Cut the file's last row in its middle: a write the disk got part of.
     fn tear_last_row(path: &Path) {
-        let body = std::fs::read(path).unwrap();
+        let body = antitamper_bpf::kernel_roots::read_all(path).unwrap();
         assert_eq!(body.last(), Some(&b'\n'));
         let start = body[..body.len() - 1]
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(0, |nl| nl + 1);
         assert!(start > 0, "the torn row is not the file's first");
-        std::fs::write(path, &body[..start + (body.len() - start) / 2]).unwrap();
+        antitamper_bpf::kernel_roots::write(path, &body[..start + (body.len() - start) / 2])
+            .unwrap();
     }
 
     /// Two file canaries deployed; one trips whole (its rows come before

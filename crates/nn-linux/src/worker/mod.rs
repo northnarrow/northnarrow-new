@@ -8,7 +8,7 @@
 //! `northnarrow-worker` account, in its sandbox (`crate::sandbox`):
 //!
 //! - [`SelfImage`]: the agent's binary, opened at boot; a worker is started
-//!   from that descriptor (`/proc/self/fd/N`), so an upgrade that replaced
+//!   from that descriptor (`execveat` of it, lot 353), so an upgrade that replaced
 //!   the file on disk does not start a worker of another version;
 //! - [`spawn`]: the child's steps between `fork` and `exec`;
 //! - [`transport`]: the channel's packets (`SOCK_SEQPACKET`, no
@@ -81,7 +81,8 @@ impl SelfImage {
 
     /// `path` (the lab harness: the agent's binary from a test).
     pub fn open(path: &Path) -> io::Result<Self> {
-        let f = std::fs::File::open(path)?;
+        // lot 353 (#563): `/proc/self/exe` beneath the anchored /proc root
+        let f = antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)?;
         // SAFETY: F_DUPFD_CLOEXEC on a descriptor we own.
         let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, IMAGE_FD_MIN) };
         if fd < 0 {
@@ -109,9 +110,20 @@ impl SelfImage {
         })
     }
 
-    /// The path a child executes it by.
+    /// The name the kernel gives a child's exec of it (`execveat` of the
+    /// descriptor, `AT_EMPTY_PATH`: `/dev/fd/<n>`) — what the exec sensor
+    /// reports, and R004 recognises as the core's own launch. Lot 353
+    /// (re-check 2 of #563): the child executes the descriptor itself
+    /// ([`super::spawn::spawn`]); the path `/proc/self/fd/<n>` it executed
+    /// was walked through the `/proc` mounted now, and a FUSE over it held
+    /// the exec (and the supervisor waiting for it).
     pub fn exec_path(&self) -> String {
-        format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+        format!("/dev/fd/{}", self.fd.as_raw_fd())
+    }
+
+    /// The descriptor of the image (the child's `execveat`).
+    pub fn raw_fd(&self) -> libc::c_int {
+        self.fd.as_raw_fd()
     }
 
     /// `(st_dev, st_ino)` of the binary.
@@ -189,7 +201,7 @@ mod tests {
         let img = SelfImage::open_own().unwrap();
         let fd: i32 = img
             .exec_path()
-            .strip_prefix("/proc/self/fd/")
+            .strip_prefix("/dev/fd/")
             .unwrap()
             .parse()
             .unwrap();

@@ -271,7 +271,7 @@ pub fn status() -> nn_proto::admin_protocol::ExploitGuardStatus {
 
 /// `/proc/sys/kernel/pid_max`.
 pub fn pid_max() -> Option<u32> {
-    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/pid_max")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
@@ -289,7 +289,7 @@ pub fn task_map_entries(requested: Option<u32>, pid_max: Option<u32>) -> u32 {
 
 /// `/proc/sys/kernel/threads-max`.
 pub fn threads_max() -> Option<u32> {
-    std::fs::read_to_string("/proc/sys/kernel/threads-max")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/threads-max")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
@@ -412,7 +412,7 @@ pub fn resolved_layout() -> Result<ResolvedLayout, String> {
 
 /// `/proc/sys/kernel/cap_last_cap`.
 pub fn cap_last_cap() -> Result<u32, String> {
-    let s = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+    let s = antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|e| format!("/proc/sys/kernel/cap_last_cap: {e}"))?;
     parse_cap_last_cap(&s)
 }
@@ -567,7 +567,8 @@ fn attach_inner(ebpf: &mut Ebpf, v: Variant) -> Result<(RingBuf<MapData>, Exploi
     // Unarmed first: the programs do nothing until every one is attached.
     let mut map = take_config(ebpf)?;
     write_config(&mut map, config)?;
-    let btf = Btf::from_sys_fs().map_err(|e| format!("vmlinux BTF: {e}"))?;
+    let btf =
+        antitamper_bpf::kernel_roots::vmlinux_btf().map_err(|e| format!("vmlinux BTF: {e}"))?;
     match v {
         Variant::Lite => {
             for (prog, tp) in LITE_TP_BTF {
@@ -722,8 +723,9 @@ impl ExploitGuard {
 fn read_counters(map: &PerCpuArray<MapData, u64>) -> [u64; counter::SLOTS as usize] {
     let mut out = [0u64; counter::SLOTS as usize];
     for (i, o) in out.iter_mut().enumerate() {
-        if let Ok(per_cpu) = map.get(&(i as u32), 0) {
-            *o = per_cpu.iter().fold(0u64, |a, v| a.wrapping_add(*v));
+        // lot 353 (#563 F2): no per-thread read of /sys by path
+        if let Ok(v) = antitamper_bpf::per_cpu::sum(map, i as u32) {
+            *o = v;
         }
     }
     out

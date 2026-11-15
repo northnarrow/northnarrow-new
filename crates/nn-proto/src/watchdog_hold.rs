@@ -88,6 +88,46 @@ pub const REASON_LIMIT_FLOOR_NOT_RESTORED: &str = "limit_floor_not_restored";
 /// what stayed below. The agent signs it as `systemd_copy_below_floor`.
 pub const REASON_COPY_BEFORE_RESPAWN: &str = "systemd_copy_before_respawn";
 
+/// Lot 353 (pre-alpha Phase 3, X6): the watchdog's stuck recovery stopped
+/// an agent that did not answer its STATUS pings (which ping failed, how
+/// many in a row, for how long). Written before the recovery's SIGINT;
+/// the agent signs it under its own kind (`stuck_unresponsive`), and the
+/// stop the SIGINT starts is named so ([`STUCK_STOP_REASON`]): the
+/// heartbeat's verifier counts it as no clean stop.
+pub const REASON_STUCK_UNRESPONSIVE: &str = "stuck_unresponsive";
+/// Lot 353: [`RESTART_LOOP_RECOVERIES`] stuck recoveries within
+/// [`RESTART_LOOP_WINDOW_SECS`] — an agent restarted again and again (a
+/// mount over a path it reads held for long, a resource starved): signed
+/// High by the agent (`agent_restart_loop`), a degradation of its status.
+pub const REASON_AGENT_RESTART_LOOP: &str = "agent_restart_loop";
+/// Lot 353 (pre-alpha Phase 3, X6 on 6.12): the stuck recovery's SIGKILL
+/// could not end the agent — a thread of it waited, uninterruptibly, on a
+/// FUSE request its daemon never answered — and the watchdog aborted that
+/// FUSE connection (`/sys/fs/fuse/connections/<id>/abort`): a FUSE mounted
+/// over `/proc`, `/sys` (the cgroup tree) or the agent's own directories
+/// only, with requests waiting. The detail names the mount, its source and
+/// the connection; the agent signs it High (`fuse_aborted`).
+pub const REASON_FUSE_ABORTED: &str = "fuse_aborted";
+/// Lot 353 (the review of #563, F1): the agent answered its pings, but its
+/// `LoopProgress` reply said its signed records had been failing for the
+/// time the detail gives (an append that cannot reach its log: a mount
+/// over a path it writes, a full disk) — the watchdog's record, signed by
+/// the next agent that can sign, High.
+pub const REASON_SIGNED_RECORDS_FAILED: &str = "signed_records_failed";
+/// Lot 353: how many stuck recoveries make a restart loop…
+pub const RESTART_LOOP_RECOVERIES: usize = 3;
+/// …within this many seconds.
+pub const RESTART_LOOP_WINDOW_SECS: u64 = 600;
+/// Lot 353: the stop reason of an agent the watchdog's stuck recovery
+/// stopped (its `agent_stop` row, its heartbeat's stop beat).
+pub const STUCK_STOP_REASON: &str = "stuck_unresponsive";
+/// Lot 353: where the watchdog leaves, before its stuck recovery's SIGINT,
+/// the one [`HoldRecord`] (`REASON_STUCK_UNRESPONSIVE`) the agent reads to
+/// name its stop ([`STUCK_STOP_REASON`]); the agent removes it.
+pub const STUCK_PATH: &str = "/run/northnarrow/watchdog.stuck";
+/// Lot 353: how old a stuck marker may be and still name a stop.
+pub const STUCK_MARKER_MAX_AGE_SECS: u64 = 120;
+
 /// One hold (or supervision event), as the watchdog records it at
 /// [`HOLD_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,4 +145,16 @@ pub struct HoldRecord {
     /// Result=…`), when the respawn goes through systemd and it answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_state: Option<String>,
+}
+
+/// Lot 353: whether the stuck marker `text` (one [`HoldRecord`]) names the
+/// agent `pid` and is at most [`STUCK_MARKER_MAX_AGE_SECS`] old at `now`
+/// (unix seconds): its detail when it does.
+pub fn stuck_marker_names(text: &str, pid: u32, now: u64) -> Option<String> {
+    let r: HoldRecord = serde_json::from_str(text.trim()).ok()?;
+    (r.reason == REASON_STUCK_UNRESPONSIVE
+        && r.agent_pid == pid
+        && now.saturating_sub(r.at) <= STUCK_MARKER_MAX_AGE_SECS
+        && r.at <= now.saturating_add(5))
+    .then_some(r.detail)
 }

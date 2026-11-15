@@ -59,7 +59,8 @@ pub fn agent_mounts(
     boot: &mut BootSequence,
     configured: &[&Path],
 ) -> Result<Verdict, BootOrderError> {
-    let table = std::fs::read(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+    let table = crate::mountinfo::read_bytes(Path::new(continuity::OWN_MOUNTINFO))
+        .map_err(|e| e.to_string());
     let config = Path::new(crate::anti_tamper::filesystem::CONFIG_DIR);
     let state = Path::new(crate::anti_tamper::filesystem::STATE_DIR);
     let mut dirs: Vec<&Path> = vec![config, state];
@@ -276,7 +277,9 @@ impl KeyDecision {
 /// inode), when it can be looked at.
 fn seen_at(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    antitamper_bpf::kernel_roots::metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
 }
 
 /// Lab PR 265 (review #466 F4-bis; the review of #468, R2, R4 and R8; its
@@ -469,8 +472,8 @@ pub fn install_manifest(
     manifest: &Path,
     audit_log: &Path,
 ) -> Result<ManifestCheck, BootOrderError> {
-    let own_exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+    let own_exe = antitamper_bpf::kernel_roots::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
     let allow = std::env::var(install_manifest::ALLOW_UNVERIFIED_ENV).ok();
     install_manifest_for(boot, manifest, &own_exe, audit_log, allow.as_deref())
 }
@@ -758,7 +761,7 @@ fn vmlinux_btf_in(
     allow_degraded: bool,
 ) -> Result<Verdict, BootOrderError> {
     let path = root.join("sys/kernel/btf/vmlinux");
-    let missing = match std::fs::metadata(&path) {
+    let missing = match antitamper_bpf::kernel_roots::metadata(&path) {
         Ok(m) if m.is_file() && m.len() > 0 => None,
         Ok(_) => Some(format!("{} is empty or not a file", path.display())),
         Err(e) => Some(format!("{}: {e}", path.display())),
@@ -1978,7 +1981,8 @@ mod tests {
         };
         let check = || {
             let mut boot = BootSequence::new();
-            let table = std::fs::read(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+            let table = crate::mountinfo::read_bytes(Path::new(continuity::OWN_MOUNTINFO))
+                .map_err(|e| e.to_string());
             let v = agent_mounts_decided(
                 &mut boot,
                 table,

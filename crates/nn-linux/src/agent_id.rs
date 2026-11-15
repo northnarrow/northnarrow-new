@@ -167,7 +167,7 @@ pub fn load_or_bootstrap(path: &Path) -> Result<[u8; AGENT_ID_LEN]> {
 
 /// [`load_or_bootstrap`], and whether the id was minted now.
 fn load_or_mint(path: &Path) -> Result<([u8; AGENT_ID_LEN], bool)> {
-    match fs::read_to_string(path) {
+    match antitamper_bpf::kernel_roots::read_to_string(path) {
         Ok(content) => {
             let id = parse(&content).with_context(|| {
                 format!(
@@ -237,7 +237,10 @@ fn per_boot_id() -> [u8; AGENT_ID_LEN] {
     }
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(fs::read("/proc/sys/kernel/random/boot_id").unwrap_or_default());
+    h.update(
+        antitamper_bpf::kernel_roots::read_all("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_default(),
+    );
     h.update(std::process::id().to_le_bytes());
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

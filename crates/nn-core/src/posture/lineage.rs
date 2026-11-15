@@ -1524,12 +1524,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let tick = H::clock_tick_ns();
         let suspended = self.suspended_ns();
         let mut seeded = 0;
-        for entry in dir.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.parse::<u32>().ok())
-            else {
+        for name in dir {
+            let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
                 continue;
             };
             if pid == 0 || self.holds(pid) {
@@ -1898,12 +1894,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         let (mut forks, mut orphans) = (0, 0);
         if let Ok(dir) = H::read_dir(&self.inner.proc_root) {
-            for entry in dir.flatten() {
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|n| n.parse::<u32>().ok())
-                else {
+            for name in dir {
+                let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
                     continue;
                 };
                 // a pid whose entry the sweep marked gone names another

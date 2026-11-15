@@ -122,6 +122,33 @@ pub fn report(source: &str, detail: &str) -> bool {
     true
 }
 
+/// Lot 353 (the review of #563, F1): [`report`] for a caller that may hold
+/// the audit log's lock (a signed log's writer telling its failure): it
+/// never signs here — past [`MAX_KEPT`] it is counted only, never signed
+/// at once (that would take the lock its caller holds). Signed at the next
+/// flush like every report. Returns whether it is new.
+pub fn note(source: &str, detail: &str) -> bool {
+    let mut r = REGISTRY.lock();
+    if r.entries
+        .iter()
+        .any(|d| d.source == source && d.detail == detail)
+    {
+        return false;
+    }
+    if r.entries.len() >= MAX_KEPT {
+        r.overflow += 1;
+        return true;
+    }
+    let at_boot = !r.boot_over;
+    r.entries.push(Degradation {
+        source: source.to_string(),
+        detail: detail.to_string(),
+        at_boot,
+        signed: false,
+    });
+    true
+}
+
 /// A degradation whose finder holds the audit log: signed now (every time,
 /// as the callers did before the registry), and kept.
 pub fn report_signed(
@@ -449,6 +476,25 @@ pub fn withdraw_where(source: &str, ended: impl Fn(&str) -> bool) -> usize {
     before - r.entries.len()
 }
 
+/// Lot 353 (the review of #563, F1): [`withdraw_where`] for a caller that
+/// may hold the audit log's lock: an entry that leaves before its record
+/// was signed is kept for the next flush (never signed here, never lost).
+/// Returns how many left.
+pub fn retire_where(source: &str, ended: impl Fn(&str) -> bool) -> usize {
+    let mut r = REGISTRY.lock();
+    let before = r.entries.len();
+    let mut unsigned = Vec::new();
+    r.entries.retain(|d| {
+        let stays = d.source != source || !ended(&d.detail);
+        if !stays && !d.signed {
+            unsigned.push(d.clone());
+        }
+        stays
+    });
+    r.withdrawn_unsigned.append(&mut unsigned);
+    before - r.entries.len()
+}
+
 /// The event loop starts: later reports are not boot ones.
 pub fn mark_boot_over() {
     REGISTRY.lock().boot_over = true;
@@ -644,6 +690,54 @@ mod tests {
         );
         assert_eq!(flush(), 0, "once");
         assert_eq!(degraded_rows(dir.path()).len(), 2);
+        reset_for_tests();
+    }
+
+    /// Lot 353 (the review of #563, F1): the failure of a signed log, told
+    /// with the writer's lock held (`note`, `retire_where`): never signed
+    /// there, and its record is not lost when the failure ends before a
+    /// flush signed it — the next flush signs it, once; past the bound it
+    /// is counted, never signed at once.
+    #[test]
+    fn a_signing_failure_told_under_the_lock_is_signed_at_the_next_flush() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert_eq!(attach_audit_log(Some(Arc::clone(&log))), 0);
+        {
+            // the writer's lock held: nothing signed here (no deadlock)
+            let _held = log.lock();
+            assert!(note("signed_log", "audit.jsonl: appends fail: EIO"));
+            assert!(
+                !note("signed_log", "audit.jsonl: appends fail: EIO"),
+                "one entry"
+            );
+            assert_eq!(
+                retire_where("signed_log", |d| d.starts_with("audit.jsonl: ")),
+                1
+            );
+        }
+        assert!(snapshot().is_empty(), "left the status");
+        assert!(
+            degraded_rows(dir.path()).is_empty(),
+            "nothing signed under the lock"
+        );
+        assert_eq!(flush(), 1, "signed at the next flush");
+        let rows = degraded_rows(dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"], "signed_log");
+        assert_eq!(flush(), 0, "once");
+        reset_for_tests();
+        for i in 0..MAX_KEPT {
+            note("x", &format!("{i}"));
+        }
+        assert!(note("x", "past the bound"));
+        assert!(
+            snapshot().iter().any(|l| l.contains("1 more")),
+            "{:?}",
+            snapshot()
+        );
         reset_for_tests();
     }
 

@@ -15,6 +15,7 @@
 //! the posture; R08c (lab PR 252): so did the ransomware and security-tool
 //! judges, which the posture names itself.
 
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,29 +31,33 @@ impl PostureHost for LinuxHost {
 
     const HOST_ROOT: &'static str = "/";
 
+    // Lot 353 (pre-alpha Phase 3, X6): the process table and the host's
+    // view (`/proc/<pid>/…`, `/proc/1/root/…`) read beneath the `/proc` root
+    // the agent's start anchored (`antitamper_bpf::kernel_roots`) — a mount
+    // laid over `/proc` since is never walked; any other path as before.
     fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-        fs::read(path)
+        antitamper_bpf::kernel_roots::read_all(path)
     }
 
     fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
-        fs::read_link(path)
+        antitamper_bpf::kernel_roots::read_link(path)
     }
 
-    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<fs::ReadDir> {
-        fs::read_dir(path)
+    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<std::ffi::OsString>> {
+        antitamper_bpf::kernel_roots::read_dir(path)
     }
 
     fn is_dir(path: &Path) -> bool {
-        path.is_dir()
+        antitamper_bpf::kernel_roots::is_dir(path)
     }
 
     fn exists(path: &Path) -> bool {
-        path.exists()
+        antitamper_bpf::kernel_roots::metadata(path).is_ok()
     }
 
     /// `lstat(2)`'s `st_uid`, for a directory only.
     fn dir_owner<P: AsRef<Path>>(path: P) -> Option<u32> {
-        fs::symlink_metadata(path)
+        antitamper_bpf::kernel_roots::symlink_metadata(path)
             .ok()
             .filter(|m| m.is_dir())
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
@@ -63,19 +68,16 @@ impl PostureHost for LinuxHost {
     /// link, no path walked in the process's mount namespace), a host path
     /// the file the agent sees there.
     fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-            .open(path)
-            .ok()?;
+        use std::os::unix::fs::MetadataExt;
+        let file = antitamper_bpf::kernel_roots::open(path, libc::O_PATH).ok()?;
         let meta = file.metadata().ok()?;
         Some((meta.dev(), meta.ino()))
     }
 
     fn dir_is_root_only<P: AsRef<Path>>(path: P) -> bool {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+        antitamper_bpf::kernel_roots::metadata(path)
+            .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
     }
 
     fn suspended_ns() -> u64 {

@@ -154,7 +154,7 @@ pub fn evaluate(paths: &BootstrapPaths) -> BootstrapGate {
     if !paths.sentinel.exists() {
         return BootstrapGate::SentinelAbsent;
     }
-    let admin_pub_bytes = match fs::read(&paths.admin_pub) {
+    let admin_pub_bytes = match antitamper_bpf::kernel_roots::read_all(&paths.admin_pub) {
         Ok(b) => b,
         Err(e) => {
             return BootstrapGate::IoError {
@@ -214,7 +214,7 @@ pub fn evaluate_loaded(
     }
 
     // Step 3 — read the install nonce.
-    let nonce_bytes = match fs::read(&paths.install_nonce) {
+    let nonce_bytes = match antitamper_bpf::kernel_roots::read_all(&paths.install_nonce) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return BootstrapGate::InstallNonceMissing;
@@ -238,7 +238,7 @@ pub fn evaluate_loaded(
     // what's on disk. The sentinel is hex-encoded so the operator
     // can `cat` it and an attacker can't trivially confuse the agent
     // by writing raw bytes (length mismatch ⇒ immediate reject).
-    let sentinel_raw = match fs::read_to_string(&paths.sentinel) {
+    let sentinel_raw = match antitamper_bpf::kernel_roots::read_to_string(&paths.sentinel) {
         Ok(s) => s,
         Err(e) => {
             return BootstrapGate::IoError {

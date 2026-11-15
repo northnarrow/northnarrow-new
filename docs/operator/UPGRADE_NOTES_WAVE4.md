@@ -2745,6 +2745,489 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   about 1 MiB more kernel memory); the exec record grew 16 bytes, the TCP
   connect record 24. The eBPF object and the agent are rebuilt together.
 
+## 47. A FUSE over `/proc`, `/sys` or the cgroup root does not stall the agent's critical loops; stuck restarts are named and a loop is signed (lot 353)
+
+What this lot covers, and what it does not (mounts over the agent's own
+directories: lot 357), is stated exactly at the end of §47.1.
+
+The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
+`/sys/fs/cgroup` that never answered the agent's threads. The integrity
+round's read of the agent's own `memory.max` and the kernel-state round's
+open of the cgroup root waited in the kernel — on the runtime's worker
+threads, with every thread that looked up the same names behind them — and
+the admin socket stopped answering the watchdog. Its stuck recovery
+(SIGINT, SIGKILL after 5 s) restarted an agent that had recorded nothing,
+and the signed log showed a clean `agent_stop` `sigint`.
+
+- **The kernel's views are read beneath the roots the agent's start
+  anchored.** `/proc`, `/sys` and the cgroup2 root are opened once, at the
+  start, and checked to be the kernel's own file systems
+  (`antitamper_bpf::kernel_roots`); every read of them — the shared state
+  readers, the mount table, the process table, the integrity and kernel-
+  state rounds, the cgroup floors and guards, the responses' cgroups — is
+  opened beneath those roots, crossing no mount (`openat2`,
+  `RESOLVE_NO_XDEV`). A mount laid over a view since is not walked: the
+  agent keeps reading the real files. A path that crosses a mount below a
+  view is read only when that mount is one of the kernel's file systems
+  (securityfs, tracefs, binfmt_misc, a cgroup v1 controller…), within a
+  2-second deadline; **a FUSE, a tmpfs or a disk's file system mounted below
+  `/proc` or `/sys` is refused** (the read fails: "not the kernel's").
+  Nothing is crossed below the cgroup2 root.
+- **A view already covered when the agent starts is not read** (a restart
+  under the mount): its reads fail at once, naming why, and the start signs
+  a `kernel_views` degradation.
+- **The integrity and kernel-state rounds run off the runtime's worker
+  threads**: a read that blocks never holds the admin socket's tasks.
+- **A mount over the kernel's views is signed High.** `mount_over_protected`
+  now also covers a mount at `/proc`, `/sys` or `/sys/fs/cgroup` of another
+  file system than theirs, and a mount below `/proc` or `/sys` of a file
+  system not the kernel's; the detail names the mount, its file system and
+  its source. **Every `mount_over_protected` row carries `"severity":
+  "high"`** (the R003 bind over `/etc` included). A host that mounts its own
+  non-kernel file system below `/proc` or `/sys` in PID 1's namespace (none
+  of the supported distributions does; containers' masks are in their own
+  namespaces) now has this row.
+- **The watchdog's stuck recovery names its cause.** Before its SIGINT it
+  records which ping failed, how many in a row and for how long
+  (`stuck_unresponsive`, signed by the agent at its next round) and leaves a
+  marker (`/run/northnarrow/watchdog.stuck`) the agent reads at that SIGINT:
+  the stop is `stuck_unresponsive` — its `agent_stop` row, its heartbeat
+  stop beat, a non-zero exit — and `heartbeat watch` says `DEGRADED`,
+  naming the stuck recovery. An operator's SIGINT is still a clean `sigint`.
+- **A restart loop is signed High.** Three stuck recoveries within 10
+  minutes are `agent_restart_loop` (High), a degradation in `nn-admin
+  status`, and `DEGRADED: … (a restart loop)` in the watchdog unit's status.
+- **A stuck recovery that fails is signed High** (`stuck_recovery_failed`,
+  once per stuck signal — at most one a minute — and the unit's status says
+  `DEGRADED` meanwhile; the watchdog holds no key, the next agent signs it).
+- **The watchdog aborts a FUSE holding the agent.** When the stuck
+  recovery's SIGKILL cannot end the agent (a thread of it waiting,
+  uninterruptibly, on a FUSE request its daemon never answers — 6.12), the
+  watchdog aborts that FUSE connection (`/sys/fs/fuse/connections/<id>/abort`)
+  and records `fuse_aborted` (High: the mount, its source, the connection,
+  the outcome): only a FUSE mounted over `/proc`, `/sys` (the cgroup tree)
+  or the agent's own directories (at or above them, never `/`), in the
+  agent's or PID 1's mount table, whose connection has requests waiting —
+  never a user's FUSE elsewhere. Self-protection: enforced under every
+  profile, `alpha` included.
+- **The agent counts its CPUs without walking the cgroup tree**
+  (`kernel_roots::available_parallelism`: the runtime's workers, the audit
+  log's parallel check): std's count reads the cgroup's `cpu.max` by path.
+  A mount's root (the open sensor's and the exec quarantine's mount rounds)
+  is read beneath the views and from the kernel's cache, never asking a FUSE
+  mounted over its point.
+
+### 47.1 The review of #563: no `/proc` on the signing path, every view read routed
+
+- **A signed record never walks `/proc`.** The signed logs (the audit log,
+  the rotating chains — heartbeat, detections, actions, netflow… — the flat
+  chains, the COMBAT compatibility log, a refused start's fallback chain)
+  were opened at every append through `/proc/self/fd/<dir>/<name>`: a FUSE
+  over `/proc` held every signed append and the audit log's lock with it
+  (the High record of that very mount was never written; detections, admin
+  handlers and decisions then waited on the lock), and a tmpfs over `/proc`
+  made every signed record fail with `ENOENT`, silently. The directory
+  descriptors are kept as before (review entry 44) and every file
+  operation of a writer — the append, the fsync's open, the tail read
+  again, a rotation's create, rename (`renameat2`), listing and eviction
+  (`unlinkat`), the manifest's, the heads store's — resolves its name
+  beneath them (`openat2`, `RESOLVE_BENEATH | RESOLVE_NO_XDEV |
+  RESOLVE_NO_MAGICLINKS`): no `/proc`, no path walked from `/`, no mount
+  crossed (a mount over the log file itself fails `EXDEV` at once, never
+  asked anything). No lock is held across an operation a mount can stall.
+  The paths in the logs' errors are the logs' own names again.
+- **A signing failure is never silent.** A signed log whose appends fail is
+  a degradation (`signed_log: <file>: appends fail: <error>`, in `nn-admin
+  status` and the trust level; signed when a chain takes rows again, never
+  dropped), an ERROR in the journal, and the watchdog's: the `LoopProgress`
+  reply carries how long the oldest failure has lasted (`unsigned_ms`, an
+  appended field; an older agent's reply reads as 0), and the watchdog
+  records `signed_records_failed` (High) in its hold once per episode
+  lasting 30 s at a ping, with an ERROR of its own.
+- **Every read of `/proc` and `/sys` the ratchet sees is routed** (the
+  ratchet no longer missed them; re-check 1 found two walks it did not see,
+  below): the known-program judgement's process walk and link
+  descriptors, the admin socket's re-bind chmod (WDG-007), the quarantine's
+  restore and its listed-shells read and its emptying, the kill response's
+  descendant walk (the `procfs` crate is gone from the product code), the
+  copy-on-write guard's writer judgement, the ring-drop and package checks,
+  the systemd executor scans (the user managers' and PID 1's descriptors),
+  the module tool's thread scan and environment, the exec checks' images
+  (`/proc/<pid>/exe`) and environments (`/proc/<pid>/environ`), the mount
+  table's watch and the open sensor's check that a mount point still shows
+  its root (`metadata` of `/proc` asked the FUSE over it), the agent's own
+  image (`std::env::current_exe`, which the telemetry probe's round asked on
+  a runtime worker), the debug `/proc/<pid>/mem` probe — all beneath the
+  anchored roots. The ratchet
+  (`xtask/tests/kernel_views.rs`) follows a path under a view through a
+  function's locals and through the parameters a call in the same file
+  hands it, whatever they are named, and refuses std's `current_exe`, the
+  `procfs` crate, aya's CPU counts and BTF read, and a per-CPU map's
+  `get`/`set`/`iter`. aya's per-thread
+  CPU count (`/sys/devices/system/cpu/possible`, read by path on every fresh
+  thread a per-CPU map was read from — the samplers on the runtime, a
+  `block_in_place` hands the core to a fresh thread) is not used: the
+  per-CPU maps are read and written by `antitamper_bpf::per_cpu`, the CPU
+  count read once at the start beneath the `/sys` root. The kernel's BTF
+  (`/sys/kernel/btf/vmlinux`, 13 loaders) is read beneath the `/sys` root
+  too: a start under a FUSE over `/sys` fails its BTF at once instead of
+  waiting with no deadline.
+- **A mount stacked or bound over a view's own point is recorded and
+  refused.** At `/proc`, `/sys` and `/sys/fs/cgroup`, a file system stacked
+  over the one mounted there (a tmpfs over the cgroup2 root, another proc
+  over `/proc`) and a directory of a file system bound over the point (a
+  cgroup2 subtree over the hierarchy's root, `/proc/sys` over `/proc`) are
+  `mount_over_protected` (High) at every round; a bind of the view onto
+  itself is the view. At the start the same mounts are not anchored, and
+  **a tmpfs at `/sys/fs/cgroup` with no cgroup2 below it on a host whose
+  processes are in the cgroup2 hierarchy alone** (`/proc/self/cgroup` names
+  no v1 hierarchy: the kernel's word, whatever is mounted) is refused —
+  never taken for a cgroup v1 host: the cgroup tree is not read, the start
+  signs a `kernel_views` degradation, and every round signs the refusal as
+  a `mount_over_protected` (High). A hybrid host's tmpfs (with `unified`
+  below it, or v1 controllers in `/proc/self/cgroup`) is still the host's.
+- **WSL2's `binfmt_misc/status` tmpfs is not a mount over a view.** WSL's
+  init lays a tmpfs (source root `/wsl/…`) over
+  `/proc/sys/fs/binfmt_misc/status`, below the binfmt_misc mounted there, at
+  every boot: in PID 1's table that one mount is the platform's — by its
+  type, its point, its parent and its source, never a path allowed whatever
+  is mounted there. A tmpfs or a FUSE over `/proc` or `/sys` themselves, or
+  another mount at that point, still fires.
+- **The watchdog's records are never dropped** (point 5). The watchdog
+  holds no key (DEP-004): `stuck_unresponsive`, `stuck_recovery_failed`,
+  `agent_restart_loop`, `fuse_aborted`, `signed_records_failed` are written
+  unsigned to `/run/northnarrow/watchdog.hold` and **signed by the next
+  agent's integrity round** — once the hold file is taken (renamed to
+  `watchdog.hold.taken`: a record the watchdog writes meanwhile goes to a
+  fresh file), it is removed only when every one of its records is signed;
+  a round whose appends fail keeps it, and the next signs it (a finding
+  whose record failed is not remembered as reported). With the signed path
+  free of `/proc`, the agent that follows a FUSE or a tmpfs over `/proc`
+  signs them. `stuck_unresponsive` is named, not High (its stop is
+  `DEGRADED` for the verifier); the other four are High. Hiding them takes
+  writing to `/run/northnarrow`.
+- **The FUSE abort reads the mount again just before it** (F6): the
+  connection's id is the mount's anonymous minor, which the kernel gives the
+  next FUSE once this one is gone; a FUSE no longer at its point on that
+  connection in the mount tables read again is not aborted. Left: the
+  moments between that read and the abort's write.
+
+- **The open sensor's rule refresh never walks the `/proc` or `/sys`
+  mounted now, and never runs on the runtime** (re-check 1 of #563). The
+  mass-write carve-outs `/proc/` and `/sys/` — and any carve-out or daemon
+  directory under a view — are placed beneath the roots the start anchored
+  (`kernel_roots::walk_root`: the walk starts at the view's root and
+  crosses no mount below it): they key the kernel's own `/proc` and `/sys`,
+  never a file system mounted over them since (a write there is counted).
+  The refresh, every minute, runs on a thread of its own, and its build of
+  the rules from the host runs on a helper thread waited for at most 10 s.
+  A build that does not answer (a mount on a home, `/run/user` or a
+  daemon's directory that does not answer) is a refresh not judged: the
+  rules last written stay in force, and a degradation `open_sensor_rules`
+  stands (in `nn-admin status`, signed) until a build answers again; while
+  one build is held, the next is not judged at once. The start's build is
+  bounded the same way: one that does not answer keeps `sys_enter_openat`
+  for the run (every open reaches userland). This was the one `FUSE_STATX`
+  of the `/proc` root the lab measured about 30 s after the mount, whose
+  caller round 1 did not find: on a host with one runtime worker (the
+  workers follow the CPUs: a 1-vCPU host) it stopped the whole runtime —
+  the status, the admin socket — and the watchdog's stuck recovery
+  restarted the agent under the mount.
+- **The other periodic tasks that walk a path by path run off the
+  runtime's workers:** the BPF link self-check (every 10 s, the pins under
+  `/sys/fs/bpf`), the telemetry probe's round (its probe file, its view of
+  the links, the deny self-test's targets), the trusted-installer window's
+  close, the `systemd-shutdown` identity refresh, the program images'
+  refresh (the system's bin directories) and the watchdog exemption's
+  refresh (its pidfile, its binary, the pins): a mount there that does not
+  answer holds that task's thread, never a worker the status answers on.
+  The admin socket's watch looks at its path on a helper thread with a 2 s
+  deadline (the look runs in the socket's own serve loop): a look that does
+  not answer is logged, and nothing is bound again.
+- **The canary's writer** opens PID 1's root (`/proc/1/root`) beneath the
+  anchored `/proc` root, the magic link followed as the kernel resolves it:
+  a canary's deploy no longer walks the `/proc` mounted now. The tracepoint
+  offsets' tracefs reads (the `format` files, the roots' file system type)
+  open beneath the anchored `/sys` root, tracefs crossed within the
+  deadline.
+- **WSL2's exemption holds on WSL's kernel only** (its release, `uname`,
+  names Microsoft). On any other kernel a tmpfs whose source root is named
+  `/wsl/…` over `binfmt_misc`'s `status` is a `mount_over_protected`
+  (High), as any other mount there.
+- **The ratchet** (`xtask/tests/kernel_views.rs`) also refuses: a walk
+  that starts at `/` by path outside `kernel_roots` (an open of `/` to walk
+  from: the refresh's shape); an `*at` call (`openat`, `fstatat`, `statx`…)
+  whose path names a view, whatever its directory, and any call whose
+  directory is `AT_FDCWD` (a closure or a helper around `openat`); a
+  constant or static that holds a view path, over several lines (a slice of
+  prefixes), and the items a `for` loop or a closure binds from one; a
+  function that builds and returns a view path, by its module path in the
+  other files; a parameter another file's call hands a view literal or
+  constant (`module::function(…)`). It fails on the four shapes the re-check
+  planted. Re-check 2 of #563: it also follows a struct field a function
+  sets to a view path (`Self { root: "/proc".into() }`, or a constructor's
+  parameter), an exec of a view path (`Command::new`, `execv*`), a helper
+  imported and called bare, the closure a function calls with a view path
+  (`on_host_path`'s op, and through a trait's impl that hands it on), a
+  callable returning one handed by name (`&host_view`), and a function
+  returning what a view-returning one returns; and it scans the functions
+  whose signature holds an array type (`[u8; 32]`), which it skipped. It is
+  lexical: a path that reaches a by-path call through a `Vec` filled by
+  `push` is not followed.
+
+Measured (the lab, debian13, 6.12, one vCPU: the agent's runtime with one
+worker): round r2b (this round's tree): `nproc` 1; a FUSE over `/proc` that
+never answers the agent (`EIO` to others), 180 s, laid in PID 1's namespace.
+No agent thread sent it a request (`stalled=0`, 0 threads); `nn-admin
+status` answered at 15/45/75/105/135/165/178 s, no ping failed, the same
+pid, no restart; the rule refresh ran under the mount (one `rules
+refreshed`, none unjudged); the signed chains took rows (audit +11,
+heartbeat +7), no signing error; `mount_over_protected` (High) signed during
+the mount and cleared after it. The deny self-test's step that opens a
+target's `/proc/<pid>/mem` (the probe's child, by path) failed under the
+FUSE and was signed as a `deny_selftest` degradation, as a step that cannot
+judge is.
+
+Not done here (recorded): the flat chains' tail read after a failed write (`heal`) reads the
+file by its path (a mount over the directory meanwhile makes the next row's
+link a visible break, never a lost row); aya's loader reads the CPU count
+by path for a perf-event array at load (none in our object); a bind of a
+kernel file system below a view (`/proc/1` over `/proc/<pid>`, F5) passes
+the record and the read (pre-existing); `waiting` counts every process's
+requests, not only the agent's; an `nn-kview-open` thread stuck in a FUSE
+`STATFS` at a start under the mount keeps the agent from exiting at a later
+stop; a rotation's lift of the state directory's `+i` opens the directory
+by its path (a FUSE over the agent's own directories: to be closed by the
+mount refusal, lot 357; the watchdog's abort comes only after a failed
+SIGKILL).
+
+Re-check 2 of #563 (fix round 3) — what re-check 1 recorded, and what the
+second re-check found, systematically: a census of every `/proc`, `/sys`
+and own-directory path of the agent, the watchdog, nn-linux, nn-core and
+the start, by thread, and every by-path use on a thread whose stall stops
+the detection, the status or the signing that the census found moved off
+it or beneath the anchored roots (re-check 3 found three by-path steps in
+our own directories it missed, and two stay on the decision thread: the
+end of this section):
+- **The decision thread never opens `/proc/<pid>/exe` by path**: a rule's
+  `exe … sha256` exemption opens the image beneath the anchored `/proc`
+  root (the magic link followed). The account database (`passwd`,
+  `login.defs`, the host's view) is read beneath it too, its stamps looked
+  at once a second on a helper with a 200 ms deadline: unanswered, the
+  table read last answers.
+- **No ransomware burst is judged with its I/O on the decision thread.**
+  The entropy sampler and the copy check read the host's view (`/proc/1/root`)
+  beneath the anchored `/proc` root; a burst the dispatcher of slow work
+  cannot take — its queue full, its thread held on one preparation past
+  10 s, or not running — and the bursts queued behind a held preparation
+  are judged on the decision thread **without** their I/O: no file sampled,
+  no package asked (the writer is not trusted by a package), counted
+  (`unprepared`). Until then, past 256 bursts the decision thread sampled
+  the files itself, and a mount that did not answer held it. While the
+  thread is held, the degradation `ransomware_slow_work` stands (in
+  `nn-admin status`, signed at the next flush), withdrawn when its
+  preparation answers.
+- **The admin socket's whole check runs off the serve loop**: the look at
+  its path and, for a socket taken away, the clear, the parent, the bind and
+  the mode run on a helper thread (one at a time); the serve loop starts a
+  check every 10 s and takes its answer when it comes, serving the listener
+  it has meanwhile. Only the look was bounded: a FUSE over
+  `/run/northnarrow` that answered it ("removed") and held the next lookup
+  of the same name held the serve loop and its worker — on one worker the
+  whole runtime. The start's bind is bounded the same way (5 s; past it the
+  serve loop does not start, an ERROR and a signed record).
+- **The watchdog reaches the agent and writes its records off its loop**:
+  the admin socket's connect on a helper thread within the ping's timeout,
+  its hold and shutdown-marker records on a helper within 2 s, one
+  unanswered step at most per path (the next fails at once, a ping
+  failure): a mount over `/run/northnarrow` that does not answer no longer
+  holds the ping or those records. It still holds the watchdog's other
+  by-path steps there (the stuck marker's removal, the respawn's reads:
+  below). Its FUSE abort runs only when the stuck recovery's SIGKILL failed.
+- **No exec walks a view**: a worker is executed by its image's descriptor
+  (`execveat(fd, "", …, AT_EMPTY_PATH)` in the child, argv and environment
+  made before the fork; the exec sensor names it `/dev/fd/<n>`, which R004
+  knows as the core's own launch); the start's deny self-test and the move
+  guard's test execute the path `/proc/self/exe` names (read beneath the
+  anchored root). The telemetry probe's child is spawned off the runtime's
+  worker (its exec resolves the image by path).
+- **The responses that change a host file reach it beneath the anchored
+  `/proc` root** (the quarantine's opens and checks, a file capability's
+  removal through the opened file, the share's subuid read), and **the
+  copy-on-write journal** (its directories, index, objects and evidence:
+  the guard's fanotify thread, whose stall left the guarded scopes' opens
+  waiting) through `kernel_roots` or its own descriptors.
+- **The systemd watch asks one question at a time**: while one is held
+  (a mount over `/run/systemd` that does not answer the connect), the next
+  is `None` at once and starts no thread — it leaked one blocking thread per
+  question, and a full pool left every `off_the_runtime` waiting.
+- Measured by a test (`fuse_stall_tests`): in a user and mount namespace,
+  a FUSE over `/proc` and one over the admin socket's directory, each
+  answering the first lookup and holding the rest, the runtime on one
+  worker: the serve loop (STATUS through a second name of the socket, past
+  its check), the decision's process facts, the signed appends, the rule
+  refresh and the entropy sampler each keep going for 14 s. In CI too since
+  re-check 3: the CI test job enables unprivileged user namespaces, and
+  under CI a namespace test that cannot run fails instead of skipping
+  (`nn_linux::fuse_testing::ran`; `xtask/tests/namespace_tests_in_ci.rs`
+  holds every such test to it). At 5da316c1 this test and the watchdog's
+  `by_path_bounds` were skipped there and "passed" in 0.00 s.
+- Measured (the lab): debian13, 6.12 (our own guest under a lease, clean
+  before, purged and powered off after), a cold boot with ONE vCPU (the
+  agent's runtime on one worker), round r3b: a FUSE over `/proc` laid in PID
+  1's namespace for 180 s that answers the agent's first lookup (`ENOENT`)
+  and holds every later request of the agent (`EIO` to others). The agent
+  sent it no request at all (answered 0, held 0, 0 threads); `nn-admin
+  status` answered at each of 12 samples (15 s to 178 s), no watchdog ping
+  failed, the same pid (695), no restart; decisions flowed during the mount
+  — an encryptor's copy-then-delete of 60 documents (`NN-L-IMP-001`
+  Critical: the entropy sampler read the burst's files beneath the anchored
+  root) and a program dropped in `/dev/shm` and run (`R002` High); the
+  signed chains took rows (audit +14, heartbeat +7), no signing error;
+  `mount_over_protected` (High) signed during the mount and cleared after
+  it. As in r2b, the deny self-test's step that opens a target's
+  `/proc/<pid>/mem` from the probe's child (another process, by path) failed
+  under the FUSE and was signed as a `deny_selftest` degradation.
+
+Re-check 3 of #563 (fix round 4): **what this lot covers, exactly.**
+
+**Covered** (each by a test that runs in CI): a FUSE over `/proc`, `/sys` or
+the cgroup2 root — the case X6 — does not stall the agent's critical loops:
+the runtime's workers and the admin socket's serve loop, the decision's
+process facts, the signed appends, the open sensor's rule refresh, the
+entropy sampler (`agent/tests/fuse_stall.rs`); nor the watchdog's ping and
+its record appends under a FUSE over `/run/northnarrow`
+(`watchdog/tests/by_path_bounds.rs`).
+
+**Not covered** — a mount over the agent's own directories (or, for the
+decision thread, over a system directory) still holds these. Each is **to
+be closed by the mount refusal, lot 357**: a BPF-LSM refusal, in the host's
+mount namespace, of a mount over `/proc`, `/sys`, the cgroup root and the
+agent's own directories.
+- **The integrity round reads our directories by path before it signs.**
+  `/etc/northnarrow` (the overlays, `read_dir`) and
+  `/run/northnarrow/watchdog.pid` (the limits) are read by path before the
+  round's findings are signed; the watchdog's holds and the rejected
+  shutdowns there are taken and removed by path (`rename`, `remove_file`)
+  after. A FUSE over either directory (root) holds the round for as long as
+  it stays — off the runtime, with no stall watch, silently: nothing is
+  signed meanwhile, that mount's own `mount_over_protected` included. To be
+  closed by the mount refusal, lot 357.
+- **The watchdog's stuck marker and the shutdown marker, by path.** After a
+  stuck signal the watchdog removes its marker
+  (`/run/northnarrow/watchdog.stuck`) by path, unbounded, on its one
+  thread; its respawn checks the shutdown marker (with `admin.pub` and
+  `agent_id`) and reads the dead agent's pidfile and argv by path. A FUSE
+  over `/run/northnarrow` holds the whole watchdog: no stuck recovery, no
+  respawn, no `sd_notify`. The FUSE abort does not come before these: it
+  runs only after a **failed** SIGKILL (`recovery_failed`); an agent the
+  stuck recovery's SIGKILL ended is respawned through these reads with no
+  abort before them. To be closed by the mount refusal, lot 357.
+- **`bpf-foreign` is written by path every round.** The kernel-state round
+  writes `/run/northnarrow/bpf-foreign` (`atomic_file::replace`: remove,
+  create, rename by path) at the end of every round (5 s), off the runtime:
+  a FUSE over `/run/northnarrow` holds the round that signs the taint,
+  livepatch, root-cgroup program and foreign BPF findings. To be closed by
+  the mount refusal, lot 357.
+- **`trusted_exe` and `ran_host_file`, on the decision thread.** A rule's
+  `exe … sha256` exemption checks the image's path and its parents by path
+  in the agent's mount namespace; the lineage's `ran_host_file`
+  (FIM-005/-019 with `logrotate` only) reads a packaged program's file at
+  its path. A FUSE over a system directory (root) holds the decision there.
+  To be closed by the mount refusal, lot 357 — for these two only if its
+  list takes the system directories an exemption or a packaged program
+  names; otherwise on a bounded reader, as the account database's.
+- **The ratchet's bypasses.** `xtask/tests/kernel_views.rs` is lexical and
+  does not see: a helper returning a view path as `&'static str` (or
+  `CStr`, `OsStr`); `std::fs` or one of its functions imported under
+  another name (`use std::fs as disk`, `use std::fs::read as slurp`);
+  libc's `*64` calls (`open64`); a `String` built from `"/proc/"` and read
+  in another file. `decision_path_io` does not scan nn-linux's decision
+  hosts (`decision_host_linux.rs`, `accounts.rs`, `canary_host_linux.rs`). A
+  by-path read of a view written in one of these shapes passes both. To be
+  closed by the mount refusal, lot 357 (no mount over a view left to hold
+  such a read).
+
+### 47.2 Fix round 5 of #563: the decision thread's reads, the bpffs's view
+
+- **The decision thread reads the kernel's views under its own filter.**
+  Its seccomp filter refuses `openat2` whatever it asks (R14c-1: a filter
+  cannot read the call's flags), and every read beneath the anchored roots
+  failed there with `EPERM`: the process facts of a rule's exemptions (a
+  process's uid, its cgroup, its executable and that image's digest) were
+  never read — no exemption by executable matched, and a debugger's attach
+  or a `process_vm_writev` into an exempt process tainted its mark but was
+  never signed (`EXEMPTION REVOKED`). Where `openat2` is refused (`EPERM`)
+  or missing (`ENOSYS`), `kernel_roots` now walks one name at a time:
+  `openat` with `O_PATH | O_NOFOLLOW`, each step's mount read from the
+  kernel's cache (`statx`, `AT_STATX_DONT_SYNC`, nothing asked: a FUSE root
+  reached is never asked anything) and refused (`EXDEV`) when it is not the
+  root's — before any name is looked up in it; a link of names alone
+  (procfs's `self`, `thread-self`) followed from its directory, a magic link
+  `ELOOP` (resolved from the root, as before), a `..` refused; the file then
+  opened through its checked descriptor (`/proc/self/fd/N` beneath the
+  anchored `/proc` root). The filter's own rules still judge every open:
+  nothing is opened for writing that way (`/proc/<pid>/mem` read-write is
+  still `EPERM`). The FUSE harness runs the decision's loop in its role,
+  under its filter, with a FUSE below `/proc` over the directory of the
+  process it reads.
+- **`/sys/fs/bpf` is a view of its own.** The bpffs is a mount below
+  `/sys`, which a path beneath the `/sys` root does not cross (`EXDEV`): the
+  start-in-cgroup tracker's pin directories beside the pin root
+  (`/sys/fs/bpf/northnarrow-cgroup-join-v2_<n>`) are made and removed by
+  their parent, the bpffs root, and every one was refused — a planted
+  directory there was left (`an old tracker pin directory NOT removed`)
+  and never signed as removed, a new generation's plant (the debug build's)
+  never made. The start anchors the bpffs on top at `/sys/fs/bpf` (the one
+  the pins made by path reach; a second bpffs stacked there is the
+  integrity round's `bpffs_mount`); a host with no bpffs there has no such
+  view (the agent pins nothing), and another file system over it at the
+  start is refused and named with the other views (`kernel_views`).
+
+### 47.3 Re-check 4 of #563: the walk's last open, a link's `..`, an exemption not judged
+
+- **The decision thread's walk opens its file again through its own
+  descriptor directory.** Where `openat2` is refused (the decision thread's
+  filter), the walk one name at a time checks every name's mount, but the
+  file it reached was then opened again by name through `self/fd/N` beneath
+  the `/proc` root — a lookup of `<pid>`, then `fd`, with no mount check: a
+  tmpfs over `/proc/<agent pid>/fd` gave the decision thread its files for
+  every fact (a uid, a cgroup, the `Tgid` the marks are read for), a FUSE
+  there held its loop. The reopen goes through the thread's own
+  `thread-self/fd` now, every name of the way checked as the walk checks
+  them (the directory kept for the thread, opened again in a forked
+  child); the entry itself is looked at first (procfs's, nothing mounted
+  on it), and the file opened is compared with the one the walk reached —
+  the same mount and inode, or the open fails (`EXDEV`). A directory is
+  opened again through its own descriptor (`.`), no name looked up. The
+  kernel has no reopen of a descriptor without a name. `kernel_roots`'s
+  `chmod_fd` and `reopen_fd` (the quarantine, the admin socket, the copy-
+  on-write journal) go through the same directory and checks. A cover laid
+  over a thread's own `fd` directory fails its reads closed (or sends them
+  to the bounded crossing, which reads the kernel's file systems only).
+- **A link whose target climbs with `..` is walked beneath the root.**
+  sysfs's links (`/sys/class/net/<if> -> ../../devices/…`) were `ELOOP` to
+  the walk, then opened with a plain `openat` that crossed whatever was
+  mounted on the way: the walk follows a target of names and `..` from the
+  link's directory, a `..` going back to the directory it came from, never
+  above the root (`EXDEV`), each step's mount checked. A name with a `:` is
+  a name off procfs (`pci0000:00`); on procfs it is still a magic link's.
+  Beside it: `openat2` beneath a root answers `EAGAIN` for a `..` while any
+  rename or mount on the host races the walk — that error was the read's;
+  it is tried again, then walked one name at a time.
+- **An exemption that could not be judged is signed.** When code is first
+  injected into a process (a debugger's attach, a write handle on its
+  memory, `process_vm_writev`, `pidfd_getfd`), the agent asks whether an
+  exemption of the per-rule policy covered it. A fact it is judged by that
+  could not be read while the process is there (a mount laid below
+  `/proc/<pid>`, a read that did not answer) made it "none covers it", and
+  the injection was a debug line. It is now `Covering::Unjudged`: signed
+  as for an exempt process (NN-L-AT-001, Log, High — Critical from a
+  non-root injector or one outside an administrator's interactive session),
+  the journal's `EXEMPTION UNJUDGED` and the record naming the exemption
+  and the file that could not be read. A process gone (no file) is still
+  "none".
+
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 
 - **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)

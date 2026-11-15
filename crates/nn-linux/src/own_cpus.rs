@@ -755,7 +755,7 @@ pub fn agent_unit_files(root: &Path, installed: Option<std::time::SystemTime>) -
     if let Some(p) = dirs
         .iter()
         .map(|d| d.join(AGENT_UNIT))
-        .find(|p| std::fs::symlink_metadata(p).is_ok())
+        .find(|p| antitamper_bpf::kernel_roots::symlink_metadata(p).is_ok())
     {
         out.extend(unit_file(&p, installed, true));
     }
@@ -796,7 +796,7 @@ fn unit_file(p: &Path, installed: Option<std::time::SystemTime>, ours: bool) -> 
         Config::Unjudgeable(_) => None,
     };
     let predates = |installed: std::time::SystemTime| {
-        std::fs::symlink_metadata(p).is_ok_and(|m| {
+        antitamper_bpf::kernel_roots::symlink_metadata(p).is_ok_and(|m| {
             let ct = std::time::UNIX_EPOCH
                 + std::time::Duration::new(
                     m.ctime().max(0) as u64,
@@ -877,17 +877,12 @@ fn read_text(p: &Path) -> Option<String> {
 /// descriptor reads, and one there at the start on another filesystem (a
 /// FUSE file, a tmpfs one, a FIFO) is refused (`Err`: why).
 pub fn open_source(path: &Path, magic: u64, dir: bool) -> Result<File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let flags = libc::O_NONBLOCK
-        | libc::O_NOCTTY
-        | libc::O_CLOEXEC
-        | if dir { libc::O_DIRECTORY } else { 0 };
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | if dir { libc::O_DIRECTORY } else { 0 };
     let at = |e: std::io::Error| format!("{}: {e}", path.display());
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .map_err(at)?;
+    // Lot 353: beneath the view's root the agent's start anchored — a mount
+    // laid over `/sys`, `/proc` or the cgroup2 root since is not walked,
+    // one over the source itself is a mount crossed (`EXDEV`)
+    let f = antitamper_bpf::kernel_roots::open(path, flags).map_err(at)?;
     let t = f.metadata().map_err(at)?.file_type();
     if (dir && !t.is_dir()) || (!dir && !t.is_file()) {
         return Err(format!(

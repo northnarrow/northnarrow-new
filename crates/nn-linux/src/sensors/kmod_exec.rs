@@ -253,7 +253,7 @@ fn builder_exec(root: &Path, event: &Event) -> Option<Builder> {
     let path = INITRAMFS_BUILDERS
         .iter()
         .find(|b| b.rsplit('/').next() == Some(name))?;
-    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(root.join(path.trim_start_matches('/'))).ok()?;
     ((stat_dev_to_kernel_dev(m.dev()), m.ino()) == (exe.dev, exe.ino)).then_some(Builder {
         start_ns: *start_ns,
         path,
@@ -325,9 +325,9 @@ fn interpreter(
     }
     let dir = proc.join(pid.to_string());
     let link = dir.join("exe");
-    let image = std::fs::read_link(&link)
+    let image = antitamper_bpf::kernel_roots::read_link(&link)
         .ok()
-        .zip(std::fs::metadata(&link).ok());
+        .zip(antitamper_bpf::kernel_roots::metadata(&link).ok());
     // after the image: still the exec's process (a pid is reused only once
     // it is reaped), with its memory
     let stat = crate::state_read::read_state(dir.join("stat")).ok();
@@ -377,7 +377,7 @@ fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
         .split(|b| *b == b' ' || *b == b'\t')
         .find(|w| !w.is_empty())?;
     let rel = std::ffi::OsStr::from_bytes(path.strip_prefix(b"/").unwrap_or(path));
-    let m = std::fs::metadata(root.join(rel)).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(root.join(rel)).ok()?;
     Some((
         String::from_utf8_lossy(path).into_owned(),
         (stat_dev_to_kernel_dev(m.dev()), m.ino()),
@@ -398,7 +398,7 @@ pub fn package_manager(proc: &Path, pid: u32) -> Option<String> {
             return None;
         }
         let dir = proc.join(p.to_string());
-        if let Ok(exe) = std::fs::read_link(dir.join("exe")) {
+        if let Ok(exe) = antitamper_bpf::kernel_roots::read_link(dir.join("exe")) {
             let exe = exe.to_string_lossy().into_owned();
             if PACKAGE_MANAGER_EXES.contains(&exe.as_str()) && real_uid(&dir) == Some(0) {
                 return Some(exe);
@@ -449,7 +449,7 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
     }
     let kmod: Vec<_> = KMOD_PATHS
         .iter()
-        .filter_map(|p| std::fs::metadata(root.join(p)).ok())
+        .filter_map(|p| antitamper_bpf::kernel_roots::metadata(root.join(p)).ok())
         .map(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()))
         .collect();
     // two files, not one under two names (a merged /usr): neither is the
@@ -563,7 +563,8 @@ fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Optio
 /// `path` (an `environ`) read into `env`: at most [`MAX_ENVIRON`] + 1
 /// bytes.
 fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
-    std::fs::File::open(path)
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(env))
         .map(drop)
 }
@@ -585,7 +586,8 @@ fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
 /// process, gone by the end of the read).
 fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
     let task = proc.join(format!("{pid}/task"));
-    let threads = match std::fs::read_dir(&task) {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let threads = match antitamper_bpf::kernel_roots::read_dir(&task) {
         Ok(threads) => threads,
         // reaped since: no thread of it runs
         Err(_) if pidfd_exited(fd) => return None,
@@ -599,11 +601,7 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
         crate::state_read::read_state(task.join(tid).join("stat"))
             .is_ok_and(|stat| has_memory(&stat))
     };
-    let Some(tid) = threads
-        .filter_map(Result::ok)
-        .map(|thread| thread.file_name())
-        .find(|tid| runs(tid))
-    else {
+    let Some(tid) = threads.into_iter().find(|tid| runs(tid)) else {
         // none seen running: the process's exit, or threads that each made
         // the next and exited between the listing and their stat (DC-B)
         if pidfd_exited(fd) {

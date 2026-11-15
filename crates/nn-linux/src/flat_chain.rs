@@ -32,9 +32,7 @@
 //! The repository's test `xtask/tests/flat_chain_writes.rs` keeps every
 //! flat chain's append here.
 
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -43,8 +41,9 @@ use tracing::warn;
 /// The append side of one flat chain file.
 #[derive(Debug)]
 pub struct FlatFile {
-    /// Where the rows are appended: through the directory fd the open took
-    /// (review entry 44, [`crate::anchored::anchor`]).
+    /// Where the rows are appended: the name resolved beneath the directory
+    /// fd the open took (review entry 44, [`crate::anchored::anchor`]; lot
+    /// 353: never through `/proc`).
     path: PathBuf,
     /// The file as the agent's command line names it: what the
     /// attestations say.
@@ -53,6 +52,8 @@ pub struct FlatFile {
     /// An append or an fsync failed (the error): what it left in the file
     /// is not known.
     poisoned: Option<String>,
+    /// Lot 353: the last append failed (told until one succeeds).
+    failing: bool,
     #[cfg(test)]
     fail_next_sync: bool,
     /// Tests: the next append writes its line but its last `n` bytes, then
@@ -69,6 +70,7 @@ impl FlatFile {
             name: path.to_path_buf(),
             mode,
             poisoned: None,
+            failing: false,
             #[cfg(test)]
             fail_next_sync: false,
             #[cfg(test)]
@@ -90,20 +92,35 @@ impl FlatFile {
     /// `fsync` it when `sync`. A failure poisons the file: the next row
     /// [`Self::heal`]s it first.
     pub fn append(&mut self, line: &[u8], sync: bool) -> Result<()> {
+        use crate::chain_host::ChainHost as _;
         let r = self.append_inner(line, sync);
-        if let Err(e) = &r {
-            self.poisoned = Some(format!("{e:#}"));
+        // Lot 353 (the review of #563, F1): a signed chain that stops taking
+        // rows is told at each change — a degradation, the watchdog's.
+        match &r {
+            Err(e) => {
+                self.poisoned = Some(format!("{e:#}"));
+                self.failing = true;
+                crate::chain_host_linux::LinuxHost::append_failed(
+                    &self.name,
+                    Some(&format!("{e:#}")),
+                );
+            }
+            Ok(()) if self.failing => {
+                self.failing = false;
+                crate::chain_host_linux::LinuxHost::append_failed(&self.name, None);
+            }
+            Ok(()) => {}
         }
         r
     }
 
     fn append_inner(&mut self, line: &[u8], sync: bool) -> Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(self.mode)
-            .open(&self.path)
-            .with_context(|| format!("opening {} for append", self.name.display()))?;
+        let mut f = crate::anchored::open(
+            &self.path,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            self.mode,
+        )
+        .with_context(|| format!("opening {} for append", self.name.display()))?;
         #[cfg(test)]
         if let Some(n) = self.cut_next_write.take() {
             f.write_all(&line[..line.len().saturating_sub(n)])?;
@@ -123,9 +140,7 @@ impl FlatFile {
     /// `fsync` of the rows appended without (the listener log's group
     /// commit). A failure poisons the file.
     pub fn sync(&mut self) -> Result<()> {
-        let r = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
+        let r = crate::anchored::open(&self.path, libc::O_WRONLY | libc::O_APPEND, 0)
             .with_context(|| format!("opening {} for fsync", self.name.display()))
             .and_then(|f| self.sync_file(&f));
         if let Err(e) = &r {
@@ -272,16 +287,21 @@ mod tests {
     }
 
     /// The rows go through the anchor, the attestation names the file.
+    /// Lot 353 (the review of #563, F1): the name is resolved beneath the
+    /// directory's descriptor, never through a `/proc/self/fd` path.
     #[test]
     fn the_rows_go_through_the_anchor() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("chain.jsonl");
-        let f = FlatFile::new(&p, 0o600);
+        let mut f = FlatFile::new(&p, 0o600);
         assert!(
-            f.path().starts_with("/proc/self/fd"),
+            crate::anchored::is_anchored(f.path()),
             "{}",
             f.path().display()
         );
+        assert!(!f.path().starts_with("/proc"), "{}", f.path().display());
         assert_eq!(f.name, p);
+        f.append(b"{}\n", true).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"{}\n");
     }
 }

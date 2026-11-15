@@ -8,7 +8,7 @@
 //! the error.
 
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use super::ExecutionOutcome;
@@ -26,11 +26,13 @@ pub fn strip(path: &str, pid: u32, _intent: &super::journal::Intent) -> Executio
             errno: libc::EINVAL,
         };
     };
+    // Lot 353 (re-check 2 of #563): the file opened beneath the anchored
+    // `/proc` root (the host's view), its attribute removed on that
+    // descriptor — by path, `removexattr` walked the `/proc` mounted now
     let removed = super::on_host_path(Path::new(path), |p| {
-        let c_path = CString::new(p.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        // SAFETY: both pointers are valid NUL-terminated strings for the call.
-        match unsafe { libc::removexattr(c_path.as_ptr(), name.as_ptr()) } {
+        let f = antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        // SAFETY: a live descriptor and a NUL-terminated name.
+        match unsafe { libc::fremovexattr(f.as_raw_fd(), name.as_ptr()) } {
             0 => Ok(()),
             _ => Err(std::io::Error::last_os_error()),
         }

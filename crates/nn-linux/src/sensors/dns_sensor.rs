@@ -187,7 +187,7 @@ fn nss_libraries() -> Vec<std::path::PathBuf> {
         let Ok(path) = std::fs::canonicalize(std::path::Path::new(dir).join(NSS_LIBRARY)) else {
             continue;
         };
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&path) else {
             continue;
         };
         if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {

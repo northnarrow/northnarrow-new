@@ -230,7 +230,7 @@ impl Rule for NnLAt001AntiTamperDenial {
             // Lot 281: not refused — code-injection access to a process
             // (`exempt_injection` signs it when an exemption covered it).
             FsProtectOperation::ExemptInjection => {
-                return Some(injection_verdict(self, event, None, None));
+                return Some(injection_verdict(self, event, Cover::None, None));
             }
             // Lot 280b: the switches that blind the sensors.
             FsProtectOperation::Kprobes => format!(
@@ -1026,17 +1026,52 @@ pub fn exempt_injection(
         } => Some(injection_verdict(
             &NnLAt001AntiTamperDenial,
             event,
-            Some(exemption),
+            Cover::Exempt(exemption),
             interactive_admin,
         )),
         _ => None,
     }
 }
 
+/// Lot 353 (re-check 4 of #563): NN-L-AT-001's verdict on code-injection
+/// access to a process whether an exemption covered which could not be
+/// judged — `why` names it and the fact that could not be read
+/// (`rule_policy::Covering::Unjudged`: a mount laid below `/proc/<pid>`).
+/// Signed as for an exempt process ([`exempt_injection`]), at its severity:
+/// on 8c1c5d12 it was a debug line.
+pub fn unjudged_injection(
+    event: &Event,
+    why: &str,
+    interactive_admin: Option<bool>,
+) -> Option<Verdict> {
+    match event {
+        Event::FsProtectDenial {
+            operation: FsProtectOperation::ExemptInjection,
+            ..
+        } => Some(injection_verdict(
+            &NnLAt001AntiTamperDenial,
+            event,
+            Cover::Unjudged(why),
+            interactive_admin,
+        )),
+        _ => None,
+    }
+}
+
+/// What the per-rule policy said of the process an injection reached.
+enum Cover<'a> {
+    /// Not asked (the rule's own verdict).
+    None,
+    /// This exemption covered it.
+    Exempt(&'a str),
+    /// Whether one did could not be judged (`rule: what — why`).
+    Unjudged(&'a str),
+}
+
 fn injection_verdict(
     rule: &NnLAt001AntiTamperDenial,
     event: &Event,
-    exemption: Option<&str>,
+    cover: Cover<'_>,
     interactive_admin: Option<bool>,
 ) -> Verdict {
     let (uid, comm, detail, target) = match event {
@@ -1049,9 +1084,13 @@ fn injection_verdict(
         } => (*uid, comm.as_str(), *target_dev, *target_ino),
         _ => (0, "", 0, 0),
     };
-    let covered = match exemption {
-        Some(e) => format!("the per-rule policy exempted it ({e}); "),
-        None => String::new(),
+    let covered = match cover {
+        Cover::Exempt(e) => format!("the per-rule policy exempted it ({e}); "),
+        Cover::Unjudged(why) => format!(
+            "whether the per-rule policy exempted it could not be judged ({why}): signed as for \
+             an exempt process; "
+        ),
+        Cover::None => String::new(),
     };
     // Not the uid's number: the record's principal carries it.
     let who = if uid != 0 {
@@ -1677,6 +1716,23 @@ mod tests {
         let plain = NnLAt001AntiTamperDenial.evaluate(&ev(0, attach)).unwrap();
         assert_eq!(plain.severity, Severity::Critical);
         assert!(!plain.reasoning.contains("exempted it"));
+        // lot 353 (re-check 4 of #563): an exemption that could not be
+        // judged — signed as for an exempt process, saying so
+        let why = "NN-L-IMP-001: exe /usr/bin/x sha256 aa — /proc/709/exe: not read";
+        let v = unjudged_injection(&ev(0, attach), why, Some(true)).expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        assert!(matches!(v.action, ResponseAction::Log));
+        for needle in [why, "could not be judged", "Not refused", "no longer holds"] {
+            assert!(v.reasoning.contains(needle), "{needle}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("exempted it ("));
+        assert_eq!(
+            unjudged_injection(&ev(1000, attach), why, Some(true))
+                .unwrap()
+                .severity,
+            Severity::Critical
+        );
+        assert!(unjudged_injection(&denial(FsProtectOperation::Ptrace), why, None).is_none());
     }
 
     #[test]

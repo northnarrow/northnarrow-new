@@ -1085,3 +1085,34 @@ fn a_go_without_its_image_is_not_trusted_by_the_ransomware_tracker() {
         .unwrap();
     assert!(a.trusted.is_some(), "{a:?}");
 }
+
+/// Lot 353 (re-check 2 of #563, R2-3): the decision thread's assessment of
+/// a burst the dispatcher of slow work could not take (full, held) samples
+/// nothing — a mount that does not answer on the burst's files cannot hold
+/// the decision: the rewrite shape counts, the entropy shape is not
+/// measured, and the actor is not decisive on it alone. The prepared
+/// assessment of the same writer's burst samples and is decisive, as
+/// before.
+#[test]
+fn an_assessment_without_io_samples_nothing() {
+    let h = Host::new();
+    h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
+    let sampler = Fixed::high("/srv/nn-malsim/");
+    let t = h.tracker(Arc::clone(&sampler));
+    let a = t
+        .prepare_without_io(&rewrites(300, T0, "/srv/nn-malsim/f020"))
+        .unwrap();
+    assert_eq!(sampler.calls.load(Ordering::Relaxed), 0, "nothing sampled");
+    let shapes: Vec<Signal> = a.signals.iter().map(|(s, _)| *s).collect();
+    assert_eq!(shapes, vec![Signal::Rewrites], "{a:?}");
+    assert!(!a.decisive, "{a:?}");
+    assert_eq!(t.counts().unprepared, 1);
+    let h2 = Host::new();
+    h2.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
+    let t2 = h2.tracker(Arc::clone(&sampler));
+    let prepared = t2
+        .prepare(&rewrites(300, T0, "/srv/nn-malsim/f020"))
+        .unwrap();
+    assert!(sampler.calls.load(Ordering::Relaxed) > 0, "with the I/O");
+    assert!(prepared.decisive, "{prepared:?}");
+}

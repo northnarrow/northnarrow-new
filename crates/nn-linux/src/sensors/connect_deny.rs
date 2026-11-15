@@ -30,7 +30,7 @@ use aya::{
         Array, MapData,
     },
     programs::Lsm,
-    Btf, Ebpf,
+    Ebpf,
 };
 use common::wire::NET_BLOCK_MAX_ENTRIES;
 
@@ -246,7 +246,8 @@ pub fn arm(ebpf: &mut Ebpf, blocklist: &NetBlocklist) -> Result<ArmReport> {
     if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, MAP_MODE) {
         tracing::warn!(error = %e, "connect deny: its mode map NOT frozen");
     }
-    let btf = Btf::from_sys_fs().context("loading vmlinux BTF for the connect deny")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf()
+        .context("loading vmlinux BTF for the connect deny")?;
     let prog: &mut Lsm = ebpf
         .program_mut(PROGRAM)
         .ok_or_else(|| anyhow!("program {PROGRAM} missing from the eBPF object"))?

@@ -105,11 +105,6 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "the agent's own descriptors listed (`/proc/self/fd`): read, no match",
     ),
     (
-        "agent/src/boot/attach.rs",
-        2,
-        "the agent's own image (`/proc/self/exe`): read, no match",
-    ),
-    (
         "crates/nn-linux/src/boot/checks.rs",
         2,
         "the agent's own image (`/proc/self/exe`): read, no match",
@@ -137,9 +132,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/canary/path_policy.rs",
-        2,
-        "PID 1's root (`/proc/1/root`), the host's view the agent reads its own paths through, \
-         tested for and joined: no caller's path",
+        // re-check 1 of #563 (N3): 2 → 1, the root opened beneath the
+        // anchored /proc root at once (no separate test of it)
+        1,
+        "PID 1's root (`/proc/1/root`), the host's view the agent writes its canaries through, \
+         opened beneath the anchored /proc root: no caller's path",
     ),
     (
         "crates/nn-linux/src/response/mod.rs",
@@ -149,9 +146,21 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
-        2,
+        3,
         "PID 1's root (`/proc/1/root`), the host's view the agent checks its own files through: \
-         no caller's path",
+         no caller's path; lot 353: `\"proc\"` is the file system type of the kernel's view at \
+         `/proc` in the mount check (`KERNEL_VIEWS`), no path segment",
+    ),
+    (
+        "antitamper-bpf/src/kernel_roots.rs",
+        6,
+        "lot 353: `\"proc\"` is procfs's name in the table of the kernel's file systems \
+         (`KERNEL_MAGICS`), no path segment, and `starts_with(\"/proc\")` asks whether a path is \
+         under the `/proc` view at all (before the views are anchored); the module resolves the \
+         magic links of `/proc` as the kernel does, matching none; `chmod_fd` and `reopen_fd` \
+         (the review of #563, F2) and the walk's reopen (re-check 4, R4-1) open the thread's \
+         own `thread-self/fd` directory beneath the anchored root to reach a descriptor they \
+         hold, matching nothing a caller wrote; `current_exe` reads the process's own `/proc/self/exe` beneath the root (std read it by path)",
     ),
     (
         "crates/nn-linux/src/impact/entropy.rs",

@@ -368,7 +368,8 @@ fn system_user(dir: &Path) -> bool {
 /// The environment of the process `dir`, read whole, holds none of
 /// [`LOADER_VARS`] (set, empty or not).
 fn loader_free(dir: &Path) -> bool {
-    let Ok(f) = std::fs::File::open(dir.join("environ")) else {
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    let Ok(f) = antitamper_bpf::kernel_roots::open(dir.join("environ"), libc::O_RDONLY) else {
         return false;
     };
     let mut env = Vec::new();
@@ -468,7 +469,7 @@ fn ns_of_container(proc: &Path, pid: u32, init: &Path) -> bool {
         return false;
     };
     let ns = |p: u32, kind: &str| {
-        std::fs::read_link(proc.join(p.to_string()).join("ns").join(kind)).ok()
+        antitamper_bpf::kernel_roots::read_link(proc.join(p.to_string()).join("ns").join(kind)).ok()
     };
     CONTAINER_NS
         .iter()
@@ -481,7 +482,7 @@ fn ns_of_container(proc: &Path, pid: u32, init: &Path) -> bool {
 /// The text of the small file at `path` (a pid file), when it is a regular
 /// file of the runtimes' owner writable by no one else.
 fn owned_small_file(path: &Path) -> Option<String> {
-    let m = std::fs::symlink_metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::symlink_metadata(path).ok()?;
     if !m.is_file()
         || m.uid() != bundle_owner()
         || m.permissions().mode() & 0o022 != 0
@@ -489,7 +490,7 @@ fn owned_small_file(path: &Path) -> Option<String> {
     {
         return None;
     }
-    std::fs::read(path)
+    antitamper_bpf::kernel_roots::read_all(path)
         .ok()
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
@@ -497,7 +498,7 @@ fn owned_small_file(path: &Path) -> Option<String> {
 /// The bundle at `path`, when it is root's and writable by no one else: its
 /// OCI spec.
 fn bundle_spec(path: &Path) -> Option<serde_json::Value> {
-    let m = std::fs::symlink_metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::symlink_metadata(path).ok()?;
     if !m.is_file()
         || m.uid() != bundle_owner()
         || m.permissions().mode() & 0o022 != 0
@@ -505,7 +506,7 @@ fn bundle_spec(path: &Path) -> Option<serde_json::Value> {
     {
         return None;
     }
-    std::fs::read(path)
+    antitamper_bpf::kernel_roots::read_all(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
 }

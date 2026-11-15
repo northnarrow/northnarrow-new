@@ -514,7 +514,7 @@ pub(crate) fn resolve_gate(
     nn_core::response::profile::DetectOnly,
 ) {
     // the running binary (an unreadable one: no install profile applies)
-    let own_exe = std::env::current_exe().unwrap_or_default();
+    let own_exe = antitamper_bpf::kernel_roots::current_exe().unwrap_or_default();
     resolve_gate_with(
         cli,
         overlay_gate,

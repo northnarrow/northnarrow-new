@@ -101,6 +101,27 @@ jobs:
         if: matrix.task == 'build'
         run: cargo build --workspace --exclude northnarrow-agent-ebpf --locked --verbose
 
+      # Lot 353 (re-check 3 of #563): the tests that run in a user and mount
+      # namespace of their own (the FUSE harnesses: agent/tests/fuse_stall.rs,
+      # watchdog/tests/by_path_bounds.rs, nn-linux's anchored, chain, open
+      # sensor and caps tests) skipped here in 0.00 s: Ubuntu 24.04's
+      # AppArmor gives an unprivileged user namespace no capabilities, so
+      # their mounts were refused. Under CI a skip is now a failure
+      # (`nn_linux::fuse_testing::ran`); this step gives them the namespaces
+      # (the runner's own kernel, a throwaway VM).
+      - name: Unprivileged user namespaces (the namespace tests)
+        if: matrix.task == 'test'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          ls -l /dev/fuse
+          unshare --user --map-root-user --mount true
+          echo "unprivileged user and mount namespaces: available"
+
       - name: cargo test --workspace
         # Integration tests that need root are #[ignore]d, so the
         # default `cargo test` run is unprivileged.

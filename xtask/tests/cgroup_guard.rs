@@ -917,8 +917,19 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     ] {
         assert!(!cr.contains(call), "config_read.rs only reads: {call}");
     }
-    assert_eq!(cr.matches("OpenOptions::new()").count(), 1);
-    assert!(in_order(cr, &["OpenOptions::new()", ".read(true)", ".open(path)"]).is_ok());
+    // lot 353: opened beneath the view's root the agent's start anchored
+    // (`kernel_roots::open`), `O_PATH`, then reopened read-only
+    assert_eq!(cr.matches("kernel_roots::open(").count(), 2);
+    assert!(!cr.contains("O_WRONLY") && !cr.contains("O_RDWR") && !cr.contains("O_CREAT"));
+    assert!(in_order(
+        cr,
+        &[
+            "crate::kernel_roots::open(path, libc::O_PATH)",
+            "crate::kernel_roots::open(",
+            "libc::O_RDONLY",
+        ]
+    )
+    .is_ok());
     assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
     // Lot 273d: the watchdog reads systemd's copy before each respawn (a
     // reload unless a harmful host drop-in withholds it), and the agent
@@ -955,7 +966,8 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
             "antitamper_bpf::unit_props::configured_text(",
             "if below_floor(\n            common::cgroup_limits::limit_kind_of(name),\n            &configured,\n            &floor,\n        ) {",
             "continue;",
-            "std::fs::write(&path, format!(\"{configured}\\n\"))",
+            // lot 353: beneath the cgroup2 root the agent's start anchored
+            "antitamper_bpf::kernel_roots::write(&path, format!(\"{configured}\\n\"))",
             "refresh_values(bpffs_root);",
         ],
     )
@@ -1027,7 +1039,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     in_order(
         q,
         &[
-            "std::fs::symlink_metadata(&from)",
+            "antitamper_bpf::kernel_roots::symlink_metadata(&from)",
             "let single = regular && meta_nlink(&meta) == 1;",
             "if !changed_since(&meta, pass.since) {",
             "keep_protected(&from, text.as_deref(), protect);",
@@ -1113,7 +1125,11 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     assert!(body(&od, "own_harms").contains("LOADER_ENV.contains(&n.as_str())"));
     in_order(
         body(&od, "install_time"),
-        &["std::fs::metadata(\"/proc/self/exe\")", "meta.ctime()"],
+        // lot 353: beneath the `/proc` root the agent's start anchored
+        &[
+            "antitamper_bpf::kernel_roots::metadata(\"/proc/self/exe\")",
+            "meta.ctime()",
+        ],
     )
     .unwrap();
     assert!(!body(&od, "install_time").contains("mtime"));
@@ -1171,8 +1187,9 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ),
         &[
             "register(&d.key, &value)",
-            "std::fs::write(&d.path,",
-            "std::fs::read_to_string(&d.path)",
+            // lot 353: beneath the cgroup2 root the start anchored
+            "crate::kernel_roots::write(&d.path,",
+            "crate::kernel_roots::read_to_string(&d.path)",
         ],
     )
     .unwrap();

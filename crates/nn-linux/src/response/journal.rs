@@ -528,7 +528,9 @@ impl ActionJournal {
         };
         drop(w);
         if let Some(path) = path {
-            if let Err(e) = crate::chainlog::sync_detached(&path) {
+            if let Err(e) =
+                crate::chainlog::sync_detached_in::<crate::chain_host_linux::LinuxHost>(&path)
+            {
                 // the rows are in the chain; whether on the disk is not known
                 self.inner
                     .counters
@@ -587,13 +589,19 @@ impl ActionJournal {
             _ => return None,
         };
         let held = match end {
-            Some(end) => crate::chainlog::holds_line_ending_at(&path, end, hash),
-            None => crate::chainlog::holds_last_line(&path, hash),
+            Some(end) => crate::chainlog::holds_line_ending_at_in::<
+                crate::chain_host_linux::LinuxHost,
+            >(&path, end, hash),
+            None => crate::chainlog::holds_last_line_in::<crate::chain_host_linux::LinuxHost>(
+                &path, hash,
+            ),
         };
         match held {
             Ok(held) => Some(held),
             // a file the chain keeps, gone: removed — the head not held
-            Err(_) if kept && std::fs::symlink_metadata(&path).is_err() => Some(false),
+            Err(_) if kept && antitamper_bpf::kernel_roots::symlink_metadata(&path).is_err() => {
+                Some(false)
+            }
             Err(_) => None,
         }
     }

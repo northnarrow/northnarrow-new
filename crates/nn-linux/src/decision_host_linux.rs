@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::chain_host_linux::LinuxHost;
-use crate::decision::rule_policy::ActorFacts;
+use crate::decision::rule_policy::{ActorFacts, ExemptionFact};
 
 /// Review of #482 (R14c-6): the longest an `rpm -qf` may take — under the
 /// errand's own wait ([`crate::caps::errands::ERRAND_WAIT`]).
@@ -60,6 +60,13 @@ impl DecisionHost for LinuxHost {
 
     fn on_host_path<T>(path: &Path, op: impl Fn(&Path) -> io::Result<T>) -> io::Result<T> {
         crate::response::on_host_path(path, op)
+    }
+
+    /// Lot 353 (re-check 2 of #563, R2-3): beneath the anchored `/proc`
+    /// root (the host's view `/proc/1/root/…`).
+    fn host_lstat(path: &Path) -> io::Result<(bool, std::time::SystemTime)> {
+        let m = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
+        Ok((m.is_file(), m.modified()?))
     }
 
     fn installer_grant(window: &TrustedInstallerOverride) -> Option<WindowGrant> {
@@ -208,24 +215,28 @@ impl ActorFacts for ProcFacts {
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
         use std::os::unix::fs::MetadataExt;
         let link = self.root.join(pid.to_string()).join("exe");
-        let path = std::fs::read_link(&link).ok()?;
+        let path = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
         let path_s = path.to_str()?.to_string();
         if !crate::posture::lineage::in_system_tree(&path_s) {
             return None;
         }
-        let mut f = std::fs::File::open(&link).ok()?;
+        // Lot 353 (re-check 2 of #563, R2-2): the image opened through the
+        // magic link beneath the `/proc` root the start anchored — by path,
+        // a FUSE over `/proc` held the decision thread on this open (a rule
+        // with an `exe … sha256` exemption)
+        let mut f = antitamper_bpf::kernel_roots::open(&link, libc::O_RDONLY).ok()?;
         let m = f.metadata().ok()?;
         if !m.file_type().is_file() || !root_only(&m) {
             return None;
         }
         // The opened file is the one at the path it names now.
-        let at_path = std::fs::symlink_metadata(&path).ok()?;
+        let at_path = antitamper_bpf::kernel_roots::symlink_metadata(&path).ok()?;
         if at_path.dev() != m.dev() || at_path.ino() != m.ino() {
             return None;
         }
         let mut dir = path.parent();
         while let Some(d) = dir {
-            if !root_only(&std::fs::symlink_metadata(d).ok()?) {
+            if !root_only(&antitamper_bpf::kernel_roots::symlink_metadata(d).ok()?) {
                 return None;
             }
             dir = d.parent();
@@ -252,6 +263,43 @@ impl ActorFacts for ProcFacts {
     fn injected(&self, pid: u32) -> Option<nn_core::decision::rule_policy::Injected> {
         crate::cgroup_join::injected(&self.root, pid)
     }
+
+    /// Lot 353 (re-check 4 of #563): the file `fact` is read from, read
+    /// again — an error but "not there" (the process gone, a kernel
+    /// thread's `exe`) is why it cannot be: a mount laid below
+    /// `/proc/<pid>` (`EXDEV`, a file system not the kernel's), a read that
+    /// did not answer within its deadline.
+    fn unread(&self, pid: u32, fact: ExemptionFact) -> Option<String> {
+        let dir = self.root.join(pid.to_string());
+        let (at, r) = match fact {
+            ExemptionFact::Uid => {
+                let at = dir.join("status");
+                let r = crate::state_read::read_state(&at).map(drop);
+                (at, r)
+            }
+            ExemptionFact::Cgroup => {
+                let at = dir.join("cgroup");
+                let r = crate::state_read::read_state(&at).map(drop);
+                (at, r)
+            }
+            ExemptionFact::Exe => {
+                let at = dir.join("exe");
+                let r = antitamper_bpf::kernel_roots::read_link(&at).and_then(|p| {
+                    if crate::posture::lineage::in_system_tree(&p.to_string_lossy()) {
+                        antitamper_bpf::kernel_roots::open(&at, libc::O_RDONLY).map(drop)
+                    } else {
+                        Ok(())
+                    }
+                });
+                (at, r)
+            }
+        };
+        match r {
+            Ok(()) => None,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => None,
+            Err(e) => Some(format!("{}: {e}", at.display())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +319,47 @@ mod tests {
         assert_eq!(f.uid(me), None);
         assert_eq!(f.cgroup(me), None);
         assert_eq!(f.trusted_exe(me), None);
+    }
+
+    /// Lot 353 (re-check 4 of #563, P2; named): a fact whose file is there
+    /// but cannot be read is unread, naming the file — a process gone (no
+    /// file) or a file that reads is not; on 8c1c5d12 there was no telling
+    /// them apart, and an exemption judged by an unread fact was "none".
+    #[test]
+    fn a_fact_that_cannot_be_read_is_told_from_a_process_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        // 7: readable; 8: its status and cgroup are directories (not read);
+        // 9: gone
+        std::fs::create_dir_all(root.join("7")).unwrap();
+        std::fs::write(root.join("7/status"), "Uid:\t5\t5\t5\t5\n").unwrap();
+        std::fs::write(root.join("7/cgroup"), "0::/x.slice\n").unwrap();
+        std::fs::create_dir_all(root.join("8/status")).unwrap();
+        std::fs::create_dir_all(root.join("8/cgroup")).unwrap();
+        let f = ProcFacts::new(root);
+        assert_eq!(f.unread(7, ExemptionFact::Uid), None);
+        assert_eq!(f.unread(7, ExemptionFact::Cgroup), None);
+        assert_eq!(f.unread(9, ExemptionFact::Uid), None);
+        assert_eq!(f.unread(9, ExemptionFact::Exe), None);
+        for (fact, file) in [
+            (ExemptionFact::Uid, "status"),
+            (ExemptionFact::Cgroup, "cgroup"),
+        ] {
+            let why = f.unread(8, fact).expect("unread");
+            assert!(
+                why.starts_with(&format!("{}", root.join("8").join(file).display())),
+                "{why}"
+            );
+        }
+        assert_eq!(f.uid(8), None);
+        // an executable link of the system tree that does not open
+        std::fs::create_dir_all(root.join("10")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/nn-test-353-none", root.join("10/exe")).unwrap();
+        assert_eq!(
+            f.unread(10, ExemptionFact::Exe),
+            None,
+            "not there: a process gone"
+        );
     }
 
     /// A root-owned system binary is trusted with its digest; a file the

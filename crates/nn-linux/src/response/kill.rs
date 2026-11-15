@@ -503,8 +503,13 @@ fn kill_tree_in_cgroup_with(
     let root_pid = root.pid();
     make_kill_cgroup(dir)?;
     let procs = dir.join("cgroup.procs");
-    if !procs.exists() || !dir.join("cgroup.kill").exists() {
-        let _ = std::fs::remove_dir(dir);
+    // lot 353: the cgroup's files beneath the cgroup2 root the agent's
+    // start anchored — a FUSE mounted over /sys/fs/cgroup since holds
+    // nothing here
+    if antitamper_bpf::kernel_roots::metadata(&procs).is_err()
+        || antitamper_bpf::kernel_roots::metadata(dir.join("cgroup.kill")).is_err()
+    {
+        let _ = antitamper_bpf::kernel_roots::remove_dir(dir);
         return Err(Error::new(
             ErrorKind::Unsupported,
             "not a cgroup v2 directory with cgroup.kill (kernel 5.14+)",
@@ -512,11 +517,11 @@ fn kill_tree_in_cgroup_with(
     }
     // The root: only while its PID still names it (CMB-004).
     if !root.still_named_by_pid() {
-        let _ = std::fs::remove_dir(dir);
+        let _ = antitamper_bpf::kernel_roots::remove_dir(dir);
         return Ok((ExecutionOutcome::AlreadyGone { pid: root_pid }, Vec::new()));
     }
     if let Err(e) = super::block_outbound::write_pid(&procs, root_pid) {
-        let _ = std::fs::remove_dir(dir);
+        let _ = antitamper_bpf::kernel_roots::remove_dir(dir);
         if e.raw_os_error() == Some(libc::ESRCH) {
             return Ok((ExecutionOutcome::AlreadyGone { pid: root_pid }, Vec::new()));
         }
@@ -528,7 +533,7 @@ fn kill_tree_in_cgroup_with(
     // freezes on entry. The cgroup freezer, unlike SIGSTOP, is invisible
     // to the root's parent: a `sudo` mirrors a stopped command by stopping
     // itself, and stayed stopped once the command was killed (lab).
-    let _ = std::fs::write(dir.join("cgroup.freeze"), "1");
+    let _ = antitamper_bpf::kernel_roots::write(dir.join("cgroup.freeze"), "1");
     let rel = cgroup_rel(dir);
     // Every descendant moved in or found inside, by its start: each is
     // checked after the kill.
@@ -621,14 +626,14 @@ fn kill_tree_in_cgroup_with(
             }
         }
     }
-    if let Err(e) = std::fs::write(dir.join("cgroup.kill"), "1") {
+    if let Err(e) = antitamper_bpf::kernel_roots::write(dir.join("cgroup.kill"), "1") {
         // The caller kills them process by process: not left frozen.
-        let _ = std::fs::write(dir.join("cgroup.freeze"), "0");
+        let _ = antitamper_bpf::kernel_roots::write(dir.join("cgroup.freeze"), "0");
         return Err(e);
     }
     let emptied = wait_cgroup_event(dir, "populated 0", KILL_WAIT);
     if emptied {
-        let _ = std::fs::remove_dir(dir);
+        let _ = antitamper_bpf::kernel_roots::remove_dir(dir);
     }
     // Checked by identity, not by `cgroup.procs`: a process moved out of
     // the cgroup before the kill (by a concurrent action, or by itself)
@@ -685,9 +690,11 @@ fn has_no_children(pid: u32) -> Option<bool> {
 
 /// [`has_no_children`] under `proc` (tests: a tree of their own).
 fn has_no_children_in(proc: &Path, pid: u32) -> Option<bool> {
-    let tasks = std::fs::read_dir(proc.join(pid.to_string()).join("task")).ok()?;
+    let task = proc.join(pid.to_string()).join("task");
+    let tasks = antitamper_bpf::kernel_roots::read_dir(&task).ok()?;
     for t in tasks {
-        let children = std::fs::read_to_string(t.ok()?.path().join("children")).ok()?;
+        let children =
+            antitamper_bpf::kernel_roots::read_to_string(task.join(t).join("children")).ok()?;
         if !children.trim().is_empty() {
             return Some(false);
         }
@@ -757,12 +764,12 @@ fn check_members_with(
 /// reused (`EBUSY`: the caller kills process by process).
 fn make_kill_cgroup(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
+        antitamper_bpf::kernel_roots::create_dir_all(parent)?;
     }
-    match std::fs::create_dir(dir) {
+    match antitamper_bpf::kernel_roots::create_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_dir(dir)?;
-            std::fs::create_dir(dir)
+            antitamper_bpf::kernel_roots::remove_dir(dir)?;
+            antitamper_bpf::kernel_roots::create_dir(dir)
         }
         other => other,
     }
@@ -773,30 +780,26 @@ fn make_kill_cgroup(dir: &Path) -> std::io::Result<()> {
 /// they hold was moved there to be killed: the kill is finished, and the
 /// directories removed. Returns how many were removed.
 pub fn reap_stale_kill_cgroups(blocked: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(blocked) else {
+    let Ok(entries) = antitamper_bpf::kernel_roots::read_dir(blocked) else {
         return 0;
     };
     let mut removed = 0;
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("neutralize-")
-        {
+    for name in entries {
+        if !name.to_string_lossy().starts_with("neutralize-") {
             continue;
         }
-        let dir = entry.path();
-        let populated = std::fs::read_to_string(dir.join("cgroup.events"))
+        let dir = blocked.join(name);
+        let populated = antitamper_bpf::kernel_roots::read_to_string(dir.join("cgroup.events"))
             .is_ok_and(|e| e.lines().any(|l| l.trim() == "populated 1"));
         if populated {
             tracing::warn!(
                 cgroup = %dir.display(),
                 "a kill cgroup left by an earlier agent still holds processes — killing them"
             );
-            let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+            let _ = antitamper_bpf::kernel_roots::write(dir.join("cgroup.kill"), "1");
             let _ = wait_cgroup_event(&dir, "populated 0", KILL_WAIT);
         }
-        if std::fs::remove_dir(&dir).is_ok() {
+        if antitamper_bpf::kernel_roots::remove_dir(&dir).is_ok() {
             removed += 1;
         }
     }
@@ -823,7 +826,7 @@ fn pid_in_cgroup(pid: u32, rel: &str) -> bool {
 fn wait_cgroup_event(dir: &Path, want: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if std::fs::read_to_string(dir.join("cgroup.events"))
+        if antitamper_bpf::kernel_roots::read_to_string(dir.join("cgroup.events"))
             .is_ok_and(|e| e.lines().any(|l| l.trim() == want))
         {
             return true;
@@ -876,26 +879,38 @@ fn collect_descendants_capped(
 
 /// Build the `ppid → [(child_pid, start ticks), ...]` adjacency map from
 /// /proc.
+///
+/// Lot 353 (the review of #563, F2): beneath the `/proc` root the start
+/// anchored (`kernel_roots`, the state reader) — the `procfs` crate walked
+/// the `/proc` mounted now, and a FUSE over it held the kill response's
+/// descendant walk.
 fn build_ppid_map() -> std::io::Result<HashMap<u32, Vec<(u32, u64)>>> {
     let mut map: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
-    let processes = match procfs::process::all_processes() {
-        Ok(it) => it,
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "procfs::all_processes failed: {e}"
-            )))
-        }
-    };
-    for proc in processes.flatten() {
-        let stat = match proc.stat() {
-            Ok(s) => s,
-            Err(_) => continue, // race: process exited mid-walk; skip
+    let names = antitamper_bpf::kernel_roots::read_dir("/proc")
+        .map_err(|e| std::io::Error::other(format!("listing /proc failed: {e}")))?;
+    for name in names {
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
         };
-        map.entry(stat.ppid as u32)
-            .or_default()
-            .push((stat.pid as u32, stat.starttime));
+        // race: a process that exited mid-walk is skipped
+        let Ok(stat) = crate::state_read::read_state(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((ppid, start)) = ppid_and_start(&stat) else {
+            continue;
+        };
+        map.entry(ppid).or_default().push((pid, start));
     }
     Ok(map)
+}
+
+/// The parent (field 4) and the start ticks (field 22) of a
+/// `/proc/<pid>/stat` line — after the last `)`, whatever the `comm`.
+fn ppid_and_start(stat: &str) -> Option<(u32, u64)> {
+    let mut f = stat.rsplit_once(')')?.1.split_whitespace();
+    let ppid = f.nth(1)?.parse().ok()?;
+    let start = f.nth(17)?.parse().ok()?;
+    Some((ppid, start))
 }
 
 #[cfg(test)]
@@ -2096,6 +2111,26 @@ mod bug122 {
                 None,
                 Some(PROTECTED),
             ]
+        );
+    }
+
+    /// Lot 353 (the review of #563, F2): the walk's own parse of `stat` —
+    /// the parent and the start, past a `comm` with spaces and parens —
+    /// and the map it builds from the anchored /proc holds this process
+    /// under its parent with the kernel's start.
+    #[test]
+    fn the_descendant_walk_reads_proc_beneath_its_anchored_root() {
+        let line = "4242 (a) b (c)) S 17 4242 4242 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 98765 1 1";
+        assert_eq!(ppid_and_start(line), Some((17, 98765)));
+        assert_eq!(ppid_and_start("garbage"), None);
+        let me = std::process::id();
+        let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
+        let (ppid, start) = ppid_and_start(&stat).unwrap();
+        let map = build_ppid_map().unwrap();
+        assert!(
+            map.get(&ppid)
+                .is_some_and(|kids| kids.contains(&(me, start))),
+            "this process under its parent"
         );
     }
 }

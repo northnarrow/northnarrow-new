@@ -247,7 +247,7 @@ impl AdminAuth {
     /// startup (`main.rs`) is the intended caller; the value is
     /// the return of [`crate::agent_id::load_or_bootstrap`].
     pub fn load_with_agent_id(config_path: &Path, agent_id: [u8; 16]) -> Result<Self> {
-        let bytes = std::fs::read(config_path)
+        let bytes = antitamper_bpf::kernel_roots::read_all(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
 
         // External audit AUT-004: a malformed line costs its own key, not
@@ -312,7 +312,7 @@ impl AdminAuth {
     /// dispatch layer; defending in depth here keeps the
     /// in-memory state non-empty.
     pub fn reload(&self, config_path: &Path) -> Result<()> {
-        let bytes = std::fs::read(config_path)
+        let bytes = antitamper_bpf::kernel_roots::read_all(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
         // External bug hunt BUG03: as `load_with_agent_id`.
         let parsed = admin_quorum::parse_admin_pub_lenient(&String::from_utf8_lossy(&bytes));
@@ -1303,7 +1303,7 @@ pub fn atomic_rewrite_admin_pub_add(
 ) -> std::result::Result<(), RotateKeysError> {
     // External bug hunt BUG03: the file's bytes, a line not UTF-8 kept as
     // it is (a comment is never rewritten with U+FFFD).
-    let body = std::fs::read(config_path).map_err(RotateKeysError::Io)?;
+    let body = antitamper_bpf::kernel_roots::read_all(config_path).map_err(RotateKeysError::Io)?;
     let new_fp = fingerprint(new_pubkey);
     let mut collision = false;
     for raw in byte_lines(&body) {
@@ -1356,7 +1356,7 @@ pub fn atomic_rewrite_admin_pub_revoke(
     target_fp: [u8; 4],
 ) -> std::result::Result<(), RotateKeysError> {
     // External bug hunt BUG03: on the bytes, as the add.
-    let body = std::fs::read(config_path).map_err(RotateKeysError::Io)?;
+    let body = antitamper_bpf::kernel_roots::read_all(config_path).map_err(RotateKeysError::Io)?;
     let target_hex = hex::encode(target_fp);
     let mut out: Vec<u8> = Vec::new();
     let mut kept_keys = 0usize;

@@ -526,7 +526,7 @@ impl CombatActuator<LinuxHost> for SystemActuator {
 pub fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
     use super::offender::{cgroup_path, shown};
     let dir = proc_root.join(pid.to_string());
-    let exe = std::fs::read_link(dir.join("exe"))
+    let exe = antitamper_bpf::kernel_roots::read_link(dir.join("exe"))
         .ok()
         .map(|p| shown(&p.to_string_lossy()));
     let cgroup = crate::state_read::read_state(dir.join("cgroup"))

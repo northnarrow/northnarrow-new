@@ -87,7 +87,11 @@ pub(crate) fn start(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            installer_ticker.close_if_expired(Instant::now());
+            // lot 353 (re-check 1 of #563): the close reads the pins and the
+            // units' drop-ins by path — off the runtime's worker
+            nn_linux::runtime::off_the_runtime(|| {
+                installer_ticker.close_if_expired(Instant::now())
+            });
         }
     });
 
@@ -247,7 +251,11 @@ pub(crate) fn spawn_shutdown_exe_refresh() {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            match northnarrow_agent::anti_tamper::refresh_shutdown_exe(root) {
+            // lot 353 (re-check 1 of #563): a pin and two binaries by path —
+            // off the runtime's worker
+            match nn_linux::runtime::off_the_runtime(|| {
+                northnarrow_agent::anti_tamper::refresh_shutdown_exe(root)
+            }) {
                 Ok(Some(k)) => info!(
                     dev = k.dev,
                     ino = k.ino,
@@ -284,8 +292,12 @@ pub(crate) fn spawn_mount_guard_regroup_watch(mount_refresh: MountGuardRefresh) 
                 continue;
             };
             if w.moved() {
-                let _one = mount_refresh.lock();
-                if let Err(e) = refresh_now(root) {
+                // the mount tables read by path — off the runtime's worker
+                let done = nn_linux::runtime::off_the_runtime(|| {
+                    let _one = mount_refresh.lock();
+                    refresh_now(root)
+                });
+                if let Err(e) = done {
                     debug!(
                         error = format!("{e:#}"),
                         "anti-tamper mount guard: refresh at a propagation change skipped"
@@ -339,7 +351,9 @@ pub(crate) fn spawn_program_images_refresh() {
         tick.tick().await; // seeded above
         loop {
             tick.tick().await;
-            let n = nn_linux::program_images::refresh();
+            // lot 353 (re-check 1 of #563): the system's bin directories
+            // walked by path — off the runtime's worker
+            let n = nn_linux::runtime::off_the_runtime(nn_linux::program_images::refresh);
             if n > 0 {
                 info!(
                     programs = n,
@@ -387,8 +401,10 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // no bpffs ⇒ register_protected_observer is a no-op (it
         // logs the degraded mode internally).
         let bpffs_root = northnarrow_agent::anti_tamper::prepare_pin_root();
-        loop {
-            tick.tick().await;
+        // lot 353 (re-check 1 of #563): one tick — the pidfile, the
+        // watchdog's binary and the pins read by path — run off the
+        // runtime's worker
+        let mut tick_once = || {
             // The review of #567 (the cross-model check): the mount guard's
             // held mounts and peer groups followed (a propagation change, an
             // automounted tracefs)
@@ -421,7 +437,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                             northnarrow_agent::anti_tamper::mount_guard::guard_watchdog(root, *pid);
                     }
                 }
-                continue; // no change — stay quiet on the hot path
+                return; // no change — stay quiet on the hot path
             }
             // External audit EBPF-002: one watchdog at a time. While the
             // registered watchdog still runs, a pidfile naming another
@@ -439,7 +455,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         );
                         refused = Some(p);
                     }
-                    continue;
+                    return;
                 }
             }
             // External audit MAIN-001: PROTECTED_PIDS follows the verified
@@ -607,6 +623,10 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 }
             }
             last = new_pid;
+        };
+        loop {
+            tick.tick().await;
+            nn_linux::runtime::off_the_runtime(&mut tick_once);
         }
     });
 }

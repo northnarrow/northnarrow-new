@@ -170,13 +170,8 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ("agent/src/cow/guard.rs", "mountinfo::read(t)", MOUNT),
     (
         "agent/src/cow/journal.rs",
-        "fs::read(host.join(\"index.jsonl\"))",
+        "read_all(host.join(\"index.jsonl\"))",
         OWN,
-    ),
-    (
-        "agent/src/cow/trust.rs",
-        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
-        PROC,
     ),
     ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),
     (
@@ -216,7 +211,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(\"/proc/stat\")",
         KNOB,
     ),
-    ("agent/src/module_trust/scan.rs", "fs::read(file)", PKG),
+    ("agent/src/module_trust/scan.rs", "read_all(file)", PKG),
     (
         "agent/src/posture/golden.rs",
         "read_to_string(&self.audit_path)",
@@ -257,7 +252,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "antitamper-bpf/src/cgroup_guard.rs",
-        "fs::read(path)",
+        "read_all(path)",
         CGROUP,
     ),
     (
@@ -267,7 +262,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "antitamper-bpf/src/lib.rs",
-        "fs::read(format!(\"/proc/{pid}/comm\"))",
+        "read_all(format!(\"/proc/{pid}/comm\"))",
         PROC,
     ),
     ("crates/nn-admin/src/cli.rs", "read_to_string(&file)", OPER),
@@ -370,7 +365,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/agent_id.rs",
-        "fs::read(\"/proc/sys/kernel/random/boot_id\")",
+        "read_all(\"/proc/sys/kernel/random/boot_id\")",
         KNOB,
     ),
     (
@@ -380,7 +375,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/anti_tamper/btf_revalidate.rs",
-        "fs::read(d.join(m))",
+        "read_all(d.join(m))",
         KNOB,
     ),
     (
@@ -481,7 +476,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ("crates/nn-linux/src/own_cpus.rs", "read_state(p)", CPUS),
     (
         "crates/nn-linux/src/known_system_prog.rs",
-        "read_to_string(pdir.join(\"fdinfo\").join(fd.file_name()))",
+        "read_to_string(pdir.join(\"fdinfo\").join(&fd))",
         KNOB,
     ),
     (
@@ -501,7 +496,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/net/known_resolver.rs",
-        "fs::read(path)",
+        "read_all(path)",
         "lot 340: a container runtime's bundle (root's, writable by no one else, checked \
          first): unreadable, the sender is not proven CoreDNS and is judged as any sender — \
          never a protection emptied",
@@ -509,7 +504,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     (
         // the review of #552 (F3): the container's init pid file
         "crates/nn-linux/src/net/known_resolver.rs",
-        "fs::read(path)",
+        "read_all(path)",
         "the review of #552 (F3): a container runtime's init pid file (root's, writable by \
          no one else, checked first): unreadable, the sender is not proven CoreDNS and is \
          judged as any sender — never a protection emptied",
@@ -562,12 +557,12 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/own_dropins.rs",
-        "fs::read(&from)",
+        "read_all(&from)",
         CONFIG,
     ),
     (
         "crates/nn-linux/src/program_images.rs",
-        "fs::read(root.join(\"etc/shells\"))",
+        "read_all(root.join(\"etc/shells\"))",
         SHELLS,
     ),
     (
@@ -607,7 +602,15 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/response/kill.rs",
-        "read_to_string(t.ok()?.path().join(\"children\"))",
+        "read_to_string(task.join(t).join(\"children\"))",
+        PROC,
+    ),
+    // lot 353 (the review of #563, F2): the descendant walk's `stat`s,
+    // beneath the anchored /proc root (the procfs crate skipped them alike):
+    // a process gone mid-walk is not a parent of anyone
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
         PROC,
     ),
     (
@@ -784,7 +787,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/ring_drops.rs",
-        "fs::read(base.join(\"cmdline\"))",
+        "read_all(base.join(\"cmdline\"))",
         PROC,
     ),
     (
@@ -830,12 +833,32 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     ("watchdog/src/lib.rs", "read_to_string(&honoured_path)", OWN),
+    // lot 353: a FUSE connection's waiting count (fusectl, the kernel's):
+    // unreadable, no request is known waiting and nothing is aborted
     (
         "watchdog/src/lib.rs",
-        "fs::read(format!(\"/proc/{pid}/stat\"))",
+        "read_to_string(connections.join(conn.to_string()).join(\"waiting\"))",
+        KNOB,
+    ),
+    // lot 353: the agent's and PID 1's mount tables, searched for a FUSE
+    // holding a stuck agent: unreadable, none is found and none aborted
+    ("watchdog/src/main.rs", "read_to_string(t)", PROC),
+    // lot 353: the watchdog's stuck marker, read at a SIGINT: unreadable,
+    // the stop is an operator's `sigint` (the hold record still names the
+    // recovery, signed at the next start)
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "read_state(path)",
+        OWN,
+    ),
+    // lot 353: the lab's `debug-walk-on-workers` trigger file
+    ("agent/src/run_loop.rs", "read_to_string(&trigger)", LAB),
+    (
+        "watchdog/src/lib.rs",
+        "read_all(format!(\"/proc/{pid}/stat\"))",
         PROC,
     ),
-    ("watchdog/src/lib.rs", "fs::read(\"/proc/stat\")", KNOB),
+    ("watchdog/src/lib.rs", "read_all(\"/proc/stat\")", KNOB),
     // The review of #538's re-check (G3): one entry per site — the second
     // sites under a key listed above — and the sites of the forms rule 2
     // now catches (`is_ok_and`, `map_or`, `Type::default()`, a later
@@ -1225,6 +1248,9 @@ const READS: &[&str] = &[
     "read_lossy",
     "mountinfo::read",
     "fs::read",
+    // lot 353: `antitamper_bpf::kernel_roots::read_all`, `std::fs::read`
+    // beneath the kernel's views
+    "read_all",
 ];
 
 /// Whether the statement of a read turns its failure into a default.

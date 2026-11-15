@@ -28,9 +28,11 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 
 > [!IMPORTANT]
 > **Pre-Beta.** A single-founder project, built in the EU. Linux x86_64 only. No release with
-> assets has been published yet: build from source. Nothing here has been validated by a third
-> party. Every number below points to the file or the CI run it comes from, and
-> [Limits, said plainly](#limits-said-plainly) lists what is still open.
+> assets has been published yet: build from source. A fresh install runs the observe-only
+> [`alpha` profile](docs/operator/ALPHA_PROFILE.md): it records what it would have done to a user
+> program and does not do it, while its self-protection stays enforced. Nothing here has been
+> validated by a third party. Every number below points to the file or the CI run it comes from,
+> and [Limits, said plainly](#limits-said-plainly) lists what is still open.
 
 ---
 
@@ -45,8 +47,8 @@ liability before it is a product. NorthNarrow inverts it:
 |---|---|---|
 | Where telemetry goes | the vendor's cloud | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` — unless the operator signs an export overlay, which sends exactly the fields [`EXPORT.md`](docs/operator/EXPORT.md) lists to the operator's own SIEM |
 | Who decides | remote models and a SOC | **deterministic rules**, correlation and an adaptive posture, on the host; no AI model on the host |
-| Who responds | a human, later | **the host itself**, on a graduated ladder that only a signed human command releases |
-| Can root switch it off? | varies | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, root included, outside a signed maintenance window. Not absolute: see [the limits](#limits-said-plainly) |
+| Who responds | a human, later | **the host itself**, on a graduated ladder that only a signed human command releases; under the `alpha` profile a response against a user program is recorded, not carried out |
+| Can root switch it off? | varies | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, and BPF programs that could signal the agent, root included, outside a signed maintenance window, under every profile. Not absolute: see [the limits](#limits-said-plainly) |
 | Air-gapped hosts | degraded | **first-class**: no update channel, offline attestation |
 | Trust | "trust us" | **signed hash chains**, a signed heartbeat verified off the host, open code, a lab and a CI gate anyone can rerun |
 
@@ -138,14 +140,22 @@ with the trusted-installer role) upgrades, uninstalls and restarts work as usual
 | `kill -9`, or any signal to the agent or the watchdog | `task_kill` refuses every userspace signal but signal 0, a self-signal and agent ↔ watchdog | signed denial, `NN-L-AT-001`, posture escalation |
 | `ptrace`, `/proc/<agent>/mem` | `ptrace_access_check` refuses | signed denial, `NN-L-AT-001` |
 | Delete, rename, rewrite or `chmod` the binaries, units, keys or chains; add a drop-in or an overlay | `inode_*`, `file_open` and `file_permission` deny hooks; no new entries in the agent's directories | signed `unlink`, `rename`, `setattr`, `write`, `create` |
-| `systemctl kill -s SIGKILL` (`cgroup.kill`), `systemctl freeze`, a move out of the unit's cgroup | the units' cgroups protected; the move guard, self-tested at every boot (lot 273) | signed `cgroup_kill`, `cgroup_freeze`, `cgroup_move` |
-| A low `memory.max` (an OOM kill), `cpu.max` or `pids.max` starvation, `systemctl set-property`, a cgroup v1 `freezer`, `oom_score_adj` | refused, except PID 1 writing back a file's registered value; cgroup v1 where systemd runs the unified hierarchy (lot 273b) | signed `cgroup_limit`, `cgroup_v1`, `oom_adj`; PID 1's attempts as `RelayedTamperAttempt` |
+| `systemctl kill -s SIGKILL` (`cgroup.kill`), `systemctl freeze`, a move out of the unit's cgroup | the units' cgroups protected; the move guard, self-tested at every boot | signed `cgroup_kill`, `cgroup_freeze`, `cgroup_move` |
+| A low `memory.max` (an OOM kill), `cpu.max` or `pids.max` starvation, `systemctl set-property`, a cgroup v1 `freezer`, `oom_score_adj` | refused, except PID 1 writing back a file's registered value; cgroup v1 where systemd runs the unified hierarchy | signed `cgroup_limit`, `cgroup_v1`, `oom_adj`; PID 1's attempts as `RelayedTamperAttempt` |
+| Confine the agent to fewer CPUs (a `cpuset` partition beside it, its cgroup's `cpuset.cpus`, a thread's affinity), which no hook is asked about | every 5 s the agent compares the CPUs it runs on with those it should; three rounds it cannot judge in a row are recorded too | signed `cpu_confined`, `NN-L-AT-001`; the `own_cpus` degradation in `nn-admin status` |
 | Rewrite the agent's BPF maps, detach or replace its links | `bpf_map` and `bpf` hooks refuse write handles and link detach/update | signed `bpf_map` / `bpf_link` denial, `NN-L-BPF-002` |
 | `kexec` into a kernel without the agent | the running agent refuses kexec image loads; `kernel.kexec_load_disabled=1` covers the time before it starts | signed denial, `NN-L-AT-001` |
 | Freeze, starve or blind the agent some other way | the watchdog respawns it; the external verifier alerts | `SILENT`, `STOPPED`, `DEGRADED`, `REPLAY` or `TAMPERED` off the host |
 | Load an untrusted kernel module (a file outside the running kernel's module tree, an `init_module` buffer, a module file changed since boot outside a package transaction) | **refused** by the module-load judge, unless a signed `module-allow` line names the module ([`RULE_POLICY.md`](docs/operator/RULE_POLICY.md)) | signed denial, `R018_KernelModuleLoad` |
 | Load a foreign BPF program of a type that can kill, blind or replace the agent's hooks (tracing — bpftrace, BCC, another EDR's sensors —, `lsm`, `struct_ops`, `ext`, `raw_tracepoint_writable`) | **refused**, unless a signed per-loader opt-out names its loader (`install.sh --allow-bpf-tools`, `--allow-bpf-loader PATH`); a program that calls `bpf_send_signal`, `bpf_probe_write_user` or `bpf_override_return`, or an `fmod_ret` program, is refused whoever loads it ([`ALPHA_PROFILE.md` §1.2](docs/operator/ALPHA_PROFILE.md#12-bpftrace-bcc-and-other-tracing-tools)) | signed `bpf_prog_type` denial, `NN-L-AT-001`; an opted-out load `bpf_prog_opt_out` (Low) |
+| A BPF program of any type, network types included, calling a signalling kfunc (`bpf_send_signal_task` from 6.13, the task-work signal kfuncs from 6.18) | refused at the load to every foreign loader, opt-outs included | signed `bpf_prog_type` denial naming the kfunc |
+| Inside a window, load a program refused outside one (a signal, override or write helper), to use it once the window closes | the load is held and always signed: with no room for its record it is refused. Outside a window its runs, attaches and tail-call slots are refused, through any descriptor, and it is signed again while it stays loaded | signed `bpf_held_load`, `bpf_held_use` |
 | `prlimit` (`RLIMIT_CPU`), scheduler, nice or I/O-priority starvation | `task_setrlimit`, `task_setscheduler`, `task_setnice` and `task_setioprio` refuse it | signed `rlimit`, `sched`, `nice`, `ioprio` |
+
+The records that are the only trace of something let through (a held BPF load, a program the
+agent never saw, kernel taint, the agent confined) spend no record budget, so a flood of refusals
+cannot crowd them out; past 32 of a kind in a round, the most dangerous are named first and the
+rest in the next rounds.
 
 The test lab replays these attacks: `deploy/lab/nn-lab.sh tamper-check` runs each case with its
 expected outcome and the evidence it must leave in the signed logs.
@@ -162,10 +172,11 @@ and `--allow-bpf-loader PATH` names any executable. The tracing types are then l
 that executable, and every such load is recorded (`bpf_prog_opt_out`, Low). Whoever loads it,
 the agent still refuses an `fmod_ret` program and a program that calls `bpf_send_signal`,
 `bpf_send_signal_thread`, `bpf_probe_write_user` or `bpf_override_return`, so a tool's kill or
-override actions (bpftrace's `signal()`, Tetragon's `Sigkill` and `Override`) are refused, and
-the flags never open `lsm`, `struct_ops` or `ext`. Network program types (XDP, tc,
-`cgroup_skb`, socket filters) are not refused. bpftrace with the opt-out was measured in our
-lab; Falco and Tetragon have not been tried there. Details:
+override actions (bpftrace's `signal()`, Tetragon's `Sigkill` and `Override`) are refused. The
+flags never open `lsm`, `struct_ops` or `ext`, and `install.sh` signs no hand-made line that
+does. Network program types (XDP, tc, `cgroup_skb`, socket filters) are not refused, unless
+they call a signalling kfunc. bpftrace and BCC's `opensnoop-bpfcc` with the opt-out were
+measured in our lab; Falco and Tetragon have not been tried there. Details:
 [`ALPHA_PROFILE.md` §1.2](docs/operator/ALPHA_PROFILE.md#12-bpftrace-bcc-and-other-tracing-tools).
 
 ---
@@ -182,7 +193,7 @@ against it on every `cargo test` by
 |---|---|---|
 | Rules | **95** rules the agent can record: 87 in the engine, 8 issued outside it (anti-tamper, exploit guard, exec policy and its environment checks, exec quarantine). Strongest test per rule: an end-to-end test or a lab script for 35, unit tests only for 55, no proof yet for 5 (the experimental exec-policy and quarantine records) | [`RULE_CATALOGUE.md`](docs/detection/RULE_CATALOGUE.md) |
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
-| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2). The eBPF object holds **123** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 117 of the pre-alpha release candidate (November 2026), and the mount guard's six (lot 357) pass it on 5.15, 6.8 and 7.0 | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
+| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2). The eBPF object holds **123** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 117 of the pre-alpha release candidate (November 2026), the mount guard's six (lot 357) pass it on 5.15, 6.8 and 7.0, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
 | Host tests | more than **5,500** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
 | Privileged suites | run as root in 5 KVM guests every night. The nightly on `main` was green on 6 of 12 nights from 22 Oct to 2 Nov, and red again on 3 Nov on Ubuntu 26.04 only; every red night was traced to a lab-harness race or a test fixture, both fixed in #487. The five-guest dispatch of the gate on that fix: 87 suites and 103 tests on each guest, 0 failed ([run 41590801439](https://github.com/northnarrow/northnarrow-new/actions/runs/41590801439)) | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
@@ -191,7 +202,9 @@ against it on every `cargo test` by
 | Heartbeat | the off-host verifier flagged a stopped agent in 6.5 s, a replayed export in 5.0 s, a frozen agent in 55.7 s and a cut network in 66.7 s | [`HEARTBEAT.md`](docs/operator/HEARTBEAT.md) |
 | Determinism | **35** golden replay cases of the decision path and **15** of the posture and COMBAT ladder, checked byte for byte on every `cargo test`; **14** fuzz targets; **4** Kani proofs, run every week and on the pull requests that touch them | [`GOLDEN_REPLAY.md`](docs/validation/GOLDEN_REPLAY.md) |
 | Cost | open-heavy work pays: the `open` microbenchmark is +41 % with the agent on, `git status` +24 % from the cgroup move guard; the one committed baseline is from Ubuntu 24.04 | [`PERF_BASELINE.md`](docs/validation/PERF_BASELINE.md) |
-| Lifecycle | fresh install, in-place upgrade with rollback, clean uninstall (`upgrade-check`, `uninstall-check`); `.deb` / `.rpm` by `pkg-check` | [operator guide](docs/operator/INSTALL_UPGRADE_UNINSTALL.md) |
+| Benign hosts | records a plain host's own work made, now Low or gone, the attack beside each judged as before: a container runtime's start (runc's sealed copy of itself, containerd's module probes, a cgroup controller enabled), a package's system account and initramfs build, a kernel or DKMS package's modules, cloud-init's boot, sudo-rs, `go test`, npm in its own directories, logrotate and rsyslog, and a desktop AppImage (judged by the image file the user ran, not by its mount under `/tmp`; what the program then does is judged as for any other). `sudo ./deploy/uninstall.sh`: 0 High in 15 runs | [`UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md) §34–§49 |
+| Detection fixes | a hard link of a watched setuid binary into a user-writable directory (NN-L-FIM-002); a write anywhere below a kernel's module directory (NN-L-FIM-008); the cross-process chains through descendants that only forked (NN-L-CHAIN-004/005/006/008); a reverse shell known by the shell's file, not its name (R020); an administrator's session vouched for only by the host's own sudo or su, run by a user who is not root, for what it ran as root after authenticating | [`CHANGELOG.md`](CHANGELOG.md) |
+| Lifecycle | fresh install, in-place upgrade with rollback, clean uninstall (`upgrade-check`, `uninstall-check`); `.deb` / `.rpm` by `pkg-check`. `install.sh` refuses a host it cannot run on before any change; after `uninstall.sh --purge` only what the guide lists remains (a state diff on five distributions); the uninstall exits 3 when the removal ends at the next boot, 4 when it left processes the agent had contained thawed and listed; a release verifies with its signed `SHA256SUMS` where no `gh` attestation is available | [operator guide](docs/operator/INSTALL_UPGRADE_UNINSTALL.md) |
 
 ### Kernels
 
@@ -201,11 +214,11 @@ kernel, and a weekly CI job recomputes the matrix over BTFHub.
 
 | Distribution | Kernel | systemd | Status | Nightly gate | Deny hooks |
 |---|---|---|---|---|---|
-| Ubuntu 22.04 LTS | 5.15 | 249 | supported, degraded (DNS names through the `ITER_IOVEC` path only) | every night and on PRs | 21 |
-| Debian 12 | 6.1 | 252 | supported | every night | 21 |
-| Ubuntu 24.04 LTS | 6.8 | 255 | supported | every night and on PRs | 23 |
-| Debian 13 | 6.12 | 257 | verified in the lab | every night | 23 |
-| Ubuntu 26.04 LTS | 7.0 | 259 | verified in the lab | every night | 23 |
+| Ubuntu 22.04 LTS | 5.15 | 249 | supported, degraded (DNS names through the `ITER_IOVEC` path only) | every night and on PRs | 26 |
+| Debian 12 | 6.1 | 252 | supported | every night | 26 |
+| Ubuntu 24.04 LTS | 6.8 | 255 | supported | every night and on PRs | 28 |
+| Debian 13 | 6.12 | 257 | verified in the lab | every night | 28 |
+| Ubuntu 26.04 LTS | 7.0 | 259 | verified in the lab | every night | 28 |
 | AlmaLinux 9 | 5.14 (el9) | — | supported with SELinux enforcing; **not re-verified since Wave 4** | self-hosted lab only | not measured since |
 
 The full matrix, with its prerequisites, is in
@@ -261,6 +274,9 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md). Among them: a refused `set-property` stays in
   systemd's own copy until a `daemon-reload`, a soft-reboot leaves the units `failed`, and a
   stop propagated by a `Conflicts=` unit records the unit as stopped.
+- **A trusted-installer window is the host's, not the installer's.** While it is open, every
+  root process gets what it lifts, and a BPF program attached inside it keeps running after it
+  (its load is signed): open one only on a host you trust for its length, and keep it short.
 - **The kernel is the host's to protect.** A root that can write kernel memory, load an unsigned
   module or `kexec` a kernel can defeat any in-kernel defence. Kernel lockdown (`integrity`),
   module signing, Secure Boot and `kexec_load_disabled` are recommended, and
@@ -269,9 +285,11 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   While it runs, the agent refuses kexec loads and untrusted module loads itself (outside a
   trusted-installer window); a module loaded inside a window is let through and recorded, and
   one loaded before the agent started is beyond its reach.
-- **A root holding the agent's key can forge its heartbeat.** The deny hooks keep the key from
-  readers, and a signature proves which key wrote a beat, not that the host is honest.
-  Hardware attestation (a TPM quote of the measured boot) is future work
+- **A root holding the agent's key can forge its heartbeat and rewrite its history.** The deny
+  hooks keep the key from readers, and a signature proves which key wrote a row, not that the
+  host is honest. The signing is not forward-secure yet: a stolen key signs a rewritten past as
+  well as new rows; only what already left the host (the beats an off-host verifier fetched, an
+  export) is beyond its reach. Hardware attestation (a TPM quote of the measured boot) is future work
   ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md#what-it-does-not-prove)).
 - **The capability manifest is the agent's own word.** The telemetry probe exercises 3 of the
   16 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
@@ -288,12 +306,17 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   leaves by pull (C21, C22; [`docs/operator/EXPORT.md`](docs/operator/EXPORT.md)).
 - **Linux x86_64 only.** No ARM64, no Windows, no macOS (C02 to C04).
 - **No published release with assets.** The signed pipeline exists, but the one tag has no assets.
-- **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). DNS is read
+- **Partial telemetry.** Exec events only: forks reach the lineage through a kernel record, not
+  as events, and there are no exit or credential events (C05). DNS is read
   over UDP only: no DNS over TCP, DoT or DoH, and no `recvmmsg` (C07).
 - **A TLS fingerprint is not an identity.** NN-L-NET-003 records a JA3 or JA4 in the operator's
   list as Medium and never acts on it; `enforce` is refused until it has a second predicate.
 - **Narrow measurements.** Overhead is measured on Ubuntu 24.04 only. One 24-hour soak passed,
   on AlmaLinux 9, before Wave 4.
+- **The alpha does not block user programs.** Under a fresh install's `alpha` profile, a
+  verdict against a user program is recorded as `would have: <action>`, not carried out; the
+  self-protection and the host-integrity refusals (modules, kexec, foreign BPF) stay enforced.
+  `enforcing` is a signed profile switch ([`ALPHA_PROFILE.md`](docs/operator/ALPHA_PROFILE.md)).
 - **Prevention is experimental and off by default:** the exec policy, exec quarantine and copy on
   first write ([`EXEC_POLICY.md`](docs/design/EXEC_POLICY.md)).
 
@@ -395,20 +418,24 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 - [x] Privilege separation: unprivileged workers in Landlock and seccomp, parsers out of the root process, one `KeyStore`, capabilities per thread
 - [x] Key continuity: the signing key decided once at boot
 
-**Phase 3, under way.**
+**Phase 3, under way.** The first tag release, v0.1.0-alpha, follows a phased pre-release
+verification: an install matrix on 5 distributions, self-protection, detection coverage, a
+multi-day false-positive soak and an independent review.
 
 - [x] `prlimit` / `RLIMIT_CPU`, scheduler, nice and I/O-priority starvation refused outside a window
 - [ ] **Wave 1**
-  - [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (lot 275; the rule records, its kill refused until measured wider)
+  - [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (the rule records, its kill refused until measured wider)
   - [ ] Process telemetry: fork, exit and credential changes
   - [ ] Deception that trips when a decoy is used
   - [ ] A self-test of every sensor, not three of sixteen
-  - [x] Foreign BPF loads and rootkit helpers refused (with a signed per-loader opt-out for tracing tools)
+  - [x] Foreign BPF loads and rootkit helpers refused (with a signed per-loader opt-out for tracing tools); the signalling kfuncs refused in every program type; a window's forbidden load held and signed
+  - [x] The agent's own CPUs watched: a confinement is signed
+  - [x] The observe-only `alpha` profile for testers, with the self-protection enforced
   - [ ] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
   - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
   - [ ] Kernel lockdown checks
-  - [ ] A tag release, verified end to end
-- [x] A minimal signed export of detections in OCSF (lot 276: off by default, `docs/operator/EXPORT.md`)
+  - [ ] A tag release, verified end to end (its signed `SHA256SUMS`, checked by `install.sh` without `gh`, is in place)
+- [x] A minimal signed export of detections in OCSF (off by default, `docs/operator/EXPORT.md`)
 - [ ] A free, public self-assessment against MITRE's open emulation plans
 - [ ] **Waves 2 and 3**: the remaining Linux capabilities, in the program's order (telemetry, prevention, detection, integration)
 

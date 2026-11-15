@@ -87,7 +87,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::chain_host::{ChainHost, ChainSigner};
+use crate::chain_host::{ChainHost, ChainSigner, Open};
 use crate::clock::{Clock, SystemClock};
 
 /// Default location of the tamper-evident audit log. Mirrors the
@@ -345,8 +345,13 @@ impl std::fmt::Debug for AuditStamps {
 pub struct AuditLog<K> {
     path: PathBuf,
     /// `path` anchored to the directory fd taken at open (review entry 44):
-    /// appends cannot be diverted by a later mount over the directory.
+    /// appends cannot be diverted by a later mount over the directory (lot
+    /// 353: the host resolves its name beneath that descriptor, never
+    /// through `/proc`).
     io_path: PathBuf,
+    /// Lot 353: the last append failed — told to the host
+    /// ([`ChainHost::append_failed`]) until one succeeds.
+    append_failing: bool,
     /// Lab PR 249: the time and the self pid the rows are stamped with.
     stamps: AuditStamps,
     /// How the run before this one ended (from the chain at open).
@@ -440,6 +445,7 @@ impl<K: ChainSigner> AuditLog<K> {
         let mut log = Self {
             path: path.to_path_buf(),
             io_path: K::Host::anchor(path),
+            append_failing: false,
             stamps,
             key,
             agent_id,
@@ -475,6 +481,7 @@ impl<K: ChainSigner> AuditLog<K> {
         Self {
             path: PathBuf::new(),
             io_path: PathBuf::new(),
+            append_failing: false,
             stamps: AuditStamps::host(),
             key,
             agent_id,
@@ -807,6 +814,26 @@ impl<K: ChainSigner> AuditLog<K> {
     /// row is never glued to a fragment (a log the next start refuses) nor
     /// chained off a row that is no longer the tail.
     pub fn append(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
+        let r = self.append_inner(draft);
+        // Lot 353 (the review of #563, F1): a signed log that stops taking
+        // rows is told to the host at each change — never silent.
+        if self.memory.is_none() {
+            match &r {
+                Err(e) => {
+                    self.append_failing = true;
+                    K::Host::append_failed(&self.path, Some(&format!("{e:#}")));
+                }
+                Ok(_) if self.append_failing => {
+                    self.append_failing = false;
+                    K::Host::append_failed(&self.path, None);
+                }
+                Ok(_) => {}
+            }
+        }
+        r
+    }
+
+    fn append_inner(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
         if self.memory.is_none() && self.poisoned.is_some() {
             self.recover_after_failed_append()?;
         }
@@ -848,7 +875,7 @@ impl<K: ChainSigner> AuditLog<K> {
         // not followed — nor its target created —, a FIFO does not stall
         // the write, and only a regular file takes the row.
         let mut f = K::Host::open_with_mode_nofollow(
-            OpenOptions::new().create(true).append(true),
+            Open::new().create(true).append(true),
             AUDIT_LOG_FILE_MODE,
             &self.io_path,
         )

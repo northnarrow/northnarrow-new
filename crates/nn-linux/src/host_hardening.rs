@@ -433,7 +433,7 @@ pub const INSTALL_MANIFEST_REL: &str = "etc/northnarrow/install-manifest.json";
 /// here.
 fn install_provenance(root: &Path) -> Check {
     let path = root.join(INSTALL_MANIFEST_REL);
-    let (status, value) = match std::fs::read_to_string(&path) {
+    let (status, value) = match antitamper_bpf::kernel_roots::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             Status::Unknown,
             "no install manifest (not installed by install.sh or a package)".to_string(),
@@ -498,16 +498,17 @@ fn nft_tool(root: &Path) -> Check {
         ),
         Err(why) if !why.is_missing() => (Status::Warn, format!("not trusted: {why}")),
         Err(_) => {
-            let accepted = std::fs::read_to_string(root.join(INSTALL_MANIFEST_REL))
-                .ok()
-                .and_then(|t| {
-                    serde_json::from_str::<crate::install_manifest::InstallManifest>(&t).ok()
-                })
-                .is_some_and(|m| {
-                    m.prerequisite_overrides
-                        .iter()
-                        .any(|f| f == WITHOUT_NFT_FLAG)
-                });
+            let accepted =
+                antitamper_bpf::kernel_roots::read_to_string(root.join(INSTALL_MANIFEST_REL))
+                    .ok()
+                    .and_then(|t| {
+                        serde_json::from_str::<crate::install_manifest::InstallManifest>(&t).ok()
+                    })
+                    .is_some_and(|m| {
+                        m.prerequisite_overrides
+                            .iter()
+                            .any(|f| f == WITHOUT_NFT_FLAG)
+                    });
             let mut value = "not installed".to_string();
             if accepted {
                 value.push_str(&format!(" (accepted with {WITHOUT_NFT_FLAG})"));
@@ -535,7 +536,7 @@ pub fn admin_keys_on_host(root: &Path) -> Vec<String> {
     ADMIN_KEY_PATHS
         .iter()
         .filter(|rel| {
-            std::fs::metadata(root.join(rel))
+            antitamper_bpf::kernel_roots::metadata(root.join(rel))
                 .map(|m| m.is_file() && m.len() > 0)
                 .unwrap_or(false)
         })
@@ -687,7 +688,7 @@ fn module_sig_enforce(root: &Path) -> Check {
 
 fn secure_boot(root: &Path) -> Check {
     let p = root.join("sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c");
-    let (status, value) = match std::fs::read(&p) {
+    let (status, value) = match antitamper_bpf::kernel_roots::read_all(&p) {
         Ok(bytes) if bytes.len() >= 5 && bytes[4] == 1 => (Status::Ok, "enabled".to_string()),
         Ok(bytes) if bytes.len() >= 5 => (Status::Warn, "disabled".to_string()),
         Ok(_) => (Status::Unknown, "efivar unreadable".to_string()),

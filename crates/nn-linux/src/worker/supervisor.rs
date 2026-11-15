@@ -1324,7 +1324,8 @@ impl Workers {
         };
         let take = |name: &str| {
             let p = dir.join(name);
-            std::fs::symlink_metadata(&p).is_ok() && std::fs::remove_file(&p).is_ok()
+            antitamper_bpf::kernel_roots::symlink_metadata(&p).is_ok()
+                && std::fs::remove_file(&p).is_ok()
         };
         let kind = WorkerKind::Parse;
         if take("debug-worker-crash") {
@@ -1336,7 +1337,9 @@ impl Workers {
         if take("debug-worker-kill") {
             self.debug(kind, DebugFault::Kill);
         }
-        let looping = std::fs::symlink_metadata(dir.join("debug-worker-crashloop")).is_ok();
+        let looping =
+            antitamper_bpf::kernel_roots::symlink_metadata(dir.join("debug-worker-crashloop"))
+                .is_ok();
         let on = self.slot(kind).is_some_and(|slot| slot.s.lock().crash_loop);
         if looping != on {
             self.debug(kind, DebugFault::CrashLoop(looping));

@@ -167,7 +167,17 @@ pub fn take_identity_report() -> Option<IdentityReport> {
 }
 
 /// `statfs` type of the filesystem holding `path` (automounts followed).
+/// Lot 353 (re-check 1 of #563, the ratchet's mini-hunt): a path under
+/// `/proc` or `/sys` (the tracefs roots the tracepoint offsets are read
+/// from) is opened beneath its view's anchored root — a mount below it
+/// crossed within the deadline, the kernel's own file systems only — and
+/// its descriptor asked (`fstatfs`): `statfs` by path walked the `/sys`
+/// mounted now.
 pub fn magic_of_path(path: &Path) -> Option<u64> {
+    if antitamper_bpf::kernel_roots::view_of(path).is_some() {
+        let f = antitamper_bpf::kernel_roots::open_crossing(path, libc::O_PATH).ok()?;
+        return magic_of_file(&f);
+    }
     let c = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: `statfs` is plain old data, valid when zeroed.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };

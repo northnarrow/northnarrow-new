@@ -169,6 +169,14 @@ pub fn main() -> Result<()> {
     // `/proc/<agent>/mem` for a reader without CAP_SYS_PTRACE. Before the
     // runtime and before any key is read; reported once logging is up.
     let undumpable = northnarrow_agent::process_hardening::forbid_core_dumps();
+    // Lot 353 (pre-alpha Phase 3, X6): the kernel's views (`/proc`, `/sys`,
+    // the cgroup2 root) anchored now, before any thread reads them — a
+    // mount laid over them later is never walked; one already there is
+    // refused and signed below as a degradation.
+    let _ = antitamper_bpf::kernel_roots::init();
+    // lot 353 (the review of #563, F1): this process's failing signed
+    // appends are degradations of its status
+    nn_linux::chain_host_linux::tell_degradations();
     northnarrow_agent::loop_progress::start();
     // R14a (plan §3.5): the binary this process runs, opened now, before
     // anything else: the workers start from this descriptor
@@ -189,6 +197,9 @@ pub fn main() -> Result<()> {
         // R14c (plan §3.1): a runtime thread holds the core's capabilities,
         // whichever thread made it start (a role's thread's `spawn_blocking`)
         .on_thread_start(nn_linux::caps::restore_core)
+        // Lot 353: its worker count without std's walk of /sys/fs/cgroup
+        // (tokio's default is `available_parallelism`)
+        .worker_threads(antitamper_bpf::kernel_roots::available_parallelism())
         .build()
         .context("building the tokio runtime")?;
     let result = runtime.block_on(run(cli, undumpable, image, &stop));
@@ -199,6 +210,10 @@ pub fn main() -> Result<()> {
     stop.finish();
     result
 }
+
+/// Lot 353: the degradation's source when a kernel view (`/proc`, `/sys`,
+/// the cgroup2 root) was not anchored at the start.
+pub const KERNEL_VIEWS_DEGRADATION: &str = "kernel_views";
 
 /// The start: its phases in their order, the event loop, the stop (R11a,
 /// lab PR 261: `main.rs`'s `run`).
@@ -213,6 +228,13 @@ async fn run(
     // before it produced and returns what the ones after it read; what the
     // agent keeps until it stops is this function's, as it was.
     logging::init(&cli, undumpable);
+    // Lot 353: a view the start could not anchor (a mount over `/proc`,
+    // `/sys` or `/sys/fs/cgroup` before the agent started: a restart under
+    // it) — its kernel state is not read, and that is signed.
+    for line in antitamper_bpf::kernel_roots::unanchored() {
+        tracing::error!(detail = %line, "kernel views: a root not anchored at the start");
+        nn_linux::boot::degradation::report(KERNEL_VIEWS_DEGRADATION, &line);
+    }
     // R14c (plan §3.1): the decision's errands — what its filter refuses it
     // (an `rpm` query, a `DEFENDER_PIDS` entry) — on a thread started now,
     // from this thread's sets, before the decision thread runs.
@@ -780,7 +802,8 @@ pub(crate) fn start_sources() -> String {
     files.push(src.join("shutdown.rs"));
     let mut out = String::new();
     for f in files {
-        let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let text = antitamper_bpf::kernel_roots::read_to_string(&f)
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
         let code = text
             .find("\n#[cfg(test)]\nmod tests {")
             .map_or(text.as_str(), |end| &text[..end]);

@@ -54,6 +54,9 @@ pub fn snapshot() -> LoopProgressResponse {
     LoopProgressResponse {
         iterations,
         since_last_ms: now_ms().saturating_sub(last),
+        // lot 353 (the review of #563, F1): a signing failure, for the
+        // watchdog
+        unsigned_ms: nn_linux::chain_host_linux::unsigned_for_ms(),
     }
 }
 

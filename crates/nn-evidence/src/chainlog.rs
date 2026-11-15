@@ -81,7 +81,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use crate::audit::GENESIS_PREV_HASH;
-use crate::chain_host::{ChainHost, ChainSigner};
+use crate::chain_host::{ChainHost, ChainSigner, Open, StdHost};
 use crate::clock::{stamp, Clock, SystemClock};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
@@ -713,7 +713,7 @@ fn append_and_fsync<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<
 /// Append a pre-serialised line to `path` (create if missing), without
 /// waiting for the disk. Returns the open file.
 fn append_line<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
-    let mut f = H::open_with_mode(OpenOptions::new().create(true).append(true), mode, path)
+    let mut f = H::open_with_mode(Open::new().create(true).append(true), mode, path)
         .with_context(|| format!("opening chainlog {} for append", path.display()))?;
     H::append_all(&mut f, line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
@@ -936,6 +936,9 @@ pub struct RotatingChainLog<P, K> {
     /// fsync) —, so the next append reads the tail again first
     /// ([`Self::recover_active`]).
     active_poison: Option<String>,
+    /// Lot 353 (the review of #563, F1): the last append failed — told to
+    /// the host ([`ChainHost::append_failed`]) until one succeeds.
+    append_failing: bool,
     /// Lot 296: the same for the manifest ([`Self::recover_manifest`]).
     manifest_poison: Option<String>,
     /// Lot 296 (lot 295's finding): a rotation the appending thread could
@@ -988,7 +991,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         let anchored = K::Host::anchor(active_path);
         let active_path = anchored.as_path();
         let manifest_path = manifest_path_for(active_path);
-        let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
+        let next_seq = scan_max_archive_seq_in::<K::Host>(active_path)?.map_or(1, |m| m + 1);
         // External audit NN-AUD-110: the adopted tail line must recompute
         // to its own `entry_hash` (and is signature-checked) before the
         // chain continues from it or a rotation is completed on its word.
@@ -999,7 +1002,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // line, the fragment is replaced by the signed row attesting it (below,
         // once the log can sign one), so the next manifest line can't fuse
         // with it.
-        let manifest_rec = recover_tail(&manifest_path, &check_manifest)?;
+        let manifest_rec = recover_tail::<K::Host>(&manifest_path, &check_manifest)?;
 
         let mut log = Self {
             active_path: active_path.to_path_buf(),
@@ -1021,6 +1024,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             checkpoint_at: std::time::Instant::now(),
             clock,
             active_poison: None,
+            append_failing: false,
             manifest_poison: None,
             rotation_owed: false,
             _marker: std::marker::PhantomData,
@@ -1055,7 +1059,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // whole-file walk that was the BUG-026 boot hang. Repair + attest a
         // torn tail the same way (the agent is exempt from its own LSM
         // setattr deny, so the in-place truncate is allowed).
-        let active_rec = recover_tail(active_path, &check_active)?;
+        let active_rec = recover_tail::<K::Host>(active_path, &check_active)?;
         if active_rec.torn {
             // Lot 296 (external bug hunt BUG39): attested first, then cut. A
             // cut made first and then not attested (the manifest could not be
@@ -1070,7 +1074,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                 active_rec.dropped_bytes,
                 active_rec.dropped_sha256.clone(),
             )?;
-            truncate_file(active_path, active_rec.clean_len)?;
+            truncate_file::<K::Host>(active_path, active_rec.clean_len)?;
         }
         if let Some(reason) = &active_rec.unverified {
             log.attest_tail_unverified("active", &active_rec.tail_hash, reason);
@@ -1186,13 +1190,13 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// dance (a new name in the immutable state directory), and register
     /// it. Must not be called from inside the dance (it takes it).
     fn ensure_manifest(&mut self) -> Result<()> {
-        if fs::symlink_metadata(&self.manifest_path).is_ok() {
+        if K::Host::symlink_metadata(&self.manifest_path).is_ok() {
             return Ok(());
         }
         let manifest = self.manifest_path.clone();
         let mode = self.cfg.file_mode;
         let create = || match K::Host::open_with_mode(
-            OpenOptions::new().create_new(true).write(true),
+            Open::new().create_new(true).write(true),
             mode,
             &manifest,
         ) {
@@ -1272,9 +1276,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         if !self.unsynced {
             return Ok(());
         }
-        let synced = OpenOptions::new()
-            .append(true)
-            .open(&self.active_path)
+        let synced = K::Host::open(Open::new().append(true), &self.active_path)
             .with_context(|| format!("opening chainlog {} for fsync", self.active_path.display()))
             .and_then(|f| {
                 K::Host::sync_all(&f)
@@ -1386,8 +1388,9 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
 
     fn reread_active(&mut self, cause: &str) -> Result<()> {
         let pubkey = self.key.verifying_key();
-        let rec = recover_tail(&self.active_path, &|l| check_active_line::<P>(l, &pubkey))
-            .context("reading the active file's tail again after a failed write")?;
+        let rec =
+            recover_tail::<K::Host>(&self.active_path, &|l| check_active_line::<P>(l, &pubkey))
+                .context("reading the active file's tail again after a failed write")?;
         if rec.torn {
             self.ensure_manifest()?;
             self.attest_torn_repair(
@@ -1396,7 +1399,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                 rec.dropped_bytes,
                 rec.dropped_sha256.clone(),
             )?;
-            truncate_file(&self.active_path, rec.clean_len)?;
+            truncate_file::<K::Host>(&self.active_path, rec.clean_len)?;
         }
         let before = self.active_bytes;
         if let Some(seq) = rec.sealed_seq {
@@ -1451,7 +1454,26 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     }
 
     fn append_with(&mut self, payload: P, durable: bool) -> Result<String> {
+        // a payload the chain refuses is the caller's error, not the log's
         check_reserved_keys(&payload)?;
+        let r = self.append_with_inner(payload, durable);
+        // Lot 353 (the review of #563, F1): a signed chain that stops taking
+        // rows is told to the host at each change — never silent.
+        match &r {
+            Err(e) => {
+                self.append_failing = true;
+                K::Host::append_failed(&self.active_path, Some(&format!("{e:#}")));
+            }
+            Ok(_) if self.append_failing => {
+                self.append_failing = false;
+                K::Host::append_failed(&self.active_path, None);
+            }
+            Ok(_) => {}
+        }
+        r
+    }
+
+    fn append_with_inner(&mut self, payload: P, durable: bool) -> Result<String> {
         self.recover_active()?;
         // External audit NN-AUD-115: a previous rotation sealed the active
         // file but could not rename it. Retry only the finish step.
@@ -1573,10 +1595,10 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         let start = self.next_seq;
         let mut seq = start;
         for _ in 0..MAX_SLOT_PROBES {
-            if slot_kind(&archive_path(&self.active_path, seq)).is_none() {
+            if slot_kind::<K::Host>(&archive_path(&self.active_path, seq)).is_none() {
                 break;
             }
-            seq = next_free_candidate(&self.active_path, seq);
+            seq = next_free_candidate::<K::Host>(&self.active_path, seq);
         }
         self.next_seq = seq;
         self.foreign_before_seal = self.taken_slots(start, seq);
@@ -1668,7 +1690,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                 match K::Host::rename_noreplace(&active, &archive) {
                     Ok(()) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let (kind, bytes) = slot_kind(&archive).unwrap_or(("other", 0));
+                        let (kind, bytes) = slot_kind::<K::Host>(&archive).unwrap_or(("other", 0));
                         foreign.push((seq, kind, bytes));
                         attempts += 1;
                         if attempts >= MAX_SLOT_PROBES {
@@ -1677,7 +1699,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                                 active.display()
                             ));
                         }
-                        seq = next_free_candidate(&active, seq);
+                        seq = next_free_candidate::<K::Host>(&active, seq);
                     }
                     Err(e) => {
                         return Err(anyhow!(e).context(format!(
@@ -1708,7 +1730,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             //    Lot 296 (external bug hunt BUG10): the archives a failed pass
             //    removed before its failure keep their `Evicted` rows.
             let (evicted, failed) =
-                evict_excess_archives(&active, max_archives, protection_inner.as_ref());
+                evict_excess_archives::<K::Host>(&active, max_archives, protection_inner.as_ref());
             // Lot 319 (BUG10's partial): a pass that stopped is a stalled
             // retention — said to the host, not an ERROR alone.
             let stalled = failed.map(|(at, e)| {
@@ -1728,7 +1750,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             });
             // Review 81: the manifest is born at the first rotation; protect
             // it like the logs it attests (idempotent on later rotations).
-            if self.manifest_path.exists() {
+            if K::Host::exists(&self.manifest_path) {
                 if let Err(e) = protection_inner.register_active(&self.manifest_path) {
                     warn!(
                         error = %format!("{e:#}"),
@@ -1871,12 +1893,13 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// terminator read: a forged one would pass): `(seq, kind, lstat
     /// size)`, at most [`MAX_FOREIGN_ATTESTED`].
     fn taken_slots(&self, from: u64, to: u64) -> Vec<(u64, &'static str, u64)> {
-        let seqs = list_archive_seqs(&self.active_path).unwrap_or_default();
+        let seqs = list_archive_seqs_in::<K::Host>(&self.active_path).unwrap_or_default();
         self.capped(
             seqs.into_iter()
                 .filter(|s| (from..to).contains(s))
                 .filter_map(|seq| {
-                    let (kind, bytes) = slot_kind(&archive_path(&self.active_path, seq))?;
+                    let (kind, bytes) =
+                        slot_kind::<K::Host>(&archive_path(&self.active_path, seq))?;
                     Some((seq, kind, bytes))
                 })
                 .collect(),
@@ -1892,11 +1915,11 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         to: u64,
         earlier_key: bool,
     ) -> Vec<(u64, &'static str, u64)> {
-        let seqs = list_archive_seqs(&self.active_path).unwrap_or_default();
+        let seqs = list_archive_seqs_in::<K::Host>(&self.active_path).unwrap_or_default();
         seqs.into_iter()
             .filter(|s| (from..to).contains(s))
             .filter_map(|seq| {
-                let (kind, bytes) = slot_kind(&archive_path(&self.active_path, seq))?;
+                let (kind, bytes) = slot_kind::<K::Host>(&archive_path(&self.active_path, seq))?;
                 (kind != "file" || !self.is_own_archive(seq, earlier_key))
                     .then_some((seq, kind, bytes))
             })
@@ -2019,13 +2042,13 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// boot. It is attested as foreign instead and the active roots at
     /// GENESIS; the verifier still flags the archive.
     fn prior_link_or_genesis(&mut self, seq: u64) -> String {
-        let reason = match prior_terminator_hash(&self.active_path, seq) {
+        let reason = match prior_terminator_hash::<K::Host>(&self.active_path, seq) {
             Ok(h) if is_chain_hash(&h) => return h,
             Ok(h) => format!("terminator entry_hash {h:?} is not a chain hash"),
             Err(e) => format!("{e:#}"),
         };
         let (kind, bytes) =
-            slot_kind(&archive_path(&self.active_path, seq)).unwrap_or(("other", 0));
+            slot_kind::<K::Host>(&archive_path(&self.active_path, seq)).unwrap_or(("other", 0));
         error!(
             log = %self.active_path.display(),
             seq,
@@ -2098,7 +2121,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
 
     fn reread_manifest(&mut self) -> Result<()> {
         let pubkey = self.key.verifying_key();
-        let rec = recover_tail(&self.manifest_path, &|l| {
+        let rec = recover_tail::<K::Host>(&self.manifest_path, &|l| {
             check_manifest_line(l, P::KIND, &pubkey)
         })
         .context("reading the manifest's tail again after a failed write")?;
@@ -2142,14 +2165,13 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         let line = ManifestLine::sealed(entry, &self.key, &rec.tail_hash, P::KIND)?;
         let text = to_jsonl(&line)?;
         let path = self.manifest_path.clone();
-        let replaced =
-            K::Host::open_with_mode(OpenOptions::new().write(true), self.cfg.file_mode, &path)
-                .and_then(|f| {
-                    K::Host::write_all_at(&f, text.as_bytes(), rec.clean_len)?;
-                    f.set_len(rec.clean_len + text.len() as u64)?;
-                    K::Host::sync_all(&f)
-                })
-                .with_context(|| format!("replacing the torn tail of {}", path.display()));
+        let replaced = K::Host::open_with_mode(Open::new().write(true), self.cfg.file_mode, &path)
+            .and_then(|f| {
+                K::Host::write_all_at(&f, text.as_bytes(), rec.clean_len)?;
+                f.set_len(rec.clean_len + text.len() as u64)?;
+                K::Host::sync_all(&f)
+            })
+            .with_context(|| format!("replacing the torn tail of {}", path.display()));
         if let Err(e) = replaced {
             self.manifest_poison = Some(format!("{e:#}"));
             return Err(e);
@@ -2167,13 +2189,19 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
 /// archive kept its key only for the boot that rotated it, and a manifest
 /// never had one.
 pub fn sealed_files(active: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = list_archive_seqs(active)
+    sealed_files_in::<StdHost>(active)
+}
+
+/// [`sealed_files`], as the host `H` resolves the names (lot 353: the
+/// agent's, beneath the directory it anchored).
+pub fn sealed_files_in<H: ChainHost>(active: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = list_archive_seqs_in::<H>(active)
         .unwrap_or_default()
         .into_iter()
         .map(|seq| archive_path(active, seq))
         .collect();
     let manifest = manifest_path_for(active);
-    if manifest.exists() {
+    if H::exists(&manifest) {
         out.push(manifest);
     }
     out
@@ -2192,7 +2220,12 @@ pub fn archive_path_for(active: &Path, seq: u64) -> PathBuf {
 /// External audit NN-AUD-109: the generation of the active file now — the
 /// archive seq it becomes when sealed (1 before any rotation).
 pub fn current_generation(active: &Path) -> u64 {
-    scan_max_archive_seq(active)
+    current_generation_in::<StdHost>(active)
+}
+
+/// [`current_generation`], the directory listed by the host `H`.
+pub fn current_generation_in<H: ChainHost>(active: &Path) -> u64 {
+    scan_max_archive_seq_in::<H>(active)
         .ok()
         .flatten()
         .map_or(1, |m| m + 1)
@@ -2245,16 +2278,22 @@ const MAX_SEQ_DIGITS: usize = 19;
 
 /// All present archive seqs for `active`, ascending.
 fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
+    list_archive_seqs_in::<StdHost>(active)
+}
+
+/// [`list_archive_seqs`], the directory listed as the host `H` resolves it
+/// (lot 353: the agent's writers, beneath the descriptor of the directory
+/// they anchored — never through `/proc`).
+fn list_archive_seqs_in<H: ChainHost>(active: &Path) -> Result<Vec<u64>> {
     let dir = active.parent().unwrap_or_else(|| Path::new("."));
     let mut seqs = Vec::new();
-    let rd = match fs::read_dir(dir) {
-        Ok(rd) => rd,
+    let names = match H::read_dir_names(dir) {
+        Ok(n) => n,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(seqs),
         Err(e) => return Err(anyhow!(e).context(format!("read_dir {}", dir.display()))),
     };
-    for ent in rd {
-        let ent = ent.with_context(|| format!("dir entry in {}", dir.display()))?;
-        if let Some(seq) = parse_archive_seq(active, &ent.file_name()) {
+    for name in names {
+        if let Some(seq) = parse_archive_seq(active, &name) {
             seqs.push(seq);
         }
     }
@@ -2263,7 +2302,11 @@ fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
 }
 
 fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
-    Ok(list_archive_seqs(active)?.into_iter().max())
+    scan_max_archive_seq_in::<StdHost>(active)
+}
+
+fn scan_max_archive_seq_in<H: ChainHost>(active: &Path) -> Result<Option<u64>> {
+    Ok(list_archive_seqs_in::<H>(active)?.into_iter().max())
 }
 
 /// R12c-2 (lab PR 270): whether the chain file at `path` still holds, as
@@ -2282,10 +2325,20 @@ fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
 /// when another hash, not a line of this file: [`head_line`] says which
 /// line a head names. It answered `true` for any hash without reading.
 pub fn holds_line_ending_at(path: &Path, bytes: u64, entry_hash: &str) -> Result<bool> {
+    holds_line_ending_at_in::<StdHost>(path, bytes, entry_hash)
+}
+
+/// [`holds_line_ending_at`], the file opened by the host `H`.
+pub fn holds_line_ending_at_in<H: ChainHost>(
+    path: &Path,
+    bytes: u64,
+    entry_hash: &str,
+) -> Result<bool> {
     if bytes == 0 {
         return Ok(entry_hash == GENESIS_PREV_HASH);
     }
-    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut f = H::open(Open::new().read(true), path)
+        .with_context(|| format!("opening {}", path.display()))?;
     let len = f.metadata()?.len();
     if len < bytes {
         return Ok(false);
@@ -2329,7 +2382,13 @@ pub fn head_line(file: u64, bytes: u64, entry_hash: &str) -> (u64, Option<u64>) 
 /// right after a rotation ([`head_line`]). An empty file holds no line.
 /// `Err`: the file cannot be read.
 pub fn holds_last_line(path: &Path, entry_hash: &str) -> Result<bool> {
-    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    holds_last_line_in::<StdHost>(path, entry_hash)
+}
+
+/// [`holds_last_line`], the file opened by the host `H`.
+pub fn holds_last_line_in<H: ChainHost>(path: &Path, entry_hash: &str) -> Result<bool> {
+    let mut f = H::open(Open::new().read(true), path)
+        .with_context(|| format!("opening {}", path.display()))?;
     let len = f.metadata()?.len();
     if len == 0 {
         return Ok(false);
@@ -2340,9 +2399,13 @@ pub fn holds_last_line(path: &Path, entry_hash: &str) -> Result<bool> {
 /// R12c (lab PR 270): the fsync [`RotatingChainLog::detach_sync`] left to
 /// its caller — of `path`, the chain's active file then.
 pub fn sync_detached(path: &Path) -> Result<()> {
-    let f = OpenOptions::new()
-        .append(true)
-        .open(path)
+    sync_detached_in::<StdHost>(path)
+}
+
+/// [`sync_detached`], the file opened by the host `H` (lot 353: the
+/// agent's, beneath the directory it anchored).
+pub fn sync_detached_in<H: ChainHost>(path: &Path) -> Result<()> {
+    let f = H::open(Open::new().append(true), path)
         .with_context(|| format!("opening chainlog {} for fsync", path.display()))?;
     f.sync_all()
         .with_context(|| format!("fsync {}", path.display()))
@@ -2353,7 +2416,12 @@ pub fn sync_detached(path: &Path) -> Result<()> {
 /// directory yields none. External audit NN-AUD-080: the one lister for
 /// the readers (the detection store and the admin read verbs).
 pub fn archives_newest_first(active: &Path) -> Vec<PathBuf> {
-    let mut seqs = list_archive_seqs(active).unwrap_or_default();
+    archives_newest_first_in::<StdHost>(active)
+}
+
+/// [`archives_newest_first`], the directory listed by the host `H`.
+pub fn archives_newest_first_in<H: ChainHost>(active: &Path) -> Vec<PathBuf> {
+    let mut seqs = list_archive_seqs_in::<H>(active).unwrap_or_default();
     seqs.reverse();
     seqs.into_iter()
         .map(|seq| archive_path(active, seq))
@@ -2402,8 +2470,8 @@ fn stall_reason(at: Option<u64>, e: &anyhow::Error) -> String {
 
 /// What occupies `path`, by `lstat` (a symlink is reported, never
 /// followed): `None` if the name is free.
-fn slot_kind(path: &Path) -> Option<(&'static str, u64)> {
-    let m = fs::symlink_metadata(path).ok()?;
+fn slot_kind<H: ChainHost>(path: &Path) -> Option<(&'static str, u64)> {
+    let m = H::symlink_metadata(path).ok()?;
     let ft = m.file_type();
     let kind = if ft.is_symlink() {
         "symlink"
@@ -2419,8 +2487,11 @@ fn slot_kind(path: &Path) -> Option<(&'static str, u64)> {
 
 /// The next archive slot to try after `taken`: past every archive name on
 /// disk, so a foreign entry is never reused or overwritten.
-fn next_free_candidate(active: &Path, taken: u64) -> u64 {
-    let max = scan_max_archive_seq(active).ok().flatten().unwrap_or(0);
+fn next_free_candidate<H: ChainHost>(active: &Path, taken: u64) -> u64 {
+    let max = scan_max_archive_seq_in::<H>(active)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     max.max(taken) + 1
 }
 
@@ -2429,12 +2500,8 @@ fn next_free_candidate(active: &Path, taken: u64) -> u64 {
 /// a name that appeared after the rename is an error, never truncated or
 /// followed.
 fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
-    H::open_with_mode(
-        OpenOptions::new().create_new(true).write(true),
-        mode,
-        active,
-    )
-    .with_context(|| format!("creating fresh active {}", active.display()))?;
+    H::open_with_mode(Open::new().create_new(true).write(true), mode, active)
+        .with_context(|| format!("creating fresh active {}", active.display()))?;
     Ok(())
 }
 
@@ -2456,12 +2523,12 @@ fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
 /// Lot 319 (BUG10's partial): the failure names the archive the pass could
 /// not remove (`None`: the listing failed) — the writer tells its host the
 /// retention stalled.
-fn evict_excess_archives(
+fn evict_excess_archives<H: ChainHost>(
     active: &Path,
     max_archives: usize,
     protection: &dyn ProtectionManager,
 ) -> (Vec<(u64, String)>, Option<EvictFailure>) {
-    let seqs = match list_archive_seqs(active) {
+    let seqs = match list_archive_seqs_in::<H>(active) {
         Ok(s) => s,
         Err(e) => return (Vec::new(), Some((None, e))),
     };
@@ -2472,7 +2539,7 @@ fn evict_excess_archives(
     let mut evicted = Vec::new();
     for &seq in seqs.iter().take(drop_n) {
         let path = archive_path(active, seq);
-        if let Some((kind, bytes)) = slot_kind(&path).filter(|(k, _)| *k != "file") {
+        if let Some((kind, bytes)) = slot_kind::<H>(&path).filter(|(k, _)| *k != "file") {
             error!(
                 seq, kind, bytes,
                 path = %path.display(),
@@ -2481,7 +2548,7 @@ fn evict_excess_archives(
             );
             continue;
         }
-        let hash = read_terminator_hash(&path).unwrap_or_default();
+        let hash = read_terminator_hash::<H>(&path).unwrap_or_default();
         if let Err(e) = protection.release(&path) {
             warn!(
                 error = %format!("{e:#}"),
@@ -2489,7 +2556,7 @@ fn evict_excess_archives(
                 "chainlog: could not release an evicted archive's inode from PROTECTED_INODES"
             );
         }
-        if let Err(e) = fs::remove_file(&path) {
+        if let Err(e) = H::remove_file(&path) {
             let e = anyhow!(e).context(format!("evicting archive {}", path.display()));
             return (evicted, Some((Some(seq), e)));
         }
@@ -2540,18 +2607,17 @@ pub fn repair_torn_tail<H: ChainHost>(
     path: &Path,
     is_line: impl Fn(&[u8]) -> bool,
 ) -> Result<Option<TailRepair>> {
-    let mut f =
-        match H::open_with_mode_nofollow(OpenOptions::new().read(true).write(true), 0o600, path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) if H::is_symlink_refusal(&e) => {
-                return Err(anyhow!(
-                    "{}: a symbolic link, not a chain file — not followed, left untouched",
-                    path.display()
-                ))
-            }
-            Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
-        };
+    let mut f = match H::open_with_mode_nofollow(Open::new().read(true).write(true), 0o600, path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if H::is_symlink_refusal(&e) => {
+            return Err(anyhow!(
+                "{}: a symbolic link, not a chain file — not followed, left untouched",
+                path.display()
+            ))
+        }
+        Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
+    };
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
         return Err(anyhow!(
@@ -2724,8 +2790,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// lowercase hex `entry_hash` (else it is skipped like a torn one) and pass
 /// `check`, the typed hash/signature check of the caller. See
 /// [`scan_back_for_tail`] for how a failed check is handled.
-fn recover_tail(path: &Path, check: &dyn Fn(&[u8]) -> LineCheck) -> Result<TailRecovery> {
-    let mut f = match OpenOptions::new().read(true).open(path) {
+fn recover_tail<H: ChainHost>(
+    path: &Path,
+    check: &dyn Fn(&[u8]) -> LineCheck,
+) -> Result<TailRecovery> {
+    let mut f = match H::open(Open::new().read(true), path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TailRecovery::empty()),
         Err(e) => {
@@ -3032,10 +3101,8 @@ fn scan_back_for_tail(
 /// log is safe: the agent is caller-exempt from its own `inode_setattr` deny
 /// hook (PHASE_D_002 — `agent-ebpf/src/inode_protect.rs`), and `set_len`
 /// touches no directory entry, so no `+i` dance is required.
-fn truncate_file(path: &Path, len: u64) -> Result<()> {
-    let f = OpenOptions::new()
-        .write(true)
-        .open(path)
+fn truncate_file<H: ChainHost>(path: &Path, len: u64) -> Result<()> {
+    let f = H::open(Open::new().write(true), path)
         .with_context(|| format!("opening {} to truncate torn tail", path.display()))?;
     f.set_len(len)
         .with_context(|| format!("truncating {} to {len} bytes", path.display()))?;
@@ -3064,10 +3131,8 @@ fn terminator_entry_hash(line: &str) -> Option<String> {
 
 /// Read the terminator `entry_hash` from the last line of a sealed
 /// archive file.
-fn read_terminator_hash(path: &Path) -> Result<String> {
-    let f = OpenOptions::new()
-        .read(true)
-        .open(path)
+fn read_terminator_hash<H: ChainHost>(path: &Path) -> Result<String> {
+    let f = H::open(Open::new().read(true), path)
         .with_context(|| format!("opening archive {}", path.display()))?;
     let mut last_term: Option<String> = None;
     for line in BufReader::new(f).lines() {
@@ -3081,8 +3146,8 @@ fn read_terminator_hash(path: &Path) -> Result<String> {
 
 /// The terminator hash of archive `seq` (used to root a fresh
 /// post-rotation active file's first line in the meta-chain).
-fn prior_terminator_hash(active: &Path, seq: u64) -> Result<String> {
-    read_terminator_hash(&archive_path(active, seq))
+fn prior_terminator_hash<H: ChainHost>(active: &Path, seq: u64) -> Result<String> {
+    read_terminator_hash::<H>(&archive_path(active, seq))
 }
 
 // ── multi-file verifier ─────────────────────────────────────────────
@@ -3633,7 +3698,7 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
         file: file.clone(),
         reason,
     };
-    let generation = current_generation(active);
+    let generation = current_generation_in::<H>(active);
     let mut f = match H::open_read_nofollow(active) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -3668,15 +3733,16 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
     let covered = len - at;
     // The link of the first line, known only when the window starts the file
     // and no rotation ran while it was read.
-    let mut expected: Option<String> = if start == 0 && current_generation(active) == generation {
-        if generation == 1 {
-            Some(GENESIS_PREV_HASH.to_string())
+    let mut expected: Option<String> =
+        if start == 0 && current_generation_in::<H>(active) == generation {
+            if generation == 1 {
+                Some(GENESIS_PREV_HASH.to_string())
+            } else {
+                read_terminator_hash::<H>(&archive_path(active, generation - 1)).ok()
+            }
         } else {
-            read_terminator_hash(&archive_path(active, generation - 1)).ok()
-        }
-    } else {
-        None
-    };
+            None
+        };
     // Complete lines only: a last write cut short is the open's to repair.
     let complete = body
         .iter()
@@ -4244,7 +4310,7 @@ mod tests {
 
         // Concretely assert the boundary link: archive seq-1's terminator
         // hash == the first line prev_hash of seq-2 (or the active file).
-        let term1 = read_terminator_hash(&archive_path(&active, 1)).unwrap();
+        let term1 = read_terminator_hash::<StdHost>(&archive_path(&active, 1)).unwrap();
         let next = if seqs.contains(&2) {
             first_line_prev_hash(&archive_path(&active, 2)).unwrap()
         } else {
@@ -7364,7 +7430,7 @@ mod tests {
         fs::create_dir(archive_path(&active, 1)).unwrap();
         let mut evicted = Vec::new();
         for _ in 0..3 {
-            let (e, failed) = evict_excess_archives(&active, 1, &NoProtection);
+            let (e, failed) = evict_excess_archives::<StdHost>(&active, 1, &NoProtection);
             assert!(failed.is_none(), "{failed:?}");
             evicted.extend(e.into_iter().map(|(s, _)| s));
         }

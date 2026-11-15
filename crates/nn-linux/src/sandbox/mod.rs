@@ -233,12 +233,22 @@ fn one_thread(count: io::Result<usize>) -> Result<(), SandboxError> {
 /// `open` and `getdents64` into a buffer on the stack: no allocation, so
 /// a forked child of a multi-threaded process may count too.
 pub fn thread_count() -> io::Result<usize> {
-    // SAFETY: open of a constant NUL-terminated path.
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: open of a constant NUL-terminated path — lot 353: beneath the
+    // `/proc` root the process's start anchored when it did (no mount laid
+    // over `/proc` since is walked; no allocation either way).
+    // A forked child that closed its descriptors (a test's) no longer has
+    // the root: `EBADF`, or `ENOTDIR` for a number reused — by path then.
     let fd = unsafe {
-        libc::open(
-            c"/proc/self/task".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
+        let anchored = match antitamper_bpf::kernel_roots::proc_root_fd() {
+            Some(proc) => libc::openat(proc, c"self/task".as_ptr(), flags),
+            None => -1,
+        };
+        if anchored >= 0 {
+            anchored
+        } else {
+            libc::open(c"/proc/self/task".as_ptr(), flags)
+        }
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
