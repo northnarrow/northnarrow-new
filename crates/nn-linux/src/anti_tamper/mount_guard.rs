@@ -42,9 +42,9 @@ use anyhow::{anyhow, Context, Result};
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
-    held_by_id, held_by_place, NameKey, BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT, GUARD_HOST,
-    GUARD_WATCHDOG, HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_NOTE, MG_ON, MG_OWN, MG_SB, MG_VIEW,
-    PROC_SUPER_MAGIC, SYSFS_MAGIC, TMPFS_MAGIC,
+    held_by_id, held_by_place, held_under, NameKey, BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT,
+    GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_NOTE, MG_ON, MG_OWN, MG_SB,
+    MG_VIEW, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC, TMPFS_MAGIC,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -100,6 +100,9 @@ const GROUPS_MAP: &str = "MOUNT_GROUPS";
 /// namespaces (what the eBPF `vacate` drops at their exit).
 const CONF_AGENT_NS: u32 = 2;
 const CONF_WATCHDOG_NS: u32 = 3;
+/// The re-check of #567 (N1): `MOUNT_GUARD_CONF`'s count of the
+/// propagation changes the hooks let through (the eBPF `CONF_REGROUP`).
+const CONF_REGROUP: u32 = 4;
 /// The maps the watchdog refresh opens by their pin (explicitly pinned at
 /// each start, as `PROTECTED_PIDS`: a by-name pin is not made by the loader).
 const PINNED_MAPS: [&str; 5] = [PROTECTED_MAP, CONF_MAP, HELD_MAP, NS_MAP, GROUPS_MAP];
@@ -547,13 +550,21 @@ pub(crate) fn held_in(
                 if let Some((ddev, dino)) = dir_key(dir) {
                     let name = NameKey::of_bytes(name.as_bytes());
                     let (shared, master) = groups.get(&parent.id).copied().unwrap_or((0, 0));
-                    for g in [shared, master] {
-                        if g != 0 {
-                            let (dev, ino) = held_by_place(g, ddev, dino, &name);
-                            let k = InodeKey { dev, ino };
-                            if !out.entries.iter().any(|(e, _)| *e == k) {
-                                out.entries.push((k, HELD_REFUSE | tag));
-                            }
+                    // the re-check of #567 (N1): and under the parent mount
+                    // itself (`held_under`), for a parent regrouped after this
+                    // read — the hook walks the parent's propagation for it
+                    let groups = [shared, master].into_iter().filter(|g| *g != 0);
+                    // — and under any group (`PLACE_ANY_GROUP`): asked of
+                    // a parent when that walk is undecided (a copy of a
+                    // held mount sits where it sits)
+                    let keys = groups.map(|g| held_by_place(g, ddev, dino, &name)).chain([
+                        held_under(parent.id as u32, ddev, dino, &name),
+                        held_by_place(PLACE_ANY_GROUP, ddev, dino, &name),
+                    ]);
+                    for (dev, ino) in keys {
+                        let k = InodeKey { dev, ino };
+                        if !out.entries.iter().any(|(e, _)| *e == k) {
+                            out.entries.push((k, HELD_REFUSE | tag));
                         }
                     }
                 }
@@ -633,6 +644,29 @@ const NOT_CANONICAL_BELOW_ROOT: [&str; 8] = [
     "tmpfs", "ramfs", "overlay", "aufs", "squashfs", "erofs", "cramfs", "iso9660",
 ];
 
+/// The re-check of #567 (N2): the overlays a host's own image tooling
+/// merges at boot over a directory that holds the agent's paths, by point
+/// and source — `systemd-sysext` over `/usr` and `/opt` (Flatcar: source
+/// `sysext`), `systemd-confext` over `/etc` (`confext`), composefs over
+/// `/usr` (Fedora Silverblue and CoreOS, bootc: `composefs`; over `/` any
+/// file system but a FUSE is canonical already). A layout, not a proof:
+/// root names a mount's source as it likes, and a runtime merge is refused
+/// outside a window all the same.
+const IMAGE_OVERLAYS: [(&str, &str); 4] = [
+    ("/usr", "sysext"),
+    ("/opt", "sysext"),
+    ("/etc", "confext"),
+    ("/usr", "composefs"),
+];
+
+/// [`IMAGE_OVERLAYS`]: an overlay at its point, with its tool's source.
+fn image_overlay(m: &MountEntry) -> bool {
+    m.fstype.as_bytes() == b"overlay"
+        && IMAGE_OVERLAYS
+            .iter()
+            .any(|(p, src)| m.mount_point == Path::new(p) && m.source.as_bytes() == src.as_bytes())
+}
+
 /// The file systems whose mount shows a subvolume as its root (`/@`,
 /// `/@var`): not a bind of another directory.
 const SUBVOLUME_TYPES: [&str; 3] = ["btrfs", "bcachefs", "zfs"];
@@ -691,7 +725,10 @@ pub fn not_canonical(t: &[MountEntry], points: &[(String, u8)]) -> Vec<String> {
                 crate::mountinfo::is_fuse(&m.fstype).then_some("a FUSE as the root")
             } else if crate::mountinfo::is_fuse(&m.fstype) {
                 Some("a FUSE over a directory that holds the agent's paths")
-            } else if NOT_CANONICAL_BELOW_ROOT.iter().any(|t| t.as_bytes() == ty) && !self_bind {
+            } else if NOT_CANONICAL_BELOW_ROOT.iter().any(|t| t.as_bytes() == ty)
+                && !self_bind
+                && !image_overlay(m)
+            {
                 Some("a memory or stacking file system over a directory that holds the agent's paths")
             } else if !whole && !self_bind && !SUBVOLUME_TYPES.iter().any(|t| t.as_bytes() == ty) {
                 Some("a bind of another directory over one that holds the agent's paths")
@@ -1145,6 +1182,63 @@ pub fn refresh(bpffs_root: &Path) -> Result<usize> {
             }
         }
         n += h.entries.len();
+    }
+    Ok(n)
+}
+
+/// The re-check of #567 (N1): the propagation changes the hooks let through
+/// since the last look — `mount(2)`'s `MS_SHARED`, `MS_PRIVATE`,
+/// `MS_SLAVE`, `MS_UNBINDABLE` on a mount of a guarded namespace or of a
+/// peer group `MOUNT_GROUPS` holds, a `move_mount(2)` of a mount in a peer
+/// group into a guarded namespace (`MOVE_MOUNT_SET_GROUP` among them). Each
+/// may give a guarded mount a group the map does not hold yet (the hook
+/// walks one it does not): the agent looks each second and refreshes the
+/// maps when the count moved ([`refresh_now`]).
+pub struct RegroupWatch {
+    conf: AyaArray<MapData, u64>,
+    seen: u64,
+}
+
+impl RegroupWatch {
+    /// The count, by the maps' pins (the guard attached at this start).
+    pub fn open(bpffs_root: &Path) -> Result<RegroupWatch> {
+        use aya::maps::Map;
+        let path = bpffs_root.join(CONF_MAP);
+        let data =
+            MapData::from_pin(&path).with_context(|| format!("opening pinned {CONF_MAP}"))?;
+        let conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(data))?;
+        let seen = conf.get(&CONF_REGROUP, 0)?;
+        Ok(RegroupWatch { conf, seen })
+    }
+
+    /// The count moved since the last look (an unreadable slot: not).
+    pub fn moved(&mut self) -> bool {
+        match self.conf.get(&CONF_REGROUP, 0) {
+            Ok(n) if n != self.seen => {
+                self.seen = n;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The re-check of #567 (N1): every guarded namespace's held mounts and
+/// peer groups read again now — PID 1's and the agent's ([`refresh`]), and
+/// the watchdog's, the holder of its role ([`guard_watchdog`]; its errors
+/// are the watchdog refresh's to report). The caller holds the agent's one
+/// refresh handle (the watchdog refresh's lock: each refresh replaces a
+/// namespace's entries, new ones first, then the stale ones go).
+pub fn refresh_now(bpffs_root: &Path) -> Result<usize> {
+    use aya::maps::Map;
+    let n = refresh(bpffs_root)?;
+    let roles: AyaArray<MapData, u32> = AyaArray::try_from(Map::Array(MapData::from_pin(
+        bpffs_root.join(antitamper_bpf::ROLE_TGIDS_MAP_NAME),
+    )?))?;
+    if let Ok(pid) = roles.get(&antitamper_bpf::ROLE_SLOT_WATCHDOG, 0) {
+        if pid != 0 {
+            let _ = guard_watchdog(bpffs_root, pid);
+        }
     }
     Ok(n)
 }
@@ -1641,5 +1735,87 @@ mod tests {
         // the same tmpfs mounted over the directory, not a bind of it onto itself
         let over = format!("{unit}304 301 0:23 / /run/northnarrow rw - tmpfs tmpfs rw\n");
         assert!(!not_canonical(&table(&over), &points()).is_empty());
+    }
+
+    /// The re-check of #567 (N1): each held mount's place is also keyed
+    /// under its parent mount itself (`held_under`) — the hook finds there,
+    /// along a regrouped parent's propagation, the place its other keys
+    /// hold under the old group, and that of a parent in no group then; a
+    /// chroot's own sysfs (the host's dentries, another mount) holds none.
+    #[test]
+    fn a_held_mounts_place_is_keyed_under_its_parent_mount_too() {
+        let key = |d: &Path| Some((0x801, d.as_os_str().len() as u64));
+        let h = held_in(
+            &table(HOST),
+            &points(),
+            GUARD_HOST,
+            &groups_of(HOST.as_bytes()),
+            &key,
+        );
+        let under = |h: &NsHeld, parent: u32, dir: &str, n: &str| {
+            let (d, i) = held_under(parent, 0x801, dir.len() as u64, &NameKey::of(n));
+            h.entries
+                .iter()
+                .any(|(k, f)| (k.dev, k.ino) == (d, i) && f & HELD_REFUSE != 0)
+        };
+        assert!(under(&h, 1, "/", "run"));
+        assert!(under(&h, 24, "/sys/fs", "cgroup"));
+        assert!(under(&h, 24, "/sys/fs", "bpf"));
+        assert!(!under(&h, 41, "/sys/fs", "cgroup"), "the chroot's sysfs");
+        assert!(!under(&h, 1, "/srv/chroot", "sys"), "a copy's place");
+        assert!(!under(&h, 24, "/sys", "fs"), "no mount there");
+        // and under any group: a copy of a held mount sits where it sits
+        let any = |h: &NsHeld, dir: &str, n: &str| {
+            let (d, i) = held_by_place(PLACE_ANY_GROUP, 0x801, dir.len() as u64, &NameKey::of(n));
+            h.entries.iter().any(|(k, _)| (k.dev, k.ino) == (d, i))
+        };
+        assert!(
+            any(&h, "/", "sys"),
+            "the host's /sys (a raw copy sits there too)"
+        );
+        assert!(!any(&h, "/srv/chroot", "sys"), "a chroot's sysfs");
+        // a host whose `/` was private at the read
+        let private = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+22 1 0:22 / /run rw,nosuid - tmpfs tmpfs rw
+";
+        let p = held_in(
+            &table(private),
+            &points(),
+            GUARD_HOST,
+            &groups_of(private.as_bytes()),
+            &key,
+        );
+        assert!(under(&p, 1, "/", "run"));
+    }
+
+    /// The re-check of #567 (N2): the overlays a host's image tooling
+    /// merges at boot — systemd-sysext over `/usr` (Flatcar), confext over
+    /// `/etc`, composefs over `/usr` — are the canonical layout at the
+    /// start; another overlay there, the tool's name on another file
+    /// system, or its overlay over another point are named.
+    #[test]
+    fn an_image_tools_overlay_is_canonical_and_another_is_not() {
+        let pts = points();
+        for line in [
+            "70 1 0:70 / /usr ro,nodev - overlay sysext ro,lowerdir=/run/systemd/sysext/meta/usr:/usr",
+            "70 1 0:70 / /etc ro - overlay confext ro,lowerdir=/run/systemd/confext/meta/etc:/etc",
+            "70 1 0:70 / /usr ro - overlay composefs ro,metacopy=on",
+        ] {
+            let found = not_canonical(&table(&format!("{HOST}{line}\n")), &pts);
+            assert!(found.is_empty(), "{line}: {found:?}");
+        }
+        for (line, words) in [
+            ("70 1 0:70 / /usr ro - overlay overlay ro", "/usr (overlay"),
+            ("70 1 0:70 / /usr ro - tmpfs sysext rw", "/usr (tmpfs"),
+            ("70 1 0:70 / /etc ro - overlay sysext ro", "/etc (overlay"),
+            (
+                "70 1 0:70 / /var/lib ro - overlay sysext ro",
+                "/var/lib (overlay",
+            ),
+        ] {
+            let found = not_canonical(&table(&format!("{HOST}{line}\n")), &pts);
+            assert!(found.iter().any(|x| x.contains(words)), "{line}: {found:?}");
+        }
     }
 }

@@ -1243,6 +1243,11 @@ pub enum FsProtectOperation {
     /// The review of #567 (F6): NOT a refusal — an unmount of the tracefs,
     /// debugfs or securityfs the agent reads, let through and recorded.
     MountNoted,
+    /// The re-check of #567 (b): a READ-mode ptrace access to one of the
+    /// agent's processes refused (its `/proc/<pid>/ns/*`, `exe`, `fd/` …),
+    /// recorded once a minute per caller and target. `target_dev` the
+    /// ptrace mode, `target_ino` the target tgid.
+    PtraceRead,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1302,6 +1307,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_MOUNT => Self::Mount,
             crate::wire::FS_OP_MOUNT_WINDOW => Self::MountWindow,
             crate::wire::FS_OP_MOUNT_NOTED => Self::MountNoted,
+            crate::wire::FS_OP_PTRACE_READ => Self::PtraceRead,
             other => Self::Unknown(other),
         }
     }
@@ -1359,6 +1365,7 @@ impl FsProtectOperation {
             Self::Mount => "mount",
             Self::MountWindow => "mount_window",
             Self::MountNoted => "mount_noted",
+            Self::PtraceRead => "ptrace_read",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2231,6 +2238,12 @@ mod tests {
                 crate::wire::FS_OP_MOUNT_NOTED,
                 FsProtectOperation::MountNoted,
                 "mount_noted",
+            ),
+            // its re-check (b)
+            (
+                crate::wire::FS_OP_PTRACE_READ,
+                FsProtectOperation::PtraceRead,
+                "ptrace_read",
             ),
         ];
         for (byte, op, name) in cases {

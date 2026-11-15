@@ -865,6 +865,10 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // review of #567) an unmount let through and recorded.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
+            } else if *operation == nn_model::FsProtectOperation::PtraceRead {
+                // the re-check of #567 (b): a read-mode access refused,
+                // recorded Low; no trigger (journald's reads of the agent's
+                // /proc/<pid>/exe meet it all day)
             } else if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
@@ -3266,8 +3270,9 @@ mod tests {
         // are sole traces; the review of #565 (F2): and the round's summary;
         // lot 357: a mount the window let through, one more minor (the
         // refused mount is decisive); the review of #567: an unmount let
-        // through and recorded, one more
-        assert_eq!((minor, sole), (19, 7));
+        // through and recorded, one more; its re-check (b): a read-mode
+        // ptrace access refused, one more
+        assert_eq!((minor, sole), (20, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3305,6 +3310,7 @@ mod tests {
             w::FS_OP_BPF_HELD_USE,
             w::FS_OP_MOUNT_WINDOW,
             w::FS_OP_MOUNT_NOTED,
+            w::FS_OP_PTRACE_READ,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }

@@ -40,11 +40,12 @@ use aya_ebpf::{
 };
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::mount_guard::{
-    decide, fnv16, held_by_id, held_by_place, is_view_magic, mount_op, reach_in, record_dev,
-    view_of, NameKey, Point, Query, Verdict, DEPTH_DEEPER, HELD_REFUSE, MAX_STACK, MAX_WALK,
-    MG_HOLD, MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT,
-    MG_OP_REMOUNT, MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC,
-    MS_RDONLY, GUARD_HOST, REACH_OTHER_NS,
+    decide, fnv16, held_by_id, held_by_place, inode_key, is_view_magic, mount_op,
+    reach_in, record_dev, regroups, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
+    BTRFS_SUPER_MAGIC, DEPTH_DEEPER, GUARD_HOST, HELD_REFUSE, MAX_STACK, MAX_WALK, MG_HOLD,
+    MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
+    MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
+    umount_spread, umount_takes_held, Spread, HELD_UNDER, PLACE_ANY_GROUP, REACH_OTHER_NS,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
@@ -107,9 +108,11 @@ pub static MOUNT_GUARD_NS: HashMap<u64, u8> = HashMap::pinned(8, 0);
 /// which a change made in another namespace reaches a guarded one — the
 /// own group (`shared:N`) and the master's (`master:N`) of each mount of
 /// PID 1's, the agent's and the watchdog's namespaces that holds a
-/// protected point or is a view → a bit per namespace. One look-up replaces
-/// the walk of the peers and slaves, which failed closed (a host with many
-/// containers sharing one group had their mounts judged). Pinned.
+/// protected point or is a view → a bit per namespace. One look-up for a
+/// group the agent's refresh has seen; one it has not (re-check N1: a
+/// guarded mount regrouped since) is walked (`common::mount_guard::
+/// spread`), and a propagation change in a guarded namespace wakes the
+/// refresh ([`CONF_REGROUP`]). Pinned.
 #[map]
 pub static MOUNT_GROUPS: HashMap<u32, u8> = HashMap::pinned(MOUNT_HELD_MAX, 0);
 
@@ -123,10 +126,31 @@ pub static MOUNT_RECONF: LruHashMap<u64, u64> = LruHashMap::pinned(1024, 0);
 
 /// Slot 0: PID 1's mount namespace (its `ns.inum`), slot 1: PID 1's user
 /// namespace, slot 2: the agent's mount namespace, slot 3: the
-/// watchdog's (the keys [`vacate`] drops from [`MOUNT_GUARD_NS`]). 0 in
-/// slot 0: not armed, every hook lets through. Pinned.
+/// watchdog's (the keys [`vacate`] drops from [`MOUNT_GUARD_NS`]), slot 4
+/// ([`CONF_REGROUP`]): the propagation changes counted. 0 in slot 0: not
+/// armed, every hook lets through. Pinned.
 #[map]
-pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(4, 0);
+pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(5, 0);
+
+/// The re-check of #567 (N1): [`MOUNT_GUARD_CONF`]'s slot counting the
+/// propagation changes that may give a guarded namespace's mount a peer
+/// group [`MOUNT_GROUPS`] does not hold — `mount(2)`'s `MS_SHARED`,
+/// `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE` on a mount of a guarded
+/// namespace or of a group it holds, a `move_mount(2)` into a guarded
+/// namespace of a mount in a peer group (`MOVE_MOUNT_SET_GROUP` among
+/// them). The hook runs before the change (the new group has no number
+/// yet): the agent reads the count each second and refreshes the map when
+/// it moved. `mount_setattr(2)` has no hook: the walk and the 30 s round.
+const CONF_REGROUP: u32 = 4;
+
+/// A propagation change counted ([`CONF_REGROUP`]; two at once may count
+/// one: any change of the count wakes the refresh).
+#[inline(always)]
+fn note_regroup() {
+    if let Some(v) = MOUNT_GUARD_CONF.get_ptr_mut(CONF_REGROUP) {
+        unsafe { *v = (*v).wrapping_add(1) };
+    }
+}
 
 /// The review of #567 (F2): the agent (role slot 1 of
 /// `bpf_defense::ROLE_TGIDS`) or the watchdog (slot 0) exits — its mount
@@ -168,10 +192,6 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
 unsafe fn peek_ptr(src: *const u8) -> *const u8 {
     peek_u64(src) as *const u8
 }
-
-/// `BTRFS_SUPER_MAGIC`: a btrfs inode's device is its subvolume's (as
-/// `stat(2)` gives it, `inode_dev::stat_dev`).
-const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 
 /// Every offset the hooks read, resolved once per run before any loop: an
 /// `off!` inside the walks is two map lookups and three branches an
@@ -378,29 +398,132 @@ unsafe fn guard_of(o: &Offs, real: *const u8) -> u8 {
     }
 }
 
-/// The coordinator's propagation point: what is done to the mount `real`
-/// is copied into a guarded namespace — its peer group is one of a
-/// guarded mount's own or master groups ([`MOUNT_GROUPS`]). A mount in no
-/// peer group propagates nothing.
-#[inline(always)]
-unsafe fn reaches_guarded(o: &Offs, real: *const u8) -> bool {
-    let group = peek_u32(real.add(o.mnt_group_id as usize));
-    group != 0 && MOUNT_GROUPS.get(&group).is_some()
+/// The kernel's propagation objects (`struct mount`), as
+/// `common::mount_guard::spread` walks them: the peer ring (`mnt_share`, a
+/// `list_head`), the slaves (`mnt_slave_list` and `mnt_slave`: a
+/// `list_head` to 6.x, an `hlist` from 6.18 — the head's first link, or a
+/// link's next, is the head itself or NULL at the end, either way).
+struct Kernel<'a>(&'a Offs);
+
+impl Mounts for Kernel<'_> {
+    type M = *const u8;
+    #[inline(always)]
+    fn group(&self, m: *const u8) -> u32 {
+        unsafe { peek_u32(m.add(self.0.mnt_group_id as usize)) }
+    }
+    #[inline(always)]
+    fn guard(&self, m: *const u8) -> u8 {
+        unsafe { guard_of(self.0, m) }
+    }
+    #[inline(always)]
+    fn known(&self, group: u32) -> bool {
+        unsafe { MOUNT_GROUPS.get(&group).is_some() }
+    }
+    #[inline(always)]
+    fn next_peer(&self, m: *const u8) -> Option<*const u8> {
+        let o = self.0.mnt_share as usize;
+        let n = unsafe { peek_ptr(m.add(o)) };
+        if n.is_null() {
+            None
+        } else {
+            Some((n as usize).wrapping_sub(o) as *const u8)
+        }
+    }
+    #[inline(always)]
+    fn first_slave(&self, m: *const u8) -> Option<*const u8> {
+        let head = unsafe { m.add(self.0.mnt_slave_list as usize) };
+        self.slave_at(head, unsafe { peek_ptr(head) })
+    }
+    #[inline(always)]
+    fn next_slave(&self, master: *const u8, s: *const u8) -> Option<*const u8> {
+        let head = unsafe { master.add(self.0.mnt_slave_list as usize) };
+        self.slave_at(head, unsafe { peek_ptr(s.add(self.0.mnt_slave as usize)) })
+    }
 }
 
-/// Where a change to the mount `real` lands: in a guarded namespace (its
-/// guard, judged there), propagated into one (`REACH_OTHER_NS`), or
-/// nowhere guarded (`None`: let through unread).
+impl Kernel<'_> {
+    /// The slave whose `mnt_slave` link is `n`, `None` at the end of the
+    /// list whose head is `head`.
+    #[inline(always)]
+    fn slave_at(&self, head: *const u8, n: *const u8) -> Option<*const u8> {
+        if n.is_null() || n == head {
+            None
+        } else {
+            Some((n as usize).wrapping_sub(self.0.mnt_slave as usize) as *const u8)
+        }
+    }
+}
+
+/// The re-check of #567 (N1), an unmount's propagation: the mounts of the
+/// parent's peers and slaves, each asked whether a held mount sits at the
+/// unmounted mount's place under it (`MOUNT_HELD`'s [`HELD_UNDER`] key, the
+/// place's hash `h`) — as [`Mounts::guard`], for `common::mount_guard::
+/// umount_reaches_held`.
+struct HeldUnder<'a> {
+    k: Kernel<'a>,
+    h: u64,
+}
+
+impl Mounts for HeldUnder<'_> {
+    type M = *const u8;
+    #[inline(always)]
+    fn group(&self, m: *const u8) -> u32 {
+        self.k.group(m)
+    }
+    #[inline(always)]
+    fn guard(&self, m: *const u8) -> u8 {
+        let id = unsafe { peek_u32(m.add(self.k.0.mnt_id as usize)) } as u64;
+        let key = InodeKey {
+            dev: HELD_UNDER | id,
+            ino: self.h,
+        };
+        unsafe { MOUNT_HELD.get(&key).is_some() as u8 }
+    }
+    #[inline(always)]
+    fn known(&self, group: u32) -> bool {
+        self.k.known(group)
+    }
+    #[inline(always)]
+    fn next_peer(&self, m: *const u8) -> Option<*const u8> {
+        self.k.next_peer(m)
+    }
+    #[inline(always)]
+    fn first_slave(&self, m: *const u8) -> Option<*const u8> {
+        self.k.first_slave(m)
+    }
+    #[inline(always)]
+    fn next_slave(&self, master: *const u8, s: *const u8) -> Option<*const u8> {
+        self.k.next_slave(master, s)
+    }
+}
+
+/// Where a change to the mount `real` lands (`common::mount_guard::
+/// target_reach`): in a guarded namespace (its guard, judged there),
+/// propagated into one (`REACH_OTHER_NS`: its peer group one
+/// [`MOUNT_GROUPS`] holds, or — re-check N1, a group not refreshed yet —
+/// one whose peers and slaves reach one or are not read whole), or nowhere
+/// guarded (`None`: let through unread).
 #[inline(always)]
 unsafe fn target_of(o: &Offs, real: *const u8) -> Option<(u8, u8)> {
-    let g = guard_of(o, real);
-    if g != 0 {
-        Some((g, reach_in(g)))
-    } else if reaches_guarded(o, real) {
-        Some((0, REACH_OTHER_NS))
-    } else {
-        None
+    target_reach(&Kernel(o), real)
+}
+
+/// The re-check of #567 (N1): a mount is a copy of a held one — its
+/// namespace's root, or sitting where a held mount sits (its place under
+/// any group, `PLACE_ANY_GROUP`): a raw namespace's `/sys`, not a chroot's
+/// own sysfs at `$T/sys`.
+#[inline(always)]
+unsafe fn parent_held_like(o: &Offs, m: *const u8) -> bool {
+    let up = peek_ptr(m.add(o.mnt_parent as usize));
+    if up.is_null() || up == m {
+        return true;
     }
+    let place = peek_ptr(m.add(o.mnt_mountpoint as usize));
+    let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
+    let mut name = NameKey::NONE;
+    name_of(o, place, &mut name);
+    let (dev, ino) = held_by_place(PLACE_ANY_GROUP, dir.dev, dir.ino, &name);
+    MOUNT_HELD.get(&InodeKey { dev, ino }).is_some()
 }
 
 /// The `MOUNT_HELD` flags of a mount (a `struct mount`) by its id.
@@ -420,20 +543,22 @@ unsafe fn held_flags(o: &Offs, real: *const u8) -> u8 {
 unsafe fn key_of(o: &Offs, dentry: *const u8) -> InodeKey {
     let inode = peek_ptr(dentry.add(o.d_inode as usize));
     let sb = peek_ptr(inode.add(o.i_sb as usize));
-    let mut dev = peek_u32(sb.add(o.s_dev as usize));
+    let s_dev = peek_u32(sb.add(o.s_dev as usize));
     let ino = peek_u64(inode.add(o.i_ino as usize));
-    if o.btrfs_vfs != 0 && peek_u64(sb.add(o.s_magic as usize)) == BTRFS_SUPER_MAGIC {
-        let bi = (inode as usize).wrapping_sub(o.btrfs_vfs as usize) as *const u8;
-        let root = peek_ptr(bi.add(o.btrfs_root as usize));
-        let anon = peek_u32(root.add(o.btrfs_anon as usize));
-        if anon != 0 {
-            dev = anon;
+    // the review of #567 (d): `common::mount_guard::inode_key` — a btrfs
+    // subvolume's own device (the magic read only with the offsets known)
+    let mut magic = 0;
+    let mut anon = 0;
+    if o.btrfs_vfs != 0 {
+        magic = peek_u64(sb.add(o.s_magic as usize));
+        if magic == BTRFS_SUPER_MAGIC {
+            let bi = (inode as usize).wrapping_sub(o.btrfs_vfs as usize) as *const u8;
+            let root = peek_ptr(bi.add(o.btrfs_root as usize));
+            anon = peek_u32(root.add(o.btrfs_anon as usize));
         }
     }
-    InodeKey {
-        dev: dev as u64,
-        ino,
-    }
+    let (dev, ino) = inode_key(s_dev, magic, ino, anon);
+    InodeKey { dev, ino }
 }
 
 /// The protected flags of a dentry (0 for none or unreadable).
@@ -689,6 +814,9 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
     let flags: u64 = ctx.arg(3);
     let op = mount_op(flags);
     if op == MG_OP_PASS {
+        if regroups(flags) {
+            note_propagation_change(ctx);
+        }
         return 0;
     }
     let Some(c) = caller(hook::SB_MOUNT) else {
@@ -755,6 +883,31 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
     answer(decide(&q), op, key, &q.point, reach)
 }
 
+/// The re-check of #567 (N1): a propagation change let through — counted
+/// ([`note_regroup`]) when its mount is in a guarded namespace, or in a
+/// peer group [`MOUNT_GROUPS`] holds (a master made private hands its
+/// slaves, a guarded one among them, to another master).
+#[inline(always)]
+unsafe fn note_propagation_change(ctx: &LsmContext) {
+    let Some(o) = Offs::load() else {
+        return;
+    };
+    let path: *const u8 = ctx.arg(1);
+    if path.is_null() {
+        return;
+    }
+    let mnt = peek_ptr(path.add(o.path_mnt as usize));
+    if mnt.is_null() {
+        return;
+    }
+    let real = real_mount(o, mnt);
+    let k = Kernel(o);
+    let group = k.group(real);
+    if k.guard(real) != 0 || (group != 0 && k.known(group)) {
+        note_regroup();
+    }
+}
+
 /// `int move_mount(const struct path *from_path, const struct path
 /// *to_path)`: `move_mount(2)` — a detached mount (`fsmount`, `open_tree`)
 /// attached at `to_path`, or an attached one moved there.
@@ -814,6 +967,12 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
     let Some((guard, reach)) = target_of(o, real_mount(o, to_mnt)) else {
         return 0;
     };
+    // re-check N1: a mount in a peer group moved into a guarded namespace,
+    // or its group given to one there (`MOVE_MOUNT_SET_GROUP`, the same
+    // hook): the refresh woken
+    if guard != 0 && Kernel(o).group(real) != 0 {
+        note_regroup();
+    }
     let mut q = query(MG_OP_MOVE_MOUNT, &c, guard);
     let mut key = InodeKey { dev: 0, ino: 0 };
     if !point_of(o, to, hook::MOVE_MOUNT, &mut q, &mut key) {
@@ -891,7 +1050,22 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
             let mut name = NameKey::NONE;
             name_of(o, place, &mut name);
             let (dev, ino) = held_by_place(group, dir.dev, dir.ino, &name);
-            if MOUNT_HELD.get(&InodeKey { dev, ino }).is_some() {
+            let mut hit = MOUNT_HELD.get(&InodeKey { dev, ino }).is_some();
+            // Re-check N1: a parent in a group the map does not hold (one
+            // regrouped since the refresh, its places keyed under its old
+            // group) — its propagation walked for a mount a held one sits
+            // under at this place (`HELD_UNDER`, the same hash `ino`)
+            if !hit {
+                let s = umount_spread(&HeldUnder { k: Kernel(o), h: ino }, parent);
+                // undecided: the parent read only then — a copy of a held
+                // mount (its namespace's root, or at a held mount's place)
+                let held_root = flags & MG_HOLD != 0;
+                let like = matches!(s, Some(Spread::Unread))
+                    && held_root
+                    && parent_held_like(o, parent);
+                hit = umount_takes_held(s, held_root, like);
+            }
+            if hit {
                 q.held = true;
                 if guard == 0 {
                     q.reaches = true;

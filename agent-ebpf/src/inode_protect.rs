@@ -61,8 +61,8 @@ use northnarrow_common::wire::{
     fs_protect_denied_op, fs_protect_init_may, fs_protect_init_may_open, fs_protect_required,
     fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
     InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
-    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
+    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE_READ, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
+    FS_OP_SETATTR, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -272,7 +272,8 @@ pub(crate) fn override_active() -> bool {
 
 /// `(caller tgid << 8) | op` → monotonic ns of the last task-denial record
 /// for that caller and operation (1 s dedup: a `while true; kill` loop
-/// from one shell is one record per second).
+/// from one shell is one record per second); a refused read-mode ptrace
+/// access by caller and target ([`emit_task_read_denial`], 60 s).
 #[map]
 static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
 
@@ -294,6 +295,13 @@ static TASK_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1
 
 const TASK_DENIAL_PER_SEC: u64 = 50;
 const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;
+/// The re-check of #567 (b): a refused read-mode ptrace access, once a
+/// minute per caller and target.
+const PTRACE_READ_DEDUP_NS: u64 = 60_000_000_000;
+/// [`TASK_DENIAL_SEEN`]'s keys by caller and target: bit 63 set, the
+/// operation in bits 48–55, the caller in 24–47, the target in 0–23 (pid
+/// numbers end below 2^22) — never a `(caller << 8) | op` key's.
+const SEEN_BY_TARGET: u64 = 1 << 63;
 /// The budget's window.
 const TASK_DENIAL_WINDOW_NS: u64 = 1_000_000_000;
 
@@ -418,6 +426,23 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
     );
 }
 
+/// The re-check of #567 (b): a refused read-mode ptrace access to one of
+/// the agent's processes (`FS_OP_PTRACE_READ`: its `/proc/<pid>/ns/*` for
+/// `nsenter` or `systemctl bind`, `exe`, `fd/` …), `target_ino` = target
+/// tgid, `target_dev` = the ptrace mode — through [`emit_limited`], deduped
+/// by caller and target over a minute (journald reads the agent's
+/// `/proc/<pid>/exe` for the log lines it takes, all day).
+#[inline(always)]
+pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
+    emit_limited(
+        FS_OP_PTRACE_READ,
+        InodeKey {
+            dev: mode as u64,
+            ino: target_tgid as u64,
+        },
+    );
+}
+
 /// [`emit_denial`] behind the per-caller dedup and the per-CPU budget of
 /// the task denials: a signal loop, a move loop, and (lot 273b) a loop of
 /// writes on a descriptor of a protected file are one record per caller
@@ -432,10 +457,22 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
     }
     let now = unsafe { bpf_ktime_get_ns() };
     let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
-    let seen = (caller << 8) | operation as u64;
+    // the re-check of #567 (b): a read-mode ptrace refusal by caller and
+    // target (its record's `ino`), once a minute
+    let (seen, dedup_ns) = if operation == FS_OP_PTRACE_READ {
+        (
+            SEEN_BY_TARGET
+                | (operation as u64) << 48
+                | (caller & 0xff_ffff) << 24
+                | (key.ino & 0xff_ffff),
+            PTRACE_READ_DEDUP_NS,
+        )
+    } else {
+        ((caller << 8) | operation as u64, TASK_DENIAL_DEDUP_NS)
+    };
     match TASK_DENIAL_SEEN.get_ptr_mut(&seen) {
         Some(last) => unsafe {
-            if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
+            if now.wrapping_sub(*last) < dedup_ns {
                 return;
             }
             *last = now;

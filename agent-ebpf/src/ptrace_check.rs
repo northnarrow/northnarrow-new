@@ -203,12 +203,18 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
-    // Evidence for ATTACH-mode accesses only (debugger attach,
-    // /proc/<pid>/mem, process_vm_readv/writev). READ-mode checks are what
-    // `ps`, `lsof` and journald (/proc/<pid>/exe) trigger all day, and
-    // NOAUDIT asks LSMs explicitly not to report: those stay silent denials.
-    if mode & PTRACE_MODE_ATTACH != 0 && mode & PTRACE_MODE_NOAUDIT == 0 {
-        crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
+    // Evidence: an ATTACH-mode access (debugger attach, /proc/<pid>/mem,
+    // process_vm_readv/writev) at each attempt (the per-caller dedup); the
+    // re-check of #567 (b): a READ-mode one (`nsenter` or `systemctl bind`
+    // opening /proc/<pid>/ns/mnt, `lsof`, journald's /proc/<pid>/exe) once a
+    // minute per caller and target. NOAUDIT asks LSMs explicitly not to
+    // report (`ps` reading /proc/<pid>/stat): a silent denial.
+    if mode & PTRACE_MODE_NOAUDIT == 0 {
+        if mode & PTRACE_MODE_ATTACH != 0 {
+            crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
+        } else {
+            crate::inode_protect::emit_task_read_denial(mode, target_tgid);
+        }
     }
     -EPERM
 }

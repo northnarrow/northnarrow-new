@@ -159,6 +159,181 @@ pub const fn held_by_place(group: u32, dir_dev: u64, dir_ino: u64, name: &NameKe
     (HELD_BY_PLACE | group as u64, h)
 }
 
+/// The re-check of #567 (N1): `MOUNT_HELD`'s key of a held mount by its
+/// place under its parent mount itself (the parent's id, not its group):
+/// `(HELD_UNDER | parent id, the place's hash)`. Registered for every held
+/// mount beside the keys under its parent's groups; looked up, mount by
+/// mount, along the propagation of an unmount whose parent is in a group
+/// the map does not hold ([`umount_reaches_held`]) — a parent regrouped
+/// since the agent's last refresh (`mount --make-private`, a decoy taking
+/// the freed number, `--make-shared`) is in a group the places were not
+/// keyed under. By the parent itself: a chroot's own sysfs has the host's
+/// dentries (one super block), so a place alone would take its
+/// `sys/fs/cgroup` for the host's.
+pub const HELD_UNDER: u64 = HELD_BY_PLACE | 1 << 61;
+
+/// [`HELD_UNDER`]'s key of a place under the parent mount `parent_mnt_id`
+/// (the hash is [`held_by_place`]'s, whatever the group).
+pub const fn held_under(
+    parent_mnt_id: u32,
+    dir_dev: u64,
+    dir_ino: u64,
+    name: &NameKey,
+) -> (u64, u64) {
+    let (_, h) = held_by_place(0, dir_dev, dir_ino, name);
+    (HELD_UNDER | parent_mnt_id as u64, h)
+}
+
+// ── Propagation: where a change made elsewhere lands (re-check N1) ───────
+
+/// How many mounts of a peer group's propagation [`spread`] reads: the
+/// target mount's peers, each followed by its slaves, one at a time.
+pub const SPREAD_MAX: u32 = 16;
+
+/// What [`spread`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spread {
+    /// Every peer and each one's every slave read: none in a guarded
+    /// namespace, none propagating further.
+    Nowhere,
+    /// A mount of a guarded namespace among them.
+    Guarded,
+    /// Not decided — more mounts than [`SPREAD_MAX`], a slave that has
+    /// peers or slaves of its own, a peer ring unreadable: counted as
+    /// reaching (fail closed; [`decide`] refuses there only what lands on,
+    /// over or below a protected point).
+    Unread,
+}
+
+/// The kernel's propagation objects as a hook reads them: a `struct mount`
+/// (a pointer in the eBPF hooks, an index in the host's tests).
+pub trait Mounts {
+    type M: Copy + PartialEq;
+    /// Its own peer group (`mnt_group_id`), 0 for none.
+    fn group(&self, m: Self::M) -> u32;
+    /// The guarded namespace it is in (`MOUNT_GUARD_NS` of its `mnt_ns`):
+    /// [`GUARD_HOST`] …, 0 for another one.
+    fn guard(&self, m: Self::M) -> u8;
+    /// `MOUNT_GROUPS` holds the group: the own or master group of a mount
+    /// of a guarded namespace that holds a protected point or is a view.
+    fn known(&self, group: u32) -> bool;
+    /// The next mount of its peer ring (`mnt_share`); `None`: unreadable.
+    fn next_peer(&self, m: Self::M) -> Option<Self::M>;
+    /// Its first slave (`mnt_slave_list`); `None`: it has none.
+    fn first_slave(&self, m: Self::M) -> Option<Self::M>;
+    /// The slave after `s` in `master`'s list (`mnt_slave`); `None`: `s`
+    /// is the last.
+    fn next_slave(&self, master: Self::M, s: Self::M) -> Option<Self::M>;
+}
+
+/// The re-check of #567 (N1): whether a change at the mount `m` (in a peer
+/// group) is copied into a guarded namespace, read in the kernel's order
+/// (`propagation_next()`): `m`, then each of its slaves, then the next peer
+/// and its slaves, around the ring. A slave that is itself shared, or a
+/// master, carries the change on to mounts not read here: undecided.
+#[inline(always)]
+pub fn spread<G: Mounts>(g: &G, m: G::M) -> Spread {
+    let mut peer = m;
+    let mut slave: Option<G::M> = None;
+    let mut i = 0;
+    while i < SPREAD_MAX {
+        let at = match slave {
+            Some(s) => s,
+            None => peer,
+        };
+        if g.guard(at) != 0 {
+            return Spread::Guarded;
+        }
+        if slave.is_some() && (g.group(at) != 0 || g.first_slave(at).is_some()) {
+            return Spread::Unread;
+        }
+        slave = match slave {
+            None => g.first_slave(peer),
+            Some(s) => g.next_slave(peer, s),
+        };
+        if slave.is_none() {
+            match g.next_peer(peer) {
+                None => return Spread::Unread,
+                Some(n) if n == m => return Spread::Nowhere,
+                Some(n) => peer = n,
+            }
+        }
+        i += 1;
+    }
+    Spread::Unread
+}
+
+/// A change at the mount `m` propagates into a guarded namespace, or may:
+/// its peer group is one `MOUNT_GROUPS` follows, or — a group the agent's
+/// refresh has not seen yet (re-check N1: a guarded mount regrouped since,
+/// by `mount(2)` or `mount_setattr(2)`) — its propagation reaches one or is
+/// not read whole ([`spread`]). A mount in no peer group propagates
+/// nothing.
+#[inline(always)]
+pub fn group_reaches<G: Mounts>(g: &G, m: G::M) -> bool {
+    let group = g.group(m);
+    group != 0 && (g.known(group) || spread(g, m) != Spread::Nowhere)
+}
+
+/// The re-check of #567 (N1): [`held_by_place`]'s group of a held mount's
+/// place under any group — registered for every held mount, and asked of
+/// the PARENT of an unmount whose propagation could not be read whole
+/// ([`umount_takes_held`]): a parent that sits where a held mount sits (a
+/// raw namespace's copy of `/sys`) is a copy of a held mount; a chroot's
+/// own sysfs at `$T/sys` is not.
+pub const PLACE_ANY_GROUP: u32 = 0;
+
+/// The re-check of #567 (N1), its unmount variant: the propagation of an
+/// unmount at a place under `parent`, when `parent` is in a peer group the
+/// map does not hold — `None` when not walked (no group: it propagates
+/// nothing; a group the map holds: the places keyed under it decide,
+/// [`held_by_place`]). The kernel takes the mount at the same place under
+/// every mount of the parent's propagation; `g`'s [`Mounts::guard`] is,
+/// here, "a held mount sits at that place under this mount"
+/// ([`held_under`]).
+#[inline(always)]
+pub fn umount_spread<G: Mounts>(g: &G, parent: G::M) -> Option<Spread> {
+    let group = g.group(parent);
+    if group == 0 || g.known(group) {
+        None
+    } else {
+        Some(spread(g, parent))
+    }
+}
+
+/// [`umount_spread`]'s verdict: a held mount under one of the parent's
+/// propagation at that place — taken; a walk that could not be finished —
+/// taken when the mount unmounted has a held mount's root (`held_root`:
+/// [`MG_HOLD`] at its root) and the parent is a copy of a held mount
+/// (`parent_held_like`: its namespace's root, or sitting at a held mount's
+/// place under any group, [`PLACE_ANY_GROUP`]), fail closed for what
+/// resolves to a protected point; let through otherwise (a chroot's own
+/// sysfs, whose copies in every sandboxed unit's namespace make its
+/// propagation wider than the walk, unmounting its `sys/fs/cgroup`).
+pub const fn umount_takes_held(s: Option<Spread>, held_root: bool, parent_held_like: bool) -> bool {
+    match s {
+        Some(Spread::Guarded) => true,
+        Some(Spread::Unread) => held_root && parent_held_like,
+        _ => false,
+    }
+}
+
+/// Where a change to the mount `m` lands: in a guarded namespace (its
+/// guard and reach: judged there), propagated into one (`(0,
+/// REACH_OTHER_NS)`, [`group_reaches`]), or nowhere guarded (`None`: let
+/// through unread).
+#[inline(always)]
+pub fn target_reach<G: Mounts>(g: &G, m: G::M) -> Option<(u8, u8)> {
+    let guard = g.guard(m);
+    if guard != 0 {
+        Some((guard, reach_in(guard)))
+    } else if group_reaches(g, m) {
+        Some((0, REACH_OTHER_NS))
+    } else {
+        None
+    }
+}
+
 // ── The namespaces judged as PID 1's (`MOUNT_GUARD_NS`, F2) ──────────────
 
 /// `MOUNT_GUARD_NS`'s value of PID 1's mount namespace.
@@ -247,6 +422,35 @@ pub const fn mount_op(flags: u64) -> u8 {
     } else {
         MG_OP_MOUNT
     }
+}
+
+/// The re-check of #567 (N1): a `mount(2)` call that changes a mount's
+/// propagation (`MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`:
+/// neither a remount nor a bind, in `path_mount`'s order). Let through
+/// ([`MG_OP_PASS`]); made on a mount of a guarded namespace, or of a group
+/// `MOUNT_GROUPS` follows, it wakes the agent's refresh of that map.
+pub const fn regroups(flags: u64) -> bool {
+    flags & (MS_REMOUNT | MS_BIND) == 0 && flags & MS_PROPAGATION != 0
+}
+
+/// `BTRFS_SUPER_MAGIC`.
+pub const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
+
+/// The review of #567 (d): the guard's key of an inode — `(device,
+/// inode)` as the hooks read a dentry's and as `stat(2)` gives it to the
+/// agent that registers the points: the super block's device (`s_dev`),
+/// and on btrfs the device of the inode's subvolume
+/// (`BTRFS_I(inode)->root->anon_dev`, what `btrfs_getattr()` reports), so
+/// two subvolumes of one file system, whose roots are both inode 256, are
+/// two keys. `anon` 0 (the btrfs offsets unknown, or unreadable): the super
+/// block's device — which matches no point registered on a subvolume.
+pub const fn inode_key(s_dev: u32, magic: u64, ino: u64, anon: u32) -> (u64, u64) {
+    let dev = if magic == BTRFS_SUPER_MAGIC && anon != 0 {
+        anon
+    } else {
+        s_dev
+    };
+    (dev as u64, ino)
 }
 
 // ── Reasons ────────────────────────────────────────────────────────────
@@ -1910,5 +2114,305 @@ mod tests {
                 "{view:x}"
             );
         }
+    }
+
+    /// The re-check of #567 (N1): a test graph of mounts — each one's peer
+    /// group, guarded namespace, the next mount of its peer ring and its
+    /// slaves — and the groups `MOUNT_GROUPS` holds.
+    struct Graph {
+        m: Vec<(u32, u8, usize, Vec<usize>)>,
+        known: Vec<u32>,
+    }
+
+    impl Graph {
+        /// `n` private mounts in no guarded namespace.
+        fn new(n: usize) -> Graph {
+            Graph {
+                m: (0..n).map(|i| (0, 0, i, Vec::new())).collect(),
+                known: Vec::new(),
+            }
+        }
+        /// These mounts are one peer group, `group`.
+        fn peers(mut self, group: u32, ring: &[usize]) -> Graph {
+            for (i, &x) in ring.iter().enumerate() {
+                self.m[x].0 = group;
+                self.m[x].2 = ring[(i + 1) % ring.len()];
+            }
+            self
+        }
+        fn guard(mut self, x: usize, g: u8) -> Graph {
+            self.m[x].1 = g;
+            self
+        }
+        /// Its peer link cannot be read.
+        fn unreadable(mut self, x: usize) -> Graph {
+            self.m[x].2 = usize::MAX;
+            self
+        }
+        fn slave(mut self, master: usize, s: usize) -> Graph {
+            self.m[master].3.push(s);
+            self
+        }
+        fn following(mut self, groups: &[u32]) -> Graph {
+            self.known = groups.to_vec();
+            self
+        }
+    }
+
+    impl Mounts for Graph {
+        type M = usize;
+        fn group(&self, m: usize) -> u32 {
+            self.m[m].0
+        }
+        fn guard(&self, m: usize) -> u8 {
+            self.m[m].1
+        }
+        fn known(&self, group: u32) -> bool {
+            self.known.contains(&group)
+        }
+        fn next_peer(&self, m: usize) -> Option<usize> {
+            Some(self.m[m].2).filter(|n| *n != usize::MAX)
+        }
+        fn first_slave(&self, m: usize) -> Option<usize> {
+            self.m[m].3.first().copied()
+        }
+        fn next_slave(&self, master: usize, s: usize) -> Option<usize> {
+            let l = &self.m[master].3;
+            l.get(l.iter().position(|x| *x == s)? + 1).copied()
+        }
+    }
+
+    /// The re-check of #567 (N1), its probe (`unshare -Urm`, 6.18): the
+    /// guarded `/` armed in group 198 (`MOUNT_GROUPS`); `mount
+    /// --make-private /`, a decoy `mount -t tmpfs d /x; mount --make-shared
+    /// /x` takes 198, `mount --make-shared /` gives `/` group 228; a raw
+    /// `unshare(CLONE_NEWNS)` copies it — a peer in 228 — and its tmpfs over
+    /// `/etc/northnarrow` propagated into the guarded view, the hook having
+    /// let a group it did not know through. Now the ring is read.
+    #[test]
+    fn a_regrouped_guarded_mount_is_still_reached_from_a_raw_namespace() {
+        // 0: the guarded `/` (regrouped), 1: the decoy, 2: the raw copy
+        let g = Graph::new(3)
+            .guard(0, GUARD_HOST)
+            .guard(1, GUARD_HOST)
+            .peers(228, &[0, 2])
+            .peers(198, &[1])
+            .following(&[198]);
+        assert!(
+            !Mounts::known(&g, g.group(2)),
+            "the map is stale: 228 unknown"
+        );
+        assert_eq!(spread(&g, 2), Spread::Guarded);
+        assert_eq!(target_reach(&g, 2), Some((0, REACH_OTHER_NS)));
+        // and the tmpfs over /etc/northnarrow from there is refused
+        let q = Query {
+            host: false,
+            reaches: true,
+            ..host(MG_OP_MOUNT, view_root(MG_ON, 0xef53), "tmpfs")
+        };
+        assert_eq!(decide(&q), Verdict::Refuse(MG_WHY_ON));
+        // the guarded mount itself, and the decoy, are judged where they are
+        assert_eq!(target_reach(&g, 0), Some((GUARD_HOST, 0)));
+        assert_eq!(target_reach(&g, 1), Some((GUARD_HOST, 0)));
+    }
+
+    /// N1's variants: the guarded mount made a slave of the raw copy's new
+    /// group (`--make-slave` after the regroup), the agent's namespace a
+    /// slave of a regrouped host mount, a group the map still follows.
+    #[test]
+    fn a_guarded_slave_of_an_unknown_group_is_reached() {
+        // 0: the raw copy (group 228), 1: the guarded `/`, now its slave
+        let g = Graph::new(2)
+            .guard(1, GUARD_HOST)
+            .peers(228, &[0])
+            .slave(0, 1);
+        assert_eq!(target_reach(&g, 0), Some((0, REACH_OTHER_NS)));
+        // a raw copy among other peers, the agent's mount a slave of the
+        // third (0 → 1 → 2 → 0)
+        let g = Graph::new(4)
+            .peers(229, &[0, 1, 2])
+            .guard(3, GUARD_AGENT)
+            .slave(2, 3);
+        assert_eq!(spread(&g, 0), Spread::Guarded);
+        // the second slave of a peer (each slave of each peer is read)
+        let g = Graph::new(3)
+            .peers(230, &[0])
+            .slave(0, 1)
+            .slave(0, 2)
+            .guard(2, GUARD_WATCHDOG);
+        assert_eq!(spread(&g, 0), Spread::Guarded);
+        // a mount in no peer group propagates nothing, even to a slave of
+        // its own (the kernel propagates from a shared mount only)
+        let g = Graph::new(2).slave(0, 1).guard(1, GUARD_HOST);
+        assert!(!group_reaches(&g, 0));
+        assert_eq!(target_reach(&g, 0), None);
+        // a known group is reached without a walk
+        let g = Graph::new(1).peers(7, &[0]).following(&[7]);
+        assert_eq!(target_reach(&g, 0), Some((0, REACH_OTHER_NS)));
+    }
+
+    /// N1, fail closed but not wide: a container's own group (a ring that
+    /// closes, private or slave-only units below it) reaches nothing; a
+    /// group wider than the hook reads, or a slave that carries the change
+    /// on (shared itself, or a master), counts as reaching — `decide`
+    /// refuses there only on, over or below a protected point.
+    #[test]
+    fn an_unknown_group_is_walked_and_an_unread_one_fails_closed() {
+        // a container's `/` (300) and its copy, two unit sandboxes (slaves)
+        let g = Graph::new(4).peers(300, &[0, 1]).slave(0, 2).slave(1, 3);
+        assert_eq!(spread(&g, 0), Spread::Nowhere);
+        assert_eq!(target_reach(&g, 0), None);
+        // a private mount, in no group, propagates nothing
+        assert_eq!(target_reach(&Graph::new(1), 0), None);
+        // wider than the 16 mounts read
+        let ring: Vec<usize> = (0..17).collect();
+        let g = Graph::new(17).peers(301, &ring);
+        assert_eq!(spread(&g, 0), Spread::Unread);
+        assert_eq!(target_reach(&g, 0), Some((0, REACH_OTHER_NS)));
+        let g = Graph::new(16).peers(301, &ring[..16]);
+        assert_eq!(spread(&g, 0), Spread::Nowhere, "a ring of 16 closes");
+        // a peer ring that cannot be read
+        let g = Graph::new(2).peers(305, &[0, 1]).unreadable(1);
+        assert_eq!(spread(&g, 0), Spread::Unread);
+        // a slave that is itself shared (its peers are not read)
+        let g = Graph::new(3)
+            .peers(302, &[0])
+            .peers(303, &[1, 2])
+            .slave(0, 1);
+        assert_eq!(spread(&g, 0), Spread::Unread);
+        // a slave that is a master
+        let g = Graph::new(3).peers(304, &[0]).slave(0, 1).slave(1, 2);
+        assert_eq!(spread(&g, 0), Spread::Unread);
+        // and what the undecided reach refuses: a protected point only
+        let q = |point: Point| Query {
+            host: false,
+            reaches: true,
+            ..host(MG_OP_MOUNT, point, "tmpfs")
+        };
+        assert_eq!(decide(&q(plain(0xef53, &["mnt", "x"]))), Verdict::Allow);
+        assert_eq!(
+            decide(&q(view_root(MG_OWN, 0xef53))),
+            Verdict::Refuse(MG_WHY_ON)
+        );
+    }
+
+    /// N1's unmount variant: a place is keyed under the parent's group at
+    /// the refresh, and under the parent mount itself ([`held_under`]), a
+    /// key of its own — never a group's, an id's or another place's.
+    #[test]
+    fn a_place_under_its_parent_mount_is_its_own_key() {
+        let cg = NameKey::of("cgroup");
+        let under = held_under(7, 0x16, 33, &cg);
+        assert_ne!(under, held_by_place(7, 0x16, 33, &cg));
+        assert_eq!(under.1, held_by_place(7, 0x16, 33, &cg).1, "one hash");
+        assert_ne!(under, held_under(8, 0x16, 33, &cg));
+        assert_ne!(under, held_under(7, 0x16, 33, &NameKey::of("bpf")));
+        assert_ne!(under.0, held_by_id(7).0);
+        assert_ne!(under.0, held_by_place(u32::MAX, 0x16, 33, &cg).0);
+        assert_eq!(under.0 & HELD_BY_ID, 0, "never an id's key");
+        let any = held_by_place(PLACE_ANY_GROUP, 0x16, 33, &cg);
+        assert_ne!(any, under);
+        assert_ne!(any, held_by_place(7, 0x16, 33, &cg));
+    }
+
+    /// N1's unmount variant (`unshare` after `/sys` was regrouped, then
+    /// `umount /sys/fs/bpf` in the raw copy: the kernel takes the host's
+    /// childless bpffs): the raw copy of `/sys` is a peer of the host's
+    /// `/sys`, under which the bpffs is held — taken. A chroot's own sysfs
+    /// (a new mount, its group new, its copies in the guarded namespaces'
+    /// slaves of `/`) holds no held mount: its `sys/fs/cgroup` unmounted is
+    /// let through (the lab's chroot case on 5.15, refused by a first
+    /// version keyed by the place alone). Undecided: fail closed on a held
+    /// root only; a known group: the keys under it decide.
+    #[test]
+    fn an_unmount_under_a_regrouped_parent_takes_a_held_mount_and_a_chroots_does_not() {
+        let takes = |g: &Graph, held_root: bool, like: bool| {
+            umount_takes_held(umount_spread(g, 0), held_root, like)
+        };
+        // 0: the raw copy of /sys, 1: the host's /sys (the bpffs held under it)
+        let g = Graph::new(2).peers(228, &[0, 1]).guard(1, 1);
+        assert_eq!(umount_spread(&g, 0), Some(Spread::Guarded));
+        assert!(takes(&g, true, true));
+        assert!(
+            takes(&g, false, false),
+            "found, whatever the root and the parent"
+        );
+        // 0: a chroot's sysfs, 1 and 2: its copies in the agent's and the
+        // watchdog's namespaces (slaves) — none holds a held mount
+        let g = Graph::new(3).peers(229, &[0]).slave(0, 1).slave(0, 2);
+        assert_eq!(umount_spread(&g, 0), Some(Spread::Nowhere));
+        assert!(!takes(&g, true, true));
+        // more than the walk reads (the lab's guests: a copy in each
+        // sandboxed unit's namespace): a held root under a copy of a held
+        // mount is kept; under a chroot's own sysfs, or another root, let go
+        let ring: Vec<usize> = (0..17).collect();
+        let g = Graph::new(17).peers(230, &ring);
+        assert_eq!(umount_spread(&g, 0), Some(Spread::Unread));
+        assert!(takes(&g, true, true));
+        assert!(!takes(&g, true, false), "the chroot's sysfs at $T/sys");
+        assert!(!takes(&g, false, true));
+        // a known group, or none: not walked (its keys decide)
+        let g = Graph::new(2).peers(7, &[0, 1]).guard(1, 1).following(&[7]);
+        assert_eq!(umount_spread(&g, 0), None);
+        assert!(!takes(&g, true, true));
+        assert!(!takes(&Graph::new(1), true, true));
+        // a parent in no peer group propagates nothing (the kernel never
+        // gives one slaves: a master is shared)
+        let g = Graph::new(2).slave(0, 1).guard(1, 1);
+        assert!(!takes(&g, true, true));
+    }
+
+    /// N1: the `mount(2)` calls that change a propagation, in the kernel's
+    /// order — a remount or a bind with a propagation flag is not one.
+    #[test]
+    fn a_propagation_change_is_told_from_a_remount_and_a_bind() {
+        const MS_REC: u64 = 1 << 14;
+        const MS_SHARED: u64 = 1 << 20;
+        const MS_PRIVATE: u64 = 1 << 18;
+        const MS_SLAVE: u64 = 1 << 19;
+        const MS_UNBINDABLE: u64 = 1 << 17;
+        for f in [
+            MS_SHARED,
+            MS_PRIVATE,
+            MS_SLAVE,
+            MS_UNBINDABLE,
+            MS_SHARED | MS_REC,
+        ] {
+            assert!(regroups(f), "{f:#x}");
+            assert_eq!(mount_op(f), MG_OP_PASS);
+        }
+        for f in [
+            MS_BIND | MS_SHARED,
+            MS_REMOUNT | MS_SHARED,
+            MS_REMOUNT | MS_BIND | MS_RDONLY,
+            MS_MOVE,
+            0,
+        ] {
+            assert!(!regroups(f), "{f:#x}");
+        }
+    }
+
+    /// The review of #567 (d): two subvolumes of one btrfs (one super
+    /// block, one `s_dev`), whose roots are both inode 256, are two keys —
+    /// each the one `stat(2)` gives (the subvolume's device), so a point on
+    /// one never matches the other; without the subvolume's device read
+    /// (the btrfs offsets unknown) the key is the super block's, which no
+    /// point registered there has.
+    #[test]
+    fn two_btrfs_subvolumes_with_one_inode_number_are_two_keys() {
+        let (s_dev, a, b) = (0x2d, 0x2e, 0x2f);
+        let ka = inode_key(s_dev, BTRFS_SUPER_MAGIC, 256, a);
+        let kb = inode_key(s_dev, BTRFS_SUPER_MAGIC, 256, b);
+        assert_ne!(ka, kb);
+        assert_eq!(ka, (a as u64, 256), "stat(2)'s key on subvolume A");
+        assert_eq!(kb, (b as u64, 256), "stat(2)'s key on subvolume B");
+        let points = [ka];
+        assert!(!points.contains(&kb), "no false match across subvolumes");
+        // another file system's inode: its super block's device, whatever is read
+        assert_eq!(inode_key(0x803, 0xef53, 256, a), (0x803, 256));
+        // the subvolume's device unread: the super block's, no point's
+        let blind = inode_key(s_dev, BTRFS_SUPER_MAGIC, 256, 0);
+        assert_eq!(blind, (s_dev as u64, 256));
+        assert!(!points.contains(&blind));
     }
 }

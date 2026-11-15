@@ -304,6 +304,54 @@ mod tests {
         );
     }
 
+    /// The re-check of #567 (N2): the mount guard's allow-list check
+    /// (`common::mount_guard::allowed_kernel_mount`) is a function of its
+    /// own in the object, which the programs judging a landing point call.
+    /// Inlined into `decide`, the BPF back end specialised its loop by the
+    /// point's depth and 5.15 matched no kernel mount any more (lot 357's
+    /// fix round); xtask's `mount_guard_codegen` pins the source's
+    /// `#[inline(never)]`, this what the compiler made of it.
+    #[test]
+    fn the_mount_guards_allow_list_check_is_a_function_of_the_object() {
+        if EMBEDDED != "1" || EBPF_BYTES.is_empty() {
+            assert!(
+                std::env::var_os(REQUIRE_OBJECT_ENV).is_none(),
+                "{REQUIRE_OBJECT_ENV} is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(EBPF_BYTES).expect("the eBPF object parses");
+        let allow: Vec<&str> = obj
+            .functions
+            .values()
+            .map(|f| f.name.as_str())
+            .filter(|n| n.contains("allowed_kernel_mount"))
+            .collect();
+        assert_eq!(
+            allow.len(),
+            1,
+            "allowed_kernel_mount is not one function of the object (inlined?): {allow:?}"
+        );
+        // BPF_JMP | BPF_CALL with src_reg BPF_PSEUDO_CALL: a call of a function
+        const CALL: u8 = 0x85;
+        for prog in ["mount_guard_sb_mount", "mount_guard_move_mount"] {
+            let p = obj
+                .programs
+                .get(prog)
+                .unwrap_or_else(|| panic!("{prog} missing"));
+            let f = obj
+                .functions
+                .get(&p.function_key())
+                .unwrap_or_else(|| panic!("{prog}'s function missing"));
+            assert!(
+                f.instructions
+                    .iter()
+                    .any(|i| i.code == CALL && i.src_reg() == 1),
+                "{prog} calls no function: the allow-list check was inlined into it"
+            );
+        }
+    }
+
     /// The emulation itself: a loop whose latch falls through to its
     /// header is caught, a jump loop and a DAG are not.
     #[test]

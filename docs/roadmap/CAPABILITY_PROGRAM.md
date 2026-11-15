@@ -11400,6 +11400,54 @@ number in parentheses is a lab PR.
     record, no ext4 recovery. An earlier round of the same tree had one
     High at each poweroff (finalrd), closed by reading the reconfigure's
     flags.
+  - Fix round 2 (re-check 1 of #567): N1 — a guarded mount regrouped
+    (`--make-private`, a decoy taking the freed number, `--make-shared`)
+    left `MOUNT_GROUPS` stale for up to 30 s, and a raw namespace's tmpfs
+    propagated over `/etc/northnarrow` unrefused (the reviewer's probe, a
+    user namespace on 6.18). Now one shared walk
+    (`common::mount_guard::spread`/`target_reach`, the hooks' `Mounts`
+    over `struct mount`, the tests' over a graph): a group the map does not
+    hold is read in the hook, its peers and each one's slaves up to 16
+    mounts, undecided counting as reaching (refused only on a protected
+    point); an unmount walks the parent's propagation for the mount a held
+    one sits under at that place (`HELD_UNDER`, by the parent's id), an
+    undecided walk refused only under a copy of a held mount — two first
+    versions refused a chroot's cgroup2 unmount on the lab's guests (keyed
+    by the place alone; then failing closed on any undecided walk: a
+    chroot's sysfs has the host's dentries and a copy in each unit's
+    namespace); `mount(2)`'s
+    propagation changes and a `move_mount(2)` of a grouped mount into a
+    guarded namespace wake the agent's refresh within a second
+    (`MOUNT_GUARD_CONF` slot 4); the two-masters-deep residual is gone.
+    The ptrace guard's read-mode refusals on the agent's processes are a
+    signed Low (`FS_OP_PTRACE_READ`, 60 s per caller and target, minor, no
+    trigger); `inode_key` is one function (two btrfs subvolumes, two
+    keys); sysext/confext/composefs overlays canonical at the start; the
+    allow list checked out of line in the object. Mutation: 32 mutants of the new code, 32 caught by a named test
+    after four tests were added for the first survivors (7e1a42ff's own
+    decision, `group != 0 && known(group)`, among the caught). Lab (the
+    round's probe — 76 refused and 38 allowed cases, the regroup ones
+    among them — the read-mode refusals and a cold boot), the final tree: ubuntu2204 (5.15.0-203:
+    `sb_mount` 556,211, 55.6 %, the highest, `sb_umount` 502,902,
+    `move_mount` 452,190; 116 OK, 0 failing, the headroom gate OK),
+    ubuntu2404 (6.8.0-149: `move_mount` 184,743, `sb_umount` 64,755; 120
+    OK, 0 failing), ubuntu2604 (7.0.0-43: `move_mount` 295,848,
+    `sb_umount` 61,986; 118 OK, 0 failing). On each: `/` regrouped by
+    `mount_setattr` (from `shared:1` to a new group, a decoy on 1), then
+    a raw namespace's tmpfs over `/etc/northnarrow`, `/run/northnarrow`
+    and below `/var/lib/northnarrow` — `EPERM`, one High each; the same
+    regroup by `mount(2)`, at once and after the refresh, and `/` made a
+    slave of the raw copy's group — refused; `/sys` regrouped, the raw
+    copy's `umount /sys/fs/bpf` — refused, the bpffs still there; a raw
+    namespace's tmpfs elsewhere let through; `nsenter -t <agent> -m` and
+    `readlink /proc/<agent>/exe` refused, one Low `ptrace_read` each, one
+    per caller and target over a minute (a process opening
+    `/proc/<agent>/ns/mnt` twice: one), 26–30 over a whole round (journald
+    11, needrestart 3–6). The chroot cases (a backup's bind and rbind of `/`,
+    debootstrap, schroot, arch-chroot, a chroot's cgroup2, an rbind of
+    `/sys`, a lazy sysfs) without a record; two earlier rounds of the fix
+    refused the chroot's cgroup2 unmount on all three. Cold boot: agent and
+    watchdog active, five guard links, no guard record.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

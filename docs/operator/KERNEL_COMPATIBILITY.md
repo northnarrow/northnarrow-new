@@ -1284,6 +1284,19 @@ highest; 123 programs, 116 OK, 0 failing), 6.8.0-149 (180,428; 120 OK) and
 7.0.0-43 (291,642; 118 OK); every refused case `EPERM` with its record,
 every allowed one silent, on the three (`UPGRADE_NOTES_WAVE4.md` §51.1).
 
+**As measured, re-check 1 of #567** (the same guests and setup, the final
+tree): the propagation walk (`common::mount_guard::spread`, 16 mounts of a
+group the map does not hold; `struct mount`'s `mnt_slave_list` and
+`mnt_slave` an `hlist` on 6.18 and 7.0, a `list_head` before: read alike)
+and the unmount's walk by parent mount keep the six programs under the
+900k gate — 5.15.0-203: `mount_guard_sb_mount` 556,211 (55.6 %, the
+object's highest), `sb_umount` 502,902, `move_mount` 452,190 (116 OK, 0
+failing; the verifier headroom gate OK); 6.8.0-149: `mount_guard_move_mount`
+184,743, `sb_mount` 119,516, `sb_umount` 64,755 (120 OK, 0 failing);
+7.0.0-43: `move_mount` 295,848, `sb_mount` 173,694, `sb_umount` 61,986
+(118 OK, 0 failing). The regrouped guarded mount's cases (§51.2) refused
+on each, the chroot cases let through.
+
 **As measured** (our lab guests, lot 357, the lot's tree, the agent
 installed as an operator with the alpha profile):
 - **Ubuntu 26.04** (`7.0.0-43-generic`, util-linux 2.41): `verifier-check`

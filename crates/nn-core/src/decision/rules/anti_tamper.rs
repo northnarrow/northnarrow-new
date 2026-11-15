@@ -483,6 +483,27 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // The re-check of #567 (b): a read-mode access refused, recorded
+            // once a minute per caller and target — Low: journald's metadata
+            // reads of the agent's log lines meet it as surely as `nsenter`.
+            FsProtectOperation::PtraceRead => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) was refused a read-mode access (ptrace mode \
+                     {target_dev:#x}) to the agent's process {target_ino}: one of its \
+                     /proc/<pid>/ links — ns/* (nsenter, `systemctl bind` or `mount-image` \
+                     entering its namespace), exe, root, cwd, fd/, environ, maps or io. Recorded \
+                     once a minute per caller and process; journald reading the agent's \
+                     executable for its log lines, lsof and a monitoring agent's process \
+                     collector are refused the same way."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -1150,6 +1171,28 @@ mod tests {
         );
         assert!(v.reasoning.contains("in the tracefs"), "{}", v.reasoning);
         assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    /// The re-check of #567 (b): a refused read-mode access to the agent's
+    /// process (`nsenter -t <agent> -m`, `systemctl bind` into its
+    /// namespace) is a signed record — Low, the mode and the target named,
+    /// never the attach's words — and an attach stays High.
+    #[test]
+    fn a_refused_read_mode_access_to_the_agent_is_a_low_record() {
+        let mut e = denial(FsProtectOperation::PtraceRead);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = 0x09; // PTRACE_MODE_READ_FSCREDS
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        for words in ["read-mode access", "0x9", "process 709", "ns/*", "nsenter"] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("ptrace attach"), "{}", v.reasoning);
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::Ptrace))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
     }
 
     /// Review 82: the kexec wire byte decodes to `Kexec`, and an unknown

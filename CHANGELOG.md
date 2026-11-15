@@ -62,6 +62,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     subdirectory never passes as the kernel's own mount; only the binaries
     that exist are points (`/usr/local` on NFS); overlay roots' file keys
     reconciled. Fail-open slot 33.
+  - **Its re-check** (§51.2): a guarded mount regrouped since the agent's
+    last read of the peer groups (`--make-private`, a decoy taking the
+    freed number, `--make-shared`) no longer lets a raw namespace's mount
+    propagate over a protected path — a group `MOUNT_GROUPS` does not hold
+    is walked in the hook (`common::mount_guard::spread`: up to 16 peers
+    and slaves; undecided counts as reaching, refused only on a protected
+    point), an unmount there walks the parent's propagation for the mount a
+    held one sits under at that place (`HELD_UNDER`, by the parent mount's
+    id: a chroot's own sysfs has the host's dentries; undecided, refused
+    under a copy of a held mount only), and a propagation
+    change through `mount(2)` or
+    `move_mount(2)` in a guarded namespace wakes the refresh within a second
+    (`MOUNT_GUARD_CONF` slot 4); a read-mode refusal of the ptrace guard on
+    the agent's processes (`nsenter`, `systemctl bind` into its namespace)
+    is a signed Low record (`FS_OP_PTRACE_READ`, `ptrace_read`, once a
+    minute per caller and target, the non-decisive budget, no posture
+    trigger); the guard's inode key is one function across the hooks and
+    the tests (two btrfs subvolumes are two keys); `systemd-sysext`,
+    `confext` and composefs overlays merged at boot are the canonical
+    layout at the start; the allow list's out-of-line function is checked
+    in the object.
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

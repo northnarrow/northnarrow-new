@@ -1081,8 +1081,8 @@ pub const FS_OP_SIGNAL: u8 = 9;
 /// A ptrace ATTACH-mode access to a protected pid refused by the
 /// `ptrace_access_check` hook — debugger attach, `/proc/<pid>/mem`,
 /// `process_vm_readv/writev` (`target_ino` = target tgid, `target_dev` = the
-/// ptrace mode bits). READ-mode and NOAUDIT checks (`ps`, `lsof`, journald
-/// reading `/proc/<pid>/exe`) are denied silently, as before.
+/// ptrace mode bits). A READ-mode refusal is [`FS_OP_PTRACE_READ`]; NOAUDIT
+/// checks (`ps` reading `/proc/<pid>/stat`) are denied silently.
 pub const FS_OP_PTRACE: u8 = 10;
 /// Review 82: a kexec kernel image load refused by the `kernel_read_file`
 /// (`kexec_file_load`) or `kernel_load_data` (`kexec_load`) hook outside
@@ -1529,8 +1529,18 @@ pub const FS_OP_MOUNT_WINDOW: u8 = 50;
 /// fields as [`FS_OP_MOUNT`]'s). Minor.
 pub const FS_OP_MOUNT_NOTED: u8 = 51;
 
+/// The re-check of #567 (b): a READ-mode ptrace access to one of the
+/// agent's processes refused by the `ptrace_access_check` hook (without
+/// `PTRACE_MODE_NOAUDIT`): its `/proc/<pid>/ns/*` links (`nsenter`,
+/// `systemctl bind` or `mount-image` entering the agent's namespace), `exe`,
+/// `root`, `cwd`, `fd/`, `environ`, `maps`, `io` — the fields as
+/// [`FS_OP_PTRACE`]'s. Recorded once a minute per caller and target
+/// (journald's metadata reads of the agent's log lines, `lsof`, a
+/// monitoring agent's process collector meet it too). Minor.
+pub const FS_OP_PTRACE_READ: u8 = 52;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_MOUNT_NOTED;
+pub const FS_OP_LAST: u8 = FS_OP_PTRACE_READ;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1590,6 +1600,8 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_MOUNT_WINDOW
             // the review of #567: an unmount let through and recorded
             | FS_OP_MOUNT_NOTED
+            // its re-check (b): a read-mode access to the agent refused
+            | FS_OP_PTRACE_READ
     )
 }
 
@@ -2906,6 +2918,7 @@ mod tests {
             FS_OP_MOUNT,
             FS_OP_MOUNT_WINDOW,
             FS_OP_MOUNT_NOTED,
+            FS_OP_PTRACE_READ,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

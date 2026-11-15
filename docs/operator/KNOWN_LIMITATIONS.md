@@ -154,13 +154,22 @@ analysis is in the
   remount — and so is one made in another namespace that propagates into a
   guarded one (a raw `unshare(CLONE_NEWNS)`, a container's `rshared` bind
   of a host directory, an unmount of an rbind copy that the kernel carries
-  onto a held mount). `mount_setattr(2)` (read-only, propagation) has no
-  kernel hook: it is not refused, it is a signed `integrity_drift`
-  (`mount_attrs_changed`, High) within one integrity round (about 30 s), as
-  is any mount on a kernel where the guard is not attached (a signed
-  degradation). The watchdog's namespace is guarded from the agent's
-  watchdog refresh, up to 30 s after the watchdog starts. A propagation
-  chain two masters deep, built after the start, is not followed. *For
+  onto a held mount): its peer group is one the agent follows (read every
+  30 s and within a second of a propagation change made by `mount(2)` or
+  `move_mount(2)`), or — a guarded mount regrouped since — the hook walks
+  the group's peers and their slaves; a group wider or deeper than the 16
+  mounts it reads counts as reaching a guarded namespace, and a mount there
+  is then refused on, over or below a protected point only.
+  `mount_setattr(2)` (read-only, propagation) has no kernel hook: it is not
+  refused, it is a signed `integrity_drift` (`mount_attrs_changed`, High)
+  within one integrity round (about 30 s), as is any mount on a kernel
+  where the guard is not attached (a signed degradation). The watchdog's
+  namespace is guarded from the agent's watchdog refresh, up to 30 s after
+  the watchdog starts. The emergency remount (`SysRq-u`, a kernel thread,
+  which root can trigger through `/proc/sysrq-trigger`) is not refused: it
+  makes every block-backed file system read-only, signed High
+  (`state_fs_read_only`); restrict `kernel.sysrq` if the host needs no
+  emergency remount. *For
   you:* on Ubuntu 22.04, `mount --move` in the host's namespace is refused
   (util-linux 2.37 names the source by a string only); a runtime
   `systemd-sysext refresh` or `systemd-confext refresh`, a
@@ -169,7 +178,8 @@ analysis is in the
   `systemctl soft-reboot` need a trusted-installer window; an rbind of
   `/sys` or `/` is made `rslave` before its `umount -R`; an ostree host
   (binds of `/var`) or a host whose `/` is a tmpfs signs its layout as not
-  canonical at each start (`mount_not_canonical`).
+  canonical at each start (`mount_not_canonical`) — a `systemd-sysext`,
+  `confext` or composefs overlay merged at boot does not.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is
